@@ -22,7 +22,9 @@ import std.format : format;
 import std.regex : regex, matchFirst, Regex;
 import std.string : strip, indexOf, toLower;
 import std.algorithm : canFind, any, all, startsWith, endsWith, filter;
-import std.array : array;
+import std.array : array, join;
+import std.algorithm : map;
+import std.sumtype : SumType, match;
 import nano.shell : parse, Simple;
 import nano.cmdexpand;
 import nano.guard;
@@ -253,16 +255,46 @@ struct Policy
         return p;
     }
 
-    /// null when the call may run, else the reason it is blocked.
-    string check(string tool, JSONValue args)
+    /// Allow, deny, or ask the user. `PermAsk` carries the reason the call
+    /// could not be verified (a shell loop whose commands are not provably
+    /// safe); with no one to answer it is blocked (see `blockedMessage`).
+    /// `PermDeny` carries the full message for the model.
+    PermissionDecision decide(string tool, JSONValue args) { return decideIn(tool, args, currentDir()); }
+
+    /// ditto, at `cwd`.
+    PermissionDecision decideIn(string tool, JSONValue args, string cwd)
     {
-        auto reason = checkIn(tool, args, currentDir());
-        if (reason is null) return null;
-        return format("Blocked by nano-coder permissions: %s. %s", reason, blockAdvice);
+        string ask;
+        auto reason = reasonIn(tool, args, cwd, ask);
+        if (reason !is null) return PermissionDecision(PermDeny(blockedMessage(reason)));
+        if (ask !is null) return PermissionDecision(PermAsk(ask));
+        return PermissionDecision(PermAllow());
     }
 
-    /// The bare reason a call is blocked (no advice), or null.
+    /// The headless view: null when the call may run, else the message the
+    /// model sees (an ask is blocked, as when no one can answer).
+    string check(string tool, JSONValue args)
+    {
+        return decide(tool, args).match!(
+            (PermAllow _) => cast(string) null,
+            (PermAsk a) => blockedMessage(a.reason),
+            (PermDeny d) => d.message,
+        );
+    }
+
+    /// The bare reason a call is blocked (no advice), or null. An ask is
+    /// blocked with the full guidance message (the headless view).
     string checkIn(string tool, JSONValue args, string cwd)
+    {
+        string ask;
+        auto reason = reasonIn(tool, args, cwd, ask);
+        if (reason !is null) return reason;
+        return ask is null ? null : blockedMessage(ask);
+    }
+
+    /// The bare deny reason, or null; `ask` is set when a bash command needs
+    /// the user's approval.
+    private string reasonIn(string tool, JSONValue args, string cwd, out string ask)
     {
         try
         {
@@ -270,7 +302,7 @@ struct Policy
             {
             case "bash":
                 auto c = stringArg(args, "command");
-                if (c !is null) checkCommand(c, cwd);
+                if (c !is null) ask = checkCommand(c, cwd);
                 return null;
             case "read_file", "write_file", "edit_file":
                 auto path = stringArg(args, "path");
@@ -335,43 +367,95 @@ struct Policy
         return null;
     }
 
-    /// Throws Blocked with the reason a shell command is refused.
-    void checkCommand(string command, string cwd)
+    /// Throws Blocked with the reason a shell command is refused; returns the
+    /// reason it needs the user's approval (an unverifiable loop), or null.
+    string checkCommand(string command, string cwd)
     {
         auto denyRules = deny.filter!(r => r.subject == Subject.command).array;
         foreach (r; denyRules)
             if (r.matches(command.strip)) throw new Blocked(format("rule `%s` denies this command", r.source));
-        Simple[] commands;
-        try commands = expandAll(parse(command));
-        catch (Exception e) throw new Blocked(format("could not inspect this command (%s); simplify it", e.msg));
+        Expansion e;
+        try e = expandAllChecked(parse(command));
+        catch (Exception ex) throw new Blocked(format("could not inspect this command (%s); simplify it", ex.msg));
+        auto commands = e.commands;
         foreach (cmd; commands)
         {
             auto text = commandText(cmd);
             foreach (r; denyRules)
                 if (r.matches(text)) throw new Blocked(format("rule `%s` denies `%s`", r.source, text));
         }
+        // An unverified loop command carries run-time arguments: a deny rule
+        // that could match it for some value denies the loop (a dynamic or
+        // glob word can take any value); an allow rule approves it only when
+        // the command has no run-time-dependent word and the rule matches.
+        auto allowRules = allow.filter!(r => r.subject == Subject.command).array;
+        static bool runtime(const Simple cmd) { return cmd.words.any!(w => w.dynamic || w.glob); }
+        foreach (item; e.unverified)
+        {
+            auto text = commandText(item.command);
+            foreach (r; denyRules)
+                if (r.matches(text))
+                    throw new Blocked(format("rule `%s` may deny `%s` depending on the loop's values", r.source, text));
+            if (runtime(item.command) && denyRules.length)
+                throw new Blocked(format("rule `%s` may deny `%s` depending on the loop's values", denyRules[0].source,
+                    text));
+        }
+        string ask;
+        foreach (item; e.unverified)
+            if (runtime(item.command) || !allowRules.any!(r => r.matches(commandText(item.command))))
+            {
+                ask = item.reason;
+                break;
+            }
         Guard guard;
         if (builtinRules)
         {
             auto realCwd = resolveSymlinks(cwd);
-            auto withAssignments = commandsWithAssignments(command);
-            auto loopBound = loopBoundVars(withAssignments);
-            auto assigned = assignments(withAssignments);
+            // The dataflow comes from the original parsed commands (loop
+            // headers and assignments intact), never the executable ones.
+            auto loopBound = loopBoundVars(e.guardSource);
+            // A loop unrolled away still ran: its variable stays loop-bound.
+            foreach (name; e.bound) loopBound[name] = true;
+            auto assigned = assignments(e.guardSource);
             foreach (name, _; loopBound) assigned[name] = Known(false, null);
             guard = Guard(realCwd, homeDir(), protectedBranches, assigned, loopBound, realCwd, 0);
             foreach (cmd; commands)
                 foreach (r; cmd.redirects)
                     if (isWriteRedirect(r.op)) guard.deviceWrite(r.target.text);
         }
-        auto allowRules = allow.filter!(r => r.subject == Subject.command).array;
         if (allowRules.length && commands.all!((cmd) {
                 auto text = commandText(cmd);
-                return (!cmd.words.length && !cmd.redirects.length) || allowRules.any!(r => r.matches(text));
+                // An assignment-only command has no program an allow rule
+                // must cover.
+                return ((!cmd.words.length || cmd.words.all!(w => isAssignment(w.text))) && !cmd.redirects.length)
+                    || allowRules.any!(r => r.matches(text));
             }))
-            return;
-        if (builtinRules) guard.check(command, commands);
+            return ask;
+        if (builtinRules)
+        {
+            // Scan the substituted commands as well as the raw text, so an
+            // unrolled loop cannot hide `DROP TABLE` behind its variable.
+            auto scan = command ~ "\n" ~ commands.map!(c => commandText(c)).join("\n");
+            guard.check(scan, commands);
+        }
+        return ask;
     }
 }
+
+/// The message a blocked call returns to the model.
+string blockedMessage(string reason)
+{
+    return format("Blocked by nano-coder permissions: %s. %s", reason, blockAdvice);
+}
+
+/// Outcome of `Policy.decide`.
+struct PermAllow {}
+/// Needs the user's approval; the reason the call could not be verified.
+struct PermAsk { string reason; }
+/// Blocked; the full message for the model.
+struct PermDeny { string message; }
+/// ditto
+alias PermissionDecision = SumType!(PermAllow, PermAsk, PermDeny);
 
 unittest
 {

@@ -1075,7 +1075,16 @@ class Agent
         // Backstop for a call already in flight when plan mode was switched on.
         if (control.mode == AgentMode.plan && !planAllows(call.name))
             return format("%s is disabled in plan mode (read-only)", call.name);
-        if (auto blocked = policy.check(call.name, call.arguments)) return blocked;
+        // An unverifiable shell loop (issue #164) asks the user once, showing
+        // the whole command, when someone can answer; headless it is blocked.
+        // Resolved before the PreToolUse hooks, so an approved call still runs
+        // them (and a rewrite they make is re-checked below).
+        auto permissionDeny = policy.decide(call.name, call.arguments).match!(
+            (PermAllow _) => cast(string) null,
+            (PermDeny d) => d.message,
+            (PermAsk a) => askPermission(call.name, call.arguments, a.reason),
+        );
+        if (permissionDeny !is null) return permissionDeny;
         // PreToolUse hooks run after the permission check, before the tool:
         // they can deny the call, rewrite its input, or add context.
         JSONValue args = call.arguments;
@@ -1192,6 +1201,29 @@ class Agent
     }
 
     private bool headless() { return !questions || !questions.interactive; }
+
+    /// Ask the user to approve a call the policy could not verify (an
+    /// unverifiable shell loop, issue #164). Null approves this call once;
+    /// otherwise the message the model sees when it stays blocked (declined,
+    /// dismissed, or no one can answer, which returns the block guidance).
+    private string askPermission(string tool, JSONValue args, string reason)
+    {
+        if (headless) return blockedMessage(reason);
+        string command;
+        if (args.type == JSONType.object)
+            if (auto c = "command" in args)
+                if (c.type == JSONType.string) command = c.str;
+        auto q = Question(format("nano-coder cannot verify this %s call automatically (%s). Run it?\n\n%s", tool,
+            reason, command), "Permission", [QuestionOption("Run once", "Run this call this one time"),
+            QuestionOption("Block", "Do not run it; the model is told why")]);
+        q.custom = false;
+        return questions.ask([q]).match!(
+            (Answered got) => got.answers.length && got.answers[0] == "Run once" ? null
+                : format("The user declined to run this %s call (%s). Do not retry it unchanged.", tool, reason),
+            _ => format("The user did not answer the approval prompt for this %s call (%s). Do not retry it unchanged.",
+                tool, reason),
+        );
+    }
 
     /// Interactive normal mode: ask whether to keep going past the cap.
     private bool askKeepGoing()
@@ -1521,6 +1553,120 @@ unittest
     agent.hooks = new HookManager([hook(Event.stop, `echo '{"decision":"block","reason":"more"}'`)], tempDir);
     assert(agent.run("go", new NullEvents) == "d");
     assert(mock.seen.length == 4 && mock.seen[1][$ - 1].content.canFind("more"));
+}
+
+// Issue #164: an unverifiable shell loop asks once interactively (and still
+// faces the PreToolUse hooks when approved), is blocked when declined or
+// headless, is rejected in plan mode without prompting, and a literal-list
+// loop whose unrolled commands are allowed runs without asking.
+// rust: agent.rs::an_unverifiable_loop_is_asked_once_interactively_and_runs_when_approved
+// rust: agent.rs::an_approved_loop_still_runs_its_pre_tool_use_hooks
+// rust: agent.rs::an_approved_loop_is_blocked_by_a_pre_tool_use_deny
+// rust: agent.rs::an_unverifiable_loop_is_blocked_when_the_user_declines
+// rust: agent.rs::an_unverifiable_loop_in_plan_mode_is_rejected_without_prompting
+// rust: agent.rs::an_unverifiable_loop_is_blocked_headless_without_asking
+// rust: agent.rs::a_literal_list_loop_runs_without_asking
+unittest
+{
+    import nano.claude_hooks : Hook, Event;
+    import nano.question : Answered, Question;
+    import nano.safeio : spawn;
+    import std.algorithm : canFind;
+    import std.file : tempDir;
+    import core.time : seconds, msecs;
+    enum loop = `{"command":"for f in $(git ls-files); do sed -i s/x/y/ \"$f\"; done"}`;
+    static bool answer(QuestionBroker broker, string label)
+    {
+        import core.thread : Thread;
+        // Bounded, so a call that is never asked fails the test, not hangs it.
+        immutable(Question)[] pending;
+        foreach (_; 0 .. 10_000)
+        {
+            if ((pending = broker.pending()) !is null) break;
+            Thread.sleep(1.msecs);
+        }
+        if (pending is null) return false;
+        assert(pending[0].header == "Permission" && !pending[0].custom);
+        broker.resolve(Answer(Answered([label])));
+        return true;
+    }
+    string[] ran;
+    auto reg = new ToolRegistry;
+    reg.register(ToolDefinition("bash", "", parseJSON(`{}`)), (JSONValue a) { ran ~= a["command"].str; return "ok"; });
+    // Run one bash call through a fresh agent; `label` answers the prompt
+    // (null: no answerer). Returns the tool result the model saw.
+    string runCall(string args, string label, bool interactive, Policy policy = Policy.init,
+        HookManager hooks = null, bool plan = false)
+    {
+        auto mock = new MockClient([LLMResponse("", "", [ToolCall.fromRaw("b1", "bash", args)]), LLMResponse("done")]);
+        auto agent = new Agent(mock, reg, policy, null);
+        agent.hooks = hooks;
+        agent.questions = QuestionBroker.make;
+        agent.questions.interactive = interactive;
+        if (plan) agent.control.mode = AgentMode.plan;
+        if (label is null)
+        {
+            agent.run("run it", new NullEvents);
+            assert(agent.questions.pending() is null);
+        }
+        else
+        {
+            auto answerer = spawn(&answer, agent.questions, label);
+            agent.run("run it", new NullEvents);
+            assert(answerer.join(), "no permission question was asked");
+        }
+        return mock.seen[1][$ - 1].content;
+    }
+    Hook hook(string command)
+    {
+        Hook h;
+        h.event = Event.preToolUse;
+        h.command = command;
+        h.matcher = "Bash";
+        h.timeout = 10.seconds;
+        return h;
+    }
+
+    // Approved: the tool runs.
+    assert(runCall(loop, "Run once", true) == "ok");
+    assert(ran.length == 1);
+
+    // An approval does not bypass the hooks: a rewrite into a denied command
+    // is re-checked and blocked. A glob loop over a static body asks (rather
+    // than denying up-front) even with the deny rule present.
+    ran = null;
+    Policy deny;
+    deny.deny ~= parseRule("Bash(forbidden-cmd*)");
+    auto text = runCall(`{"command":"for f in *; do git status; done"}`, "Run once", true, deny,
+        new HookManager([hook(`cat >/dev/null; echo '{"hookSpecificOutput":{"updatedInput":{"command":"forbidden-cmd"}}}'`)],
+            tempDir));
+    assert(text.canFind("forbidden-cmd") || text.canFind("denies") || text.canFind("Blocked"), text);
+    assert(!ran.length);
+
+    // ...and a hook deny wins over the approval.
+    text = runCall(loop, "Run once", true, Policy.init, new HookManager([hook(`cat >/dev/null; printf '%s' '`
+        ~ `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"hook says no"}}'`)],
+        tempDir));
+    assert(text.canFind("hook says no"), text);
+    assert(!ran.length);
+
+    // Declined: blocked, and the model is told so.
+    text = runCall(loop, "Block", true);
+    assert(text.canFind("declined"), text);
+    assert(!ran.length);
+
+    // Plan mode: rejected by the read-only backstop without prompting (an
+    // unanswered prompt would hang the test).
+    text = runCall(loop, null, true, Policy.init, null, true);
+    assert(text.canFind("plan mode") || text.canFind("read-only"), text);
+
+    // Headless: blocked with the guidance message, no question raised.
+    text = runCall(loop, null, false);
+    assert(text.canFind("Blocked by nano-coder permissions") && text.canFind("not a known read-only command"), text);
+    assert(!ran.length);
+
+    // A literal-list loop whose unrolled commands are allowed needs no approval.
+    assert(runCall(`{"command":"for f in a.txt b.txt; do wc -l \"$f\"; done"}`, null, false) == "ok");
 }
 
 // report_outcome ends the turn with its summary as the answer.

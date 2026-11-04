@@ -388,8 +388,9 @@ struct Guard
         case Res.none: return;
         case Res.err:
             if (word.dynamic && referencesVars(word.text, loopBound))
-                throw new Blocked(format("`%s %s` depends on a loop variable whose value nano-coder cannot determine after "
-                    ~ "the loop (the shell leaves it holding the last iterated value); rewrite it as explicit commands",
+                throw new Blocked(format("cannot allow a loop: `%s %s` depends on a loop variable whose value nano-coder "
+                    ~ "cannot determine after the loop (the shell leaves it holding the last iterated value); rewrite it "
+                    ~ "as explicit commands",
                     action, word.text));
             throw new Blocked(format("`%s %s` runs after a `cd` to a directory nano-coder can't determine; use an "
                 ~ "absolute path", action, word.text));

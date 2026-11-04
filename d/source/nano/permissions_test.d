@@ -14,6 +14,7 @@ import std.path : buildPath;
 import std.conv : to;
 import std.process : thisProcessID;
 import nano.permissions;
+import std.sumtype : match;
 import nano.paths : joinPath, homeDir;
 
 private:
@@ -41,6 +42,34 @@ void allowed(string command)
 {
     auto e = check(Policy.init, command);
     assert(e is null, command ~ ": " ~ e);
+}
+
+/// The decision for a command at the test cwd (issue #164).
+PermissionDecision decideWith(Policy p, string command) { return p.decideIn("bash", cmdArgs(command), "/work/project"); }
+
+bool asksWith(Policy p, string command)
+{
+    return decideWith(p, command).match!((PermAsk _) => true, _ => false);
+}
+
+bool allowsWith(Policy p, string command)
+{
+    return decideWith(p, command).match!((PermAllow _) => true, _ => false);
+}
+
+/// The command needs the user's approval (an unverifiable loop, #164).
+string asks(string command)
+{
+    string reason;
+    immutable got = decideWith(Policy.init, command).match!((PermAsk a) { reason = a.reason; return true; }, _ => false);
+    assert(got, command ~ ": expected Ask, got " ~ decideWith(Policy.init, command).to!string);
+    return reason;
+}
+
+void denied(string command)
+{
+    auto r = check(Policy.init, command);
+    assert(r !is null, "`" ~ command ~ "` must not be allowed");
 }
 
 bool isErr(string r) nothrow { return r !is null; }
@@ -95,8 +124,10 @@ unittest // readonly_loop_bodies_are_allowed_by_effect
 
     // A destructive, executable, or merely unclassified body remains
     // fail-closed, and the error identifies the command responsible.
+    // A glob list cannot be unrolled (its values are run-time paths), so
+    // `rm -rf "$f"` stays a loop-variable fail-closed in the guard.
     auto err = blocked("for f in *; do rm -rf \"$f\"; done");
-    assert(err.canFind("body command `rm -rf $f`"));
+    assert(err.canFind("`rm -r $f`") && err.canFind("loop variable"), err);
     err = blocked("for f in *.sh; do bash \"$f\"; done");
     assert(err.canFind("body command `bash $f`") && err.canFind("interpreter"));
     assert(blocked("for f in *.py; do python3 \"$f\"; done").canFind("interpreter"));
@@ -1163,7 +1194,9 @@ unittest // round12_guard_hardening
     // #2 Loops may now run when their bodies are provably read-only, but a
     // destructive body must still fail closed: inspecting `rm -rf "$x"`
     // with `$x` under-approximated would silently auto it through.
-    assert(blocked("for x in /; do rm -rf \"$x\"; done").canFind("loop"));
+    // A literal-list loop is unrolled (issue #164): the unrolled `rm -rf /`
+    // is the standalone catastrophic delete the guard blocks.
+    assert(blocked("for x in /; do rm -rf \"$x\"; done").canFind("filesystem root"));
     assert(blocked("select x in a b; do rm -rf \"$x\"; done").canFind("loop"));
 
     // #4 ANSI-C `$'...'` escapes are decoded, so an `rm -rf /` hidden behind
@@ -1420,4 +1453,681 @@ unittest // sandbox_confines_file_tools (+ round12 #1: a symlink escaping lexica
     Policy ro;
     ro.sandbox.mode = SandboxMode.readOnly;
     assert(ro.checkIn("edit_file", parseJSON(`{"path":"src/new.rs"}`), cwd).isErr);
+}
+
+// Issue #164 (loop permissions): ported from Rust PR #165.
+
+// rust: permissions.rs::literal_loop_lists_are_unrolled_and_checked_as_standalone_commands
+unittest // literal_loop_lists_are_unrolled_and_checked_as_standalone_commands
+{
+    Policy p; string err, reason, r;
+    // Issue #164: a `for` loop over a literal word list is exactly the
+    // commands it unrolls to, so it faces the same allow/ask/deny rules as
+    // those commands written out by hand. Both real-world loops from the
+    // issue are allowed where their unrolled commands are.
+    allowed(
+        "for q in \"agent memory mcp\" \"codebase knowledge graph\"; do gh search repos \"$q\" --sort stars --limit 8 --json fullName; done",
+    );
+    allowed(
+        "B=https://example.test; for p in auto-resolutions transcripts sessions; do curl -sS --max-time 20 --netrc-file ~/.netrc-merlin -o /tmp/nw-$p.json \"$B/$p\"; done",
+    );
+    // Plain words, quoted strings and brace expansions all unroll.
+    allowed("for f in a.txt b.txt; do wc -l \"$f\"; done");
+    allowed("for n in {1..4}; do echo \"pass $n\"; done");
+    allowed("for f in src/{main,lib}.rs; do wc -l \"$f\"; done");
+    // A brace word that is not an expansion (`{x}`, `{}`) stays one literal
+    // value, exactly as the shell passes it through.
+    allowed("for f in '{a,b}'; do echo \"$f\"; done");
+
+    // An unrolled loop whose expansion contains a denied command is denied.
+    p = policy(["Bash(wc *)"], ["Bash(rm *)"]);
+    err = check(p, "for f in a b; do rm -rf \"$f\"; done").unwrapErr;
+    assert(err.canFind("denies"));
+    // ...and one whose unrolled commands are all allow-ruled is approved.
+    check(p, "for f in a b; do wc -l \"$f\"; done").unwrapOk;
+
+    // A denied value must be caught even when the loop variable is used
+    // mid-word (`/tmp/nw-$p.json`).
+    p = policy([], ["Bash(rm *)"]);
+    assert(check(p, "for f in a b; do rm \"$f\"; done").isErr);
+
+    // A loop that cannot be unrolled (a non-literal list) and whose body is
+    // not provably read-only asks for approval instead of hard-blocking.
+    // The reason names the first command that could not be verified — here
+    // the header substitution, which runs on the parent shell each
+    // iteration.
+    reason = asks("for f in $(git ls-files); do sed -i s/x/y/ \"$f\"; done");
+    assert(reason.canFind("git ls-files"));
+    // Where no one can answer, `check` (the headless path) blocks with the
+    // same guidance message as before.
+    err = blocked("for f in $(git ls-files); do sed -i s/x/y/ \"$f\"; done");
+    assert(err.canFind("not a known read-only command"));
+    assert(err.canFind("Do not try to get around this"));
+    // A non-literal list whose header substitution is read-only but whose
+    // body is not still asks, naming the body command.
+    reason = asks("for f in $(ls src); do sed -i s/x/y/ \"$f\"; done");
+    assert(reason.canFind("sed -i s/x/y/ $f"));
+
+    // A loop over a command substitution whose header AND body are both
+    // read-only stays allowed without asking.
+    assert(allowsWith(Policy.init, "for f in $(ls src); do wc -l \"$f\"; done"));
+
+    // An allow rule cannot prove it covers *every* value a glob/command-
+    // substitution loop binds: the body word `$f` is a run-time value, and
+    // matching the rule against the placeholder text (`sed -i s/x/y/ $f`)
+    // would auto-approve bindings outside the rule. Such a loop asks — even
+    // under a broad `Bash(sed *)` — because the dynamic word makes coverage
+    // unprovable (round-3 review of #164).
+    p = policy(["Bash(sed *)"], []);
+    assert(asksWith(p, "for f in $(ls src); do sed -i s/x/y/ \"$f\"; done"));
+    // A rule that cannot cover every value the loop binds still asks.
+    p = policy(["Bash(sed -i s/x/y/ a.txt)"], []);
+    assert(asksWith(p, "for f in $(ls src); do sed -i s/x/y/ \"$f\"; done"));
+
+    // The unroll is capped (64 iterations): above it the loop cannot be
+    // checked exactly, so a body that is not provably read-only asks rather
+    // than expanding unboundedly — even one whose unrolled commands would
+    // be allowed.
+    import std.range : iota; import std.algorithm : map; import std.array : join;
+    auto many = iota(1, 101).map!(n => format("f%s", n)).join(" ");
+    reason = asks(format("for f in %s; do touch \"$f\"; done", many));
+    assert(reason.canFind("touch"));
+    // A body the policy cannot verify at all asks too, without unrolling.
+    reason = asks(format("for f in %s; do frobnicate \"$f\"; done", many));
+    assert(reason.canFind("frobnicate"));
+    // A read-only body is allowed regardless of the list size.
+    allowed(format("for f in %s; do wc -l \"$f\"; done", many));
+
+    // Hard blocks survive unrolling: a computed program, an interpreter, a
+    // dangerous assignment, or a write redirect in the body stays blocked.
+    assert(blocked("for c in id whoami; do $c; done").canFind("computed at run time"));
+    assert(blocked("for f in a.sh; do bash \"$f\"; done").canFind("interpreter"));
+    assert(blocked("for f in a b; do PATH=/tmp/evil grep x \"$f\"; done").canFind("assigns `PATH`"));
+    assert(blocked("for f in a b; do echo x > \"$f\"; done").canFind("writes via redirection"));
+    // A body that rebinds the loop variable cannot be unrolled exactly, so
+    // it asks rather than guessing.
+    reason = asks("for f in a b; do f=/etc; touch \"$f\"; done");
+    assert(reason.canFind("touch"));
+    // A post-loop destructive use of the loop variable still fails closed
+    // even though the loop itself unrolled away.
+    err = blocked("for d in /etc; do :; done; rm -rf \"$d\"");
+    assert(err.canFind("loop variable"));
+}
+
+// rust: permissions.rs::unrolled_loops_keep_assignments_sql_and_padded_ranges
+unittest // unrolled_loops_keep_assignments_sql_and_padded_ranges
+{
+    Policy p; string err, reason, r;
+    // Round-2 review of #164: the unroll must not lose information the
+    // guards need.
+
+    // #2 An assignment inside an unrolled body still reaches the guard's
+    // dataflow, so a later destructive operand resolves it instead of
+    // judging an empty operand.
+    err = blocked("NANO_DELETE_TARGET=/etc; for f in a; do touch \"$f\"; done; rm -rf \"$NANO_DELETE_TARGET\"");
+    assert(err.canFind("/etc") || err.canFind("outside the workspace"));
+    // ...including an assignment made by the loop body itself, which the
+    // guard treats as loop-bound (unknown) and fails closed.
+    err = blocked("for f in a; do T=/etc; done; rm -rf \"$T\"");
+    assert(err.canFind("loop variable"));
+
+    // #3 The destructive-SQL guard scans the substituted commands, so a
+    // loop cannot hide `DROP TABLE users` behind its variable.
+    err = blocked("for op in DROP; do sqlite3 test.db \"$op TABLE users\"; done");
+    assert(err.canFind("destructive database"));
+
+    // #6 Bash preserves zero padding in numeric brace ranges, so the
+    // checked values must be the padded ones the loop actually binds.
+    p = policy([], ["Bash(touch item01)"]);
+    err = check(p, "for n in item{01..03}; do touch \"$n\"; done").unwrapErr;
+    assert(err.canFind("denies"));
+    // ...and the padded form is what an allow rule sees too.
+    p = policy(["Bash(touch item0*)"], []);
+    check(p, "for n in item{01..03}; do touch \"$n\"; done").unwrapOk;
+    // Signed endpoints keep their padding (`{-03..-01}` → `-03 -02 -01`).
+    p = policy([], ["Bash(touch n-02)"]);
+    assert(check(p, "for n in n{-03..-01}; do touch \"$n\"; done").isErr);
+    // A stepped range binds only its stepped values.
+    p = policy([], ["Bash(touch s2)"]);
+    check(p, "for n in s{1..5..2}; do touch \"$n\"; done").unwrapOk;
+    p = policy([], ["Bash(touch s5)"]);
+    err = check(p, "for n in s{1..6..2}; do touch \"$n\"; done").unwrapErr;
+    assert(err.canFind("denies"));
+}
+
+// rust: permissions.rs::unverifiable_loops_fail_closed_on_rules_bindings_and_builtins
+unittest // unverifiable_loops_fail_closed_on_rules_bindings_and_builtins
+{
+    Policy p; string err, reason, r;
+    // Round-2 review of #164: the Ask path must not weaken any hard block.
+
+    // #4 A deny rule is matched conservatively, never against a finite
+    // sample of probe values: a rule that could match for some binding
+    // (`touch secret.txt` among `*`) denies the loop outright, and one
+    // matching the static text denies too.
+    p = policy(["Bash(touch *)"], ["Bash(touch secret.txt)"]);
+    err = check(p, "for f in *; do touch \"$f\"; done").unwrapErr;
+    assert(err.canFind("may deny"));
+    // A deny rule matching the static text denies directly.
+    p = policy([], ["Bash(touch $f)"]);
+    err = check(p, "for f in *; do touch \"$f\"; done").unwrapErr;
+    assert(err.canFind("denies"));
+    // With no deny rule that could match, the loop still asks: the body word
+    // `$f` is a run-time value, so an allow rule matching the placeholder
+    // text cannot prove it covers every binding (round-3 review of #164).
+    p = policy(["Bash(touch *)"], []);
+    assert(asksWith(p, "for f in *; do touch \"$f\"; done"));
+
+    // #5 A nested loop header rebinds the name for the rest of the outer
+    // iteration, so the outer loop cannot be unrolled with a stale value.
+    reason = asks("for d in ./scratch; do for d in /etc; do :; done; touch \"$d\"; done");
+    assert(reason.canFind("touch"));
+    // ...and the guard sees the rebind in the not-unrollable form too.
+    err = blocked("for d in ./scratch; do for d in /etc; do :; done; rm -rf \"$d\"; done");
+    assert(err.canFind("loop variable") || err.canFind("not a known read-only command"));
+
+    // #7 A declaration builtin's assignments are validated before an Ask:
+    // `export PATH=...` in a loop body stays a hard block, as do an `env`
+    // assignment and an interpreter wrapped in `env`.
+    assert(blocked("for f in a; do export PATH=/tmp/evil; ls; done").canFind("assigns `PATH`"));
+    assert(blocked("for f in a; do declare PATH=/tmp/evil; ls; done").canFind("assigns `PATH`"));
+    assert(blocked("for f in a; do env PATH=/tmp/evil ls; done").canFind("assigns `PATH`"));
+    assert(blocked("for f in a; do env bash -c 'echo $f'; done").canFind("interpreter"));
+    // A benign declaration or wrapper still asks rather than blocking. Use
+    // a glob list so the loop cannot be unrolled (a literal list would be
+    // unrolled and judged as the explicit commands, which are allowed).
+    reason = asks("for f in *; do export MARKER=1; touch \"$f\"; done");
+    assert(reason.canFind("export MARKER=1"));
+    reason = asks("for f in *; do env MARKER=1 touch \"$f\"; done");
+    assert(reason.canFind("touch"));
+}
+
+// rust: permissions.rs::readonly_loop_closes_review_round15_safety_gaps
+unittest // readonly_loop_closes_review_round15_safety_gaps
+{
+    Policy p; string err, reason, r;
+    // Round-3 Copilot review of #164 (10 threads).
+
+    // #439 Guard dataflow is built from the original commands (loop headers
+    // and assignments intact), so a loop that rebinds `d` to `/etc` after an
+    // earlier `d=./scratch` is judged against `/etc`, not the stale literal.
+    err = blocked("d=./scratch; for f in a; do touch \"$f\"; done; for d in /etc; do :; done; rm -rf \"$d\"");
+    assert(err.canFind("loop variable") || err.canFind("outside the workspace") || err.canFind("/etc"));
+
+    // #493 The destructive-SQL scan runs over the substituted commands even
+    // when a sibling loop stays unverifiable, so a `DROP` in the unrolled
+    // part is not hidden behind the other's Ask.
+    err = blocked("for op in DROP; do sqlite3 test.db \"$op TABLE users\"; done; for f in *; do touch \"$f\"; done");
+    assert(err.canFind("destructive database"));
+
+    // #428 An allow rule matching the placeholder text (`$f`) does not prove
+    // coverage over every runtime binding, so the loop asks instead of being
+    // auto-approved.
+    p = policy(["Bash(touch ??.txt)"], []);
+    assert(asksWith(p, "for f in *; do touch \"$f.txt\"; done"));
+
+    // #1384 Zero padding applies only when an endpoint has an explicit
+    // leading zero; `{9..11}` binds `9 10 11`, not `09 10 11`.
+    p = policy([], ["Bash(touch item9)"]);
+    err = check(p, "for n in item{9..11}; do touch \"$n\"; done").unwrapErr;
+    assert(err.canFind("denies"));
+    // ...while a genuinely padded range keeps its padding.
+    p = policy([], ["Bash(touch item09)"]);
+    err = check(p, "for n in item{09..11}; do touch \"$n\"; done").unwrapErr;
+    assert(err.canFind("denies"));
+
+    // #1413 A stepped range stops before advancing past its endpoint:
+    // `{1..6..2}` binds `1 3 5`, never `7`.
+    p = policy([], ["Bash(touch s7)"]);
+    check(p, "for n in s{1..6..2}; do touch \"$n\"; done").unwrapOk;
+    // ...and still binds the in-range stepped values.
+    p = policy([], ["Bash(touch s5)"]);
+    err = check(p, "for n in s{1..6..2}; do touch \"$n\"; done").unwrapErr;
+    assert(err.canFind("denies"));
+    // A step larger than the remaining distance emits only the start
+    // (`{1..5..10}` binds just `1`), and a descending letter range stops at
+    // its endpoint without overshooting (`{z..a..3}` ends at `b`, not `a`).
+    p = policy([], ["Bash(touch e5)"]);
+    check(p, "for n in e{1..5..10}; do touch \"$n\"; done").unwrapOk;
+    p = policy([], ["Bash(touch za)"]);
+    check(p, "for n in z{z..a..3}; do touch \"$n\"; done").unwrapOk;
+    p = policy([], ["Bash(touch zb)"]);
+    err = check(p, "for n in z{z..a..3}; do touch \"$n\"; done").unwrapErr;
+    assert(err.canFind("denies"));
+
+    // #2537 An assignment-only command is not an executable for allow-rule
+    // coverage: `D=/etc; rm -rf "$D"` must not fail the all-commands match
+    // just because the `D=/etc` word is not `rm *`. With the assignment
+    // excluded from coverage, the single `rm` executable matches the allow
+    // rule and the call is approved (an allow rule intentionally overrides
+    // the advisory built-in guard — the user accepted `rm`).
+    p = policy(["Bash(rm *)"], []);
+    assert(allowsWith(p, "D=/etc; rm -rf \"$D\""));
+    // ...and without an allow rule the guard still resolves `D` and blocks
+    // the out-of-workspace delete (the assignment is preserved for dataflow).
+    err = blocked("D=/etc; rm -rf \"$D\"");
+    assert(err.canFind("/etc") || err.canFind("outside the workspace") || err.canFind("top-level system"));
+
+    // #1305 A dynamic word that mixes a real expansion with a *literal*
+    // (quoted/escaped) `$f` cannot be substituted exactly — `Word::text` has
+    // already dropped the quoting — so the loop declines to unroll and asks
+    // rather than check the wrong text. `'$f'"$f"` flattens to `$f$f`; the
+    // shell runs `$fsafe`, which a deny on `touch $fsafe` must still catch.
+    p = policy([], ["Bash(touch $fsafe)"]);
+    auto d = decideWith(p, "for f in safe; do touch '$f'\"$f\"; done");
+    // Not unrolled to a wrong `touch safesafe`: either it asks (unverifiable)
+    // or the deny rule on the real runtime text fires.
+    d.match!(
+        (PermAsk _) {},
+        (PermDeny m) { assert(m.message.canFind("deny") || m.message.canFind("may deny"), m.message); },
+        (PermAllow _) { assert(0, "'$f'\"$f\" was unrolled to a wrong literal and allowed"); },
+    );
+    // An unambiguous single-occurrence word still unrolls normally.
+    p = policy(["Bash(touch safe)"], []);
+    check(p, "for f in safe; do touch \"$f\"; done").unwrapOk;
+
+    // #1715 `env -- MARKER=1 bash -c ...`: `--` ends option processing, not
+    // the assignments, so the real program (`bash`) is classified and the
+    // interpreter hard block fires rather than an allow after unrolling.
+    assert(blocked("for f in a; do env -- MARKER=1 bash -c 'echo hi'; done").canFind("interpreter"));
+    // ...and a dangerous assignment after `--` is still validated.
+    assert(blocked("for f in a; do env -- PATH=/tmp/evil ls; done").canFind("assigns `PATH`"));
+
+    // #1744 A wrapper only selects how the effective command is found; the
+    // unwrapped command is classified recursively, so a wrapped declaration
+    // builtin's assignment is a hard block, as is a nested wrapper.
+    assert(blocked("for f in a; do command export PATH=/tmp/evil; ls; done").canFind("assigns `PATH`"));
+    assert(blocked("for f in a; do builtin export PATH=/tmp/evil; ls; done").canFind("assigns `PATH`"));
+    assert(blocked("for f in a; do command builtin export PATH=/tmp/evil; ls; done").canFind("assigns `PATH`"));
+    // A wrapped read-only command stays allowed (the recursion reaches it).
+    allowed("for f in a b; do command echo \"$f\"; done");
+}
+
+/// #4463243139: a loop inside a nested script rebinds its variable for the
+/// script's later commands, so the guard's loop-bound set must recurse into
+/// `nested_scripts()` the way `collect_assignments()` does.
+// rust: permissions.rs::nested_script_loop_binding_stays_loop_bound
+unittest // nested_script_loop_binding_stays_loop_bound
+{
+    Policy p; string err, reason, r;
+    r = check(Policy.init, "bash -c 'd=./scratch; for d in /etc; do :; done; rm -rf \"$d\"'");
+    assert(r.isErr);
+}
+
+/// #4463243166: the original-form precheck cannot see a dangerous assignment
+/// name introduced by substitution, so the unrolled body is reclassified
+/// under the loop rules and its hard blocks re-applied.
+// rust: permissions.rs::substituted_declaration_assignment_hard_blocks
+unittest // substituted_declaration_assignment_hard_blocks
+{
+    Policy p; string err, reason, r;
+    r = check(Policy.init, "for name in PATH; do export \"$name=/tmp/evil\"; ls; done");
+    assert(r.isErr);
+}
+
+/// #4463243185: a dynamic word mixing a real expansion with a literal
+/// (quoted/escaped) `$name` cannot be substituted exactly, so the unroll is
+/// declined rather than checking a value the shell does not run.
+// rust: permissions.rs::mixed_literal_and_expansion_declines_unroll
+unittest // mixed_literal_and_expansion_declines_unroll
+{
+    Policy p; string err, reason, r;
+    r = check(Policy.init, "for f in safe; do touch '$f'\"$other\"; done");
+    assert(r.isErr);
+}
+
+/// #4463243203: an unquoted substitution word-splits on the effective IFS, so
+/// a rebound `IFS` must be read from the line's assignments before unrolling.
+// rust: permissions.rs::ifs_rebinding_declines_splitting_unroll
+unittest // ifs_rebinding_declines_splitting_unroll
+{
+    Policy p; string err, reason, r;
+    r = check(Policy.init, "IFS=x; for d in safex/; do rm -rf $d; done");
+    assert(r.isErr);
+}
+
+/// #4463243227: a path-qualified `/usr/bin/env` (a permitted /bin|/usr/bin
+/// utility) must face the same wrapper validation as bare `env`.
+// rust: permissions.rs::path_qualified_env_is_validated
+unittest // path_qualified_env_is_validated
+{
+    Policy p; string err, reason, r;
+    r = check(Policy.init, "for f in a; do /usr/bin/env PATH=/tmp/evil ls; done");
+    assert(r.isErr);
+    r = check(Policy.init, "for f in a; do /usr/bin/env bash -c 'echo hi'; done");
+    assert(r.isErr);
+    r = check(Policy.init, "for f in a; do /usr/bin/env -S'sh -c \"echo hi\"' echo; done");
+    assert(r.isErr);
+}
+
+/// #4463243252: an unrecognized `env` option is rejected, not skipped, so an
+/// attached/clustered split-string form cannot hide a command.
+// rust: permissions.rs::env_attached_split_string_hard_blocks
+unittest // env_attached_split_string_hard_blocks
+{
+    Policy p; string err, reason, r;
+    r = check(Policy.init, "for f in a; do env -S'sh -c \"rm -rf /etc\"' echo; done");
+    assert(r.isErr);
+}
+
+/// #4463243272: the loop-body write collector recursively unwraps the
+/// `builtin`/`command` wrappers the classifier accepts, so a wrapped
+/// declaration or nested wrapper still records its rebind.
+// rust: permissions.rs::wrapped_loop_body_writes_are_collected
+unittest // wrapped_loop_body_writes_are_collected
+{
+    Policy p; string err, reason, r;
+    r = check(Policy.init, "for d in ./scratch; do command export d=/etc; rm -rf \"$d\"; done");
+    assert(r.isErr);
+    r = check(
+        Policy.init,
+        "for d in ./scratch; do command builtin printf -v d '%s' /etc; rm -rf \"$d\"; done",
+    );
+    assert(r.isErr);
+}
+
+/// #4463243291: a literal `for` loop is not unrolled while an enclosing loop
+/// frame is active, so the outer loop's read-only classification is kept.
+// rust: permissions.rs::enclosing_loop_frame_disables_unroll
+unittest // enclosing_loop_frame_disables_unroll
+{
+    Policy p; string err, reason, r;
+    r = check(Policy.init, "while read f; do for x in a; do touch \"$f\"; done; done");
+    assert(r.isErr);
+}
+
+/// #4463243305: a literal-list loop is unrolled even when its body already
+/// classifies read-only, so an argument-specific deny rule sees the values.
+// rust: permissions.rs::readonly_loop_unrolls_for_deny_scan
+unittest // readonly_loop_unrolls_for_deny_scan
+{
+    Policy p; string err, reason, r;
+    p = policy([], ["Bash(wc -l secret.txt)"]);
+    r = check(p, "for f in secret.txt; do wc -l \"$f\"; done");
+    assert(r.isErr);
+}
+
+/// #4463243334: a range at the i64 edge stops once its endpoint is emitted
+/// and uses checked arithmetic, so it neither panics nor wraps.
+// rust: permissions.rs::range_endpoint_uses_checked_arithmetic
+unittest // range_endpoint_uses_checked_arithmetic
+{
+    Policy p; string err, reason, r;
+    r = check(Policy.init, "for i in {9223372036854775807..9223372036854775807}; do echo \"$i\"; done");
+    assert(r.isOk);
+    r = check(Policy.init, "for i in {9223372036854775800..9223372036854775807..3}; do echo \"$i\"; done");
+    assert(r.isOk);
+}
+
+/// #4464911535: an unquoted glob operand is run-time-dependent (the lexer
+/// sets `glob`, not `dynamic`), so it must count in both the conservative
+/// deny check and the allow-coverage check — `for f in *; do touch *; done`
+/// must not be auto-allowed by `touch ?` while a deny on `secret.txt` is
+/// ignored.
+// rust: permissions.rs::glob_operand_is_runtime_dependent
+unittest // glob_operand_is_runtime_dependent
+{
+    Policy p; string err, reason, r;
+    p = policy(["Bash(touch ?)"], ["Bash(touch secret.txt)"]);
+    r = check(p, "for f in *; do touch *; done");
+    assert(r.isErr);
+}
+
+/// #4464911578: Bash updates `_` to the last argument of each simple
+/// command, so it is not a stable loop binding. Decline to unroll `_` — `:`
+/// /etc` would rebind it before `rm -rf "$_"` runs.
+// rust: permissions.rs::underscore_loop_variable_is_not_unrolled
+unittest // underscore_loop_variable_is_not_unrolled
+{
+    Policy p; string err, reason, r;
+    r = check(Policy.init, "for _ in ./scratch; do : /etc; rm -rf \"$_\"; done");
+    assert(r.isErr);
+}
+
+/// #4464911615: `mapfile`/`readarray` write an array (default `MAPFILE`), so
+/// their destination must be recorded as a write — `mapfile -t d <<< /etc`
+/// sets `d[0]` to `/etc`, and a later `rm -rf "$d"` deletes it.
+// rust: permissions.rs::mapfile_destination_is_a_write
+unittest // mapfile_destination_is_a_write
+{
+    Policy p; string err, reason, r;
+    r = check(Policy.init, "for d in ./scratch; do mapfile -t d <<< /etc; rm -rf \"$d\"; done");
+    assert(r.isErr);
+    r = check(Policy.init, "for d in ./scratch; do readarray d; rm -rf \"$d\"; done");
+    assert(r.isErr);
+}
+
+/// #4464911655: a declaration builtin's options and computed destinations
+/// are writes too — `declare -x d=/etc` rebinds `d`, and `declare "$d=/etc"`
+/// hides the destination until substitution.
+// rust: permissions.rs::declaration_option_and_computed_destination_are_writes
+unittest // declaration_option_and_computed_destination_are_writes
+{
+    Policy p; string err, reason, r;
+    r = check(Policy.init, "for d in ./scratch; do declare -x d=/etc; rm -rf \"$d\"; done");
+    assert(r.isErr);
+    r = check(Policy.init, "for d in d; do declare \"$d=/etc\"; rm -rf \"$d\"; done");
+    assert(r.isErr);
+}
+
+/// #4464911699: a preceding expansion does not prove a trailing `$f` is a
+/// real expansion — `touch "$other/"'$f'` runs `touch ./$f` with a literal
+/// `$f`. The lexer's per-segment quote record (`literal_dollars`) lets the
+/// substitution keep the literal, and the mixed word is refused.
+// rust: permissions.rs::preceding_expansion_does_not_prove_trailing_literal_real
+unittest // preceding_expansion_does_not_prove_trailing_literal_real
+{
+    Policy p; string err, reason, r;
+    p = policy([], ["Bash(touch *$f)"]);
+    r = check(p, "other=.; for f in safe; do touch \"$other/\"'$f'; done");
+    assert(r.isErr);
+    // The mirror (a literal `$f` before a real expansion) is refused too.
+    r = check(Policy.init, "other=.; for f in safe; do touch '$f/'\"$other\"; done");
+    assert(r.isErr);
+    // ...while a word whose expansions are all real still unrolls.
+    r = check(Policy.init, "B=/tmp; for p in a; do echo \"$B/$p\"; done");
+    assert(r.isOk);
+}
+
+/// #4464911749: a globbed program name (`s?`) has `glob` set but not
+/// `dynamic`, so it passed the computed-command hard block while the shell
+/// pathname-expands it (to a `sh` in the working directory). Reject it.
+// rust: permissions.rs::globbed_program_name_is_rejected
+unittest // globbed_program_name_is_rejected
+{
+    Policy p; string err, reason, r;
+    r = check(Policy.init, "for f in a; do s? -c 'rm -rf /etc'; done");
+    assert(r.isErr);
+    // The `[[` / `[` test keywords' brackets are shell syntax, not a glob.
+    r = check(Policy.init, "for f in a b; do [[ \"$f\" == a ]] && echo \"$f\"; done");
+    assert(r.isOk);
+}
+
+/// #4464062553: only a word in assignment position binds IFS; an ordinary
+/// argument (`echo IFS=x`) must not be read as a persistent assignment, or
+/// the split check uses a wrong IFS and misses a root operand.
+// rust: permissions.rs::ifs_comes_only_from_assignment_position
+unittest // ifs_comes_only_from_assignment_position
+{
+    Policy p; string err, reason, r;
+    r = check(Policy.init, "echo IFS=x; for d in 'safe /'; do rm -rf $d; done");
+    assert(r.isErr);
+    // ...while a genuine assignment still is honoured.
+    r = check(Policy.init, "IFS=x; for d in safex/; do rm -rf $d; done");
+    assert(r.isErr);
+}
+
+/// #4464062589: tilde expansion is unmarked, so a value like `~+` would be
+/// checked as a literal child while the shell binds a directory. Decline to
+/// unroll any tilde-prefixed value.
+// rust: permissions.rs::tilde_values_are_not_unrolled
+unittest // tilde_values_are_not_unrolled
+{
+    Policy p; string err, reason, r;
+    r = check(Policy.init, "for d in ~+; do rm -rf \"$d\"; done");
+    assert(r.isErr);
+    r = check(Policy.init, "for d in ~; do rm -rf \"$d\"; done");
+    assert(r.isErr);
+}
+
+/// #4464062618: a body that writes IFS makes the pre-loop IFS snapshot stale
+/// (`for d in safex/; do IFS=x; rm -rf $d; done` splits into `safe` and `/`).
+// rust: permissions.rs::body_ifs_write_declines_unroll
+unittest // body_ifs_write_declines_unroll
+{
+    Policy p; string err, reason, r;
+    r = check(Policy.init, "for d in safex/; do IFS=x; rm -rf $d; done");
+    assert(r.isErr);
+}
+
+/// #4464062647: `unset` removes the loop binding, so a later `$d` expands to
+/// nothing (`rm -rf "$d/etc"` becomes `rm -rf /etc`). Record `unset`
+/// destinations as writes, including through wrappers.
+// rust: permissions.rs::unset_loop_binding_is_a_write
+unittest // unset_loop_binding_is_a_write
+{
+    Policy p; string err, reason, r;
+    r = check(Policy.init, "for d in ./scratch; do unset d; rm -rf \"$d/etc\"; done");
+    assert(r.isErr);
+    r = check(Policy.init, "for d in ./scratch; do command unset d; rm -rf \"$d/etc\"; done");
+    assert(r.isErr);
+    r = check(Policy.init, "for d in ./scratch; do env -u d true; rm -rf \"$d/etc\"; done");
+    assert(r.isErr);
+}
+
+/// #4464062682: a nested loop keeps its own frame semantics; replaying the
+/// body flat would drop it. Decline to unroll a body containing a loop.
+// rust: permissions.rs::nested_loop_body_is_not_unrolled
+unittest // nested_loop_body_is_not_unrolled
+{
+    Policy p; string err, reason, r;
+    r = check(Policy.init, "for x in a; do while read f; do touch \"$f\"; done; done");
+    assert(r.isErr);
+    r = check(Policy.init, "for x in a; do for y in b; do touch \"$y\"; done; done");
+    assert(r.isErr);
+}
+
+/// #4464062721: a mixed quoted word (`'$f/'"$other"`) is ambiguous once
+/// quoting is discarded — the checked operand is not the executed one.
+/// Refuse it even when a separator makes the expansions non-adjacent.
+// rust: permissions.rs::mixed_quoted_expansion_is_refused
+unittest // mixed_quoted_expansion_is_refused
+{
+    Policy p; string err, reason, r;
+    p = policy([], ["Bash(touch $f/*)"]);
+    r = check(p, "other=secret; for f in safe; do touch '$f/'\"$other\"; done");
+    assert(r.isErr);
+    r = check(Policy.init, "other=secret; for f in safe; do touch '$f/'\"$other\"; done");
+    assert(r.isErr);
+    // A trailing loop variable after an independent expansion stays allowed.
+    r = check(Policy.init, "B=/tmp; for p in a; do echo \"$B/$p\"; done");
+    assert(r.isOk);
+}
+
+/// #4464062767: a brace left after substitution is expanded by the shell
+/// into several operands (`rm -rf {$d,/etc}` runs on `/etc` too), which the
+/// recomputed `dynamic` flag would miss. Decline the unroll.
+// rust: permissions.rs::brace_after_substitution_declines_unroll
+unittest // brace_after_substitution_declines_unroll
+{
+    Policy p; string err, reason, r;
+    r = check(Policy.init, "for d in ./scratch; do rm -rf {$d,/etc}; done");
+    assert(r.isErr);
+    r = check(Policy.init, "for d in ./scratch; do rm -rf \"{$d,/etc}\"; done");
+    assert(r.isErr);
+}
+
+/// #4464062797: validate the original program's dynamic flag and permitted
+/// parent directory *before* dispatching on its basename, so `/tmp/env` or
+/// `/tmp/export` cannot hide behind a known basename.
+// rust: permissions.rs::basename_dispatch_validates_original_program
+unittest // basename_dispatch_validates_original_program
+{
+    Policy p; string err, reason, r;
+    r = check(Policy.init, "for f in a; do /tmp/env echo \"$f\"; done");
+    assert(r.isErr);
+    r = check(Policy.init, "for f in a; do /tmp/export PATH=/tmp/evil; done");
+    assert(r.isErr);
+    // A computed program is rejected before basename dispatch too.
+    r = check(Policy.init, "for f in a; do $CMD echo \"$f\"; done");
+    assert(r.isErr);
+}
+
+/// #4464062829: a supported wrapper (`timeout`, `nice`, `sudo`, ...) must be
+/// resolved through the loop's effective-command checks, so a wrapped shell
+/// faces the interpreter hard block instead of an unverifiable verdict the
+/// unroll discards.
+// rust: permissions.rs::wrapped_shell_faces_interpreter_hard_block
+unittest // wrapped_shell_faces_interpreter_hard_block
+{
+    Policy p; string err, reason, r;
+    foreach (cmd; [
+        "for f in a; do timeout 1 sh -c 'echo hi'; done",
+        "for f in a; do nice sh -c 'echo hi'; done",
+        "for f in a; do sudo sh -c 'echo hi'; done",
+        "for f in a; do stdbuf -oL sh -c 'echo hi'; done",
+    ])
+    {
+        r = check(Policy.init, cmd);
+        assert(r.isErr);
+    }
+}
+
+/// #4465689567: a command-prefix `IFS=x true` is temporary.
+// rust: permissions.rs::prefix_ifs_assignment_declines_unroll
+unittest // prefix_ifs_assignment_declines_unroll
+{
+    Policy p; string err, reason, r;
+    denied("IFS=x true; for d in 'safe /etc'; do rm -rf $d; done");
+}
+
+/// #4465689646 / #4465689706: prior attributes (`-u`, `-n`) transform bindings.
+// rust: permissions.rs::prior_declaration_attributes_decline_unroll
+unittest // prior_declaration_attributes_decline_unroll
+{
+    Policy p; string err, reason, r;
+    r = check(policy([], ["Bash(touch SECRET)"]), "declare -u f; for f in secret; do touch \"$f\"; done");
+    assert(r.isErr);
+    denied("declare -n d=target; for d in ./scratch; do target=/etc; rm -rf \"$d\"; done");
+}
+
+/// #4465689773: quote flattening must not hide the real `$d` boundary.
+// rust: permissions.rs::quoted_expansion_boundary_is_preserved
+unittest // quoted_expansion_boundary_is_preserved
+{
+    Policy p; string err, reason, r;
+    denied("detc=./scratch; for d in /; do rm -rf \"$d\"etc; done");
+}
+
+/// #4465689853: `nohup` must be unwrapped like `expand()` does.
+// rust: permissions.rs::nohup_wrapped_interpreter_is_blocked
+unittest // nohup_wrapped_interpreter_is_blocked
+{
+    Policy p; string err, reason, r;
+    denied("for f in a; do nohup sh -c 'echo hi'; done");
+}
+
+/// #4465689937 / #4465689990 / #4465690052 / #4465690118: implicit and
+/// unmodeled variable writes.
+// rust: permissions.rs::implicit_variable_writes_decline_unroll
+unittest // implicit_variable_writes_decline_unroll
+{
+    Policy p; string err, reason, r;
+    denied("for PWD in /tmp/scratch; do cd /etc; rm -rf \"$PWD\"; done");
+    denied("for OPTARG in ./scratch; do getopts a: opt -a /etc; rm -rf \"$OPTARG\"; done");
+    denied("for d in ./scratch; do mapfile -d : -t d <<< /etc:; rm -rf \"$d\"; done");
+    denied("for d in d; do unset \"$d\"; rm -rf \"$d/etc\"; done");
+}
+
+/// #4465690184: escaped and ANSI-C dollars are literal too.
+// rust: permissions.rs::escaped_dollar_is_literal
+unittest // escaped_dollar_is_literal
+{
+    Policy p; string err, reason, r;
+    p = policy([], ["Bash(touch *$f)"]);
+    r = check(p, "other=.; for f in safe; do touch \"$other/\\$f\"; done");
+    assert(r.isErr);
+    import nano.shell : parse;
+    auto w = parse("echo \"\\$a\"$'\\x24b'$c")[0].words[1];
+    assert(w.literalDollars == [0, 2], w.literalDollars.to!string);
 }

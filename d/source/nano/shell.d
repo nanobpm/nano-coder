@@ -38,6 +38,16 @@ struct Word
     bool splits;
     /// The word contains an expansion that can assign a shell variable.
     bool assigns;
+    /// Byte offsets in `text` of every `$` the shell treats as a literal
+    /// character (single quotes, backslash escapes, `$'...'`), derived from
+    /// `expansionDollars`. `text` flattens quoting away, so this is what tells
+    /// `'$f'` from `"$f"`.
+    immutable(size_t)[] literalDollars;
+    /// Byte offsets in `text` of every `$` that begins a real expansion.
+    immutable(size_t)[] expansionDollars;
+    /// `[start, end)` byte spans of every bare `$name` expansion, so the real
+    /// parameter name survives quote flattening (`"$d"etc` expands `$d`).
+    immutable(size_t[2])[] expansionSpans;
 }
 
 struct Redirect
@@ -722,6 +732,9 @@ private struct Parser
     {
         ++pos;
         auto c = peek();
+        immutable at = word.text.length;
+        if (c != none && (c == '(' || c == '{' || c == '_' || isAlnum(c) || "@*#?$!-".canFind(c)))
+            word.expansionDollars ~= at;
         if (c == '(' && peekAt(1) == '(')
         {
             pos += 2;
@@ -754,6 +767,7 @@ private struct Parser
         {
             word.text ~= '$';
             while (!atEnd && (isAlnum(peek()) || peek() == '_')) word.text ~= chars[pos++];
+            word.expansionSpans ~= cast(size_t[2]) [at, word.text.length];
             word.dynamic = true;
             if (!quoted) word.splits = true;
         }
@@ -802,6 +816,7 @@ private struct Parser
             {
                 ++pos;
                 backtick();
+                word.expansionDollars ~= word.text.length;
                 word.text ~= "$(...)";
                 word.dynamic = true;
             }
@@ -861,6 +876,7 @@ private struct Parser
             case '`':
                 ++pos;
                 backtick();
+                word.expansionDollars ~= word.text.length;
                 word.text ~= "$(...)";
                 word.dynamic = true;
                 word.splits = true;
@@ -879,6 +895,10 @@ private struct Parser
                 ++pos;
             }
         }
+        // Every `$` not recorded as the start of a real expansion is a literal
+        // character, however the lexer produced it.
+        foreach (i, ch; word.text)
+            if (ch == '$' && !word.expansionDollars.canFind(i)) word.literalDollars ~= i;
         return word;
     }
 
@@ -906,6 +926,7 @@ private struct Parser
             case '`':
                 ++pos;
                 backtick();
+                word.expansionDollars ~= word.text.length;
                 word.text ~= "$(...)";
                 word.dynamic = true;
                 word.splits = true;

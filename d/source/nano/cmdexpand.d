@@ -170,9 +170,67 @@ bool containsGitDir(string root)
 
 Simple[] expandAll(const Simple[] parsed)
 {
-    Simple[] out_;
-    expandSequence(parsed, 0, out_);
-    return out_;
+    return expandAllChecked(parsed).commands;
+}
+
+/// A loop command whose program is static but not a known read-only utility,
+/// so the loop could not be verified automatically. An interactive session asks
+/// the user about the whole loop; anywhere else it is blocked with `reason`.
+struct Unverified
+{
+    Simple command;
+    string reason;
+}
+
+/// The expansion of a parsed command line: the commands to check, plus the
+/// loop fallout the caller must account for.
+struct Expansion
+{
+    /// Every command the line runs, with loops classified by effect.
+    Simple[] commands;
+    /// Loop commands that could not be verified as read-only.
+    Unverified[] unverified;
+    /// Variables of loops that were unrolled away: the loop still ran, so the
+    /// name stays loop-bound for the destructive-path guard.
+    string[] bound;
+    /// The original parsed commands (loop headers and assignments intact) the
+    /// guard's dataflow is built from; the executable `commands` lose
+    /// bindings to the unroll.
+    Simple[] guardSource;
+}
+
+/// Most iterations a literal word list is unrolled into (issue #164).
+enum maxLoopUnroll = 64;
+/// Most body commands all unrolled loops of one command line may produce.
+enum maxUnrolledCommands = 1024;
+
+struct ExpandCtx
+{
+    Unverified[] unverified;
+    /// Whether literal-list `for` loops may be unrolled; off while running the
+    /// hard-block pre-check over a loop's original form.
+    bool unroll = true;
+    /// Remaining unrolled-command budget.
+    size_t budget = maxUnrolledCommands;
+    /// Variables of loops that were unrolled away.
+    string[] bound;
+
+    void note(string verdict, const Simple command)
+    {
+        if (verdict !is null) unverified ~= Unverified(withWords(command, command.words), verdict);
+    }
+}
+
+/// Expand a parsed command line. Hard blocks throw `Blocked`.
+Expansion expandAllChecked(const Simple[] parsed)
+{
+    Expansion e;
+    ExpandCtx ctx;
+    expandSequenceWith(parsed, 0, e.commands, false, ctx);
+    e.unverified = ctx.unverified;
+    e.bound = ctx.bound;
+    foreach (s; parsed) e.guardSource ~= withWords(s, s.words);
+    return e;
 }
 
 void parseInner(string script, size_t depth, ref Simple[] out_)
@@ -203,14 +261,18 @@ private struct LoopFrame
 
 void expandSequence(const Simple[] parsed, size_t depth, ref Simple[] out_)
 {
-    expandSequenceWith(parsed, depth, out_, false);
+    // A nested script (`bash -c '...'`, `eval`, `ssh host ...`) has no approval
+    // path of its own: an unverifiable loop inside it stays a hard block.
+    ExpandCtx ctx;
+    expandSequenceWith(parsed, depth, out_, false, ctx);
+    if (ctx.unverified.length) throw new Blocked(ctx.unverified[0].reason);
 }
 
 /// Expand a parsed command sequence, classifying shell loops by effect: once
 /// a `for`/`select`/`while`/`until` opens, every condition and body command
 /// until the matching `done` must be provably read-only. `readonly` is set
 /// when the sequence is itself a loop header/condition substitution.
-void expandSequenceWith(const Simple[] parsed, size_t depth, ref Simple[] out_, bool readonly)
+void expandSequenceWith(const Simple[] parsed, size_t depth, ref Simple[] out_, bool readonly, ref ExpandCtx ctx)
 {
     LoopFrame[] loops;
     size_t index = 0;
@@ -231,12 +293,18 @@ void expandSequenceWith(const Simple[] parsed, size_t depth, ref Simple[] out_, 
                     c.loopHeaderSub = false;
                     cleared ~= c;
                 }
-                expandSequenceWith(cleared, depth, out_, true);
+                // A header/condition substitution's values are produced at run
+                // time, so a literal-looking list inside it is not a literal the
+                // unroll can substitute: keep the inner loop's classification.
+                immutable saved = ctx.unroll;
+                ctx.unroll = false;
+                scope (exit) ctx.unroll = saved;
+                expandSequenceWith(cleared, depth, out_, true, ctx);
             }
             else
                 foreach (cmd; run)
                 {
-                    checkReadonlyLoopCommand(cmd, "loop", "header or condition substitution");
+                    ctx.note(checkReadonlyLoopCommand(cmd, "loop", "header or condition substitution"), cmd);
                     expand(cmd, depth, out_);
                 }
             continue;
@@ -249,13 +317,57 @@ void expandSequenceWith(const Simple[] parsed, size_t depth, ref Simple[] out_, 
         if (!loops.length && !startsLoop)
         {
             if (readonly)
-                checkReadonlyLoopCommand(withWords(simple, simple.words[offset .. $]), "loop",
-                    "header or condition substitution");
+            {
+                auto effective = withWords(simple, simple.words[offset .. $]);
+                ctx.note(checkReadonlyLoopCommand(effective, "loop", "header or condition substitution"), effective);
+            }
             expand(simple, depth, out_);
             continue;
         }
         if (loops.length && simple.words[0 .. offset].any!(w => w.text == "do"))
             loops[$ - 1].inBody = true;
+
+        // Issue #164: a `for` loop over a literal list is exactly the commands
+        // it unrolls to. Not while an enclosing loop frame is active (the
+        // unrolled body would drop the outer loop's read-only requirement).
+        if (startsLoop && ctx.unroll && head == "for" && !loops.length)
+        {
+            auto end = matchingDone(parsed, index - 1);
+            if (end >= 0)
+            {
+                // Classify the loop as written first, without unrolling: this
+                // keeps every hard block and yields the fallback expansion.
+                auto region = parsed[index - 1 .. end + 1];
+                ExpandCtx scratch;
+                scratch.unroll = false;
+                scratch.budget = 0;
+                Simple[] scratchOut;
+                expandSequenceWith(region, depth, scratchOut, readonly, scratch);
+                // Attempt the unroll even when the loop already classifies
+                // read-only, so the caller's deny scan sees the values.
+                Simple[] unrolled;
+                if (unrollLiteralLoop(region, offset, ctx.budget, parsed[0 .. index - 1], unrolled))
+                {
+                    // The loop still ran: keep its variable loop-bound.
+                    if (offset + 1 < region[0].words.length) ctx.bound ~= region[0].words[offset + 1].text;
+                    // Re-raise hard blocks a substitution introduced; a merely
+                    // unverifiable verdict is not re-recorded (the commands are
+                    // the explicit equivalents the caller judges).
+                    foreach (cmd; unrolled)
+                    {
+                        checkReadonlyLoopCommand(cmd, "for", "body");
+                        expand(cmd, depth, out_);
+                    }
+                }
+                else
+                {
+                    out_ ~= scratchOut;
+                    ctx.unverified ~= scratch.unverified;
+                }
+                index = end + 1;
+                continue;
+            }
+        }
 
         if (startsLoop)
         {
@@ -269,7 +381,7 @@ void expandSequenceWith(const Simple[] parsed, size_t depth, ref Simple[] out_, 
                 auto condWords = simple.words[offset + 1 .. $];
                 auto condOffset = loopCommandOffset(condWords);
                 auto condition = withWords(simple, condWords[condOffset .. $]);
-                checkReadonlyLoopCommand(condition, kind, "condition");
+                ctx.note(checkReadonlyLoopCommand(condition, kind, "condition"), condition);
                 expand(condition, depth, out_);
             }
             continue;
@@ -286,7 +398,7 @@ void expandSequenceWith(const Simple[] parsed, size_t depth, ref Simple[] out_, 
         }
         auto phase = frame.inBody ? "body" : "condition";
         auto effective = withWords(simple, simple.words[offset .. $]);
-        checkReadonlyLoopCommand(effective, frame.kind, phase);
+        ctx.note(checkReadonlyLoopCommand(effective, frame.kind, phase), effective);
         expand(effective, depth, out_);
     }
     if (loops.length)
@@ -308,6 +420,393 @@ size_t loopCommandOffset(const Word[] words) pure
 }
 
 bool isLoopKeyword(const Word w) pure { return !w.dynamic && !w.quoted; }
+
+/// A mutable deep copy of `w`.
+Word copyWord(const Word w) pure
+{
+    Word r;
+    r.text = w.text;
+    r.dynamic = w.dynamic;
+    r.glob = w.glob;
+    r.quoted = w.quoted;
+    r.splits = w.splits;
+    r.assigns = w.assigns;
+    r.literalDollars = w.literalDollars;
+    r.expansionDollars = w.expansionDollars;
+    r.expansionSpans = w.expansionSpans;
+    return r;
+}
+
+/// Index of the `done` closing the loop whose header is `parsed[start]`, or -1.
+ptrdiff_t matchingDone(const Simple[] parsed, size_t start) pure
+{
+    size_t depth = 0;
+    foreach (index; start .. parsed.length)
+    {
+        auto words = parsed[index].words;
+        auto offset = loopCommandOffset(words);
+        if (offset >= words.length || !isLoopKeyword(words[offset])) continue;
+        auto head = words[offset].text;
+        if (head == "for" || head == "select" || head == "while" || head == "until") ++depth;
+        else if (head == "done" && depth > 0)
+        {
+            --depth;
+            if (depth == 0) return cast(ptrdiff_t) index;
+        }
+    }
+    return -1;
+}
+
+private bool isIdentChar(char c) pure
+{
+    return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+}
+
+/// Unroll a `for NAME in WORDS; do BODY; done` loop whose word list is literal
+/// (plain words, quoted strings, brace expansion) into its body repeated once
+/// per value with the loop variable substituted, so each command is judged
+/// exactly as the explicit command it becomes. False when the loop cannot be
+/// unrolled exactly (Rust `unroll_literal_loop` returning `None`).
+bool unrollLiteralLoop(const Simple[] region, size_t offset, ref size_t budget, const Simple[] prior,
+    out Simple[] result)
+{
+    if (region.length < 2) return false;
+    auto header = region[0];
+    auto done = region[$ - 1];
+    auto body = region[1 .. $ - 1];
+    // The effective IFS: the last literal `IFS=...` assignment-position word
+    // before the loop on this line (`echo IFS=x` is an argument, not a binding).
+    string ifs = null;
+    foreach (cmd; prior)
+    {
+        auto words = cmd.words[loopCommandOffset(cmd.words) .. $];
+        if (words.length && !words[0].dynamic && declBuiltins.canFind(words[0].text)) words = words[1 .. $];
+        bool here = false, programFollows = false;
+        string value;
+        foreach (w; words)
+        {
+            if (w.dynamic || w.glob || !isAssignment(w.text)) { programFollows = true; break; }
+            if (w.text.startsWith("IFS=")) { here = true; value = w.text[4 .. $]; }
+        }
+        if (here)
+        {
+            // `IFS=x true` binds IFS for that one command only (or not,
+            // depending on the program): decline rather than guess.
+            if (programFollows) return false;
+            ifs = value is null ? "" : value;
+        }
+    }
+    if (header.redirects.length || header.heredocs.length || done.heredocs.length) return false;
+    if (offset + 2 >= header.words.length) return false;
+    auto variable = header.words[offset + 1];
+    if (variable.dynamic || variable.quoted || !isShellIdentifier(variable.text)) return false;
+    // `_` is rebound to the last argument of every simple command.
+    if (variable.text == "_") return false;
+    // A prior declaration can give the variable transforming attributes.
+    if (priorDeclares(prior, variable.text)) return false;
+    auto keyword = header.words[offset + 2];
+    if (keyword.text != "in" || !isLoopKeyword(keyword)) return false;
+    string[] values;
+    foreach (word; header.words[offset + 3 .. $])
+    {
+        if (word.glob || word.assigns || word.text.canFind('$') || word.text.canFind('`') || word.text.canFind('\\'))
+            return false;
+        if (word.text.canFind('{') || word.text.canFind('}'))
+        {
+            // The lexer marks an unquoted brace list/range dynamic; an unmarked
+            // brace word is literal text (`{x}`, `{}`).
+            if (word.dynamic)
+            {
+                if (word.quoted) return false;
+                string[] expanded;
+                if (!braceExpand(word.text, expanded)) return false;
+                values ~= expanded;
+            }
+            else values ~= word.text;
+        }
+        else
+        {
+            if (word.dynamic) return false;
+            values ~= word.text;
+        }
+        if (values.length > maxLoopUnroll) return false;
+    }
+    // Tilde expansion runs before the binding and is unmarked by the lexer.
+    if (values.any!(v => v.startsWith("~"))) return false;
+    auto total = values.length * body.length;
+    if (total > budget) return false;
+    // A body that rebinds the variable, writes IFS, or holds a nested loop
+    // cannot be replayed flat.
+    bool[string] rebinds;
+    foreach (simple; body) collectLoopBodyWrites(simple.words[loopCommandOffset(simple.words) .. $], rebinds);
+    if (variable.text in rebinds || "IFS" in rebinds) return false;
+    foreach (simple; body)
+        if (simple.words[loopCommandOffset(simple.words) .. $].any!(w => isLoopKeyword(w)
+                && ["for", "select", "while", "until", "done"].canFind(w.text)))
+            return false;
+    auto name = variable.text;
+    Simple[] unrolled;
+    foreach (value; values)
+        foreach (simple; body)
+        {
+            if (simple.heredocs.any!(h => h.expand && h.body.canFind('$'))) return false;
+            Word[] words;
+            foreach (w; simple.words)
+            {
+                Word sub;
+                if (!substituteWord(w, name, value, ifs, sub)) return false;
+                // Only a plain `$VAR` may stay dynamic: a command substitution,
+                // brace or assigning expansion re-runs per iteration.
+                if (sub.assigns || (sub.dynamic && (sub.text.canFind('`') || sub.text.canFind('{')
+                        || sub.text.canFind('}') || sub.text.canFind("$("))))
+                    return false;
+                words ~= sub;
+            }
+            Redirect[] redirects;
+            foreach (r; simple.redirects.dup ~ done.redirects.dup)
+            {
+                Word target;
+                if (!substituteWord(r.target, name, value, ifs, target)) return false;
+                if (target.assigns || (target.dynamic && (target.text.canFind('`') || target.text.canFind('{')
+                        || target.text.canFind('}'))))
+                    return false;
+                redirects ~= Redirect(r.op, target);
+            }
+            // Strip leading control keywords (`do`, `then`) so the unrolled
+            // command is the plain command it stands for.
+            auto c = withWords(simple, words[loopCommandOffset(words) .. $]);
+            c.redirects = redirects;
+            unrolled ~= c;
+        }
+    budget -= total;
+    result = unrolled;
+    return true;
+}
+
+/// Whether any command in `prior` runs a declaration builtin whose arguments
+/// name `name` or are computed (wrappers seen through by scanning every word).
+bool priorDeclares(const Simple[] prior, string name)
+{
+    foreach (cmd; prior)
+    {
+        auto words = cmd.words;
+        foreach (k, w; words)
+        {
+            if (w.dynamic || !declBuiltins.canFind(basename(w.text))) continue;
+            foreach (arg; words[k + 1 .. $])
+            {
+                if (arg.dynamic) return true;
+                string head = arg.text;
+                foreach (i, ch; head)
+                    if (ch == '=' || ch == '[') { head = head[0 .. i]; break; }
+                while (head.endsWith("+")) head = head[0 .. $ - 1];
+                if (head == name) return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// Replace `$name` / `${name}` in `word` with `value`. False when the word uses
+/// the variable another way (`${name:-x}`, `${#name}`), mixes a literal
+/// (quoted/escaped) `$name` with real expansions, or when word splitting,
+/// pathname or brace expansion would turn `value` into something other than
+/// one literal argument. `ifs` null means the default IFS.
+bool substituteWord(const Word word, string name, string value, string ifs, out Word result)
+{
+    if (!word.dynamic)
+    {
+        result = copyWord(word);
+        return true;
+    }
+    auto text = word.text;
+    string out_;
+    bool replaced = false;
+    size_t i = 0;
+    while (i < text.length)
+    {
+        if (text[i] != '$') { out_ ~= text[i]; ++i; continue; }
+        auto rest = text[i + 1 .. $];
+        if (rest.startsWith("$")) { out_ ~= "$$"; i += 2; continue; }
+        // Trust the lexer's real span over the flat text (`"$d"etc` is `$d`).
+        bool spanIsName = word.expansionSpans.any!(sp => sp[0] == i && sp[1] == i + 1 + name.length);
+        bool spanKnown = word.expansionSpans.any!(sp => sp[0] == i);
+        if (rest.startsWith(name))
+        {
+            auto after = rest[name.length .. $];
+            if (spanIsName || (!spanKnown && !(after.length && isIdentChar(after[0]))))
+            {
+                // A literal `$name` (single-quoted, escaped) stays in place.
+                if (word.literalDollars.canFind(i)) out_ ~= "$" ~ name;
+                else { out_ ~= value; replaced = true; }
+                i += 1 + name.length;
+                continue;
+            }
+        }
+        if (rest.startsWith("{"))
+        {
+            auto inner = rest[1 .. $];
+            if (inner.startsWith(name) && inner[name.length .. $].startsWith("}"))
+            {
+                if (word.literalDollars.canFind(i)) out_ ~= "${" ~ name ~ "}";
+                else { out_ ~= value; replaced = true; }
+                i += 3 + name.length;
+                continue;
+            }
+            // Any other braced form mentioning the variable is not plain.
+            auto close = inner.indexOf('}');
+            auto bodyText = close < 0 ? inner : inner[0 .. close];
+            size_t s = 0;
+            foreach (k; 0 .. bodyText.length + 1)
+                if (k == bodyText.length || !isIdentChar(bodyText[k]))
+                {
+                    if (bodyText[s .. k] == name) return false;
+                    s = k + 1;
+                }
+        }
+        out_ ~= '$';
+        ++i;
+    }
+    // A preserved literal `$name` alongside real expansions is ambiguous: the
+    // checked operand would not be the executed one.
+    foreach (lit; word.literalDollars)
+    {
+        if (lit + 1 > text.length) continue;
+        auto after = text[lit + 1 .. $];
+        if ((after.startsWith(name) && !(after.length > name.length && isIdentChar(after[name.length])))
+            || (after.startsWith("{") && after[1 .. $].startsWith(name) && after[1 + name.length .. $].startsWith("}")))
+            return false;
+    }
+    if (!replaced)
+    {
+        result = copyWord(word);
+        return true;
+    }
+    if (word.splits)
+    {
+        // An unquoted substitution word-splits on the effective IFS and is
+        // then pathname-expanded.
+        auto split = ifs is null ? " \t\n" : ifs;
+        if (!value.length || value.any!(c => split.canFind(c) || "*?[".canFind(c))) return false;
+    }
+    // A brace surviving substitution is brace-expanded by the shell.
+    if (out_.canFind('{') || out_.canFind('}')) return false;
+    result = copyWord(word);
+    result.text = out_;
+    result.dynamic = out_.canFind('$') || out_.canFind('`');
+    result.splits = result.dynamic ? word.splits : word.glob;
+    return true;
+}
+
+/// Bash brace expansion of an unquoted literal word: comma lists and integer
+/// or single-letter ranges (with an optional step), with any prefix and
+/// suffix. False on nested or unbalanced braces; a non-expanding brace group
+/// (`{}`, `{x}`) is kept literally.
+bool braceExpand(string text, out string[] result)
+{
+    import core.checkedint : adds, subs;
+    import std.conv : to, ConvException;
+    import std.ascii : isAlpha;
+    auto open = text.indexOf('{');
+    if (open < 0)
+    {
+        if (text.canFind('}')) return false;
+        result = [text];
+        return true;
+    }
+    auto closeRel = text[open .. $].indexOf('}');
+    if (closeRel < 0) return false;
+    auto close = open + closeRel;
+    auto inner = text[open + 1 .. close];
+    if (inner.canFind('{')) return false;
+    auto prefix = text[0 .. open], suffix = text[close + 1 .. $];
+    if (prefix.canFind('}')) return false;
+    string[] items;
+    static bool parseLong(string s, out long v)
+    {
+        try { v = s.to!long; return true; }
+        catch (ConvException) return false;
+    }
+    if (inner.canFind(','))
+        items = inner.split(",");
+    else if (inner.indexOf("..") >= 0)
+    {
+        auto dd = inner.indexOf("..");
+        auto from = inner[0 .. dd], rest = inner[dd + 2 .. $];
+        string to_ = rest;
+        ulong step = 1;
+        auto dd2 = rest.indexOf("..");
+        if (dd2 >= 0)
+        {
+            to_ = rest[0 .. dd2];
+            auto stepText = rest[dd2 + 2 .. $];
+            if (!stepText.length || !allDigits(stepText)) return false;
+            try step = stepText.to!ulong;
+            catch (ConvException) return false;
+            if (step == 0) step = 1;
+        }
+        long a, b;
+        if (parseLong(from, a) && parseLong(to_, b))
+        {
+            immutable ulong diff = a <= b ? cast(ulong) b - cast(ulong) a : cast(ulong) a - cast(ulong) b;
+            if (diff >= maxLoopUnroll) return false;
+            // Bash pads only when an endpoint has an explicit leading zero.
+            bool padded = (from.length > 1 && from.startsWith("0")) || from.startsWith("-0")
+                || (to_.length > 1 && to_.startsWith("0")) || to_.startsWith("-0");
+            auto width = from.length > to_.length ? from.length : to_.length;
+            if (step > long.max) step = long.max;
+            immutable long st = cast(long) step;
+            long n = a;
+            for (;;)
+            {
+                items ~= padded ? format("%0*d", width, n) : n.to!string;
+                if (n == b) break;
+                bool overflow = false;
+                auto next = a <= b ? adds(n, st, overflow) : subs(n, st, overflow);
+                if (overflow) break;
+                n = next;
+                if ((a <= b && n > b) || (a > b && n < b)) break;
+                if (items.length > maxLoopUnroll) return false;
+            }
+        }
+        else if (from.length == 1 && to_.length == 1 && isAlpha(from[0]) && isAlpha(to_[0]))
+        {
+            long ca = from[0], cb = to_[0];
+            if ((ca <= cb ? cb - ca : ca - cb) >= maxLoopUnroll) return false;
+            immutable long st = step > long.max ? long.max : cast(long) step;
+            long c = ca;
+            for (;;)
+            {
+                items ~= [cast(char) c].idup;
+                if (c == cb) break;
+                bool overflow = false;
+                auto next = ca <= cb ? adds(c, st, overflow) : subs(c, st, overflow);
+                if (overflow) break;
+                c = next;
+                if ((ca <= cb && c > cb) || (ca > cb && c < cb)) break;
+                if (items.length > maxLoopUnroll) return false;
+            }
+        }
+        else return false;
+    }
+    else
+    {
+        // Not an expansion: the braces are literal; expand the rest.
+        string[] tail;
+        if (!braceExpand(suffix, tail)) return false;
+        foreach (t; tail) result ~= prefix ~ "{" ~ inner ~ "}" ~ t;
+        return true;
+    }
+    string[] tails;
+    if (!braceExpand(suffix, tails)) return false;
+    foreach (item; items)
+        foreach (t; tails)
+        {
+            result ~= prefix ~ item ~ t;
+            if (result.length > maxLoopUnroll) return false;
+        }
+    return true;
+}
 
 bool startsReadonlyLoopKeyword(const Simple s) pure
 {
@@ -372,18 +871,27 @@ immutable string[] loopExecCommands = ["bash", "sh", "zsh", "dash", "ksh", "ash"
 
 immutable string[] arithTestOps = ["-eq", "-ne", "-lt", "-le", "-gt", "-ge"];
 
-void checkReadonlyLoopCommand(const Simple cmd, string kind, string phase)
+/// Classify one loop command. Throws `Blocked` for a hard block (a dynamic
+/// program, an interpreter, a dangerous assignment, a write, ...); returns the
+/// reason when the program is static but not a known read-only utility, so the
+/// loop cannot be verified automatically (an interactive session may ask);
+/// null when the command is provably read-only.
+string checkReadonlyLoopCommand(const Simple cmd, string kind, string phase)
 {
     checkLoopSideEffects(cmd, kind, phase);
     auto rendered = commandText(cmd);
     string fail(string what) { return format("cannot allow `%s` loop: %s command `%s` %s", kind, phase, rendered, what); }
-    size_t i = 0;
-    while (i < cmd.words.length && isAssignment(cmd.words[i].text))
+    auto unknown = fail("is not a known read-only command; keep the loop body to read-only commands like "
+        ~ "`echo`, `grep`, `cat` and `wc`, or rewrite it as explicit commands");
+    string assignmentName(string text)
     {
-        auto text = cmd.words[i].text;
         auto name = text[0 .. (text.indexOf('=') < 0 ? text.length : text.indexOf('='))];
         while (name.endsWith("+")) name = name[0 .. $ - 1];
         if (name.indexOf('[') >= 0) name = name[0 .. name.indexOf('[')];
+        return name;
+    }
+    void checkArithSubscript(string text)
+    {
         size_t idLen = 0;
         while (idLen < text.length && (text[idLen] == '_' || (text[idLen] >= 'a' && text[idLen] <= 'z')
                 || (text[idLen] >= 'A' && text[idLen] <= 'Z') || (text[idLen] >= '0' && text[idLen] <= '9')))
@@ -395,29 +903,119 @@ void checkReadonlyLoopCommand(const Simple cmd, string kind, string phase)
                 throw new Blocked(fail(format("assigns a shell variable through the arithmetic array subscript of `%s`; "
                     ~ "rewrite it as explicit commands", text)));
         }
+    }
+    void checkDangerous(string name)
+    {
         if (dangerousLoopAssignments.canFind(name))
             throw new Blocked(fail(format("assigns `%s`, which can change what the loop's commands run; rewrite it as "
                 ~ "explicit commands", name)));
+    }
+    size_t i = 0;
+    while (i < cmd.words.length && isAssignment(cmd.words[i].text))
+    {
+        checkArithSubscript(cmd.words[i].text);
+        checkDangerous(assignmentName(cmd.words[i].text));
         ++i;
     }
-    if (i >= cmd.words.length) return;
-    auto programIndex = i;
-    auto first = cmd.words[i].text;
-    if (first == "builtin") programIndex = i + 1;
-    else if (first == "command")
+    if (i >= cmd.words.length) return null;
+    // Validate the original program word before dispatching on its basename:
+    // `$CMD`, a glob (`s?`) or `/tmp/env` is not a known wrapper whatever its
+    // basename spells.
+    auto first = cmd.words[i];
+    if (first.dynamic) throw new Blocked(fail("runs a command computed at run time; rewrite it as explicit commands"));
+    enum globProgram = "runs a program name the shell expands as a glob at run time; rewrite it as explicit commands";
+    static bool globText(string t) pure
     {
+        return t != "[" && t != "[[" && (t.canFind('*') || t.canFind('?') || t.canFind('['));
+    }
+    if (globText(first.text)) throw new Blocked(fail(globProgram));
+    if (first.text.canFind('/'))
+    {
+        auto parent = first.text[0 .. first.text.lastIndexOf('/')];
+        if (parent != "/bin" && parent != "/usr/bin")
+            throw new Blocked(fail(format("runs path-qualified program `%s`, which cannot be verified as a read-only "
+                ~ "utility", first.text)));
+    }
+    auto programIndex = i;
+    bool qualified = first.text.canFind('/');
+    switch (basename(first.text))
+    {
+    case "builtin":
+        if (!qualified) programIndex = i + 1;
+        break;
+    case "command":
+        if (qualified) break;
         auto j = i + 1;
         while (j < cmd.words.length && cmd.words[j].text == "-p") ++j;
-        if (j < cmd.words.length && (cmd.words[j].text == "-v" || cmd.words[j].text == "-V")) return;
+        if (j < cmd.words.length && (cmd.words[j].text == "-v" || cmd.words[j].text == "-V")) return null;
         if (j < cmd.words.length && cmd.words[j].text == "--") ++j;
         else if (j < cmd.words.length && cmd.words[j].text.startsWith("-") && cmd.words[j].text.length > 1)
             throw new Blocked(fail("uses unsupported `command` options; rewrite it as explicit commands"));
         programIndex = j;
+        break;
+    case "export", "local", "declare", "typeset", "readonly":
+        // A declaration builtin's arguments are assignments: validate each
+        // exactly as a leading one before the unverifiable verdict.
+        foreach (w; cmd.words[i + 1 .. $])
+        {
+            if (!isAssignment(w.text)) continue;
+            checkArithSubscript(w.text);
+            checkDangerous(assignmentName(w.text));
+        }
+        return unknown;
+    case "env":
+        // `env` applies `NAME=value` words then runs its argument; `--` ends
+        // option processing, not the assignments.
+        auto j = i + 1;
+        bool optionsDone = false;
+        while (j < cmd.words.length)
+        {
+            auto t = cmd.words[j].text;
+            if (!optionsDone && t == "--") { optionsDone = true; ++j; continue; }
+            if (!optionsDone)
+            {
+                if (t == "-u" || t == "-C" || t == "--unset" || t == "--chdir") { j += 2; continue; }
+                // Every other option is unmodeled (an attached `-S'...'` would
+                // hide a command): reject rather than skip.
+                if (t.startsWith("-") && t.length > 1)
+                    throw new Blocked(fail("uses an `env` option that cannot be inspected; rewrite it as explicit commands"));
+            }
+            if (isAssignment(t))
+            {
+                checkDangerous(assignmentName(t));
+                ++j;
+                continue;
+            }
+            break;
+        }
+        programIndex = j;
+        break;
+    // Command transformers run their argument as a program: resolve them as
+    // `expand()` does so the effective command faces the loop checks.
+    case "timeout": programIndex = skipOptions(cmd.words, i + 1, "sk", timeoutLongWithValue) + 1; break;
+    case "nice": programIndex = skipOptions(cmd.words, i + 1, "n", []); break;
+    case "sudo", "doas": programIndex = skipOptions(cmd.words, i + 1, "ugCDhprtUTR", sudoLongWithValue); break;
+    case "stdbuf": programIndex = skipOptions(cmd.words, i + 1, "ioe", []); break;
+    case "setsid", "caffeinate", "nohup", "unbuffer", "busybox":
+        programIndex = skipOptions(cmd.words, i + 1, "", []);
+        break;
+    case "coproc": throw new Blocked(fail("starts a coprocess that cannot be inspected"));
+    case "ionice": programIndex = skipOptions(cmd.words, i + 1, "cnpt", []); break;
+    case "chrt":
+        auto j = skipOptions(cmd.words, i + 1, "", []);
+        if (j < cmd.words.length && allDigits(cmd.words[j].text)) ++j;
+        programIndex = j;
+        break;
+    default:
     }
     if (programIndex >= cmd.words.length) throw new Blocked(fail("does not name a command to inspect"));
+    // A wrapper only selects how the effective command is found: classify the
+    // unwrapped remainder recursively (each step consumes at least one word).
+    if (programIndex > i) return checkReadonlyLoopCommand(withWords(cmd, cmd.words[programIndex .. $]), kind, phase);
     auto programWord = cmd.words[programIndex];
     if (programWord.dynamic)
         throw new Blocked(fail("runs a command computed at run time; rewrite it as explicit commands"));
+    if (globText(programWord.text)) throw new Blocked(fail(globProgram));
     auto programText = programWord.text;
     auto program = basename(programText);
     if (programText.canFind('/'))
@@ -429,9 +1027,7 @@ void checkReadonlyLoopCommand(const Simple cmd, string kind, string phase)
     }
     if (loopExecCommands.canFind(program) || interpreters.any!(p => program.startsWith(p)))
         throw new Blocked(fail("runs an interpreter, shell, or other dynamic command; rewrite it as explicit commands"));
-    if (!readonlyLoopCommands.canFind(program))
-        throw new Blocked(fail("is not a known read-only command; keep the loop body to read-only commands like "
-            ~ "`echo`, `grep`, `cat` and `wc`, or rewrite it as explicit commands"));
+    if (!readonlyLoopCommands.canFind(program)) return unknown;
     auto args = cmd.words[programIndex + 1 .. $];
     if ((program == "[[" || program == "[" || program == "test") && args.any!(w => arithTestOps.canFind(w.text)))
         foreach (w; args)
@@ -463,6 +1059,7 @@ void checkReadonlyLoopCommand(const Simple cmd, string kind, string phase)
     case "printf": checkLoopPrintfDestination(args, kind, phase, rendered); break;
     default:
     }
+    return null;
 }
 
 void rejectDangerousLoopDestination(const Word name, string kind, string phase, string rendered, string builtin)
@@ -854,7 +1451,14 @@ void expand(const Simple simple, size_t depth, ref Simple[] out_)
     const(Word)[] rest(size_t from) { return from < words.length ? words[from .. $] : []; }
     while (true)
     {
-        if (i >= words.length) { push(i); return; }
+        if (i >= words.length)
+        {
+            // An assignment-only command keeps its static binding for the
+            // guard's dataflow; a dynamic/glob value is dropped (the name is
+            // marked assigned-at-run-time instead).
+            push(words.all!(w => !w.dynamic && !w.glob) ? 0 : i);
+            return;
+        }
         auto text = words[i].text;
         if (isAssignment(text)) { ++i; continue; }
         switch (basename(text))
@@ -903,6 +1507,18 @@ void expand(const Simple simple, size_t depth, ref Simple[] out_)
                     parseInner(scriptText(rest(j + 1)), depth, out_);
                     return;
                 default:
+                    // An attached or `=`-joined split-string carries its
+                    // script in this same word.
+                    if (t.startsWith("-S") && t.length > 2)
+                    {
+                        parseInner(t[2 .. $], depth, out_);
+                        return;
+                    }
+                    if (t.startsWith("--split-string="))
+                    {
+                        parseInner(t["--split-string=".length .. $], depth, out_);
+                        return;
+                    }
                     if (t.startsWith("-") || isAssignment(t)) ++j;
                     else break envLoop;
                 }
@@ -1035,31 +1651,6 @@ struct Known
     string value;
 }
 
-/// Parsed commands with their assignment words intact, including commands
-/// nested inside inspectable scripts. Never fails.
-Simple[] commandsWithAssignments(string command)
-{
-    Simple[] out_;
-    Simple[] parsed;
-    try parsed = parse(command);
-    catch (Exception) return out_;
-    foreach (s; parsed) collectWithAssignments(s, 0, out_);
-    return out_;
-}
-
-void collectWithAssignments(const Simple simple, size_t depth, ref Simple[] out_)
-{
-    out_ ~= withWords(simple, simple.words);
-    if (depth >= maxExpandDepth) return;
-    foreach (script; nestedScripts(simple))
-    {
-        Simple[] inner;
-        try inner = parseNested(script, depth);
-        catch (Exception) continue;
-        foreach (c; inner) collectWithAssignments(c, depth + 1, out_);
-    }
-}
-
 /// Script texts nested inside `simple` that the shell runs (deliberately
 /// permissive; used only to collect assignments).
 string[] nestedScripts(const Simple simple)
@@ -1118,50 +1709,78 @@ string[] nestedScripts(const Simple simple)
 
 private immutable string[] declBuiltins = ["export", "local", "declare", "typeset", "readonly"];
 
+/// The assignment dataflow of `commands` (the guard's original source, loop
+/// headers and assignment words intact), recursing into nested scripts
+/// (`bash -c`, `eval`, shell-fed here-docs) whose assignments stay in scope.
 Known[string] assignments(const Simple[] commands)
 {
     Known[string] out_;
-    foreach (cmd; commands)
-    {
-        auto offset = loopCommandOffset(cmd.words);
-        auto words = cmd.words[offset .. $];
-        if (words.length && declBuiltins.canFind(words[0].text)) words = words[1 .. $];
-        foreach (w; cmd.words)
-            if (w.assigns)
-            {
-                auto name = expansionAssignedName(w.text);
-                if (name !is null) out_[name] = Known(false, null);
-            }
-        foreach (w; words)
-        {
-            if (!isAssignment(w.text))
-            {
-                if (w.text.startsWith("-")) continue;
-                break;
-            }
-            auto eq = w.text.indexOf('=');
-            auto name = w.text[0 .. eq];
-            auto value = w.text[eq + 1 .. $];
-            bool append = name.endsWith("+");
-            while (name.endsWith("+")) name = name[0 .. $ - 1];
-            bool literal = !w.dynamic && !w.glob && !append;
-            out_[name] = (name in out_ || !literal) ? Known(false, null) : Known(true, value);
-        }
-    }
+    collectAssignments(commands, 0, out_);
     return out_;
 }
 
-/// Names whose value cannot be trusted to a pre-loop literal.
+void collectAssignments(const Simple[] commands, size_t depth, ref Known[string] out_)
+{
+    foreach (cmd; commands)
+    {
+        collectCommandAssignments(cmd, out_);
+        if (depth >= maxExpandDepth) continue;
+        foreach (script; nestedScripts(cmd))
+        {
+            Simple[] inner;
+            try inner = parseNested(script, depth);
+            catch (Exception) continue;
+            collectAssignments(inner, depth + 1, out_);
+        }
+    }
+}
+
+void collectCommandAssignments(const Simple cmd, ref Known[string] out_)
+{
+    auto offset = loopCommandOffset(cmd.words);
+    auto words = cmd.words[offset .. $];
+    if (words.length && declBuiltins.canFind(words[0].text)) words = words[1 .. $];
+    foreach (w; cmd.words)
+        if (w.assigns)
+        {
+            auto name = expansionAssignedName(w.text);
+            if (name !is null) out_[name] = Known(false, null);
+        }
+    foreach (w; words)
+    {
+        if (!isAssignment(w.text))
+        {
+            if (w.text.startsWith("-")) continue;
+            break;
+        }
+        auto eq = w.text.indexOf('=');
+        auto name = w.text[0 .. eq];
+        auto value = w.text[eq + 1 .. $];
+        bool append = name.endsWith("+");
+        while (name.endsWith("+")) name = name[0 .. $ - 1];
+        bool literal = !w.dynamic && !w.glob && !append;
+        out_[name] = (name in out_ || !literal) ? Known(false, null) : Known(true, value);
+    }
+}
+
+/// Names whose value cannot be trusted to a pre-loop literal, recursing into
+/// nested scripts as `assignments` does.
 bool[string] loopBoundVars(const Simple[] commands)
 {
     bool[string] out_;
-    size_t depth = 0;
+    collectLoopBoundVars(commands, 0, out_);
+    return out_;
+}
+
+void collectLoopBoundVars(const Simple[] commands, size_t depth, ref bool[string] out_)
+{
+    size_t loopDepth = 0;
     foreach (cmd; commands)
     {
         auto offset = loopCommandOffset(cmd.words);
         string head = offset < cmd.words.length && isLoopKeyword(cmd.words[offset]) ? cmd.words[offset].text : null;
         bool startsLoop = head !is null && ["for", "select", "while", "until"].canFind(head);
-        bool closesLoop = head == "done" && depth > 0;
+        bool closesLoop = head == "done" && loopDepth > 0;
         if (startsLoop)
         {
             if ((head == "for" || head == "select") && offset + 1 < cmd.words.length)
@@ -1176,21 +1795,47 @@ bool[string] loopBoundVars(const Simple[] commands)
                 auto co = loopCommandOffset(cond);
                 collectLoopBodyWrites(cond[(co < cond.length ? co : cond.length) .. $], out_);
             }
-            ++depth;
+            ++loopDepth;
             continue;
         }
-        if (closesLoop) { --depth; continue; }
-        if (depth > 0) collectLoopBodyWrites(cmd.words[offset .. $], out_);
+        if (closesLoop) { --loopDepth; continue; }
+        if (loopDepth > 0) collectLoopBodyWrites(cmd.words[offset .. $], out_);
         foreach (w; cmd.words)
             if (w.assigns)
             {
                 auto name = expansionAssignedName(w.text);
                 if (name !is null && isShellIdentifier(name)) out_[name] = true;
             }
+        // A loop inside a nested script rebinds its variable for the
+        // script's later commands.
+        if (depth < maxExpandDepth)
+            foreach (script; nestedScripts(cmd))
+            {
+                Simple[] inner;
+                try inner = parseNested(script, depth);
+                catch (Exception) continue;
+                collectLoopBoundVars(inner, depth + 1, out_);
+            }
     }
-    return out_;
 }
 
+private string assignedName(string text) pure
+{
+    auto name = text[0 .. (text.indexOf('=') < 0 ? text.length : text.indexOf('='))];
+    while (name.endsWith("+")) name = name[0 .. $ - 1];
+    if (name.indexOf('[') >= 0) name = name[0 .. name.indexOf('[')];
+    return name;
+}
+
+private void insertReferenced(const Word w, ref bool[string] out_)
+{
+    foreach (n; referencedVarNames(w.text)) insertVarName(n, out_);
+}
+
+/// Record every variable a loop-body command writes: assignments (including a
+/// declaration builtin's arguments), nested loop headers, `read`/`printf -v`/
+/// `mapfile`/`unset`/`getopts`/`env` destinations, implicit `PWD` writes, and
+/// assigning expansions, seeing through `builtin`/`command` wrappers.
 void collectLoopBodyWrites(const Word[] words, ref bool[string] out_)
 {
     foreach (w; words)
@@ -1200,33 +1845,122 @@ void collectLoopBodyWrites(const Word[] words, ref bool[string] out_)
             if (name !is null) insertVarName(name, out_);
         }
     size_t i = 0;
-    if (words.length && declBuiltins.canFind(words[0].text)) ++i;
-    while (i < words.length && isAssignment(words[i].text))
+    if (i < words.length && isLoopKeyword(words[i]) && (words[i].text == "for" || words[i].text == "select"))
     {
-        auto t = words[i].text;
-        auto name = t[0 .. t.indexOf('=')];
-        while (name.endsWith("+")) name = name[0 .. $ - 1];
-        if (name.indexOf('[') >= 0) name = name[0 .. name.indexOf('[')];
-        if (name.length) out_[name] = true;
-        ++i;
+        if (i + 1 < words.length && !words[i + 1].dynamic && !words[i + 1].quoted && isShellIdentifier(words[i + 1].text))
+            out_[words[i + 1].text] = true;
+        if (words[i].text == "select") out_["REPLY"] = true;
+        return;
     }
-    if (i >= words.length) return;
-    auto programIndex = i;
-    if (words[i].text == "builtin") programIndex = i + 1;
-    else if (words[i].text == "command")
+    if (i < words.length && isLoopKeyword(words[i]) && (words[i].text == "while" || words[i].text == "until"))
+    {
+        auto cond = words[i + 1 .. $];
+        auto co = loopCommandOffset(cond);
+        collectLoopBodyWrites(cond[(co < cond.length ? co : cond.length) .. $], out_);
+        return;
+    }
+    if (i < words.length && words[i].text == "builtin")
+    {
+        collectLoopBodyWrites(words[i + 1 .. $], out_);
+        return;
+    }
+    if (i < words.length && words[i].text == "command")
     {
         auto j = i + 1;
         while (j < words.length && words[j].text == "-p") ++j;
         if (j < words.length && (words[j].text == "-v" || words[j].text == "-V")) return;
         if (j < words.length && words[j].text == "--") ++j;
-        programIndex = j;
+        collectLoopBodyWrites(words[(j < words.length ? j : words.length) .. $], out_);
+        return;
     }
-    if (programIndex >= words.length) return;
-    auto args = words[programIndex + 1 .. $];
-    switch (basename(words[programIndex].text))
+    if (i < words.length && declBuiltins.canFind(words[i].text))
+    {
+        ++i;
+        foreach (w; words[i .. $])
+        {
+            if (w.text == "--") continue;
+            if (isAssignment(w.text))
+            {
+                auto name = assignedName(w.text);
+                if (name.length) out_[name] = true;
+            }
+            else if (w.dynamic) insertReferenced(w, out_);
+        }
+    }
+    while (i < words.length && isAssignment(words[i].text))
+    {
+        auto name = assignedName(words[i].text);
+        if (name.length) out_[name] = true;
+        ++i;
+    }
+    if (i >= words.length) return;
+    auto args = words[i + 1 .. $];
+    switch (basename(words[i].text))
     {
     case "read": collectReadDestinations(args, out_); break;
     case "printf": collectPrintfDestination(args, out_); break;
+    case "mapfile", "readarray":
+        static immutable valueOpts = ["-n", "-O", "-s", "-u", "-d", "-C", "-c", "--array-origin", "--line-count", "--skip"];
+        size_t j = 0;
+        while (j < args.length)
+        {
+            auto t = args[j].text;
+            if (t == "--") { ++j; break; }
+            if (t.startsWith("-") && t.length > 1) { j += valueOpts.canFind(t) ? 2 : 1; continue; }
+            break;
+        }
+        if (j < args.length)
+        {
+            if (args[j].dynamic) insertReferenced(args[j], out_);
+            else insertVarName(args[j].text, out_);
+        }
+        else out_["MAPFILE"] = true;
+        break;
+    case "unset":
+        foreach (a; args)
+        {
+            if (a.text == "--" || (a.text.startsWith("-") && a.text.length > 1)) continue;
+            if (a.dynamic) insertReferenced(a, out_);
+            else insertVarName(a.text, out_);
+        }
+        break;
+    case "cd", "pushd", "popd":
+        out_["PWD"] = true;
+        out_["OLDPWD"] = true;
+        break;
+    case "getopts":
+        out_["OPTARG"] = true;
+        out_["OPTIND"] = true;
+        if (args.length > 1)
+        {
+            if (args[1].dynamic) insertReferenced(args[1], out_);
+            else insertVarName(args[1].text, out_);
+        }
+        break;
+    case "env":
+        size_t j = 0;
+        bool optionsDone = false;
+        while (j < args.length)
+        {
+            auto t = args[j].text;
+            if (!optionsDone && t == "--") { optionsDone = true; ++j; continue; }
+            if (!optionsDone && (t == "-u" || t == "--unset"))
+            {
+                if (j + 1 < args.length) insertVarName(args[j + 1].text, out_);
+                j += 2;
+                continue;
+            }
+            if (!optionsDone && t.startsWith("-") && t.length > 1) { ++j; continue; }
+            if (isAssignment(t))
+            {
+                auto name = assignedName(t);
+                if (name.length) out_[name] = true;
+                ++j;
+                continue;
+            }
+            break;
+        }
+        break;
     default:
     }
 }
@@ -1313,6 +2047,17 @@ string expansionAssignedName(string text) pure
     s = text.indexOf("${");
     if (s >= 0) return ident(text[s + 2 .. $]);
     return null;
+}
+
+/// Every variable name `text` expands (`$d`, `${d}`, `${d:-x}`), used to
+/// fail closed on a computed write destination (`declare "$d=/etc"`).
+string[] referencedVarNames(string text)
+{
+    import std.regex : matchAll;
+    static re = ctRegex!(`\$\{?([A-Za-z_][A-Za-z0-9_]*)`);
+    string[] names;
+    foreach (m; matchAll(text, re)) names ~= m[1];
+    return names;
 }
 
 /// Whether `text` expands any of `names` (`$d`, `${d}`, `${d:-x}`).

@@ -23,6 +23,7 @@ agent.rs::a_hard_stop_skips_the_rest_of_the_batch	test
 agent.rs::a_headless_turn_with_no_cap_stops_at_the_safety_cap	test
 agent.rs::a_learned_window_is_the_combined_cap_when_no_total_is_advertised	todo
 agent.rs::a_learned_window_tightens_the_effective_combined_window	todo
+agent.rs::a_literal_list_loop_runs_without_asking	test
 agent.rs::a_looser_probe_does_not_replace_a_learned_window_stat	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
 agent.rs::a_lower_learned_window_restores_the_output_reservation	todo
 agent.rs::a_mid_turn_thinking_change_applies_from_the_next_step_and_drops_the_temperature	todo
@@ -46,6 +47,8 @@ agent.rs::a_tool_run_resets_the_continuation_accumulator	test
 agent.rs::a_truncated_final_assistant_is_not_replayed_as_a_clean_finish	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
 agent.rs::a_truncated_turns_stop_reason_survives_a_reload	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
 agent.rs::adds_project_instructions_to_the_system_prompt_and_nested_ones_to_file_results	todo
+agent.rs::an_approved_loop_is_blocked_by_a_pre_tool_use_deny	test
+agent.rs::an_approved_loop_still_runs_its_pre_tool_use_hooks	test
 agent.rs::an_empty_summary_at_the_output_limit_names_the_cause	todo
 agent.rs::an_equal_probe_replaces_a_learned_window_stat_source	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
 agent.rs::an_interactive_session_keeps_an_unbounded_zero_cap	todo
@@ -54,6 +57,10 @@ agent.rs::an_output_limit_rejection_is_retried_against_the_sent_budget	todo
 agent.rs::an_unset_max_tokens_defaults_to_the_models_published_output_limit	test
 agent.rs::an_unset_max_tokens_falls_back_to_a_large_default_when_unpublished	test
 agent.rs::an_unset_max_tokens_uses_a_known_model_cap_before_the_large_fallback	test
+agent.rs::an_unverifiable_loop_in_plan_mode_is_rejected_without_prompting	test
+agent.rs::an_unverifiable_loop_is_asked_once_interactively_and_runs_when_approved	test
+agent.rs::an_unverifiable_loop_is_blocked_headless_without_asking	test
+agent.rs::an_unverifiable_loop_is_blocked_when_the_user_declines	test
 agent.rs::auto_compaction_mid_turn_keeps_the_turn_going	test
 agent.rs::auto_mode_disables_the_turn_cap	todo
 agent.rs::auto_mode_does_not_disable_the_cap_in_a_headless_turn	todo
@@ -573,19 +580,44 @@ output.rs::spills_long_output_to_a_file	test
 output.rs::validates_limits	test
 permissions.rs::allow_list_still_guards_redirection_only_commands	test
 permissions.rs::allows_ordinary_deletes	test
+permissions.rs::basename_dispatch_validates_original_program	test
 permissions.rs::blocks_catastrophic_deletes	test
 permissions.rs::blocks_destructive_database_commands	test
 permissions.rs::blocks_disk_and_device_writes	test
+permissions.rs::body_ifs_write_declines_unroll	test
+permissions.rs::brace_after_substitution_declines_unroll	test
 permissions.rs::builtin_rules_can_be_disabled	todo
 permissions.rs::cd_into_symlink_tracks_physical_base	test
 permissions.rs::computed_program_words_do_not_bypass_guards	test
+permissions.rs::declaration_option_and_computed_destination_are_writes	test
+permissions.rs::enclosing_loop_frame_disables_unroll	test
+permissions.rs::env_attached_split_string_hard_blocks	test
+permissions.rs::escaped_dollar_is_literal	test
 permissions.rs::fails_closed_on_uninspectable_commands	test
 permissions.rs::find_follow_and_mv_symlink_dest_are_resolved	test
 permissions.rs::follows_cd_and_assignments_in_the_command	test
+permissions.rs::glob_operand_is_runtime_dependent	test
+permissions.rs::globbed_program_name_is_rejected	test
 permissions.rs::guards_protected_branches	test
 permissions.rs::guards_wrapper_long_options_and_qualified_targets	test
+permissions.rs::ifs_comes_only_from_assignment_position	test
+permissions.rs::ifs_rebinding_declines_splitting_unroll	test
+permissions.rs::implicit_variable_writes_decline_unroll	test
+permissions.rs::literal_loop_lists_are_unrolled_and_checked_as_standalone_commands	test
+permissions.rs::mapfile_destination_is_a_write	test
+permissions.rs::mixed_literal_and_expansion_declines_unroll	test
+permissions.rs::mixed_quoted_expansion_is_refused	test
+permissions.rs::nested_loop_body_is_not_unrolled	test
+permissions.rs::nested_script_loop_binding_stays_loop_bound	test
+permissions.rs::nohup_wrapped_interpreter_is_blocked	test
+permissions.rs::path_qualified_env_is_validated	test
 permissions.rs::path_rules_and_tool_names	test
 permissions.rs::path_rules_follow_symlink_targets	test
+permissions.rs::preceding_expansion_does_not_prove_trailing_literal_real	test
+permissions.rs::prefix_ifs_assignment_declines_unroll	test
+permissions.rs::prior_declaration_attributes_decline_unroll	test
+permissions.rs::quoted_expansion_boundary_is_preserved	test
+permissions.rs::range_endpoint_uses_checked_arithmetic	test
 permissions.rs::read_denied_is_false_without_read_deny_rules	test
 permissions.rs::read_rules_cover_grep_and_glob	test
 permissions.rs::readonly_loop_bodies_are_allowed_by_effect	test
@@ -594,6 +626,7 @@ permissions.rs::readonly_loop_closes_review_round11_safety_gaps	test
 permissions.rs::readonly_loop_closes_review_round12_safety_gaps	test
 permissions.rs::readonly_loop_closes_review_round13_safety_gaps	test
 permissions.rs::readonly_loop_closes_review_round14_safety_gaps	test
+permissions.rs::readonly_loop_closes_review_round15_safety_gaps	test
 permissions.rs::readonly_loop_closes_review_round2_safety_gaps	test
 permissions.rs::readonly_loop_closes_review_round3_safety_gaps	test
 permissions.rs::readonly_loop_closes_review_round4_safety_gaps	test
@@ -602,6 +635,7 @@ permissions.rs::readonly_loop_closes_review_round6_safety_gaps	test
 permissions.rs::readonly_loop_closes_review_round7_safety_gaps	test
 permissions.rs::readonly_loop_closes_review_round8_safety_gaps	test
 permissions.rs::readonly_loop_closes_review_round9_safety_gaps	test
+permissions.rs::readonly_loop_unrolls_for_deny_scan	test
 permissions.rs::resolve_collapses_parent_after_symlink	test
 permissions.rs::round10_guard_hardening	test
 permissions.rs::round11_guard_hardening	test
@@ -614,10 +648,18 @@ permissions.rs::round8_guard_hardening	test
 permissions.rs::sandbox_confines_file_tools	test
 permissions.rs::shred_normalizes_device_paths	test
 permissions.rs::static_guard_is_advisory_and_fails_closed_on_uninspectable_input	test
+permissions.rs::substituted_declaration_assignment_hard_blocks	test
+permissions.rs::tilde_values_are_not_unrolled	test
 permissions.rs::trailing_slash_follows_symlink_out_of_workspace	todo
+permissions.rs::underscore_loop_variable_is_not_unrolled	test
+permissions.rs::unrolled_loops_keep_assignments_sql_and_padded_ranges	test
+permissions.rs::unset_loop_binding_is_a_write	test
+permissions.rs::unverifiable_loops_fail_closed_on_rules_bindings_and_builtins	test
 permissions.rs::user_rules_deny_and_allow	test
 permissions.rs::wildcard_parent_follows_symlink_out_of_workspace	todo
 permissions.rs::workspace_under_a_system_directory	test
+permissions.rs::wrapped_loop_body_writes_are_collected	test
+permissions.rs::wrapped_shell_faces_interpreter_hard_block	test
 plan.rs::adds_updates_and_tracks_what_is_next	test
 plan.rs::context_note_drops_finished_notes_first_and_round_trips_through_acp	test
 plan.rs::rejects_bad_calls_without_changing_the_plan	test
