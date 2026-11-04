@@ -571,6 +571,16 @@ impl Store {
     /// offers no `memory_save` tool, so telling the model to use it would waste
     /// an iteration on an unavailable call.
     pub fn index(&self, writable: bool) -> String {
+        self.index_with_rendered(writable).0
+    }
+
+    /// `index` plus the ids of the memories it renders in full: the entry
+    /// survived the budget cap and neither its text nor its evidence was
+    /// clipped (no ellipsis, no dropped line). Returned together from one read
+    /// and one budget walk, so the set always describes exactly the index
+    /// string it accompanies — callers keep the pair as one snapshot of what
+    /// the installed system prompt shows (Copilot findings, src/agent.rs).
+    pub fn index_with_rendered(&self, writable: bool) -> (String, std::collections::BTreeSet<String>) {
         // Best-effort for the prompt: a *successful* read of an empty store
         // yields no index (writable sessions still get save guidance below),
         // but a *read failure* must not masquerade as an empty store — doing so
@@ -579,14 +589,14 @@ impl Store {
         // duplicate saves. Surface nothing on failure (the error shows via
         // `/memory`), so the guidance is reserved for a genuinely empty read.
         let Ok(all) = self.read_all_scopes() else {
-            return String::new();
+            return Default::default();
         };
         // A writable session hears about memory even with an empty store:
         // otherwise the model is never told what is worth saving, and the
         // store never gets started. Read-only sessions can't save, so an
         // empty store there adds nothing.
         if all.is_empty() && !writable {
-            return String::new();
+            return Default::default();
         }
         let project_label = self.project.as_deref().unwrap_or("this repository");
         // Sanitise the project label: it is git-derived (a remote URL or repo
@@ -604,7 +614,7 @@ impl Store {
         // outside the cap and the returned index can exceed it.
         let header = Self::index_header(&guidance);
         if all.is_empty() {
-            return format!("{header}No memories saved yet.");
+            return (format!("{header}No memories saved yet."), Default::default());
         }
         let marker = "- […older memories omitted; find them with memory_search]";
         // Build newest-first, applying the remaining budget as we go so the cap
@@ -632,7 +642,8 @@ impl Store {
             kept.push('\n');
             kept.push_str(marker);
         }
-        format!("{header}{kept}")
+        let rendered = lines.iter().filter(|(_, _, full)| *full).map(|(_, e, _)| e.id.clone()).collect();
+        (format!("{header}{kept}"), rendered)
     }
 
     /// The fixed framing the index prepends to its entries.
@@ -645,31 +656,10 @@ impl Store {
         )
     }
 
-    /// Ids of memories the session-start index renders in full: the entry
-    /// survived the budget cap and neither its text nor its evidence line was
-    /// clipped. Such a memory's whole content is already in the system prompt,
-    /// so a matching tool call must not spend a recall note re-showing it;
-    /// clipped or omitted entries stay eligible for recall (Copilot finding,
-    /// src/agent.rs). Best-effort like `index`: a read failure yields an empty
-    /// set, so recall simply stays eligible.
-    pub fn index_rendered(&self) -> std::collections::BTreeSet<String> {
-        let Ok(all) = self.read_all_scopes() else {
-            return Default::default();
-        };
-        // The framing cost `index` pays before entries, computed with the
-        // longer writable guidance so a borderline entry reads as omitted
-        // (still recallable) rather than wrongly suppressed.
-        let header_len = Self::index_header(&save_guidance()).len();
-        let marker_len = "- […older memories omitted; find them with memory_search]".len();
-        let project_len = scrub_control(self.project.as_deref().unwrap_or("this repository")).len();
-        let (kept, _) = Self::index_lines(&all, header_len, marker_len, project_len);
-        kept.into_iter().filter(|(_, _, full)| *full).map(|(_, entry, _)| entry.id.clone()).collect()
-    }
-
     /// The entries the index keeps within its character budget, each flagged
     /// `full` when its line renders the whole memory (no clipped text or
     /// evidence), plus whether any entry was omitted. This is the budget walk
-    /// `index` performs, shared with `index_rendered` so the rendered-in-full
+    /// `index` performs, shared with `index_with_rendered` so the rendered-in-full
     /// set cannot drift from what the prompt actually shows. `header_len` and
     /// `marker_len` are the caller's framing costs, counted against
     /// `INDEX_CHARS` exactly as `index` counts them.
@@ -704,9 +694,15 @@ impl Store {
             // `index` joins kept lines with '\n', so every line after the
             // first costs one more byte.
             kept_len += line_len + usize::from(!kept.is_empty());
-            // `one_line` clips past 200 chars with an ellipsis, so a rendered
-            // `…` means the index did not show the whole value.
-            let full = !text.contains('…') && evidence.as_deref().is_none_or(|e| !e.contains('…'));
+            // `one_line` clips past 200 chars and drops everything after the
+            // first line break, so compare the rendered value with the original
+            // (trimmed) one rather than looking for an ellipsis alone.
+            let shows_all = |rendered: &str, original: &str| rendered == original.trim();
+            let full = shows_all(&text, &entry.text)
+                && match (&evidence, &entry.evidence) {
+                    (Some(rendered), Some(original)) => shows_all(rendered, original),
+                    _ => true,
+                };
             kept.push((*scope, entry, full));
         }
         (kept, false)
@@ -2422,7 +2418,18 @@ impl Store {
     /// only when not yet seen in this context. Fired ids are marked seen in
     /// `state`. Never writes the scope files, so it works in read-only
     /// (headless/ACP/plan) sessions.
-    pub fn recall(&self, tool: &str, args: &Value, state: &mut Recall, budget: usize) -> Vec<RecallNote> {
+    /// `shown` holds the ids the installed system-prompt index renders in full:
+    /// a hint there is already in context, so it does not fire either. It is
+    /// kept apart from `state.seen` because it changes whenever the index is
+    /// re-rendered (an evicted entry must become recallable again).
+    pub fn recall(
+        &self,
+        tool: &str,
+        args: &Value,
+        state: &mut Recall,
+        shown: &std::collections::BTreeSet<String>,
+        budget: usize,
+    ) -> Vec<RecallNote> {
         if budget == 0 || is_memory_tool(tool) {
             return Vec::new();
         }
@@ -2437,7 +2444,7 @@ impl Store {
             .into_iter()
             .filter(|(_, e)| {
                 let kind = e.kind.unwrap_or_default();
-                (kind == Kind::Rule || !state.seen.contains(&e.id))
+                (kind == Kind::Rule || (!state.seen.contains(&e.id) && !shown.contains(&e.id)))
                     && anchors(e).iter().any(|a| contains_anchor(&haystack, a))
             })
             .collect();
@@ -2574,6 +2581,35 @@ mod tests {
     }
 
     #[test]
+    fn index_rendered_set_excludes_clipped_and_multiline_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let short = store.save(Scope::User, "short fact", None, None).unwrap();
+        let long = store.save(Scope::User, &"z".repeat(300), None, None).unwrap();
+        let ev = store.save(Scope::User, "has evidence", Some(&"e".repeat(300)), None).unwrap();
+        // A hand-edited entry whose text spans lines: the index shows only the
+        // first line (no ellipsis), so it is not rendered in full.
+        let multi = store.save(Scope::User, "overview", None, None).unwrap();
+        let entries: Vec<Entry> = store
+            .all()
+            .unwrap()
+            .into_iter()
+            .map(|(_, mut e)| {
+                if e.id == multi.id {
+                    e.text = "overview\nimportant details".into();
+                }
+                e
+            })
+            .collect();
+        write_all(&store.path(Scope::User).unwrap(), &entries, &[]).unwrap();
+        let (_, rendered) = store.index_with_rendered(false);
+        assert!(rendered.contains(&short.id));
+        assert!(!rendered.contains(&long.id), "clipped text");
+        assert!(!rendered.contains(&ev.id), "clipped evidence");
+        assert!(!rendered.contains(&multi.id), "multi-line text shows only its first line");
+    }
+
+    #[test]
     fn recall_respects_kind_seen_and_budget() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -2581,17 +2617,20 @@ mod tests {
         let rule = store.save_with(Scope::User, "never `pkill -f` here", None, None, Some(Kind::Rule), None).unwrap();
         let mut state = Recall::default();
         let args = json!({"command": "ssh omarchy.local pkill -f worker"});
-        let notes = store.recall("bash", &args, &mut state, 2);
+        let notes = store.recall("bash", &args, &mut state, &Default::default(), 2);
         assert_eq!(notes.len(), 2);
         assert_eq!(notes[0].id, rule.id, "rules first");
         assert!(notes[0].text.contains("verify"));
-        let notes = store.recall("bash", &args, &mut state, 2);
+        let notes = store.recall("bash", &args, &mut state, &Default::default(), 2);
         assert_eq!(notes.iter().map(|n| n.id.clone()).collect::<Vec<_>>(), vec![rule.id.clone()]);
-        assert!(store.recall("bash", &args, &mut Recall::default(), 1).len() == 1, "budget caps notes");
-        assert!(store.recall(SEARCH_TOOL, &args, &mut Recall::default(), 2).is_empty());
+        assert!(
+            store.recall("bash", &args, &mut Recall::default(), &Default::default(), 1).len() == 1,
+            "budget caps notes"
+        );
+        assert!(store.recall(SEARCH_TOOL, &args, &mut Recall::default(), &Default::default(), 2).is_empty());
         // A memory tool output marks ids as seen and reports a used reminder.
         let mut state = Recall::default();
-        store.recall("bash", &args, &mut state, 2);
+        store.recall("bash", &args, &mut state, &Default::default(), 2);
         let used = state.note_seen_in(&format!("user [{}] (2026-01-01) builds", hint.id));
         assert_eq!(used, vec![hint.id.clone()]);
     }
@@ -2618,7 +2657,8 @@ mod tests {
         let store = store(dir.path());
         let long = format!("`zzanchor` {} TAILMARK", "word ".repeat(100));
         let e = store.save(Scope::User, &long, Some(&format!("{} EVTAIL", "x ".repeat(150))), None).unwrap();
-        let notes = store.recall("bash", &json!({"command": "zzanchor"}), &mut Recall::default(), 2);
+        let notes =
+            store.recall("bash", &json!({"command": "zzanchor"}), &mut Recall::default(), &Default::default(), 2);
         assert_eq!(notes.len(), 1, "{e:?}");
         assert!(notes[0].text.contains("TAILMARK") && notes[0].text.contains("EVTAIL"), "{}", notes[0].text);
     }
