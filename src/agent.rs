@@ -4174,10 +4174,19 @@ impl Agent {
                 // PreToolUse hooks below: an approval without a later hook pass
                 // would let the call dispatch without ever running a hook that
                 // denies Bash calls, validates input, or rewrites the command.
+                //
+                // Only prompt when the call could actually run if approved: the
+                // same eligibility the PreToolUse hooks require. A malformed
+                // argument payload or a call plan mode forbids is rejected by
+                // the backstops below regardless of the answer, so asking first
+                // would park the turn on a prompt whose outcome cannot matter.
+                let askable = tool_call.raw_arguments_error(response.stop_reason.as_deref()).is_none()
+                    && (self.control.mode() != crate::mode::AgentMode::Plan
+                        || crate::mode::plan_allows(&tool_call.name));
                 let mut permission_deny: Option<String> = match &original_decision {
                     crate::permissions::Decision::Allow => None,
                     crate::permissions::Decision::Deny(message) => Some(message.clone()),
-                    crate::permissions::Decision::Ask(reason) => {
+                    crate::permissions::Decision::Ask(reason) if askable => {
                         let name = tool_call.name.clone();
                         let args = tool_call.arguments.clone();
                         let reason = reason.clone();
@@ -4191,6 +4200,10 @@ impl Agent {
                             Err(_) => Some("the permission prompt was interrupted".to_string()),
                         }
                     }
+                    // Not eligible to run even if approved (plan mode, malformed
+                    // args): skip the prompt and leave the call to the existing
+                    // rejection path below, which produces the actionable error.
+                    crate::permissions::Decision::Ask(_) => None,
                 };
 
                 // With the approval settled, an approved call runs its
@@ -11015,6 +11028,26 @@ mod tests {
         answerer.abort();
         let text = tool_text(&agent, "b1");
         assert!(text.contains("declined"), "{text}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unverifiable_loop_in_plan_mode_is_rejected_without_prompting() {
+        // Round-3 review of #164: the Ask prompt is gated on the same
+        // eligibility as the PreToolUse hooks. In plan mode a Bash loop is
+        // rejected by the plan-mode backstop regardless of the answer, so the
+        // turn must not park on a permission prompt whose outcome cannot
+        // matter — it goes straight to the read-only rejection.
+        let dir = tempfile::tempdir().unwrap();
+        let batch = call("b1", "bash", json!({"command": "for f in $(git ls-files); do sed -i s/x/y/ \"$f\"; done"}));
+        let (mut agent, _) = edit_agent(vec![batch, text("done")], dir.path());
+        agent.new_session().unwrap();
+        agent.set_mode(crate::mode::AgentMode::Plan);
+        // Interactive, but no answerer: a prompt would block forever, so the
+        // turn completing at all proves no question was raised.
+        agent.questions().set_interactive(true);
+        agent.run_turn(Some("m1"), "run it").await.unwrap();
+        let text = tool_text(&agent, "b1");
+        assert!(text.contains("plan mode") || text.contains("read-only"), "{text}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

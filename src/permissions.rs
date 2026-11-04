@@ -376,23 +376,15 @@ impl Policy {
         if let Some(rule) = deny.iter().find(|r| r.matches(command.trim())) {
             return Err(format!("rule `{}` denies this command", rule.source));
         }
-        let Expansion { commands, unverified, bound: unrolled_bound } = shell::parse(command)
+        let Expansion { commands, unverified, bound: unrolled_bound, guard_source, .. } = shell::parse(command)
             .and_then(|parsed| expand_all_checked(&parsed))
             .map_err(|e| format!("could not inspect this command ({e}); simplify it"))?;
-        // When every loop in the line was unrolled into its explicit commands,
-        // the line no longer *contains* a loop for the guard's raw-text scans:
-        // re-scanning it would mark the substituted variables loop-bound and
-        // fail closed on operands that are now literal, and would re-collect
-        // assignments the unroll already accounted for. Judge the unrolled
-        // commands themselves instead.
-        let all_unrolled = !unrolled_bound.is_empty() && unverified.is_empty();
-        // The guard's dataflow (assignments, loop-bound names) is collected
-        // from the unrolled commands, whose assignment words survive the
-        // expansion (`expand()` keeps an assignment-only command and restores
-        // a stripped assignment prefix), so a binding like
-        // `NANO_DELETE_TARGET=/etc` still resolves a later
-        // `$NANO_DELETE_TARGET` to `/etc` instead of an empty operand.
-        let guard_source: Vec<Simple> = if all_unrolled { commands.clone() } else { Vec::new() };
+        // The guard's dataflow (assignments, loop-bound names) is collected from
+        // the *original* parsed commands (`guard_source`), which keep every loop
+        // header and assignment intact. Building it from the executable
+        // `commands` would lose a binding to the unroll (a loop that rebinds `d`
+        // to `/etc` is replaced by its body, so `d=./scratch` is judged instead)
+        // and would let a retained assignment word break allow-rule coverage.
         for cmd in &commands {
             let text = command_text(cmd);
             if let Some(rule) = deny.iter().find(|r| r.matches(&text)) {
@@ -401,16 +393,21 @@ impl Policy {
         }
         // An unverified loop command carries run-time arguments. A deny rule
         // that could match it for *some* value denies the loop; an allow rule
-        // approves it only when it matches whatever the arguments turn out to be.
-        // A dynamic word can take *any* value at run time, so this cannot be
-        // settled by sampling a few probes: a deny rule that names a value no
-        // probe picked (`Bash(touch secret.txt)` against `for f in *; do touch
-        // "$f"; done`) would slip through. Instead:
-        //  - deny: a rule matching the command's static text denies, and so does
-        //    any deny rule when the command has a dynamic word it could match
-        //    through (a run-time value might be exactly the denied text);
-        //  - allow: only a rule matching the static text approves — it matches
-        //    whatever the loop binds.
+        // approves it only when it covers *every* value the loop can bind.
+        //
+        // Deny: a dynamic word can take any value at run time, so a deny rule
+        // that could match through it denies — matching only the static text
+        // (which still contains `$f`) would miss `Bash(touch secret.txt)`
+        // against `for f in *; do touch "$f"; done`.
+        //
+        // Allow: matching the variable's *source spelling* does not prove the
+        // rule covers every runtime binding — `Bash(touch ??.txt)` matches the
+        // two-character placeholder `$f` in `touch "$f.txt"` yet the loop can
+        // create a longer name outside the rule. A dynamic word is an unknown
+        // value, not a literal to pattern-match, so an allow rule approves an
+        // unverified loop only when the command has *no* dynamic word (nothing
+        // run-time-dependent) and the rule matches its static text. Otherwise
+        // the loop asks — including in a headless session, where it blocks.
         let allow: Vec<&Rule> = self.allow.iter().filter(|r| r.subject == Subject::Command).collect();
         for item in &unverified {
             let text = command_text(&item.command);
@@ -424,7 +421,13 @@ impl Policy {
         }
         let ask = unverified
             .iter()
-            .find(|item| !allow.iter().any(|r| r.matches(&command_text(&item.command))))
+            .find(|item| {
+                let cmd = &item.command;
+                let dynamic = cmd.words.iter().any(|w| w.dynamic);
+                // Only a command with no run-time-dependent word can be covered
+                // for every binding by an allow rule matching its static text.
+                dynamic || !allow.iter().any(|r| r.matches(&command_text(cmd)))
+            })
             .map(|item| item.reason.clone());
         // A broad allow rule (`Bash(echo *)`) matches on the command words only,
         // dropping redirections, so it would otherwise auto-approve a catastrophic
@@ -435,13 +438,17 @@ impl Policy {
         // is caught here too.
         let guard = self.builtin.then(|| {
             let cwd = resolve_symlinks(cwd);
-            let with_assignments = if all_unrolled { guard_source.clone() } else { commands_with_assignments(command) };
-            let mut loop_bound = loop_bound_vars(&with_assignments);
+            // Build the guard's dataflow from the original parsed commands
+            // (`guard_source`), which keep every loop header and assignment
+            // intact — never from the executable `commands`, whose unroll drops
+            // loop bindings and whose retained assignment words would otherwise
+            // be misread (see `Expansion::guard_source`).
+            let mut loop_bound = loop_bound_vars(&guard_source);
             // A loop that was unrolled away no longer has its header in the
             // expansion, but it still ran: keep its variable loop-bound so a
             // later destructive operand that depends on it fails closed.
             loop_bound.extend(unrolled_bound);
-            let mut assigned = assignments(&with_assignments);
+            let mut assigned = assignments(&guard_source);
             // A loop-bound name (a `for`/`select` header variable, or one a loop
             // body rebinds) holds a statically unknown value by the time later
             // commands run. `substitute()` reads `assigned` directly for command
@@ -470,12 +477,16 @@ impl Policy {
         }
         if !allow.is_empty()
             && commands.iter().all(|cmd| {
-                // A redirection-only command (no words but with redirects, e.g.
-                // `> /dev/sda`) is not an empty no-op: it must match an allow rule
-                // so the builtin guard still runs on it. Only a truly empty command
-                // (no words and no redirects) is treated as automatically approved.
+                // An assignment-only command (`D=/etc`) has no program to run, so
+                // it is not an executable an allow rule must cover — treating it
+                // as one would make `D=/etc; rm -rf "$D"` fail the all-commands
+                // match and the guard would then deny an explicitly allowed
+                // deletion. Only a command with a program word (or a redirect)
+                // needs an allow rule; a truly empty command is a no-op.
                 let text = command_text(cmd);
-                (cmd.words.is_empty() && cmd.redirects.is_empty()) || allow.iter().any(|r| r.matches(&text))
+                (cmd.words.is_empty() || cmd.words.iter().all(|w| ASSIGNMENT.is_match(&w.text)))
+                    && cmd.redirects.is_empty()
+                    || allow.iter().any(|r| r.matches(&text))
             })
         {
             return Ok(ask);
@@ -485,12 +496,11 @@ impl Policy {
             // unrolled loop's substituted statements behind the loop variable
             // (`for op in DROP; do sqlite3 test.db "$op TABLE users"; done`).
             // Scan the commands the line actually runs — with every substituted
-            // value in place — as well as the original text.
-            let scan = if all_unrolled {
-                format!("{command}\n{}", commands.iter().map(command_text).collect::<Vec<_>>().join("\n"))
-            } else {
-                command.to_string()
-            };
+            // value in place — as well as the original text, *regardless* of
+            // whether another loop stayed unverifiable: a destructive statement
+            // in the part that did unroll must not slip through because a
+            // sibling loop returned Ask.
+            let scan = format!("{command}\n{}", commands.iter().map(command_text).collect::<Vec<_>>().join("\n"));
             guard.check(&scan, &commands)?;
         }
         Ok(ask)
@@ -870,6 +880,15 @@ struct Expansion {
     /// `commands`, but the loop still ran, so the name stays loop-bound for the
     /// destructive-path guard.
     bound: Vec<String>,
+    /// Commands the guard's dataflow (assignments, loop-bound names) is built
+    /// from: the *original* parsed commands, with assignments and loop headers
+    /// intact. The executable `commands` drop a stripped assignment prefix and
+    /// replace a loop with its unrolled body, so building the dataflow from
+    /// them would lose a binding (`d=./scratch` judged instead of the `/etc` a
+    /// later loop rebinds it to) and would let a retained assignment word break
+    /// allow-rule coverage. Keeping the two lists separate means the guard sees
+    /// every binding while rule matching sees only real executables.
+    guard_source: Vec<Simple>,
 }
 
 /// Expand a parsed command line. Hard blocks are `Err`.
@@ -877,7 +896,7 @@ fn expand_all_checked(parsed: &[Simple]) -> Result<Expansion, String> {
     let mut commands = Vec::new();
     let mut ctx = ExpandCtx::new();
     expand_sequence_with(parsed, 0, &mut commands, false, &mut ctx)?;
-    Ok(Expansion { commands, unverified: ctx.unverified, bound: ctx.bound })
+    Ok(Expansion { commands, unverified: ctx.unverified, bound: ctx.bound, guard_source: parsed.to_vec() })
 }
 
 fn parse_inner(script: &str, depth: usize, out: &mut Vec<Simple>) -> Result<(), String> {
@@ -1330,6 +1349,38 @@ fn substitute_word(word: &Word, name: &str, value: &str) -> Option<Word> {
     if !replaced {
         return Some(word.clone());
     }
+    // `Word::text` has already discarded quoting and escaping, so a dynamic word
+    // can also contain *literal* occurrences of `$name` — `'$f'"$f"` is the text
+    // `$f$f`, where only the second is a parameter expansion. The scan above
+    // replaced both, checking `safesafe` while the shell runs `$fsafe`, which a
+    // deny rule on `touch $fsafe` would miss. Because the text no longer records
+    // which `$name` was quoted, an ambiguous word (quoted/escaped, and more than
+    // one occurrence of the variable) cannot be substituted exactly: decline to
+    // unroll it so the loop keeps its conservative read-only classification.
+    if word.quoted {
+        // Count the `$name` / `${name}` occurrences in the flattened text; more
+        // than one means at least one was a literal (quoted/escaped) occurrence
+        // that the scan above wrongly replaced.
+        let braced = format!("${{{name}}}");
+        let plain = format!("${name}");
+        let mut occurrences = 0usize;
+        let mut rest = text;
+        loop {
+            let b = rest.find(braced.as_str());
+            let p = rest.find(plain.as_str());
+            let (pos, len) = match (b, p) {
+                (Some(b), Some(p)) if b <= p => (b, braced.len()),
+                (Some(b), _) => (b, braced.len()),
+                (_, Some(p)) => (p, plain.len()),
+                _ => break,
+            };
+            occurrences += 1;
+            rest = &rest[pos + len..];
+        }
+        if occurrences > 1 {
+            return None;
+        }
+    }
     if word.splits && (value.is_empty() || value.contains(|c: char| c.is_whitespace() || "*?[".contains(c))) {
         return None;
     }
@@ -1374,23 +1425,31 @@ fn brace_expand(text: &str) -> Option<Vec<String>> {
             if a.abs_diff(b) as usize >= MAX_LOOP_UNROLL {
                 return None;
             }
-            // Bash preserves an endpoint's zero padding on every value,
-            // signed or not (`{01..03}` yields `01 02 03`, `{-03..-01}`
-            // yields `-03 -02 -01`): the width is the wider endpoint's total
-            // length including its sign, and a negative value's sign occupies
-            // one of those columns. Dropping the padding would check
-            // `item1`–`item3` while the loop touches `item01`–`item03`,
-            // missing a deny rule on the padded name.
+            // Bash zero-pads a numeric range only when an endpoint carries an
+            // explicit leading zero (`{01..03}` → `01 02 03`, `{-03..-01}` →
+            // `-03 -02 -01`); the padded width is that endpoint's total length
+            // including its sign. Width alone does *not* pad: `{9..11}` binds
+            // `9 10 11`, never `09`. Padding on width alone would check `item09`
+            // while the loop touches `item9`, missing a deny rule on the real name.
+            let padded = from.len() > 1 && from.starts_with('0')
+                || from.starts_with("-0")
+                || to.len() > 1 && to.starts_with('0')
+                || to.starts_with("-0");
             let width = from.len().max(to.len());
             let step = step as i64;
             let mut items = Vec::new();
             let mut n = a;
             loop {
-                items.push(if width > 1 { format!("{n:0width$}") } else { n.to_string() });
-                if (a <= b && n >= b) || (a > b && n <= b) {
+                items.push(if padded { format!("{n:0width$}") } else { n.to_string() });
+                // Advance by the step, then stop *before* emitting a value past
+                // the endpoint: a stepped range (`{1..6..2}`) binds `1 3 5`,
+                // never `7`, and `{1..5..10}` binds only `1` (the step overshoots
+                // the endpoint, so it is not emitted). Clamping the step to the
+                // remaining distance would wrongly emit the endpoint.
+                n += if a <= b { step } else { -step };
+                if (a <= b && n > b) || (a > b && n < b) {
                     break;
                 }
-                n += if a <= b { step } else { -step };
                 if items.len() > MAX_LOOP_UNROLL {
                     return None;
                 }
@@ -1400,18 +1459,22 @@ fn brace_expand(text: &str) -> Option<Vec<String>> {
             let (mut fc, mut tc) = (from.chars(), to.chars());
             match (fc.next(), fc.next(), tc.next(), tc.next()) {
                 (Some(a), None, Some(b), None) if a.is_ascii_alphabetic() && b.is_ascii_alphabetic() => {
-                    let (a, b) = (a as u8, b as u8);
+                    let (a, b) = (a as i64, b as i64);
                     if a.abs_diff(b) as usize >= MAX_LOOP_UNROLL {
                         return None;
                     }
+                    let step = step as i64;
                     let mut items = Vec::new();
                     let mut c = a;
                     loop {
-                        items.push(String::from(c as char));
-                        if (a <= b && c >= b) || (a > b && c <= b) {
+                        items.push(String::from(c as u8 as char));
+                        // Same advance-then-stop rule as the numeric branch,
+                        // computed in `i64` so a large step can neither
+                        // overshoot the endpoint nor over/underflow the byte.
+                        c += if a <= b { step } else { -step };
+                        if (a <= b && c > b) || (a > b && c < b) {
                             break;
                         }
-                        c = if a <= b { c + step as u8 } else { c - step as u8 };
                         if items.len() > MAX_LOOP_UNROLL {
                             return None;
                         }
@@ -1706,36 +1769,52 @@ fn check_readonly_loop_command(cmd: &Simple, kind: &str, phase: &str) -> Result<
         // assignment and an interpreter behind an unrecognized-program `Ask`.
         "env" => {
             let mut j = i + 1;
+            // `--` ends *option* processing, not the environment assignments:
+            // `env -- MARKER=1 bash ...` still applies `MARKER=1` and then runs
+            // `bash`. Keep scanning assignments (and validating them) after `--`
+            // so neither a dangerous assignment nor the real program is missed.
+            let mut options_done = false;
             while let Some(word) = cmd.words.get(j) {
                 let text = word.text.as_str();
-                match text {
-                    "--" => {
-                        j += 1;
-                        break;
-                    }
-                    "-u" | "-C" | "--unset" | "--chdir" => j += 2,
-                    "-i" | "-0" | "-S" | "--split-string" => {
-                        // `-i`/`-0` clear the environment; `-S` splits its
-                        // argument into further words this scan cannot model.
-                        return Err(format!(
-                            "cannot allow `{kind}` loop: {phase} command `{rendered}` uses an `env` option \
-                             that cannot be inspected; rewrite it as explicit commands"
-                        ));
-                    }
-                    t if t.starts_with('-') => j += 1,
-                    t if ASSIGNMENT.is_match(t) => {
-                        let name = t.split('=').next().unwrap_or_default().trim_end_matches('+');
-                        let name = name.split('[').next().unwrap_or(name);
-                        if DANGEROUS_LOOP_ASSIGNMENTS.contains(&name) {
+                if !options_done && text == "--" {
+                    options_done = true;
+                    j += 1;
+                    continue;
+                }
+                if !options_done {
+                    match text {
+                        "-u" | "-C" | "--unset" | "--chdir" => {
+                            j += 2;
+                            continue;
+                        }
+                        "-i" | "-0" | "-S" | "--split-string" => {
+                            // `-i`/`-0` clear the environment; `-S` splits its
+                            // argument into further words this scan cannot model.
                             return Err(format!(
-                                "cannot allow `{kind}` loop: {phase} command `{rendered}` assigns `{name}`, which \
-                                 can change what the loop's commands run; rewrite it as explicit commands"
+                                "cannot allow `{kind}` loop: {phase} command `{rendered}` uses an `env` option \
+                                 that cannot be inspected; rewrite it as explicit commands"
                             ));
                         }
-                        j += 1;
+                        t if t.starts_with('-') => {
+                            j += 1;
+                            continue;
+                        }
+                        _ => {}
                     }
-                    _ => break,
                 }
+                if ASSIGNMENT.is_match(text) {
+                    let name = text.split('=').next().unwrap_or_default().trim_end_matches('+');
+                    let name = name.split('[').next().unwrap_or(name);
+                    if DANGEROUS_LOOP_ASSIGNMENTS.contains(&name) {
+                        return Err(format!(
+                            "cannot allow `{kind}` loop: {phase} command `{rendered}` assigns `{name}`, which \
+                             can change what the loop's commands run; rewrite it as explicit commands"
+                        ));
+                    }
+                    j += 1;
+                    continue;
+                }
+                break;
             }
             program_index = j;
         }
@@ -1746,6 +1825,17 @@ fn check_readonly_loop_command(cmd: &Simple, kind: &str, phase: &str) -> Result<
             "cannot allow `{kind}` loop: {phase} command `{rendered}` does not name a command to inspect"
         ));
     };
+    // A `builtin`/`command` wrapper only *selects* how the effective command is
+    // found; it does not change what that command is. Recursively classify the
+    // unwrapped remainder so a wrapped declaration builtin (`command export
+    // PATH=/tmp/evil`) or a nested wrapper still faces the assignment and
+    // program checks above — resolving the wrapper and jumping straight to the
+    // program-word checks would skip them. `command -v/-V` returned early, and
+    // the recursion is bounded because each step consumes at least one word.
+    if program_index > i {
+        let effective = Simple { words: cmd.words[program_index..].to_vec(), ..cmd.clone() };
+        return check_readonly_loop_command(&effective, kind, phase);
+    }
     if program_word.dynamic {
         return Err(format!(
             "cannot allow `{kind}` loop: {phase} command `{rendered}` runs a command computed at run time; \
@@ -2801,30 +2891,77 @@ struct Guard<'a> {
     depth: std::cell::Cell<usize>,
 }
 
-/// Parsed commands with their assignment words intact (expansion drops them),
-/// including commands nested inside inspectable scripts (`bash -c`, `eval`,
-/// here-docs fed to a shell). A variable assigned inside such a script
-/// (`bash -c 'D=/; rm -rf "$D"'`) is in scope for the later commands that
-/// script runs, so the guard must see it too; expansion strips assignments, so
-/// this parallel pass collects them.
-fn commands_with_assignments(command: &str) -> Vec<Simple> {
-    let mut out = Vec::new();
-    for simple in shell::parse(command).unwrap_or_default() {
-        collect_with_assignments(&simple, 0, &mut out);
-    }
+fn assignments(commands: &[Simple]) -> HashMap<String, Option<String>> {
+    let mut out: HashMap<String, Option<String>> = HashMap::new();
+    collect_assignments(commands, 0, &mut out);
     out
 }
 
-fn collect_with_assignments(simple: &Simple, depth: usize, out: &mut Vec<Simple>) {
-    out.push(simple.clone());
-    if depth >= MAX_EXPAND_DEPTH {
-        return;
-    }
-    for script in nested_scripts(simple) {
-        if let Ok(inner) = shell::parse_nested(&script, depth) {
-            for command in &inner {
-                collect_with_assignments(command, depth + 1, out);
+/// Collect the assignment dataflow of `commands` into `out`, recursing into
+/// scripts nested inside them (`bash -c SCRIPT`, `eval SCRIPT`, a here-doc fed
+/// to a shell). A variable assigned inside such a script (`bash -c 'D=/; rm -rf
+/// "$D"'`) is in scope for the later commands that script runs, so the guard
+/// must see it too. `commands` here is the guard's *original* source (loop
+/// headers and assignment words intact), so no binding is lost to the unroll.
+fn collect_assignments(commands: &[Simple], depth: usize, out: &mut HashMap<String, Option<String>>) {
+    for cmd in commands {
+        collect_command_assignments(cmd, out);
+        if depth >= MAX_EXPAND_DEPTH {
+            continue;
+        }
+        for script in nested_scripts(cmd) {
+            if let Ok(inner) = shell::parse_nested(&script, depth) {
+                collect_assignments(&inner, depth + 1, out);
             }
+        }
+    }
+}
+
+/// Record the assignments a single command makes into `out`.
+fn collect_command_assignments(cmd: &Simple, out: &mut HashMap<String, Option<String>>) {
+    {
+        // A loop/conditional body command reaches here as `do NAME=value`,
+        // `then NAME=value`, and so on; the reserved word is syntax, so skip it
+        // or the assignment scan breaks on `do` and never records the binding,
+        // leaving a later `$NAME` resolving against a stale pre-loop literal.
+        let offset = loop_command_offset(&cmd.words);
+        let mut words = cmd.words[offset..].iter().peekable();
+        if words
+            .peek()
+            .is_some_and(|w| matches!(w.text.as_str(), "export" | "local" | "declare" | "typeset" | "readonly"))
+        {
+            words.next();
+        }
+        // An expansion anywhere in the command can assign a name without any
+        // `NAME=value` word (`echo "$((d=1))"`, `echo "${d:=/etc}"`); the shell
+        // leaves it holding a run-time value, so mark the name unknown rather
+        // than resolve a later `$d` against a stale pre-assignment literal.
+        // This scan is separate from the assignment-word loop below, which
+        // stops at the first non-assignment word (the program).
+        for word in &cmd.words {
+            if word.assigns
+                && let Some(name) = expansion_assigned_name(&word.text)
+            {
+                out.insert(name.to_string(), None);
+            }
+        }
+        for word in words {
+            // `Word::quoted` is set when *any* part of the token was quoted, so a
+            // legitimate assignment whose value is quoted (`DIR="/"`) still parses
+            // as one — don't skip it. `literal` below marks dynamic/glob values
+            // unknown, so only proven constants become known.
+            if !ASSIGNMENT.is_match(&word.text) {
+                if word.text.starts_with('-') {
+                    continue;
+                }
+                break;
+            }
+            let (name, value) = word.text.split_once('=').unwrap_or((&word.text, ""));
+            let append = name.ends_with('+');
+            let name = name.trim_end_matches('+').to_string();
+            let literal = (!word.dynamic && !word.glob && !append).then(|| value.to_string());
+            let known = if out.contains_key(&name) { None } else { literal };
+            out.insert(name, known);
         }
     }
 }
@@ -2875,56 +3012,6 @@ fn nested_scripts(simple: &Simple) -> Vec<String> {
         }
     }
     scripts
-}
-
-fn assignments(commands: &[Simple]) -> HashMap<String, Option<String>> {
-    let mut out: HashMap<String, Option<String>> = HashMap::new();
-    for cmd in commands {
-        // A loop/conditional body command reaches here as `do NAME=value`,
-        // `then NAME=value`, and so on; the reserved word is syntax, so skip it
-        // or the assignment scan breaks on `do` and never records the binding,
-        // leaving a later `$NAME` resolving against a stale pre-loop literal.
-        let offset = loop_command_offset(&cmd.words);
-        let mut words = cmd.words[offset..].iter().peekable();
-        if words
-            .peek()
-            .is_some_and(|w| matches!(w.text.as_str(), "export" | "local" | "declare" | "typeset" | "readonly"))
-        {
-            words.next();
-        }
-        // An expansion anywhere in the command can assign a name without any
-        // `NAME=value` word (`echo "$((d=1))"`, `echo "${d:=/etc}"`); the shell
-        // leaves it holding a run-time value, so mark the name unknown rather
-        // than resolve a later `$d` against a stale pre-assignment literal.
-        // This scan is separate from the assignment-word loop below, which
-        // stops at the first non-assignment word (the program).
-        for word in &cmd.words {
-            if word.assigns
-                && let Some(name) = expansion_assigned_name(&word.text)
-            {
-                out.insert(name.to_string(), None);
-            }
-        }
-        for word in words {
-            // `Word::quoted` is set when *any* part of the token was quoted, so a
-            // legitimate assignment whose value is quoted (`DIR="/"`) still parses
-            // as one — don't skip it. `literal` below marks dynamic/glob values
-            // unknown, so only proven constants become known.
-            if !ASSIGNMENT.is_match(&word.text) {
-                if word.text.starts_with('-') {
-                    continue;
-                }
-                break;
-            }
-            let (name, value) = word.text.split_once('=').unwrap_or((&word.text, ""));
-            let append = name.ends_with('+');
-            let name = name.trim_end_matches('+').to_string();
-            let literal = (!word.dynamic && !word.glob && !append).then(|| value.to_string());
-            let known = if out.contains_key(&name) { None } else { literal };
-            out.insert(name, known);
-        }
-    }
-    out
 }
 
 /// Names whose value cannot be trusted to a pre-loop literal. A `for`/`select`
@@ -4212,11 +4299,14 @@ mod tests {
         // read-only stays allowed without asking.
         assert_eq!(decide("for f in $(ls src); do wc -l \"$f\"; done"), Decision::Allow);
 
-        // An allow rule that covers the (only) unverified command whatever the
-        // loop binds approves the loop without asking. Use a read-only header
-        // substitution so the body command is the only unverified one.
+        // An allow rule cannot prove it covers *every* value a glob/command-
+        // substitution loop binds: the body word `$f` is a run-time value, and
+        // matching the rule against the placeholder text (`sed -i s/x/y/ $f`)
+        // would auto-approve bindings outside the rule. Such a loop asks — even
+        // under a broad `Bash(sed *)` — because the dynamic word makes coverage
+        // unprovable (round-3 review of #164).
         let p = policy(&["Bash(sed *)"], &[]);
-        assert_eq!(decide_with(&p, "for f in $(ls src); do sed -i s/x/y/ \"$f\"; done"), Decision::Allow);
+        assert!(matches!(decide_with(&p, "for f in $(ls src); do sed -i s/x/y/ \"$f\"; done"), Decision::Ask(_)));
         // A rule that cannot cover every value the loop binds still asks.
         let p = policy(&["Bash(sed -i s/x/y/ a.txt)"], &[]);
         assert!(matches!(decide_with(&p, "for f in $(ls src); do sed -i s/x/y/ \"$f\"; done"), Decision::Ask(_)));
@@ -4304,10 +4394,11 @@ mod tests {
         let p = policy(&[], &["Bash(touch $f)"]);
         let err = check(&p, "for f in *; do touch \"$f\"; done").unwrap_err();
         assert!(err.contains("denies"), "{err}");
-        // With no deny rule that could match, the loop still asks (the body is
-        // not provably read-only) rather than being auto-allowed.
+        // With no deny rule that could match, the loop still asks: the body word
+        // `$f` is a run-time value, so an allow rule matching the placeholder
+        // text cannot prove it covers every binding (round-3 review of #164).
         let p = policy(&["Bash(touch *)"], &[]);
-        assert!(matches!(decide_with(&p, "for f in *; do touch \"$f\"; done"), Decision::Allow));
+        assert!(matches!(decide_with(&p, "for f in *; do touch \"$f\"; done"), Decision::Ask(_)));
 
         // #5 A nested loop header rebinds the name for the rest of the outer
         // iteration, so the outer loop cannot be unrolled with a stale value.
@@ -4483,6 +4574,116 @@ mod tests {
         );
         // A read-only redirect-target substitution in a loop condition stays allowed.
         allowed("while read line < \"$(echo input)\"; do cat input; break; done");
+    }
+
+    #[test]
+    fn readonly_loop_closes_review_round15_safety_gaps() {
+        // Round-3 Copilot review of #164 (10 threads).
+
+        // #439 Guard dataflow is built from the original commands (loop headers
+        // and assignments intact), so a loop that rebinds `d` to `/etc` after an
+        // earlier `d=./scratch` is judged against `/etc`, not the stale literal.
+        let err = blocked("d=./scratch; for f in a; do touch \"$f\"; done; for d in /etc; do :; done; rm -rf \"$d\"");
+        assert!(
+            err.contains("loop variable") || err.contains("outside the workspace") || err.contains("/etc"),
+            "{err}"
+        );
+
+        // #493 The destructive-SQL scan runs over the substituted commands even
+        // when a sibling loop stays unverifiable, so a `DROP` in the unrolled
+        // part is not hidden behind the other's Ask.
+        let err =
+            blocked("for op in DROP; do sqlite3 test.db \"$op TABLE users\"; done; for f in *; do touch \"$f\"; done");
+        assert!(err.contains("destructive database"), "{err}");
+
+        // #428 An allow rule matching the placeholder text (`$f`) does not prove
+        // coverage over every runtime binding, so the loop asks instead of being
+        // auto-approved.
+        let p = policy(&["Bash(touch ??.txt)"], &[]);
+        assert!(matches!(decide_with(&p, "for f in *; do touch \"$f.txt\"; done"), Decision::Ask(_)));
+
+        // #1384 Zero padding applies only when an endpoint has an explicit
+        // leading zero; `{9..11}` binds `9 10 11`, not `09 10 11`.
+        let p = policy(&[], &["Bash(touch item9)"]);
+        let err = check(&p, "for n in item{9..11}; do touch \"$n\"; done").unwrap_err();
+        assert!(err.contains("denies"), "{err}");
+        // ...while a genuinely padded range keeps its padding.
+        let p = policy(&[], &["Bash(touch item09)"]);
+        let err = check(&p, "for n in item{09..11}; do touch \"$n\"; done").unwrap_err();
+        assert!(err.contains("denies"), "{err}");
+
+        // #1413 A stepped range stops before advancing past its endpoint:
+        // `{1..6..2}` binds `1 3 5`, never `7`.
+        let p = policy(&[], &["Bash(touch s7)"]);
+        check(&p, "for n in s{1..6..2}; do touch \"$n\"; done").unwrap();
+        // ...and still binds the in-range stepped values.
+        let p = policy(&[], &["Bash(touch s5)"]);
+        let err = check(&p, "for n in s{1..6..2}; do touch \"$n\"; done").unwrap_err();
+        assert!(err.contains("denies"), "{err}");
+        // A step larger than the remaining distance emits only the start
+        // (`{1..5..10}` binds just `1`), and a descending letter range stops at
+        // its endpoint without overshooting (`{z..a..3}` ends at `b`, not `a`).
+        let p = policy(&[], &["Bash(touch e5)"]);
+        check(&p, "for n in e{1..5..10}; do touch \"$n\"; done").unwrap();
+        let p = policy(&[], &["Bash(touch za)"]);
+        check(&p, "for n in z{z..a..3}; do touch \"$n\"; done").unwrap();
+        let p = policy(&[], &["Bash(touch zb)"]);
+        let err = check(&p, "for n in z{z..a..3}; do touch \"$n\"; done").unwrap_err();
+        assert!(err.contains("denies"), "{err}");
+
+        // #2537 An assignment-only command is not an executable for allow-rule
+        // coverage: `D=/etc; rm -rf "$D"` must not fail the all-commands match
+        // just because the `D=/etc` word is not `rm *`. With the assignment
+        // excluded from coverage, the single `rm` executable matches the allow
+        // rule and the call is approved (an allow rule intentionally overrides
+        // the advisory built-in guard — the user accepted `rm`).
+        let p = policy(&["Bash(rm *)"], &[]);
+        assert_eq!(decide_with(&p, "D=/etc; rm -rf \"$D\""), Decision::Allow);
+        // ...and without an allow rule the guard still resolves `D` and blocks
+        // the out-of-workspace delete (the assignment is preserved for dataflow).
+        let err = blocked("D=/etc; rm -rf \"$D\"");
+        assert!(
+            err.contains("/etc") || err.contains("outside the workspace") || err.contains("top-level system"),
+            "{err}"
+        );
+
+        // #1305 A dynamic word that mixes a real expansion with a *literal*
+        // (quoted/escaped) `$f` cannot be substituted exactly — `Word::text` has
+        // already dropped the quoting — so the loop declines to unroll and asks
+        // rather than check the wrong text. `'$f'"$f"` flattens to `$f$f`; the
+        // shell runs `$fsafe`, which a deny on `touch $fsafe` must still catch.
+        let p = policy(&[], &["Bash(touch $fsafe)"]);
+        let d = decide_with(&p, "for f in safe; do touch '$f'\"$f\"; done");
+        // Not unrolled to a wrong `touch safesafe`: either it asks (unverifiable)
+        // or the deny rule on the real runtime text fires.
+        match d {
+            Decision::Ask(_) => {}
+            Decision::Deny(m) => assert!(m.contains("deny") || m.contains("may deny"), "{m}"),
+            Decision::Allow => panic!("'$f'\"$f\" was unrolled to a wrong literal and allowed"),
+        }
+        // An unambiguous single-occurrence word still unrolls normally.
+        let p = policy(&["Bash(touch safe)"], &[]);
+        check(&p, "for f in safe; do touch \"$f\"; done").unwrap();
+
+        // #1715 `env -- MARKER=1 bash -c ...`: `--` ends option processing, not
+        // the assignments, so the real program (`bash`) is classified and the
+        // interpreter hard block fires rather than an allow after unrolling.
+        assert!(
+            blocked("for f in a; do env -- MARKER=1 bash -c 'echo hi'; done").contains("interpreter"),
+            "{}",
+            blocked("for f in a; do env -- MARKER=1 bash -c 'echo hi'; done")
+        );
+        // ...and a dangerous assignment after `--` is still validated.
+        assert!(blocked("for f in a; do env -- PATH=/tmp/evil ls; done").contains("assigns `PATH`"));
+
+        // #1744 A wrapper only selects how the effective command is found; the
+        // unwrapped command is classified recursively, so a wrapped declaration
+        // builtin's assignment is a hard block, as is a nested wrapper.
+        assert!(blocked("for f in a; do command export PATH=/tmp/evil; ls; done").contains("assigns `PATH`"));
+        assert!(blocked("for f in a; do builtin export PATH=/tmp/evil; ls; done").contains("assigns `PATH`"));
+        assert!(blocked("for f in a; do command builtin export PATH=/tmp/evil; ls; done").contains("assigns `PATH`"));
+        // A wrapped read-only command stays allowed (the recursion reaches it).
+        allowed("for f in a b; do command echo \"$f\"; done");
     }
 
     #[test]
