@@ -355,6 +355,7 @@ impl Trajectory {
                 // Timers are surfaced by `/timers` and the status line; not a
                 // ledger row.
                 Record::Timers { .. } => {}
+                Record::Recall { .. } => {}
                 // Audit metadata, not a conversation row.
                 Record::Hooks { .. } => {}
             }

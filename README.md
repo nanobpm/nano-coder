@@ -1307,8 +1307,22 @@ evidence (a file path or command). Search is a case-insensitive regex
 over the text and the optional evidence, as in `history_search` - no embeddings or vector
 store.
 
-**Tools** (offered when `memory` is on): `memory_save(scope, text, evidence?)`,
+**Tools** (offered when `memory` is on): `memory_save(scope, text, evidence?, kind?, anchors?)`,
 `memory_search(pattern, scope?)`, `memory_forget(id)`.
+
+**Recall from tool calls.** Before relying on the model to search, each tool call's arguments
+are matched (lexically, no model call) against memory *anchors*: backticked spans, path-like
+tokens and host names in the text and evidence (common commands such as `git` are ignored), or
+the entry's explicit `anchors` list, which replaces the extracted ones. A match attaches a
+note to the tool result - `📌 note from an earlier session (verify ...)` with its `check:`
+command and how long ago it was last used. A `hint` (the default `kind`) is recalled once per
+context; a `rule` on every match. At most 2 notes are attached per turn. What has been seen is
+session state (persisted like timers, reset by compaction and new sessions), never stored in
+the memory file, and a `memory_search` result counts as seen. Recall works in read-only
+(headless/ACP) sessions too. Each recall, and each recall later followed by a `memory_search`
+of that memory, is appended to `<memory_dir>/recall.jsonl`; `/memory` shows the counts
+(`recalled N×, used M×`) so over-broad anchors can be spotted. Entries without `kind`/`anchors`
+load unchanged.
 
 **Prompt.** A capped, dated index (most-recently-used first, ~4 KB with the guidance) is
 appended to the system prompt at session start, framed as "notes from earlier sessions; may be

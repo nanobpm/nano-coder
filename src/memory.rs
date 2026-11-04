@@ -92,6 +92,43 @@ pub struct Entry {
     /// The session that saved it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// `hint` (default) or `rule`: a rule is recalled on every matching tool
+    /// call, a hint once per context (see [`Recall`]). Absent means `hint`, so
+    /// older entries load unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<Kind>,
+    /// Explicit recall triggers. When set they replace the anchors extracted
+    /// from `text`/`evidence` (fixing missed triggers and over-broad ones).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchors: Option<Vec<String>>,
+}
+
+/// How a memory is recalled from tool calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    /// Recalled at most once per context.
+    #[default]
+    Hint,
+    /// Recalled on every matching tool call.
+    Rule,
+}
+
+impl Kind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Hint => "hint",
+            Kind::Rule => "rule",
+        }
+    }
+
+    fn parse(text: &str) -> Result<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "hint" => Ok(Kind::Hint),
+            "rule" => Ok(Kind::Rule),
+            other => bail!("unknown kind {other:?}; use \"hint\" or \"rule\""),
+        }
+    }
 }
 
 impl Entry {
@@ -225,7 +262,25 @@ impl Store {
     }
 
     /// Save a fact and record it. Rejects obvious secrets and over-long text.
+    #[cfg(test)]
     pub fn save(&self, scope: Scope, text: &str, evidence: Option<&str>, session: Option<&str>) -> Result<Entry> {
+        self.save_with(scope, text, evidence, session, None, None)
+    }
+
+    /// [`Store::save`] with an explicit recall `kind` and `anchors`.
+    pub fn save_with(
+        &self,
+        scope: Scope,
+        text: &str,
+        evidence: Option<&str>,
+        session: Option<&str>,
+        kind: Option<Kind>,
+        anchors: Option<Vec<String>>,
+    ) -> Result<Entry> {
+        let anchors = match anchors {
+            Some(list) => Some(validate_anchors(list)?),
+            None => None,
+        };
         let text = text.trim();
         if text.is_empty() {
             bail!("nothing to remember: text is empty");
@@ -306,6 +361,8 @@ impl Store {
             last_used: now,
             evidence,
             session: session.map(str::to_string),
+            kind,
+            anchors,
         };
         let path = self.path(scope)?;
         let _lock = FileLock::acquire(&path)?;
@@ -640,7 +697,9 @@ pub fn definitions(writable: bool) -> Vec<ToolDefinition> {
                 "properties": {
                     "scope": { "type": "string", "enum": ["user", "project"], "description": "\"user\" (machine/preferences) or \"project\" (this repo)" },
                     "text": { "type": "string", "description": "The fact to remember, phrased so it is still useful next session" },
-                    "evidence": { "type": "string", "description": "Optional file path or command that verifies the fact" }
+                    "evidence": { "type": "string", "description": "Optional file path or command that verifies the fact" },
+                    "kind": { "type": "string", "enum": ["hint", "rule"], "description": "\"hint\" (default): recalled once per context when a tool call matches it. \"rule\": recalled on every matching tool call (e.g. \"never use broad `pkill -f` here\"). Only use rule when the user states it as one." },
+                    "anchors": { "type": "array", "items": { "type": "string" }, "description": "Optional literal strings (hosts, paths, command names) whose appearance in a tool call's arguments recalls this memory. Replaces the anchors extracted from the text and evidence." }
                 },
                 "required": ["scope", "text"]
             }),
@@ -674,13 +733,33 @@ pub fn run(store: &Store, tool: &str, args: &Value, session: Option<&str>, read_
         SAVE_TOOL => {
             let scope = Scope::parse(arg_str(args, "scope").ok_or_else(|| anyhow!("scope is required"))?)?;
             let text = arg_str(args, "text").ok_or_else(|| anyhow!("text is required"))?;
-            let entry = store.save(scope, text, arg_str(args, "evidence"), session)?;
+            let kind = match arg_str(args, "kind") {
+                Some(k) => Some(Kind::parse(k)?),
+                None => None,
+            };
+            let anchors = match args.get("anchors") {
+                None | Some(Value::Null) => None,
+                Some(Value::Array(items)) => Some(
+                    items
+                        .iter()
+                        .map(|v| v.as_str().map(str::to_string).ok_or_else(|| anyhow!("anchors must be strings")))
+                        .collect::<Result<Vec<_>>>()?,
+                ),
+                Some(_) => bail!("anchors must be an array of strings"),
+            };
+            let entry = store.save_with(scope, text, arg_str(args, "evidence"), session, kind, anchors)?;
             // Show the whole persisted entry (text + evidence) so it is fully
             // reviewable in the transcript — save rejects control characters, so
             // both are single-line and safe to echo in full.
             let mut msg = format!("remembered ({}, {}): {}", scope.as_str(), entry.id, entry.text);
             if let Some(evidence) = &entry.evidence {
                 msg.push_str(&format!(" (check: {evidence})"));
+            }
+            if entry.kind == Some(Kind::Rule) {
+                msg.push_str(" [rule]");
+            }
+            if let Some(anchors) = &entry.anchors {
+                msg.push_str(&format!(" [anchors: {}]", anchors.join(", ")));
             }
             Ok(msg)
         }
@@ -2031,9 +2110,413 @@ fn is_placeholder_filler(value: &str) -> bool {
     segments.len() > 1 && segments.iter().all(|s| FILLER.contains(s))
 }
 
+// ---------------------------------------------------------------------------
+// Recall from tool calls (issue #166)
+// ---------------------------------------------------------------------------
+
+/// At most this many recall notes are attached per turn.
+pub const RECALL_NOTES_PER_TURN: usize = 2;
+/// Explicit anchors accepted per memory, and their length bounds.
+const MAX_ANCHORS: usize = 12;
+const MAX_ANCHOR_CHARS: usize = 120;
+const MIN_ANCHOR_CHARS: usize = 3;
+/// Name of the append-only recall log next to the scope files.
+const RECALL_LOG: &str = "recall.jsonl";
+
+/// Single words too common in tool calls to recall anything on their own (a
+/// memory that mentions `git` must not fire on every git call).
+const STOP_ANCHORS: &[&str] = &[
+    "git",
+    "cargo",
+    "npm",
+    "npx",
+    "node",
+    "make",
+    "bash",
+    "sh",
+    "zsh",
+    "ls",
+    "cat",
+    "cd",
+    "rm",
+    "cp",
+    "mv",
+    "gh",
+    "grep",
+    "rg",
+    "find",
+    "sed",
+    "awk",
+    "echo",
+    "test",
+    "tests",
+    "build",
+    "run",
+    "python",
+    "python3",
+    "pip",
+    "curl",
+    "head",
+    "tail",
+    "sudo",
+    "true",
+    "false",
+    "null",
+    "the",
+    "and",
+    "this",
+    "that",
+    "with",
+    "src",
+    "main",
+    "README.md",
+];
+
+/// Validate explicit anchors from `memory_save`: single-line, bounded, not
+/// secret-shaped. Empty strings are dropped; duplicates collapse.
+fn validate_anchors(list: Vec<String>) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for anchor in list {
+        let anchor = anchor.trim();
+        if anchor.is_empty() {
+            continue;
+        }
+        if anchor.chars().any(is_line_break) {
+            bail!("anchors must be single-line");
+        }
+        let n = anchor.chars().count();
+        if !(MIN_ANCHOR_CHARS..=MAX_ANCHOR_CHARS).contains(&n) {
+            bail!("anchor {anchor:?} must be {MIN_ANCHOR_CHARS}-{MAX_ANCHOR_CHARS} characters");
+        }
+        if looks_like_secret(anchor).is_some() {
+            bail!("refusing to save: an anchor looks like a secret");
+        }
+        if !out.iter().any(|a| a.eq_ignore_ascii_case(anchor)) {
+            out.push(anchor.to_string());
+        }
+    }
+    if out.len() > MAX_ANCHORS {
+        bail!("too many anchors ({}, max {MAX_ANCHORS})", out.len());
+    }
+    Ok(out)
+}
+
+/// The lowercase anchors a memory is recalled by: its explicit `anchors` when
+/// set, else ones extracted from its text and evidence — backticked spans,
+/// path-like tokens (`~/.local/share/x`, `owner/repo`) and host-like tokens
+/// (`omarchy.local`). Worked out at load time, so the format needs no
+/// migration and extraction can improve later.
+pub fn anchors(entry: &Entry) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut add = |raw: &str| {
+        let a = raw.trim().to_lowercase();
+        let n = a.chars().count();
+        if !(MIN_ANCHOR_CHARS..=MAX_ANCHOR_CHARS).contains(&n) || a.chars().any(is_line_break) {
+            return;
+        }
+        if STOP_ANCHORS.iter().any(|s| s.eq_ignore_ascii_case(&a)) {
+            return;
+        }
+        if !out.contains(&a) {
+            out.push(a);
+        }
+    };
+    if let Some(explicit) = &entry.anchors {
+        for a in explicit {
+            add(a);
+        }
+        return out;
+    }
+    for source in std::iter::once(entry.text.as_str()).chain(entry.evidence.as_deref()) {
+        // Backticked spans are deliberate literals: `pkill -f`, `cargo xtask`.
+        for (i, span) in source.split('`').enumerate() {
+            if i % 2 == 1 {
+                add(span);
+            }
+        }
+        for token in source.split(|c: char| c.is_whitespace() || "`\"'(),;<>[]{}|".contains(c)) {
+            let token = token.trim_matches(|c: char| ".:!?=".contains(c));
+            if is_path_like(token) || is_host_like(token) {
+                add(token);
+            }
+        }
+    }
+    out
+}
+
+fn is_path_like(token: &str) -> bool {
+    token.chars().count() >= 5
+        && token.contains('/')
+        && token.chars().any(char::is_alphanumeric)
+        && !token.starts_with("//")
+        && token != "and/or"
+}
+
+fn is_host_like(token: &str) -> bool {
+    static HOST: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)^[a-z0-9][a-z0-9-]*(\.[a-z0-9-]+)*\.(local|lan|internal|home|com|io|dev|net|org|sh|ai|app)$")
+            .unwrap()
+    });
+    HOST.is_match(token)
+}
+
+/// Every string in a tool call's arguments (keys excluded), lowercased and
+/// newline-joined: the haystack anchors are matched against.
+fn argument_text(args: &Value) -> String {
+    fn walk(v: &Value, out: &mut String) {
+        match v {
+            Value::String(s) => {
+                out.push_str(&s.to_lowercase());
+                out.push('\n');
+            }
+            Value::Array(items) => items.iter().for_each(|i| walk(i, out)),
+            Value::Object(map) => map.values().for_each(|i| walk(i, out)),
+            Value::Number(n) => {
+                out.push_str(&n.to_string());
+                out.push('\n');
+            }
+            _ => {}
+        }
+    }
+    let mut out = String::new();
+    walk(args, &mut out);
+    out
+}
+
+/// Whether `anchor` occurs in `haystack` on word boundaries (so `pkill` does
+/// not match `xpkill2`). Both are lowercase.
+fn contains_anchor(haystack: &str, anchor: &str) -> bool {
+    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    let first_is_word = word(anchor.chars().next());
+    let last_is_word = word(anchor.chars().last());
+    haystack.match_indices(anchor).any(|(i, m)| {
+        let before = haystack[..i].chars().next_back();
+        let after = haystack[i + m.len()..].chars().next();
+        !(first_is_word && word(before)) && !(last_is_word && word(after))
+    })
+}
+
+/// Per-context recall state: the ids whose full text has been seen since the
+/// last compaction. Session state, persisted like the timers; compaction and
+/// a new session reset it. Kept out of the memory file on purpose.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Recall {
+    #[serde(default)]
+    pub seen: std::collections::BTreeSet<String>,
+    /// Ids recalled by a note in this context (to log a later use).
+    #[serde(default)]
+    pub fired: std::collections::BTreeSet<String>,
+}
+
+impl Recall {
+    /// Mark every `[mem-…]` id in a memory tool's output as seen (its full
+    /// text is now in context). Returns the ids that had fired as a note
+    /// earlier in this context (a reminder that was then used).
+    pub fn note_seen_in(&mut self, output: &str) -> Vec<String> {
+        static ID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[(mem-[0-9a-f]+)\]").unwrap());
+        let mut used = Vec::new();
+        for cap in ID.captures_iter(output) {
+            let id = cap[1].to_string();
+            if self.fired.remove(&id) {
+                used.push(id.clone());
+            }
+            self.seen.insert(id);
+        }
+        used
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty() && self.fired.is_empty()
+    }
+}
+
+/// One recall note to attach to a tool result.
+#[derive(Debug, Clone)]
+pub struct RecallNote {
+    pub id: String,
+    pub text: String,
+}
+
+impl Store {
+    /// Match a tool call's arguments against memory anchors. Returns up to
+    /// `budget` notes: `rule` memories fire on every match, `hint` memories
+    /// only when not yet seen in this context. Fired ids are marked seen in
+    /// `state`. Never writes the scope files, so it works in read-only
+    /// (headless/ACP/plan) sessions.
+    pub fn recall(&self, tool: &str, args: &Value, state: &mut Recall, budget: usize) -> Vec<RecallNote> {
+        if budget == 0 || is_memory_tool(tool) {
+            return Vec::new();
+        }
+        let haystack = argument_text(args);
+        if haystack.trim().is_empty() {
+            return Vec::new();
+        }
+        let Ok(all) = self.read_all_scopes() else {
+            return Vec::new();
+        };
+        let mut matched: Vec<(Scope, Entry)> = all
+            .into_iter()
+            .filter(|(_, e)| {
+                let kind = e.kind.unwrap_or_default();
+                (kind == Kind::Rule || !state.seen.contains(&e.id))
+                    && anchors(e).iter().any(|a| contains_anchor(&haystack, a))
+            })
+            .collect();
+        // Rules first, then most recently used (already the input order).
+        matched.sort_by_key(|(_, e)| e.kind.unwrap_or_default() != Kind::Rule);
+        let now = crate::session::now();
+        matched
+            .into_iter()
+            .take(budget)
+            .map(|(scope, e)| {
+                state.seen.insert(e.id.clone());
+                state.fired.insert(e.id.clone());
+                RecallNote { id: e.id.clone(), text: recall_note(scope, &e, now) }
+            })
+            .collect()
+    }
+
+    /// Append a recall event (`fired` / `used`) to the log next to the scope
+    /// files. Best-effort: statistics never fail a tool call. Separate from the
+    /// scope files so it never races other sessions' locked rewrites.
+    pub fn log_recall(&self, event: &str, id: &str, tool: &str, session: Option<&str>) {
+        use std::io::Write;
+        if create_dir_all_private(&self.root).is_err() {
+            return;
+        }
+        let line = json!({ "at": crate::session::now(), "event": event, "id": id, "tool": tool, "session": session });
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        if let Ok(mut f) = opts.open(self.root.join(RECALL_LOG)) {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+
+    /// Per-id `(fired, used)` counts from the recall log (for `/memory`).
+    pub fn recall_stats(&self) -> std::collections::HashMap<String, (usize, usize)> {
+        let mut stats: std::collections::HashMap<String, (usize, usize)> = std::collections::HashMap::new();
+        let Ok(text) = std::fs::read_to_string(self.root.join(RECALL_LOG)) else {
+            return stats;
+        };
+        for line in text.lines() {
+            let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+            let (Some(id), Some(event)) = (v.get("id").and_then(Value::as_str), v.get("event").and_then(Value::as_str))
+            else {
+                continue;
+            };
+            let slot = stats.entry(id.to_string()).or_default();
+            match event {
+                "fired" => slot.0 += 1,
+                "used" => slot.1 += 1,
+                _ => {}
+            }
+        }
+        stats
+    }
+}
+
+/// The note text: framed as an untrusted hint to verify, with its `check:`
+/// command and a staleness signal.
+fn recall_note(scope: Scope, entry: &Entry, now: DateTime<FixedOffset>) -> String {
+    let days = (now - entry.last_used).num_days().max(0);
+    let kind = if entry.kind == Some(Kind::Rule) { ", rule" } else { "" };
+    let mut note = format!(
+        "📌 note from an earlier session (verify; {}{kind}): [{}] {}",
+        scope.as_str(),
+        scrub_control(&entry.id),
+        one_line(&entry.text)
+    );
+    if let Some(evidence) = &entry.evidence {
+        note.push_str(&format!(" (check: {})", one_line(evidence)));
+    }
+    note.push_str(&format!(
+        " (last used {days} day{} ago; a hint, not permission to act)",
+        if days == 1 { "" } else { "s" }
+    ));
+    note
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anchors_come_from_backticks_paths_and_hosts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let e = store
+            .save(
+                Scope::User,
+                "never use broad `pkill -f` on omarchy.local; logs in ~/.local/share/c8ctl-nano/logs, see `git`",
+                Some("ls ~/.local/share/c8ctl-nano/logs"),
+                None,
+            )
+            .unwrap();
+        let a = anchors(&e);
+        assert!(a.contains(&"pkill -f".to_string()), "{a:?}");
+        assert!(a.contains(&"omarchy.local".to_string()), "{a:?}");
+        assert!(a.contains(&"~/.local/share/c8ctl-nano/logs".to_string()), "{a:?}");
+        assert!(!a.contains(&"git".to_string()), "common commands are not anchors: {a:?}");
+        let explicit = store
+            .save_with(Scope::User, "about omarchy.local", None, None, None, Some(vec!["Merlin.local".into()]))
+            .unwrap();
+        assert_eq!(anchors(&explicit), vec!["merlin.local".to_string()], "explicit anchors override");
+    }
+
+    #[test]
+    fn anchors_match_on_word_boundaries() {
+        assert!(contains_anchor("pkill -f nano\n", "pkill -f"));
+        assert!(!contains_anchor("xpkill -f\n", "pkill -f"));
+        assert!(contains_anchor("ssh omarchy.local uptime", "omarchy.local"));
+        assert!(!contains_anchor("ssh omarchy.locale", "omarchy.local"));
+    }
+
+    #[test]
+    fn recall_respects_kind_seen_and_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let hint = store.save(Scope::User, "builds run on omarchy.local", None, None).unwrap();
+        let rule = store.save_with(Scope::User, "never `pkill -f` here", None, None, Some(Kind::Rule), None).unwrap();
+        let mut state = Recall::default();
+        let args = json!({"command": "ssh omarchy.local pkill -f worker"});
+        let notes = store.recall("bash", &args, &mut state, 2);
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].id, rule.id, "rules first");
+        assert!(notes[0].text.contains("verify"));
+        let notes = store.recall("bash", &args, &mut state, 2);
+        assert_eq!(notes.iter().map(|n| n.id.clone()).collect::<Vec<_>>(), vec![rule.id.clone()]);
+        assert!(store.recall("bash", &args, &mut Recall::default(), 1).len() == 1, "budget caps notes");
+        assert!(store.recall(SEARCH_TOOL, &args, &mut Recall::default(), 2).is_empty());
+        // A memory tool output marks ids as seen and reports a used reminder.
+        let mut state = Recall::default();
+        store.recall("bash", &args, &mut state, 2);
+        let used = state.note_seen_in(&format!("user [{}] (2026-01-01) builds", hint.id));
+        assert_eq!(used, vec![hint.id.clone()]);
+    }
+
+    #[test]
+    fn entries_without_kind_or_anchors_load_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        std::fs::create_dir_all(dir.path().join("memory")).unwrap();
+        let line =
+            r#"{"id":"mem-1","text":"old fact","created":"2099-01-01T00:00:00Z","last_used":"2099-01-01T00:00:00Z"}"#;
+        std::fs::write(dir.path().join("memory/user.jsonl"), format!("{line}\n")).unwrap();
+        let all = store.all().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].1.kind, None);
+        assert_eq!(serde_json::to_string(&all[0].1).unwrap(), line);
+        // And the new fields round-trip.
+        let saved = store
+            .save_with(Scope::User, "new fact", None, None, Some(Kind::Rule), Some(vec!["abc.local".into()]))
+            .unwrap();
+        assert!(store.all().unwrap().iter().any(|(_, e)| *e == saved));
+    }
 
     fn store(dir: &Path) -> Store {
         Store::new(dir.join("memory"), Some("github.com/nanobpm/nano-coder".to_string()), DEFAULT_EXPIRY_DAYS)

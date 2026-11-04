@@ -795,6 +795,11 @@ pub struct Agent {
     /// user request with no new user input. Consumed once per `run_turn`.
     auto_turn: bool,
     reminders: Reminders,
+    /// Memory recall from tool calls (issue #166): which memories' full text
+    /// is already in this context. Persisted; reset by compaction.
+    recall: memory::Recall,
+    /// Recall notes attached so far this turn (capped per turn).
+    recall_turn_notes: usize,
     /// Tool results longer than this are cut, with the whole kept on disk.
     tool_output_limit: usize,
     /// Checked before every tool call (see `permissions.rs`).
@@ -988,6 +993,8 @@ impl Agent {
             skills: Skills::default(),
             plan: Plan::default(),
             timers: Timers::default(),
+            recall: memory::Recall::default(),
+            recall_turn_notes: 0,
             #[cfg(test)]
             timers_clock: None,
             #[cfg(test)]
@@ -2689,6 +2696,7 @@ impl Agent {
         self.plan = Plan::default();
         // A fresh session starts with no timers (`/restart` clears them).
         self.timers = Timers::default();
+        self.recall = memory::Recall::default();
         self.control.publish_timers(&self.timers);
         self.pending_timer_steps = 0;
         self.reminders = Reminders::new(self.config.outcome_tool);
@@ -2776,6 +2784,7 @@ impl Agent {
         // closed fires as overdue at the next step (or the idle prompt).
         self.timers = restored.timers.unwrap_or_default();
         self.control.publish_timers(&self.timers);
+        self.recall = restored.recall.unwrap_or_default();
         self.pending_timer_steps = 0;
         // Reminders belong to the session being left (`/resume` mid-process).
         self.reminders = Reminders::new(self.config.outcome_tool);
@@ -3258,6 +3267,7 @@ impl Agent {
         }
         self.control.start_turn();
         self.reminders.start_turn();
+        self.recall_turn_notes = 0;
         // Consume the automatic-turn origin for this turn (an automatic timer
         // wakeup/nudge): the main user message pushed below is marked
         // `auto_initiated` so it bills as agent-initiated. Taken once here so it
@@ -4373,6 +4383,15 @@ impl Agent {
                     result_text.push_str("\n\n");
                     result_text.push_str(&reminders::wrap(ctx));
                 }
+                // Memory recall (issue #166): a note for each memory whose
+                // anchors appear in this call's arguments and whose full text
+                // is not already in context. Only for calls that reached a tool.
+                if dispatched {
+                    for note in self.recall_memories(&tool_call.name, &effective_arguments, ok, &result_text) {
+                        result_text.push_str("\n\n");
+                        result_text.push_str(&reminders::wrap(&note));
+                    }
+                }
                 // Consume the one-time "look in history" hint *before* the loop
                 // detector fingerprints the result (issue #65). The hint is
                 // appended to only the first failed call, so a result that
@@ -4678,6 +4697,12 @@ impl Agent {
         let report = self.compact_with(trigger, mode, instructions).await?;
         if let Some(report) = &report {
             self.compact_floor = report.tokens_after;
+            // The compacted context no longer holds any recalled memory's full
+            // text, so every memory may be recalled again.
+            if !self.recall.is_empty() {
+                self.recall = memory::Recall::default();
+                self.recall_changed();
+            }
             if trigger != CompactTrigger::Manual {
                 crate::ui::log(&format!("[agent] auto-{report}"));
             }
@@ -5142,6 +5167,50 @@ impl Agent {
             return Err(err);
         }
         Ok(Value::String(outcome.text))
+    }
+
+    /// Persist the memory-recall state after a change. Best-effort: a failed
+    /// append only means a resumed session may repeat a note.
+    fn recall_changed(&mut self) {
+        if let Some(log) = &mut self.session
+            && let Err(err) = log.append(&Record::Recall { recall: self.recall.clone(), recorded_at: session::now() })
+        {
+            crate::ui::log(&format!("[agent] could not persist memory recall state: {err}"));
+        }
+    }
+
+    /// Recall memories whose anchors appear in this tool call (issue #166),
+    /// returning the notes to attach to its result. Also marks memories whose
+    /// full text a memory tool just returned as seen.
+    fn recall_memories(&mut self, tool: &str, args: &Value, ok: bool, result: &str) -> Vec<String> {
+        let Some(store) = self.memory.as_ref() else {
+            return Vec::new();
+        };
+        let session = self.session_id.clone();
+        let mut changed = false;
+        if memory::is_memory_tool(tool) {
+            if ok {
+                let before = self.recall.clone();
+                for id in self.recall.note_seen_in(result) {
+                    store.log_recall("used", &id, tool, session.as_deref());
+                }
+                changed = before != self.recall;
+            }
+            if changed {
+                self.recall_changed();
+            }
+            return Vec::new();
+        }
+        let budget = memory::RECALL_NOTES_PER_TURN.saturating_sub(self.recall_turn_notes);
+        let notes = store.recall(tool, args, &mut self.recall, budget);
+        for note in &notes {
+            store.log_recall("fired", &note.id, tool, session.as_deref());
+        }
+        if !notes.is_empty() {
+            self.recall_turn_notes += notes.len();
+            self.recall_changed();
+        }
+        notes.into_iter().map(|n| n.text).collect()
     }
 
     /// Persist and publish the timers after a change (like `plan_changed`).
@@ -7227,6 +7296,92 @@ mod tests {
             ..Config::default()
         };
         Agent::new(Box::new(client), config)
+    }
+
+    fn tool_texts(agent: &Agent) -> Vec<String> {
+        agent.conversation.iter().filter(|m| m.role == Role::Tool).map(|m| m.content.clone()).collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tool_calls_recall_matching_memories_once_per_context() {
+        // Issue #166: a tool call whose arguments carry a memory's anchor gets
+        // that memory as a note, once per context for a hint, every time for a
+        // rule; compaction resets it, and a resume restores it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = "/nonexistent/omarchy.local/worker.log";
+        let responses = vec![
+            read_call("r1", path),
+            text("one"),
+            read_call("r2", path),
+            text("two"),
+            text("SUMMARY: read logs"),
+            read_call("r3", path),
+            text("three"),
+        ];
+        // Read-only memory (the headless/ACP default) still recalls.
+        let mut agent = memory_agent(crate::config::MemoryMode::ReadOnly, responses, dir.path());
+        agent.new_session().unwrap();
+        let store = agent.memory().unwrap();
+        let hint = store
+            .save(
+                memory::Scope::User,
+                "worker logs on omarchy.local live under ~/.local/share/c8ctl-nano/logs",
+                None,
+                None,
+            )
+            .unwrap();
+        let rule = store
+            .save_with(
+                memory::Scope::User,
+                "never broad-kill on this host",
+                None,
+                None,
+                Some(memory::Kind::Rule),
+                Some(vec!["worker.log".into()]),
+            )
+            .unwrap();
+        agent.send_message("look").await.unwrap();
+        let first = tool_texts(&agent).pop().unwrap();
+        assert!(first.contains(&hint.id) && first.contains(&rule.id), "{first}");
+        assert!(first.contains("verify"), "{first}");
+
+        agent.send_message("again").await.unwrap();
+        let second = tool_texts(&agent).pop().unwrap();
+        assert!(!second.contains(&hint.id), "a hint fires once per context: {second}");
+        assert!(second.contains(&rule.id), "a rule fires on every match: {second}");
+
+        // A resume restores what was seen.
+        let id = agent.session_id().unwrap().to_string();
+        agent.load_session(&id).unwrap();
+        assert!(agent.recall.seen.contains(&hint.id));
+
+        agent.compact(None, None).await.unwrap().expect("compacted");
+        assert!(agent.recall.seen.is_empty(), "compaction resets recall");
+        agent.send_message("after compaction").await.unwrap();
+        let third = tool_texts(&agent).pop().unwrap();
+        assert!(third.contains(&hint.id), "a hint reappears after compaction: {third}");
+
+        let stats = agent.memory().unwrap().recall_stats();
+        assert_eq!(stats.get(&hint.id).map(|s| s.0), Some(2));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recall_attaches_at_most_two_notes_per_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = "/nonexistent/omarchy.local/x";
+        let responses = vec![read_call("r1", path), read_call("r2", path), text("done")];
+        let mut agent = memory_agent(crate::config::MemoryMode::On, responses, dir.path());
+        agent.new_session().unwrap();
+        for n in 0..4 {
+            agent
+                .memory()
+                .unwrap()
+                .save(memory::Scope::User, &format!("fact {n} about omarchy.local"), None, None)
+                .unwrap();
+        }
+        agent.send_message("look").await.unwrap();
+        let notes: usize = tool_texts(&agent).iter().map(|t| t.matches("📌").count()).sum();
+        assert_eq!(notes, 2);
     }
 
     #[test]

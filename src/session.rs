@@ -120,6 +120,12 @@ pub enum Record {
         timers: crate::timers::Timers,
         recorded_at: DateTime<FixedOffset>,
     },
+    /// The memory-recall state after a change (issue #166); the latest one
+    /// wins. A compaction appends an empty one, resetting what was seen.
+    Recall {
+        recall: crate::memory::Recall,
+        recorded_at: DateTime<FixedOffset>,
+    },
     /// The external hook configuration files loaded for this session (audit
     /// trail: issue #92). Observational only — ignored when rebuilding state.
     Hooks {
@@ -189,6 +195,8 @@ pub struct Restored {
     /// The session's timers as of the latest timers record (absent when the
     /// session never set one).
     pub timers: Option<crate::timers::Timers>,
+    /// The memory-recall state as of the latest recall record.
+    pub recall: Option<crate::memory::Recall>,
     /// Whether the last replacement was a smart compaction, so the resumed
     /// session should offer the history tools without re-sniffing message text.
     pub history_available: bool,
@@ -597,6 +605,7 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
             }
             Record::Plan { plan, .. } => restored.plan = Some(plan),
             Record::Timers { timers, .. } => restored.timers = Some(timers),
+            Record::Recall { recall, .. } => restored.recall = Some(recall),
             // Audit-only: records the loaded hook config, not conversation state.
             Record::Hooks { .. } => {}
         }
