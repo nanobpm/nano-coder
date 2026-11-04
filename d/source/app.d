@@ -1372,9 +1372,14 @@ int runMain(string[] args)
     // Instruction files, discovered once per working directory.
     ProjectInstructions instructions;
     string instructionsDir;
+    // Every caller installs the prompt it builds at once, so the ids its
+    // memory index renders in full go straight to the agent (recall skips them).
+    bool[string] indexShown;
     string systemFor(string dir, bool plan)
     {
-        auto index = memory !is null ? memory.index(memoryWritable && !plan) : null;
+        indexShown = null;
+        auto index = memory !is null ? memory.indexWithRendered(memoryWritable && !plan, indexShown) : null;
+        if (agent !is null) agent.indexShown = indexShown;
         if (instructionsDir is null || instructionsDir != dir)
         {
             instructionsDir = dir;
@@ -1387,6 +1392,8 @@ int runMain(string[] args)
     tools.register(questionDefinition, (JSONValue a) => questions.run(a));
     agent = new Agent(client, tools, policy, systemFor(cwd, o.plan));
     mainAgent = agent;
+    agent.memory = memory;
+    agent.indexShown = indexShown;
     agent.instructions = instructions;
     agent.sessionTitles = cfg.sessionTitles;
     agent.titleModel = cfg.titleModel;
@@ -1486,6 +1493,7 @@ int runMain(string[] args)
         agent.historyAvailable = restored.historyAvailable;
         agent.historyHintPending = restored.historyAvailable && !restored.historyHintConsumed;
         agent.plan = Plan.init;
+        agent.restoreRecall(restored.recall);
         agent.resetSessionCounters();
         updateStatus((ref Stats s) { s.historySearches = s.historyReads = 0; });
         agent.repairDanglingToolCalls();
@@ -2160,13 +2168,20 @@ int runMain(string[] args)
                         writefln("%s memor%s (memory is %s; edit the files under %s%s):", all.length,
                             all.length == 1 ? "y" : "ies", cfg.memory == MemoryMode.on ? "on" : "read-only",
                             memory.root, writable ? ", or /memory forget <id>" : "");
+                        import nano.memory : recallStats;
+                        auto stats = recallStats(memory);
                         foreach (x; all)
                         {
                             import nano.memory : scopeName = name;
                             import std.string : lineSplitter;
                             auto first = x.e.text.lineSplitter.empty ? "" : x.e.text.lineSplitter.front.strip;
-                            writefln("  %s %s %s%s", scopeName(x.s), x.e.label, sanitizeLine(first),
+                            auto row = format("  %s %s %s%s", scopeName(x.s), x.e.label, sanitizeLine(first),
                                 x.e.evidence !is null ? " (check: " ~ sanitizeLine(x.e.evidence) ~ ")" : "");
+                            if (x.e.isRule) row ~= " [rule]";
+                            // Recall noise: how often a memory was recalled from a
+                            // tool call, and how often that was followed by reading it.
+                            if (auto st = x.e.id in stats) row ~= format(" (recalled %s×, used %s×)", (*st)[0], (*st)[1]);
+                            writeln(row);
                         }
                     }
                     catch (Exception e) stdErr.writeln(console.red("error: " ~ e.msg));

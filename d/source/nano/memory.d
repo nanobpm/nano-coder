@@ -78,6 +78,16 @@ struct Entry
     string created, lastUsed;
     SysTime lastUsedTime;
     string evidence, session;
+    /// `hint` (default) or `rule`; null when absent (an older entry), which
+    /// means `hint`. A rule is recalled on every matching tool call, a hint
+    /// once per context (see `Recall`).
+    string kind;
+    /// Explicit recall triggers; when `hasAnchors` they replace the anchors
+    /// extracted from `text`/`evidence` (Rust `Option<Vec<String>>`).
+    string[] anchors;
+    bool hasAnchors;
+
+    bool isRule() const { return kind == "rule"; }
 
     string label() const { return format("[%s] (%s)", scrubControl(id), created.length >= 10 ? created[0 .. 10] : created); }
 
@@ -87,6 +97,13 @@ struct Entry
         auto s = format(`{"id":%s,"text":%s,"created":%s,"last_used":%s`, q(id), q(text), q(created), q(lastUsed));
         if (evidence !is null) s ~= `,"evidence":` ~ q(evidence);
         if (session !is null) s ~= `,"session":` ~ q(session);
+        if (kind !is null) s ~= `,"kind":` ~ q(kind);
+        if (hasAnchors)
+        {
+            string[] qs;
+            foreach (a; anchors) qs ~= q(a);
+            s ~= `,"anchors":[` ~ qs.join(",") ~ "]";
+        }
         return s ~ "}";
     }
 
@@ -110,6 +127,15 @@ struct Entry
             case "evidence", "session":
                 if (v.type != JSONType.string && v.type != JSONType.null_) return false;
                 break;
+            case "kind":
+                if (v.type != JSONType.null_ && (v.type != JSONType.string || (v.str != "hint" && v.str != "rule")))
+                    return false;
+                break;
+            case "anchors":
+                if (v.type == JSONType.null_) break;
+                if (v.type != JSONType.array) return false;
+                foreach (a; v.arrayNoRef) if (a.type != JSONType.string) return false;
+                break;
             default: return false;
             }
         }
@@ -122,6 +148,13 @@ struct Entry
         catch (Exception) return false;
         if (auto v = "evidence" in j) if (v.type == JSONType.string) e.evidence = v.str;
         if (auto v = "session" in j) if (v.type == JSONType.string) e.session = v.str;
+        if (auto v = "kind" in j) if (v.type == JSONType.string) e.kind = v.str;
+        if (auto v = "anchors" in j)
+            if (v.type == JSONType.array)
+            {
+                e.hasAnchors = true;
+                foreach (a; v.arrayNoRef) e.anchors ~= a.str;
+            }
         return true;
     }
 }
@@ -206,6 +239,16 @@ final class Store
     /// Save a fact. Refuses obvious secrets, line breaks and over-long text.
     Entry save(Scope s, string text, string evidence, string session)
     {
+        return saveWith(s, text, evidence, session, null, null, false);
+    }
+
+    /// `save` with an optional `kind` ("hint"/"rule") and explicit anchors
+    /// (used when `hasAnchors`; validated: single-line, 3–120 chars, no
+    /// secrets, at most 12, case-insensitively deduplicated).
+    Entry saveWith(Scope s, string text, string evidence, string session, string kind, string[] anchors, bool hasAnchors)
+    {
+        if (kind !is null) kind = parseKind(kind);
+        if (hasAnchors) anchors = validateAnchors(anchors);
         text = text.strip;
         if (!text.length) throw new Exception("nothing to remember: text is empty");
         auto n = text.byDchar.count;
@@ -242,6 +285,9 @@ final class Store
         e.lastUsedTime = now;
         e.evidence = evidence;
         e.session = session;
+        e.kind = kind;
+        e.anchors = anchors;
+        e.hasAnchors = hasAnchors;
         auto p = path(s);
         auto lock = FileLock(p);
         auto f = readScopeFile(s, true);
@@ -304,7 +350,15 @@ final class Store
         foreach (h; shown)
         {
             auto line = format("%s %s %s", h.s.name, h.e.label, snippet(rx, h.e.text));
-            if (h.e.evidence !is null) line ~= format(" (evidence: %s)", oneLine(h.e.evidence));
+            if (h.e.evidence !is null)
+            {
+                // `oneLine` drops everything past the first line break without
+                // marking it, and an unmarked hit counts as fully seen
+                // (`Recall.noteSeenIn` looks for `…`): flag the truncation so
+                // the hit stays eligible for recall.
+                auto rendered = oneLine(h.e.evidence);
+                line ~= format(" (evidence: %s%s)", rendered, rendered == h.e.evidence.strip ? "" : "…");
+            }
             lines ~= line;
         }
         auto out_ = lines.join("\n");
@@ -351,7 +405,12 @@ final class Store
     }
 
     /// The capped, dated index for the system prompt. `writable` adds save guidance.
-    string index(bool writable)
+    string index(bool writable) { bool[string] _; return indexWithRendered(writable, _); }
+
+    /// `index`, also returning the ids whose text and evidence it renders in
+    /// full (not clipped, not cut at a line break): recall treats those as
+    /// already in context.
+    string indexWithRendered(bool writable, out bool[string] rendered)
     {
         Scoped[] entries;
         try entries = all();
@@ -374,6 +433,9 @@ final class Store
             if (header.length + kept.length + line.length + 1 + marker.length + 1 > indexChars) { omitted = true; break; }
             if (kept.length) kept ~= "\n";
             kept ~= line;
+            if (oneLine(x.e.text) == x.e.text.strip
+                    && (x.e.evidence is null || oneLine(x.e.evidence) == x.e.evidence.strip))
+                rendered[x.e.id] = true;
         }
         if (omitted) kept ~= "\n" ~ marker;
         return header ~ kept;
@@ -411,7 +473,7 @@ ToolDefinition[] definitions(bool writable)
             ~ "scope \"user\" for the machine or the user's preferences, \"project\" for this repo. Do NOT save "
             ~ "secrets (keys, tokens, passwords) — save where to find them instead. The save is shown in the "
             ~ "transcript and can be undone with /memory.",
-            parseJSON(`{"type":"object","properties":{"scope":{"type":"string","enum":["user","project"],"description":"\"user\" (machine/preferences) or \"project\" (this repo)"},"text":{"type":"string","description":"The fact to remember, phrased so it is still useful next session"},"evidence":{"type":"string","description":"Optional file path or command that verifies the fact"}},"required":["scope","text"]}`));
+            parseJSON(`{"type":"object","properties":{"scope":{"type":"string","enum":["user","project"],"description":"\"user\" (machine/preferences) or \"project\" (this repo)"},"text":{"type":"string","description":"The fact to remember, phrased so it is still useful next session"},"evidence":{"type":"string","description":"Optional file path or command that verifies the fact"},"kind":{"type":"string","enum":["hint","rule"],"description":"\"hint\" (default): recalled once per context when a tool call matches it. \"rule\": recalled on every matching tool call (e.g. \"never use broad ` ~ "`pkill -f`" ~ ` here\"). Only use rule when the user states it as one."},"anchors":{"type":"array","items":{"type":"string"},"description":"Optional literal strings (hosts, paths, command names) whose appearance in a tool call's arguments recalls this memory. Replaces the anchors extracted from the text and evidence."}},"required":["scope","text"]}`));
         tools ~= ToolDefinition(forgetTool,
             "Delete a saved memory by its id (the `[mem-…]` shown in the index or a search result), e.g. when it "
             ~ "turned out to be wrong or stale.",
@@ -445,9 +507,27 @@ string run(Store store, string tool, JSONValue args, string session, bool readOn
         auto s = parseScope(sc);
         auto text = arg("text");
         if (text is null) throw new Exception("text is required");
-        auto e = store.save(s, text, arg("evidence"), session);
+        string[] anchors;
+        bool hasAnchors;
+        if (args.type == JSONType.object)
+            if (auto v = "anchors" in args)
+            {
+                if (v.type == JSONType.array)
+                {
+                    hasAnchors = true;
+                    foreach (a; v.arrayNoRef)
+                    {
+                        if (a.type != JSONType.string) throw new Exception("anchors must be strings");
+                        anchors ~= a.str;
+                    }
+                }
+                else if (v.type != JSONType.null_) throw new Exception("anchors must be an array of strings");
+            }
+        auto e = store.saveWith(s, text, arg("evidence"), session, arg("kind"), anchors, hasAnchors);
         auto msg = format("remembered (%s, %s): %s", s.name, e.id, e.text);
         if (e.evidence !is null) msg ~= format(" (check: %s)", e.evidence);
+        if (e.isRule) msg ~= " [rule]";
+        if (e.hasAnchors) msg ~= format(" [anchors: %s]", e.anchors.join(", "));
         return msg;
     case searchTool:
         auto pattern = arg("pattern");
@@ -682,3 +762,361 @@ struct FileLock
 
 private extern (C) int flock(int, int) nothrow @nogc;
 private enum LOCK_EX = 2, LOCK_NB = 4, LOCK_UN = 8;
+
+// ---------------------------------------------------------------------------
+// Recall from tool calls (Rust #167, issue #166): after a tool runs, its
+// arguments are matched against each memory's anchors, and a matching memory
+// whose full text is not already in context is attached to the result as a
+// `<system-reminder>` note.
+
+/// Recall notes attached per input at most.
+enum recallNotesPerTurn = 2;
+private enum maxAnchors = 12;
+private enum maxAnchorChars = 120;
+private enum minAnchorChars = 3;
+/// Append-only `fired`/`used` event log beside the scope files.
+enum recallLog = "recall.jsonl";
+
+/// Very common commands and words: never anchors on their own.
+private immutable string[] stopAnchors = [
+    "git", "cargo", "npm", "npx", "node", "make", "bash", "sh", "zsh", "ls", "cat", "cd", "rm", "cp", "mv", "gh",
+    "grep", "rg", "find", "sed", "awk", "echo", "test", "tests", "build", "run", "python", "python3", "pip", "curl",
+    "head", "tail", "sudo", "true", "false", "null", "the", "and", "this", "that", "with", "src", "main", "README.md",
+];
+
+/// "hint" or "rule" (case-insensitive), else an error.
+string parseKind(string text)
+{
+    auto k = text.strip.toLower;
+    if (k == "hint" || k == "rule") return k;
+    throw new Exception(format("unknown kind %s; use \"hint\" or \"rule\"", JSONValue(k).toString));
+}
+
+private string[] validateAnchors(string[] list)
+{
+    string[] out_;
+    foreach (raw; list)
+    {
+        auto anchor = raw.strip;
+        if (!anchor.length) continue;
+        if (anchor.byDchar.any!isLineBreak) throw new Exception("anchors must be single-line");
+        auto n = anchor.byDchar.count;
+        if (n < minAnchorChars || n > maxAnchorChars)
+            throw new Exception(format("anchor %s must be %s-%s characters", JSONValue(anchor).toString, minAnchorChars, maxAnchorChars));
+        if (looksLikeSecret(anchor) !is null) throw new Exception("refusing to save: an anchor looks like a secret");
+        if (!out_.any!(a => asciiEqualFold(a, anchor))) out_ ~= anchor;
+    }
+    if (out_.length > maxAnchors) throw new Exception(format("too many anchors (%s, max %s)", out_.length, maxAnchors));
+    return out_;
+}
+
+/// Rust `eq_ignore_ascii_case`.
+private bool asciiEqualFold(string a, string b)
+{
+    import std.ascii : toLower;
+    if (a.length != b.length) return false;
+    foreach (i; 0 .. a.length) if (toLower(a[i]) != toLower(b[i])) return false;
+    return true;
+}
+
+/// The lowercased recall triggers of an entry: its explicit anchors, else the
+/// backticked spans and path- or host-like tokens of its text and evidence.
+string[] anchorsOf(const Entry entry)
+{
+    import std.array : split;
+    import std.uni : uniToLower = toLower;
+    string[] out_;
+    void add(string raw)
+    {
+        auto a = raw.strip.uniToLower;
+        auto n = a.byDchar.count;
+        if (n < minAnchorChars || n > maxAnchorChars || a.byDchar.any!isLineBreak) return;
+        if (stopAnchors.any!(st => asciiEqualFold(st, a))) return;
+        if (!out_.canFind(a)) out_ ~= a;
+    }
+    if (entry.hasAnchors)
+    {
+        foreach (a; entry.anchors) add(a);
+        return out_;
+    }
+    string[] sources = [entry.text];
+    if (entry.evidence !is null) sources ~= entry.evidence;
+    foreach (source; sources)
+    {
+        foreach (i, span; source.split('`')) if (i % 2 == 1) add(span);
+        import std.uni : isWhite;
+        string token;
+        void flush()
+        {
+            import std.string : strip_ = strip;
+            auto t = token.strip_(".:!?=");
+            if (isPathLike(t) || isHostLike(t)) add(t);
+            token = null;
+        }
+        foreach (dchar c; source)
+        {
+            if (isWhite(c) || "`\"'(),;<>[]{}|"d.canFind(c)) flush();
+            else token ~= c;
+        }
+        flush();
+    }
+    return out_;
+}
+
+private bool isPathLike(string token)
+{
+    import std.uni : isAlphaNum;
+    return token.byDchar.count >= 5 && token.canFind('/') && token.byDchar.any!(c => isAlphaNum(c))
+        && !token.startsWith("//") && token != "and/or";
+}
+
+private bool isHostLike(string token)
+{
+    static Regex!char host;
+    if (host.empty)
+        host = regex(`^[a-z0-9][a-z0-9-]*(\.[a-z0-9-]+)*\.(local|lan|internal|home|com|io|dev|net|org|sh|ai|app)$`, "i");
+    return !matchFirst(token, host).empty;
+}
+
+/// A tool call's string and number arguments, lowercased, one per line.
+string argumentText(const JSONValue args)
+{
+    import std.uni : uniToLower = toLower;
+    string out_;
+    void walk(const JSONValue v)
+    {
+        switch (v.type)
+        {
+        case JSONType.string: out_ ~= v.str.uniToLower ~ "\n"; break;
+        case JSONType.array: foreach (i; v.arrayNoRef) walk(i); break;
+        case JSONType.object:
+            {
+                import std.algorithm : sort;
+                auto keys = v.objectNoRef.keys;
+                sort(keys); // serde_json's map order
+                foreach (k; keys) walk(v.objectNoRef[k]);
+            }
+            break;
+        case JSONType.integer, JSONType.uinteger, JSONType.float_: out_ ~= v.toString ~ "\n"; break;
+        default: break;
+        }
+    }
+    walk(args);
+    return out_;
+}
+
+/// Whether `anchor` occurs in `haystack` without running into a word
+/// character on a side where the anchor itself starts or ends with one.
+bool containsAnchor(string haystack, string anchor)
+{
+    import std.uni : isAlphaNum;
+    import std.utf : decode, decodeFront, strideBack;
+    if (!anchor.length) return false;
+    static bool word(dchar c) { return isAlphaNum(c) || c == '_'; }
+    dchar firstC = anchor.byDchar.front;
+    dchar lastC;
+    foreach (dchar c; anchor) lastC = c;
+    bool firstWord = word(firstC), lastWord = word(lastC);
+    size_t from = 0;
+    while (from <= haystack.length)
+    {
+        auto at = haystack[from .. $].indexOf(anchor);
+        if (at < 0) return false;
+        auto i = from + cast(size_t) at;
+        auto end = i + anchor.length;
+        bool beforeWord, afterWord;
+        if (i > 0)
+        {
+            auto k = i - strideBack(haystack, i);
+            beforeWord = word(decode(haystack, k));
+        }
+        if (end < haystack.length)
+        {
+            auto k = end;
+            afterWord = word(decode(haystack, k));
+        }
+        if (!(firstWord && beforeWord) && !(lastWord && afterWord)) return true;
+        from = end; // Rust match_indices: non-overlapping
+    }
+    return false;
+}
+
+/// Which memories' full text is already in this context. Persisted in the
+/// session log (`recall` records); a compaction resets it.
+struct Recall
+{
+    /// Shown in full (by a recall note or a memory tool result).
+    bool[string] seen;
+    /// Recalled by a note and not yet followed by a `memory_search` hit.
+    bool[string] fired;
+
+    bool empty() const { return !seen.length && !fired.length; }
+
+    bool opEquals(const Recall o) const
+    {
+        return sortedKeys(seen) == sortedKeys(o.seen) && sortedKeys(fired) == sortedKeys(o.fired);
+    }
+
+    Recall dup() const
+    {
+        Recall r;
+        foreach (k, _; seen) r.seen[k] = true;
+        foreach (k, _; fired) r.fired[k] = true;
+        return r;
+    }
+
+    /// Mark the ids a memory tool's output shows: a full search hit or a save
+    /// confirmation is seen; a hit for a fired id counts as used (returned).
+    string[] noteSeenIn(string output)
+    {
+        static Regex!char hit, saved;
+        if (hit.empty)
+        {
+            hit = regex(`^(?:user|project) \[(mem-[0-9a-f]+)\] `);
+            saved = regex(`^remembered \((?:user|project), (mem-[0-9a-f]+)\): `);
+        }
+        string[] used;
+        foreach (line; output.splitLines)
+        {
+            string id;
+            bool full;
+            if (auto m = matchFirst(line, hit)) { id = m[1]; full = !line.canFind("…"); }
+            else if (auto m = matchFirst(line, saved)) { id = m[1]; full = true; }
+            else continue;
+            if (id in fired)
+            {
+                fired.remove(id);
+                used ~= id;
+            }
+            if (full) seen[id] = true;
+        }
+        return used;
+    }
+
+    /// `{"seen":[...],"fired":[...]}`, sorted (Rust `BTreeSet`).
+    JSONValue toJSON() const
+    {
+        JSONValue j = ["seen": JSONValue(sortedKeys(seen)), "fired": JSONValue(sortedKeys(fired))];
+        return j;
+    }
+
+    static Recall fromJSON(const JSONValue j)
+    {
+        Recall r;
+        if (j.type != JSONType.object) return r;
+        if (auto v = "seen" in j) if (v.type == JSONType.array) foreach (x; v.arrayNoRef) if (x.type == JSONType.string) r.seen[x.str] = true;
+        if (auto v = "fired" in j) if (v.type == JSONType.array) foreach (x; v.arrayNoRef) if (x.type == JSONType.string) r.fired[x.str] = true;
+        return r;
+    }
+}
+
+private string[] sortedKeys(const bool[string] set)
+{
+    auto k = set.keys;
+    sort(k);
+    return k;
+}
+
+struct RecallNote
+{
+    string id, text;
+}
+
+/// The notes for a tool call: memories whose anchors appear in its arguments,
+/// rules first, at most `budget`. A hint already `seen` (or rendered in full
+/// by the installed index, `shown`) is skipped; a rule fires on every match.
+/// Marks each returned memory seen and fired.
+RecallNote[] recall(Store store, string tool, const JSONValue args, ref Recall state, const bool[string] shown, size_t budget)
+{
+    if (budget == 0 || isMemoryTool(tool)) return null;
+    auto haystack = argumentText(args);
+    if (!haystack.strip.length) return null;
+    Store.Scoped[] all_;
+    try all_ = store.all();
+    catch (Exception) return null;
+    Store.Scoped[] matched;
+    foreach (x; all_)
+        if ((x.e.isRule || (x.e.id !in state.seen && x.e.id !in shown))
+                && anchorsOf(x.e).any!(a => containsAnchor(haystack, a)))
+            matched ~= x;
+    import std.algorithm : SwapStrategy;
+    matched.sort!((a, b) => a.e.isRule && !b.e.isRule, SwapStrategy.stable);
+    auto now = Clock.currTime;
+    RecallNote[] notes;
+    foreach (x; matched[0 .. matched.length < budget ? $ : budget])
+    {
+        state.seen[x.e.id] = true;
+        state.fired[x.e.id] = true;
+        notes ~= RecallNote(x.e.id, recallNoteText(x.s, x.e, now));
+    }
+    return notes;
+}
+
+/// Append a `fired`/`used` event to `recall.jsonl`. Best-effort: statistics
+/// never fail a tool call. One `write` per record, so concurrent sessions'
+/// appends never interleave.
+void logRecall(Store store, string event, string id, string tool, string session) nothrow
+{
+    import core.sys.posix.fcntl : O_WRONLY, O_CREAT, O_APPEND;
+    import core.sys.posix.unistd : close;
+    try
+    {
+        createDirAllPrivate(store.root);
+        // Keys sorted, as serde_json's `json!` map writes them.
+        JSONValue j = ["at": JSONValue(stamp(Clock.currTime)), "event": JSONValue(event), "id": JSONValue(id),
+            "session": session !is null ? JSONValue(session) : JSONValue(null), "tool": JSONValue(tool)];
+        auto line = cast(const(ubyte)[]) (j.toString(JSONOptions.doNotEscapeSlashes) ~ "\n");
+        auto fd = openPath(buildPath(store.root, recallLog), O_WRONLY | O_CREAT | O_APPEND, octal!600);
+        if (fd < 0) return;
+        scope (exit) close(fd);
+        writeFd(fd, line);
+    }
+    catch (Exception) {}
+}
+
+/// Per-id `[fired, used]` counts from the recall log (for `/memory`).
+size_t[2][string] recallStats(Store store)
+{
+    size_t[2][string] stats;
+    string text;
+    try text = readText(buildPath(store.root, recallLog));
+    catch (Exception) return stats;
+    foreach (line; text.splitLines)
+    {
+        JSONValue v;
+        try v = parseJSON(line);
+        catch (Exception) continue;
+        if (v.type != JSONType.object) continue;
+        auto id = "id" in v, event = "event" in v;
+        if (id is null || event is null || id.type != JSONType.string || event.type != JSONType.string) continue;
+        auto slot = id.str in stats;
+        if (slot is null) { stats[id.str] = [0, 0]; slot = id.str in stats; }
+        if (event.str == "fired") (*slot)[0]++;
+        else if (event.str == "used") (*slot)[1]++;
+    }
+    return stats;
+}
+
+/// The complete text on one line: line breaks and control characters become
+/// spaces and whitespace collapses, but nothing is clipped (a note marks the
+/// entry seen, so it must show all of it).
+private string fullLine(string text)
+{
+    import std.array : split;
+    import std.uni : isControl;
+    string r;
+    foreach (dchar c; text) r ~= (isLineBreak(c) || isControl(c)) ? ' ' : c;
+    return r.split.join(" ");
+}
+
+/// The note: framed as an untrusted hint to verify, with its `check:` and a
+/// staleness signal.
+private string recallNoteText(Scope s, const Entry e, SysTime now)
+{
+    auto d = (now - e.lastUsedTime).total!"days";
+    if (d < 0) d = 0;
+    auto note = format("📌 note from an earlier session (verify; %s%s): [%s] %s", s.name, e.isRule ? ", rule" : "",
+        scrubControl(e.id), fullLine(e.text));
+    if (e.evidence !is null) note ~= format(" (check: %s)", fullLine(e.evidence));
+    return note ~ format(" (last used %s day%s ago; a hint, not permission to act)", d, d == 1 ? "" : "s");
+}

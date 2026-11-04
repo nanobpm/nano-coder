@@ -484,3 +484,184 @@ unittest // sanitize_key, project keys, tool set, run
     assert(run(s, searchTool, parseJSON(`{"pattern":"python"}`), null, false).canFind("uv provides python"));
     assert(fails(run(s, saveTool, parseJSON(`{"scope":"user","text":"x"}`), null, true)), "read-only refuses saves");
 }
+
+// ---- recall from tool calls (Rust #167) ----
+
+// rust: memory.rs::anchors_come_from_backticks_paths_and_hosts
+unittest // anchors_come_from_backticks_paths_and_hosts
+{
+    auto s = store(tmp("anchors"));
+    auto e = s.save(Scope.user,
+        "never use broad `pkill -f` on omarchy.local; logs in ~/.local/share/c8ctl-nano/logs, see `git`",
+        "ls ~/.local/share/c8ctl-nano/logs", null);
+    auto a = anchorsOf(e);
+    assert(a.canFind("pkill -f"), a.join("|"));
+    assert(a.canFind("omarchy.local"), a.join("|"));
+    assert(a.canFind("~/.local/share/c8ctl-nano/logs"), a.join("|"));
+    assert(!a.canFind("git"), "common commands are not anchors: " ~ a.join("|"));
+    auto explicit = s.saveWith(Scope.user, "about omarchy.local", null, null, null, ["Merlin.local"], true);
+    assert(anchorsOf(explicit) == ["merlin.local"], "explicit anchors override");
+}
+
+// rust: memory.rs::anchors_match_on_word_boundaries
+unittest // anchors_match_on_word_boundaries
+{
+    assert(containsAnchor("pkill -f nano\n", "pkill -f"));
+    assert(!containsAnchor("xpkill -f\n", "pkill -f"));
+    assert(containsAnchor("ssh omarchy.local uptime", "omarchy.local"));
+    assert(!containsAnchor("ssh omarchy.locale", "omarchy.local"));
+    // A later occurrence still counts when an earlier one runs into a word.
+    assert(containsAnchor("xpkill -f; pkill -f y", "pkill -f"));
+}
+
+// rust: memory.rs::index_rendered_set_excludes_clipped_and_multiline_entries
+unittest // index_rendered_set_excludes_clipped_and_multiline_entries
+{
+    auto s = store(tmp("rendered"));
+    auto short_ = s.save(Scope.user, "short fact", null, null);
+    auto long_ = s.save(Scope.user, "z".replicate(300), null, null);
+    auto ev = s.save(Scope.user, "has evidence", "e".replicate(300), null);
+    auto multi = s.save(Scope.user, "overview", null, null);
+    Entry[] entries;
+    foreach (x; s.all())
+    {
+        auto e = x.e;
+        if (e.id == multi.id) e.text = "overview\nimportant details";
+        entries ~= e;
+    }
+    writeAll(s.path(Scope.user), entries, null);
+    bool[string] rendered;
+    s.indexWithRendered(false, rendered);
+    assert(short_.id in rendered);
+    assert(long_.id !in rendered, "clipped text");
+    assert(ev.id !in rendered, "clipped evidence");
+    assert(multi.id !in rendered, "multi-line text shows only its first line");
+}
+
+// rust: memory.rs::recall_respects_kind_seen_and_budget
+unittest // recall_respects_kind_seen_and_budget
+{
+    auto s = store(tmp("recall-kind"));
+    auto hint = s.save(Scope.user, "builds run on omarchy.local", null, null);
+    auto rule = s.saveWith(Scope.user, "never `pkill -f` here", null, null, "rule", null, false);
+    Recall state;
+    bool[string] none;
+    auto args = parseJSON(`{"command":"ssh omarchy.local pkill -f worker"}`);
+    auto notes = s.recall("bash", args, state, none, 2);
+    assert(notes.length == 2);
+    assert(notes[0].id == rule.id, "rules first");
+    assert(notes[0].text.canFind("verify"));
+    notes = s.recall("bash", args, state, none, 2);
+    assert(notes.length == 1 && notes[0].id == rule.id);
+    Recall fresh;
+    assert(s.recall("bash", args, fresh, none, 1).length == 1, "budget caps notes");
+    Recall fresh2;
+    assert(!s.recall(searchTool, args, fresh2, none, 2).length);
+    // A memory tool output marks ids as seen and reports a used reminder.
+    Recall st;
+    s.recall("bash", args, st, none, 2);
+    assert(st.noteSeenIn("user [" ~ hint.id ~ "] (2026-01-01) builds") == [hint.id]);
+}
+
+// rust: memory.rs::note_seen_in_only_counts_record_prefixes_and_full_hits
+unittest // note_seen_in_only_counts_record_prefixes_and_full_hits
+{
+    Recall state;
+    state.fired["mem-aa"] = true;
+    assert(!state.noteSeenIn(`No memories match "[mem-aa]".`).length);
+    assert(!state.seen.length);
+    assert(state.noteSeenIn("user [mem-aa] (2026-01-01) …builds…") == ["mem-aa"]);
+    assert("mem-aa" !in state.seen, "a clipped hit is used, not seen");
+    state.noteSeenIn("project [mem-bb] (2026-01-01) full text");
+    state.noteSeenIn("remembered (user, mem-cc): some fact (check: ls)");
+    assert("mem-bb" in state.seen && "mem-cc" in state.seen);
+}
+
+// rust: memory.rs::recall_note_renders_full_text_and_evidence
+unittest // recall_note_renders_full_text_and_evidence
+{
+    auto s = store(tmp("recall-full"));
+    auto text = "`zzanchor` " ~ "word ".replicate(100) ~ " TAILMARK";
+    s.save(Scope.user, text, "x ".replicate(150) ~ " EVTAIL", null);
+    Recall state;
+    bool[string] none;
+    auto notes = s.recall("bash", parseJSON(`{"command":"zzanchor"}`), state, none, 2);
+    assert(notes.length == 1);
+    assert(notes[0].text.canFind("TAILMARK") && notes[0].text.canFind("EVTAIL"), notes[0].text);
+}
+
+// rust: memory.rs::log_recall_writes_whole_records
+unittest // log_recall_writes_whole_records
+{
+    import nano.safeio : spawn;
+    auto dir = tmp("recall-log");
+    auto root = buildPath(dir, "memory");
+    static void worker(string root, int i) @safe
+    {
+        auto st = new Store(root, null, 0);
+        foreach (_; 0 .. 50) logRecall(st, i % 2 == 0 ? "fired" : "used", "mem-ab", "bash", "sess");
+    }
+    typeof(spawn(&worker, root, 0))[] handles;
+    foreach (i; 0 .. 8) handles ~= spawn(&worker, root, i);
+    foreach (ref h; handles) h.join();
+    auto stats = recallStats(new Store(root, null, 0));
+    assert("mem-ab" in stats && stats["mem-ab"] == [200, 200]);
+}
+
+// rust: memory.rs::entries_without_kind_or_anchors_load_unchanged
+unittest // entries_without_kind_or_anchors_load_unchanged
+{
+    auto dir = tmp("legacy");
+    auto s = store(dir);
+    mkdirRecurse(buildPath(dir, "memory"));
+    enum line = `{"id":"mem-1","text":"old fact","created":"2099-01-01T00:00:00Z","last_used":"2099-01-01T00:00:00Z"}`;
+    write(buildPath(dir, "memory", "user.jsonl"), line ~ "\n");
+    auto all_ = s.all();
+    assert(all_.length == 1 && all_[0].e.kind is null && !all_[0].e.hasAnchors);
+    assert(all_[0].e.toJson == line);
+    auto saved = s.saveWith(Scope.user, "new fact", null, null, "rule", ["abc.local"], true);
+    bool found;
+    foreach (x; s.all())
+        if (x.e.id == saved.id)
+        {
+            found = true;
+            assert(x.e.isRule && x.e.anchors == ["abc.local"] && x.e.toJson == saved.toJson);
+            assert(x.e.toJson.canFind(`"kind":"rule","anchors":["abc.local"]}`), x.e.toJson);
+        }
+    assert(found);
+    // Bad values make the line unknown (kept byte for byte), as serde would.
+    write(buildPath(dir, "memory", "user.jsonl"),
+        `{"id":"mem-2","text":"t","created":"2099-01-01T00:00:00Z","last_used":"2099-01-01T00:00:00Z","kind":"law"}` ~ "\n");
+    assert(!s.all().length);
+}
+
+// rust: memory.rs::search_marks_dropped_evidence_lines_as_incomplete
+unittest // search_marks_dropped_evidence_lines_as_incomplete
+{
+    auto s = store(tmp("search-dropped"), null, 0);
+    auto entry = s.save(Scope.user, "a fact with evidence", null, null);
+    entry.evidence = "overview\nssh omarchy.local";
+    writeAll(s.path(Scope.user), [entry], null);
+    auto out_ = s.search("fact with evidence", null);
+    assert(out_.canFind("evidence: overview…"), out_);
+    Recall r;
+    r.noteSeenIn(out_);
+    assert(entry.id !in r.seen, "an incomplete hit is not marked seen");
+    auto single = s.save(Scope.user, "another fact", "ssh omarchy.local", null);
+    out_ = s.search("another fact", null);
+    assert(out_.canFind("evidence: ssh omarchy.local)"), out_);
+    Recall r2;
+    r2.noteSeenIn(out_);
+    assert(single.id in r2.seen, "a fully shown hit is marked seen");
+}
+
+unittest // memory_save takes kind and anchors; bad values are refused
+{
+    auto s = store(tmp("save-kind"));
+    auto msg = run(s, saveTool, parseJSON(`{"scope":"user","text":"never pkill here","kind":"Rule","anchors":["pkill -f"," PKILL -F "]}`), null, false);
+    assert(msg.canFind(" [rule]") && msg.canFind("[anchors: pkill -f]"), msg);
+    assert(fails(run(s, saveTool, parseJSON(`{"scope":"user","text":"x y z","kind":"law"}`), null, false)));
+    assert(fails(run(s, saveTool, parseJSON(`{"scope":"user","text":"x y z","anchors":"abc"}`), null, false)));
+    assert(fails(run(s, saveTool, parseJSON(`{"scope":"user","text":"x y z","anchors":["ab"]}`), null, false)));
+    assert(fails(run(s, saveTool, parseJSON(`{"scope":"user","text":"x y z","anchors":[1]}`), null, false)));
+}

@@ -280,6 +280,15 @@ class SessionLog
         write_(record("timers", d));
     }
 
+    /// The memory-recall state after a change (`{seen, fired}`); the latest
+    /// record wins. A compaction appends an empty one.
+    void recall(JSONValue recall)
+    {
+        JSONValue d = ["recorded_at": nowStamp()];
+        d["recall"] = recall;
+        write_(record("recall", d));
+    }
+
     /// The turn for `inputId` finished. `stopReason` is omitted for `end_turn`.
     void turnEnd(string inputId, string response, string stopReason, JSONValue outcome = JSONValue.init)
     {
@@ -323,6 +332,9 @@ struct Restored
     JSONValue plan;
     /// The latest timers record (`{last_id, items}`), or null.
     JSONValue timers;
+    /// The memory-recall state (`{seen, fired}`) as of the latest recall
+    /// record, reset by a later replace; null when the session never had one.
+    JSONValue recall;
     /// The latest compaction was smart: the history tools are offered.
     bool historyAvailable;
     /// The one-time history hint was already shown after that compaction.
@@ -401,6 +413,11 @@ Restored restore(string path)
                 r.historyAvailable = mode !is null && mode.type == JSONType.string && mode.str == "smart";
                 r.historyHintConsumed = false;
             }
+            // The replacement drops recalled notes from context, so recall
+            // resets here while decoding, not only in the empty record the
+            // writer appends after it (a crash between the two must not
+            // suppress those memories for good). A later record still wins.
+            r.recall = parseJSON(`{"seen":[],"fired":[]}`);
             if ("pending_position" !in data || data["pending_position"].type == JSONType.null_)
             {
                 pendingId = null;
@@ -412,6 +429,9 @@ Restored restore(string path)
             break;
         case "timers":
             r.timers = data["timers"];
+            break;
+        case "recall":
+            r.recall = data["recall"];
             break;
         default: // hooks: audit only
             break;
@@ -560,4 +580,25 @@ unittest
     assert(back.toolCalls[0].invalidArguments == "{oops" && back.toolCalls[0].itemId == "fc_1");
     auto legacy = messageFromRecord(parseJSON(`{"role":"assistant","content":"","tool_calls":[{"id":"c","name":"bash","arguments":"{bad"}]}`));
     assert(legacy.toolCalls[0].invalidArguments == "{bad");
+}
+
+// rust: session.rs::replace_clears_recall_state_while_decoding
+unittest // replace_clears_recall_state_while_decoding
+{
+    auto dir = buildPath(tempDir, "nano-coder-d-session-recall");
+    if (dir.exists) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/x");
+    auto sys = Message.system("sys");
+    log.append(sys);
+    assert(restore(log.path).recall.type == JSONType.null_, "never recorded");
+    log.recall(parseJSON(`{"seen":["mem-1"],"fired":["mem-1"]}`));
+    assert(restore(log.path).recall["seen"][0].str == "mem-1", "the latest record restores");
+    // A crash after the replace but before the empty recall record that
+    // follows it: the replace alone resets recall.
+    log.replace([Message.system("sys"), Message.user("summary")], 2, 2, "standard", null);
+    auto r = restore(log.path);
+    assert(r.recall["seen"].arrayNoRef.length == 0 && r.recall["fired"].arrayNoRef.length == 0, r.recall.toString);
+    // A later record still wins.
+    log.recall(parseJSON(`{"seen":["mem-2"],"fired":[]}`));
+    assert(restore(log.path).recall["seen"][0].str == "mem-2");
 }

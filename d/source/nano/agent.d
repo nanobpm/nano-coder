@@ -22,6 +22,7 @@ import std.sumtype : match;
 import nano.mode : AgentMode, planAllows;
 import nano.goal : Outcome, OutcomeError, OutcomeStatus, outcomeToolName = toolName, outcomeDefinition = definition;
 import nano.reminders : Reminders, wrap;
+import mem = nano.memory;
 import ctx = nano.context;
 import hist = nano.session_history;
 import nano.instructions : ProjectInstructions;
@@ -337,6 +338,7 @@ class Agent
         hasOutcome = hasReported = false;
         reminders.outcomeTool = outcomeTool;
         reminders.startTurn();
+        recallTurnNotes = 0;
         if (hooks !is null)
         {
             syncHookSession();
@@ -547,6 +549,10 @@ class Agent
                 bool isError = true;
                 string result;
                 Attachment[] attachments;
+                bool dispatched;
+                JSONValue effectiveArgs;
+                auto recallBefore = recallState.dup;
+                auto notesBefore = recallTurnNotes;
                 if (control.isCancelled) result = cancelledToolResult;
                 else if (loopStop !is null) result = loopStoppedToolResult;
                 else
@@ -555,7 +561,7 @@ class Agent
                         import nano.tools : setSpillDir, spillDirFor, truncateOutput;
                         // Cut outputs are kept beside a persisted session's log.
                         setSpillDir(log !is null ? spillDirFor(log.path) : null);
-                        result = runTool(call, r.stopReason, isError);
+                        result = runTool(call, r.stopReason, isError, dispatched, effectiveArgs);
                         // bash, read_file and history_read bound their own output.
                         if (call.name != "bash" && call.name != "read_file" && call.name != hist.readTool
                             && call.name != "load_skill")
@@ -573,6 +579,12 @@ class Agent
                                 import std.file : getcwd;
                                 if (auto nested = instructions.nestedFor(p.str, getcwd())) result ~= nested;
                             }
+                    // Memory recall (Rust #167): a note for each memory whose
+                    // anchors appear in this call's arguments and whose full
+                    // text is not already in context. Only calls that ran.
+                    if (dispatched)
+                        foreach (note; recallMemories(call.name, effectiveArgs, !isError, result))
+                            result ~= "\n\n" ~ wrap(note);
                     if (hist.isHistoryTool(call.name)) historyHintPending = false;
                     else if (historyHintPending && historyEnabled && hist.looksFailed(call.name, !isError, result))
                     {
@@ -584,7 +596,17 @@ class Agent
                 ev.toolEnd(call, toolResultDisplay(result, attachments), isError);
                 auto msg = Message.toolResult(call.id, call.name, result, isError);
                 msg.attachments = attachments;
-                push(msg);
+                // Commit this call's recall changes only once the result
+                // carrying their notes is durable: a failed append rolls them
+                // back, so a resume never treats unseen notes as seen.
+                try push(msg);
+                catch (Exception e)
+                {
+                    recallState = recallBefore;
+                    recallTurnNotes = notesBefore;
+                    throw e;
+                }
+                if (recallState != recallBefore) recallChanged();
             }
             if (loopStop !is null)
             {
@@ -1016,6 +1038,14 @@ class Agent
         messages = next;
         calibLen = 0;
         if (log !is null) log.replace(messages, first, last, ctx.modeName(m), client.providerName ~ "/" ~ client.modelName);
+        // The replacement drops recalled notes' full text from context, so
+        // every memory may be recalled again (except those the retained
+        // system message's index renders in full: `indexShown` is kept).
+        if (!recallState.empty)
+        {
+            recallState = mem.Recall.init;
+            recallChanged();
+        }
         report = CompactReport(len, messages.length, tokensBefore, estimateContextTokens(), split - bodyStart,
             fallback, truncated, m);
         // Nested instructions attached to folded tool results may be gone.
@@ -1056,6 +1086,17 @@ class Agent
     }
 
     private string runTool(const ref ToolCall call, string stopReason, out bool isError)
+    {
+        bool _;
+        JSONValue _a;
+        return runTool(call, stopReason, isError, _, _a);
+    }
+
+    /// `dispatched`: the call reached its handler (not refused as invalid,
+    /// unknown, plan-mode, permission- or hook-denied); `effectiveArgs` are
+    /// the arguments it ran with (after any hook rewrite).
+    private string runTool(const ref ToolCall call, string stopReason, out bool isError, out bool dispatched,
+        out JSONValue effectiveArgs)
     {
         isError = true;
         if (call.invalidArguments.length)
@@ -1107,6 +1148,8 @@ class Agent
             }
             if (deny !is null) return withContext(deny, context);
         }
+        dispatched = true;
+        effectiveArgs = args;
         string out_;
         try
         {
@@ -1169,9 +1212,74 @@ class Agent
         calibLen = calibTokens = 0;
         compactFloor = 0;
         historyAvailable = historyHintPending = false;
+        recallState = mem.Recall.init;
+        recallTurnNotes = 0;
         resetSessionCounters();
         lastUsage = TokenUsage.init;
         hasOutcome = hasReported = false;
+    }
+
+    /// The memory store (null: memory off). Recall from tool calls reads it.
+    mem.Store memory;
+    /// Memory recall from tool calls (Rust #167): which memories' full text
+    /// is already in this context. Persisted in `recall` records; reset by
+    /// compaction and a new session.
+    mem.Recall recallState;
+    /// Recall notes attached so far for the current input.
+    size_t recallTurnNotes;
+    /// Ids the memory index in the installed system message renders in full:
+    /// recall treats them as in context. Derived, never persisted; replaced
+    /// whenever the app installs a system prompt (`installSystem`).
+    bool[string] indexShown;
+
+    /// Install `system` as the system message, with the ids its memory index
+    /// renders in full.
+    void installSystem(string system, bool[string] shown)
+    {
+        if (messages.length && messages[0].role == Role.system) messages[0].content = system;
+        indexShown = shown;
+    }
+
+    /// Restore recall state from a session log (null: none recorded). The
+    /// installed system message (and so `indexShown`) is kept.
+    void restoreRecall(JSONValue j)
+    {
+        recallState = mem.Recall.fromJSON(j);
+        recallTurnNotes = 0;
+    }
+
+    /// Persist the recall state. Best-effort: a failed append only means a
+    /// resumed session may repeat a note.
+    private void recallChanged()
+    {
+        if (log is null) return;
+        try log.recall(recallState.toJSON);
+        catch (Exception e) stdErr.writeln("[agent] could not persist memory recall state: ", e.msg);
+    }
+
+    /// Recall memories whose anchors appear in this dispatched call; returns
+    /// the note texts to attach. A memory tool's output instead marks what it
+    /// showed as seen (and logs a `used` event for a fired id).
+    private string[] recallMemories(string tool, const JSONValue args, bool ok, string result)
+    {
+        if (memory is null) return null;
+        string session = log !is null ? log.id : null;
+        if (mem.isMemoryTool(tool))
+        {
+            if (ok)
+                foreach (id; recallState.noteSeenIn(result)) mem.logRecall(memory, "used", id, tool, session);
+            return null;
+        }
+        auto budget = mem.recallNotesPerTurn > recallTurnNotes ? mem.recallNotesPerTurn - recallTurnNotes : 0;
+        auto notes = mem.recall(memory, tool, args, recallState, indexShown, budget);
+        string[] texts;
+        foreach (n; notes)
+        {
+            mem.logRecall(memory, "fired", n.id, tool, session);
+            texts ~= n.text;
+        }
+        recallTurnNotes += notes.length;
+        return texts;
     }
 
     /// Offer `report_outcome` (config `outcome_tool`).
@@ -2179,4 +2287,188 @@ unittest
     mock.script = [LLMResponse("x")];
     agent.run("off", new NullEvents);
     assert(!mock.toolsSeen[$ - 1].canFind("timer_set"));
+}
+
+// ---- memory recall from tool calls (Rust #167) ----
+version (unittest)
+{
+    private mem.Store recallStore(string name)
+    {
+        import std.file : tempDir, exists, rmdirRecurse;
+        import std.path : buildPath;
+        auto dir = buildPath(tempDir, "nano-d-recall-" ~ name);
+        if (dir.exists) rmdirRecurse(dir);
+        return new mem.Store(buildPath(dir, "memory"), null, 0);
+    }
+
+    private LLMResponse probeCall(string id, string path)
+    {
+        return LLMResponse("", "", [ToolCall.fromRaw(id, "probe", JSONValue(["path": path]).toString)]);
+    }
+
+    private ToolRegistry probeTools()
+    {
+        auto reg = new ToolRegistry;
+        reg.register(ToolDefinition("probe", "", parseJSON(`{}`)), (JSONValue a) => "no such file");
+        return reg;
+    }
+
+    private string[] toolTexts(Agent a)
+    {
+        string[] r;
+        foreach (m; a.messages) if (m.role == Role.tool) r ~= m.content;
+        return r;
+    }
+
+    private size_t pinCount(Agent a)
+    {
+        import std.algorithm : count;
+        size_t n;
+        foreach (t; toolTexts(a)) n += t.count("📌");
+        return n;
+    }
+}
+
+// rust: agent.rs::tool_calls_recall_matching_memories_once_per_context
+// rust: agent.rs::replacing_the_conversation_resets_and_persists_recall
+unittest // a hint fires once per context, a rule every time; compaction resets durably; resume restores
+{
+    import std.algorithm : canFind;
+    import std.array : replicate;
+    import std.file : tempDir, exists, rmdirRecurse;
+    import std.path : buildPath;
+    import nano.providers.mock : MockClient;
+    auto store = recallStore("once");
+    auto path = "/nonexistent/omarchy.local/worker.log";
+    auto mock = new MockClient([probeCall("r1", path), LLMResponse("one"), probeCall("r2", path), LLMResponse("two"),
+        LLMResponse("SUMMARY: read logs"), probeCall("r3", path), LLMResponse("three")]);
+    auto agent = new Agent(mock, probeTools(), Policy.init, "sys");
+    agent.memory = store;
+    auto sdir = buildPath(tempDir, "nano-d-recall-once-sessions");
+    if (sdir.exists) rmdirRecurse(sdir);
+    agent.log = new SessionLog(sdir, "mock/m", "/x");
+    // Longer than the index's 200-char clip, so the index alone does not show it.
+    auto hint = store.save(mem.Scope.user,
+        "worker logs on omarchy.local live under ~/.local/share/c8ctl-nano/logs " ~ "x".replicate(200), null, null);
+    auto rule = store.saveWith(mem.Scope.user, "never broad-kill on this host", null, null, "rule", ["worker.log"], true);
+    agent.run("look", new NullEvents);
+    auto first = toolTexts(agent)[$ - 1];
+    assert(first.canFind(hint.id) && first.canFind(rule.id) && first.canFind("verify"), first);
+    assert(first.canFind("<system-reminder>"), first);
+
+    agent.run("again", new NullEvents);
+    auto second = toolTexts(agent)[$ - 1];
+    assert(!second.canFind(hint.id), "a hint fires once per context: " ~ second);
+    assert(second.canFind(rule.id), "a rule fires on every match: " ~ second);
+
+    // A resume restores what was seen.
+    agent.restoreRecall(restore(agent.log.path).recall);
+    assert(hint.id in agent.recallState.seen);
+
+    CompactReport rep;
+    assert(agent.compact(rep));
+    assert(agent.recallState.empty, "compaction resets recall");
+    assert(mem.Recall.fromJSON(restore(agent.log.path).recall).empty, "the reset is persisted");
+    agent.run("after compaction", new NullEvents);
+    auto third = toolTexts(agent)[$ - 1];
+    assert(third.canFind(hint.id), "a hint reappears after compaction: " ~ third);
+
+    auto stats = mem.recallStats(store);
+    assert(stats[hint.id][0] == 2, "fired twice");
+}
+
+// rust: agent.rs::memories_rendered_in_full_by_the_index_do_not_refire
+unittest // the installed index's fully rendered memories don't refire; clipped ones do
+{
+    import std.algorithm : canFind, endsWith;
+    import std.array : replicate;
+    import std.string : lineSplitter;
+    import nano.providers.mock : MockClient;
+    auto store = recallStore("index");
+    auto path = "/nonexistent/omarchy.local/worker.log";
+    auto short_ = store.save(mem.Scope.user, "worker logs on omarchy.local live under ~/.local/share", null, null);
+    auto long_ = store.saveWith(mem.Scope.user, "worker.log detail: " ~ "x".replicate(300), null, null, null,
+        ["worker.log"], true);
+    bool[string] rendered;
+    auto index = store.indexWithRendered(false, rendered);
+    string shortLine, longLine;
+    foreach (l; index.lineSplitter)
+    {
+        if (l.canFind(short_.id)) shortLine = l;
+        if (l.canFind(long_.id)) longLine = l;
+    }
+    assert(shortLine.endsWith("live under ~/.local/share") && longLine.endsWith("…"), index);
+    assert(short_.id in rendered && long_.id !in rendered);
+
+    auto mock = new MockClient([probeCall("r1", path), LLMResponse("one"), probeCall("r2", path), LLMResponse("two")]);
+    auto agent = new Agent(mock, probeTools(), Policy.init, "sys" ~ index);
+    agent.memory = store;
+    agent.installSystem("sys" ~ index, rendered);
+    agent.run("look", new NullEvents);
+    auto first = toolTexts(agent)[$ - 1];
+    assert(!first.canFind(short_.id), "no duplicate recall of a fully rendered memory: " ~ first);
+    assert(first.canFind(long_.id), "the clipped memory still fires: " ~ first);
+    assert(short_.id !in agent.recallState.seen, "index visibility is not recorded as seen");
+    // A resume keeps the installed system message, so still no duplicate.
+    agent.restoreRecall(agent.recallState.toJSON);
+    agent.run("again", new NullEvents);
+    assert(!toolTexts(agent)[$ - 1].canFind(short_.id));
+}
+
+// rust: agent.rs::a_memory_evicted_from_the_installed_index_becomes_recallable
+unittest // an index re-install that drops a memory makes it recallable again
+{
+    import std.algorithm : canFind;
+    import std.array : replicate;
+    import std.format : format;
+    import nano.providers.mock : MockClient;
+    auto store = recallStore("evict");
+    auto path = "/nonexistent/omarchy.local/worker.log";
+    auto short_ = store.save(mem.Scope.user, "worker logs on omarchy.local live under ~/.local/share", null, null);
+    bool[string] rendered;
+    auto index = store.indexWithRendered(false, rendered);
+    auto mock = new MockClient([probeCall("r1", path), LLMResponse("one"), probeCall("r2", path), LLMResponse("two")]);
+    auto agent = new Agent(mock, probeTools(), Policy.init, "sys");
+    agent.memory = store;
+    agent.installSystem("sys" ~ index, rendered);
+    agent.run("look", new NullEvents);
+    assert(!toolTexts(agent)[$ - 1].canFind(short_.id), "shown by the index");
+    foreach (n; 0 .. 60)
+        store.save(mem.Scope.user, format("unrelated fact number %s %s", n, "y".replicate(150)), null, null);
+    bool[string] rendered2;
+    index = store.indexWithRendered(false, rendered2);
+    assert(!index.canFind(short_.id), "precondition: evicted from the index");
+    agent.installSystem("sys" ~ index, rendered2);
+    agent.run("again", new NullEvents);
+    auto second = toolTexts(agent)[$ - 1];
+    assert(second.canFind(short_.id), "an evicted memory recalls again: " ~ second);
+}
+
+// rust: agent.rs::recall_attaches_at_most_two_notes_per_turn
+unittest // at most two notes per input; refused calls never recall
+{
+    import std.array : replicate;
+    import std.format : format;
+    import nano.providers.mock : MockClient;
+    auto store = recallStore("cap");
+    auto path = "/nonexistent/omarchy.local/x";
+    foreach (n; 0 .. 4)
+        store.save(mem.Scope.user, format("fact %s about omarchy.local %s", n, "x".replicate(200)), null, null);
+    auto mock = new MockClient([probeCall("r1", path), probeCall("r2", path), LLMResponse("done"),
+        probeCall("r3", path), probeCall("r4", path), LLMResponse("done")]);
+    auto agent = new Agent(mock, probeTools(), Policy.init, "sys");
+    agent.memory = store;
+    agent.run("look", new NullEvents);
+    assert(pinCount(agent) == 2, format("%s", pinCount(agent)));
+    // A new input gets a fresh budget.
+    agent.run("again", new NullEvents);
+    assert(pinCount(agent) == 4, format("%s", pinCount(agent)));
+
+    // A call that never reaches a handler (unknown tool, plan-mode refusal) recalls nothing.
+    auto unknown = new MockClient([LLMResponse("", "", [ToolCall.fromRaw("u1", "nope", `{"path":"` ~ path ~ `"}`)]),
+        LLMResponse("done")]);
+    auto b = new Agent(unknown, probeTools(), Policy.init, "sys");
+    b.memory = store;
+    b.run("look", new NullEvents);
+    assert(pinCount(b) == 0);
 }

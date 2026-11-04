@@ -26,6 +26,7 @@ agent.rs::a_learned_window_tightens_the_effective_combined_window	todo
 agent.rs::a_literal_list_loop_runs_without_asking	test
 agent.rs::a_looser_probe_does_not_replace_a_learned_window_stat	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
 agent.rs::a_lower_learned_window_restores_the_output_reservation	todo
+agent.rs::a_memory_evicted_from_the_installed_index_becomes_recallable	test
 agent.rs::a_mid_turn_thinking_change_applies_from_the_next_step_and_drops_the_temperature	todo
 agent.rs::a_newer_model_request_during_a_slow_build_supersedes_the_stale_one	na	Tokio runtime races while a client builds asynchronously; D builds the client synchronously on the agent thread
 agent.rs::a_prompt_only_window_is_capped_to_the_combined_window	todo
@@ -33,6 +34,7 @@ agent.rs::a_prompt_only_window_keeps_the_estimation_margin	todo
 agent.rs::a_repeat_loop_ends_the_turn_blocked_after_the_warnings	test
 agent.rs::a_reply_cut_off_at_the_output_limit_continues_instead_of_ending	test
 agent.rs::a_resumed_session_keeps_attachments_and_survives_a_missing_file	todo
+agent.rs::a_retried_prompt_keeps_its_spent_recall_budget	na	D has no in-process retry of a pending input and its replace records never keep one, so there is no per-input recall budget to carry
 agent.rs::a_same_agent_retry_after_a_provider_error_does_not_replay_the_snapshot_twice	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
 agent.rs::a_second_overflow_is_returned	test
 agent.rs::a_small_max_tokens_caps_the_thinking_budget_with_a_warning	todo
@@ -92,6 +94,7 @@ agent.rs::manual_compaction_summarizes_older_messages	test
 agent.rs::max_tokens_is_capped_to_the_room_when_compaction_is_disabled	todo
 agent.rs::max_tokens_is_sent_unchanged_when_the_window_has_room	todo
 agent.rs::max_tokens_shrinks_so_prompt_and_output_fit_the_window	todo
+agent.rs::memories_rendered_in_full_by_the_index_do_not_refire	test
 agent.rs::memory_save_persists_and_surfaces_in_the_prompt	todo
 agent.rs::memory_tools_track_the_configured_mode	todo
 agent.rs::mid_turn_model_switch_with_a_configured_window_skips_the_probe	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
@@ -134,12 +137,14 @@ agent.rs::read_file_attaches_an_image_for_a_vision_model	test
 agent.rs::read_file_binary_error_notes_vision_capability	todo
 agent.rs::read_file_image_errors_with_a_hint_when_the_model_cannot_see	test
 agent.rs::read_only_memory_refuses_a_save	todo
+agent.rs::recall_attaches_at_most_two_notes_per_turn	test
 agent.rs::record_usage_accumulates_aic_when_reported	test
 agent.rs::records_assistant_tool_calls_before_results	todo
 agent.rs::redelivering_a_truncated_turn_replays_its_stop_reason	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
 agent.rs::refreshing_stats_tracks_a_max_tokens_driven_thinking_change	todo
 agent.rs::repairs_interrupted_turns_on_resume	test
 agent.rs::repeated_output_limit_cut_offs_end_with_a_distinct_stop_reason	test
+agent.rs::replacing_the_conversation_resets_and_persists_recall	test
 agent.rs::replay_after_a_crash_rebuilds_the_whole_answer	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
 agent.rs::replay_after_mid_turn_compaction_shows_the_folded_input_once	todo
 agent.rs::replay_after_repeated_compaction_preserves_the_original_turns	todo
@@ -188,6 +193,7 @@ agent.rs::the_loop_detector_resets_on_a_new_turn	todo
 agent.rs::the_title_fallback_uses_the_sessions_live_model	todo
 agent.rs::thinking_level_is_sent_and_drops_the_temperature_on_anthropic	todo
 agent.rs::titles_sessions_once_a_prompt_says_something	test
+agent.rs::tool_calls_recall_matching_memories_once_per_context	test
 agent.rs::tools_snapshot_captured_in_plan_mode_still_lists_mutating_tools_live	todo
 agent.rs::tools_snapshot_captured_without_history_still_lists_it_live	todo
 agent.rs::zero_turn_cap_is_unbounded	todo
@@ -536,22 +542,30 @@ markdown.rs::tables_in_code_and_lists	test
 markdown.rs::tables_render_as_grids_with_alignment	test
 markdown.rs::wide_tables_wrap_then_stack	test
 memory.rs::absurd_expiry_days_errors_instead_of_panicking	claimed	PORTING.md: all memory.rs tests ported
+memory.rs::anchors_come_from_backticks_paths_and_hosts	test
+memory.rs::anchors_match_on_word_boundaries	test
 memory.rs::default_dir_never_falls_back_to_shared_temp	claimed	PORTING.md: all memory.rs tests ported
+memory.rs::entries_without_kind_or_anchors_load_unchanged	test
 memory.rs::expires_unused_entries_on_load	test
 memory.rs::forget_sanitises_control_chars_in_id	claimed	PORTING.md: all memory.rs tests ported
 memory.rs::index_is_dated_framed_and_capped	test
 memory.rs::index_on_read_failure_is_empty_not_misreported_as_empty_store	claimed	PORTING.md: all memory.rs tests ported
+memory.rs::index_rendered_set_excludes_clipped_and_multiline_entries	test
 memory.rs::index_sanitises_control_chars_in_label_and_tag	test
 memory.rs::index_sanitises_unicode_line_separators_in_label_and_text	claimed	PORTING.md: all memory.rs tests ported
+memory.rs::log_recall_writes_whole_records	test
 memory.rs::memory_directories_created_owner_only	test
 memory.rs::memory_directories_lock_path_owner_only	test
 memory.rs::normalizes_remotes_to_a_stable_key	test
+memory.rs::note_seen_in_only_counts_record_prefixes_and_full_hits	test
 memory.rs::preexisting_memory_directory_permissions_preserved	test
 memory.rs::preserves_complete_entry_with_extra_field	claimed	PORTING.md: all memory.rs tests ported
 memory.rs::preserves_malformed_utf8_records_byte_for_byte	test
 memory.rs::preserves_unknown_records_across_rewrites	test
 memory.rs::project_scope_needs_a_repo_key	test
 memory.rs::read_only_index_omits_save_guidance	claimed	PORTING.md: all memory.rs tests ported
+memory.rs::recall_note_renders_full_text_and_evidence	test
+memory.rs::recall_respects_kind_seen_and_budget	test
 memory.rs::rejects_a_credential_split_across_text_and_evidence	test
 memory.rs::rejects_multiline_evidence	test
 memory.rs::rejects_secrets_and_overlong_text	test
@@ -561,6 +575,7 @@ memory.rs::run_dispatches_and_reports_saves	test
 memory.rs::sanitize_key_is_collision_resistant	test
 memory.rs::saves_searches_and_forgets_across_scopes	test
 memory.rs::search_bumps_last_used	claimed	PORTING.md: all memory.rs tests ported
+memory.rs::search_marks_dropped_evidence_lines_as_incomplete	test
 memory.rs::search_returns_previous_mru_order	test
 memory.rs::search_sanitises_escaped_line_breaks_in_evidence	test
 memory.rs::search_snippet_strips_terminal_control_chars	claimed	PORTING.md: all memory.rs tests ported
@@ -933,7 +948,9 @@ session.rs::reads_utc_records_and_unstamped_messages_from_older_logs	todo
 session.rs::rejects_unsupported_versions_and_bad_ids	todo
 session.rs::replace_backfills_log_lines_for_legacy_retained_messages	todo
 session.rs::replace_can_keep_the_pending_input	todo
+session.rs::replace_clears_recall_state_while_decoding	test
 session.rs::replace_resets_conversation	todo
+session.rs::replace_restores_the_pending_inputs_spent_recall_budget	na	D has no in-process retry of a pending input and its replace records never keep one, so there is no per-input recall budget to carry
 session.rs::round_trips_and_tracks_inputs	todo
 session.rs::standard_replace_does_not_offer_history_tools	test
 session.rs::turn_end_persists_a_truncated_stop_reason_and_defaults_old_records	todo

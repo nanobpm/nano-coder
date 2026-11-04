@@ -655,6 +655,7 @@ final class AcpServer : AgentEvents
         agent.completedStops = null;
         agent.completedOutcomes = null;
         agent.plan = Plan.init;
+        agent.restoreRecall(JSONValue.init);
         if (host.sessionDir !is null)
         {
             agent.log = new SessionLog(host.sessionDir, agent.client.providerName ~ "/" ~ agent.client.modelName, cwd);
@@ -687,6 +688,7 @@ final class AcpServer : AgentEvents
         agent.completedStops = restored.completedStops;
         agent.completedOutcomes = restored.completedOutcomes;
         agent.plan = Plan.init;
+        agent.restoreRecall(restored.recall);
         if (restored.plan.type == JSONType.object)
         {
             try agent.plan = Plan.fromJSON(restored.plan);
