@@ -2309,18 +2309,33 @@ pub struct Recall {
 }
 
 impl Recall {
-    /// Mark every `[mem-…]` id in a memory tool's output as seen (its full
-    /// text is now in context). Returns the ids that had fired as a note
-    /// earlier in this context (a reminder that was then used).
+    /// Mark memories a memory tool's output fully displayed as seen. Only the
+    /// tools' own record prefixes count — a `memory_search` hit line
+    /// (`user [mem-…] (date) …`) or a `memory_save` confirmation
+    /// (`remembered (user, mem-…): …`) — so an id merely echoed elsewhere (e.g.
+    /// a no-hit search pattern) is ignored. A search hit whose snippet or
+    /// evidence was clipped (`…`) is not marked seen, since the relevant part
+    /// may not have been shown. Returns the ids that had fired as a note
+    /// earlier in this context and now reappear as a record (a used reminder).
     pub fn note_seen_in(&mut self, output: &str) -> Vec<String> {
-        static ID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[(mem-[0-9a-f]+)\]").unwrap());
+        static HIT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(?:user|project) \[(mem-[0-9a-f]+)\] ").unwrap());
+        static SAVED: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"^remembered \((?:user|project), (mem-[0-9a-f]+)\): ").unwrap());
         let mut used = Vec::new();
-        for cap in ID.captures_iter(output) {
-            let id = cap[1].to_string();
+        for line in output.lines() {
+            let (id, full) = if let Some(cap) = HIT.captures(line) {
+                (cap[1].to_string(), !line.contains('…'))
+            } else if let Some(cap) = SAVED.captures(line) {
+                (cap[1].to_string(), true)
+            } else {
+                continue;
+            };
             if self.fired.remove(&id) {
                 used.push(id.clone());
             }
-            self.seen.insert(id);
+            if full {
+                self.seen.insert(id);
+            }
         }
         used
     }
@@ -2384,7 +2399,13 @@ impl Store {
         if create_dir_all_private(&self.root).is_err() {
             return;
         }
-        let line = json!({ "at": crate::session::now(), "event": event, "id": id, "tool": tool, "session": session });
+        // Serialize the whole record plus newline into one buffer and append
+        // it with a single `write_all`, so concurrent sessions' O_APPEND
+        // writes cannot interleave fragments of a record.
+        let mut line =
+            json!({ "at": crate::session::now(), "event": event, "id": id, "tool": tool, "session": session })
+                .to_string();
+        line.push('\n');
         let mut opts = std::fs::OpenOptions::new();
         opts.create(true).append(true);
         #[cfg(unix)]
@@ -2393,7 +2414,7 @@ impl Store {
             opts.mode(0o600);
         }
         if let Ok(mut f) = opts.open(self.root.join(RECALL_LOG)) {
-            let _ = writeln!(f, "{line}");
+            let _ = f.write_all(line.as_bytes());
         }
     }
 
@@ -2420,6 +2441,18 @@ impl Store {
     }
 }
 
+/// The complete text on one line: every line break / control char becomes a
+/// space and whitespace is collapsed, but nothing is clipped — a recall note
+/// marks the entry seen, so it must show all of it.
+fn full_line(text: &str) -> String {
+    text.chars()
+        .map(|c| if is_line_break(c) || c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The note text: framed as an untrusted hint to verify, with its `check:`
 /// command and a staleness signal.
 fn recall_note(scope: Scope, entry: &Entry, now: DateTime<FixedOffset>) -> String {
@@ -2429,10 +2462,10 @@ fn recall_note(scope: Scope, entry: &Entry, now: DateTime<FixedOffset>) -> Strin
         "📌 note from an earlier session (verify; {}{kind}): [{}] {}",
         scope.as_str(),
         scrub_control(&entry.id),
-        one_line(&entry.text)
+        full_line(&entry.text)
     );
     if let Some(evidence) = &entry.evidence {
-        note.push_str(&format!(" (check: {})", one_line(evidence)));
+        note.push_str(&format!(" (check: {})", full_line(evidence)));
     }
     note.push_str(&format!(
         " (last used {days} day{} ago; a hint, not permission to act)",
@@ -2497,6 +2530,52 @@ mod tests {
         store.recall("bash", &args, &mut state, 2);
         let used = state.note_seen_in(&format!("user [{}] (2026-01-01) builds", hint.id));
         assert_eq!(used, vec![hint.id.clone()]);
+    }
+
+    #[test]
+    fn note_seen_in_only_counts_record_prefixes_and_full_hits() {
+        let mut state = Recall::default();
+        state.fired.insert("mem-aa".into());
+        // An echoed no-hit pattern is not a record.
+        assert!(state.note_seen_in("No memories match \"[mem-aa]\".").is_empty());
+        assert!(state.seen.is_empty());
+        // A clipped search hit counts as used but not seen.
+        assert_eq!(state.note_seen_in("user [mem-aa] (2026-01-01) …builds…"), vec!["mem-aa".to_string()]);
+        assert!(!state.seen.contains("mem-aa"));
+        // A full hit and a save confirmation are seen.
+        state.note_seen_in("project [mem-bb] (2026-01-01) full text");
+        state.note_seen_in("remembered (user, mem-cc): some fact (check: ls)");
+        assert!(state.seen.contains("mem-bb") && state.seen.contains("mem-cc"));
+    }
+
+    #[test]
+    fn recall_note_renders_full_text_and_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let long = format!("`zzanchor` {} TAILMARK", "word ".repeat(100));
+        let e = store.save(Scope::User, &long, Some(&format!("{} EVTAIL", "x ".repeat(150))), None).unwrap();
+        let notes = store.recall("bash", &json!({"command": "zzanchor"}), &mut Recall::default(), 2);
+        assert_eq!(notes.len(), 1, "{e:?}");
+        assert!(notes[0].text.contains("TAILMARK") && notes[0].text.contains("EVTAIL"), "{}", notes[0].text);
+    }
+
+    #[test]
+    fn log_recall_writes_whole_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let store = std::sync::Arc::new(store);
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let s = store.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        s.log_recall(if i % 2 == 0 { "fired" } else { "used" }, "mem-ab", "bash", Some("sess"));
+                    }
+                })
+            })
+            .collect();
+        handles.into_iter().for_each(|h| h.join().unwrap());
+        assert_eq!(store.recall_stats().get("mem-ab"), Some(&(200, 200)));
     }
 
     #[test]
