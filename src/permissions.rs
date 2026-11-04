@@ -411,7 +411,14 @@ impl Policy {
         let allow: Vec<&Rule> = self.allow.iter().filter(|r| r.subject == Subject::Command).collect();
         for item in &unverified {
             let text = command_text(&item.command);
-            let dynamic = item.command.words.iter().any(|w| w.dynamic);
+            // A word is run-time-dependent when it is dynamic (`$f`, `$(...)`)
+            // *or* an unquoted glob (`*`, `?`, `[...]`): the lexer marks the
+            // latter `glob`/`splits` but not `dynamic`, yet pathname expansion
+            // still binds it to whatever files exist at run time. Treating a
+            // glob operand as static would let `for f in *; do touch *; done`
+            // match a narrow allow rule (`touch ?`) while a deny rule on one of
+            // the expanded names (`touch secret.txt`) is never consulted.
+            let dynamic = item.command.words.iter().any(|w| w.dynamic || w.glob);
             if let Some(rule) = deny.iter().find(|r| r.matches(&text)) {
                 return Err(format!("rule `{}` may deny `{text}` depending on the loop's values", rule.source));
             }
@@ -423,7 +430,7 @@ impl Policy {
             .iter()
             .find(|item| {
                 let cmd = &item.command;
-                let dynamic = cmd.words.iter().any(|w| w.dynamic);
+                let dynamic = cmd.words.iter().any(|w| w.dynamic || w.glob);
                 // Only a command with no run-time-dependent word can be covered
                 // for every binding by an allow rule matching its static text.
                 dynamic || !allow.iter().any(|r| r.matches(&command_text(cmd)))
@@ -1270,6 +1277,14 @@ fn unroll_literal_loop(region: &[Simple], offset: usize, budget: &mut usize, pri
     if variable.dynamic || variable.quoted || !is_shell_identifier(&variable.text) {
         return None;
     }
+    // `_` is not a stable binding: Bash updates it to the last argument of each
+    // simple command as the body runs, so `for _ in ./scratch; do : /etc; rm
+    // -rf "$_"; done` inspects the operand as `./scratch` while `:` has already
+    // rebound `_` to `/etc`. The unroll models the header's binding only, not
+    // these implicit per-command updates, so decline to unroll `_` at all.
+    if variable.text == "_" {
+        return None;
+    }
     let keyword = header.words.get(offset + 2)?;
     if keyword.text != "in" || !is_loop_keyword(keyword) {
         return None;
@@ -1408,7 +1423,6 @@ fn substitute_word(word: &Word, name: &str, value: &str, ifs_chars: Option<&[cha
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
     let mut replaced = false;
-    let mut adjacent = false;
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] != b'$' {
@@ -1426,16 +1440,19 @@ fn substitute_word(word: &Word, name: &str, value: &str, ifs_chars: Option<&[cha
         if let Some(after) = rest.strip_prefix(name)
             && !after.starts_with(|c: char| c == '_' || c.is_ascii_alphanumeric())
         {
+            // A `$name` that was single-quoted is a literal character, not a
+            // parameter expansion: leave it in place so the checked operand
+            // keeps the `$name` the shell will pass through (`touch
+            // "$other/"'$f'` runs `touch ./$f`, not `touch ./safe`). Only a
+            // real (unquoted) occurrence is substituted.
+            if word.literal_dollars.contains(&i) {
+                out.push('$');
+                out.push_str(name);
+                i += 1 + name.len();
+                continue;
+            }
             out.push_str(value);
             replaced = true;
-            // A `$name` directly adjacent to another expansion (`$f$other`,
-            // `$f${x}`, `$f$(...)`) is ambiguous once quoting is discarded: the
-            // flattened text cannot show whether this occurrence was the real
-            // parameter expansion or a literal `'$f'` glued to one. Mark it so
-            // the caller can decline to unroll the word.
-            if i + 1 + name.len() < bytes.len() && bytes[i + 1 + name.len()] == b'$' {
-                adjacent = true;
-            }
             i += 1 + name.len();
             continue;
         }
@@ -1443,11 +1460,16 @@ fn substitute_word(word: &Word, name: &str, value: &str, ifs_chars: Option<&[cha
             if let Some(after) = inner.strip_prefix(name)
                 && after.starts_with('}')
             {
+                if word.literal_dollars.contains(&i) {
+                    out.push('$');
+                    out.push('{');
+                    out.push_str(name);
+                    out.push('}');
+                    i += 3 + name.len();
+                    continue;
+                }
                 out.push_str(value);
                 replaced = true;
-                if i + 3 + name.len() < bytes.len() && bytes[i + 3 + name.len()] == b'$' {
-                    adjacent = true;
-                }
                 i += 3 + name.len();
                 continue;
             }
@@ -1462,78 +1484,26 @@ fn substitute_word(word: &Word, name: &str, value: &str, ifs_chars: Option<&[cha
         out.push('$');
         i += 1;
     }
+    // A literal (single-quoted) `$name` was preserved rather than substituted.
+    // That is itself the ambiguous mix — a literal `$name` alongside a real
+    // expansion — so decline to unroll the word: the guard would resolve the
+    // real expansion from the line's assignments while the literal `$name`
+    // stays a literal, and the checked operand is not the executed one
+    // (`touch "$other/"'$f'` checks `touch $other/safe` but runs `touch
+    // ./$f`). This holds whether a separator splits the two (`'$f'"$other"`
+    // and `"$other/"'$f'` alike). A word whose expansions are all real (no
+    // single-quoted `$name` — `"$B/$p"`, `"$f"`) has no preserved literal and
+    // is substituted exactly below.
+    let preserved_literal = word.literal_dollars.iter().any(|&lit| {
+        let after = &text[lit + 1..];
+        (after.starts_with(name) && !after[name.len()..].starts_with(|c: char| c == '_' || c.is_ascii_alphanumeric()))
+            || (after.starts_with('{') && after[1..].starts_with(name) && after[1 + name.len()..].starts_with('}'))
+    });
+    if preserved_literal {
+        return None;
+    }
     if !replaced {
         return Some(word.clone());
-    }
-    // `Word::text` has already discarded quoting and escaping, so a dynamic word
-    // can also contain *literal* occurrences of `$name` — `'$f'"$f"` is the text
-    // `$f$f`, where only the second is a parameter expansion. The scan above
-    // replaced both, checking `safesafe` while the shell runs `$fsafe`, which a
-    // deny rule on `touch $fsafe` would miss. Because the text no longer records
-    // which `$name` was quoted, an ambiguous word cannot be substituted exactly:
-    // decline to unroll it so the loop keeps its conservative read-only
-    // classification. A word is ambiguous when it is quoted/escaped and either
-    // mentions the variable more than once (`'$f'"$f"`) or stays dynamic after
-    // the substitution (`'$f'"$other"` — the remaining `$other` means the one
-    // real expansion may have belonged to a different variable, leaving this
-    // `$name` literal).
-    if word.quoted {
-        let braced = format!("${{{name}}}");
-        let plain = format!("${name}");
-        let mut occurrences = 0usize;
-        let mut rest = text;
-        loop {
-            let b = rest.find(braced.as_str());
-            let p = rest.find(plain.as_str());
-            let (pos, len) = match (b, p) {
-                (Some(b), Some(p)) if b <= p => (b, braced.len()),
-                (Some(b), _) => (b, braced.len()),
-                (_, Some(p)) => (p, plain.len()),
-                _ => break,
-            };
-            occurrences += 1;
-            rest = &rest[pos + len..];
-        }
-        // Decline when the word is ambiguous: more than one `$name` occurrence
-        // (`'$f'"$f"` — at least one is literal), or the word still contains a
-        // `$name` after the substitution, or a `$name` is *followed* by another
-        // expansion. `Word::text` has discarded which segments were quoted, so
-        // `'$f'"$other"` (→ `$f$other`) and `'$f/'"$other"` (→ `$f/$other`) are
-        // indistinguishable from a real `"$f$other"` / `"$f/$other"`: the real
-        // expansion may be `$other`'s, leaving this `$name` literal — and a
-        // separator does not disambiguate (the checked operand `safe/$other` is
-        // not the executed `$f/secret`). A trailing `$name` after an
-        // independent expansion (`"$B/$p"` → `$B/auto-resolutions`) is
-        // unambiguous — the loop variable is the real expansion — and still
-        // substitutes.
-        let retains_name = out.contains(plain.as_str()) || out.contains(braced.as_str());
-        let name_followed_by_expansion = {
-            let mut scan = 0;
-            let mut found = retains_name;
-            while !found && let Some(pos) = text[scan..].find('$').map(|p| scan + p) {
-                let after = &text[pos + 1..];
-                let is_name = after.starts_with(name)
-                    && !after[name.len()..].starts_with(|c: char| c == '_' || c.is_ascii_alphanumeric());
-                let is_braced_name =
-                    after.starts_with('{') && after[1..].starts_with(name) && after[1 + name.len()..].starts_with('}');
-                let occ_end = if is_name {
-                    pos + 1 + name.len()
-                } else if is_braced_name {
-                    pos + 3 + name.len()
-                } else {
-                    scan = pos + 1;
-                    continue;
-                };
-                // A later `$` that begins another expansion makes this `$name`
-                // ambiguous (it may be the literal half of a mixed quote).
-                found = text[occ_end..].contains('$');
-                scan = occ_end;
-            }
-            found
-        };
-        if occurrences > 1 || adjacent || name_followed_by_expansion {
-            return None;
-        }
     }
     if word.splits {
         // An unquoted substitution word-splits on the effective IFS. The default
@@ -1911,6 +1881,23 @@ fn check_readonly_loop_command(cmd: &Simple, kind: &str, phase: &str) -> Result<
              rewrite it as explicit commands"
         ));
     }
+    // A globbed program word (`s?`, `p*`) is pathname-expanded by the shell to
+    // whatever file matches at run time (a `sh` in the working directory turns
+    // `s? -c '...'` into an interpreter call). The lexer marks any unquoted
+    // `*`/`?`/`[` as `glob`, but that also flags words where the character is
+    // literal shell syntax rather than a pattern — the `[[` test keyword, or a
+    // program whose name merely contains a bracket. Only a word whose *text*
+    // carries a real glob metacharacter can expand to a different program, so
+    // key on the text rather than the flag. The `[[` / `[` test keywords'
+    // brackets are shell syntax, not a pathname pattern, so they are exempted
+    // by name. Reject a real glob program as a runtime-computed command rather
+    // than discard its unverifiable verdict during unrolling.
+    if !matches!(first.text.as_str(), "[" | "[[") && first.text.contains(['*', '?', '[']) {
+        return Err(format!(
+            "cannot allow `{kind}` loop: {phase} command `{rendered}` runs a program name the shell \
+             expands as a glob at run time; rewrite it as explicit commands"
+        ));
+    }
     if first.text.contains('/') {
         let parent = first.text.rsplit_once('/').map(|(parent, _)| parent).unwrap_or_default();
         if !matches!(parent, "/bin" | "/usr/bin") {
@@ -2083,6 +2070,17 @@ fn check_readonly_loop_command(cmd: &Simple, kind: &str, phase: &str) -> Result<
         return Err(format!(
             "cannot allow `{kind}` loop: {phase} command `{rendered}` runs a command computed at run time; \
              rewrite it as explicit commands"
+        ));
+    }
+    // As with the original program word above, a globbed resolved program
+    // (`timeout 1 s? ...`) is pathname-expanded at run time, so reject it as a
+    // runtime-computed command rather than trust a basename it may not have.
+    // Key on the text's metacharacters, not the `glob` flag, so a literal `[`
+    // (the `[` / `[[` test keywords) is not misread as a pattern.
+    if !matches!(program_word.text.as_str(), "[" | "[[") && program_word.text.contains(['*', '?', '[']) {
+        return Err(format!(
+            "cannot allow `{kind}` loop: {phase} command `{rendered}` runs a program name the shell \
+             expands as a glob at run time; rewrite it as explicit commands"
         ));
     }
     let program_text = program_word.text.as_str();
@@ -3425,6 +3423,31 @@ fn collect_loop_body_writes(words: &[Word], out: &mut HashSet<String>) {
     if words.get(i).is_some_and(|w| matches!(w.text.as_str(), "export" | "local" | "declare" | "typeset" | "readonly"))
     {
         i += 1;
+        // A declaration builtin's arguments are assignments, but they follow the
+        // program word and may carry options (`declare -x d=/etc`) or a computed
+        // destination (`declare "$d=/etc"`). Scan them here — the assignment loop
+        // below starts at the program word and would miss both. An option (`-x`)
+        // is not an assignment; an assignment records its name; anything else
+        // that is dynamic (a computed `"$d=/etc"`) cannot be resolved to a name,
+        // so conservatively record every variable it mentions — a computed
+        // destination built from the loop variable (`"$d=/etc"`) then rebinds
+        // that very name and declines the unroll.
+        for word in &words[i..] {
+            if word.text == "--" {
+                continue;
+            }
+            if ASSIGNMENT.is_match(&word.text) {
+                let name = word.text.split('=').next().unwrap_or_default().trim_end_matches('+');
+                let name = name.split('[').next().unwrap_or(name);
+                if !name.is_empty() {
+                    out.insert(name.to_string());
+                }
+            } else if word.dynamic {
+                for name in referenced_var_names(&word.text) {
+                    insert_var_name(&name, out);
+                }
+            }
+        }
     }
     while let Some(word) = words.get(i) {
         if !ASSIGNMENT.is_match(&word.text) {
@@ -3442,6 +3465,46 @@ fn collect_loop_body_writes(words: &[Word], out: &mut HashSet<String>) {
     match basename(&program.text) {
         "read" => collect_read_destinations(args, out),
         "printf" => collect_printf_destination(args, out),
+        // `mapfile`/`readarray` write an array (default `MAPFILE`): `mapfile -t
+        // d <<< /etc` sets `d[0]` to the first line, so a later `rm -rf "$d"`
+        // deletes that path while the unroll inspected the loop's literal value.
+        // Record the destination array; with no explicit name it is `MAPFILE`.
+        // Value-taking options (`-n`, `-O`, `-s`, `-t`, `-d`, `-u`) consume their
+        // operand, so only a non-option word is the destination; a computed one
+        // is resolved by name like any dynamic argument.
+        "mapfile" | "readarray" => {
+            let mut dest: Option<&Word> = None;
+            let mut j = 0;
+            // Options that consume a separate operand (the rest are flag-only or
+            // take an attached value, e.g. `-t`, `-d:`).
+            const MAPFILE_VALUE_OPTS: &[&str] = &["-n", "-O", "-s", "-u", "--array-origin", "--line-count", "--skip"];
+            while let Some(arg) = args.get(j) {
+                let text = arg.text.as_str();
+                if text == "--" {
+                    j += 1;
+                    break;
+                }
+                if text.starts_with('-') && text.len() > 1 {
+                    j += if MAPFILE_VALUE_OPTS.contains(&text) { 2 } else { 1 };
+                    continue;
+                }
+                break;
+            }
+            if let Some(word) = args.get(j) {
+                dest = Some(word);
+            }
+            match dest {
+                Some(word) if word.dynamic => {
+                    for name in referenced_var_names(&word.text) {
+                        insert_var_name(&name, out);
+                    }
+                }
+                Some(word) => insert_var_name(&word.text, out),
+                None => {
+                    out.insert("MAPFILE".to_string());
+                }
+            }
+        }
         // `unset NAME` removes the binding outright: a later `$d` expands to
         // the empty string (`rm -rf "$d/etc"` becomes `rm -rf /etc`), so the
         // removed name must be treated as written — an unroll substituting the
@@ -3624,6 +3687,16 @@ fn references_vars(text: &str, names: &HashSet<String>) -> bool {
     }
     static VAR_REF: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)").unwrap());
     VAR_REF.captures_iter(text).any(|caps| names.contains(&caps[1]))
+}
+
+/// Every variable name `text` expands (`$d`, `${d}`, `${d:-x}`). Used to fail
+/// closed on a computed write destination (`declare "$d=/etc"`): the name it
+/// assigns is resolved only at run time, so each variable it mentions is
+/// recorded as written — a destination built from the loop variable then
+/// declines the unroll.
+fn referenced_var_names(text: &str) -> Vec<String> {
+    static VAR_REF: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)").unwrap());
+    VAR_REF.captures_iter(text).map(|caps| caps[1].to_string()).collect()
 }
 
 const SAFE_DEVICES: &[&str] = &["/dev/null", "/dev/zero", "/dev/stdout", "/dev/stderr", "/dev/stdin", "/dev/tty"];
@@ -6593,6 +6666,99 @@ mod round4_regressions {
         let r =
             check(&Policy::default(), "for i in {9223372036854775800..9223372036854775807..3}; do echo \"$i\"; done");
         assert!(r.is_ok(), "stepped i64-edge range must not overflow, got {r:?}");
+    }
+}
+
+/// Round-6 review of #164 (review 5764898996): each regression below names the
+/// finding it closes, fixed as a class.
+#[cfg(test)]
+mod round6_regressions {
+    use super::*;
+    use serde_json::json;
+
+    fn policy(allow: &[&str], deny: &[&str]) -> Policy {
+        let config = PermissionsConfig {
+            allow: allow.iter().map(|s| s.to_string()).collect(),
+            deny: deny.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        Policy::new(&config, &SandboxConfig::default())
+    }
+    fn check(policy: &Policy, command: &str) -> Result<(), String> {
+        let cwd = std::path::Path::new("/work/project");
+        policy.check_in("bash", &json!({ "command": command }), cwd)
+    }
+
+    /// #4464911535: an unquoted glob operand is run-time-dependent (the lexer
+    /// sets `glob`, not `dynamic`), so it must count in both the conservative
+    /// deny check and the allow-coverage check — `for f in *; do touch *; done`
+    /// must not be auto-allowed by `touch ?` while a deny on `secret.txt` is
+    /// ignored.
+    #[test]
+    fn glob_operand_is_runtime_dependent() {
+        let p = policy(&["Bash(touch ?)"], &["Bash(touch secret.txt)"]);
+        let r = check(&p, "for f in *; do touch *; done");
+        assert!(r.is_err(), "a glob operand must not be auto-allowed past a deny rule, got {r:?}");
+    }
+
+    /// #4464911578: Bash updates `_` to the last argument of each simple
+    /// command, so it is not a stable loop binding. Decline to unroll `_` — `:`
+    /// /etc` would rebind it before `rm -rf "$_"` runs.
+    #[test]
+    fn underscore_loop_variable_is_not_unrolled() {
+        let r = check(&Policy::default(), "for _ in ./scratch; do : /etc; rm -rf \"$_\"; done");
+        assert!(r.is_err(), "the `_` loop variable must not be unrolled, got {r:?}");
+    }
+
+    /// #4464911615: `mapfile`/`readarray` write an array (default `MAPFILE`), so
+    /// their destination must be recorded as a write — `mapfile -t d <<< /etc`
+    /// sets `d[0]` to `/etc`, and a later `rm -rf "$d"` deletes it.
+    #[test]
+    fn mapfile_destination_is_a_write() {
+        let r = check(&Policy::default(), "for d in ./scratch; do mapfile -t d <<< /etc; rm -rf \"$d\"; done");
+        assert!(r.is_err(), "a mapfile destination must fail closed, got {r:?}");
+        let r = check(&Policy::default(), "for d in ./scratch; do readarray d; rm -rf \"$d\"; done");
+        assert!(r.is_err(), "a readarray destination must fail closed, got {r:?}");
+    }
+
+    /// #4464911655: a declaration builtin's options and computed destinations
+    /// are writes too — `declare -x d=/etc` rebinds `d`, and `declare "$d=/etc"`
+    /// hides the destination until substitution.
+    #[test]
+    fn declaration_option_and_computed_destination_are_writes() {
+        let r = check(&Policy::default(), "for d in ./scratch; do declare -x d=/etc; rm -rf \"$d\"; done");
+        assert!(r.is_err(), "declare -x d=/etc must be a write, got {r:?}");
+        let r = check(&Policy::default(), "for d in d; do declare \"$d=/etc\"; rm -rf \"$d\"; done");
+        assert!(r.is_err(), "a computed declare destination must fail closed, got {r:?}");
+    }
+
+    /// #4464911699: a preceding expansion does not prove a trailing `$f` is a
+    /// real expansion — `touch "$other/"'$f'` runs `touch ./$f` with a literal
+    /// `$f`. The lexer's per-segment quote record (`literal_dollars`) lets the
+    /// substitution keep the literal, and the mixed word is refused.
+    #[test]
+    fn preceding_expansion_does_not_prove_trailing_literal_real() {
+        let p = policy(&[], &["Bash(touch *$f)"]);
+        let r = check(&p, "other=.; for f in safe; do touch \"$other/\"'$f'; done");
+        assert!(r.is_err(), "a preceding expansion must not prove a trailing $f real, got {r:?}");
+        // The mirror (a literal `$f` before a real expansion) is refused too.
+        let r = check(&Policy::default(), "other=.; for f in safe; do touch '$f/'\"$other\"; done");
+        assert!(r.is_err(), "a literal $f mixed with a real expansion must fail closed, got {r:?}");
+        // ...while a word whose expansions are all real still unrolls.
+        let r = check(&Policy::default(), "B=/tmp; for p in a; do echo \"$B/$p\"; done");
+        assert!(r.is_ok(), "an all-real mixed expansion still unrolls, got {r:?}");
+    }
+
+    /// #4464911749: a globbed program name (`s?`) has `glob` set but not
+    /// `dynamic`, so it passed the computed-command hard block while the shell
+    /// pathname-expands it (to a `sh` in the working directory). Reject it.
+    #[test]
+    fn globbed_program_name_is_rejected() {
+        let r = check(&Policy::default(), "for f in a; do s? -c 'rm -rf /etc'; done");
+        assert!(r.is_err(), "a globbed program name must hard-block, got {r:?}");
+        // The `[[` / `[` test keywords' brackets are shell syntax, not a glob.
+        let r = check(&Policy::default(), "for f in a b; do [[ \"$f\" == a ]] && echo \"$f\"; done");
+        assert!(r.is_ok(), "the [[ keyword is not a glob program, got {r:?}");
     }
 }
 

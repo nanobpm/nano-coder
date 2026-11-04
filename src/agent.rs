@@ -10946,7 +10946,14 @@ mod tests {
         // policy denies. The user approves the original loop, but the rewritten
         // command must be re-checked and denied, and never reach the handler.
         write_pre_tool_use_hook(dir.path(), "Bash", r#"{"command":"forbidden-cmd"}"#);
-        let batch = call("b1", "bash", json!({"command": "for f in $(git ls-files); do sed -i s/x/y/ \"$f\"; done"}));
+        // An *Ask* fixture with a static body: a glob loop over a read-only
+        // command is unverifiable (the glob binds any file at run time) yet has
+        // no dynamic word, so the policy asks rather than denies — even with a
+        // command deny rule present. Only the hook-rewritten `forbidden-cmd`
+        // matches the deny rule, so the test fails if the approved-call hook /
+        // rewrite path is broken (a dynamic body like `sed -i ... "$f"` would be
+        // denied up-front, masking a broken hook).
+        let batch = call("b1", "bash", json!({"command": "for f in *; do git status; done"}));
         let mut agent = agent_with_deny(vec![batch, text("done")], dir.path(), vec!["Bash(forbidden-cmd*)".into()]);
         agent
             .tools()

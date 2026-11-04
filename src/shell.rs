@@ -35,6 +35,14 @@ pub struct Word {
     /// expansion runs before the command it sits in, so a guard that inspects
     /// the command's own words never sees the write.
     pub assigns: bool,
+    /// Byte offsets in `text` of every `$` that appeared inside a single-quoted
+    /// (`'...'`) segment — a `$` the shell treats as a literal character, not a
+    /// parameter expansion. `text` flattens quoting away, so `'$f'"$other"` and
+    /// `"$f$other"` both yield `$f$other`; this list is what lets a consumer
+    /// tell the literal `'$f'` from the real expansion. Empty when the word has
+    /// no single-quoted `$` (the common case), so it costs nothing for ordinary
+    /// words.
+    pub literal_dollars: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1047,7 +1055,11 @@ impl Parser {
     }
 
     /// A single-quoted `'...'` segment (pos at the opening `'`). Everything
-    /// inside is literal, so it only marks the word quoted.
+    /// inside is literal, so it only marks the word quoted — and records the
+    /// offset of any `$`, which the shell passes through as a literal character
+    /// rather than expanding. That offset is the only way a later consumer can
+    /// tell `'$f'` (literal) from `"$f"` (a real expansion) once `text` has
+    /// flattened the quoting away.
     fn single_quote(&mut self, word: &mut Word) -> Result<(), String> {
         self.pos += 1;
         word.quoted = true;
@@ -1059,6 +1071,9 @@ impl Parser {
                     return Ok(());
                 }
                 Some(c) => {
+                    if c == '$' {
+                        word.literal_dollars.push(word.text.len());
+                    }
                     word.text.push(c);
                     self.pos += 1;
                 }
