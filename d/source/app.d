@@ -540,7 +540,10 @@ Answer askQuestions(LineEditor editor, const Question[] qs, bool delegate() @saf
             custom = labels.length;
             labels ~= "Type your own answer";
         }
-        auto at = editor.select(sanitizeLine(q.question), labels, 0, away);
+        import nano.question : questionPrompt;
+        string[] body_;
+        auto prompt = questionPrompt(q.question, terminalWidth(), body_);
+        auto at = editor.select(prompt, labels, 0, away, body_);
         if (at == -2) return Answer(Away());
         if (at < 0) return Answer(Dismissed());
         if (at == custom)

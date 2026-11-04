@@ -74,6 +74,29 @@ string sanitizeLine(string s) @safe
     return out_;
 }
 
+/// How a question shows in its picker (Rust `question_prompt`): returns the
+/// prompt row and sets `body` to rows drawn above it. A plain one-line
+/// question that fits stays the prompt (no body). Anything else (several
+/// lines, markdown, too wide) is rendered as markdown into `body` with a short
+/// prompt, since the prompt is one row and would otherwise collapse a
+/// structured question into one unreadable line. The text is sanitised first
+/// (escapes dropped, line feeds kept), so the model cannot inject controls.
+string questionPrompt(string question, size_t width, out string[] body_)
+{
+    import std.array : replace, split;
+    import std.string : strip;
+    import nano.markdown : render;
+    import std.array : join;
+    import nano.trajectory : sanitizeTerminal;
+    auto text = question.strip.replace("\u2028", "\n").replace("\u2029", "\n").split('\n')
+        .map!sanitizeTerminal.join("\n");
+    // Room for the `? ` prefix.
+    auto rendered = render(text, width > 24 ? width - 4 : 20);
+    if (rendered == text && !text.canFind('\n')) return text;
+    body_ = rendered.split('\n');
+    return "Your answer";
+}
+
 /// Parse the tool's arguments, tolerating a JSON-string body.
 Question[] parse(JSONValue args)
 {
@@ -292,4 +315,27 @@ unittest // wording, and control sequences/newlines stripped
     a = resultText([Question("line1\nline2")], Answer(Answered(["ans\nwer"])));
     assert(a.canFind(`"line1line2"="answer"`) && !a.canFind('\n'));
     assert(sanitizeLine("hi\x1b[2J\nthere") == "hi[2Jthere" && sanitizeLine("plain — label") == "plain — label");
+}
+
+// rust: main.rs::a_plain_one_line_question_stays_the_picker_prompt
+// rust: main.rs::a_structured_question_is_rendered_as_markdown_above_the_picker
+// rust: main.rs::a_long_question_wraps_and_escapes_are_dropped
+unittest // questionPrompt: inline, markdown body, wrapping and escapes
+{
+    import std.algorithm : any, canFind;
+    import std.array : replicate;
+    string[] body_;
+    assert(questionPrompt("Which database should I use?", 80, body_) == "Which database should I use?");
+    assert(body_ is null);
+
+    auto q = "I found two options:\n\n- **Postgres**: already in `docker-compose.yml`\n- SQLite: simpler\n\nWhich should I use?";
+    assert(questionPrompt(q, 80, body_) == "Your answer");
+    assert(body_.length >= 4, "line breaks kept");
+    assert(body_.any!(l => l.canFind("Postgres") && !l.canFind("**")), "markdown rendered");
+    assert(body_.any!(l => l.canFind("Which should I use?")));
+
+    string[] wrapped;
+    assert(questionPrompt("\x1b[2J" ~ "word ".replicate(40), 40, wrapped) == "Your answer");
+    assert(wrapped.length > 1);
+    foreach (l; wrapped) assert(!l.canFind("\x1b[2J"), "escapes dropped");
 }

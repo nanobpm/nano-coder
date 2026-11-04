@@ -676,15 +676,24 @@ final class LineEditor
     /// Pick one of `labels` with Up/Down (or its number) and Enter; Esc or
     /// Ctrl-C dismisses (-1). Leaves the prompt and the choice on screen.
     /// When `stop` turns true (polled) the picker is removed and -2 returned.
-    ptrdiff_t select(string prompt, const string[] labels, size_t initial = 0, bool delegate() @safe stop = null)
+    ptrdiff_t select(string prompt, const string[] labels, size_t initial = 0, bool delegate() @safe stop = null,
+        const string[] body_ = null)
     {
         size_t at = initial < labels.length ? initial : 0;
         size_t top;
+        // Rows drawn above the prompt (a rendered question); kept to half the
+        // screen so the options stay visible, and committed with the answer.
+        string[] above;
+        {
+            auto h = height();
+            auto room = h > 8 ? (h - 3) / 2 : 1;
+            above = body_.length > room ? body_[0 .. room - 1].dup ~ "…" : body_.dup;
+        }
         // At most `visible` rows show; the window scrolls to keep `at` in it.
         size_t visible = labels.length;
         {
             auto h = height();
-            auto cap = h > 4 ? h - 3 : 1;
+            auto cap = h > 4 + above.length ? h - 3 - above.length : 1;
             if (cap > 15) cap = 15;
             if (visible > cap) visible = cap;
         }
@@ -694,12 +703,14 @@ final class LineEditor
             if (final_)
             {
                 frameDraw(null);
-                frameCommit("\x1b[32m?\x1b[0m " ~ prompt ~ " \x1b[36m" ~ fitCols(labels[at], fw / 2) ~ "\x1b[0m");
+                import std.array : join;
+                auto answer = "\x1b[32m?\x1b[0m " ~ prompt ~ " \x1b[36m" ~ fitCols(labels[at], fw / 2) ~ "\x1b[0m";
+                frameCommit(body_.length ? (cast(const(string)[]) body_).join("\n") ~ "\n" ~ answer : answer);
                 return;
             }
             if (at < top) top = at;
             if (at >= top + visible) top = at + 1 - visible;
-            string[] rows = ["\x1b[32m?\x1b[0m \x1b[1m" ~ fitCols(prompt, fw - 3) ~ "\x1b[0m"];
+            string[] rows = above ~ ["\x1b[32m?\x1b[0m \x1b[1m" ~ fitCols(prompt, fw - 3) ~ "\x1b[0m"];
             foreach (k; top .. top + visible)
                 rows ~= k == at ? "\x1b[36m❯ " ~ fitCols(labels[k], fw - 3) ~ "\x1b[0m" : "  " ~ fitCols(labels[k], fw - 3);
             frameDraw(rows);
@@ -1036,6 +1047,19 @@ unittest // select
     assert(e.select("Pick", ["a", "b", "c"]) == 2);
     e = editor("\x1b\xff", screen);
     assert(e.select("Pick", ["a"]) == -1);
+}
+
+unittest // select draws a question body above the prompt and keeps it with the answer
+{
+    import std.algorithm : canFind;
+    import std.string : indexOf;
+    auto screen = new Screen;
+    auto e = editor("\r", screen);
+    e.rows = () => 24;
+    assert(e.select("Your answer", ["yes", "no"], 0, null, ["Two options:", "- **A**", "- B"]) == 0);
+    auto drawn = screen.text;
+    assert(drawn.indexOf("Two options:\n- **A**\n- B\n") >= 0 && drawn.indexOf("- B") < drawn.indexOf("Your answer"), drawn);
+    assert(drawn.canFind("<COMMIT Two options:\n- **A**\n- B\n"), "committed with the answer: " ~ drawn);
 }
 
 // rust: lineedit.rs::enter_steers_and_ctrl_enter_queues_during_a_turn

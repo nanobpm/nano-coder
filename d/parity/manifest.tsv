@@ -502,6 +502,9 @@ llm.rs::splits_think_tags_across_chunks	todo
 llm.rs::tampered_newest_image_consumes_no_quota_and_sets_no_false_header	todo
 llm.rs::tampered_only_image_sets_no_vision_header	todo
 llm.rs::trajectory_fields_round_trip_and_stay_out_of_plain_messages	todo
+main.rs::a_long_question_wraps_and_escapes_are_dropped	test
+main.rs::a_plain_one_line_question_stays_the_picker_prompt	test
+main.rs::a_structured_question_is_rendered_as_markdown_above_the_picker	test
 main.rs::builtin_tools_include_search_and_no_echo	todo
 main.rs::classify_steer_input_routes_line_queue_and_commands	todo
 main.rs::double_escape_needs_two_presses_within_the_window	todo
