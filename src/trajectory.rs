@@ -355,6 +355,7 @@ impl Trajectory {
                 // Timers are surfaced by `/timers` and the status line; not a
                 // ledger row.
                 Record::Timers { .. } => {}
+                Record::Recall { .. } => {}
                 // Audit metadata, not a conversation row.
                 Record::Hooks { .. } => {}
             }
@@ -1142,6 +1143,7 @@ mod tests {
             folded: None,
             folded_base: None,
             restated: None,
+            pending_recall_notes: 0,
             recorded_at: now(),
         });
         let traj = Trajectory::from_records(&recs);

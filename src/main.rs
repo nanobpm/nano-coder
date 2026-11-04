@@ -1562,6 +1562,7 @@ fn memory_command(agent: &mut Agent, args: &str) -> String {
             )
         };
     }
+    let stats = store.recall_stats();
     let mut out = vec![format!(
         "{} memor{} (memory is {}; edit the files under {}{}):",
         entries.len(),
@@ -1590,6 +1591,14 @@ fn memory_command(agent: &mut Agent, args: &str) -> String {
         );
         if let Some(evidence) = &entry.evidence {
             line.push_str(&format!(" (check: {})", sanitize_terminal_line(evidence)));
+        }
+        if let Some(kind) = entry.kind.filter(|k| *k != memory::Kind::Hint) {
+            line.push_str(&format!(" [{}]", kind.as_str()));
+        }
+        // Recall noise (issue #166): how often a memory was recalled from a
+        // tool call, and how often that recall was followed by reading it.
+        if let Some((fired, used)) = stats.get(&entry.id) {
+            line.push_str(&format!(" (recalled {fired}×, used {used}×)"));
         }
         out.push(line);
     }
