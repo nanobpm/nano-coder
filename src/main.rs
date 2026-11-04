@@ -1098,8 +1098,45 @@ fn herdr_session(agent: &Agent, extra: &[String]) -> Option<herdr::Session> {
     Some(herdr::Session { id: id.to_string(), resume })
 }
 
+/// How a question is shown above its picker: `(body, prompt)`. A plain,
+/// single-line question that fits stays inline as the picker prompt. Anything
+/// else (several lines, markdown, too wide) is rendered as markdown into a body
+/// printed above the picker, with a short prompt: dialoguer's prompt is one
+/// row, so a long or structured question would otherwise collapse into a
+/// single unreadable line. The text is sanitised first (escapes dropped, line
+/// feeds kept), so the model cannot smuggle terminal controls through it.
+fn question_prompt(question: &str, width: usize) -> (Option<String>, String) {
+    // `trim_end` only: leading indentation is markdown-significant (an
+    // indented first line is a code block), so `trim()` would silently
+    // degrade a question that opens with indented code to paragraph text.
+    let text = sanitize_terminal_text(question.trim_end());
+    // Leave room for dialoguer's `? ` prefix and the `›` after the prompt.
+    let rendered = markdown::render(&text, width.saturating_sub(4).max(20));
+    // Inline only if the question genuinely fits one row: no line breaks,
+    // unchanged by markdown, and narrow enough for the prompt row itself
+    // (text + `? ` prefix + `› ` suffix). Measure terminal cells, not bytes,
+    // so wide glyphs count double. Without the width check an over-wide
+    // question stays inline on a narrow terminal and the picker wraps.
+    let fits = text_width(&text) <= width.saturating_sub(4);
+    if fits && !rendered.contains('\n') && rendered == text {
+        return (None, text);
+    }
+    (Some(rendered), "Your answer".to_string())
+}
+
+/// Terminal-cell width of the widest line of `s` (unicode-aware).
+fn text_width(s: &str) -> usize {
+    s.lines().map(|line| line.chars().map(|c| UnicodeWidthChar::width(c).unwrap_or(0)).sum()).max().unwrap_or(0)
+}
+
 fn ask_one(q: &question::Question) -> Result<Option<String>> {
     use dialoguer::{Input, Select};
+    let width = status::stderr_terminal_size().map_or(80, |(_, cols)| cols as usize);
+    let (body, prompt) = question_prompt(&q.question, width);
+    if let Some(body) = body {
+        // Dialoguer draws on stderr; the body goes just above it.
+        eprintln!("\n{body}\n");
+    }
     let mut labels: Vec<String> = q
         .options
         .iter()
@@ -1118,8 +1155,7 @@ fn ask_one(q: &question::Question) -> Result<Option<String>> {
     } else {
         None
     };
-    let choice =
-        Select::new().with_prompt(sanitize_terminal_line(&q.question)).items(&labels).default(0).interact_opt()?;
+    let choice = Select::new().with_prompt(prompt).items(&labels).default(0).interact_opt()?;
     match choice {
         None => Ok(None),
         Some(i) if Some(i) == custom_index => {
@@ -3511,6 +3547,67 @@ mod tests {
         // A lone/unterminated ESC still drops only the ESC byte; trailing
         // printable text is preserved.
         assert_eq!(sanitize_terminal_line("a\x1bZb"), "aZb");
+    }
+
+    #[test]
+    fn a_plain_one_line_question_stays_the_picker_prompt() {
+        let (body, prompt) = question_prompt("Which database should I use?", 80);
+        assert_eq!(body, None);
+        assert_eq!(prompt, "Which database should I use?");
+    }
+
+    #[test]
+    fn leading_indentation_is_preserved_for_markdown() {
+        // `trim()` would strip the first line's indent, degrading an indented
+        // code block to paragraph text; only trailing whitespace may go.
+        let q = "    indented\n    code";
+        let (body, prompt) = question_prompt(q, 80);
+        let body = body.expect("an indented code block renders above the picker");
+        assert_eq!(prompt, "Your answer");
+        assert!(body.contains("indented"), "{body:?}");
+        assert!(body.contains("code"), "{body:?}");
+        // Trailing whitespace is still trimmed.
+        let (body, prompt) = question_prompt("Plain question?   \n", 80);
+        assert_eq!(body, None);
+        assert_eq!(prompt, "Plain question?");
+    }
+
+    #[test]
+    fn an_over_wide_question_leaves_the_inline_prompt_on_a_narrow_terminal() {
+        // 19 cells of question on an 18-column terminal must not stay inline:
+        // the picker prompt row would wrap.
+        let (body, prompt) = question_prompt("Which should I use?", 18);
+        assert!(body.is_some(), "over-wide question renders above the picker");
+        assert_eq!(prompt, "Your answer");
+        // Exactly at the limit (14 cells of text on an 18-col terminal) fits.
+        let (body, _) = question_prompt("fits exactly!?", 18);
+        assert_eq!(body, None);
+        // Wide glyphs count by terminal cells, not chars: 10 CJK chars = 20 cells.
+        let (body, prompt) = question_prompt("数据库用哪个比较好呢？", 19);
+        assert!(body.is_some(), "20 cells on a 19-col terminal is over-wide");
+        assert_eq!(prompt, "Your answer");
+    }
+
+    #[test]
+    fn a_structured_question_is_rendered_as_markdown_above_the_picker() {
+        let q = "I found two options:\n\n- **Postgres**: already in `docker-compose.yml`\n- SQLite: simpler\n\nWhich should I use?";
+        let (body, prompt) = question_prompt(q, 80);
+        let body = body.expect("a multi-line question gets a body");
+        assert_eq!(prompt, "Your answer");
+        let lines: Vec<&str> = body.lines().collect();
+        assert!(lines.len() >= 4, "line breaks kept: {body:?}");
+        assert!(lines.iter().any(|l| l.contains("Postgres") && !l.contains("**")), "markdown rendered: {body:?}");
+        assert!(lines.iter().any(|l| l.contains("Which should I use?")), "{body:?}");
+    }
+
+    #[test]
+    fn a_long_question_wraps_and_escapes_are_dropped() {
+        let q = format!("\x1b[2J{}", "word ".repeat(40));
+        let (body, prompt) = question_prompt(&q, 40);
+        let body = body.expect("too wide for one row");
+        assert_eq!(prompt, "Your answer");
+        assert!(body.lines().count() > 1, "{body:?}");
+        assert!(!body.contains("\x1b[2J"), "escapes dropped: {body:?}");
     }
 
     #[test]
