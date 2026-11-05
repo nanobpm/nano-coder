@@ -595,21 +595,21 @@ mod tests {
     fn model_suggestions_offer_configured_models_and_skip_disabled_providers() {
         let config = config(
             r#"
-            model = "openrouter-camunda/moonshotai/kimi-k3"
+            model = "openrouter-regional/moonshotai/kimi-k3"
             [providers.openrouter]
             disabled = true
-            [providers.openrouter-camunda]
+            [providers.openrouter-regional]
             kind = "openai"
             base_url = "https://us.openrouter.ai/api/v1"
             list_models = "configured"
-            [providers.openrouter-camunda.models."amazon/nova-lite-v1"]
+            [providers.openrouter-regional.models."amazon/nova-lite-v1"]
             name = "Nova Lite 1.0"
             base_url = "https://eu.openrouter.ai/api/v1"
         "#,
         );
         let found = model_suggestions(&config, &[]);
         let nova =
-            found.iter().find(|s| s.value == "openrouter-camunda/amazon/nova-lite-v1").expect("configured model");
+            found.iter().find(|s| s.value == "openrouter-regional/amazon/nova-lite-v1").expect("configured model");
         assert_eq!(nova.note, "Nova Lite 1.0");
         assert!(
             !found.iter().any(|s| s.value == "openrouter" || s.value.starts_with("openrouter/")),
