@@ -251,7 +251,7 @@ fn thinking_suggestions() -> Vec<Suggestion> {
 /// Duplicates are dropped, keeping the earliest rank.
 fn model_suggestions(config: &Config, recents: &[String]) -> Vec<Suggestion> {
     let (user, default_provider) = config.effective_providers();
-    let all = providers::effective_providers(&user);
+    let all = providers::enabled(&providers::effective_providers(&user));
     let mut out: Vec<Suggestion> = Vec::new();
     let mut push = |value: String, note: String| {
         if !value.is_empty() && !out.iter().any(|s| s.value == value) {
@@ -277,6 +277,12 @@ fn model_suggestions(config: &Config, recents: &[String]) -> Vec<Suggestion> {
         let provider = &all[*name];
         if let Some(model) = provider.default_model.as_deref().filter(|m| !m.is_empty()) {
             push(format!("{name}/{model}"), default_note(name, provider, &default_provider));
+        }
+    }
+    // A curated list (`list_models = "configured"`) offers each of its models.
+    for name in &names {
+        for (model, label) in all[*name].configured_models().unwrap_or_default() {
+            push(format!("{name}/{model}"), label.unwrap_or_default());
         }
     }
     for name in &names {
@@ -583,6 +589,32 @@ mod tests {
         let found = model_suggestions(&config, &recents);
         let values: Vec<&str> = found.iter().map(|s| s.value.as_str()).collect();
         assert_eq!(values.iter().filter(|v| **v == "work/gpt-oss-120b").count(), 1);
+    }
+
+    #[test]
+    fn model_suggestions_offer_configured_models_and_skip_disabled_providers() {
+        let config = config(
+            r#"
+            model = "openrouter-camunda/moonshotai/kimi-k3"
+            [providers.openrouter]
+            disabled = true
+            [providers.openrouter-camunda]
+            kind = "openai"
+            base_url = "https://us.openrouter.ai/api/v1"
+            list_models = "configured"
+            [providers.openrouter-camunda.models."amazon/nova-lite-v1"]
+            name = "Nova Lite 1.0"
+            base_url = "https://eu.openrouter.ai/api/v1"
+        "#,
+        );
+        let found = model_suggestions(&config, &[]);
+        let nova =
+            found.iter().find(|s| s.value == "openrouter-camunda/amazon/nova-lite-v1").expect("configured model");
+        assert_eq!(nova.note, "Nova Lite 1.0");
+        assert!(
+            !found.iter().any(|s| s.value == "openrouter" || s.value.starts_with("openrouter/")),
+            "disabled hidden"
+        );
     }
 
     #[test]

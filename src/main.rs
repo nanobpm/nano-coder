@@ -2528,6 +2528,18 @@ async fn main() -> Result<()> {
     }
     if let Some(spec) = &args.list_models {
         let (user, default_provider) = config.effective_providers();
+        // A curated list (`list_models = "configured"`) is printed as configured.
+        let all = providers::effective_providers(&user);
+        let (name, _) = providers::parse_model_spec(spec, &all, &default_provider);
+        if let Some(list) = all.get(name).and_then(providers::ProviderConfig::configured_models) {
+            if all[name].is_disabled() {
+                anyhow::bail!("provider {name:?} is disabled (`disabled = true` in [providers.{name}])");
+            }
+            for (model, _) in list {
+                println!("{name}/{model}");
+            }
+            return Ok(());
+        }
         let client = providers::build_lister(spec, &user, &default_provider)?;
         for model in client.list_models().await? {
             println!("{}/{model}", client.provider_name());

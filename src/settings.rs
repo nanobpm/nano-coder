@@ -684,6 +684,14 @@ enum ProviderChoice {
 /// highlight: the most recent model that isn't the current one, so `/model`
 /// then Enter flips back to the previous model; without one, the current
 /// provider.
+/// A configured model's picker row: its display name, then its id.
+fn model_label(id: &str, name: Option<&str>) -> String {
+    match name.filter(|n| !n.trim().is_empty()) {
+        Some(name) => format!("{}  ({id})", crate::sanitize_terminal_line(name)),
+        None => id.to_string(),
+    }
+}
+
 fn provider_rows(
     recent: &[String],
     current_spec: &str,
@@ -700,13 +708,14 @@ fn provider_rows(
     let first_provider = rows.len();
     rows.extend(
         all.iter()
+            .filter(|(_, p)| !p.is_disabled())
             .map(|(name, p)| (format!("{name:<14} {}", key_status(p)), Some(ProviderChoice::Provider(name.clone())))),
     );
     rows.push(("Cancel".to_string(), None));
-    let default = recent
-        .iter()
-        .position(|spec| spec != current_spec)
-        .unwrap_or_else(|| first_provider + all.keys().position(|name| name == current_provider).unwrap_or(0));
+    let default = recent.iter().position(|spec| spec != current_spec).unwrap_or_else(|| {
+        first_provider
+            + all.iter().filter(|(_, p)| !p.is_disabled()).position(|(name, _)| name == current_provider).unwrap_or(0)
+    });
     (rows, default)
 }
 
@@ -747,22 +756,30 @@ async fn pick_model_from_provider(
 ) -> Result<Step> {
     let default_model = all.get(name).and_then(|p| p.default_model.clone()).unwrap_or_default();
 
-    println!("Fetching models from {name}...");
-    let models = match providers::build_lister(name, user, default_provider) {
-        Ok(client) => match tokio::time::timeout(LIST_MODELS_TIMEOUT, client.list_models()).await {
-            Ok(Ok(models)) => models,
-            Ok(Err(e)) => {
-                println!("Could not list models: {e:#}");
+    // A curated list (`list_models = "configured"`) needs no request.
+    let configured = all.get(name).and_then(ProviderConfig::configured_models);
+    if configured.is_none() {
+        println!("Fetching models from {name}...");
+    }
+    let models = if let Some(list) = &configured {
+        list.iter().map(|(id, _)| id.clone()).collect()
+    } else {
+        match providers::build_lister(name, user, default_provider) {
+            Ok(client) => match tokio::time::timeout(LIST_MODELS_TIMEOUT, client.list_models()).await {
+                Ok(Ok(models)) => models,
+                Ok(Err(e)) => {
+                    println!("Could not list models: {e:#}");
+                    Vec::new()
+                }
+                Err(_) => {
+                    println!("Listing models timed out");
+                    Vec::new()
+                }
+            },
+            Err(e) => {
+                println!("Could not build a client for {name}: {e:#}");
                 Vec::new()
             }
-            Err(_) => {
-                println!("Listing models timed out");
-                Vec::new()
-            }
-        },
-        Err(e) => {
-            println!("Could not build a client for {name}: {e:#}");
-            Vec::new()
         }
     };
 
@@ -775,7 +792,10 @@ async fn pick_model_from_provider(
             .allow_empty(true)
             .interact_text()?
     } else {
-        let mut labels = models.clone();
+        let mut labels = match &configured {
+            Some(list) => list.iter().map(|(id, name)| model_label(id, name.as_deref())).collect(),
+            None => models.clone(),
+        };
         labels.push("Other (type a model ID)".into());
         labels.push("Back to providers".into());
         let default = models.iter().position(|m| *m == default_model).unwrap_or(0);
@@ -1566,6 +1586,20 @@ mod tests {
             labels.iter().all(|l| l.starts_with("unset") || l.starts_with("default")),
             "only default/unset: {labels:?}"
         );
+    }
+
+    #[test]
+    fn provider_rows_skip_disabled_providers_and_configured_models_show_names() {
+        let mut all = providers(&["anthropic", "openai", "openrouter"]);
+        all.get_mut("anthropic").unwrap().disabled = Some(true);
+        let (rows, default) = provider_rows(&[], "openai/gpt-5", "openai", &all);
+        let labels: Vec<&str> = rows.iter().map(|(label, _)| label.as_str()).collect();
+        assert!(labels[0].starts_with("openai ") && labels[1].starts_with("openrouter "), "{labels:?}");
+        assert_eq!(labels.len(), 3, "{labels:?}");
+        assert_eq!(default, 0, "the current provider, counted among the shown rows");
+        assert_eq!(model_label("amazon/nova-lite-v1", Some("Nova Lite 1.0")), "Nova Lite 1.0  (amazon/nova-lite-v1)");
+        assert_eq!(model_label("m", Some(" ")), "m");
+        assert_eq!(model_label("m", Some("A\x1b[2Jb")), "Ab  (m)", "escape sequence dropped");
     }
 
     #[test]
