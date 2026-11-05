@@ -234,7 +234,7 @@ impl Snapshot {
     /// actually requested, not when the snapshot is captured.
     fn providers(&self) -> String {
         let mut out = vec![format!("Providers (default: {}):", self.default_provider)];
-        for (name, provider) in &self.providers {
+        for (name, provider) in self.providers.iter().filter(|(_, p)| !p.is_disabled()) {
             let kind = provider.kind.map(|k| format!("{k:?}").to_lowercase()).unwrap_or_else(|| "?".into());
             let key = crate::settings::key_status(provider);
             let url = provider.base_url.clone().unwrap_or_else(|| crate::settings::derived_endpoint_source(provider));

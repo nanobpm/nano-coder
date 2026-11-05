@@ -727,6 +727,45 @@ api_key_env = "BAILIAN_TOKEN_PLAN_API_KEY"
 as thinking models like K3 require. Set `extra_body = { reasoning_effort = "low" }` to
 make K3 think less.
 
+#### Regional OpenRouter workspaces and curated model lists
+
+Some OpenRouter workspaces (e.g. Camunda's) reject the global `openrouter.ai` host, so
+the `openrouter` preset fails with them. They accept only the regional hosts
+`us.openrouter.ai` and `eu.openrouter.ai`, and each model is served on just one of them.
+Three provider settings cover this:
+
+- `[providers.<name>.models."<model>"]` takes a `base_url`, which overrides the
+  provider's for that model, and a display `name`.
+- `list_models = "configured"` makes `/model`, `--list-models` and `/model` Tab completion
+  offer only the models configured under `models`, with their names, instead of the
+  endpoint's whole `/models` catalogue. The default is `"endpoint"`.
+- `disabled = true` hides a provider (a preset too) from `/providers`, the pickers and
+  suggestions. A model spec that names it is an error.
+
+```toml
+model = "openrouter-camunda/moonshotai/kimi-k3"
+
+[providers.openrouter]
+disabled = true                         # the global host is rejected
+
+[providers.openrouter-camunda]
+kind = "openai"
+base_url = "https://us.openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+list_models = "configured"
+
+[providers.openrouter-camunda.models."moonshotai/kimi-k3"]
+name = "Kimi K3"
+
+[providers.openrouter-camunda.models."amazon/nova-lite-v1"]
+name = "Nova Lite 1.0"
+base_url = "https://eu.openrouter.ai/api/v1"   # served in the EU only
+```
+
+[`examples/openrouter-camunda.toml`](examples/openrouter-camunda.toml) is the full
+equivalent of the `opencode.json` in Camunda's handbook. A model's `"provider": {"api": …}`
+there becomes its `base_url` here.
+
 ### Temperature
 
 `temperature` is a number, or `"default"` to send none so the model uses its own default.

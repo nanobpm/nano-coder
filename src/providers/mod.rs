@@ -116,6 +116,23 @@ pub struct ProviderConfig {
     /// the provider's.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub models: BTreeMap<String, crate::temperature::ModelSettings>,
+    /// Where `/model` and `--list-models` get the model list: `"endpoint"`
+    /// (default: the provider's `/models`) or `"configured"` (only the models
+    /// under `[providers.NAME.models]`, with their `name`s).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list_models: Option<ModelList>,
+    /// Hide this provider (a built-in preset too) from `/providers`, the
+    /// pickers and suggestions; naming it in a model spec is an error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled: Option<bool>,
+}
+
+/// Where a provider's model list comes from (`list_models`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelList {
+    Endpoint,
+    Configured,
 }
 
 impl ProviderConfig {
@@ -155,7 +172,9 @@ impl ProviderConfig {
             temperature,
             thinking,
             vision,
-            thinking_levels
+            thinking_levels,
+            list_models,
+            disabled
         );
         self.headers.extend(other.headers.clone());
         for (model, settings) in &other.models {
@@ -172,9 +191,46 @@ impl ProviderConfig {
             if settings.thinking_levels.is_some() {
                 entry.thinking_levels = settings.thinking_levels.clone();
             }
+            if settings.name.is_some() {
+                entry.name = settings.name.clone();
+            }
+            if settings.base_url.is_some() {
+                entry.base_url = settings.base_url.clone();
+            }
         }
         self
     }
+
+    /// Whether `disabled = true` hides this provider.
+    pub fn is_disabled(&self) -> bool {
+        self.disabled == Some(true)
+    }
+
+    /// The endpoint for `model`: its own `base_url` if set, else the provider's.
+    pub fn base_url_for(&self, model: &str) -> Option<&String> {
+        self.models.get(model).and_then(|m| m.base_url.as_ref()).or(self.base_url.as_ref())
+    }
+
+    /// The configured models as `(id, display name)`, when `list_models =
+    /// "configured"`; `None` means list from the endpoint.
+    pub fn configured_models(&self) -> Option<Vec<(String, Option<String>)>> {
+        (self.list_models == Some(ModelList::Configured))
+            .then(|| self.models.iter().map(|(id, m)| (id.clone(), m.name.clone())).collect())
+    }
+}
+
+/// The providers to offer in listings and pickers: `disabled` ones dropped.
+pub fn enabled(providers: &BTreeMap<String, ProviderConfig>) -> BTreeMap<String, ProviderConfig> {
+    providers.iter().filter(|(_, p)| !p.is_disabled()).map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
+/// Refuse a spec naming a disabled provider, before it can fall through to
+/// the default provider as a model id.
+fn check_enabled(name: &str, config: &ProviderConfig) -> Result<()> {
+    if config.is_disabled() {
+        bail!("provider {name:?} is disabled (`disabled = true` in [providers.{name}])");
+    }
+    Ok(())
 }
 
 /// Built-in provider presets, overridable from `[providers.<name>]`.
@@ -355,12 +411,13 @@ pub fn validate_spec(spec: &str, providers: &BTreeMap<String, ProviderConfig>, d
             providers.keys().cloned().collect::<Vec<_>>().join(", ")
         )
     })?;
+    check_enabled(name, config)?;
     let kind = config.kind.ok_or_else(|| anyhow!("provider {name:?} has no `kind` (openai, anthropic, or mock)"))?;
-    model
+    let model = model
         .map(str::to_string)
         .or_else(|| config.default_model.clone())
         .ok_or_else(|| anyhow!("no model given for provider {name:?} and it has no default_model"))?;
-    match (kind, &config.base_url) {
+    match (kind, &config.base_url_for(&model).cloned()) {
         // Mock derives (or does not need) an endpoint, so any/no base_url is
         // fine. Copilot derives its endpoint from the session token *unless
         // overridden*, and Muse from the minted key *unless overridden*; a
@@ -454,12 +511,14 @@ pub fn resolve_cancellable(
             providers.keys().cloned().collect::<Vec<_>>().join(", ")
         )
     })?;
+    check_enabled(name, config)?;
     let kind = config.kind.ok_or_else(|| anyhow!("provider {name:?} has no `kind` (openai, anthropic, or mock)"))?;
     let model = model
         .map(str::to_string)
         .or_else(|| config.default_model.clone())
         .ok_or_else(|| anyhow!("no model given for provider {name:?} and it has no default_model"))?;
-    let base_url = match (kind, &config.base_url) {
+    // A model's own `base_url` wins (regional OpenRouter hosts, #169).
+    let base_url = match (kind, &config.base_url_for(&model).cloned()) {
         // Mock needs no endpoint. Copilot derives its endpoint from the
         // session token unless overridden, and Muse from the minted key unless
         // overridden; a present non-empty override is used verbatim by their
@@ -1958,6 +2017,89 @@ mod tests {
             parse_model_spec("meta-llama/llama-4", &providers, "together"),
             ("together", Some("meta-llama/llama-4"))
         );
+    }
+
+    /// A regional OpenRouter workspace (#169): US by default, one model on EU,
+    /// a curated list, and the global preset disabled.
+    fn regional() -> HashMap<String, ProviderConfig> {
+        let camunda: ProviderConfig = toml::from_str(
+            r#"
+            kind = "openai"
+            base_url = "https://us.openrouter.ai/api/v1/"
+            api_key_env = "NANO_TEST_REGIONAL_KEY"
+            list_models = "configured"
+            default_model = "moonshotai/kimi-k3"
+            [models."moonshotai/kimi-k3"]
+            name = "Kimi K3"
+            [models."amazon/nova-lite-v1"]
+            name = "Nova Lite 1.0"
+            base_url = "https://eu.openrouter.ai/api/v1"
+        "#,
+        )
+        .unwrap();
+        let disabled: ProviderConfig = toml::from_str("disabled = true").unwrap();
+        HashMap::from([("openrouter-camunda".to_string(), camunda), ("openrouter".to_string(), disabled)])
+    }
+
+    #[test]
+    fn a_models_base_url_overrides_the_providers() {
+        let user = regional();
+        let eu = resolve("openrouter-camunda/amazon/nova-lite-v1", &user, "mock").unwrap();
+        assert_eq!(eu.base_url, "https://eu.openrouter.ai/api/v1");
+        assert_eq!(eu.model, "amazon/nova-lite-v1");
+        let us = resolve("openrouter-camunda/moonshotai/kimi-k3", &user, "mock").unwrap();
+        assert_eq!(us.base_url, "https://us.openrouter.ai/api/v1", "trailing slash trimmed");
+        // A model with no entry, and the provider's default model, use the provider's host.
+        assert_eq!(resolve("openrouter-camunda/x-ai/grok-4.6", &user, "mock").unwrap().base_url, us.base_url);
+        assert_eq!(resolve("openrouter-camunda", &user, "mock").unwrap().model, "moonshotai/kimi-k3");
+        // A bad per-model host is caught at queue time, like a bad provider host.
+        let mut bad = regional();
+        bad.get_mut("openrouter-camunda").unwrap().models.get_mut("amazon/nova-lite-v1").unwrap().base_url =
+            Some("ftp://eu.openrouter.ai".into());
+        let providers = effective_providers(&bad);
+        let err = validate_spec("openrouter-camunda/amazon/nova-lite-v1", &providers, "mock").unwrap_err();
+        assert!(err.to_string().contains("must be http(s)"), "{err}");
+        assert!(validate_spec("openrouter-camunda/moonshotai/kimi-k3", &providers, "mock").is_ok());
+    }
+
+    #[test]
+    fn a_disabled_provider_is_hidden_and_refused() {
+        let user = regional();
+        let all = effective_providers(&user);
+        assert!(all["openrouter"].is_disabled(), "the preset merges with the user's `disabled`");
+        assert_eq!(all["openrouter"].base_url.as_deref(), Some("https://openrouter.ai/api/v1"));
+        let shown = enabled(&all);
+        assert!(!shown.contains_key("openrouter") && shown.contains_key("openrouter-camunda"));
+        // Naming it is an error, not a fall-through to the default provider.
+        for spec in ["openrouter/moonshotai/kimi-k3", "openrouter"] {
+            let err = resolve(spec, &user, "openrouter-camunda").unwrap_err().to_string();
+            assert!(err.contains("\"openrouter\" is disabled"), "{err}");
+            let err = validate_spec(spec, &all, "openrouter-camunda").unwrap_err().to_string();
+            assert!(err.contains("is disabled"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_configured_model_list_keeps_names_and_merges_over_presets() {
+        let all = effective_providers(&regional());
+        assert_eq!(
+            all["openrouter-camunda"].configured_models().unwrap(),
+            vec![
+                ("amazon/nova-lite-v1".to_string(), Some("Nova Lite 1.0".to_string())),
+                ("moonshotai/kimi-k3".to_string(), Some("Kimi K3".to_string())),
+            ]
+        );
+        assert_eq!(all["openai"].configured_models(), None, "presets list from the endpoint");
+        // A later layer sets only some fields of a model: the rest survive.
+        let base: ProviderConfig =
+            toml::from_str("list_models = \"configured\"\n[models.m]\nname = \"M\"\nbase_url = \"https://a/v1\"")
+                .unwrap();
+        let over: ProviderConfig = toml::from_str("list_models = \"endpoint\"\n[models.m]\nname = \"Em\"").unwrap();
+        let merged = base.merged_with(&over);
+        assert_eq!(merged.list_models, Some(ModelList::Endpoint));
+        assert_eq!(merged.models["m"].name.as_deref(), Some("Em"));
+        assert_eq!(merged.models["m"].base_url.as_deref(), Some("https://a/v1"));
+        assert!(toml::from_str::<ProviderConfig>("list_models = \"all\"").is_err(), "unknown list mode");
     }
 
     #[test]
