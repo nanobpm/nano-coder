@@ -203,15 +203,18 @@ impl Policy {
         }
     }
 
-    /// Allow, deny, or ask the user. `Ask` carries the reason the call could
-    /// not be verified (a shell loop whose commands are not provably safe);
-    /// with no one to answer it must be treated as blocked (see
-    /// [`blocked_message`]). `Deny` carries the full message for the model.
+    /// Allow or deny. A call the static checks cannot verify (a shell loop
+    /// whose commands are not provably safe) never prompts: with the OS
+    /// sandbox active it is allowed — the sandbox confines what it can write —
+    /// and without one it is blocked with the usual guidance. Hard blocks
+    /// (`Err` from the checks) are denied either way. `Deny` carries the full
+    /// message for the model.
     pub fn decide(&self, tool: &str, args: &Value) -> Decision {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         match self.decide_in(tool, args, &cwd) {
             Ok(None) => Decision::Allow,
-            Ok(Some(reason)) => Decision::Ask(reason),
+            Ok(Some(_)) if self.sandbox.active() => Decision::Allow,
+            Ok(Some(reason)) => Decision::Deny(blocked_message(&reason)),
             Err(reason) => Decision::Deny(blocked_message(&reason)),
         }
     }
@@ -518,8 +521,6 @@ impl Policy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     Allow,
-    /// Needs the user's approval; the reason the call could not be verified.
-    Ask(String),
     /// Blocked; the full message for the model.
     Deny(String),
 }
@@ -4640,26 +4641,54 @@ mod tests {
         policy.check_in("bash", &json!({ "command": command }), cwd)
     }
 
+    /// The internal verdict of the checks, before [`Policy::decide`] resolves an
+    /// unverifiable call (`Ask`) by whether the OS sandbox is active.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Verdict {
+        Allow,
+        Ask(String),
+        Deny(String),
+    }
+
     /// The decision for a command under the default policy at the test cwd.
-    fn decide(command: &str) -> Decision {
+    fn decide(command: &str) -> Verdict {
         decide_with(&Policy::default(), command)
     }
 
-    fn decide_with(policy: &Policy, command: &str) -> Decision {
+    fn decide_with(policy: &Policy, command: &str) -> Verdict {
         let cwd = Path::new("/work/project");
         match policy.decide_in("bash", &json!({ "command": command }), cwd) {
-            Ok(None) => Decision::Allow,
-            Ok(Some(reason)) => Decision::Ask(reason),
-            Err(reason) => Decision::Deny(reason),
+            Ok(None) => Verdict::Allow,
+            Ok(Some(reason)) => Verdict::Ask(reason),
+            Err(reason) => Verdict::Deny(reason),
         }
     }
 
     /// The command needs the user's approval (an unverifiable loop, #164).
     fn asks(command: &str) -> String {
         match decide(command) {
-            Decision::Ask(reason) => reason,
+            Verdict::Ask(reason) => reason,
             other => panic!("{command}: expected Ask, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_unverifiable_loop_runs_under_the_sandbox_and_blocks_without_it() {
+        // Never prompts: the OS sandbox confines what the loop can write, so
+        // with it on the loop runs; with it off the loop is blocked.
+        let loop_cmd = json!({ "command": "for f in $(git ls-files); do sed -i s/x/y/ \"$f\"; done" });
+        let sandboxed = Policy::new(
+            &PermissionsConfig::default(),
+            &SandboxConfig { mode: crate::sandbox::SandboxMode::Workspace, ..Default::default() },
+        );
+        assert_eq!(sandboxed.decide("bash", &loop_cmd), Decision::Allow);
+        match Policy::default().decide("bash", &loop_cmd) {
+            Decision::Deny(m) => assert!(m.starts_with("Blocked by nano-coder permissions"), "{m}"),
+            Decision::Allow => panic!("unverifiable loop allowed without a sandbox"),
+        }
+        // Hard blocks stand even under the sandbox.
+        let eval = json!({ "command": "for f in a b; do eval \"$f\"; done" });
+        assert!(matches!(sandboxed.decide("bash", &eval), Decision::Deny(_)));
     }
 
     fn blocked(command: &str) -> String {
@@ -4781,7 +4810,7 @@ mod tests {
 
         // A loop over a command substitution whose header AND body are both
         // read-only stays allowed without asking.
-        assert_eq!(decide("for f in $(ls src); do wc -l \"$f\"; done"), Decision::Allow);
+        assert_eq!(decide("for f in $(ls src); do wc -l \"$f\"; done"), Verdict::Allow);
 
         // An allow rule cannot prove it covers *every* value a glob/command-
         // substitution loop binds: the body word `$f` is a run-time value, and
@@ -4790,10 +4819,10 @@ mod tests {
         // under a broad `Bash(sed *)` — because the dynamic word makes coverage
         // unprovable (round-3 review of #164).
         let p = policy(&["Bash(sed *)"], &[]);
-        assert!(matches!(decide_with(&p, "for f in $(ls src); do sed -i s/x/y/ \"$f\"; done"), Decision::Ask(_)));
+        assert!(matches!(decide_with(&p, "for f in $(ls src); do sed -i s/x/y/ \"$f\"; done"), Verdict::Ask(_)));
         // A rule that cannot cover every value the loop binds still asks.
         let p = policy(&["Bash(sed -i s/x/y/ a.txt)"], &[]);
-        assert!(matches!(decide_with(&p, "for f in $(ls src); do sed -i s/x/y/ \"$f\"; done"), Decision::Ask(_)));
+        assert!(matches!(decide_with(&p, "for f in $(ls src); do sed -i s/x/y/ \"$f\"; done"), Verdict::Ask(_)));
 
         // The unroll is capped (64 iterations): above it the loop cannot be
         // checked exactly, so a body that is not provably read-only asks rather
@@ -4882,7 +4911,7 @@ mod tests {
         // `$f` is a run-time value, so an allow rule matching the placeholder
         // text cannot prove it covers every binding (round-3 review of #164).
         let p = policy(&["Bash(touch *)"], &[]);
-        assert!(matches!(decide_with(&p, "for f in *; do touch \"$f\"; done"), Decision::Ask(_)));
+        assert!(matches!(decide_with(&p, "for f in *; do touch \"$f\"; done"), Verdict::Ask(_)));
 
         // #5 A nested loop header rebinds the name for the rest of the outer
         // iteration, so the outer loop cannot be unrolled with a stale value.
@@ -5084,7 +5113,7 @@ mod tests {
         // coverage over every runtime binding, so the loop asks instead of being
         // auto-approved.
         let p = policy(&["Bash(touch ??.txt)"], &[]);
-        assert!(matches!(decide_with(&p, "for f in *; do touch \"$f.txt\"; done"), Decision::Ask(_)));
+        assert!(matches!(decide_with(&p, "for f in *; do touch \"$f.txt\"; done"), Verdict::Ask(_)));
 
         // #1384 Zero padding applies only when an endpoint has an explicit
         // leading zero; `{9..11}` binds `9 10 11`, not `09 10 11`.
@@ -5122,7 +5151,7 @@ mod tests {
         // rule and the call is approved (an allow rule intentionally overrides
         // the advisory built-in guard — the user accepted `rm`).
         let p = policy(&["Bash(rm *)"], &[]);
-        assert_eq!(decide_with(&p, "D=/etc; rm -rf \"$D\""), Decision::Allow);
+        assert_eq!(decide_with(&p, "D=/etc; rm -rf \"$D\""), Verdict::Allow);
         // ...and without an allow rule the guard still resolves `D` and blocks
         // the out-of-workspace delete (the assignment is preserved for dataflow).
         let err = blocked("D=/etc; rm -rf \"$D\"");
@@ -5141,9 +5170,9 @@ mod tests {
         // Not unrolled to a wrong `touch safesafe`: either it asks (unverifiable)
         // or the deny rule on the real runtime text fires.
         match d {
-            Decision::Ask(_) => {}
-            Decision::Deny(m) => assert!(m.contains("deny") || m.contains("may deny"), "{m}"),
-            Decision::Allow => panic!("'$f'\"$f\" was unrolled to a wrong literal and allowed"),
+            Verdict::Ask(_) => {}
+            Verdict::Deny(m) => assert!(m.contains("deny") || m.contains("may deny"), "{m}"),
+            Verdict::Allow => panic!("'$f'\"$f\" was unrolled to a wrong literal and allowed"),
         }
         // An unambiguous single-occurrence word still unrolls normally.
         let p = policy(&["Bash(touch safe)"], &[]);
