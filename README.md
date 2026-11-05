@@ -318,11 +318,9 @@ the [permission rules and sandbox](#permissions-and-sandbox) instead.
 
 ## Permissions and Sandbox
 
-Every tool call is checked before it runs, and a blocked call returns an error telling the
-model to stop and ask the user rather than work around the block. Headless runs (agent
-fleets, `-p`, ACP) never stop to ask for approval; an interactive session prompts once for
-the few calls that can be neither approved nor denied automatically (see **Shell loops**
-below).
+nano-coder never stops to ask for approval. Every tool call is checked before it runs
+instead, and a blocked call returns an error telling the model to stop and ask the user
+rather than work around the block.
 
 **Order of checks:** `deny` rules, then `allow` rules, then the built-in guards. Deny always
 wins. An allow rule approves a shell command only when *every* command in it matches, so
@@ -356,9 +354,9 @@ wherever the two `gh` commands are, and an unrolled command that is denied or ca
 is denied. The unroll is capped (64 iterations) and refuses a body that rebinds the loop
 variable or still expands something at run time after substitution; those fall through to
 the next rule. A loop that still cannot be verified — a non-literal list, or a static body
-command that is not a known read-only utility — is **asked** about once (showing the whole
-loop) in an interactive session, and blocked with the usual guidance where no one can answer
-(headless `-p`, ACP, a fleet worker). The hard blocks always stand: a command name computed
+command that is not a known read-only utility — **runs when the OS sandbox is on** (the
+sandbox confines what it can write) and is **blocked** with the usual guidance when it is
+off; nano-coder never prompts for it. The hard blocks always stand: a command name computed
 at run time, `eval`/interpreters (`sh -c`, `python -c`, ...), path-qualified programs outside
 `/bin`/`/usr/bin`, assignments to `PATH`/`IFS` and other dangerous names, arithmetic-assignment
 tricks, and writes/redirections to computed targets.
