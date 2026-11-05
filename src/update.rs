@@ -91,11 +91,18 @@ impl Channel {
     /// The channel for an executable at `exe`, given the `CARGO_HOME`
     /// override (tests pass representative paths here).
     pub fn from_exe(exe: &Path, cargo_home: Option<PathBuf>) -> Self {
-        if exe_has_component(exe, &["node_modules", "@nanobpm"]) {
+        // macOS `current_exe()` keeps the symlink the binary was launched
+        // through (npm/nvm's `<prefix>/bin/nano-coder` link), unlike Linux's
+        // `/proc/self/exe`, so check the resolved target as well.
+        let resolved = std::fs::canonicalize(exe).ok();
+        if std::iter::once(exe)
+            .chain(resolved.as_deref())
+            .any(|path| exe_has_component(path, &["node_modules", "@nanobpm"]))
+        {
             return Channel::Npm;
         }
         let cargo_bin = cargo_home.or_else(|| dirs::home_dir().map(|h| h.join(".cargo"))).map(|h| h.join("bin"));
-        // `current_exe()` resolves symlinks, so also compare against the
+        // `current_exe()` resolves symlinks on Linux, so also compare against the
         // canonical cargo bin dir (a symlinked `~/.cargo` / `$CARGO_HOME`);
         // the lexical comparison covers paths that do not exist.
         let parent = exe.parent();
@@ -624,6 +631,21 @@ mod tests {
         );
         // A scoped path segment must be a whole component, not a substring.
         assert_eq!(Channel::from_exe(&exe("/home/u/node_modules/@nanobpm-tools/nano-coder"), None), Channel::Other);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detects_the_npm_channel_through_the_global_bin_symlink() {
+        // npm/nvm put a `<prefix>/bin/nano-coder` symlink on PATH, and macOS
+        // `current_exe()` reports that link rather than its target.
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_bin = dir.path().join("lib/node_modules/@nanobpm/nano-coder/bin");
+        std::fs::create_dir_all(&pkg_bin).unwrap();
+        std::fs::write(pkg_bin.join("nano-coder"), "").unwrap();
+        std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+        let link = dir.path().join("bin/nano-coder");
+        std::os::unix::fs::symlink("../lib/node_modules/@nanobpm/nano-coder/bin/nano-coder", &link).unwrap();
+        assert_eq!(Channel::from_exe(&link, None), Channel::Npm);
     }
 
     #[test]
