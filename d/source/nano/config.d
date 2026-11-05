@@ -34,15 +34,28 @@ struct ModelSettings
     /// Levels this model accepts; set only when `hasThinkingLevels`.
     string[] thinkingLevels;
     bool hasThinkingLevels;
+    /// Display name in the model picker (`list_models = "configured"`).
+    string name;
+    /// Endpoint for this model, overriding the provider's `base_url` (null:
+    /// unset), e.g. an OpenRouter workspace serving each model on one region.
+    string baseUrl;
 
     static ModelSettings fromJSON(JSONValue o)
     {
         ModelSettings m;
-        if (auto v = "temperature" in o) m.temperature = numberOrDefault(*v);
-        if (auto v = "thinking" in o) m.thinking = Thinking.parse(v.str);
-        if (auto v = "vision" in o) m.vision = v.boolean;
-        if (auto v = "thinking_levels" in o) m.thinkingLevels = strings(*v), m.hasThinkingLevels = true;
+        m.overlay(o);
         return m;
+    }
+
+    /// Set the fields present in `o`, keeping the rest (a later layer).
+    void overlay(JSONValue o)
+    {
+        if (auto v = "temperature" in o) temperature = numberOrDefault(*v);
+        if (auto v = "thinking" in o) thinking = Thinking.parse(v.str);
+        if (auto v = "vision" in o) vision = v.boolean;
+        if (auto v = "thinking_levels" in o) thinkingLevels = strings(*v), hasThinkingLevels = true;
+        if (auto v = "name" in o) name = v.str;
+        if (auto v = "base_url" in o) baseUrl = v.str;
     }
 }
 
@@ -90,6 +103,11 @@ struct ProviderConfig
     string[] thinkingLevels;
     bool hasThinkingLevels;
     ModelSettings[string] models;
+    /// `list_models = "configured"`: list only `models` (with their names)
+    /// instead of the endpoint's `/models`.
+    bool configuredList;
+    /// `disabled = true`: hidden from listings; naming it is an error.
+    bool disabled;
     long timeoutSecs = 600;
     long maxRetries = 5;
     long retryInitialBackoffMs = -1, retryMaxBackoffMs = -1;
@@ -163,7 +181,18 @@ struct ProviderConfig
         if (auto v = "vision" in o) vision = v.boolean;
         if (auto v = "thinking_levels" in o) thinkingLevels = strings(*v), hasThinkingLevels = true;
         if (auto v = "models" in o)
-            foreach (name, m; v.objectNoRef) models[name] = ModelSettings.fromJSON(m);
+            foreach (name, m; v.objectNoRef)
+            {
+                if (auto e = name in models) e.overlay(m);
+                else models[name] = ModelSettings.fromJSON(m);
+            }
+        if (auto v = "list_models" in o)
+        {
+            if (v.str != "configured" && v.str != "endpoint")
+                throw new Exception(format("list_models must be \"endpoint\" or \"configured\", not \"%s\"", v.str));
+            configuredList = v.str == "configured";
+        }
+        if (auto v = "disabled" in o) disabled = v.boolean;
         if (auto v = "timeout_secs" in o) timeoutSecs = v.integer;
         if (auto v = "max_retries" in o) maxRetries = v.integer;
         if (auto v = "retry_initial_backoff_ms" in o) retryInitialBackoffMs = v.integer;
@@ -176,6 +205,35 @@ struct ProviderConfig
         }
         if (auto v = "replay_reasoning" in o) replayReasoning = v.boolean;
     }
+
+    /// The configured models as (id, display name), sorted by id, when
+    /// `list_models = "configured"`; null means list from the endpoint.
+    string[2][] configuredModels() const
+    {
+        import std.algorithm : sort;
+        if (!configuredList) return null;
+        string[2][] o;
+        foreach (id, m; models) o ~= [id, m.name];
+        o.sort!((a, b) => a[0] < b[0]);
+        return o;
+    }
+}
+
+/// The names of the providers to offer in listings: `disabled` ones dropped, sorted.
+string[] enabledProviderNames(const ProviderConfig[string] providers)
+{
+    import std.algorithm : sort;
+    string[] o;
+    foreach (k, p; providers) if (!p.disabled) o ~= k;
+    o.sort();
+    return o;
+}
+
+/// Refuse a spec naming a disabled provider.
+void checkEnabled(string name, const ref ProviderConfig p)
+{
+    if (p.disabled)
+        throw new Exception(format("provider \"%s\" is disabled (`disabled = true` in [providers.%s])", name, name));
 }
 
 /// A number, or NaN for `"default"` (send none).
@@ -459,6 +517,7 @@ ResolvedProvider resolve(const ref Config c, string spec)
         names.sort();
         throw new Exception(format("unknown provider \"%s\" for model \"%s\"; known providers: %s", name, spec, names.join(", ")));
     }
+    checkEnabled(name, *pc);
     ResolvedProvider r;
     r.name = name;
     // A deep copy out of the const table, so callers may edit it freely.
@@ -466,6 +525,9 @@ ResolvedProvider resolve(const ref Config c, string spec)
     r.model = model.length ? model : pc.defaultModel;
     if (!r.model.length)
         throw new Exception(format("no model given for provider \"%s\" and it has no default_model", name));
+    // A model's own `base_url` wins (regional OpenRouter hosts, #169).
+    if (auto ms = r.model in pc.models)
+        if (ms.baseUrl !is null) r.config.baseUrl = ms.baseUrl;
     if (!r.config.hasKind) r.config.kind = ProviderKind.openai;
     final switch (r.config.kind)
     {
@@ -515,6 +577,79 @@ unittest
     assert(isNaN(c.temperature));
     auto a = resolve(c, "anthropic");
     assert(a.model == "c9" && a.config.baseUrl == "https://api.anthropic.com/v1");
+}
+
+/// A regional OpenRouter workspace (#169): US by default, one model on EU, a
+/// curated list, and the global preset disabled.
+version (unittest) Config regionalConfig(string extra = "")
+{
+    import std.file : write, tempDir, remove;
+    auto path = buildPath(tempDir, "nano-coder-d-regional-test.toml");
+    write(path, `default_provider = "mock"
+[providers.openrouter]
+disabled = true
+[providers.openrouter-camunda]
+kind = "openai"
+base_url = "https://us.openrouter.ai/api/v1/"
+api_key = "k"
+list_models = "configured"
+default_model = "moonshotai/kimi-k3"
+[providers.openrouter-camunda.models."moonshotai/kimi-k3"]
+name = "Kimi K3"
+[providers.openrouter-camunda.models."amazon/nova-lite-v1"]
+name = "Nova Lite 1.0"
+base_url = "https://eu.openrouter.ai/api/v1"
+` ~ extra);
+    scope (exit) remove(path);
+    return Config.load(path);
+}
+
+// rust: providers/mod.rs::a_models_base_url_overrides_the_providers
+unittest
+{
+    import std.algorithm : canFind;
+    import std.exception : collectExceptionMsg;
+    auto c = regionalConfig();
+    auto eu = resolve(c, "openrouter-camunda/amazon/nova-lite-v1");
+    assert(eu.config.baseUrl == "https://eu.openrouter.ai/api/v1" && eu.model == "amazon/nova-lite-v1");
+    auto us = resolve(c, "openrouter-camunda/moonshotai/kimi-k3");
+    assert(us.config.baseUrl == "https://us.openrouter.ai/api/v1", us.config.baseUrl);
+    assert(resolve(c, "openrouter-camunda/x-ai/grok-4.6").config.baseUrl == us.config.baseUrl);
+    assert(resolve(c, "openrouter-camunda").model == "moonshotai/kimi-k3");
+    // A bad per-model host is refused like a bad provider host.
+    auto bad = regionalConfig("[providers.openrouter-camunda.models.\"m\"]\nbase_url = \"ftp://eu.openrouter.ai\"\n");
+    assert(collectExceptionMsg(resolve(bad, "openrouter-camunda/m")).canFind("must be http(s)"));
+}
+
+// rust: providers/mod.rs::a_disabled_provider_is_hidden_and_refused
+unittest
+{
+    import std.algorithm : canFind;
+    import std.exception : collectExceptionMsg;
+    auto c = regionalConfig();
+    assert(c.providers["openrouter"].disabled);
+    assert(c.providers["openrouter"].baseUrl == "https://openrouter.ai/api/v1", "the preset merges");
+    auto shown = enabledProviderNames(c.providers);
+    assert(!shown.canFind("openrouter") && shown.canFind("openrouter-camunda"));
+    foreach (spec; ["openrouter/moonshotai/kimi-k3", "openrouter"])
+        assert(collectExceptionMsg(resolve(c, spec)).canFind(`"openrouter" is disabled`), spec);
+}
+
+// rust: providers/mod.rs::a_configured_model_list_keeps_names_and_merges_over_presets
+unittest
+{
+    import std.algorithm : canFind;
+    import std.exception : collectExceptionMsg;
+    auto c = regionalConfig();
+    string[2][] want = [["amazon/nova-lite-v1", "Nova Lite 1.0"], ["moonshotai/kimi-k3", "Kimi K3"]];
+    assert(c.providers["openrouter-camunda"].configuredModels == want);
+    assert(c.providers["openai"].configuredModels is null, "presets list from the endpoint");
+    // A later layer sets only some fields of a model: the rest survive.
+    ProviderConfig p;
+    p.merge(parseToml("list_models = \"configured\"\n[models.m]\nname = \"M\"\nbase_url = \"https://a/v1\"\n"));
+    p.merge(parseToml("list_models = \"endpoint\"\n[models.m]\nname = \"Em\"\n"));
+    assert(!p.configuredList && p.models["m"].name == "Em" && p.models["m"].baseUrl == "https://a/v1");
+    assert(collectExceptionMsg(p.merge(parseToml("list_models = \"all\"\n"))).canFind("list_models must be"));
 }
 
 // rust: config.rs::a_retired_legacy_renderer_setting_still_loads_with_a_notice

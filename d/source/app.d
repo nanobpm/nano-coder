@@ -1260,7 +1260,13 @@ int runMain(string[] args)
     {
         try
         {
-            foreach (m; makeClient(resolve(cfg, o.listModels)).listModels) writeln(m);
+            import std.algorithm : map;
+            import std.array : array;
+            auto rp = resolve(cfg, o.listModels);
+            // A curated list (`list_models = "configured"`) needs no request.
+            auto configured = rp.config.configuredModels;
+            auto models = configured !is null ? configured.map!(m => m[0]).array : makeClient(rp).listModels;
+            foreach (m; models) writeln(rp.name, "/", m);
             return 0;
         }
         catch (Exception e) die(e.msg);
@@ -1460,7 +1466,7 @@ int runMain(string[] args)
         host.sessionDir = o.noSession ? null : sessionDir;
         host.version_ = versionString;
         host.loadHooks = &loadHooks;
-        host.providerNames = () => cfg.providers.keys;
+        host.providerNames = () => enabledProviderNames(cfg.providers);
         host.configModel = cfg.model;
         host.configSystemPrompt = cfg.systemPrompt;
         host.sessionMeta = () {
@@ -1572,7 +1578,7 @@ int runMain(string[] args)
         push(currentSpec(), "current");
         synchronized foreach (r; recents.models) push(r, "recent");
         bool configured(string n) { return cfg.userProviders.canFind(n) || n == cfg.defaultProvider; }
-        auto names = cfg.providers.keys.dup;
+        auto names = enabledProviderNames(cfg.providers);
         names.sort!((a, b) => configured(a) != configured(b) ? configured(a) : a < b);
         string kindOf(string n)
         {
@@ -1595,6 +1601,9 @@ int runMain(string[] args)
         foreach (n; names)
             if (auto m = cfg.providers[n].defaultModel)
                 push(n ~ "/" ~ m, n == cfg.defaultProvider ? "default provider" : providerNote(n));
+        // A curated list (`list_models = "configured"`) offers each of its models.
+        foreach (n; names)
+            foreach (m; cfg.providers[n].configuredModels) push(n ~ "/" ~ m[0], m[1]);
         foreach (n; names) push(n, providerNote(n));
         return out_;
     };

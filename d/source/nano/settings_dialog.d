@@ -75,22 +75,37 @@ string pickModel(SettingsUi ui, ref SettingsHost h)
     }
 }
 
+/// A configured model's picker row: its display name, then its id.
+string modelLabel(string id, string name)
+{
+    import nano.trajectory : sanitizeTerminal;
+    return name.strip.length ? format("%s  (%s)", sanitizeTerminal(name), id) : id;
+}
+
 /// A model from `name`'s list (or typed); null goes back to the providers.
 string pickFromProvider(SettingsUi ui, ref SettingsHost h, string name)
 {
     import std.algorithm : countUntil;
     auto p = name in h.cfg.providers;
     string defaultModel = p !is null ? p.defaultModel : null;
-    ui.say(format("Fetching models from %s...", name));
-    string[] models;
-    try models = h.listModels(name);
-    catch (Exception e) ui.say(format("Could not list models: %s", e.msg));
+    // A curated list (`list_models = "configured"`) needs no request.
+    auto configured = p !is null ? p.configuredModels : null;
+    string[] models, shown;
+    if (configured !is null)
+        foreach (m; configured) models ~= m[0], shown ~= modelLabel(m[0], m[1]);
+    else
+    {
+        ui.say(format("Fetching models from %s...", name));
+        try models = h.listModels(name);
+        catch (Exception e) ui.say(format("Could not list models: %s", e.msg));
+        shown = models;
+    }
     string model;
     enum typed = "Model ID (empty to go back to the provider list)";
     if (!models.length) model = ui.input(typed, "");
     else
     {
-        auto labels = models ~ ["Other (type a model ID)", "Back to providers"];
+        auto labels = shown ~ ["Other (type a model ID)", "Back to providers"];
         auto at = models.countUntil(defaultModel);
         auto i = ui.select(format("Model from %s (Esc to go back)", name), labels, at >= 0 ? at : 0);
         if (i < 0 || i > models.length) return null;

@@ -1177,3 +1177,8 @@ vision.rs::ollama_and_llamacpp_detection	todo
 vision.rs::openai_vision_families_match_whole_segments	todo
 vision.rs::override_wins_over_detection	test
 vision.rs::per_model_override_is_most_specific	todo
+providers/mod.rs::a_models_base_url_overrides_the_providers	test
+providers/mod.rs::a_disabled_provider_is_hidden_and_refused	test
+providers/mod.rs::a_configured_model_list_keeps_names_and_merges_over_presets	test
+settings.rs::provider_rows_skip_disabled_providers_and_configured_models_show_names	test
+commands.rs::model_suggestions_offer_configured_models_and_skip_disabled_providers	claimed	app.d modelSuggestionSource closure (not unit-testable); configuredModels/enabledProviderNames tested in config.d

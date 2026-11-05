@@ -115,9 +115,8 @@ private string kindLabel(const ref ProviderConfig p)
 /// `/providers`: every effective provider in name order.
 string providersListing(const ProviderConfig[string] providers, string defaultProvider, string dataDir = null)
 {
-    import std.algorithm : sort;
-    auto names = providers.keys;
-    names.sort();
+    import nano.config : enabledProviderNames;
+    auto names = enabledProviderNames(providers);
     auto out_ = format("Providers (default: %s):", defaultProvider);
     foreach (n; names)
     {

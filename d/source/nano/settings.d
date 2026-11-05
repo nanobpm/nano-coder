@@ -8,7 +8,7 @@ module nano.settings;
 import std.format : format;
 import std.math : isNaN;
 import std.typecons : Nullable, Tuple, tuple;
-import nano.config : Config, ProviderConfig, ProviderKind, ModelSettings;
+import nano.config : Config, ProviderConfig, ProviderKind, ModelSettings, enabledProviderNames;
 import nano.thinking : Thinking;
 import nano.toml_edit;
 
@@ -79,8 +79,7 @@ ProviderRow[] providerRows(const string[] recent, string currentSpec, string cur
     foreach (spec; recent)
         rows ~= ProviderRow(format("↺ %s%s", spec, spec == currentSpec ? "  (current)" : ""), ProviderRow.Kind.model, spec);
     auto first = rows.length;
-    auto names = all.keys;
-    names.sort();
+    auto names = enabledProviderNames(all);
     foreach (n; names) rows ~= ProviderRow(format("%-14s %s", n, keyStatus(all[n], dataDir)), ProviderRow.Kind.provider, n);
     rows ~= ProviderRow("Cancel", ProviderRow.Kind.cancel);
     auto prev = recent.countUntil!(s => s != currentSpec);
@@ -269,6 +268,25 @@ unittest
     assert(rows[$ - 1].kind == ProviderRow.Kind.cancel && rows.length == 5);
     rows = providerRows([], "a/x", "b", all, initial, "/nonexistent");
     assert(initial == 1 && rows[1].value == "b");
+
+    // A disabled provider is not offered; the preselection counts shown rows.
+    // rust: settings.rs::provider_rows_skip_disabled_providers_and_configured_models_show_names
+    ProviderConfig off;
+    off.disabled = true;
+    ProviderConfig[string] some = ["a": a, "b": b, "off": off];
+    rows = providerRows([], "b/x", "b", some, initial, "/nonexistent");
+    assert(rows.length == 3 && rows[1].value == "b" && initial == 1);
+    {
+        import nano.ui : providersListing;
+        auto listing = providersListing(some, "a", "/nonexistent");
+        assert(listing.canFind("\n  b ") && !listing.canFind("off"), listing);
+    }
+    {
+        import nano.settings_dialog : modelLabel;
+        assert(modelLabel("amazon/nova-lite-v1", "Nova Lite 1.0") == "Nova Lite 1.0  (amazon/nova-lite-v1)");
+        assert(modelLabel("m", " ") == "m");
+        assert(!modelLabel("m", "A\x1b[2Jb").canFind('\x1b'), "escape dropped");
+    }
 
     auto ch = thinkingChoices(1, ["low", "high"], Nullable!Thinking(Thinking.parse("medium")), initial);
     assert(ch.length == 5 && ch[0][1].canFind("unset") && ch[4][1] == "medium" && initial == 4);
