@@ -94,20 +94,33 @@ pub fn parse_compact_args(args: &str) -> (Option<crate::config::CompactionMode>,
 pub fn rejection(line: &str) -> Option<String> {
     let line = line.trim();
     let word = line.split_whitespace().next()?;
-    if !word.starts_with('/') || word.starts_with("//") || COMMANDS.iter().any(|c| c.name == word) {
+    if !is_command(line) || COMMANDS.iter().any(|c| c.name == word) {
         return None;
     }
     let mut note = format!("Unknown command {word}");
     if let Some(close) = closest(word) {
         note.push_str(&format!(". Did you mean {close}?"));
     }
-    if word[1..].contains('/') {
-        // Looks like a path: say how to send it as a prompt.
-        note.push_str(&format!(" To send a message starting with a path, type //{}", &word[1..]));
-    } else {
-        note.push_str(" (/help lists commands)");
-    }
+    note.push_str(" (/help lists commands)");
     Some(note)
+}
+
+/// Whether a submitted line is a slash command rather than a prompt. A
+/// known command (`/help`, `/model x/y`) always is; an unknown `/word` is
+/// only when it is a single line whose first word doesn't look like a path,
+/// so a prompt such as `/workspace is shared.\n...` or `/tmp/foo is empty,
+/// why?` reaches the model instead of being swallowed (issue #173). A `//…`
+/// line is an escaped prompt, never a command.
+pub fn is_command(line: &str) -> bool {
+    let line = line.trim();
+    let Some(word) = line.split_whitespace().next() else { return false };
+    if !word.starts_with('/') || word.starts_with("//") {
+        return false;
+    }
+    if COMMANDS.iter().any(|c| c.name == word) {
+        return true;
+    }
+    !word[1..].contains('/') && !line.contains('\n')
 }
 
 /// A `//…` line is a prompt that starts with `/`: the text with one `/`
@@ -455,12 +468,43 @@ mod tests {
         assert!(!rejection("/frobnicate").unwrap().contains("Did you mean"));
         // With arguments, and with surrounding whitespace.
         assert!(rejection("  /modle gpt-4o ").unwrap().contains("Did you mean /model?"));
-        // A path: explain the `//` escape.
-        let note = rejection("/usr/lib is 4 GB, why?").unwrap();
-        assert!(note.contains("type //usr/lib"), "{note}");
-        // Not rejected: known commands (with args), `//` prompts, plain text.
-        for ok in ["/exit", "/model gpt-4o", "/compact --smart focus", "//usr/lib", "hello /exin", "", "   "] {
+        // Not rejected: known commands (with args), `//` prompts, plain text,
+        // and prompts that start with a path or span several lines (#173).
+        for ok in [
+            "/exit",
+            "/model gpt-4o",
+            "/compact --smart focus",
+            "//usr/lib",
+            "hello /exin",
+            "",
+            "   ",
+            "/usr/lib is 4 GB, why?",
+            "/tmp/foo is empty, why?",
+            "\n/workspace is the only path you share with the user.\n\nWrite a FEEL expression",
+        ] {
             assert_eq!(rejection(ok), None, "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn only_known_or_plausible_commands_are_commands() {
+        // Known commands, with or without arguments (including path-like args).
+        for cmd in ["/help", "/compact", "/compact --smart keep tests", "/model openai/gpt-4o", " /exit \n"] {
+            assert!(is_command(cmd), "{cmd:?}");
+        }
+        // A single-line unknown word is still a (mistyped) command.
+        assert!(is_command("/exin"));
+        assert!(is_command("/frobnicate now"));
+        // Path-leading prompts, single- or multi-line, are prompts (#173).
+        for prompt in [
+            "\n/workspace is the only path you share with the user.\n\nWrite a FEEL expression to /workspace/answer.feel",
+            "/tmp/foo is empty, why?",
+            "/workspace\nis shared",
+            "//escaped",
+            "plain",
+            "",
+        ] {
+            assert!(!is_command(prompt), "{prompt:?}");
         }
     }
 

@@ -1392,7 +1392,7 @@ fn classify_steer_input(text: &str, steer: bool) -> SteerRoute {
         SteerRoute::QueueCommand(op)
     } else if let Some(arg) = text.strip_prefix("/thinking ").map(str::trim).filter(|a| !a.is_empty()) {
         SteerRoute::Thinking(thinking_arg(arg))
-    } else if text.starts_with('/') && commands::unescape_prompt(text).is_none() {
+    } else if commands::is_command(text) {
         SteerRoute::DeferCommand
     } else if steer {
         SteerRoute::Steer
@@ -2168,7 +2168,7 @@ async fn run_command(
             }
             Ok(true)
         }
-        _ if cmd.starts_with('/') && commands::unescape_prompt(cmd).is_none() => {
+        _ if commands::is_command(cmd) => {
             // Never send a `/…` line to the model: the editor refuses unknown
             // commands, and this catches the rest (a known command with
             // arguments it doesn't take, or a line queued before this check).
@@ -3282,7 +3282,7 @@ async fn main() -> Result<()> {
             }
             // A refused `/command` note no longer applies once a line is sent.
             terminal.renderer.clear_transient();
-            if frame_mode && (!input.starts_with('/') || commands::unescape_prompt(&input).is_some()) {
+            if frame_mode && !commands::is_command(&input) {
                 terminal.renderer.frame_user_message(commands::unescape_prompt(&input).unwrap_or(&input));
             }
 
