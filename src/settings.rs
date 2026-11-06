@@ -665,7 +665,11 @@ fn apply_qwen_endpoint(config: &mut ProviderConfig, endpoint: &providers::qwen::
 fn recent_models(recents: &[String], all: &std::collections::BTreeMap<String, ProviderConfig>) -> Vec<String> {
     recents
         .iter()
-        .filter(|spec| spec.split_once('/').is_none_or(|(provider, _)| all.contains_key(provider)))
+        // Skip a spec whose provider is no longer configured or is hidden:
+        // hidden entries neither appear nor consume a RECENT_MODELS_SHOWN slot.
+        .filter(|spec| {
+            spec.split_once('/').is_none_or(|(provider, _)| all.get(provider).is_some_and(|p| p.is_visible()))
+        })
         .take(RECENT_MODELS_SHOWN)
         .cloned()
         .collect()
@@ -708,13 +712,13 @@ fn provider_rows(
     let first_provider = rows.len();
     rows.extend(
         all.iter()
-            .filter(|(_, p)| !p.is_disabled())
+            .filter(|(_, p)| p.is_visible())
             .map(|(name, p)| (format!("{name:<14} {}", key_status(p)), Some(ProviderChoice::Provider(name.clone())))),
     );
     rows.push(("Cancel".to_string(), None));
     let default = recent.iter().position(|spec| spec != current_spec).unwrap_or_else(|| {
         first_provider
-            + all.iter().filter(|(_, p)| !p.is_disabled()).position(|(name, _)| name == current_provider).unwrap_or(0)
+            + all.iter().filter(|(_, p)| p.is_visible()).position(|(name, _)| name == current_provider).unwrap_or(0)
     });
     (rows, default)
 }
@@ -1539,6 +1543,19 @@ mod tests {
             specs(&["work/llama3", "anthropic/claude", "bare-model", "openai/gpt-5"])
         );
         assert!(recent_models(&[], &all).is_empty());
+    }
+
+    #[test]
+    fn recent_models_skip_hidden_providers_without_consuming_slots() {
+        let mut all = providers(&["anthropic", "openai", "work"]);
+        all.get_mut("work").unwrap().hidden = Some(true);
+        let recents = specs(&["work/llama3", "anthropic/claude", "bare-model", "openai/gpt-5", "openai/o3"]);
+        // `work` is hidden: its recent neither appears nor eats one of the
+        // RECENT_MODELS_SHOWN slots, so all four visible entries are kept.
+        assert_eq!(
+            recent_models(&recents, &all),
+            specs(&["anthropic/claude", "bare-model", "openai/gpt-5", "openai/o3"])
+        );
     }
 
     #[test]
