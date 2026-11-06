@@ -626,8 +626,8 @@ mod tests {
         let work = values.iter().position(|v| *v == "work/gpt-oss-120b").unwrap();
         let bare_work = values.iter().position(|v| *v == "work").unwrap();
         assert!(work < bare_work, "provider defaults before bare providers: {values:?}");
-        let mock = values.iter().position(|v| *v == "mock/mock").unwrap();
-        assert!(work < mock, "configured providers before untouched presets: {values:?}");
+        // mock is hidden by default, so it should not appear in suggestions
+        assert!(!values.iter().any(|v| *v == "mock/mock" || *v == "mock"), "hidden mock not in suggestions: {values:?}");
         // No duplicates: a recent that is also a provider default appears once.
         let recents = vec!["work/gpt-oss-120b".to_string()];
         let found = model_suggestions(&config, &recents);

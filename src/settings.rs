@@ -708,13 +708,13 @@ fn provider_rows(
     let first_provider = rows.len();
     rows.extend(
         all.iter()
-            .filter(|(_, p)| !p.is_disabled())
+            .filter(|(_, p)| p.is_visible())
             .map(|(name, p)| (format!("{name:<14} {}", key_status(p)), Some(ProviderChoice::Provider(name.clone())))),
     );
     rows.push(("Cancel".to_string(), None));
     let default = recent.iter().position(|spec| spec != current_spec).unwrap_or_else(|| {
         first_provider
-            + all.iter().filter(|(_, p)| !p.is_disabled()).position(|(name, _)| name == current_provider).unwrap_or(0)
+            + all.iter().filter(|(_, p)| p.is_visible()).position(|(name, _)| name == current_provider).unwrap_or(0)
     });
     (rows, default)
 }

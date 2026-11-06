@@ -125,6 +125,11 @@ pub struct ProviderConfig {
     /// pickers and suggestions; naming it in a model spec is an error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled: Option<bool>,
+    /// Hide this provider from `/providers`, the pickers and suggestions, but
+    /// still allow it when named explicitly in a model spec (e.g. `mock/...`).
+    /// Unlike `disabled`, a hidden provider is still usable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hidden: Option<bool>,
 }
 
 /// Where a provider's model list comes from (`list_models`).
@@ -174,7 +179,8 @@ impl ProviderConfig {
             vision,
             thinking_levels,
             list_models,
-            disabled
+            disabled,
+            hidden
         );
         self.headers.extend(other.headers.clone());
         for (model, settings) in &other.models {
@@ -206,6 +212,16 @@ impl ProviderConfig {
         self.disabled == Some(true)
     }
 
+    /// Whether `hidden = true` hides this provider from listings but keeps it usable.
+    pub fn is_hidden(&self) -> bool {
+        self.hidden == Some(true)
+    }
+
+    /// Whether this provider should appear in listings and pickers.
+    pub fn is_visible(&self) -> bool {
+        !self.is_disabled() && !self.is_hidden()
+    }
+
     /// The endpoint for `model`: its own `base_url` if set, else the provider's.
     pub fn base_url_for(&self, model: &str) -> Option<&String> {
         self.models.get(model).and_then(|m| m.base_url.as_ref()).or(self.base_url.as_ref())
@@ -219,9 +235,9 @@ impl ProviderConfig {
     }
 }
 
-/// The providers to offer in listings and pickers: `disabled` ones dropped.
+/// The providers to offer in listings and pickers: `disabled`/`hidden` ones dropped.
 pub fn enabled(providers: &BTreeMap<String, ProviderConfig>) -> BTreeMap<String, ProviderConfig> {
-    providers.iter().filter(|(_, p)| !p.is_disabled()).map(|(k, v)| (k.clone(), v.clone())).collect()
+    providers.iter().filter(|(_, p)| p.is_visible()).map(|(k, v)| (k.clone(), v.clone())).collect()
 }
 
 /// Refuse a spec naming a disabled provider, before it can fall through to
@@ -309,7 +325,7 @@ pub fn presets() -> BTreeMap<String, ProviderConfig> {
     );
     add("ollama", ProviderConfig::preset(Openai, "http://localhost:11434/v1", None));
     add("llamacpp", ProviderConfig::preset(Openai, "http://localhost:8080/v1", None));
-    add("mock", ProviderConfig { kind: Some(Mock), default_model: Some("mock".into()), ..Default::default() });
+    add("mock", ProviderConfig { kind: Some(Mock), default_model: Some("mock".into()), hidden: Some(true), ..Default::default() });
     presets
 }
 
