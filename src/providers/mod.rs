@@ -325,7 +325,15 @@ pub fn presets() -> BTreeMap<String, ProviderConfig> {
     );
     add("ollama", ProviderConfig::preset(Openai, "http://localhost:11434/v1", None));
     add("llamacpp", ProviderConfig::preset(Openai, "http://localhost:8080/v1", None));
-    add("mock", ProviderConfig { kind: Some(Mock), default_model: Some("mock".into()), hidden: Some(true), ..Default::default() });
+    add(
+        "mock",
+        ProviderConfig {
+            kind: Some(Mock),
+            default_model: Some("mock".into()),
+            hidden: Some(true),
+            ..Default::default()
+        },
+    );
     presets
 }
 
@@ -2093,6 +2101,25 @@ mod tests {
             let err = validate_spec(spec, &all, "openrouter-camunda").unwrap_err().to_string();
             assert!(err.contains("is disabled"), "{err}");
         }
+    }
+
+    #[test]
+    fn a_hidden_provider_is_filtered_from_listings_but_still_usable() {
+        // The mock preset is hidden by default: `enabled` drops it, while the
+        // effective map still resolves an explicit `mock/...` spec.
+        let all = effective_providers(&HashMap::new());
+        assert!(all["mock"].is_hidden() && !all["mock"].is_disabled());
+        let shown = enabled(&all);
+        assert!(!shown.contains_key("mock"), "hidden mock is not listed");
+        assert!(shown.contains_key("openai"), "visible presets are listed");
+        let (provider, model) = parse_model_spec("mock/test", &all, "openai");
+        assert_eq!((provider, model), ("mock", Some("test")), "a hidden provider still resolves");
+
+        // A user-configured hidden provider is filtered the same way.
+        let user: HashMap<String, ProviderConfig> =
+            [("internal".to_string(), toml::from_str("hidden = true").unwrap())].into_iter().collect();
+        let shown = enabled(&effective_providers(&user));
+        assert!(!shown.contains_key("internal"), "a user-hidden provider is not listed");
     }
 
     #[test]

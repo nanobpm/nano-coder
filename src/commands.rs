@@ -264,7 +264,10 @@ fn thinking_suggestions() -> Vec<Suggestion> {
 /// Duplicates are dropped, keeping the earliest rank.
 fn model_suggestions(config: &Config, recents: &[String]) -> Vec<Suggestion> {
     let (user, default_provider) = config.effective_providers();
-    let all = providers::enabled(&providers::effective_providers(&user));
+    // The full map resolves specs (a hidden provider named explicitly still
+    // works); only the visible subset is offered as suggestions.
+    let all = providers::effective_providers(&user);
+    let visible = providers::enabled(&all);
     let mut out: Vec<Suggestion> = Vec::new();
     let mut push = |value: String, note: String| {
         if !value.is_empty() && !out.iter().any(|s| s.value == value) {
@@ -276,30 +279,40 @@ fn model_suggestions(config: &Config, recents: &[String]) -> Vec<Suggestion> {
     if !current.is_empty() {
         // Canonicalize to match how recents are stored, so the current model
         // and its recents entry dedupe into one row.
-        push(crate::recents::canonical(current, &all, &default_provider), "current".to_string());
+        let canonical = crate::recents::canonical(current, &all, &default_provider);
+        // A current model on a hidden provider stays usable but is not
+        // offered as a suggestion.
+        let (provider, _) = providers::parse_model_spec(&canonical, &all, &default_provider);
+        if visible.contains_key(provider) {
+            push(canonical, "current".to_string());
+        }
     }
     for spec in recents {
-        push(spec.to_string(), "recent".to_string());
+        // A recent on a hidden (or removed) provider is not offered.
+        let (provider, _) = providers::parse_model_spec(spec, &all, &default_provider);
+        if visible.contains_key(provider) {
+            push(spec.to_string(), "recent".to_string());
+        }
     }
     // A provider the user has an entry for (or the default provider) is a
     // pathway already taken; its default model outranks untouched presets.
     let configured = |name: &str| user.contains_key(name) || name == default_provider;
-    let mut names: Vec<&String> = all.keys().collect();
+    let mut names: Vec<&String> = visible.keys().collect();
     names.sort_by_key(|name| !configured(name));
     for name in &names {
-        let provider = &all[*name];
+        let provider = &visible[*name];
         if let Some(model) = provider.default_model.as_deref().filter(|m| !m.is_empty()) {
             push(format!("{name}/{model}"), default_note(name, provider, &default_provider));
         }
     }
     // A curated list (`list_models = "configured"`) offers each of its models.
     for name in &names {
-        for (model, label) in all[*name].configured_models().unwrap_or_default() {
+        for (model, label) in visible[*name].configured_models().unwrap_or_default() {
             push(format!("{name}/{model}"), label.unwrap_or_default());
         }
     }
     for name in &names {
-        push((*name).clone(), provider_note(name, &all[*name], &default_provider));
+        push((*name).clone(), provider_note(name, &visible[*name], &default_provider));
     }
     out
 }
@@ -627,7 +640,10 @@ mod tests {
         let bare_work = values.iter().position(|v| *v == "work").unwrap();
         assert!(work < bare_work, "provider defaults before bare providers: {values:?}");
         // mock is hidden by default, so it should not appear in suggestions
-        assert!(!values.iter().any(|v| *v == "mock/mock" || *v == "mock"), "hidden mock not in suggestions: {values:?}");
+        assert!(
+            !values.iter().any(|v| *v == "mock/mock" || *v == "mock"),
+            "hidden mock not in suggestions: {values:?}"
+        );
         // No duplicates: a recent that is also a provider default appears once.
         let recents = vec!["work/gpt-oss-120b".to_string()];
         let found = model_suggestions(&config, &recents);
@@ -659,6 +675,48 @@ mod tests {
             !found.iter().any(|s| s.value == "openrouter" || s.value.starts_with("openrouter/")),
             "disabled hidden"
         );
+    }
+
+    #[test]
+    fn model_suggestions_skip_hidden_current_and_recent_models() {
+        // The current model and a recent both sit on the hidden mock preset:
+        // neither is offered, and neither is canonicalized onto the default
+        // provider (`mock/test` must not become `openai/mock/test`).
+        let config = config(
+            r#"
+            model = "mock/test"
+            default_provider = "openai"
+        "#,
+        );
+        let recents = vec!["mock/test".to_string(), "openai/gpt-4o".to_string()];
+        let found = model_suggestions(&config, &recents);
+        let values: Vec<&str> = found.iter().map(|s| s.value.as_str()).collect();
+        assert!(
+            !values.iter().any(|v| *v == "mock/test" || *v == "openai/mock/test" || *v == "mock"),
+            "hidden current/recent not suggested: {values:?}"
+        );
+        assert!(values.contains(&"openai/gpt-4o"), "visible recent still offered: {values:?}");
+
+        // A user-configured hidden provider is filtered the same way.
+        let user_hidden = super::tests::config(
+            r#"
+            model = "openai/gpt-4o"
+            default_provider = "openai"
+            [providers.internal]
+            kind = "openai"
+            base_url = "http://merlin.local:8000/v1"
+            default_model = "dev-model"
+            hidden = true
+        "#,
+        );
+        let recents = vec!["internal/dev-model".to_string()];
+        let found = model_suggestions(&user_hidden, &recents);
+        let values: Vec<&str> = found.iter().map(|s| s.value.as_str()).collect();
+        assert!(
+            !values.iter().any(|v| *v == "internal" || v.starts_with("internal/")),
+            "user-hidden provider not suggested: {values:?}"
+        );
+        assert!(values.contains(&"openai/gpt-4o"), "visible current still offered: {values:?}");
     }
 
     #[test]

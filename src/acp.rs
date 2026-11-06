@@ -460,7 +460,10 @@ async fn handle_inner(agent: &mut Agent, msg: &Value) -> Option<Value> {
 
             if command == "/providers" {
                 let (user, _) = agent.config().effective_providers();
-                let names: Vec<String> = providers::effective_providers(&user).into_keys().collect();
+                // Honor visibility: hidden/disabled providers stay usable via
+                // an explicit spec but are not listed.
+                let names: Vec<String> =
+                    providers::enabled(&providers::effective_providers(&user)).into_keys().collect();
                 return Some(result(id, json!({ "stopReason": "end_turn", "providers": names })));
             }
 
