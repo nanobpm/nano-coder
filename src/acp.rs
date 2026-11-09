@@ -615,6 +615,8 @@ async fn run_turn(
 ) {
     let control = agent.control();
     let active = agent.session_id().map(str::to_string);
+    let stats = agent.context_stats();
+    let tokens_before = session_tokens(&stats.lock().unwrap());
     // Length of `deferred` when each steer arrived, so a steer that runs as its
     // own prompt keeps its place among messages deferred during the turn.
     let mut steer_marks: Vec<usize> = Vec::new();
@@ -650,6 +652,9 @@ async fn run_turn(
     // A prompt sent as a notification runs but gets no reply.
     if let Some(id) = &id {
         let mut reply = json!({ "stopReason": stop.as_acp(), "response": response });
+        if let Some(usage) = turn_usage(tokens_before, session_tokens(&stats.lock().unwrap())) {
+            reply["usage"] = usage;
+        }
         // Extension: the model's explicit completed/blocked report.
         if let Some(reported) = reported {
             reply["_meta"] = json!({ "outcome": reported });
@@ -726,9 +731,37 @@ fn thinking_value(resolved: &crate::thinking::Resolved) -> serde_json::Value {
     }
 }
 
+/// Session token counters (input, output) as reported by the provider.
+fn session_tokens(stats: &crate::context::ContextStats) -> (u64, u64) {
+    (stats.session_input_tokens, stats.session_output_tokens)
+}
+
+/// ACP `PromptResponse.usage` for one turn: the tokens the provider reported
+/// between the turn's start and end, summed over its model calls. `None` when
+/// the provider reported nothing (the field is optional in ACP).
+fn turn_usage(before: (u64, u64), after: (u64, u64)) -> Option<Value> {
+    let input = after.0.saturating_sub(before.0);
+    let output = after.1.saturating_sub(before.1);
+    if input == 0 && output == 0 {
+        return None;
+    }
+    Some(json!({ "inputTokens": input, "outputTokens": output, "totalTokens": input + output }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_usage_is_the_delta_of_the_session_counters() {
+        assert_eq!(
+            turn_usage((1_000, 50), (13_087, 54)),
+            Some(json!({ "inputTokens": 12_087, "outputTokens": 4, "totalTokens": 12_091 }))
+        );
+        assert_eq!(turn_usage((10, 5), (10, 5)), None, "nothing reported, no usage field");
+        // Counters reset by /clear mid-turn never go negative.
+        assert_eq!(turn_usage((10, 5), (3, 7)), Some(json!({ "inputTokens": 0, "outputTokens": 2, "totalTokens": 2 })));
+    }
 
     fn steer(text: &str, tag: i64) -> Steer {
         Steer { text: text.to_string(), tag: Some(json!(tag)), id: None }

@@ -117,7 +117,9 @@ A steer that arrives too late to join the turn runs as an ordinary prompt, or is
 answered with `stopReason: "cancelled"` if the turn was cancelled. Slash-command prompts
 and other requests that arrive mid-turn are handled after the turn ends. Everything
 handled after the turn, late steers included, runs in the order the client sent it.
-`stopReason` is `end_turn`, `cancelled`, or `max_turn_requests`.
+`stopReason` is `end_turn`, `cancelled`, or `max_turn_requests`. When the provider reported
+token counts, the result also carries ACP's `usage`: `{"inputTokens", "outputTokens", "totalTokens"}`,
+summed over the turn's model calls.
 
 **Streaming updates.** During a turn the harness sends `session/update` notifications:
 `agent_message_chunk` (with a `messageId`), `tool_call` (`toolCallId`, `title` = tool name,
