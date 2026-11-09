@@ -60,7 +60,7 @@ fn prompt_text(params: &Value) -> String {
 /// leading `/`, anything else passed through unchanged).
 fn enforce_slash_invariant(text: String) -> Result<String, String> {
     let trimmed = text.trim();
-    if trimmed.starts_with('/') && crate::commands::unescape_prompt(trimmed).is_none() {
+    if crate::commands::is_command(trimmed) {
         return Err(crate::commands::rejection(trimmed).unwrap_or_else(|| {
             // `rejection` returns None only for a *known* command that reached
             // this fallback because `handle_inner` didn't service it. Two very
@@ -106,7 +106,7 @@ fn classify_during_turn(msg: &Value, active: Option<&str>) -> DuringTurn {
             let trimmed = text.trim();
             if trimmed.is_empty() {
                 DuringTurn::Defer
-            } else if trimmed.starts_with('/') && crate::commands::unescape_prompt(trimmed).is_none() {
+            } else if crate::commands::is_command(trimmed) {
                 // A real slash command operates on the agent itself, so it
                 // waits for the turn. A `//…` escaped prompt is an ordinary
                 // message, so it steers instead (below), as the terminal does.
@@ -460,7 +460,10 @@ async fn handle_inner(agent: &mut Agent, msg: &Value) -> Option<Value> {
 
             if command == "/providers" {
                 let (user, _) = agent.config().effective_providers();
-                let names: Vec<String> = providers::effective_providers(&user).into_keys().collect();
+                // Honor visibility: hidden/disabled providers stay usable via
+                // an explicit spec but are not listed.
+                let names: Vec<String> =
+                    providers::enabled(&providers::effective_providers(&user)).into_keys().collect();
                 return Some(result(id, json!({ "stopReason": "end_turn", "providers": names })));
             }
 
@@ -799,6 +802,15 @@ mod tests {
     }
 
     #[test]
+    fn path_leading_prompts_reach_the_model_over_acp() {
+        // Issue #173: a prompt starting with a path is a prompt, not a command.
+        let text = "\n/workspace is the only path you share with the user.\n\nWrite a FEEL expression to /workspace/answer.feel";
+        assert_eq!(enforce_slash_invariant(text.to_string()).unwrap(), text);
+        let single = "/tmp/foo is empty, why?";
+        assert_eq!(enforce_slash_invariant(single.to_string()).unwrap(), single);
+    }
+
+    #[test]
     fn slash_prompts_never_reach_the_model_over_acp() {
         // Unknown command: rejected with a suggestion, not sent as a turn.
         let note = enforce_slash_invariant("/exin".to_string()).unwrap_err();
@@ -821,8 +833,8 @@ mod tests {
             assert_eq!(note, format!("Can't run {cmd:?} over ACP"), "{cmd}");
             assert!(!note.contains("not available over ACP"), "{cmd}");
         }
-        // A path-like slash line is rejected with the `//` escape hint.
-        assert!(enforce_slash_invariant("/usr/lib is big".to_string()).unwrap_err().contains("type //usr/lib"));
+        // A path-like slash line is a prompt, passed through unchanged (#173).
+        assert_eq!(enforce_slash_invariant("/usr/lib is big".to_string()).unwrap(), "/usr/lib is big");
         // Leading whitespace doesn't smuggle a slash line past the check.
         assert!(enforce_slash_invariant("  /exin".to_string()).is_err());
         // `//…` is an escaped prompt: the turn sees it with one `/` removed.

@@ -94,20 +94,33 @@ pub fn parse_compact_args(args: &str) -> (Option<crate::config::CompactionMode>,
 pub fn rejection(line: &str) -> Option<String> {
     let line = line.trim();
     let word = line.split_whitespace().next()?;
-    if !word.starts_with('/') || word.starts_with("//") || COMMANDS.iter().any(|c| c.name == word) {
+    if !is_command(line) || COMMANDS.iter().any(|c| c.name == word) {
         return None;
     }
     let mut note = format!("Unknown command {word}");
     if let Some(close) = closest(word) {
         note.push_str(&format!(". Did you mean {close}?"));
     }
-    if word[1..].contains('/') {
-        // Looks like a path: say how to send it as a prompt.
-        note.push_str(&format!(" To send a message starting with a path, type //{}", &word[1..]));
-    } else {
-        note.push_str(" (/help lists commands)");
-    }
+    note.push_str(" (/help lists commands)");
     Some(note)
+}
+
+/// Whether a submitted line is a slash command rather than a prompt. A
+/// known command (`/help`, `/model x/y`) always is; an unknown `/word` is
+/// only when it is a single line whose first word doesn't look like a path,
+/// so a prompt such as `/workspace is shared.\n...` or `/tmp/foo is empty,
+/// why?` reaches the model instead of being swallowed (issue #173). A `//…`
+/// line is an escaped prompt, never a command.
+pub fn is_command(line: &str) -> bool {
+    let line = line.trim();
+    let Some(word) = line.split_whitespace().next() else { return false };
+    if !word.starts_with('/') || word.starts_with("//") {
+        return false;
+    }
+    if COMMANDS.iter().any(|c| c.name == word) {
+        return true;
+    }
+    !word[1..].contains('/') && !line.contains('\n')
 }
 
 /// A `//…` line is a prompt that starts with `/`: the text with one `/`
@@ -251,7 +264,10 @@ fn thinking_suggestions() -> Vec<Suggestion> {
 /// Duplicates are dropped, keeping the earliest rank.
 fn model_suggestions(config: &Config, recents: &[String]) -> Vec<Suggestion> {
     let (user, default_provider) = config.effective_providers();
-    let all = providers::enabled(&providers::effective_providers(&user));
+    // The full map resolves specs (a hidden provider named explicitly still
+    // works); only the visible subset is offered as suggestions.
+    let all = providers::effective_providers(&user);
+    let visible = providers::enabled(&all);
     let mut out: Vec<Suggestion> = Vec::new();
     let mut push = |value: String, note: String| {
         if !value.is_empty() && !out.iter().any(|s| s.value == value) {
@@ -263,30 +279,40 @@ fn model_suggestions(config: &Config, recents: &[String]) -> Vec<Suggestion> {
     if !current.is_empty() {
         // Canonicalize to match how recents are stored, so the current model
         // and its recents entry dedupe into one row.
-        push(crate::recents::canonical(current, &all, &default_provider), "current".to_string());
+        let canonical = crate::recents::canonical(current, &all, &default_provider);
+        // A current model on a hidden provider stays usable but is not
+        // offered as a suggestion.
+        let (provider, _) = providers::parse_model_spec(&canonical, &all, &default_provider);
+        if visible.contains_key(provider) {
+            push(canonical, "current".to_string());
+        }
     }
     for spec in recents {
-        push(spec.to_string(), "recent".to_string());
+        // A recent on a hidden (or removed) provider is not offered.
+        let (provider, _) = providers::parse_model_spec(spec, &all, &default_provider);
+        if visible.contains_key(provider) {
+            push(spec.to_string(), "recent".to_string());
+        }
     }
     // A provider the user has an entry for (or the default provider) is a
     // pathway already taken; its default model outranks untouched presets.
     let configured = |name: &str| user.contains_key(name) || name == default_provider;
-    let mut names: Vec<&String> = all.keys().collect();
+    let mut names: Vec<&String> = visible.keys().collect();
     names.sort_by_key(|name| !configured(name));
     for name in &names {
-        let provider = &all[*name];
+        let provider = &visible[*name];
         if let Some(model) = provider.default_model.as_deref().filter(|m| !m.is_empty()) {
             push(format!("{name}/{model}"), default_note(name, provider, &default_provider));
         }
     }
     // A curated list (`list_models = "configured"`) offers each of its models.
     for name in &names {
-        for (model, label) in all[*name].configured_models().unwrap_or_default() {
+        for (model, label) in visible[*name].configured_models().unwrap_or_default() {
             push(format!("{name}/{model}"), label.unwrap_or_default());
         }
     }
     for name in &names {
-        push((*name).clone(), provider_note(name, &all[*name], &default_provider));
+        push((*name).clone(), provider_note(name, &visible[*name], &default_provider));
     }
     out
 }
@@ -455,12 +481,43 @@ mod tests {
         assert!(!rejection("/frobnicate").unwrap().contains("Did you mean"));
         // With arguments, and with surrounding whitespace.
         assert!(rejection("  /modle gpt-4o ").unwrap().contains("Did you mean /model?"));
-        // A path: explain the `//` escape.
-        let note = rejection("/usr/lib is 4 GB, why?").unwrap();
-        assert!(note.contains("type //usr/lib"), "{note}");
-        // Not rejected: known commands (with args), `//` prompts, plain text.
-        for ok in ["/exit", "/model gpt-4o", "/compact --smart focus", "//usr/lib", "hello /exin", "", "   "] {
+        // Not rejected: known commands (with args), `//` prompts, plain text,
+        // and prompts that start with a path or span several lines (#173).
+        for ok in [
+            "/exit",
+            "/model gpt-4o",
+            "/compact --smart focus",
+            "//usr/lib",
+            "hello /exin",
+            "",
+            "   ",
+            "/usr/lib is 4 GB, why?",
+            "/tmp/foo is empty, why?",
+            "\n/workspace is the only path you share with the user.\n\nWrite a FEEL expression",
+        ] {
             assert_eq!(rejection(ok), None, "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn only_known_or_plausible_commands_are_commands() {
+        // Known commands, with or without arguments (including path-like args).
+        for cmd in ["/help", "/compact", "/compact --smart keep tests", "/model openai/gpt-4o", " /exit \n"] {
+            assert!(is_command(cmd), "{cmd:?}");
+        }
+        // A single-line unknown word is still a (mistyped) command.
+        assert!(is_command("/exin"));
+        assert!(is_command("/frobnicate now"));
+        // Path-leading prompts, single- or multi-line, are prompts (#173).
+        for prompt in [
+            "\n/workspace is the only path you share with the user.\n\nWrite a FEEL expression to /workspace/answer.feel",
+            "/tmp/foo is empty, why?",
+            "/workspace\nis shared",
+            "//escaped",
+            "plain",
+            "",
+        ] {
+            assert!(!is_command(prompt), "{prompt:?}");
         }
     }
 
@@ -582,8 +639,11 @@ mod tests {
         let work = values.iter().position(|v| *v == "work/gpt-oss-120b").unwrap();
         let bare_work = values.iter().position(|v| *v == "work").unwrap();
         assert!(work < bare_work, "provider defaults before bare providers: {values:?}");
-        let mock = values.iter().position(|v| *v == "mock/mock").unwrap();
-        assert!(work < mock, "configured providers before untouched presets: {values:?}");
+        // mock is hidden by default, so it should not appear in suggestions
+        assert!(
+            !values.iter().any(|v| *v == "mock/mock" || *v == "mock"),
+            "hidden mock not in suggestions: {values:?}"
+        );
         // No duplicates: a recent that is also a provider default appears once.
         let recents = vec!["work/gpt-oss-120b".to_string()];
         let found = model_suggestions(&config, &recents);
@@ -615,6 +675,48 @@ mod tests {
             !found.iter().any(|s| s.value == "openrouter" || s.value.starts_with("openrouter/")),
             "disabled hidden"
         );
+    }
+
+    #[test]
+    fn model_suggestions_skip_hidden_current_and_recent_models() {
+        // The current model and a recent both sit on the hidden mock preset:
+        // neither is offered, and neither is canonicalized onto the default
+        // provider (`mock/test` must not become `openai/mock/test`).
+        let config = config(
+            r#"
+            model = "mock/test"
+            default_provider = "openai"
+        "#,
+        );
+        let recents = vec!["mock/test".to_string(), "openai/gpt-4o".to_string()];
+        let found = model_suggestions(&config, &recents);
+        let values: Vec<&str> = found.iter().map(|s| s.value.as_str()).collect();
+        assert!(
+            !values.iter().any(|v| *v == "mock/test" || *v == "openai/mock/test" || *v == "mock"),
+            "hidden current/recent not suggested: {values:?}"
+        );
+        assert!(values.contains(&"openai/gpt-4o"), "visible recent still offered: {values:?}");
+
+        // A user-configured hidden provider is filtered the same way.
+        let user_hidden = super::tests::config(
+            r#"
+            model = "openai/gpt-4o"
+            default_provider = "openai"
+            [providers.internal]
+            kind = "openai"
+            base_url = "http://merlin.local:8000/v1"
+            default_model = "dev-model"
+            hidden = true
+        "#,
+        );
+        let recents = vec!["internal/dev-model".to_string()];
+        let found = model_suggestions(&user_hidden, &recents);
+        let values: Vec<&str> = found.iter().map(|s| s.value.as_str()).collect();
+        assert!(
+            !values.iter().any(|v| *v == "internal" || v.starts_with("internal/")),
+            "user-hidden provider not suggested: {values:?}"
+        );
+        assert!(values.contains(&"openai/gpt-4o"), "visible current still offered: {values:?}");
     }
 
     #[test]
