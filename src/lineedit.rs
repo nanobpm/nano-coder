@@ -544,7 +544,11 @@ impl EditView {
     /// Submit the line: record it in history and redraw the editor empty (the
     /// caller adds the submitted line to the transcript). Submitting bumps the
     /// draft generation, so a steer/queued message sent during a timer turn
-    /// supersedes the parked draft instead of being buried under it.
+    /// supersedes the parked draft instead of being buried under it. A blank
+    /// Enter is the exception: the turn loop treats a blank line as a no-op,
+    /// so it does not bump the generation — otherwise an ignored keypress
+    /// would silently discard the parked draft by making `restore_draft`
+    /// reject it.
     fn take(&mut self) -> String {
         let line = std::mem::take(&mut self.line);
         self.history.record(&line);
@@ -553,7 +557,9 @@ impl EditView {
         self.menu_hidden = false;
         self.menu_rows = 0;
         self.last_edit = None;
-        self.draft_generation = self.draft_generation.wrapping_add(1);
+        if !line.is_empty() {
+            self.draft_generation = self.draft_generation.wrapping_add(1);
+        }
         if let Some(hook) = self.on_edit.clone() {
             hook(&self.line, self.cursor, self.queue_count, &[]);
         }
@@ -2041,6 +2047,33 @@ mod tests {
         editor.clear_line();
         editor.restore_draft(parked);
         assert!(editor.line.is_empty(), "text typed then cleared during the turn supersedes the parked draft");
+    }
+
+    #[test]
+    fn a_blank_enter_during_the_turn_keeps_the_parked_draft() {
+        // The turn loop treats a blank Enter as a no-op, so it must not bump
+        // the draft generation — otherwise the ignored keypress would make
+        // `restore_draft` reject the parked text and silently discard it.
+        let mut editor = view("");
+        editor.insert("abandoned draft");
+        let parked = editor.park_draft().expect("a non-empty draft parks");
+
+        let submitted = editor.take();
+        assert!(submitted.is_empty(), "a blank Enter submits nothing");
+        editor.restore_draft(parked);
+        assert_eq!(editor.line, "abandoned draft", "a no-op Enter does not discard the parked draft");
+
+        // A whitespace-only line is the same no-op at the turn loop (it drops
+        // it on `trim().is_empty()`), but typing those spaces is itself an
+        // edit that supersedes the parked draft — so only the truly blank
+        // buffer keeps the generation.
+
+        // A non-empty submission still supersedes the parked draft.
+        let parked = editor.park_draft().expect("the restored draft parks again");
+        editor.insert("steer while the timer runs");
+        let _sent = editor.take();
+        editor.restore_draft(parked);
+        assert!(editor.line.is_empty(), "a real submission still supersedes the parked draft");
     }
 
     #[test]
