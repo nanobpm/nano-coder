@@ -236,16 +236,21 @@ fn a_half_typed_draft_holds_an_idle_timer_back_until_it_is_cleared() {
     assert!(screen.contains("Timer 1 set for"), "{screen}");
 
     // Leave a half-typed draft (no Enter). An idle timer coming due must be
-    // held back while a draft is in the editor, never firing into it.
+    // held back while a *fresh* draft is in the editor, never firing into it.
     pty.send("a half-typed note");
-    // Wait past the one-minute deadline; the timer must NOT fire while held.
-    std::thread::sleep(Duration::from_secs(70));
+    // Wait past the one-minute deadline, tapping the draft every ~20s so it
+    // stays fresh (DRAFT_HOLD is 60s of no keystrokes). The timer must NOT
+    // fire while the user is still composing.
+    for _ in 0..3 {
+        std::thread::sleep(Duration::from_secs(20));
+        pty.send(".");
+        assert!(!session_logs(dir.path()).contains("fired: check CI"), "a fresh draft must hold the timer back");
+    }
     let screen = pty.screen();
     assert!(
         !screen.contains("⏰ timer 1") && !screen.contains("fired: check CI"),
         "a held draft must hold the timer back: {screen}"
     );
-    assert!(!session_logs(dir.path()).contains("fired: check CI"), "no firing was persisted while the draft was held");
 
     // Clear the draft (Ctrl-U, 0x15). The now-overdue timer fires.
     pty.send("\u{15}");

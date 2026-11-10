@@ -1064,14 +1064,16 @@ fn sanitize_terminal_chars(s: &str, keep_newlines: bool) -> String {
 /// use this so the rule stays identical across them: a queued Ctrl-C always
 /// wins — the interrupt must route through the exit/double-press handler instead
 /// of starting a timer turn, which reads only new channel events and would run
-/// its tools despite the stop request — a half-typed draft holds the timer
-/// back until the line is sent or cleared, and an **armed Ctrl-C exit window**
-/// (a first press waiting for its pair) holds the timer back too: otherwise a
-/// timer coming due inside the two-press window would start an automatic turn,
-/// and the user's confirming second Ctrl-C would merely cancel that surprise
-/// turn instead of exiting as promised (issue #150).
-pub(crate) fn deliver_due_timer(due: bool, draft: bool, interrupt_queued: bool, exit_armed: bool) -> bool {
-    due && !draft && !interrupt_queued && !exit_armed
+/// its tools despite the stop request — a *fresh* half-typed draft holds the
+/// timer back until the line is sent, cleared, or goes stale (no keystrokes for
+/// [`lineedit::DRAFT_HOLD`]; an abandoned AFK draft is parked and restored
+/// after the turn), and an **armed Ctrl-C exit window** (a first press waiting
+/// for its pair) holds the timer back too: otherwise a timer coming due inside
+/// the two-press window would start an automatic turn, and the user's confirming
+/// second Ctrl-C would merely cancel that surprise turn instead of exiting as
+/// promised (issue #150).
+pub(crate) fn deliver_due_timer(due: bool, draft_holds: bool, interrupt_queued: bool, exit_armed: bool) -> bool {
+    due && !draft_holds && !interrupt_queued && !exit_armed
 }
 
 /// Whether an end-of-input (Ctrl-D / closed pipe) seen during the idle timer
@@ -2946,17 +2948,19 @@ async fn main() -> Result<()> {
                         break Vec::new();
                     }
                     // Peek whether a timer is due *before* consuming it: a
-                    // half-typed draft holds delivery back, and taking the
-                    // timer here would persist its removal and drop the note
-                    // undelivered. Only consume once delivery is allowed.
+                    // fresh half-typed draft holds delivery back, and taking
+                    // the timer here would persist its removal and drop the
+                    // note undelivered. Only consume once delivery is allowed.
+                    // A stale draft (no keystrokes for DRAFT_HOLD) does not
+                    // hold: the user is AFK, so the timer may fire.
                     let due_now = agent.timers().next_due().is_some_and(|d| d <= now);
-                    let draft = terminal.view.lock().unwrap().has_draft();
+                    let draft_holds = terminal.view.lock().unwrap().holds_timer(std::time::Instant::now());
                     // No interrupt is queued here (it would have broken the wait
                     // above), so pass `false`; the armed Ctrl-C exit window,
                     // however, must hold a due timer back exactly as in the
                     // prompt loop below (a timer firing mid-window would steal
                     // the user's confirming second press).
-                    if deliver_due_timer(due_now, draft, false, exit_press.deadline().is_some()) {
+                    if deliver_due_timer(due_now, draft_holds, false, exit_press.deadline().is_some()) {
                         break agent.take_fired_timers()?;
                     }
                     // Nothing deliverable right now. Without `--wait-timers` a
@@ -3052,6 +3056,10 @@ async fn main() -> Result<()> {
                     terminal.renderer.note(&format!("⏰ timer {}: {}", timer.id, sanitize_terminal_line(&timer.note)));
                 }
                 let text = timers::Timers::fired_batch_message(&fired, Local::now());
+                // Park a stale draft so the timer turn cannot treat it as a
+                // steer; restore it after the turn (unless the user typed
+                // something new in the meantime).
+                let parked = terminal.view.lock().unwrap().park_draft();
                 // An API/network error during this idle timer turn must not
                 // tear down the REPL: show it and return to the prompt, exactly
                 // as `run_command`'s error arm below does for a user turn.
@@ -3067,6 +3075,9 @@ async fn main() -> Result<()> {
                             && args.wait_timers
                             && outcome.stop_reason == agent::StopReason::Cancelled
                         {
+                            if let Some(parked) = parked {
+                                terminal.view.lock().unwrap().restore_draft(parked);
+                            }
                             break;
                         }
                         print_turn_outcome(&outcome, &terminal.renderer)
@@ -3078,6 +3089,9 @@ async fn main() -> Result<()> {
                             eprintln!("Error: {:#}", e);
                         }
                     }
+                }
+                if let Some(parked) = parked {
+                    terminal.view.lock().unwrap().restore_draft(parked);
                 }
                 separate = true;
                 continue;
@@ -3091,11 +3105,12 @@ async fn main() -> Result<()> {
 
             let input = loop {
                 // An idle timer that is due ends the prompt read, unless the
-                // editor holds a half-typed draft — that keeps the timer back
-                // until the draft is sent or cleared. Checked before borrowing
-                // the terminal for the read.
+                // editor holds a *fresh* half-typed draft — that keeps the
+                // timer back until the draft is sent, cleared, or goes stale
+                // (no keystrokes for DRAFT_HOLD; an AFK draft is parked).
+                // Checked before borrowing the terminal for the read.
                 let timer_due = agent.timers().next_due().is_some_and(|due| due <= Local::now());
-                let draft = terminal.view.lock().unwrap().has_draft();
+                let draft_holds = terminal.view.lock().unwrap().holds_timer(std::time::Instant::now());
                 // A queued Ctrl-C (requeued out of the timer wait above, or
                 // arriving just as the timer comes due) must beat timer
                 // delivery here too: the timer turn reads only new channel
@@ -3109,7 +3124,7 @@ async fn main() -> Result<()> {
                 // before the window lapses must not start an automatic turn that
                 // the confirming second press would then cancel instead of
                 // exiting (issue #150).
-                if deliver_due_timer(timer_due, draft, interrupt_queued, exit_press.deadline().is_some()) {
+                if deliver_due_timer(timer_due, draft_holds, interrupt_queued, exit_press.deadline().is_some()) {
                     break Prompt::TimerDue;
                 }
                 // Piped stdin already closed during the timer wait and no timers
@@ -3205,6 +3220,10 @@ async fn main() -> Result<()> {
                         ));
                     }
                     let text = timers::Timers::fired_batch_message(&fired, Local::now());
+                    // Park a stale draft so the timer turn cannot treat it as a
+                    // steer; restore it after the turn (unless the user typed
+                    // something new in the meantime).
+                    let parked = terminal.view.lock().unwrap().park_draft();
                     // As above: an idle timer turn's error returns to the
                     // prompt rather than terminating the REPL.
                     agent.mark_auto_turn();
@@ -3217,6 +3236,9 @@ async fn main() -> Result<()> {
                                 && args.wait_timers
                                 && outcome.stop_reason == agent::StopReason::Cancelled
                             {
+                                if let Some(parked) = parked {
+                                    terminal.view.lock().unwrap().restore_draft(parked);
+                                }
                                 break;
                             }
                             print_turn_outcome(&outcome, &terminal.renderer)
@@ -3228,6 +3250,9 @@ async fn main() -> Result<()> {
                                 eprintln!("Error: {:#}", e);
                             }
                         }
+                    }
+                    if let Some(parked) = parked {
+                        terminal.view.lock().unwrap().restore_draft(parked);
                     }
                     separate = true;
                 }
@@ -3638,12 +3663,14 @@ mod tests {
     fn deliver_due_timer_yields_to_interrupt_and_draft() {
         // The core of the issue #150 guard, deterministically: a due timer may
         // start its turn only when nothing else must win first. A queued Ctrl-C
-        // (the race the harness test can't reliably reproduce), a half-typed
-        // draft, and an armed Ctrl-C exit window each hold the timer back; with
-        // none of them, a due timer fires.
+        // (the race the harness test can't reliably reproduce), a *fresh*
+        // half-typed draft, and an armed Ctrl-C exit window each hold the timer
+        // back; with none of them, a due timer fires. A stale (AFK) draft is
+        // not a hold — `holds_timer` is false for it — so it does not appear
+        // here; park/restore is the idle-loop's job once delivery is allowed.
         assert!(deliver_due_timer(true, false, false, false), "due, nothing else → fire");
         assert!(!deliver_due_timer(true, false, true, false), "queued interrupt must beat a due timer");
-        assert!(!deliver_due_timer(true, true, false, false), "a draft holds the timer back");
+        assert!(!deliver_due_timer(true, true, false, false), "a fresh draft holds the timer back");
         assert!(!deliver_due_timer(true, true, true, false), "interrupt wins even with a draft");
         // An armed exit window (first Ctrl-C awaiting its pair) defers the timer
         // so the confirming second press exits instead of cancelling a surprise
