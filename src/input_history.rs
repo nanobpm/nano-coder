@@ -18,6 +18,18 @@ pub struct InputHistory {
     draft: String,
 }
 
+/// The browsing half of an [`InputHistory`], snapshotted when a draft is
+/// parked for a timer turn: the entry being viewed and the pre-Up draft Down
+/// returns to. Parking clears the editor without going through an edit path,
+/// so without the snapshot the browsing state would stay live while its line
+/// is gone — and the first no-op keypress of the turn (a blank Enter) would
+/// reset it, stranding the unsent draft the user had typed before pressing
+/// Up. Restored alongside the parked text when the turn made no edits.
+pub struct HistoryBrowsing {
+    position: Option<usize>,
+    draft: String,
+}
+
 /// Most entries kept; the oldest drop off the front.
 const MAX_ENTRIES: usize = 200;
 
@@ -74,6 +86,23 @@ impl InputHistory {
     pub fn edited(&mut self) {
         self.position = None;
     }
+
+    /// Snapshot the browsing state (see [`HistoryBrowsing`]) and step out of
+    /// it: the editor is about to clear the line for a timer turn, so a live
+    /// position pointing at an entry would only be reset by the turn's first
+    /// no-op keypress, losing the saved draft with it.
+    pub fn park_browsing(&mut self) -> HistoryBrowsing {
+        HistoryBrowsing { position: self.position.take(), draft: std::mem::take(&mut self.draft) }
+    }
+
+    /// Put back a browsing state snapshotted by [`park_browsing`](Self::park_browsing)
+    /// after the timer turn made no edits: the recalled line is back in the
+    /// editor, so Down must once again reach the unsent draft saved before
+    /// the first Up.
+    pub fn restore_browsing(&mut self, browsing: HistoryBrowsing) {
+        self.position = browsing.position;
+        self.draft = browsing.draft;
+    }
 }
 
 #[cfg(test)]
@@ -116,6 +145,24 @@ mod tests {
         // The edited line is the draft Down returns to (like readline).
         assert_eq!(history.down(), Some(""));
         assert_eq!(history.down(), None, "no longer browsing");
+    }
+
+    #[test]
+    fn parking_round_trips_the_browsing_state() {
+        let mut history = InputHistory::default();
+        history.record("first");
+        history.record("second");
+        assert_eq!(history.up("typed so far"), Some("second"));
+
+        let browsing = history.park_browsing();
+        assert_eq!(history.down(), None, "parked history is not browsing");
+        assert_eq!(history.up(""), Some("second"), "a fresh Up starts from the newest again");
+
+        // Undo that fresh browse, then restore the parked state.
+        history.edited();
+        history.restore_browsing(browsing);
+        assert_eq!(history.down(), Some("typed so far"), "Down reaches the pre-Up draft again");
+        assert_eq!(history.down(), None, "past the draft: no longer browsing");
     }
 
     #[test]

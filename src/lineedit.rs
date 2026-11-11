@@ -14,7 +14,7 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::input_history::InputHistory;
+use crate::input_history::{HistoryBrowsing, InputHistory};
 
 /// Esc twice within this window acts as one gesture: it clears the idle
 /// prompt's input, and (read by the turn loop) cancels a running turn. Defined
@@ -141,15 +141,19 @@ pub struct EditContext {
 pub type SharedView = Arc<Mutex<EditView>>;
 
 /// A half-typed draft parked while an automatic timer turn runs: the text,
-/// cursor, draft age and edit generation at park time. `restore_draft` puts
-/// it back only when the generation is unchanged (the user did not edit,
-/// submit or clear during the turn) and keeps the original age so the
-/// restored draft stays stale for the next due timer.
+/// cursor, draft age, edit generation and history-browsing state at park
+/// time. `restore_draft` puts it back only when the generation is unchanged
+/// (the user did not edit, submit or clear during the turn) and keeps the
+/// original age so the restored draft stays stale for the next due timer.
 pub struct ParkedDraft {
     line: String,
     cursor: usize,
     last_edit: Option<std::time::Instant>,
     generation: u64,
+    /// Up/Down position and the pre-Up saved draft, snapshotted so a no-op
+    /// keypress during the turn cannot strand the unsent draft behind a
+    /// reset browsing state.
+    browsing: HistoryBrowsing,
 }
 
 /// Hook the app-owned frame renderer installs to receive `(line, cursor,
@@ -202,9 +206,16 @@ impl EditView {
         self.has_draft() && self.last_edit.is_none_or(|at| now.saturating_duration_since(at) >= DRAFT_HOLD)
     }
 
-    /// Snapshot the current line, cursor and draft age, then clear the editor
-    /// so a timer turn cannot treat the draft as a steer. Restored with
-    /// [`restore_draft`]. Returns `None` when the buffer is already empty.
+    /// Snapshot the current line, cursor, draft age and history-browsing
+    /// state, then clear the editor so a timer turn cannot treat the draft as
+    /// a steer. Restored with [`restore_draft`]. Returns `None` when the
+    /// buffer is already empty.
+    ///
+    /// The browsing state is parked too, not left live: the editor no longer
+    /// holds the recalled entry, and the turn's first no-op keypress (a blank
+    /// Enter) must not find a stale position to reset — that would strand the
+    /// unsent draft the user typed before pressing Up, which Down can only
+    /// reach while the browsing state survives.
     pub fn park_draft(&mut self) -> Option<ParkedDraft> {
         if self.line.is_empty() {
             return None;
@@ -214,6 +225,7 @@ impl EditView {
             cursor: self.cursor,
             last_edit: self.last_edit,
             generation: self.draft_generation,
+            browsing: self.history.park_browsing(),
         };
         self.cursor = 0;
         self.menu_hidden = false;
@@ -226,9 +238,11 @@ impl EditView {
     /// Put a parked draft back after a timer turn, keeping its original age
     /// so the restored line is still stale (the user pressed no keys during
     /// the turn) and cannot hold the next due timer for another
-    /// [`DRAFT_HOLD`]. No-op when the user edited during the turn — a new
-    /// draft, a submitted steer/queued message, or text typed then cleared
-    /// all bump the draft generation, and that newer state wins.
+    /// [`DRAFT_HOLD`]. The history-browsing state comes back with it, so Down
+    /// still recovers the unsent draft saved before the recalled entry was
+    /// parked. No-op when the user edited during the turn — a new draft, a
+    /// submitted steer/queued message, or text typed then cleared all bump
+    /// the draft generation, and that newer state wins.
     pub fn restore_draft(&mut self, parked: ParkedDraft) {
         if !self.line.is_empty() || self.draft_generation != parked.generation {
             return;
@@ -237,6 +251,7 @@ impl EditView {
         self.cursor = parked.cursor.min(self.line.chars().count());
         self.menu_hidden = false;
         self.last_edit = parked.last_edit;
+        self.history.restore_browsing(parked.browsing);
         self.draw_edit();
     }
 
@@ -555,18 +570,22 @@ impl EditView {
     /// draft generation, so a steer/queued message sent during a timer turn
     /// supersedes the parked draft instead of being buried under it. A blank
     /// Enter is the exception: the turn loop treats a blank line as a no-op,
-    /// so it does not bump the generation — otherwise an ignored keypress
-    /// would silently discard the parked draft by making `restore_draft`
-    /// reject it.
+    /// so it touches neither the generation nor the history — recording
+    /// nothing and, crucially, not resetting the browsing state. Otherwise an
+    /// ignored keypress would silently discard the parked draft by making
+    /// `restore_draft` reject it, and a blank Enter pressed while browsing
+    /// (recalled text parked for a timer turn) would clear the history
+    /// position, leaving Down unable to recover the unsent draft saved
+    /// before the first Up.
     fn take(&mut self) -> String {
         let line = std::mem::take(&mut self.line);
-        self.history.record(&line);
-        self.history.edited();
         self.cursor = 0;
         self.menu_hidden = false;
         self.menu_rows = 0;
         self.last_edit = None;
         if !line.is_empty() {
+            self.history.record(&line);
+            self.history.edited();
             self.draft_generation = self.draft_generation.wrapping_add(1);
         }
         if let Some(hook) = self.on_edit.clone() {
@@ -2123,6 +2142,57 @@ mod tests {
         assert_eq!(editor.line, "", "a whitespace-only prefix is still erased");
         editor.restore_draft(parked);
         assert_eq!(editor.line, "", "erasing the spaces superseded the parked draft");
+    }
+
+    #[test]
+    fn parking_and_restoring_keeps_the_history_browsing_state() {
+        // Copilot #178: the user types an unsent draft, presses Up to recall
+        // an entry, and goes AFK. Parking the recalled entry must snapshot the
+        // browsing state with it — otherwise a blank Enter during the timer
+        // turn resets the history position and Down can no longer recover the
+        // unsent draft after the recalled text is restored.
+        let mut editor = view("");
+        editor.history.record("older entry");
+        editor.insert("my unsent draft");
+        editor.history_up();
+        assert_eq!(editor.line, "older entry");
+
+        let parked = editor.park_draft().expect("the recalled entry parks");
+        assert!(editor.line.is_empty(), "park clears the editor");
+
+        // The timer turn's only keypress is a blank Enter: a no-op that must
+        // not reset the history state the restore is about to bring back.
+        let submitted = editor.take();
+        assert!(submitted.is_empty(), "a blank Enter submits nothing");
+
+        editor.restore_draft(parked);
+        assert_eq!(editor.line, "older entry", "the recalled entry is restored");
+        editor.history_down();
+        assert_eq!(editor.line, "my unsent draft", "Down still recovers the unsent draft");
+        assert!(editor.history.down().is_none(), "past the draft: no longer browsing");
+    }
+
+    #[test]
+    fn a_blank_enter_on_an_empty_buffer_keeps_the_history_state() {
+        // The no-op contract without a park: with the buffer empty, a blank
+        // Enter submits nothing, records nothing and — crucially — does not
+        // reset the browsing state. The turn loop drops the blank line, so an
+        // ignored keypress must not be observable in history at all.
+        let mut editor = view("");
+        editor.history.record("first entry");
+        // Browse, then come back to the draft: the saved draft is "" and the
+        // position is None again. A blank Enter now must not record a blank
+        // line or otherwise disturb the history.
+        editor.history_up();
+        assert_eq!(editor.line, "first entry");
+        editor.clear_line();
+
+        let submitted = editor.take();
+        assert!(submitted.is_empty(), "the buffer was cleared above, so Enter is blank");
+        // Browsing restarts from the newest entry, and no blank line was
+        // recorded ahead of it.
+        editor.history_up();
+        assert_eq!(editor.line, "first entry", "a blank Enter records nothing and resets nothing extra");
     }
 
     #[test]
