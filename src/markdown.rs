@@ -68,6 +68,37 @@ fn options() -> Options {
     Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS
 }
 
+/// Replace GitHub-style emoji shortcodes (`:seedling:`) with the emoji. Unknown names, and colons
+/// that do not delimit a `[a-z0-9_+-]` name (times like `12:30:45`, `a::b` paths), stay as written.
+fn expand_shortcodes(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains(':') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find(':') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let name_len = after
+            .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '+' | '-')))
+            .unwrap_or(after.len());
+        if name_len > 0
+            && after[name_len..].starts_with(':')
+            && let Some(emoji) = emojis::get_by_shortcode(&after[..name_len])
+        {
+            out.push_str(emoji.as_str());
+            rest = &after[name_len + 1..];
+            continue;
+        }
+        // Not a shortcode: keep this colon, and rescan from the next character so the closing colon of
+        // a non-match can still open a real one (`v1:zz:seedling:`).
+        out.push(':');
+        rest = after;
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
+}
+
 /// Model text with control characters removed; tabs become spaces.
 fn clean(text: &str) -> String {
     text.chars().map(|c| if c == '\t' { ' ' } else { c }).filter(|c| *c == '\n' || !c.is_control()).collect()
@@ -307,7 +338,16 @@ impl Builder {
         match event {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
-            Event::Text(t) | Event::InlineMath(t) | Event::DisplayMath(t) => {
+            Event::Text(t) => {
+                let s = self.style();
+                // Code blocks and raw HTML stay verbatim; prose gets GitHub-style `:shortcode:` emoji.
+                if matches!(self.stack.last(), Some(Node::Code { .. }) | Some(Node::Html(_))) {
+                    self.span(&t, s);
+                } else {
+                    self.span(&expand_shortcodes(&t), s);
+                }
+            }
+            Event::InlineMath(t) | Event::DisplayMath(t) => {
                 let s = self.style();
                 self.span(&t, s);
             }
@@ -835,6 +875,20 @@ mod tests {
         // Not inside code, and only before a real header + delimiter pair.
         assert_eq!(show("```\nx\n| a |\n|---|\n```", 80)[2], "| a |");
         assert_eq!(show("a | b\nc | d", 80), ["a | b c | d"]);
+    }
+
+    #[test]
+    fn emoji_shortcodes() {
+        let r = |md: &str| show(md, 80).join("\n");
+        assert!(r("Grow :seedling: now").contains("Grow 🌱 now"));
+        assert!(r(":+1: and :tada:").contains("👍 and 🎉"));
+        // Unknown names, times and paths stay literal.
+        assert!(r("keep :not_an_emoji_xyz: as is").contains(":not_an_emoji_xyz:"));
+        assert!(r("at 12:30:45 in a::b").contains("12:30:45 in a::b"));
+        assert!(r("v1:zz:seedling:").contains("v1:zz🌱"));
+        // Code stays verbatim.
+        assert!(r("`:seedling:`").contains(":seedling:"));
+        assert!(r("```\n:seedling:\n```").contains(":seedling:"));
     }
 
     #[test]
