@@ -2924,10 +2924,10 @@ async fn main() -> Result<()> {
             // never end on its own: `--wait-timers` instead sleeps until the
             // next timer is due and runs it, repeating until none are left.
             let wait_timers = args.wait_timers;
-            let fired = if agent.timers().is_empty() {
+            let (fired, parked) = if agent.timers().is_empty() {
                 // No timers to wait for: skip the wait entirely so piped input
                 // flows straight to the normal read below.
-                Vec::new()
+                (Vec::new(), None)
             } else {
                 loop {
                     let now = Local::now();
@@ -2945,7 +2945,7 @@ async fn main() -> Result<()> {
                     // the prompt loop would then fire despite the stop request
                     // (issue #150).
                     if terminal.queued.iter().any(|i| matches!(i, TermInput::Interrupt)) {
-                        break Vec::new();
+                        break (Vec::new(), None);
                     }
                     // Peek whether a timer is due *before* consuming it: a
                     // fresh half-typed draft holds delivery back, and taking
@@ -2954,25 +2954,47 @@ async fn main() -> Result<()> {
                     // A stale draft (no keystrokes for DRAFT_HOLD) does not
                     // hold: the user is AFK, so the timer may fire.
                     let due_now = agent.timers().next_due().is_some_and(|d| d <= now);
-                    let draft_holds = terminal.view.lock().unwrap().holds_timer(std::time::Instant::now());
-                    // No interrupt is queued here (it would have broken the wait
-                    // above), so pass `false`; the armed Ctrl-C exit window,
-                    // however, must hold a due timer back exactly as in the
-                    // prompt loop below (a timer firing mid-window would steal
-                    // the user's confirming second press).
-                    if deliver_due_timer(due_now, draft_holds, false, exit_press.deadline().is_some()) {
-                        break agent.take_fired_timers()?;
+                    // The freshness check and the park happen under one view
+                    // lock: the reader thread keeps typing into the editor
+                    // during the turn, so a separate `holds_timer()` then
+                    // `park_draft()` could snapshot a draft the user resumed
+                    // between the two — their next keystroke would then bump
+                    // the generation and make `restore_draft` discard the
+                    // parked text. Parking here (rather than after the notes
+                    // print) carries the snapshot through the whole turn.
+                    let mut parked = None;
+                    let fired = {
+                        let mut view = terminal.view.lock().unwrap();
+                        let draft_holds = view.holds_timer(std::time::Instant::now());
+                        // No interrupt is queued here (it would have broken the
+                        // wait above), so pass `false`; the armed Ctrl-C exit
+                        // window, however, must hold a due timer back exactly
+                        // as in the prompt loop below (a timer firing
+                        // mid-window would steal the user's confirming second
+                        // press).
+                        if deliver_due_timer(due_now, draft_holds, false, exit_press.deadline().is_some()) {
+                            let fired = agent.take_fired_timers()?;
+                            if !fired.is_empty() {
+                                parked = view.park_draft();
+                            }
+                            fired
+                        } else {
+                            Vec::new()
+                        }
+                    };
+                    if !fired.is_empty() {
+                        break (fired, parked);
                     }
                     // Nothing deliverable right now. Without `--wait-timers` a
                     // headless run is done once its input is; an interactive one
                     // waits on the terminal instead.
                     let steerable = terminal.steerable;
                     if !steerable && !wait_timers {
-                        break Vec::new();
+                        break (Vec::new(), None);
                     }
                     let Some(next_due) = agent.timers().next_due() else {
                         // No timers left: a `--wait-timers` run ends here.
-                        break Vec::new();
+                        break (Vec::new(), None);
                     };
                     // A timer already due but held back by a draft must not
                     // busy-spin on its elapsed deadline: recheck on a short
@@ -3029,7 +3051,7 @@ async fn main() -> Result<()> {
                                 continue;
                             }
                             terminal.queued.push_front(event);
-                            break Vec::new();
+                            break (Vec::new(), None);
                         }
                         None => {
                             // A deadline elapsed. If it was the Ctrl-C exit
@@ -3056,10 +3078,10 @@ async fn main() -> Result<()> {
                     terminal.renderer.note(&format!("⏰ timer {}: {}", timer.id, sanitize_terminal_line(&timer.note)));
                 }
                 let text = timers::Timers::fired_batch_message(&fired, Local::now());
-                // Park a stale draft so the timer turn cannot treat it as a
-                // steer; restore it after the turn (unless the user typed
+                // The stale draft was parked under the same view lock as the
+                // freshness check above, so the timer turn cannot treat it as
+                // a steer; restore it after the turn (unless the user typed
                 // something new in the meantime).
-                let parked = terminal.view.lock().unwrap().park_draft();
                 // An API/network error during this idle timer turn must not
                 // tear down the REPL: show it and return to the prompt, exactly
                 // as `run_command`'s error arm below does for a user turn.
@@ -3097,10 +3119,13 @@ async fn main() -> Result<()> {
                 continue;
             }
 
-            // What ended the prompt read: terminal input, or a due timer.
+            // What ended the prompt read: terminal input, or a due timer. A
+            // due timer also carries the draft parked under the same view lock
+            // as the freshness check (see below), so the reader thread cannot
+            // slip a keystroke between the check and the park.
             enum Prompt {
                 Input(TermInput),
-                TimerDue,
+                TimerDue(Option<lineedit::ParkedDraft>),
             }
 
             let input = loop {
@@ -3110,7 +3135,6 @@ async fn main() -> Result<()> {
                 // (no keystrokes for DRAFT_HOLD; an AFK draft is parked).
                 // Checked before borrowing the terminal for the read.
                 let timer_due = agent.timers().next_due().is_some_and(|due| due <= Local::now());
-                let draft_holds = terminal.view.lock().unwrap().holds_timer(std::time::Instant::now());
                 // A queued Ctrl-C (requeued out of the timer wait above, or
                 // arriving just as the timer comes due) must beat timer
                 // delivery here too: the timer turn reads only new channel
@@ -3124,8 +3148,24 @@ async fn main() -> Result<()> {
                 // before the window lapses must not start an automatic turn that
                 // the confirming second press would then cancel instead of
                 // exiting (issue #150).
-                if deliver_due_timer(timer_due, draft_holds, interrupt_queued, exit_press.deadline().is_some()) {
-                    break Prompt::TimerDue;
+                //
+                // The freshness check and the park happen under one view lock:
+                // the reader thread keeps typing into the editor during the
+                // turn, so a separate `holds_timer()` then `park_draft()` could
+                // snapshot a draft the user resumed between the two — their
+                // next keystroke would then bump the generation and make
+                // `restore_draft` discard the parked text.
+                let timer = {
+                    let mut view = terminal.view.lock().unwrap();
+                    let draft_holds = view.holds_timer(std::time::Instant::now());
+                    if deliver_due_timer(timer_due, draft_holds, interrupt_queued, exit_press.deadline().is_some()) {
+                        Some(view.park_draft())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(parked) = timer {
+                    break Prompt::TimerDue(parked);
                 }
                 // Piped stdin already closed during the timer wait and no timers
                 // remain to fire: with nothing queued, no further input will
@@ -3207,7 +3247,7 @@ async fn main() -> Result<()> {
             };
             // A due timer fires as a new turn carrying its message; loop back
             // to the prompt afterwards.
-            if matches!(input, Prompt::TimerDue) {
+            if let Prompt::TimerDue(parked) = input {
                 let fired = agent.take_fired_timers()?;
                 if !fired.is_empty() {
                     // As above: sanitize the model-controlled note before it
@@ -3220,10 +3260,10 @@ async fn main() -> Result<()> {
                         ));
                     }
                     let text = timers::Timers::fired_batch_message(&fired, Local::now());
-                    // Park a stale draft so the timer turn cannot treat it as a
-                    // steer; restore it after the turn (unless the user typed
-                    // something new in the meantime).
-                    let parked = terminal.view.lock().unwrap().park_draft();
+                    // The stale draft was parked under the same view lock as
+                    // the freshness check above, so the timer turn cannot
+                    // treat it as a steer; restore it after the turn (unless
+                    // the user typed something new in the meantime).
                     // As above: an idle timer turn's error returns to the
                     // prompt rather than terminating the REPL.
                     agent.mark_auto_turn();

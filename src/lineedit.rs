@@ -428,10 +428,17 @@ impl EditView {
     }
 
     /// Remove the word before the cursor, plus any whitespace separating it
-    /// from the cursor.
+    /// from the cursor. A Ctrl-W that would erase nothing — an empty buffer,
+    /// or only whitespace before the cursor — is a true no-op: like
+    /// [`backspace`]/[`delete`]/[`clear_line`] at their bounds it must not
+    /// call [`mutated`], or the ignored keypress would bump the draft
+    /// generation and make `restore_draft` silently discard a parked draft.
     fn erase_word(&mut self) {
         let before: String = self.line.chars().take(self.cursor).collect();
         let trimmed = before.trim_end();
+        if trimmed.is_empty() {
+            return;
+        }
         let word_start =
             trimmed.char_indices().rev().find(|(_, c)| c.is_whitespace()).map(|(i, c)| i + c.len_utf8()).unwrap_or(0);
         let start = before[..word_start].chars().count();
@@ -2074,6 +2081,29 @@ mod tests {
         let _sent = editor.take();
         editor.restore_draft(parked);
         assert!(editor.line.is_empty(), "a real submission still supersedes the parked draft");
+    }
+
+    #[test]
+    fn a_noop_ctrl_w_during_the_turn_keeps_the_parked_draft() {
+        // Parking leaves the editor empty, so a Ctrl-W pressed during the
+        // timer turn erases nothing. Like the blank Enter, that ignored
+        // keypress must not bump the draft generation — otherwise
+        // `restore_draft` would reject the parked text and silently lose it.
+        let mut editor = view("");
+        editor.insert("abandoned draft");
+        let parked = editor.park_draft().expect("a non-empty draft parks");
+
+        editor.erase_word();
+        editor.restore_draft(parked);
+        assert_eq!(editor.line, "abandoned draft", "a no-op Ctrl-W does not discard the parked draft");
+
+        // A Ctrl-W that actually erases a word *is* an edit and supersedes
+        // the parked draft.
+        let parked = editor.park_draft().expect("the restored draft parks again");
+        editor.insert("more words");
+        editor.erase_word();
+        editor.restore_draft(parked);
+        assert_eq!(editor.line, "more ", "a real erase supersedes the parked draft");
     }
 
     #[test]
