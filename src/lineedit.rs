@@ -428,17 +428,19 @@ impl EditView {
     }
 
     /// Remove the word before the cursor, plus any whitespace separating it
-    /// from the cursor. A Ctrl-W that would erase nothing — an empty buffer,
-    /// or only whitespace before the cursor — is a true no-op: like
-    /// [`backspace`]/[`delete`]/[`clear_line`] at their bounds it must not
-    /// call [`mutated`], or the ignored keypress would bump the draft
-    /// generation and make `restore_draft` silently discard a parked draft.
+    /// from the cursor. Only a Ctrl-W with nothing at all before the cursor —
+    /// an empty buffer — is a true no-op: like [`backspace`]/[`delete`]/
+    /// [`clear_line`] at their bounds it must not call [`mutated`], or the
+    /// ignored keypress would bump the draft generation and make
+    /// `restore_draft` silently discard a parked draft. A whitespace-only
+    /// prefix is *not* a no-op: those spaces are erased (and the generation
+    /// bumped), exactly as before the no-op guard existed.
     fn erase_word(&mut self) {
         let before: String = self.line.chars().take(self.cursor).collect();
-        let trimmed = before.trim_end();
-        if trimmed.is_empty() {
+        if before.is_empty() {
             return;
         }
+        let trimmed = before.trim_end();
         let word_start =
             trimmed.char_indices().rev().find(|(_, c)| c.is_whitespace()).map(|(i, c)| i + c.len_utf8()).unwrap_or(0);
         let start = before[..word_start].chars().count();
@@ -2104,6 +2106,23 @@ mod tests {
         editor.erase_word();
         editor.restore_draft(parked);
         assert_eq!(editor.line, "more ", "a real erase supersedes the parked draft");
+    }
+
+    #[test]
+    fn a_whitespace_only_ctrl_w_still_erases_and_supersedes_the_draft() {
+        // The no-op guard must not swallow a whitespace-only prefix: those
+        // spaces were always erased by Ctrl-W, and erasing them is an edit, so
+        // it bumps the generation and supersedes any parked draft.
+        let mut editor = view("");
+        editor.insert("abandoned draft");
+        let parked = editor.park_draft().expect("a non-empty draft parks");
+
+        // During the turn the user types only spaces, then Ctrl-W.
+        editor.insert("   ");
+        editor.erase_word();
+        assert_eq!(editor.line, "", "a whitespace-only prefix is still erased");
+        editor.restore_draft(parked);
+        assert_eq!(editor.line, "", "erasing the spaces superseded the parked draft");
     }
 
     #[test]
