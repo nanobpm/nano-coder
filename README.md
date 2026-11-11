@@ -682,7 +682,7 @@ kind = "anthropic"
 base_url = "https://llm-gateway.example.com/anthropic/v1"
 api_key_env = "WORK_GATEWAY_KEY"        # or api_key = "..." (prefer the env var)
 # api_key_command = "op read op://vault/gateway/key"   # used when the env var is unset
-timeout_secs = 300                      # idle timeout: max silence between streamed bytes (default 600)
+timeout_secs = 300                      # idle timeout: max silence between streamed bytes (default 120, or $NANO_CODER_PROVIDER_TIMEOUT_SECS)
 max_retries = 3
 ```
 
@@ -887,6 +887,15 @@ resume is sent as a text placeholder.
 Other per-provider fields: `replay_reasoning`, `max_tokens_param` (`max_tokens`, or `max_completion_tokens`
 which is the `openai` default), `retry_initial_backoff_ms`, `retry_max_backoff_ms`,
 `retryable_statuses` and `offline_budget_ms`.
+
+`timeout_secs` is an *idle* timeout: it resets on every received byte, so a slow but steady
+stream is never cut off — only a genuinely stalled connection trips it. The default is 120 s
+(`NANO_CODER_PROVIDER_TIMEOUT_SECS` overrides the default; an explicit `timeout_secs` wins
+over both). When nano-coder runs under a supervisor that idle-kills a silent run — e.g. the
+c8ctl-nano worker, which kills a run after 300 s of no output — `timeout_secs` must stay
+**below** that budget: at or above it the worker kills the whole run before a stalled stream
+is ever detected and retried. A supervising worker can pass its own derived budget (e.g. its
+idle-kill budget / 2) as `NANO_CODER_PROVIDER_TIMEOUT_SECS` so the two timeouts cannot drift.
 
 A transport failure with no HTTP response (DNS, connection refused or reset, connect or
 idle timeout) is treated as the network being down rather than a failed attempt: nano-coder

@@ -29,6 +29,55 @@ use serde_json::Value;
 use crate::llm::LLMClient;
 use retry::{ApiError, RetryPolicy};
 
+/// Default provider stream idle timeout (`timeout_secs`): the maximum silence
+/// between received bytes before a request fails (it resets on each chunk, so a
+/// slow but steady stream is never cut off — only a stalled connection trips
+/// it).
+///
+/// This MUST stay below the host supervisor's idle-kill budget
+/// ([`WORKER_IDLE_KILL_SECS`]): when nano-coder runs under a worker that kills
+/// a run after some silence (e.g. the c8ctl-nano worker's 300 s), a provider
+/// timeout at or above that budget means the worker kills the whole run before
+/// a stalled stream is ever detected and retried here. 120 s leaves room for
+/// the retry-and-recover path to make progress well inside a 300 s kill window.
+/// A host can pass its own derived budget via
+/// [`PROVIDER_TIMEOUT_SECS_ENV`]; an explicit `timeout_secs` in
+/// `[providers.<name>]` still wins over both.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
+
+/// The documented idle-kill budget of the c8ctl-nano worker harness: a run that
+/// produces no output and no subtree progress for this long is killed. Kept as
+/// a named const shared with the docs so the guard test can assert the default
+/// provider timeout stays below it — the two timeouts must never drift into
+/// each other (the inner one must fire first, or a stalled stream kills the run
+/// instead of being retried).
+pub const WORKER_IDLE_KILL_SECS: u64 = 300;
+
+// The invariant behind issue #179, checked at compile time in every build: the
+// default provider stream idle timeout must fire before the worker's idle
+// kill, or a stalled stream is never retried — the run is killed first.
+const _: () = assert!(
+    DEFAULT_TIMEOUT_SECS < WORKER_IDLE_KILL_SECS,
+    "default provider timeout must stay below the worker idle-kill budget"
+);
+
+/// Environment variable that overrides the default provider stream idle
+/// timeout, in seconds. A supervising worker uses this to pass its derived
+/// budget (e.g. its idle-kill budget / 2) to the harness so the two timeouts
+/// cannot drift. Ignored when empty, unparseable, or zero; an explicit
+/// `timeout_secs` in `[providers.<name>]` takes precedence over it.
+pub const PROVIDER_TIMEOUT_SECS_ENV: &str = "NANO_CODER_PROVIDER_TIMEOUT_SECS";
+
+/// The effective default stream idle timeout: [`DEFAULT_TIMEOUT_SECS`], or the
+/// [`PROVIDER_TIMEOUT_SECS_ENV`] override when it holds a positive integer.
+fn default_timeout_secs() -> u64 {
+    std::env::var(PROVIDER_TIMEOUT_SECS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .unwrap_or(DEFAULT_TIMEOUT_SECS)
+}
+
 /// Wire protocol spoken by a provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -84,7 +133,11 @@ pub struct ProviderConfig {
     pub stream: Option<bool>,
     /// Idle timeout in seconds: the maximum silence between received bytes
     /// before a request fails. Resets on each chunk, so it never cuts off a
-    /// slow but steady stream — it only catches a stalled connection. Default 600.
+    /// slow but steady stream — it only catches a stalled connection. Default
+    /// [`DEFAULT_TIMEOUT_SECS`] (or the [`PROVIDER_TIMEOUT_SECS_ENV`] override).
+    /// Keep it below the host's idle-kill budget (see [`WORKER_IDLE_KILL_SECS`]):
+    /// at or above it, a supervisor kills the run before a stalled stream is
+    /// retried.
     pub timeout_secs: Option<u64>,
     pub max_retries: Option<u32>,
     pub retry_initial_backoff_ms: Option<u64>,
@@ -599,7 +652,7 @@ pub fn resolve_cancellable(
         max_tokens_param: config.max_tokens_param.clone().unwrap_or_else(|| "max_tokens".into()),
         stream: config.stream.unwrap_or(true),
         replay_reasoning,
-        timeout: Duration::from_secs(config.timeout_secs.unwrap_or(600)),
+        timeout: Duration::from_secs(config.timeout_secs.unwrap_or_else(default_timeout_secs)),
         retry: RetryPolicy {
             max_retries: config.max_retries.unwrap_or(defaults.max_retries),
             initial_backoff: config
@@ -1949,6 +2002,92 @@ mod key_command_tests {
             start.elapsed()
         );
         assert!(format!("{err:#}").contains("cancelled"), "{err:#}");
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    //! Guards for the provider stream idle timeout default and its env
+    //! override (issue #179): the default must stay below the documented
+    //! worker idle-kill budget, or a supervisor kills the run before a stalled
+    //! stream is ever retried.
+    use super::*;
+
+    /// Serialize the env-mutating tests in this module (process env is shared
+    /// across the test threads).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard;
+    impl EnvGuard {
+        fn set(value: &str) -> Self {
+            unsafe { std::env::set_var(PROVIDER_TIMEOUT_SECS_ENV, value) };
+            EnvGuard
+        }
+        fn unset() -> Self {
+            unsafe { std::env::remove_var(PROVIDER_TIMEOUT_SECS_ENV) };
+            EnvGuard
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var(PROVIDER_TIMEOUT_SECS_ENV) };
+        }
+    }
+
+    #[test]
+    fn default_timeout_stays_below_the_worker_idle_kill_budget() {
+        // The c8ctl-nano worker idle-kills a run after WORKER_IDLE_KILL_SECS of
+        // no output. If the default provider stream idle timeout were at or
+        // above that budget, a stalled provider stream would never be detected
+        // and retried — the worker would kill the whole run first. The
+        // invariant itself is asserted at compile time next to the constants;
+        // here we pin the *resolved* default to the named constant, so it can
+        // never be a re-typed literal that drifts from it.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::unset();
+        let resolved = resolve("mock/m", &HashMap::new(), "mock").unwrap();
+        assert_eq!(resolved.timeout, Duration::from_secs(DEFAULT_TIMEOUT_SECS));
+        assert!(resolved.timeout < Duration::from_secs(WORKER_IDLE_KILL_SECS));
+    }
+
+    #[test]
+    fn env_override_sets_the_default_timeout() {
+        // The worker passes its derived budget via NANO_CODER_PROVIDER_TIMEOUT_SECS.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set("90");
+        let resolved = resolve("mock/m", &HashMap::new(), "mock").unwrap();
+        assert_eq!(resolved.timeout, Duration::from_secs(90));
+    }
+
+    #[test]
+    fn config_timeout_secs_wins_over_the_env_override() {
+        // An explicit per-provider `timeout_secs` is the most specific setting.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set("90");
+        let user = HashMap::from([(
+            "x".to_string(),
+            ProviderConfig {
+                kind: Some(ProviderKind::Openai),
+                base_url: Some("http://localhost:1".into()),
+                timeout_secs: Some(45),
+                ..Default::default()
+            },
+        )]);
+        let resolved = resolve("x/m", &user, "mock").unwrap();
+        assert_eq!(resolved.timeout, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn invalid_env_values_fall_back_to_the_default() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        for value in ["", "abc", "-5", "0", "  "] {
+            let _env = EnvGuard::set(value);
+            assert_eq!(
+                default_timeout_secs(),
+                DEFAULT_TIMEOUT_SECS,
+                "{PROVIDER_TIMEOUT_SECS_ENV}={value:?} must be ignored"
+            );
+        }
     }
 }
 
