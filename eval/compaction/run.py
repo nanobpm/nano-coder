@@ -18,6 +18,8 @@ Examples:
   eval/compaction/run.py --cases my-cases.json --models ollama/qwen3:8b
   eval/compaction/run.py turns ~/…/sessions/sess-X.jsonl                   # pick fork lines
   eval/compaction/run.py report results/2026-….jsonl                      # re-print a table
+  eval/compaction/run.py calibrate --trials 5 --models …                  # noise band δ
+  eval/compaction/run.py report --baseline A.jsonl B.jsonl --delta results/….calibration.json
 """
 import argparse
 import concurrent.futures
@@ -598,10 +600,87 @@ def run_one(args, index, case, model, mode, repeat, work_root):
         "summary_chars": len(summary),
         "history_calls": sum(1 for n in tool_calls if n.startswith("history_")),
         "tool_calls": tool_calls,
+        **run_cost(records[len(case["records"]):]),
     })
     if not args.keep and cwd == run_dir / "cwd":
         shutil.rmtree(cwd, ignore_errors=True)
     return result
+
+
+def run_cost(new_records):
+    """Tokens and request time of the requests this run made, from the
+    `usage` / `duration_ms` nano-coder logs on assistant messages (#58).
+    Seeded records are excluded, so a fork of a real log is not counted."""
+    cost = {"input_tokens": 0, "output_tokens": 0, "request_ms": 0, "requests": 0}
+    for r in new_records:
+        if r.get("type") != "message":
+            continue
+        data = r.get("data") or {}
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            cost["requests"] += 1
+            cost["input_tokens"] += int(usage.get("prompt_tokens") or 0)
+            cost["output_tokens"] += int(usage.get("completion_tokens") or 0)
+        if isinstance(data.get("duration_ms"), (int, float)):
+            cost["request_ms"] += int(data["duration_ms"])
+    return cost
+
+
+Z95 = 1.959963984540054
+
+
+def wilson(k, n, z=Z95):
+    """95% Wilson score interval for k successes in n trials, as (lo, hi)."""
+    if not n:
+        return (0.0, 1.0)
+    p = k / n
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    half = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5) / denom
+    return (max(0.0, centre - half), min(1.0, centre + half))
+
+
+def diff_interval(k1, n1, k0, n0, z=Z95):
+    """95% interval for p1 - p0 (Newcombe's hybrid score method, from the
+    two Wilson intervals). Returns (delta, lo, hi), or None without data."""
+    if not n1 or not n0:
+        return None
+    p1, p0 = k1 / n1, k0 / n0
+    l1, u1 = wilson(k1, n1, z)
+    l0, u0 = wilson(k0, n0, z)
+    d = p1 - p0
+    lo = d - ((p1 - l1) ** 2 + (u0 - p0) ** 2) ** 0.5
+    hi = d + ((u1 - p1) ** 2 + (p0 - l0) ** 2) ** 0.5
+    return (d, lo, hi)
+
+
+def cell_stats(rs):
+    """Per (model, mode) cell: pass|lost counts and mean cost per run."""
+    ok = [r for r in rs if "error" not in r]
+    lost = [r for r in ok if not r.get("kept", r.get("summary_kept"))]
+    n = len(rs) or 1
+    return {
+        "runs": len(rs), "ok": len(ok),
+        "lost": len(lost), "pass_lost": sum(bool(r["passed"]) for r in lost),
+        "in_tok": sum(r.get("input_tokens", 0) for r in rs) / n,
+        "out_tok": sum(r.get("output_tokens", 0) for r in rs) / n,
+        "secs": sum(r.get("seconds", 0) for r in rs) / n,
+        "has_cost": any("input_tokens" in r for r in rs),
+    }
+
+
+def group(results):
+    groups = defaultdict(list)
+    for r in results:
+        groups[(r["model"], r["mode"])].append(r)
+    return groups
+
+
+def interval_text(k, n):
+    if not n:
+        return "-"
+    lo, hi = wilson(k, n)
+    return f"[{100 * lo:.0f},{100 * hi:.0f}]"
 
 
 def pct(n, d):
@@ -614,7 +693,8 @@ def report(results, out=sys.stdout):
         groups[(r["model"], r["mode"])].append(r)
     width = max([len(m) for m, _ in groups] + [5])
     header = (f"{'model':<{width}}  {'mode':<8} {'runs':>4} {'errors':>6} {'pass':>7} {'kept':>9} "
-              f"{'pass|lost':>9} {'lost':>4} {'used hist':>9} {'hist/run':>8} {'secs':>6}")
+              f"{'pass|lost':>9} {'95% CI':>9} {'lost':>4} {'used hist':>9} {'hist/run':>8} {'secs':>6} "
+              f"{'in tok':>8} {'out tok':>7}")
     print(header, file=out)
     print("-" * len(header), file=out)
     for (model, mode), rs in sorted(groups.items()):
@@ -622,12 +702,16 @@ def report(results, out=sys.stdout):
         lost = [r for r in ok if not r.get("kept", r["summary_kept"])]
         print(f"{model:<{width}}  {mode:<8} {len(rs):>4} {len(rs) - len(ok):>6} "
               f"{pct(sum(r['passed'] for r in ok), len(ok)):>7} {pct(sum(r['summary_kept'] for r in ok), len(ok)):>9} "
-              f"{pct(sum(r['passed'] for r in lost), len(lost)):>9} {len(lost):>4} "
+              f"{pct(sum(r['passed'] for r in lost), len(lost)):>9} "
+              f"{interval_text(sum(r['passed'] for r in lost), len(lost)):>9} {len(lost):>4} "
               f"{pct(sum(r['history_calls'] > 0 for r in ok), len(ok)):>9} "
               f"{(sum(r['history_calls'] for r in ok) / len(ok) if ok else 0):>8.2f} "
-              f"{(sum(r['seconds'] for r in rs) / len(rs)):>6.1f}", file=out)
+              f"{(sum(r['seconds'] for r in rs) / len(rs)):>6.1f} "
+              f"{sum(r.get('input_tokens', 0) for r in rs) / len(rs):>8.0f} "
+              f"{sum(r.get('output_tokens', 0) for r in rs) / len(rs):>7.0f}", file=out)
     print("\nkept = the detail survived compaction (in the summary or the recent messages kept verbatim).\n"
-          "pass|lost = pass rate among runs where it did not (where retrieval can matter).", file=out)
+          "pass|lost = pass rate among runs where it did not (where retrieval can matter);\n"
+          "95% CI = its Wilson interval. in/out tok = mean tokens per run (0 when the log has no usage).", file=out)
     by_case = defaultdict(lambda: defaultdict(list))
     for r in results:
         by_case[r["case"].split("/")[0]][(r["model"], r["mode"])].append(r)
@@ -643,6 +727,93 @@ def report(results, out=sys.stdout):
             cell = f"{sum(r['passed'] for r in rs)}/{len(rs)}"
             cells.append(f"  {cell:>{w}}")
         print(f"  {case:<20}" + "".join(cells), file=out)
+
+
+def calibration_deltas(trials):
+    """Noise band per (model, mode) cell from repeated runs of an unchanged
+    baseline. `trials` is a list of result lists. δ is the 95th percentile of
+    |Δpass|lost| between two bootstrap resamples of the pooled runs, each the
+    size of one trial (as RRSI's calibrate step), and never less than the
+    observed spread (max - min) of the per-trial rates."""
+    import random
+    rng = random.Random(0)
+    cells = defaultdict(lambda: {"trials": [], "pooled": []})
+    for results in trials:
+        for key, rs in group(results).items():
+            st = cell_stats(rs)
+            lost = [bool(r["passed"]) for r in rs
+                    if "error" not in r and not r.get("kept", r.get("summary_kept"))]
+            cells[key]["trials"].append(st["pass_lost"] / st["lost"] if st["lost"] else None)
+            cells[key]["pooled"].append(lost)
+    out = {}
+    for (model, mode), c in sorted(cells.items()):
+        rates = [x for x in c["trials"] if x is not None]
+        pooled = [x for t in c["pooled"] for x in t]
+        size = max(1, round(len(pooled) / max(1, len(c["pooled"]))))
+        diffs = []
+        if pooled:
+            for _ in range(2000):
+                a = sum(rng.choice(pooled) for _ in range(size)) / size
+                b = sum(rng.choice(pooled) for _ in range(size)) / size
+                diffs.append(abs(a - b))
+            diffs.sort()
+        boot = diffs[int(0.95 * (len(diffs) - 1))] if diffs else 1.0
+        spread = (max(rates) - min(rates)) if rates else 1.0
+        out[f"{model}|{mode}"] = {"model": model, "mode": mode, "trials": c["trials"],
+                                  "spread": round(spread, 4), "bootstrap": round(boot, 4),
+                                  "delta": round(max(spread, boot), 4)}
+    return out
+
+
+def load_deltas(spec):
+    """--delta: a number (applies to every cell) or a calibration JSON file."""
+    if spec is None:
+        return None
+    try:
+        return float(spec)
+    except ValueError:
+        return {k: v["delta"] for k, v in json.loads(Path(spec).read_text())["cells"].items()}
+
+
+def compare(baseline, candidate, deltas=None, out=sys.stdout):
+    """Δpass|lost and Δcost per (model, mode) cell, candidate minus baseline.
+    A change is *within noise* when |Δ| ≤ δ (from --delta or calibrate) or,
+    without δ, when the 95% interval of Δ contains zero."""
+    base, cand = group(baseline), group(candidate)
+    keys = sorted(set(base) | set(cand))
+    width = max([len(m) for m, _ in keys] + [5])
+    header = (f"{'model':<{width}}  {'mode':<8} {'base':>6} {'new':>6} {'Δpass':>7} {'95% CI':>13} "
+              f"{'δ':>5} {'Δin tok':>8} {'Δout tok':>8} {'Δsecs':>6}  verdict")
+    print(header, file=out)
+    print("-" * len(header), file=out)
+    for key in keys:
+        model, mode = key
+        if key not in base or key not in cand:
+            print(f"{model:<{width}}  {mode:<8} (only in {'new' if key in cand else 'baseline'})", file=out)
+            continue
+        b, c = cell_stats(base[key]), cell_stats(cand[key])
+        d = diff_interval(c["pass_lost"], c["lost"], b["pass_lost"], b["lost"])
+        delta = deltas.get(f"{model}|{mode}") if isinstance(deltas, dict) else deltas
+        din, dout, dsec = c["in_tok"] - b["in_tok"], c["out_tok"] - b["out_tok"], c["secs"] - b["secs"]
+        if d is None:
+            verdict, dtext, ci = "no lost runs", "     -", "-"
+        else:
+            dp, lo, hi = d
+            dtext, ci = f"{100 * dp:+6.1f}", f"[{100 * lo:+.0f},{100 * hi:+.0f}]"
+            noise = abs(dp) <= delta if delta is not None else lo <= 0 <= hi
+            extra = din + dout > 0
+            if noise:
+                verdict = "within noise" + ("; adds cost" if extra else "")
+            elif dp > 0:
+                verdict = "gain" + ("; check cost" if extra else "")
+            else:
+                verdict = "regression"
+        dlt = f"{100 * delta:4.1f}" if delta is not None else "    -"
+        print(f"{model:<{width}}  {mode:<8} {pct(b['pass_lost'], b['lost']):>6} {pct(c['pass_lost'], c['lost']):>6} "
+              f"{dtext:>7} {ci:>13} {dlt:>5} {din:>+8.0f} {dout:>+8.0f} {dsec:>+6.1f}  {verdict}", file=out)
+    print("\nΔpass = change in pass|lost (new - baseline), percentage points; 95% CI by Newcombe's method.\n"
+          "δ = noise band (--delta or `run.py calibrate`); without it, within noise = the CI contains 0.\n"
+          "Δtok/Δsecs = change in mean tokens and seconds per run. See the README's acceptance rule.", file=out)
 
 
 def self_test_verdict(results):
@@ -682,7 +853,21 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "turns":
         return list_turns(sys.argv[2])
     if len(sys.argv) > 1 and sys.argv[1] == "report":
-        return report([json.loads(l) for f in sys.argv[2:] for l in open(f) if l.strip()])
+        rp = argparse.ArgumentParser(prog="run.py report", description="print the table for results files, "
+                                     "or compare against a baseline")
+        rp.add_argument("files", nargs="+", metavar="RESULTS")
+        rp.add_argument("--baseline", action="append", metavar="RESULTS",
+                        help="baseline results file (repeatable); FILES are then the candidate")
+        rp.add_argument("--delta", metavar="FLOAT|CALIBRATION",
+                        help="noise band δ: a fraction (e.g. 0.1) or a `run.py calibrate` JSON file")
+        ra = rp.parse_args(sys.argv[2:])
+        load = lambda files: [json.loads(l) for f in files for l in open(f) if l.strip()]
+        if ra.baseline:
+            return compare(load(ra.baseline), load(ra.files), load_deltas(ra.delta))
+        return report(load(ra.files))
+    calibrate = len(sys.argv) > 1 and sys.argv[1] == "calibrate"
+    if calibrate:
+        del sys.argv[1]
 
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--models", help="comma-separated provider/model specs, as for --model")
@@ -712,6 +897,8 @@ def main():
     p.add_argument("--bin", default=default_binary())
     p.add_argument("--out", default=str(HERE / "results"))
     p.add_argument("--keep", action="store_true", help="keep each run's working directory")
+    p.add_argument("--trials", type=int, default=5,
+                   help="calibrate only: how many times to run the unchanged baseline")
     args = p.parse_args()
     # Runs start in their own working directory, so resolve paths now.
     if os.sep in args.bin:
@@ -737,6 +924,26 @@ def main():
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+    if calibrate:
+        trials = []
+        for t in range(args.trials):
+            print(f"calibrate: trial {t + 1}/{args.trials}", file=sys.stderr)
+            trials.append(run_eval(args, cases, models, modes, f"{stamp}-t{t}", out_dir, quiet=True))
+        cal_path = out_dir / f"{stamp}.calibration.json"
+        cells = calibration_deltas(trials)
+        cal_path.write_text(json.dumps({"trials": args.trials, "cells": cells}, indent=2) + "\n")
+        print(f"{'cell':<40} {'trials pass|lost':<30} {'δ':>6}")
+        for k, v in cells.items():
+            rates = " ".join("-" if x is None else f"{100 * x:.0f}" for x in v["trials"])
+            print(f"{k:<40} {rates:<30} {100 * v['delta']:5.1f}%")
+        print(f"\ncalibration: {cal_path}\nuse: run.py report --baseline A.jsonl B.jsonl --delta {cal_path}")
+        return
+    results = run_eval(args, cases, models, modes, stamp, out_dir)
+    if args.self_test:
+        sys.exit(self_test_verdict(results))
+
+
+def run_eval(args, cases, models, modes, stamp, out_dir, quiet=False):
     results_path = out_dir / f"{stamp}.jsonl"
     work_root = Path(tempfile.mkdtemp(prefix=f"compaction-eval-{stamp}-"))
     # A unique index per job keeps run_dir distinct even when two cases share a
@@ -772,11 +979,11 @@ def main():
             status = "ERROR " + r["error"] if "error" in r else ("pass" if r["passed"] else "FAIL")
             print(f"[{done}/{len(jobs)}] {r['case']} {r['model']} {r['mode']}: {status} "
                   f"(kept: {r.get('kept')}, history calls: {r.get('history_calls')})", file=sys.stderr)
-    print()
-    report(results)
-    print(f"\nresults: {results_path}\nsession logs: {work_root}")
-    if args.self_test:
-        sys.exit(self_test_verdict(results))
+    if not quiet:
+        print()
+        report(results)
+        print(f"\nresults: {results_path}\nsession logs: {work_root}")
+    return results
 
 
 if __name__ == "__main__":
