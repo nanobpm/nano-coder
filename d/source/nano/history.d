@@ -55,6 +55,46 @@ struct InputHistory
 
     /// The line changed by other means: the next Up starts from the newest.
     void edited() { position = -1; }
+
+    /// Take the browsing state (position and saved draft), leaving history
+    /// not browsing, for a parked editor line (`restoreBrowsing` puts it back).
+    HistoryBrowsing parkBrowsing()
+    {
+        auto b = HistoryBrowsing(position, draft);
+        position = -1;
+        draft = null;
+        return b;
+    }
+
+    /// ditto
+    void restoreBrowsing(HistoryBrowsing b)
+    {
+        position = b.position;
+        draft = b.draft;
+    }
+}
+
+/// The browsing state set aside with a parked draft.
+struct HistoryBrowsing
+{
+    private ptrdiff_t position = -1;
+    private string draft;
+}
+
+// rust: input_history.rs::parking_round_trips_the_browsing_state
+unittest
+{
+    InputHistory h;
+    h.record("first");
+    h.record("second");
+    assert(h.up("typed so far") == "second");
+    auto b = h.parkBrowsing();
+    assert(h.down() is null, "parked history is not browsing");
+    assert(h.up("") == "second", "a fresh Up starts from the newest again");
+    h.edited();
+    h.restoreBrowsing(b);
+    assert(h.down() == "typed so far", "Down reaches the pre-Up draft again");
+    assert(h.down() is null, "past the draft: no longer browsing");
 }
 
 unittest // ports input_history.rs tests

@@ -36,7 +36,7 @@ import nano.frame : glyphMark;
 import core.time : MonoTime, seconds;
 import std.sumtype : match;
 import nano.question : QuestionBroker, Question, Answer, Answered, Away, Dismissed, sanitizeLine, questionDefinition = definition;
-import nano.lineedit : LineEditor, Outcome, K, enterKeyMode, leaveKeyMode, fdSource, writeFd, terminalWidth, terminalHeight;
+import nano.lineedit : LineEditor, Outcome, K, ParkedDraft, enterKeyMode, leaveKeyMode, fdSource, writeFd, terminalWidth, terminalHeight;
 import nano.frameui : FrameUi;
 import nano.settings_dialog : SettingsUi, SettingsHost, runSettings, pickModel, onVerbosity;
 import nano.commands : helpText, isCommand, unescapePrompt;
@@ -1860,6 +1860,8 @@ int runMain(string[] args)
     import core.time : MonoTime, msecs;
     enum exitWindow = 2000.msecs; // Rust's DOUBLE_INTERRUPT_WINDOW
     MonoTime exitArmedAt;         // first idle Ctrl-C of a pending pair (zero = disarmed)
+    ParkedDraft parkedDraft;      // a stale draft set aside for a timer turn
+    bool hasParkedDraft;
     bool quietPrompt;             // redraw the prompt in place (no separating blank line)
     // Herdr (interactive only): flags a resumed session needs to behave the same.
     string[] herdrExtra;
@@ -1914,15 +1916,25 @@ int runMain(string[] args)
             // While the Ctrl-C exit hint is armed, end the read when the window
             // lapses so the stale hint is cleared (Rust's DoublePress deadline).
             bool delegate() @safe lapse = null;
-            // A due timer ends the read too, once nothing is typed.
+            // A timer turn is over: put back the draft it parked, unless
+            // something newer was typed or sent meanwhile.
+            if (hasParkedDraft)
+            {
+                editor.restoreDraft(parkedDraft);
+                hasParkedDraft = false;
+            }
+            // A due timer ends the read too, unless a fresh draft holds it
+            // (one idle for a minute is abandoned: Rust #178).
             lapse = () @safe => (exitArmedAt != MonoTime.zero && MonoTime.currTime - exitArmedAt > exitWindow)
-                || (!editor.hasDraft && agent.timers.anyDue(agent.timerNow()));
+                || (!editor.holdsTimer(MonoTime.currTime) && agent.timers.anyDue(agent.timerNow()));
             auto r = editor.readLine(.stamp(false) ~ "› ", console.stamp() ~ glyphMark ~ " ", false, lapse);
             editor.restyle = null;
             syncMode(); // Shift-Tab at the prompt switched the mode
             if (r.outcome == Outcome.eof) break;
-            if (r.outcome == Outcome.stopped && !editor.hasDraft && agent.timers.anyDue(agent.timerNow()))
+            if (r.outcome == Outcome.stopped && !editor.holdsTimer(MonoTime.currTime) && agent.timers.anyDue(agent.timerNow()))
             {
+                // Park a stale draft so the timer turn can't take it as a steer.
+                hasParkedDraft = editor.parkDraft(parkedDraft);
                 string notice;
                 line = agent.takeFiredTimers(notice);
                 writeln(console.dim(notice));

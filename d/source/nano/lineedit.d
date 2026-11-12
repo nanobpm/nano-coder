@@ -14,7 +14,23 @@ import std.format : format;
 import std.string : indexOf;
 import std.uni : isWhite, isAlphaNum;
 
-import nano.history : InputHistory;
+import nano.history : HistoryBrowsing, InputHistory;
+import core.time : Duration, MonoTime, seconds;
+
+/// How long a half-typed line holds back a due timer. After this long with
+/// no keystrokes the draft counts as abandoned: the timer fires, and the
+/// draft is parked for the automatic turn and restored after it (Rust #178).
+enum Duration draftHold = 60.seconds;
+
+/// A draft set aside while a timer turn runs (`EditState.parkDraft`).
+struct ParkedDraft
+{
+    private dchar[] buf;
+    private size_t cursor;
+    private MonoTime lastEdit;
+    private ulong generation;
+    private HistoryBrowsing browsing;
+}
 import commands = nano.commands;
 
 @safe:
@@ -311,8 +327,59 @@ struct EditState
     size_t cursor;
     InputHistory history;
     bool menuHidden; /// Esc hid the command menu for this line
+    /// The last keystroke that edited or moved in the line (zero: none since
+    /// the last submission). A draft idle for `draftHold` is stale.
+    MonoTime lastEdit;
+    /// Bumped by every text change, so a parked draft knows whether the user
+    /// typed (or sent) something newer meanwhile.
+    ulong generation;
 
     string text() const { return buf.to!string; }
+
+    /// A fresh half-typed line holds back a due timer; an empty or stale one doesn't.
+    bool holdsTimer(MonoTime now) const { return buf.length && !draftIsStale(now); }
+
+    /// The draft has been idle for `draftHold` (or was never touched by a key).
+    bool draftIsStale(MonoTime now) const
+    {
+        return buf.length && (lastEdit == MonoTime.init || now - lastEdit >= draftHold);
+    }
+
+    /// Clear the line for a timer turn, returning it to put back afterwards;
+    /// false (nothing parked) when the line is empty.
+    bool parkDraft(out ParkedDraft parked)
+    {
+        if (!buf.length) return false;
+        parked = ParkedDraft(buf, cursor, lastEdit, generation, history.parkBrowsing());
+        buf = null;
+        cursor = 0;
+        menuHidden = false;
+        lastEdit = MonoTime.init;
+        return true;
+    }
+
+    /// Put a parked draft back, unless the user typed, cleared or sent
+    /// something since it was parked. Its age is kept, so a stale draft
+    /// doesn't hold the next timer.
+    void restoreDraft(ParkedDraft parked)
+    {
+        if (buf.length || generation != parked.generation) return;
+        buf = parked.buf;
+        cursor = min(parked.cursor, buf.length);
+        menuHidden = false;
+        lastEdit = parked.lastEdit;
+        history.restoreBrowsing(parked.browsing);
+    }
+
+    private void active() { lastEdit = MonoTime.currTime; }
+
+    /// Run a cursor move; moving counts as activity, a no-op doesn't.
+    private void move(scope void delegate() @safe f)
+    {
+        auto before = cursor;
+        f();
+        if (cursor != before) active();
+    }
 
     void set(string s)
     {
@@ -320,19 +387,26 @@ struct EditState
         cursor = buf.length;
     }
 
-    /// Take the line and reset (recording it in the history).
+    /// Take the line and reset (recording it in the history). A blank
+    /// Enter changes nothing else, so a parked draft and history browsing
+    /// survive it.
     string take()
     {
         auto t = text;
-        history.record(t);
-        history.edited();
+        lastEdit = MonoTime.init;
+        if (t.length)
+        {
+            history.record(t);
+            history.edited();
+            ++generation;
+        }
         buf = null;
         cursor = 0;
         menuHidden = false;
         return t;
     }
 
-    private void changed() { history.edited(); menuHidden = false; }
+    private void changed() { history.edited(); menuHidden = false; ++generation; active(); }
 
     void insert(string s)
     {
@@ -362,25 +436,29 @@ struct EditState
         changed();
     }
 
-    void left() { while (cursor > 0) { --cursor; if (charWidth(buf[cursor]) != 0) break; } }
-    void right() { if (cursor < buf.length) ++cursor; while (cursor < buf.length && charWidth(buf[cursor]) == 0) ++cursor; }
+    void left() { move({ while (cursor > 0) { --cursor; if (charWidth(buf[cursor]) != 0) break; } }); }
+    void right() { move({ if (cursor < buf.length) ++cursor; while (cursor < buf.length && charWidth(buf[cursor]) == 0) ++cursor; }); }
 
     /// Home/End move within the current line of a multi-line input.
-    void home() { while (cursor > 0 && buf[cursor - 1] != '\n') --cursor; }
-    void end() { while (cursor < buf.length && buf[cursor] != '\n') ++cursor; }
+    void home() { move({ while (cursor > 0 && buf[cursor - 1] != '\n') --cursor; }); }
+    void end() { move({ while (cursor < buf.length && buf[cursor] != '\n') ++cursor; }); }
 
     private static bool wordChar(dchar c) { return isAlphaNum(c) || c == '_'; }
 
     void wordLeft()
     {
-        while (cursor > 0 && !wordChar(buf[cursor - 1])) --cursor;
-        while (cursor > 0 && wordChar(buf[cursor - 1])) --cursor;
+        move({
+            while (cursor > 0 && !wordChar(buf[cursor - 1])) --cursor;
+            while (cursor > 0 && wordChar(buf[cursor - 1])) --cursor;
+        });
     }
 
     void wordRight()
     {
-        while (cursor < buf.length && !wordChar(buf[cursor])) ++cursor;
-        while (cursor < buf.length && wordChar(buf[cursor])) ++cursor;
+        move({
+            while (cursor < buf.length && !wordChar(buf[cursor])) ++cursor;
+            while (cursor < buf.length && wordChar(buf[cursor])) ++cursor;
+        });
     }
 
     /// Ctrl-W: delete the whitespace-delimited word before the cursor.
@@ -417,16 +495,16 @@ struct EditState
     /// Up: in a multi-line input, the line above; else the previous history entry.
     void up()
     {
-        if (moveLine(-1)) return;
+        if (moveLine(-1)) { active(); return; }
         auto e = history.up(text);
-        if (e !is null) set(e);
+        if (e !is null) { set(e); ++generation; active(); }
     }
 
     void down()
     {
-        if (moveLine(1)) return;
+        if (moveLine(1)) { active(); return; }
         auto e = history.down();
-        if (e !is null) set(e);
+        if (e !is null) { set(e); ++generation; active(); }
     }
 
     /// Move the cursor to the same column one line up/down within the input.
@@ -581,8 +659,17 @@ final class LineEditor
 
     private static dstring replicateD(dchar c, size_t n) pure { dstring r; foreach (_; 0 .. n) r ~= c; return r; }
 
-    /// Text is typed but not yet sent (an idle timer waits for it).
+    /// Text is typed but not yet sent.
     bool hasDraft() const { return state.buf.length > 0; }
+
+    /// A fresh draft holds back a due timer (see `EditState.holdsTimer`).
+    bool holdsTimer(MonoTime now) const { return state.holdsTimer(now); }
+
+    /// Park the draft for a timer turn (see `EditState.parkDraft`).
+    bool parkDraft(out ParkedDraft parked) { return state.parkDraft(parked); }
+
+    /// Put a parked draft back after the turn (see `EditState.restoreDraft`).
+    void restoreDraft(ParkedDraft parked) { state.restoreDraft(parked); }
 
     private Result read(string prompt, string styledPrompt, bool turn, bool delegate() @safe stop)
     {
@@ -1137,4 +1224,174 @@ unittest
     e.readLine("> ", "> ");
     e.readLine("> ", "> ");
     assert(e.readLine("> ", "> ").text == "second!");
+}
+
+// Rust #178: a stale draft stops holding due timers, and parks for the turn.
+// rust: lineedit.rs::a_fresh_draft_holds_a_timer_and_a_stale_one_does_not
+// rust: lineedit.rs::park_and_restore_round_trip_the_draft
+// rust: lineedit.rs::cursor_navigation_keeps_the_draft_fresh
+// rust: lineedit.rs::a_steer_submitted_during_the_turn_supersedes_the_parked_draft
+// rust: lineedit.rs::a_blank_enter_during_the_turn_keeps_the_parked_draft
+// rust: lineedit.rs::a_noop_ctrl_w_during_the_turn_keeps_the_parked_draft
+// rust: lineedit.rs::a_whitespace_only_ctrl_w_still_erases_and_supersedes_the_draft
+// rust: lineedit.rs::parking_and_restoring_keeps_the_history_browsing_state
+// rust: lineedit.rs::a_blank_enter_on_an_empty_buffer_keeps_the_history_state
+// rust: lineedit.rs::a_restored_draft_keeps_its_age_and_stays_stale
+unittest
+{
+    ParkedDraft parked;
+    // Fresh vs stale.
+    {
+        EditState e;
+        auto t0 = MonoTime.currTime;
+        assert(!e.holdsTimer(t0) && !e.draftIsStale(t0), "an empty buffer never holds a timer");
+        e.insert("half-typed");
+        auto now = MonoTime.currTime;
+        assert(e.holdsTimer(now) && !e.draftIsStale(now), "a just-typed draft holds the timer");
+        e.lastEdit = now - draftHold;
+        assert(e.draftIsStale(now) && !e.holdsTimer(now), "a stale draft no longer holds the timer");
+        e.lastEdit = MonoTime.init;
+        assert(e.draftIsStale(now) && !e.holdsTimer(now));
+    }
+    // Park and restore round-trip; a newer draft is not overwritten.
+    {
+        EditState e;
+        e.insert("half-typed note");
+        e.left();
+        e.left();
+        auto cursor = e.cursor;
+        assert(e.parkDraft(parked));
+        assert(e.text == "", "park clears the editor so a timer turn cannot steer it");
+        ParkedDraft none;
+        assert(!e.parkDraft(none), "an empty buffer parks nothing");
+        e.restoreDraft(parked);
+        assert(e.text == "half-typed note" && e.cursor == cursor);
+        e.clear();
+        e.insert("typed during the turn");
+        assert(e.parkDraft(parked));
+        e.insert("newer still");
+        e.restoreDraft(parked);
+        assert(e.text == "newer still", "a live draft is not overwritten");
+    }
+    // Cursor navigation is activity; a no-op move isn't.
+    {
+        EditState e;
+        e.insert("a long draft being reviewed");
+        auto now = MonoTime.currTime;
+        e.lastEdit = now - draftHold;
+        assert(e.draftIsStale(now));
+        e.left();
+        assert(!e.draftIsStale(now) && e.holdsTimer(now), "a cursor move is activity");
+        e.lastEdit = now - draftHold;
+        e.home();
+        assert(e.holdsTimer(now), "Home is activity");
+        e.lastEdit = now - draftHold;
+        e.end();
+        assert(e.holdsTimer(now), "End is activity");
+        e.lastEdit = now - draftHold;
+        e.wordLeft();
+        assert(e.holdsTimer(now), "a word jump is activity");
+        e.home();
+        e.lastEdit = now - draftHold;
+        e.home();
+        assert(e.draftIsStale(now), "a no-op move changes nothing");
+    }
+    // A steer sent (or text typed then cleared) during the turn supersedes the draft.
+    {
+        EditState e;
+        e.insert("abandoned draft");
+        assert(e.parkDraft(parked));
+        e.insert("steer while the timer runs");
+        e.take();
+        e.restoreDraft(parked);
+        assert(e.text == "", "a submitted steer supersedes the parked draft");
+        e.insert("abandoned draft");
+        assert(e.parkDraft(parked));
+        e.insert("typed then cleared");
+        e.clear();
+        e.restoreDraft(parked);
+        assert(e.text == "", "text typed then cleared supersedes the parked draft");
+    }
+    // A blank Enter keeps the parked draft; a real submission still supersedes it.
+    {
+        EditState e;
+        e.insert("abandoned draft");
+        assert(e.parkDraft(parked));
+        assert(e.take() == "", "a blank Enter submits nothing");
+        e.restoreDraft(parked);
+        assert(e.text == "abandoned draft", "a no-op Enter does not discard the parked draft");
+        assert(e.parkDraft(parked));
+        e.insert("steer while the timer runs");
+        e.take();
+        e.restoreDraft(parked);
+        assert(e.text == "");
+    }
+    // A no-op Ctrl-W keeps the parked draft; a real erase supersedes it.
+    {
+        EditState e;
+        e.insert("abandoned draft");
+        assert(e.parkDraft(parked));
+        e.eraseWord();
+        e.restoreDraft(parked);
+        assert(e.text == "abandoned draft", "a no-op Ctrl-W does not discard the parked draft");
+        assert(e.parkDraft(parked));
+        e.insert("more words");
+        e.eraseWord();
+        e.restoreDraft(parked);
+        assert(e.text == "more ", "a real erase supersedes the parked draft");
+    }
+    // A whitespace-only Ctrl-W still erases, and so supersedes.
+    {
+        EditState e;
+        e.insert("abandoned draft");
+        assert(e.parkDraft(parked));
+        e.insert("   ");
+        e.eraseWord();
+        assert(e.text == "", "a whitespace-only prefix is still erased");
+        e.restoreDraft(parked);
+        assert(e.text == "", "erasing the spaces superseded the parked draft");
+    }
+    // Parking keeps the history browsing state.
+    {
+        EditState e;
+        e.history.record("older entry");
+        e.insert("my unsent draft");
+        e.up();
+        assert(e.text == "older entry");
+        assert(e.parkDraft(parked));
+        assert(e.text == "", "park clears the editor");
+        assert(e.take() == "");
+        e.restoreDraft(parked);
+        assert(e.text == "older entry", "the recalled entry is restored");
+        e.down();
+        assert(e.text == "my unsent draft", "Down still recovers the unsent draft");
+        assert(e.history.down() is null, "past the draft: no longer browsing");
+    }
+    // A blank Enter on an empty buffer keeps the history state.
+    {
+        EditState e;
+        e.history.record("first entry");
+        e.up();
+        assert(e.text == "first entry");
+        e.clear();
+        assert(e.take() == "");
+        e.up();
+        assert(e.text == "first entry");
+    }
+    // A restored draft keeps its age.
+    {
+        EditState e;
+        e.insert("abandoned draft");
+        auto t0 = MonoTime.currTime;
+        e.lastEdit = t0 - draftHold;
+        assert(e.parkDraft(parked));
+        e.restoreDraft(parked);
+        assert(e.text == "abandoned draft" && e.draftIsStale(t0) && !e.holdsTimer(t0), "a restored AFK draft stays stale");
+        EditState f;
+        f.insert("fresh draft");
+        auto t1 = MonoTime.currTime;
+        assert(f.parkDraft(parked));
+        f.restoreDraft(parked);
+        assert(f.holdsTimer(t1), "a restored fresh draft stays fresh");
+    }
 }
