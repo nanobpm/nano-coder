@@ -355,6 +355,8 @@ final class AcpServer : AgentEvents
     this(Agent agent, Host host, void delegate(string) @safe writeLine = null)
     {
         this.agent = agent;
+        // The ACP orchestrator runs its own verification (Rust #158).
+        agent.verifyBeforeComplete = false;
         this.host = host;
         outLock = new Mutex;
         router = AcpRouter.make(atomicLoad(agent.control));

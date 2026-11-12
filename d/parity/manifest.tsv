@@ -70,7 +70,7 @@ agent.rs::an_unverifiable_loop_is_blocked_without_asking_when_unsandboxed	test
 agent.rs::auto_compaction_mid_turn_keeps_the_turn_going	test
 agent.rs::auto_mode_disables_the_turn_cap	todo
 agent.rs::auto_mode_does_not_disable_the_cap_in_a_headless_turn	todo
-agent.rs::blocked_and_needs_input_are_never_intercepted	todo
+agent.rs::blocked_and_needs_input_are_never_intercepted	test
 agent.rs::calibrated_estimate_recomputes_when_a_suffix_image_displaces_a_prefix_image	todo
 agent.rs::cancel_during_key_command_build_kills_the_child_despite_a_turn_flag_reset	na	Tokio runtime races while a client builds asynchronously; D builds the client synchronously on the agent thread
 agent.rs::cancel_during_model_call_stops_the_turn	todo
@@ -85,10 +85,10 @@ agent.rs::compaction_sends_no_temperature_to_an_always_thinking_model	todo
 agent.rs::compaction_streams_the_summary_request	todo
 agent.rs::compaction_tail_budget_mirrors_the_vision_wire_plan	todo
 agent.rs::compacts_below_the_threshold_when_output_would_not_fit	todo
-agent.rs::completed_after_an_edit_and_a_check_is_not_reminded	todo
-agent.rs::completed_after_an_edit_and_a_rejected_bash_is_still_reminded	todo
-agent.rs::completed_after_an_edit_and_an_invalid_real_bash_is_still_reminded	todo
-agent.rs::completed_after_an_unverified_edit_is_reminded_once_then_goes_through	todo
+agent.rs::completed_after_an_edit_and_a_check_is_not_reminded	test
+agent.rs::completed_after_an_edit_and_a_rejected_bash_is_still_reminded	test
+agent.rs::completed_after_an_edit_and_an_invalid_real_bash_is_still_reminded	test
+agent.rs::completed_after_an_unverified_edit_is_reminded_once_then_goes_through	test
 agent.rs::configured_read_only_memory_search_does_not_mutate_the_store	todo
 agent.rs::context_overflow_compacts_and_retries_once	test
 agent.rs::detected_window_sits_between_config_and_model_name	todo
@@ -219,7 +219,7 @@ agent.rs::too_many_mid_reply_drops_end_the_turn	todo
 agent.rs::tool_calls_recall_matching_memories_once_per_context	test
 agent.rs::tools_snapshot_captured_in_plan_mode_still_lists_mutating_tools_live	todo
 agent.rs::tools_snapshot_captured_without_history_still_lists_it_live	todo
-agent.rs::verify_before_complete_can_be_turned_off	todo
+agent.rs::verify_before_complete_can_be_turned_off	test
 agent.rs::zero_turn_cap_is_unbounded	todo
 attachment.rs::crafted_metadata_cannot_escape_the_attachments_dir	test
 attachment.rs::exists_rejects_a_tampered_stored_file	test
@@ -253,7 +253,7 @@ bash.rs::incremental_digest_matches_a_whole_file_hash	na	Rust's streamed capture
 bash.rs::kills_on_timeout_without_waiting_for_background_children	test
 bash.rs::marker_digest_covers_the_complete_capture	na	Rust's streamed capture digests for the loop detector (#65); D reads whole captures and its detector normalises spill paths instead
 bash.rs::read_bounded_honours_the_frozen_length_not_the_growing_file	na	Rust's streamed capture digests for the loop detector (#65); D reads whole captures and its detector normalises spill paths instead
-bash.rs::run_checked_rejects_commands_that_never_started	todo
+bash.rs::run_checked_rejects_commands_that_never_started	test
 bash.rs::truncates_and_keeps_full_capture	test
 bash.rs::validates_arguments	test
 claude_hooks.rs::blank_if_filter_is_normalized_to_none	claimed	PORTING.md: all claude_hooks.rs tests ported

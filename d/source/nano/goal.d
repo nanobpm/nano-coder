@@ -18,6 +18,12 @@ enum toolName = "report_outcome";
 
 enum OutcomeStatus { completed, blocked, needsInput }
 
+/// The once-per-turn reminder returned (as a tool error, so the turn goes
+/// on) when `report_outcome(completed)` follows an edit with no later `bash`
+/// check. A second report goes through regardless (Rust #158).
+enum verifyReminder = "You changed files after your last check. Run the relevant tests/build, "
+    ~ "or report again if no check applies.";
+
 /// Parse a status leniently (Rust `Status::parse`); false when unknown.
 bool parseStatus(string text, out OutcomeStatus s)
 {
@@ -130,7 +136,7 @@ ToolDefinition definition()
                 "status": { "type": "string", "enum": ["completed", "blocked", "needs_input"] },
                 "summary": {
                     "type": "string",
-                    "description": "Completed: what was done, with PR URLs or commits. Blocked: what was tried and what is needed to continue. NeedsInput: the question or decision you need from the user."
+                    "description": "Completed: what was done and how it was checked (the command run and its result). Blocked: what was tried and what is needed to continue. NeedsInput: the question or decision you need from the user."
                 }
             },
             "required": ["status", "summary"]

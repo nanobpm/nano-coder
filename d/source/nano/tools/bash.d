@@ -111,6 +111,11 @@ string execute(JSONValue args, long defaultTimeout = defaultTimeoutSecs, const S
 {
     if (args.type != JSONType.object) throw new ToolError("bash arguments must be a JSON object");
     auto command = requireString(args, "command", "bash");
+    {
+        import std.string : indexOf;
+        auto nul = command.indexOf('\0');
+        if (nul >= 0) throw new ToolError(format(`bash argument "command" contains a NUL byte at offset %s`, nul));
+    }
     auto secs = optInt(args, "timeout_seconds", defaultTimeout);
     if (secs <= 0) throw new ToolError(`bash argument "timeout_seconds" must be positive`);
     auto limit = optInt(args, "max_output_length", defaultMaxOutput);
@@ -160,6 +165,21 @@ unittest
     foreach (bad; [`0`, `-1`, `1000001`])
         assert(collectExceptionMsg(execute(parseJSON(`{"command":"ls","max_output_length":` ~ bad ~ `}`))).length);
     assert(collectExceptionMsg(execute(parseJSON(`{"command":"true","max_output_length":10}`))) is null);
+}
+
+// A call whose command never started throws (a failed tool call, so it is no
+// verification check, Rust #158); one that started returns text even when it fails.
+// rust: bash.rs::run_checked_rejects_commands_that_never_started
+unittest
+{
+    import std.exception : collectExceptionMsg;
+    import std.algorithm.searching : canFind;
+    assert(collectExceptionMsg(execute(parseJSON(`{}`))).canFind("must be set"));
+    assert(collectExceptionMsg(execute(parseJSON(`{"command":1}`))).length);
+    assert(collectExceptionMsg(execute(parseJSON(`{"command":"a\u0000b"}`))).length);
+    assert(collectExceptionMsg(execute(parseJSON(`{"command":"ls","timeout_seconds":0}`))).length);
+    assert(collectExceptionMsg(execute(parseJSON(`"ls"`))).length);
+    assert(execute(parseJSON(`{"command":"exit 3"}`)).canFind("Exit code: 3"));
 }
 
 // rust: bash.rs::truncates_and_keeps_full_capture

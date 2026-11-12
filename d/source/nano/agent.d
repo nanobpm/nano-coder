@@ -20,7 +20,7 @@ import nano.tools;
 import nano.question : QuestionError, QuestionBroker, Question, QuestionOption, Answer, Answered;
 import std.sumtype : match;
 import nano.mode : AgentMode, planAllows;
-import nano.goal : Outcome, OutcomeError, OutcomeStatus, outcomeToolName = toolName, outcomeDefinition = definition;
+import nano.goal : Outcome, OutcomeError, OutcomeStatus, verifyReminder, outcomeToolName = toolName, outcomeDefinition = definition;
 import nano.reminders : Reminders, wrap;
 import mem = nano.memory;
 import ctx = nano.context;
@@ -336,6 +336,7 @@ class Agent
         if (resetControl) control.startTurn();
         stopBlocks = 0;
         hasOutcome = hasReported = false;
+        editsSinceCheck = verifyReminderFired = false;
         reminders.outcomeTool = outcomeTool;
         reminders.startTurn();
         recallTurnNotes = 0;
@@ -568,6 +569,10 @@ class Agent
                             result = truncateOutput(result, toolOutputLimit,
                                 format("tool-%s-%s", safeName(call.id), safeName(call.name)));
                     }
+                    // A successful edit marks the tree unchecked; a bash call
+                    // that started (even one exiting non-zero) is the check.
+                    if (!isError && (call.name == "write_file" || call.name == "edit_file")) editsSinceCheck = true;
+                    else if (dispatched && !isError && call.name == "bash") editsSinceCheck = false;
                     if (call.name == "read_file") result = imageResult(result, isError, attachments);
                     // Deeper instruction files and scoped rules attach to the first
                     // file-tool result that touches a matching path.
@@ -1153,6 +1158,13 @@ class Agent
             if (isOutcome)
             {
                 auto o = Outcome.fromArgs(args);
+                // Verify-before-complete (Rust #158): `completed` after an
+                // edit with no later bash check is bounced once per turn.
+                if (verifyBeforeComplete && o.status == OutcomeStatus.completed && editsSinceCheck && !verifyReminderFired)
+                {
+                    verifyReminderFired = true;
+                    throw new OutcomeError(verifyReminder);
+                }
                 out_ = format("Recorded outcome: %s. Your turn ends now.", o.toJSON["status"].str);
                 reported = o;
                 hasReported = true;
@@ -1281,6 +1293,11 @@ class Agent
 
     /// Offer `report_outcome` (config `outcome_tool`).
     bool outcomeTool = true;
+    /// Ask once per turn for a check before accepting `report_outcome(completed)`
+    /// after unchecked edits (Rust #158). The ACP server turns it off: the
+    /// orchestrator verifies there.
+    bool verifyBeforeComplete = true;
+    private bool editsSinceCheck, verifyReminderFired;
     /// System reminders and the loop detector (config `reminders`).
     bool remindersEnabled = true;
     private Reminders reminders;
@@ -1669,6 +1686,86 @@ unittest
     assert(text.canFind("plan mode") || text.canFind("read-only"), text);
     assert(!ran.length);
     assert(runCall(`{"command":"for f in a.txt b.txt; do wc -l \"$f\"; done"}`) == "ok");
+}
+
+// Verify-before-complete (Rust #158): `completed` after an unchecked edit is
+// bounced once per turn; a bash check clears it; a never-run bash doesn't;
+// blocked/needs_input pass; the flag turns it off.
+// rust: agent.rs::completed_after_an_unverified_edit_is_reminded_once_then_goes_through
+// rust: agent.rs::completed_after_an_edit_and_a_check_is_not_reminded
+// rust: agent.rs::completed_after_an_edit_and_a_rejected_bash_is_still_reminded
+// rust: agent.rs::completed_after_an_edit_and_an_invalid_real_bash_is_still_reminded
+// rust: agent.rs::blocked_and_needs_input_are_never_intercepted
+// rust: agent.rs::verify_before_complete_can_be_turned_off
+unittest
+{
+    import nano.providers.mock;
+    import nano.tools.bash : bashDefinition = definition, bashExecute = execute;
+    import std.algorithm : canFind, startsWith;
+    ToolRegistry registry(bool realBash = false)
+    {
+        auto reg = new ToolRegistry;
+        foreach (n; ["write_file", "edit_file"])
+            reg.register(ToolDefinition(n, n, parseJSON(`{"type":"object"}`)), (JSONValue a) => "written");
+        if (realBash) reg.register(bashDefinition(), (JSONValue a) => bashExecute(a));
+        else reg.register(ToolDefinition("bash", "bash", parseJSON(`{"type":"object"}`)), (JSONValue a) => "ok");
+        return reg;
+    }
+    string toolText(Agent a, string id)
+    {
+        foreach (m; a.messages) if (m.role == Role.tool && m.toolCallId == id) return m.content;
+        assert(0, "no tool result for " ~ id);
+    }
+    auto edit = ToolCall.fromRaw("e1", "edit_file", `{"path":"a.rs"}`);
+    auto done = (string id, string summary = "done") => ToolCall.fromRaw(id, "report_outcome",
+        `{"status":"completed","summary":"` ~ summary ~ `"}`);
+    auto ev = new NullEvents;
+    // Reminded once, then the second report goes through.
+    {
+        auto mock = new MockClient([LLMResponse("", "", [edit]), LLMResponse("", "", [done("o1")]),
+            LLMResponse("", "", [done("o2", "done, cargo test passes")])]);
+        auto agent = new Agent(mock, registry(), Policy.init, "sys");
+        assert(agent.run("ship it", ev) == "done, cargo test passes");
+        assert(toolText(agent, "o1").canFind(verifyReminder));
+        assert(agent.hasOutcome && agent.lastOutcome.status == OutcomeStatus.completed);
+    }
+    // A bash check clears the edit (no further responses: the turn ended).
+    {
+        auto mock = new MockClient([LLMResponse("", "", [edit, ToolCall.fromRaw("b1", "bash", `{"command":"cargo test"}`),
+            done("o1", "done, cargo test passes")])]);
+        auto agent = new Agent(mock, registry(), Policy.init, "sys");
+        agent.run("ship it", ev);
+        auto t = toolText(agent, "o1");
+        assert(!t.canFind(verifyReminder) && t.canFind("Recorded outcome"), t);
+    }
+    // A malformed bash call, or one the real handler rejects, never ran: still reminded.
+    foreach (args; [`{"command":"cargo te`, `{}`, `{"command":1}`, `{"command":"true","timeout_seconds":0}`])
+    {
+        auto mock = new MockClient([LLMResponse("", "", [edit, ToolCall.fromRaw("b1", "bash", args), done("o1")]),
+            LLMResponse("", "", [done("o2")])]);
+        auto agent = new Agent(mock, registry(args != `{"command":"cargo te`), Policy.init, "sys");
+        agent.run("ship it", ev);
+        assert(toolText(agent, "o1").canFind(verifyReminder), args);
+    }
+    // blocked / needs_input are never intercepted.
+    foreach (st; [["blocked", "Blocked: "], ["needs_input", "Question: "]])
+    {
+        auto mock = new MockClient([LLMResponse("", "", [ToolCall.fromRaw("e1", "write_file", `{"path":"a.rs"}`),
+            ToolCall.fromRaw("o1", "report_outcome", `{"status":"` ~ st[0] ~ `","summary":"no token"}`)])]);
+        auto agent = new Agent(mock, registry(), Policy.init, "sys");
+        auto r = agent.run("ship it", ev);
+        auto t = toolText(agent, "o1");
+        assert(!t.canFind(verifyReminder) && t.canFind("Recorded outcome") && r.startsWith(st[1]), r);
+    }
+    // The flag turns it off.
+    {
+        auto mock = new MockClient([LLMResponse("", "", [edit, done("o1")])]);
+        auto agent = new Agent(mock, registry(), Policy.init, "sys");
+        agent.verifyBeforeComplete = false;
+        agent.run("ship it", ev);
+        assert(!toolText(agent, "o1").canFind(verifyReminder));
+        assert(agent.hasOutcome && agent.lastOutcome.status == OutcomeStatus.completed);
+    }
 }
 
 // report_outcome ends the turn with its summary as the answer.
