@@ -617,8 +617,9 @@ def run_cost(new_records, seeded_records=()):
     persists its usage and duration on the synthetic summary (a user message)
     inside the mode-bearing `replace` record. Each new compaction's summary
     is counted exactly once: a replace's message list also retains earlier
-    summaries and conversation messages, so only usage-bearing user messages
-    not already present in an earlier replace (seeded or new) are counted."""
+    summaries and conversation messages, so only user messages carrying usage
+    or duration (timing is kept even when the provider omits usage or the
+    summary request fails) and not already present in an earlier replace (seeded or new) are counted."""
     cost = {"input_tokens": 0, "output_tokens": 0, "request_ms": 0, "requests": 0}
 
     def add(data):
@@ -635,7 +636,8 @@ def run_cost(new_records, seeded_records=()):
         if r.get("type") != "replace" or "mode" not in data:
             return []
         return [m for m in data.get("messages") or []
-                if isinstance(m, dict) and m.get("role") == "user" and isinstance(m.get("usage"), dict)]
+                if isinstance(m, dict) and m.get("role") == "user"
+                and (isinstance(m.get("usage"), dict) or isinstance(m.get("duration_ms"), (int, float)))]
 
     def key(m):
         return json.dumps(m, sort_keys=True)
