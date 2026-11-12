@@ -5,7 +5,7 @@ module nano.tools.search;
 
 @safe:
 
-import nano.safeio : listDir, ownText, readBytes;
+import nano.safeio : listDir, ownText, readCapped;
 
 import std.json;
 import std.format : format;
@@ -21,6 +21,16 @@ import nano.llm : ToolDefinition;
 
 enum long defaultLimit = 250;
 enum long maxLimit = 5000;
+/// Larger files are skipped, and a file read stops one byte past this, so a
+/// growing file or one huge line can't be buffered whole (Rust #160).
+enum ulong maxFileBytes = 16 * 1024 * 1024;
+/// Rules kept from one .gitignore.
+enum size_t maxIgnoreRules = 1_024;
+/// Rules compiled across a whole walk; once spent, further .gitignore files
+/// add none (fail-open toward visibility, Rust #160).
+enum size_t maxTotalIgnoreRules = 16_384;
+/// Longer rules are dropped: a rule compiles to a regex that grows with it.
+enum size_t maxIgnoreRuleChars = 1_024;
 
 /// Translate a glob to an anchored regex. `*` and `?` stay within one path
 /// segment; `**/` matches zero or more directories; `**` alone matches anything.
@@ -107,6 +117,8 @@ struct Ignores
 {
     IgnoreRule[] rules;
     Denied denied;
+    /// Rules this walk may still compile.
+    size_t budget = maxTotalIgnoreRules;
 
     void load(string root, string relDir)
     {
@@ -115,21 +127,16 @@ struct Ignores
         // rules apply, and the read is bounded.
         if (!file.exists || file.isSymlink || !file.isFile || file.getSize > 1 << 20) return;
         if (denied !is null && denied(file)) return;
+        size_t added;
         foreach (raw; readText(file).lineSplitter)
         {
-            auto line = raw.strip;
-            if (!line.length || line[0] == '#') continue;
+            if (added >= min(maxIgnoreRules, budget)) break;
             IgnoreRule r;
-            r.base = relDir;
-            if (line[0] == '!') { r.negate = true; line = line[1 .. $]; }
-            if (line.endsWith("/")) { r.dirOnly = true; line = line[0 .. $ - 1]; }
-            if (line.startsWith("/")) { r.anchored = true; line = line[1 .. $]; }
-            else if (line.indexOf('/') >= 0) r.anchored = true;
-            if (!line.length) continue;
-            try r.re = regex(globToRegex(line));
-            catch (Exception) continue;
+            if (!parseIgnoreLine(raw, relDir, r)) continue;
             rules ~= r;
+            ++added;
         }
+        budget -= added;
     }
 
     /// Is `rel` (relative to root) ignored? Last matching rule wins.
@@ -151,6 +158,25 @@ struct Ignores
         }
         return result;
     }
+}
+
+/// One .gitignore line as a rule; false for blanks, comments, and over-long
+/// or invalid rules.
+bool parseIgnoreLine(string raw, string relDir, out IgnoreRule r)
+{
+    import std.utf : count;
+    auto line = raw.strip;
+    if (line.count > maxIgnoreRuleChars) return false;
+    if (!line.length || line[0] == '#') return false;
+    r.base = relDir;
+    if (line[0] == '!') { r.negate = true; line = line[1 .. $]; }
+    if (line.endsWith("/")) { r.dirOnly = true; line = line[0 .. $ - 1]; }
+    if (line.startsWith("/")) { r.anchored = true; line = line[1 .. $]; }
+    else if (line.indexOf('/') >= 0) r.anchored = true;
+    if (!line.length) return false;
+    try r.re = regex(globToRegex(line));
+    catch (Exception) return false;
+    return true;
 }
 
 /// Whether Read-deny rules hide an absolute path (null: nothing is hidden).
@@ -205,6 +231,23 @@ private bool delegate(string) @safe globFilter(string pattern)
     return (string rel) => !matchFirst(byName ? baseName(rel) : rel, re).empty;
 }
 
+/// Makes the deny check for a walk under a root (null: nothing is denied).
+alias DenyScan = Denied delegate(string root) @safe;
+
+/// ditto: search with the deny check prepared for the search root.
+string grep(JSONValue args, DenyScan scan)
+{
+    auto root = resolvePath(optString(args, "path", "."));
+    return grep(args, scan is null ? null : scan(root));
+}
+
+/// ditto
+string glob(JSONValue args, DenyScan scan)
+{
+    auto root = resolvePath(optString(args, "path", "."));
+    return glob(args, scan is null ? null : scan(root));
+}
+
 string grep(JSONValue args, Denied denied = null)
 {
     auto pattern = requireString(args, "pattern", "grep");
@@ -232,8 +275,9 @@ string grep(JSONValue args, Denied denied = null)
         if (!filter(rel)) continue;
         auto full = buildPath(base, rel);
         ubyte[] data;
-        try data = readBytes(full);
+        try data = readCapped(full, maxFileBytes);
         catch (Exception) continue;
+        if (data is null) continue; // over the cap
         if (looksBinary(data)) continue;
         auto shown = full.startsWith(cwd ~ "/") ? full[cwd.length + 1 .. $] : full;
         long n;
@@ -293,8 +337,9 @@ string glob(JSONValue args, Denied denied = null)
     return n ? out_.data : "(no matches)";
 }
 
-/// `denied` reports paths Read-deny rules hide from search results.
-void register(ToolRegistry tools, Denied denied = null)
+/// `scan` prepares, per search root, the check for paths Read-deny rules
+/// hide from search results.
+void register(ToolRegistry tools, DenyScan denied = null)
 {
     tools.register(ToolDefinition("grep",
         "Search file contents under a path for a regular expression. Read-only. Respects .gitignore, skips .git, symlinks and binary files. "
@@ -420,4 +465,138 @@ unittest
     // Globs match by name at any depth, by path with a slash; symlinks aren't walked.
     assert(rel(glob(parseJSON(`{"pattern":"*.txt","path":` ~ JSONValue(root).toString ~ `}`))) == "a/y.txt\nb/sub/z.txt");
     assert(rel(glob(parseJSON(`{"pattern":"b/*/*.txt","path":` ~ JSONValue(root).toString ~ `}`))) == "b/sub/z.txt");
+}
+
+version (unittest)
+{
+    private string tmpRoot(string name)
+    {
+        import std.file : mkdirRecurse, rmdirRecurse, tempDir;
+        auto root = buildPath(tempDir, name).absolutePath;
+        if (root.exists) rmdirRecurse(root);
+        mkdirRecurse(root);
+        import nano.paths : resolveSymlinks;
+        return resolveSymlinks(root);
+    }
+
+    private DenyScan scanOf(string[] denyRules, string cwd)
+    {
+        import nano.permissions : Policy, parseRule, ReadDenyScan;
+        Policy p;
+        foreach (r; denyRules) p.deny ~= parseRule(r);
+        return (string root) @safe {
+            ReadDenyScan scan;
+            if (!p.readDenyScan(cwd, scan)) return cast(Denied) null;
+            auto f = scan.forRoot(root);
+            return (string path) @safe => f.denied(path);
+        };
+    }
+
+    private string files(string pattern, string path, DenyScan scan = null)
+    {
+        import std.array : replace;
+        import std.string : stripRight;
+        auto out_ = grep(parseJSON(`{"pattern":` ~ JSONValue(pattern).toString ~ `,"path":` ~ JSONValue(path).toString
+            ~ `,"output_mode":"files"}`), scan);
+        return out_.replace(path ~ "/", "").stripRight;
+    }
+}
+
+// Rust #160: resource bounds on the walk and on reads.
+// rust: search.rs::search_file_bounds_peak_memory_at_the_cap
+// rust: search.rs::capped_reader_stops_at_cap_plus_one_for_over_cap_lines
+// rust: search.rs::search_file_accepts_content_just_under_the_cap
+// rust: search.rs::global_ignore_rule_budget_spans_directories
+// rust: search.rs::oversized_single_ignore_rule_is_dropped
+unittest
+{
+    import std.array : replicate, join;
+    import std.file : write, mkdir, rmdirRecurse;
+    import nano.safeio : readCapped;
+    auto root = tmpRoot("nano-d-search-bounds");
+    scope (exit) rmdirRecurse(root);
+    // An over-cap single line yields nothing; content exactly at the cap is searched.
+    write(buildPath(root, "oneline.log"), "needle " ~ "x".replicate(cast(size_t) maxFileBytes * 2));
+    assert(files("needle", root) == "(no matches)");
+    write(buildPath(root, "oneline.log"), "needle\n" ~ "x".replicate(cast(size_t) maxFileBytes + 1024));
+    assert(files("needle", root) == "(no matches)", "a match before the cap crossing leaked");
+    auto exact = "needle\n" ~ "x".replicate(cast(size_t) maxFileBytes - 8) ~ "\n";
+    assert(exact.length == maxFileBytes);
+    write(buildPath(root, "oneline.log"), exact);
+    assert(files("needle", root) == "oneline.log");
+    assert(readCapped(buildPath(root, "oneline.log"), 10) is null && readCapped(buildPath(root, "oneline.log"), maxFileBytes).length == maxFileBytes);
+    rmdirRecurse(root);
+    mkdir(root);
+    // The walk-wide rule budget spans directories: once spent, later
+    // .gitignore files add nothing.
+    enum perDir = 512;
+    auto dirs = maxTotalIgnoreRules / perDir + 2;
+    string rules;
+    foreach (r; 0 .. perDir) rules ~= format("f%s\n", r);
+    foreach (i; 0 .. dirs)
+    {
+        auto sub = buildPath(root, format("d%03d", i));
+        mkdir(sub);
+        write(buildPath(sub, ".gitignore"), rules);
+        write(buildPath(sub, "f0"), "needle\n");
+    }
+    assert(files("needle", root) == format("d%03d/f0\nd%03d/f0", dirs - 2, dirs - 1), files("needle", root));
+    rmdirRecurse(root);
+    mkdir(root);
+    // An over-long rule is dropped; its neighbours still apply.
+    auto longRule = "**/" ~ "a".replicate(maxIgnoreRuleChars * 4);
+    IgnoreRule r;
+    assert(!parseIgnoreLine(longRule, "", r) && parseIgnoreLine("a".replicate(maxIgnoreRuleChars), "", r));
+    write(buildPath(root, ".gitignore"), longRule ~ "\n*.log\n");
+    write(buildPath(root, "a.rs"), "needle\n");
+    write(buildPath(root, "b.log"), "needle\n");
+    assert(files("needle", root) == "a.rs");
+}
+
+// rust: search.rs::read_deny_scan_matches_read_denied_without_per_entry_stat
+// rust: search.rs::symlinked_search_root_cannot_bypass_read_deny
+unittest
+{
+    import std.file : write, mkdirRecurse, rmdirRecurse, symlink;
+    import nano.permissions : Policy, parseRule, ReadDenyScan;
+    auto root = tmpRoot("nano-d-search-denyscan");
+    scope (exit) rmdirRecurse(root);
+    mkdirRecurse(buildPath(root, "config"));
+    mkdirRecurse(buildPath(root, "src"));
+    Policy p;
+    p.deny ~= parseRule("Read(**/.env)");
+    ReadDenyScan scan;
+    assert(p.readDenyScan(root, scan));
+    assert(scan.denied(buildPath(root, "config/.env")) && !scan.denied(buildPath(root, "src/main.rs")));
+    auto alias_ = buildPath(root, "alias");
+    symlink(root, alias_);
+    assert(p.readDenyScan(alias_, scan));
+    assert(scan.denied(buildPath(alias_, "config/.env")), "symlinked cwd leaks a denied path");
+    assert(!scan.denied(buildPath(alias_, "src/main.rs")));
+    assert(!Policy.init.readDenyScan(root, scan));
+
+    // A symlinked search root can't bypass a rule keyed to the realDir path.
+    auto cwd = tmpRoot("nano-d-search-symroot");
+    scope (exit) rmdirRecurse(cwd);
+    auto realDir = buildPath(cwd, "real");
+    mkdirRecurse(realDir);
+    write(buildPath(realDir, "secret.txt"), "needle\n");
+    write(buildPath(realDir, "open.txt"), "needle\n");
+    symlink(realDir, buildPath(cwd, "alias"));
+    auto alias2 = buildPath(cwd, "alias");
+    auto s = scanOf(["Read(" ~ buildPath(realDir, "secret.txt") ~ ")"], cwd);
+    assert(files("needle", alias2, s) == "open.txt", files("needle", alias2, s));
+    auto listed = glob(parseJSON(`{"pattern":"**/*","path":` ~ JSONValue(alias2).toString ~ `}`), s);
+    assert(listed.canFind("open.txt") && !listed.canFind("secret.txt"), listed);
+    assert(grep(parseJSON(`{"pattern":"needle","path":` ~ JSONValue(buildPath(alias2, "secret.txt")).toString ~ `}`), s)
+        == "(no matches)");
+    s = scanOf(["Read(**/alias/secret.txt)"], cwd);
+    assert(files("needle", alias2, s) == "open.txt");
+    assert(files("needle", realDir, s) == "open.txt\nsecret.txt", "real walk wrongly filtered");
+    s = scanOf(["Read(real/secret.txt)"], cwd);
+    assert(files("needle", alias2, s) == "open.txt", "cwd-relative resolved rule bypassed via alias");
+    s = scanOf(["Read(alias/secret.txt)"], cwd);
+    assert(files("needle", alias2, s) == "open.txt", "root-relative alias rule not honoured");
+    s = scanOf(["Read(other/secret.txt)"], cwd);
+    assert(files("needle", alias2, s) == "open.txt\nsecret.txt");
 }

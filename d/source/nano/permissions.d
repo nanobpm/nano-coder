@@ -358,6 +358,20 @@ struct Policy
     /// The search tools call this for every discovered file.
     bool readDenied(string path, string cwd) { return readDenyRule(path, cwd) !is null; }
 
+    /// The Read-deny rules and resolved working directory, computed once for
+    /// a search walk so each entry is judged lexically, with no per-entry
+    /// symlink resolution (Rust `read_deny_scan`, #160). False when no
+    /// Read-deny rule exists: nothing is hidden and no work is needed.
+    bool readDenyScan(string cwd, out ReadDenyScan scan) const
+    {
+        foreach (ref r; deny)
+            if (r.subject == Subject.path && r.appliesTo("read_file")) scan.rules ~= r;
+        if (!scan.rules.length) return false;
+        scan.cwdNormalized = scan.rootNormalized = normalize(cwd);
+        scan.cwdResolved = scan.rootResolved = resolveSymlinks(cwd);
+        return true;
+    }
+
     /// The source of the `Read(...)` deny rule covering `path`, or null.
     private string readDenyRule(string path, string cwd)
     {
@@ -484,4 +498,55 @@ unittest
     assert(p.check("bash", cmd("echo hi; git push origin main")) !is null);
     assert(p.check("edit_file", JSONValue(["path": "/x/y/.env"])) !is null);
     assert(p.check("edit_file", JSONValue(["path": "/x/y/env.d"])) is null);
+}
+
+/// Read-deny rules prepared for judging many walked paths (`Policy.readDenyScan`).
+/// Walked paths never pass through a symlink (the walker doesn't follow
+/// them), so only the search root and working directory need resolving: a
+/// path under a symlinked root is also judged at its resolved location.
+struct ReadDenyScan
+{
+    private const(Rule)[] rules;
+    private string cwdNormalized, cwdResolved, rootNormalized, rootResolved;
+
+    /// The scan for a walk under `root` (which may be a symlink).
+    ReadDenyScan forRoot(string root) const
+    {
+        ReadDenyScan s;
+        s.rules = rules;
+        s.cwdNormalized = cwdNormalized;
+        s.cwdResolved = cwdResolved;
+        s.rootNormalized = normalize(joinPath(cwdNormalized, root));
+        s.rootResolved = resolveSymlinks(joinPath(cwdNormalized, root));
+        return s;
+    }
+
+    /// Whether a Read-deny rule hides `path` (absolute or cwd-relative).
+    bool denied(string path) const
+    {
+        auto absolute = normalize(joinPath(cwdNormalized, path));
+        string[] candidates = [absolute];
+        if (rootResolved != rootNormalized && startsWithPath(absolute, rootNormalized))
+        {
+            auto rest = fromComponents(components(absolute)[components(rootNormalized).length .. $]);
+            candidates ~= normalize(joinPath(rootResolved, rest));
+        }
+        bool matches(const ref Rule r, string c)
+        {
+            if (r.matches(c)) return true;
+            if (startsWithPath(c, cwdNormalized)
+                && r.matches(fromComponents(components(c)[components(cwdNormalized).length .. $])))
+                return true;
+            return cwdResolved != cwdNormalized && startsWithPath(c, cwdResolved)
+                && r.matches(fromComponents(components(c)[components(cwdResolved).length .. $]));
+        }
+        foreach (ref r; rules)
+        {
+            if (r.patternSource is null) return true;
+            foreach (base; candidates)
+                for (string c = base; c !is null; c = parent(c))
+                    if (matches(r, c)) return true;
+        }
+        return false;
+    }
 }

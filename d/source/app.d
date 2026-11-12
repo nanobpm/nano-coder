@@ -1315,8 +1315,16 @@ int runMain(string[] args)
     tools.register(bashDefinition(bashTimeout), (JSONValue a) => bashExecute(a, bashTimeout, cfg.sandbox));
     registerFiles(tools, readState);
     Agent agent;
-    // Read-deny rules hide paths from search results (Policy.readDenied).
-    registerSearch(tools, (string path) => agent.policy.readDenied(path, getcwd()));
+    // Read-deny rules hide paths from search results (Policy.readDenyScan).
+    // The deny rules and working directory are resolved once per search, so
+    // each walked entry is judged lexically (Rust #160).
+    registerSearch(tools, (string root) @safe {
+        import nano.permissions : ReadDenyScan;
+        ReadDenyScan scan;
+        if (!agent.policy.readDenyScan(getcwd(), scan)) return cast(bool delegate(string) @safe) null;
+        auto forRoot = scan.forRoot(root);
+        return (string path) @safe => forRoot.denied(path);
+    });
 
     auto cwd = getcwd();
     // Repository trust gates the repo's own skills, skill lock and hooks.

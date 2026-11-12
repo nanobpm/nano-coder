@@ -32,6 +32,31 @@ ubyte[] readBytes(string path) @trusted
     return cast(ubyte[]) read(path);
 }
 
+/// A file's bytes, reading at most `cap + 1`; null when it holds more than
+/// `cap` (checked while reading, so a growing file can't slip past).
+ubyte[] readCapped(string path, ulong cap) @safe
+{
+    import std.algorithm : min;
+    import std.stdio : File;
+    auto f = File(path, "rb");
+    auto size = f.size; // a hint only: the file may grow while read
+    auto buf = new ubyte[cast(size_t) min(cap + 1, size == ulong.max ? 64 * 1024 : size + 1)];
+    size_t got;
+    for (;;)
+    {
+        if (got == buf.length)
+        {
+            if (buf.length > cap) break;
+            buf.length = cast(size_t) min(buf.length * 2, cap + 1);
+        }
+        auto r = f.rawRead(buf[got .. $]);
+        if (!r.length) break;
+        got += r.length;
+    }
+    if (got > cap) return null;
+    return got ? buf[0 .. got] : [];
+}
+
 /// `std.file.read` as immutable bytes: the buffer is freshly allocated and
 /// only this result refers to it.
 immutable(ubyte)[] readImmutableBytes(string path) @trusted

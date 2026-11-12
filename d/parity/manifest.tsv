@@ -1018,14 +1018,14 @@ sandbox.rs::read_only_mode_does_not_grant_device_directories	claimed	PORTING.md:
 sandbox.rs::root_cwd_is_not_a_writable_root	claimed	PORTING.md: all sandbox.rs tests ported
 sandbox.rs::workspace_mode_confines_writes	claimed	PORTING.md: all sandbox.rs tests ported
 search.rs::binary_exclusion_is_independent_of_mode_and_limit	test
-search.rs::capped_reader_stops_at_cap_plus_one_for_over_cap_lines	todo
+search.rs::capped_reader_stops_at_cap_plus_one_for_over_cap_lines	test
 search.rs::display_path_preserves_filesystem_root	todo
 search.rs::display_path_preserves_relative_root	todo
 search.rs::early_return_is_correct_with_long_nonmatching_tail	todo
 search.rs::explicit_file_root_preserves_relative_prefix	todo
 search.rs::gitignore_rule_budget_stops_compilation	todo
 search.rs::glob_matches_by_name_and_by_path_sorted	test
-search.rs::global_ignore_rule_budget_spans_directories	todo
+search.rs::global_ignore_rule_budget_spans_directories	test
 search.rs::grep_content_is_sorted_with_line_numbers_and_no_ignored_files	test
 search.rs::grep_files_and_count_modes	test
 search.rs::grep_glob_filter_limits_by_file_name_and_path	test
@@ -1034,17 +1034,17 @@ search.rs::grep_rejects_bad_arguments	test
 search.rs::grep_reports_limit_truncation_and_no_matches	test
 search.rs::nested_gitignore_and_negation	test
 search.rs::oversized_gitignore_is_skipped	todo
-search.rs::oversized_single_ignore_rule_is_dropped	todo
+search.rs::oversized_single_ignore_rule_is_dropped	test
 search.rs::read_deny_rules_filter_discovered_files	test
-search.rs::read_deny_scan_matches_read_denied_without_per_entry_stat	todo
+search.rs::read_deny_scan_matches_read_denied_without_per_entry_stat	test
 search.rs::root_qualified_glob_does_not_match_via_display_path	todo
 search.rs::root_relative_pattern_is_not_name_matched	todo
-search.rs::search_file_accepts_content_just_under_the_cap	todo
-search.rs::search_file_bounds_peak_memory_at_the_cap	todo
+search.rs::search_file_accepts_content_just_under_the_cap	test
+search.rs::search_file_bounds_peak_memory_at_the_cap	test
 search.rs::search_file_discards_matches_past_byte_cap	todo
 search.rs::slash_keeps_literal_backslashes_on_unix	todo
 search.rs::symlinked_gitignore_is_not_followed	todo
-search.rs::symlinked_search_root_cannot_bypass_read_deny	todo
+search.rs::symlinked_search_root_cannot_bypass_read_deny	test
 search.rs::symlinks_are_not_followed_so_walks_cannot_loop	test
 session.rs::a_stale_log_line_on_a_direct_record_is_renumbered_to_its_physical_line	todo
 session.rs::backfill_distinguishes_messages_by_thinking_blocks	todo
