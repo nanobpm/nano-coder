@@ -66,7 +66,7 @@ agent.rs::an_unset_max_tokens_defaults_to_the_models_published_output_limit	test
 agent.rs::an_unset_max_tokens_falls_back_to_a_large_default_when_unpublished	test
 agent.rs::an_unset_max_tokens_uses_a_known_model_cap_before_the_large_fallback	test
 agent.rs::an_unverifiable_loop_in_plan_mode_is_rejected_without_prompting	test
-agent.rs::an_unverifiable_loop_is_blocked_without_asking_when_unsandboxed	todo
+agent.rs::an_unverifiable_loop_is_blocked_without_asking_when_unsandboxed	test
 agent.rs::auto_compaction_mid_turn_keeps_the_turn_going	test
 agent.rs::auto_mode_disables_the_turn_cap	todo
 agent.rs::auto_mode_does_not_disable_the_cap_in_a_headless_turn	todo
@@ -680,7 +680,7 @@ output.rs::spills_long_output_to_a_file	test
 output.rs::validates_limits	test
 permissions.rs::allow_list_still_guards_redirection_only_commands	test
 permissions.rs::allows_ordinary_deletes	test
-permissions.rs::an_unverifiable_loop_runs_under_the_sandbox_and_blocks_without_it	todo
+permissions.rs::an_unverifiable_loop_runs_under_the_sandbox_and_blocks_without_it	test
 permissions.rs::basename_dispatch_validates_original_program	test
 permissions.rs::blocks_catastrophic_deletes	test
 permissions.rs::blocks_destructive_database_commands	test

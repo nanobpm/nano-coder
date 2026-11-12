@@ -45,7 +45,7 @@ void allowed(string command)
 }
 
 /// The decision for a command at the test cwd (issue #164).
-PermissionDecision decideWith(Policy p, string command) { return p.decideIn("bash", cmdArgs(command), "/work/project"); }
+PermissionVerdict decideWith(Policy p, string command) { return p.verdictIn("bash", cmdArgs(command), "/work/project"); }
 
 bool asksWith(Policy p, string command)
 {
@@ -2130,4 +2130,20 @@ unittest // escaped_dollar_is_literal
     import nano.shell : parse;
     auto w = parse("echo \"\\$a\"$'\\x24b'$c")[0].words[1];
     assert(w.literalDollars == [0, 2], w.literalDollars.to!string);
+}
+
+// rust: permissions.rs::an_unverifiable_loop_runs_under_the_sandbox_and_blocks_without_it
+unittest // never prompts: allowed under the OS sandbox, blocked without it (Rust #171)
+{
+    import nano.sandbox : SandboxMode;
+    import std.algorithm.searching : startsWith;
+    auto loopCmd = cmdArgs("for f in $(git ls-files); do sed -i s/x/y/ \"$f\"; done");
+    Policy sandboxed;
+    sandboxed.sandbox.mode = SandboxMode.workspace;
+    assert(sandboxed.decideIn("bash", loopCmd, "/work/project").match!((PermAllow _) => true, _ => false));
+    auto d = Policy.init.decideIn("bash", loopCmd, "/work/project");
+    assert(d.match!((PermDeny m) => m.message.startsWith("Blocked by nano-coder permissions"), _ => false));
+    // Hard blocks stand even under the sandbox.
+    auto eval = cmdArgs("for f in a b; do eval \"$f\"; done");
+    assert(sandboxed.decideIn("bash", eval, "/work/project").match!((PermDeny _) => true, _ => false));
 }

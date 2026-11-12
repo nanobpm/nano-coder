@@ -255,45 +255,57 @@ struct Policy
         return p;
     }
 
-    /// Allow, deny, or ask the user. `PermAsk` carries the reason the call
-    /// could not be verified (a shell loop whose commands are not provably
-    /// safe); with no one to answer it is blocked (see `blockedMessage`).
-    /// `PermDeny` carries the full message for the model.
+    /// Allow or deny. A call the static checks cannot verify (a shell loop
+    /// whose commands are not provably safe) never prompts: with the OS
+    /// sandbox active it is allowed (the sandbox confines what it can write),
+    /// and without one it is blocked with the usual guidance (Rust #171).
+    /// Hard blocks are denied either way. `PermDeny` carries the full message
+    /// for the model.
     PermissionDecision decide(string tool, JSONValue args) { return decideIn(tool, args, currentDir()); }
 
     /// ditto, at `cwd`.
     PermissionDecision decideIn(string tool, JSONValue args, string cwd)
     {
-        string ask;
-        auto reason = reasonIn(tool, args, cwd, ask);
-        if (reason !is null) return PermissionDecision(PermDeny(blockedMessage(reason)));
-        if (ask !is null) return PermissionDecision(PermAsk(ask));
-        return PermissionDecision(PermAllow());
+        return verdictIn(tool, args, cwd).match!(
+            (PermAllow a) => PermissionDecision(a),
+            (PermAsk a) => sandbox.active ? PermissionDecision(PermAllow()) : PermissionDecision(PermDeny(blockedMessage(a.reason))),
+            (PermDeny d) => PermissionDecision(d),
+        );
     }
 
-    /// The headless view: null when the call may run, else the message the
-    /// model sees (an ask is blocked, as when no one can answer).
+    /// The checks' own verdict, before `decide` resolves an unverifiable call
+    /// (`PermAsk`) by whether the OS sandbox is active.
+    PermissionVerdict verdictIn(string tool, JSONValue args, string cwd)
+    {
+        string ask;
+        auto reason = reasonIn(tool, args, cwd, ask);
+        if (reason !is null) return PermissionVerdict(PermDeny(blockedMessage(reason)));
+        if (ask !is null) return PermissionVerdict(PermAsk(ask));
+        return PermissionVerdict(PermAllow());
+    }
+
+    /// Null when the call may run, else the message the model sees.
     string check(string tool, JSONValue args)
     {
         return decide(tool, args).match!(
             (PermAllow _) => cast(string) null,
-            (PermAsk a) => blockedMessage(a.reason),
             (PermDeny d) => d.message,
         );
     }
 
-    /// The bare reason a call is blocked (no advice), or null. An ask is
-    /// blocked with the full guidance message (the headless view).
+    /// The bare reason a call is blocked (no advice), or null. An unverifiable
+    /// call runs under the sandbox and is blocked with the full guidance
+    /// message without it.
     string checkIn(string tool, JSONValue args, string cwd)
     {
         string ask;
         auto reason = reasonIn(tool, args, cwd, ask);
         if (reason !is null) return reason;
-        return ask is null ? null : blockedMessage(ask);
+        return ask is null || sandbox.active ? null : blockedMessage(ask);
     }
 
-    /// The bare deny reason, or null; `ask` is set when a bash command needs
-    /// the user's approval.
+    /// The bare deny reason, or null; `ask` is set when a bash command can't
+    /// be verified.
     private string reasonIn(string tool, JSONValue args, string cwd, out string ask)
     {
         try
@@ -368,7 +380,7 @@ struct Policy
     }
 
     /// Throws Blocked with the reason a shell command is refused; returns the
-    /// reason it needs the user's approval (an unverifiable loop), or null.
+    /// reason it can't be verified (an unverifiable loop), or null.
     string checkCommand(string command, string cwd)
     {
         auto denyRules = deny.filter!(r => r.subject == Subject.command).array;
@@ -450,12 +462,14 @@ string blockedMessage(string reason)
 
 /// Outcome of `Policy.decide`.
 struct PermAllow {}
-/// Needs the user's approval; the reason the call could not be verified.
+/// The checks could not verify the call; the reason why (`Policy.verdictIn`).
 struct PermAsk { string reason; }
 /// Blocked; the full message for the model.
 struct PermDeny { string message; }
 /// ditto
-alias PermissionDecision = SumType!(PermAllow, PermAsk, PermDeny);
+alias PermissionDecision = SumType!(PermAllow, PermDeny);
+/// The checks' verdict, with unverifiable calls still unresolved.
+alias PermissionVerdict = SumType!(PermAllow, PermAsk, PermDeny);
 
 unittest
 {
