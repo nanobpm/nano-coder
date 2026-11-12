@@ -1576,8 +1576,11 @@ int runMain(string[] args)
         {
             if (value.length && !out_.canFind!(x => x.value == value)) out_ ~= Suggestion(value, note);
         }
-        push(currentSpec(), "current");
-        synchronized foreach (r; recents.models) push(r, "recent");
+        // A current or recent model on a hidden provider stays usable but isn't offered.
+        import nano.config : specVisible;
+        if (specVisible(currentSpec(), cfg.providers, cfg.defaultProvider)) push(currentSpec(), "current");
+        synchronized foreach (r; recents.models)
+            if (specVisible(r, cfg.providers, cfg.defaultProvider)) push(r, "recent");
         bool configured(string n) { return cfg.userProviders.canFind(n) || n == cfg.defaultProvider; }
         auto names = enabledProviderNames(cfg.providers);
         names.sort!((a, b) => configured(a) != configured(b) ? configured(a) : a < b);

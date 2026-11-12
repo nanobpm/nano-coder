@@ -303,7 +303,7 @@ commands.rs::help_lists_version	todo
 commands.rs::mode_and_verbosity_arguments_are_suggested	todo
 commands.rs::model_suggestions_hoist_current_recent_and_defaults	todo
 commands.rs::model_suggestions_offer_configured_models_and_skip_disabled_providers	claimed	app.d modelSuggestionSource closure (not unit-testable); configuredModels/enabledProviderNames tested in config.d
-commands.rs::model_suggestions_skip_hidden_current_and_recent_models	todo
+commands.rs::model_suggestions_skip_hidden_current_and_recent_models	test
 commands.rs::only_known_or_plausible_commands_are_commands	test
 commands.rs::oversized_words_skip_edit_distance_and_suggest_nothing	test
 commands.rs::rows_fit_the_terminal	test
@@ -800,7 +800,7 @@ providers/github_copilot.rs::stream_routes_completions_model_to_chat_completions
 providers/github_copilot.rs::stream_routes_gpt_model_to_responses_endpoint	todo
 providers/mod.rs::a_configured_model_list_keeps_names_and_merges_over_presets	test
 providers/mod.rs::a_disabled_provider_is_hidden_and_refused	test
-providers/mod.rs::a_hidden_provider_is_filtered_from_listings_but_still_usable	todo
+providers/mod.rs::a_hidden_provider_is_filtered_from_listings_but_still_usable	test
 providers/mod.rs::a_models_base_url_overrides_the_providers	test
 providers/mod.rs::api_key_command_supplies_key	todo
 providers/mod.rs::bounded_key_command_backgrounded_success_returns_the_key	test
@@ -1115,7 +1115,7 @@ settings.rs::provider_rows_skip_disabled_providers_and_configured_models_show_na
 settings.rs::qwen_endpoint_pick_maps_rows_to_actions	todo
 settings.rs::qwen_endpoint_rows_offer_every_plan_region_plus_custom_and_keep	todo
 settings.rs::recent_models_keep_four_with_a_configured_provider	test
-settings.rs::recent_models_skip_hidden_providers_without_consuming_slots	todo
+settings.rs::recent_models_skip_hidden_providers_without_consuming_slots	test
 settings.rs::save_creates_a_missing_file	test
 settings.rs::save_keeps_temperature_comments_when_the_provider_is_also_edited	test
 settings.rs::save_updates_only_changed_keys_and_keeps_comments	test

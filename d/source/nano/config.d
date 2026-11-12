@@ -108,6 +108,9 @@ struct ProviderConfig
     bool configuredList;
     /// `disabled = true`: hidden from listings; naming it is an error.
     bool disabled;
+    /// `hidden = true`: left out of listings and pickers, but still usable
+    /// when named in a model spec (the mock preset is hidden by default).
+    bool hidden;
     long timeoutSecs = 600;
     long maxRetries = 5;
     long retryInitialBackoffMs = -1, retryMaxBackoffMs = -1;
@@ -193,6 +196,7 @@ struct ProviderConfig
             configuredList = v.str == "configured";
         }
         if (auto v = "disabled" in o) disabled = v.boolean;
+        if (auto v = "hidden" in o) hidden = v.boolean;
         if (auto v = "timeout_secs" in o) timeoutSecs = v.integer;
         if (auto v = "max_retries" in o) maxRetries = v.integer;
         if (auto v = "retry_initial_backoff_ms" in o) retryInitialBackoffMs = v.integer;
@@ -219,14 +223,29 @@ struct ProviderConfig
     }
 }
 
-/// The names of the providers to offer in listings: `disabled` ones dropped, sorted.
+/// The names of the providers to offer in listings: `disabled` and `hidden` ones dropped, sorted.
 string[] enabledProviderNames(const ProviderConfig[string] providers)
 {
     import std.algorithm : sort;
     string[] o;
-    foreach (k, p; providers) if (!p.disabled) o ~= k;
+    foreach (k, p; providers) if (p.isVisible) o ~= k;
     o.sort();
     return o;
+}
+
+/// Whether a provider appears in listings and pickers.
+bool isVisible(const ref ProviderConfig p) pure nothrow { return !p.disabled && !p.hidden; }
+
+/// Whether a model spec (`provider/model`, or a bare model on the default
+/// provider) names a visible provider, so it may be offered as a suggestion.
+/// A spec on a hidden or removed provider stays usable but isn't offered.
+bool specVisible(string spec, const ProviderConfig[string] providers, string defaultProvider)
+{
+    import std.string : indexOf;
+    auto slash = spec.indexOf('/');
+    auto name = slash > 0 && spec[0 .. slash] in providers ? spec[0 .. slash] : defaultProvider;
+    auto p = name in providers;
+    return p !is null && (*p).isVisible;
 }
 
 /// Refuse a spec naming a disabled provider.
@@ -289,6 +308,7 @@ ProviderConfig[string] presets()
     m["ollama"] = preset(O, "http://localhost:11434/v1", null);
     m["llamacpp"] = preset(O, "http://localhost:8080/v1", null);
     m["mock"] = preset(ProviderKind.mock, null, null, "mock");
+    m["mock"].hidden = true;
     return m;
 }
 
@@ -619,6 +639,37 @@ unittest
     // A bad per-model host is refused like a bad provider host.
     auto bad = regionalConfig("[providers.openrouter-camunda.models.\"m\"]\nbase_url = \"ftp://eu.openrouter.ai\"\n");
     assert(collectExceptionMsg(resolve(bad, "openrouter-camunda/m")).canFind("must be http(s)"));
+}
+
+// rust: providers/mod.rs::a_hidden_provider_is_filtered_from_listings_but_still_usable
+unittest // the mock preset is hidden from listings, yet `mock/...` still resolves
+{
+    import std.algorithm : canFind;
+    Config c;
+    c.providers = presets();
+    assert(c.providers["mock"].hidden && !c.providers["mock"].disabled);
+    auto shown = enabledProviderNames(c.providers);
+    assert(!shown.canFind("mock") && shown.canFind("openai"));
+    resolve(c, "mock/test");
+    ProviderConfig internal;
+    internal.merge(parseToml("hidden = true\n"));
+    c.providers["internal"] = internal;
+    assert(!enabledProviderNames(c.providers).canFind("internal"));
+}
+
+// rust: commands.rs::model_suggestions_skip_hidden_current_and_recent_models
+unittest // suggestions skip a current or recent model on a hidden provider
+{
+    Config c;
+    c.providers = presets();
+    assert(!specVisible("mock/test", c.providers, "openai"));
+    assert(specVisible("openai/gpt-4o", c.providers, "openai"));
+    assert(specVisible("bare-model", c.providers, "openai"));
+    assert(!specVisible("bare-model", c.providers, "mock"));
+    ProviderConfig internal;
+    internal.hidden = true;
+    c.providers["internal"] = internal;
+    assert(!specVisible("internal/dev-model", c.providers, "openai"));
 }
 
 // rust: providers/mod.rs::a_disabled_provider_is_hidden_and_refused

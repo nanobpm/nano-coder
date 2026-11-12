@@ -8,7 +8,7 @@ module nano.settings;
 import std.format : format;
 import std.math : isNaN;
 import std.typecons : Nullable, Tuple, tuple;
-import nano.config : Config, ProviderConfig, ProviderKind, ModelSettings, enabledProviderNames;
+import nano.config : Config, ProviderConfig, ProviderKind, ModelSettings, enabledProviderNames, isVisible;
 import nano.thinking : Thinking;
 import nano.toml_edit;
 
@@ -43,7 +43,7 @@ string maxTokensLabel(long configured, string effective)
 
 enum size_t recentModelsShown = 4;
 
-/// Recent specs whose provider still exists, newest first, at most four.
+/// Recent specs whose provider still exists and is visible, newest first, at most four.
 string[] recentModels(const string[] recents, const ProviderConfig[string] all)
 {
     import std.string : indexOf;
@@ -51,7 +51,12 @@ string[] recentModels(const string[] recents, const ProviderConfig[string] all)
     foreach (spec; recents)
     {
         auto slash = spec.indexOf('/');
-        if (slash >= 0 && spec[0 .. slash] !in all) continue;
+        if (slash >= 0)
+        {
+            // A spec on a removed or hidden provider neither shows nor takes a slot.
+            auto p = spec[0 .. slash] in all;
+            if (p is null || !(*p).isVisible) continue;
+        }
         out_ ~= spec;
         if (out_.length == recentModelsShown) break;
     }
@@ -255,6 +260,7 @@ void save(const ref Config c, const ref Changes ch, const ProviderConfig[string]
 // rust: settings.rs::provider_rows_list_recents_first_and_highlight_the_previous_model
 // rust: settings.rs::recent_models_keep_four_with_a_configured_provider
 // rust: settings.rs::turn_cap_label_marks_zero_as_unbounded
+// rust: settings.rs::recent_models_skip_hidden_providers_without_consuming_slots
 unittest
 {
     import std.algorithm : canFind;
@@ -262,6 +268,11 @@ unittest
     ProviderConfig a, b;
     ProviderConfig[string] all = ["a": a, "b": b];
     assert(recentModels(["a/x", "gone/y", "b/z", "a/1", "a/2", "a/3"], all) == ["a/x", "b/z", "a/1", "a/2"]);
+    ProviderConfig work;
+    work.hidden = true;
+    ProviderConfig[string] withHidden = ["a": a, "b": b, "work": work];
+    assert(recentModels(["work/llama3", "a/claude", "bare-model", "b/gpt-5", "b/o3"], withHidden)
+        == ["a/claude", "bare-model", "b/gpt-5", "b/o3"]);
     size_t initial;
     auto rows = providerRows(["a/x", "b/z"], "a/x", "b", all, initial, "/nonexistent");
     assert(rows[0].label == "↺ a/x  (current)" && initial == 1);
