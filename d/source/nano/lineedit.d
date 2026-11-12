@@ -44,6 +44,8 @@ enum K
     backspace, delete_, killEnd, clearLine, eraseWord, tab, escape, interrupt, eof, paste, ignored, closed,
     /// Shift-Tab (CSI Z): cycle the agent mode.
     cycleMode,
+    /// Ctrl-O: expand or collapse the latest tool call/result or thought.
+    toggleExpand,
 }
 
 struct Key
@@ -79,6 +81,7 @@ Key decode(ByteSource next, int timeoutMs, ref ubyte[] utf8)
         case 0x09: return Key(K.tab);
         case 0x0b: return Key(K.killEnd);
         case 0x0e: return Key(K.down);
+        case 0x0f: return Key(K.toggleExpand);
         case 0x10: return Key(K.up);
         case 0x15: return Key(K.clearLine);
         case 0x17: return Key(K.eraseWord);
@@ -588,6 +591,8 @@ final class LineEditor
     long delegate() @safe nowMs;
     /// Shift-Tab: run with the input erased, then the input is redrawn.
     void delegate(K) @safe onAction;
+    /// Ctrl-O, at the prompt or mid-turn; the editor is left as it is.
+    void delegate() @safe onToggle;
     /// On submit, the styled prompt to redraw the line with (Rust's
     /// `restamp_prompt`: the timestamp becomes the submission time). It must
     /// keep the prompt's visible width.
@@ -732,6 +737,9 @@ final class LineEditor
                     erase();
                     onAction(key.kind);
                     if (turn && !state.buf.length) continue; // no empty prompt amid the output
+                    break;
+                case K.toggleExpand:
+                    if (onToggle !is null) onToggle();
                     break;
                 case K.interrupt:
                     state.clear();
@@ -1038,14 +1046,17 @@ unittest // editing keys
     assert(e.readLine("> ", "> ").text == "/compact focus x");
 }
 
-unittest // Shift-Tab runs the action with the input erased, keeping the text; Ctrl-O does nothing
+// rust: lineedit.rs::ctrl_o_toggles_expand
+unittest // Shift-Tab runs the action with the input erased, keeping the text; Ctrl-O toggles
 {
     auto screen = new Screen;
     K[] seen;
+    int toggles;
     auto e = editor("ab\x1b[Zc\x0f\x1b[111;5u\r", screen);
     e.onAction = (K k) { seen ~= k; screen.text ~= "<ACT>"; };
+    e.onToggle = () { toggles++; };
     assert(e.readLine("> ", "> ").text == "abc");
-    assert(seen == [K.cycleMode]);
+    assert(seen == [K.cycleMode] && toggles == 2);
     // Erased right before the action; the line is committed at the end.
     assert(screen.text.canFind("<ERASE><ACT>"));
     assert(screen.text.canFind("<COMMIT > abc>"));

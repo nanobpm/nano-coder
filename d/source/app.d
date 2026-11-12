@@ -32,7 +32,7 @@ import nano.plan : Plan, checklist;
 import nano.queue : MessageQueue, QueuedMessage, QueueUsage, queueParse = parse, queueApply = apply;
 import nano.mode : AgentMode, allModes, parseMode, planPromptNote, name, describe, nextMode = next;
 static import nano.herdr;
-import nano.frame : glyphMark;
+import nano.frame : glyphMark, foldMark, expandedBody, expandedResult;
 import core.time : MonoTime, seconds;
 import std.sumtype : match;
 import nano.question : QuestionBroker, Question, Answer, Answered, Away, Dismissed, sanitizeLine, questionDefinition = definition;
@@ -511,6 +511,8 @@ LineEditor makeEditor(ConsoleLink console, shared TurnControl control)
         if (inTurn) console.note(console.dim(format("[mode: %s — %s]", m.name, m.describe)));
         else console.note(format("Mode: %s (%s)", m.name, m.describe));
     };
+    // Ctrl-O works at the prompt and mid-turn: the frame owns the folds.
+    editor.onToggle = () { if (auto f = gFrame) f.toggleExpand(); };
     return editor;
 }
 
@@ -790,7 +792,11 @@ struct Screen
         {
             auto secs = (nowMs() - thinkStart) / 1000.0;
             auto chars = thinkText.strip.walkLength;
-            write(blockStamp ~ thinkStyle(format("∴ Thought for %.1fs", secs)) ~ dim(format(" · %s chars", chars)) ~ "\n");
+            auto line = blockStamp ~ thinkStyle(format("∴ Thought for %.1fs", secs)) ~ dim(format(" · %s chars", chars));
+            write(line ~ "\n");
+            // Ctrl-O shows the reasoning under the summary.
+            if (gFrame && chars)
+                write(foldMark("", 1, line ~ "\n" ~ expandedBody(thinkText, color ? "\x1b[38;5;245m" : "")));
         }
         midLine = false;
         stdOut.flush();
@@ -945,7 +951,10 @@ class Console : AgentEvents
         meter.reset(nowMs);
         if (quiet || quietTool(call)) return;
         endLine();
-        writeln(stamp(), color ? "\x1b[38;5;114m●\x1b[0m " : "● ", bold(call.name), " ", dim(summary(call)));
+        auto line = stamp() ~ (color ? "\x1b[38;5;114m●\x1b[0m " : "● ") ~ bold(call.name) ~ " " ~ dim(summary(call));
+        writeln(line);
+        // Ctrl-O shows the full arguments under the call.
+        if (gFrame) write(foldMark(call.id, 1, line ~ "\n" ~ expandedBody(argsText(call), color ? "\x1b[2m" : "")));
         stdOut.flush();
     }
 
@@ -959,7 +968,11 @@ class Console : AgentEvents
         if (quiet || (quietTool(call) && !isError)) return;
         auto st = stamp();
         auto w = (isTerminal(1) ? terminalWidth() : 80);
-        write(stampBlock(st, toolResult(!isError, sanitizeBlock(result), verbose, w > 8 + st.length ? w - 8 - (st.length ? stampWidth : 0) : 1)));
+        auto clean = sanitizeBlock(result);
+        auto shown = stampBlock(st, toolResult(!isError, clean, verbose, w > 8 + st.length ? w - 8 - (st.length ? stampWidth : 0) : 1));
+        write(shown);
+        // Ctrl-O shows every line, together with the call's arguments.
+        if (gFrame) write(foldMark(call.id, shown.lineCount, stampBlock(st, expandedResult(!isError, clean, color))));
         stdOut.flush();
     }
 
@@ -1026,6 +1039,13 @@ string toolResult(bool ok, string output, bool verbose, size_t width, bool color
     }
     auto more = lines.length > 1 ? format(" (+%s lines)", lines.length - 1) : "";
     return format("  %s%s %s%s%s\n", on, mark, fitText(lines[0].stripRight("\r"), width > more.length ? width - more.length : 0), more, off);
+}
+
+/// A tool call's arguments as shown expanded: pretty JSON, or the raw text
+/// when the model's arguments weren't a JSON object.
+string argsText(const ref ToolCall c)
+{
+    return c.invalidArguments.length ? c.invalidArguments : c.arguments.toPrettyString;
 }
 
 /// `text` cut to `width` characters, ending in `…` when cut.

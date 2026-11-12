@@ -378,6 +378,80 @@ struct Debouncer
     bool pending() const { return last != long.min; }
 }
 
+/// Untrusted text with every line kept and control characters dropped.
+string sanitizeLines(string s)
+{
+    import nano.trajectory : sanitizeTerminal;
+    import std.algorithm : map;
+    import std.array : join, split;
+    return s.split('\n').map!sanitizeTerminal.join("\n");
+}
+
+/// Expanded detail under a call or thought: sanitized lines, indented by four.
+string expandedBody(string text, string style)
+{
+    import std.algorithm : splitter;
+    import std.string : strip;
+    string out_;
+    auto clean = sanitizeLines(text.strip);
+    if (!clean.length) return null;
+    foreach (l; clean.splitter('\n'))
+        out_ ~= "    " ~ (style.length ? style ~ l ~ "\x1b[0m" : l) ~ "\n";
+    return out_;
+}
+
+/// A tool result with every line shown (`output` already sanitized).
+string expandedResult(bool ok, string output, bool color = true)
+{
+    import std.array : replicate, split;
+    import std.range : walkLength;
+    import std.string : stripRight;
+    string mark = ok ? "⎿" : "⎿ error:";
+    string on = !color ? "" : ok ? "\x1b[2m" : "\x1b[38;5;203m", off = color ? "\x1b[0m" : "";
+    auto body = output.stripRight;
+    if (!body.length) return format("  %s%s (no output)%s\n", on, mark, off);
+    auto pad = " ".replicate(mark.walkLength + 3);
+    string text;
+    foreach (i, l; body.split('\n'))
+        text ~= (i == 0 ? format("  %s%s %s%s", on, mark, l.stripRight("\r"), off) : pad ~ on ~ l.stripRight("\r") ~ off) ~ "\n";
+    return text;
+}
+
+// rust: frame.rs::expanded_content_is_sanitized
+unittest
+{
+    assert(expandedResult(true, "a\nb", false) == "  ⎿ a\n    b\n");
+    assert(expandedResult(false, "x\ny", false) == "  ⎿ error: x\n           y\n");
+    assert(expandedResult(true, "", false) == "  ⎿ (no output)\n");
+    import std.algorithm : canFind;
+    auto b = expandedBody("{\n  \"a\": 1\n}\x1b]0;pwn\x07\x1b[2J", "");
+    assert(b.canFind("    {\n      \"a\": 1\n") && !b.canFind("\x1b"), b);
+}
+
+/// The OSC number of a fold mark (`foldMark`).
+enum foldOsc = "8770";
+
+/// An in-band mark, written right after a collapsed block, that makes its
+/// last `lines` lines a fold: Ctrl-O swaps them for `expanded` (and back).
+/// Folds sharing a non-empty `id` (a tool call and its result) toggle
+/// together. Only for the frame transcript: a terminal would show it.
+string foldMark(string id, size_t lines, string expanded) pure
+{
+    import std.base64 : Base64;
+    import std.conv : to;
+    return "\x1b]" ~ foldOsc ~ ";" ~ Base64.encode(cast(const(ubyte)[]) id).idup ~ ";" ~ lines.to!string ~ ";"
+        ~ Base64.encode(cast(const(ubyte)[]) expanded).idup ~ "\x07";
+}
+
+/// A block of transcript lines with an alternate (expanded or collapsed) form.
+private struct Fold
+{
+    string id;
+    size_t start, length;
+    string[] other;
+    bool expanded;
+}
+
 /// The transcript as the logical lines the console printed. `feed` takes
 /// the raw bytes: `\n` ends a line, `\r` and `ESC[K`/`ESC[2K` restart the
 /// current one (the live thinking line redraws that way), `ESC[2J` clears
@@ -392,9 +466,11 @@ struct Transcript
     private bool cr;
     private string[][] cache;
     private size_t cacheWidth;
+    private Fold[] folds;
 
     void clear()
     {
+        folds = null;
         lines = null;
         cur = null;
         cache = null;
@@ -403,6 +479,7 @@ struct Transcript
 
     void feed(scope const(ubyte)[] bytes)
     {
+        import std.string : indexOf;
         auto buf = pending ~ bytes;
         // Hold back an incomplete UTF-8 sequence for the next call.
         size_t end = buf.length, k = 0;
@@ -427,6 +504,21 @@ struct Transcript
             if (c == '\r') { cr = true; continue; }
             if (c == '\x1b')
             {
+                if (i < s.length && s[i] == ']')
+                {
+                    // OSC: up to BEL or ST; an unfinished one waits for more.
+                    auto rest = s[i + 1 .. $];
+                    auto bel = rest.indexOf('\x07'), st = rest.indexOf("\x1b\\");
+                    if (bel < 0 && st < 0)
+                    {
+                        pending = cast(ubyte[]) s[at .. $].dup ~ pending;
+                        return;
+                    }
+                    auto end_ = bel >= 0 && (st < 0 || bel < st) ? bel : st;
+                    osc(rest[0 .. end_]);
+                    i += 1 + end_ + (end_ == bel ? 1 : 2);
+                    continue;
+                }
                 if (i < s.length && s[i] == '[')
                 {
                     i++;
@@ -455,6 +547,68 @@ struct Transcript
             auto drop = lines.length - cap * 9 / 10;
             lines = lines[drop .. $];
             cache = cache.length > drop ? cache[drop .. $] : null;
+            Fold[] kept;
+            foreach (f; folds)
+                if (f.start >= drop) { f.start -= drop; kept ~= f; }
+            folds = kept;
+        }
+    }
+
+    /// A fold mark (`foldMark`); anything else is dropped.
+    private void osc(string body)
+    {
+        import std.algorithm : splitter;
+        import std.array : array, split;
+        import std.base64 : Base64;
+        import std.conv : to;
+        auto parts = body.split(";");
+        if (parts.length != 4 || parts[0] != foldOsc) return;
+        try
+        {
+            auto id = cast(string) Base64.decode(parts[1]).idup;
+            auto n = parts[2].to!size_t;
+            auto expanded = cast(string) Base64.decode(parts[3]).idup;
+            import std.utf : validate;
+            validate(id);
+            validate(expanded);
+            if (!n || n > lines.length) return;
+            import std.string : stripRight;
+            folds ~= Fold(id, lines.length - n, n, expanded.stripRight("\n").split("\n"));
+            // A result arrives expanded when its call already is.
+            if (id.length)
+                foreach (f; folds[0 .. $ - 1])
+                    if (f.id == id && f.expanded) { swap(folds.length - 1, true); break; }
+        }
+        catch (Exception) {}
+    }
+
+    /// Ctrl-O: swap the latest fold (with the others sharing its id) between
+    /// collapsed and expanded. False when there is none.
+    bool toggleLatest()
+    {
+        if (!folds.length) return false;
+        auto latest = folds[$ - 1];
+        bool want = !latest.expanded;
+        foreach_reverse (k; 0 .. folds.length)
+            if (k == folds.length - 1 || (latest.id.length && folds[k].id == latest.id)) swap(k, want);
+        return true;
+    }
+
+    /// Shows fold `k` expanded (`want`) or collapsed.
+    private void swap(size_t k, bool want)
+    {
+        {
+            auto f = &folds[k];
+            if (f.expanded == want) return;
+            auto shown = lines[f.start .. f.start + f.length].dup;
+            lines = lines[0 .. f.start] ~ f.other ~ lines[f.start + f.length .. $];
+            long delta = cast(long) f.other.length - cast(long) f.length;
+            f.length = f.other.length;
+            f.other = shown;
+            f.expanded = want;
+            foreach (ref g; folds)
+                if (g.start > f.start) g.start = cast(size_t)(g.start + delta);
+            if (cache.length > f.start) cache = cache[0 .. f.start];
         }
     }
 
@@ -722,4 +876,57 @@ unittest
     assert(d.ready(0));
     d.record(0);
     assert(!d.ready(10) && d.ready(40));
+}
+
+// rust: frame.rs::ctrl_o_toggles_the_latest_tool_call_and_result_in_place
+// rust: frame.rs::ctrl_o_matches_the_call_by_id_not_adjacency
+// rust: frame.rs::tool_result_inherits_expansion_from_its_call
+unittest
+{
+    void put(ref Transcript t, string s) { t.feed(cast(const(ubyte)[]) s); }
+    Transcript t;
+    string rows;
+    foreach (i; 1 .. 16) rows ~= format("row %s\n", i);
+    put(t, "● bash ls\n" ~ foldMark("call_1", 1, "● bash ls\n    {\n      \"command\": \"ls\"\n    }\n"));
+    put(t, "● read a.rs\n" ~ foldMark("call_2", 1, "● read a.rs\n    {\"path\": \"a.rs\"}\n"));
+    put(t, "interleaved command output\n");
+    put(t, "  ⎿ file-a (+1 lines)\n" ~ foldMark("call_1", 1, expandedResult(true, "file-a\nfile-b", false)));
+    auto collapsed = t.lines.dup;
+    assert(collapsed.length == 4, format("%s", collapsed));
+    assert(t.toggleLatest());
+    // call_1 and its result expand; call_2 and the output between are untouched.
+    assert(t.lines == ["● bash ls", "    {", "      \"command\": \"ls\"", "    }", "● read a.rs",
+        "interleaved command output", "  ⎿ file-a", "    file-b"], format("%s", t.lines));
+    foreach (w; [12, 20, 80])
+        foreach (l; t.render(w)) assert(visibleWidth(l) <= w);
+    assert(t.toggleLatest());
+    assert(t.lines == collapsed);
+    // A result that arrives later expands with its already-expanded call.
+    put(t, "● bash pwd\n" ~ foldMark("call_3", 1, "● bash pwd\n    {}\n"));
+    assert(t.toggleLatest());
+    put(t, "  ⎿ /x (+1 lines)\n" ~ foldMark("call_3", 1, "  ⎿ /x\n    /y\n"));
+    assert(t.lines[$ - 4 .. $] == ["● bash pwd", "    {}", "  ⎿ /x", "    /y"], format("%s", t.lines));
+    assert(t.toggleLatest()); // collapses the pair
+    assert(t.lines[$ - 2 .. $] == ["● bash pwd", "  ⎿ /x (+1 lines)"]);
+}
+
+// rust: frame.rs::ctrl_o_toggles_the_latest_thinking_block
+unittest
+{
+    Transcript t;
+    assert(!t.toggleLatest());
+    auto mark = foldMark("", 1, "∴ Thought for 1.5s\n    first idea\n    second\n");
+    // A mark split across reads still applies.
+    t.feed(cast(const(ubyte)[]) ("∴ Thought for 1.5s\n" ~ mark[0 .. 9]));
+    t.feed(cast(const(ubyte)[]) mark[9 .. $]);
+    t.feed(cast(const(ubyte)[]) "after\n");
+    assert(t.lines == ["∴ Thought for 1.5s", "after"]);
+    assert(t.toggleLatest());
+    assert(t.lines == ["∴ Thought for 1.5s", "    first idea", "    second", "after"]);
+    // Other OSC sequences are dropped; a fold scrolled past the cap goes.
+    t.feed(cast(const(ubyte)[]) "\x1b]0;title\x07x\n");
+    assert(t.lines[$ - 1] == "x");
+    t.cap = 4;
+    t.feed(cast(const(ubyte)[]) "a\nb\nc\n");
+    assert(!t.toggleLatest());
 }

@@ -27,7 +27,8 @@ private struct Resume { Chan!bool done; }
 private struct Close { Chan!(immutable(string)[]) lines; }
 private struct Busy { bool on; }
 private struct WorkPause { bool paused; }
-private alias Request = SumType!(Draw, Commit, Redraw, Clear, Suspend, Resume, Close, Busy, WorkPause);
+private struct Toggle {}
+private alias Request = SumType!(Draw, Commit, Redraw, Clear, Suspend, Resume, Close, Busy, WorkPause, Toggle);
 
 /// The frame renderer, as seen from other threads: a sendable handle to the
 /// thread that owns the transcript and the renderer (an actor). Copies
@@ -147,6 +148,9 @@ struct FrameUi
     /// Re-renders (the status changed).
     void redraw() { send(Request(Redraw())); }
 
+    /// Ctrl-O: expands or collapses the latest fold (`foldMark`).
+    void toggleExpand() { send(Request(Toggle())); }
+
     /// Empties the transcript (`/restart`).
     void clear()
     {
@@ -188,6 +192,11 @@ private void frameThread(Isolated!FrameState state, Chan!Request requests)
                     return false;
                 },
                 (Redraw _) { f.render(); return false; },
+                (Toggle _) {
+                    f.drain();
+                    if (f.transcript.toggleLatest()) f.render();
+                    return false;
+                },
                 (Clear c) {
                     f.drain();
                     f.transcript.clear();
