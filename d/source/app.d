@@ -39,7 +39,7 @@ import nano.question : QuestionBroker, Question, Answer, Answered, Away, Dismiss
 import nano.lineedit : LineEditor, Outcome, K, enterKeyMode, leaveKeyMode, fdSource, writeFd, terminalWidth, terminalHeight;
 import nano.frameui : FrameUi;
 import nano.settings_dialog : SettingsUi, SettingsHost, runSettings, pickModel, onVerbosity;
-import nano.commands : helpText, unescapePrompt;
+import nano.commands : helpText, isCommand, unescapePrompt;
 import core.thread : Thread;
 import nano.claude_hooks : HookManager, listingField, label, isProject;
 import nano.skills : Skills, skillsDefinition = definition;
@@ -270,7 +270,8 @@ void readStdinLines(Chan!string inbox, bool color)
         auto line = input.next();
         if (line is null) { inbox.close(); return; }
         auto text = line.strip;
-        if (atomicLoad(gTurnRunning) && text.length && !text.startsWith("/"))
+        if (atomicLoad(gTurnRunning) && text.length
+            && (!text.startsWith("/") || (!isCommand(text) && unescapePrompt(text) is null)))
         {
             gControl.steer(text);
             stdErr.writeln(dim("↪ steer: " ~ text ~ " (read at the agent's next step)"));
@@ -460,7 +461,7 @@ private void readTurnKeys(LineEditor editor, ConsoleLink console, shared(bool)* 
                     stdErr.writeln(console.dim(runQueueCommand(queue, gControl, qa[0 .. $ - 1])));
                     break;
                 }
-                if (text.startsWith("/") && unescapePrompt(text) is null)
+                if (isCommand(text))
                 {
                     // Read-only commands and settings run now (turn_commands.rs).
                     if (auto shown = midTurnCommand(text, mid))
@@ -1956,7 +1957,7 @@ int runMain(string[] args)
         if (literal) line = line[1 .. $];
         auto input = line.strip;
         if (!input.length) continue;
-        if (!literal && input.startsWith("/"))
+        if (!literal && isCommand(input))
         {
             auto sp = input.indexOf(' ');
             auto cmd = sp > 0 ? input[0 .. sp] : input;

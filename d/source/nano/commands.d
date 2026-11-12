@@ -80,13 +80,27 @@ unittest
 string rejection(string line)
 {
     auto word = firstWord(line.strip);
-    if (!word.length || !word.startsWith("/") || word.startsWith("//") || commands.any!(c => c.name == word))
+    if (!isCommand(line) || commands.any!(c => c.name == word))
         return null;
     auto note = "Unknown command " ~ word;
     if (auto close = closest(word)) note ~= ". Did you mean " ~ close ~ "?";
-    if (word[1 .. $].canFind('/')) note ~= " To send a message starting with a path, type //" ~ word[1 .. $];
-    else note ~= " (/help lists commands)";
+    note ~= " (/help lists commands)";
     return note;
+}
+
+/// Whether a submitted line is a slash command rather than a prompt. A
+/// known command (`/help`, `/model x/y`) always is; an unknown `/word` is
+/// only when it is a single line whose first word doesn't look like a path,
+/// so a prompt such as `/workspace is shared.\n...` or `/tmp/foo is empty,
+/// why?` reaches the model instead of being swallowed (Rust #173). A `//…`
+/// line is an escaped prompt, never a command.
+bool isCommand(string line)
+{
+    auto t = line.strip;
+    auto word = firstWord(t);
+    if (!word.length || !word.startsWith("/") || word.startsWith("//")) return false;
+    if (commands.any!(c => c.name == word)) return true;
+    return !word[1 .. $].canFind('/') && !t.canFind('\n');
 }
 
 /// A `//…` line is a prompt that starts with `/`: the text with one `/`
@@ -377,17 +391,30 @@ string fit(string plain, size_t cols, const Style[] styles)
 // rust: commands.rs::oversized_words_skip_edit_distance_and_suggest_nothing
 // rust: commands.rs::slash_slash_escapes_a_prompt
 // rust: commands.rs::unknown_commands_are_rejected_with_a_suggestion
-unittest // rejection with did-you-mean, path hint and // escape
+unittest // rejection with did-you-mean and // escape; path-leading prompts pass
 {
     assert(rejection("/help") is null && rejection("hello") is null && rejection("//etc/hosts") is null);
     assert(rejection("/model gpt") is null);
     auto r = rejection("/exin");
     assert(r.canFind("Unknown command /exin") && r.canFind("Did you mean /exit?") && r.canFind("/help lists"), r);
     assert(rejection("/modle").canFind("Did you mean /model?"));
-    auto p = rejection("/etc/hosts is odd");
-    assert(p.canFind("type //etc/hosts") && !p.canFind("Did you mean"), p);
+    foreach (ok; ["/exit", "/model gpt-4o", "/compact --smart focus", "//usr/lib", "hello /exin", "", "   ",
+            "/usr/lib is 4 GB, why?", "/tmp/foo is empty, why?",
+            "\n/workspace is the only path you share with the user.\n\nWrite a FEEL expression"])
+        assert(rejection(ok) is null, ok);
     assert(unescapePrompt("//etc/hosts x") == "/etc/hosts x" && unescapePrompt("/help") is null);
     assert(rejection("/" ~ "x".replicateStr(5000)).canFind("Unknown"));
+}
+
+// rust: commands.rs::only_known_or_plausible_commands_are_commands
+unittest // a known command or a single-line, non-path /word is a command
+{
+    foreach (cmd; ["/help", "/compact", "/compact --smart keep tests", "/model openai/gpt-4o", " /exit \n"])
+        assert(isCommand(cmd), cmd);
+    assert(isCommand("/exin") && isCommand("/frobnicate now"));
+    foreach (prompt; ["\n/workspace is the only path you share with the user.\n\nWrite a FEEL expression to /workspace/answer.feel",
+            "/tmp/foo is empty, why?", "/workspace\nis shared", "//escaped", "plain", ""])
+        assert(!isCommand(prompt), prompt);
 }
 
 // rust: commands.rs::tab_completes_unique_commands_and_common_prefixes

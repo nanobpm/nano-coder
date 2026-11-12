@@ -34,6 +34,7 @@ import nano.plan : Plan;
 enum int protocolVersion = 1;
 
 import nano.paths : debugQuote;
+import nano.commands : isCommand;
 import nano.thinking : wireValue, setSession, label;
 import nano.temperature : label;
 import std.array : join;
@@ -95,13 +96,11 @@ string unescapePrompt(string line)
 string enforceSlashInvariant(ref string text)
 {
     auto trimmed = text.strip;
-    if (trimmed.startsWith("/") && unescapePrompt(trimmed) is null)
+    if (isCommand(trimmed))
     {
         auto sp = trimmed.indexOf(' ');
         auto word = sp > 0 ? trimmed[0 .. sp] : trimmed;
         if (acpCommandRoots.canFind(word)) return format("Can't run %s over ACP", debugQuote(trimmed));
-        if (word[1 .. $].canFind('/'))
-            return format("Unknown command %s. To send a message starting with a path, type //%s", word, word[1 .. $]);
         return format("Can't run %s: this command is not available over ACP", word);
     }
     if (auto u = unescapePrompt(trimmed)) text = u;
@@ -130,7 +129,7 @@ DuringTurn classifyDuringTurn(JSONValue msg, string active, out string steerText
         auto trimmed = text.strip;
         if (!trimmed.length) return DuringTurn.defer;
         auto u = unescapePrompt(trimmed);
-        if (trimmed.startsWith("/") && u is null) return DuringTurn.defer;
+        if (isCommand(trimmed)) return DuringTurn.defer;
         steerText = u !is null ? u : text;
         return DuringTurn.steer;
     }
@@ -807,6 +806,8 @@ unittest
     assert(enforceSlashInvariant(t) is null && t == "/etc/hosts is odd");
     t = "/model";
     assert(enforceSlashInvariant(t) == `Can't run "/model" over ACP`);
+    t = "/usr/lib is big";
+    assert(enforceSlashInvariant(t) is null && t == "/usr/lib is big");
     // An escaped prompt steers; a real command waits.
     string s;
     auto prompt = (string x) => parseJSON(`{"method":"session/prompt","params":{"prompt":[{"type":"text","text":` ~ JSONValue(x).toString ~ `}]}}`);
@@ -818,6 +819,19 @@ unittest
     assert(promptText(get(q[0], "params")) == "//x");
     assert(isJsonRpcRequest(parseJSON(`{"jsonrpc":"2.0","method":"session/cancel"}`)));
     assert(!isJsonRpcRequest(parseJSON(`{}`)) && !isJsonRpcRequest(parseJSON(`null`)));
+}
+
+// rust: acp.rs::path_leading_prompts_reach_the_model_over_acp
+unittest // a prompt starting with a path is a prompt, not a command (Rust #173)
+{
+    string t = "\n/workspace is the only path you share with the user.\n\nWrite a FEEL expression to /workspace/answer.feel";
+    auto orig = t;
+    assert(enforceSlashInvariant(t) is null && t == orig);
+    t = "/tmp/foo is empty, why?";
+    assert(enforceSlashInvariant(t) is null && t == "/tmp/foo is empty, why?");
+    string s;
+    auto prompt = parseJSON(`{"method":"session/prompt","params":{"prompt":[{"type":"text","text":"/tmp/x is odd"}]}}`);
+    assert(classifyDuringTurn(prompt, null, s) == DuringTurn.steer && s == "/tmp/x is odd");
 }
 
 // End to end: a prompt runs a tool, streams updates and returns its stop reason.
