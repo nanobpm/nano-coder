@@ -974,9 +974,9 @@ reminders.rs::exempt_tools_and_start_turn_reset_the_detector	test
 reminders.rs::identical_large_history_read_with_per_call_spill_paths_still_counts	todo
 reminders.rs::identical_large_output_with_per_call_spill_paths_still_counts	test
 reminders.rs::less_logfile_option_is_not_diagnostic	test
-reminders.rs::less_numeric_option_prefix_does_not_hide_a_writer_flag	todo
+reminders.rs::less_numeric_option_prefix_does_not_hide_a_writer_flag	test
 reminders.rs::nudges_a_stale_plan_until_it_changes	test
-reminders.rs::option_values_are_not_misread_as_writer_flags	todo
+reminders.rs::option_values_are_not_misread_as_writer_flags	test
 reminders.rs::pipeline_key_keeps_stages_that_write_through_options_or_shell_control	test
 reminders.rs::pipeline_key_only_collapses_read_only_diagnostic_stages	test
 reminders.rs::repeat_warning_only_names_report_outcome_when_it_is_offered	test
@@ -987,7 +987,7 @@ reminders.rs::spill_normalisation_only_touches_the_marker_not_arbitrary_output	t
 reminders.rs::spill_path_normalisation_collapses_per_call_names	test
 reminders.rs::suggests_a_plan_once_per_session	test
 reminders.rs::suggests_saving_a_memory_once_unless_one_was_saved	test
-reminders.rs::unmodelled_shell_shapes_fail_closed	todo
+reminders.rs::unmodelled_shell_shapes_fail_closed	test
 reminders.rs::warns_on_the_third_identical_call_not_before	test
 resume.rs::ago_is_brief	test
 resume.rs::directory_view_includes_unknown_cwd	test

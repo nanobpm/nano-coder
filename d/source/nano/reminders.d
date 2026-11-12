@@ -251,42 +251,154 @@ bool isDiagnosticStage(string stage)
     foreach (ch; stage)
         if (ch == '>' || ch == '<' || ch == ';' || ch == '&' || ch == '`' || ch == '\n') return false;
     if (stage.canFind("$(") || stage.canFind("${")) return false;
-    auto tokens = stage.split;
-    if (!tokens.length || !diagnosticStages.canFind(tokens[0])) return false;
-    return !stageHasSideEffect(tokens[0], tokens[1 .. $]);
+    // Tokenise shell-style (quotes stripped, escapes honoured); a shape we
+    // don't model (unterminated quote, glob/brace/expansion) fails closed.
+    string[] words;
+    if (!shellWords(stage, words) || !words.length || !diagnosticStages.canFind(words[0])) return false;
+    return !stageHasSideEffect(words[0], words[1 .. $]);
 }
 
-/// Whether a diagnostic command writes a file or runs a helper via an option.
-private bool stageHasSideEffect(string cmd, string[] args)
+/// Option grammar of one diagnostic command, enough to tell a writer option
+/// from an option's value (`sort -k2o` is `-k` with value `2o`, not `-o`).
+private struct OptionSpec
+{
+    string shortWithArg;     // consume the rest of the cluster or the next word
+    string shortNumericArg;  // consume following digits (`less -x4`, `-#1`)
+    string shortWriters;     // write a file
+    immutable(string)[] longWithArg, longWriters;
+    long maxReadPositionals = -1; // more positionals than this write (uniq OUT)
+}
+
+private bool optionSpec(string cmd, out OptionSpec spec)
 {
     switch (cmd)
     {
         case "sort":
-            foreach (a; args)
-                if (shortClusterContains(a, 'o') || a.startsWith("--output") || a.startsWith("--compress-program"))
-                    return true;
-            return false;
-        case "uniq":
-            size_t positional;
-            foreach (a; args) if (a == "-" || !a.startsWith("-")) ++positional;
-            return positional >= 2;
+            spec = OptionSpec("kotST", "", "o",
+                ["--key", "--field-separator", "--buffer-size", "--temporary-directory", "--parallel",
+                 "--batch-size", "--files0-from", "--sort", "--random-source"],
+                ["--output", "--compress-program"]);
+            return true;
         case "less":
-            foreach (a; args)
-                if (shortClusterContains(a, 'o') || shortClusterContains(a, 'O') || a.startsWith("--log-file"))
-                    return true;
-            return false;
+            spec = OptionSpec("bhjkoOpPtT", "xz#", "oO", [], ["--log-file", "--LOG-FILE"]);
+            return true;
+        case "uniq":
+            spec = OptionSpec("fsw", "", "", ["--skip-fields", "--skip-chars", "--check-chars"], [], 1);
+            return true;
         default:
             return false;
     }
 }
 
-private bool shortClusterContains(string token, char opt)
+/// Whether a diagnostic command writes a file or runs a helper via an option
+/// or an extra positional. Long options match by unambiguous prefix (`--out`).
+private bool stageHasSideEffect(string cmd, string[] args)
 {
-    return token.startsWith("-") && !token.startsWith("--") && token[1 .. $].canFind(opt);
+    import std.algorithm.searching : startsWith, findSplit;
+    import std.ascii : isDigit;
+    OptionSpec spec;
+    if (!optionSpec(cmd, spec)) return false;
+    size_t positionals, i;
+    bool optionsDone;
+    while (i < args.length)
+    {
+        auto a = args[i++];
+        if (optionsDone || a == "-" || !a.startsWith("-")) { ++positionals; continue; }
+        if (a == "--") { optionsDone = true; continue; }
+        if (a.startsWith("--"))
+        {
+            auto parts = a.findSplit("=");
+            auto name = parts[0];
+            bool hasValue = parts[1].length > 0;
+            foreach (w; spec.longWriters) if (w.startsWith(name)) return true;
+            if (!hasValue) foreach (w; spec.longWithArg) if (w.startsWith(name)) { ++i; break; }
+            continue;
+        }
+        auto cluster = a[1 .. $];
+        size_t pos;
+        while (pos < cluster.length)
+        {
+            auto c = cluster[pos];
+            if (spec.shortWriters.canFind(c)) return true;
+            if (spec.shortNumericArg.canFind(c))
+            {
+                ++pos;
+                while (pos < cluster.length && cluster[pos].isDigit) ++pos;
+                continue;
+            }
+            if (spec.shortWithArg.canFind(c))
+            {
+                if (pos + 1 == cluster.length) ++i;
+                break;
+            }
+            ++pos;
+        }
+    }
+    return spec.maxReadPositionals >= 0 && positionals > spec.maxReadPositionals;
+}
+
+/// Shell-style words of a stage: quotes stripped, escapes honoured. False for
+/// shapes not modelled (expansions, globs, redirections, unterminated quotes).
+private bool shellWords(string stage, out string[] words) nothrow
+{
+    string cur;
+    bool inWord;
+    size_t i;
+    bool next(out char c) { if (i >= stage.length) return false; c = stage[i++]; return true; }
+    char c;
+    while (next(c))
+    {
+        switch (c)
+        {
+            case ' ', '\t', '\n':
+                if (inWord) { words ~= cur; cur = null; inWord = false; }
+                break;
+            case '\\':
+                char n;
+                if (!next(n)) return false;
+                cur ~= n; inWord = true;
+                break;
+            case '\'':
+                inWord = true;
+                for (;;)
+                {
+                    char q;
+                    if (!next(q)) return false;
+                    if (q == '\'') break;
+                    cur ~= q;
+                }
+                break;
+            case '"':
+                inWord = true;
+                for (;;)
+                {
+                    char q;
+                    if (!next(q)) return false;
+                    if (q == '"') break;
+                    if (q == '$' || q == '`') return false;
+                    if (q == '\\')
+                    {
+                        char n;
+                        if (!next(n)) return false;
+                        if (n != '"' && n != '\\' && n != '$' && n != '`') cur ~= '\\';
+                        cur ~= n;
+                    }
+                    else cur ~= q;
+                }
+                break;
+            case '$', '`', '*', '?', '[', '{', '(', ')', '~', '!', '<', '>', ';', '&', '|':
+                return false;
+            default:
+                cur ~= c; inWord = true;
+        }
+    }
+    if (inWord) words ~= cur;
+    return true;
 }
 
 /// Split into top-level pipeline stages, quote- and escape-aware. Returns null
-/// when the command contains `||` (not a pipeline).
+/// for shapes not modelled: `||`, `|&`, substitutions, here-docs, newlines and
+/// unterminated quotes.
 string[] splitPipeline(string command) nothrow
 {
     string[] stages;
@@ -298,14 +410,22 @@ string[] splitPipeline(string command) nothrow
         if (c == '\\' && !single) { i += 2; continue; }
         if (c == '\'' && !dbl) single = !single;
         else if (c == '"' && !single) dbl = !dbl;
+        // Command substitution, here-docs and newlines can hide a `|` or
+        // carry further commands: shapes not modelled, so refuse to split.
+        else if (c == '`' && !single) return null;
+        else if (c == '$' && !single && i + 1 < command.length && command[i + 1] == '(') return null;
+        else if (c == '<' && !single && !dbl && i + 1 < command.length && command[i + 1] == '<') return null;
+        else if (c == '\n' && !single && !dbl) return null;
         else if (c == '|' && !single && !dbl)
         {
-            if (i + 1 < command.length && command[i + 1] == '|') return null;
+            // `||` is logical OR and `|&` also pipes stderr.
+            if (i + 1 < command.length && (command[i + 1] == '|' || command[i + 1] == '&')) return null;
             stages ~= command[start .. i];
             start = i + 1;
         }
         ++i;
     }
+    if (single || dbl) return null;
     stages ~= command[start .. $];
     return stages;
 }
@@ -553,4 +673,46 @@ unittest // distinct side-effecting pipelines do not hard-stop
 {
     Reminders r;
     foreach (i; 0 .. 8) assert(call(r, format("make | tee /tmp/out%s", i), true, "ok").none);
+}
+
+// rust: reminders.rs::option_values_are_not_misread_as_writer_flags
+unittest
+{
+    assert(pipelineKey("cat f | sort -k2o") == "cat f");
+    assert(pipelineKey("cat f | sort -t o") == "cat f");
+    assert(pipelineKey("cat f | sort -k 2 -o /tmp/a") == "cat f | sort -k 2 -o /tmp/a");
+    assert(pipelineKey("cat f | sort -rk2 -o/tmp/a") != pipelineKey("cat f | sort -rk2 -o/tmp/b"));
+    assert(pipelineKey("cat f | sort --out=/tmp/a") == "cat f | sort --out=/tmp/a");
+    assert(pipelineKey("cat f | less --log=/tmp/a") == "cat f | less --log=/tmp/a");
+    assert(pipelineKey("cat f | uniq -f 2") == "cat f");
+    assert(pipelineKey("cat f | uniq -f 2 - /tmp/out") == "cat f | uniq -f 2 - /tmp/out");
+    assert(pipelineKey("cat f | uniq -- -in -out") == "cat f | uniq -- -in -out");
+    assert(pipelineKey("cat f | uniq --group - /tmp/out") == "cat f | uniq --group - /tmp/out");
+    assert(pipelineKey("cat f | uniq --all-repeated - /tmp/out") == "cat f | uniq --all-repeated - /tmp/out");
+    assert(pipelineKey("cat f | uniq --group=prepend") == "cat f");
+    assert(pipelineKey("cat f | uniq --all-repeated=separate") == "cat f");
+    foreach (sep; ["\v", "\r", "\f"])
+        assert(pipelineKey("cat f | sort -t" ~ sep ~ " -o /tmp/out") == "cat f | sort -t" ~ sep ~ " -o /tmp/out");
+    assert(pipelineKey("cat f | sort '-o' /tmp/a") == "cat f | sort '-o' /tmp/a");
+    assert(pipelineKey("cat f | 'tee' /tmp/a") == "cat f | 'tee' /tmp/a");
+}
+
+// rust: reminders.rs::less_numeric_option_prefix_does_not_hide_a_writer_flag
+unittest
+{
+    foreach (o; ["-x4o", "-x4O", "-z4o", "-#1o", "-x4No"])
+        assert(pipelineKey("printf x | less " ~ o ~ "/tmp/a") != pipelineKey("printf x | less " ~ o ~ "/tmp/b"), o);
+    foreach (o; ["-x4", "-x 4", "-#1", "-x4N", "-pfoo", "-p foo"])
+        assert(pipelineKey("printf x | less " ~ o) == "printf x", o);
+}
+
+// rust: reminders.rs::unmodelled_shell_shapes_fail_closed
+unittest
+{
+    foreach (c; ["echo $(cat a | wc -l)", "echo `cat a | wc -l`", "make |& tee log", "cat <<EOF | wc\nx\nEOF",
+                 "cmd | grep 'x", "cmd | sort $OPT", "cmd | sort -*"])
+        assert(pipelineKey(c) == c, c);
+    foreach (w; ["tee -a /tmp/a", "cp a b", "mv a b", "rsync a b", "xargs rm"])
+        assert(pipelineKey("cmd | " ~ w) == "cmd | " ~ w);
+    assert(pipelineKey("cmd | grep 'a b' | head -n 3") == "cmd");
 }
