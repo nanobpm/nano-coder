@@ -649,3 +649,19 @@ unittest // finish closes an unterminated code block; plain text is unchanged
     assert(plain(all) == plain(render("text\n\n```\ncode more", 80) ~ "\n"));
     assert(stream(["just ", "some words\n", "on lines"], 80) == "just some words on lines\n");
 }
+
+// rust: markdown.rs::emoji_shortcodes
+unittest // GitHub-style emoji shortcodes in prose; code stays verbatim
+{
+    import std.algorithm : canFind;
+    import std.array : join;
+    auto r = (string md) => show(md, 80).join("\n");
+    assert(r("Grow :seedling: now").canFind("Grow 🌱 now"));
+    assert(r(":+1: and :tada:").canFind("👍 and 🎉"));
+    assert(r(":sweat_smile:").canFind("😅"), r(":sweat_smile:"));
+    assert(r("keep :not_an_emoji_xyz: as is").canFind(":not_an_emoji_xyz:"));
+    assert(r("at 12:30:45 in a::b").canFind("12:30:45 in a::b"));
+    assert(r("v1:zz:seedling:").canFind("v1:zz🌱"));
+    assert(r("`:seedling:`").canFind(":seedling:"));
+    assert(r("```\n:seedling:\n```").canFind(":seedling:"));
+}

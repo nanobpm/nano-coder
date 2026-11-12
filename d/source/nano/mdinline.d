@@ -485,6 +485,11 @@ Span[] inlineSpans(string text) pure
 {
     Flatten f;
     f.walk(parse(text), 0);
+    // Prose gets GitHub-style `:shortcode:` emoji; code stays verbatim (Rust
+    // #181). Expanded after merging, as `_` in a name splits the text runs.
+    import nano.emoji : expandShortcodes;
+    foreach (ref sp; f.spans)
+        if (!(sp.style & CODE)) sp.text = expandShortcodes(sp.text);
     return f.spans;
 }
 

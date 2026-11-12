@@ -611,7 +611,7 @@ markdown.rs::block_quotes_get_a_bar	test
 markdown.rs::cached_rendering_matches_and_tracks_width	claimed	PORTING.md: all markdown.rs tests ported
 markdown.rs::code_blocks_are_verbatim_between_dim_fences	test
 markdown.rs::controls_in_model_text_are_dropped	test
-markdown.rs::emoji_shortcodes	todo
+markdown.rs::emoji_shortcodes	test
 markdown.rs::every_line_fits_the_width	claimed	PORTING.md: all markdown.rs tests ported
 markdown.rs::headings_paragraphs_and_rules	test
 markdown.rs::inline_markup_is_styled_and_markers_removed	test
