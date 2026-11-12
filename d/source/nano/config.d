@@ -111,7 +111,9 @@ struct ProviderConfig
     /// `hidden = true`: left out of listings and pickers, but still usable
     /// when named in a model spec (the mock preset is hidden by default).
     bool hidden;
-    long timeoutSecs = 600;
+    /// `timeout_secs`, the stream idle timeout; 0 (unset) means
+    /// `defaultTimeoutSecs()`.
+    long timeoutSecs;
     long maxRetries = 5;
     long retryInitialBackoffMs = -1, retryMaxBackoffMs = -1;
     ushort[] retryableStatuses;
@@ -221,6 +223,33 @@ struct ProviderConfig
         o.sort!((a, b) => a[0] < b[0]);
         return o;
     }
+}
+
+/// Default provider stream idle timeout (`timeout_secs`): the longest silence
+/// between received bytes before a request fails. It must stay below a
+/// supervising worker's idle-kill budget (`workerIdleKillSecs`), or the worker
+/// kills the run before a stalled stream is detected and retried (Rust #179).
+enum long defaultTimeoutSecsValue = 120;
+/// The c8ctl-nano worker's documented idle-kill budget.
+enum long workerIdleKillSecs = 300;
+static assert(defaultTimeoutSecsValue < workerIdleKillSecs,
+    "default provider timeout must stay below the worker idle-kill budget");
+/// Overrides the default timeout in seconds; an explicit `timeout_secs` wins.
+enum providerTimeoutSecsEnv = "NANO_CODER_PROVIDER_TIMEOUT_SECS";
+
+/// The effective default stream idle timeout: the env override when it holds
+/// a positive integer, else `defaultTimeoutSecsValue`.
+long defaultTimeoutSecs()
+{
+    import std.conv : to;
+    import std.string : strip;
+    try
+    {
+        auto v = environment.get(providerTimeoutSecsEnv, "").strip.to!long;
+        if (v > 0) return v;
+    }
+    catch (Exception) {}
+    return defaultTimeoutSecsValue;
 }
 
 /// The names of the providers to offer in listings: `disabled` and `hidden` ones dropped, sorted.
@@ -562,6 +591,7 @@ ResolvedProvider resolve(const ref Config c, string spec)
             break;
     }
     r.config.baseUrl = r.config.baseUrl.stripRight('/');
+    if (r.config.timeoutSecs <= 0) r.config.timeoutSecs = defaultTimeoutSecs();
     r.replayReasoning = pc.replayReasoning.isNull ? reasonsOverResponses(r.config.kind, r.model) : pc.replayReasoning.get;
     r.apiKey = pc.apiKey;
     if (!r.apiKey.length && pc.apiKeyEnv.length) r.apiKey = environment.get(pc.apiKeyEnv, "");
@@ -670,6 +700,39 @@ unittest // suggestions skip a current or recent model on a hidden provider
     internal.hidden = true;
     c.providers["internal"] = internal;
     assert(!specVisible("internal/dev-model", c.providers, "openai"));
+}
+
+// rust: providers/mod.rs::default_timeout_stays_below_the_worker_idle_kill_budget
+// rust: providers/mod.rs::env_override_sets_the_default_timeout
+// rust: providers/mod.rs::config_timeout_secs_wins_over_the_env_override
+// rust: providers/mod.rs::invalid_env_values_fall_back_to_the_default
+unittest // the stream idle timeout: 120 s default, env override, explicit config wins
+{
+    // Unittests run one at a time, so changing the environment here is safe.
+    {
+        auto saved = environment.get(providerTimeoutSecsEnv);
+        scope (exit)
+        {
+            if (saved is null) environment.remove(providerTimeoutSecsEnv);
+            else environment[providerTimeoutSecsEnv] = saved;
+        }
+        environment.remove(providerTimeoutSecsEnv);
+        Config c;
+        c.providers = presets();
+        auto r = resolve(c, "mock/m");
+        assert(r.config.timeoutSecs == defaultTimeoutSecsValue && r.config.timeoutSecs < workerIdleKillSecs);
+        environment[providerTimeoutSecsEnv] = "90";
+        assert(resolve(c, "mock/m").config.timeoutSecs == 90);
+        ProviderConfig x;
+        x.merge(parseToml("kind = \"openai\"\nbase_url = \"http://localhost:1\"\ntimeout_secs = 45\n"));
+        c.providers["x"] = x;
+        assert(resolve(c, "x/m").config.timeoutSecs == 45);
+        foreach (v; ["", "abc", "-5", "0", "  "])
+        {
+            environment[providerTimeoutSecsEnv] = v;
+            assert(defaultTimeoutSecs() == defaultTimeoutSecsValue, v);
+        }
+    }
 }
 
 // rust: providers/mod.rs::a_disabled_provider_is_hidden_and_refused

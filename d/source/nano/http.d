@@ -45,7 +45,7 @@ struct Request
     string url;
     string[string] headers;
     string body_;
-    Duration idleTimeout = 600.seconds;
+    Duration idleTimeout = 120.seconds;
     Duration connectTimeout = 30.seconds;
 }
 
@@ -123,7 +123,8 @@ string postJson(string url, string[string] headers, JSONValue body_, string what
     req.headers["Content-Type"] = "application/json";
     if (onEvent !is null) req.headers["Accept"] = "text/event-stream";
     req.body_ = body_.toString;
-    req.idleTimeout = timeoutSecs.seconds;
+    import nano.config : defaultTimeoutSecs;
+    req.idleTimeout = (timeoutSecs > 0 ? timeoutSecs : defaultTimeoutSecs()).seconds;
     auto offline = OfflineWait(what, policy);
     scope (failure) offline.abandon();
     for (long attempt = 0;; attempt++)
