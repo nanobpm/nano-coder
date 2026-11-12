@@ -600,25 +600,25 @@ def run_one(args, index, case, model, mode, repeat, work_root):
         "summary_chars": len(summary),
         "history_calls": sum(1 for n in tool_calls if n.startswith("history_")),
         "tool_calls": tool_calls,
-        **run_cost(records[len(case["records"]):]),
+        **run_cost(records[len(case["records"]):], records[:len(case["records"])]),
     })
     if not args.keep and cwd == run_dir / "cwd":
         shutil.rmtree(cwd, ignore_errors=True)
     return result
 
 
-def run_cost(new_records):
+def run_cost(new_records, seeded_records=()):
     """Tokens and request time of the requests this run made, from the
     `usage` / `duration_ms` nano-coder logs on assistant messages (#58).
     Seeded records are excluded, so a fork of a real log is not counted.
 
-    The compaction summary request is counted exactly once: it issues no
-    assistant message of its own, so nano-coder persists its usage and
-    duration on the synthetic summary message inside the `replace` record.
-    Only a replace with a `mode` (a real compaction) carries it — a plain
-    rebuild's messages have none — and only the latest compaction is read:
-    its message list embeds every earlier one, so summing them all would
-    double count."""
+    Ordinary requests are counted only from `message` records. A compaction
+    summary request issues no assistant message of its own, so nano-coder
+    persists its usage and duration on the synthetic summary (a user message)
+    inside the mode-bearing `replace` record. Each new compaction's summary
+    is counted exactly once: a replace's message list also retains earlier
+    summaries and conversation messages, so only usage-bearing user messages
+    not already present in an earlier replace (seeded or new) are counted."""
     cost = {"input_tokens": 0, "output_tokens": 0, "request_ms": 0, "requests": 0}
 
     def add(data):
@@ -630,14 +630,24 @@ def run_cost(new_records):
         if isinstance(data.get("duration_ms"), (int, float)):
             cost["request_ms"] += int(data["duration_ms"])
 
+    def summaries(r):
+        data = r.get("data") or {}
+        if r.get("type") != "replace" or "mode" not in data:
+            return []
+        return [m for m in data.get("messages") or []
+                if isinstance(m, dict) and m.get("role") == "user" and isinstance(m.get("usage"), dict)]
+
+    def key(m):
+        return json.dumps(m, sort_keys=True)
+
+    seen = {key(m) for r in seeded_records for m in summaries(r)}
     for r in new_records:
         if r.get("type") == "message":
             add(r.get("data") or {})
-    replace = next((r for r in reversed(new_records)
-                    if r.get("type") == "replace" and "mode" in (r.get("data") or {})), None)
-    if replace is not None:
-        for m in replace["data"].get("messages") or []:
-            add(m)
+        for m in summaries(r):
+            if key(m) not in seen:
+                seen.add(key(m))
+                add(m)
     return cost
 
 
@@ -779,6 +789,11 @@ def calibration_deltas(trials):
                 case[-1].append(bool(r["passed"]))
     out = {}
     for (model, mode), c in sorted(cells.items()):
+        # Pad every case to the cell's full trial count: a trial in which the
+        # case had no lost run contributes an empty outcome list, so trailing
+        # trials are sampled as often as leading ones (no trial-order bias).
+        for case in c["cases"].values():
+            case.extend([] for _ in range(len(c["trials"]) - len(case)))
         rates = [x for x in c["trials"] if x is not None]
         cases = list(c["cases"].values())
         diffs = []
