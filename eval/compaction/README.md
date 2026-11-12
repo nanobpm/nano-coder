@@ -42,11 +42,53 @@ retrieval. With standard mode, `pass|lost` should be near zero. If it isn't,
 the model is guessing or the question leaks the answer. If smart mode has a
 high `pass|lost` but low `used hist`, check the answers in the results file.
 
+| column | meaning |
+| --- | --- |
+| `95% CI` | Wilson interval of `pass\|lost` — the spread a point estimate hides |
+| `in tok` / `out tok` | mean input/output tokens per run, from the session log's `usage` records (0 when the provider reports none) |
+
 A per-case pass table follows. Every run is written as one JSON line to
 `eval/compaction/results/<timestamp>.jsonl`, with the answer, tool calls,
-summary size and the path of the session log (kept, so you can read what
-happened). `run.py report FILE...` prints the table again, optionally
-combining several files.
+summary size, token usage, wall time and the path of the session log (kept,
+so you can read what happened). `run.py report FILE...` prints the table
+again, optionally combining several files.
+
+## Noise band and comparing two runs
+
+A point estimate of `pass|lost` can't tell a real gain from luck. Two tools
+help:
+
+```sh
+# Run the unchanged baseline several times and record the noise band δ
+# (per model x mode cell) to results/<stamp>.calibration.json:
+eval/compaction/run.py calibrate --trials 5 --models …
+# Compare a candidate run against a saved baseline:
+eval/compaction/run.py report --baseline A.jsonl B.jsonl --delta results/….calibration.json
+```
+
+`calibrate` repeats the whole eval `--trials` times on the *unchanged* code
+and estimates δ per cell as the 95th percentile of |Δ`pass|lost`| between
+two bootstrap resamples — each resample redraws one trial's repetitions
+*within each case*, preserving kept/lost membership and the fixed case mix,
+so case difficulty is not mistaken for run-to-run noise — floored at the
+observed spread of the per-trial rates (the calibration step of RRSI,
+[arXiv:2609.24972](https://arxiv.org/abs/2609.24972)). The calibration file
+stores δ at full precision; only the printed table rounds.
+
+`report --baseline A.jsonl B.jsonl` prints, per cell: Δ`pass|lost` with its
+95% interval (Newcombe's method from the two Wilson intervals), δ, and the
+change in mean input/output tokens and seconds per run. A cell is *within
+noise* when |Δ| ≤ δ (without `--delta`: when the interval contains 0), and
+the verdict says so — adding "; adds cost" when the change also spends more
+tokens. `--delta` also accepts a plain fraction, e.g. `--delta 0.1`. Token
+deltas and cost claims appear only when every run on both sides carries
+token fields; a baseline from before cost logging shows `n/a` instead of
+reading the missing data as zero.
+
+**Acceptance rule** (convention, not enforced by the harness): accept a
+harness or compaction change only if Δ`pass|lost` > δ **and** its extra
+tokens are justified by that gain. A change within the noise band must not
+add cost.
 
 ## Cases
 
