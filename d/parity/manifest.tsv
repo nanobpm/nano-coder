@@ -7,7 +7,7 @@ acp.rs::path_leading_prompts_reach_the_model_over_acp	test
 acp.rs::requeued_escaped_steers_are_re_escaped	todo
 acp.rs::slash_prompts_never_reach_the_model_over_acp	todo
 acp.rs::thinking_value_reports_nothing_for_a_dropped_level	test
-acp.rs::turn_usage_is_the_delta_of_the_session_counters	todo
+acp.rs::turn_usage_is_the_delta_of_the_session_counters	test
 agent.rs::a_background_probe_refines_a_default_window_source	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
 agent.rs::a_chat_output_cap_fallback_halves_the_sent_budget	todo
 agent.rs::a_compaction_summary_cap_fallback_halves_the_sent_budget	todo

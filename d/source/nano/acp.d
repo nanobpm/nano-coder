@@ -107,6 +107,26 @@ string enforceSlashInvariant(ref string text)
     return null;
 }
 
+/// ACP `PromptResponse.usage` for one turn: the tokens the provider reported
+/// between the turn's start and end (input, output), summed over its model
+/// calls. A null JSON value when the provider reported nothing (the field is
+/// optional in ACP). Counters reset mid-turn by /clear never go negative.
+JSONValue turnUsage(const ulong[2] before, const ulong[2] after)
+{
+    auto input = after[0] > before[0] ? after[0] - before[0] : 0;
+    auto output = after[1] > before[1] ? after[1] - before[1] : 0;
+    if (input == 0 && output == 0) return JSONValue(null);
+    return JSONValue(["inputTokens": input, "outputTokens": output, "totalTokens": input + output]);
+}
+
+// rust: acp.rs::turn_usage_is_the_delta_of_the_session_counters
+unittest
+{
+    assert(turnUsage([1_000, 50], [13_087, 54]) == JSONValue(["inputTokens": 12_087UL, "outputTokens": 4UL, "totalTokens": 12_091UL]));
+    assert(turnUsage([10, 5], [10, 5]).type == JSONType.null_, "nothing reported, no usage field");
+    assert(turnUsage([10, 5], [3, 7]) == JSONValue(["inputTokens": 0UL, "outputTokens": 2UL, "totalTokens": 2UL]));
+}
+
 /// Whether `msg` is a JSON-RPC 2.0 request or notification.
 bool isJsonRpcRequest(JSONValue msg)
 {
@@ -721,6 +741,7 @@ final class AcpServer : AgentEvents
     private void runTurn(JSONValue id, string text, string givenId = null)
     {
         router.startTurn();
+        immutable ulong[2] tokensBefore = [agent.sessionInputTokens, agent.sessionOutputTokens];
         string response;
         try response = agent.run(text, this, false, givenId);
         catch (Exception e)
@@ -735,6 +756,8 @@ final class AcpServer : AgentEvents
                 auto reply = JSONValue(["stopReason": stop, "response": response]);
                 // Extension: the model's explicit completed/blocked report.
                 if (agent.hasOutcome && stop == "end_turn") reply["_meta"] = JSONValue(["outcome": agent.lastOutcome.toJSON]);
+                auto usage = turnUsage(tokensBefore, [agent.sessionInputTokens, agent.sessionOutputTokens]);
+                if (usage.type != JSONType.null_) reply["usage"] = usage;
                 send(rpcResult(id, reply));
             }
             // Steers folded into this turn are answered by it.
