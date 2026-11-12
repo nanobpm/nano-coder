@@ -4947,6 +4947,9 @@ impl Agent {
         // discard sink, and compaction fell through to `dropped_note`, removing
         // the earlier messages from the active context with no summary.
         let mut summary_stream_restarts: u32 = 0;
+        // Wall clock for the summary call (all attempts), persisted on the
+        // replace record's synthetic summary message as `duration_ms`.
+        let summary_started = std::time::Instant::now();
         let result = loop {
             // Honour a `/model` switch queued while a previous summary attempt
             // was in flight, before building this attempt's request — the chat
@@ -5057,9 +5060,20 @@ impl Agent {
                 other => break other,
             }
         };
+        // The summary request is a real model call whose cost the session log
+        // must carry: the compaction's `replace` record otherwise persists only
+        // the synthetic summary, and offline cost accounting (the compaction
+        // eval's `run_cost`, which reads `usage`/`duration_ms` off logged
+        // messages) would see a compaction as free, so a change that makes
+        // summarizing more expensive looks cost-neutral. Capture the usage and
+        // wall time of the *final* attempt (the one whose response produced —
+        // or failed to produce — the summary); they ride along on the synthetic
+        // summary message in the replace record below.
+        let mut summary_usage = None;
         let mut truncated = false;
         let (summary, fallback) = match result {
             Ok(response) if !response.content.trim().is_empty() => {
+                summary_usage = response.usage.clone();
                 self.record_usage(&response, false);
                 // A summary cut off at the output limit silently loses whatever
                 // it had not reached yet; say so, so the agent re-checks state
@@ -5088,11 +5102,13 @@ impl Agent {
                 } else {
                     "empty summary".to_string()
                 };
+                summary_usage = response.usage.clone();
                 self.record_usage(&response, false);
                 (dropped, Some(reason))
             }
             Err(e) => (self.dropped_note(summarized.len(), smart.then_some(range).flatten()), Some(format!("{e:#}"))),
         };
+        let summary_duration_ms = u64::try_from(summary_started.elapsed().as_millis()).ok();
 
         let mut messages: Vec<Message> = self.conversation[..body_start].to_vec();
         let summary = if self.config.plan_tools && !self.plan.is_empty() {
@@ -5100,7 +5116,14 @@ impl Agent {
         } else {
             summary
         };
-        messages.push(Message::user(&summary));
+        // The synthetic summary stands in for the folded assistant turns in the
+        // persisted replace record; attach the summary request's cost to it so
+        // the log keeps that cost (usage/duration are log-only fields, never
+        // sent to a provider).
+        let mut summary_message = Message::user(&summary);
+        summary_message.usage = summary_usage;
+        summary_message.duration_ms = summary_duration_ms;
+        messages.push(summary_message);
         // When the active input is itself folded into the summary it is
         // restated after it; `restated_index` records where, so the replay can
         // skip that synthetic copy (the original is in `summarized_msgs`).
@@ -12453,6 +12476,54 @@ mod tests {
         let report = agent.compact_logged(CompactTrigger::Manual, CompactionMode::Standard, None).await.unwrap();
         assert!(report.is_none(), "a cancelled compaction summarizes nothing");
         assert_eq!(seen.lock().unwrap().len(), 2, "no summary call was issued on cancel");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compaction_persists_the_summary_request_usage_on_the_replace_record() {
+        // The summary request is a real model call whose cost the session log
+        // must carry: offline cost accounting (the compaction eval's
+        // `run_cost`) reads `usage`/`duration_ms` off logged messages, and a
+        // replace record that persists only the synthetic summary would make
+        // compaction look free (PR #183 review). The summary response's usage
+        // and the call's wall time ride along on the synthetic summary message
+        // inside the replace record.
+        let summary_response = LLMResponse {
+            content: "SUMMARY: pinged once".into(),
+            usage: Some(crate::llm::TokenUsage {
+                prompt_tokens: 321,
+                completion_tokens: 45,
+                total_tokens: 366,
+                aic: None,
+            }),
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _seen) = agent(vec![tool_call("c1"), text("done"), summary_response], dir.path());
+        agent.new_session().unwrap();
+        agent.send_message("ping").await.unwrap();
+        let report = agent.compact_logged(CompactTrigger::Manual, CompactionMode::Standard, None).await.unwrap();
+        assert!(report.is_some(), "compaction ran");
+
+        let session_id = agent.session_id().expect("a session is active").to_string();
+        let records = crate::session::read_records(dir.path(), &session_id).unwrap();
+        let replace = records
+            .iter()
+            .rev()
+            .find_map(|r| match r {
+                crate::session::Record::Replace { messages, mode: Some(_), .. } => Some(messages),
+                _ => None,
+            })
+            .expect("the compaction logged a replace record");
+        let summary = replace
+            .iter()
+            .find(|m| m.role == Role::User && m.content.contains("SUMMARY: pinged once"))
+            .expect("the synthetic summary is in the replace record");
+        let usage = summary.usage.as_ref().expect("the summary request's usage is persisted");
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (321, 45));
+        assert!(summary.duration_ms.is_some(), "the summary request's wall time is persisted");
+        // No other message in the record carries a cost: the folded turns keep
+        // their own (absent) usage rather than double counting the summary's.
+        assert!(replace.iter().filter(|m| m.usage.is_some()).count() == 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -68,16 +68,22 @@ eval/compaction/run.py report --baseline A.jsonl B.jsonl --delta results/….cal
 
 `calibrate` repeats the whole eval `--trials` times on the *unchanged* code
 and estimates δ per cell as the 95th percentile of |Δ`pass|lost`| between
-two bootstrap resamples of the pooled runs (each the size of one trial),
-floored at the observed spread of the per-trial rates — the calibration step
-of RRSI ([arXiv:2609.24972](https://arxiv.org/abs/2609.24972)).
+two bootstrap resamples — each resample redraws one trial's repetitions
+*within each case*, preserving kept/lost membership and the fixed case mix,
+so case difficulty is not mistaken for run-to-run noise — floored at the
+observed spread of the per-trial rates (the calibration step of RRSI,
+[arXiv:2609.24972](https://arxiv.org/abs/2609.24972)). The calibration file
+stores δ at full precision; only the printed table rounds.
 
 `report --baseline A.jsonl B.jsonl` prints, per cell: Δ`pass|lost` with its
 95% interval (Newcombe's method from the two Wilson intervals), δ, and the
 change in mean input/output tokens and seconds per run. A cell is *within
 noise* when |Δ| ≤ δ (without `--delta`: when the interval contains 0), and
 the verdict says so — adding "; adds cost" when the change also spends more
-tokens. `--delta` also accepts a plain fraction, e.g. `--delta 0.1`.
+tokens. `--delta` also accepts a plain fraction, e.g. `--delta 0.1`. Token
+deltas and cost claims appear only when every run on both sides carries
+token fields; a baseline from before cost logging shows `n/a` instead of
+reading the missing data as zero.
 
 **Acceptance rule** (convention, not enforced by the harness): accept a
 harness or compaction change only if Δ`pass|lost` > δ **and** its extra

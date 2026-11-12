@@ -610,12 +610,18 @@ def run_one(args, index, case, model, mode, repeat, work_root):
 def run_cost(new_records):
     """Tokens and request time of the requests this run made, from the
     `usage` / `duration_ms` nano-coder logs on assistant messages (#58).
-    Seeded records are excluded, so a fork of a real log is not counted."""
+    Seeded records are excluded, so a fork of a real log is not counted.
+
+    The compaction summary request is counted exactly once: it issues no
+    assistant message of its own, so nano-coder persists its usage and
+    duration on the synthetic summary message inside the `replace` record.
+    Only a replace with a `mode` (a real compaction) carries it — a plain
+    rebuild's messages have none — and only the latest compaction is read:
+    its message list embeds every earlier one, so summing them all would
+    double count."""
     cost = {"input_tokens": 0, "output_tokens": 0, "request_ms": 0, "requests": 0}
-    for r in new_records:
-        if r.get("type") != "message":
-            continue
-        data = r.get("data") or {}
+
+    def add(data):
         usage = data.get("usage")
         if isinstance(usage, dict):
             cost["requests"] += 1
@@ -623,6 +629,15 @@ def run_cost(new_records):
             cost["output_tokens"] += int(usage.get("completion_tokens") or 0)
         if isinstance(data.get("duration_ms"), (int, float)):
             cost["request_ms"] += int(data["duration_ms"])
+
+    for r in new_records:
+        if r.get("type") == "message":
+            add(r.get("data") or {})
+    replace = next((r for r in reversed(new_records)
+                    if r.get("type") == "replace" and "mode" in (r.get("data") or {})), None)
+    if replace is not None:
+        for m in replace["data"].get("messages") or []:
+            add(m)
     return cost
 
 
@@ -655,7 +670,10 @@ def diff_interval(k1, n1, k0, n0, z=Z95):
 
 
 def cell_stats(rs):
-    """Per (model, mode) cell: pass|lost counts and mean cost per run."""
+    """Per (model, mode) cell: pass|lost counts and mean cost per run.
+    `has_cost` is set only when every run carries both token fields, so a
+    baseline that predates cost logging (or a cell mixing old and new
+    records) is not read as zero cost."""
     ok = [r for r in rs if "error" not in r]
     lost = [r for r in ok if not r.get("kept", r.get("summary_kept"))]
     n = len(rs) or 1
@@ -665,7 +683,7 @@ def cell_stats(rs):
         "in_tok": sum(r.get("input_tokens", 0) for r in rs) / n,
         "out_tok": sum(r.get("output_tokens", 0) for r in rs) / n,
         "secs": sum(r.get("seconds", 0) for r in rs) / n,
-        "has_cost": any("input_tokens" in r for r in rs),
+        "has_cost": bool(rs) and all("input_tokens" in r and "output_tokens" in r for r in rs),
     }
 
 
@@ -732,36 +750,56 @@ def report(results, out=sys.stdout):
 def calibration_deltas(trials):
     """Noise band per (model, mode) cell from repeated runs of an unchanged
     baseline. `trials` is a list of result lists. δ is the 95th percentile of
-    |Δpass|lost| between two bootstrap resamples of the pooled runs, each the
-    size of one trial (as RRSI's calibrate step), and never less than the
-    observed spread (max - min) of the per-trial rates."""
+    |Δpass|lost| between two bootstrap resamples, floored at the observed
+    spread (max - min) of the per-trial rates.
+
+    The resample redraws *repetitions within each case*, preserving kept/lost
+    membership and the fixed case mix: pooling outcomes across cases would
+    treat fixed differences in case difficulty as run-to-run noise (five
+    identical trials of five always-passing and five always-failing cases
+    would yield δ = 0.4, labelling a deterministic 30-point improvement
+    "within noise"). Each arm resamples one trial per case, and the arm's
+    rate pools those trials' lost runs, so δ reflects repetition noise at the
+    same case mix a comparison sees. Values are stored at full precision —
+    rounding the saved δ can lower it below the observed spread and turn an
+    unchanged baseline's own variation into a "gain"."""
     import random
     rng = random.Random(0)
-    cells = defaultdict(lambda: {"trials": [], "pooled": []})
+    cells = defaultdict(lambda: {"trials": [], "cases": defaultdict(list)})
     for results in trials:
         for key, rs in group(results).items():
             st = cell_stats(rs)
-            lost = [bool(r["passed"]) for r in rs
-                    if "error" not in r and not r.get("kept", r.get("summary_kept"))]
             cells[key]["trials"].append(st["pass_lost"] / st["lost"] if st["lost"] else None)
-            cells[key]["pooled"].append(lost)
+            for r in rs:
+                if "error" in r or r.get("kept", r.get("summary_kept")):
+                    continue
+                case = cells[key]["cases"][r["case"]]
+                while len(case) < len(cells[key]["trials"]):
+                    case.append([])
+                case[-1].append(bool(r["passed"]))
     out = {}
     for (model, mode), c in sorted(cells.items()):
         rates = [x for x in c["trials"] if x is not None]
-        pooled = [x for t in c["pooled"] for x in t]
-        size = max(1, round(len(pooled) / max(1, len(c["pooled"]))))
+        cases = list(c["cases"].values())
         diffs = []
-        if pooled:
+        if cases:
+            def arm_rate():
+                k = n = 0
+                for case in cases:
+                    outcomes = rng.choice(case)
+                    k += sum(outcomes)
+                    n += len(outcomes)
+                return k / n if n else None
             for _ in range(2000):
-                a = sum(rng.choice(pooled) for _ in range(size)) / size
-                b = sum(rng.choice(pooled) for _ in range(size)) / size
-                diffs.append(abs(a - b))
+                a, b = arm_rate(), arm_rate()
+                if a is not None and b is not None:
+                    diffs.append(abs(a - b))
             diffs.sort()
         boot = diffs[int(0.95 * (len(diffs) - 1))] if diffs else 1.0
         spread = (max(rates) - min(rates)) if rates else 1.0
         out[f"{model}|{mode}"] = {"model": model, "mode": mode, "trials": c["trials"],
-                                  "spread": round(spread, 4), "bootstrap": round(boot, 4),
-                                  "delta": round(max(spread, boot), 4)}
+                                  "spread": spread, "bootstrap": boot,
+                                  "delta": max(spread, boot)}
     return out
 
 
@@ -794,6 +832,11 @@ def compare(baseline, candidate, deltas=None, out=sys.stdout):
         b, c = cell_stats(base[key]), cell_stats(cand[key])
         d = diff_interval(c["pass_lost"], c["lost"], b["pass_lost"], b["lost"])
         delta = deltas.get(f"{model}|{mode}") if isinstance(deltas, dict) else deltas
+        # Token deltas are meaningful only when every run on BOTH sides has
+        # input and output token fields; an old baseline (or a cell mixing old
+        # and new records) otherwise reads as zero and an unchanged candidate
+        # is reported as adding cost.
+        cost_known = b["has_cost"] and c["has_cost"]
         din, dout, dsec = c["in_tok"] - b["in_tok"], c["out_tok"] - b["out_tok"], c["secs"] - b["secs"]
         if d is None:
             verdict, dtext, ci = "no lost runs", "     -", "-"
@@ -801,7 +844,7 @@ def compare(baseline, candidate, deltas=None, out=sys.stdout):
             dp, lo, hi = d
             dtext, ci = f"{100 * dp:+6.1f}", f"[{100 * lo:+.0f},{100 * hi:+.0f}]"
             noise = abs(dp) <= delta if delta is not None else lo <= 0 <= hi
-            extra = din + dout > 0
+            extra = cost_known and din + dout > 0
             if noise:
                 verdict = "within noise" + ("; adds cost" if extra else "")
             elif dp > 0:
@@ -809,11 +852,13 @@ def compare(baseline, candidate, deltas=None, out=sys.stdout):
             else:
                 verdict = "regression"
         dlt = f"{100 * delta:4.1f}" if delta is not None else "    -"
+        tok = (f"{din:>+8.0f} {dout:>+8.0f}" if cost_known else f"{'n/a':>8} {'n/a':>8}")
         print(f"{model:<{width}}  {mode:<8} {pct(b['pass_lost'], b['lost']):>6} {pct(c['pass_lost'], c['lost']):>6} "
-              f"{dtext:>7} {ci:>13} {dlt:>5} {din:>+8.0f} {dout:>+8.0f} {dsec:>+6.1f}  {verdict}", file=out)
+              f"{dtext:>7} {ci:>13} {dlt:>5} {tok} {dsec:>+6.1f}  {verdict}", file=out)
     print("\nΔpass = change in pass|lost (new - baseline), percentage points; 95% CI by Newcombe's method.\n"
           "δ = noise band (--delta or `run.py calibrate`); without it, within noise = the CI contains 0.\n"
-          "Δtok/Δsecs = change in mean tokens and seconds per run. See the README's acceptance rule.", file=out)
+          "Δtok/Δsecs = change in mean tokens and seconds per run (n/a when any run on either side lacks\n"
+          "token fields — e.g. a baseline from before cost logging). See the README's acceptance rule.", file=out)
 
 
 def self_test_verdict(results):
