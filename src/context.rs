@@ -68,6 +68,16 @@ The agent can later read any message in full by that ID, so the summary can stay
 may matter (an error message, a command and its output, a file's contents, the user's exact wording), cite its source \
 as (#N) instead of copying long text. Cite only IDs that appear in the transcript.";
 
+/// Added to the summarizer prompt when the transcript holds an `[earlier
+/// summary]` block (a repeated compaction): that block is a paraphrase of a
+/// paraphrase, so the user's goals must not be restated from it — the harness
+/// pins the user's original requests verbatim alongside the new summary
+/// (issue #66).
+pub const EARLIER_SUMMARY_LOSSY_INSTRUCTIONS: &str = "\n\nA block labelled [earlier summary] is a summary of a \
+summary: it is lossy and may have blurred or dropped the user's original requests. Do not restate the user's goals \
+or requirements from it. The user's exact requests are pinned verbatim alongside your summary by the harness, so you \
+need not reproduce them; summarize only the work and decisions the [earlier summary] covers.";
+
 /// Note after a smart summary telling the agent how to recover originals.
 pub fn smart_summary_note(range: Option<(u64, u64)>) -> String {
     let covered = match range {
@@ -714,6 +724,88 @@ pub fn render_transcript(messages: &[Message], max_chars: usize, ids: bool) -> S
     kept.join("\n\n")
 }
 
+/// Starts the pinned block of the user's own requests, attached verbatim after
+/// a compaction summary so the user's actual words survive repeated
+/// compactions (a summary of a summary paraphrases them away — issue #66).
+pub const PINNED_REQUESTS_PREFIX: &str = "[The user's requests, kept verbatim by the harness — not the summariser's words. These are the exact \
+     originals; the summary above may paraphrase or lose them. Treat this block as the authoritative statement \
+     of what the user asked for.]";
+
+/// Character budget for the *first* pinned request, which usually states the
+/// task's goal and carries the exact detail (a flag, a number, a phrase) a
+/// later question depends on. Later requests get one line each (below).
+const PINNED_FIRST_CHARS: usize = 1_500;
+
+/// Character budget for each later pinned request: one line's worth.
+const PINNED_LATER_CHARS: usize = 200;
+
+/// True when a message is a genuine user request — a turn the user initiated —
+/// rather than a harness injection: an automatic reminder/continuation/timer
+/// (`auto_initiated` and its sub-kinds), a previous compaction's synthetic
+/// summary, or a harness plan note (a carried-over or restated plan). Only
+/// genuine requests are pinned; re-pinning a summary would re-introduce the
+/// paraphrase-of-a-paraphrase drift this block exists to prevent (issue #66).
+/// A user prompt that merely *starts* with a bracket (e.g. `[constraint] …`)
+/// is still a genuine request and is pinned.
+fn is_user_request(message: &Message) -> bool {
+    if message.role != Role::User || message.auto_initiated || message.continuation || message.timer {
+        return false;
+    }
+    let content = message.content.trim_start();
+    if content.starts_with(SUMMARY_PREFIX) || content.starts_with(SMART_SUMMARY_PREFIX) {
+        return false;
+    }
+    // Harness plan notes, not user requests.
+    if content.starts_with("[Your plan, kept by the harness") || content.starts_with("[A plan carried over") {
+        return false;
+    }
+    true
+}
+
+/// True when a message is a previous compaction's synthetic summary — the
+/// block `render_transcript` labels `[earlier summary]`. Used to warn the
+/// summariser that such a block is lossy (issue #66).
+pub fn is_summary_message(message: &Message) -> bool {
+    message.role == Role::User
+        && (message.content.starts_with(SUMMARY_PREFIX) || message.content.starts_with(SMART_SUMMARY_PREFIX))
+}
+
+/// Render the pinned block of the user's requests, rebuilt from the original
+/// messages on every compaction — never from the previous summary (issue #66).
+///
+/// `prior` is the stash of real turns from earlier compactions
+/// (`pre_compaction_transcript`), `new` the turns this compaction is folding.
+/// Together they hold every genuine user request the session has seen, so the
+/// block is regenerated from originals each time rather than carried forward as
+/// a paraphrase. The first request (which usually states the goal) keeps up to
+/// [`PINNED_FIRST_CHARS`] characters; each later request is clipped to one
+/// line. With `smart`, each request is labelled with its `#N` session-log ID so
+/// the full text is one `history_read` away. Returns `None` when there is
+/// nothing to pin.
+pub fn pinned_user_requests(prior: &[Message], new: &[Message], smart: bool) -> Option<String> {
+    let requests: Vec<&Message> = prior.iter().chain(new.iter()).filter(|m| is_user_request(m)).collect();
+    if requests.is_empty() {
+        return None;
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for (index, request) in requests.iter().enumerate() {
+        let budget = if index == 0 { PINNED_FIRST_CHARS } else { PINNED_LATER_CHARS };
+        // Collapse internal newlines so each later request stays one line; the
+        // first keeps its structure up to the larger budget.
+        let text = if index == 0 {
+            clip(request.content.trim(), budget)
+        } else {
+            clip(&request.content.split_whitespace().collect::<Vec<_>>().join(" "), budget)
+        };
+        let label = match (smart, request.log_line) {
+            (true, Some(line)) => format!("#{line}: "),
+            _ => String::new(),
+        };
+        lines.push(format!("{label}{text}"));
+    }
+    Some(format!("{PINNED_REQUESTS_PREFIX}\n{}", lines.join("\n")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1326,6 +1418,78 @@ mod tests {
         bracketed.log_line = None;
         assert!(!render_transcript(&[bracketed], 10_000, true).contains("[earlier summary]"));
         assert!(smart_summary_note(Some((2, 40))).contains("#2–#40"));
+    }
+
+    #[test]
+    fn pinned_requests_keep_the_users_words_not_the_summary() {
+        // A genuine first request with an exact detail, a later request, a
+        // reminder and a previous summary: only the two genuine requests are
+        // pinned, the summary and reminder excluded (issue #66).
+        let mut first = Message::user("Fix the lease race. Use port 8123, never 5173.");
+        first.log_line = Some(2);
+        let reminder = Message::user("remember to be careful").auto_initiated();
+        let summary = Message::user(&format!("{SUMMARY_PREFIX} the user wanted something about a port"));
+        let mut later = Message::user("Now add a test for it.");
+        later.log_line = Some(40);
+        let pinned = pinned_user_requests(&[], &[first, reminder, summary, later], false).expect("requests to pin");
+        assert!(pinned.starts_with(PINNED_REQUESTS_PREFIX), "{pinned}");
+        assert!(pinned.contains("Use port 8123, never 5173."), "exact detail pinned: {pinned}");
+        assert!(pinned.contains("Now add a test for it."), "{pinned}");
+        assert!(!pinned.contains("wanted something about a port"), "summary not pinned: {pinned}");
+        assert!(!pinned.contains("be careful"), "reminder not pinned: {pinned}");
+    }
+
+    #[test]
+    fn pinned_requests_label_log_lines_in_smart_mode() {
+        let mut first = Message::user("first request");
+        first.log_line = Some(3);
+        let mut later = Message::user("second request");
+        later.log_line = Some(9);
+        let pinned = pinned_user_requests(&[], &[first, later], true).unwrap();
+        assert!(pinned.contains("#3: first request"), "{pinned}");
+        assert!(pinned.contains("#9: second request"), "{pinned}");
+        // Standard mode carries no IDs.
+        let plain = pinned_user_requests(&[], &[Message::user("first request")], false).unwrap();
+        assert!(!plain.contains('#'), "{plain}");
+    }
+
+    #[test]
+    fn pinned_requests_clip_the_first_and_one_line_the_rest() {
+        let long_first = Message::user(&"x".repeat(PINNED_FIRST_CHARS + 500));
+        let multi_line_later = Message::user("line one\nline two\nline three");
+        let pinned = pinned_user_requests(&[], &[long_first, multi_line_later], false).unwrap();
+        let body = pinned.strip_prefix(PINNED_REQUESTS_PREFIX).unwrap();
+        // The first request is clipped to its budget (the clip marker is
+        // charged against it, so the rendered head+marker+tail stays within).
+        let first_block: String = body.trim().lines().take_while(|l| *l != "line one line two line three").collect();
+        assert!(first_block.chars().count() <= PINNED_FIRST_CHARS + 60, "first clipped: {}", first_block.len());
+        assert!(first_block.contains("omitted"), "long first request is clipped: {first_block}");
+        // A later request is collapsed onto one line, at the end.
+        assert_eq!(body.trim().lines().last(), Some("line one line two line three"));
+    }
+
+    #[test]
+    fn pinned_requests_combine_prior_and_new_turns() {
+        // A repeated compaction: the earlier real turns come from the stash, the
+        // newly folded ones from this span, so all genuine requests are pinned.
+        let prior = vec![Message::user("the original goal")];
+        let new = vec![Message::user("a follow-up")];
+        let pinned = pinned_user_requests(&prior, &new, false).unwrap();
+        assert!(pinned.contains("the original goal"), "{pinned}");
+        assert!(pinned.contains("a follow-up"), "{pinned}");
+        // Nothing genuine to pin yields no block.
+        assert!(pinned_user_requests(&[], &[Message::user(&format!("{SUMMARY_PREFIX} x"))], false).is_none());
+    }
+
+    #[test]
+    fn pinned_requests_keep_a_bracketed_user_prompt() {
+        // A genuine request that happens to start with a bracket is pinned; only
+        // the harness's own bracketed notes are excluded.
+        let request = Message::user("[constraint] use port 8080");
+        let plan_note = Message::user("[Your plan, kept by the harness. …]\n- do a thing");
+        let pinned = pinned_user_requests(&[], &[request, plan_note], false).unwrap();
+        assert!(pinned.contains("[constraint] use port 8080"), "{pinned}");
+        assert!(!pinned.contains("do a thing"), "plan note not pinned: {pinned}");
     }
 
     #[test]

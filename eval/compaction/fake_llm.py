@@ -14,7 +14,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 LOSSY_SUMMARY = "The user and the agent worked on the lease crate and then did several unrelated follow-ups. Details were not recorded."
 
 # Question keyword -> pattern the oracle searches for.
-SEARCHES = [("method", "no method named"), ("branch", "branch"), ("command", "--features"), ("mutex", "mutex"), ("ticket", "ticket")]
+SEARCHES = [("method", "no method named"), ("branch", "branch"), ("command", "--features"), ("mutex", "mutex"),
+            ("ticket", "ticket"), ("flag", "--strict-lease")]
 
 
 def reply(body):

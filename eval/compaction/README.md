@@ -99,14 +99,38 @@ detail):
 | case | the detail |
 | --- | --- |
 | `buried-error` | a method name in one failed build's output |
+| `long-log-error` | an error line from the middle of a ~50k-character build log |
 | `user-constraint` | the branch name and port the user asked for in the first message |
 | `working-command` | the exact command that finally made tests pass, after failed attempts |
 | `rejected-approach` | an approach the user ruled out, and why (PR number, deadlock) |
 | `recent-control` | a detail in the last message, which compaction keeps. Both modes should pass; if not, the question or grading is off |
+| `pinned-request` | a flag, a pass count and a label stated once in the first message, compacted **twice** (issue #66) |
 
 Unique values are derived from the seed, so the answer can't be known
 without the history. More filler makes the summary lossier: the default of
 15 turns is about 100k characters.
+
+### The pinned-request block (issue #66)
+
+Compaction pins the user's requests verbatim after the summary, rebuilt from
+the original messages on every compaction rather than re-summarized from the
+previous summary. The `pinned-request` case is the scenario that needs it: a
+detail stated once in the first message, folded by **two** compactions, then
+questioned. Cases whose detail lives in a *user* message (`user-constraint`,
+`rejected-approach`, `pinned-request`) survive in both modes while the pin is
+on; cases whose detail lives in a *tool output* (`buried-error`,
+`long-log-error`, `working-command`) are not pinned and still exercise the
+history tools.
+
+To measure the block's effect, append `-nopin` to a mode to run it with the
+pin disabled (`compaction_pin_requests = false`):
+
+```sh
+eval/compaction/run.py --models … --modes standard,smart,standard-nopin,smart-nopin
+```
+
+Each `-nopin` cell is reported separately, so `standard` vs `standard-nopin`
+is the with/without-pin A/B for standard compaction (and likewise for smart).
 
 Real sessions: list the turns of a log, pick a fork point right after a
 detail was established plus some later work, and write a case file:

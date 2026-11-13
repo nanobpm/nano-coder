@@ -4914,11 +4914,19 @@ impl Agent {
                 if let Some(focus) = instructions.map(str::trim).filter(|f| !f.is_empty()) {
                     request_text.push_str(&format!("\n\nWhen summarizing, focus on: {focus}"));
                 }
-                let system_prompt = if smart {
+                let mut system_prompt = if smart {
                     format!("{}{}", context::SUMMARY_SYSTEM_PROMPT, context::SMART_SUMMARY_INSTRUCTIONS)
                 } else {
                     context::SUMMARY_SYSTEM_PROMPT.to_string()
                 };
+                // A repeated compaction folds the previous synthetic summary back
+                // in (rendered as `[earlier summary]`). Warn the summariser that
+                // block is lossy so it does not restate the user's goals from a
+                // paraphrase of a paraphrase — the harness pins the user's exact
+                // requests alongside the new summary (issue #66).
+                if summarized.iter().any(context::is_summary_message) {
+                    system_prompt.push_str(context::EARLIER_SUMMARY_LOSSY_INSTRUCTIONS);
+                }
                 let summary_messages = [Message::system(&system_prompt), Message::user(&request_text)];
                 (summary_messages, output_budget)
             };
@@ -5113,6 +5121,24 @@ impl Agent {
         let mut messages: Vec<Message> = self.conversation[..body_start].to_vec();
         let summary = if self.config.plan_tools && !self.plan.is_empty() {
             format!("{summary}\n\n{}", self.plan.context_note())
+        } else {
+            summary
+        };
+        // Pin the user's requests verbatim after the summary, the same way the
+        // plan note is attached, so the user's actual words survive repeated
+        // compactions instead of being paraphrased away (a summary of a
+        // summary). Rebuilt from the original messages on every compaction —
+        // the earlier real turns in `pre_compaction_transcript` plus the turns
+        // this compaction is folding (`summarized_msgs`, which already excludes
+        // the previous summary and its synthetic restatement) — never from the
+        // previous summary itself (issue #66). The eval can disable it
+        // (`compaction_pin_requests = false`) to measure its effect.
+        let prior_turns = self.pre_compaction_transcript.as_deref().unwrap_or(&[]);
+        let summary = if self.config.compaction_pin_requests {
+            match context::pinned_user_requests(prior_turns, &summarized_msgs, smart) {
+                Some(pinned) => format!("{summary}\n\n{pinned}"),
+                None => summary,
+            }
         } else {
             summary
         };
@@ -5747,13 +5773,23 @@ mod tests {
             agent.session_id().unwrap().to_string()
         };
         // The first turn's text is persisted once per folded copy: a
-        // cumulative re-write would store it in both replace records.
+        // cumulative re-write would store it in both replace records. Parse each
+        // log line and inspect only the `folded` stash — the marker also appears
+        // in the second summary's pinned-request block (issue #66), which is a
+        // separate, legitimate copy that is not the folded stash.
         let mut copies = 0;
         for entry in walkdir_files(dir.path()) {
             if let Ok(text) = std::fs::read_to_string(&entry)
                 && text.contains(&id)
             {
-                copies += text.lines().filter(|l| l.contains("\"folded\"") && l.contains("ping-unique-marker")).count();
+                for line in text.lines() {
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+                    let Some(folded) = value.get("data").and_then(|d| d.get("folded")).and_then(|f| f.as_array())
+                    else {
+                        continue;
+                    };
+                    copies += folded.iter().filter(|m| m.to_string().contains("ping-unique-marker")).count();
+                }
             }
         }
         assert_eq!(copies, 1, "the first folded turn is logged once, not re-persisted per compaction");
@@ -8259,7 +8295,10 @@ mod tests {
         let conversation = agent.conversation().to_vec();
         assert_eq!(conversation[1].role, Role::User);
         assert!(conversation[1].content.starts_with(context::SUMMARY_PREFIX));
-        assert!(conversation[1].content.ends_with("SUMMARY: pinged once"));
+        assert!(conversation[1].content.contains("SUMMARY: pinged once"));
+        // The user's request is pinned verbatim after the summary (issue #66).
+        assert!(conversation[1].content.contains(context::PINNED_REQUESTS_PREFIX));
+        assert!(conversation[1].content.contains("ping"));
         assert_eq!(unstamped(&conversation[2]), Message::assistant("done"));
         assert_eq!(agent.context_stats().lock().unwrap().compactions, 1);
 
@@ -9902,7 +9941,11 @@ mod tests {
         let report = agent.compact(None, None).await.unwrap().expect("compacted");
         assert_eq!(report.fallback, None, "summary must not fall back to dropping messages");
         assert_eq!(*streamed.lock().unwrap(), 1);
-        assert!(agent.conversation()[1].content.ends_with("SUMMARY: streamed"));
+        assert!(agent.conversation()[1].content.contains("SUMMARY: streamed"));
+        // The user's requests are pinned verbatim after the summary (issue #66).
+        assert!(agent.conversation()[1].content.contains(context::PINNED_REQUESTS_PREFIX));
+        assert!(agent.conversation()[1].content.contains("one"));
+        assert!(agent.conversation()[1].content.contains("two"));
     }
 
     /// A summary stream that breaks mid-summary (`StreamInterrupted`) for its
@@ -9975,7 +10018,9 @@ mod tests {
         let report = agent.compact(None, None).await.unwrap().expect("compacted");
         assert_eq!(report.fallback, None, "a mid-summary drop is retried, not a dropped-history fallback");
         assert_eq!(*attempts.lock().unwrap(), 3, "two breaks then one successful summary");
-        assert!(agent.conversation()[1].content.ends_with("the summary"));
+        assert!(agent.conversation()[1].content.contains("the summary"));
+        // The user's requests are pinned verbatim after the summary (issue #66).
+        assert!(agent.conversation()[1].content.contains(context::PINNED_REQUESTS_PREFIX));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -10218,9 +10263,12 @@ mod tests {
         // The summary request never thinks.
         assert_eq!(seen[1].0, None);
         // The retry re-resolved against the post-compaction room and sends the
-        // full budget — not the stale pre-compaction drop.
+        // full budget — not the stale pre-compaction drop. The pinned-request
+        // block (issue #66) re-attaches the (clipped) giant user message after
+        // the summary, so the post-compaction room is a little under the bare
+        // budget; the assertion's floor leaves room for it.
         assert_eq!(seen[2].0, Some(Request::Budget(16_384)), "retry sends the level: {:?}", seen[2]);
-        assert!(seen[2].1.unwrap() >= 16_384, "room for the budget after compaction: {:?}", seen[2]);
+        assert!(seen[2].1.unwrap() >= 15_000, "room for the budget after compaction: {:?}", seen[2]);
         // The trajectory records what the successful retry sent, not the
         // pre-compaction drop.
         let last = agent.conversation().iter().rev().find(|m| m.role == Role::Assistant).unwrap();
@@ -10404,6 +10452,10 @@ mod tests {
         agent.config.auto_compact_threshold = 0.5;
         agent.config.project_instructions = false;
         agent.config.memory = crate::config::MemoryMode::Off;
+        // Pinning off keeps this test focused on the image tail budget: the
+        // large text turn would otherwise be pinned (clipped) into the summary
+        // and trip the "folded" assertion below (issue #66).
+        agent.config.compaction_pin_requests = false;
         agent.new_session().unwrap();
         // The image must be intact on disk for the wire plan (and so the kept-tail
         // budget) to count it as a sendable image rather than a placeholder.
@@ -12524,6 +12576,71 @@ mod tests {
         // No other message in the record carries a cost: the folded turns keep
         // their own (absent) usage rather than double counting the summary's.
         assert!(replace.iter().filter(|m| m.usage.is_some()).count() == 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compaction_pins_the_users_requests_across_a_second_compaction() {
+        // The user's exact words must survive being compacted twice: each
+        // compaction re-summarizes the previous summary, so without pinning the
+        // original request survives only as a paraphrase of a paraphrase. The
+        // pinned block is rebuilt from the original messages on every
+        // compaction and attached verbatim after the summary (issue #66).
+        let dir = tempfile::tempdir().unwrap();
+        // Turn, turn, summary #1, turn, summary #2.
+        let (mut agent, _) = agent(
+            vec![
+                text("working on the lease"),
+                text("more work"),
+                text("SUMMARY ONE: the user mentioned a port"),
+                text("even more work"),
+                text("SUMMARY TWO: something about a lease and a port"),
+            ],
+            dir.path(),
+        );
+        agent.new_session().unwrap();
+        // The exact detail lives in the first user message.
+        agent.send_message("Fix the lease renewal race. Run the dev server on port 8123, never 5173.").await.unwrap();
+        agent.send_message("Now add a regression test.").await.unwrap();
+        agent.compact_logged(CompactTrigger::Manual, CompactionMode::Standard, None).await.unwrap();
+        agent.send_message("Also update the docs.").await.unwrap();
+        agent.compact_logged(CompactTrigger::Manual, CompactionMode::Standard, None).await.unwrap();
+
+        // After two compactions the summary message still carries the user's
+        // exact words verbatim, not just the summariser's paraphrase.
+        let summary = agent
+            .conversation()
+            .iter()
+            .find(|m| context::is_summary_message(m))
+            .expect("a synthetic summary is in context")
+            .content
+            .clone();
+        assert!(summary.contains(context::PINNED_REQUESTS_PREFIX), "pinned block attached: {summary}");
+        assert!(summary.contains("Run the dev server on port 8123, never 5173."), "exact detail pinned: {summary}");
+        assert!(summary.contains("Now add a regression test."), "later request pinned: {summary}");
+        assert!(summary.contains("Also update the docs."), "request folded by the second compaction pinned: {summary}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_repeated_compaction_warns_the_summariser_the_earlier_summary_is_lossy() {
+        // The second compaction folds the first summary back in (rendered as
+        // `[earlier summary]`). The summariser must be told that block is lossy
+        // and not to restate the user's goals from it (issue #66).
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, seen) =
+            agent(vec![text("work"), text("SUMMARY ONE"), text("more"), text("SUMMARY TWO")], dir.path());
+        agent.new_session().unwrap();
+        agent.send_message("first request").await.unwrap();
+        agent.compact_logged(CompactTrigger::Manual, CompactionMode::Standard, None).await.unwrap();
+        agent.send_message("second request").await.unwrap();
+        agent.compact_logged(CompactTrigger::Manual, CompactionMode::Standard, None).await.unwrap();
+
+        // The last summary request's system prompt carries the lossy warning.
+        let summary_request = seen.lock().unwrap().last().expect("a summary request was sent").clone();
+        let system = &summary_request[0].content;
+        assert!(
+            system.contains("lossy") && system.contains("Do not restate the user's goals"),
+            "the summariser is warned: {system}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
