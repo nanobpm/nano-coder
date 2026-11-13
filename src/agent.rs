@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+mod compaction;
 mod hook;
 mod probe;
 
@@ -10,6 +11,7 @@ mod probe;
 use crate::llm::DetectedWindow;
 use anyhow::Result;
 use chrono::{DateTime, Local, Utc};
+use compaction::CompactionState;
 use hook::{ClaudePromptHook, HookState};
 use probe::{Detected, ProbeState};
 use serde_json::{Value, json};
@@ -719,26 +721,14 @@ pub struct Agent {
     message_counter: u64,
     control: TurnControl,
     stats: SharedStats,
-    /// Conversation length and exact token count from the last response's
-    /// reported usage, used to anchor the context estimate.
-    calibration: Option<(usize, usize)>,
-    /// Window learned from a context-overflow error (until the model changes).
-    learned_window: Option<usize>,
-    /// Output-token cap learned from an output-limit rejection error, used
-    /// until the model changes. With automatic `max_tokens` an unlisted model
-    /// whose real cap is below `DEFAULT_MAX_OUTPUT_TOKENS` would otherwise be
-    /// rejected every request until a background `/model`-switch probe lands;
-    /// learning the cap from the first rejection lets the retry succeed without
-    /// blocking the switch on the probe (issue #114).
-    learned_max_output: Option<usize>,
     /// Capabilities reported by the endpoint (window, thinking levels, vision,
     /// output limit) and the generation guard that stops a slow background
     /// probe for a superseded model overwriting them (see `probe.rs`).
     probe: ProbeState,
-    /// Context size right after the last compaction; auto-compaction waits
-    /// for real growth past it so an incompressible context is not
-    /// re-summarized on every call.
-    compact_floor: usize,
+    /// Compaction, token-calibration and replay state: the usage anchor and
+    /// learned window/output caps, the post-compaction floor, the history-tools
+    /// gate and the pre-compaction replay stash (see `compaction.rs`).
+    compaction: CompactionState,
     /// Stream model output as `TextDelta` / `ThinkingDelta` events.
     streaming: bool,
     /// AGENTS.md and similar files for the working directory.
@@ -817,35 +807,6 @@ pub struct Agent {
     /// cached summary (from the log's tail) instead of rescanning the whole
     /// log.
     turn_log_offset: Option<u64>,
-    /// Whether a real smart-compaction summary is in context, gating the
-    /// history tools. Tracked explicitly (set by compaction, restored from the
-    /// replace record's mode) rather than sniffed from message text, so a user
-    /// message that merely begins with the summary prefix cannot unlock them.
-    history_available: bool,
-    /// A failed tool call (e.g. bash, read_file) after a smart compaction gets a one-time
-    /// pointer to the history tools (models tend to look on disk for what
-    /// was only in the conversation). Cleared once shown or once the agent
-    /// uses a history tool.
-    history_hint_pending: bool,
-    /// The real pre-compaction turns, captured when a compaction folded them
-    /// into the synthetic summary. `replay_history` replays THESE (and skips
-    /// the summary) so a legacy → frame renderer switch rebuilds the visible
-    /// transcript instead of exposing the summary as a user turn and dropping
-    /// the folded turns — the frame's first full redraw clears the legacy
-    /// scrollback, so the replay is the only copy. The same stash is persisted
-    /// in the compaction's `Record::Replace`, so a resume or /relaunch (a fresh
-    /// process over the session log) restores it and replays the real turns
-    /// too. Kept across replays (every renderer rebuild needs it), replaced by
-    /// the next compaction, and cleared by any non-compaction conversation
-    /// replacement (a plain rebuild or system-prompt change) and on a new
-    /// session. `None` when no compaction has run (or none was captured).
-    pre_compaction_transcript: Option<Vec<Message>>,
-    /// Index, in the compacted conversation, of the synthetic restatement of
-    /// the active input the current `pre_compaction_transcript` compaction
-    /// folded into its summary (see `CompactionRecord::restated`).
-    /// `replay_history` skips it so the prompt is not shown twice. Tracked and
-    /// cleared in lockstep with `pre_compaction_transcript`.
-    pre_compaction_restated: Option<usize>,
     /// Cross-session memory store, present when `config.memory` is not `off`
     /// (see `memory.rs`). Whether the model may write to it is `config.memory`.
     memory: Option<memory::Store>,
@@ -917,11 +878,8 @@ impl Agent {
             message_counter: 0,
             control: TurnControl::default(),
             stats: SharedStats::default(),
-            calibration: None,
-            learned_window: None,
-            learned_max_output: None,
             probe: ProbeState::default(),
-            compact_floor: 0,
+            compaction: CompactionState::default(),
             streaming: false,
             instructions: None,
             skills: Skills::default(),
@@ -947,10 +905,6 @@ impl Agent {
             edits_since_check: false,
             verify_reminder_fired: false,
             turn_log_offset: None,
-            history_available: false,
-            history_hint_pending: false,
-            pre_compaction_transcript: None,
-            pre_compaction_restated: None,
             titles_requested: HashSet::new(),
             memory,
             memory_index_cache: None,
@@ -1346,12 +1300,9 @@ impl Agent {
     /// detect the new model's window / thinking levels / vision (blocking).
     async fn install_client(&mut self, client: Box<dyn LLMClient>) {
         self.client = client;
-        self.calibration = None;
-        self.learned_window = None;
-        self.learned_max_output = None;
+        self.compaction.reset_for_model_change();
         *self.probe.window() = None;
         *self.probe.thinking() = None;
-        self.compact_floor = 0;
         self.detect_context_window().await;
     }
 
@@ -1486,11 +1437,8 @@ impl Agent {
                 Ok(client) => {
                     self.client = client;
                     self.config.model = spec.clone();
-                    self.calibration = None;
-                    self.learned_window = None;
-                    self.learned_max_output = None;
+                    self.compaction.reset_for_model_change();
                     *self.probe.window() = None;
-                    self.compact_floor = 0;
                     self.detect_context_window_for_switch();
                     let spec = crate::recents::canonical(&spec, &all, &default_provider);
                     self.emit(AgentEvent::ModelSwitched { spec: &spec, previous: &previous });
@@ -1861,7 +1809,7 @@ impl Agent {
     fn context_cap(&self) -> ContextCap {
         if self.configured_window().is_none()
             && let Some(detected) = self.probe.window().as_ref()
-            && self.learned_window.is_none_or(|learned| learned >= detected.tokens)
+            && self.compaction.learned_window_at_least(detected.tokens)
         {
             return detected.cap;
         }
@@ -1884,12 +1832,7 @@ impl Agent {
     /// total again.
     fn combined_window(&self) -> Option<usize> {
         let advertised = self.probe.window().as_ref().and_then(|d| d.total_tokens);
-        match (advertised, self.learned_window) {
-            (Some(advertised), Some(learned)) => Some(advertised.min(learned)),
-            (Some(advertised), None) => Some(advertised),
-            (None, Some(learned)) => Some(learned),
-            (None, None) => None,
-        }
+        self.compaction.combined_window(advertised)
     }
 
     /// Forward-replay the in-flight output-limit continuation state for a turn
@@ -1979,10 +1922,7 @@ impl Agent {
         // hard ceiling for this model; never send above it, even over a
         // configured value, so the request stays valid until the model changes
         // (issue #114).
-        match self.learned_max_output {
-            Some(cap) => base.min(cap as i64),
-            None => base,
-        }
+        self.compaction.cap_output(base)
     }
 
     /// `output_token_base` before the learned-cap clamp.
@@ -2048,10 +1988,7 @@ impl Agent {
         } else {
             (context::DEFAULT_CONTEXT_WINDOW, "default".to_string())
         };
-        match self.learned_window {
-            Some(learned) if learned < window => (learned, "learned from a context-overflow error".to_string()),
-            _ => (window, source),
-        }
+        self.compaction.effective_window(window, source)
     }
 
     /// Estimated tokens the next request would send, anchored to the last
@@ -2070,7 +2007,7 @@ impl Agent {
         // image cost. Ignoring availability undercounts a resumed, image-heavy
         // request by thousands of tokens and delays compaction past the limit.
         let available = context::available_attachments(&self.conversation, Some(&self.attachments_dir()));
-        if let Some((len, tokens)) = self.calibration
+        if let Some((len, tokens)) = self.compaction.calibration()
             && len <= self.conversation.len()
         {
             let (prefix, suffix) = self.conversation.split_at(len);
@@ -2169,7 +2106,7 @@ impl Agent {
         if counts_as_context && usage.prompt_tokens > 0 {
             // Anchored at the assistant message about to be pushed.
             let total = (usage.prompt_tokens + usage.completion_tokens.max(0)) as usize;
-            self.calibration = Some((self.conversation.len() + 1, total));
+            self.compaction.calibrate(self.conversation.len() + 1, total);
         }
     }
 
@@ -2320,7 +2257,7 @@ impl Agent {
         // summary on the second switch. It is replaced by the next compaction
         // and cleared on a new session; a resume or /relaunch rebuilds it from
         // the compaction's persisted replace record (see `load_session`).
-        let pre_compaction = self.pre_compaction_transcript.clone();
+        let pre_compaction = self.compaction.stash().cloned();
         let skip_summary = pre_compaction.is_some();
         let conversation = self.conversation.clone();
         let mut calls: HashMap<&str, &ToolCall> = HashMap::new();
@@ -2334,7 +2271,7 @@ impl Agent {
         // except the synthetic restatement of a folded active input (its
         // original is already replayed from the stash above), which is skipped
         // so the one submitted prompt is not shown twice.
-        let restated = self.pre_compaction_restated;
+        let restated = self.compaction.restated();
         let mut skipped_summary = !skip_summary;
         for (idx, message) in conversation.iter().enumerate() {
             if !skipped_summary && message.role != Role::System {
@@ -2431,7 +2368,7 @@ impl Agent {
     /// beginning with the prefix unlock the tools, so state is tracked
     /// explicitly instead.
     fn history_tools_enabled(&self) -> bool {
-        self.session.is_some() && self.history_available
+        self.session.is_some() && self.compaction.history_available()
     }
 
     /// Start a fresh conversation, persisted under a new session ID if enabled.
@@ -2515,17 +2452,12 @@ impl Agent {
         self.claude.reset_fresh();
         self.sync_claude_hook_session();
         self.persist_claude_hook_config();
-        self.calibration = None;
-        self.compact_floor = 0;
-        self.history_available = false;
-        self.history_hint_pending = false;
+        // A fresh session has no calibration, no compaction behind it and no
+        // pre-compaction transcript for `replay_history` to restore.
+        self.compaction.reset_for_new_session();
         // The previous session's installed index no longer describes the
         // prompt; the next request's prompt install sets it afresh.
         self.index_shown.clear();
-        // A fresh session has no compaction behind it, so there is no
-        // pre-compaction transcript for `replay_history` to restore.
-        self.pre_compaction_transcript = None;
-        self.pre_compaction_restated = None;
         {
             // A fresh session starts with clean cumulative counters so the
             // status line and `/context` reflect only this session. Shared
@@ -2614,25 +2546,17 @@ impl Agent {
         self.session = Some(log);
         self.session_id = Some(id.to_string());
         self.set_spill_dir(id);
-        self.calibration = None;
-        self.compact_floor = 0;
-        // Whether the history tools are offered is durable state: restore it
-        // from the log (the last replace's mode) rather than the message text.
-        self.history_available = restored.history_available;
-        // Keep the post-compaction hint one-time per compaction: if it was
-        // already emitted (or a history tool already used) after the latest
-        // smart compaction, a resume must not append it again.
-        self.history_hint_pending = restored.history_available && !restored.history_hint_consumed;
-        // Rebuild the pre-compaction transcript from the folded turns the
-        // compaction persisted in its replace record, so a resumed (or
-        // /relaunch'd) session replays the real turns instead of exposing the
-        // synthetic summary — the same replay a same-process legacy → frame
-        // switch produces. Logs written before the folded turns were persisted
-        // carry none; those replay the compacted conversation, the pre-change
-        // behaviour (the folded turns remain recoverable via the history
-        // tools).
-        self.pre_compaction_transcript = restored.folded;
-        self.pre_compaction_restated = restored.restated;
+        // Restore the durable compaction/history state: the history-tools gate
+        // from the last replace's mode (not message text), the one-time hint
+        // (a resume does not re-append it), and the pre-compaction replay stash
+        // rebuilt from the folded turns the compaction persisted (logs written
+        // before that carry none and replay the compacted conversation).
+        self.compaction.restore_from(
+            restored.history_available,
+            restored.history_hint_consumed,
+            restored.folded,
+            restored.restated,
+        );
         self.claude.reset_resumed();
         self.sync_claude_hook_session();
         self.persist_claude_hook_config();
@@ -2724,7 +2648,7 @@ impl Agent {
         };
         // A repeated compaction logs only its newly folded turns plus the
         // prefix length they extend, so the log grows linearly.
-        let base_len = self.pre_compaction_transcript.as_ref().map_or(0, Vec::len);
+        let base_len = self.compaction.stash_len();
         let extends = extends && base_len > 0;
         let folded_base = extends.then_some(base_len);
         let delta_folded = folded_turns.as_ref().filter(|f| !f.is_empty() || extends).cloned();
@@ -2765,32 +2689,22 @@ impl Agent {
         }
         // Flip the flag only once the durable replace record is appended, so a
         // failed replacement leaves the active history state unchanged.
-        self.history_available = history_available;
-        self.history_hint_pending = history_available;
+        self.compaction.set_history_available(history_available);
         self.conversation = messages;
         // Assign unconditionally: a compaction stashes its folded turns for the
         // replay, and any other replacement (a plain rebuild, a system-prompt
         // change, …) clears the stash so a later replay cannot resurrect the
         // previous conversation and skip the first new user turn as though it
-        // were a synthetic summary.
-        self.pre_compaction_transcript = match folded_turns {
-            Some(new) if extends => {
-                let mut stash = self.pre_compaction_transcript.take().unwrap_or_default();
-                stash.extend(new);
-                Some(stash)
-            }
-            other => other.filter(|f| !f.is_empty()),
-        };
-        // Track the restatement to skip alongside the stash; a cleared stash
-        // (any non-compaction replacement) clears it too.
-        self.pre_compaction_restated = self.pre_compaction_transcript.as_ref().and(restated);
+        // were a synthetic summary. The restatement skip is tracked in lockstep
+        // (a cleared stash clears it too).
+        self.compaction.replace_stash(folded_turns, extends, restated);
         self.pending_input = match (self.pending_input.take(), pending_position) {
             (Some(pending), Some(position)) => {
                 Some(PendingInput { position, continuation_base: Some(self.conversation.len()), ..pending })
             }
             _ => None,
         };
-        self.calibration = None;
+        self.compaction.clear_calibration();
         // Any replacement (compaction, a `/settings` system-prompt change, a
         // rebuild) drops the recalled memories' full text from context, so
         // every memory may be recalled again — except those the retained
@@ -3768,7 +3682,7 @@ impl Agent {
                             // fail a turn that a retry at the sent budget's
                             // lower value would save (issue #114).
                             if learned < request_max_tokens {
-                                self.learned_max_output = Some(learned as usize);
+                                self.compaction.learn_max_output(learned as usize);
                                 self.refresh_stats();
                                 crate::ui::log(&format!(
                                     "[agent] output-limit rejection ({message}); retrying with max_tokens={learned}"
@@ -3784,8 +3698,8 @@ impl Agent {
                         // compact once before retrying.
                         overflow_retried = true;
                         let estimate = self.estimate_context_tokens().0;
-                        self.learned_window =
-                            Some(context::limit_from_error(&message).unwrap_or(estimate * 9 / 10).max(1_000));
+                        self.compaction
+                            .learn_window(context::limit_from_error(&message).unwrap_or(estimate * 9 / 10).max(1_000));
                         // Publish the just-learned window to the shared stats
                         // before the awaited compaction below: mid-turn
                         // `/context` renders exclusively from `SharedStats`, so
@@ -4262,12 +4176,12 @@ impl Agent {
                 // rather than one call early. The detector's own warning text
                 // is still appended afterward, below.
                 if history::is_history_tool(&tool_call.name) {
-                    self.history_hint_pending = false;
+                    self.compaction.clear_history_hint();
                 } else if history::looks_failed(&tool_call.name, ok, &result_text)
-                    && self.history_hint_pending
+                    && self.compaction.history_hint_pending()
                     && self.history_tools_enabled()
                 {
-                    self.history_hint_pending = false;
+                    self.compaction.clear_history_hint();
                     result_text.push_str("\n\n");
                     result_text.push_str(history::FAILED_TOOL_HINT);
                 }
@@ -4520,7 +4434,7 @@ impl Agent {
             }
             _ => limit,
         };
-        tokens as f64 > limit && tokens > self.compact_floor + window / 10
+        tokens as f64 > limit && self.compaction.exceeds_floor(tokens, window)
     }
 
     /// `max_tokens` for the next request: the configured value, lowered so the
@@ -4577,7 +4491,7 @@ impl Agent {
         }
         let report = self.compact_with(trigger, mode, instructions).await?;
         if let Some(report) = &report {
-            self.compact_floor = report.tokens_after;
+            self.compaction.set_floor(report.tokens_after);
             if trigger != CompactTrigger::Manual {
                 crate::ui::log(&format!("[agent] auto-{report}"));
             }
@@ -4666,13 +4580,13 @@ impl Agent {
         // first summarized message is the previous synthetic summary, whose
         // real turns already live in the stash, and `replace_keeping_pending`
         // extends that stash in place (no cumulative copy).
-        let extends_stash = self.pre_compaction_transcript.as_ref().is_some_and(|p| !p.is_empty());
+        let extends_stash = self.compaction.has_stash();
         let summarized_msgs: Vec<Message> = if extends_stash {
             summarized
                 .iter()
                 .enumerate()
                 .skip(1)
-                .filter(|(offset, _)| self.pre_compaction_restated != Some(body_start + offset))
+                .filter(|(offset, _)| self.compaction.restated() != Some(body_start + offset))
                 .map(|(_, m)| m.clone())
                 .collect()
         } else {
@@ -4859,7 +4773,7 @@ impl Agent {
                         // summary budget we just sent; otherwise the rejection
                         // is about something else and retrying would repeat it.
                         if learned < budget {
-                            self.learned_max_output = Some(learned as usize);
+                            self.compaction.learn_max_output(learned as usize);
                             self.refresh_stats();
                             crate::ui::log(&format!(
                                 "[agent] summary output-limit rejection ({message}); retrying with max_tokens={learned}"
@@ -4939,7 +4853,7 @@ impl Agent {
         // (`compaction_pin_requests = false`) to measure its effect. The block
         // is bounded by an overall allowance derived from the context window,
         // so a long session's pins cannot grow past the window.
-        let prior_turns = self.pre_compaction_transcript.as_deref().unwrap_or(&[]);
+        let prior_turns = self.compaction.stash_slice();
         let summary = if self.config.compaction_pin_requests {
             match context::pinned_user_requests(prior_turns, &summarized_msgs, smart, self.context_window()) {
                 Some(pinned) => format!("{summary}\n\n{pinned}"),
@@ -9410,7 +9324,7 @@ mod tests {
             total_tokens: None,
             max_output_tokens: None,
         });
-        agent.learned_window = Some(learned);
+        agent.compaction.set_learned_window(learned);
         agent.new_session().unwrap();
         agent.run_turn(Some("in-1"), "go").await.unwrap();
         let (tokens, _) = agent.estimate_context_tokens();
@@ -9548,7 +9462,7 @@ mod tests {
             total_tokens: Some(advertised),
             max_output_tokens: None,
         });
-        agent.learned_window = Some(learned);
+        agent.compaction.set_learned_window(learned);
         agent.new_session().unwrap();
         // A ~96K-token prompt: under the prompt-only cap (no compaction) but
         // within the reserve of the learned 110K combined window. Against the
@@ -9584,7 +9498,7 @@ mod tests {
             total_tokens: None,
             max_output_tokens: None,
         });
-        agent.learned_window = Some(learned);
+        agent.compaction.set_learned_window(learned);
         agent.new_session().unwrap();
         // A ~96K-token prompt: under the prompt-only cap (no compaction) but
         // within the reserve of the learned 110K combined window. With no
@@ -10212,7 +10126,7 @@ mod tests {
         let img = stored_image(&adir, b"calib-displace-image", 1000, 1000);
         // Prefix: one message carrying an image, anchored to a reported total.
         agent.conversation.push(Message::user("look").with_attachments(vec![img.clone()]));
-        agent.calibration = Some((agent.conversation.len(), 5_000));
+        agent.compaction.set_calibration(agent.conversation.len(), 5_000);
         // No suffix yet: the anchor stands (no displacement).
         assert_eq!(agent.estimate_context_tokens(), (5_000, true));
         // A newer image in the suffix displaces the prefix image.
