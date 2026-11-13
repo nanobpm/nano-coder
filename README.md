@@ -1112,7 +1112,11 @@ After the summary, compaction re-attaches the **user's requests verbatim** (a pi
 `compaction_pin_requests`, on by default). A summary of a summary would otherwise paraphrase
 the user's original words away over repeated compactions; the pinned block is rebuilt from the
 original messages each time, so an exact flag, number or phrase the user stated once survives
-intact. In smart mode each pinned request is labelled with its `#N` log ID, so the full text is
+intact. The block is bounded by an allowance derived from the context window (about an eighth
+of it): when a long session's requests outgrow it, the oldest follow-ups are dropped with an
+explicit omission note — the goal and the newest requests are kept — so the pin can never push
+the context past the window. Hook output appended to a prompt is not pinned as the user's
+words. In smart mode each pinned request is labelled with its `#N` log ID, so the full text is
 one `history_read` away.
 
 ### Smart compaction (experimental)

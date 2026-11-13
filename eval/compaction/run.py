@@ -575,11 +575,15 @@ def run_one(args, index, case, model, mode, repeat, work_root):
             # in the first message, compacted twice, then questioned). Between
             # compactions a short follow-up turn runs so the next compaction has
             # new work to fold — compacting twice back-to-back would leave the
-            # second with nothing new to summarize.
+            # second with nothing new to summarize. The follow-up asks for a
+            # bare acknowledgement: a content-bearing reply would echo the
+            # visible context (the pinned block) into the retained tail, and the
+            # case could then pass on that echo even when the next compaction
+            # failed to regenerate the pin.
             compactions = int(case.get("compactions", 1))
             for n in range(compactions):
                 if n:
-                    followup = case.get("between", "Continue with the next step of the work.")
+                    followup = case.get("between", "Reply with a bare acknowledgement and nothing else.")
                     acp.call("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": followup}]})
                 compacted = acp.call("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": f"/compact --{compact_mode}"}]})
                 result["compacted"] = bool(compacted and compacted.get("compacted"))
@@ -602,6 +606,20 @@ def run_one(args, index, case, model, mode, repeat, work_root):
         summary = next((m["content"] for m in remaining if m["role"] == "user" and m["content"].startswith("[")), "")
         # Everything left in context: summary plus the recent messages compaction keeps.
         kept = "\n".join(str(m.get("content") or "") + json.dumps(m.get("tool_calls") or []) for m in remaining)
+        if int(case.get("compactions", 1)) > 1:
+            # A repeated compaction must REGENERATE the pin, not ride on an
+            # echo: check the messages kept verbatim after the summary carry
+            # none of the expected values, so a pass can only come from the
+            # regenerated block (or a history lookup), never from a retained
+            # intermediate reply quoting the first pin (issue #66).
+            summary_at = next((i for i, m in enumerate(remaining)
+                               if m["role"] == "user" and m["content"].startswith("[")), len(remaining))
+            tail = "\n".join(str(m.get("content") or "") + json.dumps(m.get("tool_calls") or [])
+                             for m in remaining[summary_at + 1:])
+            leaked = [e for e in case["expect"] if e in tail]
+            if leaked and "error" not in result:
+                result["error"] = (f"the retained tail echoes the target values {leaked}: "
+                                   "the run cannot prove the pin was regenerated")
     tool_calls = [c["name"] for r in after if r["type"] == "message" for c in r["data"].get("tool_calls", [])]
     turn_end = next((r["data"] for r in reversed(after) if r["type"] == "turn_end"), None)
     answer = turn_end["response"] if turn_end else ""

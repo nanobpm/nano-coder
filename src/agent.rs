@@ -4898,7 +4898,10 @@ impl Agent {
         // `request_max_tokens()`'s cap handling. The model-dependent inputs
         // (`window`, `context_cap`, `combined_window`) are passed in per attempt
         // — not captured — so a `/model` switch honoured on a retry rebuilds
-        // them for the new model (issue #114).
+        // them for the new model (issue #114). `pin_requests` is likewise
+        // resolved once up front: the closure cannot borrow `self` (the retry
+        // loop mutates it), and the flag does not change mid-compaction.
+        let pin_requests = self.config.compaction_pin_requests;
         let build_request =
             |output_budget: i64, window: usize, context_cap: ContextCap, combined_window: Option<usize>| {
                 let input_window = match context_cap {
@@ -4923,9 +4926,16 @@ impl Agent {
                 // in (rendered as `[earlier summary]`). Warn the summariser that
                 // block is lossy so it does not restate the user's goals from a
                 // paraphrase of a paraphrase — the harness pins the user's exact
-                // requests alongside the new summary (issue #66).
+                // requests alongside the new summary (issue #66). With pinning
+                // off there is no pin to lean on, so the instruction instead
+                // tells the summariser to carry every requirement forward.
                 if summarized.iter().any(context::is_summary_message) {
-                    system_prompt.push_str(context::EARLIER_SUMMARY_LOSSY_INSTRUCTIONS);
+                    let lossy = if pin_requests {
+                        context::EARLIER_SUMMARY_LOSSY_INSTRUCTIONS
+                    } else {
+                        context::EARLIER_SUMMARY_LOSSY_NO_PIN_INSTRUCTIONS
+                    };
+                    system_prompt.push_str(lossy);
                 }
                 let summary_messages = [Message::system(&system_prompt), Message::user(&request_text)];
                 (summary_messages, output_budget)
@@ -5132,10 +5142,12 @@ impl Agent {
         // this compaction is folding (`summarized_msgs`, which already excludes
         // the previous summary and its synthetic restatement) — never from the
         // previous summary itself (issue #66). The eval can disable it
-        // (`compaction_pin_requests = false`) to measure its effect.
+        // (`compaction_pin_requests = false`) to measure its effect. The block
+        // is bounded by an overall allowance derived from the context window,
+        // so a long session's pins cannot grow past the window.
         let prior_turns = self.pre_compaction_transcript.as_deref().unwrap_or(&[]);
         let summary = if self.config.compaction_pin_requests {
-            match context::pinned_user_requests(prior_turns, &summarized_msgs, smart) {
+            match context::pinned_user_requests(prior_turns, &summarized_msgs, smart, self.context_window()) {
                 Some(pinned) => format!("{summary}\n\n{pinned}"),
                 None => summary,
             }
@@ -12640,6 +12652,34 @@ mod tests {
         assert!(
             system.contains("lossy") && system.contains("Do not restate the user's goals"),
             "the summariser is warned: {system}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_repeated_compaction_without_the_pin_tells_the_summariser_to_preserve_requirements() {
+        // With `compaction_pin_requests = false` there is no pinned block to
+        // lean on, so the lossy warning must NOT tell the summariser to skip
+        // the user's goals — the new summary is the only place requirements
+        // still in the earlier summary survive (issue #66).
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, seen) =
+            agent(vec![text("work"), text("SUMMARY ONE"), text("more"), text("SUMMARY TWO")], dir.path());
+        agent.config.compaction_pin_requests = false;
+        agent.new_session().unwrap();
+        agent.send_message("first request").await.unwrap();
+        agent.compact_logged(CompactTrigger::Manual, CompactionMode::Standard, None).await.unwrap();
+        agent.send_message("second request").await.unwrap();
+        agent.compact_logged(CompactTrigger::Manual, CompactionMode::Standard, None).await.unwrap();
+
+        let summary_request = seen.lock().unwrap().last().expect("a summary request was sent").clone();
+        let system = &summary_request[0].content;
+        assert!(
+            system.contains("lossy") && system.contains("Preserve every goal, requirement"),
+            "the no-pin warning preserves requirements: {system}"
+        );
+        assert!(
+            !system.contains("pinned verbatim alongside your summary"),
+            "no pin is promised when pinning is off: {system}"
         );
     }
 
