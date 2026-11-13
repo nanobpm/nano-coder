@@ -68,6 +68,28 @@ The agent can later read any message in full by that ID, so the summary can stay
 may matter (an error message, a command and its output, a file's contents, the user's exact wording), cite its source \
 as (#N) instead of copying long text. Cite only IDs that appear in the transcript.";
 
+/// Added to the summarizer prompt when the transcript holds an `[earlier
+/// summary]` block (a repeated compaction): that block is a paraphrase of a
+/// paraphrase, so the user's goals must not be restated from it — the harness
+/// pins the user's original requests verbatim alongside the new summary
+/// (issue #66). Only appended when pinning is actually on
+/// (`compaction_pin_requests`): the instruction leans on the pinned block.
+pub const EARLIER_SUMMARY_LOSSY_INSTRUCTIONS: &str = "\n\nA block labelled [earlier summary] is a summary of a \
+summary: it is lossy and may have blurred or dropped the user's original requests. Do not restate the user's goals \
+or requirements from it. The user's exact requests are pinned verbatim alongside your summary by the harness, so you \
+need not reproduce them; summarize only the work and decisions the [earlier summary] covers.";
+
+/// The same warning for a repeated compaction when the pinned block is
+/// disabled (`compaction_pin_requests = false`): with no pin to lean on, the
+/// new summary is the only place the user's requirements survive, so the
+/// summarizer must carry forward every requirement the [earlier summary]
+/// still holds instead of dropping them (issue #66).
+pub const EARLIER_SUMMARY_LOSSY_NO_PIN_INSTRUCTIONS: &str = "\n\nA block labelled [earlier summary] is a summary of a \
+summary: it is lossy and may have blurred or dropped the user's original requests. Preserve every goal, requirement \
+and constraint the [earlier summary] still records — quote exact wording where it matters — because your summary is \
+the only place they survive; do not drop one because it looks already satisfied. For the rest, summarize only the \
+work and decisions the [earlier summary] covers.";
+
 /// Note after a smart summary telling the agent how to recover originals.
 pub fn smart_summary_note(range: Option<(u64, u64)>) -> String {
     let covered = match range {
@@ -403,6 +425,24 @@ pub fn output_cap_from_error(error: &str) -> Option<usize> {
     patterns.iter().find_map(|p| Regex::new(p).ok()?.captures(error)?.get(1)?.as_str().parse().ok())
 }
 
+/// [`clip`] bounded by UTF-8 *bytes* rather than characters, so a budget
+/// measured with the byte-based [`text_tokens`] estimate holds for non-ASCII
+/// text too (issue #66). The cut always lands on a character boundary because
+/// it is made by [`clip`] on characters; the character budget shrinks until
+/// the rendered result fits `max_bytes`.
+fn clip_bytes(text: &str, max_bytes: usize) -> String {
+    let mut chars = max_bytes;
+    loop {
+        let out = clip(text, chars);
+        if out.len() <= max_bytes || chars == 0 {
+            return out;
+        }
+        // Strictly decreasing: scale by the overshoot, at least one char less.
+        let scaled = chars.saturating_mul(max_bytes) / out.len();
+        chars = scaled.min(chars - 1);
+    }
+}
+
 fn clip(text: &str, max_chars: usize) -> String {
     let total = text.chars().count();
     if total <= max_chars {
@@ -712,6 +752,261 @@ pub fn render_transcript(messages: &[Message], max_chars: usize, ids: bool) -> S
     }
     kept.reverse();
     kept.join("\n\n")
+}
+
+/// Starts the pinned block of the user's own requests, attached verbatim after
+/// a compaction summary so the user's actual words survive repeated
+/// compactions (a summary of a summary paraphrases them away — issue #66).
+pub const PINNED_REQUESTS_PREFIX: &str = "[The user's requests, kept verbatim by the harness — not the summariser's words. These are the exact \
+     originals; the summary above may paraphrase or lose them. Treat this block as the authoritative statement \
+     of what the user asked for.]";
+
+/// Character budget for the *first* pinned request, which usually states the
+/// task's goal and carries the exact detail (a flag, a number, a phrase) a
+/// later question depends on. Later requests get one line each (below).
+const PINNED_FIRST_CHARS: usize = 1_500;
+
+/// Character budget for each later pinned request: one line's worth.
+const PINNED_LATER_CHARS: usize = 200;
+
+/// The pinned block's share of the model's context window, in tokens. The
+/// per-request budgets above do not bound the *block*: every request the
+/// session has seen is appended again on each compaction, so a long session
+/// would otherwise grow the block past the window — and compaction could never
+/// reclaim that space, because it regenerates the same oversized block. The
+/// overall allowance is derived from the window instead (see
+/// [`pinned_user_requests`]).
+const PINNED_WINDOW_SHARE: usize = 8;
+
+/// The smallest overall allowance [`pinned_user_requests`] works with, in
+/// tokens: below this the share above would leave too little for even the
+/// first request, so the allowance is raised to this floor (the window is
+/// tiny, and the summary the pin rides on is proportionally small too).
+const PINNED_MIN_ALLOWANCE_TOKENS: usize = 600;
+
+/// Marks the requests dropped to fit the overall allowance, so the agent
+/// knows the block is partial (and, in smart mode, which session-log IDs to
+/// `history_read` for the full text).
+fn omitted_note(count: usize, whereabouts: &str) -> String {
+    format!("[… {count} earlier request(s) omitted from this pin to fit its context allowance{whereabouts} …]")
+}
+
+/// True when a message is a genuine user request — a turn the user initiated —
+/// rather than a harness injection: an automatic reminder/continuation/timer
+/// (`auto_initiated` and its sub-kinds), a previous compaction's synthetic
+/// summary, or a harness plan note (a carried-over or restated plan). Only
+/// genuine requests are pinned; re-pinning a summary would re-introduce the
+/// paraphrase-of-a-paraphrase drift this block exists to prevent (issue #66).
+/// A user prompt that merely *starts* with a bracket (e.g. `[constraint] …`)
+/// is still a genuine request and is pinned.
+///
+/// Hook output is not user input, so a message whose text carries harness
+/// additions is pinned only in its user-typed part: a fresh prompt with
+/// `SessionStart`/`UserPromptSubmit` context appended (wrapped as a
+/// `<system-reminder>`, agent.rs) is pinned from its recorded `pin_text` (the
+/// user-typed part), and a message that *is* hook context (a resume
+/// `SessionStart` block, flagged `hook_context` at its origin) is excluded
+/// outright. Otherwise compaction would preserve transient hook instructions as the user's authoritative original words.
+fn is_user_request(message: &Message) -> bool {
+    if message.role != Role::User || message.auto_initiated || message.continuation || message.timer {
+        return false;
+    }
+    let content = message.content.trim_start();
+    if content.starts_with(SUMMARY_PREFIX) || content.starts_with(SMART_SUMMARY_PREFIX) {
+        return false;
+    }
+    // Harness plan notes, not user requests.
+    if content.starts_with("[Your plan, kept by the harness") || content.starts_with("[A plan carried over") {
+        return false;
+    }
+    // A harness hook-context block (a resume `SessionStart` hook's context),
+    // identified by its origin flag — never by a `<system-reminder>` text
+    // prefix, which a user can type at the start of a genuine prompt.
+    !message.hook_context
+}
+
+/// The user-typed text of a genuine request, so the pin holds the user's words
+/// only — never harness additions. When the harness appended hook context to the
+/// prompt (agent.rs wraps it as a `<system-reminder>` block on the wire
+/// `content`), the pristine user text was recorded separately in `pin_text` and
+/// is used directly. Otherwise the content is used as-is. This deliberately does
+/// NOT clip `content` at the first `<system-reminder>` tag: a user can *type*
+/// that tag (e.g. `Rename <system-reminder> to <harness-note> in reminders.rs`),
+/// and clipping there would pin just `Rename`, losing the actual task (issue
+/// #66). Only known harness additions — recorded as `pin_text` — are excluded.
+fn request_text(message: &Message) -> &str {
+    match &message.pin_text {
+        Some(text) => text.trim(),
+        None => message.content.trim(),
+    }
+}
+
+/// True when a message is a previous compaction's synthetic summary — the
+/// block `render_transcript` labels `[earlier summary]`. Used to warn the
+/// summariser that such a block is lossy (issue #66).
+pub fn is_summary_message(message: &Message) -> bool {
+    message.role == Role::User
+        && (message.content.starts_with(SUMMARY_PREFIX) || message.content.starts_with(SMART_SUMMARY_PREFIX))
+}
+
+/// Render the pinned block of the user's requests, rebuilt from the original
+/// messages on every compaction — never from the previous summary (issue #66).
+///
+/// `prior` is the stash of real turns from earlier compactions
+/// (`pre_compaction_transcript`), `new` the turns this compaction is folding.
+/// Together they hold every genuine user request the session has seen, so the
+/// block is regenerated from originals each time rather than carried forward as
+/// a paraphrase. The first request (which usually states the goal) keeps up to
+/// [`PINNED_FIRST_CHARS`] characters; each later request is clipped to one
+/// line. With `smart`, each request is labelled with its `#N` session-log ID so
+/// the full text is one `history_read` away. Returns `None` when there is
+/// nothing to pin.
+///
+/// The whole block — header and labels included — is bounded by an overall
+/// allowance derived from the model's context `window` (`window_tokens` /
+/// [`PINNED_WINDOW_SHARE`], floored at [`PINNED_MIN_ALLOWANCE_TOKENS`]):
+/// without it a long session's block would grow past the window, and further
+/// compaction could never reclaim that space because it regenerates the same
+/// oversized block. When the requests do not fit, the *oldest* ones are
+/// dropped (the newest requests are the likeliest to steer the next steps;
+/// the first request keeps its larger budget while it fits), the first is
+/// clipped harder if it alone overflows, and an explicit omission note records
+/// how many were dropped and their session-log IDs. Requests are pinned
+/// through [`request_text`], so hook output appended to a prompt is never
+/// pinned as the user's words.
+pub fn pinned_user_requests(prior: &[Message], new: &[Message], smart: bool, window_tokens: usize) -> Option<String> {
+    let requests: Vec<&Message> = prior.iter().chain(new.iter()).filter(|m| is_user_request(m)).collect();
+    if requests.is_empty() {
+        return None;
+    }
+    // The overall allowance, in UTF-8 bytes: the same accounting as
+    // [`text_tokens`] (~4 bytes/token), so multibyte text cannot overrun the
+    // intended token share. The header and each line's joining newline are
+    // charged against it.
+    let allowance = (window_tokens / PINNED_WINDOW_SHARE).max(PINNED_MIN_ALLOWANCE_TOKENS).saturating_mul(4).max(1);
+    let remaining = allowance.saturating_sub(PINNED_REQUESTS_PREFIX.len() + 1);
+
+    // One rendered line per request, clipped to its per-request budget. The
+    // first request keeps its structure up to the larger budget; later ones
+    // are collapsed onto one line.
+    let render = |index: usize, request: &Message, first_budget: usize| -> String {
+        let budget = if index == 0 { first_budget } else { PINNED_LATER_CHARS };
+        let text = request_text(request);
+        let label = match (smart, request.log_line) {
+            (true, Some(line)) => format!("#{line}: "),
+            _ => String::new(),
+        };
+        // Budgets are bytes (token-consistent); the label is charged too.
+        let budget = budget.saturating_sub(label.len());
+        let clipped = if index == 0 {
+            clip_bytes(text, budget)
+        } else {
+            clip_bytes(&text.split_whitespace().collect::<Vec<_>>().join(" "), budget)
+        };
+        format!("{label}{clipped}")
+    };
+    let mut lines: Vec<String> = (0..requests.len()).map(|i| render(i, requests[i], PINNED_FIRST_CHARS)).collect();
+    let cost = |line: &str| line.len() + 1;
+
+    // The explicit omission policy: drop the *oldest later* requests first
+    // (the newest requests steer the next steps; the first request states the
+    // goal), then the first request itself only when it is the last one left.
+    //
+    // Selection runs in linear time even when most requests are omitted: the
+    // dropped set is always a contiguous run of requests (the oldest later
+    // ones, plus the first when it too must go), so suffix sums give each
+    // candidate's line cost in O(1), and the omission note names the dropped
+    // requests by one *covering* session-log span (`#lo-#hi`) whose bounds are
+    // prefix minima/maxima — also O(1) per candidate. A covering span keeps the
+    // note's size independent of how many requests were dropped or how their
+    // IDs interleave with other log records, so the note can never crowd out
+    // the requests it accompanies (issue #66). The note is rendered once, after
+    // selection.
+    //
+    // `keep_first`: whether the first (goal) request survives.
+    // `tail_start`: the first later request kept; `tail_start..n` are kept.
+    let n = requests.len();
+    let line_costs: Vec<usize> = lines.iter().map(|l| cost(l)).collect();
+    // suffix[i] = cost of lines[i..n].
+    let mut suffix = vec![0usize; n + 1];
+    for i in (0..n).rev() {
+        suffix[i] = suffix[i + 1] + line_costs[i];
+    }
+    // span[i] = (min, max) log ID over requests[1..i] (None when no IDs).
+    let mut span: Vec<Option<(u64, u64)>> = vec![None; n + 1];
+    for i in 1..n {
+        let merged = match (span[i], requests[i].log_line) {
+            (Some((lo, hi)), Some(id)) => Some((lo.min(id), hi.max(id))),
+            (None, Some(id)) => Some((id, id)),
+            (cur, None) => cur,
+        };
+        span[i + 1] = merged;
+    }
+    let dropped_span = |keep_first: bool, tail_start: usize| -> Option<(u64, u64)> {
+        let later = span[tail_start.max(1)];
+        let first = if keep_first { None } else { requests[0].log_line.map(|id| (id, id)) };
+        match (first, later) {
+            (Some((a, b)), Some((c, d))) => Some((a.min(c), b.max(d))),
+            (x, None) | (None, x) => x,
+        }
+    };
+    let omitted_count =
+        |keep_first: bool, tail_start: usize| -> usize { (tail_start.max(1) - 1) + usize::from(!keep_first) };
+    let note = |keep_first: bool, tail_start: usize| -> Option<String> {
+        let omitted = omitted_count(keep_first, tail_start);
+        if omitted == 0 {
+            return None;
+        }
+        let whereabouts = match (smart, dropped_span(keep_first, tail_start)) {
+            (true, Some((lo, hi))) if lo == hi => format!("; full text at #{lo}"),
+            (true, Some((lo, hi))) => format!("; full text within session log #{lo}-#{hi}"),
+            _ => String::new(),
+        };
+        Some(omitted_note(omitted, &whereabouts))
+    };
+    let total = |keep_first: bool, tail_start: usize| -> usize {
+        (if keep_first { line_costs[0] } else { 0 })
+            + suffix[tail_start.max(1)]
+            + note(keep_first, tail_start).map_or(0, |t| cost(&t))
+    };
+
+    let mut keep_first = true;
+    let mut tail_start = 1usize;
+    // Drop the oldest later requests until the block (lines + note) fits.
+    while tail_start < n && total(keep_first, tail_start) > remaining {
+        tail_start += 1;
+    }
+    // Still too large with only the first request kept: drop the first too and
+    // keep shrinking the tail from the oldest remaining.
+    if total(keep_first, tail_start) > remaining {
+        keep_first = false;
+        while tail_start < n && total(keep_first, tail_start) > remaining {
+            tail_start += 1;
+        }
+    }
+
+    if !keep_first && tail_start >= n {
+        // Not even one request fits — nothing usable to pin.
+        return None;
+    }
+
+    // The first request alone can still overflow a tiny allowance: clip it
+    // harder, to what is actually left, rather than exceed the allowance.
+    if keep_first && tail_start >= n && line_costs[0] > remaining {
+        lines[0] = render(0, requests[0], remaining.saturating_sub(1));
+    }
+
+    let mut body: Vec<String> = Vec::new();
+    // The note sits where the dropped requests were: ahead of the kept lines.
+    // Room for it was reserved by the selection above.
+    body.extend(note(keep_first, tail_start));
+    if keep_first {
+        body.push(lines[0].clone());
+    }
+    for line in &lines[tail_start.max(1)..] {
+        body.push(line.clone());
+    }
+    Some(format!("{PINNED_REQUESTS_PREFIX}\n{}", body.join("\n")))
 }
 
 #[cfg(test)]
@@ -1329,6 +1624,290 @@ mod tests {
     }
 
     #[test]
+    fn pinned_requests_keep_the_users_words_not_the_summary() {
+        // A genuine first request with an exact detail, a later request, a
+        // reminder and a previous summary: only the two genuine requests are
+        // pinned, the summary and reminder excluded (issue #66).
+        let mut first = Message::user("Fix the lease race. Use port 8123, never 5173.");
+        first.log_line = Some(2);
+        let reminder = Message::user("remember to be careful").auto_initiated();
+        let summary = Message::user(&format!("{SUMMARY_PREFIX} the user wanted something about a port"));
+        let mut later = Message::user("Now add a test for it.");
+        later.log_line = Some(40);
+        let pinned = pinned_user_requests(&[], &[first, reminder, summary, later], false, DEFAULT_CONTEXT_WINDOW)
+            .expect("requests to pin");
+        assert!(pinned.starts_with(PINNED_REQUESTS_PREFIX), "{pinned}");
+        assert!(pinned.contains("Use port 8123, never 5173."), "exact detail pinned: {pinned}");
+        assert!(pinned.contains("Now add a test for it."), "{pinned}");
+        assert!(!pinned.contains("wanted something about a port"), "summary not pinned: {pinned}");
+        assert!(!pinned.contains("be careful"), "reminder not pinned: {pinned}");
+    }
+
+    #[test]
+    fn pinned_requests_label_log_lines_in_smart_mode() {
+        let mut first = Message::user("first request");
+        first.log_line = Some(3);
+        let mut later = Message::user("second request");
+        later.log_line = Some(9);
+        let pinned = pinned_user_requests(&[], &[first, later], true, DEFAULT_CONTEXT_WINDOW).unwrap();
+        assert!(pinned.contains("#3: first request"), "{pinned}");
+        assert!(pinned.contains("#9: second request"), "{pinned}");
+        // Standard mode carries no IDs.
+        let plain =
+            pinned_user_requests(&[], &[Message::user("first request")], false, DEFAULT_CONTEXT_WINDOW).unwrap();
+        assert!(!plain.contains('#'), "{plain}");
+    }
+
+    #[test]
+    fn pinned_requests_clip_the_first_and_one_line_the_rest() {
+        let long_first = Message::user(&"x".repeat(PINNED_FIRST_CHARS + 500));
+        let multi_line_later = Message::user("line one\nline two\nline three");
+        let pinned = pinned_user_requests(&[], &[long_first, multi_line_later], false, DEFAULT_CONTEXT_WINDOW).unwrap();
+        let body = pinned.strip_prefix(PINNED_REQUESTS_PREFIX).unwrap();
+        // The first request is clipped to its budget (the clip marker is
+        // charged against it, so the rendered head+marker+tail stays within).
+        let first_block: String = body.trim().lines().take_while(|l| *l != "line one line two line three").collect();
+        assert!(first_block.chars().count() <= PINNED_FIRST_CHARS + 60, "first clipped: {}", first_block.len());
+        assert!(first_block.contains("omitted"), "long first request is clipped: {first_block}");
+        // A later request is collapsed onto one line, at the end.
+        assert_eq!(body.trim().lines().last(), Some("line one line two line three"));
+    }
+
+    #[test]
+    fn pinned_requests_combine_prior_and_new_turns() {
+        // A repeated compaction: the earlier real turns come from the stash, the
+        // newly folded ones from this span, so all genuine requests are pinned.
+        let prior = vec![Message::user("the original goal")];
+        let new = vec![Message::user("a follow-up")];
+        let pinned = pinned_user_requests(&prior, &new, false, DEFAULT_CONTEXT_WINDOW).unwrap();
+        assert!(pinned.contains("the original goal"), "{pinned}");
+        assert!(pinned.contains("a follow-up"), "{pinned}");
+        // Nothing genuine to pin yields no block.
+        assert!(
+            pinned_user_requests(&[], &[Message::user(&format!("{SUMMARY_PREFIX} x"))], false, DEFAULT_CONTEXT_WINDOW)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pinned_requests_keep_a_bracketed_user_prompt() {
+        // A genuine request that happens to start with a bracket is pinned; only
+        // the harness's own bracketed notes are excluded.
+        let request = Message::user("[constraint] use port 8080");
+        let plan_note = Message::user("[Your plan, kept by the harness. …]\n- do a thing");
+        let pinned = pinned_user_requests(&[], &[request, plan_note], false, DEFAULT_CONTEXT_WINDOW).unwrap();
+        assert!(pinned.contains("[constraint] use port 8080"), "{pinned}");
+        assert!(!pinned.contains("do a thing"), "plan note not pinned: {pinned}");
+    }
+
+    #[test]
+    fn pinned_requests_stay_within_the_overall_allowance() {
+        // The per-request budgets do not bound the *block*: many requests would
+        // otherwise grow it past the window, and compaction could never reclaim
+        // that space. The oldest later requests are dropped with an explicit
+        // omission note; the goal (first) and the newest survive.
+        let first = Message::user("the original goal");
+        let later: Vec<Message> = (0..500).map(|i| Message::user(&format!("follow-up request number {i}"))).collect();
+        let all: Vec<Message> = std::iter::once(first).chain(later).collect();
+        // A small window forces a small allowance.
+        let window = 8_000; // allowance: 8_000/8 = 1_000 tokens = 4_000 chars
+        let pinned = pinned_user_requests(&[], &all, false, window).expect("requests to pin");
+        let allowance = (window / PINNED_WINDOW_SHARE).max(PINNED_MIN_ALLOWANCE_TOKENS) * 4;
+        assert!(
+            pinned.chars().count() <= allowance,
+            "block within the allowance: {} <= {allowance}",
+            pinned.chars().count()
+        );
+        assert!(pinned.contains("the original goal"), "the goal survives: {pinned}");
+        assert!(pinned.contains("follow-up request number 499"), "the newest request survives: {pinned}");
+        assert!(pinned.contains("omitted from this pin"), "the omission is explicit: {pinned}");
+        assert!(!pinned.contains("follow-up request number 0\n"), "the oldest later requests are dropped: {pinned}");
+    }
+
+    #[test]
+    fn pinned_requests_allowance_tracks_the_window() {
+        // The allowance is context-aware: a larger window pins more requests.
+        let requests: Vec<Message> = (0..500).map(|i| Message::user(&format!("request {i}"))).collect();
+        let small = pinned_user_requests(&[], &requests, false, 8_000).unwrap();
+        let large = pinned_user_requests(&[], &requests, false, 200_000).unwrap();
+        assert!(large.len() > small.len(), "a larger window pins more: {} > {}", large.len(), small.len());
+        // And a block is never larger than the window-derived allowance.
+        let allowance = (200_000 / PINNED_WINDOW_SHARE) * 4;
+        assert!(large.chars().count() <= allowance, "{large}");
+    }
+
+    #[test]
+    fn pinned_requests_omission_note_names_ids_in_smart_mode() {
+        let mut first = Message::user("the goal");
+        first.log_line = Some(2);
+        let mut dropped = Message::user("an old follow-up that no longer fits");
+        dropped.log_line = Some(9);
+        let mut newest = Message::user("the latest ask");
+        newest.log_line = Some(40);
+        // A tiny window drops the middle request; smart mode points at its ID.
+        let pinned = pinned_user_requests(&[], &[first, dropped, newest], true, 4_800).unwrap();
+        if pinned.contains("omitted from this pin") {
+            assert!(pinned.contains("#9"), "the dropped request's ID is named: {pinned}");
+        }
+        assert!(pinned.contains("#40: the latest ask"), "the newest request is pinned with its ID: {pinned}");
+    }
+
+    #[test]
+    fn pinned_requests_strip_hook_output_from_a_prompt() {
+        // A fresh prompt with SessionStart/UserPromptSubmit hook context
+        // appended (agent.rs) records the user-typed text separately, so the
+        // pin holds the user's words only; a resume SessionStart context block
+        // (a bare reminder message) is not a user request at all.
+        let prompt = Message::user(&format!(
+            "Fix the lease race.\n\n{}",
+            crate::reminders::wrap("hook says: always use nightly")
+        ))
+        .with_pin_text("Fix the lease race.");
+        let hook_only = Message::user(&crate::reminders::wrap("resumed session context from a hook")).hook_context();
+        let pinned = pinned_user_requests(&[], &[prompt, hook_only], false, DEFAULT_CONTEXT_WINDOW).unwrap();
+        assert!(pinned.contains("Fix the lease race."), "the user's words are pinned: {pinned}");
+        assert!(!pinned.contains("nightly"), "hook output is not pinned as the user's words: {pinned}");
+        assert!(!pinned.contains("resumed session context"), "a hook-only message is not pinned: {pinned}");
+    }
+
+    #[test]
+    fn pinned_requests_preserve_a_user_typed_reminder_tag() {
+        // A user can *type* the `<system-reminder>` tag (e.g. asking to rename
+        // it). With no hook context appended there is no `pin_text`, so the pin
+        // must keep the WHOLE user text — clipping at the tag would lose the
+        // actual task (issue #66).
+        let request = Message::user("Rename <system-reminder> to <harness-note> in reminders.rs");
+        let pinned = pinned_user_requests(&[], &[request], false, DEFAULT_CONTEXT_WINDOW).unwrap();
+        assert!(
+            pinned.contains("Rename <system-reminder> to <harness-note> in reminders.rs"),
+            "the user-typed tag survives in the pin: {pinned}"
+        );
+
+        // And when hook context IS appended, the recorded user text keeps its
+        // own literal tag while the appended reminder block stays out.
+        let with_hook = Message::user(&format!(
+            "Rename <system-reminder> to <harness-note>.\n\n{}",
+            crate::reminders::wrap("hook says: use nightly")
+        ))
+        .with_pin_text("Rename <system-reminder> to <harness-note>.");
+        let pinned = pinned_user_requests(&[], &[with_hook], false, DEFAULT_CONTEXT_WINDOW).unwrap();
+        assert!(pinned.contains("Rename <system-reminder> to <harness-note>."), "user tag pinned: {pinned}");
+        assert!(!pinned.contains("nightly"), "appended hook output not pinned: {pinned}");
+    }
+
+    #[test]
+    fn pinned_requests_a_hook_only_message_left_alone_pins_nothing() {
+        let hook_only = Message::user(&crate::reminders::wrap("hook context")).hook_context();
+        assert!(pinned_user_requests(&[], &[hook_only], false, DEFAULT_CONTEXT_WINDOW).is_none());
+    }
+
+    #[test]
+    fn pinned_requests_omission_note_stays_within_the_allowance() {
+        // Copilot's case: 1,000 short requests with a 4,800-token window must
+        // not let the omission note's ID list push the block past the
+        // allowance. The note names the dropped IDs as one covering span, and the
+        // total budget (lines + note) is enforced before returning.
+        let mut requests: Vec<Message> = Vec::new();
+        let mut first = Message::user("the original goal");
+        first.log_line = Some(1);
+        requests.push(first);
+        for i in 1..1000u64 {
+            let mut m = Message::user("x"); // one-char follow-ups
+            m.log_line = Some(i + 1);
+            requests.push(m);
+        }
+        let window = 4_800;
+        let allowance = (window / PINNED_WINDOW_SHARE).max(PINNED_MIN_ALLOWANCE_TOKENS) * 4;
+        let pinned = pinned_user_requests(&[], &requests, true, window).expect("requests to pin");
+        assert!(
+            pinned.chars().count() <= allowance,
+            "block (note included) within the allowance: {} <= {allowance}",
+            pinned.chars().count()
+        );
+        assert!(pinned.contains("omitted from this pin"), "the omission is explicit: {pinned}");
+
+        // The invariant holds across a sweep of window sizes and both modes:
+        // whatever the selection keeps, the rendered block — omission note and
+        // all — never exceeds the allowance.
+        for window in [4_800, 8_000, 16_000, 32_000, 128_000] {
+            let allowance = (window / PINNED_WINDOW_SHARE).max(PINNED_MIN_ALLOWANCE_TOKENS) * 4;
+            for smart in [true, false] {
+                if let Some(pinned) = pinned_user_requests(&[], &requests, smart, window) {
+                    assert!(
+                        pinned.chars().count() <= allowance,
+                        "window {window} smart {smart}: {} <= {allowance}",
+                        pinned.chars().count()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_requests_omission_note_uses_a_span_in_smart_mode() {
+        // Many dropped requests are named by one `#lo-#hi` span, not a long list.
+        let mut requests: Vec<Message> = Vec::new();
+        let mut first = Message::user("the original goal");
+        first.log_line = Some(1);
+        requests.push(first);
+        for i in 1..200u64 {
+            let mut m = Message::user("follow-up");
+            m.log_line = Some(i + 1);
+            requests.push(m);
+        }
+        let pinned = pinned_user_requests(&[], &requests, true, 4_800).expect("requests to pin");
+        if pinned.contains("omitted from this pin") {
+            assert!(pinned.contains("-#"), "dropped IDs are named by a covering span: {pinned}");
+            assert!(!pinned.contains("#2, #3, #4"), "no long uncompressed list: {pinned}");
+        }
+    }
+
+    #[test]
+    fn pinned_requests_keep_a_prompt_starting_with_a_literal_reminder_tag() {
+        // Only the origin flag marks hook context: a genuine prompt that begins
+        // with a literal `<system-reminder>` tag is still the user's request,
+        // with or without recorded `pin_text` (issue #66).
+        let plain = Message::user("<system-reminder> blocks leak into the TUI; hide them");
+        let pinned = pinned_user_requests(&[], &[plain], false, DEFAULT_CONTEXT_WINDOW).unwrap();
+        assert!(pinned.contains("<system-reminder> blocks leak into the TUI; hide them"), "{pinned}");
+
+        let with_hook = Message::user(&format!(
+            "<system-reminder>x</system-reminder> rename this tag\n\n{}",
+            crate::reminders::wrap("hook says: use nightly")
+        ))
+        .with_pin_text("<system-reminder>x</system-reminder> rename this tag");
+        let pinned = pinned_user_requests(&[], &[with_hook], false, DEFAULT_CONTEXT_WINDOW).unwrap();
+        assert!(pinned.contains("rename this tag"), "{pinned}");
+        assert!(!pinned.contains("nightly"), "{pinned}");
+    }
+
+    #[test]
+    fn pinned_requests_nonconsecutive_ids_keep_the_newest_request() {
+        // Real request IDs interleave with other log records (#3, #7, #11, …):
+        // the omission note must stay bounded so it never discards the whole
+        // pin when the header, goal and newest request fit (issue #66).
+        let mut requests: Vec<Message> = Vec::new();
+        for i in 0..1000u64 {
+            let mut m = Message::user(if i == 0 {
+                "g"
+            } else if i == 999 {
+                "z"
+            } else {
+                "x"
+            });
+            m.log_line = Some(3 + 4 * i);
+            requests.push(m);
+        }
+        let window = 4_800;
+        let allowance = (window / PINNED_WINDOW_SHARE).max(PINNED_MIN_ALLOWANCE_TOKENS) * 4;
+        let pinned = pinned_user_requests(&[], &requests, true, window).expect("the pin survives");
+        assert!(pinned.chars().count() <= allowance, "{pinned}");
+        assert!(pinned.contains("#3: g"), "goal kept: {pinned}");
+        assert!(pinned.contains("#3999: z"), "newest kept: {pinned}");
+        assert!(pinned.contains("full text within session log #"), "covering span named: {pinned}");
+    }
+
+    #[test]
     fn model_windows() {
         assert_eq!(window_for_model("claude-sonnet-4-5"), Some(200_000));
         assert_eq!(window_for_model("gpt-4.1-mini"), Some(1_047_576));
@@ -1370,5 +1949,30 @@ mod boundary_excerpt_tests {
         assert!(out.chars().count() <= 2000);
         assert!(out.starts_with("$ cargo test"));
         assert!(out.ends_with("exit status: 101\n"));
+    }
+
+    #[test]
+    fn pinned_requests_budget_counts_utf8_bytes_for_multibyte_text() {
+        // 1,500 CJK characters (3 bytes each) fit a character budget but not
+        // the byte/token-consistent one: the block must stay within the
+        // allowance measured as `text_tokens` does (issue #66).
+        let first = Message::user(&"漢".repeat(1_500));
+        let later = Message::user(&"字".repeat(400));
+        for window in [4_800usize, 16_000, 128_000] {
+            for smart in [false, true] {
+                let block = pinned_user_requests(&[], &[first.clone(), later.clone()], smart, window).unwrap();
+                let allowance = (window / PINNED_WINDOW_SHARE).max(PINNED_MIN_ALLOWANCE_TOKENS);
+                assert!(text_tokens(&block) <= allowance, "window {window}: {} > {allowance}", text_tokens(&block));
+                assert!(block.contains('漢'));
+            }
+        }
+    }
+
+    #[test]
+    fn clip_bytes_cuts_on_char_boundaries_within_budget() {
+        for max in [0usize, 1, 2, 3, 10, 100, 1_000] {
+            let out = clip_bytes(&"é漢x".repeat(200), max);
+            assert!(out.len() <= max, "{max}: {}", out.len());
+        }
     }
 }

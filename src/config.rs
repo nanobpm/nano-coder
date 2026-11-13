@@ -60,6 +60,11 @@ pub struct Config {
     pub auto_compact_threshold: f64,
     /// How compaction treats the history it folds away (see `CompactionMode`).
     pub compaction_mode: CompactionMode,
+    /// Pin the user's requests verbatim after each compaction summary, rebuilt
+    /// from the original messages rather than re-summarized from the previous
+    /// summary (issue #66). The eval turns this off to measure the pinned
+    /// block's effect ("with and without the pinned block").
+    pub compaction_pin_requests: bool,
     /// How much the interactive CLI prints (and whether hook events are logged).
     pub verbosity: crate::ui::Verbosity,
     /// The retired `renderer` setting. Only the frame renderer remains (#133);
@@ -179,6 +184,7 @@ impl Default for Config {
             auto_compact: true,
             auto_compact_threshold: 0.8,
             compaction_mode: CompactionMode::Standard,
+            compaction_pin_requests: true,
             verbosity: crate::ui::Verbosity::Normal,
             retired_renderer: None,
             timestamps: true,

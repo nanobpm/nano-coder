@@ -71,9 +71,14 @@ pub struct ContentHashes<'a> {
     pub spills: &'a [&'a crate::output::Spill],
 }
 
+/// The tag every harness reminder is wrapped in ([`wrap`]). Compaction's
+/// request pinning keys on it to tell user-typed text from harness additions
+/// appended to the same message (issue #66).
+pub const WRAP_START: &str = "<system-reminder>";
+
 /// Wrap reminder text in `<system-reminder>` tags.
 pub fn wrap(text: &str) -> String {
-    format!("<system-reminder>\n{text}\n</system-reminder>")
+    format!("{WRAP_START}\n{text}\n</system-reminder>")
 }
 
 /// Tool-call counters behind the plan reminders.

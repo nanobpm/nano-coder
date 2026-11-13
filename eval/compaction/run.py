@@ -45,7 +45,7 @@ import cases as synthetic  # noqa: E402
 # Denied unless --tools all: synthetic logs describe a project that doesn't
 # exist, so without history tools the agent would explore the real disk.
 WORK_TOOLS = ("bash", "read_file", "write_file", "edit_file")
-OVERRIDDEN = ("session_dir", "compaction_mode", "auto_compact", "persist_sessions", "project_instructions", "model")
+OVERRIDDEN = ("session_dir", "compaction_mode", "compaction_pin_requests", "auto_compact", "persist_sessions", "project_instructions", "model")
 
 
 def default_config():
@@ -213,7 +213,7 @@ def extra_body_arg(text):
     return value
 
 
-def config_text(base, session_dir, mode, extra_body=None, providers=()):
+def config_text(base, session_dir, mode, extra_body=None, providers=(), pin=True):
     """The user's config (for providers and keys) with eval overrides on top.
     Overridden top-level keys are removed from the base so TOML stays valid."""
     lines = []
@@ -229,6 +229,8 @@ def config_text(base, session_dir, mode, extra_body=None, providers=()):
     head = [
         f"session_dir = {json.dumps(str(session_dir))}",
         f'compaction_mode = "{mode}"',
+        # The pinned-block A/B (issue #66): a `-nopin` mode suffix turns it off.
+        f"compaction_pin_requests = {'true' if pin else 'false'}",
         "auto_compact = false",
         "persist_sessions = true",
         "project_instructions = false",
@@ -541,6 +543,12 @@ def read_log(path):
 
 
 def run_one(args, index, case, model, mode, repeat, work_root):
+    # A `-nopin` suffix on the mode (e.g. `smart-nopin`) runs that compaction
+    # mode with the pinned-request block disabled, for the with/without-pin A/B
+    # (issue #66). The reported `mode` keeps the suffix so the cells stay
+    # distinct; the `/compact` command and config use the bare mode.
+    pin = not mode.endswith("-nopin")
+    compact_mode = mode[:-len("-nopin")] if not pin else mode
     run_dir = work_root / f"{case['name'].replace('/', '_')}-{model.replace('/', '_').replace(':', '_')}-{mode}-r{repeat}-j{index}"
     session_dir, cwd = run_dir / "sessions", run_dir / "cwd"
     cwd.mkdir(parents=True, exist_ok=True)
@@ -549,7 +557,7 @@ def run_one(args, index, case, model, mode, repeat, work_root):
     session_id = f"eval-{uuid.uuid4().hex[:12]}"
     write_log(case["records"], session_dir, session_id)
     config = run_dir / "config.toml"
-    config.write_text(config_text(args.config, session_dir, mode, args.extra_body, [provider_for(model, args.config)]))
+    config.write_text(config_text(args.config, session_dir, compact_mode, args.extra_body, [provider_for(model, args.config)], pin))
     result = {"case": case["name"], "model": model, "mode": mode, "repeat": repeat, "tools": args.tools,
               "question": case["question"], "expect": case["expect"], "forbid": case["forbid"], "session": str(session_dir / f"{session_id}.jsonl")}
     started = time.monotonic()
@@ -563,9 +571,41 @@ def run_one(args, index, case, model, mode, repeat, work_root):
         if case.get("precompacted"):
             result["compacted"], result["fallback"] = True, None
         else:
-            compacted = acp.call("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": f"/compact --{mode}"}]})
-            result["compacted"] = bool(compacted and compacted.get("compacted"))
-            result["fallback"] = compacted.get("fallback") if compacted else None
+            # A case can ask to be compacted more than once (issue #66: a detail
+            # in the first message, compacted twice, then questioned). Between
+            # compactions a short follow-up turn runs so the next compaction has
+            # new work to fold — compacting twice back-to-back would leave the
+            # second with nothing new to summarize. The follow-up asks for a
+            # bare acknowledgement: a content-bearing reply would echo the
+            # visible context (the pinned block) into the retained tail, and the
+            # case could then pass on that echo even when the next compaction
+            # failed to regenerate the pin.
+            compactions = int(case.get("compactions", 1))
+            outcomes = []
+            for n in range(compactions):
+                if n:
+                    followup = case.get("between", "Reply with a bare acknowledgement and nothing else.")
+                    acp.call("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": followup}]})
+                compacted = acp.call("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": f"/compact --{compact_mode}"}]})
+                outcomes.append((bool(compacted and compacted.get("compacted")), compacted.get("fallback") if compacted else None))
+            result["compacted"], result["fallback"] = outcomes[-1]
+            if compactions > 1:
+                # A repeated-compaction case proves an EARLIER summary was
+                # summarized again. That only holds when EVERY requested
+                # compaction actually completed: a skipped one leaves the prior
+                # pin in place for grading, and a fallback (a later success
+                # overwriting an earlier failure) means the chain broke. Reject
+                # the run as soon as any requested compaction is skipped or
+                # reports ANY fallback (whatever its wording, e.g. "empty
+                # summary"), so a pass can only mean the full chain completed
+                # (issue #66).
+                for k, (ok, fb) in enumerate(outcomes):
+                    if not ok:
+                        result["error"] = f"compaction {k + 1} of {compactions} was skipped; the run cannot prove an earlier summary was summarized again"
+                        break
+                    if fb is not None:
+                        result["error"] = f"compaction {k + 1} of {compactions} fell back: {str(fb)[:300]}"
+                        break
         question = case["question"] + (" Answer in one line." if args.terse else "")
         acp.call("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": question}]})
     except Exception as e:
@@ -584,6 +624,20 @@ def run_one(args, index, case, model, mode, repeat, work_root):
         summary = next((m["content"] for m in remaining if m["role"] == "user" and m["content"].startswith("[")), "")
         # Everything left in context: summary plus the recent messages compaction keeps.
         kept = "\n".join(str(m.get("content") or "") + json.dumps(m.get("tool_calls") or []) for m in remaining)
+        if int(case.get("compactions", 1)) > 1:
+            # A repeated compaction must REGENERATE the pin, not ride on an
+            # echo: check the messages kept verbatim after the summary carry
+            # none of the expected values, so a pass can only come from the
+            # regenerated block (or a history lookup), never from a retained
+            # intermediate reply quoting the first pin (issue #66).
+            summary_at = next((i for i, m in enumerate(remaining)
+                               if m["role"] == "user" and m["content"].startswith("[")), len(remaining))
+            tail = "\n".join(str(m.get("content") or "") + json.dumps(m.get("tool_calls") or [])
+                             for m in remaining[summary_at + 1:])
+            leaked = [e for e in case["expect"] if re.search(e, tail, re.IGNORECASE)]
+            if leaked and "error" not in result:
+                result["error"] = (f"the retained tail echoes the target values {leaked}: "
+                                   "the run cannot prove the pin was regenerated")
     tool_calls = [c["name"] for r in after if r["type"] == "message" for c in r["data"].get("tool_calls", [])]
     turn_end = next((r["data"] for r in reversed(after) if r["type"] == "turn_end"), None)
     answer = turn_end["response"] if turn_end else ""
@@ -881,20 +935,38 @@ def compare(baseline, candidate, deltas=None, out=sys.stdout):
 def self_test_verdict(results):
     """With the oracle: standard fails buried cases, smart passes them via the
     history tools, and both pass the control. Returns a process exit code."""
+    # Cases whose detail is stated in a *user* message (not a tool output). The
+    # pinned-request block (issue #66, on by default) keeps such a detail
+    # verbatim across compaction, so with the pin ON the oracle passes these in
+    # both modes with no history lookup; with it OFF (`-nopin`) they are buried
+    # cases — standard loses the detail, smart recovers it via the history
+    # tools. Cases whose detail is in a tool output (buried-error,
+    # long-log-error, working-command) are not pinned and always follow the
+    # buried-case rule.
+    user_detail_cases = {"user-constraint", "rejected-approach", "pinned-request"}
     problems = []
     for r in results:
         base = r["case"].split("/")[0]
+        mode = r["mode"]
+        nopin = mode.endswith("-nopin")
+        bare_mode = mode[:-len("-nopin")] if nopin else mode
         if "error" in r:
-            problems.append(f"{r['case']} {r['mode']}: {r['error']}")
+            problems.append(f"{r['case']} {mode}: {r['error']}")
         elif base == "recent-control":
             if not (r["passed"] and r["kept"]):
-                problems.append(f"{r['case']} {r['mode']}: control failed (passed={r['passed']} kept={r['kept']})")
+                problems.append(f"{r['case']} {mode}: control failed (passed={r['passed']} kept={r['kept']})")
+        elif base in user_detail_cases and not nopin:
+            # Pinned: the user's exact words survive, so the oracle passes in
+            # both modes without needing the history tools.
+            if not (r["passed"] and r["kept"]):
+                problems.append(f"{r['case']} {mode}: pinned detail should survive and pass "
+                                f"(passed={r['passed']} kept={r['kept']})")
         elif r["kept"]:
-            problems.append(f"{r['case']} {r['mode']}: the detail survived a lossy summary?")
-        elif r["mode"] == "standard" and (r["passed"] or r["history_calls"]):
-            problems.append(f"{r['case']} standard: passed={r['passed']} history_calls={r['history_calls']}")
-        elif r["mode"] == "smart" and not (r["passed"] and r["history_calls"]):
-            problems.append(f"{r['case']} smart: passed={r['passed']} history_calls={r['history_calls']}")
+            problems.append(f"{r['case']} {mode}: the detail survived a lossy summary?")
+        elif bare_mode == "standard" and (r["passed"] or r["history_calls"]):
+            problems.append(f"{r['case']} {mode}: passed={r['passed']} history_calls={r['history_calls']}")
+        elif bare_mode == "smart" and not (r["passed"] and r["history_calls"]):
+            problems.append(f"{r['case']} {mode}: passed={r['passed']} history_calls={r['history_calls']}")
     print("\nself-test:", "OK" if not problems else "FAILED\n  " + "\n  ".join(problems))
     return 1 if problems else 0
 

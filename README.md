@@ -587,6 +587,7 @@ session_titles = false                  # ask the model for a few-word title per
 auto_compact = true                     # summarize automatically when the context fills up
 auto_compact_threshold = 0.8            # fraction of the context window
 compaction_mode = "standard"            # standard | smart (experimental, see Smart compaction)
+# compaction_pin_requests = true        # re-attach the user's requests verbatim after each summary (issue #66)
 # context_window = 128000               # override the window (providers can set it too)
 verbosity = "normal"                    # quiet | normal | verbose | debug (or --verbosity)
 timestamps = true                       # prefix CLI messages with the local time (HH:MM:SS)
@@ -1106,6 +1107,20 @@ It won't run again until the context has grown by
 another 10% of the window, so a context that can't shrink isn't summarized on every call.
 If summarizing fails, the older messages are dropped with a note. The session log records
 the new conversation, so `--resume` continues from it.
+
+After the summary, compaction re-attaches the **user's requests verbatim** (a pinned block,
+`compaction_pin_requests`, on by default). A summary of a summary would otherwise paraphrase
+the user's original words away over repeated compactions; the pinned block is rebuilt from the
+original messages each time, so an exact flag, number or phrase the user stated once survives
+intact. The block is bounded by an allowance derived from the context window (about an eighth
+of it): when a long session's requests outgrow it, the oldest follow-ups are dropped with an
+explicit omission note — the goal and the newest requests are kept — so the pin can never push
+the context past the window. The note names the dropped requests by one covering session-log span
+(`#2-#40`), so however many requests are dropped the note stays a fixed, small size. Hook output appended to a prompt is not pinned as the user's
+words — the user-typed text is recorded separately, so a prompt that itself mentions a
+`<system-reminder>` tag (even at its very start) keeps its whole task in the pin. In smart mode each pinned request is
+labelled with its `#N` log ID, so the full text is
+one `history_read` away.
 
 ### Smart compaction (experimental)
 
