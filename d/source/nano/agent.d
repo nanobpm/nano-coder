@@ -2210,6 +2210,7 @@ unittest
 
 // A reply whose stream drops mid-way is asked for again; the partial text
 // isn't kept in the conversation.
+// rust: agent.rs::mid_reply_drops_are_retried_and_leave_no_partial_text_in_history, agent.rs::too_many_mid_reply_drops_end_the_turn
 unittest
 {
     import nano.providers.mock;
@@ -2230,6 +2231,8 @@ unittest
 
 // Timers: a timer set by the model fires mid-turn as a system note before
 // the next model call, and an idle one is handed to the caller as a prompt.
+// rust: agent.rs::a_timer_set_in_a_turn_fires_mid_turn_when_the_clock_passes_it, agent.rs::a_pending_timer_nudges_every_few_steps_until_marked_done
+// rust: agent.rs::idle_take_fired_timers_returns_due_timers_once, agent.rs::timer_tools_are_hidden_when_timers_are_disabled
 unittest
 {
     import nano.providers.mock;

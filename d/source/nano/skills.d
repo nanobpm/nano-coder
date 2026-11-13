@@ -743,7 +743,8 @@ version (unittest)
     }
 }
 
-unittest // cap_keeps_truncated_body_within_max
+// rust: skills.rs::cap_keeps_truncated_body_within_max
+unittest
 {
     import std.array : replicate;
     auto out_ = cap("x".replicate(1024), 256);
@@ -791,7 +792,8 @@ unittest // discovers_repository_and_user_skills_with_precedence
     catch (ToolError e) assert(e.msg.canFind("available: review, deploy, notes"));
 }
 
-unittest // no_skills_means_no_index
+// rust: skills.rs::no_skills_means_no_index
+unittest
 {
     auto dir = tmpRoot("none");
     auto c = cfg();

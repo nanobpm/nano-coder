@@ -38,7 +38,7 @@ which macOS and most Linux distributions already have.
 | `nano/tools/search.d` | `search.rs` | `grep` and `glob` with the same schemas. They honour nested .gitignore files and skip `.git`, symlinks and binary files. Results are sorted and capped. |
 | `nano/shell.d` | `shell.rs` | The shell word/redirect/heredoc parser the guards inspect. |
 | `nano/paths.d` | `std::path` usage in `permissions.rs` | Lexical path semantics (components, normalize, parent, starts_with) plus symlink resolution. |
-| `nano/cmdexpand.d` | `permissions.rs` 548–2549 | Expands commands for inspection: wrappers, nested `bash -c`, loops, option scans, containers, heredocs, assignments and loop-bound variables. Literal-list `for` loops are unrolled (`unrollLiteralLoop`, `substituteWord`, `braceExpand`, #164); an unverifiable loop command is recorded in `Expansion.unverified` rather than blocked. `Blocked` is Rust's `Err(String)`. |
+| `nano/cmdexpand.d` | `permissions.rs` 548–2549 | Expands commands for inspection: wrappers, nested `bash -c`, loops, option scans, containers, heredocs, assignments and loop-bound variables. Literal-list `for` loops are unrolled (`unrollLiteralLoop`, `substituteWord`, `braceExpand`, #164); an unverifiable loop command is recorded in `Expansion.unverified`; it is allowed under an active OS sandbox and blocked without one, never prompted (#171). `Blocked` is Rust's `Err(String)`. |
 | `nano/guard.d` | `permissions.rs` 2549–3320 | The built-in guards: root/home/workspace deletes, devices, protected branches, databases, `cd` tracking. |
 | `nano/permissions.d` | `permissions.rs` 1–547 | Rules (`Bash`/`Read`/`Edit`/tool names, `:*` prefixes, `**` paths), deny, then allow, then guards, `decide` (`PermissionDecision` = `PermAllow`/`PermAsk`/`PermDeny`, Rust's `Decision`; the agent asks via the question broker when interactive, #164), `readDenied`, `ruleMatches`, `validateRule`. Also plan mode, which Rust handles in the agent. Bad rules are rejected at startup. |
 | `nano/permissions_test.d` | `permissions.rs` tests | 46 of the 47 Rust tests, translated one to one. `sandbox_confines_file_tools` is left out (no sandbox). |
@@ -106,7 +106,7 @@ directory works; it's kept separate by default so the port can't damage real ses
   the agent's future self), `timer_list` and `timer_cancel` let the agent come back to
   something later in the session, such as a CI run, a deploy or a review (`nano/timers.d`).
   The harness owns the clock. A due timer joins a running turn as a system note before the
-  next model call. At an idle prompt it starts a new turn, but only while nothing is typed.
+  next model call. At an idle prompt it starts a new turn while nothing is typed; a draft left untouched for 60 s is set aside for the timer turn and restored afterwards (#178).
   With `-p` it fires only with `--wait-timers`, which sleeps until each timer is due and
   runs it; without the flag, timers left unfired are named in a note when the run ends.
   Limits: delays of 1 minute to 24 hours, and at most 10 timers at once. Timers don't
@@ -117,6 +117,24 @@ directory works; it's kept separate by default so the port can't damage real ses
   them, and one that came due while nano-coder was closed fires as overdue. `/timers` lists
   them and the status line shows `⏰ HH:MM`. Timers are off under `--acp`, which has no idle
   loop to fire them. Rust: nanobpm/nano-coder#150.
+
+- **Ported from Rust 0.52–0.65.** Path-leading and multi-line prompts go to the
+  model (#175); the mock provider is hidden (#176); the stream idle timeout defaults
+  to 120 s (#180); ACP reports the turn's token usage (#177); compaction clips keep
+  error lines (#161); `report_outcome(completed)` after an unchecked edit is bounced
+  once (#158); search walks are resource-bounded (#160); the loop detector tokenises
+  shell stages (#159); markdown renders `:emoji:` shortcodes (#181).
+- **Ctrl-O (#156).** Expands or collapses the latest tool call/result or thought in
+  the frame UI. D's transcript is printed bytes, so folds are in-band OSC 8770 marks
+  the frame swaps in place; only the latest block toggles, and a thought still
+  streaming can't be expanded.
+- **Updates (#154, #172).** Interactive npm installs (`@nanobpm/nano-coder-d`, found
+  through the global bin symlink too) check the registry at startup and hourly in the
+  background, keep `update-check.json` in the D data dir, and hint once per version
+  at an idle prompt. `check_updates = false`, `NANO_CODER_NO_UPDATE_CHECK`,
+  `NO_UPDATE_NOTIFIER` or `CI` turn it off. `/update` re-checks and runs `npm install
+  -g` attached to the terminal; other installs get the releases page. `/relaunch`
+  execs the binary with `--resume <session>`. There is no cargo channel.
 
 ## Parity tracking
 

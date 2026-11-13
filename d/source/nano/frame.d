@@ -880,7 +880,7 @@ unittest
 
 // rust: frame.rs::ctrl_o_toggles_the_latest_tool_call_and_result_in_place
 // rust: frame.rs::ctrl_o_matches_the_call_by_id_not_adjacency
-// rust: frame.rs::tool_result_inherits_expansion_from_its_call
+// rust: ui.rs::tool_result_inherits_expansion_from_its_call
 unittest
 {
     void put(ref Transcript t, string s) { t.feed(cast(const(ubyte)[]) s); }

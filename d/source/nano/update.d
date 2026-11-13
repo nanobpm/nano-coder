@@ -427,7 +427,7 @@ unittest
 }
 
 // rust: update.rs::probe_hints_only_for_newer_unhinted_versions
-// rust: update.rs::state_round_trips_through_json
+// rust: update.rs::state_round_trips_through_json, update.rs::save_state_leaves_no_temp_file_and_round_trips
 unittest
 {
     State s;
@@ -442,11 +442,15 @@ unittest
     auto p = buildPath(tempDir, "nano-d-update-state", "update-check.json");
     saveState(p, s);
     assert(loadState(p) == s);
+    import std.file : dirEntries, SpanMode;
+    import std.algorithm : count;
+    assert(dirEntries(buildPath(tempDir, "nano-d-update-state"), SpanMode.shallow).count == 1, "no temp file left");
     assert(loadState(p ~ ".missing") == State.init);
 }
 
 // rust: update.rs::a_restart_inside_the_interval_defers_the_startup_check
 // rust: update.rs::a_failed_check_is_silent_and_cheap
+// rust: update.rs::a_restart_re_arms_a_pending_hint_from_the_persisted_state, update.rs::an_unmanaged_install_never_inherits_a_cached_hint
 unittest
 {
     auto p = buildPath(tempDir, "nano-d-update-defer.json");
@@ -459,6 +463,7 @@ unittest
     assert(c.dueIn(1060) == checkIntervalSecs - 60);
     // A version known from before and not yet hinted is hinted once.
     assert(c.hintPending());
+    assert(!new Checker(Channel.other, p, "0.1.0", "x", 1060).hintPending(), "an unmanaged install never hints");
     auto h = c.takeHint();
     assert(h == "nano-coder-d 0.3.0 is available (you have 0.1.0) — /update to install it", h);
     assert(c.takeHint() is null && loadState(p).hinted == "0.3.0");

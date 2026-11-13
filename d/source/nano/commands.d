@@ -445,6 +445,7 @@ unittest // menu rows
     assert(few.length == 3 && few[2].canFind("more"));
     foreach (r; menu("/", 20, 20)) assert(r.count <= 19 + 30, r);
     assert(helpText().canFind("/memory [forget ID]"));
+    assert(helpText().canFind("/version")); // rust: commands.rs::help_lists_version
 }
 
 string replicateStr(string s, size_t n) pure nothrow { string r; foreach (_; 0 .. n) r ~= s; return r; }

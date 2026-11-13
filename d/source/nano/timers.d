@@ -355,6 +355,7 @@ ToolDefinition[] definitions()
     ];
 }
 
+// rust: timers.rs::parses_delays, timers.rs::rejects_unparsable_delays
 unittest
 {
     assert(parseDelay("90s") == 90 && parseDelay("30m") == 1800 && parseDelay("1h30m") == 5400);
@@ -365,6 +366,9 @@ unittest
     assert(describe(45) == "45s" && describe(300) == "5m" && describe(5400) == "1h30m" && describe(7200) == "2h");
 }
 
+// rust: timers.rs::set_list_and_cancel, timers.rs::takes_due_timers_once_soonest_first, timers.rs::fired_message_marks_an_overdue_timer
+// rust: timers.rs::fired_timers_stay_pending_until_done, timers.rs::timer_done_and_cancel_handle_pending_and_errors
+// rust: timers.rs::a_json_round_trip_keeps_ids_counting, timers.rs::pending_survives_a_json_round_trip
 unittest
 {
     import std.exception : collectExceptionMsg;
@@ -406,6 +410,7 @@ unittest
     assert(back.items[0].id == t.lastId + 1);
 }
 
+// rust: timers.rs::parses_at_times
 unittest
 {
     import std.datetime.systime : SysTime;
@@ -418,4 +423,25 @@ unittest
     assert(parseAt("2026-10-25T11:15", at1000) - at1000 == 4500);
     import std.exception : assertThrown;
     assertThrown!TimerError(parseAt("noon", at1000));
+}
+
+// rust: timers.rs::rejects_bad_calls_without_changing_the_timers, timers.rs::rejects_oversized_delays_without_overflowing
+// rust: timers.rs::clips_a_long_note
+unittest
+{
+    import std.exception : collectExceptionMsg;
+    import std.array : replicate;
+    Timers t;
+    enum now = 1_000_000L;
+    t.apply("timer_set", parseJSON(`{"after": "30m", "note": "check CI"}`), now);
+    auto before = t;
+    foreach (bad; [`{"after": "20s", "note": "x"}`, `{"after": "0h0m0s", "note": "x"}`, `{"after": "25h", "note": "x"}`,
+        `{"after": "1000000000000h", "note": "x"}`, `{"after": "13h13h", "note": "x"}`, `{"after": "30m"}`, `{"note": "x"}`])
+        assert(collectExceptionMsg(t.apply("timer_set", parseJSON(bad), now)) !is null, bad);
+    assert(t == before);
+    assert(parseDelay("24h") == 86_400 && parseDelay("23h59m59s") == 86_399);
+    t.apply("timer_set", parseJSON(`{"after": "1h", "note": "` ~ "x".replicate(1200) ~ `"}`), now);
+    import std.uni : byGrapheme;
+    import std.range : walkLength;
+    assert(t.items[1].note.byGrapheme.walkLength <= maxNoteChars + 1);
 }

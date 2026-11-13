@@ -1046,7 +1046,6 @@ unittest // editing keys
     assert(e.readLine("> ", "> ").text == "/compact focus x");
 }
 
-// rust: lineedit.rs::ctrl_o_toggles_expand
 unittest // Shift-Tab runs the action with the input erased, keeping the text; Ctrl-O toggles
 {
     auto screen = new Screen;

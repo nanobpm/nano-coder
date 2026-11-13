@@ -34,7 +34,8 @@ string trustRoot(string cwd)
 bool isTrusted(string root, string file)
 {
     if (!exists(file)) return false;
-    try return readText(file).splitLines.canFind!(l => l.strip == root);
+    // An exact line only: a padded entry never authorizes the trimmed root.
+    try return readText(file).splitLines.canFind!(l => l == root);
     catch (Exception) return false;
 }
 
@@ -84,6 +85,9 @@ bool decideTrust(string root, const string[] resources, TrustMode mode, string f
     return true;
 }
 
+// rust: trust.rs::detects_workspace_skills, trust.rs::empty_skill_dir_is_not_gated, trust.rs::empty_answer_is_no, trust.rs::eof_answer_is_no
+// rust: trust.rs::yolo_trusts_without_asking, trust.rs::yes_variants_trust_and_remember_once, trust.rs::remembered_root_is_trusted_even_non_interactively
+// rust: trust.rs::trailing_whitespace_entry_does_not_authorize_trimmed_root, trust.rs::trust_file_honours_env_override
 unittest
 {
     import std.file : tempDir, write, rmdirRecurse, remove;
@@ -114,4 +118,10 @@ unittest
     assert(decideTrust(root, res, TrustMode.deny, file, null), "remembered trust holds without a terminal");
     remember(root, file);
     assert(readText(file) == root ~ "\n", "remembered once");
+    write(file, root ~ " \n");
+    assert(!isTrusted(root, file), "a padded entry does not trust the root");
+    auto old = environment.get("NANO_CODER_TRUST_FILE");
+    environment["NANO_CODER_TRUST_FILE"] = file;
+    scope (exit) { if (old is null) environment.remove("NANO_CODER_TRUST_FILE"); else environment["NANO_CODER_TRUST_FILE"] = old; }
+    assert(trustFile() == file);
 }

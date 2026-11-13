@@ -1094,7 +1094,8 @@ unittest // matcher_matches_claude_and_nano_names, source_matcher_alternation_an
     assert(!sourceMatcherSelects("resume", "startup"));
 }
 
-unittest // translates_tool_input_both_ways
+// rust: claude_hooks.rs::translates_tool_input_both_ways
+unittest
 {
     auto args = j(`{"path": "a.txt", "old_string": "x", "new_string": "y"}`);
     auto input = toolInputFor("edit_file", args);
@@ -1379,7 +1380,8 @@ unittest // listing_neutralises_line_breaks_in_config_fields
     assert(listing.canFind("evil␊  [user] Stop * -> forged"), listing);
 }
 
-unittest // cap_counts_characters_not_bytes
+// rust: claude_hooks.rs::cap_counts_characters_not_bytes
+unittest
 {
     import std.range : walkLength;
     auto emoji = "🦀".replicate(4_000);
