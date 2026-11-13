@@ -425,6 +425,24 @@ pub fn output_cap_from_error(error: &str) -> Option<usize> {
     patterns.iter().find_map(|p| Regex::new(p).ok()?.captures(error)?.get(1)?.as_str().parse().ok())
 }
 
+/// [`clip`] bounded by UTF-8 *bytes* rather than characters, so a budget
+/// measured with the byte-based [`text_tokens`] estimate holds for non-ASCII
+/// text too (issue #66). The cut always lands on a character boundary because
+/// it is made by [`clip`] on characters; the character budget shrinks until
+/// the rendered result fits `max_bytes`.
+fn clip_bytes(text: &str, max_bytes: usize) -> String {
+    let mut chars = max_bytes;
+    loop {
+        let out = clip(text, chars);
+        if out.len() <= max_bytes || chars == 0 {
+            return out;
+        }
+        // Strictly decreasing: scale by the overshoot, at least one char less.
+        let scaled = chars.saturating_mul(max_bytes) / out.len();
+        chars = scaled.min(chars - 1);
+    }
+}
+
 fn clip(text: &str, max_chars: usize) -> String {
     let total = text.chars().count();
     if total <= max_chars {
@@ -861,11 +879,12 @@ pub fn pinned_user_requests(prior: &[Message], new: &[Message], smart: bool, win
     if requests.is_empty() {
         return None;
     }
-    // The overall allowance, in characters (the block is plain text; the
-    // token estimate is ~4 chars/token). The header and each line's joining
-    // newline are charged against it.
+    // The overall allowance, in UTF-8 bytes: the same accounting as
+    // [`text_tokens`] (~4 bytes/token), so multibyte text cannot overrun the
+    // intended token share. The header and each line's joining newline are
+    // charged against it.
     let allowance = (window_tokens / PINNED_WINDOW_SHARE).max(PINNED_MIN_ALLOWANCE_TOKENS).saturating_mul(4).max(1);
-    let remaining = allowance.saturating_sub(PINNED_REQUESTS_PREFIX.chars().count() + 1);
+    let remaining = allowance.saturating_sub(PINNED_REQUESTS_PREFIX.len() + 1);
 
     // One rendered line per request, clipped to its per-request budget. The
     // first request keeps its structure up to the larger budget; later ones
@@ -873,19 +892,21 @@ pub fn pinned_user_requests(prior: &[Message], new: &[Message], smart: bool, win
     let render = |index: usize, request: &Message, first_budget: usize| -> String {
         let budget = if index == 0 { first_budget } else { PINNED_LATER_CHARS };
         let text = request_text(request);
-        let clipped = if index == 0 {
-            clip(text, budget)
-        } else {
-            clip(&text.split_whitespace().collect::<Vec<_>>().join(" "), budget)
-        };
         let label = match (smart, request.log_line) {
             (true, Some(line)) => format!("#{line}: "),
             _ => String::new(),
         };
+        // Budgets are bytes (token-consistent); the label is charged too.
+        let budget = budget.saturating_sub(label.len());
+        let clipped = if index == 0 {
+            clip_bytes(text, budget)
+        } else {
+            clip_bytes(&text.split_whitespace().collect::<Vec<_>>().join(" "), budget)
+        };
         format!("{label}{clipped}")
     };
     let mut lines: Vec<String> = (0..requests.len()).map(|i| render(i, requests[i], PINNED_FIRST_CHARS)).collect();
-    let cost = |line: &str| line.chars().count() + 1;
+    let cost = |line: &str| line.len() + 1;
 
     // The explicit omission policy: drop the *oldest later* requests first
     // (the newest requests steer the next steps; the first request states the
@@ -1928,5 +1949,30 @@ mod boundary_excerpt_tests {
         assert!(out.chars().count() <= 2000);
         assert!(out.starts_with("$ cargo test"));
         assert!(out.ends_with("exit status: 101\n"));
+    }
+
+    #[test]
+    fn pinned_requests_budget_counts_utf8_bytes_for_multibyte_text() {
+        // 1,500 CJK characters (3 bytes each) fit a character budget but not
+        // the byte/token-consistent one: the block must stay within the
+        // allowance measured as `text_tokens` does (issue #66).
+        let first = Message::user(&"漢".repeat(1_500));
+        let later = Message::user(&"字".repeat(400));
+        for window in [4_800usize, 16_000, 128_000] {
+            for smart in [false, true] {
+                let block = pinned_user_requests(&[], &[first.clone(), later.clone()], smart, window).unwrap();
+                let allowance = (window / PINNED_WINDOW_SHARE).max(PINNED_MIN_ALLOWANCE_TOKENS);
+                assert!(text_tokens(&block) <= allowance, "window {window}: {} > {allowance}", text_tokens(&block));
+                assert!(block.contains('漢'));
+            }
+        }
+    }
+
+    #[test]
+    fn clip_bytes_cuts_on_char_boundaries_within_budget() {
+        for max in [0usize, 1, 2, 3, 10, 100, 1_000] {
+            let out = clip_bytes(&"é漢x".repeat(200), max);
+            assert!(out.len() <= max, "{max}: {}", out.len());
+        }
     }
 }

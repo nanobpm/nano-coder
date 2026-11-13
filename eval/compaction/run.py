@@ -634,7 +634,7 @@ def run_one(args, index, case, model, mode, repeat, work_root):
                                if m["role"] == "user" and m["content"].startswith("[")), len(remaining))
             tail = "\n".join(str(m.get("content") or "") + json.dumps(m.get("tool_calls") or [])
                              for m in remaining[summary_at + 1:])
-            leaked = [e for e in case["expect"] if e in tail]
+            leaked = [e for e in case["expect"] if re.search(e, tail, re.IGNORECASE)]
             if leaked and "error" not in result:
                 result["error"] = (f"the retained tail echoes the target values {leaked}: "
                                    "the run cannot prove the pin was regenerated")

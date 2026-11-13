@@ -485,6 +485,28 @@ fn backfill_log_lines(messages: &mut [Message], originals: &[Message], summarize
     }
 }
 
+/// Recover `pin_text` for a user message written before it was recorded
+/// (issue #66): a legacy log stores a prompt with hook context appended
+/// (`<input>\n\n<system-reminder>…`) and no `pin_text`, so the pin would treat
+/// the hook output as the user's words. When the content is a logged input's
+/// exact text followed by a harness reminder block, that input text is the
+/// pristine user part. Messages that already carry `pin_text`, or whose
+/// content is exactly an input, are left alone.
+fn backfill_pin_text(message: &mut Message, inputs: &[String]) {
+    if message.role != crate::llm::Role::User || message.pin_text.is_some() || message.hook_context {
+        return;
+    }
+    let found = inputs.iter().rev().find(|input| {
+        message
+            .content
+            .strip_prefix(input.as_str())
+            .is_some_and(|rest| !rest.is_empty() && rest.trim_start().starts_with(crate::reminders::WRAP_START))
+    });
+    if let Some(input) = found {
+        message.pin_text = Some(input.clone());
+    }
+}
+
 fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
     let mut restored = Restored::default();
     // Every direct message record seen so far, with its assigned `log_line`, so
@@ -495,6 +517,8 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
     // writer's in-memory stash survives such rebuilds too).
     let mut last_stash: Vec<Message> = Vec::new();
     let mut stash_active = false;
+    // Every logged input's text, to backfill `pin_text` on legacy messages.
+    let mut inputs: Vec<String> = Vec::new();
     // Record ordinals count only decodable records (the session header is
     // record 1), but a message's `log_line` is its PHYSICAL line number:
     // `history_read`/`history_search` enumerate physical lines and skip empty
@@ -519,6 +543,7 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
             }
             _ if index == 0 => bail!("session log does not start with a session header"),
             Record::Input { id, text, .. } => {
+                inputs.push(text.clone());
                 restored.pending_input = Some(PendingInput {
                     id,
                     text,
@@ -535,6 +560,7 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
                 // tools would cite. Embedded IDs are meaningful only on
                 // messages nested inside `replace` records.
                 message.log_line = Some(line_no as u64 + 1);
+                backfill_pin_text(&mut message, &inputs);
                 if crate::history::consumes_hint(&message) {
                     restored.history_hint_consumed = true;
                 }
@@ -574,6 +600,9 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
                 ..
             } => {
                 backfill_log_lines(&mut messages, &originals, summarized);
+                for message in messages.iter_mut() {
+                    backfill_pin_text(message, &inputs);
+                }
                 restored.conversation = messages;
                 restored.pending_input = match (restored.pending_input.take(), pending_position) {
                     // Restore the persisted continuation state too: the chunks it
@@ -608,12 +637,18 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
                 stash_active = match (folded, folded_base) {
                     // A delta record: the previous stash's first `base` turns
                     // plus the new turns.
-                    (Some(delta), Some(base)) if base.min(last_stash.len()) + delta.len() > 0 => {
+                    (Some(mut delta), Some(base)) if base.min(last_stash.len()) + delta.len() > 0 => {
+                        for message in delta.iter_mut() {
+                            backfill_pin_text(message, &inputs);
+                        }
                         last_stash.truncate(base);
                         last_stash.extend(delta);
                         true
                     }
-                    (Some(full), None) if !full.is_empty() => {
+                    (Some(mut full), None) if !full.is_empty() => {
+                        for message in full.iter_mut() {
+                            backfill_pin_text(message, &inputs);
+                        }
                         last_stash = full;
                         true
                     }
@@ -830,6 +865,35 @@ mod tests {
         drop(log);
         let (_, restored) = SessionLog::open(dir.path(), "s2").unwrap();
         assert_eq!(restored.conversation, vec![Message::system("new")]);
+    }
+
+    #[test]
+    fn legacy_logs_recover_pin_text_from_the_input_record() {
+        // A pre-#66 log has a prompt with hook output appended and no
+        // `pin_text`; decoding must recover the user-typed part from the
+        // `Input` record — for direct, retained and folded messages alike.
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "s66").unwrap();
+        let wire = "Fix the race.\n\n<system-reminder>\nuse nightly\n</system-reminder>";
+        log.append(&Record::Input { id: "in-1".into(), text: "Fix the race.".into(), recorded_at: now() }).unwrap();
+        log.append(&Record::Message(Box::new(Message::user(wire)))).unwrap();
+        // A user who typed the tag themselves (content == input) is untouched.
+        let typed = "Rename <system-reminder> to <note>";
+        log.append(&Record::Input { id: "in-2".into(), text: typed.into(), recorded_at: now() }).unwrap();
+        log.append(&Record::Message(Box::new(Message::user(typed)))).unwrap();
+        drop(log);
+        let (_, restored) = SessionLog::open(dir.path(), "s66").unwrap();
+        let direct = restored.conversation.iter().find(|m| m.content == wire).unwrap();
+        assert_eq!(direct.pin_text.as_deref(), Some("Fix the race."));
+        let typed_msg = restored.conversation.iter().find(|m| m.content == typed).unwrap();
+        assert_eq!(typed_msg.pin_text, None);
+
+        let mut message = Message::user(wire);
+        backfill_pin_text(&mut message, &["Fix the race.".to_string()]);
+        assert_eq!(message.pin_text.as_deref(), Some("Fix the race."));
+        let mut tool = Message::assistant(wire);
+        backfill_pin_text(&mut tool, &["Fix the race.".to_string()]);
+        assert_eq!(tool.pin_text, None);
     }
 
     #[test]
