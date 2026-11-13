@@ -44,6 +44,8 @@ immutable Command[] commands = [
     Command("/trajectory", "[--json|--markdown]", "Show this session's turn-by-turn trajectory in your pager (or export it)"),
     Command("/resume", "[ID|last]", "Switch to a saved session: pick one, or give its ID"),
     Command("/restart", "", "Start a fresh session (clean context) without exiting"),
+    Command("/update", "", "Install the latest release through the channel nano-coder-d was installed from"),
+    Command("/relaunch", "", "Restart the binary, resuming this session (picks up a just-installed update)"),
     Command("/exit", "", "Exit the agent"),
     Command("/quit", "", "Exit the agent (alias for /exit)"),
 ];

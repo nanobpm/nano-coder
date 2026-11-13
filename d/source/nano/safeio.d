@@ -57,6 +57,23 @@ ubyte[] readCapped(string path, ulong cap) @safe
     return got ? buf[0 .. got] : [];
 }
 
+/// Replaces this process with `path` run with `args` (argv[0] included).
+/// Returns only on failure, with the reason. `@trusted`: the strings are
+/// copied into NUL-terminated buffers that outlive the call, and the array
+/// ends in null as execv requires.
+string execProgram(string path, const string[] args) @trusted
+{
+    import core.stdc.errno : errno;
+    import core.stdc.string : strerror;
+    import core.sys.posix.unistd : execv;
+    import std.string : toStringz, fromStringz;
+    const(char)*[] argv;
+    foreach (a; args) argv ~= a.toStringz;
+    argv ~= null;
+    execv(path.toStringz, argv.ptr);
+    return strerror(errno).fromStringz.idup;
+}
+
 /// `std.file.read` as immutable bytes: the buffer is freshly allocated and
 /// only this result refers to it.
 immutable(ubyte)[] readImmutableBytes(string path) @trusted

@@ -494,6 +494,37 @@ private void readTurnKeys(LineEditor editor, ConsoleLink console, shared(bool)* 
     }
 }
 
+/// `/update`: a fresh check, then the channel's installer attached to the
+/// terminal (frame and key mode handed back while it runs).
+void updateCommand(bool frameUi)
+{
+    import nano.update;
+    if (!updateAllowed(isTerminal(0), frameUi || isTerminal(1), isCi()))
+    {
+        writeln("/update only runs in an interactive terminal outside CI; install the update with your package manager");
+        return;
+    }
+    auto channel = channelFor(launchExe());
+    if (channel == Channel.npm)
+    {
+        auto latest = new Checker(channel, defaultStatePath(), packageVersion).check(true);
+        if (latest.length && !isNewer(latest, packageVersion))
+        {
+            writefln("nano-coder-d is up to date (%s)", latest);
+            return;
+        }
+    }
+    string[] lines;
+    {
+        stdOut.flush();
+        if (gFrame) gFrame.suspend();
+        leaveKeyMode();
+        scope (exit) { enterKeyMode(0); if (gFrame) gFrame.resume(); }
+        lines = runInstaller(channel, launchExe(), packageVersion, (string p, string[] a) @safe => spawnInstaller(p, a));
+    }
+    foreach (l; lines) writeln(l);
+}
+
 /// The interactive line editor. Built here, not in `runMain`, so its
 /// callbacks can reach only what is passed in (sendable handles) and
 /// globals: the editor moves to the turn's key reader thread.
@@ -1840,6 +1871,7 @@ int runMain(string[] args)
     }
 
     bool interactive = isTerminal(0);
+    Chan!string updateHints; // update hints for an idle prompt
     if (interactive && isTerminal(1) && environment.get("TERM", "") != "dumb"
         && environment.get("NANO_CODER_PLAIN_INPUT") is null && enterKeyMode(0))
     {
@@ -1854,6 +1886,11 @@ int runMain(string[] args)
         editor = makeEditor(console.link, atomicLoad(agent.control));
         questions.interactive = true;
         refreshStatus();
+        // The background update check (Rust #154): interactive terminal
+        // sessions installed through npm only.
+        import nano.update : channelFor, launchExe, disabledByEnv, isCi, startChecker, Channel;
+        if (!o.acp && cfg.checkUpdates && !disabledByEnv && !isCi && channelFor(launchExe) == Channel.npm)
+            updateHints = startChecker(Channel.npm, packageVersion);
     }
     scope (exit) leaveKeyMode();
     scope (exit) if (gFrame) { gFrame.uninstall(); gFrame = FrameUi.init; }
@@ -1953,8 +1990,13 @@ int runMain(string[] args)
             }
             // A due timer ends the read too, unless a fresh draft holds it
             // (one idle for a minute is abandoned: Rust #178).
+            // An update hint ends it too, to be shown above the prompt.
+            string updateHint;
+            if (updateHints && updateHints.tryTake(updateHint)) writeln(console.dim(updateHint));
+            updateHint = null;
             lapse = () @safe => (exitArmedAt != MonoTime.zero && MonoTime.currTime - exitArmedAt > exitWindow)
-                || (!editor.holdsTimer(MonoTime.currTime) && agent.timers.anyDue(agent.timerNow()));
+                || (!editor.holdsTimer(MonoTime.currTime) && agent.timers.anyDue(agent.timerNow()))
+                || (updateHints && updateHints.tryTake(updateHint));
             auto r = editor.readLine(.stamp(false) ~ "› ", console.stamp() ~ glyphMark ~ " ", false, lapse);
             editor.restyle = null;
             syncMode(); // Shift-Tab at the prompt switched the mode
@@ -1967,6 +2009,12 @@ int runMain(string[] args)
                 line = agent.takeFiredTimers(notice);
                 writeln(console.dim(notice));
                 line = "\x00" ~ line;
+            }
+            else if (r.outcome == Outcome.stopped && updateHint.length)
+            {
+                writeln(console.dim(updateHint));
+                quietPrompt = true;
+                continue;
             }
             else if (r.outcome == Outcome.stopped)
             {
@@ -2044,6 +2092,36 @@ int runMain(string[] args)
                     refreshStatus();
                     if (log !is null) writefln("Session: %s (resume with --resume %s)", log.id, log.id);
                     else writefln("Session: %s", newSessionId());
+                    continue;
+                }
+                case "/update":
+                    updateCommand(editor !is null);
+                    continue;
+                case "/relaunch":
+                {
+                    // At the idle prompt the queue is empty (queued messages
+                    // run before it shows) and the draft was this command, so
+                    // there is nothing to confirm discarding.
+                    import nano.update : launchExe, relaunchArgv;
+                    import nano.safeio : execProgram;
+                    if (agent.log is null)
+                    {
+                        writeln("This session isn't saved (--no-session), so a relaunch cannot resume it. "
+                            ~ "Use /restart for a fresh session.");
+                        continue;
+                    }
+                    auto exe = launchExe();
+                    auto id = agent.log.id;
+                    // Printed after the frame hands the terminal back, so it stays on screen.
+                    if (gFrame) gFrame.suspend();
+                    writefln("\nRelaunching into session %s (resume later with --resume %s)", id, id);
+                    stdOut.flush();
+                    leaveKeyMode();
+                    nano.herdr.release();
+                    auto err = execProgram(exe, [exe] ~ relaunchArgv(args[1 .. $], id));
+                    enterKeyMode(0);
+                    if (gFrame) gFrame.resume();
+                    writefln("Relaunch failed: could not exec %s: %s", exe, err);
                     continue;
                 }
                 case "/providers":
