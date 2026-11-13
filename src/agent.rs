@@ -6,15 +6,17 @@ use std::time::{Duration, Instant};
 mod compaction;
 mod hook;
 mod probe;
+mod session_state;
 
 #[cfg(test)]
 use crate::llm::DetectedWindow;
 use anyhow::Result;
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Local};
 use compaction::CompactionState;
 use hook::{ClaudePromptHook, HookState};
 use probe::{Detected, ProbeState};
 use serde_json::{Value, json};
+use session_state::SessionState;
 
 use crate::claude_hooks;
 use crate::config::{CompactionMode, Config};
@@ -692,21 +694,10 @@ pub struct Agent {
     hooks: HookRegistry,
     config: Config,
     conversation: Vec<Message>,
-    session: Option<SessionLog>,
-    /// Active session ID (also set when persistence is disabled).
-    session_id: Option<String>,
-    /// Responses for inputs already processed, by input ID (deduplication).
-    completed_inputs: HashMap<String, String>,
-    /// Outcomes reported by completed inputs, by input ID.
-    completed_outcomes: HashMap<String, Outcome>,
-    /// Non-`EndTurn` stop reasons of completed inputs, by input ID, so a
-    /// redelivered input replays how its turn actually ended — e.g. a truncated
-    /// `MaxTokens` turn — instead of a clean `EndTurn` (issue #114). Clean turns
-    /// are absent.
-    completed_stop_reasons: HashMap<String, StopReason>,
-    /// An input that was accepted but whose turn never finished (crash, kill, or error).
-    pending_input: Option<PendingInput>,
-    input_counter: u64,
+    /// Session persistence and redelivery state: the durable log and active
+    /// session ID, the `completed_*` redelivery maps, the pending input, the
+    /// ID counters and the turn's log offset (see `session_state.rs`).
+    session: SessionState,
     event_sink: Option<EventSink>,
     /// Test-only hook fired between a request's thinking snapshot and its
     /// status-line update, to interleave a mid-update `/thinking` change.
@@ -718,7 +709,6 @@ pub struct Agent {
     /// next iteration absorbs it (issue #114).
     #[cfg(test)]
     after_continuation_scheduled: Option<Box<dyn Fn() + Send + Sync>>,
-    message_counter: u64,
     control: TurnControl,
     stats: SharedStats,
     /// Capabilities reported by the endpoint (window, thinking levels, vision,
@@ -802,11 +792,6 @@ pub struct Agent {
     /// (max-fires = 1), so a second `report_outcome(completed)` always goes
     /// through and the model is never trapped.
     verify_reminder_fired: bool,
-    /// Session-log size when the current turn began; the session-index update
-    /// in `finish_turn` folds the input records committed since into the
-    /// cached summary (from the log's tail) instead of rescanning the whole
-    /// log.
-    turn_log_offset: Option<u64>,
     /// Cross-session memory store, present when `config.memory` is not `off`
     /// (see `memory.rs`). Whether the model may write to it is `config.memory`.
     memory: Option<memory::Store>,
@@ -863,19 +848,12 @@ impl Agent {
             claude: HookState::default(),
             config,
             conversation,
-            session: None,
-            session_id: None,
-            completed_inputs: HashMap::new(),
-            completed_outcomes: HashMap::new(),
-            completed_stop_reasons: HashMap::new(),
-            pending_input: None,
-            input_counter: 0,
+            session: SessionState::default(),
             event_sink: None,
             #[cfg(test)]
             after_thinking_snapshot: None,
             #[cfg(test)]
             after_continuation_scheduled: None,
-            message_counter: 0,
             control: TurnControl::default(),
             stats: SharedStats::default(),
             probe: ProbeState::default(),
@@ -904,7 +882,6 @@ impl Agent {
             turn_history_calls: 0,
             edits_since_check: false,
             verify_reminder_fired: false,
-            turn_log_offset: None,
             titles_requested: HashSet::new(),
             memory,
             memory_index_cache: None,
@@ -1076,8 +1053,8 @@ impl Agent {
     /// receives the correct `session_id`, `transcript_path` and
     /// `permission_mode`.
     fn sync_claude_hook_session(&mut self) {
-        let id = self.session_id.clone().unwrap_or_default();
-        let transcript = self.session.as_ref().map(|log| log.path().to_path_buf());
+        let id = self.session.id().unwrap_or_default().to_string();
+        let transcript = self.session.transcript_path();
         let mode = self.control.mode();
         self.claude.sync_session(&id, transcript.as_deref(), &mode);
     }
@@ -1103,9 +1080,7 @@ impl Agent {
         if files.is_empty() {
             return;
         }
-        if let Some(log) = &mut self.session {
-            let _ = log.append(&Record::Hooks { files, recorded_at: session::now() });
-        }
+        self.session.append_best_effort(&Record::Hooks { files, recorded_at: session::now() });
     }
 
     pub fn config(&self) -> &Config {
@@ -1896,7 +1871,7 @@ impl Agent {
         // Snapshot the current conversation length before the `&mut` borrow:
         // it is the new replay boundary (see below).
         let boundary = self.conversation.len();
-        if let Some(pending) = self.pending_input.as_mut() {
+        if let Some(pending) = self.session.pending_mut() {
             pending.continuation = (!continued_answer.is_empty() || truncated_continuations > 0)
                 .then(|| (continued_answer.to_string(), truncated_continuations));
             // Advance the replay boundary in lockstep with the snapshot. The
@@ -2066,7 +2041,7 @@ impl Agent {
             stats.window_source = window_source;
             stats.messages = self.conversation.len();
             stats.auto_compact = self.config.auto_compact.then_some(self.config.auto_compact_threshold);
-            stats.smart_compact = self.config.compaction_mode == CompactionMode::Smart && self.session.is_some();
+            stats.smart_compact = self.config.compaction_mode == CompactionMode::Smart && self.session.is_persistent();
             stats.history_available = self.history_tools_enabled();
             stats.plan = (!self.plan.items.is_empty()).then(|| self.plan.progress());
             stats.timers = (!self.timers.is_empty()).then(|| self.timers.status_segment());
@@ -2227,7 +2202,7 @@ impl Agent {
             self.control.publish_plan(plan);
         }
         if let Some(sink) = &self.event_sink {
-            sink(self.session_id.as_deref(), &event);
+            sink(self.session.id(), &event);
         }
     }
 
@@ -2235,8 +2210,7 @@ impl Agent {
         if text.trim().is_empty() || self.event_sink.is_none() {
             return;
         }
-        self.message_counter += 1;
-        let message_id = format!("msg-{}-{}", Utc::now().timestamp_millis(), self.message_counter);
+        let message_id = self.session.next_message_id();
         self.emit(AgentEvent::AssistantMessage { message_id: &message_id, text });
     }
 
@@ -2316,11 +2290,11 @@ impl Agent {
     }
 
     pub fn session_id(&self) -> Option<&str> {
-        self.session_id.as_deref()
+        self.session.id()
     }
 
     pub fn session_path(&self) -> Option<&std::path::Path> {
-        self.session.as_ref().map(SessionLog::path)
+        self.session.path()
     }
 
     /// Directory for complete copies of truncated tool output, shared so the
@@ -2344,7 +2318,7 @@ impl Agent {
     /// valid after the process exits; an ephemeral session uses a
     /// process-local temp dir.
     fn attachments_dir(&self) -> std::path::PathBuf {
-        if let (Some(id), true) = (self.session_id.as_deref(), self.session.is_some()) {
+        if let (Some(id), true) = (self.session.id(), self.session.is_persistent()) {
             session::attachments_dir_for(&self.config.session_dir(), id)
         } else {
             std::env::temp_dir().join(format!("nano-coder-attachments-{}", std::process::id()))
@@ -2354,7 +2328,7 @@ impl Agent {
     /// Persisted sessions keep spilled output beside their log, so the paths
     /// in the log stay valid after the process exits.
     fn set_spill_dir(&self, id: &str) {
-        let dir = if self.session.is_some() {
+        let dir = if self.session.is_persistent() {
             session::spill_dir_for(&self.config.session_dir(), id)
         } else {
             output::spill_dir()
@@ -2368,7 +2342,7 @@ impl Agent {
     /// beginning with the prefix unlock the tools, so state is tracked
     /// explicitly instead.
     fn history_tools_enabled(&self) -> bool {
-        self.session.is_some() && self.compaction.history_available()
+        self.session.is_persistent() && self.compaction.history_available()
     }
 
     /// Start a fresh conversation, persisted under a new session ID if enabled.
@@ -2435,10 +2409,7 @@ impl Agent {
         // succeeded — so a `SessionLog::create` / initial-append failure above
         // still leaves the live session (and its override) untouched.
         self.control.set_thinking(None);
-        self.completed_inputs.clear();
-        self.completed_outcomes.clear();
-        self.completed_stop_reasons.clear();
-        self.pending_input = None;
+        self.session.reset_for_new_session();
         self.plan = Plan::default();
         // A fresh session starts with no timers (`/restart` clears them).
         self.timers = Timers::default();
@@ -2446,8 +2417,7 @@ impl Agent {
         self.control.publish_timers(&self.timers);
         self.pending_timer_steps = 0;
         self.reminders = Reminders::new(self.config.outcome_tool);
-        self.session = session;
-        self.session_id = Some(id.clone());
+        self.session.install(session, id.clone());
         self.set_spill_dir(&id);
         self.claude.reset_fresh();
         self.sync_claude_hook_session();
@@ -2517,10 +2487,7 @@ impl Agent {
             Some(first) if first.role == Role::System => *first = system,
             _ => self.conversation.insert(0, system),
         }
-        self.completed_inputs = restored.completed;
-        self.completed_outcomes = restored.outcomes;
-        self.completed_stop_reasons = restored.stop_reasons;
-        self.pending_input = restored.pending_input;
+        self.session.restore_from(restored.completed, restored.outcomes, restored.stop_reasons, restored.pending_input);
         self.plan = restored.plan.unwrap_or_default();
         // Restore the session's timers; one that came due while nano-coder was
         // closed fires as overdue at the next step (or the idle prompt).
@@ -2543,8 +2510,7 @@ impl Agent {
         // `titles_requested` is deliberately not reset: it tracks which
         // sessions this process already asked to title, so switching
         // A → B → A does not launch a second (paid) title request for A.
-        self.session = Some(log);
-        self.session_id = Some(id.to_string());
+        self.session.install_loaded(log, id);
         self.set_spill_dir(id);
         // Restore the durable compaction/history state: the history-tools gate
         // from the last replace's mode (not message text), the one-time hint
@@ -2604,8 +2570,8 @@ impl Agent {
 
     fn push(&mut self, mut message: Message) -> Result<()> {
         message.timestamp.get_or_insert_with(session::now);
-        if let Some(log) = &mut self.session {
-            let line = log.append(&Record::Message(Box::new(message.clone())))?;
+        if self.session.is_persistent() {
+            let line = self.session.append(&Record::Message(Box::new(message.clone())))?;
             message.log_line.get_or_insert(line);
         }
         self.conversation.push(message);
@@ -2652,40 +2618,43 @@ impl Agent {
         let extends = extends && base_len > 0;
         let folded_base = extends.then_some(base_len);
         let delta_folded = folded_turns.as_ref().filter(|f| !f.is_empty() || extends).cloned();
-        if let Some(log) = &mut self.session {
-            log.append(&Record::Replace {
-                messages: messages.clone(),
-                pending_position,
-                summarized: range,
-                mode,
-                // Record the resolved provider/model, not the raw user spec
-                // (which can be a bare model name under a default provider), so
-                // mode comparisons keep the provider dimension.
-                model: mode.map(|_| format!("{}/{}", self.client.provider_name(), self.client.model_name())),
-                // Persist the surviving pending input's in-flight continuation
-                // state: the truncated chunks it was built from may be folded
-                // into the summary, so without this a post-compaction crash
-                // loses the answer prefix and resets the count (issue #114).
-                continuation: self.pending_input.as_ref().and_then(|p| p.continuation.clone()),
-                // Persist the folded real turns (and the restated-input skip)
-                // too: a resume or relaunch rebuilds the visible transcript
-                // from the log, and without them it would show the synthetic
-                // summary in place of the pre-compaction history.
-                // A repeated compaction's stash extends the previous one; log
-                // only the newly folded turns (plus the prefix length they
-                // extend) so the log grows linearly, not quadratically.
-                folded: delta_folded,
-                folded_base,
-                restated,
-                // Persist the surviving pending input's spent recall-note
-                // budget too: a crash between this record and the next recall
-                // record must not hand the resumed retry a fresh per-input
-                // budget (Copilot finding, src/agent.rs). Recorded even when
-                // `pending_position` is `None` — the decode then drops the
-                // pending input, and with it the budget.
-                pending_recall_notes: self.pending_input.as_ref().map_or(0, |p| p.recall_notes),
-                recorded_at: now,
-            })?;
+        // Persist the surviving pending input's in-flight continuation state
+        // and spent recall-note budget alongside the replacement (issue #114 /
+        // Copilot finding): the truncated chunks the continuation was built
+        // from may be folded into the summary, so without these a
+        // post-compaction crash loses the answer prefix and resets the count,
+        // and a crash before the next recall record hands the resumed retry a
+        // fresh per-input budget. Read *before* the `&mut self.session` append
+        // borrow below.
+        let continuation = self.session.pending_continuation();
+        let pending_recall_notes = self.session.pending_recall_notes();
+        let record = Record::Replace {
+            messages: messages.clone(),
+            pending_position,
+            summarized: range,
+            mode,
+            // Record the resolved provider/model, not the raw user spec
+            // (which can be a bare model name under a default provider), so
+            // mode comparisons keep the provider dimension.
+            model: mode.map(|_| format!("{}/{}", self.client.provider_name(), self.client.model_name())),
+            continuation,
+            // Persist the folded real turns (and the restated-input skip)
+            // too: a resume or relaunch rebuilds the visible transcript
+            // from the log, and without them it would show the synthetic
+            // summary in place of the pre-compaction history.
+            // A repeated compaction's stash extends the previous one; log
+            // only the newly folded turns (plus the prefix length they
+            // extend) so the log grows linearly, not quadratically.
+            folded: delta_folded,
+            folded_base,
+            restated,
+            // Recorded even when `pending_position` is `None` — the decode
+            // then drops the pending input, and with it the budget.
+            pending_recall_notes,
+            recorded_at: now,
+        };
+        if self.session.is_persistent() {
+            self.session.append(&record)?;
         }
         // Flip the flag only once the durable replace record is appended, so a
         // failed replacement leaves the active history state unchanged.
@@ -2698,12 +2667,7 @@ impl Agent {
         // were a synthetic summary. The restatement skip is tracked in lockstep
         // (a cleared stash clears it too).
         self.compaction.replace_stash(folded_turns, extends, restated);
-        self.pending_input = match (self.pending_input.take(), pending_position) {
-            (Some(pending), Some(position)) => {
-                Some(PendingInput { position, continuation_base: Some(self.conversation.len()), ..pending })
-            }
-            _ => None,
-        };
+        self.session.reanchor_pending(pending_position, self.conversation.len());
         self.compaction.clear_calibration();
         // Any replacement (compaction, a `/settings` system-prompt change, a
         // rebuild) drops the recalled memories' full text from context, so
@@ -2884,8 +2848,9 @@ impl Agent {
         if std::mem::take(&mut self.fail_next_persist) {
             return Err(anyhow::anyhow!("forced plan persist failure (test)"));
         }
-        if let Some(log) = &mut self.session {
-            log.append(&Record::Plan { plan: self.plan.clone(), recorded_at: session::now() })?;
+        let record = Record::Plan { plan: self.plan.clone(), recorded_at: session::now() };
+        if self.session.is_persistent() {
+            self.session.append(&record)?;
         }
         Ok(())
     }
@@ -3001,15 +2966,10 @@ impl Agent {
             outcome,
         };
         if let Some(id) = input_id
-            && let Some(response) = self.completed_inputs.get(id)
+            && let Some((response, stop_reason, outcome)) = self.session.completed(id)
         {
             crate::ui::log(&format!("[agent] input {id:?} already processed; returning recorded response"));
-            let stop_reason = self.completed_stop_reasons.get(id).copied().unwrap_or(StopReason::EndTurn);
-            return Ok(TurnOutcome {
-                response: response.clone(),
-                stop_reason,
-                outcome: self.completed_outcomes.get(id).cloned(),
-            });
+            return Ok(TurnOutcome { response, stop_reason, outcome });
         }
         self.control.start_turn();
         self.reminders.start_turn();
@@ -3026,8 +2986,8 @@ impl Agent {
         // `finish_turn` folds the input records committed by this turn into
         // the cached summary (from the log's tail) instead of rescanning the
         // whole log.
-        self.turn_log_offset = self.session.as_ref().map(|log| log.size());
-        let resuming = self.pending_input.clone().filter(|pending| input_id == Some(pending.id.as_str()));
+        self.session.begin_turn();
+        let resuming = self.session.pending_matching(input_id);
         // The recall-note budget is per *input*, not per `run_turn` call — like
         // the verify-before-complete state below: a retry of an interrupted
         // prompt resumes its pending input, so it must resume the budget it
@@ -3065,10 +3025,7 @@ impl Agent {
         let mut hook_context_start: Option<usize> = None;
         let input_id = match input_id {
             Some(id) => id.to_string(),
-            None => {
-                self.input_counter += 1;
-                format!("in-{}-{}", Utc::now().timestamp_millis(), self.input_counter)
-            }
+            None => self.session.next_input_id(),
         };
 
         // Trigger before_context_load hook
@@ -3148,7 +3105,7 @@ impl Agent {
             None => {
                 let extra = match self.claude.run_prompt_hooks(user_input) {
                     ClaudePromptHook::Reject(reason) => {
-                        self.pending_input = Some(PendingInput {
+                        self.session.set_pending(PendingInput {
                             id: input_id.clone(),
                             text: user_input.to_string(),
                             position: self.conversation.len(),
@@ -3156,8 +3113,8 @@ impl Agent {
                             continuation_base: None,
                             recall_notes: 0,
                         });
-                        if let Some(log) = &mut self.session {
-                            log.append(&Record::Input {
+                        if self.session.is_persistent() {
+                            self.session.append(&Record::Input {
                                 id: input_id.clone(),
                                 text: user_input.to_string(),
                                 recorded_at: session::now(),
@@ -3175,7 +3132,7 @@ impl Agent {
                     }
                     ClaudePromptHook::Proceed(extra) => extra,
                 };
-                self.pending_input = Some(PendingInput {
+                self.session.set_pending(PendingInput {
                     id: input_id.clone(),
                     text: user_input.to_string(),
                     position: self.conversation.len(),
@@ -3183,8 +3140,8 @@ impl Agent {
                     continuation_base: None,
                     recall_notes: 0,
                 });
-                if let Some(log) = &mut self.session {
-                    log.append(&Record::Input {
+                if self.session.is_persistent() {
+                    self.session.append(&Record::Input {
                         id: input_id.clone(),
                         text: user_input.to_string(),
                         recorded_at: session::now(),
@@ -3507,7 +3464,7 @@ impl Agent {
                     attachments_dir: Some(attachments_dir.as_path()),
                 };
                 let control = self.control.clone();
-                let (event_sink, session_id) = (&self.event_sink, self.session_id.as_deref());
+                let (event_sink, session_id) = (&self.event_sink, self.session.id());
                 let stats = self.stats.clone();
                 let rate_meter = Arc::new(Mutex::new(RateMeter::new(Instant::now())));
                 // A fresh generation has no measured rate yet. Clear any rate
@@ -4262,7 +4219,7 @@ impl Agent {
                     // budget so a retry of this input may still attach them.
                     if let Some(spent) = notes_before {
                         self.recall_turn_notes = spent;
-                        if let Some(pending) = self.pending_input.as_mut() {
+                        if let Some(pending) = self.session.pending_mut() {
                             pending.recall_notes = spent;
                         }
                     }
@@ -4343,8 +4300,8 @@ impl Agent {
         outcome: Option<Outcome>,
         stop_reason: StopReason,
     ) -> Result<(String, Option<Outcome>)> {
-        if let Some(log) = &mut self.session {
-            log.append(&Record::TurnEnd {
+        if self.session.is_persistent() {
+            self.session.append(&Record::TurnEnd {
                 input_id: input_id.clone(),
                 response: response.clone(),
                 outcome: outcome.clone(),
@@ -4355,27 +4312,17 @@ impl Agent {
             // Keep the `--resume` picker's summary current. Only a cache:
             // the picker rebuilds a missing or stale summary from the log.
             let model = format!("{}/{}", self.client.provider_name(), self.client.model_name());
-            let from = self.turn_log_offset.unwrap_or(0);
+            let from = self.session.turn_log_offset();
             // `update` folds every input record committed to the log since
             // `from` straight from the log's tail, so a resumed pending input
             // (which lies before `from`) is never recounted and a concurrent
             // writer's prompt (after `from`) is never lost.
-            if let Ok(summary) = crate::session_index::update(log.path(), from, Some(model)) {
-                let path = log.path().to_path_buf();
+            let path = self.session.path().expect("persistent session has a path").to_path_buf();
+            if let Ok(summary) = crate::session_index::update(&path, from, Some(model)) {
                 self.request_title(path, &summary);
             }
         }
-        match &outcome {
-            Some(outcome) => self.completed_outcomes.insert(input_id.clone(), outcome.clone()),
-            None => self.completed_outcomes.remove(&input_id),
-        };
-        if stop_reason.is_end_turn() {
-            self.completed_stop_reasons.remove(&input_id);
-        } else {
-            self.completed_stop_reasons.insert(input_id.clone(), stop_reason);
-        }
-        self.completed_inputs.insert(input_id, response.clone());
-        self.pending_input = None;
+        self.session.record_completion(input_id, response.clone(), outcome.clone(), stop_reason);
         Ok((response, outcome))
     }
 
@@ -4510,7 +4457,7 @@ impl Agent {
     ) -> Result<Option<CompactReport>> {
         // Smart compaction points into the session log; without one it
         // falls back to a plain summary.
-        let mode = if self.session.is_some() { mode } else { CompactionMode::Standard };
+        let mode = if self.session.is_persistent() { mode } else { CompactionMode::Standard };
         let smart = mode == CompactionMode::Smart;
         let window = self.context_window();
         let body_start = usize::from(self.conversation.first().is_some_and(|m| m.role == Role::System));
@@ -4874,7 +4821,7 @@ impl Agent {
         // restated after it; `restated_index` records where, so the replay can
         // skip that synthetic copy (the original is in `summarized_msgs`).
         let mut restated_index = None;
-        let pending_position = match &self.pending_input {
+        let pending_position = match self.session.pending() {
             // The in-flight input was folded into the summary: restate it.
             Some(pending) if pending.position < split => {
                 messages.push(Message::user(&pending.text));
@@ -5022,8 +4969,9 @@ impl Agent {
     /// Persist the memory-recall state after a change. Best-effort: a failed
     /// append only means a resumed session may repeat a note.
     fn recall_changed(&mut self) {
-        if let Some(log) = &mut self.session
-            && let Err(err) = log.append(&Record::Recall { recall: self.recall.clone(), recorded_at: session::now() })
+        let record = Record::Recall { recall: self.recall.clone(), recorded_at: session::now() };
+        if self.session.is_persistent()
+            && let Err(err) = self.session.append(&record)
         {
             crate::ui::log(&format!("[agent] could not persist memory recall state: {err}"));
         }
@@ -5036,7 +4984,7 @@ impl Agent {
         let Some(store) = self.memory.as_ref() else {
             return Vec::new();
         };
-        let session = self.session_id.clone();
+        let session = self.session.id().map(str::to_string);
         let before = self.recall.clone();
         if memory::is_memory_tool(tool) {
             if ok {
@@ -5060,7 +5008,7 @@ impl Agent {
             // Carry the spent budget on the pending input too, so a retry of
             // this (still in-flight) input resumes with it instead of
             // re-arming the per-input cap (Copilot finding, src/agent.rs).
-            if let Some(pending) = self.pending_input.as_mut() {
+            if let Some(pending) = self.session.pending_mut() {
                 pending.recall_notes = self.recall_turn_notes;
             }
             self.recall_unpersisted.get_or_insert(before);
@@ -5074,8 +5022,9 @@ impl Agent {
         if std::mem::take(&mut self.fail_next_persist) {
             return Err(anyhow::anyhow!("forced timers persist failure (test)"));
         }
-        if let Some(log) = &mut self.session {
-            log.append(&Record::Timers { timers: self.timers.clone(), recorded_at: session::now() })?;
+        let record = Record::Timers { timers: self.timers.clone(), recorded_at: session::now() };
+        if self.session.is_persistent() {
+            self.session.append(&record)?;
         }
         self.control.publish_timers(&self.timers);
         self.refresh_stats();
@@ -5184,7 +5133,7 @@ impl Agent {
         if !self.config.memory.writable() && call.name != memory::SEARCH_TOOL {
             return Err(anyhow::anyhow!("{} is disabled: memory is read-only here", call.name));
         }
-        let session = self.session_id.as_deref();
+        let session = self.session_id();
         // A search must not mutate the store when the session is read-only —
         // either because the agent is in Plan mode, OR because memory is
         // configured read-only (`MemoryMode::ReadOnly`, e.g. a configured
@@ -7424,7 +7373,7 @@ mod tests {
                 .unwrap();
         }
         agent.load_session("retry-budget").unwrap();
-        assert_eq!(agent.pending_input.as_ref().map(|p| p.recall_notes), Some(2), "the budget survives the log");
+        assert_eq!(agent.session.pending().map(|p| p.recall_notes), Some(2), "the budget survives the log");
         agent.send_input(Some("msg-1"), "look").await.unwrap();
         let notes: usize = tool_texts(&agent).iter().map(|t| t.matches("📌").count()).sum();
         assert_eq!(notes, 0, "the retried input re-arms no notes: {notes}");
