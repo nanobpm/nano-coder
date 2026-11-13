@@ -116,11 +116,16 @@ Compaction pins the user's requests verbatim after the summary, rebuilt from
 the original messages on every compaction rather than re-summarized from the
 previous summary. The `pinned-request` case is the scenario that needs it: a
 detail stated once in the first message, folded by **two** compactions, then
-questioned. Cases whose detail lives in a *user* message (`user-constraint`,
-`rejected-approach`, `pinned-request`) survive in both modes while the pin is
-on; cases whose detail lives in a *tool output* (`buried-error`,
-`long-log-error`, `working-command`) are not pinned and still exercise the
-history tools.
+questioned. A repeated-compaction case only proves the pin was regenerated when
+**every** requested compaction actually completed: a skipped compaction leaves
+the prior pin in place for grading, and a fallback (a later success overwriting
+an earlier failure) breaks the chain. `run_one` therefore rejects such a run as
+soon as any requested compaction is skipped or falls back, so a pass can only
+mean the full chain completed. Cases whose detail lives in a *user* message
+(`user-constraint`, `rejected-approach`, `pinned-request`) survive in both
+modes while the pin is on; cases whose detail lives in a *tool output*
+(`buried-error`, `long-log-error`, `working-command`) are not pinned and still
+exercise the history tools.
 
 To measure the block's effect, append `-nopin` to a mode to run it with the
 pin disabled (`compaction_pin_requests = false`):

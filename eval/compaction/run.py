@@ -581,13 +581,30 @@ def run_one(args, index, case, model, mode, repeat, work_root):
             # case could then pass on that echo even when the next compaction
             # failed to regenerate the pin.
             compactions = int(case.get("compactions", 1))
+            outcomes = []
             for n in range(compactions):
                 if n:
                     followup = case.get("between", "Reply with a bare acknowledgement and nothing else.")
                     acp.call("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": followup}]})
                 compacted = acp.call("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": f"/compact --{compact_mode}"}]})
-                result["compacted"] = bool(compacted and compacted.get("compacted"))
-                result["fallback"] = compacted.get("fallback") if compacted else None
+                outcomes.append((bool(compacted and compacted.get("compacted")), compacted.get("fallback") if compacted else None))
+            result["compacted"], result["fallback"] = outcomes[-1]
+            if compactions > 1:
+                # A repeated-compaction case proves an EARLIER summary was
+                # summarized again. That only holds when EVERY requested
+                # compaction actually completed: a skipped one leaves the prior
+                # pin in place for grading, and a fallback (a later success
+                # overwriting an earlier failure) means the chain broke. Reject
+                # the run as soon as any requested compaction is skipped or
+                # falls back, so a pass can only mean the full chain completed
+                # (issue #66).
+                for k, (ok, fb) in enumerate(outcomes):
+                    if not ok:
+                        result["error"] = f"compaction {k + 1} of {compactions} was skipped; the run cannot prove an earlier summary was summarized again"
+                        break
+                    if fb and "failed" in str(fb):
+                        result["error"] = f"compaction {k + 1} of {compactions} fell back: {str(fb)[:300]}"
+                        break
         question = case["question"] + (" Answer in one line." if args.terse else "")
         acp.call("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": question}]})
     except Exception as e:

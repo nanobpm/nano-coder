@@ -118,6 +118,17 @@ pub struct Message {
     /// to the log only inside `replace` records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_line: Option<u64>,
+    /// The user-typed text of a genuine request, recorded separately when the
+    /// harness appends hook context to the prompt (agent.rs wraps it as a
+    /// `<system-reminder>` block on the wire `content`). Compaction pins the
+    /// request from this pristine text rather than clipping `content` at the
+    /// first `<system-reminder>` tag, so a user who *types* that tag (e.g.
+    /// `Rename <system-reminder> to …`) keeps their whole task in the pin
+    /// instead of losing everything from the tag on (issue #66). `None` when no
+    /// hook context was appended — then the pin is taken from `content` itself.
+    /// Log only; not sent to providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin_text: Option<String>,
     /// Assistant messages: the reasoning text the model produced for this
     /// response. Kept in the session log (for the trajectory view and
     /// `history_read`); not sent to providers.
@@ -166,6 +177,7 @@ impl Message {
             name: None,
             timestamp: None,
             log_line: None,
+            pin_text: None,
             thinking: String::new(),
             usage: None,
             duration_ms: None,
@@ -214,6 +226,16 @@ impl Message {
     /// (issue #114).
     pub fn auto_initiated(mut self) -> Self {
         self.auto_initiated = true;
+        self
+    }
+
+    /// Record the user-typed text of this request separately, because the
+    /// harness appended hook context to the wire `content` (a `<system-reminder>`
+    /// block, agent.rs). Compaction pins the request from this pristine text, so
+    /// a user who *types* a `<system-reminder>` tag keeps their whole task in the
+    /// pin (issue #66).
+    pub fn with_pin_text(mut self, text: &str) -> Self {
+        self.pin_text = Some(text.to_string());
         self
     }
 

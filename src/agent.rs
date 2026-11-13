@@ -3493,7 +3493,14 @@ impl Agent {
                     Some(extra) => format!("{user_input}\n\n{}", reminders::wrap(extra)),
                     None => user_input.to_string(),
                 };
-                let message = Message::user(&message);
+                let mut message = Message::user(&message);
+                // Hook context was appended to the wire content: record the
+                // user-typed text separately so compaction pins the user's own
+                // words, even when they contain a literal `<system-reminder>`
+                // tag (issue #66).
+                if extra.is_some() {
+                    message = message.with_pin_text(user_input);
+                }
                 let message = if auto_turn { message.auto_initiated() } else { message };
                 self.push(message)?;
             }

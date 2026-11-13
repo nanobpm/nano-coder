@@ -1115,8 +1115,12 @@ original messages each time, so an exact flag, number or phrase the user stated 
 intact. The block is bounded by an allowance derived from the context window (about an eighth
 of it): when a long session's requests outgrow it, the oldest follow-ups are dropped with an
 explicit omission note — the goal and the newest requests are kept — so the pin can never push
-the context past the window. Hook output appended to a prompt is not pinned as the user's
-words. In smart mode each pinned request is labelled with its `#N` log ID, so the full text is
+the context past the window. The note names the dropped requests' `#N` IDs as compact ranges
+(`#2-#40`), so even a session that drops hundreds of requests keeps the note itself within the
+allowance. Hook output appended to a prompt is not pinned as the user's
+words — the user-typed text is recorded separately, so a prompt that itself mentions a
+`<system-reminder>` tag keeps its whole task in the pin. In smart mode each pinned request is
+labelled with its `#N` log ID, so the full text is
 one `history_read` away.
 
 ### Smart compaction (experimental)
