@@ -496,12 +496,19 @@ fn backfill_pin_text(message: &mut Message, inputs: &[String]) {
     if message.role != crate::llm::Role::User || message.pin_text.is_some() || message.hook_context {
         return;
     }
-    let found = inputs.iter().rev().find(|input| {
+    // A message whose content is exactly some logged input is that input's
+    // own pristine text (e.g. a user typing a literal reminder tag) — never
+    // reinterpret it as an older, shorter input plus hook output.
+    if inputs.contains(&message.content) {
+        return;
+    }
+    // Among candidate prefixes, the longest is the most specific match.
+    let found = inputs.iter().rev().filter(|input| {
         message
             .content
             .strip_prefix(input.as_str())
             .is_some_and(|rest| !rest.is_empty() && rest.trim_start().starts_with(crate::reminders::WRAP_START))
-    });
+    }).max_by_key(|input| input.len());
     if let Some(input) = found {
         message.pin_text = Some(input.clone());
     }
@@ -894,6 +901,18 @@ mod tests {
         let mut tool = Message::assistant(wire);
         backfill_pin_text(&mut tool, &["Fix the race.".to_string()]);
         assert_eq!(tool.pin_text, None);
+
+        // A genuine follow-up that extends an older input with a literal tag
+        // has its own exact input: it must not match the older shorter one.
+        let follow = "Fix the race.\n\n<system-reminder>Rename this tag to <note>.</system-reminder>";
+        let inputs = ["Fix the race.".to_string(), follow.to_string()];
+        let mut m = Message::user(follow);
+        backfill_pin_text(&mut m, &inputs);
+        assert_eq!(m.pin_text, None);
+        let inputs = [follow.to_string(), "Fix the race.".to_string()];
+        let mut m = Message::user(follow);
+        backfill_pin_text(&mut m, &inputs);
+        assert_eq!(m.pin_text, None);
     }
 
     #[test]
