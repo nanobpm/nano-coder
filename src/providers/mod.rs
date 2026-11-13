@@ -2185,7 +2185,7 @@ mod tests {
     /// A regional OpenRouter workspace (#169): US by default, one model on EU,
     /// a curated list, and the global preset disabled.
     fn regional() -> HashMap<String, ProviderConfig> {
-        let camunda: ProviderConfig = toml::from_str(
+        let regional: ProviderConfig = toml::from_str(
             r#"
             kind = "openai"
             base_url = "https://us.openrouter.ai/api/v1/"
@@ -2201,28 +2201,28 @@ mod tests {
         )
         .unwrap();
         let disabled: ProviderConfig = toml::from_str("disabled = true").unwrap();
-        HashMap::from([("openrouter-camunda".to_string(), camunda), ("openrouter".to_string(), disabled)])
+        HashMap::from([("openrouter-regional".to_string(), regional), ("openrouter".to_string(), disabled)])
     }
 
     #[test]
     fn a_models_base_url_overrides_the_providers() {
         let user = regional();
-        let eu = resolve("openrouter-camunda/amazon/nova-lite-v1", &user, "mock").unwrap();
+        let eu = resolve("openrouter-regional/amazon/nova-lite-v1", &user, "mock").unwrap();
         assert_eq!(eu.base_url, "https://eu.openrouter.ai/api/v1");
         assert_eq!(eu.model, "amazon/nova-lite-v1");
-        let us = resolve("openrouter-camunda/moonshotai/kimi-k3", &user, "mock").unwrap();
+        let us = resolve("openrouter-regional/moonshotai/kimi-k3", &user, "mock").unwrap();
         assert_eq!(us.base_url, "https://us.openrouter.ai/api/v1", "trailing slash trimmed");
         // A model with no entry, and the provider's default model, use the provider's host.
-        assert_eq!(resolve("openrouter-camunda/x-ai/grok-4.6", &user, "mock").unwrap().base_url, us.base_url);
-        assert_eq!(resolve("openrouter-camunda", &user, "mock").unwrap().model, "moonshotai/kimi-k3");
+        assert_eq!(resolve("openrouter-regional/x-ai/grok-4.6", &user, "mock").unwrap().base_url, us.base_url);
+        assert_eq!(resolve("openrouter-regional", &user, "mock").unwrap().model, "moonshotai/kimi-k3");
         // A bad per-model host is caught at queue time, like a bad provider host.
         let mut bad = regional();
-        bad.get_mut("openrouter-camunda").unwrap().models.get_mut("amazon/nova-lite-v1").unwrap().base_url =
+        bad.get_mut("openrouter-regional").unwrap().models.get_mut("amazon/nova-lite-v1").unwrap().base_url =
             Some("ftp://eu.openrouter.ai".into());
         let providers = effective_providers(&bad);
-        let err = validate_spec("openrouter-camunda/amazon/nova-lite-v1", &providers, "mock").unwrap_err();
+        let err = validate_spec("openrouter-regional/amazon/nova-lite-v1", &providers, "mock").unwrap_err();
         assert!(err.to_string().contains("must be http(s)"), "{err}");
-        assert!(validate_spec("openrouter-camunda/moonshotai/kimi-k3", &providers, "mock").is_ok());
+        assert!(validate_spec("openrouter-regional/moonshotai/kimi-k3", &providers, "mock").is_ok());
     }
 
     #[test]
@@ -2232,12 +2232,12 @@ mod tests {
         assert!(all["openrouter"].is_disabled(), "the preset merges with the user's `disabled`");
         assert_eq!(all["openrouter"].base_url.as_deref(), Some("https://openrouter.ai/api/v1"));
         let shown = enabled(&all);
-        assert!(!shown.contains_key("openrouter") && shown.contains_key("openrouter-camunda"));
+        assert!(!shown.contains_key("openrouter") && shown.contains_key("openrouter-regional"));
         // Naming it is an error, not a fall-through to the default provider.
         for spec in ["openrouter/moonshotai/kimi-k3", "openrouter"] {
-            let err = resolve(spec, &user, "openrouter-camunda").unwrap_err().to_string();
+            let err = resolve(spec, &user, "openrouter-regional").unwrap_err().to_string();
             assert!(err.contains("\"openrouter\" is disabled"), "{err}");
-            let err = validate_spec(spec, &all, "openrouter-camunda").unwrap_err().to_string();
+            let err = validate_spec(spec, &all, "openrouter-regional").unwrap_err().to_string();
             assert!(err.contains("is disabled"), "{err}");
         }
     }
@@ -2265,7 +2265,7 @@ mod tests {
     fn a_configured_model_list_keeps_names_and_merges_over_presets() {
         let all = effective_providers(&regional());
         assert_eq!(
-            all["openrouter-camunda"].configured_models().unwrap(),
+            all["openrouter-regional"].configured_models().unwrap(),
             vec![
                 ("amazon/nova-lite-v1".to_string(), Some("Nova Lite 1.0".to_string())),
                 ("moonshotai/kimi-k3".to_string(), Some("Kimi K3".to_string())),

@@ -730,7 +730,7 @@ make K3 think less.
 
 #### Regional OpenRouter workspaces and curated model lists
 
-Some OpenRouter workspaces (e.g. Camunda's) reject the global `openrouter.ai` host, so
+Some OpenRouter workspaces reject the global `openrouter.ai` host, so
 the `openrouter` preset fails with them. They accept only the regional hosts
 `us.openrouter.ai` and `eu.openrouter.ai`, and each model is served on just one of them.
 Three provider settings cover this:
@@ -744,28 +744,24 @@ Three provider settings cover this:
   suggestions. A model spec that names it is an error.
 
 ```toml
-model = "openrouter-camunda/moonshotai/kimi-k3"
+model = "openrouter-regional/moonshotai/kimi-k3"
 
 [providers.openrouter]
 disabled = true                         # the global host is rejected
 
-[providers.openrouter-camunda]
+[providers.openrouter-regional]
 kind = "openai"
 base_url = "https://us.openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 list_models = "configured"
 
-[providers.openrouter-camunda.models."moonshotai/kimi-k3"]
+[providers.openrouter-regional.models."moonshotai/kimi-k3"]
 name = "Kimi K3"
 
-[providers.openrouter-camunda.models."amazon/nova-lite-v1"]
+[providers.openrouter-regional.models."amazon/nova-lite-v1"]
 name = "Nova Lite 1.0"
 base_url = "https://eu.openrouter.ai/api/v1"   # served in the EU only
 ```
-
-[`examples/openrouter-camunda.toml`](examples/openrouter-camunda.toml) is the full
-equivalent of the `opencode.json` in Camunda's handbook. A model's `"provider": {"api": …}`
-there becomes its `base_url` here.
 
 ### Temperature
 
