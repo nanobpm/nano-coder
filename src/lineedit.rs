@@ -131,6 +131,12 @@ pub struct EditView {
 /// sent as a steer.
 pub const DRAFT_HOLD: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How long the prompt — and any draft in it — must sit untouched before an
+/// opportunistic idle compaction runs (issue #182). Longer than
+/// [`DRAFT_HOLD`]: a coffee pause should not spend a summary-model call.
+/// Overridden by `idle_compact_hold_secs`.
+pub const IDLE_COMPACT_HOLD: std::time::Duration = std::time::Duration::from_secs(180);
+
 /// What the argument type-ahead needs from the agent loop.
 #[derive(Default)]
 pub struct EditContext {
@@ -199,6 +205,13 @@ impl EditView {
     /// user is either not composing or has gone AFK.
     pub fn holds_timer(&self, now: std::time::Instant) -> bool {
         self.has_draft() && !self.draft_is_stale(now)
+    }
+
+    /// When the prompt last saw user activity: the later of `shown` (when the
+    /// idle prompt was put up) and the buffer's last edit. An idle compaction
+    /// waits for this to be older than its hold (issue #182).
+    pub fn quiet_since(&self, shown: std::time::Instant) -> std::time::Instant {
+        self.last_edit.map_or(shown, |at| at.max(shown))
     }
 
     /// A non-empty buffer whose last edit is older than [`DRAFT_HOLD`].

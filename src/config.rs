@@ -65,6 +65,14 @@ pub struct Config {
     /// summary (issue #66). The eval turns this off to measure the pinned
     /// block's effect ("with and without the pinned block").
     pub compaction_pin_requests: bool,
+    /// Run the auto-compaction at the idle prompt, while the user is away,
+    /// instead of on the critical path of their next message (issue #182).
+    /// Only when the context is already past `auto_compact_threshold`, never
+    /// while a fresh draft is being typed, and off when `auto_compact` is.
+    pub idle_compact: bool,
+    /// How long the prompt (and any draft in it) must sit untouched before an
+    /// idle compaction may run. Unset: `lineedit::IDLE_COMPACT_HOLD`.
+    pub idle_compact_hold_secs: Option<u64>,
     /// How much the interactive CLI prints (and whether hook events are logged).
     pub verbosity: crate::ui::Verbosity,
     /// The retired `renderer` setting. Only the frame renderer remains (#133);
@@ -185,6 +193,8 @@ impl Default for Config {
             auto_compact_threshold: 0.8,
             compaction_mode: CompactionMode::Standard,
             compaction_pin_requests: true,
+            idle_compact: true,
+            idle_compact_hold_secs: None,
             verbosity: crate::ui::Verbosity::Normal,
             retired_renderer: None,
             timestamps: true,

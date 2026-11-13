@@ -23,8 +23,18 @@ impl MockLLMClient {
         Self { provider: provider.to_string(), model: model.to_string(), call_count: AtomicI64::new(0) }
     }
 
-    fn usage(completion_tokens: i64) -> Option<TokenUsage> {
-        Some(TokenUsage { prompt_tokens: 50, completion_tokens, total_tokens: 50 + completion_tokens, aic: None })
+    /// Usage as a real endpoint would report it: the prompt is roughly a
+    /// quarter-token per character (at least 50), so a large context reads as
+    /// large and auto/idle compaction can be exercised on a PTY (issue #182).
+    fn usage(request: &ChatRequest<'_>, completion_tokens: i64) -> Option<TokenUsage> {
+        let chars: usize = request.messages.iter().map(|m| m.content.len()).sum();
+        let prompt_tokens = ((chars / 4) as i64).max(50);
+        Some(TokenUsage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+            aic: None,
+        })
     }
 
     fn pick_tool(content: &str) -> Option<(&'static str, serde_json::Value)> {
@@ -151,7 +161,7 @@ impl LLMClient for MockLLMClient {
                         item_id: None,
                         malformed_arguments: None,
                     }],
-                    usage: Self::usage(20),
+                    usage: Self::usage(request, 20),
                     stop_reason: Some("tool_calls".into()),
                     ..Default::default()
                 });
@@ -165,7 +175,7 @@ impl LLMClient for MockLLMClient {
                     name,
                     tool_msg.content.lines().next().unwrap_or_default()
                 ),
-                usage: Self::usage(30),
+                usage: Self::usage(request, 30),
                 stop_reason: Some("stop".into()),
                 ..Default::default()
             });
@@ -182,7 +192,7 @@ impl LLMClient for MockLLMClient {
                         item_id: None,
                         malformed_arguments: None,
                     }],
-                    usage: Self::usage(20),
+                    usage: Self::usage(request, 20),
                     stop_reason: Some("tool_calls".into()),
                     ..Default::default()
                 });
@@ -194,7 +204,7 @@ impl LLMClient for MockLLMClient {
                 "This is a mock response from {} (call #{}). I'm simulating an LLM agent. Try asking me about the time, or to list files or run a command, to see tool calls in action.",
                 self.model, call_id
             ),
-            usage: Self::usage(30),
+            usage: Self::usage(request, 30),
             stop_reason: Some("stop".into()),
             thinking,
             ..Default::default()

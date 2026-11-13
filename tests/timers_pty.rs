@@ -361,3 +361,62 @@ fn ctrl_o_expands_the_latest_thinking_block() {
     pty.send("\x0f");
     pty.wait_for("restate the problem", Duration::from_secs(10));
 }
+
+/// Issue #182: walking away from a full context compacts it before the next
+/// message — but never while a draft is being typed, and with a visible
+/// transcript note rather than silently. The single oversized message fills
+/// the small window; mid-turn auto-compaction has nothing to fold (only the
+/// in-flight message), so the turn ends above the threshold and the idle
+/// prompt is where the compaction happens.
+#[test]
+fn an_idle_prompt_above_the_threshold_compacts_but_a_fresh_draft_holds_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+model = "mock/test"
+session_dir = "{}"
+project_instructions = false
+persist_sessions = true
+disable_hooks = true
+timestamps = false
+context_window = 2000
+auto_compact_threshold = 0.5
+idle_compact_hold_secs = 3
+"#,
+            dir.path().join("sessions").display()
+        ),
+    )
+    .unwrap();
+    let pty = Pty::spawn(&["--model", "mock/test", "--config", config.to_str().unwrap()]);
+    pty.wait_for("mock/test", Duration::from_secs(15));
+
+    // Pasted (bracketed), not typed: one editor update instead of thousands.
+    let big = "lorem ipsum ".repeat(400);
+    pty.send(&format!("\x1b[200~{big}\x1b[201~"));
+    std::thread::sleep(Duration::from_millis(300));
+    pty.send("\r");
+    pty.wait_for("mock response", Duration::from_secs(30));
+
+    // A fresh draft holds the compaction: keep typing well past the hold.
+    for c in "half typed".chars() {
+        pty.send(&c.to_string());
+        std::thread::sleep(Duration::from_millis(700));
+    }
+    let screen = pty.screen();
+    assert!(!screen.contains("compacted while idle"), "a fresh draft must hold it:\n{screen}");
+
+    // Walk away: the draft goes stale, the compaction runs, says so, and the
+    // draft comes back unsent.
+    let screen = pty.wait_for("compacted while idle (was", Duration::from_secs(30));
+    assert!(screen.contains("half typed"), "the parked draft is restored:\n{screen}");
+    let records = session_records(dir.path());
+    assert!(!records.iter().any(|r| r.to_string().contains("half typed")), "the draft was not sent");
+
+    // Once per crossing: no second idle compaction while nothing grows.
+    std::thread::sleep(Duration::from_secs(5));
+    let screen = pty.screen();
+    assert_eq!(screen.matches("compacted while idle").count(), 1, "{screen}");
+}

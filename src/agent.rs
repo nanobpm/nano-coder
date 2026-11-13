@@ -3,12 +3,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+mod idle_compact;
 mod probe;
 
 #[cfg(test)]
 use crate::llm::DetectedWindow;
 use anyhow::Result;
 use chrono::{DateTime, Local, Utc};
+use idle_compact::IdleCompactGate;
 use probe::{Detected, ProbeState};
 use serde_json::{Value, json};
 
@@ -612,6 +614,33 @@ pub struct CompactReport {
     pub mode: CompactionMode,
 }
 
+/// The outcome of an idle compaction, with context usage before and after as
+/// a percentage of the window for the transcript note.
+#[derive(Debug, Clone)]
+pub struct IdleCompactReport {
+    pub report: CompactReport,
+    pub percent_before: usize,
+    pub percent_after: usize,
+}
+
+impl IdleCompactReport {
+    fn new(report: CompactReport, window: usize) -> Self {
+        let pct = |tokens: usize| (tokens as f64 * 100.0 / window as f64).round() as usize;
+        Self { percent_before: pct(report.tokens_before), percent_after: pct(report.tokens_after), report }
+    }
+}
+
+impl std::fmt::Display for IdleCompactReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "compacted while idle (was {}% → {}%)", self.percent_before, self.percent_after)?;
+        // A degraded compaction is never reported as a clean one.
+        if self.report.fallback.is_some() || self.report.truncated {
+            write!(f, "; {}", self.report)?;
+        }
+        Ok(())
+    }
+}
+
 impl std::fmt::Display for CompactReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -639,6 +668,8 @@ enum CompactTrigger {
     Manual,
     Threshold,
     Overflow,
+    /// Opportunistic, at the idle prompt (issue #182). Folds like `Threshold`.
+    Idle,
 }
 
 /// What a compaction folded away, handed to `replace_keeping_pending` so the
@@ -745,6 +776,9 @@ pub struct Agent {
     /// for real growth past it so an incompressible context is not
     /// re-summarized on every call.
     compact_floor: usize,
+    /// Once-per-crossing gate for opportunistic compaction at the idle
+    /// prompt (issue #182, see `idle_compact.rs`).
+    idle_gate: IdleCompactGate,
     /// Stream model output as `TextDelta` / `ThinkingDelta` events.
     streaming: bool,
     /// AGENTS.md and similar files for the working directory.
@@ -945,6 +979,7 @@ impl Agent {
             learned_max_output: None,
             probe: ProbeState::default(),
             compact_floor: 0,
+            idle_gate: IdleCompactGate::default(),
             streaming: false,
             instructions: None,
             skills: Skills::default(),
@@ -1470,6 +1505,7 @@ impl Agent {
         *self.probe.window() = None;
         *self.probe.thinking() = None;
         self.compact_floor = 0;
+        self.idle_gate.reset();
         self.detect_context_window().await;
     }
 
@@ -1609,6 +1645,8 @@ impl Agent {
                     self.learned_max_output = None;
                     *self.probe.window() = None;
                     self.compact_floor = 0;
+                    self.idle_gate.reset();
+                    self.idle_gate.reset();
                     self.detect_context_window_for_switch();
                     let spec = crate::recents::canonical(&spec, &all, &default_provider);
                     self.emit(AgentEvent::ModelSwitched { spec: &spec, previous: &previous });
@@ -2637,6 +2675,7 @@ impl Agent {
         self.persist_claude_hook_config();
         self.calibration = None;
         self.compact_floor = 0;
+        self.idle_gate.reset();
         self.history_available = false;
         self.history_hint_pending = false;
         // The previous session's installed index no longer describes the
@@ -2736,6 +2775,7 @@ impl Agent {
         self.set_spill_dir(id);
         self.calibration = None;
         self.compact_floor = 0;
+        self.idle_gate.reset();
         // Whether the history tools are offered is durable state: restore it
         // from the log (the last replace's mode) rather than the message text.
         self.history_available = restored.history_available;
@@ -4603,6 +4643,42 @@ impl Agent {
         report
     }
 
+    /// Whether an opportunistic idle compaction is due (issue #182): idle
+    /// compaction and auto-compaction are both enabled, the context is already
+    /// past the auto-compaction threshold (with the usual `compact_floor`
+    /// hysteresis), and no idle attempt has already been spent on this
+    /// crossing. The caller owns the *idle* half of the gate — prompt open,
+    /// no fresh draft, steerable terminal (see `main::deliver_idle_compact`).
+    pub fn idle_compact_due(&self) -> bool {
+        if !self.config.idle_compact || !self.over_threshold() {
+            return false;
+        }
+        let (tokens, _) = self.estimate_context_tokens();
+        self.idle_gate.armed(tokens, self.context_window())
+    }
+
+    /// Run the same compaction auto-compaction would, at the idle prompt.
+    /// Cancellable through the agent's control like a turn. Whatever the
+    /// outcome, an attempt that did not compact spends the gate for this
+    /// crossing so a cancelled or failed run is not retried in a loop.
+    pub async fn idle_compact(&mut self) -> Result<Option<IdleCompactReport>> {
+        self.control.start_turn();
+        let window = self.context_window().max(1);
+        let (tokens_before, _) = self.estimate_context_tokens();
+        let result = self.compact_logged(CompactTrigger::Idle, self.config.compaction_mode, None).await;
+        self.set_activity(Activity::Idle);
+        let cancelled = self.control.is_cancelled();
+        match &result {
+            Ok(Some(_)) if !cancelled => {}
+            _ => self.idle_gate.spend(tokens_before),
+        }
+        let report = result?;
+        if cancelled {
+            return Ok(None);
+        }
+        Ok(report.map(|report| IdleCompactReport::new(report, window)))
+    }
+
     fn over_threshold(&self) -> bool {
         if !self.config.auto_compact {
             return false;
@@ -4682,7 +4758,11 @@ impl Agent {
         mode: CompactionMode,
         instructions: Option<&str>,
     ) -> Result<Option<CompactReport>> {
-        self.set_activity(Activity::Compacting);
+        self.set_activity(if trigger == CompactTrigger::Idle {
+            Activity::IdleCompacting
+        } else {
+            Activity::Compacting
+        });
         // Compaction summarizes via a model call (`compact_with`), so a
         // `/model` queued but not yet applied — e.g. one typed during a turn's
         // final in-flight call, which `run_turn` never reaches a hook to apply,
@@ -4700,6 +4780,7 @@ impl Agent {
         let report = self.compact_with(trigger, mode, instructions).await?;
         if let Some(report) = &report {
             self.compact_floor = report.tokens_after;
+            self.idle_gate.reset();
             if trigger != CompactTrigger::Manual {
                 crate::ui::log(&format!("[agent] auto-{report}"));
             }
@@ -9779,6 +9860,78 @@ mod tests {
         assert_eq!(seen.len(), 4, "call, call, summary, call: {seen:?}");
         assert!(seen[2].1, "the third request is the summary: {seen:?}");
         assert!(agent.context_stats().lock().unwrap().compactions >= 1);
+    }
+
+    /// An agent left idle above the auto-compaction threshold: the turn ran
+    /// with auto-compaction off (so nothing compacted mid-turn), then it is
+    /// switched back on, as if the threshold were crossed by the turn's end.
+    async fn idle_above_threshold(responses: Vec<LLMResponse>, dir: &std::path::Path) -> Agent {
+        let (mut agent, _) = agent(std::iter::once(text("ok")).chain(responses).collect(), dir);
+        agent.config.context_window = Some(3_000);
+        agent.config.auto_compact = false;
+        agent.new_session().unwrap();
+        agent.run_turn(Some("in-1"), &"x ".repeat(4_000)).await.unwrap();
+        agent.config.auto_compact = true;
+        agent.config.auto_compact_threshold = 0.5;
+        agent
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_compaction_runs_once_per_crossing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = idle_above_threshold(vec![text("SUMMARY")], dir.path()).await;
+        assert!(agent.idle_compact_due(), "idle above the threshold is due");
+        let report = agent.idle_compact().await.unwrap().expect("compacted");
+        assert!(report.percent_before > 50, "{report}");
+        assert!(report.percent_after < report.percent_before, "{report}");
+        assert!(report.to_string().starts_with("compacted while idle (was "), "{report}");
+        assert!(!agent.idle_compact_due(), "not again until usage recrosses the floor");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_compaction_is_off_without_idle_or_auto_compact() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = idle_above_threshold(vec![], dir.path()).await;
+        assert!(agent.idle_compact_due());
+        agent.config.idle_compact = false;
+        assert!(!agent.idle_compact_due(), "idle_compact = false");
+        agent.config.idle_compact = true;
+        agent.config.auto_compact = false;
+        assert!(!agent.idle_compact_due(), "auto_compact = false turns it off too");
+        agent.config.auto_compact = true;
+        agent.config.context_window = Some(100_000);
+        assert!(!agent.idle_compact_due(), "below the threshold: never compacts early");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_idle_compaction_is_not_retried_on_the_same_crossing() {
+        let dir = tempfile::tempdir().unwrap();
+        // Call 1 is the turn; call 2 is the idle summary, which Esc Esc
+        // cancels (and which never answers).
+        let (mut agent, seen) = interfering(
+            vec![text("ok")],
+            dir.path(),
+            |call, control| {
+                if call == 2 {
+                    control.cancel();
+                }
+            },
+            Some(2),
+        );
+        agent.config.context_window = Some(3_000);
+        agent.config.auto_compact = false;
+        agent.new_session().unwrap();
+        agent.run_turn(Some("in-1"), &"x ".repeat(4_000)).await.unwrap();
+        agent.config.auto_compact = true;
+        agent.config.auto_compact_threshold = 0.5;
+        assert!(agent.idle_compact_due());
+        let before = agent.estimate_context_tokens().0;
+
+        let report = agent.idle_compact().await.unwrap();
+        assert!(report.is_none(), "cancelled: {report:?}");
+        assert_eq!(seen.lock().unwrap().len(), 2, "the summary call was made, then cancelled");
+        assert_eq!(agent.estimate_context_tokens().0, before, "nothing was folded");
+        assert!(!agent.idle_compact_due(), "a cancelled attempt spends the crossing");
     }
 
     #[tokio::test(flavor = "multi_thread")]

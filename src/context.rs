@@ -117,6 +117,8 @@ pub enum Activity {
     Thinking,
     Tool(String),
     Compacting,
+    /// An opportunistic compaction at the idle prompt (issue #182).
+    IdleCompacting,
 }
 
 /// Context and usage figures, shared with the status line.
