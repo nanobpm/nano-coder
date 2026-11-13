@@ -596,13 +596,14 @@ def run_one(args, index, case, model, mode, repeat, work_root):
                 # pin in place for grading, and a fallback (a later success
                 # overwriting an earlier failure) means the chain broke. Reject
                 # the run as soon as any requested compaction is skipped or
-                # falls back, so a pass can only mean the full chain completed
+                # reports ANY fallback (whatever its wording, e.g. "empty
+                # summary"), so a pass can only mean the full chain completed
                 # (issue #66).
                 for k, (ok, fb) in enumerate(outcomes):
                     if not ok:
                         result["error"] = f"compaction {k + 1} of {compactions} was skipped; the run cannot prove an earlier summary was summarized again"
                         break
-                    if fb and "failed" in str(fb):
+                    if fb is not None:
                         result["error"] = f"compaction {k + 1} of {compactions} fell back: {str(fb)[:300]}"
                         break
         question = case["question"] + (" Answer in one line." if args.terse else "")

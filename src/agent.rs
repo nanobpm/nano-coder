@@ -3441,7 +3441,7 @@ impl Agent {
                     // logged *before* this point, not the conversation's new
                     // tail (issue #114).
                     hook_context_start = Some(self.conversation.len());
-                    self.push(Message::user(&reminders::wrap(&ctx)))?;
+                    self.push(Message::user(&reminders::wrap(&ctx)).hook_context())?;
                 }
             }
             None => {
