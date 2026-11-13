@@ -3,12 +3,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+mod hook;
 mod probe;
 
 #[cfg(test)]
 use crate::llm::DetectedWindow;
 use anyhow::Result;
 use chrono::{DateTime, Local, Utc};
+use hook::{ClaudePromptHook, HookState};
 use probe::{Detected, ProbeState};
 use serde_json::{Value, json};
 
@@ -667,14 +669,6 @@ struct CompactionRecord {
 /// Receives events with the active session ID.
 pub type EventSink = std::sync::Arc<dyn Fn(Option<&str>, &AgentEvent) + Send + Sync>;
 
-/// Result of the `SessionStart`/`UserPromptSubmit` hooks for a fresh prompt.
-enum ClaudePromptHook {
-    /// Proceed, attaching any additional context to the prompt.
-    Proceed(Option<String>),
-    /// Reject the prompt with this reason.
-    Reject(String),
-}
-
 /// The thinking level the status line shows: the one actually sent, if any.
 fn status_thinking(thinking: &crate::thinking::Resolved) -> Option<String> {
     match &thinking.effective {
@@ -793,23 +787,10 @@ pub struct Agent {
     tool_output_limit: usize,
     /// Checked before every tool call (see `permissions.rs`).
     policy: Policy,
-    /// Claude Code-compatible user hooks (see `claude_hooks.rs`); `None` until
-    /// loaded (headless/test agents may never load them).
-    claude_hooks: Option<claude_hooks::HookManager>,
-    /// Whether the `SessionStart` hooks have run for the active session.
-    claude_session_started: bool,
-    /// `SessionStart` context that has been collected but not yet delivered to
-    /// the model. `SessionStart` runs once per session and may have side
-    /// effects, so its context must survive a `UserPromptSubmit` rejection of
-    /// the first prompt: it is cached here and delivered with the first
-    /// *accepted* prompt (or the resumed turn) rather than re-running the hook.
-    pending_session_start_context: Option<String>,
-    /// Whether the active session was resumed (loaded) rather than created new,
-    /// so `SessionStart` reports `source: "resume"` instead of `"startup"`.
-    claude_session_resumed: bool,
-    /// Number of times a `Stop` hook has blocked the turn end this turn, capped
-    /// to avoid loops.
-    claude_stop_blocks: u32,
+    /// Claude Code-compatible user hooks and the per-session/per-turn state
+    /// that drives them (`SessionStart` once-per-session, cached context,
+    /// resume vs startup, the `Stop`-block cap). See `hook.rs`.
+    claude: HookState,
     /// Rendezvous for the `question` tool: the handler blocks here until the
     /// turn loop answers.
     questions: crate::question::QuestionBroker,
@@ -918,11 +899,7 @@ impl Agent {
             client,
             tools: ToolRegistry::new(),
             hooks: HookRegistry::new(),
-            claude_hooks: None,
-            claude_session_started: false,
-            pending_session_start_context: None,
-            claude_session_resumed: false,
-            claude_stop_blocks: 0,
+            claude: HookState::default(),
             config,
             conversation,
             session: None,
@@ -1126,24 +1103,19 @@ impl Agent {
             sandbox: self.config.sandbox.clone(),
         };
         let manager = claude_hooks::HookManager::load(&opts, cwd);
-        self.claude_hooks = Some(manager);
-        self.claude_session_started = false;
-        self.pending_session_start_context = None;
+        self.claude.install(manager);
         self.sync_claude_hook_session();
     }
 
     /// One-line startup notice for project hooks, printed by the CLI/ACP once
     /// the agent is built. `None` when there is nothing to report.
     pub fn claude_hooks_notice(&self) -> Option<String> {
-        self.claude_hooks.as_ref().and_then(|h| h.startup_notice())
+        self.claude.notice()
     }
 
     /// `/hooks`: every loaded hook with its source, then every skipped hook.
     pub fn claude_hooks_listing(&self) -> String {
-        match &self.claude_hooks {
-            Some(hooks) => hooks.listing(),
-            None => "No hooks loaded.\n".to_string(),
-        }
+        self.claude.listing()
     }
 
     /// Push the active session's identity into the hook manager so every hook
@@ -1152,13 +1124,8 @@ impl Agent {
     fn sync_claude_hook_session(&mut self) {
         let id = self.session_id.clone().unwrap_or_default();
         let transcript = self.session.as_ref().map(|log| log.path().to_path_buf());
-        let mode = match self.control.mode() {
-            crate::mode::AgentMode::Plan => "plan",
-            _ => "default",
-        };
-        if let Some(hooks) = &mut self.claude_hooks {
-            hooks.set_session(&id, transcript.as_deref(), mode);
-        }
+        let mode = self.control.mode();
+        self.claude.sync_session(&id, transcript.as_deref(), &mode);
     }
 
     /// Record which hook configuration files were loaded (path, source and a
@@ -1167,7 +1134,7 @@ impl Agent {
     /// requires. Best-effort: an audit-append failure never fails session
     /// setup, and a session without a log (headless/no-persist) is a no-op.
     fn persist_claude_hook_config(&mut self) {
-        let files: Vec<session::HookFile> = match &self.claude_hooks {
+        let files: Vec<session::HookFile> = match self.claude.manager() {
             Some(hooks) => hooks
                 .files
                 .iter()
@@ -1184,91 +1151,6 @@ impl Agent {
         }
         if let Some(log) = &mut self.session {
             let _ = log.append(&Record::Hooks { files, recorded_at: session::now() });
-        }
-    }
-
-    /// Run the once-per-session `SessionStart` hooks if they have not run yet.
-    /// Any context is cached in `pending_session_start_context` (not returned)
-    /// so it survives a `UserPromptSubmit` rejection of the first prompt:
-    /// `SessionStart` runs once and may have side effects, so its context must
-    /// not be re-collected by re-running the hook. Separate from
-    /// `UserPromptSubmit` so the resume path (which must not re-validate an
-    /// already-accepted prompt) can still deliver `SessionStart` context when a
-    /// restored session continues.
-    fn run_claude_session_start(&mut self) {
-        if self.claude_hooks.is_none() || self.claude_session_started {
-            return;
-        }
-        self.claude_session_started = true;
-        let trigger = if self.claude_session_resumed { "resume" } else { "startup" };
-        let outcome = self.claude_hooks.as_ref().expect("checked above").run_session_start(trigger);
-        if let Some(ctx) = outcome.context_block() {
-            // Prepend to anything already cached (there should not be, but do
-            // not drop context if the hook somehow produced it twice).
-            let cached = self.pending_session_start_context.take();
-            self.pending_session_start_context = Some(match cached {
-                Some(existing) if !existing.is_empty() => format!("{existing}\n\n{ctx}"),
-                _ => ctx,
-            });
-        }
-    }
-
-    /// Drain any cached `SessionStart` context for delivery to the model.
-    fn take_session_start_context(&mut self) -> Option<String> {
-        self.pending_session_start_context.take()
-    }
-
-    /// Run the `SessionStart` (once per session) and `UserPromptSubmit` hooks
-    /// for a fresh prompt. Returns either any additional context to attach to
-    /// the prompt, or a rejection reason.
-    fn run_claude_prompt_hooks(&mut self, user_input: &str) -> ClaudePromptHook {
-        if self.claude_hooks.is_none() {
-            return ClaudePromptHook::Proceed(None);
-        }
-        self.run_claude_session_start();
-        let outcome = self.claude_hooks.as_ref().expect("checked above").run_user_prompt_submit(user_input);
-        if outcome.blocked {
-            // The prompt is rejected, so its context is not delivered — but the
-            // SessionStart context collected above must NOT be discarded with
-            // it. `claude_session_started` is already true, so leaving it cached
-            // in `pending_session_start_context` delivers it with the first
-            // accepted prompt instead of losing it (or re-running the hook).
-            return ClaudePromptHook::Reject(outcome.block_reason.unwrap_or_default());
-        }
-        let mut contexts = Vec::new();
-        // The prompt was accepted: deliver any cached SessionStart context now.
-        if let Some(ctx) = self.take_session_start_context() {
-            contexts.push(ctx);
-        }
-        if let Some(ctx) = outcome.context_block() {
-            contexts.push(ctx);
-        }
-        if contexts.is_empty() {
-            ClaudePromptHook::Proceed(None)
-        } else {
-            ClaudePromptHook::Proceed(Some(contexts.join("\n\n")))
-        }
-    }
-
-    /// Run the `Stop` hooks when the turn is about to end. Returns a reason to
-    /// keep the agent going, or `None` to let the turn end. Blocks are capped
-    /// per turn to avoid loops.
-    fn run_claude_stop_hooks(&mut self) -> Option<String> {
-        if self.claude_hooks.is_none() || self.claude_stop_blocks >= claude_hooks::MAX_STOP_BLOCKS {
-            return None;
-        }
-        let active = self.claude_stop_blocks > 0;
-        let outcome = self.claude_hooks.as_ref().expect("checked above").run_stop(active);
-        if outcome.blocked {
-            self.claude_stop_blocks += 1;
-            Some(
-                outcome
-                    .block_reason
-                    .filter(|r| !r.trim().is_empty())
-                    .unwrap_or_else(|| "A Stop hook asked the agent to keep going.".to_string()),
-            )
-        } else {
-            None
         }
     }
 
@@ -2630,9 +2512,7 @@ impl Agent {
         self.session = session;
         self.session_id = Some(id.clone());
         self.set_spill_dir(&id);
-        self.claude_session_started = false;
-        self.pending_session_start_context = None;
-        self.claude_session_resumed = false;
+        self.claude.reset_fresh();
         self.sync_claude_hook_session();
         self.persist_claude_hook_config();
         self.calibration = None;
@@ -2753,9 +2633,7 @@ impl Agent {
         // tools).
         self.pre_compaction_transcript = restored.folded;
         self.pre_compaction_restated = restored.restated;
-        self.claude_session_started = false;
-        self.pending_session_start_context = None;
-        self.claude_session_resumed = true;
+        self.claude.reset_resumed();
         self.sync_claude_hook_session();
         self.persist_claude_hook_config();
         {
@@ -3226,7 +3104,7 @@ impl Agent {
         // `auto_initiated` so it bills as agent-initiated. Taken once here so it
         // never leaks into the next, genuinely user-initiated turn.
         let auto_turn = std::mem::take(&mut self.auto_turn);
-        self.claude_stop_blocks = 0;
+        self.claude.begin_turn();
         self.sync_claude_hook_session();
         self.apply_mode_to_system_prompt();
         self.turn_history_calls = 0;
@@ -3300,7 +3178,7 @@ impl Agent {
                 // early-return replay branches — which complete an
                 // already-answered turn from the log without a model call —
                 // leave it cached rather than dropping it.
-                self.run_claude_session_start();
+                self.claude.ensure_session_start();
                 let recorded = self.conversation.get(pending.position);
                 if !recorded.is_some_and(|m| m.role == Role::User) {
                     // The input was logged but its user message was not.
@@ -3343,7 +3221,7 @@ impl Agent {
                     self.push(Message::assistant(&response))?;
                     return self.finish_turn(input_id, response, Some(outcome), StopReason::EndTurn).map(end_turn);
                 }
-                if let Some(ctx) = self.take_session_start_context() {
+                if let Some(ctx) = self.claude.take_session_start_context() {
                     // Remember where the resume `SessionStart` hook context
                     // lands: it is appended *after* the persisted turn tail, so
                     // the continuation scan below must look at the messages
@@ -3354,7 +3232,7 @@ impl Agent {
                 }
             }
             None => {
-                let extra = match self.run_claude_prompt_hooks(user_input) {
+                let extra = match self.claude.run_prompt_hooks(user_input) {
                     ClaudePromptHook::Reject(reason) => {
                         self.pending_input = Some(PendingInput {
                             id: input_id.clone(),
@@ -3992,7 +3870,7 @@ impl Agent {
                 // reason as the next message (capped to avoid loops).
                 if iteration < budget
                     && !self.control.is_cancelled()
-                    && let Some(reason) = self.run_claude_stop_hooks()
+                    && let Some(reason) = self.claude.run_stop_hooks()
                 {
                     self.push(Message::user(&reminders::wrap(&reason)).auto_initiated())?;
                     // The Stop-hook reply is a fresh answer, not a continuation.
@@ -4094,7 +3972,7 @@ impl Agent {
                 let mut pre_hook_deny: Option<String> = None;
                 // The decision of the first policy check on the original arguments.
                 let original_decision = self.policy.decide(&tool_call.name, &tool_call.arguments);
-                if let Some(claude_hooks) = self.claude_hooks.as_ref() {
+                if let Some(claude_hooks) = self.claude.manager() {
                     let runnable = tool_call.raw_arguments_error(response.stop_reason.as_deref()).is_none()
                         && (self.control.mode() != crate::mode::AgentMode::Plan
                             || crate::mode::plan_allows(&tool_call.name))
@@ -4349,7 +4227,7 @@ impl Agent {
                 // Only after a handler actually ran — a blocked/rejected call
                 // (policy, plan mode, malformed input, a PreToolUse deny) never
                 // reached a tool, so its PostToolUse side effects must not fire.
-                if dispatched && let Some(hooks) = &self.claude_hooks {
+                if dispatched && let Some(hooks) = self.claude.manager() {
                     let outcome =
                         hooks.run_post_tool_use(&tool_call.name, &effective_arguments, &result_text, &tool_call.id);
                     if let Some(ctx) = outcome.context_block() {
@@ -4501,7 +4379,7 @@ impl Agent {
                 // the turn is no longer complete — and continue the loop.
                 if iteration < budget
                     && !self.control.is_cancelled()
-                    && let Some(reason) = self.run_claude_stop_hooks()
+                    && let Some(reason) = self.claude.run_stop_hooks()
                 {
                     self.push(Message::user(&reminders::wrap(&reason)).auto_initiated())?;
                     last_content = reported.take().map(|outcome| outcome.response()).unwrap_or_default();
