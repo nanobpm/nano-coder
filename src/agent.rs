@@ -3,8 +3,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+mod probe;
+
+#[cfg(test)]
+use crate::llm::DetectedWindow;
 use anyhow::Result;
 use chrono::{DateTime, Local, Utc};
+use probe::{Detected, ProbeState};
 use serde_json::{Value, json};
 
 use crate::claude_hooks;
@@ -14,9 +19,7 @@ use crate::goal::{self, Outcome};
 use crate::history;
 use crate::hooks::{HookContext, HookEvent, HookRegistry};
 use crate::instructions::ProjectInstructions;
-use crate::llm::{
-    ChatRequest, ContextCap, DetectedWindow, LLMClient, LLMResponse, Message, Role, StreamEvent, ToolCall,
-};
+use crate::llm::{ChatRequest, ContextCap, LLMClient, LLMResponse, Message, Role, StreamEvent, ToolCall};
 use crate::memory;
 use crate::output;
 use crate::permissions::Policy;
@@ -734,31 +737,10 @@ pub struct Agent {
     /// learning the cap from the first rejection lets the retry succeed without
     /// blocking the switch on the probe (issue #114).
     learned_max_output: Option<usize>,
-    /// Window reported by the endpoint (see `detect_context_window`). Shared
-    /// and locked because a mid-turn `/model` switch probes in a background
-    /// task (see `detect_context_window_for_switch`), which publishes here
-    /// when it lands.
-    detected_window: std::sync::Arc<std::sync::Mutex<Option<DetectedWindow>>>,
-    /// Monotonic switch counter, bumped on every model change (see
-    /// `detect_context_window_for_switch`). A background window probe captures
-    /// the generation it was spawned under and discards its result if a later
-    /// switch has since bumped it, so a slow probe for a superseded model can
-    /// never overwrite the current model's detected window.
-    detect_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Thinking levels reported by the endpoint (see `detect_context_window`).
-    /// Shared for the same reason as `detected_window`.
-    reported_thinking: std::sync::Arc<std::sync::Mutex<Option<crate::thinking::Reported>>>,
-    /// Vision capability reported by the endpoint (see `detect_context_window`).
-    /// Shared for the same reason as `detected_window`.
-    reported_vision: std::sync::Arc<std::sync::Mutex<Option<crate::vision::Vision>>>,
-    /// The model's own maximum output tokens as published by the endpoint,
-    /// captured on **both** probe paths — the default combined probe and the
-    /// configured-window path (which skips the window follow-up but still reads
-    /// the shared `/models` entry that carries this limit). Kept separate from
-    /// `detected_window` so a configured context window — which clears the
-    /// detected window — never discards the discovered output limit (issue
-    /// #114). Shared for the same reason as `detected_window`.
-    reported_max_output: std::sync::Arc<std::sync::Mutex<Option<usize>>>,
+    /// Capabilities reported by the endpoint (window, thinking levels, vision,
+    /// output limit) and the generation guard that stops a slow background
+    /// probe for a superseded model overwriting them (see `probe.rs`).
+    probe: ProbeState,
     /// Context size right after the last compaction; auto-compaction waits
     /// for real growth past it so an incompressible context is not
     /// re-summarized on every call.
@@ -925,41 +907,6 @@ const DETECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
     providers::openai::MAX_PROBE_CHAIN as u64 * providers::openai::PROBE_TIMEOUT.as_secs() + 2,
 );
 
-/// The shared slots a background capability probe publishes into (see
-/// `Agent::detect_context_window_for_switch`).
-struct DetectSlots {
-    window: std::sync::Arc<std::sync::Mutex<Option<DetectedWindow>>>,
-    thinking: std::sync::Arc<std::sync::Mutex<Option<crate::thinking::Reported>>>,
-    vision: std::sync::Arc<std::sync::Mutex<Option<crate::vision::Vision>>>,
-    max_output: std::sync::Arc<std::sync::Mutex<Option<usize>>>,
-}
-
-/// What a background capability probe found.
-struct Detected {
-    window: Option<DetectedWindow>,
-    thinking: Option<crate::thinking::Reported>,
-    vision: Option<crate::vision::Vision>,
-    /// The model's published output-token limit, kept separate from `window`
-    /// so a configured window (which carries none) never discards it (#114).
-    max_output: Option<usize>,
-}
-
-#[cfg(test)]
-impl Detected {
-    /// A probe that reported only a window.
-    fn window(window: DetectedWindow) -> Self {
-        Detected { window: Some(window), thinking: None, vision: None, max_output: None }
-    }
-}
-
-#[cfg(test)]
-impl DetectSlots {
-    /// Slots around an existing window slot, with fresh thinking/vision slots.
-    fn window(window: std::sync::Arc<std::sync::Mutex<Option<DetectedWindow>>>) -> Self {
-        DetectSlots { window, thinking: Default::default(), vision: Default::default(), max_output: Default::default() }
-    }
-}
-
 impl Agent {
     pub fn new(client: Box<dyn LLMClient>, config: Config) -> Self {
         let conversation = vec![Message { timestamp: Some(session::now()), ..Message::system(&config.system_prompt) }];
@@ -996,11 +943,7 @@ impl Agent {
             calibration: None,
             learned_window: None,
             learned_max_output: None,
-            detected_window: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            detect_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            reported_thinking: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            reported_vision: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            reported_max_output: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            probe: ProbeState::default(),
             compact_floor: 0,
             streaming: false,
             instructions: None,
@@ -1425,7 +1368,7 @@ impl Agent {
             self.client.kind(),
             &provider,
             self.model_name(),
-            self.reported_thinking.lock().unwrap().as_ref(),
+            self.probe.thinking().as_ref(),
         );
         // A fixed budget must stay below the output cap. Always check, even
         // when an earlier adjustment already warned: a level fitted down (e.g.
@@ -1524,8 +1467,8 @@ impl Agent {
         self.calibration = None;
         self.learned_window = None;
         self.learned_max_output = None;
-        *self.detected_window.lock().unwrap() = None;
-        *self.reported_thinking.lock().unwrap() = None;
+        *self.probe.window() = None;
+        *self.probe.thinking() = None;
         self.compact_floor = 0;
         self.detect_context_window().await;
     }
@@ -1664,7 +1607,7 @@ impl Agent {
                     self.calibration = None;
                     self.learned_window = None;
                     self.learned_max_output = None;
-                    *self.detected_window.lock().unwrap() = None;
+                    *self.probe.window() = None;
                     self.compact_floor = 0;
                     self.detect_context_window_for_switch();
                     let spec = crate::recents::canonical(&spec, &all, &default_provider);
@@ -1693,9 +1636,7 @@ impl Agent {
         // Bump the generation so any in-flight background probe from an earlier
         // mid-turn switch (see `detect_context_window_for_switch`) is discarded
         // and cannot overwrite what this blocking detect establishes.
-        self.detect_generation.fetch_add(1, Ordering::SeqCst);
-        *self.detected_window.lock().unwrap() = None;
-        *self.reported_max_output.lock().unwrap() = None;
+        self.probe.begin_blocking_detect();
         if self.configured_window().is_some() {
             // The configured window wins, so the window half of the combined
             // probe is discarded — running it anyway can only hurt: a
@@ -1715,17 +1656,14 @@ impl Agent {
         // cap with no recognized window field) or when a later configured
         // window clears the detected window (issue #114). Fall back to the
         // window's own cap when the probe returns none independently.
-        *self.reported_max_output.lock().unwrap() =
-            max_output.or_else(|| window.as_ref().and_then(|w| w.max_output_tokens));
-        *self.detected_window.lock().unwrap() = window;
-        *self.reported_thinking.lock().unwrap() = thinking;
+        let max_output = max_output.or_else(|| window.as_ref().and_then(|w| w.max_output_tokens));
         // Vision is derived from the same probe responses `detect_capabilities`
         // already fetched, so it costs no extra round trip. Storing the report
         // is always the right move: a `vision = false` override discards it at
         // resolution time, but `true`/none keep it (`true` forces the capability
         // on yet preserves the endpoint's reported limits), so keeping it here
         // lets `resolve` apply those limits on the default path too.
-        *self.reported_vision.lock().unwrap() = vision;
+        self.probe.store(Detected { window, thinking, vision, max_output });
         self.refresh_stats();
     }
 
@@ -1745,11 +1683,9 @@ impl Agent {
     async fn detect_thinking(&mut self) {
         let probe = self.client.detect_thinking_and_vision();
         let (thinking, vision, max_output) = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().unwrap_or_default();
-        *self.reported_thinking.lock().unwrap() = thinking;
-        *self.reported_vision.lock().unwrap() = vision;
         // The output limit is a separate budget from the window, so keep it even
         // though the configured window wins over the probed one (issue #114).
-        *self.reported_max_output.lock().unwrap() = max_output;
+        self.probe.store_without_window(thinking, vision, max_output);
         self.refresh_stats();
     }
 
@@ -1776,7 +1712,7 @@ impl Agent {
             self.client.kind(),
             &provider,
             self.model_name(),
-            self.reported_vision.lock().unwrap().as_ref(),
+            self.probe.vision().as_ref(),
         )
     }
 
@@ -1904,13 +1840,9 @@ impl Agent {
         // for the previous model is already invalidated: its `finish_detect`
         // re-reads the generation under the slot lock and discards a stale
         // result rather than clobbering this model's window.
-        let generation = self.detect_generation.fetch_add(1, Ordering::SeqCst) + 1;
-        *self.detected_window.lock().unwrap() = None;
         // The previous model's reports must not leak onto the new one; until
         // the background probe lands, the built-in assumptions apply.
-        *self.reported_thinking.lock().unwrap() = None;
-        *self.reported_vision.lock().unwrap() = None;
-        *self.reported_max_output.lock().unwrap() = None;
+        let generation = self.probe.begin_detect();
         // Publish the new model's fallback stats (provider/model name + the
         // model-name or default window) right away, so a slow or `None` probe
         // cannot leave the UI on the previous model's window.
@@ -1919,15 +1851,9 @@ impl Agent {
         // and vision are probed then (see `detect_thinking`).
         let configured = self.configured_window().is_some();
         let probe = self.client.clone_boxed();
-        let slots = DetectSlots {
-            window: self.detected_window.clone(),
-            thinking: self.reported_thinking.clone(),
-            vision: self.reported_vision.clone(),
-            max_output: self.reported_max_output.clone(),
-        };
+        let slots = self.probe.clone();
         let sink = self.event_sink.clone();
         let stats = self.stats.clone();
-        let current = self.detect_generation.clone();
         tokio::spawn(async move {
             let (detected, thinking, vision, max_output) = if configured {
                 let (thinking, vision, max_output) =
@@ -1949,7 +1875,6 @@ impl Agent {
             Self::finish_detect(
                 Detected { window: detected, thinking, vision, max_output },
                 generation,
-                current,
                 slots,
                 sink,
                 stats,
@@ -1975,31 +1900,15 @@ impl Agent {
     fn finish_detect(
         detected: Detected,
         generation: u64,
-        current: std::sync::Arc<std::sync::atomic::AtomicU64>,
-        slots: DetectSlots,
+        probe: ProbeState,
         sink: Option<EventSink>,
         stats: SharedStats,
     ) {
-        let Detected { window: detected, thinking, vision, max_output } = detected;
-        {
-            // Check the generation under the window slot lock so a switch
-            // racing this completion either bumps it before we read (we
-            // discard) or clears the slots after we write (it then refreshes to
-            // its own fallback). The window lock is held while the thinking
-            // and vision reports are written too, so all three land together.
-            let mut slot = slots.window.lock().unwrap();
-            if current.load(Ordering::SeqCst) != generation {
-                return;
-            }
-            *slots.thinking.lock().unwrap() = thinking;
-            *slots.vision.lock().unwrap() = vision;
-            // Published output limit lands with the rest; kept even when the
-            // window slot stays empty (configured-window path) (issue #114).
-            *slots.max_output.lock().unwrap() = max_output;
-            if let Some(detected) = &detected {
-                *slot = Some(detected.clone());
-            }
-        }
+        // `publish_if_current` checks the generation under the window slot
+        // lock and lands all four reports together (see `ProbeState`).
+        let Some(detected) = probe.publish_if_current(generation, detected) else {
+            return;
+        };
         let Some(detected) = detected else {
             if let Some(sink) = sink {
                 sink(None, &AgentEvent::Context);
@@ -2010,7 +1919,7 @@ impl Agent {
         {
             let mut stats = stats.lock().unwrap();
             // Re-check: a switch may have superseded us between the two locks.
-            if current.load(Ordering::SeqCst) != generation {
+            if !probe.is_current(generation) {
                 return;
             }
             if stats.window_source.starts_with("reported by the endpoint")
@@ -2069,7 +1978,7 @@ impl Agent {
     /// so the output reservation must count against it again.
     fn context_cap(&self) -> ContextCap {
         if self.configured_window().is_none()
-            && let Some(detected) = self.detected_window.lock().unwrap().as_ref()
+            && let Some(detected) = self.probe.window().as_ref()
             && self.learned_window.is_none_or(|learned| learned >= detected.tokens)
         {
             return detected.cap;
@@ -2092,7 +2001,7 @@ impl Agent {
     /// is not sized against the prompt-only cap and pushed past the learned
     /// total again.
     fn combined_window(&self) -> Option<usize> {
-        let advertised = self.detected_window.lock().unwrap().as_ref().and_then(|d| d.total_tokens);
+        let advertised = self.probe.window().as_ref().and_then(|d| d.total_tokens);
         match (advertised, self.learned_window) {
             (Some(advertised), Some(learned)) => Some(advertised.min(learned)),
             (Some(advertised), None) => Some(advertised),
@@ -2230,8 +2139,8 @@ impl Agent {
         // across the window lock here inverts that order and can deadlock a
         // background model-switch probe when the report is still `None`
         // (issue #114).
-        let reported = *self.reported_max_output.lock().unwrap();
-        reported.or_else(|| self.detected_window.lock().unwrap().as_ref().and_then(|d| d.max_output_tokens))
+        let reported = *self.probe.max_output();
+        reported.or_else(|| self.probe.window().as_ref().and_then(|d| d.max_output_tokens))
     }
 
     /// The effective `max_tokens` the next request would send before the
@@ -2248,7 +2157,7 @@ impl Agent {
         let (_, model) = providers::context_window(&self.config.model, &user, &default_provider);
         let (window, source) = if let Some((window, source)) = self.configured_window() {
             (window, source.to_string())
-        } else if let Some(detected) = &*self.detected_window.lock().unwrap() {
+        } else if let Some(detected) = &*self.probe.window() {
             (detected.tokens, format!("reported by the endpoint ({})", detected.source))
         } else if let Some(window) =
             context::window_for_model(&model).or_else(|| context::window_for_model(self.client.model_name()))
@@ -6631,7 +6540,7 @@ mod tests {
             Box::new(Scripted { responses: Mutex::new(vec![]), seen: Arc::new(Mutex::new(vec![])) }),
             config,
         );
-        let reported = agent.reported_max_output.clone();
+        let reported = agent.probe.max_output_slot();
         let client = OutputCapClient {
             cap: 8_000,
             seen_max_tokens: seen.clone(),
@@ -9499,7 +9408,7 @@ mod tests {
         let (mut agent, seen) = budgeted_agent(vec![big_call("b1"), text("done")], window, 4_000, dir.path());
         agent.config_mut().max_tokens = 0;
         agent.config_mut().context_window = None;
-        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
+        *agent.probe.window() = Some(DetectedWindow {
             tokens: window,
             source: "Copilot /models max_context_window_tokens".into(),
             cap: ContextCap::Total,
@@ -9516,7 +9425,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut agent, seen) = budgeted_agent(vec![big_call("b1"), text("done")], window, 4_000, dir.path());
         agent.config_mut().context_window = None;
-        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
+        *agent.probe.window() = Some(DetectedWindow {
             tokens: window,
             source: "Copilot /models max_context_window_tokens".into(),
             cap: ContextCap::Total,
@@ -9557,9 +9466,9 @@ mod tests {
         let (mut agent, _seen) = budgeted_agent(vec![text("done")], 200_000, 4_000, dir.path());
         agent.config_mut().max_tokens = 0;
         // The configured-window probe path leaves the detected window empty.
-        assert!(agent.detected_window.lock().unwrap().is_none());
+        assert!(agent.probe.window().is_none());
         // ...yet the output limit it read from the shared `/models` entry stands.
-        *agent.reported_max_output.lock().unwrap() = Some(16_000);
+        *agent.probe.max_output() = Some(16_000);
         assert_eq!(agent.detected_max_output(), Some(16_000));
         assert_eq!(agent.effective_max_tokens(), 16_000);
     }
@@ -9587,7 +9496,7 @@ mod tests {
         let window = 24_000;
         let (mut agent, seen) = budgeted_agent(vec![big_call("b1"), text("done")], window, 40_000, dir.path());
         agent.config_mut().context_window = None;
-        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
+        *agent.probe.window() = Some(DetectedWindow {
             tokens: window,
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
@@ -9616,7 +9525,7 @@ mod tests {
         // trigger, yet close enough that the reservation caps `max_tokens`.
         let (mut agent, seen) = budgeted_agent(vec![big_call("b1"), text("done")], detected, 36_000, dir.path());
         agent.config_mut().context_window = None;
-        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
+        *agent.probe.window() = Some(DetectedWindow {
             tokens: detected,
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
@@ -9650,7 +9559,7 @@ mod tests {
         // combined window, so `max_tokens` is capped to the combined room.
         let (mut agent, seen) = budgeted_agent(vec![text("done")], prompt_window, 0, dir.path());
         agent.config_mut().context_window = None;
-        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
+        *agent.probe.window() = Some(DetectedWindow {
             tokens: prompt_window,
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
@@ -9682,7 +9591,7 @@ mod tests {
         let combined = 102_000;
         let (mut agent, seen) = budgeted_agent(vec![text("SUMMARY"), text("done")], prompt_window, 0, dir.path());
         agent.config_mut().context_window = None;
-        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
+        *agent.probe.window() = Some(DetectedWindow {
             tokens: prompt_window,
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
@@ -9718,7 +9627,7 @@ mod tests {
         let prompt_window = 100_000;
         let (mut agent, seen) = budgeted_agent(vec![text("SUMMARY"), text("done")], prompt_window, 0, dir.path());
         agent.config_mut().context_window = None;
-        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
+        *agent.probe.window() = Some(DetectedWindow {
             tokens: prompt_window,
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
@@ -9754,7 +9663,7 @@ mod tests {
         let learned = 110_000;
         let (mut agent, seen) = budgeted_agent(vec![text("done")], prompt_window, 0, dir.path());
         agent.config_mut().context_window = None;
-        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
+        *agent.probe.window() = Some(DetectedWindow {
             tokens: prompt_window,
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
@@ -9790,7 +9699,7 @@ mod tests {
         let learned = 110_000;
         let (mut agent, seen) = budgeted_agent(vec![text("done")], prompt_window, 0, dir.path());
         agent.config_mut().context_window = None;
-        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
+        *agent.probe.window() = Some(DetectedWindow {
             tokens: prompt_window,
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
@@ -10322,7 +10231,7 @@ mod tests {
         agent.config_mut().context_window = Some(32_000);
         agent.detect_context_window().await;
         assert_eq!(agent.context_window_with_source(), (32_000, "context_window in config".into()));
-        assert!(agent.detected_window.lock().unwrap().is_none(), "no probe when config sets the window");
+        assert!(agent.probe.window().is_none(), "no probe when config sets the window");
     }
 
     #[tokio::test]
@@ -10372,11 +10281,11 @@ mod tests {
         agent.detect_context_window().await;
         assert_eq!(*calls.lock().unwrap(), ["thinking"], "the discarded window half is not probed");
         assert_eq!(
-            agent.reported_thinking.lock().unwrap().as_ref().map(|r| r.levels.as_slice()),
+            agent.probe.thinking().as_ref().map(|r| r.levels.as_slice()),
             Some(["off".to_string(), "on".to_string()].as_slice()),
             "the thinking levels are still probed"
         );
-        assert!(agent.detected_window.lock().unwrap().is_none(), "the configured window stands");
+        assert!(agent.probe.window().is_none(), "the configured window stands");
     }
 
     #[test]
@@ -10413,7 +10322,7 @@ mod tests {
         // compaction early); the estimate must instead recompute the whole
         // conversation to mirror the real newest-N wire plan.
         let (mut agent, _) = agent(vec![], std::path::Path::new("/nonexistent"));
-        *agent.reported_vision.lock().unwrap() = Some(crate::vision::Vision {
+        *agent.probe.vision() = Some(crate::vision::Vision {
             max_images: 1,
             max_image_bytes: crate::attachment::DEFAULT_MAX_BYTES,
             media_types: Vec::new(),
@@ -10458,7 +10367,7 @@ mod tests {
         // than `KEEP_RECENT_TOKENS` intends.
         let dir = tempfile::tempdir().unwrap();
         let (mut agent, _) = agent(vec![text("SUMMARY"), text("done")], dir.path());
-        *agent.reported_vision.lock().unwrap() = Some(crate::vision::Vision {
+        *agent.probe.vision() = Some(crate::vision::Vision {
             max_images: 1,
             max_image_bytes: crate::attachment::DEFAULT_MAX_BYTES,
             media_types: Vec::new(),
@@ -12726,7 +12635,7 @@ mod tests {
         let (window, source) = agent.context_window_with_source();
         assert_eq!(window, 111_111, "{source}");
         assert_eq!(source, "provider context_window");
-        assert!(agent.detected_window.lock().unwrap().is_none(), "a configured window skips the endpoint probe");
+        assert!(agent.probe.window().is_none(), "a configured window skips the endpoint probe");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -12752,7 +12661,7 @@ mod tests {
         assert_eq!(agent.provider_name(), "mock", "switched mid-turn");
         // The mock client reports no window, so the background probe publishes
         // nothing and the model-name fallback stays in effect.
-        assert!(agent.detected_window.lock().unwrap().is_none());
+        assert!(agent.probe.window().is_none());
     }
 
     #[test]
@@ -12771,8 +12680,7 @@ mod tests {
         Agent::finish_detect(
             Detected::window(DetectedWindow::total(999, "stale")),
             3,
-            current.clone(),
-            DetectSlots::window(slot.clone()),
+            ProbeState::with_window(slot.clone(), current.clone()),
             None,
             stats.clone(),
         );
@@ -12783,8 +12691,7 @@ mod tests {
         Agent::finish_detect(
             Detected::window(DetectedWindow::total(4096, "fresh")),
             5,
-            current.clone(),
-            DetectSlots::window(slot.clone()),
+            ProbeState::with_window(slot.clone(), current.clone()),
             None,
             stats.clone(),
         );
@@ -12807,8 +12714,7 @@ mod tests {
         Agent::finish_detect(
             Detected::window(DetectedWindow::total(8192, "max_model_len")),
             1,
-            current.clone(),
-            DetectSlots::window(slot.clone()),
+            ProbeState::with_window(slot.clone(), current.clone()),
             None,
             stats.clone(),
         );
@@ -12833,8 +12739,7 @@ mod tests {
         Agent::finish_detect(
             Detected::window(DetectedWindow::total(128_000, "max_model_len")),
             1,
-            current.clone(),
-            DetectSlots::window(slot.clone()),
+            ProbeState::with_window(slot.clone(), current.clone()),
             None,
             stats.clone(),
         );
@@ -12859,8 +12764,7 @@ mod tests {
         Agent::finish_detect(
             Detected::window(DetectedWindow::total(200_000, "max_model_len")),
             1,
-            current.clone(),
-            DetectSlots::window(slot.clone()),
+            ProbeState::with_window(slot.clone(), current.clone()),
             None,
             stats.clone(),
         );
@@ -12888,8 +12792,7 @@ mod tests {
         Agent::finish_detect(
             Detected::window(DetectedWindow::total(128_000, "max_model_len")),
             1,
-            current.clone(),
-            DetectSlots::window(slot.clone()),
+            ProbeState::with_window(slot.clone(), current.clone()),
             None,
             stats.clone(),
         );
