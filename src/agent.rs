@@ -1646,7 +1646,6 @@ impl Agent {
                     *self.probe.window() = None;
                     self.compact_floor = 0;
                     self.idle_gate.reset();
-                    self.idle_gate.reset();
                     self.detect_context_window_for_switch();
                     let spec = crate::recents::canonical(&spec, &all, &default_provider);
                     self.emit(AgentEvent::ModelSwitched { spec: &spec, previous: &previous });
@@ -4654,7 +4653,17 @@ impl Agent {
             return false;
         }
         let (tokens, _) = self.estimate_context_tokens();
-        self.idle_gate.armed(tokens, self.context_window())
+        let window = self.context_window();
+        // `over_threshold` also subtracts the output reservation, which can
+        // put its limit *below* the configured threshold on a small total
+        // window. Idle compaction is opportunistic, so it additionally
+        // requires usage at or past `window × auto_compact_threshold` itself
+        // and never runs earlier than the user asked (issue #182).
+        let threshold = self.config.auto_compact_threshold.clamp(0.1, 0.99);
+        if (tokens as f64) < window as f64 * threshold {
+            return false;
+        }
+        self.idle_gate.armed(tokens, window)
     }
 
     /// Run the same compaction auto-compaction would, at the idle prompt.
@@ -9901,6 +9910,28 @@ mod tests {
         agent.config.auto_compact = true;
         agent.config.context_window = Some(100_000);
         assert!(!agent.idle_compact_due(), "below the threshold: never compacts early");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_compaction_never_runs_below_the_configured_threshold() {
+        // Issue #182: `over_threshold` subtracts the output reservation, so
+        // on a small total window it trips below the configured threshold.
+        // Idle compaction must still wait for the threshold itself.
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = idle_above_threshold(vec![], dir.path()).await;
+        let (tokens, _) = agent.estimate_context_tokens();
+        // A window where the reserve (≥ MIN_OUTPUT_RESERVE-capped output +
+        // margin) puts the limit under `tokens`, yet tokens < 99% of it.
+        agent.config.context_window = Some(tokens + 1_000);
+        agent.config.auto_compact_threshold = 0.99;
+        assert!(agent.over_threshold(), "the reservation trips mid-turn rescue");
+        assert!(
+            (tokens as f64) < agent.context_window() as f64 * 0.99,
+            "usage {tokens} is under the configured threshold"
+        );
+        assert!(!agent.idle_compact_due(), "idle compaction waits for the configured threshold");
+        agent.config.auto_compact_threshold = 0.5;
+        assert!(agent.idle_compact_due(), "past the configured threshold it is due");
     }
 
     #[tokio::test(flavor = "multi_thread")]

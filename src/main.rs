@@ -379,6 +379,11 @@ struct Terminal {
     /// Lines typed during a turn join the message queue (only when stdin is a
     /// terminal); piped lines keep the "queued as later prompts" path.
     steerable: bool,
+    /// The key reader (and so `view`) is live: both stdin and stdout are a
+    /// terminal. With stdout redirected input falls back to `read_line` and
+    /// the editor view never sees keystrokes, so anything relying on its
+    /// quiet timestamps (idle compaction, issue #182) must require this.
+    key_mode: bool,
     /// Where `/settings` saves changes.
     config_path: std::path::PathBuf,
     /// The line being typed (terminal stdin only).
@@ -500,6 +505,7 @@ impl Terminal {
             queued: VecDeque::new(),
             messages: queue::MessageQueue::default(),
             steerable: io::stdin().is_terminal(),
+            key_mode,
             config_path,
             view,
             recents,
@@ -1093,6 +1099,30 @@ pub(crate) fn deliver_idle_compact(
     due && quiet_for >= hold && !interrupt_queued && !exit_armed
 }
 
+/// Whether an idle compaction may start now, and when to recheck if not
+/// (issue #182). Requires the key reader (`Terminal::key_mode`), since only
+/// it keeps the editor's quiet timestamps current. Non-mutating: the caller
+/// that acts on it re-checks and parks the draft under one view lock.
+fn idle_compact_poll(
+    agent: &Agent,
+    terminal: &Terminal,
+    shown: std::time::Instant,
+    hold: std::time::Duration,
+    interrupt_queued: bool,
+    exit_armed: bool,
+) -> (bool, Option<std::time::Instant>) {
+    let due = terminal.key_mode && agent.idle_compact_due();
+    if !due {
+        return (false, None);
+    }
+    let quiet = terminal.view.lock().unwrap().quiet_since(shown);
+    let now = std::time::Instant::now();
+    let deliver = deliver_idle_compact(due, now.saturating_duration_since(quiet), hold, interrupt_queued, exit_armed);
+    // Wake when the hold would elapse, so the compaction starts without
+    // waiting for a keystroke (bounded below to avoid a busy spin).
+    (deliver, Some((quiet + hold).max(now + std::time::Duration::from_millis(200))))
+}
+
 /// The idle-compaction hold: `idle_compact_hold_secs`, else
 /// [`lineedit::IDLE_COMPACT_HOLD`].
 fn idle_compact_hold(config: &config::Config) -> std::time::Duration {
@@ -1504,6 +1534,13 @@ async fn drive_compaction<R>(
     // restores the idle `Prompt` mode when it drops at function exit, so there
     // is no explicit restore to skip even if a future edit adds an early return.
     let report = loop {
+        // Keep a read outstanding: a submitted line ends the reader's current
+        // read, and without a fresh request further keys — Esc Esc, `/queue`
+        // edits — would go unread until the compaction finished. Same EOF
+        // guard as `run_interactive_turn`: never re-request after end of input.
+        if !terminal.queued.iter().any(|i| matches!(i, TermInput::Eof)) {
+            terminal.request_line();
+        }
         tokio::select! {
             biased;
             report = &mut compaction => break report,
@@ -2977,6 +3014,11 @@ async fn main() -> Result<()> {
             // never end on its own: `--wait-timers` instead sleeps until the
             // next timer is due and runs it, repeating until none are left.
             let wait_timers = args.wait_timers;
+            // When this idle prompt went up (timer wait included): an idle
+            // compaction waits for the prompt (and any draft) to sit
+            // untouched for its hold from here.
+            let prompt_shown = std::time::Instant::now();
+            let idle_hold = idle_compact_hold(agent.config());
             let (fired, parked) = if agent.timers().is_empty() {
                 // No timers to wait for: skip the wait entirely so piped input
                 // flows straight to the normal read below.
@@ -3066,7 +3108,23 @@ async fn main() -> Result<()> {
                     // here, so an armed exit hint that is never confirmed must
                     // clear here too rather than linger on the status bar for the
                     // (possibly hours-away) timer's whole wait.
-                    let deadline = [exit_press.deadline(), Some(timer_deadline)]
+                    // Idle compaction (issue #182) must not wait out a
+                    // far-off timer: once it is deliverable, leave the wait
+                    // so the prompt loop below runs it (that loop re-checks
+                    // and parks a stale draft under one view lock); until
+                    // then wake when its hold would elapse.
+                    let (idle_now, idle_deadline) = idle_compact_poll(
+                        &agent,
+                        &terminal,
+                        prompt_shown,
+                        idle_hold,
+                        false,
+                        exit_press.deadline().is_some(),
+                    );
+                    if idle_now {
+                        break (Vec::new(), None);
+                    }
+                    let deadline = [exit_press.deadline(), Some(timer_deadline), idle_deadline]
                         .into_iter()
                         .flatten()
                         .min()
@@ -3184,10 +3242,6 @@ async fn main() -> Result<()> {
                 IdleCompact(Option<lineedit::ParkedDraft>),
             }
 
-            // When this idle prompt went up: an idle compaction waits for the
-            // prompt (and any draft) to sit untouched for its hold from here.
-            let prompt_shown = std::time::Instant::now();
-            let idle_hold = idle_compact_hold(agent.config());
             let input = loop {
                 // An idle timer that is due ends the prompt read, unless the
                 // editor holds a *fresh* half-typed draft — that keeps the
@@ -3229,11 +3283,11 @@ async fn main() -> Result<()> {
                 }
                 // Idle compaction (issue #182): the same compaction auto would
                 // run on the next message, moved here while the user is away.
-                // Only on a steerable terminal (headless `--wait-timers` and
-                // ACP never idle-compact), past the threshold, once per
+                // Only with the key reader live (headless `--wait-timers`, ACP
+                // and a redirected stdout never idle-compact), past the threshold, once per
                 // crossing, and never while the prompt saw recent activity —
                 // a fresh draft holds it, a stale one is parked like a timer's.
-                let idle_due = terminal.steerable && agent.idle_compact_due();
+                let idle_due = terminal.key_mode && agent.idle_compact_due();
                 let idle = {
                     let mut view = terminal.view.lock().unwrap();
                     let quiet = view.quiet_since(prompt_shown);
@@ -3255,10 +3309,14 @@ async fn main() -> Result<()> {
                 }
                 // Wake when the hold would elapse, so the compaction starts
                 // without waiting for a keystroke.
-                let idle_deadline = idle_due.then(|| {
-                    let quiet = terminal.view.lock().unwrap().quiet_since(prompt_shown);
-                    (quiet + idle_hold).max(std::time::Instant::now() + std::time::Duration::from_millis(200))
-                });
+                let (_, idle_deadline) = idle_compact_poll(
+                    &agent,
+                    &terminal,
+                    prompt_shown,
+                    idle_hold,
+                    interrupt_queued,
+                    exit_press.deadline().is_some(),
+                );
                 // Piped stdin already closed during the timer wait and no timers
                 // remain to fire: with nothing queued, no further input will
                 // arrive, so end the session rather than block on a read that
