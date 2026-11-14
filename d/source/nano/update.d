@@ -8,7 +8,7 @@
 /// `NANO_CODER_NO_UPDATE_CHECK` / `NO_UPDATE_NOTIFIER` turn it off.
 ///
 /// The D port ships only through npm (`@nanobpm/nano-coder-d`), so there is
-/// no cargo channel: anything else (a release tarball, a dev build) is
+/// no cargo or Homebrew channel (Rust #188): anything else (a release tarball, a dev build) is
 /// "other" and is never changed by `/update`.
 module nano.update;
 
