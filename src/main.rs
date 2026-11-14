@@ -1825,7 +1825,7 @@ fn resume_command(agent: &mut Agent, arg: &str, terminal: &mut Terminal) -> Resu
 }
 
 /// `/update`: install the latest release through the channel this binary was
-/// installed from (`npm install -g` or `cargo install`), with the installer's
+/// installed from (`npm install -g`, `brew upgrade` or `cargo install`), with the installer's
 /// progress attached to the terminal. Only at idle; on failure the running
 /// session is untouched.
 async fn update_command(terminal: &mut Terminal, checker: Option<&update::Checker>) -> Result<()> {

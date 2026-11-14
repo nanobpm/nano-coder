@@ -2,7 +2,8 @@
 //!
 //! nano-coder learns how it was installed once at startup from
 //! `std::env::current_exe()` ([`Channel::detect`]): under a
-//! `node_modules/@nanobpm/` tree it is the npm package, under
+//! `node_modules/@nanobpm/` tree it is the npm package, under a Homebrew
+//! `Cellar/nano-coder/` the `nanobpm/tap` formula, under
 //! `$CARGO_HOME/bin` (default `~/.cargo/bin`) a `cargo install`, and anything
 //! else (a standalone tarball, a local `cargo build` in `target/`) is
 //! unmanaged. Only managed installs get a background check and a working
@@ -18,7 +19,8 @@
 //! `NANO_CODER_NO_UPDATE_CHECK` / `NO_UPDATE_NOTIFIER` environment variables.
 //!
 //! `/update` runs the channel's installer (`npm install -g
-//! @nanobpm/nano-coder@latest` or `cargo install nano-coder`) attached to the
+//! @nanobpm/nano-coder@latest`, `brew upgrade nanobpm/tap/nano-coder` or
+//! `cargo install nano-coder`) attached to the
 //! terminal so its progress is visible and Ctrl-C cancels it, then verifies
 //! the installed binary's `--version`. `/relaunch` re-`exec`s the binary
 //! at its launch path (captured at startup, so a just-installed update at
@@ -41,6 +43,13 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 /// The registry endpoints, overridable in tests.
 const NPM_LATEST_URL: &str = "https://registry.npmjs.org/@nanobpm/nano-coder/latest";
 const CRATES_URL: &str = "https://crates.io/api/v1/crates/nano-coder";
+/// The tap's formula. `brew upgrade` installs whatever it points at, which the
+/// release workflow bumps a few minutes after a release, so this (not the
+/// GitHub release) is the latest version a brew install can get.
+const BREW_FORMULA_URL: &str = "https://raw.githubusercontent.com/nanobpm/homebrew-tap/main/Formula/nano-coder.rb";
+/// The formula `/update` upgrades (tap-qualified, so it never picks up a
+/// same-named formula from another tap).
+const BREW_FORMULA: &str = "nanobpm/tap/nano-coder";
 /// crates.io requires a descriptive User-Agent; npm's registry ignores it.
 const USER_AGENT: &str = concat!("nano-coder/", env!("CARGO_PKG_VERSION"), " (https://github.com/nanobpm/nano-coder)");
 /// Where `/update` on an unmanaged install points.
@@ -54,6 +63,9 @@ pub enum Channel {
     /// platform-package binary the JS launcher spawns, and the self-replaced
     /// copy in `bin/` (see `npm/nano-coder/bin/nano-coder`).
     Npm,
+    /// `brew install nanobpm/tap/nano-coder`: the exe resolves into
+    /// `<prefix>/Cellar/nano-coder/<version>/`.
+    Brew,
     /// `cargo install nano-coder`: the exe is in `$CARGO_HOME/bin`
     /// (default `~/.cargo/bin`).
     Cargo,
@@ -70,7 +82,28 @@ pub enum Channel {
 /// replacement now lives.
 pub fn launch_exe() -> PathBuf {
     static EXE: OnceLock<PathBuf> = OnceLock::new();
-    EXE.get_or_init(|| strip_deleted_suffix(std::env::current_exe().unwrap_or_default())).clone()
+    EXE.get_or_init(|| {
+        let exe = strip_deleted_suffix(std::env::current_exe().unwrap_or_default());
+        // A path into a versioned Homebrew keg (what Linux's `/proc/self/exe`
+        // reports) is gone after `brew upgrade` cleans up the old version;
+        // the formula's `opt` link always names the installed one.
+        brew_opt_exe(&exe).filter(|opt| opt.exists()).unwrap_or(exe)
+    })
+    .clone()
+}
+
+/// For `<prefix>/Cellar/nano-coder/<version>/bin/nano-coder`, the stable
+/// `<prefix>/opt/nano-coder/bin/nano-coder` link that follows upgrades.
+fn brew_opt_exe(exe: &Path) -> Option<PathBuf> {
+    let parts: Vec<_> = exe.components().collect();
+    let n = parts.len();
+    let tail = parts.get(n.checked_sub(5)?..)?;
+    let names: Vec<_> = tail.iter().map(|c| c.as_os_str()).collect();
+    if names[0] != "Cellar" || names[1] != "nano-coder" || names[3] != "bin" || names[4] != "nano-coder" {
+        return None;
+    }
+    let prefix: PathBuf = parts[..n - 5].iter().collect();
+    Some(prefix.join("opt/nano-coder/bin/nano-coder"))
 }
 
 /// Drop Linux's ` (deleted)` marker from a `/proc/self/exe` resolution, so a
@@ -101,6 +134,12 @@ impl Channel {
         {
             return Channel::Npm;
         }
+        if std::iter::once(exe)
+            .chain(resolved.as_deref())
+            .any(|path| exe_has_component(path, &["Cellar", "nano-coder"]))
+        {
+            return Channel::Brew;
+        }
         let cargo_bin = cargo_home.or_else(|| dirs::home_dir().map(|h| h.join(".cargo"))).map(|h| h.join("bin"));
         // `current_exe()` resolves symlinks on Linux, so also compare against the
         // canonical cargo bin dir (a symlinked `~/.cargo` / `$CARGO_HOME`);
@@ -122,6 +161,7 @@ impl Channel {
     fn installer(self) -> Option<&'static str> {
         match self {
             Channel::Npm => Some("npm"),
+            Channel::Brew => Some("brew"),
             Channel::Cargo => Some("cargo"),
             Channel::Other => None,
         }
@@ -131,6 +171,7 @@ impl Channel {
     fn install_args(self) -> &'static [&'static str] {
         match self {
             Channel::Npm => &["install", "-g", "@nanobpm/nano-coder@latest"],
+            Channel::Brew => &["upgrade", BREW_FORMULA],
             Channel::Cargo => &["install", "nano-coder"],
             Channel::Other => &[],
         }
@@ -148,6 +189,7 @@ impl Channel {
     fn latest_url(self) -> Option<&'static str> {
         match self {
             Channel::Npm => Some(NPM_LATEST_URL),
+            Channel::Brew => Some(BREW_FORMULA_URL),
             Channel::Cargo => Some(CRATES_URL),
             Channel::Other => None,
         }
@@ -260,14 +302,29 @@ pub fn is_newer(candidate: &str, running: &str) -> bool {
 async fn fetch_latest(channel: Channel, url: Option<&str>) -> Option<String> {
     let url = url.unwrap_or(channel.latest_url()?);
     let client = reqwest::Client::builder().timeout(HTTP_TIMEOUT).user_agent(USER_AGENT).build().ok()?;
-    let body: serde_json::Value = client.get(url).send().await.ok()?.json().await.ok()?;
+    let response = client.get(url).send().await.ok()?.error_for_status().ok()?;
     let version = match channel {
-        Channel::Npm => body.get("version")?.as_str()?,
-        Channel::Cargo => body.get("crate")?.get("max_stable_version")?.as_str()?,
+        Channel::Npm => response.json::<serde_json::Value>().await.ok()?.get("version")?.as_str()?.to_string(),
+        Channel::Cargo => response
+            .json::<serde_json::Value>()
+            .await
+            .ok()?
+            .get("crate")?
+            .get("max_stable_version")?
+            .as_str()?
+            .to_string(),
+        Channel::Brew => formula_version(&response.text().await.ok()?)?.to_string(),
         Channel::Other => return None,
     };
     let version = version.trim();
     (!version.is_empty()).then(|| version.to_string())
+}
+
+/// The release a formula installs, read from its download URL
+/// (`…/releases/download/v<version>/…`).
+fn formula_version(formula: &str) -> Option<&str> {
+    let (_, rest) = formula.split_once("/releases/download/v")?;
+    rest.split('/').next().filter(|v| !v.is_empty())
 }
 
 /// One registry probe, factored out of [`Checker::tick`] so tests can drive
@@ -441,7 +498,7 @@ impl Checker {
 
 /// The outcome of a `/update` attempt, as the message lines to show.
 pub enum UpdateOutcome {
-    /// This install is not managed by cargo or npm; nothing was changed.
+    /// This install is not managed by npm, Homebrew or cargo; nothing was changed.
     Unmanaged(String),
     /// The channel's installer is not on `PATH`; the manual command is shown.
     NoInstaller(String),
@@ -475,7 +532,7 @@ pub async fn run_installer(
 ) -> UpdateOutcome {
     let Some(program) = channel.installer() else {
         return UpdateOutcome::Unmanaged(format!(
-            "This nano-coder was not installed with cargo or npm (install channel: other), so it cannot update itself. \
+            "This nano-coder was not installed with npm, Homebrew or cargo (install channel: other), so it cannot update itself. \
              Download the latest release from {RELEASES_URL} — a locally built binary is never overwritten."
         ));
     };
@@ -660,6 +717,83 @@ mod tests {
         assert_eq!(Channel::from_exe(&default_bin.join("nano-coder"), Some(custom)), Channel::Other);
         // A subdirectory of the cargo bin is not the cargo bin.
         assert_eq!(Channel::from_exe(&default_bin.join("nested/nano-coder"), None), Channel::Other);
+    }
+
+    #[test]
+    fn detects_the_brew_channel_on_versioned_keg_paths() {
+        // Linux `/proc/self/exe` and a direct keg launch name the Cellar path.
+        assert_eq!(
+            Channel::from_exe(&exe("/home/linuxbrew/.linuxbrew/Cellar/nano-coder/0.67.0/bin/nano-coder"), None),
+            Channel::Brew
+        );
+        assert_eq!(
+            Channel::from_exe(&exe("/opt/homebrew/Cellar/nano-coder/0.67.0/bin/nano-coder"), None),
+            Channel::Brew
+        );
+        // Another formula's keg is not ours.
+        assert_eq!(
+            Channel::from_exe(&exe("/opt/homebrew/Cellar/nano-coder-x/1.0/bin/nano-coder"), None),
+            Channel::Other
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detects_the_brew_channel_through_the_bin_and_opt_links() {
+        // macOS `current_exe()` keeps the `<prefix>/bin/nano-coder` link brew
+        // puts on PATH; it resolves into the keg.
+        let dir = tempfile::tempdir().unwrap();
+        let keg_bin = dir.path().join("Cellar/nano-coder/0.67.0/bin");
+        std::fs::create_dir_all(&keg_bin).unwrap();
+        std::fs::write(keg_bin.join("nano-coder"), "").unwrap();
+        std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+        let link = dir.path().join("bin/nano-coder");
+        std::os::unix::fs::symlink("../Cellar/nano-coder/0.67.0/bin/nano-coder", &link).unwrap();
+        assert_eq!(Channel::from_exe(&link, None), Channel::Brew);
+        std::fs::create_dir_all(dir.path().join("opt")).unwrap();
+        std::os::unix::fs::symlink("../Cellar/nano-coder/0.67.0", dir.path().join("opt/nano-coder")).unwrap();
+        assert_eq!(Channel::from_exe(&dir.path().join("opt/nano-coder/bin/nano-coder"), None), Channel::Brew);
+    }
+
+    #[test]
+    fn a_keg_path_maps_to_the_stable_opt_link() {
+        assert_eq!(
+            brew_opt_exe(&exe("/home/linuxbrew/.linuxbrew/Cellar/nano-coder/0.67.0/bin/nano-coder")),
+            Some(exe("/home/linuxbrew/.linuxbrew/opt/nano-coder/bin/nano-coder"))
+        );
+        assert_eq!(brew_opt_exe(&exe("/opt/homebrew/bin/nano-coder")), None);
+        assert_eq!(brew_opt_exe(&exe("/opt/homebrew/Cellar/other/1.0/bin/nano-coder")), None);
+        assert_eq!(brew_opt_exe(&exe("nano-coder")), None);
+    }
+
+    #[test]
+    fn the_brew_channel_upgrades_the_tap_formula() {
+        assert_eq!(Channel::Brew.install_command(), "brew upgrade nanobpm/tap/nano-coder");
+        assert_eq!(Channel::Brew.latest_url(), Some(BREW_FORMULA_URL));
+    }
+
+    #[test]
+    fn the_formula_version_is_read_from_its_download_url() {
+        let formula = r#"class NanoCoder < Formula
+  on_macos do
+    on_arm do
+      url "https://github.com/nanobpm/nano-coder/releases/download/v0.68.1/nano-coder-0.68.1-aarch64-apple-darwin.tar.gz"
+"#;
+        assert_eq!(formula_version(formula), Some("0.68.1"));
+        assert_eq!(formula_version("class NanoCoder < Formula\nend\n"), None);
+    }
+
+    #[tokio::test]
+    async fn a_brew_check_reads_the_tap_formula() {
+        let (url, server) = fake_server(
+            "url \"https://github.com/nanobpm/nano-coder/releases/download/v0.43.0/nano-coder-0.43.0-x86_64-apple-darwin.tar.gz\"\n"
+                .to_string(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let checker = Checker::with_url(Channel::Brew, dir.path().join("s.json"), "0.42.1".into(), Some(url));
+        assert_eq!(checker.force_check().await.as_deref(), Some("0.43.0"));
+        server.join().unwrap();
+        assert!(checker.take_hint().is_some_and(|hint| hint.contains("0.43.0 is available")));
     }
 
     #[test]
@@ -899,6 +1033,11 @@ mod tests {
 
     /// A one-shot fake registry answering `{"version": <version>}`.
     fn fake_registry(version: &'static str) -> (String, std::thread::JoinHandle<()>) {
+        fake_server(format!(r#"{{"version":"{version}"}}"#))
+    }
+
+    /// A one-shot fake server answering 200 with `body`.
+    fn fake_server(body: String) -> (String, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/latest", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
@@ -906,7 +1045,6 @@ mod tests {
             use std::io::{Read, Write};
             let mut buf = [0u8; 1024];
             let _ = conn.read(&mut buf);
-            let body = format!(r#"{{"version":"{version}"}}"#);
             write!(conn, "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body)
                 .unwrap();
         });

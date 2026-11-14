@@ -7,8 +7,9 @@ nano-coder is a coding agent for the terminal, written in Rust. It uses about 6M
 ## Install
 
 ```sh
-npm install -g @nanobpm/nano-coder   # prebuilt binaries for macOS and Linux (x64, arm64)
-cargo install nano-coder             # or build from source
+npm install -g @nanobpm/nano-coder       # prebuilt binaries for macOS and Linux (x64, arm64)
+brew install nanobpm/tap/nano-coder      # the same binaries through Homebrew
+cargo install nano-coder                 # or build from source
 ```
 
 ## Features
@@ -455,7 +456,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
 - `/trajectory` - Show this session's trajectory turn by turn: user input, thinking, answers, tool calls and results, tokens and timings. Each message row is labelled with its `#N` session-log ID, the same ID `history_read` and smart-compaction summaries use (compaction and crash-recovered input rows have no `#N`, as they aren't cited that way). It opens in your pager (`$PAGER`, default `less`), even when it would fit on the screen, so you dismiss it with `q` and it doesn't stay in the transcript or your scrollback — but only at an idle prompt on a terminal: invoked mid-turn (while a turn runs) or with piped output it prints inline instead. `/trajectory --json` or `/trajectory --markdown` prints an export instead; `nano-coder --trajectory SESSION_ID [--json|--markdown]` does the same for any saved session
 - `/resume [ID|last]` - Switch to a saved session without restarting: the same picker as `--resume` (leaving out the session in use), or the session with that ID, or `last` (the most recent other session in this directory). Run it at the prompt, not during a turn
 - `/restart` - Start a fresh session (clean context) without exiting
-- `/update` - Install the latest release through the channel nano-coder was installed from (`npm install -g @nanobpm/nano-coder@latest` or `cargo install nano-coder`), with the installer's progress on the terminal; verifies the installed version afterwards and leaves the running session untouched on failure. On an install that is not managed by cargo or npm it prints the releases page and changes nothing. Run it at the prompt, not during a turn (see [Updates](#updates))
+- `/update` - Install the latest release through the channel nano-coder was installed from (`npm install -g @nanobpm/nano-coder@latest`, `brew upgrade nanobpm/tap/nano-coder` or `cargo install nano-coder`), with the installer's progress on the terminal; verifies the installed version afterwards and leaves the running session untouched on failure. On an install that is not managed by npm, Homebrew or cargo it prints the releases page and changes nothing. Run it at the prompt, not during a turn (see [Updates](#updates))
 - `/relaunch` - Restart the binary (re-resolved, so a just-installed update is picked up), resuming the current session — the transcript and scrollback carry over. Works whether or not an update was just installed. An unsent draft or queued messages are confirmed before being discarded. Run it at the prompt, not during a turn (see [Updates](#updates))
 - `/exit` - Exit the agent (prints the session's `--resume` command first, when session persistence is enabled)
 
@@ -478,6 +479,11 @@ by a known install channel, detected once at startup from the executable's path:
   platform-package binary and the self-replaced copy in `bin/`): the latest version comes
   from `https://registry.npmjs.org/@nanobpm/nano-coder/latest`, and `/update` runs
   `npm install -g @nanobpm/nano-coder@latest`.
+- **Homebrew** (the binary resolves into `<brew prefix>/Cellar/nano-coder/`): the latest
+  version is the one the [nanobpm/homebrew-tap](https://github.com/nanobpm/homebrew-tap)
+  formula points at (bumped by the release workflow a few minutes after each release), and
+  `/update` runs `brew upgrade nanobpm/tap/nano-coder`. `/relaunch` restarts through the
+  formula's `opt` link, so it finds the new version after brew removes the old one.
 - **cargo** (in `$CARGO_HOME/bin`, default `~/.cargo/bin`): the latest version comes from
   `https://crates.io/api/v1/crates/nano-coder`, and `/update` runs `cargo install
   nano-coder` — which compiles from source and takes minutes, so the installer runs

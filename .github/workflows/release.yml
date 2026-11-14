@@ -152,6 +152,47 @@ jobs:
           cd dist && sha256sum *.tar.gz > SHA256SUMS
           gh release upload "v${{ needs.release.outputs.version }}" --repo "${GITHUB_REPOSITORY}" --clobber *.tar.gz SHA256SUMS
 
+  # Point the Homebrew formula (nanobpm/homebrew-tap) at the new release binaries.
+  # The release app must be installed on homebrew-tap (see RELEASING.md).
+  homebrew:
+    needs: [release, github-release]
+    if: needs.release.outputs.released == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Release app token for the tap
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          repositories: homebrew-tap
+          permission-contents: write
+      - uses: actions/checkout@v5
+        with:
+          path: src
+      - uses: actions/checkout@v5
+        with:
+          repository: nanobpm/homebrew-tap
+          path: tap
+          token: ${{ steps.app.outputs.token }}
+      - name: Update and push the formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.release.outputs.version }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+        run: |
+          gh release download "v$VERSION" --repo "$GITHUB_REPOSITORY" -p SHA256SUMS -O SHA256SUMS
+          node src/scripts/homebrew-formula.mjs --version "$VERSION" --sums SHA256SUMS --out tap/Formula/nano-coder.rb
+          cd tap
+          if git diff --quiet; then echo "formula already at $VERSION"; exit 0; fi
+          uid=$(gh api "/users/${APP_SLUG}[bot]" --jq .id)
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${uid}+${APP_SLUG}[bot]@users.noreply.github.com"
+          git commit -qam "nano-coder $VERSION"
+          git push
+
   crates-io:
     needs: [release, build]
     if: needs.release.outputs.released == 'true'
