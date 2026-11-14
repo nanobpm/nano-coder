@@ -1099,6 +1099,9 @@ pub(crate) fn deliver_idle_compact(
     due && quiet_for >= hold && !interrupt_queued && !exit_armed
 }
 
+/// Bounded idle-compaction eligibility recheck while not yet due (issue #182).
+const IDLE_COMPACT_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Whether an idle compaction may start now, and when to recheck if not
 /// (issue #182). Requires the key reader (`Terminal::key_mode`), since only
 /// it keeps the editor's quiet timestamps current. Non-mutating: the caller
@@ -1113,7 +1116,14 @@ fn idle_compact_poll(
 ) -> (bool, Option<std::time::Instant>) {
     let due = terminal.key_mode && agent.idle_compact_due();
     if !due {
-        return (false, None);
+        // A background capability probe can shrink the window and make idle
+        // compaction eligible without waking the prompt (its `Context` event
+        // only updates the renderer), so while idle compaction could apply,
+        // keep a bounded eligibility recheck instead of waiting indefinitely.
+        let config = agent.config();
+        let recheck = (terminal.key_mode && config.idle_compact && config.auto_compact)
+            .then(|| std::time::Instant::now() + IDLE_COMPACT_RECHECK);
+        return (false, recheck);
     }
     let quiet = terminal.view.lock().unwrap().quiet_since(shown);
     let now = std::time::Instant::now();

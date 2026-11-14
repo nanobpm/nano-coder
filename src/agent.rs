@@ -4672,8 +4672,23 @@ impl Agent {
     /// crossing so a cancelled or failed run is not retried in a loop.
     pub async fn idle_compact(&mut self) -> Result<Option<IdleCompactReport>> {
         self.control.start_turn();
-        let window = self.context_window().max(1);
+        // A `/model` left pending by the previous turn changes the window and
+        // so the threshold: apply it *before* re-checking eligibility and
+        // capturing the report window, so idle compaction never runs below
+        // the new model's threshold or reports against the old window.
         let (tokens_before, _) = self.estimate_context_tokens();
+        if self.apply_model_request().await {
+            self.refresh_stats();
+            self.set_activity(Activity::Idle);
+            self.idle_gate.spend(tokens_before);
+            return Ok(None);
+        }
+        self.refresh_stats();
+        if !self.idle_compact_due() {
+            self.set_activity(Activity::Idle);
+            return Ok(None);
+        }
+        let window = self.context_window().max(1);
         let result = self.compact_logged(CompactTrigger::Idle, self.config.compaction_mode, None).await;
         self.set_activity(Activity::Idle);
         let cancelled = self.control.is_cancelled();
