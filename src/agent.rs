@@ -721,8 +721,15 @@ fn status_thinking(thinking: &crate::thinking::Resolved) -> Option<String> {
 }
 
 /// Inputs that change the in-memory context estimate: conversation length,
-/// calibration anchor, image quota (see `Agent::idle_compact_due_polled`).
-type IdleEstimateKey = (usize, Option<(usize, usize)>, usize);
+/// calibration anchor, image quota, and the offered tool set (agent mode and
+/// history-tool availability) — see `Agent::idle_compact_due_polled`.
+type IdleEstimateKey = (
+    usize,
+    Option<(usize, usize)>,
+    usize,
+    crate::mode::AgentMode,
+    bool,
+);
 
 /// Agent manages the conversation loop, tool execution, and hooks
 pub struct Agent {
@@ -2784,6 +2791,9 @@ impl Agent {
         self.calibration = None;
         self.compact_floor = 0;
         self.idle_gate.reset();
+        // The resumed conversation is a different context: never serve the
+        // previous session's memoized idle-poll estimate for it.
+        self.idle_estimate_cache.set(None);
         // Whether the history tools are offered is durable state: restore it
         // from the log (the last replace's mode) rather than the message text.
         self.history_available = restored.history_available;
@@ -4685,6 +4695,8 @@ impl Agent {
             self.conversation.len(),
             self.calibration,
             self.vision().map(|v| v.max_images).unwrap_or(0),
+            self.control.mode(),
+            self.history_tools_enabled(),
         );
         let tokens = match self.idle_estimate_cache.get() {
             Some((cached, tokens)) if cached == key => tokens,
@@ -10007,6 +10019,32 @@ mod tests {
         assert!(!agent.idle_compact_due(), "idle compaction waits for the configured threshold");
         agent.config.auto_compact_threshold = 0.5;
         assert!(agent.idle_compact_due(), "past the configured threshold it is due");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_poll_cache_is_keyed_on_the_offered_tool_set() {
+        // The uncalibrated estimate includes the mode-filtered tool
+        // definitions, so a mode switch must miss the poll cache.
+        let dir = tempfile::tempdir().unwrap();
+        let agent = idle_above_threshold(vec![], dir.path()).await;
+        assert!(agent.idle_compact_due_polled());
+        // Poison the cached estimate as "below threshold" under the live key.
+        let (key, _) = agent.idle_estimate_cache.get().unwrap();
+        agent.idle_estimate_cache.set(Some((key, 0)));
+        assert!(!agent.idle_compact_due_polled(), "a key hit serves the cache");
+        let other = if agent.mode() == crate::mode::AgentMode::Plan {
+            crate::mode::AgentMode::default()
+        } else {
+            crate::mode::AgentMode::Plan
+        };
+        agent.control.set_mode(other);
+        assert_ne!(agent.idle_estimate_cache.get().unwrap().0 .3, other);
+        let _ = agent.idle_compact_due_polled();
+        assert_eq!(
+            agent.idle_estimate_cache.get().unwrap().0 .3,
+            other,
+            "a mode switch re-estimates instead of serving the stale entry"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
