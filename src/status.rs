@@ -227,6 +227,7 @@ fn render(stats: &ContextStats, cols: usize) -> String {
         Activity::Thinking => Some(("● thinking…".to_string(), "\x1b[38;5;117m")),
         Activity::Tool(name) => Some((format!("▶ {name}"), "\x1b[38;5;180m")),
         Activity::Compacting => Some(("⟳ compacting…".to_string(), "\x1b[38;5;221m")),
+        Activity::IdleCompacting => Some(("⟳ compacting (idle)…".to_string(), "\x1b[38;5;221m")),
     };
     if let Some((text, color)) = activity {
         segments.push(Segment { text: format!(" {text} "), color: Some(color), priority: 7 });

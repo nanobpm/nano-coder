@@ -116,6 +116,12 @@ pub struct EditView {
     /// timer treats a draft as stale once this is older than [`DRAFT_HOLD`],
     /// so an abandoned half-typed line cannot park a due timer forever.
     last_edit: Option<std::time::Instant>,
+    /// When the reader last saw *any* key at all — including ones that leave
+    /// the buffer untouched (a lone Esc, Shift+Tab, Ctrl-O, a cursor key at
+    /// its bound). Only the idle-compaction quiet check reads it (issue
+    /// #182); draft staleness and parking keep using `last_edit`, so a no-op
+    /// key never changes the draft-generation semantics.
+    last_key: Option<std::time::Instant>,
     /// Bumped by every user-side buffer mutation (insert, delete, clear,
     /// history recall, submit) — never by parking/restoring a draft. A timer
     /// turn restores the parked draft only when this is unchanged since the
@@ -130,6 +136,12 @@ pub struct EditView {
 /// may fire, parking the line and restoring it after the turn so it is not
 /// sent as a steer.
 pub const DRAFT_HOLD: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long the prompt — and any draft in it — must sit untouched before an
+/// opportunistic idle compaction runs (issue #182). Longer than
+/// [`DRAFT_HOLD`]: a coffee pause should not spend a summary-model call.
+/// Overridden by `idle_compact_hold_secs`.
+pub const IDLE_COMPACT_HOLD: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// What the argument type-ahead needs from the agent loop.
 #[derive(Default)]
@@ -177,6 +189,7 @@ impl EditView {
             on_edit: None,
             history: InputHistory::default(),
             last_edit: None,
+            last_key: None,
             draft_generation: 0,
         }))
     }
@@ -199,6 +212,19 @@ impl EditView {
     /// user is either not composing or has gone AFK.
     pub fn holds_timer(&self, now: std::time::Instant) -> bool {
         self.has_draft() && !self.draft_is_stale(now)
+    }
+
+    /// When the prompt last saw user activity: the latest of `shown` (when
+    /// the idle prompt was put up), the buffer's last edit and the last key
+    /// of any kind. An idle compaction waits for this to be older than its
+    /// hold (issue #182).
+    pub fn quiet_since(&self, shown: std::time::Instant) -> std::time::Instant {
+        [self.last_edit, self.last_key].into_iter().flatten().fold(shown, std::cmp::Ord::max)
+    }
+
+    /// Record that the reader saw a key (see `last_key`).
+    pub fn key_seen(&mut self, at: std::time::Instant) {
+        self.last_key = Some(at);
     }
 
     /// A non-empty buffer whose last edit is older than [`DRAFT_HOLD`].
@@ -918,6 +944,9 @@ impl LineReader {
         loop {
             let Some(byte) = self.first_byte() else { return Key::Eof };
             let mut view = view.lock().unwrap();
+            // Every byte is user activity for the idle-compaction quiet check,
+            // whether or not it edits the buffer.
+            view.key_seen(std::time::Instant::now());
             match byte {
                 b'\r' | b'\n' => {
                     // Treat CR LF as one line end.
@@ -1276,6 +1305,7 @@ mod tests {
             on_edit: None,
             history: InputHistory::default(),
             last_edit: None,
+            last_key: None,
             draft_generation: 0,
         };
         view.mode = EditMode::Turn;
@@ -2338,5 +2368,19 @@ mod tests {
         reader.pending.extend(b"/x\r".iter());
         let _ = reader.read_line(&view, &|_| {});
         assert!(last("/x").is_empty(), "no menu during a turn");
+    }
+
+    #[test]
+    fn quiet_since_counts_non_editing_keys() {
+        // Issue #182: a key that leaves the buffer untouched (lone Esc,
+        // Shift+Tab, Ctrl-O, cursor at its bound) is still user activity.
+        let shown = std::time::Instant::now();
+        let mut v = view("draft");
+        v.last_edit = Some(shown - DRAFT_HOLD);
+        assert_eq!(v.quiet_since(shown), shown, "shown wins over an older edit");
+        let later = shown + std::time::Duration::from_secs(5);
+        v.key_seen(later);
+        assert_eq!(v.quiet_since(shown), later, "a no-op key resets the quiet clock");
+        assert!(v.draft_is_stale(later), "but leaves draft staleness alone");
     }
 }
