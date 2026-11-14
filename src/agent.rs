@@ -723,13 +723,7 @@ fn status_thinking(thinking: &crate::thinking::Resolved) -> Option<String> {
 /// Inputs that change the in-memory context estimate: conversation length,
 /// calibration anchor, image quota, and the offered tool set (agent mode and
 /// history-tool availability) — see `Agent::idle_compact_due_polled`.
-type IdleEstimateKey = (
-    usize,
-    Option<(usize, usize)>,
-    usize,
-    crate::mode::AgentMode,
-    bool,
-);
+type IdleEstimateKey = (usize, Option<(usize, usize)>, usize, crate::mode::AgentMode, bool);
 
 /// Agent manages the conversation loop, tool execution, and hooks
 pub struct Agent {
@@ -10038,10 +10032,10 @@ mod tests {
             crate::mode::AgentMode::Plan
         };
         agent.control.set_mode(other);
-        assert_ne!(agent.idle_estimate_cache.get().unwrap().0 .3, other);
+        assert_ne!(agent.idle_estimate_cache.get().unwrap().0.3, other);
         let _ = agent.idle_compact_due_polled();
         assert_eq!(
-            agent.idle_estimate_cache.get().unwrap().0 .3,
+            agent.idle_estimate_cache.get().unwrap().0.3,
             other,
             "a mode switch re-estimates instead of serving the stale entry"
         );
