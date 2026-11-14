@@ -1148,6 +1148,12 @@ async fn run_idle_compaction(agent: &mut Agent, terminal: &mut Terminal) {
     terminal.renderer.transient_note("compacting (idle)… Esc Esc to cancel");
     let result = drive_compaction(agent.idle_compact(), control.clone(), stats, terminal).await;
     terminal.renderer.clear_transient();
+    // `idle_compact` applies a `/model` left pending by the previous turn,
+    // which updates the agent's config but not the shared editor context.
+    // Resync on every outcome — report, no report, or error — so `/model`
+    // completion treats the newly switched model as `current`, as the
+    // between-turns path does after `run_interactive_turn`.
+    terminal.sync_context(agent);
     match result {
         Ok(Some(report)) => terminal.renderer.note(&format!("[{report}]")),
         Ok(None) if control.is_cancelled() => terminal.renderer.note("[idle compaction cancelled]"),
