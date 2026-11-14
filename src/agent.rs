@@ -720,6 +720,10 @@ fn status_thinking(thinking: &crate::thinking::Resolved) -> Option<String> {
     }
 }
 
+/// Inputs that change the in-memory context estimate: conversation length,
+/// calibration anchor, image quota (see `Agent::idle_compact_due_polled`).
+type IdleEstimateKey = (usize, Option<(usize, usize)>, usize);
+
 /// Agent manages the conversation loop, tool execution, and hooks
 pub struct Agent {
     client: Box<dyn LLMClient>,
@@ -779,6 +783,10 @@ pub struct Agent {
     /// Once-per-crossing gate for opportunistic compaction at the idle
     /// prompt (issue #182, see `idle_compact.rs`).
     idle_gate: IdleCompactGate,
+    /// Memoized context estimate for the idle prompt's poll, keyed on
+    /// (conversation length, calibration, image quota) — see
+    /// `idle_compact_due_polled`.
+    idle_estimate_cache: std::cell::Cell<Option<(IdleEstimateKey, usize)>>,
     /// Stream model output as `TextDelta` / `ThinkingDelta` events.
     streaming: bool,
     /// AGENTS.md and similar files for the working directory.
@@ -980,6 +988,7 @@ impl Agent {
             probe: ProbeState::default(),
             compact_floor: 0,
             idle_gate: IdleCompactGate::default(),
+            idle_estimate_cache: std::cell::Cell::new(None),
             streaming: false,
             instructions: None,
             skills: Skills::default(),
@@ -2850,7 +2859,11 @@ impl Agent {
     }
 
     fn replace_conversation(&mut self, messages: Vec<Message>) -> Result<()> {
-        self.replace_keeping_pending(messages, None, None)
+        self.replace_keeping_pending(messages, None, None)?;
+        // A new conversation starts a new crossing: a gate spent at the
+        // discarded context's size must not hold back the new one.
+        self.idle_gate.reset();
+        Ok(())
     }
 
     /// Replace the conversation; `pending_position` keeps the in-flight input
@@ -2866,6 +2879,7 @@ impl Agent {
         pending_position: Option<usize>,
         compaction: Option<CompactionRecord>,
     ) -> Result<()> {
+        self.idle_estimate_cache.set(None);
         let now = session::now();
         for message in &mut messages {
             message.timestamp.get_or_insert(now);
@@ -4648,11 +4662,45 @@ impl Agent {
     /// hysteresis), and no idle attempt has already been spent on this
     /// crossing. The caller owns the *idle* half of the gate — prompt open,
     /// no fresh draft, steerable terminal (see `main::deliver_idle_compact`).
+    #[cfg(test)]
     pub fn idle_compact_due(&self) -> bool {
-        if !self.config.idle_compact || !self.over_threshold() {
+        if !self.config.idle_compact || !self.config.auto_compact {
             return false;
         }
         let (tokens, _) = self.estimate_context_tokens();
+        self.idle_compact_due_at(tokens)
+    }
+
+    /// `idle_compact_due` for the prompt's periodic poll. The estimate reads
+    /// and hashes every stored attachment, so it is memoized on the inputs
+    /// that change it in memory (conversation length, calibration anchor,
+    /// image quota); the poll then costs no file I/O while the context is
+    /// unchanged. `idle_compact` itself re-checks with a fresh estimate before
+    /// compacting, so a stale cache can at most delay or skip a wake-up.
+    pub fn idle_compact_due_polled(&self) -> bool {
+        if !self.config.idle_compact || !self.config.auto_compact {
+            return false;
+        }
+        let key = (
+            self.conversation.len(),
+            self.calibration,
+            self.vision().map(|v| v.max_images).unwrap_or(0),
+        );
+        let tokens = match self.idle_estimate_cache.get() {
+            Some((cached, tokens)) if cached == key => tokens,
+            _ => {
+                let (tokens, _) = self.estimate_context_tokens();
+                self.idle_estimate_cache.set(Some((key, tokens)));
+                tokens
+            }
+        };
+        self.idle_compact_due_at(tokens)
+    }
+
+    fn idle_compact_due_at(&self, tokens: usize) -> bool {
+        if !self.config.idle_compact || !self.over_threshold_at(tokens) {
+            return false;
+        }
         let window = self.context_window();
         // `over_threshold` also subtracts the output reservation, which can
         // put its limit *below* the configured threshold on a small total
@@ -4676,15 +4724,19 @@ impl Agent {
         // so the threshold: apply it *before* re-checking eligibility and
         // capturing the report window, so idle compaction never runs below
         // the new model's threshold or reports against the old window.
-        let (tokens_before, _) = self.estimate_context_tokens();
+        let tokens_at_entry = self.estimate_context_tokens().0;
         if self.apply_model_request().await {
             self.refresh_stats();
             self.set_activity(Activity::Idle);
-            self.idle_gate.spend(tokens_before);
+            self.idle_gate.spend(tokens_at_entry);
             return Ok(None);
         }
         self.refresh_stats();
-        if !self.idle_compact_due() {
+        // Re-measure after the switch: installing a model clears calibration,
+        // so the unchanged transcript can estimate differently. Spending the
+        // gate at the stale size could re-arm it with no real growth.
+        let tokens_before = self.estimate_context_tokens().0;
+        if !self.idle_compact_due_at(tokens_before) || !self.config.auto_compact {
             self.set_activity(Activity::Idle);
             return Ok(None);
         }
@@ -4707,8 +4759,16 @@ impl Agent {
         if !self.config.auto_compact {
             return false;
         }
-        let threshold = self.config.auto_compact_threshold.clamp(0.1, 0.99);
         let (tokens, _) = self.estimate_context_tokens();
+        self.over_threshold_at(tokens)
+    }
+
+    /// `over_threshold` for an already-estimated context size.
+    fn over_threshold_at(&self, tokens: usize) -> bool {
+        if !self.config.auto_compact {
+            return false;
+        }
+        let threshold = self.config.auto_compact_threshold.clamp(0.1, 0.99);
         let window = self.context_window();
         // Endpoints such as vLLM and Splash reject a request whose prompt plus
         // `max_tokens` exceeds the window, so the output reservation counts
@@ -9978,6 +10038,13 @@ mod tests {
         assert_eq!(seen.lock().unwrap().len(), 2, "the summary call was made, then cancelled");
         assert_eq!(agent.estimate_context_tokens().0, before, "nothing was folded");
         assert!(!agent.idle_compact_due(), "a cancelled attempt spends the crossing");
+        assert!(!agent.idle_compact_due_polled(), "the polled check agrees");
+
+        // A replaced conversation starts a fresh crossing.
+        let messages = agent.conversation.clone();
+        agent.replace_conversation(messages).unwrap();
+        assert!(agent.idle_compact_due(), "replacing the conversation re-arms the gate");
+        assert!(agent.idle_compact_due_polled(), "and the polled cache was invalidated");
     }
 
     #[tokio::test(flavor = "multi_thread")]

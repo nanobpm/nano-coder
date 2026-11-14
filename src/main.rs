@@ -1114,7 +1114,7 @@ fn idle_compact_poll(
     interrupt_queued: bool,
     exit_armed: bool,
 ) -> (bool, Option<std::time::Instant>) {
-    let due = terminal.key_mode && agent.idle_compact_due();
+    let due = terminal.key_mode && agent.idle_compact_due_polled();
     if !due {
         // A background capability probe can shrink the window and make idle
         // compaction eligible without waking the prompt (its `Context` event
@@ -3297,7 +3297,7 @@ async fn main() -> Result<()> {
                 // and a redirected stdout never idle-compact), past the threshold, once per
                 // crossing, and never while the prompt saw recent activity —
                 // a fresh draft holds it, a stale one is parked like a timer's.
-                let idle_due = terminal.key_mode && agent.idle_compact_due();
+                let idle_due = terminal.key_mode && agent.idle_compact_due_polled();
                 let idle = {
                     let mut view = terminal.view.lock().unwrap();
                     let quiet = view.quiet_since(prompt_shown);
