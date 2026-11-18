@@ -592,7 +592,7 @@ enum planLines = 12;
 /// The plan as the terminal shows it after a change (Rust `ui::plan_checklist`).
 string checklist(const ref Plan plan, size_t width, bool color)
 {
-    import nano.question : sanitizeLine;
+    import nano.trajectory : terminalSafe;
     string c(string code) { return color ? code : ""; }
     auto green = c("\x1b[32m"), bold = c("\x1b[1m"), dim = c("\x1b[2m"), red = c("\x1b[31m"), reset = c("\x1b[0m");
     auto pr = plan.progress;
@@ -612,7 +612,7 @@ string checklist(const ref Plan plan, size_t width, bool color)
             out_ ~= format!"  %s… +%s more%s\n"(dim, visible.length - shown, reset);
             break;
         }
-        auto title = fitWidth(sanitizeLine(it.title), width);
+        auto title = fitWidth(terminalSafe(it.title), width);
         string line;
         final switch (it.status)
         {
@@ -648,7 +648,7 @@ unittest // checklist
     plan.apply("plan_add", parseJSON(`{"items": ["one", "two\u001b[2J", "three"]}`));
     plan.apply("plan_update", parseJSON(`{"updates": [{"id": 1, "status": "done"}, {"id": 2, "status": "in_progress"}]}`));
     auto text = checklist(plan, 80, false);
-    assert(text == "● Plan 1/3 done\n  ✔ one\n  ◼ two[2J\n  ☐ three\n", text);
+    assert(text == "● Plan 1/3 done\n  ✔ one\n  ◼ two\n  ☐ three\n", text);
 }
 
 // rust: ui.rs::plan_checklist_sanitizes_model_controlled_titles

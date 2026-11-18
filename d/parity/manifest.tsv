@@ -607,7 +607,7 @@ llm.rs::trajectory_fields_round_trip_and_stay_out_of_plain_messages	test
 main.rs::a_long_question_wraps_and_escapes_are_dropped	test
 main.rs::a_plain_one_line_question_stays_the_picker_prompt	test
 main.rs::a_structured_question_is_rendered_as_markdown_above_the_picker	test
-main.rs::an_over_wide_question_leaves_the_inline_prompt_on_a_narrow_terminal	gap	D question prompts do not adapt to a narrow terminal
+main.rs::an_over_wide_question_leaves_the_inline_prompt_on_a_narrow_terminal	test
 main.rs::builtin_tools_include_search_and_no_echo	todo
 main.rs::classify_steer_input_routes_line_queue_and_commands	todo
 main.rs::deliver_due_timer_yields_to_interrupt_and_draft	gap	D idle-loop timer delivery is in app.d, which has no unit tests
@@ -618,7 +618,7 @@ main.rs::double_press_is_time_based_not_disarmed_by_other_input	todo
 main.rs::eof_suppression_is_headless_wait_timers_only	gap	D idle-loop timer delivery is in app.d, which has no unit tests
 main.rs::forget_id_requires_a_token_boundary	todo
 main.rs::idle_compact_hold_defaults_to_the_named_constant	test
-main.rs::leading_indentation_is_preserved_for_markdown	gap	D does not expand tabs to tab stops when sanitizing terminal output
+main.rs::leading_indentation_is_preserved_for_markdown	test
 main.rs::list_sessions_and_resume_are_mutually_exclusive	todo
 main.rs::list_sessions_and_trajectory_are_mutually_exclusive	todo
 main.rs::list_sessions_conflicts_with_other_action_modes	todo
@@ -627,13 +627,13 @@ main.rs::memory_list_hints_gate_on_effective_plan_mode_writability	todo
 main.rs::next_step_setting_accepts_any_whitespace_separator	todo
 main.rs::resume_attached_form_names_dash_prefixed_ids	todo
 main.rs::resume_conflicts_with_other_action_modes	todo
-main.rs::sanitize_strips_whole_ansi_sequences	gap	D frame sanitizes rendered lines, but plain (non-frame) tool previews pass escapes through; no matching test
-main.rs::sanitize_terminal_expands_tabs_to_spaces	gap	D does not expand tabs to tab stops when sanitizing terminal output
+main.rs::sanitize_strips_whole_ansi_sequences	test
+main.rs::sanitize_terminal_expands_tabs_to_spaces	test
 main.rs::sanitize_terminal_line_drops_line_feeds	test
-main.rs::sanitize_terminal_tab_stops_track_unicode_cell_width	gap	D does not expand tabs to tab stops when sanitizing terminal output
-main.rs::sanitize_terminal_text_preserves_line_feeds	todo
-main.rs::sanitize_terminal_text_strips_control_and_escape_sequences	todo
-main.rs::sanitize_terminal_text_strips_unicode_line_separators	todo
+main.rs::sanitize_terminal_tab_stops_track_unicode_cell_width	test
+main.rs::sanitize_terminal_text_preserves_line_feeds	test
+main.rs::sanitize_terminal_text_strips_control_and_escape_sequences	test
+main.rs::sanitize_terminal_text_strips_unicode_line_separators	test
 main.rs::slash_escaped_lines_steer_or_queue_instead_of_deferring	todo
 main.rs::the_work_clock_guard_brackets_a_picker	todo
 main.rs::turn_print_repairs_truncation_before_the_max_turn_fallback	todo

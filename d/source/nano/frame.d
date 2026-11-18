@@ -382,10 +382,10 @@ struct Debouncer
 /// Untrusted text with every line kept and control characters dropped.
 string sanitizeLines(string s)
 {
-    import nano.trajectory : sanitizeTerminal;
+    import nano.trajectory : terminalSafe;
     import std.algorithm : map;
     import std.array : join, split;
-    return s.split('\n').map!sanitizeTerminal.join("\n");
+    return s.split('\n').map!(l => terminalSafe(l)).join("\n");
 }
 
 /// Expanded detail under a call or thought: sanitized lines, indented by four.

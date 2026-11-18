@@ -65,7 +65,8 @@ class QuestionError : Exception
 }
 
 /// Drop control characters (newlines too) and line/paragraph separators from
-/// a single-line field (Rust `sanitize_terminal_line`).
+/// a single-line field the model reads back (question.rs). Text bound for the
+/// terminal uses `nano.trajectory.terminalSafe`, which drops whole escapes.
 string sanitizeLine(string s) @safe
 {
     string out_;
@@ -83,16 +84,19 @@ string sanitizeLine(string s) @safe
 /// (escapes dropped, line feeds kept), so the model cannot inject controls.
 string questionPrompt(string question, size_t width, out string[] body_)
 {
-    import std.array : replace, split;
-    import std.string : strip;
+    import std.array : split;
+    import std.string : stripRight;
     import nano.markdown : render;
-    import std.array : join;
-    import nano.trajectory : sanitizeTerminal;
-    auto text = question.strip.replace("\u2028", "\n").replace("\u2029", "\n").split('\n')
-        .map!sanitizeTerminal.join("\n");
-    // Room for the `? ` prefix.
-    auto rendered = render(text, width > 24 ? width - 4 : 20);
-    if (rendered == text && !text.canFind('\n')) return text;
+    import nano.resume : cells;
+    import nano.trajectory : terminalSafe;
+    // Trailing space only: leading indentation is markdown (a code block).
+    auto text = terminalSafe(question.stripRight, true);
+    // Room for the `? ` prefix and the `› ` after the prompt.
+    import nano.arith : saturatingSub;
+    auto room = saturatingSub(width, 4);
+    auto rendered = render(text, room > 20 ? room : 20);
+    // Inline only if it fits the prompt row, in cells (wide glyphs count 2).
+    if (rendered == text && !text.canFind('\n') && cells(text) <= room) return text;
     body_ = rendered.split('\n');
     return "Your answer";
 }
@@ -338,4 +342,24 @@ unittest // questionPrompt: inline, markdown body, wrapping and escapes
     assert(questionPrompt("\x1b[2J" ~ "word ".replicate(40), 40, wrapped) == "Your answer");
     assert(wrapped.length > 1);
     foreach (l; wrapped) assert(!l.canFind("\x1b[2J"), "escapes dropped");
+}
+
+// rust: main.rs::an_over_wide_question_leaves_the_inline_prompt_on_a_narrow_terminal
+unittest
+{
+    string[] body_;
+    assert(questionPrompt("Which should I use?", 18, body_) == "Your answer" && body_.length, "over-wide renders above");
+    body_ = null;
+    assert(questionPrompt("fits exactly!?", 18, body_) == "fits exactly!?" && !body_.length);
+    assert(questionPrompt("数据库用哪个比较好呢？", 19, body_) == "Your answer", "20 cells on a 19-col terminal");
+}
+
+// rust: main.rs::leading_indentation_is_preserved_for_markdown
+unittest
+{
+    string[] body_;
+    assert(questionPrompt("    indented\n    code", 80, body_) == "Your answer");
+    assert(body_.canFind!(l => l.canFind("indented")) && body_.canFind!(l => l.canFind("code")));
+    body_ = null;
+    assert(questionPrompt("Plain question?   \n", 80, body_) == "Plain question?" && !body_.length);
 }

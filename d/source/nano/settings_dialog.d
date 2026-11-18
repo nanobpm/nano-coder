@@ -79,8 +79,8 @@ string pickModel(SettingsUi ui, ref SettingsHost h)
 /// A configured model's picker row: its display name, then its id.
 string modelLabel(string id, string name)
 {
-    import nano.trajectory : sanitizeTerminal;
-    return name.strip.length ? format("%s  (%s)", sanitizeTerminal(name), id) : id;
+    import nano.trajectory : terminalSafe;
+    return name.strip.length ? format("%s  (%s)", terminalSafe(name), id) : id;
 }
 
 /// A model from `name`'s list (or typed); null goes back to the providers.

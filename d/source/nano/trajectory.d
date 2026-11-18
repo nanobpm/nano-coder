@@ -614,8 +614,104 @@ string sanitizeMarkdown(string text)
     return splitNl(text).map!sanitizeTerminal.join("\n");
 }
 
+/// Drop control characters (C0/C1) and whole escape sequences (CSI to its
+/// final byte, OSC to BEL or ST; a lone ESC drops alone), so no escape body
+/// shows as text, and the U+2028/U+2029 separators a terminal folds into a
+/// row; expand tabs to 8-column stops measured in cells. `keepNewlines`
+/// keeps `\n` (resetting the column) for multi-line text (main.rs
+/// sanitize_terminal_text / sanitize_terminal_line).
+public string terminalSafe(string text, bool keepNewlines = false)
+{
+    import std.uni : isControl;
+    import std.utf : decode, encode;
+    import nano.resume : cells;
+    string o;
+    size_t col, i;
+    while (i < text.length)
+    {
+        dchar c = decode(text, i);
+        if (c == '\x1b')
+        {
+            if (i < text.length && text[i] == '[')
+            {
+                ++i;
+                while (i < text.length)
+                {
+                    auto f = decode(text, i);
+                    if (f >= '@' && f <= '~') break;
+                }
+            }
+            else if (i < text.length && text[i] == ']')
+            {
+                ++i;
+                while (i < text.length)
+                {
+                    auto f = decode(text, i);
+                    if (f == '\x07') break;
+                    if (f == '\x1b' && i < text.length && text[i] == '\\') { ++i; break; }
+                }
+            }
+            continue;
+        }
+        if (c == '\t')
+        {
+            auto n = 8 - col % 8;
+            o ~= " ".replicate(n);
+            col += n;
+            continue;
+        }
+        if (c == '\n' && keepNewlines) { o ~= '\n'; col = 0; continue; }
+        if (c == '\u2028' || c == '\u2029' || isControl(c)) continue;
+        char[4] buf;
+        auto len = encode(buf, c);
+        o ~= buf[0 .. len].idup;
+        col += cells(buf[0 .. len].idup);
+    }
+    return o;
+}
+
+// rust: main.rs::sanitize_strips_whole_ansi_sequences
+unittest
+{
+    assert(terminalSafe("\x1b[31mred\x1b[0m") == "red");
+    assert(terminalSafe("a\x1b]52;c;Zm8=\x07b") == "ab");
+    assert(terminalSafe("a\x1b]0;title\x1b\\b") == "ab");
+    assert(terminalSafe("a\x1bZb") == "aZb");
+}
+
+// rust: main.rs::sanitize_terminal_expands_tabs_to_spaces, main.rs::sanitize_terminal_tab_stops_track_unicode_cell_width
+unittest
+{
+    assert(terminalSafe("     1\tleft\tright", true) == "     1  left    right");
+    assert(terminalSafe("     1\tleft\tright") == "     1  left    right");
+    assert(terminalSafe("a\tb", true) == "a       b");
+    assert(terminalSafe("ab\tc\nx\ty", true) == "ab      c\nx       y");
+    assert(terminalSafe("hi\x1b[2J\tthere") == "hi      there");
+    foreach (keep; [false, true])
+    {
+        assert(terminalSafe("界\tX", keep) == "界" ~ " ".replicate(6) ~ "X");
+        assert(terminalSafe("界界\tX", keep) == "界界" ~ " ".replicate(4) ~ "X");
+        assert(terminalSafe("e\u0301\tX", keep) == "e\u0301" ~ " ".replicate(7) ~ "X");
+    }
+}
+
+// rust: main.rs::sanitize_terminal_text_preserves_line_feeds, main.rs::sanitize_terminal_text_strips_control_and_escape_sequences, main.rs::sanitize_terminal_text_strips_unicode_line_separators
+unittest
+{
+    assert(terminalSafe("one\ntwo\nthree", true) == "one\ntwo\nthree");
+    assert(terminalSafe("one\x1b[2J\ntwo", true) == "one\ntwo");
+    assert(terminalSafe("one\ntwo") == "onetwo", "a single-line field drops the line feed");
+    assert(terminalSafe("hi\x1b[2Jthere", true) == "hithere");
+    assert(terminalSafe("a\x07\x00b\tc", true) == "ab      c");
+    assert(terminalSafe("plain — label", true) == "plain — label");
+    assert(terminalSafe("mem-evil\u2028forged row", true) == "mem-evilforged row");
+    assert(terminalSafe("head\u2029forged row", true) == "headforged row");
+    assert(terminalSafe("café — label", true) == "café — label");
+}
+
 /// Drop control characters (C0/C1, so no escape sequence survives) and expand
-/// tabs to 8-column stops.
+/// tabs to 8-column stops (trajectory.rs sanitize_terminal: escape bodies
+/// stay as text, only the bytes that drive a terminal go).
 public string sanitizeTerminal(string text)
 {
     import std.uni : isControl;

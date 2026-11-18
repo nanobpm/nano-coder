@@ -37,7 +37,8 @@ static import nano.herdr;
 import nano.frame : glyphMark, foldMark, expandedBody, expandedResult;
 import core.time : MonoTime, seconds;
 import std.sumtype : match;
-import nano.question : QuestionBroker, Question, Answer, Answered, Away, Dismissed, sanitizeLine, questionDefinition = definition;
+import nano.trajectory : terminalSafe;
+import nano.question : QuestionBroker, Question, Answer, Answered, Away, Dismissed, questionDefinition = definition;
 import nano.lineedit : LineEditor, Outcome, K, ParkedDraft, enterKeyMode, leaveKeyMode, fdSource, writeFd, terminalWidth, terminalHeight;
 import nano.frameui : FrameUi;
 import nano.settings_dialog : SettingsUi, SettingsHost, runSettings, pickModel, onVerbosity;
@@ -463,7 +464,7 @@ private void readTurnKeys(LineEditor editor, ConsoleLink console, shared(bool)* 
                 if (auto qs = questions.pending)
                 {
                     console.endLine();
-                    nano.herdr.report(nano.herdr.State.blocked, qs.length ? sanitizeLine(qs[0].question) : null);
+                    nano.herdr.report(nano.herdr.State.blocked, qs.length ? terminalSafe(qs[0].question) : null);
                     // The user's time at the picker isn't working time.
                     if (gFrame) gFrame.pauseWork(true);
                     bool delegate() @safe away = null;
@@ -608,8 +609,8 @@ Answer askQuestions(LineEditor editor, const Question[] qs, bool delegate() @saf
     {
         string[] labels;
         foreach (ref opt; q.options)
-            labels ~= opt.description.length ? sanitizeLine(opt.label) ~ " — " ~ sanitizeLine(opt.description)
-                : sanitizeLine(opt.label);
+            labels ~= opt.description.length ? terminalSafe(opt.label) ~ " — " ~ terminalSafe(opt.description)
+                : terminalSafe(opt.label);
         ptrdiff_t custom = -1;
         if (q.custom)
         {
@@ -1173,10 +1174,8 @@ ConfiguredWindow windowFor(const ref Config c, const ref ProviderConfig p)
 /// control character (so any escape sequence) dropped, tabs expanded.
 string sanitizeBlock(string s)
 {
-    import nano.trajectory : sanitizeTerminal;
-    import std.algorithm : map;
-    import std.array : join, split;
-    return s.split('\n').map!sanitizeTerminal.join("\n");
+    import nano.trajectory : terminalSafe;
+    return terminalSafe(s, true);
 }
 
 size_t lineCount(string s)
@@ -2415,8 +2414,8 @@ int runMain(string[] args)
                             import nano.memory : scopeName = name;
                             import std.string : lineSplitter;
                             auto first = x.e.text.lineSplitter.empty ? "" : x.e.text.lineSplitter.front.strip;
-                            auto row = format("  %s %s %s%s", scopeName(x.s), x.e.label, sanitizeLine(first),
-                                x.e.evidence !is null ? " (check: " ~ sanitizeLine(x.e.evidence) ~ ")" : "");
+                            auto row = format("  %s %s %s%s", scopeName(x.s), x.e.label, terminalSafe(first),
+                                x.e.evidence !is null ? " (check: " ~ terminalSafe(x.e.evidence) ~ ")" : "");
                             if (x.e.isRule) row ~= " [rule]";
                             // Recall noise: how often a memory was recalled from a
                             // tool call, and how often that was followed by reading it.
