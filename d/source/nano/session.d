@@ -117,6 +117,8 @@ JSONValue messageRecord(const ref Message m)
             "total_tokens": m.usage.inputTokens + m.usage.outputTokens]);
     if (m.hasUsage && m.usage.hasAic) j["usage"]["aic"] = m.usage.aic;
     if (m.durationMs >= 0) j["duration_ms"] = m.durationMs;
+    if (m.temperature.length) j["temperature"] = m.temperature;
+    if (m.thinkingLevel.length) j["thinking_level"] = m.thinkingLevel;
     if (m.stopReason.length) j["stop_reason"] = m.stopReason;
     if (m.logLine) j["log_line"] = m.logLine;
     if (m.autoInitiated) j["auto_initiated"] = true;
@@ -181,6 +183,8 @@ Message messageFromRecord(JSONValue j)
             break;
         case "duration_ms": m.durationMs = v.integer; break;
         case "stop_reason": m.stopReason = v.str; break;
+        case "temperature": if (v.type == JSONType.string) m.temperature = v.str; break;
+        case "thinking_level": if (v.type == JSONType.string) m.thinkingLevel = v.str; break;
         case "log_line": if (v.type == JSONType.integer) m.logLine = v.integer; break; // direct records: the physical line wins
         case "auto_initiated": m.autoInitiated = v.type == JSONType.true_; break;
         case "hook_context": m.hookContext = v.type == JSONType.true_; break;

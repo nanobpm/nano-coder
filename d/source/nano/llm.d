@@ -86,6 +86,12 @@ struct Message
     long durationMs = -1;
     /// Assistant: the provider's stop reason, normalised (`end_turn`, `tool_use`, `max_tokens`).
     string stopReason;
+    /// Assistant: the temperature the request sent and why, e.g.
+    /// `0.3 (set for this model)`. Recorded so runs can be compared.
+    string temperature;
+    /// Assistant: the thinking level the request sent and why, e.g. `high
+    /// (set for this session)`; only when a level was sent or set.
+    string thinkingLevel;
     /// The message's physical line in the session log (0: not logged), its
     /// `#N` ID for smart compaction and the history tools.
     ulong logLine;

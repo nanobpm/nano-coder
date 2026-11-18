@@ -28,7 +28,7 @@ import mem = nano.memory;
 import ctx = nano.context;
 import hist = nano.session_history;
 import nano.instructions : ProjectInstructions;
-import nano.thinking : Thinking, ThinkingResolved = Resolved, resolveThinking = resolve, Request, cappedBudget, Reported;
+import nano.thinking : Thinking, ThinkingResolved = Resolved, resolveThinking = resolve, Request, cappedBudget, Reported, ThinkingSource = Source;
 import temp = nano.temperature;
 import nano.vision : Vision, resolveVision = resolve;
 import nano.llm : Attachment;
@@ -635,6 +635,9 @@ class Agent
             auto sw = StopWatch(AutoStart.yes);
             bool overflowRetried, capRetried;
             size_t dropped;
+            // What the request that answered sent (a retry re-resolves).
+            ThinkingResolved sentThinking;
+            temp.Resolved sentTemperature;
             for (;;)
             {
                 ChatRequest req;
@@ -645,10 +648,13 @@ class Agent
                 req.thinking = th.request();
                 req.vision = vision();
                 req.attachmentsDir = attachmentsDir();
-                req.temperature = temperatureFor(th.anthropicThinkingOn).effective;
+                auto tr = temperatureFor(th.anthropicThinkingOn);
+                req.temperature = tr.effective;
                 try
                 {
                     r = client.chat(req, (bool t, string s) { ev.text(t, s); });
+                    sentThinking = th;
+                    sentTemperature = tr;
                     break;
                 }
                 catch (Cancelled) return cancelled(ev);
@@ -715,6 +721,11 @@ class Agent
             reply.usage = r.usage;
             reply.hasUsage = r.usage != TokenUsage.init;
             reply.durationMs = sw.peek.total!"msecs";
+            reply.temperature = sentTemperature.describe;
+            // Only when a level is sent or set somewhere, so logs without
+            // thinking levels stay unchanged.
+            if (sentThinking.effective != Thinking.init || sentThinking.source != ThinkingSource.global)
+                reply.thinkingLevel = sentThinking.describe;
             reply.stopReason = r.toolCalls.length ? "tool_use"
                 : (r.stopReason == "length" || r.stopReason == "max_tokens") ? "max_tokens" : "end_turn";
             push(reply);

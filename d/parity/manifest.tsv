@@ -31,7 +31,7 @@ agent.rs::a_literal_list_loop_runs_without_asking	test
 agent.rs::a_looser_probe_does_not_replace_a_learned_window_stat	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
 agent.rs::a_lower_learned_window_restores_the_output_reservation	test
 agent.rs::a_memory_evicted_from_the_installed_index_becomes_recallable	test
-agent.rs::a_mid_turn_thinking_change_applies_from_the_next_step_and_drops_the_temperature	todo
+agent.rs::a_mid_turn_thinking_change_applies_from_the_next_step_and_drops_the_temperature	test
 agent.rs::a_newer_model_request_during_a_slow_build_supersedes_the_stale_one	na	Tokio runtime races while a client builds asynchronously; D builds the client synchronously on the agent thread
 agent.rs::a_pending_timer_nudges_every_few_steps_until_marked_done	test
 agent.rs::a_plan_tool_persistence_failure_rolls_the_live_plan_back	gap	D does not roll the live timers/plan back when persisting their change to the session log fails
@@ -45,13 +45,13 @@ agent.rs::a_resumed_session_keeps_attachments_and_survives_a_missing_file	todo
 agent.rs::a_retried_prompt_keeps_its_spent_recall_budget	na	D has no in-process retry of a pending input and its replace records never keep one, so there is no per-input recall budget to carry
 agent.rs::a_same_agent_retry_after_a_provider_error_does_not_replay_the_snapshot_twice	test
 agent.rs::a_second_overflow_is_returned	test
-agent.rs::a_small_max_tokens_caps_the_thinking_budget_with_a_warning	todo
+agent.rs::a_small_max_tokens_caps_the_thinking_budget_with_a_warning	test
 agent.rs::a_spoofed_summary_prefix_does_not_unlock_history_tools	todo
 agent.rs::a_stale_background_probe_is_discarded_after_a_later_switch	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
 agent.rs::a_steer_between_continuations_drops_the_cut_off_prefix	test
 agent.rs::a_stricter_probe_replaces_a_learned_window_stat	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
 agent.rs::a_summary_cut_off_at_the_output_limit_is_flagged	test
-agent.rs::a_thinking_level_set_mid_turn_applies_from_the_next_step	todo
+agent.rs::a_thinking_level_set_mid_turn_applies_from_the_next_step	test
 agent.rs::a_timer_set_in_a_turn_fires_mid_turn_when_the_clock_passes_it	test
 agent.rs::a_timer_tool_persistence_failure_rolls_the_live_timers_back	gap	D does not roll the live timers/plan back when persisting their change to the session log fails
 agent.rs::a_title_is_requested_at_most_once_per_session_across_switches	todo
@@ -132,13 +132,13 @@ agent.rs::model_switch_to_an_unbuildable_spec_drops_the_request_and_reports_it	t
 agent.rs::new_generation_clears_stale_output_rate	todo
 agent.rs::new_session_and_load_reset_the_mode	todo
 agent.rs::new_session_resets_cumulative_counters	test
-agent.rs::no_room_for_a_budget_drops_the_level_everywhere	todo
+agent.rs::no_room_for_a_budget_drops_the_level_everywhere	test
 agent.rs::no_titles_unless_enabled	test
 agent.rs::normal_mode_cap_stops_headless	test
 agent.rs::one_shot_provider_publishes_usage_over_elapsed_rate	todo
 agent.rs::only_read_file_decodes_image_results	todo
 agent.rs::output_limit_continuations_accumulate_the_whole_answer	test
-agent.rs::overflow_retry_reresolves_thinking_against_the_post_compaction_room	todo
+agent.rs::overflow_retry_reresolves_thinking_against_the_post_compaction_room	test
 agent.rs::overflow_smart_compaction_rebuilds_tools_before_retry	todo
 agent.rs::persisted_sessions_spill_beside_their_log	test
 agent.rs::plan_mode_blocks_a_memory_mutation_that_reached_the_handler	todo
@@ -219,7 +219,7 @@ agent.rs::temperature_resolves_against_the_live_client	test
 agent.rs::temperature_resolves_for_a_custom_mock_provider	todo
 agent.rs::the_loop_detector_resets_on_a_new_turn	todo
 agent.rs::the_title_fallback_uses_the_sessions_live_model	todo
-agent.rs::thinking_level_is_sent_and_drops_the_temperature_on_anthropic	todo
+agent.rs::thinking_level_is_sent_and_drops_the_temperature_on_anthropic	test
 agent.rs::timer_tools_are_hidden_when_timers_are_disabled	test
 agent.rs::timers_survive_resume_and_restart_clears_them	gap	timer state across resume/restart is restored by D but untested; the cache-prefix interleaving case is not handled
 agent.rs::titles_sessions_once_a_prompt_says_something	test
