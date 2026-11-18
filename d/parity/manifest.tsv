@@ -22,7 +22,7 @@ agent.rs::a_failed_direct_model_switch_still_clears_a_stale_queued_request	test
 agent.rs::a_failed_new_session_keeps_the_thinking_override	todo
 agent.rs::a_failed_repair_on_resume_leaves_the_live_session_untouched	todo
 agent.rs::a_failed_tool_after_smart_compaction_points_to_history_once	test
-agent.rs::a_firing_persistence_failure_rolls_the_due_timers_back	gap	D does not roll the live timers/plan back when persisting their change to the session log fails
+agent.rs::a_firing_persistence_failure_rolls_the_due_timers_back	test
 agent.rs::a_hard_stop_skips_the_rest_of_the_batch	test
 agent.rs::a_headless_turn_with_no_cap_stops_at_the_safety_cap	test
 agent.rs::a_learned_window_is_the_combined_cap_when_no_total_is_advertised	test
@@ -34,7 +34,7 @@ agent.rs::a_memory_evicted_from_the_installed_index_becomes_recallable	test
 agent.rs::a_mid_turn_thinking_change_applies_from_the_next_step_and_drops_the_temperature	test
 agent.rs::a_newer_model_request_during_a_slow_build_supersedes_the_stale_one	na	Tokio runtime races while a client builds asynchronously; D builds the client synchronously on the agent thread
 agent.rs::a_pending_timer_nudges_every_few_steps_until_marked_done	test
-agent.rs::a_plan_tool_persistence_failure_rolls_the_live_plan_back	gap	D does not roll the live timers/plan back when persisting their change to the session log fails
+agent.rs::a_plan_tool_persistence_failure_rolls_the_live_plan_back	test
 agent.rs::a_prompt_only_window_is_capped_to_the_combined_window	test
 agent.rs::a_prompt_only_window_keeps_the_estimation_margin	test
 agent.rs::a_repeat_loop_ends_the_turn_blocked_after_the_warnings	test
@@ -53,7 +53,7 @@ agent.rs::a_stricter_probe_replaces_a_learned_window_stat	gap	D probes capabilit
 agent.rs::a_summary_cut_off_at_the_output_limit_is_flagged	test
 agent.rs::a_thinking_level_set_mid_turn_applies_from_the_next_step	test
 agent.rs::a_timer_set_in_a_turn_fires_mid_turn_when_the_clock_passes_it	test
-agent.rs::a_timer_tool_persistence_failure_rolls_the_live_timers_back	gap	D does not roll the live timers/plan back when persisting their change to the session log fails
+agent.rs::a_timer_tool_persistence_failure_rolls_the_live_timers_back	test
 agent.rs::a_title_is_requested_at_most_once_per_session_across_switches	todo
 agent.rs::a_tool_run_resets_the_continuation_accumulator	test
 agent.rs::a_truncated_final_assistant_is_not_replayed_as_a_clean_finish	test
@@ -96,7 +96,7 @@ agent.rs::completed_after_an_unverified_edit_is_reminded_once_then_goes_through	
 agent.rs::configured_read_only_memory_search_does_not_mutate_the_store	test
 agent.rs::context_overflow_compacts_and_retries_once	test
 agent.rs::detected_window_sits_between_config_and_model_name	test
-agent.rs::disabled_timers_neither_fire_nor_nudge_on_a_turn	gap	D timer nudging: no test that disabled timers stay silent / that idle firing resets the nudge counter
+agent.rs::disabled_timers_neither_fire_nor_nudge_on_a_turn	test
 agent.rs::emits_acp_updates_for_messages_and_tools	test
 agent.rs::estimate_is_anchored_to_reported_usage	test
 agent.rs::failed_model_switch_restores_the_previous_spec	test
@@ -105,7 +105,7 @@ agent.rs::identical_tool_calls_draw_a_loop_warning_on_the_third	test
 agent.rs::idle_compaction_is_off_without_idle_or_auto_compact	test
 agent.rs::idle_compaction_never_runs_below_the_configured_threshold	test
 agent.rs::idle_compaction_runs_once_per_crossing	test
-agent.rs::idle_firing_resets_the_pending_nudge_counter	gap	D timer nudging: no test that disabled timers stay silent / that idle firing resets the nudge counter
+agent.rs::idle_firing_resets_the_pending_nudge_counter	test
 agent.rs::idle_poll_cache_is_keyed_on_the_offered_tool_set	test
 agent.rs::idle_take_fired_timers_returns_due_timers_once	test
 agent.rs::indexes_skills_in_the_system_prompt_and_loads_them_on_request	todo
@@ -221,7 +221,7 @@ agent.rs::the_loop_detector_resets_on_a_new_turn	test
 agent.rs::the_title_fallback_uses_the_sessions_live_model	todo
 agent.rs::thinking_level_is_sent_and_drops_the_temperature_on_anthropic	test
 agent.rs::timer_tools_are_hidden_when_timers_are_disabled	test
-agent.rs::timers_survive_resume_and_restart_clears_them	gap	timer state across resume/restart is restored by D but untested; the cache-prefix interleaving case is not handled
+agent.rs::timers_survive_resume_and_restart_clears_them	test
 agent.rs::titles_sessions_once_a_prompt_says_something	test
 agent.rs::too_many_mid_reply_drops_end_the_turn	test
 agent.rs::tool_calls_recall_matching_memories_once_per_context	test

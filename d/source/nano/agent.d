@@ -1920,10 +1920,17 @@ class Agent
         return now !is null ? now() : Clock.currTime.toUnixTime;
     }
 
-    private string runTimerTool(string name, JSONValue args)
+    package string runTimerTool(string name, JSONValue args)
     {
+        auto before = Timers(timers.items.dup, timers.pending.dup, timers.lastId);
         auto o = timers.apply(name, args, timerNow());
-        if (o.changed) timersChanged();
+        if (o.changed)
+        {
+            // A change the log did not record is rolled back, so the live
+            // timers never run ahead of what a resume restores.
+            scope (failure) timers = before;
+            timersChanged();
+        }
         return o.text;
     }
 
@@ -1938,9 +1945,15 @@ class Agent
     string takeFiredTimers(out string notice)
     {
         auto t = timerNow();
+        auto before = Timers(timers.items.dup, timers.pending.dup, timers.lastId);
         auto due = timers.takeDue(t);
         if (!due.length) return null;
-        timersChanged();
+        {
+            // Unrecorded, they stay due and fire on the next try.
+            scope (failure) timers = before;
+            timersChanged();
+        }
+        stepsSinceTimerNote = 0; // a fresh firing restarts the nudge interval
         notice = firedNotice(due);
         return firedMessage(due, t);
     }
@@ -1958,7 +1971,6 @@ class Agent
             tm.timer = true;
             push(tm);
             ev.userMessage(notice);
-            stepsSinceTimerNote = 0;
             return;
         }
         if (!timers.pending.length) { stepsSinceTimerNote = 0; return; }
@@ -1968,7 +1980,7 @@ class Agent
         nudge.timer = true;
         push(nudge);
     }
-    private size_t stepsSinceTimerNote;
+    package size_t stepsSinceTimerNote;
 
     /// Replace the timers with ones restored from the session log.
     void setTimers(Timers t)
@@ -1977,17 +1989,23 @@ class Agent
         if (onTimersChanged !is null) onTimersChanged();
     }
 
-    private string runPlanTool(string name, JSONValue args)
+    package string runPlanTool(string name, JSONValue args)
     {
+        auto before = plan.dup;
         auto o = plan.apply(name, args);
-        if (o.changed) planChanged();
+        if (o.changed)
+        {
+            // As for timers: an unrecorded change is rolled back.
+            scope (failure) plan = before;
+            planChanged();
+        }
         return o.text;
     }
 
     private void planChanged()
     {
-        reminders.planChanged();
         log.ifSome((SessionLog l) { l.plan(plan.toJSON); });
+        reminders.planChanged();
         if (onPlanChanged !is null) onPlanChanged();
     }
 
@@ -3145,3 +3163,4 @@ unittest // at most two notes per input; refused calls never recall
     b.run("look", new NullEvents);
     assert(pinCount(b) == 0);
 }
+

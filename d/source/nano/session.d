@@ -252,8 +252,16 @@ class SessionLog
         f = File(path, "a");
     }
 
+    /// Tests: the next write fails (Rust `fail_next_persist`).
+    bool failNextWrite;
+
     private void write_(string line)
     {
+        if (failNextWrite)
+        {
+            failNextWrite = false;
+            throw new Exception("session log write failed (injected)");
+        }
         f.write(line);
         f.flush();
         ++lines;
