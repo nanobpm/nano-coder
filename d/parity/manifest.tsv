@@ -59,7 +59,7 @@ agent.rs::a_tool_run_resets_the_continuation_accumulator	test
 agent.rs::a_truncated_final_assistant_is_not_replayed_as_a_clean_finish	test
 agent.rs::a_truncated_turns_stop_reason_survives_a_reload	test
 agent.rs::adds_project_instructions_to_the_system_prompt_and_nested_ones_to_file_results	todo
-agent.rs::an_automatic_timer_turn_marks_its_message_auto_initiated	gap	D session records have no auto-initiated flag for timer-driven turns
+agent.rs::an_automatic_timer_turn_marks_its_message_auto_initiated	test
 agent.rs::an_empty_summary_at_the_output_limit_names_the_cause	test
 agent.rs::an_equal_probe_replaces_a_learned_window_stat_source	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
 agent.rs::an_interactive_session_keeps_an_unbounded_zero_cap	test
@@ -121,7 +121,7 @@ agent.rs::memories_rendered_in_full_by_the_index_do_not_refire	test
 agent.rs::memory_save_persists_and_surfaces_in_the_prompt	test
 agent.rs::memory_tools_track_the_configured_mode	test
 agent.rs::mid_reply_drops_are_retried_and_leave_no_partial_text_in_history	test
-agent.rs::mid_reply_restart_emits_a_reset_event_before_resending	gap	D has no response-reset UI event: a partial reply already printed before a mid-reply drop stays on screen
+agent.rs::mid_reply_restart_emits_a_reset_event_before_resending	test
 agent.rs::mid_turn_model_switch_with_a_configured_window_skips_the_probe	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
 agent.rs::mid_turn_model_switch_without_a_configured_window_probes_in_the_background	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
 agent.rs::model_switch_during_tool_call_applies_at_the_next_model_call	test

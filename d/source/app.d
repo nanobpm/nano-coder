@@ -1036,6 +1036,13 @@ class Console : AgentEvents
         endLine();
         writeln(stampBlock(stamp(), dim("↪ " ~ text)));
     }
+    /// Close the abandoned partial so the resent reply starts a fresh segment
+    /// instead of joining the stale prefix.
+    void responseRestarted()
+    {
+        if (!quiet) endLine();
+    }
+
     void assistantMessage(string text, string reasoning)
     {
         finalAnswer = text;

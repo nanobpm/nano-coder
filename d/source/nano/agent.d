@@ -60,6 +60,9 @@ interface AgentEvents
     void userMessage(string text);
     /// A complete model reply (after its deltas went to `text`).
     void assistantMessage(string text, string reasoning);
+    /// A streamed reply broke off and is being asked again: the partial
+    /// already shown is abandoned, and the restart begins a fresh segment.
+    void responseRestarted();
 }
 
 /// Wrap text the model should read as a system note, not user words.
@@ -681,7 +684,7 @@ class Agent
                     if (control.isCancelled) return cancelled(ev);
                     if (++dropped > maxStreamRestarts) throw e;
                     stdErr.writefln("[agent] %s; asking again (%s/%s)", e.msg, dropped, maxStreamRestarts);
-                    ev.text(false, "\n");
+                    ev.responseRestarted();
                     continue;
                 }
                 catch (Exception e)
@@ -2093,6 +2096,8 @@ version (unittest)
         string[] steered;
         void userMessage(string t) { steered ~= t; }
         void assistantMessage(string t, string r) {}
+        size_t restarts;
+        void responseRestarted() { restarts++; }
     }
 }
 
@@ -2518,6 +2523,7 @@ unittest
 
 // Automatic turns are flagged at their origin; hook context appended to a
 // prompt leaves the user's text in `pinText`.
+// rust: agent.rs::an_automatic_timer_turn_marks_its_message_auto_initiated
 unittest
 {
     import nano.providers.mock;

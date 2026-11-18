@@ -309,6 +309,7 @@ class Order : NullEvents
     string[] names;
     override void text(bool reasoning, string chunk) { names ~= (reasoning ? "thinking-delta:" : "text-delta:") ~ chunk; }
     override void assistantMessage(string text, string reasoning) { names ~= "message:" ~ text ~ "|" ~ reasoning; }
+    override void responseRestarted() { names ~= "restart"; }
 }
 
 // rust: agent.rs::streams_deltas_and_reports_thinking_before_the_answer
@@ -394,4 +395,18 @@ unittest
     assert(t.content.canFind("can't view images"), t.content);
     t = toolResult(true, ToolCall.fromRaw("c1", "shot", `{}`));
     assert(!t.isError && !t.attachments.length && t.content.canFind(`"image"`), t.content);
+}
+
+// rust: agent.rs::mid_reply_restart_emits_a_reset_event_before_resending
+unittest
+{
+    auto mock = new MockClient([LLMResponse("!drop:partial reply "), LLMResponse("!drop:partial reply "),
+        LLMResponse("the full answer")]);
+    auto agent = new Agent(mock, new ToolRegistry, Policy.init, "sys");
+    auto ev = new Order;
+    agent.run("hi", ev);
+    import std.algorithm : count;
+    assert(ev.names.count("restart") == 2, imported!"std.conv".to!string(ev.names));
+    assert(ev.names[0] == "text-delta:partial reply " && ev.names[1] == "restart", imported!"std.conv".to!string(ev.names));
+    assert(ev.names[$ - 1] == "message:the full answer|");
 }

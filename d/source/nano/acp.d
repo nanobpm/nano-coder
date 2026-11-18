@@ -404,6 +404,9 @@ final class AcpServer : AgentEvents
         update(JSONValue(["sessionUpdate": JSONValue("user_message_chunk"), "content": textBlock(t)]));
     }
 
+    /// Nothing to retract over ACP: the client has the streamed chunks.
+    void responseRestarted() {}
+
     void assistantMessage(string t, string reasoning)
     {
         if (reasoning.length)
