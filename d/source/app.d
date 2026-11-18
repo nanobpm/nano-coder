@@ -1493,6 +1493,7 @@ int runMain(string[] args)
     agent.maxTokens = cfg.maxTokens;
     agent.configuredWindow = configuredWindow;
     agent.autoCompact = cfg.autoCompact;
+    agent.compactionPinRequests = cfg.compactionPinRequests;
     agent.autoCompactThreshold = cfg.autoCompactThreshold;
     {
         import nano.context : parseCompactionMode;
@@ -1561,6 +1562,7 @@ int runMain(string[] args)
         agent.log = o.noSession ? null : new SessionLog(path);
         agent.historyAvailable = restored.historyAvailable;
         agent.historyHintPending = restored.historyAvailable && !restored.historyHintConsumed;
+        agent.pinStash = restored.pinStash;
         agent.plan = Plan.init;
         agent.restoreRecall(restored.recall);
         agent.resetSessionCounters();
@@ -1859,6 +1861,7 @@ int runMain(string[] args)
             auto fired = agent.takeFiredTimers(notice);
             if (fired is null) continue;
             stdErr.writeln(console.dim(notice));
+            agent.automaticInput = true;
             ok = turn(fired);
         }
         if (ok && !o.waitTimers && !agent.timers.empty)
@@ -2008,6 +2011,7 @@ int runMain(string[] args)
                 string notice;
                 line = agent.takeFiredTimers(notice);
                 writeln(console.dim(notice));
+                agent.automaticInput = true;
                 line = "\x00" ~ line;
             }
             else if (r.outcome == Outcome.stopped && updateHint.length)

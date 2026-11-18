@@ -89,6 +89,14 @@ struct Message
     /// The message's physical line in the session log (0: not logged), its
     /// `#N` ID for smart compaction and the history tools.
     ulong logLine;
+    /// User role: a harness-initiated turn (reminder, continuation, timer),
+    /// not user input (`auto_initiated`). Compaction never pins it.
+    bool autoInitiated;
+    /// User role: entirely harness hook context (`hook_context`), never pinned.
+    bool hookContext;
+    /// User role: the user-typed text when hook context was appended to
+    /// `content` (`pin_text`); compaction pins this instead (issue #66).
+    string pinText;
     /// Assistant: provider reasoning items replayed on later requests.
     JSONValue[] thinkingBlocks;
     /// Fields the D port doesn't model (e.g. Anthropic `thinking_blocks`),
@@ -97,6 +105,13 @@ struct Message
 
     static Message system(string c) { return Message(Role.system, c); }
     static Message user(string c) { return Message(Role.user, c); }
+    /// A harness-initiated user-role message (a reminder, continuation or timer).
+    static Message auto_(string c)
+    {
+        auto m = Message(Role.user, c);
+        m.autoInitiated = true;
+        return m;
+    }
     static Message assistant(string c, ToolCall[] calls = null)
     {
         auto m = Message(Role.assistant, c);

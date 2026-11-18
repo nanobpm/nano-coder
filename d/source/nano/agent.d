@@ -149,6 +149,16 @@ class Agent
     bool autoCompact = true;
     double autoCompactThreshold = 0.8;
     ctx.CompactionMode compactionMode = ctx.CompactionMode.standard;
+    /// Pin the user's requests verbatim after each compaction summary
+    /// (`compaction_pin_requests`, issue #66).
+    bool compactionPinRequests = true;
+    /// Set before `run` when the input is harness-initiated (a fired timer);
+    /// `run` consumes it.
+    bool automaticInput;
+    /// The genuine user requests folded by earlier compactions, so each
+    /// compaction rebuilds the pinned block from originals (Rust's
+    /// `pre_compaction_transcript`, trimmed to requests).
+    Message[] pinStash;
     /// The provider config's `context_window` (0: none).
     size_t configuredWindow;
     /// Learned from a context-overflow error (0: none).
@@ -204,6 +214,9 @@ class Agent
     {
         import std.datetime.systime : Clock;
         import std.conv : to;
+        // A harness-initiated input (a fired timer): never pinned as a request.
+        bool automatic = automaticInput;
+        automaticInput = false;
         if (givenId.length)
             if (auto done = givenId in completedInputs)
             {
@@ -223,7 +236,7 @@ class Agent
         ulong from = log !is null ? logSize() : 0;
         if (log !is null) log.input(inputId, input);
         string response;
-        try response = runTurn(input, ev, resetControl);
+        try response = runTurn(input, ev, resetControl, automatic);
         catch (Exception e)
         {
             if (log !is null)
@@ -331,7 +344,7 @@ class Agent
         ~ "that says what the user is working on, from their requests below. Reply with the title only: no quotes, "
         ~ "no trailing period.";
 
-    private string runTurn(string input, AgentEvents ev, bool resetControl)
+    private string runTurn(string input, AgentEvents ev, bool resetControl, bool automatic = false)
     {
         if (resetControl) control.startTurn();
         stopBlocks = 0;
@@ -340,6 +353,7 @@ class Agent
         reminders.outcomeTool = outcomeTool;
         reminders.startTurn();
         recallTurnNotes = 0;
+        string pinText;
         if (hooks !is null)
         {
             syncHookSession();
@@ -365,9 +379,18 @@ class Agent
             if (pendingStartContext !is null) extra ~= pendingStartContext;
             pendingStartContext = null;
             if (auto ctx = o.contextBlock) extra ~= ctx;
-            if (extra.length) input ~= "\n\n" ~ wrapReminder(extra.join("\n\n"));
+            if (extra.length)
+            {
+                pinText = input;
+                input ~= "\n\n" ~ wrapReminder(extra.join("\n\n"));
+            }
         }
-        push(Message.user(input));
+        {
+            auto um = Message.user(input);
+            um.pinText = pinText;
+            um.autoInitiated = automatic;
+            push(um);
+        }
         string last;
         // Output-limit continuations: the cut-off chunks so far, and how many.
         string continued;
@@ -517,7 +540,7 @@ class Agent
                 {
                     truncations++;
                     continued ~= r.content;
-                    push(Message.user(wrapReminder(truncatedContinuationNote(r.usage.outputTokens))));
+                    push(Message.auto_(wrapReminder(truncatedContinuationNote(r.usage.outputTokens))));
                     continue;
                 }
                 if (cut) ev.text(false, "\n[the reply hit the output-token limit]");
@@ -533,7 +556,7 @@ class Agent
                         stopBlocks++;
                         continued = null;
                         auto reason = o.blockReason.strip.length ? o.blockReason : "A Stop hook asked the agent to keep going.";
-                        push(Message.user(wrapReminder(reason)));
+                        push(Message.auto_(wrapReminder(reason)));
                         ev.userMessage(reason);
                         continue;
                     }
@@ -640,7 +663,7 @@ class Agent
                         stopBlocks++;
                         hasReported = false;
                         auto reason = o.blockReason.strip.length ? o.blockReason : "A Stop hook asked the agent to keep going.";
-                        push(Message.user(wrapReminder(reason)));
+                        push(Message.auto_(wrapReminder(reason)));
                         ev.userMessage(reason);
                         last = reported.response;
                         continue;
@@ -938,6 +961,7 @@ class Agent
     bool compact(out CompactReport report, CompactTrigger trigger = CompactTrigger.manual,
             const(ctx.CompactionMode)* mode = null, string focus = null)
     {
+        import std.algorithm : canFind;
         ctx.CompactionMode m = mode is null ? compactionMode : *mode;
         // Smart compaction points into the session log; without one it is standard.
         if (log is null) m = ctx.CompactionMode.standard;
@@ -980,8 +1004,12 @@ class Agent
             auto request = "Conversation to summarize:\n\n" ~ ctx.renderTranscript(summarized, chars, smart);
             if (focus.strip.length) request ~= "\n\nWhen summarizing, focus on: " ~ focus.strip;
             ChatRequest req;
-            req.messages = [Message.system(ctx.summarySystemPrompt ~ (smart ? ctx.smartSummaryInstructions : "")),
-                Message.user(request)];
+            auto system = ctx.summarySystemPrompt ~ (smart ? ctx.smartSummaryInstructions : "");
+            // A repeated compaction folds the previous summary back in: warn
+            // that it is lossy (issue #66).
+            if (summarized.canFind!((ref m) => ctx.isSummaryMessage(m)))
+                system ~= compactionPinRequests ? ctx.earlierSummaryLossyInstructions : ctx.earlierSummaryLossyNoPinInstructions;
+            req.messages = [Message.system(system), Message.user(request)];
             req.maxTokens = budget;
             // No thinking field: only a model that thinks anyway locks the temperature.
             req.temperature = temperatureFor(thinking().alwaysAnthropicThinking).effective;
@@ -1028,6 +1056,12 @@ class Agent
             summary = smart && first ? ctx.smartSummaryPrefix ~ "\n" ~ note ~ "\n\n" ~ ctx.smartSummaryNote(first, last) : note;
         }
         if (planTools && !plan.empty) summary ~= "\n\n" ~ plan.contextNote();
+        // Pin the user's own words, rebuilt from the originals every time.
+        if (compactionPinRequests)
+            if (auto pinned = ctx.pinnedUserRequests(pinStash, summarized, smart, window))
+                summary ~= "\n\n" ~ pinned;
+        foreach (ref x; summarized)
+            if (ctx.isUserRequest(x)) pinStash ~= x;
 
         Message[] next = messages[0 .. bodyStart].dup;
         next ~= Message.user(summary);
@@ -1042,7 +1076,7 @@ class Agent
         }
         messages = next;
         calibLen = 0;
-        if (log !is null) log.replace(messages, first, last, ctx.modeName(m), client.providerName ~ "/" ~ client.modelName);
+        if (log !is null) log.replace(messages, first, last, ctx.modeName(m), client.providerName ~ "/" ~ client.modelName, pinStash);
         // The replacement drops recalled notes' full text from context, so
         // every memory may be recalled again (except those the retained
         // system message's index renders in full: `indexShown` is kept).
@@ -1220,6 +1254,7 @@ class Agent
         stopBlocks = 0;
         calibLen = calibTokens = 0;
         compactFloor = 0;
+        pinStash = null;
         historyAvailable = historyHintPending = false;
         recallState = mem.Recall.init;
         recallTurnNotes = 0;
@@ -1395,7 +1430,7 @@ class Agent
         {
             string notice;
             auto text = takeFiredTimers(notice);
-            push(Message.user(wrapReminder(text)));
+            push(Message.auto_(wrapReminder(text)));
             ev.userMessage(notice);
             stepsSinceTimerNote = 0;
             return;
@@ -1403,7 +1438,7 @@ class Agent
         if (!timers.pending.length) { stepsSinceTimerNote = 0; return; }
         if (++stepsSinceTimerNote < pendingNudgeEvery) return;
         stepsSinceTimerNote = 0;
-        push(Message.user(wrapReminder(pendingNudge(timers.pending, timerNow()))));
+        push(Message.auto_(wrapReminder(pendingNudge(timers.pending, timerNow()))));
     }
     private size_t stepsSinceTimerNote;
 
@@ -1862,6 +1897,74 @@ unittest
     assert(agent.run("again", new NullEvents) == "done");
 }
 
+// rust: agent.rs::compaction_pins_the_users_requests_across_a_second_compaction
+unittest
+{
+    import std.algorithm : canFind, find;
+    import nano.providers.mock;
+    auto mock = new MockClient([LLMResponse("working on the lease"), LLMResponse("more work"),
+        LLMResponse("SUMMARY ONE: the user mentioned a port"), LLMResponse("even more work"),
+        LLMResponse("SUMMARY TWO: something about a lease and a port")]);
+    auto agent = new Agent(mock, new ToolRegistry, Policy.init, "sys");
+    agent.run("Fix the lease renewal race. Run the dev server on port 8123, never 5173.", new NullEvents);
+    agent.run("Now add a regression test.", new NullEvents);
+    CompactReport rep;
+    assert(agent.compact(rep));
+    agent.run("Also update the docs.", new NullEvents);
+    assert(agent.compact(rep));
+    auto summary = agent.messages.find!((ref m) => ctx.isSummaryMessage(m))[0].content;
+    assert(summary.canFind(ctx.pinnedRequestsPrefix), summary);
+    assert(summary.canFind("Run the dev server on port 8123, never 5173."), summary);
+    assert(summary.canFind("Now add a regression test.") && summary.canFind("Also update the docs."), summary);
+    assert(!summary.canFind("SUMMARY ONE\n\n["), summary);
+}
+
+// rust: agent.rs::a_repeated_compaction_warns_the_summariser_the_earlier_summary_is_lossy
+// rust: agent.rs::a_repeated_compaction_without_the_pin_tells_the_summariser_to_preserve_requirements
+unittest
+{
+    import std.algorithm : canFind;
+    import nano.providers.mock;
+    foreach (pin; [true, false])
+    {
+        auto mock = new MockClient([LLMResponse("work"), LLMResponse("SUMMARY ONE"), LLMResponse("more"),
+            LLMResponse("SUMMARY TWO")]);
+        auto agent = new Agent(mock, new ToolRegistry, Policy.init, "sys");
+        agent.compactionPinRequests = pin;
+        agent.run("first request", new NullEvents);
+        CompactReport rep;
+        assert(agent.compact(rep));
+        assert(!mock.seen[$ - 1][0].content.canFind("lossy"), "a first compaction has no earlier summary");
+        agent.run("second request", new NullEvents);
+        assert(agent.compact(rep));
+        auto system = mock.seen[$ - 1][0].content;
+        assert(system.canFind("lossy"), system);
+        assert(system.canFind("Do not restate the user's goals") == pin, system);
+        assert(system.canFind("Preserve every goal, requirement") == !pin, system);
+        assert(system.canFind("pinned verbatim alongside your summary") == pin, system);
+        assert(agent.messages[1].content.canFind(ctx.pinnedRequestsPrefix) == pin);
+    }
+}
+
+// Automatic turns are flagged at their origin; hook context appended to a
+// prompt leaves the user's text in `pinText`.
+unittest
+{
+    import nano.providers.mock;
+    auto agent = new Agent(new MockClient([LLMResponse("ok"), LLMResponse("ok")]), new ToolRegistry, Policy.init, "sys");
+    agent.run("plain prompt", new NullEvents);
+    assert(!agent.messages[1].autoInitiated && agent.messages[1].pinText is null);
+    // A fired timer's turn is harness-initiated; the flag is one-shot.
+    agent.automaticInput = true;
+    agent.run("timer fired", new NullEvents);
+    assert(agent.messages[3].content == "timer fired" && agent.messages[3].autoInitiated && !agent.automaticInput);
+    assert(Message.auto_("x").autoInitiated && !ctx.isUserRequest(Message.auto_("x")));
+    // A reset (new session or /clear) drops the stash.
+    agent.pinStash = [Message.user("old")];
+    agent.restart("sys", null);
+    assert(agent.pinStash is null);
+}
+
 // Compaction: manual, past the threshold, and after a context overflow.
 unittest
 {
@@ -1872,7 +1975,8 @@ unittest
     agent.messages ~= [Message.user("u1"), Message.assistant("a1"), Message.user("u2"), Message.assistant("a2")];
     CompactReport rep;
     assert(agent.compact(rep));
-    assert(agent.messages.length == 3 && agent.messages[1].content == ctx.summaryPrefix ~ "\nSUM");
+    assert(agent.messages.length == 3 && agent.messages[1].content
+        == ctx.summaryPrefix ~ "\nSUM\n\n" ~ ctx.pinnedRequestsPrefix ~ "\nu1\nu2", agent.messages[1].content);
     assert(agent.messages[2].content == "a2" && rep.summarized == 3 && agent.compactions == 1);
     assert(rep.toString.startsWith("compacted 3 messages: ~"), rep.toString);
     // The summarizer saw the folded messages, not the kept one.
@@ -1895,6 +1999,7 @@ unittest
     auto auto_ = new MockClient([LLMResponse("SUM2"), LLMResponse("done")]);
     auto b = new Agent(auto_, new ToolRegistry, Policy.init, "sys");
     b.configuredWindow = 4_000;
+    b.compactionPinRequests = false; // the threshold floor, not the pin, is under test
     b.messages ~= [Message.user(big), Message.assistant(big), Message.user("q"), Message.assistant("a")];
     string reported;
     b.onCompacted = (ref const CompactReport r) { reported = r.toString; };
@@ -1908,6 +2013,7 @@ unittest
     auto over = new MockClient([LLMResponse("!error:This model's maximum context length is 9000 tokens"),
         LLMResponse("SUM3"), LLMResponse("ok")]);
     auto c = new Agent(over, new ToolRegistry, Policy.init, "sys");
+    c.compactionPinRequests = false;
     c.messages ~= [Message.user("x"), Message.assistant("y")];
     assert(c.run("go", new NullEvents) == "ok");
     assert(c.learnedWindow == 9_000 && c.contextWindow == 9_000 && over.seen.length == 3);

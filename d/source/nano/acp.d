@@ -703,6 +703,7 @@ final class AcpServer : AgentEvents
             if (m.role != Role.system) agent.messages ~= m;
         agent.historyAvailable = restored.historyAvailable;
         agent.historyHintPending = restored.historyAvailable && !restored.historyHintConsumed;
+        agent.pinStash = restored.pinStash;
         agent.log = new SessionLog(path);
         sessionId = agent.log.id;
         agent.completedInputs = restored.completed;

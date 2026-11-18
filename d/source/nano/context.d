@@ -834,3 +834,308 @@ unittest
         assert(nchars(out_) <= 2000 && out_.startsWith("$ cargo test") && out_.endsWith("exit status: 101\n"), out_);
     }
 }
+
+// ---- pinned user requests (Rust context.rs, issue #66 / #184) ----
+
+/// Added to the summarizer prompt when the transcript holds an `[earlier
+/// summary]` block and pinning is on: that block is a paraphrase of a
+/// paraphrase, and the harness pins the user's requests verbatim.
+enum string earlierSummaryLossyInstructions = "\n\nA block labelled [earlier summary] is a summary of a "
+    ~ "summary: it is lossy and may have blurred or dropped the user's original requests. Do not restate the user's goals "
+    ~ "or requirements from it. The user's exact requests are pinned verbatim alongside your summary by the harness, so you "
+    ~ "need not reproduce them; summarize only the work and decisions the [earlier summary] covers.";
+
+/// The same warning with pinning off: the new summary is the only place the
+/// user's requirements survive, so they must be carried forward.
+enum string earlierSummaryLossyNoPinInstructions = "\n\nA block labelled [earlier summary] is a summary of a "
+    ~ "summary: it is lossy and may have blurred or dropped the user's original requests. Preserve every goal, requirement "
+    ~ "and constraint the [earlier summary] still records — quote exact wording where it matters — because your summary is "
+    ~ "the only place they survive; do not drop one because it looks already satisfied. For the rest, summarize only the "
+    ~ "work and decisions the [earlier summary] covers.";
+
+/// Starts the pinned block of the user's own requests, attached verbatim
+/// after a compaction summary.
+enum string pinnedRequestsPrefix = "[The user's requests, kept verbatim by the harness — not the summariser's words. These are the exact "
+    ~ "originals; the summary above may paraphrase or lose them. Treat this block as the authoritative statement "
+    ~ "of what the user asked for.]";
+
+/// Byte budget for the first pinned request (it usually states the goal).
+enum size_t pinnedFirstChars = 1_500;
+/// Byte budget for each later pinned request: one line's worth.
+enum size_t pinnedLaterChars = 200;
+/// The pinned block's share of the context window (1/N), in tokens.
+enum size_t pinnedWindowShare = 8;
+/// The floor of the block's overall allowance, in tokens.
+enum size_t pinnedMinAllowanceTokens = 600;
+
+/// `clip` bounded by UTF-8 bytes rather than characters, cut on a character
+/// boundary, so a byte/token budget holds for non-ASCII text too.
+string clipBytes(string text, size_t maxBytes)
+{
+    size_t chars = maxBytes;
+    for (;;)
+    {
+        auto out_ = clip(text, chars);
+        if (out_.length <= maxBytes || chars == 0) return out_;
+        auto scaled = chars * maxBytes / out_.length;
+        chars = scaled < chars - 1 ? scaled : chars - 1;
+    }
+}
+
+/// A previous compaction's synthetic summary (`[earlier summary]`).
+bool isSummaryMessage(const ref Message m)
+{
+    return m.role == Role.user && (m.content.startsWith(summaryPrefix) || m.content.startsWith(smartSummaryPrefix));
+}
+
+/// A genuine user request, not a harness injection (automatic turn, summary,
+/// plan note or hook context). A prompt that merely starts with a bracket or
+/// a literal `<system-reminder>` tag is still a request.
+bool isUserRequest(const ref Message m)
+{
+    import std.string : stripLeft;
+    if (m.role != Role.user || m.autoInitiated || m.hookContext) return false;
+    auto c = m.content.stripLeft;
+    if (c.startsWith(summaryPrefix) || c.startsWith(smartSummaryPrefix)) return false;
+    return !c.startsWith("[Your plan, kept by the harness") && !c.startsWith("[A plan carried over");
+}
+
+/// ditto
+bool isUserRequest(const Message m) { return isUserRequest(m); }
+
+/// The user-typed text of a request: `pinText` when hook context was appended.
+private string requestText(const ref Message m) { return (m.pinText.length ? m.pinText : m.content).strip; }
+
+/// The pinned block of the user's requests, rebuilt from the original
+/// messages (`prior`: earlier compactions' requests; `new_`: the turns being
+/// folded), or null when there is nothing to pin. The first request keeps
+/// `pinnedFirstChars` bytes, later ones one line each; smart mode labels them
+/// `#N`. The whole block fits an allowance of window/8 tokens (floored):
+/// the oldest later requests are dropped first, with an omission note naming
+/// them by one covering log span.
+string pinnedUserRequests(const Message[] prior, const Message[] new_, bool smart, size_t windowTokens)
+{
+    const(Message)[] requests;
+    foreach (ref m; prior) if (isUserRequest(m)) requests ~= m;
+    foreach (ref m; new_) if (isUserRequest(m)) requests ~= m;
+    if (!requests.length) return null;
+    auto allowance = max(windowTokens / pinnedWindowShare, pinnedMinAllowanceTokens) * 4;
+    auto prefixCost = pinnedRequestsPrefix.length + 1;
+    size_t remaining = allowance > prefixCost ? allowance - prefixCost : 0;
+
+    string render(size_t index, const ref Message r, size_t firstBudget)
+    {
+        auto budget = index == 0 ? firstBudget : pinnedLaterChars;
+        auto label = smart && r.logLine ? format("#%s: ", r.logLine) : "";
+        budget = budget > label.length ? budget - label.length : 0;
+        auto text = requestText(r);
+        if (index != 0)
+        {
+            import std.array : split;
+            text = text.split.join(" ");
+        }
+        return label ~ clipBytes(text, budget);
+    }
+    auto n = requests.length;
+    auto lines = new string[n];
+    foreach (i; 0 .. n) lines[i] = render(i, requests[i], pinnedFirstChars);
+    static size_t cost(string l) { return l.length + 1; }
+    auto suffix = new size_t[n + 1];
+    foreach_reverse (i; 0 .. n) suffix[i] = suffix[i + 1] + cost(lines[i]);
+    // span[i]: min/max log ID over requests[1 .. i] (0: none).
+    auto spanLo = new ulong[n + 1], spanHi = new ulong[n + 1];
+    foreach (i; 1 .. n)
+    {
+        spanLo[i + 1] = spanLo[i];
+        spanHi[i + 1] = spanHi[i];
+        if (auto id = requests[i].logLine)
+        {
+            spanLo[i + 1] = spanLo[i] ? min(spanLo[i], id) : id;
+            spanHi[i + 1] = max(spanHi[i], id);
+        }
+    }
+    string note(bool keepFirst, size_t tailStart)
+    {
+        auto t = max(tailStart, 1);
+        auto omitted = (t - 1) + (keepFirst ? 0 : 1);
+        if (!omitted) return null;
+        ulong lo = spanLo[t], hi = spanHi[t];
+        if (!keepFirst)
+            if (auto id = requests[0].logLine) { lo = lo ? min(lo, id) : id; hi = max(hi, id); }
+        string where;
+        if (smart && lo) where = lo == hi ? format("; full text at #%s", lo) : format("; full text within session log #%s-#%s", lo, hi);
+        return format("[… %s earlier request(s) omitted from this pin to fit its context allowance%s …]", omitted, where);
+    }
+    size_t total(bool keepFirst, size_t tailStart)
+    {
+        auto nt = note(keepFirst, tailStart);
+        return (keepFirst ? cost(lines[0]) : 0) + suffix[max(tailStart, 1)] + (nt is null ? 0 : cost(nt));
+    }
+    bool keepFirst = true;
+    size_t tailStart = 1;
+    while (tailStart < n && total(keepFirst, tailStart) > remaining) tailStart++;
+    if (total(keepFirst, tailStart) > remaining)
+    {
+        keepFirst = false;
+        while (tailStart < n && total(keepFirst, tailStart) > remaining) tailStart++;
+    }
+    if (!keepFirst && tailStart >= n) return null;
+    if (keepFirst && tailStart >= n && cost(lines[0]) > remaining)
+        lines[0] = render(0, requests[0], remaining > 1 ? remaining - 1 : 0);
+    string[] body_;
+    if (auto nt = note(keepFirst, tailStart)) body_ ~= nt;
+    if (keepFirst) body_ ~= lines[0];
+    foreach (l; lines[max(tailStart, 1) .. $]) body_ ~= l;
+    return pinnedRequestsPrefix ~ "\n" ~ body_.join("\n");
+}
+
+version (unittest)
+{
+    private Message req(string text, ulong id = 0)
+    {
+        auto m = Message.user(text);
+        m.logLine = id;
+        return m;
+    }
+    private size_t nchars_(string s) { import std.range : walkLength; return s.walkLength; }
+}
+
+// rust: context.rs::pinned_requests_keep_the_users_words_not_the_summary
+unittest
+{
+    auto pinned = pinnedUserRequests(null, [req("Fix the lease race. Use port 8123, never 5173.", 2),
+        Message.auto_("remember to be careful"), Message.user(summaryPrefix ~ " the user wanted something about a port"),
+        req("Now add a test for it.", 40)], false, defaultContextWindow);
+    assert(pinned.startsWith(pinnedRequestsPrefix), pinned);
+    assert(pinned.canFind("Use port 8123, never 5173.") && pinned.canFind("Now add a test for it."), pinned);
+    assert(!pinned.canFind("wanted something about a port") && !pinned.canFind("be careful"), pinned);
+}
+
+// rust: context.rs::pinned_requests_label_log_lines_in_smart_mode
+unittest
+{
+    auto pinned = pinnedUserRequests(null, [req("first request", 3), req("second request", 9)], true, defaultContextWindow);
+    assert(pinned.canFind("#3: first request") && pinned.canFind("#9: second request"), pinned);
+    assert(!pinnedUserRequests(null, [req("first request")], false, defaultContextWindow).canFind('#'));
+}
+
+// rust: context.rs::pinned_requests_clip_the_first_and_one_line_the_rest
+unittest
+{
+    import std.array : replicate, split;
+    import std.algorithm : until;
+    auto pinned = pinnedUserRequests(null, [req("x".replicate(pinnedFirstChars + 500)), req("line one\nline two\nline three")],
+        false, defaultContextWindow);
+    auto body_ = pinned[pinnedRequestsPrefix.length .. $].strip;
+    auto ls = body_.split("\n");
+    assert(ls[$ - 1] == "line one line two line three", pinned);
+    auto first = ls[0 .. $ - 1].join("");
+    assert(nchars_(first) <= pinnedFirstChars + 60 && first.canFind("omitted"), first);
+}
+
+// rust: context.rs::pinned_requests_combine_prior_and_new_turns
+// rust: context.rs::pinned_requests_keep_a_bracketed_user_prompt
+unittest
+{
+    auto pinned = pinnedUserRequests([req("the original goal")], [req("a follow-up")], false, defaultContextWindow);
+    assert(pinned.canFind("the original goal") && pinned.canFind("a follow-up"), pinned);
+    assert(pinnedUserRequests(null, [req(summaryPrefix ~ " x")], false, defaultContextWindow) is null);
+    pinned = pinnedUserRequests(null, [req("[constraint] use port 8080"), req("[Your plan, kept by the harness. …]\n- do a thing")],
+        false, defaultContextWindow);
+    assert(pinned.canFind("[constraint] use port 8080") && !pinned.canFind("do a thing"), pinned);
+}
+
+// rust: context.rs::pinned_requests_stay_within_the_overall_allowance
+// rust: context.rs::pinned_requests_allowance_tracks_the_window
+unittest
+{
+    Message[] all = [req("the original goal")];
+    foreach (i; 0 .. 500) all ~= req(format("follow-up request number %s", i));
+    enum window = 8_000;
+    auto pinned = pinnedUserRequests(null, all, false, window);
+    auto allowance = max(window / pinnedWindowShare, pinnedMinAllowanceTokens) * 4;
+    assert(nchars_(pinned) <= allowance, pinned);
+    assert(pinned.canFind("the original goal") && pinned.canFind("follow-up request number 499"), pinned);
+    assert(pinned.canFind("omitted from this pin") && !pinned.canFind("follow-up request number 0\n"), pinned);
+    Message[] rs;
+    foreach (i; 0 .. 500) rs ~= req(format("request %s", i));
+    auto small = pinnedUserRequests(null, rs, false, 8_000), large = pinnedUserRequests(null, rs, false, 200_000);
+    assert(large.length > small.length && nchars_(large) <= 200_000 / pinnedWindowShare * 4);
+}
+
+// rust: context.rs::pinned_requests_omission_note_names_ids_in_smart_mode
+unittest
+{
+    auto pinned = pinnedUserRequests(null, [req("the goal", 2), req("an old follow-up that no longer fits", 9),
+        req("the latest ask", 40)], true, 4_800);
+    if (pinned.canFind("omitted from this pin")) assert(pinned.canFind("#9"), pinned);
+    assert(pinned.canFind("#40: the latest ask"), pinned);
+}
+
+// rust: context.rs::pinned_requests_strip_hook_output_from_a_prompt
+// rust: context.rs::pinned_requests_a_hook_only_message_left_alone_pins_nothing
+unittest
+{
+    auto prompt = Message.user("Fix the lease race.\n\n<system-reminder>\nhook says: always use nightly\n</system-reminder>");
+    prompt.pinText = "Fix the lease race.";
+    auto hookOnly = Message.user("<system-reminder>\nresumed session context from a hook\n</system-reminder>");
+    hookOnly.hookContext = true;
+    auto pinned = pinnedUserRequests(null, [prompt, hookOnly], false, defaultContextWindow);
+    assert(pinned.canFind("Fix the lease race.") && !pinned.canFind("nightly") && !pinned.canFind("resumed session"), pinned);
+    assert(pinnedUserRequests(null, [hookOnly], false, defaultContextWindow) is null);
+}
+
+// rust: context.rs::pinned_requests_preserve_a_user_typed_reminder_tag
+// rust: context.rs::pinned_requests_keep_a_prompt_starting_with_a_literal_reminder_tag
+unittest
+{
+    auto typed = "Rename <system-reminder> to <harness-note> in reminders.rs";
+    assert(pinnedUserRequests(null, [req(typed)], false, defaultContextWindow).canFind(typed));
+    auto lead = "<system-reminder> blocks leak into the TUI; hide them";
+    assert(pinnedUserRequests(null, [req(lead)], false, defaultContextWindow).canFind(lead));
+    auto withHook = Message.user("<system-reminder>x</system-reminder> rename this tag\n\n<system-reminder>\nhook says: use nightly\n</system-reminder>");
+    withHook.pinText = "<system-reminder>x</system-reminder> rename this tag";
+    auto pinned = pinnedUserRequests(null, [withHook], false, defaultContextWindow);
+    assert(pinned.canFind("rename this tag") && !pinned.canFind("nightly"), pinned);
+}
+
+// rust: context.rs::pinned_requests_omission_note_stays_within_the_allowance
+// rust: context.rs::pinned_requests_omission_note_uses_a_span_in_smart_mode
+unittest
+{
+    Message[] rs = [req("the original goal", 1)];
+    foreach (i; 1 .. 1000) rs ~= req("x", i + 1);
+    auto pinned = pinnedUserRequests(null, rs, true, 4_800);
+    assert(nchars_(pinned) <= max(4_800 / pinnedWindowShare, pinnedMinAllowanceTokens) * 4);
+    assert(pinned.canFind("omitted from this pin") && pinned.canFind("-#") && !pinned.canFind("#2, #3, #4"), pinned);
+    foreach (window; [4_800, 8_000, 16_000, 32_000, 128_000])
+        foreach (smart; [true, false])
+            if (auto p = pinnedUserRequests(null, rs, smart, window))
+                assert(nchars_(p) <= max(window / pinnedWindowShare, pinnedMinAllowanceTokens) * 4);
+}
+
+// rust: context.rs::pinned_requests_nonconsecutive_ids_keep_the_newest_request
+unittest
+{
+    Message[] rs;
+    foreach (ulong i; 0 .. 1000) rs ~= req(i == 0 ? "g" : i == 999 ? "z" : "x", 3 + 4 * i);
+    auto pinned = pinnedUserRequests(null, rs, true, 4_800);
+    assert(nchars_(pinned) <= max(4_800 / pinnedWindowShare, pinnedMinAllowanceTokens) * 4, pinned);
+    assert(pinned.canFind("#3: g") && pinned.canFind("#3999: z") && pinned.canFind("full text within session log #"), pinned);
+}
+
+// rust: context.rs::pinned_requests_budget_counts_utf8_bytes_for_multibyte_text
+// rust: context.rs::clip_bytes_cuts_on_char_boundaries_within_budget
+unittest
+{
+    import std.array : replicate;
+    auto first = req("漢".replicate(1_500)), later = req("字".replicate(400));
+    foreach (window; [4_800, 16_000, 128_000])
+        foreach (smart; [false, true])
+        {
+            auto block = pinnedUserRequests(null, [first, later], smart, window);
+            assert(textTokens(block) <= max(window / pinnedWindowShare, pinnedMinAllowanceTokens) && block.canFind("漢"));
+        }
+    foreach (mx; [0, 1, 2, 3, 10, 100, 1_000])
+        assert(clipBytes("é漢x".replicate(200), mx).length <= mx);
+}

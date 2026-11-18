@@ -393,6 +393,8 @@ struct Config
     double autoCompactThreshold = 0.8;
     /// `standard` or `smart` (summary cites the session log; history tools).
     string compactionMode = "standard";
+    /// Pin the user's requests verbatim after each compaction summary.
+    bool compactionPinRequests = true;
     bool disableHooks;
     bool disableProjectHooks;
     bool claudeUserHooks = true;
@@ -456,6 +458,7 @@ struct Config
         if (auto v = "auto_compact_threshold" in doc)
             c.autoCompactThreshold = v.type == JSONType.integer ? v.integer : v.floating;
         if (auto v = "compaction_mode" in doc) c.compactionMode = v.str;
+        if (auto v = "compaction_pin_requests" in doc) c.compactionPinRequests = v.boolean;
         if (auto v = "disable_hooks" in doc) c.disableHooks = v.boolean;
         if (auto v = "disable_project_hooks" in doc) c.disableProjectHooks = v.boolean;
         if (auto v = "claude_user_hooks" in doc) c.claudeUserHooks = v.boolean;

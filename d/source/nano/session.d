@@ -116,6 +116,9 @@ JSONValue messageRecord(const ref Message m)
     if (m.durationMs >= 0) j["duration_ms"] = m.durationMs;
     if (m.stopReason.length) j["stop_reason"] = m.stopReason;
     if (m.logLine) j["log_line"] = m.logLine;
+    if (m.autoInitiated) j["auto_initiated"] = true;
+    if (m.hookContext) j["hook_context"] = true;
+    if (m.pinText.length) j["pin_text"] = m.pinText;
     return j;
 }
 
@@ -174,6 +177,14 @@ Message messageFromRecord(JSONValue j)
         case "duration_ms": m.durationMs = v.integer; break;
         case "stop_reason": m.stopReason = v.str; break;
         case "log_line": if (v.type == JSONType.integer) m.logLine = v.integer; break; // direct records: the physical line wins
+        case "auto_initiated": m.autoInitiated = v.type == JSONType.true_; break;
+        case "hook_context": m.hookContext = v.type == JSONType.true_; break;
+        case "pin_text": if (v.type == JSONType.string) m.pinText = v.str; break;
+        // Sub-kinds of an automatic turn (kept for the round trip).
+        case "continuation", "timer":
+            if (v.type == JSONType.true_) m.autoInitiated = true;
+            extra[k] = v;
+            break;
         default: extra[k] = v;
         }
     }
@@ -303,17 +314,46 @@ class SessionLog
 
     /// The conversation was replaced wholesale (e.g. `/clear` keeps only the system prompt).
     /// Compaction also records the folded log-line range, its mode and model.
-    void replace(const Message[] messages, ulong first = 0, ulong last = 0, string mode = null, string model = null)
+    /// `pinStash`: the user requests folded by compactions so far (resume
+    /// rebuilds the pinned block from them).
+    void replace(const Message[] messages, ulong first = 0, ulong last = 0, string mode = null, string model = null,
+        const Message[] pinStash = null)
     {
         JSONValue[] ms;
         foreach (ref m; messages) ms ~= messageRecord(m);
         JSONValue d = ["recorded_at": nowStamp()];
         d["messages"] = ms;
+        if (pinStash.length)
+        {
+            JSONValue[] ps;
+            foreach (ref m; pinStash) ps ~= messageRecord(m);
+            d["pinned_requests"] = ps;
+        }
         if (first) d["summarized"] = JSONValue([JSONValue(first), JSONValue(last)]);
         if (mode !is null) d["mode"] = mode;
         if (model !is null) d["model"] = model;
         write_(record("replace", d));
     }
+}
+
+/// Recover `pinText` for a user message logged before it was recorded: a
+/// legacy prompt with hook context appended (`<input>\n\n<system-reminder>…`)
+/// gets the logged input it starts with (the longest such) as its user-typed
+/// part. A message that already has one, or is exactly an input, is left alone.
+void backfillPinText(ref Message m, const string[] inputs)
+{
+    import std.algorithm : canFind, startsWith;
+    import std.string : stripLeft;
+    if (m.role != Role.user || m.pinText.length || m.hookContext) return;
+    enum wrapStart = "<system-reminder>";
+    if ((inputs.length && inputs[$ - 1] == m.content) || !m.content.canFind(wrapStart)) return;
+    if (inputs.canFind(m.content)) return;
+    string found;
+    foreach_reverse (input; inputs)
+        if (m.content.length > input.length && m.content.startsWith(input)
+            && m.content[input.length .. $].stripLeft.startsWith(wrapStart) && input.length > found.length)
+            found = input;
+    if (found.length) m.pinText = found;
 }
 
 /// What a session log restores to.
@@ -335,6 +375,9 @@ struct Restored
     /// The memory-recall state (`{seen, fired}`) as of the latest recall
     /// record, reset by a later replace; null when the session never had one.
     JSONValue recall;
+    /// The user requests folded by compactions (`pinned_requests`, or a Rust
+    /// log's `folded` stash), for rebuilding the pinned block.
+    Message[] pinStash;
     /// The latest compaction was smart: the history tools are offered.
     bool historyAvailable;
     /// The one-time history hint was already shown after that compaction.
@@ -351,6 +394,9 @@ Restored restore(string path)
     while (committed && text[committed - 1] != '\n') committed--;
     if (!committed) throw new Exception("session log " ~ path ~ " has no committed records");
     string pendingId;
+    // Every logged input's text, to backfill `pinText` on legacy messages.
+    string[] inputs;
+    Message[] rustStash;
     size_t index;
     ulong lineNo;
     foreach (line; text[0 .. committed].lineSplitter)
@@ -382,10 +428,12 @@ Restored restore(string path)
         case "input":
             pendingId = data["id"].str;
             r.pendingInput = data["text"].str;
+            inputs ~= r.pendingInput;
             break;
         case "message":
             r.conversation ~= messageFromRecord(data);
             r.conversation[$ - 1].logLine = lineNo;
+            backfillPinText(r.conversation[$ - 1], inputs);
             {
                 import nano.session_history : consumesHint;
                 if (r.historyAvailable && consumesHint(r.conversation[$ - 1])) r.historyHintConsumed = true;
@@ -408,6 +456,41 @@ Restored restore(string path)
         case "replace":
             r.conversation = null;
             foreach (m; data["messages"].arrayNoRef) r.conversation ~= messageFromRecord(m);
+            foreach (ref m; r.conversation) backfillPinText(m, inputs);
+            {
+                static Message[] decode(const JSONValue v, const string[] inputs)
+                {
+                    Message[] o;
+                    if (v.type == JSONType.array)
+                        foreach (m; v.arrayNoRef)
+                        {
+                            o ~= messageFromRecord(m);
+                            backfillPinText(o[$ - 1], inputs);
+                        }
+                    return o;
+                }
+                // Rust's cumulative stash of folded turns: full, or a delta on a base.
+                auto folded = "folded" in data, base = "folded_base" in data;
+                bool active;
+                if (folded !is null && base !is null && base.type == JSONType.integer)
+                {
+                    auto b = cast(size_t) base.integer;
+                    auto delta = decode(*folded, inputs);
+                    if ((b < rustStash.length ? b : rustStash.length) + delta.length > 0)
+                    {
+                        rustStash = rustStash[0 .. (b < rustStash.length ? b : rustStash.length)] ~ delta;
+                        active = true;
+                    }
+                }
+                else if (folded !is null)
+                {
+                    auto full = decode(*folded, inputs);
+                    if (full.length) { rustStash = full; active = true; }
+                }
+                if (!active) rustStash = null;
+                auto pins = "pinned_requests" in data;
+                r.pinStash = pins !is null ? decode(*pins, inputs) : rustStash.dup;
+            }
             {
                 auto mode = "mode" in data;
                 r.historyAvailable = mode !is null && mode.type == JSONType.string && mode.str == "smart";
@@ -601,4 +684,81 @@ unittest // replace_clears_recall_state_while_decoding
     // A later record still wins.
     log.recall(parseJSON(`{"seen":["mem-2"],"fired":[]}`));
     assert(restore(log.path).recall["seen"][0].str == "mem-2");
+}
+
+// rust: session.rs::legacy_logs_recover_pin_text_from_the_input_record
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, write;
+    import std.path : buildPath;
+    import std.algorithm : find;
+    auto dir = buildPath(tempDir, "nano-d-pin66-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto wire = "Fix the race.\n\n<system-reminder>\nuse nightly\n</system-reminder>";
+    auto typed = "Rename <system-reminder> to <note>";
+    static JSONValue rec(Message m) { return messageRecord(m); }
+    string line(string type, JSONValue data) { return JSONValue(["type": JSONValue(type), "data": data]).toString ~ "\n"; }
+    auto path = buildPath(dir, "s66.jsonl");
+    write(path, `{"type":"session","data":{"version":1,"id":"s66","created_at":"x"}}` ~ "\n"
+        ~ line("input", JSONValue(["id": "in-1", "text": "Fix the race."]))
+        ~ line("message", rec(Message.user(wire)))
+        ~ line("input", JSONValue(["id": "in-2", "text": typed]))
+        ~ line("message", rec(Message.user(typed))));
+    auto r = restore(path);
+    assert(r.conversation.find!(m => m.content == wire)[0].pinText == "Fix the race.");
+    assert(r.conversation.find!(m => m.content == typed)[0].pinText is null);
+
+    auto m = Message.user(wire);
+    backfillPinText(m, ["Fix the race."]);
+    assert(m.pinText == "Fix the race.");
+    auto a = Message.assistant(wire);
+    backfillPinText(a, ["Fix the race."]);
+    assert(a.pinText is null);
+    // A follow-up with its own exact input never matches the older shorter one.
+    auto follow = "Fix the race.\n\n<system-reminder>Rename this tag to <note>.</system-reminder>";
+    foreach (inputs; [["Fix the race.", follow], [follow, "Fix the race."]])
+    {
+        auto f = Message.user(follow);
+        backfillPinText(f, inputs);
+        assert(f.pinText is null);
+    }
+}
+
+// The pinned-request stash rides on the replace record (D's `pinned_requests`,
+// or a Rust log's cumulative `folded` stash) and the flags round-trip.
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, write;
+    import std.path : buildPath;
+    auto dir = buildPath(tempDir, "nano-d-pinstash-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/w");
+    auto hook = Message.user("<system-reminder>ctx</system-reminder>");
+    hook.hookContext = true;
+    auto p = Message.user("goal\n\n<system-reminder>x</system-reminder>");
+    p.pinText = "goal";
+    log.replace([Message.auto_("note"), hook], 1, 2, "standard", "m", [p]);
+    auto r = restore(log.path);
+    assert(r.pinStash.length == 1 && r.pinStash[0].pinText == "goal");
+    assert(r.conversation[0].autoInitiated && r.conversation[1].hookContext);
+    log.replace([Message.user("x")]);
+    assert(restore(log.path).pinStash.length == 0, "a plain replace clears the stash");
+
+    static JSONValue rec(Message m) { return messageRecord(m); }
+    string line(string type, JSONValue data) { return JSONValue(["type": JSONValue(type), "data": data]).toString ~ "\n"; }
+    JSONValue rep(JSONValue[] folded, long base = -1)
+    {
+        JSONValue d = ["messages": JSONValue(cast(JSONValue[]) [])];
+        d["folded"] = folded;
+        if (base >= 0) d["folded_base"] = base;
+        return d;
+    }
+    auto path = buildPath(dir, "rust.jsonl");
+    write(path, `{"type":"session","data":{"version":1,"id":"rust","created_at":"x"}}` ~ "\n"
+        ~ line("replace", rep([rec(Message.user("one")), rec(Message.assistant("a"))]))
+        ~ line("replace", rep([rec(Message.user("two"))], 1)));
+    auto rr = restore(path);
+    assert(rr.pinStash.length == 2 && rr.pinStash[0].content == "one" && rr.pinStash[1].content == "two");
 }
