@@ -1352,6 +1352,9 @@ class Agent
         auto budget = ctx.summaryOutputBudget(window, cast(long) outputBase);
         string summary, fallback;
         bool truncated, retried;
+        size_t drops;
+        TokenUsage summaryUsage;
+        long summaryMs = -1;
         for (;;)
         {
             // Every compaction (manual, threshold, overflow, idle) and its
@@ -1376,7 +1379,11 @@ class Agent
             req.temperature = temperatureFor(thinking().alwaysAnthropicThinking).effective;
             try
             {
+                import std.datetime.stopwatch : StopWatch, AutoStart;
+                auto sw = StopWatch(AutoStart.yes);
                 auto r = client.chat(req, (bool, string) {});
+                summaryMs = sw.peek.total!"msecs";
+                summaryUsage = r.usage;
                 recordUsage(r.usage);
                 truncated = r.stopReason == "length" || r.stopReason == "max_tokens";
                 auto body_ = r.content.strip;
@@ -1394,6 +1401,19 @@ class Agent
                 break;
             }
             catch (Cancelled) return false;
+            catch (StreamInterrupted e)
+            {
+                // A dropped summary stream is asked again, as a turn's is,
+                // before history is dropped for want of a summary.
+                if (control.isCancelled) return false;
+                if (++drops <= maxStreamRestarts)
+                {
+                    stdErr.writefln("[agent] %s; asking for the summary again (%s/%s)", e.msg, drops, maxStreamRestarts);
+                    continue;
+                }
+                fallback = e.msg;
+                break;
+            }
             catch (Exception e)
             {
                 if (control.isCancelled) return false;
@@ -1439,6 +1459,10 @@ class Agent
         Message[] next = messages[0 .. bodyStart].dup;
         next ~= Message.user(summary);
         next[$ - 1].timestamp = nowStamp();
+        // The summary request's cost, persisted with the replace record.
+        next[$ - 1].usage = summaryUsage;
+        next[$ - 1].hasUsage = summaryUsage != TokenUsage.init;
+        if (summaryMs >= 0) next[$ - 1].durationMs = summaryMs;
         // An in-flight input folded into the summary is restated after it.
         size_t pendingPos;
         if (hasPending)

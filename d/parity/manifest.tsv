@@ -80,11 +80,11 @@ agent.rs::cancel_during_model_call_stops_the_turn	test
 agent.rs::cancel_kills_running_bash_and_skips_remaining_calls	test
 agent.rs::cancelled_apply_model_request_signals_the_caller_and_keeps_the_request	na	Tokio runtime races while a client builds asynchronously; D builds the client synchronously on the agent thread
 agent.rs::cancelled_compaction_does_not_issue_the_summary_call	test
-agent.rs::compaction_falls_back_after_too_many_mid_summary_drops	gap	D retries mid-reply drops for turns only, not for the compaction summary request
+agent.rs::compaction_falls_back_after_too_many_mid_summary_drops	test
 agent.rs::compaction_keeps_the_temperature_when_turns_think_on_anthropic	test
-agent.rs::compaction_persists_the_summary_request_usage_on_the_replace_record	gap	D replace records do not carry the summary request token usage
+agent.rs::compaction_persists_the_summary_request_usage_on_the_replace_record	test
 agent.rs::compaction_pins_the_users_requests_across_a_second_compaction	test	pinned user requests (#184)
-agent.rs::compaction_retries_a_mid_summary_drop_instead_of_dropping_history	gap	D retries mid-reply drops for turns only, not for the compaction summary request
+agent.rs::compaction_retries_a_mid_summary_drop_instead_of_dropping_history	test
 agent.rs::compaction_sends_no_temperature_to_an_always_thinking_model	test
 agent.rs::compaction_streams_the_summary_request	test
 agent.rs::compaction_tail_budget_mirrors_the_vision_wire_plan	todo

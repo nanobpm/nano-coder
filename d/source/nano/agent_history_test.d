@@ -207,3 +207,62 @@ unittest
     assert(spy.toolsSeen[3].canFind("history_search") && spy.toolsSeen[3].canFind("history_read"),
         "the retry offers the history tools");
 }
+
+Agent breaksMidSummary(MockClient mock)
+{
+    auto agent = new Agent(mock, new ToolRegistry, Policy.init, "sys");
+    agent.run("one", new NullEvents);
+    agent.run("two", new NullEvents);
+    return agent;
+}
+
+// rust: agent.rs::compaction_retries_a_mid_summary_drop_instead_of_dropping_history
+// rust: agent.rs::compaction_falls_back_after_too_many_mid_summary_drops
+unittest
+{
+    auto mock = new MockClient([LLMResponse("a1"), LLMResponse("a2"), LLMResponse("!drop:x"), LLMResponse("!drop:x"),
+        LLMResponse("the summary")]);
+    auto agent = breaksMidSummary(mock);
+    CompactReport rep;
+    assert(agent.compact(rep));
+    assert(rep.fallback is null, "a mid-summary drop is retried: " ~ rep.fallback);
+    assert(mock.seen.length == 5, "two breaks then one summary");
+    assert(agent.messages[1].content.canFind("the summary") && agent.messages[1].content.canFind("one"));
+
+    auto script = [LLMResponse("a1"), LLMResponse("a2")];
+    foreach (i; 0 .. maxStreamRestarts + 1) script ~= LLMResponse("!drop:x");
+    mock = new MockClient(script);
+    agent = breaksMidSummary(mock);
+    assert(agent.compact(rep));
+    assert(rep.fallback !is null, "a persistently broken summary stream falls back");
+    assert(mock.seen.length == 2 + maxStreamRestarts + 1);
+}
+
+// rust: agent.rs::compaction_persists_the_summary_request_usage_on_the_replace_record
+unittest
+{
+    auto dir = buildPath(tempDir, "nano-summary-usage");
+    if (exists(dir)) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto summary = LLMResponse("SUMMARY: pinged once");
+    summary.usage = TokenUsage(321, 45);
+    auto agent = new Agent(new MockClient([LLMResponse("done"), summary]), new ToolRegistry, Policy.init, "sys");
+    auto log = new SessionLog(dir, "mock/m", "/w");
+    log.append(agent.messages[0]);
+    agent.log = some(log);
+    agent.run("ping", new NullEvents);
+    CompactReport rep;
+    assert(agent.compact(rep));
+    JSONValue replace;
+    foreach (line; readText(log.path).lineSplitter)
+    {
+        auto j = parseJSON(line);
+        if (j["type"].str == "replace") replace = j["data"];
+    }
+    auto msgs = replace["messages"].arrayNoRef;
+    auto withUsage = msgs.filter!(m => "usage" in m.objectNoRef).array;
+    assert(withUsage.length == 1, replace.toString);
+    assert(withUsage[0]["content"].str.canFind("SUMMARY: pinged once"));
+    assert(withUsage[0]["usage"]["prompt_tokens"].integer == 321 && withUsage[0]["usage"]["completion_tokens"].integer == 45);
+    assert("duration_ms" in withUsage[0].objectNoRef);
+}
