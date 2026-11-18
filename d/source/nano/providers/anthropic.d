@@ -155,8 +155,7 @@ class AnthropicClient : LLMClient, KindedClient
         }
         AnthropicStream st;
         st.sink = sink;
-        auto whole = postProvider(url, headers(), requestBody(req, true), what, p.config,
-                (string data) { st.event(data); });
+        auto whole = postStream(st, url, headers(), requestBody(req, true), what, p.config);
         if (whole !is null) return reportWhole(parseWhole(parseJSON(whole)), sink);
         return st.finish();
     }

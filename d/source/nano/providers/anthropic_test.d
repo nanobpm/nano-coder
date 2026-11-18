@@ -148,3 +148,104 @@ unittest
     assert(r.toolCalls[0].invalidArguments == `{"path":"/tmp/big.txt","content":"...`);
     assert(r.toolCalls[0].arguments == parseJSON(`{}`));
 }
+
+AnthropicClient against(string url, bool stream)
+{
+    ResolvedProvider p;
+    p.name = "anthropic";
+    p.model = "claude";
+    p.apiKey = "ak-test";
+    p.config.baseUrl = url;
+    p.config.stream = stream;
+    p.config.timeoutSecs = 10;
+    return new AnthropicClient(p);
+}
+
+string sse(string[] events)
+{
+    string s;
+    foreach (e; events) s ~= "event: " ~ parseJSON(e)["type"].str ~ "\ndata: " ~ e ~ "\n\n";
+    return s;
+}
+
+// rust: providers/anthropic.rs::retries_overload_and_parses_tool_use
+unittest
+{
+    import std.algorithm : canFind;
+    import std.string : toLower;
+    import nano.testserver;
+    auto srv = serve([
+        immutable Reply(529, "retry-after: 0.01\r\n", `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`),
+        immutable Reply(200, "", `{"content":[{"type":"text","text":"Let me check."},`
+            ~ `{"type":"tool_use","id":"toolu_1","name":"bash","input":{"command":"date"}}],`
+            ~ `"stop_reason":"tool_use","usage":{"input_tokens":10,"output_tokens":5}}`),
+    ]);
+    ChatRequest req;
+    req.messages = [Message.user("date?")];
+    req.maxTokens = 64;
+    auto r = against(srv.url, false).chat(req, null);
+    auto seen = srv.finish();
+    assert(r.content == "Let me check." && r.toolCalls[0].arguments["command"].str == "date");
+    assert(r.usage.inputTokens + r.usage.outputTokens == 15);
+    assert(seen.length == 2 && seen[1].path == "/messages");
+    auto h = seen[1].headers.toLower;
+    assert(h.canFind("x-api-key: ak-test") && h.canFind("anthropic-version: 2023-06-01"), h);
+}
+
+// rust: providers/anthropic.rs::retries_after_empty_delta_and_resets_accumulator
+unittest
+{
+    import nano.testserver;
+    enum start = `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`;
+    auto truncated = sse([start, `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}`])
+        ~ "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"wor";
+    auto good = sse([`{"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":1}}}`, start,
+        `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"world"}}`,
+        `{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}`,
+        `{"type":"message_stop"}`]);
+    auto srv = serve([immutable Reply(200, "content-type: text/event-stream\r\nx-truncate: 1\r\n", truncated),
+        immutable Reply(200, "content-type: text/event-stream\r\n", good)]);
+    ChatRequest req;
+    req.messages = [Message.user("hi")];
+    req.maxTokens = 64;
+    string[] shown;
+    auto r = against(srv.url, true).chat(req, (bool t, string x) { if (!t && x.length) shown ~= x; });
+    assert(srv.finish().length == 2);
+    assert(r.content == "world" && shown == ["world"], r.content);
+}
+
+// rust: providers/anthropic.rs::streams_thinking_text_and_tool_use_and_replays_thinking
+unittest
+{
+    import nano.testserver;
+    auto srv = serve([immutable Reply(200, "content-type: text/event-stream\r\n", sse([
+        `{"type":"message_start","message":{"usage":{"input_tokens":20,"output_tokens":1}}}`,
+        `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`,
+        `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Plan."}}`,
+        `{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}`,
+        `{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}`,
+        `{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Running"}}`,
+        `{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"tu_1","name":"bash","input":{}}}`,
+        `{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"command\":"}}`,
+        `{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"\"ls\"}"}}`,
+        `{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":9}}`,
+        `{"type":"message_stop"}`]))]);
+    ChatRequest req;
+    req.messages = [Message.user("hello")];
+    req.maxTokens = 64;
+    string thought;
+    auto r = against(srv.url, true).chat(req, (bool t, string x) { if (t) thought ~= x; });
+    auto seen = srv.finish();
+    assert(thought == "Plan." && r.content == "Running" && r.reasoning == "Plan.");
+    assert(r.toolCalls[0].arguments == parseJSON(`{"command":"ls"}`));
+    assert(r.usage.inputTokens == 20 && r.usage.outputTokens == 9);
+    assert(parseJSON(seen[0].body_)["stream"].boolean);
+
+    auto reply = Message.assistant(r.content, r.toolCalls);
+    reply.thinkingBlocks = r.thinkingBlocks;
+    ChatRequest again;
+    again.messages = [Message.user("hello"), reply];
+    auto content = body_(again)["messages"][1]["content"];
+    assert(content[0] == parseJSON(`{"type":"thinking","thinking":"Plan.","signature":"sig"}`));
+    assert(content[1]["type"].str == "text");
+}

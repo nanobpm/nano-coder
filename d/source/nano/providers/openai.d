@@ -175,8 +175,7 @@ class OpenAIClient : LLMClient, CapabilityProbe, KindedClient
         StreamState st;
         st.sink = sink;
         st.replay = p.replayReasoning;
-        auto whole = postProvider(url, headers(req), requestBody(req, true), what, p.config,
-                (string data) { st.event(data); });
+        auto whole = postStream(st, url, headers(req), requestBody(req, true), what, p.config);
         if (whole !is null) return reportWhole(parseWhole(parseJSON(whole), p.replayReasoning), sink);
         return st.finish();
     }
@@ -509,7 +508,7 @@ class CopilotClient : OpenAIClient
             ResponsesStream st;
             st.sink = sink;
             st.replay = p.replayReasoning;
-            auto whole = postProvider(url, h, body_, what, p.config, (string data) { st.event(data); });
+            auto whole = postStream(st, url, h, body_, what, p.config);
             if (whole !is null) return reportWhole(parseResponses(parseJSON(whole), p.replayReasoning), sink);
             return st.finish();
         }
@@ -520,7 +519,7 @@ class CopilotClient : OpenAIClient
             return reportWhole(AnthropicClient.parseWhole(parseJSON(postProvider(url, h, body_, what, p.config))), sink);
         AnthropicStream st;
         st.sink = sink;
-        auto whole = postProvider(url, h, body_, what, p.config, (string data) { st.event(data); });
+        auto whole = postStream(st, url, h, body_, what, p.config);
         if (whole !is null) return reportWhole(AnthropicClient.parseWhole(parseJSON(whole)), sink);
         return st.finish();
     }

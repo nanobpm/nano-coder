@@ -112,7 +112,8 @@ int perform(const ref Request req, out string body_, out ResponseMeta meta,
 /// is retried. A server that answers a stream request with plain JSON gets
 /// that body returned (parse it whole); an SSE reply returns null.
 string postJson(string url, string[string] headers, JSONValue body_, string what, RetryPolicy policy,
-        const(ushort)[] statuses, long timeoutSecs, scope void delegate(string data) @safe onEvent = null)
+        const(ushort)[] statuses, long timeoutSecs, scope void delegate(string data) @safe onEvent = null,
+        scope bool delegate() @safe shown = null, scope void delegate() @safe reset = null)
 {
     import std.random : uniform01;
     import std.datetime.systime : Clock;
@@ -150,14 +151,25 @@ string postJson(string url, string[string] headers, JSONValue body_, string what
         catch (CurlException e)
         {
             if (cancelRequested()) throw new Cancelled;
-            // A stream cut after events arrived can't be restarted here (the
-            // events were already shown); the agent asks again.
-            if (received) throw new StreamInterrupted(format("%s: connection lost mid-reply (%s)", what, curlReason(e.msg)));
-            // Connection refused/reset, DNS, timeouts: the network is down or
-            // flaky. Wait for it (backing off) without using up the retry budget.
-            offline.wait(e);
-            attempt--;
-            continue;
+            if (received)
+            {
+                // A stream cut after visible output can't be restarted here
+                // (it was shown); the agent asks again. When only bookkeeping
+                // events arrived (role, usage, empty deltas), the caller's
+                // accumulator is reset and the request retried like any other.
+                auto lost = new StreamInterrupted(format("%s: connection lost mid-reply (%s)", what, curlReason(e.msg)));
+                if (shown is null || reset is null || shown() || attempt >= policy.maxRetries) throw lost;
+                reset();
+                failure = lost;
+            }
+            else
+            {
+                // Connection refused/reset, DNS, timeouts: the network is down or
+                // flaky. Wait for it (backing off) without using up the retry budget.
+                offline.wait(e);
+                attempt--;
+                continue;
+            }
         }
         offline.end();
         if (failure is null)
@@ -324,7 +336,8 @@ unittest
 
 /// `postJson` with a provider's retry policy, retryable statuses and timeout.
 string postProvider(string url, string[string] headers, JSONValue body_, string what,
-        const ref imported!"nano.config".ProviderConfig c, scope void delegate(string data) @safe onEvent = null)
+        const ref imported!"nano.config".ProviderConfig c, scope void delegate(string data) @safe onEvent = null,
+        scope bool delegate() @safe shown = null, scope void delegate() @safe reset = null)
 {
     // Drop the OpenAI-style `[DONE]` terminator for every provider, as the Rust
     // shared SSE layer does: GitHub Copilot's Anthropic Messages endpoint sends
@@ -332,7 +345,28 @@ string postProvider(string url, string[string] headers, JSONValue body_, string 
     void delegate(string) @safe filtered = null;
     if (onEvent !is null)
         filtered = (string data) { if (!isStreamEnd(data)) onEvent(data); };
-    return postJson(url, headers, body_, what, c.retryPolicy, c.statuses, c.timeoutSecs, filtered);
+    return postJson(url, headers, body_, what, c.retryPolicy, c.statuses, c.timeoutSecs, filtered, shown, reset);
+}
+
+/// Stream a provider request into `st` (an accumulator with a `sink` and an
+/// `event(data)` method). A drop before any visible output (non-empty text or
+/// thinking reached the sink) restarts from a fresh copy of `st` as given.
+/// Returns the whole body when the reply wasn't an event stream, else null.
+string postStream(S)(ref S st, string url, string[string] headers, JSONValue body_, string what,
+        const ref imported!"nano.config".ProviderConfig c)
+{
+    auto sink = st.sink;
+    bool shown;
+    S local = st;
+    local.sink = (bool thinking, string text) {
+        if (text.length) shown = true;
+        if (sink !is null) sink(thinking, text);
+    };
+    auto initial = local;
+    auto whole = postProvider(url, headers, body_, what, c, (string data) { local.event(data); }, () => shown,
+        () { local = initial; });
+    st = local;
+    return whole;
 }
 
 /// The `data: [DONE]` end-of-stream marker (not a JSON event).

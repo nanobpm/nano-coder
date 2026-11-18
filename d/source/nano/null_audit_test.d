@@ -11,6 +11,7 @@ static import nano.acp;
 static import nano.agent;
 static import nano.agent_status;
 static import nano.system_prompt;
+static import nano.testserver;
 static import nano.arith;
 static import nano.attachment;
 static import nano.claude_hooks;
@@ -92,6 +93,7 @@ private alias modules = imported!"std.meta".AliasSeq!(
     nano.agent,
     nano.agent_status,
     nano.system_prompt,
+    nano.testserver,
     nano.arith,
     nano.attachment,
     nano.claude_hooks,

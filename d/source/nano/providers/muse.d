@@ -128,7 +128,7 @@ class MuseClient : LLMClient, CapabilityProbe, KindedClient
         ResponsesStream st;
         st.sink = sink;
         st.replay = p.replayReasoning;
-        auto whole = postProvider(url, h, body_, what, p.config, (string data) { st.event(data); });
+        auto whole = postStream(st, url, h, body_, what, p.config);
         if (whole !is null) return reportWhole(parseResponses(parseJSON(whole), p.replayReasoning), sink);
         return st.finish();
     }

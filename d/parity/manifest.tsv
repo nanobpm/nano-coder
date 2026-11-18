@@ -801,10 +801,10 @@ providers/anthropic.rs::encodes_system_tools_and_grouped_tool_results	test
 providers/anthropic.rs::encodes_thinking_levels	test
 providers/anthropic.rs::finish_preserves_truncated_tool_call_arguments_as_malformed	test
 providers/anthropic.rs::parses_copilot_aic_from_response_and_stream	test
-providers/anthropic.rs::retries_after_empty_delta_and_resets_accumulator	todo
-providers/anthropic.rs::retries_overload_and_parses_tool_use	todo
+providers/anthropic.rs::retries_after_empty_delta_and_resets_accumulator	test
+providers/anthropic.rs::retries_overload_and_parses_tool_use	test
 providers/anthropic.rs::skips_reasoning_blocks_from_openai_compatible_providers	test
-providers/anthropic.rs::streams_thinking_text_and_tool_use_and_replays_thinking	todo
+providers/anthropic.rs::streams_thinking_text_and_tool_use_and_replays_thinking	test
 providers/anthropic.rs::tool_result_carries_image_as_base64_block	test
 providers/anthropic.rs::trajectory_data_is_never_sent	test
 providers/github_copilot.rs::auto_initiated_trailing_user_message_is_billed_as_agent	todo
