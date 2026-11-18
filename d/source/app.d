@@ -1611,34 +1611,12 @@ int runMain(string[] args)
     void loadSession(string path)
     {
         auto restored = restore(path);
-        agent.messages = agent.messages[0 .. 1];
-        foreach (m; restored.conversation)
-            if (m.role != Role.system) agent.messages ~= m;
-        agent.log = o.noSession ? Option!SessionLog(none) : some(new SessionLog(path));
-        agent.historyAvailable = restored.historyAvailable;
-        agent.historyHintPending = restored.historyAvailable && !restored.historyHintConsumed;
-        agent.pinStash = restored.pinStash;
-        agent.replayStash = restored.replayStash;
-        agent.replayRestated = restored.replayRestated;
-        agent.adoptPending(restored);
-        agent.plan = Plan.init;
-        agent.restoreRecall(restored.recall);
-        agent.resetSessionCounters();
+        foreach (note; agent.loadRestored(restored, o.noSession ? Option!SessionLog(none) : some(new SessionLog(path))))
+            stdErr.writeln("nano-coder-d: ignoring ", note);
         updateStatus((ref Stats s) { s.historySearches = s.historyReads = 0; });
-        agent.repairDanglingToolCalls();
-        if (restored.plan.type == JSONType.object)
-        {
-            try agent.plan = Plan.fromJSON(restored.plan);
-            catch (Exception e) stdErr.writeln("nano-coder-d: ignoring the saved plan: ", e.msg);
-        }
-        {
-            import nano.timers : Timers;
-            Timers t;
-            try t = Timers.fromJSON(restored.timers);
-            catch (Exception e) stdErr.writeln("nano-coder-d: ignoring the saved timers: ", e.msg);
-            agent.setTimers(t);
-            if (!t.empty) stdErr.writefln("%s timer%s still set (/timers lists them)", t.items.length, t.items.length == 1 ? "" : "s");
-        }
+        if (!agent.timers.empty)
+            stdErr.writefln("%s timer%s still set (/timers lists them)", agent.timers.items.length,
+                agent.timers.items.length == 1 ? "" : "s");
         stdErr.writefln("resumed %s (%s messages)", restored.id, agent.messages.length - 1);
         if (restored.pendingInput.length)
             stdErr.writefln("the last prompt never finished (the session was interrupted): %s",

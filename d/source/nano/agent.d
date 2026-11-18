@@ -1627,6 +1627,50 @@ class Agent
         return o;
     }
 
+    /// Adopt a restored session (Rust `load_session`): its conversation
+    /// after the current system message, logged to `newLog`, with its
+    /// redelivery answers, pending input, plan, timers, recall, compaction
+    /// stashes and history state. The mode and session thinking reset, as for
+    /// a new session. Returns a note per part of the saved state it dropped.
+    string[] loadRestored(ref Restored r, Option!SessionLog newLog)
+    {
+        import nano.mode : AgentMode;
+        string[] dropped;
+        messages = messages.length && messages[0].role == Role.system ? messages[0 .. 1] : null;
+        foreach (ref m; r.conversation)
+            if (m.role != Role.system) messages ~= m;
+        log = newLog;
+        control.mode = AgentMode.normal;
+        sessionThinking.nullify();
+        completedInputs = r.completed;
+        completedStops = r.completedStops;
+        completedOutcomes = r.completedOutcomes;
+        historyAvailable = r.historyAvailable;
+        historyHintPending = r.historyAvailable && !r.historyHintConsumed;
+        pinStash = r.pinStash;
+        replayStash = r.replayStash;
+        replayRestated = r.replayRestated;
+        adoptPending(r);
+        plan = Plan.init;
+        if (r.plan.type == JSONType.object)
+        {
+            try plan = Plan.fromJSON(r.plan);
+            catch (Exception e) dropped ~= "the saved plan: " ~ e.msg; // a malformed plan is dropped, the session resumes
+        }
+        Timers t;
+        try t = Timers.fromJSON(r.timers);
+        catch (Exception e) dropped ~= "the saved timers: " ~ e.msg; // malformed timers are dropped, the session resumes
+        setTimers(t);
+        restoreRecall(r.recall);
+        reminders = Reminders.init;
+        calibLen = calibTokens = 0;
+        compactFloor = 0;
+        resetIdleCompaction();
+        resetSessionCounters();
+        repairDanglingToolCalls();
+        return dropped;
+    }
+
     /// Start a fresh session in place (Rust `new_session`, for `/restart`):
     /// the conversation is just `system`, logged to `newLog` (none: not
     /// persisted); mode, session thinking, plan, timers, reminders, hook session,

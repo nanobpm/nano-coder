@@ -704,29 +704,9 @@ final class AcpServer : AgentEvents
         auto sys = host.systemPrompt !is null ? host.systemPrompt(getcwd()) : null;
         agent.messages = sys.length ? [Message.system(sys)] : null;
         auto restored = restore(path);
-        foreach (m; restored.conversation)
-            if (m.role != Role.system) agent.messages ~= m;
-        agent.historyAvailable = restored.historyAvailable;
-        agent.historyHintPending = restored.historyAvailable && !restored.historyHintConsumed;
-        agent.pinStash = restored.pinStash;
-        agent.replayStash = restored.replayStash;
-        agent.replayRestated = restored.replayRestated;
-        agent.adoptPending(restored);
         auto log = new SessionLog(path);
-        agent.log = some(log);
+        agent.loadRestored(restored, some(log)); // ACP has no channel for the dropped-state notes
         sessionId = log.id;
-        agent.completedInputs = restored.completed;
-        agent.completedStops = restored.completedStops;
-        agent.completedOutcomes = restored.completedOutcomes;
-        agent.plan = Plan.init;
-        agent.restoreRecall(restored.recall);
-        if (restored.plan.type == JSONType.object)
-        {
-            try agent.plan = Plan.fromJSON(restored.plan);
-            catch (Exception) {} // a malformed saved plan is dropped; the session resumes without one
-        }
-        agent.resetSessionCounters();
-        agent.repairDanglingToolCalls();
         if (host.loadHooks !is null) agent.useHooks(host.loadHooks(getcwd()), true);
         replayHistory();
     }

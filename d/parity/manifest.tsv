@@ -130,7 +130,7 @@ agent.rs::model_switch_queued_during_a_call_applies_before_threshold_compaction	
 agent.rs::model_switch_queued_during_an_overflow_applies_to_the_compaction_and_retry	test
 agent.rs::model_switch_to_an_unbuildable_spec_drops_the_request_and_reports_it	test
 agent.rs::new_generation_clears_stale_output_rate	todo
-agent.rs::new_session_and_load_reset_the_mode	todo
+agent.rs::new_session_and_load_reset_the_mode	test
 agent.rs::new_session_resets_cumulative_counters	test
 agent.rs::no_room_for_a_budget_drops_the_level_everywhere	test
 agent.rs::no_titles_unless_enabled	test
@@ -145,7 +145,7 @@ agent.rs::plan_mode_blocks_a_memory_mutation_that_reached_the_handler	test
 agent.rs::plan_mode_drops_save_from_tools_and_index_guidance	test
 agent.rs::plan_mode_gates_mutating_tools	test
 agent.rs::plan_mode_keeps_read_only_tools	test
-agent.rs::plan_survives_compaction_and_resume	todo
+agent.rs::plan_survives_compaction_and_resume	test
 agent.rs::plan_tools_can_be_turned_off	test
 agent.rs::pre_tool_use_context_survives_a_deny	test
 agent.rs::pre_tool_use_rewrite_is_rechecked_against_policy	test
@@ -189,8 +189,8 @@ agent.rs::resume_after_repeated_compaction_rebuilds_the_stash_from_delta_records
 agent.rs::resume_after_the_third_cutoff_still_issues_the_last_continuation	test
 agent.rs::resume_before_a_logged_continuation_reminder_re_prompts_and_stitches	test
 agent.rs::resume_before_a_stop_hook_reply_does_not_restore_the_discarded_prefix	test
-agent.rs::resume_finishes_a_recorded_answer_without_calling_the_model	todo
-agent.rs::resume_finishes_a_reported_outcome_without_calling_the_model	todo
+agent.rs::resume_finishes_a_recorded_answer_without_calling_the_model	test
+agent.rs::resume_finishes_a_reported_outcome_without_calling_the_model	test
 agent.rs::resume_preserves_the_prefix_across_an_interleaved_timer_message	test
 agent.rs::resume_restores_a_lost_user_message	test
 agent.rs::resume_restores_continuation_state_before_session_start_context	test
@@ -199,9 +199,9 @@ agent.rs::resume_runs_session_start_hooks_for_the_continued_turn	todo
 agent.rs::resume_stops_reconstruction_at_a_stop_hook_reprompt	test
 agent.rs::resume_with_a_spent_budget_before_turn_end_ends_max_tokens	test
 agent.rs::resumed_pending_input_is_not_folded_into_the_index_twice	todo
-agent.rs::resumes_sessions_and_deduplicates_inputs	todo
+agent.rs::resumes_sessions_and_deduplicates_inputs	test
 agent.rs::session_start_context_survives_a_rejected_first_prompt	test
-agent.rs::session_transitions_clear_the_thinking_override	todo
+agent.rs::session_transitions_clear_the_thinking_override	test
 agent.rs::smart_compaction_cites_log_lines_and_offers_history_tools	todo
 agent.rs::smart_mode_needs_a_session_log	todo
 agent.rs::stale_plan_gets_a_reminder_in_a_tool_result	test
@@ -212,7 +212,7 @@ agent.rs::steer_during_tool_call_joins_next_model_call	test
 agent.rs::steer_on_last_iteration_keeps_the_final_answer	test
 agent.rs::stored_system_message_reflects_mode_change	todo
 agent.rs::streams_deltas_and_reports_thinking_before_the_answer	todo
-agent.rs::switching_sessions_in_process_resets_totals_and_indexes	todo
+agent.rs::switching_sessions_in_process_resets_totals_and_indexes	test
 agent.rs::switching_to_auto_mid_turn_keeps_the_headless_safety_cap	test
 agent.rs::temperature_ignores_config_kind_for_a_kindless_client	todo
 agent.rs::temperature_resolves_against_the_live_client	test

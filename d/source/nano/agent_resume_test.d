@@ -71,13 +71,7 @@ Agent loaded(string path, MockClient mock)
 {
     auto agent = new Agent(mock, echoTools, Policy.init, "sys");
     auto r = restore(path);
-    agent.messages = agent.messages[0 .. 1];
-    foreach (m; r.conversation)
-        if (m.role != Role.system) agent.messages ~= m;
-    agent.log = some(new SessionLog(path));
-    agent.completedInputs = r.completed.dup;
-    agent.completedStops = r.completedStops.dup;
-    agent.adoptPending(r);
+    assert(agent.loadRestored(r, some(new SessionLog(path))).length == 0);
     return agent;
 }
 
@@ -425,4 +419,121 @@ size_t lastIndexOf_(string s, string needle)
 {
     import std.string : lastIndexOf;
     return cast(size_t) s.lastIndexOf(needle);
+}
+
+// A crash after the answer was logged: redelivering the input finishes it
+// from the log, without a model call.
+// rust: agent.rs::resume_finishes_a_recorded_answer_without_calling_the_model
+unittest
+{
+    auto mock = new MockClient([]);
+    auto path = crashedSession(freshDir("lost-end"), [Message.user("run it"), Message.assistant("already answered")]);
+    auto agent = loaded(path, mock);
+    assert(agent.resume == "already answered");
+    assert(mock.seen.length == 0);
+    auto r = restore(path);
+    assert(r.completed["msg-1"] == "already answered" && !r.hasPending);
+}
+
+// rust: agent.rs::resume_finishes_a_reported_outcome_without_calling_the_model
+unittest
+{
+    import nano.goal : OutcomeStatus;
+    auto mock = new MockClient([]);
+    auto report = Message.assistant("");
+    report.toolCalls = [ToolCall.fromRaw("o1", "report_outcome", `{"status":"blocked","summary":"need a token"}`)];
+    auto agent = loaded(crashedSession(freshDir("lost-outcome"), [Message.user("run it"), report,
+        Message.toolResult("o1", "report_outcome", "Recorded outcome: blocked.")]), mock);
+    assert(agent.resume == "Blocked: need a token", agent.messages[$ - 1].content);
+    assert(agent.hasOutcome && agent.lastOutcome.status == OutcomeStatus.blocked);
+    assert(mock.seen.length == 0);
+}
+
+// A finished input redelivered after a resume answers from the log; a new
+// one continues the restored conversation.
+// rust: agent.rs::resumes_sessions_and_deduplicates_inputs
+unittest
+{
+    auto dir = freshDir("dedupe");
+    auto first = new Agent(new MockClient([LLMResponse("one")]), echoTools, Policy.init, "sys");
+    auto log = new SessionLog(dir, "mock/m", "/w");
+    log.append(first.messages[0]);
+    first.log = some(log);
+    assert(first.run("hello", new NullEvents, true, "msg-1") == "one");
+
+    auto mock = new MockClient([LLMResponse("two")]);
+    auto second = loaded(log.path, mock);
+    assert(second.messages.length == 3);
+    assert(second.run("hello", new NullEvents, true, "msg-1") == "one");
+    assert(mock.seen.length == 0);
+    assert(second.run("again", new NullEvents, true, "msg-2") == "two");
+    assert(mock.seen[0].length == 4);
+}
+
+// The plan is restored by a resume, carried through compaction, and a
+// load resets the mode.
+// rust: agent.rs::plan_survives_compaction_and_resume
+// rust: agent.rs::new_session_and_load_reset_the_mode
+unittest
+{
+    import std.algorithm : canFind, startsWith;
+    import nano.mode : AgentMode;
+    auto dir = freshDir("plan");
+    auto mock = new MockClient([
+        LLMResponse("", "", [ToolCall.fromRaw("p1", "plan_add", `{"goal":"Fix the bug","items":["Find it","Fix it"]}`)]),
+        LLMResponse("", "", [ToolCall.fromRaw("p2", "plan_update", `{"id":1,"status":"done","note":"it is in parser.rs:40"}`)]),
+        LLMResponse("", "", [ToolCall.fromRaw("p3", "plan_update", `{"id":7,"status":"done"}`)]),
+        LLMResponse("found it"), LLMResponse("SUMMARY: looked for the bug")]);
+    auto agent = new Agent(mock, echoTools, Policy.init, "sys");
+    auto log = new SessionLog(dir, "mock/m", "/w");
+    log.append(agent.messages[0]);
+    agent.log = some(log);
+    agent.run("go", new NullEvents);
+    assert(mock.seen[1][3].content.startsWith("Set the goal, added items 1-2."), mock.seen[1][3].content);
+    assert(mock.seen[3][7].isError && mock.seen[3][7].content.canFind("items are 1, 2"), mock.seen[3][7].content);
+    CompactReport report;
+    assert(agent.compact(report));
+    auto summary = agent.messages[1].content;
+    assert(summary.canFind("SUMMARY: looked for the bug") && summary.canFind("Goal: Fix the bug"), summary);
+    assert(summary.canFind("- it is in parser.rs:40") && summary.canFind("Next: 2. Fix it"), summary);
+
+    auto resumed = new Agent(new MockClient([]), echoTools, Policy.init, "sys");
+    resumed.control.mode = AgentMode.plan;
+    auto r = restore(log.path);
+    resumed.loadRestored(r, some(new SessionLog(log.path)));
+    assert(resumed.plan == agent.plan);
+    assert(resumed.control.mode == AgentMode.normal, "a load resets the mode");
+}
+
+// A restart or a load drops the session's thinking override and its totals.
+// (A failed switch keeping the override has no D counterpart: D opens the
+// new log before calling restart, so a failure leaves the agent untouched.)
+// rust: agent.rs::session_transitions_clear_the_thinking_override
+// rust: agent.rs::switching_sessions_in_process_resets_totals_and_indexes
+unittest
+{
+    import std.algorithm : canFind;
+    import std.typecons : Nullable;
+    import nano.option : Option;
+    import nano.thinking : Thinking;
+    auto dir = freshDir("transitions");
+    auto agent = new Agent(new MockClient([LLMResponse("one")]), echoTools, Policy.init, "sys");
+    auto log = new SessionLog(dir, "mock/m", "/w");
+    log.append(agent.messages[0]);
+    agent.log = some(log);
+    agent.run("alpha question here", new NullEvents);
+
+    agent.sessionThinking = Nullable!Thinking(Thinking.parse("high"));
+    agent.restart("sys", Option!SessionLog.init);
+    assert(agent.sessionThinking.isNull, "a restart clears the override");
+
+    agent.sessionThinking = Nullable!Thinking(Thinking.parse("high"));
+    agent.sessionInputTokens = 99;
+    agent.sessionOutputTokens = 77;
+    agent.compactions = 2;
+    auto r = restore(log.path);
+    agent.loadRestored(r, some(new SessionLog(log.path)));
+    assert(agent.sessionThinking.isNull, "a load clears the override");
+    assert(agent.sessionInputTokens == 0 && agent.sessionOutputTokens == 0 && agent.compactions == 0);
+    assert(agent.messages.canFind!(m => m.content == "alpha question here"));
 }
