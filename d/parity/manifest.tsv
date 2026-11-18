@@ -225,8 +225,8 @@ agent.rs::timers_survive_resume_and_restart_clears_them	gap	timer state across r
 agent.rs::titles_sessions_once_a_prompt_says_something	test
 agent.rs::too_many_mid_reply_drops_end_the_turn	test
 agent.rs::tool_calls_recall_matching_memories_once_per_context	test
-agent.rs::tools_snapshot_captured_in_plan_mode_still_lists_mutating_tools_live	todo
-agent.rs::tools_snapshot_captured_without_history_still_lists_it_live	todo
+agent.rs::tools_snapshot_captured_in_plan_mode_still_lists_mutating_tools_live	test
+agent.rs::tools_snapshot_captured_without_history_still_lists_it_live	test
 agent.rs::verify_before_complete_can_be_turned_off	test
 agent.rs::zero_turn_cap_is_unbounded	test
 agent/idle_compact.rs::armed_until_spent_then_only_after_real_growth	test

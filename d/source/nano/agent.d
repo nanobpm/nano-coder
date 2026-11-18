@@ -1811,6 +1811,22 @@ class Agent
         return kept;
     }
 
+    /// The `/tools` listing: the tools offered right now (plan mode hides
+    /// the mutating ones; plan, outcome, history and timer tools as enabled),
+    /// one line each with the description's first line.
+    string toolsListing()
+    {
+        import std.string : indexOf;
+        string[] out_;
+        foreach (d; offeredTools)
+        {
+            auto nl = d.description.indexOf('\n');
+            auto l = nl >= 0 ? d.description[0 .. nl] : d.description;
+            out_ ~= format("  %-14s %s", d.name, l.length > 160 ? l[0 .. 160] ~ "…" : l);
+        }
+        return out_.join("\n");
+    }
+
     private bool headless() { return !questions || !questions.interactive; }
 
     /// Interactive normal mode: ask whether to keep going past the cap.

@@ -1223,12 +1223,7 @@ Option!ProjectInstructions discoverInstructions(const ref Config c, string dir)
 }
 
 /// `/context`: window use, token totals, compaction settings.
-string toolsListing(Agent agent)
-{
-    string[] out_;
-    foreach (d; agent.tools.definitions) out_ ~= format("  %-14s %s", d.name, firstLine(d.description));
-    return out_.join("\n");
-}
+string toolsListing(Agent agent) { return agent.toolsListing; }
 
 string skillsListing(const Skills skills)
 {

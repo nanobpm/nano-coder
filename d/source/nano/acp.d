@@ -598,7 +598,7 @@ final class AcpServer : AgentEvents
         if (text == "/tools")
         {
             JSONValue[] names;
-            foreach (d; agent.tools.definitions) names ~= JSONValue(d.name);
+            foreach (d; agent.offeredTools) names ~= JSONValue(d.name);
             return rpcResult(id, JSONValue(["stopReason": JSONValue("end_turn"), "tools": JSONValue(names)]));
         }
         if (text == "/settings")

@@ -144,3 +144,26 @@ unittest
     agent.run("what was the error?", new NullEvents);
     assert(!brokenResults(mock).any!(r => r.canFind(hist.failedToolHint)));
 }
+
+// /tools lists what is offered now: plan mode hides the mutating tools, and
+// the history tools appear once a smart compaction has made them available.
+// (Rust captures a snapshot when the turn starts and filters it live; D
+// renders the listing from the live state after each step.)
+// rust: agent.rs::tools_snapshot_captured_in_plan_mode_still_lists_mutating_tools_live
+// rust: agent.rs::tools_snapshot_captured_without_history_still_lists_it_live
+unittest
+{
+    import nano.mode : AgentMode;
+    auto agent = logged("listing", new MockClient([]));
+    agent.tools.register(ToolDefinition("write_file", "write a file\nzq-second-line", parseJSON(`{"type":"object"}`)),
+        (JSONValue a) => "ok");
+    assert(agent.toolsListing.canFind("write_file") && agent.toolsListing.canFind("plan_add"));
+    assert(!agent.toolsListing.canFind("zq-second-line"), "one line per tool");
+    agent.control.mode = AgentMode.plan;
+    assert(!agent.toolsListing.canFind("write_file"), "plan mode hides the mutating tool");
+    agent.control.mode = AgentMode.normal;
+    assert(agent.toolsListing.canFind("write_file"));
+    assert(!agent.toolsListing.canFind(hist.searchTool));
+    agent.historyAvailable = true;
+    assert(agent.toolsListing.canFind(hist.searchTool) && agent.toolsListing.canFind(hist.readTool));
+}
