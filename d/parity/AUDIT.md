@@ -2,6 +2,20 @@
 
 Audit of Rust `main` at 80ca911 (0.68.0 plus #190) against `epic/d-port` at bb3665b, done on 2026-11-14.
 
+## Status (2026-11-14, after the suggested order below)
+
+All five priorities are ported on `epic/d-port`, with Rust's tests:
+
+| Priority | Commit |
+| --- | --- |
+| `edit_file` robustness and atomic writes | 04b734a |
+| #184 pinned requests (`compaction_pin_requests`) | ff2cf44 |
+| Saved cut-off continuations, stitched on resume and redelivery (#114) | 1495709 |
+| Trust hardening (skill containment, hook gating, the non-interactive note, locked trust-file writes) | 8498140 |
+| #186 idle compaction; the `persist_sessions`, `session_dir` and `verify_before_complete` keys | 36a2086 |
+
+The `rusty-harness` folder migration is `na`, because D has always used its own `nano-coder-d` folders. #185 (the ProbeState refactor) leaves three probe tests as `todo` rows. BASELINE is now 80ca911, and the manifest stands at 800 `test`, 45 `claimed`, 27 `na`, 57 `gap` and 480 `todo`, with a budget of 525. The tables below are the audit as written, before this work.
+
 ## Method
 
 - **Parity manifest** (`manifest.tsv`): 684 `test`, 45 `claimed`, 23 `na`, 139 `gap`, 485 `todo`, plus 33 new Rust tests that aren't listed yet.
