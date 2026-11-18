@@ -358,54 +358,54 @@ context.rs::model_windows	todo
 context.rs::summary_budget_leaves_room_for_reasoning	todo
 context.rs::transcript_keeps_the_newest_messages	test
 context.rs::transcript_labels_log_lines_when_asked	todo
-files.rs::a_failed_read_does_not_authorize_edits	todo
-files.rs::a_miss_shows_the_closest_lines	gap	edit_file: on a miss D says "not found" without Rust's closest-lines hint
-files.rs::a_misspelled_single_line_still_gets_a_closest_hint	gap	edit_file: on a miss D says "not found" without Rust's closest-lines hint
-files.rs::absent_target_write_refuses_to_clobber_a_concurrent_create	gap	write_file/edit_file: D writes in place (std.file.write) after a freshness check; Rust writes a temp file, re-validates and renames atomically
-files.rs::bare_blank_line_in_numbered_old_is_not_stripped	gap	edit_file: D doesn't strip read_file line-number prefixes copied into old_string
-files.rs::consecutive_tsv_numbers_do_not_retarget_an_unrelated_block	gap	edit_file: D doesn't strip read_file line-number prefixes copied into old_string
-files.rs::crossing_crlf_and_lf_ranges_are_ambiguous_not_collapsed	gap	edit_file: D has no CRLF-aware matching or line-ending normalisation of the replacement
-files.rs::dedent_across_multibyte_whitespace_does_not_panic	gap	edit_file: D's indentation-insensitive match inserts new_string verbatim; Rust re-indents it to the matched block and rejects incompatible indentation
-files.rs::edit_fails_when_file_changes_mid_call	gap	write_file/edit_file: D writes in place (std.file.write) after a freshness check; Rust writes a temp file, re-validates and renames atomically
-files.rs::edit_in_crlf_region_of_mixed_file_converts_replacement_to_crlf	gap	edit_file: D has no CRLF-aware matching or line-ending normalisation of the replacement
-files.rs::edit_in_lf_region_of_mixed_file_keeps_lf_replacement	gap	edit_file: D has no CRLF-aware matching or line-ending normalisation of the replacement
-files.rs::edit_matches_crlf_files_as_read	gap	edit_file: D has no CRLF-aware matching or line-ending normalisation of the replacement
+files.rs::a_failed_read_does_not_authorize_edits	test
+files.rs::a_miss_shows_the_closest_lines	test
+files.rs::a_misspelled_single_line_still_gets_a_closest_hint	test
+files.rs::absent_target_write_refuses_to_clobber_a_concurrent_create	test
+files.rs::bare_blank_line_in_numbered_old_is_not_stripped	test
+files.rs::consecutive_tsv_numbers_do_not_retarget_an_unrelated_block	test
+files.rs::crossing_crlf_and_lf_ranges_are_ambiguous_not_collapsed	test
+files.rs::dedent_across_multibyte_whitespace_does_not_panic	test
+files.rs::edit_fails_when_file_changes_mid_call	test
+files.rs::edit_in_crlf_region_of_mixed_file_converts_replacement_to_crlf	test
+files.rs::edit_in_lf_region_of_mixed_file_keeps_lf_replacement	test
+files.rs::edit_matches_crlf_files_as_read	test
 files.rs::edit_result_shows_the_changed_lines_in_context	test
 files.rs::edits_and_overwrites_require_a_current_read	test
-files.rs::failed_pre_rename_validation_removes_the_temp_file	gap	write_file/edit_file: D writes in place (std.file.write) after a freshness check; Rust writes a temp file, re-validates and renames atomically
+files.rs::failed_pre_rename_validation_removes_the_temp_file	test
 files.rs::image_reads_authorize_writes_only_once_dispatched_to_the_model	todo
-files.rs::incompatible_indentation_rejects_the_relaxed_match	gap	edit_file: D's indentation-insensitive match inserts new_string verbatim; Rust re-indents it to the matched block and rejects incompatible indentation
-files.rs::line_number_prefix_at_u64_max_does_not_overflow	gap	edit_file: D doesn't strip read_file line-number prefixes copied into old_string
-files.rs::line_number_prefix_requires_exact_six_wide_rendering	gap	edit_file: D doesn't strip read_file line-number prefixes copied into old_string
-files.rs::literal_prefix_shaped_row_is_edited_in_place_not_rejected	gap	edit_file: D doesn't strip read_file line-number prefixes copied into old_string
-files.rs::mixed_whitespace_deepen_appends_delta_after_existing_indentation	gap	edit_file: D's indentation-insensitive match inserts new_string verbatim; Rust re-indents it to the matched block and rejects incompatible indentation
-files.rs::mixed_whitespace_shift_preserves_the_common_prefix	gap	edit_file: D's indentation-insensitive match inserts new_string verbatim; Rust re-indents it to the matched block and rejects incompatible indentation
-files.rs::near_miss_qualifies_a_truncated_scan	gap	edit_file: on a miss D says "not found" without Rust's closest-lines hint
-files.rs::new_string_tsv_row_is_not_stripped_as_a_line_prefix	gap	edit_file: D doesn't strip read_file line-number prefixes copied into old_string
-files.rs::nonconsecutive_numeric_prefixes_are_not_line_numbers	gap	edit_file: D doesn't strip read_file line-number prefixes copied into old_string
-files.rs::nonuniform_indentation_rejects_the_relaxed_match	gap	edit_file: D's indentation-insensitive match inserts new_string verbatim; Rust re-indents it to the matched block and rejects incompatible indentation
-files.rs::numbered_old_with_prefixed_blank_line_strips_and_edits	gap	edit_file: D doesn't strip read_file line-number prefixes copied into old_string
-files.rs::old_matching_both_ending_styles_is_not_treated_as_unique	gap	edit_file: D has no CRLF-aware matching or line-ending normalisation of the replacement
-files.rs::overlapping_crlf_and_lf_ranges_are_one_occurrence	gap	edit_file: D has no CRLF-aware matching or line-ending normalisation of the replacement
-files.rs::overwrite_propagates_read_errors_instead_of_skipping_freshness	gap	write_file/edit_file: D writes in place (std.file.write) after a freshness check; Rust writes a temp file, re-validates and renames atomically
-files.rs::prefix_shaped_new_string_in_copied_range_is_rejected	gap	edit_file: D doesn't strip read_file line-number prefixes copied into old_string
+files.rs::incompatible_indentation_rejects_the_relaxed_match	test
+files.rs::line_number_prefix_at_u64_max_does_not_overflow	test
+files.rs::line_number_prefix_requires_exact_six_wide_rendering	test
+files.rs::literal_prefix_shaped_row_is_edited_in_place_not_rejected	test
+files.rs::mixed_whitespace_deepen_appends_delta_after_existing_indentation	test
+files.rs::mixed_whitespace_shift_preserves_the_common_prefix	test
+files.rs::near_miss_qualifies_a_truncated_scan	test
+files.rs::new_string_tsv_row_is_not_stripped_as_a_line_prefix	test
+files.rs::nonconsecutive_numeric_prefixes_are_not_line_numbers	test
+files.rs::nonuniform_indentation_rejects_the_relaxed_match	test
+files.rs::numbered_old_with_prefixed_blank_line_strips_and_edits	test
+files.rs::old_matching_both_ending_styles_is_not_treated_as_unique	test
+files.rs::overlapping_crlf_and_lf_ranges_are_one_occurrence	test
+files.rs::overwrite_propagates_read_errors_instead_of_skipping_freshness	test
+files.rs::prefix_shaped_new_string_in_copied_range_is_rejected	test
 files.rs::read_detects_image_despite_text_extension	todo
 files.rs::read_image_stores_absolute_source_path	todo
 files.rs::read_pages_with_line_numbers	test
 files.rs::read_rejects_binary	test
 files.rs::read_returns_images_by_magic_bytes	todo
-files.rs::reindent_shifts_lines_shallower_than_the_match	gap	edit_file: D's indentation-insensitive match inserts new_string verbatim; Rust re-indents it to the matched block and rejects incompatible indentation
-files.rs::relaxed_matches_ignore_whitespace_and_line_numbers	gap	edit_file: D doesn't strip read_file line-number prefixes copied into old_string
+files.rs::reindent_shifts_lines_shallower_than_the_match	test
+files.rs::relaxed_matches_ignore_whitespace_and_line_numbers	test
 files.rs::relaxed_matches_must_be_unique	test
-files.rs::relaxed_matching_rejects_ambiguity_across_attempts	gap	edit_file: D's indentation-insensitive match inserts new_string verbatim; Rust re-indents it to the matched block and rejects incompatible indentation
-files.rs::replace_all_does_not_apply_to_a_stripped_relaxed_match	gap	edit_file: D doesn't strip read_file line-number prefixes copied into old_string
-files.rs::replace_all_normalizes_each_occurrence_to_its_own_region	gap	edit_file: D has no CRLF-aware matching or line-ending normalisation of the replacement
-files.rs::replace_all_result_shows_every_changed_region	gap	edit_file: D's result shows only the first changed region
-files.rs::single_line_match_normalizes_multiline_replacement_endings	gap	edit_file: D has no CRLF-aware matching or line-ending normalisation of the replacement
-files.rs::snippet_output_is_globally_capped	gap	edit_file: on a miss D says "not found" without Rust's closest-lines hint
+files.rs::relaxed_matching_rejects_ambiguity_across_attempts	test
+files.rs::replace_all_does_not_apply_to_a_stripped_relaxed_match	test
+files.rs::replace_all_normalizes_each_occurrence_to_its_own_region	test
+files.rs::replace_all_result_shows_every_changed_region	test
+files.rs::single_line_match_normalizes_multiline_replacement_endings	test
+files.rs::snippet_output_is_globally_capped	test
 files.rs::string_arg_distinguishes_missing_null_and_wrong_type	todo
-files.rs::stripped_line_number_match_must_begin_at_line_boundary	gap	edit_file: D doesn't strip read_file line-number prefixes copied into old_string
-files.rs::unpadded_tsv_number_is_not_treated_as_a_line_prefix	gap	edit_file: D doesn't strip read_file line-number prefixes copied into old_string
+files.rs::stripped_line_number_match_must_begin_at_line_boundary	test
+files.rs::unpadded_tsv_number_is_not_treated_as_a_line_prefix	test
 files.rs::write_creates_parents_and_edit_requires_unique_match	test
 files.rs::writes_through_symlinks	test
 frame.rs::a_differential_render_after_a_wrapping_raw_line_addresses_real_rows	todo
