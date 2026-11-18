@@ -20,7 +20,7 @@ agent.rs::a_direct_model_switch_supersedes_a_stale_queued_request	test
 agent.rs::a_direct_model_switch_with_a_slow_key_command_does_not_stall_the_runtime	na	Tokio runtime races while a client builds asynchronously; D builds the client synchronously on the agent thread
 agent.rs::a_failed_direct_model_switch_still_clears_a_stale_queued_request	test
 agent.rs::a_failed_new_session_keeps_the_thinking_override	todo
-agent.rs::a_failed_repair_on_resume_leaves_the_live_session_untouched	todo
+agent.rs::a_failed_repair_on_resume_leaves_the_live_session_untouched	test
 agent.rs::a_failed_tool_after_smart_compaction_points_to_history_once	test
 agent.rs::a_firing_persistence_failure_rolls_the_due_timers_back	test
 agent.rs::a_hard_stop_skips_the_rest_of_the_batch	test

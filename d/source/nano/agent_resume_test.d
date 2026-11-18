@@ -7,7 +7,7 @@ module nano.agent_resume_test;
 
 version (unittest):
 
-import nano.option : some, unwrap;
+import nano.option : match, some, unwrap;
 import std.json;
 import std.file : tempDir, exists, rmdirRecurse;
 import std.path : buildPath;
@@ -577,4 +577,29 @@ unittest
     auto s = list(dir);
     assert(s[0].prompts == 1, "the resumed input is counted once");
     assert(s[0].lastPrompt == "run it");
+}
+
+// A dangling tool call is repaired by a log write; when that write fails the
+// live session (log, conversation) is untouched.
+// rust: agent.rs::a_failed_repair_on_resume_leaves_the_live_session_untouched
+unittest
+{
+    import std.exception : assertThrown;
+    auto dir = freshDir("failed-repair");
+    auto agent = new Agent(new MockClient([LLMResponse("one")]), echoTools, Policy.init, "sys");
+    auto live = new SessionLog(dir, "mock/m", "/w");
+    live.append(agent.messages[0]);
+    agent.log = some(live);
+    assert(agent.run("hello", new NullEvents) == "one");
+    auto liveLen = agent.messages.length;
+
+    auto call = Message.assistant("");
+    call.toolCalls = [echoCall("c9")];
+    auto path = crashedSession(dir, [Message.user("run it"), call]);
+    auto r = restore(path);
+    auto target = new SessionLog(path);
+    target.failNextWrite = true;
+    assertThrown(agent.loadRestored(r, some(target)));
+    assert(agent.messages.length == liveLen);
+    assert(agent.log.match!(l => l is live, () => false), "the live log stays");
 }

@@ -321,14 +321,6 @@ class Agent
         messages ~= m;
     }
 
-    /// Answer the tool calls of the last assistant message that a crash left
-    /// without results, so a resumed conversation is valid to send (providers
-    /// reject a tool call with no result). Each repair is logged like a push.
-    void repairDanglingToolCalls()
-    {
-        foreach (m; danglingRepairs(messages)) push(m);
-    }
-
     /// Run one user input to completion. Returns the final assistant text,
     /// or `cancelledResponse` when the turn was cancelled. Steers that arrive
     /// too late for this turn stay in `control` for the caller to queue.
@@ -1689,6 +1681,14 @@ class Agent
     {
         import nano.mode : AgentMode;
         string[] dropped;
+        // Repairs are logged first: a failed write leaves the live session as it was.
+        auto repairs = danglingRepairs(r.conversation);
+        foreach (ref m; repairs)
+        {
+            import nano.session : nowStamp;
+            if (!m.timestamp.length) m.timestamp = nowStamp();
+            newLog.ifSome((SessionLog l) { m.logLine = l.append(m); });
+        }
         messages = messages.length && messages[0].role == Role.system ? messages[0 .. 1] : null;
         foreach (ref m; r.conversation)
             if (m.role != Role.system) messages ~= m;
@@ -1720,7 +1720,7 @@ class Agent
         compactFloor = 0;
         resetIdleCompaction();
         resetSessionCounters();
-        repairDanglingToolCalls();
+        messages ~= repairs;
         return dropped;
     }
 
