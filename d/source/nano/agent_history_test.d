@@ -167,3 +167,43 @@ unittest
     agent.historyAvailable = true;
     assert(agent.toolsListing.canFind(hist.searchTool) && agent.toolsListing.canFind(hist.readTool));
 }
+
+/// Records the tool names each request offers; a scripted error is thrown.
+class ToolSpy : MockClient
+{
+    string[][] toolsSeen;
+    string[] errors;
+    this(LLMResponse[] script, string[] errors) { super(script); this.errors = errors; }
+    override LLMResponse chat(const ref ChatRequest req, StreamSink sink)
+    {
+        string[] names;
+        foreach (ref t; req.tools) names ~= t.name;
+        toolsSeen ~= names;
+        if (toolsSeen.length == 2) throw new Exception(errors[0]);
+        return super.chat(req, sink);
+    }
+}
+
+// rust: agent.rs::overflow_smart_compaction_rebuilds_tools_before_retry
+unittest
+{
+    import std.algorithm : canFind;
+    import nano.context : CompactionMode;
+    auto spy = new ToolSpy([LLMResponse("", "", [ToolCall.fromRaw("c1", "echo", `{}`)]),
+        LLMResponse("SUMMARY: pinged"), LLMResponse("done")],
+        ["HTTP 400: This model's maximum context length is 4000 tokens. However, you requested 5000 tokens."]);
+    auto reg = new ToolRegistry;
+    reg.register(ToolDefinition("echo", "echo", parseJSON(`{"type":"object"}`)), (JSONValue a) => "pong");
+    auto agent = new Agent(spy, reg, Policy.init, "sys");
+    agent.compactionMode = CompactionMode.smart;
+    auto dir = buildPath(tempDir, "nano-overflow-tools");
+    if (exists(dir)) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/w");
+    log.append(agent.messages[0]);
+    agent.log = some(log);
+    assert(agent.run("ping", new NullEvents) == "done");
+    assert(spy.toolsSeen.length == 4, imported!"std.conv".to!string(spy.toolsSeen.length));
+    assert(!spy.toolsSeen[1].canFind("history_search"), "no history tools before smart compaction");
+    assert(spy.toolsSeen[3].canFind("history_search") && spy.toolsSeen[3].canFind("history_read"),
+        "the retry offers the history tools");
+}

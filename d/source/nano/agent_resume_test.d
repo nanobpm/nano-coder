@@ -537,3 +537,44 @@ unittest
     assert(agent.sessionInputTokens == 0 && agent.sessionOutputTokens == 0 && agent.compactions == 0);
     assert(agent.messages.canFind!(m => m.content == "alpha question here"));
 }
+
+// rust: agent.rs::resume_runs_session_start_hooks_for_the_continued_turn
+unittest
+{
+    import core.time : seconds;
+    import std.algorithm : any, canFind;
+    import nano.claude_hooks : Event, Hook, HookManager;
+    Hook h(Event e, string cmd, string matcher)
+    {
+        Hook r;
+        r.event = e;
+        r.command = cmd;
+        r.matcher = matcher;
+        r.timeout = 10.seconds;
+        return r;
+    }
+    auto mock = new MockClient([LLMResponse("continued")]);
+    auto agent = loaded(crashedSession(freshDir("resume-start"), [Message.user("run it")]), mock);
+    agent.useHooks(new HookManager([h(Event.sessionStart, "echo resumed-context", "resume"),
+        h(Event.userPromptSubmit, "echo should-not-run-on-resume", null)], tempDir), true);
+    assert(agent.resume == "continued");
+    auto req = mock.seen[0];
+    assert(req.any!(m => m.role == Role.user && m.content.canFind("resumed-context")),
+        "SessionStart resume context is delivered on the continued turn");
+    assert(!req.any!(m => m.content.canFind("should-not-run-on-resume")),
+        "UserPromptSubmit is not re-run for an accepted prompt");
+}
+
+// rust: agent.rs::resumed_pending_input_is_not_folded_into_the_index_twice
+unittest
+{
+    import nano.session_index : list;
+    auto dir = freshDir("index-once");
+    auto path = crashedSession(dir, null);
+    assert(list(dir)[0].prompts == 1);
+    auto agent = loaded(path, new MockClient([LLMResponse("done")]));
+    assert(agent.resume == "done");
+    auto s = list(dir);
+    assert(s[0].prompts == 1, "the resumed input is counted once");
+    assert(s[0].lastPrompt == "run it");
+}
