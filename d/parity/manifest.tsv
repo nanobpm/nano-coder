@@ -93,7 +93,7 @@ agent.rs::completed_after_an_edit_and_a_check_is_not_reminded	test
 agent.rs::completed_after_an_edit_and_a_rejected_bash_is_still_reminded	test
 agent.rs::completed_after_an_edit_and_an_invalid_real_bash_is_still_reminded	test
 agent.rs::completed_after_an_unverified_edit_is_reminded_once_then_goes_through	test
-agent.rs::configured_read_only_memory_search_does_not_mutate_the_store	todo
+agent.rs::configured_read_only_memory_search_does_not_mutate_the_store	test
 agent.rs::context_overflow_compacts_and_retries_once	test
 agent.rs::detected_window_sits_between_config_and_model_name	test
 agent.rs::disabled_timers_neither_fire_nor_nudge_on_a_turn	gap	D timer nudging: no test that disabled timers stay silent / that idle firing resets the nudge counter
@@ -118,8 +118,8 @@ agent.rs::max_tokens_is_capped_to_the_room_when_compaction_is_disabled	test
 agent.rs::max_tokens_is_sent_unchanged_when_the_window_has_room	test
 agent.rs::max_tokens_shrinks_so_prompt_and_output_fit_the_window	test
 agent.rs::memories_rendered_in_full_by_the_index_do_not_refire	test
-agent.rs::memory_save_persists_and_surfaces_in_the_prompt	todo
-agent.rs::memory_tools_track_the_configured_mode	todo
+agent.rs::memory_save_persists_and_surfaces_in_the_prompt	test
+agent.rs::memory_tools_track_the_configured_mode	test
 agent.rs::mid_reply_drops_are_retried_and_leave_no_partial_text_in_history	test
 agent.rs::mid_reply_restart_emits_a_reset_event_before_resending	gap	D has no response-reset UI event: a partial reply already printed before a mid-reply drop stays on screen
 agent.rs::mid_turn_model_switch_with_a_configured_window_skips_the_probe	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
@@ -141,8 +141,8 @@ agent.rs::output_limit_continuations_accumulate_the_whole_answer	test
 agent.rs::overflow_retry_reresolves_thinking_against_the_post_compaction_room	test
 agent.rs::overflow_smart_compaction_rebuilds_tools_before_retry	todo
 agent.rs::persisted_sessions_spill_beside_their_log	test
-agent.rs::plan_mode_blocks_a_memory_mutation_that_reached_the_handler	todo
-agent.rs::plan_mode_drops_save_from_tools_and_index_guidance	todo
+agent.rs::plan_mode_blocks_a_memory_mutation_that_reached_the_handler	test
+agent.rs::plan_mode_drops_save_from_tools_and_index_guidance	test
 agent.rs::plan_mode_gates_mutating_tools	test
 agent.rs::plan_mode_keeps_read_only_tools	test
 agent.rs::plan_survives_compaction_and_resume	todo
@@ -161,7 +161,7 @@ agent.rs::rate_meter_tracks_scripted_stream	test
 agent.rs::read_file_attaches_an_image_for_a_vision_model	test
 agent.rs::read_file_binary_error_notes_vision_capability	todo
 agent.rs::read_file_image_errors_with_a_hint_when_the_model_cannot_see	test
-agent.rs::read_only_memory_refuses_a_save	todo
+agent.rs::read_only_memory_refuses_a_save	test
 agent.rs::recall_attaches_at_most_two_notes_per_turn	test
 agent.rs::record_usage_accumulates_aic_when_reported	test
 agent.rs::records_assistant_tool_calls_before_results	test

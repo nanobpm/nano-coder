@@ -45,7 +45,7 @@ import nano.commands : helpText, isCommand, unescapePrompt;
 import core.thread : Thread;
 import nano.claude_hooks : HookManager, listingField, label, isProject;
 import nano.skills : Skills, skillsDefinition = definition;
-import nano.memory : MemoryStore = Store, MemoryMode, memoryDefinitions = definitions, runMemory = run, memoryDefaultDir = defaultDir, projectKey, Scope;
+import nano.memory : MemoryStore = Store, MemoryMode, memorySessionTools = sessionTools, memoryDefaultDir = defaultDir, projectKey, Scope;
 import nano.control : TurnControl, FdLineReader;
 import nano.instructions : ProjectInstructions, InstructionOptions = Options, expandHome;
 import core.atomic : atomicLoad, atomicStore, cas;
@@ -1478,19 +1478,18 @@ int runMain(string[] args)
         auto dir = cfg.memoryDir.length ? cfg.memoryDir : memoryDefaultDir();
         if (dir.length) memory = some(new MemoryStore(dir, projectKey(cwd), cfg.memoryExpiryDays < 0 ? 0 : cfg.memoryExpiryDays));
     }
-    foreach (store; memory)
+    // A helper, not a foreach-body delegate: D closures share the loop variable.
+    ToolHandler asToolError(string delegate(JSONValue) @safe handler)
     {
-        // A helper, not a foreach-body delegate: D closures share the loop variable.
-        ToolHandler memoryHandler(string name)
-        {
-            return (JSONValue a) {
-                bool ro = !memoryWritable || agent.control.mode == AgentMode.plan;
-                try return runMemory(store, name, a, agent.log.match!(l => l.id, () => string.init), ro);
-                catch (Exception e) throw new ToolError(e.msg);
-            };
-        }
-        foreach (d; memoryDefinitions(memoryWritable)) tools.register(d, memoryHandler(d.name));
+        return (JSONValue a) {
+            try return handler(a);
+            catch (Exception e) throw new ToolError(e.msg);
+        };
     }
+    foreach (store; memory)
+        foreach (t; memorySessionTools(store, memoryWritable, () => agent.control.mode == AgentMode.plan,
+                () => agent.log.match!(l => l.id, () => string.init)))
+            tools.register(t.definition, asToolError(t.handler));
     // Instruction files, discovered once per working directory.
     Option!ProjectInstructions instructions;
     string instructionsDir;

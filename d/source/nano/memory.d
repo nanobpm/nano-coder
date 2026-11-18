@@ -486,6 +486,33 @@ ToolDefinition[] definitions(bool writable)
 
 bool isMemoryTool(string n) { return n == saveTool || n == searchTool || n == forgetTool; }
 
+/// A memory tool as a session offers it.
+struct SessionTool
+{
+    ToolDefinition definition;
+    string delegate(JSONValue) @safe handler;
+}
+
+/// The memory tools for a session. Save and forget exist only when
+/// `writable` (memory "on" and a human vetting saves live). A write that
+/// reaches its handler in plan mode is refused, and search never writes
+/// unless the session is writable.
+SessionTool[] sessionTools(Store store, bool writable, bool delegate() @safe planMode, string delegate() @safe session)
+{
+    // A helper, not a foreach-body delegate: D closures share the loop variable.
+    string delegate(JSONValue) @safe handlerFor(string name)
+    {
+        return (JSONValue a) {
+            bool plan = planMode();
+            if (plan && name != searchTool) throw new Exception(name ~ " is disabled in plan mode (read-only)");
+            return run(store, name, a, session(), !writable || plan);
+        };
+    }
+    SessionTool[] r;
+    foreach (d; definitions(writable)) r ~= SessionTool(d, handlerFor(d.name));
+    return r;
+}
+
 /// Run a memory tool.
 string run(Store store, string tool, JSONValue args, string session, bool readOnly)
 {
