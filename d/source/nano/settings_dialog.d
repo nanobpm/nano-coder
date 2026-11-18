@@ -12,7 +12,7 @@ import std.string : strip, toUpper;
 import std.array : replace;
 import std.typecons : Nullable;
 import nano.config : Config, ProviderConfig, ProviderKind, ModelSettings, presets;
-import nano.agent : Agent;
+import nano.agent : Agent, ConfiguredWindow;
 import nano.settings;
 
 /// The prompts the dialog needs. `select` and `input` return -1 / null on Esc.
@@ -280,7 +280,9 @@ private bool editContext(SettingsUi ui, ref SettingsHost h)
     a.compactionMode = m == 1 ? CompactionMode.smart : CompactionMode.standard;
     cfg.contextWindow = window;
     auto pc = a.client.providerName in cfg.providers;
-    a.configuredWindow = window > 0 ? cast(size_t) window : pc !is null && pc.contextWindow > 0 ? cast(size_t) pc.contextWindow : 0;
+    a.setConfiguredWindow(window > 0 ? ConfiguredWindow(cast(size_t) window, "context_window in config")
+        : pc !is null && pc.contextWindow > 0 ? ConfiguredWindow(cast(size_t) pc.contextWindow, "provider context_window")
+        : ConfiguredWindow.init);
     return true;
 }
 

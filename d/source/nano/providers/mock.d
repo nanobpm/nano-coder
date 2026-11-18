@@ -12,6 +12,8 @@ class MockClient : LLMClient
     Message[][] seen;
     /// The tool names offered with each request.
     string[][] toolsSeen;
+    /// The `max_tokens` sent with each request.
+    long[] maxTokensSeen;
 
     this(LLMResponse[] script) { this.script = script; }
 
@@ -24,6 +26,7 @@ class MockClient : LLMClient
         string[] names;
         foreach (ref t; req.tools) names ~= t.name;
         toolsSeen ~= names;
+        maxTokensSeen ~= req.maxTokens;
         if (script.length == 0) return LLMResponse("(mock: script exhausted)");
         auto r = script[0];
         script = script[1 .. $];

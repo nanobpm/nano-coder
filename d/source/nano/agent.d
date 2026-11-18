@@ -144,6 +144,13 @@ enum StopReason : string
     maxTokens = "max_tokens",
 }
 
+/// A `context_window` from the configuration and which key set it.
+struct ConfiguredWindow
+{
+    size_t tokens;
+    string source;
+}
+
 class Agent
 {
     NotNull!LLMClient client;
@@ -253,8 +260,16 @@ class Agent
     /// compaction rebuilds the pinned block from originals (Rust's
     /// `pre_compaction_transcript`, trimmed to requests).
     Message[] pinStash;
-    /// The provider config's `context_window` (0: none).
+    /// The configured `context_window` (0: none), and whether the top-level
+    /// key or the provider's set it (`contextWindow`'s source).
     size_t configuredWindow;
+    string configuredWindowSource = "context_window in config";
+
+    void setConfiguredWindow(ConfiguredWindow w)
+    {
+        configuredWindow = w.tokens;
+        if (w.source.length) configuredWindowSource = w.source;
+    }
     /// Learned from a context-overflow error (0: none).
     size_t learnedWindow;
     /// Compactions this session.
@@ -905,7 +920,7 @@ class Agent
     size_t contextWindow(out string source) const
     {
         size_t w;
-        if (configuredWindow) { w = configuredWindow; source = "configured"; }
+        if (configuredWindow) { w = configuredWindow; source = configuredWindowSource; }
         else if (capabilities.window) { w = capabilities.window; source = "reported by the endpoint (" ~ capabilities.windowSource ~ ")"; }
         else if ((w = ctx.windowForModel(client.modelName)) != 0) source = "known for the model name";
         else { w = ctx.defaultContextWindow; source = "default"; }
@@ -921,12 +936,43 @@ class Agent
     /// to provider-reported usage.
     size_t estimateContextTokens(out bool calibrated)
     {
+        // Mirror the wire plan: only the newest `imageSlots` images still
+        // intact on disk are sent as images, every other one as a placeholder.
+        auto slots = imageSlots;
+        auto avail = availability();
+        auto part(size_t from, size_t to) { return avail is null ? null : avail[from .. to]; }
         calibrated = calibLen && calibLen <= messages.length;
-        if (calibrated) return calibTokens + ctx.messagesTokens(messages[calibLen .. $], imageSlots);
+        if (calibrated)
+        {
+            // The anchor charged the prefix's newest images in full. A newer
+            // image after it takes a slot and turns one of those into a
+            // placeholder; keeping the anchor would charge both, so recompute.
+            auto prefix = ctx.availableCount(messages[0 .. calibLen], part(0, calibLen));
+            auto suffix = ctx.availableCount(messages[calibLen .. $], part(calibLen, messages.length));
+            calibrated = min(prefix, slots) == min(prefix, saturatingSub(slots, suffix));
+            if (calibrated) return calibTokens + ctx.messagesTokens(messages[calibLen .. $], slots, part(calibLen, messages.length));
+        }
         size_t tools_;
         foreach (d; offeredTools())
             tools_ += ctx.textTokens(d.name) + ctx.textTokens(d.description) + ctx.textTokens(() { return d.parameters.toString; }());
-        return ctx.messagesTokens(messages, imageSlots) + tools_;
+        return ctx.messagesTokens(messages, slots, avail) + tools_;
+    }
+
+    /// Whether each attachment of each message is intact on disk, as
+    /// `ChatRequest.attachmentPlan` decides for the wire. Without vision every
+    /// attachment is a placeholder anyway, so the files aren't read.
+    private const(bool[])[] availability()
+    {
+        import nano.attachment : exists;
+        if (!imageSlots) return null;
+        auto dir = attachmentsDir();
+        auto out_ = new bool[][](messages.length);
+        foreach (i, ref m; messages)
+        {
+            out_[i] = new bool[](m.attachments.length);
+            foreach (j, ref a; m.attachments) out_[i][j] = dir.length && exists(dir, a);
+        }
+        return out_;
     }
 
     size_t estimateContextTokens() { bool _; return estimateContextTokens(_); }
@@ -1232,6 +1278,7 @@ class Agent
         auto window = contextWindow();
         size_t bodyStart = messages.length && messages[0].role == Role.system ? 1 : 0;
         auto len = messages.length;
+        auto avail = availability();
         size_t keepBudget = trigger == CompactTrigger.manual ? 0
             : (ctx.keepRecentTokens < window / 4 ? ctx.keepRecentTokens : window / 4);
         // Split where no tool result is separated from its call.
@@ -1242,7 +1289,7 @@ class Agent
         auto split = boundaries[$ - 1];
         foreach_reverse (b; boundaries)
         {
-            if (ctx.messagesTokens(messages[b .. $], imageSlots) > keepBudget) break;
+            if (ctx.messagesTokens(messages[b .. $], imageSlots, avail is null ? null : avail[b .. len]) > keepBudget) break;
             split = b;
         }
         if (split == boundaries[0]) split = boundaries[$ - 1];

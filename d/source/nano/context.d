@@ -135,20 +135,39 @@ size_t imageTokens(const ref imported!"nano.attachment".Attachment a)
 /// attachments count as images, the rest as their placeholder text. (Rust
 /// also leaves out of the quota attachments whose stored file is gone; D
 /// assumes they are all present.)
-size_t messagesTokens(const Message[] ms, size_t maxImages = 0)
+size_t messagesTokens(const Message[] ms, size_t maxImages = 0, const(bool[])[] avail = null)
 {
-    size_t total, n;
-    foreach (ref m; ms) total += m.attachments.length;
+    // Only available occurrences can be sent as images, so only they count
+    // toward the quota: the oldest `omitted` of them are placeholders, the
+    // newest `maxImages` images. An unavailable one is always a placeholder.
+    // `avail[i][j]` says whether `ms[i].attachments[j]` is intact on disk
+    // (null: all are), as `ChatRequest.attachmentPlan` decides for the wire.
+    bool isAvailable(size_t i, size_t j) { return avail is null || avail[i][j]; }
+    size_t total, n, seen;
+    foreach (i, ref m; ms)
+        foreach (j; 0 .. m.attachments.length)
+            if (isAvailable(i, j)) total++;
     auto omitted = saturatingSub(total, maxImages);
-    foreach (ref m; ms)
+    foreach (i, ref m; ms)
     {
         n += messageTokens(m);
-        foreach (ref a; m.attachments)
+        foreach (j, ref a; m.attachments)
         {
-            if (omitted) { omitted--; n += textTokens(a.placeholder); }
-            else n += imageTokens(a);
+            auto here = isAvailable(i, j);
+            n += here && seen >= omitted ? imageTokens(a) : textTokens(a.placeholder);
+            if (here) seen++;
         }
     }
+    return n;
+}
+
+/// Available attachment occurrences in `ms` (`avail` as for `messagesTokens`).
+size_t availableCount(const Message[] ms, const(bool[])[] avail)
+{
+    size_t n;
+    foreach (i, ref m; ms)
+        foreach (j; 0 .. m.attachments.length)
+            if (avail is null || avail[i][j]) n++;
     return n;
 }
 
@@ -162,6 +181,46 @@ unittest
     assert(messagesTokens([m], 1) == base + textTokens(m.attachments[0].placeholder) + 1);
     assert(messagesTokens([m], 2) == base + 750 + 1);
     assert(messagesTokens([m]) == base + textTokens(m.attachments[0].placeholder) + textTokens(m.attachments[1].placeholder));
+}
+
+// The older, available image is backfilled into the one slot a newer,
+// missing image can't use, and charged in full.
+// rust: context.rs::messages_tokens_charge_the_backfilled_image_when_the_newest_is_unavailable
+unittest
+{
+    import nano.llm : Message, Role, Attachment;
+    import nano.attachment : MAX_DIMENSION;
+    auto big = Attachment("image/png", "x.png", "", MAX_DIMENSION, MAX_DIMENSION);
+    auto tiny = Attachment("image/png", "x.png", "", 1, 1);
+    auto m = Message.user("look");
+    m.attachments = [big, tiny];
+    const(bool[])[] avail = [[true, false]];
+    auto got = messagesTokens([m], 1, avail);
+    assert(got == messageTokens(m) + imageTokens(big) + textTokens(tiny.placeholder));
+    // The availability-blind estimate charged tiny as the image and big as text.
+    auto blind = messageTokens(m) + textTokens(big.placeholder) + imageTokens(tiny);
+    assert(got > blind + 3_000);
+    assert(availableCount([m], avail) == 1);
+}
+
+// rust: context.rs::messages_tokens_with_vision_honors_the_newest_n_plan
+unittest
+{
+    import nano.llm : Message, Role, Attachment;
+    auto img = Attachment("image/png", "x.png", "", 1000, 1000);
+    auto m0 = Message.user("first");
+    m0.attachments = [img];
+    auto m1 = Message.user("second");
+    m1.attachments = [img, img];
+    auto convo = [m0, m1];
+    const(bool[])[] all = [[true], [true, true]];
+    auto naive = messageTokens(m0) + messageTokens(m1) + 3 * imageTokens(img);
+    auto imgCost = imageTokens(img), phCost = textTokens(img.placeholder);
+    assert(imgCost > phCost);
+    assert(messagesTokens(convo, 1, all) + 2 * imgCost == naive + 2 * phCost);
+    assert(messagesTokens(convo, 0, all) + 3 * imgCost == naive + 3 * phCost);
+    assert(messagesTokens(convo, 3, all) == naive);
+    assert(messagesTokens(convo, 99, all) == naive);
 }
 
 /// Context window by model family, for models whose provider config has none.

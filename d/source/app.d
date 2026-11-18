@@ -1139,10 +1139,13 @@ unittest
     assert(toolResult(true, "x\ny", true, 80, false) == "  ⎿ x\n    y\n");
 }
 
-/// The configured context window: top-level `context_window`, else the provider's.
-size_t windowFor(const ref Config c, const ref ProviderConfig p)
+/// The configured context window: top-level `context_window`, else the
+/// provider's (0: none), and which one it is.
+ConfiguredWindow windowFor(const ref Config c, const ref ProviderConfig p)
 {
-    return c.contextWindow > 0 ? cast(size_t) c.contextWindow : p.contextWindow > 0 ? cast(size_t) p.contextWindow : 0;
+    if (c.contextWindow > 0) return ConfiguredWindow(cast(size_t) c.contextWindow, "context_window in config");
+    if (p.contextWindow > 0) return ConfiguredWindow(cast(size_t) p.contextWindow, "provider context_window");
+    return ConfiguredWindow.init;
 }
 
 /// Untrusted multi-line text for the terminal: lines kept, every other
@@ -1372,7 +1375,7 @@ int runMain(string[] args)
 
     auto spec = o.model.length ? o.model : cfg.model;
     LLMClient client;
-    size_t configuredWindow;
+    ConfiguredWindow configuredWindow;
     try
     {
         auto rp = resolve(cfg, spec);
@@ -1542,7 +1545,7 @@ int runMain(string[] args)
     }
     agent.maxIterations = cfg.maxIterations;
     agent.maxTokens = cfg.maxTokens;
-    agent.configuredWindow = configuredWindow;
+    agent.setConfiguredWindow(configuredWindow);
     agent.autoCompact = cfg.autoCompact;
     agent.idleCompact = cfg.idleCompact;
     agent.verifyBeforeComplete = cfg.verifyBeforeComplete;
@@ -1736,7 +1739,7 @@ int runMain(string[] args)
         auto rp = resolve(cfg, spec);
         client = makeClient(rp);
         agent.client = client;
-        agent.configuredWindow = windowFor(cfg, rp.config);
+        agent.setConfiguredWindow(windowFor(cfg, rp.config));
         agent.learnedWindow = 0;
         agent.learnedMaxOutput = 0;
         agent.refreshCapabilities();

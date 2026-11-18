@@ -25,18 +25,18 @@ agent.rs::a_failed_tool_after_smart_compaction_points_to_history_once	todo
 agent.rs::a_firing_persistence_failure_rolls_the_due_timers_back	gap	D does not roll the live timers/plan back when persisting their change to the session log fails
 agent.rs::a_hard_stop_skips_the_rest_of_the_batch	test
 agent.rs::a_headless_turn_with_no_cap_stops_at_the_safety_cap	test
-agent.rs::a_learned_window_is_the_combined_cap_when_no_total_is_advertised	todo
-agent.rs::a_learned_window_tightens_the_effective_combined_window	todo
+agent.rs::a_learned_window_is_the_combined_cap_when_no_total_is_advertised	test
+agent.rs::a_learned_window_tightens_the_effective_combined_window	test
 agent.rs::a_literal_list_loop_runs_without_asking	test
 agent.rs::a_looser_probe_does_not_replace_a_learned_window_stat	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
-agent.rs::a_lower_learned_window_restores_the_output_reservation	todo
+agent.rs::a_lower_learned_window_restores_the_output_reservation	test
 agent.rs::a_memory_evicted_from_the_installed_index_becomes_recallable	test
 agent.rs::a_mid_turn_thinking_change_applies_from_the_next_step_and_drops_the_temperature	todo
 agent.rs::a_newer_model_request_during_a_slow_build_supersedes_the_stale_one	na	Tokio runtime races while a client builds asynchronously; D builds the client synchronously on the agent thread
 agent.rs::a_pending_timer_nudges_every_few_steps_until_marked_done	test
 agent.rs::a_plan_tool_persistence_failure_rolls_the_live_plan_back	gap	D does not roll the live timers/plan back when persisting their change to the session log fails
-agent.rs::a_prompt_only_window_is_capped_to_the_combined_window	todo
-agent.rs::a_prompt_only_window_keeps_the_estimation_margin	todo
+agent.rs::a_prompt_only_window_is_capped_to_the_combined_window	test
+agent.rs::a_prompt_only_window_keeps_the_estimation_margin	test
 agent.rs::a_repeat_loop_ends_the_turn_blocked_after_the_warnings	test
 agent.rs::a_repeated_compaction_warns_the_summariser_the_earlier_summary_is_lossy	test	pinned user requests (#184)
 agent.rs::a_repeated_compaction_without_the_pin_tells_the_summariser_to_preserve_requirements	test	pinned user requests (#184)
@@ -74,7 +74,7 @@ agent.rs::auto_compaction_mid_turn_keeps_the_turn_going	test
 agent.rs::auto_mode_disables_the_turn_cap	todo
 agent.rs::auto_mode_does_not_disable_the_cap_in_a_headless_turn	todo
 agent.rs::blocked_and_needs_input_are_never_intercepted	test
-agent.rs::calibrated_estimate_recomputes_when_a_suffix_image_displaces_a_prefix_image	todo
+agent.rs::calibrated_estimate_recomputes_when_a_suffix_image_displaces_a_prefix_image	test
 agent.rs::cancel_during_key_command_build_kills_the_child_despite_a_turn_flag_reset	na	Tokio runtime races while a client builds asynchronously; D builds the client synchronously on the agent thread
 agent.rs::cancel_during_model_call_stops_the_turn	todo
 agent.rs::cancel_kills_running_bash_and_skips_remaining_calls	test
@@ -88,17 +88,17 @@ agent.rs::compaction_retries_a_mid_summary_drop_instead_of_dropping_history	gap	
 agent.rs::compaction_sends_no_temperature_to_an_always_thinking_model	todo
 agent.rs::compaction_streams_the_summary_request	todo
 agent.rs::compaction_tail_budget_mirrors_the_vision_wire_plan	todo
-agent.rs::compacts_below_the_threshold_when_output_would_not_fit	todo
+agent.rs::compacts_below_the_threshold_when_output_would_not_fit	test
 agent.rs::completed_after_an_edit_and_a_check_is_not_reminded	test
 agent.rs::completed_after_an_edit_and_a_rejected_bash_is_still_reminded	test
 agent.rs::completed_after_an_edit_and_an_invalid_real_bash_is_still_reminded	test
 agent.rs::completed_after_an_unverified_edit_is_reminded_once_then_goes_through	test
 agent.rs::configured_read_only_memory_search_does_not_mutate_the_store	todo
 agent.rs::context_overflow_compacts_and_retries_once	test
-agent.rs::detected_window_sits_between_config_and_model_name	todo
+agent.rs::detected_window_sits_between_config_and_model_name	test
 agent.rs::disabled_timers_neither_fire_nor_nudge_on_a_turn	gap	D timer nudging: no test that disabled timers stay silent / that idle firing resets the nudge counter
 agent.rs::emits_acp_updates_for_messages_and_tools	test
-agent.rs::estimate_is_anchored_to_reported_usage	todo
+agent.rs::estimate_is_anchored_to_reported_usage	test
 agent.rs::failed_model_switch_restores_the_previous_spec	todo
 agent.rs::failed_tool_reports_failed_status_and_replay_covers_history	todo
 agent.rs::identical_tool_calls_draw_a_loop_warning_on_the_third	test
@@ -114,9 +114,9 @@ agent.rs::logs_thinking_usage_and_duration_with_assistant_messages	todo
 agent.rs::long_tool_output_is_cut_and_kept_on_disk	test
 agent.rs::malformed_tool_call_skips_handler_and_reports_actionable_error	test
 agent.rs::manual_compaction_summarizes_older_messages	test
-agent.rs::max_tokens_is_capped_to_the_room_when_compaction_is_disabled	todo
-agent.rs::max_tokens_is_sent_unchanged_when_the_window_has_room	todo
-agent.rs::max_tokens_shrinks_so_prompt_and_output_fit_the_window	todo
+agent.rs::max_tokens_is_capped_to_the_room_when_compaction_is_disabled	test
+agent.rs::max_tokens_is_sent_unchanged_when_the_window_has_room	test
+agent.rs::max_tokens_shrinks_so_prompt_and_output_fit_the_window	test
 agent.rs::memories_rendered_in_full_by_the_index_do_not_refire	test
 agent.rs::memory_save_persists_and_surfaces_in_the_prompt	todo
 agent.rs::memory_tools_track_the_configured_mode	todo
@@ -150,7 +150,7 @@ agent.rs::plan_tools_can_be_turned_off	todo
 agent.rs::pre_tool_use_context_survives_a_deny	todo
 agent.rs::pre_tool_use_rewrite_is_rechecked_against_policy	todo
 agent.rs::pre_tool_use_rewrite_reaches_special_tools	todo
-agent.rs::prompt_only_window_compacts_against_the_combined_window	todo
+agent.rs::prompt_only_window_compacts_against_the_combined_window	test
 agent.rs::prompt_only_window_does_not_shrink_max_tokens	test
 agent.rs::rate_meter_finish_falls_back_to_usage_over_elapsed_for_one_shot	test
 agent.rs::rate_meter_finish_uses_first_token_denominator_for_multi_delta_stream	test
@@ -364,8 +364,8 @@ context.rs::detects_output_cap_errors_and_their_limits	todo
 context.rs::detects_overflow_errors_and_limits	todo
 context.rs::error_line_detection_is_small_and_fixed	test
 context.rs::image_tokens_counts_a_max_dimension_square_fully	todo
-context.rs::messages_tokens_charge_the_backfilled_image_when_the_newest_is_unavailable	todo
-context.rs::messages_tokens_with_vision_honors_the_newest_n_plan	todo
+context.rs::messages_tokens_charge_the_backfilled_image_when_the_newest_is_unavailable	test
+context.rs::messages_tokens_with_vision_honors_the_newest_n_plan	test
 context.rs::model_output_limits	todo
 context.rs::model_windows	todo
 context.rs::pinned_requests_a_hook_only_message_left_alone_pins_nothing	test	pinned user requests (#184)
