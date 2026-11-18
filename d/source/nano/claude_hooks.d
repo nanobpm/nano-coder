@@ -225,7 +225,7 @@ bool isHerdrIntegration(string command)
             auto got = File(path, "rb").rawRead(head[]);
             if ((cast(const(char)[]) got).canFind("HERDR_INTEGRATION_ID=")) return true;
         }
-        catch (Exception) continue;
+        catch (Exception) continue; // an unreadable hook script isn't a Herdr integration; check the next
     }
     return false;
 }
@@ -485,7 +485,7 @@ class HookManager
         m["transcript_path"] = transcriptPath;
         string cwd;
         try cwd = getcwd();
-        catch (Exception) cwd = projectDir;
+        catch (Exception) cwd = projectDir; // a deleted cwd: fall back to the project dir hooks were loaded for
         m["cwd"] = cwd;
         m["permission_mode"] = permissionMode;
         m["hook_event_name"] = claudeName(event);
@@ -590,7 +590,7 @@ private bool fullMatch(string pattern, string text)
 {
     import std.regex : regex, matchFirst;
     try return !matchFirst(text, regex("^(?:" ~ pattern ~ ")$")).empty;
-    catch (Exception) return false;
+    catch (Exception) return false; // an invalid matcher regex matches nothing (as in Claude Code)
 }
 
 private bool ifSelects(string ifRule, string nanoTool, JSONValue args)
@@ -885,7 +885,7 @@ private HookResult interpret(Event event, const ref Hook hook, ProcessRun run)
             parsed = parseJSON(trimmed);
             isJson = parsed.type == JSONType.object;
         }
-        catch (Exception) {}
+        catch (Exception) {} // plain-text hook output: handled as text below
     }
     if (isJson) applyJsonOutput(event, parsed, r);
     else if (trimmed.length && (event == Event.sessionStart || event == Event.userPromptSubmit))

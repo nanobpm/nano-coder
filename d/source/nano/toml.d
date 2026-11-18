@@ -231,7 +231,7 @@ private struct Parser
             if (clean.length >= 10 && clean[4] == '-') return JSONValue(raw); // dates: keep as text
             return JSONValue(clean.to!long);
         }
-        catch (Exception)
+        catch (Exception) // fail() rethrows it as a TOML error with the position
         {
             fail("invalid value: " ~ raw);
         }

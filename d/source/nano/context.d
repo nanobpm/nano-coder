@@ -2,6 +2,7 @@
 module nano.context;
 
 @safe:
+import nano.arith : checkedSub, saturatingSub;
 
 import std.algorithm : canFind, min, max;
 import std.array : join;
@@ -138,7 +139,7 @@ size_t messagesTokens(const Message[] ms, size_t maxImages = 0)
 {
     size_t total, n;
     foreach (ref m; ms) total += m.attachments.length;
-    auto omitted = total > maxImages ? total - maxImages : 0;
+    auto omitted = saturatingSub(total, maxImages);
     foreach (ref m; ms)
     {
         n += messageTokens(m);
@@ -218,7 +219,7 @@ private size_t firstCapture(string error, const string[] patterns)
         if (!m.empty)
         {
             try return m[1].to!size_t;
-            catch (Exception) {}
+            catch (Exception) {} // a capture too large for size_t isn't a usable limit; try the next pattern
         }
     }
     return 0;
@@ -259,11 +260,11 @@ string clip(string text, size_t maxChars)
     if (text.length <= maxChars) return text;
     auto chars = text.toUTF32;
     if (chars.length <= maxChars) return text;
-    auto marker = format("\n…[%s characters omitted]…\n", chars.length - maxChars);
+    auto marker = format("\n…[%s characters omitted]…\n", checkedSub(chars.length, maxChars));
     auto markerLen = marker.toUTF32.length;
     // An allowance smaller than the marker itself: a bare head cut.
     if (markerLen >= maxChars) return chars[0 .. maxChars].toUTF8;
-    auto budget = maxChars - markerLen;
+    auto budget = checkedSub(maxChars, markerLen);
     return chars[0 .. budget * 2 / 3].toUTF8 ~ marker ~ chars[$ - budget / 3 .. $].toUTF8;
 }
 
@@ -317,7 +318,7 @@ string clipToolResult(string text, size_t maxChars)
     string bare(size_t i) { return bareD(i).toUTF8; }
     size_t[] errorLines;
     foreach (i; 0 .. lines.length) if (isErrorLine(bare(i))) errorLines ~= i;
-    auto marker = format("…[%s characters omitted; error lines pinned]…\n", total - maxChars);
+    auto marker = format("…[%s characters omitted; error lines pinned]…\n", checkedSub(total, maxChars));
     auto markerLen = marker.toUTF32.length;
     if (!errorLines.length || maxChars < markerLen + 64) return clip(text, maxChars);
     enum long gap = 2; // "…\n" for every gap after the first
@@ -345,7 +346,7 @@ string clipToolResult(string text, size_t maxChars)
     }
     size_t sumLens(size_t a, size_t b) { size_t t; foreach (k; a .. b) t += lens[k]; return t; }
     // 1. Head and tail floors (whole lines), so both ends always show.
-    auto floor = (maxChars - markerLen) / 6;
+    auto floor = checkedSub(maxChars, markerLen) / 6;
     size_t headEnd;
     while (headEnd < n && sumLens(0, headEnd + 1) <= floor && tryKeep(headEnd)) ++headEnd;
     size_t tailStart = n;
@@ -375,7 +376,7 @@ string clipToolResult(string text, size_t maxChars)
         auto room = min(floor, cast(size_t) max(0L, cast(long) maxChars - cast(long) used - base));
         if (room > 8)
         {
-            admitClipped(0, excerpt(bareD(0), room - 2, false) ~ (endsNl(0) ? "\n" : ""), base);
+            admitClipped(0, excerpt(bareD(0), checkedSub(room, 2), false) ~ (endsNl(0) ? "\n" : ""), base);
             if (kept[0]) headEnd = 1;
         }
     }
@@ -387,7 +388,7 @@ string clipToolResult(string text, size_t maxChars)
         if (room > 8)
         {
             auto nl = endsNl(i);
-            admitClipped(i, excerpt(bareD(i), room - 1 - nl, true) ~ (nl ? "\n" : ""), base);
+            admitClipped(i, excerpt(bareD(i), checkedSub(room, 1 + nl), true) ~ (nl ? "\n" : ""), base);
             if (kept[i]) tailStart = i;
         }
     }
@@ -412,13 +413,13 @@ string clipToolResult(string text, size_t maxChars)
     //    line that is itself an unpinned error is not admitted.
     foreach (i; pinned)
     {
-        auto lo = i >= clipErrorContext ? i - clipErrorContext : 0;
+        auto lo = saturatingSub(i, clipErrorContext);
         auto hi = min(i + clipErrorContext, n - 1);
         foreach (j; lo .. hi + 1)
             if (!kept[j] && !isErrorLine(bare(j))) tryKeep(j);
     }
     // 4. Grow the head (2/3 of what is left) then the tail, then the head again.
-    auto spare = maxChars - used;
+    auto spare = checkedSub(maxChars, used);
     auto headTarget = used + spare * 2 / 3;
     while (headEnd < n && !kept[headEnd])
     {
@@ -878,7 +879,7 @@ string clipBytes(string text, size_t maxBytes)
         auto out_ = clip(text, chars);
         if (out_.length <= maxBytes || chars == 0) return out_;
         auto scaled = chars * maxBytes / out_.length;
-        chars = scaled < chars - 1 ? scaled : chars - 1;
+        chars = min(scaled, checkedSub(chars, 1));
     }
 }
 
@@ -921,13 +922,13 @@ string pinnedUserRequests(const Message[] prior, const Message[] new_, bool smar
     if (!requests.length) return null;
     auto allowance = max(windowTokens / pinnedWindowShare, pinnedMinAllowanceTokens) * 4;
     auto prefixCost = pinnedRequestsPrefix.length + 1;
-    size_t remaining = allowance > prefixCost ? allowance - prefixCost : 0;
+    size_t remaining = saturatingSub(allowance, prefixCost);
 
     string render(size_t index, const ref Message r, size_t firstBudget)
     {
         auto budget = index == 0 ? firstBudget : pinnedLaterChars;
         auto label = smart && r.logLine ? format("#%s: ", r.logLine) : "";
-        budget = budget > label.length ? budget - label.length : 0;
+        budget = saturatingSub(budget, label.length);
         auto text = requestText(r);
         if (index != 0)
         {
@@ -981,7 +982,7 @@ string pinnedUserRequests(const Message[] prior, const Message[] new_, bool smar
     }
     if (!keepFirst && tailStart >= n) return null;
     if (keepFirst && tailStart >= n && cost(lines[0]) > remaining)
-        lines[0] = render(0, requests[0], remaining > 1 ? remaining - 1 : 0);
+        lines[0] = render(0, requests[0], saturatingSub(remaining, 1));
     string[] body_;
     if (auto nt = note(keepFirst, tailStart)) body_ ~= nt;
     if (keepFirst) body_ ~= lines[0];

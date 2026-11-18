@@ -7,6 +7,7 @@
 module nano.trajectory;
 
 @safe:
+import nano.arith : saturatingSub;
 
 import std.algorithm : canFind, map, max, sum, filter;
 import std.array : join, replicate, split, array;
@@ -487,7 +488,7 @@ long millisBetween(string a, string b)
         auto d = (SysTime.fromISOExtString(b) - SysTime.fromISOExtString(a)).total!"msecs";
         return d >= 0 ? d : -1;
     }
-    catch (Exception) return -1;
+    catch (Exception) return -1; // an unparsable timestamp has no duration (-1)
 }
 
 string compactText(const JSONValue data, string mode, string model)
@@ -830,10 +831,10 @@ bool page(string text)
         {
             auto p = pipeShell(pager, Redirect.stdin, env);
             try { p.stdin.write(text); p.stdin.close(); }
-            catch (Exception) {}
+            catch (Exception) {} // the pager quit early (EPIPE): fine, it has what it showed
             return pagerRan(wait(p.pid));
         }
-        catch (Exception) return false;
+        catch (Exception) return false; // no pager: the caller prints the text instead
     });
 }
 
@@ -850,7 +851,7 @@ bool pagerRan(int code) nothrow { return code != 126 && code != 127; }
 bool needsPager(string text, size_t rows, size_t cols)
 {
     cols = max(cols, 1);
-    auto limit = rows >= 2 ? rows - 2 : 0;
+    auto limit = saturatingSub(rows, 2);
     size_t used;
     foreach (line; text.lineSplitter)
     {

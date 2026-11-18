@@ -208,7 +208,7 @@ private bool parseCount(string t, out long v)
 {
     import std.conv : to;
     try { v = t.strip.to!long; return v >= 0; }
-    catch (Exception) return false;
+    catch (Exception) return false; // not a number: the caller asks again
 }
 
 private void switchTo(SettingsUi ui, ref SettingsHost h, string spec, ref Changes changes, ref string[] notices)
@@ -260,7 +260,7 @@ private bool editContext(SettingsUi ui, ref SettingsHost h)
             import std.conv : to;
             double p;
             try p = t.strip.to!double;
-            catch (Exception) { ui.say("between 10 and 99"); continue; }
+            catch (Exception) { ui.say("between 10 and 99"); continue; } // reported to the user just here, then asked again
             if (p < 10 || p > 99) { ui.say("between 10 and 99"); continue; }
             threshold = p / 100;
             break;
@@ -320,6 +320,7 @@ private void editTemperature(SettingsUi ui, ref SettingsHost h, ref Changes chan
         if (t == "default") { value = double.nan; break; }
         import std.conv : to;
         try value = t.to!double;
+        // reported to the user just here, then asked again
         catch (Exception) { ui.say(format("invalid temperature %s", t)); continue; }
         if (value < 0 || value > maxTemperature) { ui.say(format("temperature must be between 0 and %s", show(maxTemperature))); continue; }
         break;

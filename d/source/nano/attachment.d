@@ -186,7 +186,7 @@ uint exifOrientation(const(ubyte)[] b, ImageFormat f)
         }
         return true;
     });
-    catch (Exception) {}
+    catch (Exception) {} // a truncated or malformed JPEG: keep whatever was read so far
     return result;
 }
 
@@ -427,7 +427,7 @@ string store(string dir, const ref Attachment a, const(ubyte)[] bytes)
     auto path = buildPath(dir, name);
     bool intact;
     try intact = exists(path) && sha256Hex(readBytes(path)) == a.sha256;
-    catch (Exception) {}
+    catch (Exception) {} // a missing or unreadable copy counts as not intact and is rewritten below
     if (!intact)
     {
         auto tmp = buildPath(dir, format(".tmp-%s-%s", thisProcessID, Clock.currStdTime));
@@ -450,7 +450,7 @@ private immutable(ubyte)[] readIntact(string dir, const ref Attachment a)
         auto b = readImmutableBytes(buildPath(dir, name));
         return sha256Hex(b) == a.sha256 ? b : null;
     }
-    catch (Exception) return null;
+    catch (Exception) return null; // missing, unreadable or changed on disk: the caller treats null as gone
 }
 
 /// Whether the stored copy is present and intact (the gate before sending).
@@ -479,7 +479,7 @@ Nullable!ImageData readForLimits(string dir, const ref Attachment a, const ref I
         auto p = prepare(bytes, f.get, limits, encode);
         return Nullable!ImageData(ImageData(p.mediaType, Base64.encode(p.bytes).idup));
     }
-    catch (Exception) return none;
+    catch (Exception) return none; // unreadable or undecodable image: the caller skips it
 }
 
 version (unittest)

@@ -13,6 +13,7 @@
 module nano.update;
 
 @safe:
+import nano.arith : saturatingSub;
 
 import std.json;
 import std.format : format;
@@ -57,7 +58,7 @@ string launchExe()
     import std.file : thisExePath;
     import std.string : chomp;
     try return thisExePath().chomp(" (deleted)");
-    catch (Exception) return null;
+    catch (Exception) return null; // no executable path: updates can't relaunch, the caller says so
 }
 
 /// The update command for a channel ("" for other).
@@ -124,7 +125,7 @@ State loadState(string path)
 {
     import std.file : readText;
     try return State.fromJson(parseJSON(readText(path)));
-    catch (Exception) return State.init;
+    catch (Exception) return State.init; // no state yet, or a corrupt file: start fresh
 }
 
 /// Written atomically; failures are ignored (the check is best-effort).
@@ -140,6 +141,7 @@ void saveState(string path, const State s)
         write(tmp, s.toJson.toPrettyString ~ "\n");
         rename(tmp, path);
     }
+    // update state is a cache; failing to save it means checking again sooner
     catch (Exception) { try remove(tmp); catch (Exception) {} }
 }
 
@@ -159,7 +161,7 @@ bool isNewer(string candidate, string running) pure
         foreach (p; parts[0].splitter('.'))
         {
             ulong n;
-            try n = p.to!ulong; catch (Exception) n = 0;
+            try n = p.to!ulong; catch (Exception) n = 0; // a non-numeric part sorts as 0
             nums ~= n;
         }
     }
@@ -202,7 +204,7 @@ string fetchLatest(string url)
         auto j = parseJSON(body_);
         if (auto v = "version" in j) if (v.type == JSONType.string && v.str.strip.length) return v.str.strip;
     }
-    catch (Exception) {}
+    catch (Exception) {} // offline or a bad response: no update notice
     return null;
 }
 
@@ -266,7 +268,7 @@ final class Checker
     }
 
     /// Seconds until the next check is due.
-    long dueIn(long now = unixNow()) { return nextDue > now ? nextDue - now : 0; }
+    long dueIn(long now = unixNow()) { return saturatingSub(nextDue, now); }
 }
 
 long unixNow()
@@ -347,7 +349,7 @@ string installedVersion(string exe)
         if (!t.startsWith("nano-coder-d ")) return null;
         return t["nano-coder-d ".length .. $].findSplit(" ")[0];
     }
-    catch (Exception) return null;
+    catch (Exception) return null; // not runnable or not ours: unknown version
 }
 
 /// `program` on PATH, or null.
@@ -363,7 +365,7 @@ string which(string program)
         if (!dir.length) continue;
         auto p = buildPath(dir, program);
         try if (p.exists && p.isFile && (getAttributes(p) & octal!111)) return p;
-        catch (Exception) {}
+        catch (Exception) {} // unreadable entry on PATH: keep looking
     }
     return null;
 }

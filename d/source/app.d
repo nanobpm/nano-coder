@@ -3,6 +3,7 @@
 module app;
 
 @safe:
+import nano.arith : saturatingSub;
 
 import nano.safeio : Chan, Isolated, Join, JoinHandle, Locked, Shared, deepCopy, spawn, spawnDaemon, exitProcess, stdErr, stdinLine, stdOut;
 
@@ -1109,7 +1110,7 @@ string toolResult(bool ok, string output, bool verbose, size_t width, bool color
         return text;
     }
     auto more = lines.length > 1 ? format(" (+%s lines)", lines.length - 1) : "";
-    return format("  %s%s %s%s%s\n", on, mark, fitText(lines[0].stripRight("\r"), width > more.length ? width - more.length : 0), more, off);
+    return format("  %s%s %s%s%s\n", on, mark, fitText(lines[0].stripRight("\r"), saturatingSub(width, more.length)), more, off);
 }
 
 /// A tool call's arguments as shown expanded: pretty JSON, or the raw text
@@ -2341,7 +2342,7 @@ int runMain(string[] args)
                     auto path = buildPath(sessionDir, id ~ ".jsonl");
                     bool ok;
                     try { validateId(id); ok = path.exists && path.isFile; }
-                    catch (Exception) {}
+                    catch (Exception) {} // an invalid ID or unreadable path is reported as "no saved session" just below
                     if (!ok) { writefln("No saved session %s: /resume without an ID lists them", JSONValue(id).toString); continue; }
                     try loadSession(path);
                     catch (Exception e) { writeln(e.msg); continue; }

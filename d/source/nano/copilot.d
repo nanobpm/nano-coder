@@ -202,7 +202,7 @@ bool loadCredentials(out StoredCredentials c, string dataDir = null)
         c.createdAt = "created_at" in j ? j["created_at"].str : "";
         return true;
     }
-    catch (Exception) return false;
+    catch (Exception) return false; // no stored credentials, or a corrupt file: not signed in
 }
 
 /// Write the login with owner-only permissions; returns the path.

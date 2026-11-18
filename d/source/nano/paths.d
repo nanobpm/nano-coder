@@ -100,21 +100,21 @@ string readLink(string path)
 {
     import std.file : readLink_ = readLink;
     try return readLink_(path);
-    catch (Exception) return null;
+    catch (Exception) return null; // not a symlink, or unreadable: null
 }
 
 bool isSymlink(string path)
 {
     import std.file : isSymlink_ = isSymlink;
     try return isSymlink_(path);
-    catch (Exception) return false;
+    catch (Exception) return false; // missing or unreadable: not a symlink
 }
 
 bool isDir(string path)
 {
     import std.file : exists, isDir_ = isDir;
     try return exists(path) && isDir_(path);
-    catch (Exception) return false;
+    catch (Exception) return false; // missing or unreadable: not a directory
 }
 
 /// The user's home directory, or null.

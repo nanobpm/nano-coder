@@ -131,7 +131,7 @@ bool loadCredentials(out StoredCredentials c, string dataDir = null)
     auto path = credentialsPath(dataDir);
     if (!path.exists) return false;
     try c = StoredCredentials.fromJSON(parseJSON(readText(path)));
-    catch (Exception) return false;
+    catch (Exception) return false; // a corrupt credentials file means not signed in
     return true;
 }
 
@@ -154,7 +154,7 @@ void persistRotated(const OauthGrant renewed, const OauthGrant prior, string dat
     if (renewed.refreshToken !is null) c.refreshToken = renewed.refreshToken;
     if (!renewed.expiresAt.isNull) c.expiresAt = renewed.expiresAt;
     try saveCredentials(c, dataDir);
-    catch (Exception) {}
+    catch (Exception) {} // the rotated token still works this run; failing to persist it only means signing in again later
 }
 
 /// A grant another client already renewed and saved: adopted only when it
@@ -264,7 +264,7 @@ MintedKey mint(const Endpoints e, string oauth, bool onboard)
     auto status = perform(req, text);
     JSONValue v;
     try v = parseJSON(text);
-    catch (Exception) {}
+    catch (Exception) {} // a non-JSON body is reported from the status code below
     if (status < 200 || status >= 300)
     {
         // A 401 is an ApiError so the caller's re-mint logic sees it.
@@ -317,7 +317,7 @@ Nullable!OauthGrant refreshGrant(const Endpoints e, const OauthGrant grant)
     JSONValue v;
     try v = postForm(e.token, [["client_id", clientId()], ["grant_type", "refresh_token"],
         ["refresh_token", grant.refreshToken]], false, status);
-    catch (Exception) return typeof(return).init;
+    catch (Exception) return typeof(return).init; // a failed refresh is reported to the caller as no grant
     if (status < 200 || status >= 300) return typeof(return).init;
     auto token = strField(v, "access_token");
     if (token is null) return typeof(return).init;

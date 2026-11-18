@@ -80,7 +80,7 @@ struct Gated
 private bool isFileAt(string p)
 {
     try return exists(p) && isFile(p);
-    catch (Exception) return false;
+    catch (Exception) return false; // unreadable counts as absent
 }
 
 /// Whether `answer` is an affirmative (`y`/`yes`, any case and padding).
@@ -173,7 +173,7 @@ bool dirHasSkill(string repoRoot, string dir)
             foreach (e; dirEntries(real_, SpanMode.shallow, false))
                 if (!e.name.baseName.startsWith(".")) children ~= e.name;
         }
-        catch (Exception) return false;
+        catch (Exception) return false; // an unreadable directory can't hold a skill we would load
         foreach (c; children)
             if (scan(c, depth + 1)) return true;
         return false;
@@ -188,7 +188,7 @@ string trustKey(string root)
 {
     if (!root.length || root.canFind('\n') || root.canFind('\r')) return null;
     try validate(root);
-    catch (Exception) return null;
+    catch (Exception) return null; // a non-UTF-8 root can't be stored as a trust line: never trusted
     return root;
 }
 
@@ -204,7 +204,7 @@ bool isRemembered(string root, string file)
         if (!exists(file)) return false;
         text = readText(file);
     }
-    catch (Exception) return false;
+    catch (Exception) return false; // an unreadable trust file trusts nothing (fail closed)
     if (text.length && !text.endsWith("\n")) return false;
     // An exact line only: a padded entry never authorizes the trimmed root.
     return text.lineSplitter.canFind!(l => l == key);
@@ -225,7 +225,7 @@ void remember(string root, string file)
     auto key = trustKey(root);
     if (key is null || file is null) return;
     try mkdirRecurse(dirName(file));
-    catch (Exception) {}
+    catch (Exception) {} // if the dir can't be made, the open below fails and nothing is remembered: asked again next time
     auto fd = openPath(file, O_RDWR | O_APPEND | O_CREAT, octal600);
     if (fd < 0) return;
     scope (exit) closeFd(fd);
@@ -237,7 +237,7 @@ void remember(string root, string file)
     {
         ptrdiff_t n;
         try n = readFd(fd, buf[]);
-        catch (Exception) return;
+        catch (Exception) return; // unreadable: don't append blind; the user is asked again next time
         if (n < 0) return;
         if (n == 0) break;
         existing ~= buf[0 .. n];
@@ -246,7 +246,7 @@ void remember(string root, string file)
     if (text.lineSplitter.canFind!(l => l == key)) return;
     if (text.length && !text.endsWith("\n")) return;
     try writeFd(fd, cast(const(ubyte)[]) (key ~ "\n"));
-    catch (Exception) {}
+    catch (Exception) {} // not remembered: the user is asked again next time (fail closed)
 }
 
 private enum octal600 = 0x180;

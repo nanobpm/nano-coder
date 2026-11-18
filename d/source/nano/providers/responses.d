@@ -320,7 +320,7 @@ unittest
     assert(inc.stopReason == "max_output_tokens");
     bool threw;
     try parseResponses(parseJSON(`{"status":"failed","error":{"message":"bad"},"output":[]}`), false);
-    catch (Exception) threw = true;
+    catch (Exception) threw = true; // expected: a failed response must throw, which is what this test checks
     assert(threw);
 }
 
@@ -351,6 +351,6 @@ unittest
     bad.sink = (bool t, string x) {};
     bool threw;
     try bad.event(`{"type":"response.failed","response":{"error":{"message":"nope"}}}`);
-    catch (Exception e) threw = true;
+    catch (Exception e) threw = true; // expected: a failed stream event must throw, which is what this test checks
     assert(threw);
 }

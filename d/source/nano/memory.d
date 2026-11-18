@@ -14,6 +14,7 @@
 module nano.memory;
 
 @safe:
+import nano.arith : saturatingSub;
 
 import nano.safeio : chmodPath, fchmodFd, openPath, statMode, writeFd;
 
@@ -112,10 +113,10 @@ struct Entry
     {
         auto text = cast(string) line.idup;
         try validate(text);
-        catch (Exception) return false;
+        catch (Exception) return false; // an invalid UTF-8 line is skipped (kept verbatim by the caller)
         JSONValue j;
         try j = parseJSON(text);
-        catch (Exception) return false;
+        catch (Exception) return false; // a non-JSON line is skipped (kept verbatim by the caller)
         if (j.type != JSONType.object) return false;
         foreach (k, v; j.objectNoRef)
         {
@@ -145,7 +146,7 @@ struct Entry
         e.created = j["created"].str;
         e.lastUsed = j["last_used"].str;
         try { e.lastUsedTime = SysTime.fromISOExtString(e.lastUsed); SysTime.fromISOExtString(e.created); }
-        catch (Exception) return false;
+        catch (Exception) return false; // a bad timestamp makes the entry unparsable; kept verbatim by the caller
         if (auto v = "evidence" in j) if (v.type == JSONType.string) e.evidence = v.str;
         if (auto v = "session" in j) if (v.type == JSONType.string) e.session = v.str;
         if (auto v = "kind" in j) if (v.type == JSONType.string) e.kind = v.str;
@@ -306,6 +307,7 @@ final class Store
         if (!pattern.length) throw new Exception("pattern must be a non-empty string");
         Regex!dchar rx;
         try rx = regex(pattern.to!dstring, "i");
+        // not a valid regex: search for the pattern literally instead
         catch (Exception) rx = regex(pattern.escaper.to!dstring, "i");
         struct Hit { Scope s; Entry e; }
         struct Loaded { Scope s; string path; ScopeFile f; FileLock* lock; }
@@ -414,7 +416,7 @@ final class Store
     {
         Scoped[] entries;
         try entries = all();
-        catch (Exception) return "";
+        catch (Exception) return ""; // an unreadable store shows no memory index, rather than failing the prompt
         if (!entries.length && !writable) return "";
         auto safeProject = scrubControl(project !is null ? project : "this repository");
         auto guidance = writable ? saveGuidance : "Find more with " ~ searchTool ~ ".";
@@ -490,7 +492,7 @@ string run(Store store, string tool, JSONValue args, string session, bool readOn
     if (args.type == JSONType.string)
     {
         try args = parseJSON(args.str);
-        catch (Exception) {}
+        catch (Exception) {} // a non-JSON string is handled as missing arguments below
     }
     string arg(string k)
     {
@@ -565,7 +567,7 @@ private string gitOutput(string cwd, string[] args)
         auto r = execute(["git", "-C", cwd] ~ args);
         return r.status == 0 ? r.output : null;
     }
-    catch (Exception) return null;
+    catch (Exception) return null; // git missing or not a repository: no output
 }
 
 /// The project key: the normalised git remote, else the git root. Null outside a repo.
@@ -648,7 +650,7 @@ private string snippet(Regex!dchar rx, string text)
     size_t start = 0, end = 0;
     if (!m.empty) { start = m.pre.length; end = start + m.hit.length; }
     enum lead = snippetChars / 3;
-    auto from = start > lead ? start - lead : 0;
+    auto from = saturatingSub(start, lead);
     auto room = snippetChars - (start - from);
     auto to_ = end + room < d.length ? end + room : d.length;
     import std.array : split;
@@ -713,7 +715,7 @@ void writeAll(string p, const Entry[] entries, const(ubyte[])[] unknown)
 private void collectRemove(string p) nothrow
 {
     try remove(p);
-    catch (Exception) {}
+    catch (Exception) {} // best-effort cleanup of a temp file (nothrow)
 }
 
 /// An advisory `flock` on `<scope>.jsonl.lock`, held for a read-modify-write.
@@ -883,9 +885,11 @@ string argumentText(const JSONValue args)
 {
     import std.uni : uniToLower = toLower;
     string out_;
-    void walk(const JSONValue v)
+    // Explicitly @safe: LDC fails to infer it for this recursive nested
+    // function once its `final switch` is built in release mode.
+    void walk(const JSONValue v) @safe
     {
-        switch (v.type)
+        final switch (v.type)
         {
         case JSONType.string: out_ ~= v.str.uniToLower ~ "\n"; break;
         case JSONType.array: foreach (i; v.arrayNoRef) walk(i); break;
@@ -898,7 +902,7 @@ string argumentText(const JSONValue args)
             }
             break;
         case JSONType.integer, JSONType.uinteger, JSONType.float_: out_ ~= v.toString ~ "\n"; break;
-        default: break;
+        case JSONType.null_, JSONType.true_, JSONType.false_: break;
         }
     }
     walk(args);
@@ -1033,7 +1037,7 @@ RecallNote[] recall(Store store, string tool, const JSONValue args, ref Recall s
     if (!haystack.strip.length) return null;
     Store.Scoped[] all_;
     try all_ = store.all();
-    catch (Exception) return null;
+    catch (Exception) return null; // recall is best effort: an unreadable store recalls nothing
     Store.Scoped[] matched;
     foreach (x; all_)
         if ((x.e.isRule || (x.e.id !in state.seen && x.e.id !in shown))
@@ -1071,7 +1075,7 @@ void logRecall(Store store, string event, string id, string tool, string session
         scope (exit) close(fd);
         writeFd(fd, line);
     }
-    catch (Exception) {}
+    catch (Exception) {} // the recall log is best-effort statistics
 }
 
 /// Per-id `[fired, used]` counts from the recall log (for `/memory`).
@@ -1080,12 +1084,12 @@ size_t[2][string] recallStats(Store store)
     size_t[2][string] stats;
     string text;
     try text = readText(buildPath(store.root, recallLog));
-    catch (Exception) return stats;
+    catch (Exception) return stats; // no recall log yet: no statistics
     foreach (line; text.splitLines)
     {
         JSONValue v;
         try v = parseJSON(line);
-        catch (Exception) continue;
+        catch (Exception) continue; // skip a torn or corrupt log line
         if (v.type != JSONType.object) continue;
         auto id = "id" in v, event = "event" in v;
         if (id is null || event is null || id.type != JSONType.string || event.type != JSONType.string) continue;

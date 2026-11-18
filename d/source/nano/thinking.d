@@ -567,7 +567,7 @@ Resolved resolve(const Thinking global, scope const(Thinking)* session, Provider
                 else if (t.isDefault) reserved ~= l;
                 else r.levels ~= l;
             }
-            catch (Exception) invalid ~= l;
+            catch (Exception) invalid ~= l; // a malformed level is listed as invalid, reported by the caller
         }
     }
     else if (reported !is null) r.levels = reported.levels.dup;

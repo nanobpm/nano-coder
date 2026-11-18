@@ -62,7 +62,7 @@ struct Outcome
         if (args.type == JSONType.string)
         {
             try args = parseJSON(args.str);
-            catch (Exception) args = JSONValue(null);
+            catch (Exception) args = JSONValue(null); // a non-JSON string argument has no outcome fields
         }
         auto st = args.type == JSONType.object ? "status" in args.objectNoRef : null;
         if (st is null || st.type != JSONType.string)

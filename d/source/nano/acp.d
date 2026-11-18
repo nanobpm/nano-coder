@@ -15,6 +15,7 @@
 module nano.acp;
 
 @safe:
+import nano.arith : saturatingSub;
 
 import nano.safeio : spawnDaemon, stdErr, stdOut;
 
@@ -113,8 +114,8 @@ string enforceSlashInvariant(ref string text)
 /// optional in ACP). Counters reset mid-turn by /clear never go negative.
 JSONValue turnUsage(const ulong[2] before, const ulong[2] after)
 {
-    auto input = after[0] > before[0] ? after[0] - before[0] : 0;
-    auto output = after[1] > before[1] ? after[1] - before[1] : 0;
+    auto input = saturatingSub(after[0], before[0]);
+    auto output = saturatingSub(after[1], before[1]);
     if (input == 0 && output == 0) return JSONValue(null);
     return JSONValue(["inputTokens": input, "outputTokens": output, "totalTokens": input + output]);
 }
@@ -253,7 +254,7 @@ struct AcpRouter
             if (st.turnActive)
             {
                 string steerText;
-                switch (classifyDuringTurn(msg, st.sessionId, steerText))
+                final switch (classifyDuringTurn(msg, st.sessionId, steerText))
                 {
                 case DuringTurn.cancel:
                     ctl.cancel();
@@ -263,7 +264,7 @@ struct AcpRouter
                     st.steerMarks ~= st.items.length;
                     ctl.steer(Steer(steerText, get(msg, "id")));
                     return null;
-                default:
+                case DuringTurn.defer:
                     break;
                 }
             }
@@ -715,7 +716,7 @@ final class AcpServer : AgentEvents
         if (restored.plan.type == JSONType.object)
         {
             try agent.plan = Plan.fromJSON(restored.plan);
-            catch (Exception) {}
+            catch (Exception) {} // a malformed saved plan is dropped; the session resumes without one
         }
         agent.resetSessionCounters();
         agent.repairDanglingToolCalls();
@@ -728,9 +729,9 @@ final class AcpServer : AgentEvents
     {
         foreach (m; agent.messages)
         {
-            switch (m.role)
+            final switch (m.role)
             {
-            default: break;
+            case Role.system: break;
             case Role.user: userMessage(m.content); break;
             case Role.assistant:
                 assistantMessage(m.content, null);
@@ -793,7 +794,7 @@ final class AcpServer : AgentEvents
 JSONValue[] requeueSteers(JSONValue[] deferred, Steer[] leftover, const(size_t)[] marks, string active)
 {
     import std.algorithm : min;
-    auto first = marks.length > leftover.length ? marks.length - leftover.length : 0;
+    auto first = saturatingSub(marks.length, leftover.length);
     foreach_reverse (i, s; leftover)
     {
         auto mark = first + i < marks.length ? marks[first + i] : deferred.length;

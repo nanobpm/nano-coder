@@ -8,6 +8,7 @@
 module nano.timers;
 
 @safe:
+import nano.arith : saturatingSub;
 
 import std.algorithm : canFind, sort, filter, map, any;
 import std.array : array, join;
@@ -168,7 +169,7 @@ struct Timers
         foreach (t; pending)
             s ~= format("%s. fired at %s, not done yet: %s\n", t.id, clock(t.dueAt), t.note.oneLine(200));
         foreach (t; items)
-            s ~= format("%s. %s (in %s): %s\n", t.id, clock(t.dueAt), describe(t.dueAt > now ? t.dueAt - now : 0),
+            s ~= format("%s. %s (in %s): %s\n", t.id, clock(t.dueAt), describe(saturatingSub(t.dueAt, now)),
                 t.note.oneLine(200));
         return s;
     }
@@ -226,7 +227,7 @@ string pendingNudge(const Timer[] pending, long now)
 {
     string s = "Fired timers you haven't marked done:\n";
     foreach (t; pending)
-        s ~= format("- %s (fired %s ago): %s\n", t.id, describe(now > t.dueAt ? now - t.dueAt : 0), t.note.oneLine(300));
+        s ~= format("- %s (fired %s ago): %s\n", t.id, describe(saturatingSub(now, t.dueAt)), t.note.oneLine(300));
     return s ~ "Handle them (now, or once the current step is finished) and call timer_done; timer_cancel drops one.";
 }
 

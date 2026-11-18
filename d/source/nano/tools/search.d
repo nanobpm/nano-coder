@@ -175,7 +175,7 @@ bool parseIgnoreLine(string raw, string relDir, out IgnoreRule r)
     else if (line.indexOf('/') >= 0) r.anchored = true;
     if (!line.length) return false;
     try r.re = regex(globToRegex(line));
-    catch (Exception) return false;
+    catch (Exception) return false; // an invalid pattern ignores nothing (git skips bad lines too)
     return true;
 }
 
@@ -276,7 +276,7 @@ string grep(JSONValue args, Denied denied = null)
         auto full = buildPath(base, rel);
         ubyte[] data;
         try data = readCapped(full, maxFileBytes);
-        catch (Exception) continue;
+        catch (Exception) continue; // unreadable files are skipped, as grep -s does
         if (data is null) continue; // over the cap
         if (looksBinary(data)) continue;
         auto shown = full.startsWith(cwd ~ "/") ? full[cwd.length + 1 .. $] : full;

@@ -49,7 +49,7 @@ struct ToolCall
                 return c;
             }
         }
-        catch (Exception) {}
+        catch (Exception) {} // invalid argument JSON is kept in invalidArguments below for the model to see
         c.arguments = JSONValue(string[string].init);
         c.invalidArguments = raw;
         return c;
@@ -193,12 +193,12 @@ void readCopilotAic(const JSONValue parent, ref TokenUsage usage) @safe
     auto n = "total_nano_aiu" in cu.objectNoRef;
     if (n is null) return;
     double nano;
-    switch (n.type)
+    final switch (n.type)
     {
         case JSONType.integer: nano = n.integer; break;
         case JSONType.uinteger: nano = n.uinteger; break;
         case JSONType.float_: nano = n.floating; break;
-        default: return;
+        case JSONType.null_, JSONType.string, JSONType.array, JSONType.object, JSONType.true_, JSONType.false_: return;
     }
     usage.hasAic = true;
     usage.aic = nano / 1e9;

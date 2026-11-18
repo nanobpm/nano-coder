@@ -288,7 +288,7 @@ void ensureDir(string path)
 {
     import std.file : exists, mkdirRecurse;
     try if (!exists(path)) mkdirRecurse(path);
-    catch (Exception) {}
+    catch (Exception) {} // the sandbox profile still lists the path; a missing dir just can't be written
 }
 
 string tempDirectory()
@@ -315,7 +315,7 @@ string[] gitDirs(string cwd) nothrow
             if (l.strip.length) dirs ~= joinPath(cwd, l.strip);
         return dirs;
     }
-    catch (Exception) return null;
+    catch (Exception) return null; // git missing or not a repository: no extra writable dirs
 }
 
 /// Whether `gitDir` is the per-worktree git directory of the worktree rooted
@@ -328,7 +328,7 @@ bool worktreeBackpointerWithin(string gitDir, string cwdReal) nothrow
         auto parent = parentOf(readText(joinPath(gitDir, "gitdir")).strip);
         return parent !is null && canonicalize(parent) == cwdReal;
     }
-    catch (Exception) return false;
+    catch (Exception) return false; // an unreadable gitdir file: not a linked worktree of this repo
 }
 
 version (unittest)
@@ -377,7 +377,7 @@ unittest
     assert(parseMode("workspace") == SandboxMode.workspace);
     assert(parseMode("read-only") == SandboxMode.readOnly);
     bool threw;
-    try parseMode("nope"); catch (Exception) threw = true;
+    try parseMode("nope"); catch (Exception) threw = true; // expected: an unknown mode must throw, which is what this test checks
     assert(threw);
     import nano.toml : parseToml;
     auto c = SandboxConfig.fromJSON(parseToml("mode = \"read-only\"\nnetwork = false"));

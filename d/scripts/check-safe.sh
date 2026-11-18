@@ -71,4 +71,39 @@ if ! find source -name '*.d' | sort | xargs awk '
     END { exit bad }'; then
     status=1
 fi
+# Size arithmetic: `size_t` wraps on underflow, so "what's left" is
+# `saturatingSub` from nano.arith, not a hand-written `a > b ? a - b : 0`
+# (easy to get subtly wrong), and arithmetic that must not wrap is
+# `checkedSub`/`checkedAdd`/`checkedMul`. In the token-budget modules
+# (context.d, agent.d) the raw subtractions left are capped by
+# scripts/subtraction-budget; most are index steps guarded on the same line.
+if code '([[:alnum:]_.]+) >=? ([[:alnum:]_.]+) \? \1 - \2 : 0' | grep -v '^source/nano/arith.d:' >&2; then
+    echo "Error: use nano.arith.saturatingSub(a, b) instead of \`a > b ? a - b : 0\`" >&2
+    status=1
+fi
+subs=$(awk '
+    /^[[:space:]]*(\/\/|\*)/ { next }
+    {
+        s = $0
+        gsub(/\\./, "", s); gsub(/"[^"]*"/, "\"\"", s); gsub(/`[^`]*`/, "``", s); sub(/\/\/.*/, "", s)
+        gsub(/\$[[:space:]]*-/, "", s)
+        n += gsub(/[[:alnum:]_)\]][[:space:]]+-[[:space:]]+[[:alnum:]_(]/, "", s)
+    }
+    END { print n + 0 }' source/nano/context.d source/nano/agent.d)
+ratchet "in context.d and agent.d" "$subs" scripts/subtraction-budget "raw subtractions"
+# Catches: a `catch (Exception)` that swallows (neither rethrows nor uses
+# the exception) says why in a `//` comment, so "deliberately best effort"
+# and "forgot to handle it" look different. `Throwable` and `Error` are
+# never caught. The number of `catch (Exception)` outside the *_test.d
+# modules is capped by scripts/catch-budget.
+if find source -name '*.d' ! -name '*_test.d' | sort | xargs awk -f scripts/catch.awk | grep . >&2; then
+    status=1
+fi
+ratchet "outside *_test.d" "$(find source -name '*.d' ! -name '*_test.d' | xargs grep -hE 'catch[[:space:]]*\([[:space:]]*Exception\b' | grep -vcE '^[[:space:]]*//')" scripts/catch-budget "\`catch (Exception)\`"
+# Exhaustiveness: a `switch` over an enum is a `final switch`, so adding a
+# member breaks the build wherever it isn't handled (Rust's `match`). Skipped
+# members are listed in a `case`, not hidden behind `default:`.
+if find source -name '*.d' | sort | xargs awk -f scripts/enum-switch.awk | grep . >&2; then
+    status=1
+fi
 exit $status

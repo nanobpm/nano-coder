@@ -10,6 +10,7 @@
 module nano.frame;
 
 @safe:
+import nano.arith : saturatingSub;
 
 import std.array : appender, replicate;
 import std.format : format;
@@ -349,7 +350,7 @@ final class FrameRenderer
         auto diff = firstDiff(prev, frame);
         if (diff < 0) return;
         auto prevPhysical = physicalRows(prev, width), newPhysical = physicalRows(frame, width);
-        auto prevTop = prev.length > height ? prev.length - height : 0;
+        auto prevTop = saturatingSub(prev.length, height);
         if (prevPhysical != newPhysical || diff < prevTop) return fullRedraw(frame, width, height);
         size_t before;
         foreach (l; frame[0 .. diff]) before += linePhysicalRows(l, width);
@@ -579,7 +580,7 @@ struct Transcript
                 foreach (f; folds[0 .. $ - 1])
                     if (f.id == id && f.expanded) { swap(folds.length - 1, true); break; }
         }
-        catch (Exception) {}
+        catch (Exception) {} // a malformed OSC from the terminal is ignored, like any unknown escape
     }
 
     /// Ctrl-O: swap the latest fold (with the others sharing its id) between
@@ -726,14 +727,14 @@ struct WorkClock
 
     long elapsed(long now) const pure nothrow
     {
-        return banked + (since >= 0 && now > since ? now - since : 0);
+        return banked + (since >= 0 ? saturatingSub(now, since) : 0);
     }
 
     /// Stop counting. Idempotent, so overlapping pauses never bank twice.
     void pause(long now) pure nothrow
     {
         if (since < 0) return;
-        banked += now > since ? now - since : 0;
+        banked += saturatingSub(now, since);
         since = -1;
     }
 

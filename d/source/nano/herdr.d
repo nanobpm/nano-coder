@@ -249,7 +249,7 @@ private void run(string bin, string[] args)
         auto devNull = File("/dev/null", "r+");
         pid = spawnProcess([bin] ~ args, devNull, devNull, devNull, null, Config.none);
     }
-    catch (Exception) return;
+    catch (Exception) return; // herdr missing or not runnable: the integration is best effort
     auto deadline = MonoTime.currTime + timeout;
     try
     {
@@ -265,7 +265,7 @@ private void run(string bin, string[] args)
             Thread.sleep(10.msecs);
         }
     }
-    catch (Exception) return;
+    catch (Exception) return; // waiting on herdr is best effort; never block or fail a turn on it
 }
 
 // rust: herdr.rs::pane_needs_all_herdr_variables

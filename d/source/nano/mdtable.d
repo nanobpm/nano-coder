@@ -8,6 +8,7 @@
 module nano.mdtable;
 
 @safe:
+import nano.arith : saturatingSub;
 
 import std.array : appender, join, replicate;
 import std.string : strip, stripRight;
@@ -101,7 +102,7 @@ private string[] wrap(string text, size_t w) pure
 private string pad(string text, size_t w, Align a) pure
 {
     auto tw = width(text);
-    auto gap = w > tw ? w - tw : 0;
+    auto gap = saturatingSub(w, tw);
     size_t l, r;
     final switch (a)
     {

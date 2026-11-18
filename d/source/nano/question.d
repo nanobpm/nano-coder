@@ -103,7 +103,7 @@ Question[] parse(JSONValue args)
     if (args.type == JSONType.string)
     {
         try args = parseJSON(args.str);
-        catch (Exception) args = JSONValue(null);
+        catch (Exception) args = JSONValue(null); // a non-JSON string is reported as missing questions below
     }
     JSONValue[] list;
     if (args.type == JSONType.object)

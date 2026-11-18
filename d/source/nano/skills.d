@@ -285,7 +285,7 @@ final class Skills
         if (args.type == JSONType.string)
         {
             try args = parseJSON(args.str);
-            catch (Exception) args = JSONValue(null);
+            catch (Exception) args = JSONValue(null); // a non-JSON string is reported as a missing name below
         }
         if (args.type != JSONType.object || "name" !in args || args["name"].type != JSONType.string)
             throw new ToolError(toolName ~ " needs `name`");
@@ -384,7 +384,7 @@ private bool readSkill(string dir, string nameOverride, Source source, out Skill
 {
     string text;
     try text = lossyUtf8(readBytes(buildPath(dir, skillFile)));
-    catch (Exception) return false;
+    catch (Exception) return false; // an unreadable SKILL.md is not a skill
     string[2][] fields;
     auto body_ = frontMatter(text, fields);
     string field(string key)
@@ -593,7 +593,7 @@ private string pluginSkillsDir(string plugin)
 private bool headIs(string dir, string commit)
 {
     try return readText(buildPath(dir, ".git", "HEAD")).strip == commit;
-    catch (Exception) return false;
+    catch (Exception) return false; // no HEAD (not a git checkout): not that commit
 }
 
 /// A checkout of the locked commit: the spm store's if it has one, else the
@@ -612,7 +612,7 @@ private string checkoutFor(const ref Locked locked, const ref SkillsConfig confi
     mkdirRecurse(locations.cache);
     auto dest = buildPath(locations.cache, locked.store);
     auto tmp = buildPath(locations.cache, format(".tmp-%s-%s", thisProcessID, locked.store));
-    void rm(string d) { try if (d.exists) rmdirRecurse(d); catch (Exception) {} }
+    void rm(string d) { try if (d.exists) rmdirRecurse(d); catch (Exception) {} } // best-effort cleanup of a scratch checkout
     rm(tmp);
     try fetchCommit(locked.git, locked.commit, tmp);
     catch (Exception e)
@@ -660,6 +660,7 @@ private void fetchCommit(string url, string sha, string dest)
     git(dest, ["init", "-q"]);
     git(dest, ["remote", "add", "origin", url]);
     try git(dest, ["fetch", "-q", "--depth", "1", "origin", sha]);
+    // servers that refuse fetching a bare commit: fetch everything instead
     catch (Exception) git(dest, ["fetch", "-q", "origin"]);
     git(dest, ["-c", "advice.detachedHead=false", "checkout", "-q", "--detach", sha]);
 }

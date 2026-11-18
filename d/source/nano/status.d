@@ -3,6 +3,7 @@
 module nano.status;
 
 @safe:
+import nano.arith : saturatingSub;
 
 import std.format : format;
 import std.conv : to;
@@ -224,7 +225,7 @@ string render(const ref Stats stats, size_t cols)
         auto overflow = total - cols;
         auto cwdW = cellWidth(stats.cwd);
         auto floor_ = cwdMinCells < cwdW ? cwdMinCells : cwdW;
-        auto budget = cwdW > overflow ? cwdW - overflow : 0;
+        auto budget = saturatingSub(cwdW, overflow);
         if (budget < floor_) budget = floor_;
         segments[cwdSegment].text = " " ~ elidePath(stats.cwd, budget) ~ " ";
     }
@@ -244,12 +245,12 @@ string render(const ref Stats stats, size_t cols)
             line ~= "│";
             used++;
         }
-        auto text = fitCells(s.text, cols > used ? cols - used : 0);
+        auto text = fitCells(s.text, saturatingSub(cols, used));
         used += cellWidth(text);
         if (s.color.length) line ~= s.color ~ text ~ BG;
         else line ~= text;
     }
-    line ~= repeatStr(" ", cols > used ? cols - used : 0);
+    line ~= repeatStr(" ", saturatingSub(cols, used));
     return line ~ RESET;
 }
 

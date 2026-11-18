@@ -3,6 +3,7 @@
 module nano.resume;
 
 @safe:
+import nano.arith : saturatingSub;
 
 import nano.safeio : stdErr, stdOut;
 
@@ -194,7 +195,7 @@ size_t physicalRows(string line, size_t cols)
 /// `maxVisible`; zero when the prompt already fills the screen.
 size_t itemWindow(size_t rows, size_t promptRows, size_t maxVisible)
 {
-    return min(maxVisible, rows > promptRows ? rows - promptRows : 0);
+    return min(maxVisible, saturatingSub(rows, promptRows));
 }
 
 /// The scroll offset that keeps `sel` inside a `maxVisible`-row window.
@@ -353,7 +354,7 @@ struct Picker
     long handle(Key k)
     {
         auto filtered = rank(items, search);
-        switch (k.kind)
+        final switch (k.kind)
         {
             case K.escape, K.interrupt, K.eof, K.closed: return -2;
             case K.submit:
@@ -376,7 +377,7 @@ struct Picker
                 foreach (dchar c; k.text) if (c >= 0x20 && c != 0x7f) search ~= c;
                 sel = top = 0;
                 return -1;
-            default: return -1;
+            case K.none, K.newline, K.left, K.right, K.home, K.end, K.wordLeft, K.wordRight, K.delete_, K.killEnd, K.clearLine, K.eraseWord, K.ignored, K.cycleMode, K.toggleExpand: return -1;
         }
     }
 }
@@ -463,7 +464,7 @@ Pick pickOutcome(string dir, string cwd, string exclude, out string id)
         if (hidden) items ~= format("Show all sessions (%s more in other directories)", hidden);
         auto prompt = showAll ? "Resume which session? (type to filter, Esc to cancel)"
             : format("Resume which session in %s? (type to filter, Esc to cancel)", sanitize(cwd));
-        auto p = Picker(prompt, items, cols > 4 ? cols - 4 : 0, true);
+        auto p = Picker(prompt, items, saturatingSub(cols, 4), true);
         auto r = runPicker(p, src, (string s) { writeFd(2, s); }, rows, cols, maxVisible);
         if (r < 0) return Pick.cancelled;
         if (r == shown.length) { showAll = true; continue; }

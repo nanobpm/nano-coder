@@ -185,7 +185,7 @@ class MuseClient : LLMClient, CapabilityProbe
             foreach (r; catalogRows(catalogJson(true)))
                 if (modelId(r) == p.model) { row = parseJSON(r.toString); break; }
         }
-        catch (Exception) return c;
+        catch (Exception) return c; // the catalogue is optional: keep the defaults
         if (row.type != JSONType.object) return c;
         c.thinking = Reported.fromModelEntry(row);
         if (c.thinking.isNull)

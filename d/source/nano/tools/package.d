@@ -104,7 +104,7 @@ long optInt(JSONValue args, string name, long def)
     {
         import std.conv : to;
         try return v.str.to!long;
-        catch (Exception) {}
+        catch (Exception) {} // not numeric: reported as a tool error just below
     }
     throw new ToolError(format(`argument "%s" must be an integer`, name));
 }

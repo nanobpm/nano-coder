@@ -191,7 +191,7 @@ bool ruleMatches(string ruleSrc, string tool, JSONValue args)
             foreach (cmd; expandAll(parse(c)))
                 if (rule.matches(commandText(cmd))) return true;
         }
-        catch (Exception) {}
+        catch (Exception) {} // unparsable: only the whole-command match above applies (as in Rust)
         return false;
     case Subject.path:
         auto path = stringArg(args, "path");
@@ -226,7 +226,7 @@ private string currentDir() nothrow
 {
     import std.file : getcwd;
     try return getcwd();
-    catch (Exception) return "/";
+    catch (Exception) return "/"; // a deleted cwd: resolve relative paths from /, which no allow rule covers
 }
 
 /// Checks tool calls against rules and the built-in guards.

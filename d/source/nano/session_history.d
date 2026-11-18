@@ -4,6 +4,7 @@
 module nano.session_history;
 
 @safe:
+import nano.arith : saturatingSub;
 
 import std.algorithm : canFind, startsWith, min;
 import std.array : join, split;
@@ -90,7 +91,7 @@ Entry[] load(string path)
             auto rec = parseJSON(line);
             if (rec["type"].str == "message") out_ ~= Entry(n, messageFromRecord(rec["data"]));
         }
-        catch (Exception) {}
+        catch (Exception) {} // skip a torn or corrupt line, like the resume loader does
     }
     return out_;
 }
@@ -152,10 +153,10 @@ private string snippet(string text, size_t start, size_t end)
     import std.utf : toUTF32, toUTF8, count;
     auto pre = text[0 .. start].toUTF32;
     auto lead = snippetChars / 3;
-    auto fromC = pre.length > lead ? pre.length - lead : 0;
+    auto fromC = saturatingSub(pre.length, lead);
     auto from = text[0 .. start].length - pre[fromC .. $].toUTF8.length;
     auto used = pre.length - fromC + text[start .. end].count;
-    auto room = snippetChars > used ? snippetChars - used : 0;
+    auto room = saturatingSub(snippetChars, used);
     auto post = text[end .. $].toUTF32;
     auto to_ = post.length > room ? end + post[0 .. room].toUTF8.length : text.length;
     auto out_ = text[from .. to_].split.join(" ");
@@ -174,7 +175,7 @@ string search(string path, JSONValue args)
     auto pattern = p.str;
     Regex!char re;
     try re = regex(pattern, "i");
-    catch (Exception) re = regex(escaper(pattern).to!string, "i");
+    catch (Exception) re = regex(escaper(pattern).to!string, "i"); // not a valid regex: search for the pattern literally instead
     string role;
     if (auto r = "role" in args.objectNoRef) if (r.type == JSONType.string) role = r.str;
     auto before = idArg(args, "before", false), after = idArg(args, "after", false);

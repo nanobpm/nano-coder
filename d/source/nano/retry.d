@@ -24,7 +24,7 @@ struct ErrorInfo
         e.status = status;
         JSONValue j;
         try j = parseJSON(body_);
-        catch (Exception) {}
+        catch (Exception) {} // a non-JSON error body: fall back to the raw text below
         JSONValue* err = j.type == JSONType.object ? "error" in j.objectNoRef : null;
         string field(string name)
         {
@@ -127,20 +127,20 @@ Duration parseRetryAfterHeader(string value, long nowUnix)
     import std.math : isFinite;
     value = value.strip;
     try return value.to!ulong.seconds;
-    catch (Exception) {}
+    catch (Exception) {} // not delta-seconds; try the other Retry-After forms
     try
     {
         auto s = value.to!double;
         if (isFinite(s) && s > 0) return usecsOf(s * 1e6);
     }
-    catch (Exception) {}
+    catch (Exception) {} // not fractional seconds; try an HTTP date
     try
     {
         import std.datetime.systime : parseRFC822DateTime;
         auto at = parseRFC822DateTime(value).toUnixTime;
         return at > nowUnix ? (at - nowUnix).seconds : Duration.zero;
     }
-    catch (Exception) {}
+    catch (Exception) {} // not an HTTP date either: no hint, use the normal backoff
     return Duration.zero;
 }
 
@@ -155,7 +155,7 @@ Duration parseRetryAfterMessage(string message)
     if (m.empty) return Duration.zero;
     double amount;
     try amount = m[1].to!double;
-    catch (Exception) return Duration.zero;
+    catch (Exception) return Duration.zero; // an unparsable amount gives no hint; use the normal backoff
     return m[2].toLower[0] == 'm' ? usecsOf(amount * 1e3) : usecsOf(amount * 1e6);
 }
 

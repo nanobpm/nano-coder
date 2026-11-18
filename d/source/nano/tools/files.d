@@ -5,6 +5,7 @@
 module nano.tools.files;
 
 @safe:
+import nano.arith : saturatingSub;
 
 import nano.safeio : ownText, readBytes, realPath, statMode, chmodPath;
 
@@ -182,6 +183,7 @@ void writeAtomically(string path, const(char)[] content, Expect expect, ReadStat
     catch (FileException e) throw new ToolError(format("%s: create %s: %s", tool, path.dirName, e.msg));
     import std.process : thisProcessID;
     auto tmp = buildPath(path.dirName, format(".%s.tmp-%s", path.baseName, thisProcessID));
+    // best-effort cleanup of the temp file; the original error propagates
     scope (failure) { try remove(tmp); catch (Exception) {} }
     try write(tmp, content);
     catch (FileException e) throw new ToolError(format("%s: write %s: %s", tool, tmp, e.msg));
@@ -584,7 +586,7 @@ string snippet(string text, const size_t[2][] ranges)
         auto region = text[r[0] .. r[1]];
         if (region.endsWith("\n")) region = region[0 .. $ - 1];
         auto last = min(first + region.count('\n'), mx);
-        spans ~= [first > 3 ? first - 3 : 0, min(last + 3, mx)];
+        spans ~= [saturatingSub(first, 3), min(last + 3, mx)];
     }
     spans.sort!((x, y) => x[0] != y[0] ? x[0] < y[0] : x[1] < y[1]);
     size_t[2][] merged;

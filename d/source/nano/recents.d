@@ -106,7 +106,7 @@ Recents load(string path) nothrow
             }
         }
     }
-    catch (Exception) return Recents.init;
+    catch (Exception) return Recents.init; // no recents file, or a corrupt one: start empty
     if (r.models.length > maxRecents) r.models = r.models[0 .. maxRecents];
     return r;
 }
@@ -121,7 +121,7 @@ void save(string path, const Recents r) nothrow
         mkdirRecurse(path.dirName);
         write(path, r.toJson);
     }
-    catch (Exception) {}
+    catch (Exception) {} // recents are a convenience; failing to save them never fails a model switch
 }
 
 // rust: providers/mod.rs::parses_model_specs

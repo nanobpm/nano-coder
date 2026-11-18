@@ -464,7 +464,7 @@ private bool idOf(const JSONValue v, out uint id)
             return true;
         }
     }
-    catch (Exception) {}
+    catch (Exception) {} // a non-numeric or out-of-range id is not an id
     return false;
 }
 
@@ -612,12 +612,12 @@ string checklist(const ref Plan plan, size_t width, bool color)
         }
         auto title = fitWidth(sanitizeLine(it.title), width);
         string line;
-        switch (it.status)
+        final switch (it.status)
         {
             case Status.done: line = green ~ "✔" ~ reset ~ " " ~ dim ~ title ~ reset; break;
             case Status.inProgress: line = bold ~ "◼ " ~ title ~ reset; break;
             case Status.blocked: line = red ~ "! " ~ title ~ reset; break;
-            default: line = dim ~ "☐" ~ reset ~ " " ~ title; break;
+            case Status.pending, Status.dropped: line = dim ~ "☐" ~ reset ~ " " ~ title; break;
         }
         out_ ~= "  " ~ line ~ "\n";
     }

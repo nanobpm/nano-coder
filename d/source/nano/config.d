@@ -248,7 +248,7 @@ long defaultTimeoutSecs()
         auto v = environment.get(providerTimeoutSecsEnv, "").strip.to!long;
         if (v > 0) return v;
     }
-    catch (Exception) {}
+    catch (Exception) {} // a non-numeric env value is ignored; use the default
     return defaultTimeoutSecsValue;
 }
 

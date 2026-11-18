@@ -90,7 +90,7 @@ string currentBranch(string dir)
         auto name = r.output.strip;
         return r.status == 0 && name.length ? name : null;
     }
-    catch (Exception) return null;
+    catch (Exception) return null; // git missing or not a repository: no branch
 }
 
 /// A resolved path operand.

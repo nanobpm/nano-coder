@@ -104,7 +104,7 @@ Key decode(ByteSource next, int timeoutMs, ref ubyte[] utf8)
             auto s = (() => cast(string) utf8.idup)();
             utf8 = null;
             import std.utf : validate;
-            try validate(s); catch (Exception) return Key(K.ignored);
+            try validate(s); catch (Exception) return Key(K.ignored); // invalid UTF-8 from the terminal is dropped, not inserted
             return Key(K.insert, s);
     }
 }
@@ -236,7 +236,7 @@ private uint[] splitNums(string s)
         auto colon = p.indexOf(':');
         if (colon >= 0) p = p[0 .. colon];
         try out_ ~= p.length ? p.to!uint : 1;
-        catch (Exception) out_ ~= 1;
+        catch (Exception) out_ ~= 1; // a malformed CSI parameter takes the default of 1, as terminals do
     }
     return out_;
 }
@@ -839,7 +839,7 @@ final class LineEditor
                 frameDraw(null);
                 return -2;
             }
-            switch (key.kind)
+            final switch (key.kind)
             {
                 case K.up: at = at ? at - 1 : labels.length - 1; break;
                 case K.down, K.tab: at = (at + 1) % labels.length; break;
@@ -855,7 +855,7 @@ final class LineEditor
                     if (key.text.length == 1 && key.text[0].isDigit && key.text[0] != '0'
                             && key.text[0] - '1' < labels.length) at = key.text[0] - '1';
                     break;
-                default: break;
+                case K.none, K.newline, K.left, K.right, K.home, K.end, K.wordLeft, K.wordRight, K.backspace, K.delete_, K.killEnd, K.clearLine, K.eraseWord, K.paste, K.ignored, K.cycleMode, K.toggleExpand: break;
             }
             draw(false);
         }

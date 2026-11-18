@@ -178,7 +178,7 @@ private string inputText(const(char)[] line)
         if (rec["type"].str != "input") return null;
         return rec["data"]["text"].str;
     }
-    catch (Exception) return null;
+    catch (Exception) return null; // a corrupt line has no input text
 }
 
 /// Fold every committed input record in `path` after byte offset `from`
@@ -221,7 +221,7 @@ Summary summarize(string path)
                 if (auto m = "model" in d) if (m.type == JSONType.string) s.model = m.str;
             }
         }
-        catch (Exception) {}
+        catch (Exception) {} // skip a corrupt line; a missing header is reported just below
     }
     if (!ok) throw new Exception(format("session log %s has no resumable header", path));
     foreach (line; lines[1 .. $])
@@ -237,7 +237,7 @@ private string indexPath(string dir)
 private ulong sizeOr0(string path)
 {
     try return getSize(path);
-    catch (Exception) return 0;
+    catch (Exception) return 0; // no file: size 0
 }
 
 /// Index lines parsed into `map` (latest wins, titles monotonic). Unreadable
@@ -251,7 +251,7 @@ private void mergeLines(const(ubyte)[] bytes, ref Summary[string] map, ref size_
         lines++;
         Summary s;
         try s = Summary.fromJson(line);
-        catch (Exception) continue;
+        catch (Exception) continue; // skip a corrupt index line; the log rebuilds it
         // A later line without a title must not hide one an earlier line recorded.
         if (s.title is null)
             if (auto prev = s.id in map) s.title = prev.title;
@@ -266,7 +266,7 @@ private Summary[string] load(string dir, out size_t lines)
     Summary[string] map;
     ubyte[] bytes;
     try bytes = readBytes(indexPath(dir));
-    catch (Exception) return map;
+    catch (Exception) return map; // no index yet: start empty and rebuild
     mergeLines(bytes, map, lines);
     return map;
 }
@@ -309,7 +309,7 @@ private void rewrite(string dir, const Summary[string] summaries, ulong since)
             mergeLines(rest, merged, n);
         }
     }
-    catch (Exception) {}
+    catch (Exception) {} // lines appended since are lost to this rewrite only; the logs rebuild them
     auto ids = merged.keys.sort.array;
     string text;
     foreach (id; ids) text ~= merged[id].toJson ~ "\n";
@@ -454,7 +454,7 @@ Summary[] list(string dir)
         if (name.extension != ".jsonl" || name == indexFile) continue;
         auto id = name.stripExtension;
         try validateId(id);
-        catch (Exception) continue;
+        catch (Exception) continue; // not a session log name: skip
         if (!e.isFile) continue;
         auto size = e.size;
         Summary s;

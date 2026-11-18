@@ -238,7 +238,7 @@ class OpenAIClient : LLMClient, CapabilityProbe
             if (status < 200 || status >= 300) return JSONValue.init;
             return parseJSON(text);
         }
-        catch (Exception) return JSONValue.init;
+        catch (Exception) return JSONValue.init; // a failed probe means "unknown"; the caller keeps its defaults
     }
 
     /// Whether probing is worth a startup round trip: Copilot, or a local
@@ -714,7 +714,7 @@ void ollamaWindow(JSONValue ps, JSONValue show, string model, ref Capabilities c
             auto n = l["num_ctx".length .. $].strip.to!size_t;
             if (n > 0) { c.window = n; c.windowSource = "Ollama num_ctx"; return; }
         }
-        catch (Exception) {}
+        catch (Exception) {} // a non-numeric num_ctx: fall back to the other window sources
     }
 }
 

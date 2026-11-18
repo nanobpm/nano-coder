@@ -3,6 +3,7 @@
 module nano.agent;
 
 @safe:
+import nano.arith : checkedMul, checkedSub, saturatingSub;
 
 import nano.safeio : Isolated, JoinHandle, spawnDaemon, stdErr, stdOut;
 
@@ -239,7 +240,7 @@ class Agent
                         hasOutcome = true;
                         return true;
                     }
-                    catch (Exception) {}
+                    catch (Exception) {} // malformed outcome arguments: not a recorded outcome, keep scanning
                 }
         return false;
     }
@@ -366,7 +367,7 @@ class Agent
     {
         import std.file : getSize;
         try return getSize(log.path);
-        catch (Exception) return 0;
+        catch (Exception) return 0; // no log file yet (or unreadable): treat as empty
     }
 
     /// Keep the `--resume` picker's summary current (only a cache: the picker
@@ -376,7 +377,7 @@ class Agent
         import nano.session_index : update, Summary;
         Summary s;
         try s = update(log.path, from, client.providerName ~ "/" ~ client.modelName);
-        catch (Exception) return;
+        catch (Exception) return; // indexing is best effort; the session log itself is intact
         requestTitle(s);
     }
 
@@ -483,7 +484,7 @@ class Agent
             {
                 // The final answer was recorded but the turn end was not:
                 // rebuild the whole answer, the chunks before it included.
-                auto end = messages.length - 1;
+                auto end = checkedSub(messages.length, 1);
                 auto boundary = min(pending.hasBase ? pending.base : pos, end);
                 auto rc = replayContinuation(pending, messages[boundary .. end]);
                 outcomeFrom(messages[pos .. $]);
@@ -612,7 +613,7 @@ class Agent
                 import nano.thinking : setSession;
                 // Checked when it was typed, so this can't fail.
                 try setSession(sessionThinking, level);
-                catch (Exception) {}
+                catch (Exception) {} // the level was validated when typed, so this can't fail
             }
             LLMResponse r;
             import std.datetime.stopwatch : StopWatch, AutoStart;
@@ -1041,7 +1042,8 @@ class Agent
         auto window = contextWindow();
         auto reserved = (outputBase < ctx.minOutputReserve ? outputBase : ctx.minOutputReserve) + ctx.outputMargin(window);
         double limit = window * threshold;
-        if (window > reserved && window - reserved < limit) limit = window - reserved;
+        auto headroom = saturatingSub(window, reserved);
+        if (headroom && headroom < limit) limit = headroom;
         return tokens > limit && tokens > compactFloor + window / 10;
     }
 
@@ -1162,7 +1164,7 @@ class Agent
         if (!result.startsWith(`{"image":`)) return result;
         JSONValue image;
         try image = parseJSON(result)["image"];
-        catch (Exception) return result;
+        catch (Exception) return result; // not image JSON after all: pass the text through unchanged
         string str(string k) { auto p = jsonGet(image, k); return p && p.type == JSONType.string ? p.str : ""; }
         auto path = str("path");
         auto v = vision();
@@ -1201,13 +1203,13 @@ class Agent
             auto combined = combinedWindow();
             if (!combined) return maxTokens;
             auto usedC = estimateContextTokens() + ctx.outputMargin(combined);
-            long roomC = combined > usedC ? cast(long)(combined - usedC) : 0;
+            long roomC = cast(long) saturatingSub(combined, usedC);
             auto c = maxTokens < roomC ? maxTokens : roomC;
             return c < 1 ? 1 : c;
         }
         auto window = contextWindow();
         auto used = estimateContextTokens() + ctx.outputMargin(window);
-        long room = window > used ? cast(long)(window - used) : 0;
+        long room = cast(long) saturatingSub(window, used);
         auto n = maxTokens < room ? maxTokens : room;
         return n < 1 ? 1 : n;
     }
@@ -1256,8 +1258,8 @@ class Agent
         bool truncated, retried;
         for (;;)
         {
-            auto inputWindow = window > cast(size_t) budget ? window - cast(size_t) budget : 0;
-            auto chars = (inputWindow > 4_000 ? inputWindow - 2_000 : 2_000) * 3;
+            auto inputWindow = saturatingSub(window, budget);
+            auto chars = checkedMul(max(saturatingSub(inputWindow, 2_000), 2_000), 3);
             auto request = "Conversation to summarize:\n\n" ~ ctx.renderTranscript(summarized, chars, smart);
             if (focus.strip.length) request ~= "\n\nWhen summarizing, focus on: " ~ focus.strip;
             ChatRequest req;
@@ -1332,7 +1334,7 @@ class Agent
                 next ~= Message.user(pending.text);
                 pendingPos = next.length - 1;
             }
-            else pendingPos = pending.position - split + next.length;
+            else pendingPos = checkedSub(pending.position, split) + next.length;
         }
         next ~= messages[split .. $];
         if (trigger != CompactTrigger.manual)
@@ -1360,7 +1362,7 @@ class Agent
             recallState = mem.Recall.init;
             recallChanged();
         }
-        report = CompactReport(len, messages.length, tokensBefore, estimateContextTokens(), split - bodyStart,
+        report = CompactReport(len, messages.length, tokensBefore, estimateContextTokens(), checkedSub(split, bodyStart),
             fallback, truncated, m);
         // Nested instructions attached to folded tool results may be gone.
         if (instructions !is null) instructions.forgetNested();
@@ -1592,7 +1594,7 @@ class Agent
                 foreach (id; recallState.noteSeenIn(result)) mem.logRecall(memory, "used", id, tool, session);
             return null;
         }
-        auto budget = mem.recallNotesPerTurn > recallTurnNotes ? mem.recallNotesPerTurn - recallTurnNotes : 0;
+        auto budget = saturatingSub(mem.recallNotesPerTurn, recallTurnNotes);
         auto notes = mem.recall(memory, tool, args, recallState, indexShown, budget);
         string[] texts;
         foreach (n; notes)
@@ -2305,7 +2307,7 @@ unittest
         LLMResponse("!error:context length exceeded")];
     bool threw;
     try c.run("again", new NullEvents);
-    catch (Exception e) threw = true;
+    catch (Exception e) threw = true; // expected: the run must throw, which is what this test checks
     assert(threw);
 
     // An output-cap error lowers max_tokens and retries once.

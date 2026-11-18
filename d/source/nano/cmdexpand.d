@@ -135,7 +135,7 @@ bool regexReaches(string pattern, const string[] targets)
             if (!matchFirst(t, r).empty) return true;
         return false;
     }
-    catch (Exception) return true;
+    catch (Exception) return true; // an unparsable pattern might reach anything: answer yes, the safe side
 }
 
 /// Whether a `.git` directory exists at or below `root` (symlinks not
@@ -161,7 +161,7 @@ bool containsGitDir(string root)
                 stack ~= e.name;
             }
         }
-        catch (Exception) continue;
+        catch (Exception) continue; // an unreadable directory can't hold a .git we could reach; skip it
     }
     return false;
 }
@@ -1729,7 +1729,7 @@ void collectAssignments(const Simple[] commands, size_t depth, ref Known[string]
         {
             Simple[] inner;
             try inner = parseNested(script, depth);
-            catch (Exception) continue;
+            catch (Exception) continue; // an unparsable nested script contributes no assignments
             collectAssignments(inner, depth + 1, out_);
         }
     }
@@ -1813,7 +1813,7 @@ void collectLoopBoundVars(const Simple[] commands, size_t depth, ref bool[string
             {
                 Simple[] inner;
                 try inner = parseNested(script, depth);
-                catch (Exception) continue;
+                catch (Exception) continue; // an unparsable nested script binds no loop variables
                 collectLoopBoundVars(inner, depth + 1, out_);
             }
     }

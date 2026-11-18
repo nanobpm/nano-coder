@@ -110,14 +110,14 @@ private bool isFile_(string p) nothrow
 {
     import std.file : exists, isFile;
     try return exists(p) && isFile(p);
-    catch (Exception) return false;
+    catch (Exception) return false; // unreadable counts as absent (nothrow probe)
 }
 
 private bool isDir_(string p) nothrow
 {
     import std.file : exists, isDir;
     try return exists(p) && isDir(p);
-    catch (Exception) return false;
+    catch (Exception) return false; // unreadable counts as absent (nothrow probe)
 }
 
 private string canonOr(string p) { auto c = canonicalize(p); return c !is null ? c : p; }
@@ -131,7 +131,7 @@ string readCapped(string path)
     if (!isFile_(path)) return null;
     string raw;
     try raw = sanitize(readRawText(path));
-    catch (Exception) return null;
+    catch (Exception) return null; // unreadable instructions file: treated as absent
     auto text = stripHtmlComments(raw).strip;
     if (!text.length) return null;
     if (text.length <= maxFileBytes) return text;
@@ -436,7 +436,7 @@ private Regex!char[] compilePatterns(const string[] patterns)
         foreach (e; expandBraces(q, budget))
         {
             try out_ ~= regex(pathGlob(e));
-            catch (Exception) {}
+            catch (Exception) {} // an invalid glob in a paths: list matches nothing; the others still apply
         }
     }
     return out_;
@@ -458,7 +458,7 @@ private string[] markdownFiles(string dir, string root, bool allowOutside)
         visited[real_] = true;
         string[] paths;
         try foreach (e; dirEntries(d, SpanMode.shallow, false)) paths ~= e.name;
-        catch (Exception) return;
+        catch (Exception) return; // an unreadable directory contributes no instruction files
         paths.sort();
         foreach (p; paths)
         {
