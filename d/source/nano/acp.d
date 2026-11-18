@@ -709,6 +709,8 @@ final class AcpServer : AgentEvents
         agent.historyAvailable = restored.historyAvailable;
         agent.historyHintPending = restored.historyAvailable && !restored.historyHintConsumed;
         agent.pinStash = restored.pinStash;
+        agent.replayStash = restored.replayStash;
+        agent.replayRestated = restored.replayRestated;
         agent.adoptPending(restored);
         auto log = new SessionLog(path);
         agent.log = some(log);
@@ -732,7 +734,7 @@ final class AcpServer : AgentEvents
     /// Replay the conversation as session/update notifications.
     private void replayHistory()
     {
-        foreach (m; agent.messages)
+        foreach (m; agent.replayMessages)
         {
             final switch (m.role)
             {

@@ -18,6 +18,7 @@ import std.process : environment;
 import std.algorithm : sort, filter, map;
 import std.array : array;
 import nano.llm;
+import nano.option : Option, some, ifSome;
 
 /// The session log directory: `NANO_CODER_D_SESSIONS`, else the configured
 /// `session_dir` (`~` expanded), else the platform data folder.
@@ -325,8 +326,12 @@ class SessionLog
     /// rebuilds the pinned block from them).
     /// `pending`: an in-flight input that survives the replacement (a
     /// mid-turn compaction), with its continuation snapshot.
+    /// `folded`: the real turns this compaction folded, extending the first
+    /// `foldedBase` turns of the previous stash when that is set; `restated`:
+    /// the index of the restated in-flight input in `messages`.
     void replace(const Message[] messages, ulong first = 0, ulong last = 0, string mode = null, string model = null,
-        const Message[] pinStash = null, scope const(PendingInput)* pending = null)
+        const Message[] pinStash = null, scope const(PendingInput)* pending = null, const Message[] folded = null,
+        Option!size_t foldedBase = Option!size_t.init, Option!size_t restated = Option!size_t.init)
     {
         JSONValue[] ms;
         foreach (ref m; messages) ms ~= messageRecord(m);
@@ -344,6 +349,14 @@ class SessionLog
             if (pending.hasContinuation) d["continuation"] = JSONValue([JSONValue(pending.answer), JSONValue(pending.count)]);
             if (pending.recallNotes) d["pending_recall_notes"] = pending.recallNotes;
         }
+        if (folded.length || foldedBase.isSome)
+        {
+            JSONValue[] fs;
+            foreach (ref m; folded) fs ~= messageRecord(m);
+            d["folded"] = fs;
+            foldedBase.ifSome((size_t b) { d["folded_base"] = b; });
+        }
+        restated.ifSome((size_t i) { d["restated"] = i; });
         if (first) d["summarized"] = JSONValue([JSONValue(first), JSONValue(last)]);
         if (mode !is null) d["mode"] = mode;
         if (model !is null) d["model"] = model;
@@ -417,6 +430,13 @@ struct Restored
     /// The user requests folded by compactions (`pinned_requests`, or a Rust
     /// log's `folded` stash), for rebuilding the pinned block.
     Message[] pinStash;
+    /// The real turns folded by the compactions since the last plain
+    /// replacement (Rust's `folded` stash): a replay shows these in place of
+    /// the synthetic summary.
+    Message[] replayStash;
+    /// Index, in the compacted conversation, of the restated in-flight input
+    /// the latest compaction folded (its original is in `replayStash`).
+    Option!size_t replayRestated;
     /// The latest compaction was smart: the history tools are offered.
     bool historyAvailable;
     /// The one-time history hint was already shown after that compaction.
@@ -558,6 +578,10 @@ Restored restore(string path)
                     if (full.length) { rustStash = full; active = true; }
                 }
                 if (!active) rustStash = null;
+                r.replayStash = rustStash.dup;
+                r.replayRestated = Option!size_t.init;
+                if (auto at = "restated" in data)
+                    if (active && at.type == JSONType.integer && at.integer >= 0) r.replayRestated = some(cast(size_t) at.integer);
                 auto pins = "pinned_requests" in data;
                 r.pinStash = pins !is null ? decode(*pins, inputs) : rustStash.dup;
             }

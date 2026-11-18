@@ -260,6 +260,12 @@ class Agent
     /// compaction rebuilds the pinned block from originals (Rust's
     /// `pre_compaction_transcript`, trimmed to requests).
     Message[] pinStash;
+    /// The real turns folded by compactions since the last plain replacement:
+    /// a replay (ACP session/load) shows them in place of the summary.
+    Message[] replayStash;
+    /// Index of the restated in-flight input the latest compaction folded;
+    /// a replay skips it, its original being in `replayStash`.
+    Option!size_t replayRestated;
     /// The configured `context_window` (0: none), and whether the top-level
     /// key or the provider's set it (`contextWindow`'s source).
     size_t configuredWindow;
@@ -1393,6 +1399,18 @@ class Agent
         foreach (ref x; summarized)
             if (ctx.isUserRequest(x)) pinStash ~= x;
 
+        // The newly folded real turns for the replay stash. On a repeated
+        // compaction the first folded message is the previous summary, whose
+        // turns are already stashed, and a previous restatement is dropped.
+        immutable extendsStash = replayStash.length > 0;
+        Message[] folded;
+        foreach (i, ref x; summarized)
+        {
+            if (extendsStash && i == 0) continue;
+            if (extendsStash && replayRestated.match!(r => r == bodyStart + i, () => false)) continue;
+            folded ~= x;
+        }
+
         Message[] next = messages[0 .. bodyStart].dup;
         next ~= Message.user(summary);
         next[$ - 1].timestamp = nowStamp();
@@ -1417,6 +1435,10 @@ class Agent
         }
         messages = next;
         calibLen = 0;
+        size_t stashBase = replayStash.length;
+        replayStash = extendsStash ? replayStash ~ folded : folded;
+        replayRestated = replayStash.length && hasPending && pending.position < split
+            ? some(pendingPos) : Option!size_t.init;
         if (hasPending)
         {
             pending.position = pendingPos;
@@ -1425,7 +1447,7 @@ class Agent
         }
         log.ifSome((SessionLog l) {
             l.replace(messages, first, last, ctx.modeName(m), client.providerName ~ "/" ~ client.modelName, pinStash,
-                hasPending ? &pending : null);
+                hasPending ? &pending : null, folded, extendsStash ? some(stashBase) : Option!size_t.init, replayRestated);
         });
         // The replacement drops recalled notes' full text from context, so
         // every memory may be recalled again (except those the retained
@@ -1588,6 +1610,23 @@ class Agent
     bool historyHintPending;
     bool historyEnabled() const { return log.isSome && historyAvailable; }
 
+    /// The messages a replay shows (Rust `replay_history`): the stashed
+    /// pre-compaction turns, then the conversation without its synthetic
+    /// summary (the first non-system message) or the restated input.
+    const(Message)[] replayMessages() const
+    {
+        if (!replayStash.length) return messages;
+        const(Message)[] o = replayStash;
+        bool skipped;
+        foreach (i, ref m; messages)
+        {
+            if (!skipped && m.role != Role.system) { skipped = true; continue; }
+            if (replayRestated.match!(r => r == i, () => false)) continue;
+            o ~= m;
+        }
+        return o;
+    }
+
     /// Start a fresh session in place (Rust `new_session`, for `/restart`):
     /// the conversation is just `system`, logged to `newLog` (none: not
     /// persisted); mode, session thinking, plan, timers, reminders, hook session,
@@ -1611,6 +1650,8 @@ class Agent
         compactFloor = 0;
         resetIdleCompaction();
         pinStash = null;
+        replayStash = null;
+        replayRestated = Option!size_t.init;
         hasPending = false;
         historyAvailable = historyHintPending = false;
         recallState = mem.Recall.init;
