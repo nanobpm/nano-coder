@@ -1327,47 +1327,47 @@ turn_commands.rs::timing_sorts_commands_by_what_they_touch	todo
 turn_commands.rs::tools_listing_follows_live_history_availability	todo
 turn_commands.rs::tools_listing_follows_the_live_mode	todo
 turn_commands.rs::trajectory_without_a_session_says_so	todo
-ui.rs::a_paused_work_clock_freezes_the_prompt_and_resumes	todo
-ui.rs::a_spinner_tick_reuses_the_wrapped_transcript	todo
+ui.rs::a_paused_work_clock_freezes_the_prompt_and_resumes	test
+ui.rs::a_spinner_tick_reuses_the_wrapped_transcript	na	D has no item model or wrapped-transcript cache: the frame thread re-wraps the byte transcript per render
 ui.rs::assistant_message_reconciles_a_partial_stream	todo
-ui.rs::begin_turn_supersedes_a_transient_hint	todo
-ui.rs::clear_transient_drops_a_hint_before_the_turn_ends	todo
-ui.rs::deferred_notes_and_raw_exports_keep_submission_order	todo
-ui.rs::entering_quiet_alone_does_not_flag_truncation	todo
-ui.rs::frame_batch_defers_rendering_until_the_batch_ends	todo
-ui.rs::frame_quiet_preserves_a_model_switch_failure	todo
-ui.rs::fully_quiet_final_answer_closed_by_a_louder_message_is_not_reprinted	todo
-ui.rs::non_streamed_final_message_clears_an_earlier_suppressed_segments_guard	todo
-ui.rs::non_streamed_thinking_event_still_emits_summary	todo
+ui.rs::begin_turn_supersedes_a_transient_hint	na	D transient hints are the line editor hint, outside the transcript and cleared per read
+ui.rs::clear_transient_drops_a_hint_before_the_turn_ends	na	D transient hints are the line editor hint, outside the transcript and cleared per read
+ui.rs::deferred_notes_and_raw_exports_keep_submission_order	na	D has no deferral queue: a note or export ends the answer line and prints at once, in order
+ui.rs::entering_quiet_alone_does_not_flag_truncation	test
+ui.rs::frame_batch_defers_rendering_until_the_batch_ends	na	D has no frame batch API: output reaches the frame as pipe bytes, drained and rendered together
+ui.rs::frame_quiet_preserves_a_model_switch_failure	na	D Console.note is not gated by quiet; the switch failure is a note (app.d onModelRequest)
+ui.rs::fully_quiet_final_answer_closed_by_a_louder_message_is_not_reprinted	na	D never prints a non-streamed message inline; the end-of-turn print is the single copy
+ui.rs::non_streamed_final_message_clears_an_earlier_suppressed_segments_guard	test
+ui.rs::non_streamed_thinking_event_still_emits_summary	na	D frame has no thinking items; Screen.endReasoning prints non-streamed reasoning once
 ui.rs::parses_and_orders_verbosity	test
 ui.rs::pausing_and_resuming_the_work_clock_is_idempotent	test
-ui.rs::plain_tool_result_strips_terminal_escapes	gap	D frame sanitizes rendered lines, but plain (non-frame) tool previews pass escapes through; no matching test
+ui.rs::plain_tool_result_strips_terminal_escapes	test
 ui.rs::plan_checklist_sanitizes_model_controlled_titles	test
-ui.rs::prompt_glyph_and_hint_say_whose_turn_it_is	todo
-ui.rs::quiet_assistant_message_closes_the_plain_stream	todo
-ui.rs::raw_export_is_kept_in_the_frame_transcript	todo
-ui.rs::raw_export_mid_stream_does_not_duplicate_the_answer	todo
+ui.rs::prompt_glyph_and_hint_say_whose_turn_it_is	test
+ui.rs::quiet_assistant_message_closes_the_plain_stream	test
+ui.rs::raw_export_is_kept_in_the_frame_transcript	na	D frame transcript is the stdout byte stream, so printed exports are kept by construction
+ui.rs::raw_export_mid_stream_does_not_duplicate_the_answer	na	D frame transcript is the stdout byte stream; no message items to duplicate
 ui.rs::response_restart_discards_the_partial_in_frame_mode	gap	D has no response-reset UI event: a partial reply already printed before a mid-reply drop stays on screen
 ui.rs::response_restart_resets_frame_stream_even_when_quiet	gap	D has no response-reset UI event: a partial reply already printed before a mid-reply drop stays on screen
-ui.rs::response_restart_resets_the_plain_stream	gap	D has no response-reset UI event: a partial reply already printed before a mid-reply drop stays on screen
+ui.rs::response_restart_resets_the_plain_stream	test
 ui.rs::stamps_the_first_line_and_aligns_the_rest	test
-ui.rs::streamed_reasoning_then_text_emits_one_thinking_summary	todo
-ui.rs::summarizes_tool_calls	todo
-ui.rs::the_prompt_spins_during_a_turn_and_shows_ready_after	todo
-ui.rs::the_transcript_cache_invalidates_when_items_change	todo
-ui.rs::tool_args_text_keeps_malformed_arguments_verbatim	gap	not ported
+ui.rs::streamed_reasoning_then_text_emits_one_thinking_summary	na	D frame has no thinking items; Screen.endReasoning skips reasoning that already streamed
+ui.rs::summarizes_tool_calls	test
+ui.rs::the_prompt_spins_during_a_turn_and_shows_ready_after	test
+ui.rs::the_transcript_cache_invalidates_when_items_change	na	D has no item model or wrapped-transcript cache: the frame thread re-wraps the byte transcript per render
+ui.rs::tool_args_text_keeps_malformed_arguments_verbatim	test
 ui.rs::tool_result_inherits_expansion_from_its_call	test
 ui.rs::trailing_thinking_merges_interleaved_reasoning_fragments	gap	D prints reasoning as it streams; no trailing-thinking reconciliation
 ui.rs::trailing_thinking_never_overwrites_previous_response_reasoning	gap	D prints reasoning as it streams; no trailing-thinking reconciliation
 ui.rs::trailing_thinking_reconciles_truncated_streamed_reasoning	gap	D prints reasoning as it streams; no trailing-thinking reconciliation
-ui.rs::transient_note_stays_out_of_the_transcript_and_clears_on_turn_end	todo
-ui.rs::truncation_guard_resets_per_answer_segment	todo
-ui.rs::truncation_guard_tracks_suppressed_deltas_not_quiet_start	todo
-ui.rs::turn_raw_at_a_line_boundary_prints_without_deferring	todo
-ui.rs::turn_raw_defers_while_answer_text_is_mid_line	todo
-ui.rs::user_message_event_is_recorded_in_frame_transcript	todo
-ui.rs::verbosity_guard_owner_tracks_reentrancy_and_handoff	todo
-ui.rs::waiting_for_user_input_does_not_count_as_working_time	todo
+ui.rs::transient_note_stays_out_of_the_transcript_and_clears_on_turn_end	na	D transient hints are the line editor hint, outside the transcript and cleared per read
+ui.rs::truncation_guard_resets_per_answer_segment	test
+ui.rs::truncation_guard_tracks_suppressed_deltas_not_quiet_start	test
+ui.rs::turn_raw_at_a_line_boundary_prints_without_deferring	na	D has no deferral queue: a note or export ends the answer line and prints at once, in order
+ui.rs::turn_raw_defers_while_answer_text_is_mid_line	na	D has no deferral queue: a note or export ends the answer line and prints at once, in order
+ui.rs::user_message_event_is_recorded_in_frame_transcript	na	D frame transcript is the stdout byte stream; userMessage prints into it
+ui.rs::verbosity_guard_owner_tracks_reentrancy_and_handoff	na	Rust thread-owner verbosity guard; D verbosity is one atomic
+ui.rs::waiting_for_user_input_does_not_count_as_working_time	test
 update.rs::a_brew_check_reads_the_tap_formula	na	D ships only via npm (@nanobpm/nano-coder-d); no tarballs or Homebrew formula, so no brew channel (Rust #188)
 update.rs::a_due_background_check_waits_for_an_in_flight_one_without_spinning	na	D checker is one thread sending hints over a channel; no shared in-flight state or waiter
 update.rs::a_failed_check_is_silent_and_cheap	test

@@ -929,7 +929,18 @@ class Console : AgentEvents
     /// that turns louder mid-answer reprints the whole answer).
     bool quiet() const { return verbosity == Verbosity.quiet; }
     string finalAnswer;
+    /// Whether the answer segment streaming now, or the last one closed,
+    /// had deltas dropped while quiet. Per segment (ui.rs truncation
+    /// guard): a suppressed intermediate answer doesn't make a final answer
+    /// that streamed in full reprint.
     bool droppedAnswer;
+    private bool segmentDropped;
+
+    /// A new turn: nothing dropped yet.
+    void beginAnswerGuard() { droppedAnswer = segmentDropped = false; }
+
+    /// Whether the turn's final answer has to be printed again at the end.
+    bool answerMayBeTruncated() const { return segmentDropped || droppedAnswer; }
     bool renderMarkdown() const { return tty && color; }
 
     /// A whole answer as shown on this console: markdown rendered for a
@@ -964,9 +975,11 @@ class Console : AgentEvents
             auto rate = meter.record(chunk.length, nowMs);
             if (rate > 0) updateStatus((ref Stats s) { if (s.activity == Activity.thinking) s.tokensPerSec = rate; });
         }
+        // An answer delta belongs to a new segment: the closed one's guard ends.
+        if (!reasoning && chunk.length) droppedAnswer = false;
         if (quiet)
         {
-            if (!reasoning && chunk.length) droppedAnswer = true;
+            if (!reasoning && chunk.length) segmentDropped = true;
             return;
         }
         link.screen.update((ref Screen s) { s.text(reasoning, chunk); });
@@ -1040,13 +1053,19 @@ class Console : AgentEvents
     /// instead of joining the stale prefix.
     void responseRestarted()
     {
+        segmentDropped = false;
         if (!quiet) endLine();
     }
 
     void assistantMessage(string text, string reasoning)
     {
         finalAnswer = text;
-        if (quiet) return;
+        // The segment closes: its guard is the turn's until the next one.
+        droppedAnswer = segmentDropped;
+        segmentDropped = false;
+        // Quiet still closes a segment that streamed before the switch, so
+        // the next answer starts its own line (ui.rs).
+        if (quiet) { endLine(); return; }
         link.screen.update((ref Screen s) { s.endReasoning(reasoning); });
     }
 
@@ -1057,9 +1076,11 @@ class Console : AgentEvents
             if (auto v = k in c.arguments)
                 if (v.type == JSONType.string)
                 {
-                    auto s = v.str.firstLine;
-                    return s.length > 120 ? s[0 .. 120] ~ "…" : s;
+                    // One line: runs of whitespace (newlines too) become a space.
+                    import std.regex : regex, replaceAll;
+                    return fitText(v.str.replaceAll(regex(`\s+`), " ").strip, 121);
                 }
+        if (c.arguments.type == JSONType.object && c.arguments.toString == "{}") return "";
         return c.encodedArguments;
     }
 }
@@ -1092,6 +1113,7 @@ string toolResult(bool ok, string output, bool verbose, size_t width, bool color
 
 // rust: frame.rs::tool_result_count_rows_are_bounded_to_the_width
 // rust: frame.rs::tool_result_preview_strips_terminal_escapes
+// rust: ui.rs::plain_tool_result_strips_terminal_escapes
 unittest
 {
     import std.algorithm : canFind;
@@ -1115,7 +1137,9 @@ unittest
 /// when the model's arguments weren't a JSON object.
 string argsText(const ref ToolCall c)
 {
-    return c.invalidArguments.length ? c.invalidArguments : c.arguments.toPrettyString;
+    if (c.invalidArguments.length) return c.invalidArguments;
+    if (c.arguments.type == JSONType.object && c.arguments.toString == "{}") return "";
+    return c.arguments.toPrettyString;
 }
 
 /// `text` cut to `width` characters, ending in `…` when cut.
@@ -1859,7 +1883,7 @@ int runMain(string[] args)
         return driven(() @safe {
             bool ok = true;
             console.finalAnswer = null;
-            console.droppedAnswer = false;
+            console.beginAnswerGuard();
             try agent.run(input, console);
             catch (Exception e)
             {
@@ -1870,7 +1894,7 @@ int runMain(string[] args)
             console.endLine();
             // Quiet shows only the final answer; a turn that got louder after
             // answer deltas were dropped reprints the whole answer (ui.rs).
-            if ((console.quiet || console.droppedAnswer) && console.finalAnswer.length)
+            if ((console.quiet || console.answerMayBeTruncated) && console.finalAnswer.length)
             {
                 writeln(console.display(console.finalAnswer));
                 stdOut.flush();
@@ -2443,3 +2467,99 @@ int runMain(string[] args)
 static assert(imported!"nano.nullaudit".bareRefs!(app)().length == 0,
     "bare class references (use NotNull!C, Option!C or @nullable(\"why\")): "
     ~ imported!"std.array".join(imported!"nano.nullaudit".bareRefs!(app)(), ", "));
+
+// rust: ui.rs::truncation_guard_tracks_suppressed_deltas_not_quiet_start, ui.rs::entering_quiet_alone_does_not_flag_truncation
+unittest
+{
+    auto was = verbosity;
+    scope (exit) setVerbosity(was);
+    auto c = new Console(false);
+    setVerbosity(Verbosity.quiet);
+    c.beginAnswerGuard();
+    setVerbosity(Verbosity.normal);
+    assert(!c.answerMayBeTruncated, "a quiet start with no suppressed delta must not flag truncation");
+    setVerbosity(Verbosity.quiet);
+    c.beginAnswerGuard();
+    c.text(false, "hello");
+    assert(c.answerMayBeTruncated, "a suppressed non-empty delta flags truncation");
+}
+
+// rust: ui.rs::truncation_guard_resets_per_answer_segment, ui.rs::non_streamed_final_message_clears_an_earlier_suppressed_segments_guard
+unittest
+{
+    auto was = verbosity;
+    scope (exit) setVerbosity(was);
+    auto c = new Console(false);
+    setVerbosity(Verbosity.quiet);
+    c.beginAnswerGuard();
+    c.text(false, "intermediate");
+    assert(c.answerMayBeTruncated, "the suppressed intermediate delta flags truncation");
+    c.assistantMessage("intermediate", null);
+    setVerbosity(Verbosity.normal);
+    // Normal deltas go to the screen; only the guard matters here, so the
+    // final segment is a non-streamed message (the quiet-start case below
+    // streams quietly).
+    c.assistantMessage("final answer", null);
+    assert(!c.answerMayBeTruncated, "a final message after an earlier quiet segment must not be reprinted");
+
+    setVerbosity(Verbosity.quiet);
+    c.beginAnswerGuard();
+    c.text(false, "A");
+    c.assistantMessage("A", null);
+    c.text(false, "final prefix");
+    assert(c.answerMayBeTruncated, "a final answer whose own prefix was suppressed must be reprinted");
+    c.responseRestarted();
+    assert(!c.answerMayBeTruncated, "a restart discards the dropped partial");
+}
+
+// rust: ui.rs::summarizes_tool_calls
+unittest
+{
+    ToolCall c;
+    c.name = "bash";
+    c.arguments = parseJSON(`{"command":"ls\n  -la"}`);
+    assert(Console.summary(c) == "ls -la");
+    c.arguments = parseJSON(`{}`);
+    assert(Console.summary(c) == "");
+    assert(fitText("abcdef", 4) == "abc…");
+    import std.array : replicate;
+    c.arguments = parseJSON(`{"path":"` ~ "é".replicate(200) ~ `"}`);
+    import std.utf : validate;
+    validate(Console.summary(c));
+}
+
+// rust: ui.rs::tool_args_text_keeps_malformed_arguments_verbatim
+unittest
+{
+    auto bad = ToolCall.fromRaw("c1", "bash", `{"command": "ls",`);
+    assert(bad.invalidArguments.length && argsText(bad) == `{"command": "ls",`);
+    ToolCall ok;
+    ok.arguments = parseJSON(`{"command":"ls"}`);
+    assert(argsText(ok) == ok.arguments.toPrettyString);
+    ok.arguments = parseJSON(`{}`);
+    assert(argsText(ok) == "");
+}
+
+// rust: ui.rs::quiet_assistant_message_closes_the_plain_stream, ui.rs::response_restart_resets_the_plain_stream
+unittest
+{
+    auto was = verbosity;
+    scope (exit) setVerbosity(was);
+    auto c = new Console(false);
+    void streaming() { c.link.screen.update((ref Screen s) { s.answering = true; s.midLine = true; }); }
+    bool closed()
+    {
+        bool r;
+        c.link.screen.update((ref Screen s) { r = !s.answering && !s.midLine; });
+        return r;
+    }
+    setVerbosity(Verbosity.normal);
+    streaming();
+    setVerbosity(Verbosity.quiet);
+    c.assistantMessage("first", null);
+    assert(closed, "a quiet-closed segment ends the line and the stream");
+    setVerbosity(Verbosity.normal);
+    streaming();
+    c.responseRestarted();
+    assert(closed, "a restart closes the abandoned partial");
+}

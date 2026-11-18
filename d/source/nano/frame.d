@@ -786,7 +786,8 @@ string[] decorate(const string[] rows, bool busy, long elapsedMs, size_t width) 
     return out_;
 }
 
-unittest // the working clock pauses and resumes (working_time_excludes_paused_spans)
+// rust: ui.rs::waiting_for_user_input_does_not_count_as_working_time
+unittest // the working clock pauses and resumes
 {
     auto c = WorkClock.started(0);
     assert(c.elapsed(3000) == 3000);
@@ -809,6 +810,7 @@ unittest // pausing_and_resuming_the_work_clock_is_idempotent
     assert(c.elapsed(13_000) == 5000);
 }
 
+// rust: ui.rs::prompt_glyph_and_hint_say_whose_turn_it_is
 unittest // elapsed text, glyph and hint
 {
     import std.algorithm : canFind;
@@ -827,6 +829,21 @@ unittest // decorate fills the placeholders and keeps the row within the width
     assert(!rows[0].canFind(glyphMark) && rows[0].canFind("working 2s"));
     assert(rows[1] == "more");
     assert(visibleWidth(decorate([glyphMark ~ " " ~ hintMark], false, 0, 10)[0]) <= 10);
+}
+
+// rust: ui.rs::a_paused_work_clock_freezes_the_prompt_and_resumes, ui.rs::the_prompt_spins_during_a_turn_and_shows_ready_after
+unittest
+{
+    import std.algorithm : canFind;
+    auto c = WorkClock.started(0);
+    c.pause(65_000);
+    auto frozen = decorate([glyphMark ~ " " ~ hintMark], true, c.elapsed(90_000), 80)[0];
+    assert(frozen == decorate([glyphMark ~ " " ~ hintMark], true, c.elapsed(95_000), 80)[0], "a paused clock banks no wait");
+    assert(frozen.canFind("working 1m 05s"), "the prompt still shows the working turn");
+    c.resume(95_000);
+    assert(c.elapsed(96_000) > 65_000, "resuming counts working time again");
+    assert(decorate([glyphMark], true, 0, 80)[0].canFind("⠋"), "a turn spins the glyph");
+    assert(decorate([glyphMark], false, 0, 80)[0].canFind("›"), "ready after the turn");
 }
 
 // rust: ui.rs::pausing_and_resuming_the_work_clock_is_idempotent
