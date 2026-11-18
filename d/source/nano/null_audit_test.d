@@ -9,6 +9,7 @@ module nano.null_audit_test;
 import nano.nullaudit;
 static import nano.acp;
 static import nano.agent;
+static import nano.agent_status;
 static import nano.arith;
 static import nano.attachment;
 static import nano.claude_hooks;
@@ -88,6 +89,7 @@ static import nano.vision;
 private alias modules = imported!"std.meta".AliasSeq!(
     nano.acp,
     nano.agent,
+    nano.agent_status,
     nano.arith,
     nano.attachment,
     nano.claude_hooks,

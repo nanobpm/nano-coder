@@ -166,7 +166,7 @@ agent.rs::recall_attaches_at_most_two_notes_per_turn	test
 agent.rs::record_usage_accumulates_aic_when_reported	test
 agent.rs::records_assistant_tool_calls_before_results	test
 agent.rs::redelivering_a_truncated_turn_replays_its_stop_reason	test
-agent.rs::refreshing_stats_tracks_a_max_tokens_driven_thinking_change	todo
+agent.rs::refreshing_stats_tracks_a_max_tokens_driven_thinking_change	test
 agent.rs::repairs_interrupted_turns_on_resume	test
 agent.rs::repeated_output_limit_cut_offs_end_with_a_distinct_stop_reason	test
 agent.rs::replacing_the_conversation_resets_and_persists_recall	test
@@ -205,8 +205,8 @@ agent.rs::session_transitions_clear_the_thinking_override	test
 agent.rs::smart_compaction_cites_log_lines_and_offers_history_tools	test
 agent.rs::smart_mode_needs_a_session_log	test
 agent.rs::stale_plan_gets_a_reminder_in_a_tool_result	test
-agent.rs::status_bar_reports_nothing_for_a_dropped_level	todo
-agent.rs::status_line_reflects_the_level_the_request_sends_not_a_reread	todo
+agent.rs::status_bar_reports_nothing_for_a_dropped_level	test
+agent.rs::status_line_reflects_the_level_the_request_sends_not_a_reread	test
 agent.rs::steer_during_final_answer_extends_the_turn	test
 agent.rs::steer_during_tool_call_joins_next_model_call	test
 agent.rs::steer_on_last_iteration_keeps_the_final_answer	test

@@ -4,7 +4,7 @@ module nano.agent;
 
 @safe:
 import nano.arith : checkedMul, checkedSub, saturatingSub;
-import nano.option : Option, some, none, match, ifSome, unwrap, NotNull;
+import nano.option : Option, some, none, match, ifSome, orElse, unwrap, NotNull;
 
 import nano.safeio : Isolated, JoinHandle, spawnDaemon, stdErr, stdOut;
 
@@ -265,6 +265,10 @@ class Agent
     Message[] replayStash;
     /// history_search / history_read calls in the current turn (logged on its turn_end).
     uint turnHistoryCalls;
+    /// The thinking level the turn's latest request sent (as the status line
+    /// shows it; empty: none), so a setting changed while it runs is shown
+    /// only once a request sends it. None between turns.
+    Option!string requestThinking;
     /// Index of the restated in-flight input the latest compaction folded;
     /// a replay skips it, its original being in `replayStash`.
     Option!size_t replayRestated;
@@ -356,6 +360,7 @@ class Agent
         bool resuming = hasPending && givenId.length && pending.id == givenId;
         if (!resuming) log.ifSome((SessionLog l) { l.input(inputId, input); });
         turnHistoryCalls = 0;
+        scope (exit) requestThinking = Option!string.init;
         string response;
         try response = runTurn(input, ev, resetControl, automatic, inputId, resuming);
         catch (Exception e)
@@ -656,6 +661,7 @@ class Agent
                 req.maxTokens = requestMaxTokens();
                 auto th = thinking();
                 req.thinking = th.request();
+                requestThinking = some(shownLevel(th));
                 req.vision = vision();
                 req.attachmentsDir = attachmentsDir();
                 auto tr = temperatureFor(th.anthropicThinkingOn);
@@ -1182,6 +1188,18 @@ class Agent
     {
         auto r = temp.resolve(temperature, providerKind, *providerEntry, client.modelName);
         return on ? r.fixedBy("thinking is on, and Anthropic then requires the default temperature") : r;
+    }
+
+    /// The thinking level the status line shows: what the running turn's
+    /// request sent, else what the next one would (empty: none sent, as for
+    /// a level the provider drops).
+    string shownThinking() { return requestThinking.orElse(shownLevel(thinking())); }
+
+    private static string shownLevel(const ThinkingResolved th)
+    {
+        import nano.thinking : wireValue;
+        auto w = wireValue(th);
+        return w.isNull ? null : w.str;
     }
 
     /// The temperature the current model is sent, and why.

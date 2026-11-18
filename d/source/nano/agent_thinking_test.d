@@ -230,3 +230,63 @@ unittest
     c = sonnet.temperatureFor(sonnet.thinking.alwaysAnthropicThinking);
     assert(!c.fixed.length && c.effective == 0.5);
 }
+
+string shown(Agent agent)
+{
+    import nano.agent_status : statusFromAgent;
+    import nano.status : Stats;
+    Stats s;
+    statusFromAgent(s, agent, "~");
+    return s.thinking;
+}
+
+/// An OpenAI-kinded double.
+class Gpt : MockClient, KindedClient
+{
+    this() { super([]); }
+    override string modelName() const { return "gpt-5"; }
+    ProviderKind kind() const { return ProviderKind.openai; }
+}
+
+// rust: agent.rs::status_bar_reports_nothing_for_a_dropped_level
+unittest
+{
+    auto agent = new Agent(new Gpt, new ToolRegistry, Policy.init, "sys");
+    auto pc = new ProviderConfig;
+    pc.dropParams = ["reasoning_effort"];
+    agent.providerLookup = (string name) => cast(const(ProviderConfig)*) pc;
+    agent.sessionThinking = session("high");
+    assert(agent.thinking.dropped);
+    assert(shown(agent) is null, "a dropped level is not shown as sent");
+}
+
+// A level changed while a step runs shows once a request sends it.
+// rust: agent.rs::status_line_reflects_the_level_the_request_sends_not_a_reread
+unittest
+{
+    string[] seen;
+    auto claude = new Claude("claude-sonnet-4-6", [toolCall("c1"), LLMResponse("done")]);
+    auto agent = agentFor(claude, (Agent a) {
+        a.sessionThinking = session("high");
+        seen ~= shown(a);
+    });
+    agent.sessionThinking = session("low");
+    agent.run("go", new NullEvents);
+    assert(claude.sent[0].thinking == effort("low") && claude.sent[1].thinking == effort("high"));
+    assert(seen == ["low"], "step 1 shows what its request sent");
+    assert(shown(agent) == "high", "between turns: what the next request sends");
+}
+
+// A max_tokens change that drops a budget level shows on the next refresh.
+// rust: agent.rs::refreshing_stats_tracks_a_max_tokens_driven_thinking_change
+unittest
+{
+    auto agent = agentFor(new Claude("claude-sonnet-4-5", []));
+    agent.maxTokens = 16_384;
+    agent.sessionThinking = session("high");
+    assert(shown(agent).length, "a budget level that fits is shown");
+    agent.maxTokens = 1024;
+    assert(shown(agent) is null, "too small a max_tokens drops it");
+    agent.maxTokens = 16_384;
+    assert(shown(agent).length);
+}
