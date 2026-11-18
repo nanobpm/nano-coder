@@ -656,7 +656,7 @@ final class LineEditor
         return read(prompt, styledPrompt, false, null);
     }
 
-    private bool plain, masked;
+    private bool plain, masked, inTurn;
 
     private void delegate(string[] rows) @safe frameDraw;
     private void delegate(string line) @safe frameCommit;
@@ -698,6 +698,10 @@ final class LineEditor
     {
         this.prompt = prompt;
         this.styledPrompt = styledPrompt;
+        // Each read starts a fresh Esc pair: an arm from before a turn (or a
+        // turn-time press) must not complete an idle clear after it.
+        lastEscMs = long.min / 2;
+        inTurn = turn;
         notice = hint;
         hint = null;
         render();
@@ -778,7 +782,7 @@ final class LineEditor
                     auto now = nowMs();
                     bool second = now - lastEscMs <= 500;
                     lastEscMs = second ? long.min / 2 : now;
-                    if (state.menu(80, menuRows).length) { state.menuHidden = true; break; }
+                    if (!inTurn && state.menu(80, menuRows).length) { state.menuHidden = true; break; }
                     if (!second) break;
                     if (turn) { erase(); return Result(Outcome.cancel); }
                     state.clear();
@@ -897,7 +901,8 @@ final class LineEditor
     {
         string[] extra;
         if (notice.length) extra = [notice];
-        else if (!plain) extra = state.menu(max(width(), 2), menuRows);
+        // No command menu during a turn (Rust): the line there is a steer.
+        else if (!plain && !inTurn) extra = state.menu(max(width(), 2), menuRows);
         drawFrame(extra);
         drawn = true;
     }
@@ -1441,3 +1446,4 @@ unittest
     assert(v.quietSince(shown) == later, "a no-op key resets the quiet clock");
     assert(v.draftIsStale(later), "but leaves draft staleness alone");
 }
+

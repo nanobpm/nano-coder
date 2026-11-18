@@ -467,6 +467,10 @@ unittest // argument type-ahead (Rust suggestions / complete_line / suggestion_m
     assert(completeLine("/model o") is null || completeLine("/model o") == "/model o");
     assert(completeLine("/model oll") == "/model ollama");
     assert(completeLine("/model ollama") == "/model ollama/llama3");
+    // rust: lineedit.rs::tab_completes_model_arguments_from_context
+    assert(completeLine("/mode a") == "/mode auto");
+    assert(completeLine("/model zz") is null, "no match: unchanged");
+    assert(completeLine("/model  ol") == "/model ollama", "irregular spacing canonicalizes");
     assert(completeLine("/model zz") is null);
     assert(completeLine("/mode p") == "/mode plan");
     assert(completeLine("/thinking xh") == "/thinking xhigh");
