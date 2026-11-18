@@ -727,7 +727,8 @@ final class AcpServer : AgentEvents
                 assistantMessage(m.content, null);
                 foreach (c; m.toolCalls) toolStart(c);
                 break;
-            case Role.tool: toolUpdate(m.toolCallId, m.content, m.isError); break;
+            // As shown live: the model-facing text plus any image marker.
+            case Role.tool: toolUpdate(m.toolCallId, toolResultDisplay(m.content, m.attachments), m.isError); break;
             }
         }
     }
@@ -886,4 +887,92 @@ unittest
     auto r4 = parseJSON(lines[$ - 1]);
     assert(r4["id"].integer == 4 && r4["result"]["response"].str.canFind("not available over ACP"));
     assert(agent.messages[0].content == "sys");
+}
+
+// session/load replays a logged session as it was shown live: a failed tool
+// is "failed", and a tool result keeps its image marker.
+// rust: agent.rs::failed_tool_reports_failed_status_and_replay_covers_history
+// rust: agent.rs::replay_shows_the_image_marker_on_persisted_tool_results
+unittest
+{
+    import std.file : exists, rmdirRecurse, tempDir;
+    import std.path : buildPath;
+    import nano.attachment : Attachment;
+    import nano.option : some;
+    import nano.permissions : Policy;
+    import nano.providers.mock;
+    import nano.session : SessionLog;
+    import nano.tools;
+    auto dir = buildPath(tempDir, "nano-acp-replay");
+    if (exists(dir)) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    JSONValue[] updates(string[] lines)
+    {
+        JSONValue[] u;
+        foreach (l; lines)
+        {
+            auto m = parseJSON(l);
+            if ("method" in m) u ~= m["params"]["update"];
+        }
+        return u;
+    }
+    static class Sink { string[] lines; }
+    AcpServer server(LLMResponse[] script, Sink sink)
+    {
+        auto reg = new ToolRegistry;
+        reg.register(ToolDefinition("broken", "fails", parseJSON(`{"type":"object"}`)), (JSONValue a) {
+            throw new ToolError("boom");
+            return "";
+        });
+        auto agent = new Agent(new MockClient(script), reg, Policy.init, null);
+        return new AcpServer(agent, Host((string cwd) => "sys", null, dir, "test"), (string l) { sink.lines ~= l; });
+    }
+
+    auto live = new Sink;
+    auto srv = server([LLMResponse("", "", [ToolCall.fromRaw("b1", "broken", `{}`)]), LLMResponse("sorry")], live);
+    srv.receive(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}`);
+    srv.receive(`{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"prompt":[{"type":"text","text":"try"}]}}`);
+    srv.close();
+    assert(srv.run());
+    auto sid = parseJSON(live.lines[0])["result"]["sessionId"].str;
+    auto u = updates(live.lines);
+    assert(u[1]["status"].str == "failed", u[1].toString);
+
+    auto replayed = new Sink;
+    srv = server([], replayed);
+    srv.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ sid ~ `"}}`);
+    srv.close();
+    assert(srv.run());
+    u = updates(replayed.lines);
+    string[] kinds;
+    foreach (x; u) kinds ~= x["sessionUpdate"].str;
+    assert(kinds == ["user_message_chunk", "tool_call", "tool_call_update", "agent_message_chunk"], kinds.format!"%s");
+    assert(u[0]["content"]["text"].str == "try");
+    assert(u[2]["toolCallId"].str == "b1" && u[2]["status"].str == "failed", "replay matches the live status");
+
+    // A persisted image result.
+    auto log = new SessionLog(dir, "mock/m", "/w");
+    auto sys = Message.system("sys");
+    log.append(sys);
+    auto call = Message.assistant("");
+    call.toolCalls = [ToolCall.fromRaw("t1", "read_file", `{}`)];
+    log.append(call);
+    Attachment img;
+    img.mediaType = "image/png";
+    img.path = "x.png";
+    img.width = 12;
+    img.height = 34;
+    img.extension = "png";
+    auto res = Message.toolResult("t1", "read_file", "saw it");
+    res.attachments = [img];
+    log.append(res);
+    auto shown = new Sink;
+    srv = server([], shown);
+    srv.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ log.id ~ `"}}`);
+    srv.close();
+    assert(srv.run());
+    JSONValue upd;
+    foreach (x; updates(shown.lines)) if (x["sessionUpdate"].str == "tool_call_update") upd = x;
+    auto raw = upd["rawOutput"].str;
+    assert(raw.canFind("[image: x.png, 12×34]") && raw.canFind("saw it"), raw);
 }
