@@ -16,6 +16,7 @@ module nano.acp;
 
 @safe:
 import nano.arith : saturatingSub;
+import nano.option : Option, some, none, match, ifSome;
 
 import nano.safeio : spawnDaemon, stdErr, stdOut;
 
@@ -672,7 +673,7 @@ final class AcpServer : AgentEvents
         auto cwd = getcwd();
         auto sys = host.systemPrompt !is null ? host.systemPrompt(cwd) : null;
         agent.messages = sys.length ? [Message.system(sys)] : null;
-        agent.log = null;
+        agent.log = none;
         agent.completedInputs = null;
         agent.completedStops = null;
         agent.completedOutcomes = null;
@@ -680,9 +681,10 @@ final class AcpServer : AgentEvents
         agent.restoreRecall(JSONValue.init);
         if (host.sessionDir !is null)
         {
-            agent.log = new SessionLog(host.sessionDir, agent.client.providerName ~ "/" ~ agent.client.modelName, cwd);
-            foreach (m; agent.messages) agent.log.append(m);
-            sessionId = agent.log.id;
+            auto log = new SessionLog(host.sessionDir, agent.client.providerName ~ "/" ~ agent.client.modelName, cwd);
+            foreach (m; agent.messages) log.append(m);
+            agent.log = some(log);
+            sessionId = log.id;
         }
         else
         {
@@ -706,8 +708,9 @@ final class AcpServer : AgentEvents
         agent.historyHintPending = restored.historyAvailable && !restored.historyHintConsumed;
         agent.pinStash = restored.pinStash;
         agent.adoptPending(restored);
-        agent.log = new SessionLog(path);
-        sessionId = agent.log.id;
+        auto log = new SessionLog(path);
+        agent.log = some(log);
+        sessionId = log.id;
         agent.completedInputs = restored.completed;
         agent.completedStops = restored.completedStops;
         agent.completedOutcomes = restored.completedOutcomes;

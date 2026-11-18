@@ -206,13 +206,13 @@ QueueOp parse(string args)
 }
 
 /// Apply an edit to the queue and any unread steers (`steers` is the
-/// running turn's controls, or null between turns); says what happened.
+/// agent's turn controls; between turns it has none unread); says what happened.
 string apply(MessageQueue queue, shared TurnControl steers, const QueueOp op)
 {
     return op.match!(
         (const ListOp _) => describe(queue, atomicLoad(steers)),
         (const RemoveOp r) {
-            auto withdrawn = steers is null ? 0 : steers.removeSteers(r.ids);
+            auto withdrawn = steers.removeSteers(r.ids);
             auto removed = queue.remove(r.ids);
             auto sum = summary(queue, atomicLoad(steers));
             if (!withdrawn && !removed) return format!"No pending message with %s (%s)"(idsText(r.ids), sum);
@@ -222,7 +222,7 @@ string apply(MessageQueue queue, shared TurnControl steers, const QueueOp op)
                 removed, plural(removed), sum);
         },
         (const EditOp e) {
-            if (steers !is null && steers.editSteer(e.id, e.text))
+            if (steers.editSteer(e.id, e.text))
                 return format!"Steer #%s updated: %s"(e.id, preview(e.text, 60));
             if (queue.edit(e.id, e.text)) return format!"Queue #%s updated: %s"(e.id, preview(e.text, 60));
             return format!"No pending message with id %s (%s)"(e.id, summary(queue, atomicLoad(steers)));
@@ -232,7 +232,7 @@ string apply(MessageQueue queue, shared TurnControl steers, const QueueOp op)
             return format!"↧ queued #%s (%s) — /queue remove %s to drop"(id, summary(queue, atomicLoad(steers)), id);
         },
         (const ClearOp _) {
-            auto w = steers is null ? 0 : steers.clearSteers();
+            auto w = steers.clearSteers();
             auto n = queue.clear();
             return w == 0 ? format!"Cleared %s queued message%s"(n, plural(n))
                 : format!"Cleared %s queued message%s and withdrew %s steer%s"(n, plural(n), w, plural(w));
@@ -244,10 +244,10 @@ enum emptyQueue = "Queue is empty. Enter while a turn runs steers it; Ctrl-Enter
 
 /// One line per pending message: unread steers first (the agent reads them
 /// at its next step), then queued messages, oldest first.
-string describe(MessageQueue queue, shared TurnControl steers = null)
+string describe(MessageQueue queue, shared TurnControl steers)
 {
     auto entries = queue.list;
-    auto pending = steers is null ? null : steers.pendingSteers;
+    auto pending = steers.pendingSteers;
     if (!entries.length && !pending.length) return emptyQueue;
     auto out_ = format!"Pending (%s):"(entries.length + pending.length);
     foreach (m; pending) out_ ~= format!"\n  %3s  steer   %s"(m.id, preview(m.text, 80));
@@ -259,7 +259,7 @@ string describe(MessageQueue queue, shared TurnControl steers = null)
 /// "2 steers pending, 1 queued" / "queue is empty", for trailing summaries.
 private string summary(MessageQueue queue, shared TurnControl steers)
 {
-    auto w = steers is null ? 0 : steers.pendingSteers.length;
+    auto w = steers.pendingSteers.length;
     auto n = queue.length;
     if (!w) return n == 0 ? "queue is empty" : format!"%s queued"(n);
     return n == 0 ? format!"%s steer%s pending"(w, plural(w)) : format!"%s steer%s pending, %s queued"(w, plural(w), n);
@@ -333,20 +333,21 @@ unittest // apply reports what happened
 {
     import std.algorithm : canFind, startsWith;
     auto q = MessageQueue.make;
+    auto idle = new shared TurnControl; // between turns: no unread steers
     q.push("alpha");
     q.push("beta");
     q.push("gamma");
-    auto listed = apply(q, null, QueueOp(ListOp()));
+    auto listed = apply(q, atomicLoad(idle), QueueOp(ListOp()));
     assert(listed.canFind("Pending (3):") && listed.canFind("  0  queued  alpha") && listed.canFind("  2  queued  gamma"),
         listed);
-    auto removed = apply(q, null, QueueOp(RemoveOp([1, 9])));
+    auto removed = apply(q, atomicLoad(idle), QueueOp(RemoveOp([1, 9])));
     assert(removed.canFind("Removed 1 queued message") && removed.canFind("(2 queued)"), removed);
-    assert(apply(q, null, QueueOp(EditOp(2, "GAMMA"))).canFind("#2"));
+    assert(apply(q, atomicLoad(idle), QueueOp(EditOp(2, "GAMMA"))).canFind("#2"));
     assert(q.list[1].text == "GAMMA");
-    assert(apply(q, null, QueueOp(RemoveOp([7]))).canFind("No pending message with id 7"));
-    assert(apply(q, null, QueueOp(ClearOp())).canFind("Cleared 2"));
-    assert(apply(q, null, QueueOp(ListOp())) == emptyQueue);
-    auto note = apply(q, null, QueueOp(AddOp("later")));
+    assert(apply(q, atomicLoad(idle), QueueOp(RemoveOp([7]))).canFind("No pending message with id 7"));
+    assert(apply(q, atomicLoad(idle), QueueOp(ClearOp())).canFind("Cleared 2"));
+    assert(apply(q, atomicLoad(idle), QueueOp(ListOp())) == emptyQueue);
+    auto note = apply(q, atomicLoad(idle), QueueOp(AddOp("later")));
     assert(note.startsWith("↧ queued #") && note.canFind("/queue remove") && q.length == 1, note);
 }
 

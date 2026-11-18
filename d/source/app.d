@@ -4,6 +4,7 @@ module app;
 
 @safe:
 import nano.arith : saturatingSub;
+import nano.option : Option, some, none, match, ifSome, unwrap;
 
 import nano.safeio : Chan, Isolated, Join, JoinHandle, Locked, Shared, deepCopy, spawn, spawnDaemon, exitProcess, stdErr, stdinLine, stdOut;
 
@@ -1176,7 +1177,7 @@ string indent(string s)
 
 alias planNote = planPromptNote;
 
-string buildSystemPrompt(const ref Config c, string cwd, bool plan, const Skills skills = null, string memoryIndex = null,
+string buildSystemPrompt(const ref Config c, string cwd, bool plan, const Skills skills, string memoryIndex = null,
     string instructions = null)
 {
     import std.datetime.systime : Clock;
@@ -1187,7 +1188,7 @@ string buildSystemPrompt(const ref Config c, string cwd, bool plan, const Skills
     auto s = format("%s\n\nWorking directory: %s\nPlatform: %s\nToday's date: %s", base, cwd, os,
             Clock.currTime.toISOExtString[0 .. 10]);
     s ~= instructions;
-    if (skills !is null) s ~= skills.renderIndex;
+    s ~= skills.renderIndex;
     s ~= memoryIndex;
     if (plan) s ~= planNote;
     return s;
@@ -1206,16 +1207,16 @@ string[] settingWarnings(Agent agent)
 
 /// The instruction files for `dir`, or null when disabled (config
 /// `project_instructions`, env `AGENTIC_NO_PROJECT_INSTRUCTIONS`).
-ProjectInstructions discoverInstructions(const ref Config c, string dir)
+Option!ProjectInstructions discoverInstructions(const ref Config c, string dir)
 {
     import std.process : environment;
-    if (!c.projectInstructions || environment.get("AGENTIC_NO_PROJECT_INSTRUCTIONS") !is null) return null;
+    if (!c.projectInstructions || environment.get("AGENTIC_NO_PROJECT_INSTRUCTIONS") !is null) return typeof(return).init;
     InstructionOptions o;
     o.names = c.projectInstructionFiles.dup;
     foreach (f; c.userInstructionFiles) o.userFiles ~= expandHome(f);
     foreach (d; c.userRulesDirs) o.userRulesDirs ~= expandHome(d);
     o.importsOutsideProject = c.instructionImportsOutsideProject;
-    return ProjectInstructions.discover(dir, o);
+    return some(ProjectInstructions.discover(dir, o));
 }
 
 /// `/context`: window use, token totals, compaction settings.
@@ -1228,7 +1229,7 @@ string toolsListing(Agent agent)
 
 string skillsListing(const Skills skills)
 {
-    if (skills is null || skills.empty) return "No skills found.";
+    if (skills.empty) return "No skills found.";
     string[] out_;
     foreach (sk; skills.skills) out_ ~= format("  %-20s %s", sk.name, firstLine(sk.description));
     return out_.join("\n");
@@ -1236,7 +1237,7 @@ string skillsListing(const Skills skills)
 
 string sessionText(Agent agent)
 {
-    return agent.log is null ? "not recording (--no-session)" : format("session %s\nlog: %s", agent.log.id, agent.log.path);
+    return agent.log.match!(l => format("session %s\nlog: %s", l.id, l.path), () => "not recording (--no-session)");
 }
 
 /// `/timers`: the agent's active timers.
@@ -1277,11 +1278,12 @@ string contextReport(Agent agent)
     out_ ~= "Thinking:     " ~ agent.thinking().describe;
     auto vision = agent.vision;
     out_ ~= "Vision:       " ~ (vision.isNull ? "no" : format("yes (up to %s image(s), %s bytes each)", vision.get.maxImages, vision.get.maxImageBytes));
-    if (agent.instructions is null || !agent.instructions.loadedPaths.length)
+    auto loaded = agent.instructions.match!(pi => pi.loadedPaths, () => string[].init);
+    auto onDemand = agent.instructions.match!(pi => pi.onDemandPaths, () => string[].init);
+    if (!loaded.length)
         out_ ~= "Instructions: none (no AGENTS.md, CLAUDE.md or .github/copilot-instructions.md found)";
-    else out_ ~= "Instructions: " ~ agent.instructions.loadedPaths.join(", ");
-    if (agent.instructions !is null && agent.instructions.onDemandPaths.length)
-        out_ ~= "On-demand rules: " ~ agent.instructions.onDemandPaths.join(", ");
+    else out_ ~= "Instructions: " ~ loaded.join(", ");
+    if (onDemand.length) out_ ~= "On-demand rules: " ~ onDemand.join(", ");
     out_ ~= format("Session:      %s input, %s output tokens", agent.sessionInputTokens, agent.sessionOutputTokens);
     if (agent.hasSessionAic) out_ ~= format("AI Credits:   %.2f used this session", agent.sessionAic);
     out_ ~= agent.autoCompact
@@ -1293,13 +1295,13 @@ string contextReport(Agent agent)
 }
 
 /// The agent, for `main`'s exit (title requests may still be in flight).
-Agent mainAgent; /// the REPL's agent (main thread only)
+Option!Agent mainAgent; /// the REPL's agent (main thread only); none if startup ended early
 
 int main(string[] args)
 {
     auto rc = runMain(args);
     import core.time : dur;
-    if (mainAgent !is null && !mainAgent.settleTitles(dur!"seconds"(3)))
+    if (mainAgent.match!(a => !a.settleTitles(dur!"seconds"(3)), () => false))
     {
         // A title request is still running: druntime teardown would race the
         // thread, so leave without it (Rust likewise drops pending tasks).
@@ -1449,11 +1451,13 @@ int runMain(string[] args)
         return ok;
     }
     // Skills: the index goes into the system prompt; `load_skill` reads one.
+    // Off is an empty set (as in Rust), not null.
+    // NANO_CODER_NO_SKILLS turns skills off for one run (as in Rust).
+    bool skillsOn = cfg.skills.enabled && environment.get("NANO_CODER_NO_SKILLS") is null;
     Skills skills;
     Skills discoverSkills(string dir)
     {
-        // NANO_CODER_NO_SKILLS turns skills off for one run (as in Rust).
-        if (!cfg.skills.enabled || environment.get("NANO_CODER_NO_SKILLS") !is null) return null;
+        if (!skillsOn) return new Skills;
         auto sc = cfg.skills;
         if (!trusted(dir)) { sc.dirs = null; sc.aiLock = false; }
         auto s = Skills.discover(dir, sc);
@@ -1461,31 +1465,31 @@ int runMain(string[] args)
         return s;
     }
     skills = discoverSkills(cwd);
-    if (cfg.skills.enabled && skills !is null && (o.acp || !skills.empty))
+    if (skillsOn && (o.acp || !skills.empty))
         tools.register(skillsDefinition, (JSONValue a) => skills.load(a));
     // Memory: read-only when no human vets saves live (ACP, -p, piped stdio) and in plan mode.
-    MemoryStore memory;
+    Option!MemoryStore memory;
     bool memoryWritable = cfg.memory == MemoryMode.on && !o.acp && !o.prompt.length && isTerminal(0) && isTerminal(1);
     if (cfg.memory != MemoryMode.off)
     {
         auto dir = cfg.memoryDir.length ? cfg.memoryDir : memoryDefaultDir();
-        if (dir.length) memory = new MemoryStore(dir, projectKey(cwd), cfg.memoryExpiryDays < 0 ? 0 : cfg.memoryExpiryDays);
+        if (dir.length) memory = some(new MemoryStore(dir, projectKey(cwd), cfg.memoryExpiryDays < 0 ? 0 : cfg.memoryExpiryDays));
     }
-    if (memory !is null)
+    foreach (store; memory)
     {
         // A helper, not a foreach-body delegate: D closures share the loop variable.
         ToolHandler memoryHandler(string name)
         {
             return (JSONValue a) {
                 bool ro = !memoryWritable || agent.control.mode == AgentMode.plan;
-                try return runMemory(memory, name, a, agent.log !is null ? agent.log.id : null, ro);
+                try return runMemory(store, name, a, agent.log.match!(l => l.id, () => string.init), ro);
                 catch (Exception e) throw new ToolError(e.msg);
             };
         }
         foreach (d; memoryDefinitions(memoryWritable)) tools.register(d, memoryHandler(d.name));
     }
     // Instruction files, discovered once per working directory.
-    ProjectInstructions instructions;
+    Option!ProjectInstructions instructions;
     string instructionsDir;
     // Every caller installs the prompt it builds at once, so the ids its
     // memory index renders in full go straight to the agent (recall skips them).
@@ -1493,7 +1497,8 @@ int runMain(string[] args)
     string systemFor(string dir, bool plan)
     {
         indexShown = null;
-        auto index = memory !is null ? memory.indexWithRendered(memoryWritable && !plan, indexShown) : null;
+        // `agent` is null only on the first call: the agent is built from this prompt.
+        auto index = memory.match!(m => m.indexWithRendered(memoryWritable && !plan, indexShown), () => string.init);
         if (agent !is null) agent.indexShown = indexShown;
         if (instructionsDir is null || instructionsDir != dir)
         {
@@ -1501,12 +1506,12 @@ int runMain(string[] args)
             instructions = discoverInstructions(cfg, dir);
             if (agent !is null) agent.instructions = instructions;
         }
-        return buildSystemPrompt(cfg, dir, plan, skills, index, instructions !is null ? instructions.render : null);
+        return buildSystemPrompt(cfg, dir, plan, skills, index, instructions.match!(pi => pi.render, () => string.init));
     }
     auto questions = QuestionBroker.make;
     tools.register(questionDefinition, (JSONValue a) => questions.run(a));
     agent = new Agent(client, tools, policy, systemFor(cwd, o.plan));
-    mainAgent = agent;
+    mainAgent = some(agent);
     agent.memory = memory;
     agent.indexShown = indexShown;
     agent.instructions = instructions;
@@ -1579,14 +1584,14 @@ int runMain(string[] args)
         host.configModel = cfg.model;
         host.configSystemPrompt = cfg.systemPrompt;
         host.sessionMeta = () {
-            JSONValue meta = ["projectInstructions": JSONValue(instructions !is null ? instructions.loadedPaths : null),
-                "skills": JSONValue(skills !is null ? skills.names : null)];
-            if (instructions !is null)
+            JSONValue meta = ["projectInstructions": JSONValue(instructions.match!(pi => pi.loadedPaths, () => string[].init)),
+                "skills": JSONValue(skills.names)];
+            foreach (pi; instructions)
             {
-                if (auto od = instructions.onDemandPaths) meta["projectInstructionsOnDemand"] = od;
-                if (instructions.warnings.length) meta["instructionWarnings"] = instructions.warnings;
+                if (auto od = pi.onDemandPaths) meta["projectInstructionsOnDemand"] = od;
+                if (pi.warnings.length) meta["instructionWarnings"] = pi.warnings;
             }
-            if (skills !is null && skills.warnings.length) meta["skillWarnings"] = skills.warnings;
+            if (skills.warnings.length) meta["skillWarnings"] = skills.warnings;
             return meta;
         };
         auto server = new AcpServer(agent, host);
@@ -1607,7 +1612,7 @@ int runMain(string[] args)
         agent.messages = agent.messages[0 .. 1];
         foreach (m; restored.conversation)
             if (m.role != Role.system) agent.messages ~= m;
-        agent.log = o.noSession ? null : new SessionLog(path);
+        agent.log = o.noSession ? Option!SessionLog(none) : some(new SessionLog(path));
         agent.historyAvailable = restored.historyAvailable;
         agent.historyHintPending = restored.historyAvailable && !restored.historyHintConsumed;
         agent.pinStash = restored.pinStash;
@@ -1641,8 +1646,9 @@ int runMain(string[] args)
         if (o.hasResume) loadSession(findSession(sessionDir, o.resume, cwd));
         else if (!o.noSession)
         {
-            agent.log = new SessionLog(sessionDir, spec, cwd);
-            foreach (m; agent.messages) agent.log.append(m);
+            auto log = new SessionLog(sessionDir, spec, cwd);
+            foreach (m; agent.messages) log.append(m);
+            agent.log = some(log);
         }
     }
     catch (Exception e) die(e.msg);
@@ -1668,7 +1674,8 @@ int runMain(string[] args)
     gControl = atomicLoad(agent.control);
     installSigint();
     Chan!string inbox;
-    LineEditor editor;
+    // none in -p/piped runs, and while a turn lends it to the key reader.
+    Option!LineEditor editor;
     string[] held; // lines to run before reading the prompt again
     auto queue = MessageQueue.make; // Ctrl-Enter messages: one runs per following turn
 
@@ -1765,7 +1772,7 @@ int runMain(string[] args)
         view.set("/plan", planText(agent));
         view.set("/timers", timersText(agent));
         view.set("/context", contextReport(agent));
-        view.set("log", agent.log is null ? null : agent.log.path);
+        view.set("log", agent.log.match!(l => l.path, () => string.init));
         refreshStatus();
     }
     console.afterStep = &refreshView;
@@ -1816,7 +1823,7 @@ int runMain(string[] args)
         Join!(Isolated!LineEditor) keys;
         Chan!string heldLines;
         bool keysStarted;
-        if (editor !is null)
+        foreach (ed; editor)
         {
             if (verbosity >= Verbosity.verbose)
                 stdErr.writeln(console.dim("[running: Enter sends a message to steer the agent, Ctrl-Enter queues it for later "
@@ -1824,23 +1831,28 @@ int runMain(string[] args)
             refreshView();
             heldLines = Chan!string.make;
             auto mid = MidTurn(atomicLoad(agent.control), view, [frozenConfig(cfg)]);
-            // Isolated: `editor` is set to null until the join hands it back,
-            // and its callbacks (built by `makeEditor`)
-            // reach only shared state.
-            auto owned = Isolated!LineEditor.assumeIsolated(editor);
-            editor = null;
+            // Isolated: `editor` is none until the join hands it back, and its
+            // callbacks (built by `makeEditor`) reach only shared state.
+            auto owned = Isolated!LineEditor.assumeIsolated(ed);
+            editor = none;
             keys = spawn(&turnKeys, imported!"core.lifetime".move(owned), console.link, turnDone, heldLines, questions, queue, mid);
             keysStarted = true;
         }
-        scope (exit)
-            if (keysStarted)
-            {
-                atomicStore(*turnDone, true);
-                editor = keys.join().unwrap;
-                string line;
-                while (heldLines.tryTake(line)) held ~= line;
-            }
+        bool keysRunning = keysStarted;
+        void stopKeys()
+        {
+            if (!keysRunning) return;
+            keysRunning = false;
+            atomicStore(*turnDone, true);
+            editor = some(keys.join().unwrap);
+            string line;
+            while (heldLines.tryTake(line)) held ~= line;
+        }
+        scope (exit) stopKeys(); // when `work` throws
         bool ok = work();
+        // Stop the key reader before taking the late steers: one typed between
+        // the take and the stop would land in `control` and never run.
+        stopKeys();
         // Steers that arrived after the agent's last step run as the next prompts.
         // One the user steered at the prompt keeps its `/queue` id.
         auto late = agent.control.takePending;
@@ -1852,7 +1864,8 @@ int runMain(string[] args)
         }
         if (inbox)
             foreach_reverse (t; late) inbox.put(t.text, true);
-        if (editor !is null)
+        // Keyed on the reader, not on `editor` (which `stopKeys` has handed back).
+        if (keysStarted)
         {
             // Re-escape a steer starting with `/` so it runs as a message.
             string asLine(string text) { return text.startsWith("/") ? "/" ~ text : text; }
@@ -1947,7 +1960,7 @@ int runMain(string[] args)
             leaveKeyMode();
             die("could not start the terminal renderer");
         }
-        editor = makeEditor(console.link, atomicLoad(agent.control));
+        editor = some(makeEditor(console.link, atomicLoad(agent.control)));
         questions.interactive = true;
         refreshStatus();
         // The background update check (Rust #154): interactive terminal
@@ -1958,7 +1971,7 @@ int runMain(string[] args)
     }
     scope (exit) leaveKeyMode();
     scope (exit) if (gFrame) { gFrame.uninstall(); gFrame = FrameUi.init; }
-    if (interactive && editor is null)
+    if (interactive && editor.isNone)
     {
         import core.thread : Thread;
         inbox = Chan!string.make;
@@ -1974,14 +1987,14 @@ int runMain(string[] args)
             "nano-coder-d v" ~ packageVersion,
             format("Model: %s (provider: %s)", client.modelName, client.providerName),
         ];
-        if (agent.log !is null) banner ~= format("Session: %s (resume with --resume %s)", agent.log.id, agent.log.id);
-        if (instructions !is null)
+        agent.log.ifSome((SessionLog l) { banner ~= format("Session: %s (resume with --resume %s)", l.id, l.id); });
+        foreach (pi; instructions)
         {
-            foreach (f; instructions.loadedPaths) banner ~= "Instructions: " ~ f;
-            foreach (w; instructions.warnings) banner ~= "Instructions warning: " ~ w;
+            foreach (f; pi.loadedPaths) banner ~= "Instructions: " ~ f;
+            foreach (w; pi.warnings) banner ~= "Instructions warning: " ~ w;
         }
-        if (skills !is null && skills.names.length) banner ~= "Skills: " ~ skills.names.join(", ");
-        if (skills !is null) foreach (w; skills.warnings) banner ~= "Skills warning: " ~ w;
+        if (skills.names.length) banner ~= "Skills: " ~ skills.names.join(", ");
+        foreach (w; skills.warnings) banner ~= "Skills warning: " ~ w;
         if (auto note = cfg.retiredRendererNotice) banner ~= note;
         banner ~= "Type /help for commands";
         writeln(stampBlock(console.stamp(), banner.join("\n")));
@@ -1994,7 +2007,7 @@ int runMain(string[] args)
     bool quietPrompt;             // redraw the prompt in place (no separating blank line)
     // Herdr (interactive only): flags a resumed session needs to behave the same.
     string[] herdrExtra;
-    if (editor !is null)
+    if (editor.isSome)
     {
         import std.path : absolutePath;
         nano.herdr.start();
@@ -2007,7 +2020,7 @@ int runMain(string[] args)
     void goodbye()
     {
         writeln("\nGoodbye!");
-        if (agent.log !is null) writefln("Session: %s (resume with --resume %s)", agent.log.id, agent.log.id);
+        agent.log.ifSome((SessionLog l) { writefln("Session: %s (resume with --resume %s)", l.id, l.id); });
         stdOut.flush();
     }
     for (;;)
@@ -2024,24 +2037,26 @@ int runMain(string[] args)
             writeln(console.dim(format("↧ queued #%s: %s", next.id, next.text.strip)));
             line = next.text;
         }
-        else if (editor !is null)
+        else if (editor.isSome)
         {
+            auto ed = editor.unwrap("checked on the line above");
             refreshStatus();
             if (!quietPrompt) write("\n");
             quietPrompt = false;
             stdOut.flush();
             // Ready for input: tell Herdr, with the session to resume (re-read
             // each time so `/resume` and `/restart` are picked up).
-            if (nano.herdr.active && agent.log !is null)
+            string resumeId = nano.herdr.active ? agent.log.match!(l => l.id, () => string.init) : null;
+            if (resumeId.length)
             {
-                auto resume = nano.herdr.resumeArgv(agent.log.id, agent.client.providerName ~ "/" ~ agent.client.modelName, herdrExtra);
+                auto resume = nano.herdr.resumeArgv(resumeId, agent.client.providerName ~ "/" ~ agent.client.modelName, herdrExtra);
                 if (resume !is null)
-                    nano.herdr.report(nano.herdr.State.idle, null, nano.herdr.Session(agent.log.id, resume), true);
+                    nano.herdr.report(nano.herdr.State.idle, null, nano.herdr.Session(resumeId, resume), true);
                 else nano.herdr.report(nano.herdr.State.idle);
             }
             else nano.herdr.report(nano.herdr.State.idle);
             // The prompt's stamp is redrawn with the submission time (Rust's restamp).
-            editor.restyle = () => console.stamp() ~ console.bold("› ");
+            ed.restyle = () => console.stamp() ~ console.bold("› ");
             // While the Ctrl-C exit hint is armed, end the read when the window
             // lapses so the stale hint is cleared (Rust's DoublePress deadline).
             bool delegate() @safe lapse = null;
@@ -2049,7 +2064,7 @@ int runMain(string[] args)
             // something newer was typed or sent meanwhile.
             if (hasParkedDraft)
             {
-                editor.restoreDraft(parkedDraft);
+                ed.restoreDraft(parkedDraft);
                 hasParkedDraft = false;
             }
             // A due timer ends the read too, unless a fresh draft holds it
@@ -2064,21 +2079,21 @@ int runMain(string[] args)
             auto idleHold = idleCompactHoldFor(cfg);
             bool idleNow() @safe
             {
-                return deliverIdleCompact(agent.idleCompactDuePolled(), MonoTime.currTime - editor.quietSince(promptShown),
+                return deliverIdleCompact(agent.idleCompactDuePolled(), MonoTime.currTime - ed.quietSince(promptShown),
                     idleHold, false, exitArmedAt != MonoTime.zero);
             }
             lapse = () @safe => (exitArmedAt != MonoTime.zero && MonoTime.currTime - exitArmedAt > exitWindow)
-                || (!editor.holdsTimer(MonoTime.currTime) && agent.timers.anyDue(agent.timerNow()))
+                || (!ed.holdsTimer(MonoTime.currTime) && agent.timers.anyDue(agent.timerNow()))
                 || idleNow()
                 || (updateHints && updateHints.tryTake(updateHint));
-            auto r = editor.readLine(.stamp(false) ~ "› ", console.stamp() ~ glyphMark ~ " ", false, lapse);
-            editor.restyle = null;
+            auto r = ed.readLine(.stamp(false) ~ "› ", console.stamp() ~ glyphMark ~ " ", false, lapse);
+            ed.restyle = null;
             syncMode(); // Shift-Tab at the prompt switched the mode
             if (r.outcome == Outcome.eof) break;
-            if (r.outcome == Outcome.stopped && !editor.holdsTimer(MonoTime.currTime) && agent.timers.anyDue(agent.timerNow()))
+            if (r.outcome == Outcome.stopped && !ed.holdsTimer(MonoTime.currTime) && agent.timers.anyDue(agent.timerNow()))
             {
                 // Park a stale draft so the timer turn can't take it as a steer.
-                hasParkedDraft = editor.parkDraft(parkedDraft);
+                hasParkedDraft = ed.parkDraft(parkedDraft);
                 string notice;
                 line = agent.takeFiredTimers(notice);
                 writeln(console.dim(notice));
@@ -2088,7 +2103,7 @@ int runMain(string[] args)
             else if (r.outcome == Outcome.stopped && idleNow())
             {
                 // Park the draft so keys typed meanwhile steer nothing stale.
-                hasParkedDraft = editor.parkDraft(parkedDraft);
+                hasParkedDraft = ed.parkDraft(parkedDraft);
                 writeln(console.dim("compacting (idle)… Esc Esc to cancel"));
                 stdOut.flush();
                 updateStatus((ref Stats s) { s.activity = Activity.idleCompacting; });
@@ -2125,7 +2140,7 @@ int runMain(string[] args)
                 auto now = MonoTime.currTime;
                 if (exitArmedAt != MonoTime.zero && now - exitArmedAt <= exitWindow) break;
                 exitArmedAt = now;
-                editor.hint = console.dim("(Ctrl-C again to exit)");
+                ed.hint = console.dim("(Ctrl-C again to exit)");
                 quietPrompt = true;
                 continue;
             }
@@ -2168,18 +2183,18 @@ int runMain(string[] args)
             switch (cmd)
             {
                 case "/quit", "/exit": goodbye(); return 0;
-                case "/help": writeln(editor !is null ? helpText() : usage); continue;
+                case "/help": writeln(editor.isSome ? helpText() : usage); continue;
                 case "/restart":
                 {
                     // A brand-new session in place: new ID, just the system
                     // prompt, default mode, empty plan, counters zeroed. The
                     // previous log stays on disk and is still resumable.
                     import nano.session : newSessionId;
-                    SessionLog log;
+                    Option!SessionLog log;
                     try
                     {
                         if (!o.noSession)
-                            log = new SessionLog(sessionDir, agent.client.providerName ~ "/" ~ agent.client.modelName, cwd);
+                            log = some(new SessionLog(sessionDir, agent.client.providerName ~ "/" ~ agent.client.modelName, cwd));
                     }
                     catch (Exception e) { writeln(console.red("error: " ~ e.msg)); continue; }
                     agent.restart(systemFor(cwd, false), log);
@@ -2188,12 +2203,12 @@ int runMain(string[] args)
                     agent.useHooks(loadHooks(cwd), false);
                     if (gFrame) gFrame.clear();
                     refreshStatus();
-                    if (log !is null) writefln("Session: %s (resume with --resume %s)", log.id, log.id);
-                    else writefln("Session: %s", newSessionId());
+                    log.match!(l => writefln("Session: %s (resume with --resume %s)", l.id, l.id),
+                        () => writefln("Session: %s", newSessionId()));
                     continue;
                 }
                 case "/update":
-                    updateCommand(editor !is null);
+                    updateCommand(editor.isSome);
                     continue;
                 case "/relaunch":
                 {
@@ -2202,14 +2217,14 @@ int runMain(string[] args)
                     // there is nothing to confirm discarding.
                     import nano.update : launchExe, relaunchArgv;
                     import nano.safeio : execProgram;
-                    if (agent.log is null)
+                    auto id = agent.log.match!(l => l.id, () => string.init);
+                    if (!id.length)
                     {
                         writeln("This session isn't saved (--no-session), so a relaunch cannot resume it. "
                             ~ "Use /restart for a fresh session.");
                         continue;
                     }
                     auto exe = launchExe();
-                    auto id = agent.log.id;
                     // Printed after the frame hands the terminal back, so it stays on screen.
                     if (gFrame) gFrame.suspend();
                     writefln("\nRelaunching into session %s (resume later with --resume %s)", id, id);
@@ -2276,7 +2291,7 @@ int runMain(string[] args)
                     writeln(contextReport(agent));
                     continue;
                 case "/queue":
-                    writeln(runQueueCommand(queue, null, arg));
+                    writeln(runQueueCommand(queue, atomicLoad(agent.control), arg));
                     continue;
                 case "/plan":
                     writeln(planText(agent));
@@ -2313,7 +2328,7 @@ int runMain(string[] args)
                     import nano.resume : pickOutcome, Pick, listRows, resumeLast = last;
                     import std.array : join;
                     if (o.noSession) { writeln("Sessions aren't saved (--no-session), so there is nothing to resume"); continue; }
-                    auto current = agent.log !is null ? agent.log.id : null;
+                    auto current = agent.log.match!(l => l.id, () => string.init);
                     string id = arg;
                     try
                     {
@@ -2352,14 +2367,15 @@ int runMain(string[] args)
                 case "/trajectory":
                 {
                     static import nano.trajectory;
-                    if (agent.log is null) { writeln("Session persistence is disabled: no trajectory to show"); continue; }
+                    string logPath = agent.log.match!(l => l.path, () => string.init);
+                    if (!logPath.length) { writeln("Session persistence is disabled: no trajectory to show"); continue; }
                     if (arg.length && arg != "--json" && arg != "--markdown" && arg != "--md")
                     {
                         writefln("Unknown option %s; use /trajectory [--json|--markdown]", JSONValue(arg).toString);
                         continue;
                     }
                     nano.trajectory.Trajectory t;
-                    try t = nano.trajectory.load(agent.log.path);
+                    try t = nano.trajectory.load(logPath);
                     catch (Exception e) { writeln("Could not read the session log: ", e.msg); continue; }
                     if (arg == "--json") writeln(t.toJson);
                     else if (arg.length) writeln(t.toMarkdown);
@@ -2370,15 +2386,16 @@ int runMain(string[] args)
                     writeln(sessionText(agent));
                     continue;
                 case "/hooks":
-                    write(agent.hooks !is null ? agent.hooks.listing : "No hooks loaded.\n");
+                    write(agent.hooks.match!(h => h.listing, () => "No hooks loaded.\n"));
                     continue;
                 case "/memory":
-                    if (memory is null) { writeln("memory is off"); continue; }
+                    if (memory.isNone) { writeln("memory is off"); continue; }
+                    auto store = memory.unwrap("checked on the line above");
                     try
                     {
                         if (arg.startsWith("forget "))
                         {
-                            writeln(memory.forget(arg[7 .. $]));
+                            writeln(store.forget(arg[7 .. $]));
                             continue;
                         }
                         if (arg.length)
@@ -2389,19 +2406,19 @@ int runMain(string[] args)
                         }
                         // Plan mode has no memory_save tool either.
                         bool writable = memoryWritable && agent.control.mode != AgentMode.plan;
-                        auto all = memory.all();
+                        auto all = store.all();
                         if (!all.length)
                         {
                             writefln(writable ? "No memories yet. The model saves them with memory_save; files live under %s."
                                 : "No memories yet. Memory is read-only here, so the model cannot save them; files live under %s.",
-                                memory.root);
+                                store.root);
                             continue;
                         }
                         writefln("%s memor%s (memory is %s; edit the files under %s%s):", all.length,
                             all.length == 1 ? "y" : "ies", cfg.memory == MemoryMode.on ? "on" : "read-only",
-                            memory.root, writable ? ", or /memory forget <id>" : "");
+                            store.root, writable ? ", or /memory forget <id>" : "");
                         import nano.memory : recallStats;
-                        auto stats = recallStats(memory);
+                        auto stats = recallStats(store);
                         foreach (x; all)
                         {
                             import nano.memory : scopeName = name;
@@ -2419,18 +2436,18 @@ int runMain(string[] args)
                     catch (Exception e) stdErr.writeln(console.red("error: " ~ e.msg));
                     continue;
                 case "/settings":
-                    if (editor is null) { writeln("/settings needs an interactive terminal"); continue; }
+                    if (editor.isNone) { writeln("/settings needs an interactive terminal"); continue; }
                     {
                         auto h = settingsHost();
-                        foreach (n; runSettings(new EditorUi(editor), h)) writeln(n);
+                        foreach (n; runSettings(new EditorUi(editor.unwrap("checked above")), h)) writeln(n);
                     }
                     refreshStatus();
                     continue;
                 case "/model":
-                    if (!arg.length && editor !is null)
+                    if (!arg.length && editor.isSome)
                     {
                         auto h = settingsHost();
-                        if (auto picked = pickModel(new EditorUi(editor), h))
+                        if (auto picked = pickModel(new EditorUi(editor.unwrap("checked above")), h))
                         {
                             try writeln(switchModel(picked));
                             catch (Exception e) stdErr.writeln(console.red("error: " ~ e.msg));

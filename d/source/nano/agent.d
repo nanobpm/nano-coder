@@ -4,6 +4,7 @@ module nano.agent;
 
 @safe:
 import nano.arith : checkedMul, checkedSub, saturatingSub;
+import nano.option : Option, some, none, match, ifSome, unwrap;
 
 import nano.safeio : Isolated, JoinHandle, spawnDaemon, stdErr, stdOut;
 
@@ -46,7 +47,7 @@ import nano.timers : Timers, TimerError, isTimerTool, timerDefinitions = definit
 import nano.permissions;
 import nano.session;
 import nano.control;
-import nano.claude_hooks : HookManager, Decision, applyUpdatedInput, maxStopBlocks;
+import nano.claude_hooks : HookManager, Decision, HookOutcome = Outcome, applyUpdatedInput, maxStopBlocks;
 
 /// What the loop reports as it works (the CLI renders these).
 interface AgentEvents
@@ -164,7 +165,7 @@ class Agent
     /// What the endpoint reports about the current model.
     Capabilities capabilities;
     private ProviderConfig noProvider;
-    SessionLog log;
+    Option!SessionLog log;
     TokenUsage lastUsage;
     /// Steer or cancel the running turn from another thread.
     shared TurnControl control;
@@ -176,7 +177,7 @@ class Agent
     string[string] completedStops;
     JSONValue[string] completedOutcomes;
     /// Claude Code-compatible user hooks (null = none).
-    HookManager hooks;
+    Option!HookManager hooks;
     /// Whether this agent continues a restored session (`SessionStart` source).
     bool resumed;
     private bool sessionStarted;
@@ -286,7 +287,7 @@ class Agent
     {
         import nano.session : nowStamp;
         if (!m.timestamp.length) m.timestamp = nowStamp();
-        if (log !is null) m.logLine = log.append(m);
+        log.ifSome((SessionLog l) { m.logLine = l.append(m); });
         messages ~= m;
     }
 
@@ -326,27 +327,25 @@ class Agent
         // so an input without one marks a turn a crash interrupted.
         auto inputId = givenId.length ? givenId
             : format("in-%s-%s", (Clock.currStdTime - 621_355_968_000_000_000L) / 10_000, ++inputCounter);
-        ulong from = log !is null ? logSize() : 0;
+        ulong from = logSize();
         // Redelivering the id of an interrupted turn resumes it (its input
         // was logged already).
         bool resuming = hasPending && givenId.length && pending.id == givenId;
-        if (log !is null && !resuming) log.input(inputId, input);
+        if (!resuming) log.ifSome((SessionLog l) { l.input(inputId, input); });
         string response;
         try response = runTurn(input, ev, resetControl, automatic, inputId, resuming);
         catch (Exception e)
         {
-            if (log !is null)
-            {
-                log.turnEnd(inputId, "Error: " ~ e.msg, "end_turn");
-                indexTurn(from);
-            }
+            log.ifSome((SessionLog l) {
+                l.turnEnd(inputId, "Error: " ~ e.msg, "end_turn");
+                indexTurn(l, from);
+            });
             throw e;
         }
-        if (log !is null)
-        {
-            log.turnEnd(inputId, response, cast(string) lastStop, hasOutcome ? lastOutcome.toJSON : JSONValue.init);
-            indexTurn(from);
-        }
+        log.ifSome((SessionLog l) {
+            l.turnEnd(inputId, response, cast(string) lastStop, hasOutcome ? lastOutcome.toJSON : JSONValue.init);
+            indexTurn(l, from);
+        });
         hasPending = false;
         completedInputs[inputId] = response;
         if (lastStop != StopReason.endTurn) completedStops[inputId] = cast(string) lastStop;
@@ -366,25 +365,27 @@ class Agent
     private ulong logSize()
     {
         import std.file : getSize;
-        try return getSize(log.path);
+        string path = log.match!(l => l.path, () => string.init);
+        if (!path.length) return 0;
+        try return getSize(path);
         catch (Exception) return 0; // no log file yet (or unreadable): treat as empty
     }
 
     /// Keep the `--resume` picker's summary current (only a cache: the picker
     /// rebuilds a missing or stale summary), then maybe request a title.
-    private void indexTurn(ulong from)
+    private void indexTurn(SessionLog log, ulong from)
     {
         import nano.session_index : update, Summary;
         Summary s;
         try s = update(log.path, from, client.providerName ~ "/" ~ client.modelName);
         catch (Exception) return; // indexing is best effort; the session log itself is intact
-        requestTitle(s);
+        requestTitle(s, log.path);
     }
 
     /// With `session_titles` on, ask the model for a title in the background
     /// once the session has a telling prompt and no title. Failures are silent:
     /// a later run tries again.
-    private void requestTitle(const ref nano.session_index.Summary s)
+    private void requestTitle(const ref nano.session_index.Summary s, string logPath)
     {
         import nano.session_index : titleSource;
         if (!sessionTitles || titleClient is null || s.title !is null || (s.id in titlesRequested)) return;
@@ -397,7 +398,7 @@ class Agent
         catch (Exception) return; // a title is optional
         // Isolated: `titleClient` builds a new client from a resolved
         // (deep-copied) config, and only the title thread keeps it.
-        titleThreads ~= spawnDaemon(&fetchTitle, Isolated!LLMClient.assumeIsolated(c), source, log.path);
+        titleThreads ~= spawnDaemon(&fetchTitle, Isolated!LLMClient.assumeIsolated(c), source, logPath);
     }
 
     /// Ask `client` for a title for `source` and store it in the session at
@@ -457,14 +458,14 @@ class Agent
         auto typed = input;
         // Where a resume `SessionStart` context message lands (size_t.max: none).
         size_t hookContextStart = size_t.max;
-        if (hooks !is null)
+        foreach (h; hooks)
         {
-            syncHookSession();
+            syncHookSession(h);
             if (!sessionStarted)
             {
                 // Runs once; its context waits for the first accepted prompt.
                 sessionStarted = true;
-                auto start = hooks.runSessionStart(resumed ? "resume" : "startup");
+                auto start = h.runSessionStart(resumed ? "resume" : "startup");
                 if (auto ctx = start.contextBlock) pendingStartContext = ctx;
             }
         }
@@ -508,9 +509,9 @@ class Agent
                 push(hm);
             }
         }
-        else if (hooks !is null)
+        else foreach (h; hooks)
         {
-            auto o = hooks.runUserPromptSubmit(input);
+            auto o = h.runUserPromptSubmit(input);
             if (o.blocked)
             {
                 hasPending = true;
@@ -728,10 +729,10 @@ class Agent
                 // The whole answer: the chunks carried across continuations, then this one.
                 last = continued ~ r.content;
                 // A blocking Stop hook keeps the turn going (capped per turn).
-                if (hooks !is null && !cut && stopBlocks < maxStopBlocks && !control.isCancelled
-                    && iteration < budget)
+                if (!cut && stopBlocks < maxStopBlocks && !control.isCancelled && iteration < budget)
                 {
-                    auto o = hooks.runStop(stopBlocks > 0);
+                    // Not `foreach (h; hooks)`: the `continue` below is for the turn loop.
+                    auto o = hooks.match!(h => h.runStop(stopBlocks > 0), () => HookOutcome.init);
                     if (o.blocked)
                     {
                         stopBlocks++;
@@ -767,7 +768,7 @@ class Agent
                     {
                         import nano.tools : setSpillDir, spillDirFor, truncateOutput;
                         // Cut outputs are kept beside a persisted session's log.
-                        setSpillDir(log !is null ? spillDirFor(log.path) : null);
+                        setSpillDir(log.match!(l => spillDirFor(l.path), () => string.init));
                         result = runTool(call, r.stopReason, isError, dispatched, effectiveArgs);
                         // bash, read_file and history_read bound their own output.
                         if (call.name != "bash" && call.name != "read_file" && call.name != hist.readTool
@@ -782,13 +783,14 @@ class Agent
                     if (call.name == "read_file") result = imageResult(result, isError, attachments);
                     // Deeper instruction files and scoped rules attach to the first
                     // file-tool result that touches a matching path.
-                    if (!isError && instructions !is null
-                        && (call.name == "read_file" || call.name == "write_file" || call.name == "edit_file"))
+                    if (!isError && (call.name == "read_file" || call.name == "write_file" || call.name == "edit_file"))
                         if (auto p = "path" in call.arguments)
                             if (p.type == JSONType.string)
                             {
                                 import std.file : getcwd;
-                                if (auto nested = instructions.nestedFor(p.str, getcwd())) result ~= nested;
+                                instructions.ifSome((ProjectInstructions pi) {
+                                    if (auto nested = pi.nestedFor(p.str, getcwd())) result ~= nested;
+                                });
                             }
                     // Memory recall (Rust #167): a note for each memory whose
                     // anchors appear in this call's arguments and whose full
@@ -838,9 +840,10 @@ class Agent
             {
                 // A reported outcome ends the turn like a tool-free answer, so
                 // it passes the same Stop gate.
-                if (hooks !is null && stopBlocks < maxStopBlocks && !control.isCancelled && iteration < budget)
+                if (stopBlocks < maxStopBlocks && !control.isCancelled && iteration < budget)
                 {
-                    auto o = hooks.runStop(stopBlocks > 0);
+                    // Not `foreach (h; hooks)`: the `continue` below is for the turn loop.
+                    auto o = hooks.match!(h => h.runStop(stopBlocks > 0), () => HookOutcome.init);
                     if (o.blocked)
                     {
                         stopBlocks++;
@@ -1138,7 +1141,8 @@ class Agent
         import std.path : buildPath, dirName;
         import std.file : tempDir;
         import std.process : thisProcessID;
-        if (log !is null && log.path.length) return buildPath(dirName(log.path), log.id ~ ".attachments");
+        string dir = log.match!(l => l.path.length ? buildPath(dirName(l.path), l.id ~ ".attachments") : null, () => string.init);
+        if (dir.length) return dir;
         return buildPath(tempDir, format("nano-coder-attachments-%s", thisProcessID));
     }
 
@@ -1223,7 +1227,7 @@ class Agent
         import std.algorithm : canFind;
         ctx.CompactionMode m = mode is null ? compactionMode : *mode;
         // Smart compaction points into the session log; without one it is standard.
-        if (log is null) m = ctx.CompactionMode.standard;
+        if (log.isNone) m = ctx.CompactionMode.standard;
         bool smart = m == ctx.CompactionMode.smart;
         auto window = contextWindow();
         size_t bodyStart = messages.length && messages[0].role == Role.system ? 1 : 0;
@@ -1352,8 +1356,10 @@ class Agent
             pending.hasBase = true;
             pending.base = messages.length;
         }
-        if (log !is null) log.replace(messages, first, last, ctx.modeName(m), client.providerName ~ "/" ~ client.modelName, pinStash,
-            hasPending ? &pending : null);
+        log.ifSome((SessionLog l) {
+            l.replace(messages, first, last, ctx.modeName(m), client.providerName ~ "/" ~ client.modelName, pinStash,
+                hasPending ? &pending : null);
+        });
         // The replacement drops recalled notes' full text from context, so
         // every memory may be recalled again (except those the retained
         // system message's index renders in full: `indexShown` is kept).
@@ -1365,7 +1371,7 @@ class Agent
         report = CompactReport(len, messages.length, tokensBefore, estimateContextTokens(), checkedSub(split, bodyStart),
             fallback, truncated, m);
         // Nested instructions attached to folded tool results may be gone.
-        if (instructions !is null) instructions.forgetNested();
+        instructions.ifSome((ProjectInstructions pi) { pi.forgetNested(); });
         compactFloor = report.tokensAfter;
         idleGate.reset();
         compactions++;
@@ -1444,9 +1450,9 @@ class Agent
         // they can deny the call, rewrite its input, or add context.
         JSONValue args = call.arguments;
         string[] context;
-        if (hooks !is null)
+        foreach (h; hooks)
         {
-            auto o = hooks.runPreToolUse(call.name, call.arguments, call.id);
+            auto o = h.runPreToolUse(call.name, call.arguments, call.id);
             if (auto ctx = o.contextBlock) context ~= ctx;
             string deny;
             if (o.denies) deny = o.blockReason.length ? o.blockReason : "blocked by a PreToolUse hook";
@@ -1482,7 +1488,11 @@ class Agent
                 hasReported = true;
             }
             else if (isHistory)
-                out_ = call.name == hist.searchTool ? hist.search(log.path, args) : hist.read(log.path, args);
+            {
+                // History tools are offered only when historyEnabled(), which needs a log.
+                auto logPath = log.unwrap("history tools are offered only with a session log").path;
+                out_ = call.name == hist.searchTool ? hist.search(logPath, args) : hist.read(logPath, args);
+            }
             else if (isTimer) out_ = runTimerTool(call.name, args);
             else out_ = isPlan ? runPlanTool(call.name, args) : tools.execute(call.name, args);
             isError = false;
@@ -1494,9 +1504,9 @@ class Agent
         catch (OutcomeError e) out_ = e.msg;
         catch (QuestionError e) out_ = e.msg;
         catch (Exception e) out_ = format("%s failed: %s", call.name, e.msg);
-        if (hooks !is null)
+        foreach (h; hooks)
         {
-            auto o = hooks.runPostToolUse(call.name, args, out_, call.id);
+            auto o = h.runPostToolUse(call.name, args, out_, call.id);
             if (auto ctx = o.contextBlock) context ~= ctx;
             if (o.blocked && o.blockReason.strip.length) context ~= o.blockReason;
         }
@@ -1504,23 +1514,23 @@ class Agent
     }
 
     /// Instruction files: nested ones attach to file-tool results.
-    ProjectInstructions instructions;
+    Option!ProjectInstructions instructions;
     /// A smart summary is in context: offer history_search/history_read.
     bool historyAvailable;
     /// Append the "look in history" hint to the next failed tool result.
     bool historyHintPending;
-    bool historyEnabled() const { return log !is null && historyAvailable; }
+    bool historyEnabled() const { return log.isSome && historyAvailable; }
 
     /// Start a fresh session in place (Rust `new_session`, for `/restart`):
-    /// the conversation is just `system`, logged to `newLog` (null: not
+    /// the conversation is just `system`, logged to `newLog` (none: not
     /// persisted); mode, session thinking, plan, timers, reminders, hook session,
     /// calibration, history tools and counters are reset. The old log stays.
-    void restart(string system, SessionLog newLog)
+    void restart(string system, Option!SessionLog newLog)
     {
         import nano.mode : AgentMode;
         messages = [Message.system(system)];
         log = newLog;
-        if (log !is null) log.append(messages[0]);
+        log.ifSome((SessionLog l) { l.append(messages[0]); });
         control.mode = AgentMode.normal;
         sessionThinking.nullify();
         plan = Plan.init;
@@ -1544,7 +1554,7 @@ class Agent
     }
 
     /// The memory store (null: memory off). Recall from tool calls reads it.
-    mem.Store memory;
+    Option!(mem.Store) memory;
     /// Memory recall from tool calls (Rust #167): which memories' full text
     /// is already in this context. Persisted in `recall` records; reset by
     /// compaction and a new session.
@@ -1576,9 +1586,10 @@ class Agent
     /// resumed session may repeat a note.
     private void recallChanged()
     {
-        if (log is null) return;
-        try log.recall(recallState.toJSON);
-        catch (Exception e) stdErr.writeln("[agent] could not persist memory recall state: ", e.msg);
+        log.ifSome((SessionLog l) {
+            try l.recall(recallState.toJSON);
+            catch (Exception e) stdErr.writeln("[agent] could not persist memory recall state: ", e.msg);
+        });
     }
 
     /// Recall memories whose anchors appear in this dispatched call; returns
@@ -1586,8 +1597,13 @@ class Agent
     /// showed as seen (and logs a `used` event for a fired id).
     private string[] recallMemories(string tool, const JSONValue args, bool ok, string result)
     {
-        if (memory is null) return null;
-        string session = log !is null ? log.id : null;
+        foreach (store; memory) return recallMemories(store, tool, args, ok, result);
+        return null;
+    }
+
+    private string[] recallMemories(mem.Store memory, string tool, const JSONValue args, bool ok, string result)
+    {
+        string session = log.match!(l => l.id, () => string.init);
         if (mem.isMemoryTool(tool))
         {
             if (ok)
@@ -1686,7 +1702,7 @@ class Agent
 
     private void timersChanged()
     {
-        if (log !is null) log.timers(timers.toJSON);
+        log.ifSome((SessionLog l) { l.timers(timers.toJSON); });
         if (onTimersChanged !is null) onTimersChanged();
     }
 
@@ -1744,7 +1760,7 @@ class Agent
     private void planChanged()
     {
         reminders.planChanged();
-        if (log !is null) log.plan(plan.toJSON);
+        log.ifSome((SessionLog l) { l.plan(plan.toJSON); });
         if (onPlanChanged !is null) onPlanChanged();
     }
 
@@ -1754,7 +1770,7 @@ class Agent
     {
         plan = p;
         if (announce && planTools && !plan.empty) push(Message.user(plan.carriedOverNote));
-        if (log !is null) log.plan(plan.toJSON);
+        log.ifSome((SessionLog l) { l.plan(plan.toJSON); });
     }
 
     private static string withContext(string text, string[] context)
@@ -1768,20 +1784,20 @@ class Agent
     /// are recorded in the session log for the audit trail.
     void useHooks(HookManager h, bool resumed)
     {
-        hooks = h;
+        hooks = some(h);
         this.resumed = resumed;
         sessionStarted = false;
         pendingStartContext = null;
-        if (h is null || log is null || !h.files.length) return;
+        if (!h.files.length) return;
         import nano.claude_hooks : label;
         string[3][] files;
         foreach (f; h.files) files ~= [f.path, f.source.label, f.hash];
-        log.hooks(files);
+        log.ifSome((SessionLog l) { l.hooks(files); });
     }
 
-    private void syncHookSession()
+    private void syncHookSession(HookManager h)
     {
-        hooks.setSession(log !is null ? log.id : "", log !is null ? log.path : "",
+        h.setSession(log.match!(l => l.id, () => ""), log.match!(l => l.path, () => ""),
             control.mode == AgentMode.plan ? "plan" : "default");
     }
 
@@ -1937,8 +1953,8 @@ unittest
     // UserPromptSubmit: context is attached; exit 2 rejects without a model call.
     auto mock = new MockClient([LLMResponse("ok")]);
     auto agent = new Agent(mock, reg, Policy.init, "sys");
-    agent.hooks = new HookManager([hook(Event.sessionStart, "echo started"),
-        hook(Event.userPromptSubmit, `grep -q forbidden && { echo no secrets >&2; exit 2; }; echo ctx`)], tempDir);
+    agent.hooks = some(new HookManager([hook(Event.sessionStart, "echo started"),
+        hook(Event.userPromptSubmit, `grep -q forbidden && { echo no secrets >&2; exit 2; }; echo ctx`)], tempDir));
     assert(agent.run("hello", new NullEvents) == "ok");
     auto first = mock.seen[0][$ - 1].content;
     assert(first.canFind("hello") && first.canFind("started") && first.canFind("ctx") && first.canFind("<system-reminder>"), first);
@@ -1953,11 +1969,11 @@ unittest
         LLMResponse("done"),
     ]);
     agent = new Agent(mock, reg, Policy.init, null);
-    agent.hooks = new HookManager([
+    agent.hooks = some(new HookManager([
         hook(Event.preToolUse, `echo '{"decision":"block"}' >/dev/null; echo nope >&2; exit 2`, "echo"),
         hook(Event.preToolUse, `grep -q '"ls"' && echo '{"hookSpecificOutput":{"permissionDecision":"allow","updatedInput":{"command":"echo patched"}}}' || echo '{"hookSpecificOutput":{"updatedInput":{"command":"sudo rm -rf /"}}}'`, "Bash"),
         hook(Event.postToolUse, `echo '{"hookSpecificOutput":{"additionalContext":"post-note"}}'`, "Bash"),
-    ], tempDir);
+    ], tempDir));
     ran = null;
     agent.run("go", new NullEvents);
     auto results = mock.seen[1][$ - 3 .. $];
@@ -1969,7 +1985,7 @@ unittest
     // Stop: a block keeps the turn going, capped per turn.
     mock = new MockClient([LLMResponse("a"), LLMResponse("b"), LLMResponse("c"), LLMResponse("d"), LLMResponse("e")]);
     agent = new Agent(mock, reg, Policy.init, null);
-    agent.hooks = new HookManager([hook(Event.stop, `echo '{"decision":"block","reason":"more"}'`)], tempDir);
+    agent.hooks = some(new HookManager([hook(Event.stop, `echo '{"decision":"block","reason":"more"}'`)], tempDir));
     assert(agent.run("go", new NullEvents) == "d");
     assert(mock.seen.length == 4 && mock.seen[1][$ - 1].content.canFind("more"));
 }
@@ -2246,7 +2262,7 @@ unittest
     assert(Message.auto_("x").autoInitiated && !ctx.isUserRequest(Message.auto_("x")));
     // A reset (new session or /clear) drops the stash.
     agent.pinStash = [Message.user("old")];
-    agent.restart("sys", null);
+    agent.restart("sys", Option!SessionLog.init);
     assert(agent.pinStash is null);
 }
 
@@ -2409,7 +2425,7 @@ unittest
     if (dir.exists) rmdirRecurse(dir);
     auto agent = new Agent(new MockClient([LLMResponse("a"), LLMResponse("b"), LLMResponse("c")]), new ToolRegistry,
         Policy.init, null);
-    agent.log = new SessionLog(dir, "mock/m", "/w");
+    agent.log = some(new SessionLog(dir, "mock/m", "/w"));
     MockClient titler;
     string[] specs;
     agent.sessionTitles = true;
@@ -2522,7 +2538,7 @@ unittest
     auto mock = new MockClient([LLMResponse("", "", [ToolCall.fromRaw("big1", "echo", `{}`)]), LLMResponse("done")]);
     auto agent = new Agent(mock, reg, Policy.init, "sys");
     agent.toolOutputLimit = 10;
-    agent.log = new SessionLog(dir, "m", dir, "sess-x");
+    agent.log = some(new SessionLog(dir, "m", dir, "sess-x"));
     agent.run("go", new NullEvents);
     auto tool = agent.messages[3];
     assert(tool.content.indexOf("characters omitted; full output saved to " ~ buildPath(dir, "sess-x.spill")) > 0,
@@ -2773,10 +2789,10 @@ unittest // a hint fires once per context, a rule every time; compaction resets 
     auto mock = new MockClient([probeCall("r1", path), LLMResponse("one"), probeCall("r2", path), LLMResponse("two"),
         LLMResponse("SUMMARY: read logs"), probeCall("r3", path), LLMResponse("three")]);
     auto agent = new Agent(mock, probeTools(), Policy.init, "sys");
-    agent.memory = store;
+    agent.memory = some(store);
     auto sdir = buildPath(tempDir, "nano-d-recall-once-sessions");
     if (sdir.exists) rmdirRecurse(sdir);
-    agent.log = new SessionLog(sdir, "mock/m", "/x");
+    agent.log = some(new SessionLog(sdir, "mock/m", "/x"));
     // Longer than the index's 200-char clip, so the index alone does not show it.
     auto hint = store.save(mem.Scope.user,
         "worker logs on omarchy.local live under ~/.local/share/c8ctl-nano/logs " ~ "x".replicate(200), null, null);
@@ -2792,13 +2808,13 @@ unittest // a hint fires once per context, a rule every time; compaction resets 
     assert(second.canFind(rule.id), "a rule fires on every match: " ~ second);
 
     // A resume restores what was seen.
-    agent.restoreRecall(restore(agent.log.path).recall);
+    agent.restoreRecall(restore(agent.log.unwrap("set above").path).recall);
     assert(hint.id in agent.recallState.seen);
 
     CompactReport rep;
     assert(agent.compact(rep));
     assert(agent.recallState.empty, "compaction resets recall");
-    assert(mem.Recall.fromJSON(restore(agent.log.path).recall).empty, "the reset is persisted");
+    assert(mem.Recall.fromJSON(restore(agent.log.unwrap("set above").path).recall).empty, "the reset is persisted");
     agent.run("after compaction", new NullEvents);
     auto third = toolTexts(agent)[$ - 1];
     assert(third.canFind(hint.id), "a hint reappears after compaction: " ~ third);
@@ -2832,7 +2848,7 @@ unittest // the installed index's fully rendered memories don't refire; clipped 
 
     auto mock = new MockClient([probeCall("r1", path), LLMResponse("one"), probeCall("r2", path), LLMResponse("two")]);
     auto agent = new Agent(mock, probeTools(), Policy.init, "sys" ~ index);
-    agent.memory = store;
+    agent.memory = some(store);
     agent.installSystem("sys" ~ index, rendered);
     agent.run("look", new NullEvents);
     auto first = toolTexts(agent)[$ - 1];
@@ -2859,7 +2875,7 @@ unittest // an index re-install that drops a memory makes it recallable again
     auto index = store.indexWithRendered(false, rendered);
     auto mock = new MockClient([probeCall("r1", path), LLMResponse("one"), probeCall("r2", path), LLMResponse("two")]);
     auto agent = new Agent(mock, probeTools(), Policy.init, "sys");
-    agent.memory = store;
+    agent.memory = some(store);
     agent.installSystem("sys" ~ index, rendered);
     agent.run("look", new NullEvents);
     assert(!toolTexts(agent)[$ - 1].canFind(short_.id), "shown by the index");
@@ -2887,7 +2903,7 @@ unittest // at most two notes per input; refused calls never recall
     auto mock = new MockClient([probeCall("r1", path), probeCall("r2", path), LLMResponse("done"),
         probeCall("r3", path), probeCall("r4", path), LLMResponse("done")]);
     auto agent = new Agent(mock, probeTools(), Policy.init, "sys");
-    agent.memory = store;
+    agent.memory = some(store);
     agent.run("look", new NullEvents);
     assert(pinCount(agent) == 2, format("%s", pinCount(agent)));
     // A new input gets a fresh budget.
@@ -2898,7 +2914,7 @@ unittest // at most two notes per input; refused calls never recall
     auto unknown = new MockClient([LLMResponse("", "", [ToolCall.fromRaw("u1", "nope", `{"path":"` ~ path ~ `"}`)]),
         LLMResponse("done")]);
     auto b = new Agent(unknown, probeTools(), Policy.init, "sys");
-    b.memory = store;
+    b.memory = some(store);
     b.run("look", new NullEvents);
     assert(pinCount(b) == 0);
 }

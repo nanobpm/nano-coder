@@ -7,6 +7,7 @@ module nano.agent_resume_test;
 
 version (unittest):
 
+import nano.option : some, unwrap;
 import std.json;
 import std.file : tempDir, exists, rmdirRecurse;
 import std.path : buildPath;
@@ -73,7 +74,7 @@ Agent loaded(string path, MockClient mock)
     agent.messages = agent.messages[0 .. 1];
     foreach (m; r.conversation)
         if (m.role != Role.system) agent.messages ~= m;
-    agent.log = new SessionLog(path);
+    agent.log = some(new SessionLog(path));
     agent.completedInputs = r.completed.dup;
     agent.completedStops = r.completedStops.dup;
     agent.adoptPending(r);
@@ -286,7 +287,7 @@ unittest
     auto mock = new MockClient([cut("one "), LLMResponse("!error:provider glitch"), cut("two "), cut("three "),
         LLMResponse("four")]);
     auto agent = new Agent(mock, echoTools, Policy.init, "sys");
-    agent.log = new SessionLog(dir, "mock/m", "/w");
+    agent.log = some(new SessionLog(dir, "mock/m", "/w"));
     bool failed;
     try agent.run("go", new NullEvents, true, "in-1");
     catch (Exception) failed = true;
@@ -305,7 +306,7 @@ unittest
     foreach (_; 0 .. maxTruncatedContinuations + 1) cuts ~= cut("more");
     auto mock = new MockClient(cuts);
     auto agent = new Agent(mock, echoTools, Policy.init, "sys");
-    agent.log = new SessionLog(dir, "mock/m", "/w");
+    agent.log = some(new SessionLog(dir, "mock/m", "/w"));
     auto first = agent.run("go", new NullEvents, true, "in-1");
     assert(agent.lastStop == StopReason.maxTokens);
     mock.seen = null;
@@ -315,11 +316,11 @@ unittest
     assert(mock.seen.length == 0, "a recorded turn is not re-run");
 
     // After a reload too: the persisted turn end carries the stop reason.
-    auto r = restore(agent.log.path);
+    auto r = restore(agent.log.unwrap("set by the test").path);
     assert(r.completedStops["in-1"] == "max_tokens");
     assert(!r.hasPending);
     auto fresh = new MockClient(null);
-    auto second = loaded(agent.log.path, fresh);
+    auto second = loaded(agent.log.unwrap("set by the test").path, fresh);
     second.run("go", new NullEvents, true, "in-1");
     assert(second.lastStop == StopReason.maxTokens);
     assert(fresh.seen.length == 0);
@@ -331,20 +332,20 @@ unittest
 {
     auto dir = freshDir("compact-persist");
     auto agent = new Agent(new MockClient(null), echoTools, Policy.init, "sys");
-    agent.log = new SessionLog(dir, "mock/m", "/w");
+    agent.log = some(new SessionLog(dir, "mock/m", "/w"));
     agent.hasPending = true;
     agent.pending = PendingInput("in-9", "do the thing", 1, true, "half ", 1);
     auto p = agent.pending;
-    agent.log.input("in-9", "do the thing");
-    agent.log.replace([Message.system("sys"), Message.user("summary"), Message.user("do the thing")], 1, 2,
+    agent.log.unwrap("set by the test").input("in-9", "do the thing");
+    agent.log.unwrap("set by the test").replace([Message.system("sys"), Message.user("summary"), Message.user("do the thing")], 1, 2,
         "standard", null, null, &p);
-    auto r = restore(agent.log.path);
+    auto r = restore(agent.log.unwrap("set by the test").path);
     assert(r.hasPending && r.pending.id == "in-9");
     assert(r.pending.hasContinuation && r.pending.answer == "half " && r.pending.count == 1);
     assert(r.pending.hasBase && r.pending.base == 3);
     // A replace without a pending position (a /clear) drops it.
-    agent.log.replace([Message.system("sys")]);
-    assert(!restore(agent.log.path).hasPending);
+    agent.log.unwrap("set by the test").replace([Message.system("sys")]);
+    assert(!restore(agent.log.unwrap("set by the test").path).hasPending);
 }
 
 // rust: agent.rs::resume_after_a_logged_continuation_reminder_stitches_the_prefix

@@ -106,4 +106,25 @@ ratchet "outside *_test.d" "$(find source -name '*.d' ! -name '*_test.d' | xargs
 if find source -name '*.d' | sort | xargs awk -f scripts/enum-switch.awk | grep . >&2; then
     status=1
 fi
+# Absence: a value that may be missing is an `Option!T` (nano.option), whose
+# value can't be reached without handling `none`. A class reference that may
+# be null says nothing, so null checks on class-typed names are capped by
+# scripts/class-null-budget (scripts/class-null.awk lists them); new code
+# uses Option, or an object that is always there (an empty Skills, say).
+# `Nullable!` doesn't force handling either (its `.get` on empty returns
+# T.init in release builds), so its uses only go down
+# (scripts/nullable-budget). Class declarations other than exceptions are
+# capped by scripts/class-budget, so a new reference type is a visible
+# decision: prefer a struct, an enum or a SumType for a value.
+nfiles=$(find source -name '*.d' | wc -l | tr -d ' ')
+files=$(find source -name '*.d' | sort)
+# shellcheck disable=SC2086 # the list is passed three times, one per pass
+classnull=$(awk -v n="$nfiles" -f scripts/class-null.awk $files $files $files)
+if [ "$(printf '%s' "$classnull" | grep -c .)" -gt "$(cat scripts/class-null-budget)" ]; then
+    printf '%s\n' "$classnull" >&2
+    echo "Use nano.option.Option!T for a reference that may be absent (see its module comment)." >&2
+fi
+ratchet "outside *_test.d" "$(printf '%s' "$classnull" | grep -c .)" scripts/class-null-budget "null checks on class references"
+ratchet "outside *_test.d" "$(find source -name '*.d' ! -name '*_test.d' | xargs grep -hE 'Nullable!' | grep -vE '^[[:space:]]*//' | grep -oE 'Nullable!' | wc -l | tr -d ' ')" scripts/nullable-budget "\`Nullable!\` uses (use nano.option.Option!T)"
+ratchet "outside *_test.d" "$(find source -name '*.d' ! -name '*_test.d' | xargs grep -hE '^[[:space:]]*((final|abstract|private|static|public)[[:space:]]+)*class[[:space:]]+[A-Z]' | grep -vcE 'class[[:space:]]+[A-Za-z0-9_]*(Error|Exception)\b|:[[:space:]]*Exception')" scripts/class-budget "class declarations (exceptions aside)"
 exit $status
