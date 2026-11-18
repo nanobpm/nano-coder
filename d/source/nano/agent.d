@@ -2632,6 +2632,7 @@ unittest
 // rust: agent.rs::titles_sessions_once_a_prompt_says_something
 // rust: agent.rs::read_file_image_errors_with_a_hint_when_the_model_cannot_see
 // rust: agent.rs::read_file_attaches_an_image_for_a_vision_model
+// rust: agent.rs::a_resumed_session_keeps_attachments_and_survives_a_missing_file
 unittest
 {
     // read_file on an image: attached for a vision model, an error otherwise.
@@ -2685,6 +2686,20 @@ unittest
     auto gone = req.attachmentPlan;
     assert(req.resolveAttachments(1, gone)[0].text.canFind("no longer available"));
     assert(toolResultDisplay("x", t.attachments) == "x\n[image: " ~ png ~ ", 20×10]");
+    // A resumed session keeps the attachment (by hash) on its tool result.
+    {
+        import nano.session : SessionLog, restore;
+        import std.algorithm : filter;
+        import std.array : array;
+        auto log = new SessionLog(buildPath(dir, "sessions"), "mock/m", "/w");
+        log.append(agent.messages[0]);
+        foreach (ref m; agent.messages[1 .. $]) log.append(m);
+        auto r = restore(log.path);
+        auto resumed = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "sys");
+        resumed.loadRestored(r, some(new SessionLog(log.path)));
+        auto kept = resumed.messages.filter!(m => m.attachments.length).array;
+        assert(kept.length == 1 && kept[0].attachments[0].sha256 == t.attachments[0].sha256);
+    }
 }
 
 // Each turn updates the session index; with session_titles on, a telling

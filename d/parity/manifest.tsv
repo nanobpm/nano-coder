@@ -41,7 +41,7 @@ agent.rs::a_repeat_loop_ends_the_turn_blocked_after_the_warnings	test
 agent.rs::a_repeated_compaction_warns_the_summariser_the_earlier_summary_is_lossy	test	pinned user requests (#184)
 agent.rs::a_repeated_compaction_without_the_pin_tells_the_summariser_to_preserve_requirements	test	pinned user requests (#184)
 agent.rs::a_reply_cut_off_at_the_output_limit_continues_instead_of_ending	test
-agent.rs::a_resumed_session_keeps_attachments_and_survives_a_missing_file	todo
+agent.rs::a_resumed_session_keeps_attachments_and_survives_a_missing_file	test
 agent.rs::a_retried_prompt_keeps_its_spent_recall_budget	na	D has no in-process retry of a pending input and its replace records never keep one, so there is no per-input recall budget to carry
 agent.rs::a_same_agent_retry_after_a_provider_error_does_not_replay_the_snapshot_twice	test
 agent.rs::a_second_overflow_is_returned	test
