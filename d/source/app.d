@@ -1155,23 +1155,8 @@ string indent(string s)
 }
 
 alias planNote = planPromptNote;
+import nano.system_prompt : buildSystemPrompt;
 
-string buildSystemPrompt(const ref Config c, string cwd, bool plan, const Skills skills, string memoryIndex = null,
-    string instructions = null)
-{
-    import std.datetime.systime : Clock;
-    auto base = c.systemPrompt.length ? c.systemPrompt : "You are a helpful assistant with access to tools.";
-    version (OSX) enum os = "macOS";
-    else version (linux) enum os = "Linux";
-    else enum os = "unknown";
-    auto s = format("%s\n\nWorking directory: %s\nPlatform: %s\nToday's date: %s", base, cwd, os,
-            Clock.currTime.toISOExtString[0 .. 10]);
-    s ~= instructions;
-    s ~= skills.renderIndex;
-    s ~= memoryIndex;
-    if (plan) s ~= planNote;
-    return s;
-}
 
 /// Warnings for the current model's temperature and thinking settings.
 string[] settingWarnings(Agent agent)

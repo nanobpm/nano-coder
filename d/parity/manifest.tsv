@@ -58,7 +58,7 @@ agent.rs::a_title_is_requested_at_most_once_per_session_across_switches	todo
 agent.rs::a_tool_run_resets_the_continuation_accumulator	test
 agent.rs::a_truncated_final_assistant_is_not_replayed_as_a_clean_finish	test
 agent.rs::a_truncated_turns_stop_reason_survives_a_reload	test
-agent.rs::adds_project_instructions_to_the_system_prompt_and_nested_ones_to_file_results	todo
+agent.rs::adds_project_instructions_to_the_system_prompt_and_nested_ones_to_file_results	test
 agent.rs::an_automatic_timer_turn_marks_its_message_auto_initiated	test
 agent.rs::an_empty_summary_at_the_output_limit_names_the_cause	test
 agent.rs::an_equal_probe_replaces_a_learned_window_stat_source	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
@@ -108,7 +108,7 @@ agent.rs::idle_compaction_runs_once_per_crossing	test
 agent.rs::idle_firing_resets_the_pending_nudge_counter	test
 agent.rs::idle_poll_cache_is_keyed_on_the_offered_tool_set	test
 agent.rs::idle_take_fired_timers_returns_due_timers_once	test
-agent.rs::indexes_skills_in_the_system_prompt_and_loads_them_on_request	todo
+agent.rs::indexes_skills_in_the_system_prompt_and_loads_them_on_request	test
 agent.rs::load_session_renders_prompt_with_default_mode_writability	todo
 agent.rs::logs_thinking_usage_and_duration_with_assistant_messages	test
 agent.rs::long_tool_output_is_cut_and_kept_on_disk	test
