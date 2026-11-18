@@ -388,13 +388,21 @@ struct StreamState
 
     void emit(bool thinking, string text)
     {
+        import std.string : stripLeft;
+        // Drop the blank lines that usually follow `</think>`, but only when
+        // thinking preceded this content: otherwise leading whitespace is
+        // real (a continuation resuming mid-line, Rust #114).
+        if (!thinking && !r.content.length && r.reasoning.length) text = text.stripLeft;
+        if (!text.length) return;
         if (thinking) r.reasoning ~= text; else r.content ~= text;
         sink(thinking, text);
     }
 
     LLMResponse finish()
     {
+        import std.string : strip;
         think.finish((bool t, string x) { emit(t, x); });
+        r.reasoning = r.reasoning.strip;
         foreach (n, idx; order)
         {
             auto id = ids[idx].length ? ids[idx] : format("call_%s", n);

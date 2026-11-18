@@ -14,6 +14,10 @@ struct Reply
     int status;
     string headers;
     string body_;
+    /// When set, the body is sent without a length, one `\n\n`-ended event
+    /// at a time with this many milliseconds before each, then the
+    /// connection closes (a slow but steady stream).
+    int dripMs;
 }
 
 /// One request as the server saw it.
@@ -88,6 +92,22 @@ private immutable(Captured)[] run(immutable(Reply)[] replies, Chan!ushort port)
         auto first = headText[0 .. headText.indexOf("\r\n") < 0 ? $ : headText.indexOf("\r\n")];
         auto sp1 = first.indexOf(' '), sp2 = first.indexOf(' ', sp1 + 1);
         seen ~= Captured(first[0 .. sp1], first[sp1 + 1 .. sp2], headText, buf[head + 4 .. $].idup);
+        if (r.dripMs > 0)
+        {
+            import core.thread : Thread;
+            import core.time : msecs;
+            import std.string : indexOf;
+            conn.send(format("HTTP/1.1 %s Status\r\n%sConnection: close\r\n\r\n", r.status, r.headers));
+            for (string rest = r.body_; rest.length;)
+            {
+                auto end = rest.indexOf("\n\n");
+                auto n = end < 0 ? rest.length : end + 2;
+                Thread.sleep(r.dripMs.msecs);
+                conn.send(rest[0 .. n]);
+                rest = rest[n .. $];
+            }
+            continue;
+        }
         bool cut = r.headers.toLower.canFind("x-truncate");
         auto len = cut ? r.body_.length + 64 : r.body_.length;
         auto response = format("HTTP/1.1 %s Status\r\n%sContent-Length: %s\r\nConnection: close\r\n\r\n%s",
