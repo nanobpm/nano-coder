@@ -62,7 +62,7 @@ agent.rs::adds_project_instructions_to_the_system_prompt_and_nested_ones_to_file
 agent.rs::an_automatic_timer_turn_marks_its_message_auto_initiated	gap	D session records have no auto-initiated flag for timer-driven turns
 agent.rs::an_empty_summary_at_the_output_limit_names_the_cause	test
 agent.rs::an_equal_probe_replaces_a_learned_window_stat_source	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
-agent.rs::an_interactive_session_keeps_an_unbounded_zero_cap	todo
+agent.rs::an_interactive_session_keeps_an_unbounded_zero_cap	test
 agent.rs::an_output_limit_rejection_is_learned_and_retried	test
 agent.rs::an_output_limit_rejection_is_retried_against_the_sent_budget	test
 agent.rs::an_unset_max_tokens_defaults_to_the_models_published_output_limit	test
@@ -71,12 +71,12 @@ agent.rs::an_unset_max_tokens_uses_a_known_model_cap_before_the_large_fallback	t
 agent.rs::an_unverifiable_loop_in_plan_mode_is_rejected_without_prompting	test
 agent.rs::an_unverifiable_loop_is_blocked_without_asking_when_unsandboxed	test
 agent.rs::auto_compaction_mid_turn_keeps_the_turn_going	test
-agent.rs::auto_mode_disables_the_turn_cap	todo
-agent.rs::auto_mode_does_not_disable_the_cap_in_a_headless_turn	todo
+agent.rs::auto_mode_disables_the_turn_cap	test
+agent.rs::auto_mode_does_not_disable_the_cap_in_a_headless_turn	test
 agent.rs::blocked_and_needs_input_are_never_intercepted	test
 agent.rs::calibrated_estimate_recomputes_when_a_suffix_image_displaces_a_prefix_image	test
 agent.rs::cancel_during_key_command_build_kills_the_child_despite_a_turn_flag_reset	na	Tokio runtime races while a client builds asynchronously; D builds the client synchronously on the agent thread
-agent.rs::cancel_during_model_call_stops_the_turn	todo
+agent.rs::cancel_during_model_call_stops_the_turn	test
 agent.rs::cancel_kills_running_bash_and_skips_remaining_calls	test
 agent.rs::cancelled_apply_model_request_signals_the_caller_and_keeps_the_request	na	Tokio runtime races while a client builds asynchronously; D builds the client synchronously on the agent thread
 agent.rs::cancelled_compaction_does_not_issue_the_summary_call	test
@@ -164,7 +164,7 @@ agent.rs::read_file_image_errors_with_a_hint_when_the_model_cannot_see	test
 agent.rs::read_only_memory_refuses_a_save	todo
 agent.rs::recall_attaches_at_most_two_notes_per_turn	test
 agent.rs::record_usage_accumulates_aic_when_reported	test
-agent.rs::records_assistant_tool_calls_before_results	todo
+agent.rs::records_assistant_tool_calls_before_results	test
 agent.rs::redelivering_a_truncated_turn_replays_its_stop_reason	test
 agent.rs::refreshing_stats_tracks_a_max_tokens_driven_thinking_change	todo
 agent.rs::repairs_interrupted_turns_on_resume	test
@@ -209,15 +209,15 @@ agent.rs::status_bar_reports_nothing_for_a_dropped_level	todo
 agent.rs::status_line_reflects_the_level_the_request_sends_not_a_reread	todo
 agent.rs::steer_during_final_answer_extends_the_turn	test
 agent.rs::steer_during_tool_call_joins_next_model_call	test
-agent.rs::steer_on_last_iteration_keeps_the_final_answer	todo
+agent.rs::steer_on_last_iteration_keeps_the_final_answer	test
 agent.rs::stored_system_message_reflects_mode_change	todo
 agent.rs::streams_deltas_and_reports_thinking_before_the_answer	todo
 agent.rs::switching_sessions_in_process_resets_totals_and_indexes	todo
-agent.rs::switching_to_auto_mid_turn_keeps_the_headless_safety_cap	todo
+agent.rs::switching_to_auto_mid_turn_keeps_the_headless_safety_cap	test
 agent.rs::temperature_ignores_config_kind_for_a_kindless_client	todo
 agent.rs::temperature_resolves_against_the_live_client	test
 agent.rs::temperature_resolves_for_a_custom_mock_provider	todo
-agent.rs::the_loop_detector_resets_on_a_new_turn	todo
+agent.rs::the_loop_detector_resets_on_a_new_turn	test
 agent.rs::the_title_fallback_uses_the_sessions_live_model	todo
 agent.rs::thinking_level_is_sent_and_drops_the_temperature_on_anthropic	test
 agent.rs::timer_tools_are_hidden_when_timers_are_disabled	test
@@ -228,7 +228,7 @@ agent.rs::tool_calls_recall_matching_memories_once_per_context	test
 agent.rs::tools_snapshot_captured_in_plan_mode_still_lists_mutating_tools_live	todo
 agent.rs::tools_snapshot_captured_without_history_still_lists_it_live	todo
 agent.rs::verify_before_complete_can_be_turned_off	test
-agent.rs::zero_turn_cap_is_unbounded	todo
+agent.rs::zero_turn_cap_is_unbounded	test
 agent/idle_compact.rs::armed_until_spent_then_only_after_real_growth	test
 agent/probe.rs::a_stale_generation_publishes_nothing	todo	ProbeState refactor (#185); triage at the end
 agent/probe.rs::a_windowless_result_keeps_the_window_slot_but_publishes_the_rest	todo	ProbeState refactor (#185); triage at the end

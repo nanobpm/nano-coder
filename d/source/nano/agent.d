@@ -735,8 +735,10 @@ class Agent
             {
                 bool cut = r.stopReason == "length" || r.stopReason == "max_tokens";
                 // A steer that arrived while the answer was written extends the
-                // turn; the reply after it is a fresh answer.
-                if (control.hasSteers && !control.isCancelled)
+                // turn; the reply after it is a fresh answer. On the last
+                // allowed call the answer stands and the steer stays queued
+                // for the caller.
+                if (iteration < budget && control.hasSteers && !control.isCancelled)
                 {
                     continued = null;
                     syncPendingContinuation(continued, truncations);
