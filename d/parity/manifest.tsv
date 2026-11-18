@@ -834,7 +834,7 @@ providers/mod.rs::a_configured_model_list_keeps_names_and_merges_over_presets	te
 providers/mod.rs::a_disabled_provider_is_hidden_and_refused	test
 providers/mod.rs::a_hidden_provider_is_filtered_from_listings_but_still_usable	test
 providers/mod.rs::a_models_base_url_overrides_the_providers	test
-providers/mod.rs::api_key_command_supplies_key	todo
+providers/mod.rs::api_key_command_supplies_key	test
 providers/mod.rs::bounded_key_command_backgrounded_success_returns_the_key	test
 providers/mod.rs::bounded_key_command_cancel_applies_after_the_leader_exits	test
 providers/mod.rs::bounded_key_command_cancel_applies_despite_process_group_escapee	gap	D's key command writes to temp files and waits for its process group; a descendant that escapes the group (setsid) isn't detected, so a key printed before it finishes is accepted
@@ -869,13 +869,13 @@ providers/mod.rs::offline_budget_bounds_the_backoff_sleep	gap	D retry.d waits fo
 providers/mod.rs::parses_events_split_across_chunks	test
 providers/mod.rs::parses_model_specs	test
 providers/mod.rs::qwen_and_kimi_presets	test
-providers/mod.rs::the_qwen_preset_is_derived_from_the_endpoint_table	todo
+providers/mod.rs::the_qwen_preset_is_derived_from_the_endpoint_table	test
 providers/mod.rs::transport_does_not_wait_out_a_redirect_loop	gap	D retry.d waits for the network (#149) but has no tests bounding the offline budget
 providers/mod.rs::transport_waits_out_an_offline_endpoint_past_max_retries_then_fails	gap	D retry.d waits for the network (#149) but has no tests bounding the offline budget
 providers/mod.rs::user_config_overrides_and_extends_presets	test
-providers/mod.rs::validate_spec_matches_resolve_for_the_buildable_cases	todo
+providers/mod.rs::validate_spec_matches_resolve_for_the_buildable_cases	test
 providers/mod.rs::validate_spec_rejects_a_provider_without_a_model	test
-providers/mod.rs::validate_spec_rejects_an_empty_or_malformed_base_url	todo
+providers/mod.rs::validate_spec_rejects_an_empty_or_malformed_base_url	test
 providers/muse.rs::catalog_applies_configured_provider_headers	todo
 providers/muse.rs::catalog_remints_on_a_401_with_a_non_json_body	todo
 providers/muse.rs::catalog_remints_once_after_a_401	todo
