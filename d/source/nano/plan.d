@@ -596,7 +596,9 @@ string checklist(const ref Plan plan, size_t width, bool color)
     string c(string code) { return color ? code : ""; }
     auto green = c("\x1b[32m"), bold = c("\x1b[1m"), dim = c("\x1b[2m"), red = c("\x1b[31m"), reset = c("\x1b[0m");
     auto pr = plan.progress;
-    string out_ = format!"%s●%s %sPlan%s %s%s/%s done%s\n"(green, reset, bold, reset, dim, pr[0], pr[1], reset);
+    import nano.frame : fit;
+    // The header is fitted too, so a narrow terminal never wraps it.
+    string out_ = fit(format!"%s●%s %sPlan%s %s%s/%s done%s"(green, reset, bold, reset, dim, pr[0], pr[1], reset), width) ~ "\n";
     const(PlanItem)[] live;
     foreach (ref i; plan.items) if (i.status != Status.dropped) live ~= i;
     bool collapse = live.length > planLines && pr[0] > 0;

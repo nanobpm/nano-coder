@@ -1090,6 +1090,27 @@ string toolResult(bool ok, string output, bool verbose, size_t width, bool color
     return format("  %s%s %s%s%s\n", on, mark, fitText(lines[0].stripRight("\r"), saturatingSub(width, more.length)), more, off);
 }
 
+// rust: frame.rs::tool_result_count_rows_are_bounded_to_the_width
+// rust: frame.rs::tool_result_preview_strips_terminal_escapes
+unittest
+{
+    import std.algorithm : canFind;
+    import std.array : join;
+    import std.conv : to;
+    import std.range : iota;
+    import std.string : lineSplitter;
+    import nano.frame : visibleWidth;
+    // The caller passes the width left after the `  ⎿ ` prefix (4 cells).
+    auto output = iota(40).map!(i => "line " ~ i.to!string).join("\n");
+    foreach (width; 3 .. 24)
+        foreach (verbose; [false, true])
+            foreach (line; toolResult(true, output, verbose, width).lineSplitter)
+                assert(visibleWidth(line) <= width + 4, line);
+    auto shown = toolResult(true, sanitizeBlock("note \x1b]0;pwned\x07 \x1b[2J done"), true, 120, false);
+    assert(!shown.canFind('\x1b') && !shown.canFind('\x07'), shown);
+    assert(shown.canFind("note") && shown.canFind("done"), shown);
+}
+
 /// A tool call's arguments as shown expanded: pretty JSON, or the raw text
 /// when the model's arguments weren't a JSON object.
 string argsText(const ref ToolCall c)
