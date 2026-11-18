@@ -11,7 +11,7 @@ import nano.lineedit : charWidth;
 import nano.mode : AgentMode;
 
 /// What the agent is doing.
-enum Activity { idle, thinking, tool, compacting }
+enum Activity { idle, thinking, tool, compacting, idleCompacting }
 
 /// Everything the status line shows.
 struct Stats
@@ -206,6 +206,7 @@ string render(const ref Stats stats, size_t cols)
         case Activity.thinking: segments ~= Segment(" ● thinking… ", "\x1b[38;5;117m", 7); break;
         case Activity.tool: segments ~= Segment(" ▶ " ~ stats.tool ~ " ", "\x1b[38;5;180m", 7); break;
         case Activity.compacting: segments ~= Segment(" ⟳ compacting… ", "\x1b[38;5;221m", 7); break;
+        case Activity.idleCompacting: segments ~= Segment(" ⟳ compacting (idle)… ", "\x1b[38;5;221m", 7); break;
     }
     if (stats.activity == Activity.thinking && stats.tokensPerSec > 0)
         segments ~= Segment(" " ~ formatRate(stats.tokensPerSec) ~ " ", "\x1b[38;5;108m", 0);

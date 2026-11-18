@@ -167,7 +167,7 @@ int runLogin(string provider)
 }
 
 /// `--list-sessions [--all] [--json]`: this directory's saved sessions, newest first.
-int printSessions(bool all, bool json)
+int printSessions(string sessionDir, bool all, bool json)
 {
     import nano.resume : printList;
     try printList(sessionDir, getcwd(), all, json);
@@ -176,7 +176,7 @@ int printSessions(bool all, bool json)
 }
 
 /// `--trajectory ID [--json|--markdown]`: a saved session's turn-by-turn ledger.
-int printTrajectory(string id, bool json, bool markdown)
+int printTrajectory(string sessionDir, string id, bool json, bool markdown)
 {
     import nano.session : validateId;
     import std.path : buildPath;
@@ -398,6 +398,46 @@ string midTurnCommand(string text, MidTurn ctx)
 
 /// The turn's key reader (its own thread): owns the line editor until
 /// `*done`, then hands it back. Lines that wait for the turn go to `held`.
+/// The idle-compaction hold: `idle_compact_hold_secs`, or the default.
+imported!"core.time".Duration idleCompactHoldFor(const ref Config cfg) @safe
+{
+    import core.time : seconds;
+    import nano.lineedit : idleCompactHold;
+    return cfg.idleCompactHoldSecs > 0 ? cfg.idleCompactHoldSecs.seconds : idleCompactHold;
+}
+
+/// Whether the idle prompt runs a due idle compaction now: quiet for the
+/// hold, no queued Ctrl-C, no armed exit window (Rust `deliver_idle_compact`).
+bool deliverIdleCompact(bool due, imported!"core.time".Duration quietFor, imported!"core.time".Duration hold,
+    bool interruptQueued, bool exitArmed) @safe pure nothrow @nogc
+{
+    return due && quietFor >= hold && !interruptQueued && !exitArmed;
+}
+
+// rust: main.rs::deliver_idle_compact_waits_for_a_quiet_prompt
+@safe unittest
+{
+    import core.time : seconds;
+    auto hold = 180.seconds, quiet = hold, fresh = 5.seconds;
+    assert(deliverIdleCompact(true, quiet, hold, false, false), "due and quiet for the hold: compact");
+    assert(!deliverIdleCompact(true, fresh, hold, false, false), "a fresh draft or keystroke holds it");
+    assert(!deliverIdleCompact(false, quiet, hold, false, false), "not due (off, under threshold, spent)");
+    assert(!deliverIdleCompact(true, quiet, hold, true, false), "a queued Ctrl-C wins");
+    assert(!deliverIdleCompact(true, quiet, hold, false, true), "an armed exit window holds it");
+}
+
+// rust: main.rs::idle_compact_hold_defaults_to_the_named_constant
+@safe unittest
+{
+    import nano.lineedit : idleCompactHold;
+    Config c;
+    assert(c.idleCompact, "on by default");
+    assert(idleCompactHoldFor(c) == idleCompactHold);
+    c.idleCompactHoldSecs = 7;
+    import core.time : seconds;
+    assert(idleCompactHoldFor(c) == 7.seconds);
+}
+
 Isolated!LineEditor turnKeys(Isolated!LineEditor owned, ConsoleLink console, shared(bool)* done, Chan!string held,
     QuestionBroker questions, MessageQueue queue, MidTurn mid)
 {
@@ -1284,8 +1324,11 @@ int runMain(string[] args)
     }
     catch (Exception e) die(e.msg);
 
-    if (o.trajectory !is null) return printTrajectory(o.trajectory, o.json, o.markdown);
-    if (o.listSessions) return printSessions(o.all, o.json);
+    // `session_dir` relocates the logs; `persist_sessions = false` saves none.
+    immutable sessionDir = nano.session.sessionDir(cfg.sessionDir);
+    if (!cfg.persistSessions) o.noSession = true;
+    if (o.trajectory !is null) return printTrajectory(sessionDir, o.trajectory, o.json, o.markdown);
+    if (o.listSessions) return printSessions(sessionDir, o.all, o.json);
     if (o.hasResume && (o.resume == "" || o.resume == "last"))
     {
         import nano.resume : pickOutcome, Pick, printList, resumeLast = last;
@@ -1495,6 +1538,8 @@ int runMain(string[] args)
     agent.maxTokens = cfg.maxTokens;
     agent.configuredWindow = configuredWindow;
     agent.autoCompact = cfg.autoCompact;
+    agent.idleCompact = cfg.idleCompact;
+    agent.verifyBeforeComplete = cfg.verifyBeforeComplete;
     agent.compactionPinRequests = cfg.compactionPinRequests;
     agent.autoCompactThreshold = cfg.autoCompactThreshold;
     {
@@ -1759,21 +1804,11 @@ int runMain(string[] args)
         return h;
     }
 
-    bool turn(string input) @safe
+    /// Run `work` (a turn, or an idle compaction) with the key reader live:
+    /// keys typed meanwhile steer, Ctrl-C or Esc Esc cancels, and steers left
+    /// over afterwards run as the next prompts.
+    bool driven(scope bool delegate() @safe work) @safe
     {
-        syncMode();
-        nano.herdr.report(nano.herdr.State.working);
-        if (gFrame) gFrame.busy(true);
-        scope (exit) if (gFrame) gFrame.busy(false);
-        atomicStore(gTurnRunning, true);
-        scope (exit) atomicStore(gTurnRunning, false);
-        updateStatus((ref Stats s) { s.activity = Activity.thinking; s.tokensPerSec = 0; });
-        scope (exit)
-        {
-            refreshStatus();
-            updateStatus((ref Stats s) { s.activity = Activity.idle; s.tokensPerSec = 0; });
-        }
-        bool ok = true;
         // With the line editor, keys typed during the turn steer it (a
         // `/command` waits for the turn to end); Ctrl-C or Esc Esc cancels.
         auto turnDone = new shared(bool);
@@ -1804,23 +1839,7 @@ int runMain(string[] args)
                 string line;
                 while (heldLines.tryTake(line)) held ~= line;
             }
-        console.finalAnswer = null;
-        console.droppedAnswer = false;
-        try agent.run(input, console);
-        catch (Exception e)
-        {
-            console.endLine();
-            stdErr.writeln(console.red("error: " ~ e.msg));
-            ok = false;
-        }
-        console.endLine();
-        // Quiet shows only the final answer; a turn that got louder after
-        // answer deltas were dropped reprints the whole answer (ui.rs).
-        if ((console.quiet || console.droppedAnswer) && console.finalAnswer.length)
-        {
-            writeln(console.display(console.finalAnswer));
-            stdOut.flush();
-        }
+        bool ok = work();
         // Steers that arrived after the agent's last step run as the next prompts.
         // One the user steered at the prompt keeps its `/queue` id.
         auto late = agent.control.takePending;
@@ -1841,6 +1860,44 @@ int runMain(string[] args)
         }
         return ok;
     }
+
+    bool turn(string input) @safe
+    {
+        syncMode();
+        nano.herdr.report(nano.herdr.State.working);
+        if (gFrame) gFrame.busy(true);
+        scope (exit) if (gFrame) gFrame.busy(false);
+        atomicStore(gTurnRunning, true);
+        scope (exit) atomicStore(gTurnRunning, false);
+        updateStatus((ref Stats s) { s.activity = Activity.thinking; s.tokensPerSec = 0; });
+        scope (exit)
+        {
+            refreshStatus();
+            updateStatus((ref Stats s) { s.activity = Activity.idle; s.tokensPerSec = 0; });
+        }
+        return driven(() @safe {
+            bool ok = true;
+            console.finalAnswer = null;
+            console.droppedAnswer = false;
+            try agent.run(input, console);
+            catch (Exception e)
+            {
+                console.endLine();
+                stdErr.writeln(console.red("error: " ~ e.msg));
+                ok = false;
+            }
+            console.endLine();
+            // Quiet shows only the final answer; a turn that got louder after
+            // answer deltas were dropped reprints the whole answer (ui.rs).
+            if ((console.quiet || console.droppedAnswer) && console.finalAnswer.length)
+            {
+                writeln(console.display(console.finalAnswer));
+                stdOut.flush();
+            }
+            return ok;
+        });
+    }
+
 
     if (o.prompt.length)
     {
@@ -2000,8 +2057,18 @@ int runMain(string[] args)
             string updateHint;
             if (updateHints && updateHints.tryTake(updateHint)) writeln(console.dim(updateHint));
             updateHint = null;
+            // An idle compaction is due once the prompt (and any draft) sat
+            // untouched for the hold, unless the exit window is armed (#186).
+            auto promptShown = MonoTime.currTime;
+            auto idleHold = idleCompactHoldFor(cfg);
+            bool idleNow() @safe
+            {
+                return deliverIdleCompact(agent.idleCompactDuePolled(), MonoTime.currTime - editor.quietSince(promptShown),
+                    idleHold, false, exitArmedAt != MonoTime.zero);
+            }
             lapse = () @safe => (exitArmedAt != MonoTime.zero && MonoTime.currTime - exitArmedAt > exitWindow)
                 || (!editor.holdsTimer(MonoTime.currTime) && agent.timers.anyDue(agent.timerNow()))
+                || idleNow()
                 || (updateHints && updateHints.tryTake(updateHint));
             auto r = editor.readLine(.stamp(false) ~ "› ", console.stamp() ~ glyphMark ~ " ", false, lapse);
             editor.restyle = null;
@@ -2016,6 +2083,29 @@ int runMain(string[] args)
                 writeln(console.dim(notice));
                 agent.automaticInput = true;
                 line = "\x00" ~ line;
+            }
+            else if (r.outcome == Outcome.stopped && idleNow())
+            {
+                // Park the draft so keys typed meanwhile steer nothing stale.
+                hasParkedDraft = editor.parkDraft(parkedDraft);
+                writeln(console.dim("compacting (idle)… Esc Esc to cancel"));
+                stdOut.flush();
+                updateStatus((ref Stats s) { s.activity = Activity.idleCompacting; });
+                IdleCompactReport rep;
+                bool did;
+                string failed;
+                compactingByHand = true;
+                driven(() @safe {
+                    try did = agent.runIdleCompaction(rep);
+                    catch (Exception e) failed = e.msg;
+                    return true;
+                });
+                compactingByHand = false;
+                updateStatus((ref Stats s) { s.activity = Activity.idle; });
+                if (did) writeln(console.dim("[" ~ rep.toString ~ "]"));
+                else if (failed.length) writeln(console.dim("[idle compaction failed: " ~ failed ~ "]"));
+                else if (atomicLoad(agent.control).isCancelled) writeln(console.dim("[idle compaction cancelled]"));
+                continue;
             }
             else if (r.outcome == Outcome.stopped && updateHint.length)
             {

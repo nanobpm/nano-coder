@@ -67,7 +67,44 @@ string wrapReminder(string text) nothrow
 }
 
 /// Why compaction was requested.
-enum CompactTrigger { manual, threshold, overflow }
+enum CompactTrigger { manual, threshold, overflow, /** opportunistic, at the idle prompt (Rust #186); folds like threshold */ idle }
+
+/// Once-per-crossing gate for idle compaction (Rust `idle_compact.rs`): after
+/// an idle attempt that did not compact, it stays shut until the context grows
+/// by real headroom (`window / 10`); any compaction or a reset re-arms it.
+struct IdleCompactGate
+{
+    private bool spent;
+    private size_t spentAt;
+    bool armed(size_t tokens, size_t window) const { return !spent || tokens > spentAt + window / 10; }
+    void spend(size_t tokens) { spent = true; spentAt = tokens; }
+    void reset() { spent = false; }
+}
+
+/// An idle compaction's outcome, with usage before and after as a percentage
+/// of the window for the transcript note.
+struct IdleCompactReport
+{
+    CompactReport report;
+    size_t percentBefore, percentAfter;
+
+    this(CompactReport r, size_t window)
+    {
+        import std.math : round;
+        size_t pct(size_t t) { return cast(size_t) round(t * 100.0 / (window ? window : 1)); }
+        report = r;
+        percentBefore = pct(r.tokensBefore);
+        percentAfter = pct(r.tokensAfter);
+    }
+
+    string toString() const
+    {
+        auto s = format("compacted while idle (was %s%% → %s%%)", percentBefore, percentAfter);
+        // A degraded compaction is never reported as a clean one.
+        if (report.fallback !is null || report.truncated) s ~= "; " ~ report.toString;
+        return s;
+    }
+}
 
 /// What a compaction did.
 struct CompactReport
@@ -162,6 +199,8 @@ class Agent
     /// logged system message, so remap them.
     void adoptPending(const ref Restored r)
     {
+        // A loaded conversation starts a fresh crossing.
+        resetIdleCompaction();
         hasPending = r.hasPending;
         if (!hasPending) return;
         pending = r.pending;
@@ -919,11 +958,86 @@ class Agent
 
     /// Past the auto-compaction threshold (or too close to the window for the
     /// output reservation)?
-    bool overThreshold()
+    bool overThreshold() { return overThresholdAt(estimateContextTokens()); }
+
+    /// Run the auto-compaction at the idle prompt instead of on the critical
+    /// path of the next message (Rust #186). Off with `auto_compact`.
+    bool idleCompact = true;
+    IdleCompactGate idleGate;
+    private struct IdleKey { size_t len, calibLen, calibTokens, images; AgentMode mode; bool history; }
+    private IdleKey idleKey;
+    private size_t idleTokens;
+    private bool idleCached;
+
+    /// Whether an idle compaction is due: idle and auto compaction are on, the
+    /// context is past the threshold (with the floor's hysteresis, and never
+    /// below the configured fraction itself), and the gate is armed. The
+    /// caller owns the *idle* half (prompt quiet, no fresh draft).
+    bool idleCompactDue() { return idleCompact && autoCompact && idleCompactDueAt(estimateContextTokens()); }
+
+    /// `idleCompactDue` for the prompt's periodic poll, memoized on what
+    /// changes the estimate in memory; `runIdleCompaction` re-checks fresh.
+    bool idleCompactDuePolled()
+    {
+        if (!idleCompact || !autoCompact) return false;
+        auto key = IdleKey(messages.length, calibLen, calibTokens, imageSlots, control.mode, historyAvailable);
+        if (!idleCached || key != idleKey)
+        {
+            idleTokens = estimateContextTokens();
+            idleKey = key;
+            idleCached = true;
+        }
+        return idleCompactDueAt(idleTokens);
+    }
+
+    /// Forget the poll's memoized estimate (a different conversation).
+    void resetIdleCompaction()
+    {
+        idleGate.reset();
+        idleCached = false;
+    }
+
+    private bool idleCompactDueAt(size_t tokens)
+    {
+        if (!idleCompact || !overThresholdAt(tokens)) return false;
+        auto window = contextWindow();
+        auto threshold = clamp(autoCompactThreshold, 0.1, 0.99);
+        if (tokens < window * threshold) return false;
+        return idleGate.armed(tokens, window);
+    }
+
+    /// Run the compaction auto-compaction would, at the idle prompt.
+    /// Cancellable like a turn; an attempt that did not compact spends the
+    /// gate for this crossing so it is not retried in a loop.
+    bool runIdleCompaction(out IdleCompactReport report)
+    {
+        control.startTurn();
+        auto atEntry = estimateContextTokens();
+        // A `/model` left pending changes the window: apply it first and
+        // look again on the next poll.
+        if (auto spec = control.takeModelRequest())
+        {
+            if (onModelRequest !is null) onModelRequest(spec);
+            idleGate.spend(atEntry);
+            return false;
+        }
+        auto before = estimateContextTokens();
+        if (!idleCompact || !autoCompact || !idleCompactDueAt(before)) return false;
+        auto window = contextWindow();
+        CompactReport rep;
+        bool done;
+        scope (exit) if (!done || control.isCancelled) idleGate.spend(before);
+        done = compact(rep, CompactTrigger.idle);
+        if (!done || control.isCancelled) return false;
+        report = IdleCompactReport(rep, window);
+        return true;
+    }
+
+    /// `overThreshold` for an already-estimated context size.
+    bool overThresholdAt(size_t tokens)
     {
         if (!autoCompact) return false;
         auto threshold = autoCompactThreshold < 0.1 ? 0.1 : autoCompactThreshold > 0.99 ? 0.99 : autoCompactThreshold;
-        auto tokens = estimateContextTokens();
         auto window = contextWindow();
         auto reserved = (outputBase < ctx.minOutputReserve ? outputBase : ctx.minOutputReserve) + ctx.outputMargin(window);
         double limit = window * threshold;
@@ -1251,6 +1365,7 @@ class Agent
         // Nested instructions attached to folded tool results may be gone.
         if (instructions !is null) instructions.forgetNested();
         compactFloor = report.tokensAfter;
+        idleGate.reset();
         compactions++;
         historyAvailable = historyHintPending = m == ctx.CompactionMode.smart;
         if (onCompacted !is null) onCompacted(report);
@@ -1415,6 +1530,7 @@ class Agent
         stopBlocks = 0;
         calibLen = calibTokens = 0;
         compactFloor = 0;
+        resetIdleCompaction();
         pinStash = null;
         hasPending = false;
         historyAvailable = historyHintPending = false;

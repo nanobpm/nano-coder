@@ -395,6 +395,18 @@ struct Config
     string compactionMode = "standard";
     /// Pin the user's requests verbatim after each compaction summary.
     bool compactionPinRequests = true;
+    /// Compact at the idle prompt, once quiet for the hold (Rust #186).
+    bool idleCompact = true;
+    /// Persist conversations as JSONL session logs (false: like --no-session).
+    bool persistSessions = true;
+    /// Session log directory (empty: the platform data folder).
+    string sessionDir;
+    /// Ask once per turn for a check's evidence before accepting a completed
+    /// outcome when files were edited after the last bash call. ACP turns it off.
+    bool verifyBeforeComplete = true;
+    /// Seconds the prompt must sit untouched before an idle compaction
+    /// (0 = unset: `lineedit.idleCompactHold`).
+    long idleCompactHoldSecs;
     bool disableHooks;
     bool disableProjectHooks;
     bool claudeUserHooks = true;
@@ -459,6 +471,11 @@ struct Config
             c.autoCompactThreshold = v.type == JSONType.integer ? v.integer : v.floating;
         if (auto v = "compaction_mode" in doc) c.compactionMode = v.str;
         if (auto v = "compaction_pin_requests" in doc) c.compactionPinRequests = v.boolean;
+        if (auto v = "idle_compact" in doc) c.idleCompact = v.boolean;
+        if (auto v = "persist_sessions" in doc) c.persistSessions = v.boolean;
+        if (auto v = "session_dir" in doc) c.sessionDir = v.str;
+        if (auto v = "verify_before_complete" in doc) c.verifyBeforeComplete = v.boolean;
+        if (auto v = "idle_compact_hold_secs" in doc) c.idleCompactHoldSecs = v.integer;
         if (auto v = "disable_hooks" in doc) c.disableHooks = v.boolean;
         if (auto v = "disable_project_hooks" in doc) c.disableProjectHooks = v.boolean;
         if (auto v = "claude_user_hooks" in doc) c.claudeUserHooks = v.boolean;
@@ -633,6 +650,21 @@ unittest
     assert(isNaN(c.temperature));
     auto a = resolve(c, "anthropic");
     assert(a.model == "c9" && a.config.baseUrl == "https://api.anthropic.com/v1");
+}
+
+// The session, verification and idle-compaction keys: defaults and parsing.
+unittest
+{
+    import std.file : write, tempDir, remove;
+    Config d;
+    assert(d.persistSessions && d.sessionDir is null && d.verifyBeforeComplete && d.idleCompact && d.idleCompactHoldSecs == 0);
+    auto path = buildPath(tempDir, "nano-coder-d-keys-test.toml");
+    write(path, "persist_sessions = false\nsession_dir = \"~/logs\"\nverify_before_complete = false\n"
+        ~ "idle_compact = false\nidle_compact_hold_secs = 30\n");
+    scope (exit) remove(path);
+    auto c = Config.load(path);
+    assert(!c.persistSessions && c.sessionDir == "~/logs" && !c.verifyBeforeComplete);
+    assert(!c.idleCompact && c.idleCompactHoldSecs == 30);
 }
 
 /// A regional OpenRouter workspace (#169): US by default, one model on EU, a

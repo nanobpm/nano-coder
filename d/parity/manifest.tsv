@@ -9,7 +9,7 @@ acp.rs::slash_prompts_never_reach_the_model_over_acp	todo
 acp.rs::thinking_value_reports_nothing_for_a_dropped_level	test
 acp.rs::turn_usage_is_the_delta_of_the_session_counters	test
 agent.rs::a_background_probe_refines_a_default_window_source	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
-agent.rs::a_cancelled_idle_compaction_is_not_retried_on_the_same_crossing	todo	idle compaction (#186), P5
+agent.rs::a_cancelled_idle_compaction_is_not_retried_on_the_same_crossing	test
 agent.rs::a_chat_output_cap_fallback_halves_the_sent_budget	todo
 agent.rs::a_compaction_summary_cap_fallback_halves_the_sent_budget	todo
 agent.rs::a_compaction_summary_is_retried_after_learning_the_output_cap	todo
@@ -102,11 +102,11 @@ agent.rs::estimate_is_anchored_to_reported_usage	todo
 agent.rs::failed_model_switch_restores_the_previous_spec	todo
 agent.rs::failed_tool_reports_failed_status_and_replay_covers_history	todo
 agent.rs::identical_tool_calls_draw_a_loop_warning_on_the_third	test
-agent.rs::idle_compaction_is_off_without_idle_or_auto_compact	todo	idle compaction (#186), P5
-agent.rs::idle_compaction_never_runs_below_the_configured_threshold	todo	idle compaction (#186), P5
-agent.rs::idle_compaction_runs_once_per_crossing	todo	idle compaction (#186), P5
+agent.rs::idle_compaction_is_off_without_idle_or_auto_compact	test
+agent.rs::idle_compaction_never_runs_below_the_configured_threshold	test
+agent.rs::idle_compaction_runs_once_per_crossing	test
 agent.rs::idle_firing_resets_the_pending_nudge_counter	gap	D timer nudging: no test that disabled timers stay silent / that idle firing resets the nudge counter
-agent.rs::idle_poll_cache_is_keyed_on_the_offered_tool_set	todo	idle compaction (#186), P5
+agent.rs::idle_poll_cache_is_keyed_on_the_offered_tool_set	test
 agent.rs::idle_take_fired_timers_returns_due_timers_once	test
 agent.rs::indexes_skills_in_the_system_prompt_and_loads_them_on_request	todo
 agent.rs::load_session_renders_prompt_with_default_mode_writability	todo
@@ -229,7 +229,7 @@ agent.rs::tools_snapshot_captured_in_plan_mode_still_lists_mutating_tools_live	t
 agent.rs::tools_snapshot_captured_without_history_still_lists_it_live	todo
 agent.rs::verify_before_complete_can_be_turned_off	test
 agent.rs::zero_turn_cap_is_unbounded	todo
-agent/idle_compact.rs::armed_until_spent_then_only_after_real_growth	todo	idle compaction (#186), P5
+agent/idle_compact.rs::armed_until_spent_then_only_after_real_growth	test
 agent/probe.rs::a_stale_generation_publishes_nothing	todo	ProbeState refactor (#185); triage at the end
 agent/probe.rs::a_windowless_result_keeps_the_window_slot_but_publishes_the_rest	todo	ProbeState refactor (#185); triage at the end
 agent/probe.rs::begin_detect_clears_every_report_and_invalidates_in_flight_probes	todo	ProbeState refactor (#185); triage at the end
@@ -326,14 +326,14 @@ commands.rs::suggestions_narrow_on_the_argument_prefix	test
 commands.rs::tab_completes_unique_commands_and_common_prefixes	test
 commands.rs::unknown_commands_are_rejected_with_a_suggestion	test
 config.rs::a_retired_legacy_renderer_setting_still_loads_with_a_notice	test
-config.rs::app_dir_prefers_current_and_falls_back_to_legacy	todo
+config.rs::app_dir_prefers_current_and_falls_back_to_legacy	na	the rusty-harness folder migration: D has always used its own nano-coder-d folders
 config.rs::create_compat_link_is_race_idempotent	todo
-config.rs::keeps_reporting_link_failure_while_legacy_path_stays_occupied	todo
+config.rs::keeps_reporting_link_failure_while_legacy_path_stays_occupied	na	the rusty-harness folder migration: D has always used its own nano-coder-d folders
 config.rs::legacy_base_url_targets_an_openai_compatible_default	todo
-config.rs::migrates_legacy_dir_once_and_leaves_a_link	todo
+config.rs::migrates_legacy_dir_once_and_leaves_a_link	na	the rusty-harness folder migration: D has always used its own nano-coder-d folders
 config.rs::parses_partial_config_with_providers	todo
 config.rs::recreates_a_missing_compatibility_link_on_a_later_start	todo
-config.rs::reports_link_failure_when_current_exists_and_legacy_is_occupied	todo
+config.rs::reports_link_failure_when_current_exists_and_legacy_is_occupied	na	the rusty-harness folder migration: D has always used its own nano-coder-d folders
 context.rs::clip_bytes_cuts_on_char_boundaries_within_budget	test	pinned user requests (#184)
 context.rs::clip_stays_within_a_sub_marker_budget	test
 context.rs::clip_stays_within_budget_marker_included	test
@@ -581,7 +581,7 @@ lineedit.rs::parses_cursor_and_function_keys	test
 lineedit.rs::parses_kitty_and_modify_other_keys_control_keys	test
 lineedit.rs::parses_modified_cursor_keys	test
 lineedit.rs::paste_normalizes_line_endings	test
-lineedit.rs::quiet_since_counts_non_editing_keys	todo	idle compaction (#186), P5
+lineedit.rs::quiet_since_counts_non_editing_keys	test
 lineedit.rs::tab_completes_commands_and_is_a_space_elsewhere	test
 lineedit.rs::tab_completes_model_arguments_from_context	todo
 lineedit.rs::take_returns_the_multiline_input	test
@@ -611,13 +611,13 @@ main.rs::an_over_wide_question_leaves_the_inline_prompt_on_a_narrow_terminal	gap
 main.rs::builtin_tools_include_search_and_no_echo	todo
 main.rs::classify_steer_input_routes_line_queue_and_commands	todo
 main.rs::deliver_due_timer_yields_to_interrupt_and_draft	gap	D idle-loop timer delivery is in app.d, which has no unit tests
-main.rs::deliver_idle_compact_waits_for_a_quiet_prompt	todo	idle compaction (#186), P5
+main.rs::deliver_idle_compact_waits_for_a_quiet_prompt	test
 main.rs::double_escape_needs_two_presses_within_the_window	todo
 main.rs::double_press_deadline_arms_and_disarm_clears_it	todo
 main.rs::double_press_is_time_based_not_disarmed_by_other_input	todo
 main.rs::eof_suppression_is_headless_wait_timers_only	gap	D idle-loop timer delivery is in app.d, which has no unit tests
 main.rs::forget_id_requires_a_token_boundary	todo
-main.rs::idle_compact_hold_defaults_to_the_named_constant	todo	idle compaction (#186), P5
+main.rs::idle_compact_hold_defaults_to_the_named_constant	test
 main.rs::leading_indentation_is_preserved_for_markdown	gap	D does not expand tabs to tab stops when sanitizing terminal output
 main.rs::list_sessions_and_resume_are_mutually_exclusive	todo
 main.rs::list_sessions_and_trajectory_are_mutually_exclusive	todo

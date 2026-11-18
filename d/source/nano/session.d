@@ -19,9 +19,12 @@ import std.algorithm : sort, filter, map;
 import std.array : array;
 import nano.llm;
 
-string sessionDir()
+/// The session log directory: `NANO_CODER_D_SESSIONS`, else the configured
+/// `session_dir` (`~` expanded), else the platform data folder.
+string sessionDir(string configured = null)
 {
     if (auto x = environment.get("NANO_CODER_D_SESSIONS")) return x;
+    if (configured.length) return expandTilde(configured);
     version (OSX)
         return buildPath(expandTilde("~"), "Library", "Application Support", "nano-coder-d", "sessions");
     else

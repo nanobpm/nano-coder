@@ -21,6 +21,10 @@ import core.time : Duration, MonoTime, seconds;
 /// no keystrokes the draft counts as abandoned: the timer fires, and the
 /// draft is parked for the automatic turn and restored after it (Rust #178).
 enum Duration draftHold = 60.seconds;
+/// How long the prompt (and any draft) must sit untouched before an idle
+/// compaction runs (Rust #186): longer than `draftHold`, so a coffee pause
+/// does not spend a summary call. `idle_compact_hold_secs` overrides it.
+enum Duration idleCompactHold = 180.seconds;
 
 /// A draft set aside while a timer turn runs (`EditState.parkDraft`).
 struct ParkedDraft
@@ -336,8 +340,19 @@ struct EditState
     /// Bumped by every text change, so a parked draft knows whether the user
     /// typed (or sent) something newer meanwhile.
     ulong generation;
+    /// When the reader last saw *any* key, including ones that leave the
+    /// buffer alone (a lone Esc, Shift+Tab, a cursor key at its bound). Only
+    /// the idle-compaction quiet check reads it; staleness keeps `lastEdit`.
+    MonoTime lastKey;
 
     string text() const { return buf.to!string; }
+
+    /// When the prompt last saw user activity: the latest of `shown` (when
+    /// the prompt was put up), the last edit and the last key of any kind.
+    MonoTime quietSince(MonoTime shown) const { return max(shown, lastEdit, lastKey); }
+
+    /// Record that the reader saw a key (see `lastKey`).
+    void keySeen(MonoTime at) { lastKey = at; }
 
     /// A fresh half-typed line holds back a due timer; an empty or stale one doesn't.
     bool holdsTimer(MonoTime now) const { return buf.length && !draftIsStale(now); }
@@ -670,6 +685,9 @@ final class LineEditor
     /// A fresh draft holds back a due timer (see `EditState.holdsTimer`).
     bool holdsTimer(MonoTime now) const { return state.holdsTimer(now); }
 
+    /// See `EditState.quietSince`.
+    MonoTime quietSince(MonoTime shown) const { return state.quietSince(shown); }
+
     /// Park the draft for a timer turn (see `EditState.parkDraft`).
     bool parkDraft(out ParkedDraft parked) { return state.parkDraft(parked); }
 
@@ -691,6 +709,8 @@ final class LineEditor
                 if (stop !is null && stop()) { erase(); return Result(Outcome.stopped); }
                 continue;
             }
+            // Every key is activity for the idle-compaction quiet check.
+            state.keySeen(MonoTime.currTime);
             notice = null;
             final switch (key.kind)
             {
@@ -1404,4 +1424,20 @@ unittest
         f.restoreDraft(parked);
         assert(f.holdsTimer(t1), "a restored fresh draft stays fresh");
     }
+}
+
+// rust: lineedit.rs::quiet_since_counts_non_editing_keys
+// Rust #186: a key that leaves the buffer
+// untouched is still activity for the quiet clock, but not for staleness.
+@safe unittest
+{
+    EditState v;
+    v.insert("draft");
+    auto shown = MonoTime.currTime;
+    v.lastEdit = shown - draftHold;
+    assert(v.quietSince(shown) == shown, "shown wins over an older edit");
+    auto later = shown + 5.seconds;
+    v.keySeen(later);
+    assert(v.quietSince(shown) == later, "a no-op key resets the quiet clock");
+    assert(v.draftIsStale(later), "but leaves draft staleness alone");
 }
