@@ -10,7 +10,7 @@ import std.math : isNaN;
 import nano.llm;
 import nano.http;
 import nano.config;
-import nano.thinking : applyChat, applyAnthropic;
+import nano.thinking : anthropicDefaultMaxTokens, applyChat, applyAnthropic;
 
 class AnthropicClient : LLMClient, KindedClient
 {
@@ -34,7 +34,7 @@ class AnthropicClient : LLMClient, KindedClient
     JSONValue requestBody(const ref ChatRequest req, bool stream)
     {
         JSONValue b = ["model": p.model];
-        b["max_tokens"] = req.maxTokens > 0 ? req.maxTokens : 32_000;
+        b["max_tokens"] = req.maxTokens > 0 ? req.maxTokens : anthropicDefaultMaxTokens;
         string system;
         JSONValue[] msgs;
         auto plan = req.attachmentPlan();

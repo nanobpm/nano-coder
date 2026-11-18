@@ -1162,7 +1162,7 @@ class Agent
         if (req.kind == Request.Kind.budget)
         {
             auto maxTok = requestMaxTokens();
-            if (maxTok <= 0) maxTok = 32_000;
+            if (maxTok <= 0) maxTok = imported!"nano.thinking".anthropicDefaultMaxTokens;
             auto sent = cappedBudget(req.budget, maxTok);
             string extra;
             if (sent == 0)

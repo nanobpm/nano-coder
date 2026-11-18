@@ -690,6 +690,9 @@ void applyChat(const Request req, ref JSONValue body)
 
 /// Write `req` into an Anthropic Messages body; returns whether thinking is on
 /// (which rules out a custom temperature).
+/// `max_tokens` the Anthropic client sends when none is configured (as Rust).
+enum anthropicDefaultMaxTokens = 8192;
+
 bool applyAnthropic(const Request req, ref JSONValue body, long maxTokens)
 {
     alias K = Request.Kind;
