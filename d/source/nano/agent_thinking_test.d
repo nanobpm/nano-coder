@@ -290,3 +290,108 @@ unittest
     agent.maxTokens = 16_384;
     assert(shown(agent).length);
 }
+
+/// Streams each reply's thinking, then its content.
+class Thinker : MockClient
+{
+    LLMResponse[] replies;
+    this(LLMResponse[] script) { super(script); replies = script; }
+    override LLMResponse chat(const ref ChatRequest req, StreamSink sink)
+    {
+        auto n = seen.length;
+        if (n < replies.length && replies[n].reasoning.length) sink(true, replies[n].reasoning);
+        return super.chat(req, sink);
+    }
+}
+
+class Order : NullEvents
+{
+    string[] names;
+    override void text(bool reasoning, string chunk) { names ~= (reasoning ? "thinking-delta:" : "text-delta:") ~ chunk; }
+    override void assistantMessage(string text, string reasoning) { names ~= "message:" ~ text ~ "|" ~ reasoning; }
+}
+
+// rust: agent.rs::streams_deltas_and_reports_thinking_before_the_answer
+unittest
+{
+    auto thought = LLMResponse("answer");
+    thought.reasoning = "reasoning";
+    thought.thinkingBlocks = [parseJSON(`{"type":"thinking","thinking":"reasoning","signature":"s"}`)];
+    auto mock = new Thinker([thought, LLMResponse("later")]);
+    auto agent = new Agent(mock, new ToolRegistry, Policy.init, "sys");
+    auto ev = new Order;
+    agent.run("hi", ev);
+    assert(ev.names == ["thinking-delta:reasoning", "text-delta:answer", "message:answer|reasoning"], imported!"std.conv".to!string(ev.names));
+    agent.run("again", new NullEvents);
+    assert(mock.seen[1][2].thinkingBlocks.length == 1, "the signed block is replayed");
+}
+
+// rust: agent.rs::logs_thinking_usage_and_duration_with_assistant_messages
+unittest
+{
+    import std.file : exists, readText, rmdirRecurse, tempDir;
+    import std.path : buildPath;
+    import std.string : lineSplitter;
+    import nano.option : some;
+    import nano.session : SessionLog;
+    auto first = toolCall("c1");
+    first.reasoning = "call the tool";
+    first.usage = TokenUsage(10, 1);
+    auto second = LLMResponse("done");
+    second.reasoning = "now answer";
+    second.usage = TokenUsage(20, 1);
+    auto agent = agentFor(new MockClient([first, second]));
+    auto dir = buildPath(tempDir, "nano-log-thinking");
+    if (exists(dir)) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/w");
+    log.append(agent.messages[0]);
+    agent.log = some(log);
+    assert(agent.run("ping", new NullEvents) == "done");
+    JSONValue[] assistants, others;
+    foreach (line; readText(log.path).lineSplitter)
+    {
+        auto j = parseJSON(line);
+        if (j["type"].str != "message") continue;
+        if (j["data"]["role"].str == "assistant") assistants ~= j["data"];
+        else others ~= j["data"];
+    }
+    assert(assistants.length == 2);
+    assert(assistants[0]["thinking"].str == "call the tool" && assistants[0]["usage"]["prompt_tokens"].integer == 10);
+    assert(assistants[1]["thinking"].str == "now answer" && assistants[1]["usage"]["prompt_tokens"].integer == 20);
+    foreach (a; assistants) assert("duration_ms" in a.objectNoRef);
+    foreach (o; others) assert("duration_ms" !in o.objectNoRef && "usage" !in o.objectNoRef, o.toString);
+}
+
+// rust: agent.rs::read_file_binary_error_notes_vision_capability
+// rust: agent.rs::only_read_file_decodes_image_results
+unittest
+{
+    import std.algorithm : canFind;
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir, write;
+    import std.path : buildPath;
+    import nano.tools.files : ReadState, registerFiles = register;
+    auto dir = buildPath(tempDir, "nano-binary-hint");
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto bin = buildPath(dir, "blob.bin");
+    write(bin, cast(const(ubyte)[]) [0, 1, 2, 3, 255, 0, 42]);
+    Message toolResult(bool vision, ToolCall call)
+    {
+        auto reg = new ToolRegistry;
+        registerFiles(reg, new ReadState);
+        reg.register(ToolDefinition("shot", "shot", parseJSON(`{"type":"object"}`)), (JSONValue a) =>
+            `{"image":{"media_type":"image/png","path":"/nope.png","width":1,"height":1,"bytes":3}}`);
+        auto agent = new Agent(new MockClient([LLMResponse("", "", [call]), LLMResponse("ok")]), reg, Policy.init, "sys");
+        agent.globalVision = vision;
+        agent.run("read", new NullEvents);
+        return agent.messages[$ - 2];
+    }
+    auto read = ToolCall.fromRaw("c1", "read_file", JSONValue(["path": bin]).toString);
+    auto t = toolResult(true, read);
+    assert(t.isError && t.content.canFind("looks like a binary file") && t.content.canFind("can view images"), t.content);
+    t = toolResult(false, read);
+    assert(t.content.canFind("can't view images"), t.content);
+    t = toolResult(true, ToolCall.fromRaw("c1", "shot", `{}`));
+    assert(!t.isError && !t.attachments.length && t.content.canFind(`"image"`), t.content);
+}
