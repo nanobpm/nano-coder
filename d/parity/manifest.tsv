@@ -10,15 +10,15 @@ acp.rs::thinking_value_reports_nothing_for_a_dropped_level	test
 acp.rs::turn_usage_is_the_delta_of_the_session_counters	test
 agent.rs::a_background_probe_refines_a_default_window_source	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
 agent.rs::a_cancelled_idle_compaction_is_not_retried_on_the_same_crossing	test
-agent.rs::a_chat_output_cap_fallback_halves_the_sent_budget	todo
-agent.rs::a_compaction_summary_cap_fallback_halves_the_sent_budget	todo
-agent.rs::a_compaction_summary_is_retried_after_learning_the_output_cap	todo
-agent.rs::a_compaction_summary_retry_honours_a_pending_model_switch	todo
+agent.rs::a_chat_output_cap_fallback_halves_the_sent_budget	test
+agent.rs::a_compaction_summary_cap_fallback_halves_the_sent_budget	test
+agent.rs::a_compaction_summary_is_retried_after_learning_the_output_cap	test
+agent.rs::a_compaction_summary_retry_honours_a_pending_model_switch	test
 agent.rs::a_configured_window_preserves_the_probed_output_limit	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
 agent.rs::a_configured_window_probes_only_the_thinking_levels	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
-agent.rs::a_direct_model_switch_supersedes_a_stale_queued_request	todo
+agent.rs::a_direct_model_switch_supersedes_a_stale_queued_request	test
 agent.rs::a_direct_model_switch_with_a_slow_key_command_does_not_stall_the_runtime	na	Tokio runtime races while a client builds asynchronously; D builds the client synchronously on the agent thread
-agent.rs::a_failed_direct_model_switch_still_clears_a_stale_queued_request	todo
+agent.rs::a_failed_direct_model_switch_still_clears_a_stale_queued_request	test
 agent.rs::a_failed_new_session_keeps_the_thinking_override	todo
 agent.rs::a_failed_repair_on_resume_leaves_the_live_session_untouched	todo
 agent.rs::a_failed_tool_after_smart_compaction_points_to_history_once	todo
@@ -50,7 +50,7 @@ agent.rs::a_spoofed_summary_prefix_does_not_unlock_history_tools	todo
 agent.rs::a_stale_background_probe_is_discarded_after_a_later_switch	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
 agent.rs::a_steer_between_continuations_drops_the_cut_off_prefix	test
 agent.rs::a_stricter_probe_replaces_a_learned_window_stat	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
-agent.rs::a_summary_cut_off_at_the_output_limit_is_flagged	todo
+agent.rs::a_summary_cut_off_at_the_output_limit_is_flagged	test
 agent.rs::a_thinking_level_set_mid_turn_applies_from_the_next_step	todo
 agent.rs::a_timer_set_in_a_turn_fires_mid_turn_when_the_clock_passes_it	test
 agent.rs::a_timer_tool_persistence_failure_rolls_the_live_timers_back	gap	D does not roll the live timers/plan back when persisting their change to the session log fails
@@ -60,11 +60,11 @@ agent.rs::a_truncated_final_assistant_is_not_replayed_as_a_clean_finish	test
 agent.rs::a_truncated_turns_stop_reason_survives_a_reload	test
 agent.rs::adds_project_instructions_to_the_system_prompt_and_nested_ones_to_file_results	todo
 agent.rs::an_automatic_timer_turn_marks_its_message_auto_initiated	gap	D session records have no auto-initiated flag for timer-driven turns
-agent.rs::an_empty_summary_at_the_output_limit_names_the_cause	todo
+agent.rs::an_empty_summary_at_the_output_limit_names_the_cause	test
 agent.rs::an_equal_probe_replaces_a_learned_window_stat_source	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
 agent.rs::an_interactive_session_keeps_an_unbounded_zero_cap	todo
 agent.rs::an_output_limit_rejection_is_learned_and_retried	test
-agent.rs::an_output_limit_rejection_is_retried_against_the_sent_budget	todo
+agent.rs::an_output_limit_rejection_is_retried_against_the_sent_budget	test
 agent.rs::an_unset_max_tokens_defaults_to_the_models_published_output_limit	test
 agent.rs::an_unset_max_tokens_falls_back_to_a_large_default_when_unpublished	test
 agent.rs::an_unset_max_tokens_uses_a_known_model_cap_before_the_large_fallback	test
@@ -79,14 +79,14 @@ agent.rs::cancel_during_key_command_build_kills_the_child_despite_a_turn_flag_re
 agent.rs::cancel_during_model_call_stops_the_turn	todo
 agent.rs::cancel_kills_running_bash_and_skips_remaining_calls	test
 agent.rs::cancelled_apply_model_request_signals_the_caller_and_keeps_the_request	na	Tokio runtime races while a client builds asynchronously; D builds the client synchronously on the agent thread
-agent.rs::cancelled_compaction_does_not_issue_the_summary_call	todo
+agent.rs::cancelled_compaction_does_not_issue_the_summary_call	test
 agent.rs::compaction_falls_back_after_too_many_mid_summary_drops	gap	D retries mid-reply drops for turns only, not for the compaction summary request
 agent.rs::compaction_keeps_the_temperature_when_turns_think_on_anthropic	todo
 agent.rs::compaction_persists_the_summary_request_usage_on_the_replace_record	gap	D replace records do not carry the summary request token usage
 agent.rs::compaction_pins_the_users_requests_across_a_second_compaction	test	pinned user requests (#184)
 agent.rs::compaction_retries_a_mid_summary_drop_instead_of_dropping_history	gap	D retries mid-reply drops for turns only, not for the compaction summary request
 agent.rs::compaction_sends_no_temperature_to_an_always_thinking_model	todo
-agent.rs::compaction_streams_the_summary_request	todo
+agent.rs::compaction_streams_the_summary_request	test
 agent.rs::compaction_tail_budget_mirrors_the_vision_wire_plan	todo
 agent.rs::compacts_below_the_threshold_when_output_would_not_fit	test
 agent.rs::completed_after_an_edit_and_a_check_is_not_reminded	test
@@ -99,7 +99,7 @@ agent.rs::detected_window_sits_between_config_and_model_name	test
 agent.rs::disabled_timers_neither_fire_nor_nudge_on_a_turn	gap	D timer nudging: no test that disabled timers stay silent / that idle firing resets the nudge counter
 agent.rs::emits_acp_updates_for_messages_and_tools	test
 agent.rs::estimate_is_anchored_to_reported_usage	test
-agent.rs::failed_model_switch_restores_the_previous_spec	todo
+agent.rs::failed_model_switch_restores_the_previous_spec	test
 agent.rs::failed_tool_reports_failed_status_and_replay_covers_history	todo
 agent.rs::identical_tool_calls_draw_a_loop_warning_on_the_third	test
 agent.rs::idle_compaction_is_off_without_idle_or_auto_compact	test
@@ -124,11 +124,11 @@ agent.rs::mid_reply_drops_are_retried_and_leave_no_partial_text_in_history	test
 agent.rs::mid_reply_restart_emits_a_reset_event_before_resending	gap	D has no response-reset UI event: a partial reply already printed before a mid-reply drop stays on screen
 agent.rs::mid_turn_model_switch_with_a_configured_window_skips_the_probe	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
 agent.rs::mid_turn_model_switch_without_a_configured_window_probes_in_the_background	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
-agent.rs::model_switch_during_tool_call_applies_at_the_next_model_call	todo
-agent.rs::model_switch_queued_before_manual_compaction_applies_to_the_summary	todo
-agent.rs::model_switch_queued_during_a_call_applies_before_threshold_compaction	todo
-agent.rs::model_switch_queued_during_an_overflow_applies_to_the_compaction_and_retry	todo
-agent.rs::model_switch_to_an_unbuildable_spec_drops_the_request_and_reports_it	todo
+agent.rs::model_switch_during_tool_call_applies_at_the_next_model_call	test
+agent.rs::model_switch_queued_before_manual_compaction_applies_to_the_summary	test
+agent.rs::model_switch_queued_during_a_call_applies_before_threshold_compaction	test
+agent.rs::model_switch_queued_during_an_overflow_applies_to_the_compaction_and_retry	test
+agent.rs::model_switch_to_an_unbuildable_spec_drops_the_request_and_reports_it	test
 agent.rs::new_generation_clears_stale_output_rate	todo
 agent.rs::new_session_and_load_reset_the_mode	todo
 agent.rs::new_session_resets_cumulative_counters	test

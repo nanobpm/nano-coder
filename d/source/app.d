@@ -1733,16 +1733,26 @@ int runMain(string[] args)
     };
 
     /// Switch the model (history carries over); the "Model set to" text.
-    string switchModel(string spec)
+    /// `queued`: a `/model` from mid-turn, already taken off the queue; a
+    /// direct switch also drops one still queued.
+    string switchModel(string spec, bool queued = false)
     {
         auto previous = currentSpec();
-        auto rp = resolve(cfg, spec);
-        client = makeClient(rp);
-        agent.client = client;
-        agent.setConfiguredWindow(windowFor(cfg, rp.config));
-        agent.learnedWindow = 0;
-        agent.learnedMaxOutput = 0;
-        agent.refreshCapabilities();
+        LLMClient build(string s, out ConfiguredWindow w)
+        {
+            auto rp = resolve(cfg, s);
+            auto c = makeClient(rp);
+            w = windowFor(cfg, rp.config);
+            return c;
+        }
+        if (queued)
+        {
+            ConfiguredWindow w;
+            auto c = build(spec, w);
+            agent.useClient(c, w);
+        }
+        else agent.setModel(spec, &build);
+        client = agent.client;
         synchronized
         {
             recents.record(previous);
@@ -1754,7 +1764,7 @@ int runMain(string[] args)
         return text;
     }
     agent.onModelRequest = (string spec) {
-        try console.note(switchModel(spec));
+        try console.note(switchModel(spec, true));
         catch (Exception e) console.note(console.red(format("[/model %s: %s]", spec, e.msg)));
     };
 

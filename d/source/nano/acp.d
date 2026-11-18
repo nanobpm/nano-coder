@@ -566,6 +566,8 @@ final class AcpServer : AgentEvents
             auto notice = agent.onCompacted;
             agent.onCompacted = null;
             scope (exit) agent.onCompacted = notice;
+            // A cancel left from an earlier turn must not stop this one.
+            agent.control.nonNull.startTurn();
             try done = agent.compact(rep, CompactTrigger.manual, hasMode ? new CompactionMode(mode) : null, focus.length ? focus : null);
             catch (Exception e) return rpcError(id, -32603, e.msg);
             if (!done) return rpcResult(id, JSONValue(["stopReason": JSONValue("end_turn"), "compacted": JSONValue(false)]));

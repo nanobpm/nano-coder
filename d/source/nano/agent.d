@@ -622,8 +622,7 @@ class Agent
                 compact(rep, CompactTrigger.threshold);
                 if (control.isCancelled) return cancelled(ev);
             }
-            if (auto spec = control.takeModelRequest())
-                if (onModelRequest !is null) onModelRequest(spec);
+            applyModelRequest();
             if (auto level = control.takeThinkingRequest())
             {
                 import nano.thinking : setSession;
@@ -684,6 +683,9 @@ class Agent
                         }
                     }
                     if (overflowRetried || !ctx.isContextOverflow(e.msg)) throw e;
+                    // A `/model` queued during the call applies to the
+                    // compaction and the retry, not the model being left.
+                    applyModelRequest();
                     // The request did not fit: learn the window, compact, retry once.
                     overflowRetried = true;
                     auto learned = ctx.limitFromError(e.msg);
@@ -1065,9 +1067,8 @@ class Agent
         auto atEntry = estimateContextTokens();
         // A `/model` left pending changes the window: apply it first and
         // look again on the next poll.
-        if (auto spec = control.takeModelRequest())
+        if (applyModelRequest())
         {
-            if (onModelRequest !is null) onModelRequest(spec);
             idleGate.spend(atEntry);
             return false;
         }
@@ -1309,6 +1310,12 @@ class Agent
         bool truncated, retried;
         for (;;)
         {
+            // Every compaction (manual, threshold, overflow, idle) and its
+            // retry summarizes on the model the user chose: a `/model` still
+            // queued applies first. A cancel pending now stops before the
+            // call (callers reset the control for a manual run).
+            applyModelRequest();
+            if (control.isCancelled) return false;
             auto inputWindow = saturatingSub(window, budget);
             auto chars = checkedMul(max(saturatingSub(inputWindow, 2_000), 2_000), 3);
             auto request = "Conversation to summarize:\n\n" ~ ctx.renderTranscript(summarized, chars, smart);
@@ -1722,8 +1729,41 @@ class Agent
     bool planTools = true;
     /// Called after the plan changes (the UI shows the checklist).
     void delegate() onPlanChanged;
-    /// A `/model SPEC` queued mid-turn, applied (on the agent thread) before the next model call.
+    /// A `/model SPEC` queued mid-turn, applied (on the agent thread) before
+    /// the next model call. It reports a failure itself: the request is
+    /// dropped either way, so a bad spec can't retry every turn.
     void delegate(string) onModelRequest;
+
+    /// Apply a queued `/model`, if any; whether there was one.
+    bool applyModelRequest()
+    {
+        auto spec = control.takeModelRequest();
+        if (!spec.length) return false;
+        if (onModelRequest !is null) onModelRequest(spec);
+        return true;
+    }
+
+    /// A direct switch (at the prompt or from settings): it supersedes a
+    /// `/model` still queued from the last turn, even when `build` fails, and
+    /// a failed build changes nothing else.
+    void setModel(string spec, LLMClient delegate(string spec, out ConfiguredWindow window) @safe build)
+    {
+        control.takeModelRequest();
+        ConfiguredWindow window;
+        auto c = build(spec, window);
+        useClient(c, window);
+    }
+
+    /// Switch to a built client; history carries over, what was learned about
+    /// the old model doesn't.
+    void useClient(LLMClient c, ConfiguredWindow window)
+    {
+        client = c;
+        setConfiguredWindow(window);
+        learnedWindow = 0;
+        learnedMaxOutput = 0;
+        refreshCapabilities();
+    }
 
     /// Timers the agent set for itself (`timer_*` tools).
     Timers timers;
