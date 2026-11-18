@@ -1563,6 +1563,7 @@ int runMain(string[] args)
         agent.historyAvailable = restored.historyAvailable;
         agent.historyHintPending = restored.historyAvailable && !restored.historyHintConsumed;
         agent.pinStash = restored.pinStash;
+        agent.adoptPending(restored);
         agent.plan = Plan.init;
         agent.restoreRecall(restored.recall);
         agent.resetSessionCounters();

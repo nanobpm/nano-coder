@@ -39,6 +39,7 @@ string toolResultDisplay(string text, const(Attachment)[] attachments)
 }
 import nano.config : ProviderConfig, ProviderKind;
 import std.typecons : Nullable;
+import std.algorithm : min, max, clamp;
 import nano.plan : Plan, PlanError, isPlanTool, planDefinitions = definitions;
 import nano.timers : Timers, TimerError, isTimerTool, timerDefinitions = definitions, firedMessage, firedNotice, pendingNudge, pendingNudgeEvery;
 import nano.permissions;
@@ -152,6 +153,58 @@ class Agent
     /// Pin the user's requests verbatim after each compaction summary
     /// (`compaction_pin_requests`, issue #66).
     bool compactionPinRequests = true;
+    /// The accepted input whose turn has not ended (redelivering its id resumes it).
+    bool hasPending;
+    PendingInput pending;
+
+    /// Take a restored log's pending input. Its positions index the logged
+    /// conversation; the agent keeps its own system prompt in place of any
+    /// logged system message, so remap them.
+    void adoptPending(const ref Restored r)
+    {
+        hasPending = r.hasPending;
+        if (!hasPending) return;
+        pending = r.pending;
+        static size_t remap(const Message[] conv, size_t i)
+        {
+            size_t n = 1;
+            foreach (ref m; conv[0 .. min(i, conv.length)]) if (m.role != Role.system) n++;
+            return n;
+        }
+        pending.position = remap(r.conversation, r.pending.position);
+        if (pending.hasBase) pending.base = remap(r.conversation, r.pending.base);
+    }
+
+    /// Mirror the live continuation into the pending input (so a mid-turn
+    /// compaction persists it) and advance its replay boundary.
+    private void syncPendingContinuation(string answer, size_t count)
+    {
+        if (!hasPending) return;
+        pending.hasContinuation = answer.length || count;
+        pending.answer = pending.hasContinuation ? answer : null;
+        pending.count = pending.hasContinuation ? count : 0;
+        pending.hasBase = true;
+        pending.base = messages.length;
+    }
+
+    /// Take a reported outcome from a resumed turn's messages; true when found.
+    private bool outcomeFrom(const Message[] tail)
+    {
+        foreach_reverse (ref m; tail)
+            foreach_reverse (ref c; m.toolCalls)
+                if (c.name == outcomeToolName)
+                {
+                    try
+                    {
+                        lastOutcome = Outcome.fromArgs(c.arguments);
+                        hasOutcome = true;
+                        return true;
+                    }
+                    catch (Exception) {}
+                }
+        return false;
+    }
+
     /// Set before `run` when the input is harness-initiated (a fired timer);
     /// `run` consumes it.
     bool automaticInput;
@@ -223,7 +276,7 @@ class Agent
                 import std.stdio : stderr;
                 stdErr.writefln("[agent] input %s already processed; returning recorded response", JSONValue(givenId).toString);
                 auto st = givenId in completedStops;
-                lastStop = st is null ? StopReason.endTurn : (*st).to!StopReason;
+                lastStop = st is null ? StopReason.endTurn : stopReasonFrom(*st);
                 auto oc = givenId in completedOutcomes;
                 hasOutcome = oc !is null;
                 if (hasOutcome) lastOutcome = Outcome.fromArgs(*oc);
@@ -234,9 +287,12 @@ class Agent
         auto inputId = givenId.length ? givenId
             : format("in-%s-%s", (Clock.currStdTime - 621_355_968_000_000_000L) / 10_000, ++inputCounter);
         ulong from = log !is null ? logSize() : 0;
-        if (log !is null) log.input(inputId, input);
+        // Redelivering the id of an interrupted turn resumes it (its input
+        // was logged already).
+        bool resuming = hasPending && givenId.length && pending.id == givenId;
+        if (log !is null && !resuming) log.input(inputId, input);
         string response;
-        try response = runTurn(input, ev, resetControl, automatic);
+        try response = runTurn(input, ev, resetControl, automatic, inputId, resuming);
         catch (Exception e)
         {
             if (log !is null)
@@ -251,6 +307,7 @@ class Agent
             log.turnEnd(inputId, response, cast(string) lastStop, hasOutcome ? lastOutcome.toJSON : JSONValue.init);
             indexTurn(from);
         }
+        hasPending = false;
         completedInputs[inputId] = response;
         if (lastStop != StopReason.endTurn) completedStops[inputId] = cast(string) lastStop;
         else completedStops.remove(inputId);
@@ -344,16 +401,22 @@ class Agent
         ~ "that says what the user is working on, from their requests below. Reply with the title only: no quotes, "
         ~ "no trailing period.";
 
-    private string runTurn(string input, AgentEvents ev, bool resetControl, bool automatic = false)
+    private string runTurn(string input, AgentEvents ev, bool resetControl, bool automatic = false,
+        string inputId = null, bool resuming = false)
     {
         if (resetControl) control.startTurn();
         stopBlocks = 0;
         hasOutcome = hasReported = false;
-        editsSinceCheck = verifyReminderFired = false;
+        // Verify-before-complete and the recall budget are per input: a
+        // resumed input keeps them.
+        if (!resuming) editsSinceCheck = verifyReminderFired = false;
         reminders.outcomeTool = outcomeTool;
         reminders.startTurn();
-        recallTurnNotes = 0;
+        recallTurnNotes = resuming ? pending.recallNotes : 0;
         string pinText;
+        auto typed = input;
+        // Where a resume `SessionStart` context message lands (size_t.max: none).
+        size_t hookContextStart = size_t.max;
         if (hooks !is null)
         {
             syncHookSession();
@@ -364,9 +427,54 @@ class Agent
                 auto start = hooks.runSessionStart(resumed ? "resume" : "startup");
                 if (auto ctx = start.contextBlock) pendingStartContext = ctx;
             }
+        }
+        if (resuming)
+        {
+            // UserPromptSubmit isn't re-run: the prompt was accepted already.
+            auto pos = pending.position;
+            if (pos >= messages.length || messages[pos].role != Role.user)
+            {
+                // The input was logged but its user message was not.
+                if (pos < messages.length) messages = messages[0 .. pos];
+                pending.position = messages.length;
+                push(Message.user(pending.text));
+            }
+            else if (messages.length > pos + 1 && messages[$ - 1].role == Role.assistant && !messages[$ - 1].toolCalls.length
+                && !isLengthStop(messages[$ - 1].stopReason))
+            {
+                // The final answer was recorded but the turn end was not:
+                // rebuild the whole answer, the chunks before it included.
+                auto end = messages.length - 1;
+                auto boundary = min(pending.hasBase ? pending.base : pos, end);
+                auto rc = replayContinuation(pending, messages[boundary .. end]);
+                outcomeFrom(messages[pos .. $]);
+                lastStop = StopReason.endTurn;
+                return rc.answer ~ messages[$ - 1].content;
+            }
+            else if (outcomeTool && messages[$ - 1].role == Role.tool && outcomeFrom(messages[pos .. $]))
+            {
+                // The outcome was reported but the answer it implies was not recorded.
+                auto response = lastOutcome.response;
+                push(Message.assistant(response));
+                lastStop = StopReason.endTurn;
+                return response;
+            }
+            if (pendingStartContext !is null)
+            {
+                hookContextStart = messages.length;
+                auto hm = Message.user(wrapReminder(pendingStartContext));
+                hm.hookContext = true;
+                pendingStartContext = null;
+                push(hm);
+            }
+        }
+        else if (hooks !is null)
+        {
             auto o = hooks.runUserPromptSubmit(input);
             if (o.blocked)
             {
+                hasPending = true;
+                pending = PendingInput(inputId, typed, messages.length);
                 push(Message.user(input));
                 auto reason = o.blockReason.strip.length ? o.blockReason : "Your message was blocked by a UserPromptSubmit hook.";
                 push(Message.assistant(reason, null));
@@ -385,16 +493,43 @@ class Agent
                 input ~= "\n\n" ~ wrapReminder(extra.join("\n\n"));
             }
         }
+        if (!resuming)
         {
             auto um = Message.user(input);
             um.pinText = pinText;
             um.autoInitiated = automatic;
+            hasPending = true;
+            pending = PendingInput(inputId, typed, messages.length);
             push(um);
         }
         string last;
         // Output-limit continuations: the cut-off chunks so far, and how many.
         string continued;
         size_t truncations;
+        // A resumed turn rebuilds its in-flight continuation from the
+        // messages logged before the interrupt (issue #114).
+        if (resuming && pending.position <= messages.length)
+        {
+            auto start = pending.position;
+            auto scanEnd = max(hookContextStart != size_t.max ? hookContextStart : messages.length, start);
+            auto boundary = clamp(pending.hasBase ? pending.base : start, start, scanEnd);
+            auto rc = replayContinuation(pending, messages[boundary .. scanEnd]);
+            continued = rc.answer;
+            truncations = rc.count;
+            bool lastTruncated = scanEnd > start && messages[scanEnd - 1].role == Role.assistant
+                && !messages[scanEnd - 1].toolCalls.length && isLengthStop(messages[scanEnd - 1].stopReason);
+            // The crash came before the chunk's reminder was logged: re-prompt,
+            // unless the budget is spent.
+            if (lastTruncated && truncations < maxTruncatedContinuations) push(continuationReminder(0));
+            syncPendingContinuation(continued, truncations);
+            if (lastTruncated && truncations >= maxTruncatedContinuations)
+            {
+                // Never call the model past the cap: end the turn MaxTokens.
+                outcomeFrom(messages[start .. $]);
+                lastStop = StopReason.maxTokens;
+                return continued;
+            }
+        }
         // The turn cap: interactive normal mode asks to keep going; auto mode
         // has none; headless runs (ACP, -p) stop at the cap, or at a safety
         // cap when there is none. Re-read from the live mode each iteration.
@@ -532,7 +667,12 @@ class Agent
                 bool cut = r.stopReason == "length" || r.stopReason == "max_tokens";
                 // A steer that arrived while the answer was written extends the
                 // turn; the reply after it is a fresh answer.
-                if (control.hasSteers && !control.isCancelled) { continued = null; continue; }
+                if (control.hasSteers && !control.isCancelled)
+                {
+                    continued = null;
+                    syncPendingContinuation(continued, truncations);
+                    continue;
+                }
                 // A reply cut off at the output-token limit isn't finished (any
                 // tool call in it was dropped): ask for the rest, in smaller
                 // pieces, up to maxTruncatedContinuations times.
@@ -540,7 +680,8 @@ class Agent
                 {
                     truncations++;
                     continued ~= r.content;
-                    push(Message.auto_(wrapReminder(truncatedContinuationNote(r.usage.outputTokens))));
+                    push(continuationReminder(r.usage.outputTokens));
+                    syncPendingContinuation(continued, truncations);
                     continue;
                 }
                 if (cut) ev.text(false, "\n[the reply hit the output-token limit]");
@@ -555,6 +696,7 @@ class Agent
                     {
                         stopBlocks++;
                         continued = null;
+                        syncPendingContinuation(continued, truncations);
                         auto reason = o.blockReason.strip.length ? o.blockReason : "A Stop hook asked the agent to keep going.";
                         push(Message.auto_(wrapReminder(reason)));
                         ev.userMessage(reason);
@@ -566,6 +708,7 @@ class Agent
             }
             // Tool calls begin a new answer: dropped call markup mustn't prefix it.
             continued = null;
+            syncPendingContinuation(continued, truncations);
             string loopStop;
             foreach (call; r.toolCalls)
             {
@@ -1066,6 +1209,17 @@ class Agent
         Message[] next = messages[0 .. bodyStart].dup;
         next ~= Message.user(summary);
         next[$ - 1].timestamp = nowStamp();
+        // An in-flight input folded into the summary is restated after it.
+        size_t pendingPos;
+        if (hasPending)
+        {
+            if (pending.position < split)
+            {
+                next ~= Message.user(pending.text);
+                pendingPos = next.length - 1;
+            }
+            else pendingPos = pending.position - split + next.length;
+        }
         next ~= messages[split .. $];
         if (trigger != CompactTrigger.manual)
         {
@@ -1076,7 +1230,14 @@ class Agent
         }
         messages = next;
         calibLen = 0;
-        if (log !is null) log.replace(messages, first, last, ctx.modeName(m), client.providerName ~ "/" ~ client.modelName, pinStash);
+        if (hasPending)
+        {
+            pending.position = pendingPos;
+            pending.hasBase = true;
+            pending.base = messages.length;
+        }
+        if (log !is null) log.replace(messages, first, last, ctx.modeName(m), client.providerName ~ "/" ~ client.modelName, pinStash,
+            hasPending ? &pending : null);
         // The replacement drops recalled notes' full text from context, so
         // every memory may be recalled again (except those the retained
         // system message's index renders in full: `indexShown` is kept).
@@ -1255,6 +1416,7 @@ class Agent
         calibLen = calibTokens = 0;
         compactFloor = 0;
         pinStash = null;
+        hasPending = false;
         historyAvailable = historyHintPending = false;
         recallState = mem.Recall.init;
         recallTurnNotes = 0;
@@ -1323,6 +1485,7 @@ class Agent
             texts ~= n.text;
         }
         recallTurnNotes += notes.length;
+        if (hasPending) pending.recallNotes = recallTurnNotes;
         return texts;
     }
 
@@ -1430,7 +1593,9 @@ class Agent
         {
             string notice;
             auto text = takeFiredTimers(notice);
-            push(Message.auto_(wrapReminder(text)));
+            auto tm = Message.auto_(wrapReminder(text));
+            tm.timer = true;
+            push(tm);
             ev.userMessage(notice);
             stepsSinceTimerNote = 0;
             return;
@@ -1438,7 +1603,9 @@ class Agent
         if (!timers.pending.length) { stepsSinceTimerNote = 0; return; }
         if (++stepsSinceTimerNote < pendingNudgeEvery) return;
         stepsSinceTimerNote = 0;
-        push(Message.auto_(wrapReminder(pendingNudge(timers.pending, timerNow()))));
+        auto nudge = Message.auto_(wrapReminder(pendingNudge(timers.pending, timerNow())));
+        nudge.timer = true;
+        push(nudge);
     }
     private size_t stepsSinceTimerNote;
 
@@ -2251,6 +2418,51 @@ enum maxTruncatedContinuations = 3;
 enum maxStreamRestarts = 10;
 
 /// The nudge after a reply cut off at the output-token limit (Rust's wording).
+/// The stop reason a log records by value (`max_tokens`); unknown: end_turn.
+StopReason stopReasonFrom(string value) @safe pure nothrow
+{
+    import std.traits : EnumMembers;
+    static foreach (m; EnumMembers!StopReason)
+        if (value == m) return m;
+    return StopReason.endTurn;
+}
+
+/// A stop reason meaning the reply was cut off at the output-token limit.
+bool isLengthStop(string reason) @safe pure nothrow { return reason == "length" || reason == "max_tokens"; }
+
+/// The reminder asking the model to continue a cut-off reply.
+Message continuationReminder(long completionTokens)
+{
+    auto m = Message.auto_(wrapReminder(truncatedContinuationNote(completionTokens)));
+    m.continuation = true;
+    return m;
+}
+
+/// Replay a turn's logged messages over a continuation snapshot: the answer
+/// carried across cut-off chunks and how many continuations ran. A fired
+/// timer keeps the prefix; any other user message, a tool run or a finished
+/// reply starts a new answer segment (issue #114).
+auto replayContinuation(const ref PendingInput snapshot, const Message[] tail)
+{
+    static struct Replayed { string answer; size_t count; }
+    auto r = Replayed(snapshot.hasContinuation ? snapshot.answer : null, snapshot.hasContinuation ? snapshot.count : 0);
+    foreach (ref m; tail)
+        final switch (m.role)
+        {
+            case Role.user:
+                if (m.continuation) r.count++;
+                else if (!m.timer) r.answer = null;
+                break;
+            case Role.assistant:
+                if (!m.toolCalls.length && isLengthStop(m.stopReason)) r.answer ~= m.content;
+                else r.answer = null;
+                break;
+            case Role.tool: r.answer = null; break;
+            case Role.system: break;
+        }
+    return r;
+}
+
 string truncatedContinuationNote(long completionTokens)
 {
     auto at = completionTokens > 0 ? format(" at the output-token limit (%s tokens)", completionTokens)

@@ -43,12 +43,12 @@ agent.rs::a_repeated_compaction_without_the_pin_tells_the_summariser_to_preserve
 agent.rs::a_reply_cut_off_at_the_output_limit_continues_instead_of_ending	test
 agent.rs::a_resumed_session_keeps_attachments_and_survives_a_missing_file	todo
 agent.rs::a_retried_prompt_keeps_its_spent_recall_budget	na	D has no in-process retry of a pending input and its replace records never keep one, so there is no per-input recall budget to carry
-agent.rs::a_same_agent_retry_after_a_provider_error_does_not_replay_the_snapshot_twice	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
+agent.rs::a_same_agent_retry_after_a_provider_error_does_not_replay_the_snapshot_twice	test
 agent.rs::a_second_overflow_is_returned	test
 agent.rs::a_small_max_tokens_caps_the_thinking_budget_with_a_warning	todo
 agent.rs::a_spoofed_summary_prefix_does_not_unlock_history_tools	todo
 agent.rs::a_stale_background_probe_is_discarded_after_a_later_switch	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
-agent.rs::a_steer_between_continuations_drops_the_cut_off_prefix	todo
+agent.rs::a_steer_between_continuations_drops_the_cut_off_prefix	test
 agent.rs::a_stricter_probe_replaces_a_learned_window_stat	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
 agent.rs::a_summary_cut_off_at_the_output_limit_is_flagged	todo
 agent.rs::a_thinking_level_set_mid_turn_applies_from_the_next_step	todo
@@ -56,8 +56,8 @@ agent.rs::a_timer_set_in_a_turn_fires_mid_turn_when_the_clock_passes_it	test
 agent.rs::a_timer_tool_persistence_failure_rolls_the_live_timers_back	gap	D does not roll the live timers/plan back when persisting their change to the session log fails
 agent.rs::a_title_is_requested_at_most_once_per_session_across_switches	todo
 agent.rs::a_tool_run_resets_the_continuation_accumulator	test
-agent.rs::a_truncated_final_assistant_is_not_replayed_as_a_clean_finish	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
-agent.rs::a_truncated_turns_stop_reason_survives_a_reload	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
+agent.rs::a_truncated_final_assistant_is_not_replayed_as_a_clean_finish	test
+agent.rs::a_truncated_turns_stop_reason_survives_a_reload	test
 agent.rs::adds_project_instructions_to_the_system_prompt_and_nested_ones_to_file_results	todo
 agent.rs::an_automatic_timer_turn_marks_its_message_auto_initiated	gap	D session records have no auto-initiated flag for timer-driven turns
 agent.rs::an_empty_summary_at_the_output_limit_names_the_cause	todo
@@ -165,12 +165,12 @@ agent.rs::read_only_memory_refuses_a_save	todo
 agent.rs::recall_attaches_at_most_two_notes_per_turn	test
 agent.rs::record_usage_accumulates_aic_when_reported	test
 agent.rs::records_assistant_tool_calls_before_results	todo
-agent.rs::redelivering_a_truncated_turn_replays_its_stop_reason	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
+agent.rs::redelivering_a_truncated_turn_replays_its_stop_reason	test
 agent.rs::refreshing_stats_tracks_a_max_tokens_driven_thinking_change	todo
 agent.rs::repairs_interrupted_turns_on_resume	test
 agent.rs::repeated_output_limit_cut_offs_end_with_a_distinct_stop_reason	test
 agent.rs::replacing_the_conversation_resets_and_persists_recall	test
-agent.rs::replay_after_a_crash_rebuilds_the_whole_answer	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
+agent.rs::replay_after_a_crash_rebuilds_the_whole_answer	test
 agent.rs::replay_after_mid_turn_compaction_shows_the_folded_input_once	todo
 agent.rs::replay_after_repeated_compaction_preserves_the_original_turns	todo
 agent.rs::replay_after_resume_restores_the_persisted_pre_compaction_turns	na	D never had the pre-compaction replay stash
@@ -179,25 +179,25 @@ agent.rs::replay_history_replays_every_user_message	todo
 agent.rs::replay_shows_the_image_marker_on_persisted_tool_results	todo
 agent.rs::reporting_an_outcome_ends_the_turn_and_is_recorded	test
 agent.rs::request_settings_derives_temperature_from_the_snapshot_not_a_reread	todo
-agent.rs::resume_after_a_logged_continuation_reminder_stitches_the_prefix	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
-agent.rs::resume_after_compaction_replays_a_logged_clean_final_answer	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
-agent.rs::resume_after_compaction_replays_chunks_logged_after_the_summary	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
-agent.rs::resume_after_compaction_resets_the_prefix_on_a_post_summary_tool_run	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
-agent.rs::resume_after_compaction_restores_the_persisted_continuation	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
-agent.rs::resume_after_compaction_with_a_spent_budget_ends_max_tokens	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
+agent.rs::resume_after_a_logged_continuation_reminder_stitches_the_prefix	test
+agent.rs::resume_after_compaction_replays_a_logged_clean_final_answer	test
+agent.rs::resume_after_compaction_replays_chunks_logged_after_the_summary	test
+agent.rs::resume_after_compaction_resets_the_prefix_on_a_post_summary_tool_run	test
+agent.rs::resume_after_compaction_restores_the_persisted_continuation	test
+agent.rs::resume_after_compaction_with_a_spent_budget_ends_max_tokens	test
 agent.rs::resume_after_repeated_compaction_rebuilds_the_stash_from_delta_records	na	D never had the pre-compaction replay stash
-agent.rs::resume_after_the_third_cutoff_still_issues_the_last_continuation	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
-agent.rs::resume_before_a_logged_continuation_reminder_re_prompts_and_stitches	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
-agent.rs::resume_before_a_stop_hook_reply_does_not_restore_the_discarded_prefix	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
+agent.rs::resume_after_the_third_cutoff_still_issues_the_last_continuation	test
+agent.rs::resume_before_a_logged_continuation_reminder_re_prompts_and_stitches	test
+agent.rs::resume_before_a_stop_hook_reply_does_not_restore_the_discarded_prefix	test
 agent.rs::resume_finishes_a_recorded_answer_without_calling_the_model	todo
 agent.rs::resume_finishes_a_reported_outcome_without_calling_the_model	todo
-agent.rs::resume_preserves_the_prefix_across_an_interleaved_timer_message	gap	timer state across resume/restart is restored by D but untested; the cache-prefix interleaving case is not handled
-agent.rs::resume_restores_a_lost_user_message	todo
-agent.rs::resume_restores_continuation_state_before_session_start_context	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
-agent.rs::resume_restores_the_continuation_budget_before_a_tool_run	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
+agent.rs::resume_preserves_the_prefix_across_an_interleaved_timer_message	test
+agent.rs::resume_restores_a_lost_user_message	test
+agent.rs::resume_restores_continuation_state_before_session_start_context	test
+agent.rs::resume_restores_the_continuation_budget_before_a_tool_run	test
 agent.rs::resume_runs_session_start_hooks_for_the_continued_turn	todo
-agent.rs::resume_stops_reconstruction_at_a_stop_hook_reprompt	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
-agent.rs::resume_with_a_spent_budget_before_turn_end_ends_max_tokens	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
+agent.rs::resume_stops_reconstruction_at_a_stop_hook_reprompt	test
+agent.rs::resume_with_a_spent_budget_before_turn_end_ends_max_tokens	test
 agent.rs::resumed_pending_input_is_not_folded_into_the_index_twice	todo
 agent.rs::resumes_sessions_and_deduplicates_inputs	todo
 agent.rs::session_start_context_survives_a_rejected_first_prompt	todo
@@ -1097,7 +1097,7 @@ session.rs::replace_resets_conversation	todo
 session.rs::replace_restores_the_pending_inputs_spent_recall_budget	na	D has no in-process retry of a pending input and its replace records never keep one, so there is no per-input recall budget to carry
 session.rs::round_trips_and_tracks_inputs	todo
 session.rs::standard_replace_does_not_offer_history_tools	test
-session.rs::turn_end_persists_a_truncated_stop_reason_and_defaults_old_records	todo
+session.rs::turn_end_persists_a_truncated_stop_reason_and_defaults_old_records	test
 session_index.rs::cache_filename_cannot_collide_with_a_session_id	todo
 session_index.rs::clean_title_strips_terminal_control_characters	test
 session_index.rs::cleans_title_replies	test

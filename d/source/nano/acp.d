@@ -704,6 +704,7 @@ final class AcpServer : AgentEvents
         agent.historyAvailable = restored.historyAvailable;
         agent.historyHintPending = restored.historyAvailable && !restored.historyHintConsumed;
         agent.pinStash = restored.pinStash;
+        agent.adoptPending(restored);
         agent.log = new SessionLog(path);
         sessionId = agent.log.id;
         agent.completedInputs = restored.completed;

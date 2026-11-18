@@ -117,6 +117,8 @@ JSONValue messageRecord(const ref Message m)
     if (m.stopReason.length) j["stop_reason"] = m.stopReason;
     if (m.logLine) j["log_line"] = m.logLine;
     if (m.autoInitiated) j["auto_initiated"] = true;
+    if (m.continuation) j["continuation"] = true;
+    if (m.timer) j["timer"] = true;
     if (m.hookContext) j["hook_context"] = true;
     if (m.pinText.length) j["pin_text"] = m.pinText;
     return j;
@@ -180,11 +182,9 @@ Message messageFromRecord(JSONValue j)
         case "auto_initiated": m.autoInitiated = v.type == JSONType.true_; break;
         case "hook_context": m.hookContext = v.type == JSONType.true_; break;
         case "pin_text": if (v.type == JSONType.string) m.pinText = v.str; break;
-        // Sub-kinds of an automatic turn (kept for the round trip).
-        case "continuation", "timer":
-            if (v.type == JSONType.true_) m.autoInitiated = true;
-            extra[k] = v;
-            break;
+        // Sub-kinds of an automatic turn.
+        case "continuation": m.continuation = v.type == JSONType.true_; break;
+        case "timer": m.timer = v.type == JSONType.true_; break;
         default: extra[k] = v;
         }
     }
@@ -316,8 +316,10 @@ class SessionLog
     /// Compaction also records the folded log-line range, its mode and model.
     /// `pinStash`: the user requests folded by compactions so far (resume
     /// rebuilds the pinned block from them).
+    /// `pending`: an in-flight input that survives the replacement (a
+    /// mid-turn compaction), with its continuation snapshot.
     void replace(const Message[] messages, ulong first = 0, ulong last = 0, string mode = null, string model = null,
-        const Message[] pinStash = null)
+        const Message[] pinStash = null, scope const(PendingInput)* pending = null)
     {
         JSONValue[] ms;
         foreach (ref m; messages) ms ~= messageRecord(m);
@@ -328,6 +330,12 @@ class SessionLog
             JSONValue[] ps;
             foreach (ref m; pinStash) ps ~= messageRecord(m);
             d["pinned_requests"] = ps;
+        }
+        if (pending !is null)
+        {
+            d["pending_position"] = pending.position;
+            if (pending.hasContinuation) d["continuation"] = JSONValue([JSONValue(pending.answer), JSONValue(pending.count)]);
+            if (pending.recallNotes) d["pending_recall_notes"] = pending.recallNotes;
         }
         if (first) d["summarized"] = JSONValue([JSONValue(first), JSONValue(last)]);
         if (mode !is null) d["mode"] = mode;
@@ -356,6 +364,27 @@ void backfillPinText(ref Message m, const string[] inputs)
     if (found.length) m.pinText = found;
 }
 
+/// An input that was accepted but whose turn has not ended (Rust
+/// `PendingInput`): redelivering its id resumes the turn.
+struct PendingInput
+{
+    string id, text;
+    /// Conversation length when the input was accepted; its user message, if
+    /// recorded, is at this index.
+    size_t position;
+    /// The in-flight output-limit continuation: the answer carried across
+    /// cut-off chunks and how many continuations ran (issue #114).
+    bool hasContinuation;
+    string answer;
+    size_t count;
+    /// The conversation length the snapshot already accounts for: recovery
+    /// replays only later messages over it (none: from `position`, empty).
+    bool hasBase;
+    size_t base;
+    /// Recall notes already attached for this input.
+    size_t recallNotes;
+}
+
 /// What a session log restores to.
 struct Restored
 {
@@ -363,6 +392,9 @@ struct Restored
     Message[] conversation;
     /// The text of an input whose turn never ended (a crash mid-turn).
     string pendingInput;
+    /// That input in full, when `hasPending`.
+    bool hasPending;
+    PendingInput pending;
     /// Finished turns by input id: response, stop reason and any outcome
     /// (redelivering one of these ids replays the recorded answer).
     string[string] completed;
@@ -429,6 +461,8 @@ Restored restore(string path)
             pendingId = data["id"].str;
             r.pendingInput = data["text"].str;
             inputs ~= r.pendingInput;
+            r.hasPending = true;
+            r.pending = PendingInput(pendingId, r.pendingInput, r.conversation.length);
             break;
         case "message":
             r.conversation ~= messageFromRecord(data);
@@ -440,7 +474,7 @@ Restored restore(string path)
             }
             break;
         case "turn_end":
-            if (data["input_id"].str == pendingId) { pendingId = null; r.pendingInput = null; }
+            if (data["input_id"].str == pendingId) { pendingId = null; r.pendingInput = null; r.hasPending = false; }
             {
                 auto iid = data["input_id"].str;
                 auto resp = "response" in data;
@@ -457,6 +491,35 @@ Restored restore(string path)
             r.conversation = null;
             foreach (m; data["messages"].arrayNoRef) r.conversation ~= messageFromRecord(m);
             foreach (ref m; r.conversation) backfillPinText(m, inputs);
+            {
+                // An in-flight input survives a mid-turn compaction at
+                // `pending_position`, with its continuation snapshot.
+                auto pos = "pending_position" in data;
+                if (r.hasPending && pos !is null && pos.type == JSONType.integer)
+                {
+                    r.pending.position = cast(size_t) pos.integer;
+                    r.pending.hasContinuation = false;
+                    r.pending.answer = null;
+                    r.pending.count = 0;
+                    auto c = "continuation" in data;
+                    if (c !is null && c.type == JSONType.array && c.arrayNoRef.length == 2)
+                    {
+                        r.pending.hasContinuation = true;
+                        r.pending.answer = c.arrayNoRef[0].str;
+                        r.pending.count = cast(size_t) c.arrayNoRef[1].integer;
+                    }
+                    r.pending.hasBase = true;
+                    r.pending.base = r.conversation.length;
+                    auto rn = "pending_recall_notes" in data;
+                    r.pending.recallNotes = rn !is null && rn.type == JSONType.integer ? cast(size_t) rn.integer : 0;
+                }
+                else
+                {
+                    r.hasPending = false;
+                    r.pendingInput = null;
+                    pendingId = null;
+                }
+            }
             {
                 static Message[] decode(const JSONValue v, const string[] inputs)
                 {

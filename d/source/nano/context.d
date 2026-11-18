@@ -894,7 +894,7 @@ bool isSummaryMessage(const ref Message m)
 bool isUserRequest(const ref Message m)
 {
     import std.string : stripLeft;
-    if (m.role != Role.user || m.autoInitiated || m.hookContext) return false;
+    if (m.role != Role.user || m.autoInitiated || m.continuation || m.timer || m.hookContext) return false;
     auto c = m.content.stripLeft;
     if (c.startsWith(summaryPrefix) || c.startsWith(smartSummaryPrefix)) return false;
     return !c.startsWith("[Your plan, kept by the harness") && !c.startsWith("[A plan carried over");
