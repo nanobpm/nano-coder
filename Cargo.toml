@@ -26,6 +26,17 @@ lto = "fat"
 codegen-units = 1
 strip = "symbols"
 
+# Dev/test builds: line tables only for nano-coder itself, no debuginfo for
+# dependencies. Panic backtraces keep file:line for our frames (dependency
+# frames keep their function names); what's lost is variable inspection in a
+# debugger. For a debugger session, set both to `debug = "full"` locally
+# (don't commit it).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
