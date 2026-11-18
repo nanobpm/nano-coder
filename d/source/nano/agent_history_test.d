@@ -266,3 +266,49 @@ unittest
     assert(withUsage[0]["usage"]["prompt_tokens"].integer == 321 && withUsage[0]["usage"]["completion_tokens"].integer == 45);
     assert("duration_ms" in withUsage[0].objectNoRef);
 }
+
+// The kept tail is sized as the wire sends it: past the image limit, older
+// images cost a placeholder, so several image turns fit.
+// rust: agent.rs::compaction_tail_budget_mirrors_the_vision_wire_plan
+unittest
+{
+    import std.digest : toHexString, LetterCase;
+    import std.digest.sha : sha256Of;
+    import std.format : format;
+    import nano.attachment : Attachment, store;
+    import nano.vision : Vision;
+    auto mock = new MockClient([LLMResponse("SUMMARY"), LLMResponse("done")]);
+    auto agent = new Agent(mock, new ToolRegistry, Policy.init, "sys");
+    Vision v;
+    v.maxImages = 1;
+    agent.capabilities.vision = v;
+    agent.configuredWindow = 6_000;
+    agent.autoCompactThreshold = 0.5;
+    agent.compactionPinRequests = false;
+    auto dir = agent.attachmentsDir;
+    scope (exit) if (exists(dir)) rmdirRecurse(dir);
+    immutable bytes = cast(immutable(ubyte)[]) "compaction-tail-image";
+    Attachment img;
+    img.mediaType = "image/png";
+    img.extension = "png";
+    img.sha256 = toHexString!(LetterCase.lower)(sha256Of(bytes)).idup;
+    img.width = img.height = 1000;
+    img.bytes = bytes.length;
+    store(dir, img, bytes);
+    string big;
+    foreach (i; 0 .. 4_000) big ~= "big ";
+    agent.messages ~= Message.user(big);
+    foreach (i; 0 .. 120)
+    {
+        auto m = Message.user(format("img%s", i));
+        m.attachments = [img];
+        agent.messages ~= m;
+    }
+    agent.run("go", new NullEvents);
+    assert(agent.compactions == 1, "threshold compaction ran");
+    auto kept = agent.messages.map!(m => m.content).array;
+    assert(!kept.any!(c => c.canFind("big ")), "the large text turn is folded");
+    assert(kept.canFind("img119"), "the newest image turn is kept");
+    auto images = kept.filter!(c => c.startsWith("img")).array.length;
+    assert(images > 1 && images < 120, format("kept %s image turns", images));
+}

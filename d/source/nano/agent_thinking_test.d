@@ -70,6 +70,8 @@ string[] loggedLevels(Agent agent)
 // temperature in its own request (Anthropic requires the default then).
 // rust: agent.rs::a_mid_turn_thinking_change_applies_from_the_next_step_and_drops_the_temperature
 // rust: agent.rs::a_thinking_level_set_mid_turn_applies_from_the_next_step
+// (D resolves the temperature from the same thinking snapshot the request sends.)
+// rust: agent.rs::request_settings_derives_temperature_from_the_snapshot_not_a_reread
 unittest
 {
     auto c = new Claude("claude-sonnet-4-6", [toolCall("c1"), LLMResponse("done")]);
