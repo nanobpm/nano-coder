@@ -447,6 +447,43 @@ imported!"core.time".Duration idleCompactHoldFor(const ref Config cfg) @safe
 }
 
 /// Whether the idle prompt runs a due idle compaction now: quiet for the
+/// Whether a due timer runs now at the idle prompt (Rust deliver_due_timer):
+/// a queued interrupt, a fresh draft and an armed Ctrl-C exit window each
+/// hold it back (a timer firing mid-window would steal the second press).
+bool deliverDueTimer(bool due, bool draftHolds, bool interruptQueued, bool exitArmed) pure nothrow @nogc
+{
+    return due && !draftHolds && !interruptQueued && !exitArmed;
+}
+
+// rust: main.rs::deliver_due_timer_yields_to_interrupt_and_draft
+unittest
+{
+    assert(deliverDueTimer(true, false, false, false), "due, nothing else: fire");
+    assert(!deliverDueTimer(true, false, true, false), "a queued interrupt beats a due timer");
+    assert(!deliverDueTimer(true, true, false, false), "a fresh draft holds the timer back");
+    assert(!deliverDueTimer(true, true, true, false));
+    assert(!deliverDueTimer(true, false, false, true), "an armed exit window holds the timer back");
+    assert(!deliverDueTimer(true, true, true, true));
+    assert(!deliverDueTimer(false, false, false, false), "a timer that isn't due never fires");
+    assert(!deliverDueTimer(false, false, true, false) && !deliverDueTimer(false, false, false, true));
+}
+
+/// Whether end of input waits for pending timers instead of ending the
+/// session: only a headless `--wait-timers` run (its driver may close stdin
+/// while the timers are the point); Ctrl-D at a terminal always exits (#150).
+bool suppressEofForTimers(bool waitTimers, bool steerable) pure nothrow @nogc
+{
+    return waitTimers && !steerable;
+}
+
+// rust: main.rs::eof_suppression_is_headless_wait_timers_only
+unittest
+{
+    assert(suppressEofForTimers(true, false), "headless --wait-timers suppresses EOF");
+    assert(!suppressEofForTimers(true, true), "interactive EOF still exits under --wait-timers");
+    assert(!suppressEofForTimers(false, false) && !suppressEofForTimers(false, true));
+}
+
 /// hold, no queued Ctrl-C, no armed exit window (Rust `deliver_idle_compact`).
 bool deliverIdleCompact(bool due, imported!"core.time".Duration quietFor, imported!"core.time".Duration hold,
     bool interruptQueued, bool exitArmed) @safe pure nothrow @nogc
@@ -1969,15 +2006,15 @@ int runMain(string[] args)
     }
 
 
-    if (o.prompt.length)
+    // --wait-timers: sleep until the next timer the agent set fires and
+    // return it as the next (literal, "\x00"-marked) prompt; null once none
+    // are left or Ctrl-C stopped the run.
+    string awaitTimerTurn()
     {
-        bool ok = turn(o.prompt);
-        // --wait-timers: sleep until each timer the agent set fires and run
-        // it as the next prompt, until none are left (Ctrl-C stops waiting).
-        while (ok && o.waitTimers && !agent.timers.empty && !agent.control.nonNull.isCancelled)
+        import core.thread : Thread;
+        import core.time : msecs;
+        while (!agent.timers.empty && !agent.control.nonNull.isCancelled)
         {
-            import core.thread : Thread;
-            import core.time : msecs;
             stdOut.flush(); // the answer before the notes
             auto wait = agent.timers.nextDue - agent.timerNow();
             if (wait > 0)
@@ -1992,7 +2029,19 @@ int runMain(string[] args)
             if (fired is null) continue;
             stdErr.writeln(console.dim(notice));
             agent.automaticInput = true;
-            ok = turn(fired);
+            return "\x00" ~ fired;
+        }
+        return null;
+    }
+
+    if (o.prompt.length)
+    {
+        bool ok = turn(o.prompt);
+        while (ok && o.waitTimers)
+        {
+            auto next = awaitTimerTurn();
+            if (next is null) break;
+            ok = turn(next[1 .. $]);
         }
         if (ok && !o.waitTimers && !agent.timers.empty)
         {
@@ -2138,15 +2187,20 @@ int runMain(string[] args)
                 return deliverIdleCompact(agent.idleCompactDuePolled(), MonoTime.currTime - ed.quietSince(promptShown),
                     idleHold, false, exitArmedAt != MonoTime.zero);
             }
+            bool timerNow() @safe
+            {
+                return deliverDueTimer(agent.timers.anyDue(agent.timerNow()), ed.holdsTimer(MonoTime.currTime), false,
+                    exitArmedAt != MonoTime.zero);
+            }
             lapse = () @safe => (exitArmedAt != MonoTime.zero && MonoTime.currTime - exitArmedAt > exitWindow)
-                || (!ed.holdsTimer(MonoTime.currTime) && agent.timers.anyDue(agent.timerNow()))
+                || timerNow()
                 || idleNow()
                 || (updateHints && updateHints.tryTake(updateHint));
             auto r = ed.readLine(.stamp(false) ~ "› ", console.stamp() ~ glyphMark ~ " ", false, lapse);
             ed.restyle = null;
             syncMode(); // Shift-Tab at the prompt switched the mode
             if (r.outcome == Outcome.eof) break;
-            if (r.outcome == Outcome.stopped && !ed.holdsTimer(MonoTime.currTime) && agent.timers.anyDue(agent.timerNow()))
+            if (r.outcome == Outcome.stopped && timerNow())
             {
                 // Park a stale draft so the timer turn can't take it as a steer.
                 hasParkedDraft = ed.parkDraft(parkedDraft);
@@ -2211,6 +2265,10 @@ int runMain(string[] args)
         {
             if (interactive) { write("\n" ~ console.stamp() ~ console.bold("› ")); stdOut.flush(); }
             line = inbox ? takeLine(inbox) : stdinLine();
+            // Headless --wait-timers: input is done, but pending timers still
+            // run, each as the next prompt, until none are left (#150).
+            if (line is null && suppressEofForTimers(o.waitTimers, interactive))
+                line = awaitTimerTurn();
         }
         if (line is null) break;
         bool literal = line.startsWith("\x00");

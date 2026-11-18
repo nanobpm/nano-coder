@@ -610,12 +610,12 @@ main.rs::a_structured_question_is_rendered_as_markdown_above_the_picker	test
 main.rs::an_over_wide_question_leaves_the_inline_prompt_on_a_narrow_terminal	test
 main.rs::builtin_tools_include_search_and_no_echo	test
 main.rs::classify_steer_input_routes_line_queue_and_commands	todo
-main.rs::deliver_due_timer_yields_to_interrupt_and_draft	gap	D idle-loop timer delivery is in app.d, which has no unit tests
+main.rs::deliver_due_timer_yields_to_interrupt_and_draft	test
 main.rs::deliver_idle_compact_waits_for_a_quiet_prompt	test
 main.rs::double_escape_needs_two_presses_within_the_window	todo
 main.rs::double_press_deadline_arms_and_disarm_clears_it	todo
 main.rs::double_press_is_time_based_not_disarmed_by_other_input	todo
-main.rs::eof_suppression_is_headless_wait_timers_only	gap	D idle-loop timer delivery is in app.d, which has no unit tests
+main.rs::eof_suppression_is_headless_wait_timers_only	test
 main.rs::forget_id_requires_a_token_boundary	test
 main.rs::idle_compact_hold_defaults_to_the_named_constant	test
 main.rs::leading_indentation_is_preserved_for_markdown	test
