@@ -4,6 +4,7 @@
   "license": "Apache-2.0",
   "targetName": "nano-coder-d",
   "targetType": "executable",
+  "mainSourceFile": "source/entry.d",
   "libs": [
     "curl"
   ],

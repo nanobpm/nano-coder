@@ -1151,3 +1151,70 @@ private string recallNoteText(Scope s, const Entry e, SysTime now)
     if (e.evidence !is null) note ~= format(" (check: %s)", fullLine(e.evidence));
     return note ~ format(" (last used %s day%s ago; a hint, not permission to act)", d, d == 1 ? "" : "s");
 }
+
+/// The id after `forget`, which must end at a token boundary (`forgetful`
+/// is not a forget); "" for a bare `forget`, `none` for anything else.
+import nano.option : Option, none;
+Option!string parseForgetId(string arg)
+{
+    import std.string : startsWith, strip;
+    import std.uni : isWhite;
+    import std.utf : decodeFront;
+    if (!arg.startsWith("forget")) return Option!string(none);
+    auto rest = arg["forget".length .. $];
+    if (rest.length)
+    {
+        auto r = rest;
+        if (!isWhite(r.decodeFront)) return Option!string(none);
+    }
+    return Option!string(rest.strip);
+}
+
+/// `/memory` (list) and `/memory forget <id>` (main.rs memory_command).
+/// `writable`: the session may write memory at all; `plan`: plan mode,
+/// read-only too; `on`: memory is on (not read-only) in the config.
+string memoryCommand(Store store, string arg, bool writable, bool plan, bool on)
+{
+    // A bad id or an unreadable file is the user's message, not a crash.
+    try return memoryCommandText(store, arg, writable, plan, on);
+    catch (Exception e) return e.msg ~ "\n";
+}
+
+private string memoryCommandText(Store store, string arg, bool writable, bool plan, bool on)
+{
+    import std.json : JSONValue, JSONOptions;
+    import std.string : lineSplitter, strip;
+    import nano.trajectory : terminalSafe;
+    foreach (id; parseForgetId(arg))
+    {
+        if (!id.length) return "Usage: /memory forget <id>\n";
+        if (plan) return "Memory is read-only in plan mode; /memory forget cannot delete entries.\n";
+        if (!writable) return "Memory is read-only in this session; /memory forget cannot delete entries.\n";
+        return store.forget(id) ~ "\n";
+    }
+    if (arg.length)
+        return format("Unknown /memory argument %s; use /memory or /memory forget <id>.\n",
+            JSONValue(arg).toString(JSONOptions.doNotEscapeSlashes));
+    // Effective writability: plan mode has no memory_save tool either.
+    bool canWrite = writable && !plan;
+    auto all_ = store.all();
+    if (!all_.length)
+        return format(canWrite ? "No memories yet. The model saves them with memory_save; files live under %s.\n"
+            : "No memories yet. Memory is read-only here, so the model cannot save them; files live under %s.\n",
+            store.root);
+    auto o = format("%s memor%s (memory is %s; edit the files under %s%s):\n", all_.length,
+        all_.length == 1 ? "y" : "ies", on ? "on" : "read-only", store.root, canWrite ? ", or /memory forget <id>" : "");
+    auto stats = recallStats(store);
+    foreach (x; all_)
+    {
+        auto first = x.e.text.lineSplitter.empty ? "" : x.e.text.lineSplitter.front.strip;
+        auto row = format("  %s %s %s%s", name(x.s), x.e.label, terminalSafe(first),
+            x.e.evidence !is null ? " (check: " ~ terminalSafe(x.e.evidence) ~ ")" : "");
+        if (x.e.isRule) row ~= " [rule]";
+        // Recall noise: how often a memory was recalled from a tool call,
+        // and how often that was followed by reading it.
+        if (auto st = x.e.id in stats) row ~= format(" (recalled %s×, used %s×)", (*st)[0], (*st)[1]);
+        o ~= row ~ "\n";
+    }
+    return o;
+}

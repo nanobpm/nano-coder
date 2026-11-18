@@ -16,8 +16,10 @@ import std.algorithm : canFind;
 /// whitespace, so `/trajectory\t--json` classifies like `/trajectory --json`.
 string[2] splitCmd(string cmd) nothrow
 {
+    import std.ascii : isWhite;
+    // Any whitespace separates (a vertical tab too, as Rust's split_whitespace).
     foreach (i, char c; cmd)
-        if (c == ' ' || c == '\t' || c == '\n' || c == '\r')
+        if (isWhite(c))
             return [cmd[0 .. i], cmd[i + 1 .. $].strip];
     return [cmd, ""];
 }

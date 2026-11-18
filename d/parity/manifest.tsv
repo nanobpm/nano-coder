@@ -608,7 +608,7 @@ main.rs::a_long_question_wraps_and_escapes_are_dropped	test
 main.rs::a_plain_one_line_question_stays_the_picker_prompt	test
 main.rs::a_structured_question_is_rendered_as_markdown_above_the_picker	test
 main.rs::an_over_wide_question_leaves_the_inline_prompt_on_a_narrow_terminal	test
-main.rs::builtin_tools_include_search_and_no_echo	todo
+main.rs::builtin_tools_include_search_and_no_echo	test
 main.rs::classify_steer_input_routes_line_queue_and_commands	todo
 main.rs::deliver_due_timer_yields_to_interrupt_and_draft	gap	D idle-loop timer delivery is in app.d, which has no unit tests
 main.rs::deliver_idle_compact_waits_for_a_quiet_prompt	test
@@ -616,15 +616,15 @@ main.rs::double_escape_needs_two_presses_within_the_window	todo
 main.rs::double_press_deadline_arms_and_disarm_clears_it	todo
 main.rs::double_press_is_time_based_not_disarmed_by_other_input	todo
 main.rs::eof_suppression_is_headless_wait_timers_only	gap	D idle-loop timer delivery is in app.d, which has no unit tests
-main.rs::forget_id_requires_a_token_boundary	todo
+main.rs::forget_id_requires_a_token_boundary	test
 main.rs::idle_compact_hold_defaults_to_the_named_constant	test
 main.rs::leading_indentation_is_preserved_for_markdown	test
 main.rs::list_sessions_and_resume_are_mutually_exclusive	todo
 main.rs::list_sessions_and_trajectory_are_mutually_exclusive	todo
 main.rs::list_sessions_conflicts_with_other_action_modes	todo
-main.rs::memory_forget_is_refused_in_plan_mode	todo
-main.rs::memory_list_hints_gate_on_effective_plan_mode_writability	todo
-main.rs::next_step_setting_accepts_any_whitespace_separator	todo
+main.rs::memory_forget_is_refused_in_plan_mode	test
+main.rs::memory_list_hints_gate_on_effective_plan_mode_writability	test
+main.rs::next_step_setting_accepts_any_whitespace_separator	test
 main.rs::resume_attached_form_names_dash_prefixed_ids	todo
 main.rs::resume_conflicts_with_other_action_modes	todo
 main.rs::sanitize_strips_whole_ansi_sequences	test

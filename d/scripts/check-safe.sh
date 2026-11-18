@@ -132,8 +132,8 @@ ratchet "outside *_test.d" "$(find source -name '*.d' ! -name '*_test.d' | xargs
 # no field or module-level variable holds a bare class reference; each is
 # `NotNull!C`, `Option!C`, or marked `@nullable("why")`. The marks are
 # capped by scripts/nullable-mark-budget, and null_audit_test.d must list
-# every module (app.d checks itself).
-missing=$(find source -name '*.d' ! -name '*_test.d' ! -path source/app.d | sort | xargs sed -n 's/^module \([a-z_.]*\);.*/\1/p' | while read -r m; do
+# every module (app.d checks itself; entry.d is only `main`).
+missing=$(find source -name '*.d' ! -name '*_test.d' ! -path source/app.d ! -path source/entry.d | sort | xargs sed -n 's/^module \([a-z_.]*\);.*/\1/p' | while read -r m; do
     grep -q "^static import $m;" source/nano/null_audit_test.d || echo "$m"
 done)
 if [ -n "$missing" ]; then

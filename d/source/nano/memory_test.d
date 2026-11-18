@@ -665,3 +665,43 @@ unittest // memory_save takes kind and anchors; bad values are refused
     assert(fails(run(s, saveTool, parseJSON(`{"scope":"user","text":"x y z","anchors":["ab"]}`), null, false)));
     assert(fails(run(s, saveTool, parseJSON(`{"scope":"user","text":"x y z","anchors":[1]}`), null, false)));
 }
+
+// rust: main.rs::forget_id_requires_a_token_boundary
+unittest
+{
+    import nano.option : Option;
+    string id(string a) { foreach (x; parseForgetId(a)) return x; return "<none>"; }
+    assert(id("forget mem-abc") == "mem-abc");
+    assert(id("forget  mem-abc  ") == "mem-abc");
+    assert(id("forget\tmem-abc") == "mem-abc");
+    assert(id("forget") == "");
+    assert(id("forgetmem-abc") == "<none>" && id("forgetful") == "<none>");
+    assert(id("") == "<none>" && id("list") == "<none>");
+}
+
+// rust: main.rs::memory_forget_is_refused_in_plan_mode
+unittest
+{
+    auto s = store(tmp("cmd-forget"));
+    auto e = s.save(Scope.user, "a fact to keep", null, null);
+    bool kept() { return s.all().any!(x => x.e.id == e.id); }
+    auto msg = memoryCommand(s, "forget " ~ e.id, true, true, true);
+    assert(msg.canFind("plan mode") && kept, msg);
+    msg = memoryCommand(s, "forget " ~ e.id, false, false, false);
+    assert(msg.canFind("read-only in this session") && kept, msg);
+    assert(memoryCommand(s, "forget", true, false, true).canFind("Usage: /memory forget <id>"));
+    msg = memoryCommand(s, "forget " ~ e.id, true, false, true);
+    assert(!msg.canFind("plan mode") && !kept, msg);
+}
+
+// rust: main.rs::memory_list_hints_gate_on_effective_plan_mode_writability
+unittest
+{
+    auto s = store(tmp("cmd-list"));
+    assert(!memoryCommand(s, "", true, true, true).canFind("memory_save"), "plan mode hides memory_save");
+    assert(memoryCommand(s, "", true, false, true).canFind("memory_save"));
+    s.save(Scope.user, "a fact to keep", null, null);
+    assert(!memoryCommand(s, "", true, true, true).canFind("/memory forget"), "plan mode hides the forget hint");
+    assert(memoryCommand(s, "", true, false, true).canFind("/memory forget"));
+    assert(memoryCommand(s, "bogus", true, false, true).canFind("Unknown /memory argument \"bogus\""));
+}

@@ -26,7 +26,7 @@ import nano.providers;
 import nano.tools;
 import nano.tools.bash : bashDefinition = definition, bashExecute = execute;
 import nano.tools.files : ReadState, registerFiles = register;
-import nano.tools.search : registerSearch = register;
+import nano.tools.search : DenyScan, registerSearch = register;
 import nano.permissions;
 import nano.session;
 import nano.toml : parseToml;
@@ -699,6 +699,30 @@ unittest
 
 private string spaces(size_t n) { import std.array : replicate; return " ".replicate(n); }
 Verbosity verbosity() { return atomicLoad(gVerbosity); }
+/// The built-in tools every session offers: bash, the file tools and
+/// search (`deny` hides read-denied paths from search results).
+void registerBuiltinTools(ToolRegistry tools, const ref Config cfg, ReadState readState, DenyScan deny)
+{
+    auto bashTimeout = cfg.bashTimeoutSecs;
+    auto sandbox = cfg.sandbox;
+    tools.register(bashDefinition(bashTimeout), (JSONValue a) => bashExecute(a, bashTimeout, sandbox));
+    registerFiles(tools, readState);
+    registerSearch(tools, deny);
+}
+
+// rust: main.rs::builtin_tools_include_search_and_no_echo
+unittest
+{
+    import std.algorithm : canFind, map;
+    import std.array : array;
+    Config c;
+    auto reg = new ToolRegistry;
+    registerBuiltinTools(reg, c, new ReadState, (string root) @safe => cast(bool delegate(string) @safe) null);
+    auto names = reg.definitions.map!(d => d.name).array;
+    assert(names.canFind("grep") && names.canFind("glob") && names.canFind("bash") && names.canFind("edit_file"));
+    assert(!names.canFind("echo"), "no vestigial echo tool");
+}
+
 void setVerbosity(Verbosity v) { atomicStore(gVerbosity, v); }
 
 // What the frame's status bar shows (status.rs).
@@ -1105,11 +1129,14 @@ string toolResult(bool ok, string output, bool verbose, size_t width, bool color
         foreach (i, l; lines[0 .. min($, previewLines)])
             text ~= format("  %s%s %s%s\n", on, i == 0 ? mark : " ", fitText(l.stripRight("\r"), width), off);
         if (lines.length > previewLines)
-            text ~= format("  %s  … +%s lines%s\n", color ? "\x1b[2m" : "", lines.length - previewLines, off);
+            text ~= format("  %s  %s%s\n", color ? "\x1b[2m" : "",
+                fitText(format("… +%s lines", lines.length - previewLines), width), off);
         return text;
     }
     auto more = lines.length > 1 ? format(" (+%s lines)", lines.length - 1) : "";
-    return format("  %s%s %s%s%s\n", on, mark, fitText(lines[0].stripRight("\r"), saturatingSub(width, more.length)), more, off);
+    // The count is cut too when the width can't hold it (a narrow pane).
+    auto row = fitText(fitText(lines[0].stripRight("\r"), saturatingSub(width, more.length)) ~ more, width);
+    return format("  %s%s %s%s\n", on, mark, row, off);
 }
 
 // rust: frame.rs::tool_result_count_rows_are_bounded_to_the_width
@@ -1120,6 +1147,7 @@ unittest
     import std.algorithm : canFind;
     import std.array : join;
     import std.conv : to;
+    import std.algorithm : map;
     import std.range : iota;
     import std.string : lineSplitter;
     import nano.frame : visibleWidth;
@@ -1300,7 +1328,9 @@ string contextReport(Agent agent)
 /// The agent, for `main`'s exit (title requests may still be in flight).
 Option!Agent mainAgent; /// the REPL's agent (main thread only); none if startup ended early
 
-int main(string[] args)
+/// The program (source/entry.d's `main` calls it, so `dub test` builds
+/// and tests this module like any other).
+int appMain(string[] args)
 {
     auto rc = runMain(args);
     import core.time : dur;
@@ -1411,14 +1441,11 @@ int runMain(string[] args)
 
     auto tools = new ToolRegistry;
     auto readState = new ReadState;
-    auto bashTimeout = cfg.bashTimeoutSecs;
-    tools.register(bashDefinition(bashTimeout), (JSONValue a) => bashExecute(a, bashTimeout, cfg.sandbox));
-    registerFiles(tools, readState);
     Agent agent;
     // Read-deny rules hide paths from search results (Policy.readDenyScan).
     // The deny rules and working directory are resolved once per search, so
     // each walked entry is judged lexically (Rust #160).
-    registerSearch(tools, (string root) @safe {
+    registerBuiltinTools(tools, cfg, readState, (string root) @safe {
         import nano.permissions : ReadDenyScan;
         ReadDenyScan scan;
         if (!agent.policy.readDenyScan(getcwd(), scan)) return cast(bool delegate(string) @safe) null;
@@ -2380,50 +2407,13 @@ int runMain(string[] args)
                     continue;
                 case "/memory":
                     if (memory.isNone) { writeln("memory is off"); continue; }
-                    auto store = memory.unwrap("checked on the line above");
-                    try
                     {
-                        if (arg.startsWith("forget "))
-                        {
-                            writeln(store.forget(arg[7 .. $]));
-                            continue;
-                        }
-                        if (arg.length)
-                        {
-                            writefln("Unknown /memory argument %s; use /memory or /memory forget <id>.",
-                                JSONValue(arg).toString(JSONOptions.doNotEscapeSlashes));
-                            continue;
-                        }
-                        // Plan mode has no memory_save tool either.
-                        bool writable = memoryWritable && agent.control.mode != AgentMode.plan;
-                        auto all = store.all();
-                        if (!all.length)
-                        {
-                            writefln(writable ? "No memories yet. The model saves them with memory_save; files live under %s."
-                                : "No memories yet. Memory is read-only here, so the model cannot save them; files live under %s.",
-                                store.root);
-                            continue;
-                        }
-                        writefln("%s memor%s (memory is %s; edit the files under %s%s):", all.length,
-                            all.length == 1 ? "y" : "ies", cfg.memory == MemoryMode.on ? "on" : "read-only",
-                            store.root, writable ? ", or /memory forget <id>" : "");
-                        import nano.memory : recallStats;
-                        auto stats = recallStats(store);
-                        foreach (x; all)
-                        {
-                            import nano.memory : scopeName = name;
-                            import std.string : lineSplitter;
-                            auto first = x.e.text.lineSplitter.empty ? "" : x.e.text.lineSplitter.front.strip;
-                            auto row = format("  %s %s %s%s", scopeName(x.s), x.e.label, terminalSafe(first),
-                                x.e.evidence !is null ? " (check: " ~ terminalSafe(x.e.evidence) ~ ")" : "");
-                            if (x.e.isRule) row ~= " [rule]";
-                            // Recall noise: how often a memory was recalled from a
-                            // tool call, and how often that was followed by reading it.
-                            if (auto st = x.e.id in stats) row ~= format(" (recalled %s×, used %s×)", (*st)[0], (*st)[1]);
-                            writeln(row);
-                        }
+                        import nano.memory : memoryCommand;
+                        auto store = memory.unwrap("checked on the line above");
+                        // Plan mode has no memory_save tool, and can't forget.
+                        auto plan = agent.control.mode == AgentMode.plan;
+                        write(memoryCommand(store, arg, memoryWritable, plan, cfg.memory == MemoryMode.on));
                     }
-                    catch (Exception e) stdErr.writeln(console.red("error: " ~ e.msg));
                     continue;
                 case "/settings":
                     if (editor.isNone) { writeln("/settings needs an interactive terminal"); continue; }
@@ -2561,4 +2551,20 @@ unittest
     streaming();
     c.responseRestarted();
     assert(closed, "a restart closes the abandoned partial");
+}
+
+// rust: main.rs::next_step_setting_accepts_any_whitespace_separator
+unittest
+{
+    import std.algorithm : canFind, startsWith;
+    import nano.option : notNull;
+    Config c;
+    auto ctx = MidTurn(notNull(new shared TurnControl), LiveView.make, [frozenConfig(c)]);
+    foreach (sep; ["\t", "\n", "\x0b", "  ", " "])
+    {
+        auto note = midTurnCommand("/mode" ~ sep ~ "plan", ctx);
+        assert(note.startsWith("Mode set to"), "separator not recognised: " ~ note);
+    }
+    assert(midTurnCommand("/mode bogus", ctx).canFind("bogus"), "a bad mode is reported");
+    assert(midTurnCommand("/modex plan", ctx) is null, "not a setting: held for after the turn");
 }
