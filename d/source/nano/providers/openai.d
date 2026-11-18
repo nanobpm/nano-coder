@@ -261,7 +261,7 @@ class OpenAIClient : LLMClient, CapabilityProbe, KindedClient
         if (!shouldProbe()) return c;
         auto base = baseUrl;
         auto root = base.length > 3 && base[$ - 3 .. $] == "/v1" ? base[0 .. $ - 3] : base;
-        auto entry = modelEntry(probe(base ~ "/models"), p.model);
+        auto entry = modelEntry(probe(base ~ "/models"), p.model, !copilotLimits);
         if (entry.type == JSONType.object)
         {
             c.thinking = Reported.fromModelEntry(entry);
@@ -476,8 +476,11 @@ class CopilotClient : OpenAIClient
         h["Authorization"] = "Bearer " ~ session.token;
         h["Openai-Intent"] = "conversation-edits";
         // The last message decides who initiated this request: a tool result
-        // is the agent continuing, anything else is the user.
-        h["X-Initiator"] = req.messages.length && req.messages[$ - 1].role == Role.tool ? "agent" : "user";
+        // or an auto-initiated nudge (a continuation, a timer) is the agent
+        // continuing; anything else is a billed user turn.
+        bool agent = req.messages.length
+            && (req.messages[$ - 1].role == Role.tool || req.messages[$ - 1].autoInitiated);
+        h["X-Initiator"] = agent ? "agent" : "user";
         if (req.attachmentPlan().carriesImage) h["Copilot-Vision-Request"] = "true";
         foreach (k, v; p.config.headers) h[k] = v;
         return h;
@@ -605,7 +608,7 @@ unittest
 
 /// The `/models` entry for `model`; a server listing a single model (such
 /// as ds4, which accepts aliases) is taken to be serving it.
-JSONValue modelEntry(JSONValue models, string model)
+JSONValue modelEntry(JSONValue models, string model, bool onlyFallback = true)
 {
     JSONValue items = models;
     if (models.type == JSONType.object)
@@ -619,7 +622,9 @@ JSONValue modelEntry(JSONValue models, string model)
         if (m.type == JSONType.object)
             if (auto id = "id" in m.objectNoRef)
                 if (id.type == JSONType.string && id.str == model) return m;
-    return items.arrayNoRef.length == 1 ? items.arrayNoRef[0] : JSONValue.init;
+    // A local server listing one model (llama.cpp names it after the file)
+    // serves that model; Copilot's catalogue must match exactly.
+    return onlyFallback && items.arrayNoRef.length == 1 ? items.arrayNoRef[0] : JSONValue.init;
 }
 
 /// A positive integer at `path`, else 0.
