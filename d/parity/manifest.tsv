@@ -1285,40 +1285,40 @@ trajectory.rs::synthetic_final_answer_is_not_a_model_call	test
 trajectory.rs::thinking_blocks_supply_the_think_row_when_the_plain_field_is_empty	todo
 trajectory.rs::tool_call_only_assistant_still_records_metrics	todo
 trajectory.rs::tool_invocation_is_counted_once_for_call_and_result	test
-trust.rs::acp_trusts_without_asking	gap	D trust (#147) is a simplified port: no tests for these cases, and no hook-enablement gating or non-interactive note
-trust.rs::ai_lock_is_gated	gap	D trust (#147) is a simplified port: no tests for these cases, and no hook-enablement gating or non-interactive note
-trust.rs::concurrent_remembers_never_splice_or_lose_an_entry	gap	D trust file writes are plain appends: no locking, no newline/terminator checks
-trust.rs::describe_covers_both	gap	D trust (#147) is a simplified port: no tests for these cases, and no hook-enablement gating or non-interactive note
-trust.rs::detection_follows_symlinked_skill_dirs	gap	D skill detection for trust does not check symlink containment, .git entries or cycles
-trust.rs::detection_rejects_a_skill_file_symlinked_outside_the_skills_root	gap	D skill detection for trust does not check symlink containment, .git entries or cycles
-trust.rs::detection_rejects_a_skills_dir_symlinked_outside_the_repo	gap	D skill detection for trust does not check symlink containment, .git entries or cycles
-trust.rs::detection_rejects_a_subdirectory_symlinked_outside_the_skills_root	gap	D skill detection for trust does not check symlink containment, .git entries or cycles
-trust.rs::detection_skips_a_dot_git_entry_inside_the_skills_root	gap	D skill detection for trust does not check symlink containment, .git entries or cycles
-trust.rs::detection_skips_a_skill_file_symlinked_through_a_dot_git	gap	D skill detection for trust does not check symlink containment, .git entries or cycles
+trust.rs::acp_trusts_without_asking	test
+trust.rs::ai_lock_is_gated	test
+trust.rs::concurrent_remembers_never_splice_or_lose_an_entry	test
+trust.rs::describe_covers_both	test
+trust.rs::detection_follows_symlinked_skill_dirs	test
+trust.rs::detection_rejects_a_skill_file_symlinked_outside_the_skills_root	test
+trust.rs::detection_rejects_a_skills_dir_symlinked_outside_the_repo	test
+trust.rs::detection_rejects_a_subdirectory_symlinked_outside_the_skills_root	test
+trust.rs::detection_skips_a_dot_git_entry_inside_the_skills_root	test
+trust.rs::detection_skips_a_skill_file_symlinked_through_a_dot_git	test
 trust.rs::detects_workspace_skills	test
-trust.rs::disabled_project_hooks_are_not_gated	gap	D trust (#147) is a simplified port: no tests for these cases, and no hook-enablement gating or non-interactive note
-trust.rs::disabled_skills_are_not_gated	gap	D trust (#147) is a simplified port: no tests for these cases, and no hook-enablement gating or non-interactive note
+trust.rs::disabled_project_hooks_are_not_gated	test
+trust.rs::disabled_skills_are_not_gated	test
 trust.rs::empty_answer_is_no	test
 trust.rs::empty_skill_dir_is_not_gated	test
 trust.rs::eof_answer_is_no	test
-trust.rs::hook_only_repo_stays_ungated_when_hooks_disabled	gap	D trust (#147) is a simplified port: no tests for these cases, and no hook-enablement gating or non-interactive note
-trust.rs::is_remembered_rejects_an_unterminated_record	gap	D trust file writes are plain appends: no locking, no newline/terminator checks
-trust.rs::newline_bearing_path_is_not_representable	gap	D trust file writes are plain appends: no locking, no newline/terminator checks
-trust.rs::no_gated_resources_stays_gated_without_a_question	gap	D trust (#147) is a simplified port: no tests for these cases, and no hook-enablement gating or non-interactive note
-trust.rs::non_interactive_is_untrusted_with_a_note	gap	D trust (#147) is a simplified port: no tests for these cases, and no hook-enablement gating or non-interactive note
-trust.rs::non_interactive_note_escapes_control_characters_in_the_path	gap	D trust (#147) is a simplified port: no tests for these cases, and no hook-enablement gating or non-interactive note
-trust.rs::non_utf8_paths_are_not_conflated	gap	D trust file writes are plain appends: no locking, no newline/terminator checks
-trust.rs::remember_fails_closed_when_existing_file_is_unreadable	gap	D trust file writes are plain appends: no locking, no newline/terminator checks
-trust.rs::remember_never_splices_onto_a_newline_less_final_entry	gap	D trust file writes are plain appends: no locking, no newline/terminator checks
-trust.rs::remember_round_trips_an_exact_match	gap	D trust (#147) is a simplified port: no tests for these cases, and no hook-enablement gating or non-interactive note
-trust.rs::remembered_empty_root_is_trusted	gap	D trust (#147) is a simplified port: no tests for these cases, and no hook-enablement gating or non-interactive note
+trust.rs::hook_only_repo_stays_ungated_when_hooks_disabled	test
+trust.rs::is_remembered_rejects_an_unterminated_record	test
+trust.rs::newline_bearing_path_is_not_representable	test
+trust.rs::no_gated_resources_stays_gated_without_a_question	test
+trust.rs::non_interactive_is_untrusted_with_a_note	test
+trust.rs::non_interactive_note_escapes_control_characters_in_the_path	test
+trust.rs::non_utf8_paths_are_not_conflated	test
+trust.rs::remember_fails_closed_when_existing_file_is_unreadable	test
+trust.rs::remember_never_splices_onto_a_newline_less_final_entry	test
+trust.rs::remember_round_trips_an_exact_match	test
+trust.rs::remembered_empty_root_is_trusted	test
 trust.rs::remembered_root_is_trusted_even_non_interactively	test
-trust.rs::scan_finds_skill_through_shorter_path_despite_cycle	gap	D skill detection for trust does not check symlink containment, .git entries or cycles
-trust.rs::scan_terminates_on_symlink_cycles	gap	D skill detection for trust does not check symlink containment, .git entries or cycles
+trust.rs::scan_finds_skill_through_shorter_path_despite_cycle	test
+trust.rs::scan_terminates_on_symlink_cycles	test
 trust.rs::trailing_whitespace_entry_does_not_authorize_trimmed_root	test
 trust.rs::trust_file_honours_env_override	test
 trust.rs::yes_variants_trust_and_remember_once	test
-trust.rs::yolo_and_acp_trust_even_an_empty_root	gap	D trust (#147) is a simplified port: no tests for these cases, and no hook-enablement gating or non-interactive note
+trust.rs::yolo_and_acp_trust_even_an_empty_root	test
 trust.rs::yolo_trusts_without_asking	test
 turn_commands.rs::context_window_source_follows_live_stats	todo
 turn_commands.rs::non_space_whitespace_routes_like_a_space	todo

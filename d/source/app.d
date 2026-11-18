@@ -1381,24 +1381,26 @@ int runMain(string[] args)
     // Repository trust gates the repo's own skills, skill lock and hooks.
     bool trusted(string dir)
     {
-        import nano.trust : trustRoot, projectResources, decideTrust, TrustMode, trustFile;
+        import nano.trust : trustRoot, decideRoot, TrustOptions = Options, Gated, isYes, trustQuestion, trustFile;
         static bool[string] decided;
         auto root = trustRoot(dir);
         if (auto d = root in decided) return *d;
-        auto interactive = !o.prompt.length && isTerminal(0) && isTerminal(1);
-        auto mode = o.yolo || o.acp ? TrustMode.yolo : interactive ? TrustMode.ask : TrustMode.deny;
-        auto res = projectResources(root, cfg.skills.dirs);
-        string ask(string q)
+        TrustOptions to;
+        to.yolo = o.yolo;
+        to.acp = o.acp;
+        to.interactive = !o.prompt.length && isTerminal(0) && isTerminal(1);
+        // A resource that can't load isn't gated (and never drives the question).
+        to.hooksEnabled = !(cfg.disableHooks || o.noHooks || cfg.disableProjectHooks);
+        to.skillsEnabled = cfg.skills.enabled && environment.get("NANO_CODER_NO_SKILLS") is null;
+        bool confirm(string r, Gated g)
         {
-            stdErr.write(q);
+            stdErr.write(trustQuestion(r, g));
             stdErr.flush;
             auto line = stdinLine();
-            return line.length ? line : null;
+            return line.length && isYes(line);
         }
-        auto ok = decideTrust(root, res, mode, trustFile, interactive ? &ask : null);
-        if (!ok && res.length)
-            stdErr.writeln("nano-coder-d: not loading skills or hooks from untrusted ", root,
-                interactive ? "" : " (start interactively to trust it, or pass --yolo)");
+        void note(string msg) { stdErr.writeln("nano-coder-d: ", msg); }
+        auto ok = decideRoot(root, cfg.skills.dirs, cfg.skills.aiLock, to, trustFile, &confirm, &note);
         decided[root] = ok;
         return ok;
     }
