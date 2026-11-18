@@ -634,3 +634,165 @@ version (unittest) private bool canFindSlashEscape(string s)
     import std.algorithm : canFind;
     return s.canFind(`\/`);
 }
+
+// rust: session_index.rs::cache_filename_cannot_collide_with_a_session_id
+unittest
+{
+    import std.exception : assertThrown;
+    assertThrown(validateId(indexFile.stripExtension), "the cache file stem must not be a valid session id");
+    auto dir = testDir("collide");
+    scope (exit) rmdirRecurse(dir);
+    writeLog(dir, "index", ["A prompt from the session named index"]);
+    import std.algorithm : map;
+    assert(list(dir).map!(s => s.id).array == ["index"], "a session named `index` is listed, not hidden by the cache");
+    assert(indexPath(dir).exists);
+}
+
+// rust: session_index.rs::index_is_compacted_and_forgets_deleted_logs
+unittest
+{
+    auto dir = testDir("compact");
+    scope (exit) rmdirRecurse(dir);
+    auto keep = writeLog(dir, "k", ["Keep this session around"]);
+    foreach (_; 0 .. 100) update(keep, 0, null);
+    auto gone = writeLog(dir, "gone", []);
+    list(dir);
+    std.file.remove(gone);
+    list(dir);
+    size_t lines;
+    assert(load(dir, lines).length == 1 && lines == 1);
+    std.file.write(indexPath(dir), "not json\n");
+    assert(list(dir).length == 1);
+}
+
+// rust: session_index.rs::list_propagates_directory_errors_except_not_found
+unittest
+{
+    import std.exception : assertThrown;
+    auto dir = testDir("errors");
+    scope (exit) rmdirRecurse(dir);
+    assert(list(buildPath(dir, "does-not-exist")).length == 0, "a missing directory means no sessions");
+    std.file.write(buildPath(dir, "a-file"), "x");
+    assertThrown(list(buildPath(dir, "a-file")), "a non-NotFound directory error propagates");
+}
+
+// rust: session_index.rs::list_skips_invalid_id_even_on_cache_hit
+unittest
+{
+    auto dir = testDir("hidden");
+    scope (exit) rmdirRecurse(dir);
+    auto hidden = buildPath(dir, ".hidden.jsonl");
+    std.file.write(hidden, `{"type":"input","data":{"id":"i1","text":"hi"}}` ~ "\n");
+    Summary cached;
+    cached.id = ".hidden";
+    cached.lastUsed = Clock.currTime;
+    cached.prompts = 1;
+    cached.firstPrompt = cached.lastPrompt = "hi";
+    cached.logBytes = getSize(hidden);
+    append(dir, [cached]);
+    assert(list(dir).length == 0, "an invalid id is not listed from the cache");
+}
+
+// rust: session_index.rs::list_skips_non_regular_jsonl_entries
+unittest
+{
+    auto dir = testDir("nonregular");
+    scope (exit) rmdirRecurse(dir);
+    writeLog(dir, "s", ["A real session prompt"]);
+    mkdirRecurse(buildPath(dir, "notalog.jsonl"));
+    auto sessions = list(dir);
+    assert(sessions.length == 1 && sessions[0].id == "s", "the directory entry is skipped");
+}
+
+/// Two indexed sessions `a` and `b`.
+version (unittest) private string twoSessions(string name)
+{
+    auto dir = testDir(name);
+    writeLog(dir, "a", ["Session a's prompt"]);
+    writeLog(dir, "b", ["Session b's prompt"]);
+    list(dir);
+    return dir;
+}
+
+// rust: session_index.rs::load_isolates_a_non_utf8_line_instead_of_discarding_the_index
+unittest
+{
+    auto dir = twoSessions("utf8");
+    scope (exit) rmdirRecurse(dir);
+    size_t lines;
+    assert(load(dir, lines).length == 2);
+    std.file.append(indexPath(dir), cast(const(ubyte)[]) "\xff\xfe not utf8\n");
+    auto after = load(dir, lines);
+    assert(after.length == 2, "the two good lines survive the corrupt one");
+    assert(lines == 3, "the corrupt line still counts toward compaction");
+    assert(after["a"].prompts == 1 && after["b"].prompts == 1);
+}
+
+/// Append a newer summary of `b` (another model) after `prefix`, then rewrite
+/// from the state read before it.
+version (unittest) private void rewriteAfter(string dir, const(ubyte)[] prefix)
+{
+    size_t lines;
+    auto current = load(dir, lines);
+    auto since = getSize(indexPath(dir));
+    auto newer = summarize(buildPath(dir, "b.jsonl"));
+    newer.model = "anthropic/claude";
+    std.file.append(indexPath(dir), prefix ~ cast(const(ubyte)[]) (newer.toJson ~ "\n"));
+    rewrite(dir, current, since);
+    auto sessions = list(dir);
+    assert(sessions.length == 2);
+    assert(sessions.filter!(s => s.id == "b").front.model == "anthropic/claude", "the line appended since the read survives");
+}
+
+// rust: session_index.rs::rewrite_isolates_a_corrupt_tail_line_instead_of_discarding_later_ones
+unittest
+{
+    auto dir = twoSessions("corrupt-tail");
+    scope (exit) rmdirRecurse(dir);
+    rewriteAfter(dir, cast(const(ubyte)[]) "\xff\xfe not utf8\n");
+}
+
+// rust: session_index.rs::rewrite_merges_lines_appended_since_the_read
+unittest
+{
+    auto dir = twoSessions("merge");
+    scope (exit) rmdirRecurse(dir);
+    rewriteAfter(dir, null);
+}
+
+// rust: session_index.rs::summarize_rejects_ids_open_would_refuse
+// rust: session_index.rs::summarize_rejects_logs_open_would_refuse
+unittest
+{
+    import std.exception : assertThrown;
+    auto dir = testDir("refuse");
+    scope (exit) rmdirRecurse(dir);
+    auto good = writeLog(dir, "good", ["A prompt in a badly named log"]);
+    std.file.copy(good, buildPath(dir, ".hidden.jsonl"));
+    assertThrown(summarize(buildPath(dir, ".hidden.jsonl")), "an invalid id does not summarize");
+    std.file.copy(good, buildPath(dir, "renamed.jsonl"));
+    assertThrown(summarize(buildPath(dir, "renamed.jsonl")), "a renamed log does not summarize");
+    std.file.write(buildPath(dir, "headerless.jsonl"), `{"type":"input","data":{"id":"i1","text":"hi"}}` ~ "\n");
+    assertThrown(summarize(buildPath(dir, "headerless.jsonl")), "an input-only log does not summarize");
+    auto s = summarize(good);
+    assert(s.id == "good" && s.prompts == 1);
+}
+
+// rust: session_index.rs::update_rescans_a_legacy_line_missing_the_first_telling_prompt
+unittest
+{
+    import nano.session : SessionLog;
+    auto dir = testDir("legacy-telling");
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "p/m", "/w", "s");
+    log.input("i1", "Investigate the flaky deploy test");
+    auto legacy = summarize(log.path);
+    legacy.firstTellingPrompt = null;
+    append(dir, [legacy]);
+    auto from = getSize(log.path);
+    log.input("i2", "Now fix the retry logic in the deployer");
+    update(log.path, from, null);
+    auto s = list(dir)[0];
+    assert(s.firstTellingPrompt == "Investigate the flaky deploy test", s.firstTellingPrompt);
+    assert(titleSource(s) == "Investigate the flaky deploy test\n\nNow fix the retry logic in the deployer", titleSource(s));
+}
