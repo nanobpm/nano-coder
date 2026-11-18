@@ -81,8 +81,16 @@ struct Options
     string[] allow, deny;
 }
 
+/// A command line that doesn't parse; `main` prints it and exits 2.
+class UsageError : Exception
+{
+    this(string msg) @safe { super(msg); }
+}
+
+/// The command line (Rust parse_args_from). Throws `UsageError`.
 Options parseArgs(string[] args)
 {
+    static void fail(string msg) { throw new UsageError(msg); }
     Options o;
     for (size_t i = 1; i < args.length; i++)
     {
@@ -92,7 +100,7 @@ Options parseArgs(string[] args)
         string value()
         {
             if (eq > 0) return a[eq + 1 .. $];
-            if (i + 1 >= args.length) die(flag ~ " needs a value");
+            if (i + 1 >= args.length) fail(flag ~ " needs a value");
             return args[++i];
         }
         switch (flag)
@@ -126,19 +134,48 @@ Options parseArgs(string[] args)
                 break;
             case "--version", "-V": writeln(versionString); exitProcess(0);
             case "--help", "-h": writeln(usage); exitProcess(0);
-            default: die("unknown argument " ~ a ~ "\n\n" ~ usage);
+            default: fail("unknown argument " ~ a ~ "\n\n" ~ usage);
         }
     }
-    if (o.json && o.markdown) die("--json and --markdown are mutually exclusive");
-    if (o.markdown && o.trajectory is null) die("--markdown requires --trajectory <id>");
-    if (o.json && o.trajectory is null && !o.listSessions) die("--json requires --trajectory <id> or --list-sessions");
-    if (o.all && !o.listSessions) die("--all requires --list-sessions");
-    if (o.listSessions && o.trajectory !is null) die("--list-sessions and --trajectory are mutually exclusive");
-    if (o.hasResume && o.trajectory !is null) die("--resume and --trajectory are mutually exclusive");
+    if (o.json && o.markdown) fail("--json and --markdown are mutually exclusive");
+    if (o.markdown && o.trajectory is null) fail("--markdown requires --trajectory <id>");
+    if (o.json && o.trajectory is null && !o.listSessions) fail("--json requires --trajectory <id> or --list-sessions");
+    if (o.all && !o.listSessions) fail("--all requires --list-sessions");
+    if (o.listSessions && o.trajectory !is null) fail("--list-sessions and --trajectory are mutually exclusive");
+    if (o.hasResume && o.trajectory !is null) fail("--resume and --trajectory are mutually exclusive");
     if (o.listSessions && (o.hasResume || o.acp || o.listModels.length || o.prompt.length || o.login.length))
-        die("--list-sessions can't be combined with --resume, --acp, --list-models, --login or -p");
-    if (o.hasResume && o.login.length) die("--resume and --login are mutually exclusive");
+        fail("--list-sessions can't be combined with --resume, --acp, --list-models, --login or -p");
+    if (o.hasResume && o.login.length) fail("--resume and --login are mutually exclusive");
+    if (o.hasResume && o.listModels.length) fail("--resume and --list-models are mutually exclusive");
     return o;
+}
+
+// rust: main.rs::list_sessions_and_resume_are_mutually_exclusive, main.rs::list_sessions_and_trajectory_are_mutually_exclusive
+// rust: main.rs::list_sessions_conflicts_with_other_action_modes, main.rs::resume_conflicts_with_other_action_modes
+// rust: main.rs::resume_attached_form_names_dash_prefixed_ids
+unittest
+{
+    bool ok(string[] a...)
+    {
+        try { parseArgs(["nano-coder"] ~ a); return true; }
+        catch (UsageError) return false;
+    }
+    assert(ok("--list-sessions") && ok("--resume", "sess-1") && ok("--resume") && ok("--trajectory", "sess-1"));
+    assert(!ok("--list-sessions", "--resume", "sess-1") && !ok("--resume", "sess-1", "--list-sessions"));
+    assert(!ok("--list-sessions", "--resume"));
+    assert(!ok("--list-sessions", "--trajectory", "sess-1") && !ok("--trajectory", "sess-1", "--list-sessions", "--json"));
+    assert(ok("--login", "github-copilot") && ok("--list-models", "openai") && ok("--acp"));
+    assert(!ok("--list-sessions", "--login", "github-copilot") && !ok("--list-sessions", "--list-models", "openai"));
+    assert(!ok("--list-sessions", "--acp") && !ok("--acp", "--list-sessions"));
+    assert(!ok("--resume", "--login", "github-copilot") && !ok("--login", "github-copilot", "--resume", "sess-1"));
+    assert(!ok("--resume", "--trajectory", "sess-1") && !ok("--trajectory", "sess-1", "--resume"));
+    assert(!ok("--resume", "--list-models", "openai") && !ok("--list-models", "openai", "--resume=sess-1"));
+    assert(ok("--acp", "--resume", "sess-1"));
+    assert(parseArgs(["nano-coder", "--resume", "sess-1"]).resume == "sess-1");
+    auto bare = parseArgs(["nano-coder", "--resume"]);
+    assert(bare.hasResume && bare.resume == "");
+    assert(parseArgs(["nano-coder", "--resume=-sess"]).resume == "-sess");
+    assert(!ok("--resume", "-sess"), "a dash-prefixed id needs the attached form");
 }
 
 /// `--login PROVIDER`: interactive device-flow sign-in.
@@ -1348,7 +1385,9 @@ int appMain(string[] args)
 
 int runMain(string[] args)
 {
-    auto o = parseArgs(args);
+    Options o;
+    try o = parseArgs(args);
+    catch (UsageError e) die(e.msg);
     auto cfgPath = o.configPath.length ? o.configPath : Config.defaultPath;
     Config cfg;
     JSONValue rawConfig = JSONValue(string[string].init);
