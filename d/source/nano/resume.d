@@ -626,3 +626,44 @@ unittest
     Summary here = {id: "here", cwd: "/a"}, there = {id: "there", cwd: "/b"}, old = {id: "old"};
     assert(inDir([here, there, old], "/a").map!(x => x.id).array == ["here", "old"]);
 }
+
+// rust: resume.rs::pick_outcome_reports_empty_apart_from_cancelled
+unittest
+{
+    import std.file : exists, mkdirRecurse, rmdirRecurse, tempDir;
+    import std.path : buildPath;
+    import nano.session : SessionLog;
+    auto dir = buildPath(tempDir, "nano-d-resume-pick");
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    string id;
+    assert(pickOutcome(dir, "/a", null, id) == Pick.empty && id is null);
+    new SessionLog(dir, "m", "/a", "s").input("i", "hello there");
+    assert(pickOutcome(dir, "/a", "s", id) == Pick.empty && id is null, "the only session is the one in use");
+}
+
+// rust: resume.rs::row_shows_project_count_and_topic
+unittest
+{
+    import std.algorithm : canFind, endsWith, startsWith;
+    static Summary summary(string cwd, string last, string context)
+    {
+        Summary s;
+        s.id = "s";
+        s.cwd = cwd;
+        s.lastUsed = Clock.currTime;
+        s.prompts = 3;
+        s.lastPrompt = last;
+        s.contextPrompt = context;
+        return s;
+    }
+    auto s = summary("/work/rusty-harness", "do it\nnow", "Fix the flaky\n deploy test");
+    auto wide = row(s, Clock.currTime, 200);
+    assert(wide.startsWith("just now    rusty-harness  3 prompts"), wide);
+    assert(wide.canFind("3 prompts  do it now  ← Fix the flaky deploy test"), wide);
+    auto narrow = row(s, Clock.currTime, 70);
+    assert(narrow.endsWith("…") && cells(narrow) <= 70, narrow);
+    auto none = summary(null, "x", null);
+    assert(project(none) == "?");
+}

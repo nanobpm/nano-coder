@@ -289,7 +289,19 @@ string read(string path, JSONValue args)
     auto m = &found.message;
     if (m.role == Role.system) throw new HistoryError(format("message #%s is a system message and cannot be read", id));
     auto text = label(id, *m) ~ "\n";
-    if (m.thinking.length) text ~= "[thinking] " ~ m.thinking ~ "\n";
+    // Reasoning models may carry their content only in thinking blocks; other
+    // providers log plain text (replay blocks such as `reasoning_content` have
+    // no readable `thinking`), so the logged text fills in when no block did.
+    bool emitted;
+    foreach (b; m.thinkingBlocks)
+        if (b.type == JSONType.object)
+            if (auto t = "thinking" in b.objectNoRef)
+                if (t.type == JSONType.string)
+                {
+                    text ~= "[thinking] " ~ t.str ~ "\n";
+                    emitted = true;
+                }
+    if (!emitted && m.thinking.length) text ~= "[thinking] " ~ m.thinking ~ "\n";
     text ~= m.content;
     foreach (ref c; m.toolCalls) text ~= format("\n[called %s id=%s %s]", c.name, c.id, c.arguments.toString);
     return truncateOutput(text, limit, format("history-%s", id));
