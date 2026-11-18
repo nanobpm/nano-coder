@@ -395,6 +395,41 @@ void backfillPinText(ref Message m, const string[] inputs)
     if (found.length) m.pinText = found;
 }
 
+/// The same logged message: role, content, tool calls and results, thinking blocks.
+private bool sameContent(const ref Message a, const ref Message b)
+{
+    static string calls(const ref Message m)
+    {
+        auto j = messageRecord(m);
+        auto c = "tool_calls" in j;
+        return c is null ? "" : c.toString;
+    }
+    static string blocks(const ref Message m) { return JSONValue(m.thinkingBlocks.dup).toString; }
+    return a.role == b.role && a.content == b.content && a.toolCallId == b.toolCallId && a.toolName == b.toolName
+        && a.isError == b.isError && calls(a) == calls(b) && blocks(a) == blocks(b);
+}
+
+/// Backfill stable `[#N]` IDs onto a `replace` record's retained messages
+/// from the direct records they came from (Rust `backfill_log_lines`): logs
+/// from before stable IDs stored retained messages without `log_line`. Each
+/// un-IDed non-system message takes the first unclaimed original with the
+/// same content past the summarized range (folded originals are not retained).
+private void backfillLogLines(Message[] messages, const Message[] originals, ulong summarizedEnd)
+{
+    auto claimed = new bool[originals.length];
+    foreach (ref m; messages)
+    {
+        if (m.logLine || m.role == Role.system) continue;
+        foreach (i, ref o; originals)
+            if (!claimed[i] && o.logLine > summarizedEnd && sameContent(o, m))
+            {
+                m.logLine = o.logLine;
+                claimed[i] = true;
+                break;
+            }
+    }
+}
+
 /// An input that was accepted but whose turn has not ended (Rust
 /// `PendingInput`): redelivering its id resumes the turn.
 struct PendingInput
@@ -467,6 +502,8 @@ Restored restore(string path)
     // Every logged input's text, to backfill `pinText` on legacy messages.
     string[] inputs;
     Message[] rustStash;
+    // Every direct message record, with its line, for `backfillLogLines`.
+    Message[] originals;
     size_t index;
     ulong lineNo;
     foreach (line; text[0 .. committed].lineSplitter)
@@ -506,6 +543,7 @@ Restored restore(string path)
             r.conversation ~= messageFromRecord(data);
             r.conversation[$ - 1].logLine = lineNo;
             backfillPinText(r.conversation[$ - 1], inputs);
+            originals ~= r.conversation[$ - 1];
             {
                 import nano.session_history : consumesHint;
                 if (r.historyAvailable && consumesHint(r.conversation[$ - 1])) r.historyHintConsumed = true;
@@ -528,6 +566,12 @@ Restored restore(string path)
         case "replace":
             r.conversation = null;
             foreach (m; data["messages"].arrayNoRef) r.conversation ~= messageFromRecord(m);
+            {
+                ulong floor;
+                if (auto sum = "summarized" in data)
+                    if (sum.type == JSONType.array && sum.arrayNoRef.length == 2) floor = sum.arrayNoRef[1].integer;
+                backfillLogLines(r.conversation, originals, floor);
+            }
             foreach (ref m; r.conversation) backfillPinText(m, inputs);
             {
                 // An in-flight input survives a mid-turn compaction at
