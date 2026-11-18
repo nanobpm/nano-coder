@@ -11,7 +11,7 @@ import std.json : JSONValue, parseJSON;
 import std.math : isNaN;
 import std.typecons : Nullable;
 import nano.agent;
-import nano.config : ProviderConfig, ProviderKind;
+import nano.config : KindedClient, ProviderConfig, ProviderKind;
 import nano.llm;
 import nano.permissions : Policy;
 import nano.providers.mock : MockClient;
@@ -24,7 +24,7 @@ private:
 struct Sent { double temperature; Request thinking; long maxTokens; }
 
 /// A scripted Anthropic model that records what each request sent.
-class Claude : MockClient
+class Claude : MockClient, KindedClient
 {
     string model;
     Sent[] sent;
@@ -36,6 +36,7 @@ class Claude : MockClient
     }
     override string modelName() const { return model; }
     override string providerName() const { return "anthropic"; }
+    ProviderKind kind() const { return ProviderKind.anthropic; }
 }
 
 Agent agentFor(LLMClient c, void delegate(Agent) @safe tool = null)
@@ -159,4 +160,73 @@ unittest
         == ["0.5 (global setting)", "model default (required: the model accepts no temperature)", "0.5 (global setting)"]);
     agent.sessionThinking.nullify();
     assert(agent.thinking().effective == Thinking.init && agent.thinking().source == Source.global);
+}
+
+/// A test double that names no provider API.
+class Kindless : MockClient
+{
+    this() { super([]); }
+    override string providerName() const { return "mock"; }
+}
+
+// The kind comes from the live client: a kindless one gets the provider's
+// temperature unclamped, though its config says Anthropic.
+// rust: agent.rs::temperature_ignores_config_kind_for_a_kindless_client
+unittest
+{
+    import nano.temperature : TSource = Source;
+    auto agent = new Agent(new Kindless, new ToolRegistry, Policy.init, "sys");
+    auto pc = new ProviderConfig;
+    pc.hasKind = true;
+    pc.kind = ProviderKind.anthropic;
+    pc.temperature = 1.5;
+    agent.providerLookup = (string name) => cast(const(ProviderConfig)*) pc;
+    auto r = agent.temperatureNow;
+    assert(r.effective == 1.5 && r.source == TSource.provider && r.warning is null, r.warning);
+}
+
+// rust: agent.rs::temperature_resolves_for_a_custom_mock_provider
+unittest
+{
+    import nano.config : Config, resolve;
+    import nano.providers : makeClient;
+    import nano.temperature : TSource = Source;
+    Config c;
+    ProviderConfig demo;
+    demo.hasKind = true;
+    demo.kind = ProviderKind.mock;
+    demo.temperature = 0.2;
+    c.providers["demo"] = demo;
+    auto client = makeClient(resolve(c, "demo/foo"));
+    assert(client.providerName == "demo");
+    auto agent = new Agent(client, new ToolRegistry, Policy.init, "sys");
+    agent.providerLookup = (string name) => name in c.providers;
+    auto r = agent.temperatureNow;
+    assert(r.effective == 0.2 && r.source == TSource.provider);
+}
+
+// A model that always thinks gets no custom temperature, compaction included;
+// one that thinks only when asked keeps it for compaction.
+// rust: agent.rs::compaction_sends_no_temperature_to_an_always_thinking_model
+// rust: agent.rs::compaction_keeps_the_temperature_when_turns_think_on_anthropic
+unittest
+{
+    auto fable = agentFor(new Claude("claude-fable-5", []));
+    fable.temperature = 0.5;
+    assert(fable.thinking.alwaysAnthropicThinking);
+    auto c = fable.temperatureFor(fable.thinking.alwaysAnthropicThinking);
+    assert(c.fixed.length && isNaN(c.effective));
+    fable.sessionThinking = session("high");
+    c = fable.temperatureFor(fable.thinking.alwaysAnthropicThinking);
+    assert(c.fixed.length && isNaN(c.effective), "a level does not unlock the temperature");
+
+    auto sonnet = agentFor(new Claude("claude-sonnet-4-6", []));
+    sonnet.temperature = 0.5;
+    sonnet.sessionThinking = session("high");
+    assert(sonnet.temperatureNow.fixed.length, "turns that think drop it");
+    c = sonnet.temperatureFor(sonnet.thinking.alwaysAnthropicThinking);
+    assert(!c.fixed.length && c.effective == 0.5, "compaction keeps it");
+    sonnet.sessionThinking.nullify();
+    c = sonnet.temperatureFor(sonnet.thinking.alwaysAnthropicThinking);
+    assert(!c.fixed.length && c.effective == 0.5);
 }

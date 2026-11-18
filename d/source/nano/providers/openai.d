@@ -16,7 +16,7 @@ import nano.http;
 import nano.config;
 import nano.thinking : applyChat, applyAnthropic;
 
-class OpenAIClient : LLMClient, CapabilityProbe
+class OpenAIClient : LLMClient, CapabilityProbe, KindedClient
 {
     protected ResolvedProvider p;
 
@@ -24,6 +24,7 @@ class OpenAIClient : LLMClient, CapabilityProbe
 
     string modelName() const { return p.model; }
     string providerName() const { return p.name; }
+    ProviderKind kind() const { return ProviderKind.openai; }
 
     protected string baseUrl() { return p.config.baseUrl.stripRight("/"); }
 
@@ -420,6 +421,8 @@ class CopilotClient : OpenAIClient
     Endpoints endpoints;
     private SessionToken session;
     private bool forceRefresh;
+
+    override ProviderKind kind() const { return ProviderKind.githubCopilot; }
 
     this(ResolvedProvider p)
     {

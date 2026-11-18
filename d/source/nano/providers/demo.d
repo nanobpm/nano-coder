@@ -12,7 +12,9 @@ import std.uni : toLower, isAlphaNum;
 import std.string : indexOf;
 import std.algorithm : canFind, splitter;
 
-class DemoClient : LLMClient
+import nano.config : KindedClient, ProviderKind;
+
+class DemoClient : LLMClient, KindedClient
 {
     private string provider, model;
     private long calls;
@@ -157,6 +159,7 @@ class DemoClient : LLMClient
     string[] listModels() { return [model]; }
     string modelName() const { return model; }
     string providerName() const { return provider; }
+    ProviderKind kind() const { return ProviderKind.mock; }
 }
 
 unittest

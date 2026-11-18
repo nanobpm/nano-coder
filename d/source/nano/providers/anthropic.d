@@ -12,7 +12,7 @@ import nano.http;
 import nano.config;
 import nano.thinking : applyChat, applyAnthropic;
 
-class AnthropicClient : LLMClient
+class AnthropicClient : LLMClient, KindedClient
 {
     private ResolvedProvider p;
 
@@ -20,6 +20,7 @@ class AnthropicClient : LLMClient
 
     string modelName() const { return p.model; }
     string providerName() const { return p.name; }
+    ProviderKind kind() const { return ProviderKind.anthropic; }
 
     private string[string] headers()
     {

@@ -68,6 +68,14 @@ string[] strings(JSONValue v)
 
 enum ProviderKind { openai, anthropic, githubCopilot, muse, mock }
 
+/// A client that speaks a real provider API reports which (Rust
+/// `LLMClient::kind`). The agent takes the kind from the live client, not the
+/// config: a test double implements no kind, and is then treated as `mock`.
+interface KindedClient
+{
+    ProviderKind kind() const;
+}
+
 ProviderKind parseKind(string s)
 {
     switch (s)

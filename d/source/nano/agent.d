@@ -39,7 +39,7 @@ string toolResultDisplay(string text, const(Attachment)[] attachments)
     foreach (ref a; attachments) text ~= (text.length ? "\n" : "") ~ a.placeholder;
     return text;
 }
-import nano.config : ProviderConfig, ProviderKind;
+import nano.config : KindedClient, ProviderConfig, ProviderKind;
 import std.typecons : Nullable;
 import std.algorithm : min, max, clamp;
 import nano.plan : Plan, PlanError, isPlanTool, planDefinitions = definitions;
@@ -1131,10 +1131,13 @@ class Agent
         return pc is null ? &noProvider : pc;
     }
 
+    /// The API the live client speaks (Rust takes `kind()` from the client,
+    /// so a config edit whose rebuild failed cannot change it); a client
+    /// that names none (a test double) follows no provider's rules.
     private ProviderKind providerKind()
     {
-        auto pc = providerEntry();
-        return pc.hasKind ? pc.kind : ProviderKind.openai;
+        if (auto k = cast(KindedClient) client.nonNull) return k.kind;
+        return ProviderKind.mock;
     }
 
     /// Ask the endpoint what the current model supports (after a model change).

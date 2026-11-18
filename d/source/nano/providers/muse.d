@@ -20,7 +20,7 @@ struct SessionKey
     string apiKey, baseUrl;
 }
 
-class MuseClient : LLMClient, CapabilityProbe
+class MuseClient : LLMClient, CapabilityProbe, KindedClient
 {
     private ResolvedProvider p;
     /// The OAuth grant to mint with; unset when `META_API_KEY` is the key.
@@ -54,6 +54,7 @@ class MuseClient : LLMClient, CapabilityProbe
 
     string modelName() const { return p.model; }
     string providerName() const { return p.name; }
+    ProviderKind kind() const { return ProviderKind.muse; }
 
     private string configuredBase() const { return p.config.baseUrl.stripRight('/'); }
 
