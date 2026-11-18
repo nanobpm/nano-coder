@@ -21,7 +21,7 @@ agent.rs::a_direct_model_switch_with_a_slow_key_command_does_not_stall_the_runti
 agent.rs::a_failed_direct_model_switch_still_clears_a_stale_queued_request	test
 agent.rs::a_failed_new_session_keeps_the_thinking_override	todo
 agent.rs::a_failed_repair_on_resume_leaves_the_live_session_untouched	todo
-agent.rs::a_failed_tool_after_smart_compaction_points_to_history_once	todo
+agent.rs::a_failed_tool_after_smart_compaction_points_to_history_once	test
 agent.rs::a_firing_persistence_failure_rolls_the_due_timers_back	gap	D does not roll the live timers/plan back when persisting their change to the session log fails
 agent.rs::a_hard_stop_skips_the_rest_of_the_batch	test
 agent.rs::a_headless_turn_with_no_cap_stops_at_the_safety_cap	test
@@ -46,7 +46,7 @@ agent.rs::a_retried_prompt_keeps_its_spent_recall_budget	na	D has no in-process 
 agent.rs::a_same_agent_retry_after_a_provider_error_does_not_replay_the_snapshot_twice	test
 agent.rs::a_second_overflow_is_returned	test
 agent.rs::a_small_max_tokens_caps_the_thinking_budget_with_a_warning	test
-agent.rs::a_spoofed_summary_prefix_does_not_unlock_history_tools	todo
+agent.rs::a_spoofed_summary_prefix_does_not_unlock_history_tools	test
 agent.rs::a_stale_background_probe_is_discarded_after_a_later_switch	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
 agent.rs::a_steer_between_continuations_drops_the_cut_off_prefix	test
 agent.rs::a_stricter_probe_replaces_a_learned_window_stat	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
@@ -202,8 +202,8 @@ agent.rs::resumed_pending_input_is_not_folded_into_the_index_twice	todo
 agent.rs::resumes_sessions_and_deduplicates_inputs	test
 agent.rs::session_start_context_survives_a_rejected_first_prompt	test
 agent.rs::session_transitions_clear_the_thinking_override	test
-agent.rs::smart_compaction_cites_log_lines_and_offers_history_tools	todo
-agent.rs::smart_mode_needs_a_session_log	todo
+agent.rs::smart_compaction_cites_log_lines_and_offers_history_tools	test
+agent.rs::smart_mode_needs_a_session_log	test
 agent.rs::stale_plan_gets_a_reminder_in_a_tool_result	test
 agent.rs::status_bar_reports_nothing_for_a_dropped_level	todo
 agent.rs::status_line_reflects_the_level_the_request_sends_not_a_reread	todo

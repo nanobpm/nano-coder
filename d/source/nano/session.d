@@ -309,10 +309,13 @@ class SessionLog
     }
 
     /// The turn for `inputId` finished. `stopReason` is omitted for `end_turn`.
-    void turnEnd(string inputId, string response, string stopReason, JSONValue outcome = JSONValue.init)
+    /// `historyCalls`: history_search / history_read calls in the turn.
+    void turnEnd(string inputId, string response, string stopReason, JSONValue outcome = JSONValue.init,
+        uint historyCalls = 0)
     {
         JSONValue d = ["input_id": inputId, "response": response];
         if (outcome.type == JSONType.object) d["outcome"] = outcome;
+        if (historyCalls) d["history_calls"] = historyCalls;
         d["recorded_at"] = nowStamp();
         if (stopReason.length && stopReason != "end_turn") d["stop_reason"] = stopReason;
         write_(record("turn_end", d));

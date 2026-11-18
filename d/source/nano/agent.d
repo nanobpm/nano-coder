@@ -263,6 +263,8 @@ class Agent
     /// The real turns folded by compactions since the last plain replacement:
     /// a replay (ACP session/load) shows them in place of the summary.
     Message[] replayStash;
+    /// history_search / history_read calls in the current turn (logged on its turn_end).
+    uint turnHistoryCalls;
     /// Index of the restated in-flight input the latest compaction folded;
     /// a replay skips it, its original being in `replayStash`.
     Option!size_t replayRestated;
@@ -353,6 +355,7 @@ class Agent
         // was logged already).
         bool resuming = hasPending && givenId.length && pending.id == givenId;
         if (!resuming) log.ifSome((SessionLog l) { l.input(inputId, input); });
+        turnHistoryCalls = 0;
         string response;
         try response = runTurn(input, ev, resetControl, automatic, inputId, resuming);
         catch (Exception e)
@@ -364,7 +367,8 @@ class Agent
             throw e;
         }
         log.ifSome((SessionLog l) {
-            l.turnEnd(inputId, response, cast(string) lastStop, hasOutcome ? lastOutcome.toJSON : JSONValue.init);
+            l.turnEnd(inputId, response, cast(string) lastStop, hasOutcome ? lastOutcome.toJSON : JSONValue.init,
+                turnHistoryCalls);
             indexTurn(l, from);
         });
         hasPending = false;
@@ -1288,7 +1292,7 @@ class Agent
     /// `mode` overrides `compactionMode` (null: the configured one); `focus`
     /// steers the summary. Returns false when there is nothing to compact.
     bool compact(out CompactReport report, CompactTrigger trigger = CompactTrigger.manual,
-            const(ctx.CompactionMode)* mode = null, string focus = null)
+            scope const(ctx.CompactionMode)* mode = null, string focus = null)
     {
         import std.algorithm : canFind;
         ctx.CompactionMode m = mode is null ? compactionMode : *mode;
@@ -1580,6 +1584,7 @@ class Agent
             {
                 // History tools are offered only when historyEnabled(), which needs a log.
                 auto logPath = log.unwrap("history tools are offered only with a session log").path;
+                turnHistoryCalls++;
                 out_ = call.name == hist.searchTool ? hist.search(logPath, args) : hist.read(logPath, args);
             }
             else if (isTimer) out_ = runTimerTool(call.name, args);
