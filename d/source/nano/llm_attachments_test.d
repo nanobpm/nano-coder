@@ -145,3 +145,34 @@ unittest
     blind.vision = Nullable!Vision.init;
     assert(!blind.attachmentPlan.carriesImage && !at(blind, 0).isImage, "no vision");
 }
+
+// Attachments and trajectory fields (reasoning, usage, duration) round-trip
+// through the session record; a plain message carries none of them.
+// rust: llm.rs::attachments_round_trip_and_stay_off_plain_messages
+// rust: llm.rs::trajectory_fields_round_trip_and_stay_out_of_plain_messages
+unittest
+{
+    import std.json : parseJSON;
+    import nano.session : messageFromRecord, messageRecord;
+    auto m = Message.toolResult("c1", "read_file", "image/png, 10×10, 5 B");
+    m.attachments = [image("a", 10)];
+    auto j = messageRecord(m);
+    assert(j["attachments"][0]["media_type"].str == "image/png" && j["attachments"][0]["width"].get!long == 10, j.toString);
+    assert(messageFromRecord(j).attachments == m.attachments);
+
+    auto t = Message.assistant("hi");
+    t.thinking = "because";
+    t.usage.inputTokens = 10;
+    t.usage.outputTokens = 5;
+    t.hasUsage = true;
+    t.durationMs = 42;
+    j = messageRecord(t);
+    assert(j["thinking"].str == "because" && j["duration_ms"].get!long == 42, j.toString);
+    assert(j["usage"] == parseJSON(`{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}`), j["usage"].toString);
+    auto back = messageFromRecord(j);
+    assert(back.thinking == "because" && back.hasUsage && back.usage.outputTokens == 5 && back.durationMs == 42);
+
+    auto plain = Message.assistant("hi");
+    assert(messageRecord(plain) == parseJSON(`{"role":"assistant","content":"hi"}`), messageRecord(plain).toString);
+    assert(messageFromRecord(messageRecord(plain)).content == "hi");
+}

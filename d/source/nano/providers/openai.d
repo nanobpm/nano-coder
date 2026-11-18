@@ -211,13 +211,9 @@ class OpenAIClient : LLMClient, CapabilityProbe, KindedClient
     {
         import std.string : indexOf;
         if (r.content.indexOf("<think>") < 0) return;
-        string said, thought;
-        ThinkSplitter s;
-        void emit(bool t, string x) { if (t) thought ~= x; else said ~= x; }
-        s.push(r.content, &emit);
-        s.finish(&emit);
-        r.content = said.strip;
-        r.reasoning ~= thought;
+        auto parts = ThinkSplitter.splitAll(r.content);
+        r.content = parts[0];
+        r.reasoning ~= parts[1];
     }
 
     /// GET/POST `url` with a short timeout; null on any failure.

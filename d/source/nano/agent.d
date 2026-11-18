@@ -1555,14 +1555,7 @@ class Agent
         out JSONValue effectiveArgs)
     {
         isError = true;
-        if (call.invalidArguments.length)
-        {
-            auto raw = call.invalidArguments.length > 300 ? call.invalidArguments[0 .. 300] ~ "…" : call.invalidArguments;
-            auto advice = stopReason == "length" || stopReason == "max_tokens"
-                ? "The reply was cut off by the output-token limit; send a smaller call (e.g. write the file in parts)."
-                : "Send the arguments as a single JSON object.";
-            return format("Invalid arguments for %s (not a JSON object): %s\n%s", call.name, raw, advice);
-        }
+        if (auto e = call.rawArgumentsError(stopReason)) return e;
         bool isPlan = planTools && isPlanTool(call.name);
         bool isOutcome = outcomeTool && call.name == outcomeToolName;
         bool isHistory = historyEnabled && hist.isHistoryTool(call.name);
@@ -2119,8 +2112,8 @@ unittest
     auto second = mock.seen[1];
     assert(second[$ - 3].content == "echoed hi" && !second[$ - 3].isError);
     assert(second[$ - 2].isError && second[$ - 1].isError);
-    import std.string : indexOf;
-    assert(second[$ - 1].content.indexOf("Invalid arguments") == 0);
+    import std.algorithm : canFind;
+    assert(second[$ - 1].content.canFind("malformed JSON") && second[$ - 1].content.canFind("`echo`"));
 }
 
 // rust: agent.rs::steer_during_tool_call_joins_next_model_call
@@ -2852,7 +2845,6 @@ StopReason stopReasonFrom(string value) @safe pure nothrow
 }
 
 /// A stop reason meaning the reply was cut off at the output-token limit.
-bool isLengthStop(string reason) @safe pure nothrow { return reason == "length" || reason == "max_tokens"; }
 
 /// The reminder asking the model to continue a cut-off reply.
 Message continuationReminder(long completionTokens)

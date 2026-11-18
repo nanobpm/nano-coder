@@ -59,6 +59,38 @@ struct ToolCall
     {
         return invalidArguments.length ? invalidArguments : arguments.toString;
     }
+
+    /// The tool result for a call whose arguments were not a JSON object
+    /// (null when they were), with advice suited to why the reply ended.
+    string rawArgumentsError(string stopReason) const
+    {
+        import std.format : format;
+        import std.range : take;
+        import std.utf : count;
+        import std.conv : to;
+        if (!invalidArguments.length) return null;
+        auto shown = invalidArguments.take(300).to!string ~ (invalidArguments.count > 300 ? "…" : "");
+        if (isLengthStop(stopReason))
+            return format("the arguments for `%s` were cut off because the response hit the output-token "
+                ~ "limit (stop reason `%s`), so the call was not run: `%s`. "
+                ~ "Retrying the same call will hit the same limit — make a smaller call instead, "
+                ~ "for example by splitting the work across multiple `%s` calls or reducing the "
+                ~ "argument size so the full JSON fits within the limit.", name, stopReason, shown, name);
+        return format("the arguments for `%s` arrived as malformed JSON (usually a truncated "
+            ~ "response), so the call was not run: `%s`. "
+            ~ "If this was a transient transport error, simply retry the same `%s` call with "
+            ~ "the same arguments; if it keeps happening, the response was probably truncated "
+            ~ "by the output-token limit, so make a smaller call instead (for example by "
+            ~ "splitting the content).", name, shown, name);
+    }
+}
+
+/// Whether a stop reason means the reply hit the output-token limit: OpenAI
+/// chat `length`, Anthropic `max_tokens`, Responses `max_output_tokens`
+/// (a bare `incomplete` is not: providers resolve it to its reason first).
+bool isLengthStop(string reason) @safe pure nothrow
+{
+    return reason == "length" || reason == "max_tokens" || reason == "max_output_tokens";
 }
 
 struct Message
@@ -402,6 +434,20 @@ struct ThinkSplitter
         if (pending.length) emit(inThink, pending);
         pending = null;
     }
+
+    /// A whole reply split into [content, thinking]: the content loses the
+    /// blank lines after `</think>`, the thinking is trimmed.
+    static string[2] splitAll(string text)
+    {
+        import std.string : indexOf, strip, stripLeft;
+        if (text.indexOf("<think>") < 0) return [text, ""];
+        string said, thought;
+        ThinkSplitter s;
+        void emit(bool t, string x) { if (t) thought ~= x; else said ~= x; }
+        s.push(text, &emit);
+        s.finish(&emit);
+        return [said.stripLeft, thought.strip];
+    }
 }
 
 unittest
@@ -421,6 +467,64 @@ unittest
     foreach (chunk; ["hi <thi", "nk>pon", "der</th", "ink> done"]) s.push(chunk, &emit);
     s.finish(&emit);
     assert(thought == "ponder" && said == "hi  done");
+}
+
+// rust: llm.rs::splits_think_tags_across_chunks
+unittest
+{
+    string thought, said;
+    ThinkSplitter s;
+    void emit(bool r, string t) { if (r) thought ~= t; else said ~= t; }
+    foreach (chunk; ["<th", "ink>plan ", "it</thi", "nk>Answer <b>", "</b> done"]) s.push(chunk, &emit);
+    s.finish(&emit);
+    assert(thought == "plan it" && said == "Answer <b></b> done", said);
+    assert(ThinkSplitter.splitAll("<think>x</think>\n\nhi") == ["hi", "x"]);
+    assert(ThinkSplitter.splitAll("plain") == ["plain", ""]);
+}
+
+// rust: llm.rs::decodes_valid_arguments_and_marks_invalid_ones
+unittest
+{
+    import std.algorithm : canFind;
+    auto valid = ToolCall.fromRaw("c", "write_file", `{"path":"/tmp/x"}`);
+    assert(valid.arguments == parseJSON(`{"path":"/tmp/x"}`) && valid.invalidArguments is null);
+    assert(ToolCall.fromRaw("c", "t", "").arguments.type == JSONType.object);
+    assert(ToolCall.fromRaw("c", "t", "   ").invalidArguments is null);
+    enum raw = `{"path":"/tmp/x","content":"abc`;
+    auto call = ToolCall.fromRaw("c1", "write_file", raw);
+    assert(call.arguments == parseJSON(`{}`), "malformed args leave the object empty");
+    assert(call.invalidArguments == raw);
+    auto e = call.rawArgumentsError(null);
+    assert(e.canFind("write_file") && e.canFind("malformed JSON") && e.canFind("retry the same")
+        && e.canFind(`{"path":"/tmp/x`), e);
+    assert(valid.rawArgumentsError(null) is null);
+}
+
+// rust: llm.rs::raw_arguments_error_tailors_advice_to_stop_reason
+unittest
+{
+    import std.algorithm : canFind;
+    auto call = ToolCall.fromRaw("c1", "write_file", `{"path":"/tmp/x","content":"abc`);
+    foreach (reason; ["length", "max_tokens", "max_output_tokens"])
+    {
+        auto e = call.rawArgumentsError(reason);
+        assert(e.canFind("output-token limit") && e.canFind("smaller call") && !e.canFind("retry the same"), reason);
+    }
+    foreach (reason; ["tool_use", "incomplete"])
+    {
+        auto e = call.rawArgumentsError(reason);
+        assert(e.canFind("retry the same") && e.canFind("truncated by the output-token limit"), reason);
+    }
+}
+
+// rust: llm.rs::raw_arguments_error_truncates_long_payloads
+unittest
+{
+    import std.algorithm : canFind;
+    import std.array : replicate;
+    auto raw = `{"content":"` ~ "x".replicate(1000);
+    auto e = ToolCall.fromRaw("c", "write_file", raw).rawArgumentsError(null);
+    assert(e.canFind("…") && e.length < raw.length + 400);
 }
 
 unittest
