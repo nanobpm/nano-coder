@@ -4,7 +4,7 @@ module nano.agent;
 
 @safe:
 import nano.arith : checkedMul, checkedSub, saturatingSub;
-import nano.option : Option, some, none, match, ifSome, unwrap;
+import nano.option : Option, some, none, match, ifSome, unwrap, NotNull;
 
 import nano.safeio : Isolated, JoinHandle, spawnDaemon, stdErr, stdOut;
 
@@ -146,8 +146,8 @@ enum StopReason : string
 
 class Agent
 {
-    LLMClient client;
-    ToolRegistry tools;
+    NotNull!LLMClient client;
+    NotNull!ToolRegistry tools;
     Policy policy;
     Message[] messages;
     long maxIterations;
@@ -168,7 +168,7 @@ class Agent
     Option!SessionLog log;
     TokenUsage lastUsage;
     /// Steer or cancel the running turn from another thread.
-    shared TurnControl control;
+    NotNull!(shared TurnControl) control;
     /// Why the last `run` ended.
     StopReason lastStop;
     /// Finished turns by input id (see `Restored.completed`): redelivering
@@ -1071,7 +1071,7 @@ class Agent
     void refreshCapabilities()
     {
         capabilities = Capabilities.init;
-        if (auto probe = cast(CapabilityProbe) client) capabilities = probe.probeCapabilities();
+        if (auto probe = cast(CapabilityProbe) client.nonNull) capabilities = probe.probeCapabilities();
     }
 
     /// The thinking level the current model is sent, and why. A fixed budget

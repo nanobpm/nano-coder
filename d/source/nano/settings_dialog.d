@@ -5,6 +5,7 @@ module nano.settings_dialog;
 
 @safe:
 
+import nano.option : NotNull;
 import std.format : format;
 import std.math : isNaN;
 import std.string : strip, toUpper;
@@ -32,7 +33,7 @@ bool confirm(SettingsUi ui, string prompt, bool dflt)
 struct SettingsHost
 {
     Config* cfg;
-    Agent agent;
+    NotNull!Agent agent;
     string configPath;
     string[] delegate() @safe recents;
     /// Switches the session's model (recording it in recents); an error or null.

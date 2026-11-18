@@ -16,7 +16,7 @@ module nano.acp;
 
 @safe:
 import nano.arith : saturatingSub;
-import nano.option : Option, some, none, match, ifSome;
+import nano.option : Option, some, none, match, ifSome, NotNull;
 
 import nano.safeio : spawnDaemon, stdErr, stdOut;
 
@@ -228,10 +228,10 @@ struct AcpRouter
         immutable(size_t)[] steerMarks; /// queue length when each steer arrived
     }
     private Shared!State state;
-    private shared TurnControl control;
+    private NotNull!(shared TurnControl) control;
 
     /// Routing for `control` (the agent's).
-    static AcpRouter make(shared TurnControl control) { return AcpRouter(Shared!State.make, control); }
+    static AcpRouter make(shared TurnControl control) { return AcpRouter(Shared!State.make, NotNull!(shared TurnControl)(atomicLoad(control))); }
 
     /// Route one input line. Returns a reply to send at once (a cancel's
     /// result), or null.
@@ -345,10 +345,10 @@ private void writeStdoutLine(string l)
 
 final class AcpServer : AgentEvents
 {
-    private Agent agent;
+    private NotNull!Agent agent;
     private Host host;
     private void delegate(string line) writeLine_;
-    private Mutex outLock;
+    private NotNull!Mutex outLock;
     private AcpRouter router;
     private string sessionId_;
     private size_t messageSeq;
@@ -361,7 +361,7 @@ final class AcpServer : AgentEvents
         agent.verifyBeforeComplete = false;
         this.host = host;
         outLock = new Mutex;
-        router = AcpRouter.make(atomicLoad(agent.control));
+        router = AcpRouter.make(agent.control.nonNull);
         writeLine_ = writeLine !is null ? writeLine : (string l) => writeStdoutLine(l);
         agent.onPlanChanged = () {
             JSONValue u = ["sessionUpdate": "plan"];

@@ -12,6 +12,7 @@ module nano.control;
 
 @safe:
 
+import nano.option : NotNull;
 import core.atomic : atomicLoad, atomicStore;
 
 /// The result recorded for tool calls skipped because of a cancel.
@@ -74,7 +75,7 @@ final class TurnControl
         /// A `/thinking` argument typed mid-turn (null: none).
         string thinkingRequest;
     }
-    private Locked!State state;
+    private NotNull!(shared Locked!State) state;
     private int mode_;
 
     this() shared { state = new shared Locked!State; }

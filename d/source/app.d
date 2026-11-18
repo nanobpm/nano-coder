@@ -4,7 +4,7 @@ module app;
 
 @safe:
 import nano.arith : saturatingSub;
-import nano.option : Option, some, none, match, ifSome, unwrap;
+import nano.option : Option, some, none, match, ifSome, unwrap, notNull, NotNull, nullable;
 
 import nano.safeio : Chan, Isolated, Join, JoinHandle, Locked, Shared, deepCopy, spawn, spawnDaemon, exitProcess, stdErr, stdinLine, stdOut;
 
@@ -233,7 +233,7 @@ bool isTerminal(int fd)
 /// Renders agent events on the terminal.
 // Ctrl-C handling: cancel the running turn, or exit when idle.
 /// The running agent's controls, for the key reader and the SIGINT handler.
-shared TurnControl gControl_;
+@nullable("null until the agent is built; the SIGINT handler checks") shared TurnControl gControl_;
 shared(TurnControl) gControl() nothrow @nogc { return atomicLoad(gControl_); }
 void gControl(shared TurnControl c) nothrow @nogc { atomicStore(gControl_, c); }
 shared bool gTurnRunning;
@@ -316,7 +316,7 @@ string runQueueCommand(MessageQueue queue, shared TurnControl steers, string arg
 /// turn controls, the live view, and a frozen copy of the config.
 struct MidTurn
 {
-    shared TurnControl control;
+    NotNull!(shared TurnControl) control;
     LiveView view;
     /// One element (a slice keeps `MidTurn` assignable).
     immutable(Config)[] cfg;
@@ -640,7 +640,7 @@ import nano.ui : Verbosity, parseVerbosity, verbosityListing, providersListing;
 /// The `/settings` prompts on the line editor.
 final class EditorUi : SettingsUi
 {
-    private LineEditor e;
+    private NotNull!LineEditor e;
     this(LineEditor e) { this.e = e; }
 
     ptrdiff_t select(string prompt, const string[] labels, size_t initial)
@@ -704,7 +704,7 @@ void setVerbosity(Verbosity v) { atomicStore(gVerbosity, v); }
 import nano.status : Stats, Activity, RateMeter, tildePath;
 /// The frame renderer (`FrameUi.init` when off): set by the main thread,
 /// used by any.
-shared Locked!FrameUi gFrameCell;
+@nullable("set by the module constructor below") shared Locked!FrameUi gFrameCell;
 shared static this() { gFrameCell = new shared Locked!FrameUi; }
 /// The running frame renderer, or `FrameUi.init`.
 FrameUi gFrame() { return atomicLoad(gFrameCell).get(); }
@@ -722,7 +722,7 @@ string frameStatus(size_t width)
 
 /// The status bar's figures, read and changed under their lock by the turn
 /// and the renderer.
-shared Locked!Stats gStats;
+@nullable("set by the module constructor below") shared Locked!Stats gStats;
 shared static this() { gStats = new shared Locked!Stats; }
 
 /// Change the status bar's stats and redraw it (no-op without a frame).
@@ -1671,7 +1671,7 @@ int runMain(string[] args)
         stdOut.flush();
     };
 
-    gControl = atomicLoad(agent.control);
+    gControl = agent.control.nonNull;
     installSigint();
     Chan!string inbox;
     // none in -p/piped runs, and while a turn lends it to the key reader.
@@ -1792,9 +1792,7 @@ int runMain(string[] args)
     // dialog (they all run inside runMain).
     SettingsHost settingsHost()
     {
-        SettingsHost h;
-        h.cfg = &cfg;
-        h.agent = agent;
+        auto h = SettingsHost(&cfg, notNull(agent));
         h.configPath = cfgPath;
         h.recents = () => recents.models;
         h.switchModel = (string spec) {
@@ -1830,7 +1828,7 @@ int runMain(string[] args)
                     ~ "(/queue lists, edits, removes), Esc Esc or Ctrl-C to cancel]"));
             refreshView();
             heldLines = Chan!string.make;
-            auto mid = MidTurn(atomicLoad(agent.control), view, [frozenConfig(cfg)]);
+            auto mid = MidTurn(agent.control, view, [frozenConfig(cfg)]);
             // Isolated: `editor` is none until the join hands it back, and its
             // callbacks (built by `makeEditor`) reach only shared state.
             auto owned = Isolated!LineEditor.assumeIsolated(ed);
@@ -1857,7 +1855,7 @@ int runMain(string[] args)
         // One the user steered at the prompt keeps its `/queue` id.
         auto late = agent.control.takePending;
         // A cancelled turn drops them (Rust: only a successful cancelled outcome).
-        if (ok && atomicLoad(agent.control).isCancelled)
+        if (ok && agent.control.nonNull.isCancelled)
         {
             foreach (t; late) stdErr.writeln(console.dim("[steer dropped: " ~ t.text ~ "]"));
             late = null;
@@ -1918,7 +1916,7 @@ int runMain(string[] args)
         bool ok = turn(o.prompt);
         // --wait-timers: sleep until each timer the agent set fires and run
         // it as the next prompt, until none are left (Ctrl-C stops waiting).
-        while (ok && o.waitTimers && !agent.timers.empty && !atomicLoad(agent.control).isCancelled)
+        while (ok && o.waitTimers && !agent.timers.empty && !agent.control.nonNull.isCancelled)
         {
             import core.thread : Thread;
             import core.time : msecs;
@@ -1960,7 +1958,7 @@ int runMain(string[] args)
             leaveKeyMode();
             die("could not start the terminal renderer");
         }
-        editor = some(makeEditor(console.link, atomicLoad(agent.control)));
+        editor = some(makeEditor(console.link, agent.control.nonNull));
         questions.interactive = true;
         refreshStatus();
         // The background update check (Rust #154): interactive terminal
@@ -2120,7 +2118,7 @@ int runMain(string[] args)
                 updateStatus((ref Stats s) { s.activity = Activity.idle; });
                 if (did) writeln(console.dim("[" ~ rep.toString ~ "]"));
                 else if (failed.length) writeln(console.dim("[idle compaction failed: " ~ failed ~ "]"));
-                else if (atomicLoad(agent.control).isCancelled) writeln(console.dim("[idle compaction cancelled]"));
+                else if (agent.control.nonNull.isCancelled) writeln(console.dim("[idle compaction cancelled]"));
                 continue;
             }
             else if (r.outcome == Outcome.stopped && updateHint.length)
@@ -2291,7 +2289,7 @@ int runMain(string[] args)
                     writeln(contextReport(agent));
                     continue;
                 case "/queue":
-                    writeln(runQueueCommand(queue, atomicLoad(agent.control), arg));
+                    writeln(runQueueCommand(queue, agent.control.nonNull, arg));
                     continue;
                 case "/plan":
                     writeln(planText(agent));
@@ -2469,3 +2467,10 @@ int runMain(string[] args)
     goodbye();
     return 0;
 }
+
+// nano.nullaudit for this module (dub test leaves app.d out, so
+// null_audit_test.d can't import it): fails the build on a field or global
+// holding a bare class reference.
+static assert(imported!"nano.nullaudit".bareRefs!(app)().length == 0,
+    "bare class references (use NotNull!C, Option!C or @nullable(\"why\")): "
+    ~ imported!"std.array".join(imported!"nano.nullaudit".bareRefs!(app)(), ", "));

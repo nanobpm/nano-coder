@@ -114,7 +114,8 @@ fi
 # `Nullable!` doesn't force handling either (its `.get` on empty returns
 # T.init in release builds), so its uses only go down
 # (scripts/nullable-budget). Class declarations other than exceptions are
-# capped by scripts/class-budget, so a new reference type is a visible
+# capped by scripts/class-budget (`static class`, used only for helpers
+# inside unittests, isn't counted), so a new reference type is a visible
 # decision: prefer a struct, an enum or a SumType for a value.
 nfiles=$(find source -name '*.d' | wc -l | tr -d ' ')
 files=$(find source -name '*.d' | sort)
@@ -126,5 +127,18 @@ if [ "$(printf '%s' "$classnull" | grep -c .)" -gt "$(cat scripts/class-null-bud
 fi
 ratchet "outside *_test.d" "$(printf '%s' "$classnull" | grep -c .)" scripts/class-null-budget "null checks on class references"
 ratchet "outside *_test.d" "$(find source -name '*.d' ! -name '*_test.d' | xargs grep -hE 'Nullable!' | grep -vE '^[[:space:]]*//' | grep -oE 'Nullable!' | wc -l | tr -d ' ')" scripts/nullable-budget "\`Nullable!\` uses (use nano.option.Option!T)"
-ratchet "outside *_test.d" "$(find source -name '*.d' ! -name '*_test.d' | xargs grep -hE '^[[:space:]]*((final|abstract|private|static|public)[[:space:]]+)*class[[:space:]]+[A-Z]' | grep -vcE 'class[[:space:]]+[A-Za-z0-9_]*(Error|Exception)\b|:[[:space:]]*Exception')" scripts/class-budget "class declarations (exceptions aside)"
+ratchet "outside *_test.d" "$(find source -name '*.d' ! -name '*_test.d' | xargs grep -hE '^[[:space:]]*((final|abstract|private|public)[[:space:]]+)*class[[:space:]]+[A-Z]' | grep -vcE 'class[[:space:]]+[A-Za-z0-9_]*(Error|Exception)\b|:[[:space:]]*Exception')" scripts/class-budget "class declarations (exceptions aside)"
+# Fields and globals: source/nano/nullaudit.d checks at compile time that
+# no field or module-level variable holds a bare class reference; each is
+# `NotNull!C`, `Option!C`, or marked `@nullable("why")`. The marks are
+# capped by scripts/nullable-mark-budget, and null_audit_test.d must list
+# every module (app.d checks itself).
+missing=$(find source -name '*.d' ! -name '*_test.d' ! -path source/app.d | sort | xargs sed -n 's/^module \([a-z_.]*\);.*/\1/p' | while read -r m; do
+    grep -q "^static import $m;" source/nano/null_audit_test.d || echo "$m"
+done)
+if [ -n "$missing" ]; then
+    echo "Error: add to source/nano/null_audit_test.d (static import and the modules list): $missing" >&2
+    status=1
+fi
+ratchet "outside *_test.d" "$(find source -name '*.d' ! -name '*_test.d' | xargs grep -hE '^[[:space:]]*@nullable\(' | wc -l | tr -d ' ')" scripts/nullable-mark-budget "\`@nullable\` marks"
 exit $status

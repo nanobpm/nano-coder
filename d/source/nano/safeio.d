@@ -594,7 +594,9 @@ Join!R spawnDaemon(R, Args...)(R function(Args) @safe fn, auto ref Args args)
 
 import std.meta : allSatisfy, staticMap;
 import std.traits : Unqual;
-private final class SpawnBox(Args...) { staticMap!(Unqual, Args) args; }
+// `= void`: an argument type may have no default (`@disable this()`, as
+// NotNull does); each slot is filled by `moveEmplace` before any read.
+private final class SpawnBox(Args...) { staticMap!(Unqual, Args) args = void; }
 
 /// `@trusted`: the arguments (checked sendable by `spawn`) are moved into a
 /// box only the new thread can reach; `shared` is stripped for the move and
@@ -602,10 +604,10 @@ private final class SpawnBox(Args...) { staticMap!(Unqual, Args) args; }
 /// into a box read only after `join`.
 private Join!R startSpawned(R, Args...)(R function(Args) @safe fn, ref Args args, bool daemon) @trusted
 {
-    import core.lifetime : move;
+    import core.lifetime : move, moveEmplace;
     auto box = new SpawnBox!Args;
     static foreach (i; 0 .. Args.length)
-        box.args[i] = move(*cast(Unqual!(Args[i])*) &args[i]);
+        moveEmplace(*cast(Unqual!(Args[i])*) &args[i], box.args[i]);
     Join!R h;
     static if (is(R == void))
         auto t = new Thread({ mixin("fn(" ~ callArgs!(Args.length) ~ ");"); });

@@ -7,6 +7,7 @@ module nano.mdblock;
 
 @safe:
 
+import nano.option : NotNull, notNull;
 import std.array : appender, join;
 import std.string : strip, stripLeft, stripRight, indexOf;
 import nano.mdinline;
@@ -40,7 +41,7 @@ struct Item
 /// lines excluded) and, for a list, the line each item starts on.
 struct Parsed
 {
-    Block block;
+    NotNull!Block block;
     size_t start, end;
     size_t[] items;
 }
@@ -262,7 +263,7 @@ Parsed[] parseLines(string[] lines) pure
         if (isBlank(line)) { i++; continue; }
         auto ind = indentOf(line);
         auto start = i;
-        void add(Block b, size_t end, size_t[] items = null) { out_ ~= Parsed(b, start, end, items); }
+        void add(Block b, size_t end, size_t[] items = null) { out_ ~= Parsed(notNull(b), start, end, items); }
 
         if (ind >= 4)
         {

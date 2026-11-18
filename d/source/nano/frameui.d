@@ -6,6 +6,7 @@ module nano.frameui;
 
 @safe:
 
+import nano.option : NotNull;
 import nano.frame;
 import nano.lineedit : writeFd, ttyOut, terminalWidth, terminalHeight;
 import nano.safeio : closeFd, dup2Fd, dupFd, lineBufferStdout, pipeFds, pollFds, readFd_ = readFd, setNonBlocking, stdErr, stdOut, Chan, Isolated, spawnDaemon;
@@ -50,9 +51,10 @@ struct FrameUi
         int[2] p, w;
         if (pipeFds(p) != 0) return FrameUi.init;
         if (pipeFds(w) != 0) { closeFd(p[0]); closeFd(p[1]); return FrameUi.init; }
-        auto f = new FrameState;
+        immutable tty = dupFd(1);
+        auto f = new FrameState(new FrameRenderer((string s) { writeFd(tty, s); }));
         f.status = status;
-        f.tty = dupFd(1);
+        f.tty = tty;
         f.readFd = p[0];
         f.wakeFd = w[0];
         setNonBlocking(f.readFd);
@@ -62,8 +64,6 @@ struct FrameUi
         ttyOut = f.tty;
         // Line-buffered: a pipe would otherwise hold whole blocks back.
         lineBufferStdout();
-        immutable tty = f.tty;
-        f.renderer = new FrameRenderer((string s) { writeFd(tty, s); });
         writeFd(f.tty, "\x1b[?25l");
         f.render();
         auto ui = FrameUi(Chan!Request.make, f.tty, p[1], w[1]);
@@ -256,10 +256,12 @@ private final class FrameState
     int tty = -1, readFd = -1, wakeFd = -1;
     Transcript transcript;
     immutable(string)[] editorRows;
-    FrameRenderer renderer;
+    NotNull!FrameRenderer renderer;
     bool paused;
     size_t lastW, lastH;
     Debouncer debounce = Debouncer(150);
+
+    this(FrameRenderer renderer) { this.renderer = renderer; }
     StatusFn status;
     /// A turn is running: the prompt shows the spinner and `clock`.
     bool busy;

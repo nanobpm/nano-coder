@@ -75,6 +75,102 @@ struct Option(T)
     bool isNone() const { return !present; }
 }
 
+/// Marks a class-typed field or global that may be null on purpose, with
+/// the reason: `@nullable("set once startup finishes") Agent agent;`.
+/// nano.nullaudit reports bare class references without it, and check-safe
+/// counts the marks (scripts/nullable-mark-budget).
+struct nullable { string why; }
+
+/// A class or interface reference that is never null: construction and
+/// assignment halt on null, and there is no default (`NotNull!C x;` doesn't
+/// compile). It reads as the reference itself (`alias this`), so a field can
+/// move from `C` to `NotNull!C` without touching its uses.
+struct NotNull(T) if (is(T == class) || is(T == interface))
+{
+    private T value;
+
+    @disable this();
+
+    this(T x)
+    {
+        if (load(x) is null) assert(0, "NotNull!" ~ T.stringof ~ " given null");
+        store(value, x);
+    }
+
+    void opAssign(T x)
+    {
+        if (load(x) is null) assert(0, "NotNull!" ~ T.stringof ~ " given null");
+        store(value, x);
+    }
+
+    @disable void opAssign(typeof(null));
+
+    static if (is(T == shared))
+    {
+        // Held in a shared object (a field of a `shared` class).
+        this(T x) shared
+        {
+            if (load(x) is null) assert(0, "NotNull!" ~ T.stringof ~ " given null");
+            store(value, x);
+        }
+
+        T nonNull() const { return load(value); }
+        T nonNull() const shared { return load(value); }
+    }
+    else
+        inout(T) nonNull() inout { return value; }
+
+    alias nonNull this;
+}
+
+/// Reads and writes of a reference, atomic when it is `shared`
+/// (-preview=nosharedaccess treats even reading a shared parameter as access).
+private auto load(R)(ref R r)
+{
+    static if (is(R == shared))
+    {
+        import core.atomic : atomicLoad;
+        return atomicLoad(r);
+    }
+    else
+        return r;
+}
+
+private void store(R)(ref R r, ref R v)
+{
+    static if (is(R == shared))
+    {
+        import core.atomic : atomicLoad, atomicStore;
+        atomicStore(r, atomicLoad(v));
+    }
+    else
+        r = v;
+}
+
+/// `NotNull!T(x)` with the type inferred; halts on null.
+NotNull!T notNull(T)(T x) { return NotNull!T(load(x)); }
+
+unittest
+{
+    static class C { int n = 7; }
+    auto c = notNull(new C);
+    assert(c.n == 7);           // reads through to the reference
+    C plain = c;                // and converts back to it
+    assert(plain.n == 7);
+    c = new C;
+    static assert(!__traits(compiles, { NotNull!C x; }));
+    static assert(!__traits(compiles, { auto x = notNull(new C); x = null; }));
+    struct Holder { NotNull!C c; }
+    static assert(!__traits(compiles, { Holder h; }));
+}
+
+unittest
+{
+    static class S { int read() shared const @safe { return 3; } }
+    auto s = notNull(new shared S);
+    assert(s.read == 3);         // atomic read, then the shared method
+}
+
 /// A present `Option`; halts on a null reference.
 Option!T some(T)(T x) { return Option!T(x); }
 

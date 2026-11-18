@@ -40,7 +40,9 @@ budgets allow (`scripts/trusted-budget` outside `safeio.d`,
 `Nullable!`: check-safe caps null checks on class references, `Nullable!`
 uses and class declarations (`scripts/class-null-budget`,
 `scripts/nullable-budget`, `scripts/class-budget`), so prefer a struct, a
-`SumType` or an always-present object. The build uses `-preview=dip1000`
+`SumType` or an always-present object. A field or global holding a class
+reference is `NotNull!C`, `Option!C` or `@nullable("why") C`; the build
+checks every module for this at compile time (`source/nano/nullaudit.d`). The build uses `-preview=dip1000`
 and `-preview=nosharedaccess` and requires LDC 1.43 or later (dub rejects
 DMD and GDC). CI also runs D-Scanner with the bug-finding checks in
 `dscanner.ini`, and `.github/CODEOWNERS` routes changes to `safeio.d`, the
