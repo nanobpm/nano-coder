@@ -85,7 +85,7 @@ Entry[] load(string path)
     foreach (line; readText(path).lineSplitter)
     {
         ++n;
-        if (!line.startsWith(`{"type":"message"`)) continue;
+        if (!line.canFind(`"message"`)) continue; // cheap pre-filter; any JSON spacing is valid
         try
         {
             auto rec = parseJSON(line);

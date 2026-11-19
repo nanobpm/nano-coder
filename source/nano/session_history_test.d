@@ -185,3 +185,17 @@ unittest
     auto out_ = find(log.path, `{"pattern":"lease"}`);
     assert(out_.canFind("[3 matches]") && out_.canFind("no method named `renew`"), out_);
 }
+
+// Logs written by other tools (the compaction eval writes Python's
+// `{"type": "message", ...}`) are valid JSON and must be searched too.
+unittest
+{
+    import std.file : write;
+    auto dir = fresh("spaced");
+    scope (exit) rmdirRecurse(dir);
+    auto path = buildPath(dir, "s.jsonl");
+    write(path, `{"type": "session", "data": {"version": 1, "id": "s", "created_at": "2026-01-01T00:00:00+00:00"}}` ~ "\n"
+        ~ `{"type": "message", "data": {"role": "tool", "content": "error: no method named x", "tool_call_id": "c", "name": "bash"}}` ~ "\n");
+    auto out_ = find(path, `{"pattern":"no method named"}`);
+    assert(out_.startsWith("#2 tool bash"), out_);
+}

@@ -19,7 +19,7 @@ import std.format : format;
 import std.string : strip, startsWith;
 static import std.string;
 import std.datetime.systime : SysTime, Clock;
-import std.algorithm : sort, any, filter;
+import std.algorithm : sort, any, filter, canFind;
 import std.array : array, join, split;
 import std.range : walkLength, take;
 import std.conv : to;
@@ -171,7 +171,7 @@ private const(char)[][] committedLines(const(ubyte)[] bytes)
 /// The input text of a committed log line, or null when it isn't an input record.
 private string inputText(const(char)[] line)
 {
-    if (!line.startsWith(`{"type":"input"`)) return null;
+    if (!line.canFind(`"input"`)) return null; // cheap pre-filter; any JSON spacing is valid
     try
     {
         auto rec = parseJSON(line);
