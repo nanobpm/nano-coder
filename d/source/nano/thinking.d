@@ -935,3 +935,192 @@ unittest
     auto res = resolve(Thinking.init, &t, ProviderKind.openai, none, "local", &rep);
     assert(res.request() == Request(Request.Kind.templateEffort, "high"));
 }
+
+version (unittest)
+{
+    private enum Request reqNone = Request.init, reqOff = Request(Request.Kind.off),
+        reqAdaptiveOn = Request(Request.Kind.adaptiveOn);
+    private Request reqEffort(string l) { return Request(Request.Kind.effort, l); }
+    private Thinking off_() { return Thinking.parse("off"); }
+    /// resolve with Rust's argument order: global, session (or none), kind, provider, model.
+    private Resolved rv(Thinking global, Thinking session, bool hasSession, ProviderKind kind, ProviderConfig p,
+        string model, scope Reported* reported = null)
+    {
+        return resolve(global, hasSession ? &session : null, kind, p, model, reported);
+    }
+    private Resolved rs(Thinking session, ProviderKind kind, ProviderConfig p, string model, scope Reported* rep = null)
+    {
+        return rv(Thinking.init, session, true, kind, p, model, rep);
+    }
+    private Resolved rd(ProviderKind kind, ProviderConfig p, string model)
+    {
+        return rv(Thinking.init, Thinking.init, false, kind, p, model);
+    }
+}
+
+// rust: thinking.rs::a_preserved_disable_control_unlocks_the_temperature
+// rust: thinking.rs::adaptive_off_request_keeps_its_disable_control_under_an_effort_override
+// rust: thinking.rs::effort_only_override_with_default_effective_is_no_complete_control
+unittest // an output_config.effort override owns only the effort
+{
+    enum A = ProviderKind.anthropic;
+    auto p = prov(`extra_body = { output_config = { effort = "low" } }`);
+    auto r = rs(off_, A, p, "claude-sonnet-4-7");
+    assert(r.effective.kind == Thinking.Kind.off && r.extraBodyOverride == "output_config");
+    assert(r.request == reqOff, "the disable control is preserved");
+    assert(!r.extraBodyThinkingOn.isNull && r.extraBodyThinkingOn.get, "the effort override enables thinking");
+    assert(!r.anthropicThinkingOn, "the emitted disabled control wins: no temperature lock");
+    r = rs(lv("high"), A, p, "claude-sonnet-4-7");
+    assert(r.request == reqAdaptiveOn && r.anthropicThinkingOn && r.alwaysAnthropicThinking);
+    r = rs(off_, A, p, "claude-sonnet-5.5");
+    assert(r.modelAlwaysThinks && r.anthropicThinkingOn, "an always-thinking model locks regardless");
+
+    r = rd(A, p, "claude-sonnet-4-7");
+    assert(r.request == reqNone, "Default emits no adaptive enable half");
+    assert(r.extraBodyThinkingOn.get && !r.anthropicThinkingOn && !r.alwaysAnthropicThinking);
+    p = prov(`extra_body = { thinking = { type = "enabled" } }`);
+    r = rd(A, p, "claude-sonnet-4-7");
+    assert(r.request == reqNone && r.anthropicThinkingOn && r.alwaysAnthropicThinking, "a complete override locks");
+}
+
+// rust: thinking.rs::an_extra_body_control_overrides_a_setting_fitted_to_default
+unittest
+{
+    enum O = ProviderKind.openai;
+    auto p = prov(`extra_body = { reasoning_effort = "low" }`);
+    auto r = rs(lv("high"), O, p, "some-unknown-model");
+    assert(!r.levels.length && r.effective.isDefault && r.overridden);
+    assert(r.warning.canFind("extra_body") && r.warning.canFind("high"), r.warning);
+    r = rs(lv("high"), O, ProviderConfig.init, "some-unknown-model");
+    assert(!r.overridden && r.warning.canFind("no thinking levels are known"), r.warning);
+    r = rd(O, p, "some-unknown-model");
+    assert(!r.overridden && r.warning is null, "no requested setting means no override");
+}
+
+// rust: thinking.rs::default_aliases_in_configured_levels_are_rejected
+// rust: thinking.rs::off_aliases_in_configured_levels_are_rejected
+unittest
+{
+    import std.format : format;
+    enum O = ProviderKind.openai;
+    foreach (alias_; ["default", "auto", "Model Default", " DEFAULT "])
+    {
+        auto r = rs(lv("low"), O, prov(format(`thinking_levels = ["%s", "low"]`, alias_)), "x");
+        assert(r.levels == ["low"], alias_);
+        assert(r.warning.canFind("the model default is always available"), r.warning);
+    }
+    auto r = rd(ProviderKind.anthropic, prov(`thinking_levels = ["default"]`), "some-claude");
+    assert(!r.levels.length && !r.alwaysAnthropicThinking, "an empty profile is not always-thinking");
+
+    r = rs(off_, O, prov(`thinking_levels = ["none", "low"]`), "x");
+    assert(r.levels == ["low"] && r.effective.isDefault);
+    assert(r.warning.canFind("an off alias is not a level") && r.warning.canFind(`"none"`)
+        && r.warning.canFind("can't turn thinking off"), r.warning);
+    r = rs(off_, O, prov(`thinking_levels = ["off", "low"]`), "x");
+    assert(r.request == reqOff && r.warning is null, r.warning);
+    r = rs(off_, O, prov(`thinking_levels = ["disabled"]`), "x");
+    assert(r.warning.canFind("an off alias is not a level") && r.warning.canFind(`"disabled"`), r.warning);
+}
+
+// rust: thinking.rs::default_on_an_always_thinking_model_still_locks_the_temperature
+unittest
+{
+    enum A = ProviderKind.anthropic;
+    foreach (m; ["claude-fable-5", "claude-sonnet-5.5", "claude-opus-5.5"])
+    {
+        auto r = rd(A, ProviderConfig.init, m);
+        assert(r.effective.isDefault && r.anthropicThinkingOn, m);
+    }
+    assert(!rd(A, ProviderConfig.init, "claude-sonnet-4-6").anthropicThinkingOn);
+    auto r = rd(A, ProviderConfig.init, "some-unknown-model");
+    assert(!r.levels.length && !r.anthropicThinkingOn);
+    assert(rs(lv("low"), A, ProviderConfig.init, "claude-fable-5").anthropicThinkingOn);
+    r = rv(off_, Thinking.init, false, A, ProviderConfig.init, "claude-fable-5");
+    assert(r.effective.isDefault && r.anthropicThinkingOn, "an unsendable off still leaves it thinking");
+}
+
+// rust: thinking.rs::drop_params_strips_the_preserved_half_of_an_output_config_override
+unittest
+{
+    enum A = ProviderKind.anthropic;
+    auto p = prov("drop_params = [\"thinking\"]\nextra_body = { output_config = { effort = \"low\" } }");
+    auto r = rs(lv("high"), A, p, "claude-sonnet-4-7");
+    assert(r.extraBodyOverride == "output_config" && r.dropped && r.request == reqNone);
+    assert(r.warning.canFind(`"thinking"`) && r.warning.canFind("drop_params"), r.warning);
+    r = rs(off_, A, p, "claude-sonnet-4-7");
+    assert(r.dropped && r.request == reqNone && !r.anthropicThinkingOn);
+    auto both = prov("drop_params = [\"output_config\", \"thinking\"]\nextra_body = { output_config = { effort = \"low\" } }");
+    r = rs(lv("high"), A, both, "claude-sonnet-4-7");
+    assert(!r.overridden && r.dropped && r.request == reqNone, "a dropped override is no override");
+    r = rs(lv("high"), A, p, "claude-sonnet-4-5");
+    assert(r.anthropic == AnthropicStyle.budget && r.overridden && !r.dropped && r.request == reqNone);
+}
+
+// rust: thinking.rs::muse_is_analysed_as_a_responses_wire
+unittest
+{
+    enum M = ProviderKind.muse;
+    enum lv3 = "thinking_levels = [\"low\", \"medium\", \"high\"]\n";
+    auto r = rs(lv("high"), M, prov(lv3), "muse-spark-1.3");
+    assert(r.wire == Wire.responses && r.request == reqEffort("high"));
+    r = rs(lv("high"), M, prov(lv3 ~ `extra_body = { reasoning = { summary = "auto" } }`), "muse-spark-1.3");
+    assert(!r.overridden && r.request == reqEffort("high"));
+    r = rs(lv("high"), M, prov(lv3 ~ `extra_body = { reasoning = { effort = "low" } }`), "muse-spark-1.3");
+    assert(r.overridden && r.extraBodyOverride == "reasoning" && r.request == reqNone);
+    r = rs(lv("high"), M, prov(lv3 ~ `extra_body = { reasoning_effort = "low" }`), "muse-spark-1.3");
+    assert(!r.overridden && r.request == reqEffort("high"), "a Chat Completions key isn't a Responses control");
+}
+
+// rust: thinking.rs::picks_the_request_form_for_the_api
+unittest
+{
+    enum A = ProviderKind.anthropic, C = ProviderKind.githubCopilot;
+    auto none = ProviderConfig.init;
+    auto r = rs(lv("high"), A, none, "claude-opus-4-7");
+    assert(r.request == reqEffort("high") && r.anthropicThinkingOn);
+    assert(rs(lv("high"), A, none, "claude-sonnet-4-5").request == Request(Request.Kind.budget, null, 16384));
+    r = rs(lv("high"), C, none, "claude-sonnet-4.5");
+    assert(r.wire == Wire.anthropicMessages && r.request == Request(Request.Kind.budget, null, 16384));
+    r = rs(lv("high"), C, none, "gpt-5.6-sol");
+    assert(r.wire == Wire.responses && r.request == reqEffort("high") && !r.anthropicThinkingOn);
+    r = rs(lv("high"), ProviderKind.openai, none, "anthropic/claude-sonnet-4.5");
+    assert(r.wire == Wire.chatCompletions && r.request == reqEffort("high"));
+}
+
+// rust: thinking.rs::unrelated_nested_extra_body_options_do_not_suppress_the_generated_control
+unittest
+{
+    enum C = ProviderKind.githubCopilot, O = ProviderKind.openai;
+    auto r = rs(lv("high"), C, prov(`extra_body = { reasoning = { summary = "auto" } }`), "gpt-5.6-sol");
+    assert(r.wire == Wire.responses && !r.overridden && r.extraBodyOverride is null);
+    assert(r.request == reqEffort("high") && r.warning is null);
+    r = rs(lv("high"), C, prov(`extra_body = { reasoning = { effort = "low", summary = "auto" } }`), "gpt-5.6-sol");
+    assert(r.overridden && r.extraBodyOverride == "reasoning" && r.request == reqNone);
+    assert(rs(lv("high"), C, prov(`extra_body = { reasoning = "high" }`), "gpt-5.6-sol").overridden);
+
+    auto sw = Reported(["off", ON], false, Format.templateSwitch);
+    r = rs(lv("high"), O, prov(`extra_body = { chat_template_kwargs = { foo = true } }`), "local", &sw);
+    assert(!r.overridden && r.request == Request(Request.Kind.templateSwitch, null, 0, true));
+    r = rs(lv("high"), O, prov(`extra_body = { chat_template_kwargs = { enable_thinking = false } }`), "local", &sw);
+    assert(r.overridden && r.request == reqNone);
+    auto ef = Reported(["low", "high"], false, Format.templateEffort);
+    r = rs(lv("high"), O, prov(`extra_body = { chat_template_kwargs = { foo = true } }`), "local", &ef);
+    assert(!r.overridden && r.request == Request(Request.Kind.templateEffort, "high"));
+    r = rs(lv("high"), O, prov(`extra_body = { chat_template_kwargs = { reasoning_effort = "low" } }`), "local", &ef);
+    assert(r.overridden && r.request == reqNone);
+    assert(rs(lv("high"), O, prov(`extra_body = { reasoning_effort = "low" }`), "gpt-5").overridden);
+}
+
+// rust: thinking.rs::unrelated_output_config_fields_do_not_enable_thinking
+unittest
+{
+    enum A = ProviderKind.anthropic;
+    auto r = rd(A, prov(`extra_body = { output_config = { format = "json" } }`), "claude-sonnet-4-6");
+    assert(r.extraBodyThinkingOn.isNull && !r.anthropicThinkingOn && !r.alwaysAnthropicThinking);
+    r = rd(A, prov(`extra_body = { output_config = { effort = "high", format = "json" } }`), "claude-sonnet-4-6");
+    assert(r.extraBodyThinkingOn.get && r.request == reqNone && !r.anthropicThinkingOn);
+    r = rd(A, prov(`extra_body = { output_config = { effort = "none" } }`), "claude-sonnet-4-6");
+    assert(!r.extraBodyThinkingOn.isNull && !r.extraBodyThinkingOn.get && !r.anthropicThinkingOn);
+    r = rd(A, prov(`extra_body = { output_config = { format = "json" }, thinking = true }`), "claude-sonnet-4-6");
+    assert(r.extraBodyThinkingOn.get && r.anthropicThinkingOn, "a thinking control past a non-thinking output_config");
+}
