@@ -245,19 +245,47 @@ static assert(defaultTimeoutSecsValue < workerIdleKillSecs,
 /// Overrides the default timeout in seconds; an explicit `timeout_secs` wins.
 enum providerTimeoutSecsEnv = "NANO_CODER_PROVIDER_TIMEOUT_SECS";
 
-/// The effective default stream idle timeout: the env override when it holds
-/// a positive integer, else `defaultTimeoutSecsValue`.
-long defaultTimeoutSecs()
+/// A positive integer env override, or 0 when unset or non-numeric (a bad
+/// value means "no override", never a crash at startup).
+private long envPositiveLong(string name)
 {
     import std.conv : to;
     import std.string : strip;
     try
     {
-        auto v = environment.get(providerTimeoutSecsEnv, "").strip.to!long;
+        auto v = environment.get(name, "").strip.to!long;
         if (v > 0) return v;
     }
     catch (Exception) {} // a non-numeric env value is ignored; use the default
-    return defaultTimeoutSecsValue;
+    return 0;
+}
+
+/// The effective default stream idle timeout: the env override when it holds
+/// a positive integer, else `defaultTimeoutSecsValue`.
+long defaultTimeoutSecs()
+{
+    auto v = envPositiveLong(providerTimeoutSecsEnv);
+    return v > 0 ? v : defaultTimeoutSecsValue;
+}
+
+/// The default bash heartbeat interval (`bash_heartbeat_secs`): how often a
+/// running bash call emits a supervisor-visible "still running" note. It must
+/// stay below the worker idle-kill budget, or a healthy long command looks dead.
+enum long defaultBashHeartbeatSecsValue = 60;
+static assert(defaultBashHeartbeatSecsValue < workerIdleKillSecs,
+    "default bash heartbeat must stay below the worker idle-kill budget");
+/// Overrides the heartbeat interval in seconds; an explicit
+/// `bash_heartbeat_secs` config value wins over it.
+enum bashHeartbeatSecsEnv = "NANO_CODER_BASH_HEARTBEAT_SECS";
+
+/// The effective bash heartbeat interval in seconds: an explicit `configSecs`
+/// (> 0) wins, else the env override when it holds a positive integer, else
+/// `defaultBashHeartbeatSecsValue`.
+long bashHeartbeatIntervalSecs(long configSecs)
+{
+    if (configSecs > 0) return configSecs;
+    auto v = envPositiveLong(bashHeartbeatSecsEnv);
+    return v > 0 ? v : defaultBashHeartbeatSecsValue;
 }
 
 /// The names of the providers to offer in listings: `disabled` and `hidden` ones dropped, sorted.
@@ -381,6 +409,10 @@ struct Config
     string titleModel;
     long maxIterations = 0;
     long bashTimeoutSecs = 600;
+    /// Bash heartbeat interval (`bash_heartbeat_secs`): how often a running
+    /// bash call emits a supervisor-visible "still running" note. 0 (the
+    /// default) means unset — `defaultBashHeartbeatSecsValue` applies.
+    long bashHeartbeatSecs = 0;
     ProviderConfig[string] providers;
     /// Providers with a `[providers.*]` table in the config file (presets the user touched, or their own).
     string[] userProviders;
@@ -470,6 +502,7 @@ struct Config
         if (auto v = "session_titles" in doc) c.sessionTitles = v.boolean;
         if (auto v = "title_model" in doc) c.titleModel = v.str;
         if (auto v = "bash_timeout_secs" in doc) c.bashTimeoutSecs = v.integer;
+        if (auto v = "bash_heartbeat_secs" in doc) c.bashHeartbeatSecs = v.integer;
         if (auto v = "plan_tools" in doc) c.planTools = v.boolean;
         if (auto v = "outcome_tool" in doc) c.outcomeTool = v.boolean;
         if (auto v = "reminders" in doc) c.reminders = v.boolean;

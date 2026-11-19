@@ -377,6 +377,14 @@ final class AcpServer : AgentEvents
 
     void send(JSONValue msg) { writeOut(msg.toString); }
 
+    /// A bash "still running" heartbeat: a `session/update` the supervising
+    /// worker sees on the JSON-RPC stream. It is not part of the model's
+    /// context or any tool result — pure liveness, no token cost.
+    void heartbeat(string line)
+    {
+        update(JSONValue(["sessionUpdate": JSONValue("agent_thought_chunk"), "content": textBlock(line)]));
+    }
+
     private void writeOut(string line)
     {
         outLock.lock();
