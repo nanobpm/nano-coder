@@ -235,24 +235,24 @@ agent/probe.rs::a_windowless_result_keeps_the_window_slot_but_publishes_the_rest
 agent/probe.rs::begin_detect_clears_every_report_and_invalidates_in_flight_probes	todo	ProbeState refactor (#185); triage at the end
 attachment.rs::crafted_metadata_cannot_escape_the_attachments_dir	test
 attachment.rs::exists_rejects_a_tampered_stored_file	test
-attachment.rs::jpeg_composites_transparency_onto_white_not_black	todo
-attachment.rs::jpeg_half_transparent_blends_toward_white	todo
-attachment.rs::prepare_applies_exif_orientation_before_reencoding	todo
+attachment.rs::jpeg_composites_transparency_onto_white_not_black	na	D composites in the external encoder: ImageMagick gets -background white -alpha remove; sips flattens transparent PNG to white (checked on macOS 2026-11-19)
+attachment.rs::jpeg_half_transparent_blends_toward_white	na	D composites in the external encoder: ImageMagick gets -background white -alpha remove; sips flattens transparent PNG to white (checked on macOS 2026-11-19)
+attachment.rs::prepare_applies_exif_orientation_before_reencoding	gap	D reports oriented dimensions, and the magick path rotates pixels (-auto-orient), but the sips path is not verified to rotate pixels before re-encoding
 attachment.rs::prepare_downscales_oversized_images	test
 attachment.rs::prepare_errors_when_minimum_size_still_exceeds_byte_cap	test
 attachment.rs::prepare_errors_when_no_implemented_codec_is_accepted	test
 attachment.rs::prepare_keeps_small_images_unchanged	test
-attachment.rs::prepare_preserves_narrow_aspect_ratio_while_shrinking	todo
+attachment.rs::prepare_preserves_narrow_aspect_ratio_while_shrinking	test
 attachment.rs::prepare_reencodes_unaccepted_source_into_an_accepted_codec	test
-attachment.rs::prepare_reencodes_when_type_not_accepted	todo
+attachment.rs::prepare_reencodes_when_type_not_accepted	test
 attachment.rs::prepare_reports_oriented_dimensions_on_passthrough_path	test
-attachment.rs::prepare_respects_accepted_types_when_shrinking	todo
+attachment.rs::prepare_respects_accepted_types_when_shrinking	test
 attachment.rs::prepare_shrinks_until_under_byte_cap	test
-attachment.rs::read_base64_rejects_a_tampered_stored_file	todo
-attachment.rs::read_for_limits_ignores_lying_stored_dimensions	todo
-attachment.rs::read_for_limits_omits_when_limits_cannot_be_met	todo
+attachment.rs::read_base64_rejects_a_tampered_stored_file	test
+attachment.rs::read_for_limits_ignores_lying_stored_dimensions	test
+attachment.rs::read_for_limits_omits_when_limits_cannot_be_met	test
 attachment.rs::read_for_limits_passes_compliant_bytes_through	test
-attachment.rs::read_for_limits_reencodes_for_a_stricter_media_type	todo
+attachment.rs::read_for_limits_reencodes_for_a_stricter_media_type	test
 attachment.rs::read_for_limits_rejects_missing_and_tampered_files	test
 attachment.rs::scaled_dimensions_preserve_aspect_and_cap	test
 attachment.rs::sha256_is_stable	test

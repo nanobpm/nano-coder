@@ -618,3 +618,87 @@ unittest
     assert(Attachment.fromJSON(a.toJSON) == a);
     assert(a.placeholder == "[image: /x.png, 20×10]");
 }
+
+// rust: attachment.rs::prepare_reencodes_when_type_not_accepted
+// rust: attachment.rs::prepare_respects_accepted_types_when_shrinking
+// rust: attachment.rs::prepare_preserves_narrow_aspect_ratio_while_shrinking
+unittest
+{
+    // A stand-in encoder that scales like sips -Z / magick -resize: the
+    // longest side becomes `side`, the short side follows the aspect ratio.
+    uint srcW, srcH;
+    Encoder enc = (const(ubyte)[] src, ImageFormat codec, uint side) @safe {
+        uint w = srcW >= srcH ? side : cast(uint)(cast(ulong) srcW * side / srcH);
+        uint h = srcW >= srcH ? cast(uint)(cast(ulong) srcH * side / srcW) : side;
+        if (w == 0) w = 1;
+        if (h == 0) h = 1;
+        auto size = cast(size_t) w * h / 4 + 64;
+        return codec == ImageFormat.png ? fakePng(w, h, size) : fakeJpeg(w, h) ~ new immutable(ubyte)[](size);
+    };
+    // GIF to a JPEG/PNG model: re-encoded as JPEG, stored as .jpg.
+    srcW = 20; srcH = 20;
+    auto gif = cast(immutable(ubyte)[]) "GIF89a\x14\0\x14\0";
+    ImageLimits jp = {acceptedMediaTypes: ["image/jpeg", "image/png"]};
+    auto g = prepare(gif, ImageFormat.gif, jp, enc);
+    assert(g.mediaType == "image/jpeg" && g.extension == "jpg" && sniff(g.bytes).get == ImageFormat.jpeg);
+    // A PNG-only model never gets a JPEG while shrinking.
+    srcW = 2000; srcH = 2000;
+    ImageLimits pngOnly = {acceptedMediaTypes: ["image/png"], maxBytes: 50_000};
+    auto p = prepare(fakePng(2000, 2000, 4_000_000), ImageFormat.png, pngOnly, enc);
+    assert(p.bytes.length <= 50_000 && p.mediaType == "image/png" && p.extension == "png");
+    assert(sniff(p.bytes).get == ImageFormat.png);
+    // A 100:1 panorama shrinks along its longest side; the short side
+    // follows the ratio below 16 instead of being pinned there.
+    srcW = 2400; srcH = 24;
+    ImageLimits capped = {maxBytes: 4_000, acceptedMediaTypes: ["image/png"]};
+    auto pan = prepare(fakePng(2400, 24, 100_000), ImageFormat.png, capped, enc);
+    assert(pan.bytes.length <= 4_000 && pan.height < 16, format("%s×%s", pan.width, pan.height));
+    assert(cast(double) pan.width / pan.height > 60);
+}
+
+// rust: attachment.rs::read_base64_rejects_a_tampered_stored_file
+// rust: attachment.rs::read_for_limits_ignores_lying_stored_dimensions
+// rust: attachment.rs::read_for_limits_omits_when_limits_cannot_be_met
+// rust: attachment.rs::read_for_limits_reencodes_for_a_stricter_media_type
+unittest
+{
+    import std.base64 : Base64;
+    import std.file : tempDir, rmdirRecurse, write, exists_ = exists;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    auto dir = buildPath(tempDir, format("nano-att-limits-%s", thisProcessID));
+    scope (exit) if (exists_(dir)) rmdirRecurse(dir);
+    Attachment stored(immutable(ubyte)[] b, string ext, string media)
+    {
+        Attachment a = {mediaType: media, path: "/x." ~ ext, sha256: sha256Hex(b), bytes: b.length, extension: ext};
+        store(dir, a, b);
+        return a;
+    }
+    Encoder enc = (const(ubyte)[] src, ImageFormat codec, uint side) @safe =>
+        codec == ImageFormat.png ? fakePng(side, side, 200) : fakeJpeg(side, side);
+    ImageLimits lim;
+
+    // The log lies that a 2000×2000 image is 10×10: the real size decides.
+    auto big = stored(fakePng(2000, 2000), "png", "image/png");
+    big.width = 10;
+    big.height = 10;
+    auto ready = readForLimits(dir, big, lim, enc);
+    assert(!ready.isNull);
+    auto sent = dimensions(Base64.decode(ready.get.dataBase64));
+    assert(sent[0] == MAX_DIMENSION && sent[1] == MAX_DIMENSION, format("%s", sent));
+
+    // A cap no re-encode can meet omits the image.
+    auto small = stored(fakePng(64, 64, 300), "png", "image/png");
+    ImageLimits tiny = {maxBytes: 10};
+    assert(readForLimits(dir, small, tiny, enc).isNull);
+
+    // A stricter media type re-encodes GIF into the accepted PNG.
+    auto gif = stored(cast(immutable(ubyte)[]) "GIF89a\x14\0\x14\0", "gif", "image/gif");
+    ImageLimits pngOnly = {acceptedMediaTypes: ["image/png"]};
+    auto r = readForLimits(dir, gif, pngOnly, enc);
+    assert(!r.isNull && r.get.mediaType == "image/png" && sniff(Base64.decode(r.get.dataBase64)).get == ImageFormat.png);
+
+    // A swapped stored copy reads as unavailable, not as the new bytes.
+    write(buildPath(dir, storedFilename(small)), "tampered");
+    assert(readForLimits(dir, small, lim, enc).isNull);
+}
