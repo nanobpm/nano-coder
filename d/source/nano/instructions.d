@@ -1131,3 +1131,106 @@ unittest // a symlink cycle in the rules directory terminates
     symlink(buildPath(root, ".claude/rules"), buildPath(root, ".claude/rules/a/loop"));
     assert(texts(find(root)) == ["rule a"]);
 }
+
+// rust: instructions.rs::a_fence_looking_line_inside_an_open_span_does_not_open_a_fence
+// rust: instructions.rs::an_indented_continuation_line_can_close_an_open_span
+// rust: instructions.rs::indented_code_blocks_preserve_comments_and_imports
+// rust: instructions.rs::rejected_fence_candidate_does_not_break_an_open_span
+unittest
+{
+    import std.algorithm : canFind;
+    // A fence-looking line inside an open code span is span content.
+    assert(importRefs("``open\n```\n@hidden.md\n``\n@live.md") == ["live.md"]);
+    assert(importRefs("`open\n~~~\n@hidden.md\n`\n@live.md") == ["live.md"]);
+    assert(importRefs("```\n@hidden.md\n```\n@live.md") == ["live.md"]);
+    // An indented continuation line can close an open span.
+    assert(importRefs("`open\n    `\n@live.md") == ["live.md"]);
+    assert(importRefs("``open\n    ``\n@live.md") == ["live.md"]);
+    assert(importRefs("``open\n    `\n@secret.md").length == 0);
+    assert(importRefs("text\n\n    @secret.md").length == 0);
+    // Indented code keeps its comments and imports.
+    assert(stripHtmlComments("text\n\n    <!-- example -->\n").canFind("<!-- example -->"));
+    assert(importRefs("text\n\n    @code.md\n@live.md") == ["live.md"]);
+    assert(stripHtmlComments("text\n\n\t<!-- tabbed -->\n").canFind("<!-- tabbed -->"));
+    assert(stripHtmlComments("   <!-- shallow -->\nkeep\n") == "keep\n");
+    // A rejected fence candidate doesn't break an open span.
+    assert(importRefs("``open\n``` `x`\n@secret.md").length == 0);
+    assert(importRefs("`open\n``` `x`\n@secret.md").length == 0);
+    assert(importRefs("``open\n~~~ `x`\n@secret.md").length == 0);
+    assert(importRefs("``open\n`` `x`\n@after.md") == ["after.md"]);
+}
+
+// rust: instructions.rs::front_matter_imports_are_not_expanded_when_front_matter_is_dropped
+// rust: instructions.rs::a_dormant_scoped_rules_import_does_not_suppress_a_rendered_file
+// rust: instructions.rs::a_scoped_rule_already_imported_is_not_re_emitted
+// rust: instructions.rs::scoped_rule_import_shared_with_loaded_file_is_not_duplicated
+// rust: instructions.rs::rules_nested_deeper_than_eight_directories_are_still_loaded
+unittest // imports through rules
+{
+    import std.algorithm : count;
+    import std.file : rmdirRecurse;
+    auto base = testDir("ruleimports");
+    scope (exit) rmdirRecurse(base);
+    auto root = buildPath(base, "repo");
+    {
+        put(buildPath(root, "secret.md"), "SECRET BODY");
+        put(buildPath(root, ".claude/rules/x.md"), "---\ndescription: see @secret.md\n---\nrule body");
+        auto r = find(root).render;
+        assert(r.canFind("rule body") && !r.canFind("SECRET BODY"), "dropped front matter isn't scanned for imports");
+    }
+    {
+        put(buildPath(root, ".claude/shared-detail.md"), "shared detail");
+        put(buildPath(root, ".claude/rules/a-scoped.md"), "---\npaths:\n  - \"src/**\"\n---\nscoped, see @../shared-detail.md");
+        put(buildPath(root, ".claude/rules/b-plain.md"), "plain rule, see @../shared-detail.md");
+        auto r = find(root).render;
+        assert(r.canFind("shared detail"), "a dormant rule's import doesn't suppress it: " ~ r);
+    }
+    {
+        put(buildPath(root, ".claude/rules/dup.md"), "---\npaths: docs/**\n---\ndup body");
+        put(buildPath(root, "CLAUDE.md"), "@.claude/rules/dup.md");
+        auto p = find(root);
+        assert(p.render.count("dup body") == 1);
+        assert(p.nestedFor(buildPath(root, "docs/x.md"), root) is null, "an imported rule isn't attached again");
+    }
+    {
+        put(buildPath(root, "CLAUDE.md"), "root, see @shared.md");
+        put(buildPath(root, "shared.md"), "shared once");
+        put(buildPath(root, ".claude/rules/api.md"), "---\npaths:\n  - \"src/**\"\n---\nrule, see @shared.md");
+        auto out_ = find(root).nestedFor(buildPath(root, "src/x.rs"), root);
+        assert(out_.canFind("rule, see") && !out_.canFind("shared once"), out_);
+    }
+    {
+        put(buildPath(root, ".claude/rules/a/b/c/d/e/f/g/h/i/j/k/deep.md"), "---\npaths:\n  - \"src/**\"\n---\ndeep rule");
+        auto out_ = find(root).nestedFor(buildPath(root, "src/y.rs"), root);
+        assert(out_.canFind("deep rule"), out_);
+    }
+}
+
+// rust: instructions.rs::repeated_blocked_outside_import_warns_only_once
+// rust: instructions.rs::nested_attached_files_stay_listed_in_loaded_paths
+unittest
+{
+    import std.algorithm : count, filter, any;
+    import std.file : rmdirRecurse;
+    import std.conv : to;
+    auto base = testDir("warnonce");
+    scope (exit) rmdirRecurse(base);
+    auto root = buildPath(base, "repo");
+    auto outside = buildPath(base, "secret.txt");
+    put(outside, "SECRET");
+    put(buildPath(root, "CLAUDE.md"), format("@%1$s\n@%1$s\n@%1$s", outside));
+    auto p = find(root);
+    assert(p.warnings.filter!(w => w.canFind("skipped import")).count == 1, p.warnings.to!string);
+    assert(!p.render.canFind("SECRET"));
+
+    put(buildPath(root, "a/AGENTS.md"), "nested agents");
+    p = find(root);
+    bool listed() { return p.loadedPaths.any!(x => x.canFind("a/AGENTS.md")); }
+    assert(!listed, "not attached yet");
+    assert(p.nestedFor(buildPath(root, "a/x.rs"), root).canFind("nested agents"));
+    assert(listed, "an attached nested file stays in loadedPaths: " ~ p.loadedPaths.to!string);
+    p.forgetNested();
+    assert(!listed, "reset by forgetNested");
+    p.nestedFor(buildPath(root, "a/x.rs"), root);
+    assert(p.loadedPaths.count!(x => x.canFind("a/AGENTS.md")) == 1);
+}
