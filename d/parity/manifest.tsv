@@ -850,7 +850,7 @@ providers/mod.rs::bounded_key_command_honours_cancellation_and_kills_the_child	t
 providers/mod.rs::bounded_key_command_returns_the_trimmed_key	test
 providers/mod.rs::bounded_key_command_timeout_kills_descendants_holding_the_pipes	test
 providers/mod.rs::bounded_key_command_times_out_and_kills_a_hung_command	test
-providers/mod.rs::clean_reason_strips_curl_handle_noise	gap	D offline wait (#149) uses its own notice text; no curl-noise cleanup / live width notice
+providers/mod.rs::clean_reason_strips_curl_handle_noise	test
 providers/mod.rs::config_timeout_secs_wins_over_the_env_override	test
 providers/mod.rs::copilot_endpoint_override_is_validated_when_present	test
 providers/mod.rs::copilot_reasoning_models_default_to_reasoning_replay	test
@@ -859,19 +859,19 @@ providers/mod.rs::env_override_sets_the_default_timeout	test
 providers/mod.rs::failing_api_key_command_is_an_error	test
 providers/mod.rs::finish_body_deep_merges_nested_extra_body_objects	test
 providers/mod.rs::finish_body_keeps_resolved_temperature	test
-providers/mod.rs::human_secs_drops_trailing_zero_but_keeps_fractions	gap	D offline wait (#149) uses its own notice text; no curl-noise cleanup / live width notice
+providers/mod.rs::human_secs_drops_trailing_zero_but_keeps_fractions	na	D\'s offline notice shows elapsed time (formatElapsed, tested in http.d), not a fractional retry delay
 providers/mod.rs::invalid_env_values_fall_back_to_the_default	test
-providers/mod.rs::live_notice_width_preserves_narrow_terminals	gap	D offline wait (#149) uses its own notice text; no curl-noise cleanup / live width notice
+providers/mod.rs::live_notice_width_preserves_narrow_terminals	test
 providers/mod.rs::muse_defaults_to_reasoning_replay	test
 providers/mod.rs::muse_endpoint_override_is_validated_when_present	test
-providers/mod.rs::offline_budget_bounds_an_in_flight_resend	gap	D retry.d waits for the network (#149) but has no tests bounding the offline budget
-providers/mod.rs::offline_budget_bounds_the_backoff_sleep	gap	D retry.d waits for the network (#149) but has no tests bounding the offline budget
+providers/mod.rs::offline_budget_bounds_an_in_flight_resend	test
+providers/mod.rs::offline_budget_bounds_the_backoff_sleep	test
 providers/mod.rs::parses_events_split_across_chunks	test
 providers/mod.rs::parses_model_specs	test
 providers/mod.rs::qwen_and_kimi_presets	test
 providers/mod.rs::the_qwen_preset_is_derived_from_the_endpoint_table	test
-providers/mod.rs::transport_does_not_wait_out_a_redirect_loop	gap	D retry.d waits for the network (#149) but has no tests bounding the offline budget
-providers/mod.rs::transport_waits_out_an_offline_endpoint_past_max_retries_then_fails	gap	D retry.d waits for the network (#149) but has no tests bounding the offline budget
+providers/mod.rs::transport_does_not_wait_out_a_redirect_loop	test
+providers/mod.rs::transport_waits_out_an_offline_endpoint_past_max_retries_then_fails	test
 providers/mod.rs::user_config_overrides_and_extends_presets	test
 providers/mod.rs::validate_spec_matches_resolve_for_the_buildable_cases	test
 providers/mod.rs::validate_spec_rejects_a_provider_without_a_model	test

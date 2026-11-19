@@ -138,6 +138,7 @@ string postJson(string url, string[string] headers, JSONValue body_, string what
         Exception failure;
         // The failed request's error details (in a GC-owned ApiError), if any.
         const(ErrorInfo)* info;
+        offline.bound(req);
         try
         {
             status = perform(req, text, meta, onEvent is null ? null : (const(char)[] chunk) {
@@ -218,6 +219,7 @@ string curlReason(string msg) pure
     return i < 0 ? msg : msg[0 .. i];
 }
 
+// rust: providers/mod.rs::clean_reason_strips_curl_handle_noise
 unittest
 {
     assert(curlReason("Couldn't connect to server on handle B45438000") == "Couldn't connect to server");
@@ -230,11 +232,15 @@ int performOnline(const ref Request req, out string body_, string what, RetryPol
 {
     auto offline = OfflineWait(what, policy);
     scope (failure) offline.abandon();
+    Request r = {method: req.method, url: req.url, body_: req.body_, idleTimeout: req.idleTimeout,
+        connectTimeout: req.connectTimeout};
+    foreach (k, v; req.headers) r.headers[k] = v;
     for (;;)
     {
+        offline.bound(r);
         try
         {
-            auto status = perform(req, body_);
+            auto status = perform(r, body_);
             offline.end();
             return status;
         }
@@ -260,35 +266,73 @@ private struct OfflineWait
     bool live;
     string reason;
 
+    Duration idle, connect; // the request's own timeouts, before `bound` capped them
+
     this(string what, RetryPolicy policy) { this.what = what; this.policy = policy; }
 
+    /// The budget left while an outage is being waited out (`Duration.max`
+    /// when none is, or the budget is unbounded).
+    Duration remaining() const
+    {
+        if (failures == 0 || policy.offlineBudget == Duration.max) return Duration.max;
+        auto spent = MonoTime.currTime - since;
+        return spent >= policy.offlineBudget ? Duration.zero : policy.offlineBudget - spent;
+    }
+
+    /// Cap a resend's timeouts at the remaining budget, so a resend that
+    /// connects and then stalls can't outlive it. Only the idle and connect
+    /// timeouts: a reply that is flowing is never cut off.
+    void bound(ref Request req)
+    {
+        import std.algorithm : min, max;
+        if (idle == Duration.zero) { idle = req.idleTimeout; connect = req.connectTimeout; }
+        auto left = remaining();
+        req.idleTimeout = left == Duration.max ? idle : min(idle, max(left, 1.seconds));
+        req.connectTimeout = left == Duration.max ? connect : min(connect, max(left, 1.msecs));
+    }
+
     /// One failed attempt: throws once the offline budget is spent, else
-    /// sleeps the next backoff (Ctrl-C throws Cancelled).
+    /// sleeps the next backoff, clamped to the budget (Ctrl-C throws
+    /// Cancelled). A redirect loop isn't an outage: it fails at once.
     void wait(CurlException e)
     {
+        import std.algorithm : min;
+        import std.uni : toLower;
         auto now = MonoTime.currTime;
         reason = curlReason(e.msg);
+        if (reason.toLower.indexOf("redirect") >= 0) throw new Exception(format("%s: %s", what, reason));
         if (failures == 0)
         {
             since = now;
             live = liveStderr();
             if (!live) stdErr.writefln("[%s] network unavailable (%s); waiting to reconnect (Ctrl-C to stop)", what, reason);
         }
-        if (now - since >= policy.offlineBudget) throw new Exception(format("%s: %s", what, e.msg));
-        auto until = now + policy.backoff(failures++);
+        auto spent = () => failures > 0 && remaining() == Duration.zero;
+        auto outOfBudget = () => new Exception(format("%s: network unavailable (%s)", what, reason));
+        if (spent()) throw outOfBudget();
+        auto backoff = policy.backoff(failures++);
+        auto pauseFor = min(backoff, remaining());
+        auto until = now + pauseFor;
         while (MonoTime.currTime < until)
         {
             if (cancelRequested()) throw new Cancelled;
             if (live && MonoTime.currTime - shown >= 1.seconds) draw();
-            Thread.sleep(50.msecs);
+            Thread.sleep(min(50.msecs, until - MonoTime.currTime));
         }
+        // No further request once the budget is gone.
+        if (spent()) throw outOfBudget();
     }
 
     private void draw()
     {
         shown = MonoTime.currTime;
-        stdErr.writef("\r\x1b[K[%s] network unavailable (%s); waiting to reconnect, %s (Ctrl-C to stop)", what, reason,
-            formatElapsed(shown - since));
+        import core.sys.posix.unistd : isatty;
+        import nano.frame : fit;
+        import nano.lineedit : terminalWidth;
+        // Fitted to the row: a wrapped line leaves stale rows `\r` can't reach.
+        auto cols = noticeWidth(terminalWidth(isatty(2) ? 2 : 1));
+        stdErr.writef("\r\x1b[K%s", fit(format("[%s] network unavailable (%s); waiting to reconnect, %s (Ctrl-C to stop)",
+            what, reason, formatElapsed(shown - since)), cols));
         stdErr.flush();
     }
 
@@ -308,6 +352,21 @@ private struct OfflineWait
         stdErr.writefln("[%s] network back after %s", what, took);
         failures = 0;
     }
+}
+
+/// The live notice's width: the measured columns, at least one (never a
+/// wider floor, which would wrap on a narrow terminal).
+size_t noticeWidth(size_t cols) pure nothrow { return cols ? cols : 1; }
+
+// rust: providers/mod.rs::live_notice_width_preserves_narrow_terminals
+unittest
+{
+    import nano.frame : fit;
+    import nano.frame : visibleWidth;
+    foreach (c; [10, 19, 1, 80, 200]) assert(noticeWidth(c) == c);
+    assert(noticeWidth(0) == 1);
+    auto notice = "[agent] network unavailable (connection refused); waiting to reconnect, 3s (Ctrl-C to stop)";
+    foreach (c; [1, 5, 10, 19, 20, 80]) assert(visibleWidth(fit(notice, noticeWidth(c))) <= c);
 }
 
 /// Whether stderr shows an in-place line: a terminal, or the frame UI's transcript.
@@ -472,4 +531,84 @@ unittest
     assert(msg.length && msg[0 .. 6] == "probe:", msg);
     // Retried well past maxRetries = 0 before giving up.
     assert(MonoTime.currTime - start >= 300.msecs);
+}
+
+// rust: providers/mod.rs::transport_waits_out_an_offline_endpoint_past_max_retries_then_fails
+// rust: providers/mod.rs::offline_budget_bounds_the_backoff_sleep
+unittest
+{
+    import core.time : msecs, MonoTime;
+    import std.algorithm : canFind;
+    RetryPolicy p;
+    p.maxRetries = 0;
+    p.initialBackoff = 1000.msecs;
+    p.maxBackoff = 1000.msecs;
+    p.offlineBudget = 100.msecs;
+    auto start = MonoTime.currTime;
+    import std.exception : collectExceptionMsg;
+    auto msg = collectExceptionMsg(postJson("http://127.0.0.1:9/x", null, JSONValue(1), "probe", p, [], 5));
+    auto took = MonoTime.currTime - start;
+    assert(msg.canFind("network unavailable"), msg);
+    assert(took >= 80.msecs && took < 600.msecs, "the backoff is clamped to the budget");
+}
+
+private void holdStalledListener(ushort port)
+{
+    import std.socket : TcpSocket, InternetAddress, SocketOptionLevel, SocketOption;
+    Thread.sleep(30.msecs);
+    auto l = new TcpSocket;
+    scope (exit) l.close();
+    l.setOption(SocketOptionLevel.SOCKET, SocketOption.REUSEADDR, true);
+    l.bind(new InternetAddress("127.0.0.1", port));
+    l.listen(4); // never accepted: connections complete and then hear nothing
+    Thread.sleep(3.seconds);
+}
+
+// rust: providers/mod.rs::offline_budget_bounds_an_in_flight_resend
+unittest
+{
+    import core.time : MonoTime;
+    import std.algorithm : canFind;
+    import std.socket : TcpSocket, InternetAddress;
+    import nano.safeio : spawn;
+    ushort port;
+    {
+        auto probe = new TcpSocket;
+        probe.bind(new InternetAddress("127.0.0.1", InternetAddress.PORT_ANY));
+        port = (cast(InternetAddress) probe.localAddress).port;
+        probe.close(); // the first attempt is refused: the outage starts
+    }
+    auto h = spawn(&holdStalledListener, port);
+    RetryPolicy p;
+    p.maxRetries = 0;
+    p.initialBackoff = 20.msecs;
+    p.maxBackoff = 20.msecs;
+    p.offlineBudget = 150.msecs;
+    auto start = MonoTime.currTime;
+    import std.exception : collectExceptionMsg;
+    auto msg = collectExceptionMsg(postJson(format("http://127.0.0.1:%s/x", port), null, JSONValue(1), "probe", p, [], 30));
+    auto took = MonoTime.currTime - start;
+    h.join();
+    assert(msg.canFind("network unavailable"), msg);
+    assert(took >= 120.msecs && took < 5.seconds, "a stalled resend outlived the budget");
+}
+
+// rust: providers/mod.rs::transport_does_not_wait_out_a_redirect_loop
+unittest
+{
+    import core.time : MonoTime;
+    import std.algorithm : canFind;
+    import std.range : repeat;
+    import std.array : array;
+    import nano.testserver : serve, Reply;
+    immutable loop = Reply(301, "Location: /\r\n", "");
+    auto srv = serve(loop.repeat(60).array.idup);
+    RetryPolicy p;
+    p.maxRetries = 0;
+    p.offlineBudget = 10.seconds;
+    auto start = MonoTime.currTime;
+    import std.exception : collectExceptionMsg;
+    auto msg = collectExceptionMsg(postJson(srv.url ~ "/x", null, JSONValue(1), "probe", p, [], 5));
+    assert(MonoTime.currTime - start < 3.seconds, "a redirect loop was waited out as an outage: " ~ msg);
+    assert(msg.length && !msg.canFind("network unavailable"), msg);
 }
