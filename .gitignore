@@ -1,4 +1,8 @@
-/target
+# dub build output
+.dub/
+/nano-coder
+/nano-coder-test-*
+*.o
 
 # TLC output
 tla/states/
@@ -6,4 +10,3 @@ tla/*_TTrace_*
 tla/*.bin
 states/
 /node_modules
-target-bench/

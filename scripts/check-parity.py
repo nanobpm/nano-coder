@@ -2,7 +2,7 @@
 """Feature-parity check between the Rust crate and the D port.
 
 The Rust test suite is the specification: each Rust test is one behaviour.
-`d/parity/manifest.tsv` gives every Rust test a status:
+`parity/manifest.tsv` gives every Rust test a status:
 
   test     ported, and a D unittest carries a `// rust: FILE::NAME` marker
   claimed  ported according to PORTING.md, but no D test is linked yet
@@ -13,13 +13,13 @@ The Rust test suite is the specification: each Rust test is one behaviour.
 The check fails when
   * the Rust tree has a test the manifest doesn't list (a new Rust feature),
   * the manifest lists a test Rust no longer has,
-  * a `test` row has no matching marker in d/source, or a marker names a
+  * a `test` row has no matching marker in source/, or a marker names a
     test the manifest doesn't mark `test`,
-  * Rust commits touched src/ after d/parity/BASELINE (untriaged changes),
-  * `todo` + `claimed` rows exceed d/parity/budget (a ratchet: lower it as
+  * Rust commits touched src/ after parity/BASELINE (untriaged changes),
+  * `todo` + `claimed` rows exceed parity/budget (a ratchet: lower it as
     rows are triaged or linked, never raise it).
 
-Usage: d/scripts/check-parity.py [--ref origin/main] [--update]
+Usage: scripts/check-parity.py [--ref rust-final] [--update]
 --update adds new Rust tests as `todo` and drops removed ones, then rewrites
 the manifest sorted; it never changes an existing row's status.
 """
@@ -30,7 +30,7 @@ import sys
 
 ROOT = subprocess.run(['git', 'rev-parse', '--show-toplevel'], capture_output=True, text=True,
                       check=True).stdout.strip()
-D = os.path.join(ROOT, 'd')
+D = ROOT
 MANIFEST = os.path.join(D, 'parity', 'manifest.tsv')
 BASELINE = os.path.join(D, 'parity', 'BASELINE')
 BUDGET = os.path.join(D, 'parity', 'budget')
@@ -55,7 +55,7 @@ def rust_tests(ref):
 
 
 def d_markers():
-    """`// rust: FILE::NAME` markers in d/source -> first location."""
+    """`// rust: FILE::NAME` markers in source/ -> first location."""
     found = {}
     for dirpath, _, files in os.walk(os.path.join(D, 'source')):
         for f in sorted(files):
@@ -86,7 +86,7 @@ def read_manifest():
 
 def write_manifest(rows):
     with open(MANIFEST, 'w', encoding='utf-8') as f:
-        f.write('# Rust test -> D port status; see d/scripts/check-parity.py. Columns: test, status, note\n')
+        f.write('# Rust test -> D port status; see scripts/check-parity.py. Columns: test, status, note\n')
         for k in sorted(rows):
             s, note = rows[k]
             f.write(f'{k}\t{s}\t{note}\n' if note else f'{k}\t{s}\n')
@@ -119,7 +119,7 @@ def main():
     pending = git('log', '--oneline', f'{base}..{ref}', '--', 'src').strip()
     if pending:
         errors.append(f'Rust commits since the triaged baseline {base} (port or mark them n/a, then move '
-                      'd/parity/BASELINE):\n  ' + pending.replace('\n', '\n  '))
+                      'parity/BASELINE):\n  ' + pending.replace('\n', '\n  '))
     counts = {s: 0 for s in STATUSES}
     for s, _ in rows.values():
         counts[s] += 1
@@ -133,7 +133,7 @@ def main():
     for e in errors:
         print('error:', e)
     if open_rows < budget and not errors:
-        print(f'note: todo + claimed is {open_rows}; lower d/parity/budget to {open_rows}')
+        print(f'note: todo + claimed is {open_rows}; lower parity/budget to {open_rows}')
     sys.exit(1 if errors else 0)
 
 

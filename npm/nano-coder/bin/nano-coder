@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// JS launcher for nano-coder-d (the D port). On its first run it best-effort replaces itself
+// JS launcher for nano-coder. On its first run it best-effort replaces itself
 // with the native binary (so later invocations run without a Node process in
 // front), then runs the binary for the current invocation. If the swap fails
 // (e.g. a read-only global prefix) the launcher stays and keeps working — every
@@ -13,7 +13,7 @@ let bin;
 try {
   bin = binaryPath();
 } catch (err) {
-  console.error(`nano-coder-d: ${err.message}`);
+  console.error(`nano-coder: ${err.message}`);
   process.exit(1);
 }
 
@@ -32,7 +32,7 @@ try {
 
 const r = spawnSync(bin, process.argv.slice(2), { stdio: 'inherit' });
 if (r.error) {
-  console.error(`nano-coder-d: failed to run ${bin}: ${r.error.message}`);
+  console.error(`nano-coder: failed to run ${bin}: ${r.error.message}`);
   process.exit(1);
 }
 if (r.signal) process.kill(process.pid, r.signal);

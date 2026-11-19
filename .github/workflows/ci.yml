@@ -1,26 +1,22 @@
-name: CI (D port)
+name: CI
 
 on:
-  pull_request:
-    paths: ["d/**", ".github/workflows/ci-d.yml"]
   push:
     branches: [main]
-    paths: ["d/**", ".github/workflows/ci-d.yml"]
+  pull_request:
 
 permissions:
   contents: read
 
 jobs:
+  # The job names `test (<os>)` are required checks in the main branch ruleset.
   test:
-    name: dub test (${{ matrix.os }})
+    name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-14]
-    defaults:
-      run:
-        working-directory: d
+        os: [ubuntu-24.04, macos-15]
     steps:
       - uses: actions/checkout@v5
       - uses: dlang-community/setup-dlang@v2
@@ -32,13 +28,14 @@ jobs:
       - run: dub test
       - run: dub build -b release
       - run: ./nano-coder --version
+      - name: compaction eval self-test (fake model)
+        run: python3 eval/compaction/run.py --self-test --seeds 1 --filler-turns 4 --bin ./nano-coder --out "$RUNNER_TEMP/eval"
+      - name: npm launcher syntax
+        run: node --check npm/nano-coder/bin/nano-coder && node --check npm/nano-coder/lib/platform.js && node --check scripts/npm-packages.mjs && node --check scripts/set-version.mjs && node --check scripts/homebrew-formula.mjs
 
   lint:
-    name: D-Scanner
+    name: lint
     runs-on: ubuntu-24.04
-    defaults:
-      run:
-        working-directory: d
     steps:
       - uses: actions/checkout@v5
       - uses: dlang-community/setup-dlang@v2
@@ -46,17 +43,3 @@ jobs:
           compiler: ldc-1.43.0
       - run: ./scripts/check-safe.sh
       - run: dub run -q dscanner@0.16.0-beta.5 -- --styleCheck --config dscanner.ini source
-
-  parity:
-    name: Rust parity manifest
-    runs-on: ubuntu-24.04
-    defaults:
-      run:
-        working-directory: d
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-      # Every Rust test must have a row in d/parity/manifest.tsv, and Rust
-      # commits after d/parity/BASELINE must be triaged.
-      - run: git fetch --no-tags origin main && python3 scripts/check-parity.py --ref origin/main

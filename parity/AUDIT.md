@@ -14,7 +14,7 @@ All five priorities are ported on `epic/d-port`, with Rust's tests:
 | Trust hardening (skill containment, hook gating, the non-interactive note, locked trust-file writes) | 8498140 |
 | #186 idle compaction; the `persist_sessions`, `session_dir` and `verify_before_complete` keys | 36a2086 |
 
-The `rusty-harness` folder migration is `na`, because D has always used its own `nano-coder-d` folders. #185 (the ProbeState refactor) leaves three probe tests as `todo` rows. BASELINE is now 80ca911, and the manifest stands at 800 `test`, 45 `claimed`, 27 `na`, 57 `gap` and 480 `todo`, with a budget of 525. The tables below are the audit as written, before this work.
+The `rusty-harness` folder migration is `na`, because D has always used its own `nano-coder-d` folders (moved into `nano-coder/sessions` on first start since 1.0). #185 (the ProbeState refactor) leaves three probe tests as `todo` rows. BASELINE is now 80ca911, and the manifest stands at 800 `test`, 45 `claimed`, 27 `na`, 57 `gap` and 480 `todo`, with a budget of 525. The tables below are the audit as written, before this work.
 
 ## Method
 

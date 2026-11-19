@@ -1,6 +1,6 @@
 {
   "name": "nano-coder",
-  "description": "nano-coder, reimplemented in D (port in progress; see PORTING.md)",
+  "description": "A 4MB coding agent. Run a fleet on your laptop.",
   "license": "Apache-2.0",
   "targetName": "nano-coder",
   "targetType": "executable",

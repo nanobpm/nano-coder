@@ -9,7 +9,7 @@ loads it in `nano-coder --acp --model MODEL`, runs `/compact --standard` or
 compacted part. The answer is graded with regexes.
 
 ```sh
-cargo build --release
+dub build -b release
 # Check the harness itself; no provider needed (fake model, see below).
 eval/compaction/run.py --self-test
 # Compare models; providers and keys come from your config.toml.
@@ -18,7 +18,7 @@ eval/compaction/run.py --models github-copilot/gpt-4.1 --seeds 5 --repeats 2 --j
 ```
 
 Needs Python 3.9+ (stdlib only) and a built `nano-coder`. It uses
-`target/release`, then `target/debug`, then `PATH`; `--bin` overrides.
+`./nano-coder` in the repository root, then `PATH`; `--bin` overrides.
 Provider settings come from `--config`, which defaults to
 `~/.config/nano-coder/config.toml`. The harness overrides only `session_dir`,
 `compaction_mode`, `auto_compact` (off), `persist_sessions` and

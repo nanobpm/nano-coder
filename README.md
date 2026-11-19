@@ -92,7 +92,7 @@ With piped (non-terminal) stdin, lines read during a turn are queued as later pr
 ### ACP Headless Mode (--acp flag)
 
 ```bash
-nano-coder-d --acp
+nano-coder --acp
 ```
 
 Speaks the Agent Communication Protocol (ACP) over stdio using newline-delimited JSON-RPC 2.0 messages. Compatible with c8ctl-nano's `spawnCaptureAcp` executor.
@@ -166,7 +166,7 @@ explicitly (`input doesn't look like ACP JSON-RPC …`).
 ## Architecture
 
 ```
-d/source/
+source/
 ├── app.d        # Single binary entry point (interactive + ACP modes), REPL, key reader
 └── nano/
     ├── agent.d      # Agent core: conversation management, tool execution loop
@@ -216,14 +216,16 @@ d/source/
     └── safeio.d     # The audited @trusted wrappers and thread-safe primitives
 ```
 
-`d/PORTING.md` maps every Rust module to its D counterpart and lists the known differences;
-`d/REVIEW.md` compares the safety and architecture of the two implementations.
+nano-coder was written in Rust up to 0.69; 1.0 is a rewrite in D. The Rust code is on the
+`rust` branch. `PORTING.md` maps every Rust module to its D counterpart and lists the known
+differences, `REVIEW.md` compares the safety and architecture of the two implementations, and
+`parity/manifest.tsv` records how each Rust test was ported.
 
 Mode selection: `--acp` flag enables ACP headless mode; default is interactive CLI.
 
 ## Lifecycle Hooks
 
-nano-coder-d has two hook systems.
+nano-coder has two hook systems.
 
 ### Internal events (observe-only)
 
@@ -436,7 +438,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
 - `/thinking [level|default|off|reset]` - Show the thinking level in use and the levels the current model takes, or set one for this session (`reset` goes back to the configured level). See [Thinking](#thinking)
 - `/providers` - List providers, endpoints and whether their API key is available
 - `/session` - Show the session ID and log path
-- `/trajectory` - Show this session's trajectory turn by turn: user input, thinking, answers, tool calls and results, tokens and timings. Each message row is labelled with its `#N` session-log ID, the same ID `history_read` and smart-compaction summaries use (compaction and crash-recovered input rows have no `#N`, as they aren't cited that way). It opens in your pager (`$PAGER`, default `less`), even when it would fit on the screen, so you dismiss it with `q` and it doesn't stay in the transcript or your scrollback — but only at an idle prompt on a terminal: invoked mid-turn (while a turn runs) or with piped output it prints inline instead. `/trajectory --json` or `/trajectory --markdown` prints an export instead; `nano-coder-d --trajectory SESSION_ID [--json|--markdown]` does the same for any saved session
+- `/trajectory` - Show this session's trajectory turn by turn: user input, thinking, answers, tool calls and results, tokens and timings. Each message row is labelled with its `#N` session-log ID, the same ID `history_read` and smart-compaction summaries use (compaction and crash-recovered input rows have no `#N`, as they aren't cited that way). It opens in your pager (`$PAGER`, default `less`), even when it would fit on the screen, so you dismiss it with `q` and it doesn't stay in the transcript or your scrollback — but only at an idle prompt on a terminal: invoked mid-turn (while a turn runs) or with piped output it prints inline instead. `/trajectory --json` or `/trajectory --markdown` prints an export instead; `nano-coder --trajectory SESSION_ID [--json|--markdown]` does the same for any saved session
 - `/resume [ID|last]` - Switch to a saved session without restarting: the same picker as `--resume` (leaving out the session in use), or the session with that ID, or `last` (the most recent other session in this directory). Run it at the prompt, not during a turn
 - `/restart` - Start a fresh session (clean context) without exiting
 - `/exit` - Exit the agent (prints the session's `--resume` command first, when session persistence is enabled)
@@ -447,19 +449,18 @@ You need [LDC](https://github.com/ldc-developers/ldc) 1.43+ and dub, plus the li
 development headers on Linux.
 
 ```bash
-cd d
-dub build -b release   # ./nano-coder-d
-./nano-coder-d
+dub build -b release   # ./nano-coder
+./nano-coder
 ```
 
 Then, for example:
 
 ```bash
-nano-coder-d --model anthropic/claude-sonnet-4-5
-nano-coder-d --model ollama/qwen2.5:1.5b
-nano-coder-d --resume sess-20260923T012518-7e7923f8
-nano-coder-d --resume        # pick a session
-nano-coder-d --resume last   # the most recent session in this directory
+nano-coder --model anthropic/claude-sonnet-4-5
+nano-coder --model ollama/qwen2.5:1.5b
+nano-coder --resume sess-20260923T012518-7e7923f8
+nano-coder --resume        # pick a session
+nano-coder --resume last   # the most recent session in this directory
 ```
 
 **Resuming.** `--resume` without an ID opens a picker of this directory's saved sessions, most
@@ -487,7 +488,7 @@ Flags: `--login github-copilot|muse`, `--list-models PROVIDER`, `--trajectory SE
 `--config PATH`, `--verbosity LEVEL` (`-v`), `--sandbox off|workspace|read-only` (or `NANO_CODER_SANDBOX`),
 `--allow RULE` and `--deny RULE` (repeatable; added to the config's rules), `--version` (`-V`).
 
-Before opening a PR, run `dub build` and `dub test` in `d/` (both run `scripts/check-safe.sh`
+Before opening a PR, run `dub build` and `dub test` (both run `scripts/check-safe.sh`
 first) and D-Scanner (`dub run dscanner -- --styleCheck --config dscanner.ini source`); CI
 checks all three. All code is `@safe`: every module starts with `@safe:`, and calls the
 compiler can't check are wrapped in small, commented `@trusted` functions (shared ones in
@@ -810,9 +811,9 @@ terms or your organisation's Copilot policy, it can break without notice, and mi
 get an account flagged. It is never used unless you select it.
 
 ```bash
-nano-coder-d --login github-copilot          # interactive; saves the OAuth token (0600)
-nano-coder-d --list-models github-copilot
-nano-coder-d --model github-copilot/gpt-4.1
+nano-coder --login github-copilot          # interactive; saves the OAuth token (0600)
+nano-coder --list-models github-copilot
+nano-coder --model github-copilot/gpt-4.1
 ```
 
 Headless workers can't do the device flow; set `GITHUB_COPILOT_OAUTH_TOKEN` to a token from a
@@ -845,9 +846,9 @@ provider relays Meta's own message and the URL to fix it (`dev.meta.ai` to onboa
 until you renew and log in again.
 
 ```bash
-nano-coder-d --login muse                    # interactive; saves the OAuth token + minted key (0600)
-nano-coder-d --list-models muse
-nano-coder-d --model muse/muse-spark-1.3
+nano-coder --login muse                    # interactive; saves the OAuth token + minted key (0600)
+nano-coder --list-models muse
+nano-coder --model muse/muse-spark-1.3
 ```
 
 Headless workers can't do the device flow; set `META_API_KEY` to a Meta API key instead. Note
@@ -1263,7 +1264,7 @@ Run inside a [Herdr](https://herdr.dev) pane (`HERDR_ENV=1`, `HERDR_PANE_ID` and
 `HERDR_BIN_PATH` set), the interactive CLI reports itself to Herdr: `working` while a
 turn runs, `blocked` while a question or the turn limit waits for you, and `idle` at the
 prompt. A saved session is reported with the command that resumes it
-(`nano-coder-d --resume <id> --model <provider/model>`, plus `--config` if given), so Herdr
+(`nano-coder --resume <id> --model <provider/model>`, plus `--config` if given), so Herdr
 can reopen it after a restart (Herdr 0.9.2 or later). The pane is released on exit.
 Reports run in the background and failures are ignored; outside Herdr nothing is sent.
 

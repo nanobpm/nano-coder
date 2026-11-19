@@ -1,6 +1,6 @@
 # Rust vs D: safety and architecture review
 
-This compares the Rust `nano-coder` with its D port in `d/`. The port now covers
+This compares the Rust `nano-coder` with its D port (now the root of the repository). The port now covers
 everything listed in `PORTING.md`. It is about 33k lines of D including 302
 unit-test blocks, against about 72k lines of Rust including inline tests. The
 known differences are listed in `PORTING.md`. Performance numbers are in

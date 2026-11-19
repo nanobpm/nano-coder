@@ -1,11 +1,11 @@
 # nano-coder in D: porting status
 
-`d/` is a D reimplementation of nano-coder. It builds with LDC and dub, and it
-runs alongside the Rust crate at the repo root. The Rust crate is still the
-reference implementation, and the port reads the same `~/.config/nano-coder/config.toml`.
+nano-coder 1.0 is a D reimplementation of the Rust nano-coder (up to 0.69, kept on the
+`rust` branch and tagged `rust-final`). It builds with LDC and dub and reads the same
+`~/.config/nano-coder/config.toml` and session logs. This file records how the port maps
+to the Rust modules and where it differs.
 
 ```sh
-cd d
 dub test                 # unit tests (all modules)
 dub build -b release     # ./nano-coder
 ./nano-coder -p "list the *.d files here"
@@ -129,13 +129,14 @@ on the first start that uses the default folder; a log whose name already exists
   the frame UI. D's transcript is printed bytes, so folds are in-band OSC 8770 marks
   the frame swaps in place; only the latest block toggles, and a thought still
   streaming can't be expanded.
-- **Updates (#154, #172).** Interactive npm installs (`@nanobpm/nano-coder-d`, found
+- **Updates (#154, #172).** Interactive npm installs (`@nanobpm/nano-coder`, found
   through the global bin symlink too) check the registry at startup and hourly in the
   background, keep `update-check.json` in the D data dir, and hint once per version
   at an idle prompt. `check_updates = false`, `NANO_CODER_NO_UPDATE_CHECK`,
   `NO_UPDATE_NOTIFIER` or `CI` turn it off. `/update` re-checks and runs `npm install
   -g` attached to the terminal; other installs get the releases page. `/relaunch`
-  execs the binary with `--resume <session>`. There is no cargo channel.
+  execs the binary with `--resume <session>`. Homebrew installs (#188) check the tap formula and `/update` runs `brew upgrade`. There is
+  no cargo channel.
 
 ## Parity tracking
 
@@ -143,7 +144,8 @@ The Rust test suite is the feature specification. `parity/manifest.tsv` lists ev
 test (`FILE::NAME`) with a status: `test` (a D unittest carries a `// rust: FILE::NAME`
 marker), `claimed` (ported per this file, no linked test yet), `gap` (not ported; the note
 says what's missing), `na` (doesn't apply; the note says why) or `todo` (not triaged).
-`scripts/check-parity.py` (CI job "Rust parity manifest") fails when:
+The Rust code is frozen at the `rust-final` tag, so CI no longer runs the check; the manifest
+is the record of the port. `scripts/check-parity.py --ref rust-final` still checks it, and fails when:
 
 - Rust gains a test the manifest doesn't list (`--update` adds it as `todo`);
 - a `test` row has no marker, or a marker isn't backed by a `test` row;
@@ -183,10 +185,8 @@ Roughly in dependency order. Sizes are Rust lines.
     and type-ahead. Markdown rendering is ported too (`nano/markdown.d`). One difference
     remains. Input typed before the editor takes over the terminal at startup goes through the kernel's
     line discipline, so an Enter there arrives as a newline.
-13. ~~**Packaging**~~: done. It adds `@nanobpm/nano-coder-d` and its platform packages (`npm/`,
-    `scripts/npm-packages.mjs`) and two workflows: `release-d.yml` (dispatch only, dry run by default) and
-    `ci-d.yml`. See `RELEASING.md`. npm trusted publishing still has to be configured for the new package
-    names before the first real publish.
+13. ~~**Packaging**~~: done. D publishes under the Rust names (`@nanobpm/nano-coder` and its platform packages,
+    `nanobpm/tap/nano-coder`) from `release.yml`, starting at 1.0.0. See `RELEASING.md`.
 
 Notes for porting:
 - Keep tool names, schemas and error wording identical to Rust. Models and
