@@ -2106,7 +2106,6 @@ class Agent
 
 version (unittest)
 {
-    import nano.providers.mock;
 
     class NullEvents : AgentEvents
     {
@@ -2129,6 +2128,7 @@ version (unittest)
 // rust: agent.rs::malformed_tool_call_skips_handler_and_reports_actionable_error
 unittest
 {
+    import nano.providers.mock;
     auto reg = new ToolRegistry;
     reg.register(ToolDefinition("echo", "echo", parseJSON(`{"type":"object"}`)),
         (JSONValue a) => "echoed " ~ a["text"].str);
@@ -2151,6 +2151,7 @@ unittest
 // rust: agent.rs::steer_during_tool_call_joins_next_model_call
 unittest
 {
+    import nano.providers.mock;
     auto reg = new ToolRegistry;
     bool ran;
     reg.register(ToolDefinition("bash", "", parseJSON(`{}`)), (JSONValue a) { ran = true; return ""; });
@@ -2171,6 +2172,7 @@ unittest
 // rust: agent.rs::steer_during_final_answer_extends_the_turn
 unittest
 {
+    import nano.providers.mock;
     auto reg = new ToolRegistry;
     Agent agent;
     reg.register(ToolDefinition("work", "", parseJSON(`{}`)), (JSONValue a) {
@@ -2190,6 +2192,7 @@ unittest
 // rust: agent.rs::cancel_kills_running_bash_and_skips_remaining_calls
 unittest
 {
+    import nano.providers.mock;
     auto reg = new ToolRegistry;
     Agent agent;
     auto mock = new MockClient([LLMResponse("long answer"), LLMResponse("short")]);
@@ -2205,6 +2208,7 @@ unittest
 // A cancel stops the turn: remaining tool calls are recorded as cancelled.
 unittest
 {
+    import nano.providers.mock;
     auto reg = new ToolRegistry;
     Agent agent;
     int runs;
@@ -2231,6 +2235,7 @@ unittest
 // rust: agent.rs::reporting_an_outcome_ends_the_turn_and_is_recorded
 unittest
 {
+    import nano.providers.mock;
     import nano.claude_hooks : Hook, Event;
     import std.algorithm : canFind;
     import std.file : tempDir;
@@ -2298,6 +2303,7 @@ unittest
 // rust: agent.rs::a_literal_list_loop_runs_without_asking
 unittest
 {
+    import nano.providers.mock;
     enum loop = `{"command":"for f in $(git ls-files); do sed -i s/x/y/ \"$f\"; done"}`;
     string[] ran;
     auto reg = new ToolRegistry;
@@ -2767,6 +2773,7 @@ unittest
 // rust: agent.rs::record_usage_accumulates_aic_when_reported, agent.rs::new_session_resets_cumulative_counters
 unittest
 {
+    import nano.providers.mock;
     import std.math : isClose;
     auto reg = new ToolRegistry;
     LLMResponse credited(string text, bool aic)
@@ -2835,6 +2842,7 @@ private string safeName(string s)
 // rust: agent.rs::persisted_sessions_spill_beside_their_log, agent.rs::long_tool_output_is_cut_and_kept_on_disk
 unittest
 {
+    import nano.providers.mock;
     import std.file : tempDir, rmdirRecurse, exists, dirEntries, SpanMode, mkdirRecurse;
     import std.path : buildPath;
     import std.process : thisProcessID;
@@ -2932,6 +2940,7 @@ private LLMResponse cutText(string content, long tokens)
 // rust: agent.rs::a_reply_cut_off_at_the_output_limit_continues_instead_of_ending
 unittest
 {
+    import nano.providers.mock;
     import std.string : indexOf;
     auto mock = new MockClient([cutText("half a file", 4096), LLMResponse("all done")]);
     auto agent = new Agent(mock, new ToolRegistry, Policy.init, "sys");
@@ -2945,6 +2954,7 @@ unittest
 // rust: agent.rs::repeated_output_limit_cut_offs_end_with_a_distinct_stop_reason
 unittest
 {
+    import nano.providers.mock;
     LLMResponse[] cuts;
     foreach (_; 0 .. maxTruncatedContinuations + 1) cuts ~= cutText("still going", 100);
     auto mock = new MockClient(cuts);
@@ -2957,6 +2967,7 @@ unittest
 // rust: agent.rs::output_limit_continuations_accumulate_the_whole_answer
 unittest
 {
+    import nano.providers.mock;
     auto mock = new MockClient([cutText("one ", 100), cutText("two ", 100), LLMResponse("three")]);
     auto agent = new Agent(mock, new ToolRegistry, Policy.init, "sys");
     assert(agent.run("go", new NullEvents) == "one two three");
@@ -2966,6 +2977,7 @@ unittest
 // rust: agent.rs::a_tool_run_resets_the_continuation_accumulator
 unittest
 {
+    import nano.providers.mock;
     auto reg = new ToolRegistry;
     reg.register(ToolDefinition("echo", "echo", parseJSON(`{"type":"object"}`)), (JSONValue a) => "pong");
     auto mock = new MockClient([cutText("lost ", 100), LLMResponse("", "", [ToolCall.fromRaw("c1", "echo", `{}`)]),

@@ -1072,11 +1072,10 @@ private ulong sipHash13(const(ubyte)[] data) @safe pure nothrow
 
 version (unittest)
 {
-    import std.file : mkdirRecurse, write, rmdirRecurse, tempDir, setAttributes;
-    import std.array : replicate;
 
     private string tdir(string name)
     {
+        import std.file : mkdirRecurse, rmdirRecurse, tempDir;
         auto d = buildPath(tempDir, "nano-d-hooks-" ~ name);
         if (exists(d)) rmdirRecurse(d);
         mkdirRecurse(d);
@@ -1085,13 +1084,14 @@ version (unittest)
 
     private string script(string dir, string name, string body_)
     {
+        import std.file : write, setAttributes;
+        import std.conv : octal;
         auto p = buildPath(dir, name);
         write(p, body_);
         setAttributes(p, octal!755);
         return p;
     }
 
-    import std.conv : octal;
 
     private Hook cmd(Event e, string command)
     {
@@ -1113,6 +1113,7 @@ version (unittest)
 
     private HookManager loadProject(string dir, string settings, bool disable = false, bool noProject = false)
     {
+        import std.file : mkdirRecurse, write;
         mkdirRecurse(buildPath(dir, ".git"));
         mkdirRecurse(buildPath(dir, ".claude"));
         if (settings !is null) write(buildPath(dir, ".claude", "settings.json"), settings);
@@ -1206,6 +1207,7 @@ unittest // session_start_matcher_selects_on_source_trigger, plain text becomes 
 // rust: claude_hooks.rs::hook_that_ignores_large_stdin_does_not_deadlock
 unittest // hook_that_ignores_large_stdin_does_not_deadlock; user_prompt_submit_exit_2_blocks_with_stderr
 {
+    import std.array : replicate;
     auto dir = tdir("stdin");
     auto big = JSONValue(["command": JSONValue("x".replicate(1_000_000))]);
     assert(!with_([cmd(Event.postToolUse, "echo done")], dir).runPostToolUse("bash", big, "ok", "t1").blocked);
@@ -1286,6 +1288,7 @@ unittest // loads_and_dedups_from_settings_files; disable flags; disableAllHooks
 
 unittest // nano [hooks] and ~/.claude/settings.json load alongside the project; duplicates collapse
 {
+    import std.file : mkdirRecurse, write;
     import nano.toml : parseToml;
     auto dir = tdir("sources");
     auto home = buildPath(dir, "home");
@@ -1307,6 +1310,8 @@ unittest // nano [hooks] and ~/.claude/settings.json load alongside the project;
 // rust: claude_hooks.rs::unreadable_settings_file_is_reported_not_silently_skipped
 unittest // unreadable_settings_file_is_reported_not_silently_skipped
 {
+    import std.file : setAttributes;
+    import std.conv : octal;
     import core.sys.posix.unistd : geteuid;
     if (geteuid() == 0) return; // root reads mode-0 files
     auto dir = tdir("unreadable");
@@ -1460,6 +1465,7 @@ unittest // listing_neutralises_line_breaks_in_config_fields
 // rust: claude_hooks.rs::cap_counts_characters_not_bytes
 unittest
 {
+    import std.array : replicate;
     import std.range : walkLength;
     auto emoji = "🦀".replicate(4_000);
     assert(cap(emoji) == emoji);

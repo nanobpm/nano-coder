@@ -481,17 +481,14 @@ string[] relaunchArgv(const string[] argv, string session)
     return out_;
 }
 
-version (unittest)
-{
-    import std.file : tempDir, exists, remove, mkdirRecurse, rmdirRecurse, write, symlink;
-    import std.path : buildPath;
-}
 
 // rust: update.rs::detects_the_npm_channel_in_both_launcher_states
 // rust: update.rs::detects_the_npm_channel_through_the_global_bin_symlink
 // rust: update.rs::standalone_and_dev_builds_are_unmanaged
 unittest
 {
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, write, symlink, exists;
+    import std.path : buildPath;
     assert(channelFor("/usr/lib/node_modules/@nanobpm/nano-coder/bin/nano-coder") == Channel.npm);
     assert(channelFor("/usr/lib/node_modules/@nanobpm/nano-coder-darwin-arm64/bin/nano-coder") == Channel.npm);
     assert(channelFor("/home/u/src/nano-coder/d/nano-coder") == Channel.other);
@@ -522,6 +519,8 @@ unittest
 // rust: update.rs::state_round_trips_through_json, update.rs::save_state_leaves_no_temp_file_and_round_trips
 unittest
 {
+    import std.file : tempDir;
+    import std.path : buildPath;
     State s;
     assert(probeOutcome(s, "0.1.0", "0.2.0", 100) == "0.2.0" && s.lastCheck == 100 && s.latestKnown == "0.2.0");
     s.hinted = "0.2.0";
@@ -545,6 +544,8 @@ unittest
 // rust: update.rs::a_restart_re_arms_a_pending_hint_from_the_persisted_state, update.rs::an_unmanaged_install_never_inherits_a_cached_hint
 unittest
 {
+    import std.file : tempDir, remove;
+    import std.path : buildPath;
     auto p = buildPath(tempDir, "nano-d-update-defer.json");
     State s;
     s.lastCheck = 1000;

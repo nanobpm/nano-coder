@@ -488,9 +488,12 @@ Flags: `--login github-copilot|muse`, `--list-models PROVIDER`, `--trajectory SE
 `--config PATH`, `--verbosity LEVEL` (`-v`), `--sandbox off|workspace|read-only` (or `NANO_CODER_SANDBOX`),
 `--allow RULE` and `--deny RULE` (repeatable; added to the config's rules), `--version` (`-V`).
 
-Before opening a PR, run `dub build` and `dub test` (both run `scripts/check-safe.sh`
-first) and D-Scanner (`dub run dscanner -- --styleCheck --config dscanner.ini source`); CI
-checks all three. All code is `@safe`: every module starts with `@safe:`, and calls the
+CI runs `scripts/ci.sh`, and so can you: `scripts/ci.sh` runs everything CI does (lint,
+unit tests, release build, typecheck of both the release and unittest builds, smoke checks);
+`scripts/ci.sh quick` is the fast subset. With `git config core.hooksPath .githooks`, the
+pre-push hook runs `quick` before every push. Test-only imports go inside the unittest or
+test helper that uses them, never in a file-level `version (unittest)` block, where non-test
+code could use them and pass `dub test` but fail the release build. All code is `@safe`: every module starts with `@safe:`, and calls the
 compiler can't check are wrapped in small, commented `@trusted` functions (shared ones in
 `source/nano/safeio.d`). `check-safe.sh` fails the build on a module without `@safe:`, an
 uncommented `@trusted`, raw threads or `__gshared` outside `safeio.d`, or more `@trusted` than
