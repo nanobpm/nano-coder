@@ -765,7 +765,7 @@ void updateCommand(bool frameUi)
         if (gFrame) gFrame.suspend();
         leaveKeyMode();
         scope (exit) { enterKeyMode(0); if (gFrame) gFrame.resume(); }
-        lines = runInstaller(channel, launchExe(), packageVersion, (string p, string[] a) @safe => spawnInstaller(p, a));
+        lines = runInstaller(channel, launchExe(), packageVersion, (string p, string[] a, const string[string] e) @safe => spawnInstaller(p, a, e));
     }
     foreach (l; lines) writeln(l);
 }
