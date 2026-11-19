@@ -1,12 +1,12 @@
 /// `api_key_command`: run a shell command for a provider's key, bounded by a
 /// timeout and by turn cancellation (Rust `run_key_command_bounded`).
 ///
-/// The command runs in its own session (process group) with stdout and
-/// stderr going to temp files, so a large or never-closed output can't
-/// deadlock the wait. The key is accepted only once the whole group has
-/// exited: a backgrounded descendant still running after the leader (which
-/// could yet print the rest of the key) fails closed. Every failure kills
-/// the group.
+/// The command runs in its own session (process group). Stdout is a pipe,
+/// drained as it fills, so a large output can't deadlock the wait; stderr
+/// goes to a temp file. The key is accepted only once the leader has exited
+/// and stdout has reached EOF: anything still holding it (a backgrounded
+/// descendant, even one that left the group with `setsid`) could yet print
+/// more, so it fails closed. Every failure kills the group.
 module nano.keycmd;
 
 @safe:
@@ -24,77 +24,91 @@ extern (C) private int setsid() nothrow @nogc;
 /// The trimmed key `command` prints; throws with an actionable message.
 string runKeyCommand(string provider, string command, Duration timeout = keyCommandTimeout)
 {
+    import core.sys.posix.poll : pollfd, POLLIN;
     import core.sys.posix.signal : SIGKILL;
-    import core.thread : Thread;
     import std.file : exists, read, remove, tempDir;
     import std.path : buildPath;
-    import std.process : Config, spawnProcess, thisProcessID, tryWait, wait;
+    import std.process : Config, pipe, spawnProcess, thisProcessID, tryWait, wait;
     import std.stdio : File;
     import std.string : strip;
     import nano.control : cancelRequested;
-    import nano.safeio : killPid;
+    import nano.safeio : killPid, pollFds, readFd, setNonBlocking;
     import nano.tools : lossyUtf8;
 
     static shared size_t counter;
     import core.atomic : atomicOp;
-    auto stem = buildPath(tempDir, format("nano-coder-d-key-%s-%s", thisProcessID, atomicOp!"+="(counter, 1)));
-    auto outPath = stem ~ ".out", errPath = stem ~ ".err";
-    scope (exit)
-    {
-        if (outPath.exists) remove(outPath);
-        if (errPath.exists) remove(errPath);
-    }
-    auto outF = File(outPath, "w"), errF = File(errPath, "w"), inF = File("/dev/null", "r");
+    auto errPath = buildPath(tempDir, format("nano-coder-d-key-%s-%s.err", thisProcessID, atomicOp!"+="(counter, 1)));
+    scope (exit) if (errPath.exists) remove(errPath);
+    // Stdout is a pipe: EOF comes only once every process holding it has
+    // closed it, including one that left the process group (`setsid`).
+    auto outPipe = pipe();
+    auto errF = File(errPath, "w"), inF = File("/dev/null", "r");
     Config cfg;
     cfg.preExecFunction = () nothrow @nogc { setsid(); return true; };
-    auto pid = spawnProcess(["sh", "-c", command], inF, outF, errF, null, cfg);
-    outF.close();
+    auto pid = spawnProcess(["sh", "-c", command], inF, outPipe.writeEnd, errF, null, cfg);
+    outPipe.writeEnd.close();
     errF.close();
+    auto outFd = outPipe.readEnd.fileno;
+    setNonBlocking(outFd);
     auto group = -pid.processID;
     string what = format("provider %s: api_key_command", provider);
     string stderrText() { return lossyUtf8(cast(const(ubyte)[]) read(errPath)).strip; }
+    bool exited;
+    int status;
     void fail(string why)
     {
         killPid(group, SIGKILL);
+        if (!exited) wait(pid);
         throw new Exception(format("%s %s", what, why));
     }
 
+    ubyte[] captured;
+    ubyte[4096] buf;
+    bool eof;
+    // Reads what's ready, waiting up to 10ms for it.
+    void drain()
+    {
+        pollfd[1] fds = [pollfd(outFd, POLLIN, 0)];
+        if (pollFds(fds[], 10) <= 0) return;
+        for (;;)
+        {
+            auto n = readFd(outFd, buf[]);
+            if (n > 0) { captured ~= buf[0 .. n]; continue; }
+            if (n == 0) eof = true;
+            return; // EOF, or nothing more right now (EAGAIN)
+        }
+    }
+
     auto deadline = MonoTime.currTime + timeout;
-    int status;
+    MonoTime grace;
     for (;;)
     {
-        auto st = tryWait(pid);
-        if (st.terminated) { status = st.status; break; }
-        if (cancelRequested())
+        if (!eof) drain();
+        else
         {
-            killPid(group, SIGKILL);
-            wait(pid);
-            throw new Exception(what ~ " was cancelled");
+            import core.thread : Thread;
+            Thread.sleep(10.msecs);
         }
-        if (MonoTime.currTime >= deadline)
+        if (!exited)
         {
-            killPid(group, SIGKILL);
-            wait(pid);
-            throw new Exception(format("%s timed out after %s and was killed", what, timeout));
+            auto st = tryWait(pid);
+            if (st.terminated) { exited = true; status = st.status; grace = MonoTime.currTime + keyCommandDrainGrace; }
         }
-        Thread.sleep(10.msecs);
-    }
-    // The leader is gone; wait briefly for the rest of its group.
-    auto grace = MonoTime.currTime + keyCommandDrainGrace;
-    while (killPid(group, 0) == 0)
-    {
-        if (MonoTime.currTime >= grace || MonoTime.currTime >= deadline)
+        if (exited && eof) break;
+        if (cancelRequested()) fail("was cancelled");
+        auto now = MonoTime.currTime;
+        if (!exited && now >= deadline) fail(format("timed out after %s and was killed", timeout));
+        if (exited && (now >= grace || now >= deadline))
             fail("exited but a background process it started is still running (and holding stdout open), "
                 ~ "so the key can't be confirmed complete; don't background anything in the command");
-        if (cancelRequested()) fail("was cancelled");
-        Thread.sleep(10.msecs);
     }
+    killPid(group, SIGKILL); // stdout is closed: nothing left in the group can add to the key
     if (status != 0)
     {
         auto err = stderrText();
         throw new Exception(format("%s failed (exit %s)%s", what, status, err.length ? ": " ~ err : ""));
     }
-    auto key = lossyUtf8(cast(const(ubyte)[]) read(outPath)).strip;
+    auto key = lossyUtf8(captured).strip;
     if (!key.length) throw new Exception(what ~ " printed no key");
     return key;
 }
@@ -146,4 +160,40 @@ unittest
     assert(collectExceptionMsg(runKeyCommand("cmd", "sleep 30; printf sk", 20.seconds)).canFind("cancelled"));
     assert(collectExceptionMsg(runKeyCommand("cmd", "sleep 30 & printf sk", 20.seconds)).canFind("cancelled"));
     assert(MonoTime.currTime - t0 < 5.seconds);
+}
+
+/// A command fragment that backgrounds a process outside the command's
+/// process group, holding stdout open; null when neither tool is available.
+version (unittest) private string escapee()
+{
+    import std.process : executeShell;
+    if (executeShell("command -v setsid").status == 0) return "setsid sleep 5 &";
+    if (executeShell("command -v perl").status == 0) return "perl -e 'use POSIX; POSIX::setsid(); sleep 5' &";
+    return null;
+}
+
+// rust: providers/mod.rs::bounded_key_command_fails_closed_on_process_group_escapee_holding_stdout
+// rust: providers/mod.rs::bounded_key_command_fails_closed_on_keyless_process_group_escapee
+// rust: providers/mod.rs::bounded_key_command_cancel_applies_despite_process_group_escapee
+unittest
+{
+    import std.algorithm : canFind;
+    import std.exception : collectExceptionMsg;
+    import nano.control : TurnControl;
+    auto e = escapee();
+    if (e is null) return;
+    auto t0 = MonoTime.currTime;
+    // The key printed, then an escapee holds stdout: not confirmed complete.
+    auto msg = collectExceptionMsg(runKeyCommand("cmd", "printf sk-maybe-partial; " ~ e, 100.msecs));
+    assert(msg.canFind("holding stdout open"), msg);
+    // No key at all: fails promptly rather than hanging on the open pipe.
+    msg = collectExceptionMsg(runKeyCommand("cmd", e, 100.msecs));
+    assert(msg.canFind("holding stdout open"), msg);
+    assert(MonoTime.currTime - t0 < 4.seconds, "an escapee blocked the bound");
+    // Cancellation applies too.
+    auto c = new shared TurnControl;
+    c.cancel();
+    scope (exit) c.startTurn();
+    msg = collectExceptionMsg(runKeyCommand("cmd", e ~ " printf sk", 20.seconds));
+    assert(msg.canFind("cancelled"), msg);
 }

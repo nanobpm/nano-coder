@@ -837,12 +837,12 @@ providers/mod.rs::a_models_base_url_overrides_the_providers	test
 providers/mod.rs::api_key_command_supplies_key	test
 providers/mod.rs::bounded_key_command_backgrounded_success_returns_the_key	test
 providers/mod.rs::bounded_key_command_cancel_applies_after_the_leader_exits	test
-providers/mod.rs::bounded_key_command_cancel_applies_despite_process_group_escapee	gap	D's key command writes to temp files and waits for its process group; a descendant that escapes the group (setsid) isn't detected, so a key printed before it finishes is accepted
+providers/mod.rs::bounded_key_command_cancel_applies_despite_process_group_escapee	test
 providers/mod.rs::bounded_key_command_cancel_kills_descendants_holding_the_pipes	test
 providers/mod.rs::bounded_key_command_cancelled_mid_flight_is_killed	test
 providers/mod.rs::bounded_key_command_drains_large_output_without_deadlock	test
-providers/mod.rs::bounded_key_command_fails_closed_on_keyless_process_group_escapee	gap	D's key command writes to temp files and waits for its process group; a descendant that escapes the group (setsid) isn't detected, so a key printed before it finishes is accepted
-providers/mod.rs::bounded_key_command_fails_closed_on_process_group_escapee_holding_stdout	gap	D's key command writes to temp files and waits for its process group; a descendant that escapes the group (setsid) isn't detected, so a key printed before it finishes is accepted
+providers/mod.rs::bounded_key_command_fails_closed_on_keyless_process_group_escapee	test
+providers/mod.rs::bounded_key_command_fails_closed_on_process_group_escapee_holding_stdout	test
 providers/mod.rs::bounded_key_command_fails_closed_when_descendant_holds_pipe_before_the_key	test
 providers/mod.rs::bounded_key_command_fails_closed_when_leader_exits_but_descendant_holds_stdout	test
 providers/mod.rs::bounded_key_command_fails_closed_when_no_key_was_captured	test
