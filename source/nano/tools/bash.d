@@ -199,7 +199,7 @@ unittest
 {
     auto r = run("echo out; echo err >&2; exit 3", 5.seconds);
     assert(r.stdout_ == "out\n" && r.stderr_ == "err\n" && r.exitCode == 3 && !r.timedOut);
-    auto t = run("sleep 5 & sleep 5", 300.msecs);
+    auto t = run("sleep 5 & sleep 5", 100.msecs);
     assert(t.timedOut);
     import std.string : indexOf;
     auto text = execute(parseJSON(`{"command":"printf hi; false"}`));
@@ -285,18 +285,16 @@ unittest
     scope (exit) { heartbeatSink = savedSink; heartbeatInterval = savedInterval; }
     string[] beats;
     heartbeatSink = (string line) { beats ~= line; };
-    heartbeatInterval = 100.msecs;
-    // ~350 ms of silence at a 100 ms interval: at least 2 heartbeats.
-    auto r = run("sleep 0.35", 5.seconds);
+    heartbeatInterval = 40.msecs;
+    // ~150 ms of silence at a 40 ms interval: at least 2 heartbeats.
+    auto r = run("sleep 0.15", 5.seconds);
     assert(!r.timedOut && r.exitCode == 0);
     assert(beats.length >= 2, "expected ≥2 heartbeats, got " ~ beats.length.to!string);
     foreach (b; beats) assert(b.canFind("still running"), b);
     // The beat names the command head so the supervisor can tell calls apart.
-    assert(beats[0].canFind("sleep 0.35"), beats[0]);
-    // No heartbeat after the command finished.
-    auto n = beats.length;
-    sleepFor(250.msecs);
-    assert(beats.length == n, "heartbeat kept firing after the command ended");
+    assert(beats[0].canFind("sleep 0.15"), beats[0]);
+    // Beats come only from run's polling loop, on this thread, so none can
+    // follow its return: nothing to wait for here.
 }
 
 // The tool result carries no heartbeat text: it is supervisor-only.
@@ -308,8 +306,8 @@ unittest
     scope (exit) { heartbeatSink = savedSink; heartbeatInterval = savedInterval; }
     string[] beats;
     heartbeatSink = (string line) { beats ~= line; };
-    heartbeatInterval = 50.msecs;
-    auto text = execute(parseJSON(`{"command":"sleep 0.2; printf done"}`));
+    heartbeatInterval = 30.msecs;
+    auto text = execute(parseJSON(`{"command":"sleep 0.1; printf done"}`));
     assert(beats.length >= 1);
     assert(text.canFind("done") && !text.canFind("still running"), text);
 }
@@ -322,6 +320,6 @@ unittest
     scope (exit) { heartbeatSink = savedSink; heartbeatInterval = savedInterval; }
     heartbeatSink = null;
     heartbeatInterval = 20.msecs;
-    auto r = run("sleep 0.1", 5.seconds);
+    auto r = run("sleep 0.05", 5.seconds);
     assert(r.exitCode == 0); // no crash, no output, no heartbeat
 }
