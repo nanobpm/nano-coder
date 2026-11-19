@@ -504,3 +504,56 @@ unittest
     assert(updateAllowed(true, true, false) && !updateAllowed(false, true, false));
     assert(!updateAllowed(true, false, false) && !updateAllowed(true, true, true));
 }
+
+version (unittest) private string fakeRegistryDir(string tag)
+{
+    import std.file : tempDir, mkdirRecurse, exists, rmdirRecurse;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    auto dir = buildPath(tempDir, format("nano-d-update-%s-%s", tag, thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    return dir;
+}
+
+// rust: update.rs::check_against_a_fake_registry_hints_once_and_caches
+unittest
+{
+    import std.algorithm : canFind;
+    import std.file : rmdirRecurse;
+    import std.path : buildPath;
+    import nano.testserver : serve, Reply;
+    auto srv = serve([immutable Reply(200, "content-type: application/json\r\n", `{"version":"0.43.0"}`)]);
+    auto dir = fakeRegistryDir("hint");
+    scope (exit) rmdirRecurse(dir);
+    auto state = buildPath(dir, "state.json");
+    auto checker = new Checker(Channel.npm, state, "0.42.1", srv.url ~ "/latest");
+    assert(checker.check(true) == "0.43.0");
+    srv.finish();
+    auto hint = checker.takeHint();
+    assert(hint.canFind("0.43.0 is available (you have 0.42.1)") && hint.canFind("/update"), hint);
+    assert(checker.takeHint() is null, "hinted once");
+    // Persisted: a restarted process knows the version and doesn't re-hint it.
+    auto restarted = new Checker(Channel.npm, state, "0.42.1", "http://127.0.0.1:9/unused");
+    assert(restarted.latestKnown == "0.43.0");
+    assert(restarted.takeHint() is null, "already hinted before the restart");
+}
+
+// rust: update.rs::force_check_reports_the_current_version_when_up_to_date
+unittest
+{
+    import std.file : rmdirRecurse;
+    import std.path : buildPath;
+    import nano.testserver : serve, Reply;
+    foreach (reported; ["0.42.1", "0.40.0"])
+    {
+        auto srv = serve([immutable Reply(200, "content-type: application/json\r\n", `{"version":"` ~ reported ~ `"}`)]);
+        auto dir = fakeRegistryDir("current");
+        scope (exit) rmdirRecurse(dir);
+        auto checker = new Checker(Channel.npm, buildPath(dir, "s.json"), "0.42.1", srv.url ~ "/latest");
+        assert(checker.check(true) == reported, "/update can say up to date");
+        srv.finish();
+        assert(checker.latestKnown is null, "the hint cache stays newer-only");
+        assert(checker.takeHint() is null);
+    }
+}

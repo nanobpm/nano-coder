@@ -367,9 +367,40 @@ unittest
     import std.algorithm : canFind;
     assert(out_.canFind("temperature = \"default\" # global tune\n"), out_);
     assert(out_.canFind("[providers.groq] # fast\nmax_retries = 2\ntemperature = 0.4 # tuned for this provider\nthinking = \"off\" # tuned\n"), out_);
-    // (Unsetting a key inside an inline table is a gap: D leaves it.)
+    // Not changed, so the inline table is left as written.
     assert(out_.canFind("models = { k3 = { temperature = 0.7, thinking = \"low\" } }"), out_);
     assert(out_.canFind("temperature = 0.3") && out_.canFind("thinking = \"xhigh\""), out_);
+}
+
+// rust: settings.rs::save_writes_provider_and_model_temperatures_in_place
+unittest
+{
+    import std.algorithm : canFind;
+    import std.math : isNaN;
+    import nano.toml : parseToml;
+    auto doc = "temperature = 0.2 # global tune\n\n[providers.groq] # fast\nmax_retries = 2\n"
+        ~ "temperature = 0.1 # tuned for this provider\n\n[providers.kimi]\nmodels = { \"k3\" = { temperature = 0.5 } }\n";
+    Config c;
+    c.temperature = double.nan;
+    ProviderConfig groq, kimi;
+    groq.temperature = 0.4;
+    kimi.models["k3"] = ModelSettings.init; // temperature unset
+    c.providers = ["groq": groq, "kimi": kimi];
+    c.providers["anthropic"] = ProviderConfig.init;
+    c.providers["anthropic"].models["claude"] = ModelSettings.init;
+    c.providers["anthropic"].models["claude"].temperature = 0.3;
+    Changes ch;
+    ch.temperature = true;
+    ch.providerTemperatures["groq"] = true;
+    ch.modelTemperatures[pairKey("anthropic", "claude")] = true;
+    ch.modelTemperatures[pairKey("kimi", "k3")] = true;
+    auto text = applyChanges(doc, c, ch, null);
+    assert(text.canFind("temperature = \"default\" # global tune"), text);
+    assert(text.canFind("[providers.groq] # fast\nmax_retries = 2\ntemperature = 0.4 # tuned for this provider"), text);
+    assert(text.canFind("[providers.anthropic.models.claude]\ntemperature = 0.3"), text);
+    assert(!text.canFind("[providers]\n") && !text.canFind("[providers.anthropic]\n"), text);
+    assert(!text.canFind("0.5"), "unsetting inside an inline table removes the key: " ~ text);
+    parseToml(text); // still valid TOML
 }
 
 // rust: settings.rs::save_creates_a_missing_file

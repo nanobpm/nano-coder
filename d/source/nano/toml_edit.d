@@ -184,7 +184,27 @@ string tomlSet(string doc, const string[] path, string key, string value)
     }
     if (start < 0)
     {
-        if (value is null) return doc;
+        if (value is null)
+        {
+            // The table may be an inline value on some line: remove the key
+            // inside it, keeping the rest of the line.
+            foreach (i, l; lines)
+            {
+                auto k = lineKey(l);
+                if (k is null) continue;
+                auto h = tableAt(lines, i);
+                if (!(h.length < path.length && equal(h, path[0 .. h.length]) && k == path[h.length])) continue;
+                auto col = l.indexOf('=') + 1;
+                while (col < l.length && l[col] == ' ') col++;
+                if (col >= l.length || l[col] != '{') continue;
+                bool found;
+                auto edited = inlineRemove(l[col .. $], path[h.length + 1 .. $], key, found);
+                if (!found) return doc;
+                lines[i] = l[0 .. col] ~ edited;
+                return lines.join("\n") ~ (trailingNl ? "\n" : "");
+            }
+            return doc;
+        }
         // A dotted or inline definition elsewhere would make a new header a
         // redefinition: refuse rather than corrupt the file.
         foreach (i, l; lines)
@@ -232,6 +252,89 @@ string tomlSet(string doc, const string[] path, string key, string value)
         if (lineKey(lines[i]) !is null) { size_t er; valueEnd(lines, i, lines[i].indexOf('=') + 1, er); at = er + 1; }
     auto res = lines[0 .. at] ~ [tomlKey(key) ~ " = " ~ value] ~ lines[at .. $];
     return res.join("\n") ~ "\n";
+}
+
+/// `text` (starting at an inline table's `{`) with `key` under the nested
+/// inline tables `path` removed, entry and separating comma; `found` says
+/// whether it was there. Everything after the table is kept as it was.
+private string inlineRemove(string text, const string[] path, string key, out bool found)
+{
+    // Where the value starting at `i` ends (exclusive).
+    static size_t valueStop(string t, size_t i)
+    {
+        int depth;
+        for (; i < t.length; i++)
+        {
+            auto c = t[i];
+            if (c == '"' || c == '\'')
+            {
+                for (i++; i < t.length && t[i] != c; i++) if (c == '"' && t[i] == '\\') i++;
+                if (depth == 0) return i + 1;
+                continue;
+            }
+            if (c == '{' || c == '[') depth++;
+            else if (c == '}' || c == ']') { if (depth == 0) return i; if (--depth == 0) return i + 1; }
+            else if (depth == 0 && (c == ',' || c == ' ' || c == '#')) return i;
+        }
+        return i;
+    }
+    static size_t skipWs(string t, size_t i) { while (i < t.length && (t[i] == ' ' || t[i] == '\t')) i++; return i; }
+    size_t i = 1; // past `{`
+    size_t prevEnd = 0; // end of the previous entry's value (0: none yet)
+    for (;;)
+    {
+        i = skipWs(text, i);
+        if (i >= text.length || text[i] == '}') return text;
+        auto entryStart = i;
+        string k;
+        if (text[i] == '"' || text[i] == '\'')
+        {
+            auto q = text[i];
+            auto j = i + 1;
+            while (j < text.length && text[j] != q) j++;
+            k = text[i + 1 .. j];
+            i = j + 1;
+        }
+        else
+        {
+            auto j = i;
+            while (j < text.length && text[j] != ' ' && text[j] != '=' && text[j] != '.') j++;
+            k = text[i .. j];
+            i = j;
+        }
+        i = skipWs(text, i);
+        if (i >= text.length || text[i] != '=') return text; // dotted keys: left alone
+        auto vStart = skipWs(text, i + 1);
+        auto vEnd = valueStop(text, vStart);
+        auto next = skipWs(text, vEnd);
+        bool comma = next < text.length && text[next] == ',';
+        if (path.length && k == path[0] && vStart < text.length && text[vStart] == '{')
+        {
+            auto inner = inlineRemove(text[vStart .. $], path[1 .. $], key, found);
+            return text[0 .. vStart] ~ inner;
+        }
+        if (!path.length && k == key)
+        {
+            found = true;
+            if (comma) return text[0 .. entryStart] ~ text[skipWs(text, next + 1) .. $];
+            // The last entry: drop the comma before it instead.
+            if (prevEnd) return text[0 .. prevEnd] ~ " " ~ text[next .. $];
+            return text[0 .. entryStart] ~ text[next .. $];
+        }
+        prevEnd = vEnd;
+        i = comma ? next + 1 : next;
+    }
+}
+
+unittest
+{
+    bool f;
+    assert(inlineRemove(`{ "k3" = { temperature = 0.5 } }`, ["k3"], "temperature", f) == `{ "k3" = { } }` && f);
+    assert(inlineRemove(`{ k3 = { temperature = 0.7, thinking = "low" } } # x`, ["k3"], "temperature", f)
+        == `{ k3 = { thinking = "low" } } # x`);
+    assert(inlineRemove(`{ k3 = { thinking = "a,}", temperature = 0.7 } }`, ["k3"], "temperature", f)
+        == `{ k3 = { thinking = "a,}" } }`);
+    assert(inlineRemove(`{ k3 = { thinking = "low" } }`, ["k3"], "temperature", f) == `{ k3 = { thinking = "low" } }` && !f);
 }
 
 /// The header path in force at line `row`.

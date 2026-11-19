@@ -1152,7 +1152,7 @@ settings.rs::recent_models_skip_hidden_providers_without_consuming_slots	test
 settings.rs::save_creates_a_missing_file	test
 settings.rs::save_keeps_temperature_comments_when_the_provider_is_also_edited	test
 settings.rs::save_updates_only_changed_keys_and_keeps_comments	test
-settings.rs::save_writes_provider_and_model_temperatures_in_place	gap	D's TOML editor can't remove a key inside an inline table (models = { k3 = { temperature = ... } }): unsetting it leaves the value; everything else in this test is covered by the settings.d save test
+settings.rs::save_writes_provider_and_model_temperatures_in_place	test
 settings.rs::save_writes_thinking_levels_in_place	test
 settings.rs::switching_a_preset_to_a_key_command_overrides_its_env_var	test
 settings.rs::the_picker_is_offered_for_qwen_providers_only	todo
@@ -1378,14 +1378,14 @@ update.rs::a_restart_inside_the_interval_defers_the_startup_check	test
 update.rs::a_restart_re_arms_a_pending_hint_from_the_persisted_state	test
 update.rs::a_symlinked_cargo_home_is_still_the_cargo_channel	na	D ships only through npm: no cargo channel
 update.rs::an_unmanaged_install_never_inherits_a_cached_hint	test
-update.rs::check_against_a_fake_registry_hints_once_and_caches	gap	D update tests have no fake registry server; registry answers are untested
+update.rs::check_against_a_fake_registry_hints_once_and_caches	test
 update.rs::deleted_suffix_is_stripped_from_the_launch_path	claimed	launchExe strips " (deleted)"; thisExePath is not injectable for a test
 update.rs::detects_the_brew_channel_on_versioned_keg_paths	na	D ships only via npm (@nanobpm/nano-coder-d); no tarballs or Homebrew formula, so no brew channel (Rust #188)
 update.rs::detects_the_brew_channel_through_the_bin_and_opt_links	na	D ships only via npm (@nanobpm/nano-coder-d); no tarballs or Homebrew formula, so no brew channel (Rust #188)
 update.rs::detects_the_cargo_channel_with_and_without_cargo_home	na	D ships only through npm: no cargo channel
 update.rs::detects_the_npm_channel_in_both_launcher_states	test
 update.rs::detects_the_npm_channel_through_the_global_bin_symlink	test
-update.rs::force_check_reports_the_current_version_when_up_to_date	gap	D update tests have no fake registry server; registry answers are untested
+update.rs::force_check_reports_the_current_version_when_up_to_date	test
 update.rs::probe_hints_only_for_newer_unhinted_versions	test
 update.rs::relaunch_argv_replaces_resume_and_continue	test
 update.rs::relaunch_argv_uses_the_attached_form_for_dash_prefixed_ids	test
