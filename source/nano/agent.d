@@ -3,6 +3,7 @@
 module nano.agent;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 import nano.clock : monoNow, since, sleepFor, stdTimeNow, wallNow;
 import nano.arith : checkedMul, checkedSub, saturatingSub;
 import nano.option : Option, some, none, match, ifSome, orElse, unwrap, NotNull;
@@ -97,7 +98,7 @@ struct IdleCompactReport
     CompactReport report;
     size_t percentBefore, percentAfter;
 
-    this(CompactReport r, size_t window)
+    this(CompactReport r, size_t window) pure
     {
         import std.math : round;
         size_t pct(size_t t) { return cast(size_t) round(t * 100.0 / (window ? window : 1)); }
@@ -243,7 +244,7 @@ class Agent
     }
 
     /// Take a reported outcome from a resumed turn's messages; true when found.
-    private bool outcomeFrom(const Message[] tail)
+    private bool outcomeFrom(const Message[] tail) pure
     {
         foreach_reverse (ref m; tail)
             foreach_reverse (ref c; m.toolCalls)
@@ -341,7 +342,7 @@ class Agent
             if (auto done = givenId in completedInputs)
             {
                 import std.stdio : stderr;
-                stdErr.writefln("[agent] input %s already processed; returning recorded response", JSONValue(givenId).toString);
+                stdErr.writefln("[agent] input %s already processed; returning recorded response", JSONValue(givenId).jsonText);
                 auto st = givenId in completedStops;
                 lastStop = st is null ? StopReason.endTurn : stopReasonFrom(*st);
                 auto oc = givenId in completedOutcomes;
@@ -945,9 +946,9 @@ class Agent
     }
 
     /// The context window and where it came from.
-    size_t contextWindow() const { string _; return contextWindow(_); }
+    size_t contextWindow() pure const { string _; return contextWindow(_); }
 
-    size_t contextWindow(out string source) const
+    size_t contextWindow(out string source) pure const
     {
         size_t w;
         if (configuredWindow) { w = configuredWindow; source = configuredWindowSource; }
@@ -984,7 +985,7 @@ class Agent
         }
         size_t tools_;
         foreach (d; offeredTools())
-            tools_ += ctx.textTokens(d.name) + ctx.textTokens(d.description) + ctx.textTokens(() { return d.parameters.toString; }());
+            tools_ += ctx.textTokens(d.name) + ctx.textTokens(d.description) + ctx.textTokens(() { return d.parameters.jsonText; }());
         return ctx.messagesTokens(messages, slots, avail) + tools_;
     }
 
@@ -1007,12 +1008,12 @@ class Agent
 
     size_t estimateContextTokens() { bool _; return estimateContextTokens(_); }
 
-    private size_t outputBase() const { return cast(size_t) effectiveMaxTokens(); }
+    private size_t outputBase() pure const { return cast(size_t) effectiveMaxTokens(); }
 
     /// The output budget before the context-window clamp: `max_tokens` when
     /// configured, else the model's published cap, a known cap for the model
     /// name, or the large default; never above a cap learned from an error.
-    long effectiveMaxTokens() const
+    long effectiveMaxTokens() pure const
     {
         long base = maxTokens > 0 ? maxTokens
             : capabilities.maxOutput ? cast(long) capabilities.maxOutput
@@ -1077,7 +1078,7 @@ class Agent
         idleCached = false;
     }
 
-    private bool idleCompactDueAt(size_t tokens)
+    private bool idleCompactDueAt(size_t tokens) pure
     {
         if (!idleCompact || !overThresholdAt(tokens)) return false;
         auto window = contextWindow();
@@ -1113,7 +1114,7 @@ class Agent
     }
 
     /// `overThreshold` for an already-estimated context size.
-    bool overThresholdAt(size_t tokens)
+    bool overThresholdAt(size_t tokens) pure
     {
         if (!autoCompact) return false;
         auto threshold = autoCompactThreshold < 0.1 ? 0.1 : autoCompactThreshold > 0.99 ? 0.99 : autoCompactThreshold;
@@ -3077,9 +3078,9 @@ version (unittest)
         return new mem.Store(buildPath(dir, "memory"), null, 0);
     }
 
-    private LLMResponse probeCall(string id, string path)
+    private LLMResponse probeCall(string id, string path) pure
     {
-        return LLMResponse("", "", [ToolCall.fromRaw(id, "probe", JSONValue(["path": path]).toString)]);
+        return LLMResponse("", "", [ToolCall.fromRaw(id, "probe", JSONValue(["path": path]).jsonText)]);
     }
 
     private ToolRegistry probeTools() pure

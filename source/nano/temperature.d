@@ -5,6 +5,7 @@
 module nano.temperature;
 
 @safe:
+pure:
 
 import std.algorithm : canFind;
 import std.format : format;

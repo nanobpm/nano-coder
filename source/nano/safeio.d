@@ -768,20 +768,23 @@ size_t[2] terminalSize(int fd = 1) @trusted nothrow @nogc
 
 /// C `strtod` (correctly rounded, unlike `std.conv.to!double`) on `text`;
 /// `consumed` is how many characters it read. The string is copied to a
-/// NUL-terminated buffer, and `end` only points into that copy.
-double cStrtod(string text, out size_t consumed) @trusted
+/// NUL-terminated buffer, and `end` only points into that copy. Pure: strtod
+/// reads only its input and the C locale, which stays "C" (check-safe bans
+/// setlocale); the errno it may set on overflow is never read.
+double cStrtod(string text, out size_t consumed) pure @trusted
 {
     import core.stdc.stdlib : strtod;
     import std.string : toStringz;
+    alias Strtod = double function(scope const(char)*, scope char**) pure nothrow @nogc;
     auto z = text.toStringz;
-    immutable(char)* end;
-    auto v = strtod(z, &end);
+    char* end;
+    auto v = (cast(Strtod) &strtod)(z, &end);
     consumed = end - z;
     return v;
 }
 
 /// ditto
-double cStrtod(string text)
+double cStrtod(string text) pure
 {
     size_t n;
     return cStrtod(text, n);
@@ -896,4 +899,54 @@ U deepCopy(U)(const U v) pure
     assert(jsonGet(j, "a").integer == 1 && jsonGet(j, "b") is null);
     auto n1 = JSONValue(1);
     assert(jsonGet(n1, "a") is null);
+}
+
+// --- JSON text, pure -------------------------------------------------------
+
+import std.json : JSONOptions, JSONValue;
+
+private string jsonTextImpl(const JSONValue v, JSONOptions options, bool pretty)
+{
+    return pretty ? v.toPrettyString(options) : v.toString(options);
+}
+
+/// `v.toString(options)`, but `pure`, so code that serializes JSON can be.
+// why: std.json's toJSON recurses through a nested function, for which D
+// infers no attributes, so it isn't marked pure; it only writes to its own
+// appender (floats through std.format's pure formatter) and reads no globals.
+string jsonText(const JSONValue v, JSONOptions options = JSONOptions.none) pure @trusted
+{
+    alias Impure = string function(const JSONValue, JSONOptions, bool) @safe;
+    alias Pure = string function(const JSONValue, JSONOptions, bool) pure @safe;
+    return (cast(Pure) cast(Impure) &jsonTextImpl)(v, options, false);
+}
+
+/// `v.toPrettyString(options)`, pure; see `jsonText`.
+// why: as for jsonText.
+string jsonPretty(const JSONValue v, JSONOptions options = JSONOptions.none) pure @trusted
+{
+    alias Impure = string function(const JSONValue, JSONOptions, bool) @safe;
+    alias Pure = string function(const JSONValue, JSONOptions, bool) pure @safe;
+    return (cast(Pure) cast(Impure) &jsonTextImpl)(v, options, true);
+}
+
+/// Through a pointer, as `p.toString` reads (UFCS doesn't dereference).
+string jsonText(const(JSONValue)* v, JSONOptions options = JSONOptions.none) pure
+{
+    return jsonText(*v, options);
+}
+
+/// ditto
+string jsonPretty(const(JSONValue)* v, JSONOptions options = JSONOptions.none) pure
+{
+    return jsonPretty(*v, options);
+}
+
+unittest
+{
+    import std.json : parseJSON;
+    auto v = parseJSON(`{"a":[1,2.5,"x/y"],"b":null}`);
+    assert(jsonText(v) == v.toString);
+    assert(jsonText(v, JSONOptions.doNotEscapeSlashes) == v.toString(JSONOptions.doNotEscapeSlashes));
+    assert(jsonPretty(v) == v.toPrettyString);
 }

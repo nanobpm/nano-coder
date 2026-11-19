@@ -218,7 +218,7 @@ string[] walk(string root, Denied denied = null)
     return found;
 }
 
-private void readLimit(JSONValue args, out long limit)
+private void readLimit(JSONValue args, out long limit) pure
 {
     limit = optInt(args, "limit", defaultLimit);
     if (limit < 1 || limit > maxLimit) throw new ToolError(format("limit must be between 1 and %s", maxLimit));

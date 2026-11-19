@@ -262,7 +262,7 @@ private final class FrameState
     size_t lastW, lastH;
     Debouncer debounce = Debouncer(150);
 
-    this(FrameRenderer renderer) { this.renderer = renderer; }
+    this(FrameRenderer renderer) pure { this.renderer = renderer; }
     StatusFn status;
     /// A turn is running: the prompt shows the spinner and `clock`.
     bool busy;

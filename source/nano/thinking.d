@@ -9,6 +9,7 @@
 module nano.thinking;
 
 @safe:
+pure:
 
 import std.algorithm : canFind, countUntil, filter, map, all;
 import std.array : array, join;
@@ -721,7 +722,7 @@ bool applyAnthropic(const Request req, ref JSONValue body, long maxTokens) pure
 
 version (unittest)
 {
-    private ProviderConfig prov(string toml)
+    private ProviderConfig prov(string toml) pure
     {
         import nano.toml : parseToml;
         ProviderConfig p;

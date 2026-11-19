@@ -2,6 +2,7 @@
 module nano.llm;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 
 import std.json;
 
@@ -55,9 +56,9 @@ struct ToolCall
         return c;
     }
 
-    string encodedArguments() const
+    string encodedArguments() pure const
     {
-        return invalidArguments.length ? invalidArguments : arguments.toString;
+        return invalidArguments.length ? invalidArguments : arguments.jsonText;
     }
 
     /// The tool result for a call whose arguments were not a JSON object
@@ -169,7 +170,7 @@ struct Message
         return m;
     }
 
-    JSONValue toJson() const
+    JSONValue toJson() pure const
     {
         JSONValue j = ["role": roleName(role), "content": content];
         if (toolCalls.length)
@@ -394,8 +395,8 @@ interface LLMClient
 {
     LLMResponse chat(const ref ChatRequest req, StreamSink sink);
     string[] listModels();
-    string modelName() const;
-    string providerName() const;
+    string modelName() pure const;
+    string providerName() pure const;
 }
 
 /// Splits `<think>...</think>` out of streamed content, across chunk boundaries.

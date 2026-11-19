@@ -31,7 +31,7 @@ class Interfering : MockClient
         if (hook !is null) hook(seen.length + 1);
         return super.chat(req, sink);
     }
-    override string modelName() const { return model; }
+    override string modelName() pure const { return model; }
 }
 
 Agent agentFor(LLMClient c)

@@ -7,6 +7,7 @@ version (unittest):
 import std.algorithm : all, canFind;
 import std.regex : regex, replaceAll;
 import nano.status;
+import nano.paths : tildePath;
 
 private:
 

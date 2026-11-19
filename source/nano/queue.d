@@ -14,6 +14,7 @@
 module nano.queue;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 
 import std.sumtype : SumType, match;
 import std.format : format;
@@ -142,10 +143,10 @@ enum usage = "usage: /queue [list] | /queue add text | /queue remove N... | /que
 
 class QueueUsage : Exception
 {
-    this(string msg) { super(msg); }
+    this(string msg) pure { super(msg); }
 }
 
-private size_t parseId(string word)
+private size_t parseId(string word) pure
 {
     import std.json : JSONValue;
     try
@@ -153,7 +154,7 @@ private size_t parseId(string word)
         if (word.length && word[0] != '+' && word[0] != '-') return word.to!size_t;
     }
     catch (ConvException) {}
-    throw new QueueUsage(format!"%s is not a queue id — %s"(JSONValue(word).toString, usage));
+    throw new QueueUsage(format!"%s is not a queue id — %s"(JSONValue(word).jsonText, usage));
 }
 
 private string[] words(string s) pure
@@ -174,7 +175,7 @@ private string[2] splitOnce(string s) pure
 }
 
 /// Parse the arguments after `/queue` (empty means list); throws QueueUsage.
-QueueOp parse(string args)
+QueueOp parse(string args) pure
 {
     args = args.strip;
     if (!args.length || args == "list" || args == "ls") return QueueOp(ListOp());

@@ -2,6 +2,7 @@
 module nano.providers.anthropic;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 
 import std.json;
 import std.format : format;
@@ -16,7 +17,7 @@ class AnthropicClient : LLMClient, KindedClient
 {
     private ResolvedProvider p;
 
-    this(ResolvedProvider p) { this.p = p; }
+    this(ResolvedProvider p) pure { this.p = p; }
 
     string modelName() pure const { return p.model; }
     string providerName() pure const { return p.name; }
@@ -55,7 +56,7 @@ class AnthropicClient : LLMClient, KindedClient
                     foreach (ref tb; m.thinkingBlocks)
                         if (tb.type == JSONType.object && "type" in tb && tb["type"].type == JSONType.string
                                 && (tb["type"].str == "thinking" || tb["type"].str == "redacted_thinking"))
-                            blocks ~= parseJSON(tb.toString);
+                            blocks ~= parseJSON(tb.jsonText);
                     if (m.content.length) blocks ~= textBlock(m.content);
                     foreach (c; m.toolCalls)
                     {
@@ -281,7 +282,7 @@ struct AnthropicStream
                 if (auto u = "usage" in j) { readUsage(*u, r.usage); readCopilotAic(j, r.usage); }
                 break;
             case "error":
-                throw new Exception("anthropic stream error: " ~ j["error"].toString);
+                throw new Exception("anthropic stream error: " ~ j["error"].jsonText);
             default:
                 break;
         }

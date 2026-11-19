@@ -2,6 +2,8 @@
 module nano.context;
 
 @safe:
+pure:
+import nano.safeio : jsonText, jsonPretty;
 import nano.arith : checkedSub, saturatingSub;
 
 import std.algorithm : canFind, min, max;
@@ -114,10 +116,10 @@ string formatBytes(size_t bytes) pure
 size_t textTokens(string text) pure { return (text.length + 3) / 4; }
 
 /// Tokens for one message: content, each tool call, framing overhead.
-size_t messageTokens(const ref Message m)
+size_t messageTokens(const ref Message m) pure
 {
     size_t calls;
-    foreach (ref c; m.toolCalls) calls += textTokens(c.name) + textTokens(c.arguments.toString) + 4;
+    foreach (ref c; m.toolCalls) calls += textTokens(c.name) + textTokens(c.arguments.jsonText) + 4;
     return textTokens(m.content) + calls + 4;
 }
 
@@ -135,7 +137,7 @@ size_t imageTokens(const ref imported!"nano.attachment".Attachment a) pure
 /// attachments count as images, the rest as their placeholder text. (Rust
 /// also leaves out of the quota attachments whose stored file is gone; D
 /// assumes they are all present.)
-size_t messagesTokens(const Message[] ms, size_t maxImages = 0, const(bool[])[] avail = null)
+size_t messagesTokens(const Message[] ms, size_t maxImages = 0, const(bool[])[] avail = null) pure
 {
     // Only available occurrences can be sent as images, so only they count
     // toward the quota: the oldest `omitted` of them are placeholders, the
@@ -269,26 +271,30 @@ bool isContextOverflow(string error) pure
     return false;
 }
 
-private size_t firstCapture(string error, const string[] patterns)
+/// The first capture of the first of `patterns` (case-insensitive) that
+/// matches `error`, as a number, or 0. The patterns are compiled at compile
+/// time, so matching is pure (`regex()` keeps a global cache).
+private size_t firstCapture(patterns...)(string error) pure
 {
-    import std.regex : regex, matchFirst;
-    foreach (p; patterns)
-    {
-        auto m = matchFirst(error, regex(p, "i"));
+    import std.regex : ctRegex, matchFirst;
+    static foreach (p; patterns)
+    {{
+        static immutable re = ctRegex!(p, "i");
+        auto m = matchFirst(error, re);
         if (!m.empty)
         {
             try return m[1].to!size_t;
             catch (Exception) {} // a capture too large for size_t isn't a usable limit; try the next pattern
         }
-    }
+    }}
     return 0;
 }
 
 /// The window size stated in a context-overflow error, or 0.
-size_t limitFromError(string error)
+size_t limitFromError(string error) pure
 {
-    return firstCapture(error, [`maximum context length is (\d+)`, `context size \((\d+) tokens\)`, `> ?(\d+) maximum`,
-        `context window (?:of|is) (\d+)`, `limit of (\d+) tokens`]);
+    return firstCapture!(`maximum context length is (\d+)`, `context size \((\d+) tokens\)`, `> ?(\d+) maximum`,
+        `context window (?:of|is) (\d+)`, `limit of (\d+) tokens`)(error);
 }
 
 /// Does this error say `max_tokens` exceeded the model's output cap?
@@ -303,11 +309,11 @@ bool isOutputCapError(string error) pure
 }
 
 /// The output cap stated in an output-cap rejection, or 0.
-size_t outputCapFromError(string error)
+size_t outputCapFromError(string error) pure
 {
-    return firstCapture(error, [`max_tokens:\s*\d+\s*>\s*(\d+)`, `at most (\d+) completion tokens`,
+    return firstCapture!(`max_tokens:\s*\d+\s*>\s*(\d+)`, `at most (\d+) completion tokens`,
         `output tokens(?: for [^ ]+)? is (\d+)`, `maximum output tokens (?:is|of) (\d+)`,
-        `max_tokens must be less than or equal to (\d+)`, `maximum of (\d+) (?:completion|output) tokens`]);
+        `max_tokens must be less than or equal to (\d+)`, `maximum of (\d+) (?:completion|output) tokens`)(error);
 }
 
 /// Keep the head (2/3) and tail (1/3) of text longer than `maxChars`. The
@@ -520,7 +526,7 @@ bool clipMessage(ref Message m, size_t maxTokens) pure
 
 /// Render messages as a plain transcript for the summarizer, newest content
 /// kept when it exceeds `maxChars`. With `ids`, blocks carry `[#N]` labels.
-string renderTranscript(const Message[] messages, size_t maxChars, bool ids)
+string renderTranscript(const Message[] messages, size_t maxChars, bool ids) pure
 {
     string[] blocks;
     foreach (ref m; messages)
@@ -534,7 +540,7 @@ string renderTranscript(const Message[] messages, size_t maxChars, bool ids)
                 block = "ASSISTANT:";
                 if (m.content.strip.length) block ~= "\n" ~ clip(m.content, 6_000);
                 foreach (ref c; m.toolCalls)
-                    block ~= format("\n[called %s(%s)]", c.name, clip(c.arguments.toString, 1_500));
+                    block ~= format("\n[called %s(%s)]", c.name, clip(c.arguments.jsonText, 1_500));
                 break;
             case Role.tool:
                 block = format("TOOL %s (%s):\n%s", m.isError ? "failed" : "result", m.toolName.length ? m.toolName : "tool",

@@ -62,7 +62,7 @@ alias Answer = SumType!(Answered, Away, Dismissed);
 
 class QuestionError : Exception
 {
-    this(string msg) @safe { super(msg); }
+    this(string msg) pure @safe { super(msg); }
 }
 
 /// Drop control characters (newlines too) and line/paragraph separators from
@@ -103,7 +103,7 @@ string questionPrompt(string question, size_t width, out string[] body_) pure
 }
 
 /// Parse the tool's arguments, tolerating a JSON-string body.
-Question[] parse(JSONValue args)
+Question[] parse(JSONValue args) pure
 {
     if (args.type == JSONType.string)
     {

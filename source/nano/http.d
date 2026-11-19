@@ -3,6 +3,7 @@
 module nano.http;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 import nano.clock : monoNow, sleepFor, wallNow;
 
 import nano.safeio : stdErr, stdOut;
@@ -20,7 +21,7 @@ import nano.retry : ErrorInfo, RetryPolicy, retryDelay, retryableError = retryab
 /// be resumed, but the caller can discard the partial reply and ask again.
 class StreamInterrupted : Exception
 {
-    this(string msg) { super(msg); }
+    this(string msg) pure { super(msg); }
 }
 
 class ApiError : Exception
@@ -29,7 +30,7 @@ class ApiError : Exception
     string body_;
     /// The body's normalized error (code, type, message).
     ErrorInfo info;
-    this(int status, string body_, string what)
+    this(int status, string body_, string what) pure
     {
         this.status = status;
         this.body_ = body_;
@@ -124,7 +125,7 @@ string postJson(string url, string[string] headers, JSONValue body_, string what
     req.headers = headers.dup;
     req.headers["Content-Type"] = "application/json";
     if (onEvent !is null) req.headers["Accept"] = "text/event-stream";
-    req.body_ = body_.toString;
+    req.body_ = body_.jsonText;
     import nano.config : defaultTimeoutSecs;
     req.idleTimeout = (timeoutSecs > 0 ? timeoutSecs : defaultTimeoutSecs()).seconds;
     auto offline = OfflineWait(what, policy);
@@ -269,7 +270,7 @@ private struct OfflineWait
 
     Duration idle, connect; // the request's own timeouts, before `bound` capped them
 
-    this(string what, RetryPolicy policy) { this.what = what; this.policy = policy; }
+    this(string what, RetryPolicy policy) pure { this.what = what; this.policy = policy; }
 
     /// The budget left while an outage is being waited out (`Duration.max`
     /// when none is, or the budget is unbounded).

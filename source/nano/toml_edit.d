@@ -5,6 +5,7 @@
 module nano.toml_edit;
 
 @safe:
+pure:
 
 import std.array : join, split;
 import std.format : format;

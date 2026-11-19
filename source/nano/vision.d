@@ -6,6 +6,7 @@
 module nano.vision;
 
 @safe:
+pure:
 
 import std.algorithm : canFind, any;
 import std.json;

@@ -15,6 +15,7 @@
 module nano.acp;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 import nano.clock : stdTimeNow;
 import nano.arith : saturatingSub;
 import nano.option : Option, some, none, match, ifSome, NotNull;
@@ -324,7 +325,7 @@ struct AcpRouter
             foreach (t; st.items) items ~= parseJSON(t);
             if (!finish(items, st.steerMarks, st.sessionId)) return;
             immutable(string)[] back;
-            foreach (m; items) back ~= m.toString;
+            foreach (m; items) back ~= m.jsonText;
             st.items = back;
         });
     }
@@ -376,7 +377,7 @@ final class AcpServer : AgentEvents
         };
     }
 
-    void send(JSONValue msg) { writeOut(msg.toString); }
+    void send(JSONValue msg) { writeOut(msg.jsonText); }
 
     /// A bash "still running" heartbeat: a `session/update` the supervising
     /// worker sees on the JSON-RPC stream. It is not part of the model's
@@ -434,7 +435,7 @@ final class AcpServer : AgentEvents
     {
         JSONValue u = ["sessionUpdate": JSONValue("tool_call"), "toolCallId": JSONValue(call.id),
             "title": JSONValue(call.name), "kind": JSONValue(toolKind(call.name)), "status": JSONValue("in_progress")];
-        u["rawInput"] = parseJSON(call.arguments.toString);
+        u["rawInput"] = parseJSON(call.arguments.jsonText);
         update(u);
     }
 

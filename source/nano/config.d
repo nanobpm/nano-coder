@@ -4,6 +4,7 @@
 module nano.config;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 
 import nano.skills : SkillsConfig;
 import nano.memory : MemoryMode, parseMemoryMode, defaultExpiryDays;
@@ -472,12 +473,12 @@ struct Config
 
     /// A notice for a config that still sets the retired `renderer` option
     /// to anything but `frame` (the only renderer left).
-    string retiredRendererNotice() const
+    string retiredRendererNotice() pure const
     {
         import std.string : strip;
         if (retiredRenderer is null || retiredRenderer.strip == "frame") return null;
         return format("Note: renderer = %s is no longer available; using the frame renderer (remove the setting)",
-            imported!"std.json".JSONValue(retiredRenderer).toString);
+            imported!"std.json".JSONValue(retiredRenderer).jsonText);
     }
 
     static Config load(string path)

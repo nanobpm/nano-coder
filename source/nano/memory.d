@@ -14,6 +14,7 @@
 module nano.memory;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 import nano.clock : monoNow, sleepFor, wallNow;
 import nano.arith : saturatingSub;
 
@@ -48,14 +49,14 @@ private enum defaultLimit = 20;
 /// `memory` in config.toml.
 enum MemoryMode { off, readOnly, on }
 
-MemoryMode parseMemoryMode(string s)
+MemoryMode parseMemoryMode(string s) pure
 {
     switch (s)
     {
     case "off": return MemoryMode.off;
     case "read_only": return MemoryMode.readOnly;
     case "on": return MemoryMode.on;
-    default: throw new Exception(format("memory must be \"on\", \"read_only\" or \"off\", not %s", JSONValue(s).toString));
+    default: throw new Exception(format("memory must be \"on\", \"read_only\" or \"off\", not %s", JSONValue(s).jsonText));
     }
 }
 
@@ -63,13 +64,13 @@ enum Scope { user, project }
 
 string name(Scope s) pure { return s == Scope.user ? "user" : "project"; }
 
-Scope parseScope(string text)
+Scope parseScope(string text) pure
 {
     switch (text.strip.toLower)
     {
     case "user", "machine", "global": return Scope.user;
     case "project", "repo", "repository": return Scope.project;
-    default: throw new Exception(format("unknown scope %s; use \"user\" or \"project\"", JSONValue(text.strip.toLower).toString));
+    default: throw new Exception(format("unknown scope %s; use \"user\" or \"project\"", JSONValue(text.strip.toLower).jsonText));
     }
 }
 
@@ -93,9 +94,9 @@ struct Entry
 
     string label() pure const { return format("[%s] (%s)", scrubControl(id), created.length >= 10 ? created[0 .. 10] : created); }
 
-    string toJson() const
+    string toJson() pure const
     {
-        string q(string s) { return JSONValue(s).toString(JSONOptions.doNotEscapeSlashes); }
+        string q(string s) { return JSONValue(s).jsonText(JSONOptions.doNotEscapeSlashes); }
         auto s = format(`{"id":%s,"text":%s,"created":%s,"last_used":%s`, q(id), q(text), q(created), q(lastUsed));
         if (evidence !is null) s ~= `,"evidence":` ~ q(evidence);
         if (session !is null) s ~= `,"session":` ~ q(session);
@@ -185,7 +186,7 @@ final class Store
     /// Entries unused for this many days expire; 0 disables expiry.
     ulong expiryDays;
 
-    this(string root, string project, ulong expiryDays)
+    this(string root, string project, ulong expiryDays) pure
     {
         this.root = root;
         this.project = project;
@@ -329,7 +330,7 @@ final class Store
             }
             loaded ~= Loaded(s, p, f, lock);
         }
-        if (!hits.length) return format("No memories match %s.", JSONValue(pattern).toString);
+        if (!hits.length) return format("No memories match %s.", JSONValue(pattern).jsonText);
         import std.algorithm : SwapStrategy;
         hits.sort!((a, b) => a.e.lastUsedTime > b.e.lastUsedTime, SwapStrategy.stable);
         auto shown = hits[0 .. hits.length < defaultLimit ? $ : defaultLimit];
@@ -815,11 +816,11 @@ private immutable string[] stopAnchors = [
 ];
 
 /// "hint" or "rule" (case-insensitive), else an error.
-string parseKind(string text)
+string parseKind(string text) pure
 {
     auto k = text.strip.toLower;
     if (k == "hint" || k == "rule") return k;
-    throw new Exception(format("unknown kind %s; use \"hint\" or \"rule\"", JSONValue(k).toString));
+    throw new Exception(format("unknown kind %s; use \"hint\" or \"rule\"", JSONValue(k).jsonText));
 }
 
 private string[] validateAnchors(string[] list)
@@ -832,7 +833,7 @@ private string[] validateAnchors(string[] list)
         if (anchor.byDchar.any!isLineBreak) throw new Exception("anchors must be single-line");
         auto n = anchor.byDchar.count;
         if (n < minAnchorChars || n > maxAnchorChars)
-            throw new Exception(format("anchor %s must be %s-%s characters", JSONValue(anchor).toString, minAnchorChars, maxAnchorChars));
+            throw new Exception(format("anchor %s must be %s-%s characters", JSONValue(anchor).jsonText, minAnchorChars, maxAnchorChars));
         if (looksLikeSecret(anchor) !is null) throw new Exception("refusing to save: an anchor looks like a secret");
         if (!out_.any!(a => asciiEqualFold(a, anchor))) out_ ~= anchor;
     }
@@ -909,7 +910,7 @@ private bool isHostLike(string token)
 }
 
 /// A tool call's string and number arguments, lowercased, one per line.
-string argumentText(const JSONValue args)
+string argumentText(const JSONValue args) pure
 {
     import std.uni : uniToLower = toLower;
     string out_;
@@ -929,7 +930,7 @@ string argumentText(const JSONValue args)
                 foreach (k; keys) walk(v.objectNoRef[k]);
             }
             break;
-        case JSONType.integer, JSONType.uinteger, JSONType.float_: out_ ~= v.toString ~ "\n"; break;
+        case JSONType.integer, JSONType.uinteger, JSONType.float_: out_ ~= v.jsonText ~ "\n"; break;
         case JSONType.null_, JSONType.true_, JSONType.false_: break;
         }
     }
@@ -1097,7 +1098,7 @@ void logRecall(Store store, string event, string id, string tool, string session
         // Keys sorted, as serde_json's `json!` map writes them.
         JSONValue j = ["at": JSONValue(stamp(wallNow)), "event": JSONValue(event), "id": JSONValue(id),
             "session": session !is null ? JSONValue(session) : JSONValue(null), "tool": JSONValue(tool)];
-        auto line = cast(const(ubyte)[]) (j.toString(JSONOptions.doNotEscapeSlashes) ~ "\n");
+        auto line = cast(const(ubyte)[]) (j.jsonText(JSONOptions.doNotEscapeSlashes) ~ "\n");
         auto fd = openPath(buildPath(store.root, recallLog), O_WRONLY | O_CREAT | O_APPEND, octal!600);
         if (fd < 0) return;
         scope (exit) close(fd);
@@ -1195,7 +1196,7 @@ private string memoryCommandText(Store store, string arg, bool writable, bool pl
     }
     if (arg.length)
         return format("Unknown /memory argument %s; use /memory or /memory forget <id>.\n",
-            JSONValue(arg).toString(JSONOptions.doNotEscapeSlashes));
+            JSONValue(arg).jsonText(JSONOptions.doNotEscapeSlashes));
     // Effective writability: plan mode has no memory_save tool either.
     bool canWrite = writable && !plan;
     auto all_ = store.all();

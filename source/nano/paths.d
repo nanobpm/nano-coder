@@ -235,3 +235,14 @@ unittest
 {
     assert(debugQuote(`a/"b"`) == `"a/\"b\""`);
 }
+
+/// `path` with the home directory shown as `~`, matching `home` and its
+/// symlink-resolved form (`nano.status.tildePath` does the matching).
+string tildePath(string path, string home)
+{
+    import std.file : exists;
+    import nano.safeio : realPath;
+    static import nano.status;
+    return nano.status.tildePath(path, home, home.length && home.exists ? realPath(home) : null);
+}
+

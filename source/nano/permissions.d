@@ -16,6 +16,7 @@
 module nano.permissions;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 
 import std.json;
 import std.format : format;
@@ -203,7 +204,7 @@ bool ruleMatches(string ruleSrc, string tool, JSONValue args)
         auto joined = joinPath(cwd, expandTilde(path));
         return pathRuleMatches(rule, normalize(joined), cwd) || pathRuleMatches(rule, resolveSymlinks(joined), cwd);
     case Subject.arguments:
-        return rule.matches(args.toString);
+        return rule.matches(args.jsonText);
     }
 }
 
@@ -338,13 +339,13 @@ struct Policy
                 if (root is null) root = ".";
                 if (auto rule = readDenyRule(expandTilde(root), cwd))
                     return format("rule `%s` denies %s on %s", rule, tool, root);
-                auto text = args.toString;
+                auto text = args.jsonText;
                 foreach (rule; deny)
                     if (rule.subject == Subject.arguments && rule.appliesTo(tool) && rule.matches(text))
                         return format("rule `%s` denies %s", rule.source, tool);
                 return null;
             default:
-                auto text = args.toString;
+                auto text = args.jsonText;
                 foreach (rule; deny)
                     if (rule.appliesTo(tool) && rule.matches(text))
                         return format("rule `%s` denies %s", rule.source, tool);

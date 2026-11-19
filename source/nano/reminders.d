@@ -5,6 +5,7 @@
 module nano.reminders;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 
 import std.algorithm : canFind, startsWith, all;
 import std.array : join;
@@ -62,7 +63,7 @@ struct Reminders
     /// Whether `report_outcome` is offered, so the warning only names it then.
     bool outcomeTool;
 
-    this(bool outcomeTool) { this.outcomeTool = outcomeTool; }
+    this(bool outcomeTool) pure { this.outcomeTool = outcomeTool; }
 
     void startTurn() pure
     {
@@ -207,7 +208,7 @@ immutable string[] diagnosticStages = ["wc", "head", "tail", "cat", "tac", "sort
 
 /// The argument text a repeat match is based on: for bash, the command with
 /// its trailing read-only diagnostic stages stripped plus the other arguments.
-string normalisedArgs(string tool, JSONValue args)
+string normalisedArgs(string tool, JSONValue args) pure
 {
     if (tool == "bash" && args.type == JSONType.object)
         if (auto c = "command" in args.objectNoRef)
@@ -215,9 +216,9 @@ string normalisedArgs(string tool, JSONValue args)
             {
                 JSONValue[string] rest;
                 foreach (k, v; args.objectNoRef) if (k != "command") rest[k] = v;
-                return pipelineKey(c.str) ~ "|" ~ JSONValue(rest).toString;
+                return pipelineKey(c.str) ~ "|" ~ JSONValue(rest).jsonText;
             }
-    return args.toString;
+    return args.jsonText;
 }
 
 /// Strip the trailing run of read-only diagnostic stages from a command.

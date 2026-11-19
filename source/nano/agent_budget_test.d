@@ -227,7 +227,7 @@ private class Reports : MockClient, CapabilityProbe
         c.windowSource = "test";
         return c;
     }
-    override string modelName() const { return "claude-test"; }
+    override string modelName() pure const { return "claude-test"; }
 }
 
 // The window's sources in order: config, then what the endpoint reports,

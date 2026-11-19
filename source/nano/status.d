@@ -3,6 +3,7 @@
 module nano.status;
 
 @safe:
+pure:
 import nano.arith : saturatingSub;
 
 import std.format : format;
@@ -88,13 +89,13 @@ string fitCells(string text, size_t budget) pure
     return out_;
 }
 
-/// `path` with the home directory shown as `~` (whole components only; the
-/// symlink-resolved home matches too, as on macOS `/tmp` is `/private/tmp`).
-string tildePath(string path, string home)
+/// `path` with the home directory shown as `~` (whole components only).
+/// `resolvedHome` is `home` with symlinks resolved, which matches too (on
+/// macOS `/tmp` is `/private/tmp`); `nano.paths.tildePath` finds it.
+string tildePath(string path, string home, string resolvedHome) pure
 {
     import std.path : pathSplitter;
     import std.range : walkLength;
-    import std.file : exists;
     static string rest(string p, string h)
     {
         if (h.length < 2) return null;
@@ -104,15 +105,9 @@ string tildePath(string path, string home)
         return null;
     }
     if (home.length && home.pathSplitter.walkLength <= 1) home = null;
-    string resolved;
-    if (home.length && home.exists)
-    {
-        import nano.safeio : realPath;
-        resolved = realPath(home);
-        if (resolved !is null && resolved.pathSplitter.walkLength <= 1) resolved = null;
-    }
+    if (!home.length || (resolvedHome.length && resolvedHome.pathSplitter.walkLength <= 1)) resolvedHome = null;
     auto r = rest(path, home);
-    if (r is null) r = rest(path, resolved);
+    if (r is null) r = rest(path, resolvedHome);
     if (r is null) return path;
     return r.length ? "~/" ~ r : "~";
 }
@@ -354,8 +349,20 @@ unittest
 unittest
 {
     import std.algorithm : canFind;
-    import std.regex : regex, replaceAll;
-    string visible(string s) { return s.replaceAll(regex(`\x1b\[[0-9;]*m`), ""); }
+    string visible(string s) // without SGR escapes (`\x1b[...m`)
+    {
+        string o;
+        for (size_t i = 0; i < s.length; i++)
+        {
+            if (s[i] == '\x1b' && i + 1 < s.length && s[i + 1] == '[')
+            {
+                while (i < s.length && s[i] != 'm') i++;
+                continue;
+            }
+            o ~= s[i];
+        }
+        return o;
+    }
     Stats s = {provider: "openai", model: "gpt-4o", cwd: "~/workspace/nano/src/providers", tokens: 12_345,
         window: 128_000, messages: 7, autoCompact: true, threshold: 0.8};
     auto line = visible(render(s, 200));
@@ -385,10 +392,10 @@ unittest
     assert(elidePath("~/averyveryverylongdirectory", 10) == "…directory");
     assert(fitCells("a\x1b[2Jb世c", 4) == "a[2J" && fitCells("ab世c", 3) == "ab");
 
-    assert(tildePath("/home/joshua/x", "/home/joshua") == "~/x");
-    assert(tildePath("/home/joshua", "/home/joshua") == "~");
-    assert(tildePath("/home/joshua2", "/home/joshua") == "/home/joshua2");
-    assert(tildePath("/x", "/") == "/x");
+    assert(tildePath("/home/joshua/x", "/home/joshua", null) == "~/x");
+    assert(tildePath("/home/joshua", "/home/joshua", null) == "~");
+    assert(tildePath("/home/joshua2", "/home/joshua", null) == "/home/joshua2");
+    assert(tildePath("/x", "/", null) == "/x");
 
     RateMeter m;
     assert(m.record(400, 0) == 0 && m.record(400, 100) == 0);

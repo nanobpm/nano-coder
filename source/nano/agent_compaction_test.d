@@ -49,8 +49,8 @@ class CapClient : LLMClient
     }
 
     string[] listModels() { return ["cap"]; }
-    string modelName() const { return "cap"; }
-    string providerName() const { return "cap"; }
+    string modelName() pure const { return "cap"; }
+    string providerName() pure const { return "cap"; }
 }
 
 Agent agentFor(LLMClient c)
@@ -182,8 +182,8 @@ class StreamOnlySummary : LLMClient
         return LLMResponse("SUMMARY: streamed");
     }
     string[] listModels() { return ["s"]; }
-    string modelName() const { return "s"; }
-    string providerName() const { return "s"; }
+    string modelName() pure const { return "s"; }
+    string providerName() pure const { return "s"; }
 }
 
 // rust: agent.rs::compaction_streams_the_summary_request

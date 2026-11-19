@@ -4,6 +4,7 @@
 module nano.qwen;
 
 @safe:
+pure:
 
 import std.string : strip, toLower, indexOf, startsWith, endsWith;
 import std.algorithm : stripRight;

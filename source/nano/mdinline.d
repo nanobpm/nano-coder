@@ -9,6 +9,7 @@
 module nano.mdinline;
 
 @safe:
+pure:
 
 import std.array : appender;
 import std.string : strip, toLower;

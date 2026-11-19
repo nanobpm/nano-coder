@@ -4,6 +4,7 @@
 module nano.session_history;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 import nano.arith : saturatingSub;
 
 import std.algorithm : canFind, startsWith, min;
@@ -26,7 +27,7 @@ enum size_t defaultLimit = 20, maxLimit = 100, snippetChars = 240, snippetsPerMe
 
 class HistoryError : Exception
 {
-    this(string msg) @safe { super(msg); }
+    this(string msg) pure @safe { super(msg); }
 }
 
 bool isHistoryTool(string name) pure @safe { return name == searchTool || name == readTool; }
@@ -118,16 +119,16 @@ private string label(ulong id, const ref Message m) pure @safe
 }
 
 /// Text and tool calls, leaving out history lookups so a search can't find itself.
-private string searchable(const ref Message m)
+private string searchable(const ref Message m) pure
 {
     if (isHistoryTool(m.toolName)) return "";
     string text = m.content;
     foreach (ref c; m.toolCalls)
-        if (!isHistoryTool(c.name)) text ~= format("\n[called %s(%s)]", c.name, c.arguments.toString);
+        if (!isHistoryTool(c.name)) text ~= format("\n[called %s(%s)]", c.name, c.arguments.jsonText);
     return text;
 }
 
-private ulong idArg(JSONValue args, string key, bool required)
+private ulong idArg(JSONValue args, string key, bool required) pure
 {
     auto v = args.type == JSONType.object ? key in args.objectNoRef : null;
     if (v is null || v.type == JSONType.null_)
@@ -256,7 +257,7 @@ string search(string path, JSONValue args)
     }
     if (!hits.length)
     {
-        auto o = format("No %smessages match %s.", role.length ? role ~ " " : "", JSONValue(pattern).toString);
+        auto o = format("No %smessages match %s.", role.length ? role ~ " " : "", JSONValue(pattern).jsonText);
         return hiddenNote.length ? o ~ "\n" ~ hiddenNote : o;
     }
     auto out_ = hits.join("\n");
@@ -303,7 +304,7 @@ string read(string path, JSONValue args)
                 }
     if (!emitted && m.thinking.length) text ~= "[thinking] " ~ m.thinking ~ "\n";
     text ~= m.content;
-    foreach (ref c; m.toolCalls) text ~= format("\n[called %s id=%s %s]", c.name, c.id, c.arguments.toString);
+    foreach (ref c; m.toolCalls) text ~= format("\n[called %s id=%s %s]", c.name, c.id, c.arguments.jsonText);
     return truncateOutput(text, limit, format("history-%s", id));
 }
 

@@ -3,6 +3,7 @@
 module nano.providers.muse;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 import nano.clock : wallNow;
 
 import nano.llm;
@@ -185,7 +186,7 @@ class MuseClient : LLMClient, CapabilityProbe, KindedClient
         try
         {
             foreach (r; catalogRows(catalogJson(true)))
-                if (modelId(r) == p.model) { row = parseJSON(r.toString); break; }
+                if (modelId(r) == p.model) { row = parseJSON(r.jsonText); break; }
         }
         catch (Exception) return c; // the catalogue is optional: keep the defaults
         if (row.type != JSONType.object) return c;

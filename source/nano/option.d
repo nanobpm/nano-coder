@@ -43,7 +43,7 @@ struct Option(T)
     private bool present;
 
     /// Present; halts if `x` is a null reference (use `none` for absent).
-    this(T x)
+    this(T x) pure
     {
         static if (is(T == class) || is(T == interface) || is(T : U*, U))
             if (x is null) assert(0, "some(null): use none for an absent " ~ T.stringof);
@@ -52,7 +52,7 @@ struct Option(T)
     }
 
     /// Absent.
-    this(None) {}
+    this(None) pure {}
 
     void opAssign(None) pure { value = T.init; present = false; }
 
@@ -91,7 +91,7 @@ struct NotNull(T) if (is(T == class) || is(T == interface))
 
     @disable this();
 
-    this(T x)
+    this(T x) pure
     {
         if (load(x) is null) assert(0, "NotNull!" ~ T.stringof ~ " given null");
         store(value, x);
@@ -108,7 +108,7 @@ struct NotNull(T) if (is(T == class) || is(T == interface))
     static if (is(T == shared))
     {
         // Held in a shared object (a field of a `shared` class).
-        this(T x) shared
+        this(T x) pure shared
         {
             if (load(x) is null) assert(0, "NotNull!" ~ T.stringof ~ " given null");
             store(value, x);

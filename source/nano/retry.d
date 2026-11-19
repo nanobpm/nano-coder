@@ -4,6 +4,7 @@
 module nano.retry;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 
 import core.time : Duration, seconds, msecs, usecs;
 import std.json;
@@ -18,7 +19,7 @@ struct ErrorInfo
     string code, kind, message;
 
     /// `{"error":{"code","type","message"}}` or `{"type":"error","error":{...}}`.
-    static ErrorInfo fromBody(int status, string body_)
+    static ErrorInfo fromBody(int status, string body_) pure
     {
         ErrorInfo e;
         e.status = status;
@@ -32,7 +33,7 @@ struct ErrorInfo
             auto v = name in err.objectNoRef;
             if (v is null) return null;
             if (v.type == JSONType.string) return v.str;
-            if (v.type == JSONType.integer || v.type == JSONType.uinteger || v.type == JSONType.float_) return v.toString;
+            if (v.type == JSONType.integer || v.type == JSONType.uinteger || v.type == JSONType.float_) return v.jsonText;
             return null;
         }
         e.code = field("code");

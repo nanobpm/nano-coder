@@ -9,6 +9,7 @@
 module nano.claude_hooks;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 import nano.clock : monoNow, sleepFor;
 
 import nano.safeio : ignoreSigpipe, killGroup, pollFds, readFd, setNonBlocking, writeFd;
@@ -246,7 +247,7 @@ class HookManager
     string permissionMode = "default";
     SandboxConfig sandbox;
 
-    this(Hook[] hooks, string projectDir)
+    this(Hook[] hooks, string projectDir) pure
     {
         this.hooks = hooks;
         this.projectDir = projectDir;
@@ -370,7 +371,7 @@ class HookManager
                     if (ifRule !is null)
                         if (auto err = validateRule(ifRule))
                         {
-                            skipped ~= Skipped(eventName, format("invalid `if` filter %s: %s", JSONValue(ifRule).toString, err), source);
+                            skipped ~= Skipped(eventName, format("invalid `if` filter %s: %s", JSONValue(ifRule).jsonText, err), source);
                             continue;
                         }
                     Hook h;
@@ -382,7 +383,7 @@ class HookManager
                         if (a.type == JSONType.array)
                         {
                             h.hasArgs = true;
-                            foreach (x; a.arrayNoRef) h.args ~= x.type == JSONType.string ? x.str : x.toString;
+                            foreach (x; a.arrayNoRef) h.args ~= x.type == JSONType.string ? x.str : x.jsonText;
                         }
                     if (auto t = "timeout" in entry)
                     {
@@ -399,14 +400,14 @@ class HookManager
     /// Drop duplicate handlers (same event, matcher, `if` rule and command and
     /// args), keeping the first. Shell form (no args) stays distinct from exec
     /// form with no args.
-    private void dedup()
+    private void dedup() pure
     {
         bool[string] seen;
         Hook[] kept;
         foreach (h; hooks)
         {
             auto key = JSONValue([JSONValue(claudeName(h.event)), JSONValue(h.matcher), JSONValue(h.ifRule),
-                JSONValue(h.command), h.hasArgs ? JSONValue(h.args) : JSONValue(null)]).toString;
+                JSONValue(h.command), h.hasArgs ? JSONValue(h.args) : JSONValue(null)]).jsonText;
             if (key in seen) continue;
             seen[key] = true;
             kept ~= h;
@@ -542,7 +543,7 @@ class HookManager
     private Outcome runAll(const(Hook)[] selected, Event event, JSONValue input)
     {
         Outcome o;
-        auto json = input.toString;
+        auto json = input.jsonText;
         foreach (ref h; selected) o.absorb(interpret(event, h, execute(h, json, projectDir, h.source.isProject ? sandbox : SandboxConfig.init)));
         return o;
     }
@@ -1106,7 +1107,7 @@ version (unittest)
         return h;
     }
 
-    private HookManager with_(Hook[] hooks, string dir)
+    private HookManager with_(Hook[] hooks, string dir) pure
     {
         auto m = new HookManager(hooks, dir);
         m.sessionId = "s1";

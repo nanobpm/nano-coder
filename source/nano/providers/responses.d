@@ -5,6 +5,7 @@
 module nano.providers.responses;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 
 import std.json;
 import std.format : format;
@@ -45,7 +46,7 @@ JSONValue responsesBody(const ref ChatRequest req, const ref ResolvedProvider p,
                 // Reasoning items go right before the calls they led to.
                 if (replay)
                     foreach (ref b; m.thinkingBlocks)
-                        if (typeOf(b) == "reasoning") input ~= parseJSON(b.toString);
+                        if (typeOf(b) == "reasoning") input ~= parseJSON(b.jsonText);
                 foreach (ref c; m.toolCalls)
                 {
                     JSONValue fc = ["type": "function_call", "call_id": c.id, "name": c.name,
@@ -154,12 +155,12 @@ private ToolCall callFrom(const JSONValue item, string raw) pure
 }
 
 /// Parse a whole (non-streamed) Responses payload.
-LLMResponse parseResponses(JSONValue v, bool replay)
+LLMResponse parseResponses(JSONValue v, bool replay) pure
 {
     if (strOf(v, "status") == "failed")
-        throw new Exception("response failed: " ~ ("error" in v ? v["error"].toString : v.toString));
+        throw new Exception("response failed: " ~ ("error" in v ? v["error"].jsonText : v.jsonText));
     auto output = "output" in v;
-    if (output is null || output.type != JSONType.array) throw new Exception("response has no output: " ~ v.toString);
+    if (output is null || output.type != JSONType.array) throw new Exception("response has no output: " ~ v.jsonText);
     LLMResponse r;
     foreach (item; output.arrayNoRef)
         switch (typeOf(item))
@@ -236,9 +237,9 @@ struct ResponsesStream
                 break;
             case "response.failed":
                 auto resp = "response" in j;
-                throw new Exception("response failed: " ~ (resp && "error" in *resp ? (*resp)["error"].toString : j.toString));
+                throw new Exception("response failed: " ~ (resp && "error" in *resp ? (*resp)["error"].jsonText : j.jsonText));
             case "error", "response.error":
-                throw new Exception("stream error: " ~ ("error" in j ? j["error"].toString : j.toString));
+                throw new Exception("stream error: " ~ ("error" in j ? j["error"].jsonText : j.jsonText));
             default:
                 break;
         }

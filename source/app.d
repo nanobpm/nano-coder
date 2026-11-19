@@ -3,6 +3,7 @@
 module app;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 import nano.clock : monoNow, sleepFor, wallNow;
 import nano.arith : saturatingSub;
 import nano.option : Option, some, none, match, ifSome, unwrap, notNull, NotNull, nullable;
@@ -86,7 +87,7 @@ struct Options
 /// A command line that doesn't parse; `main` prints it and exits 2.
 class UsageError : Exception
 {
-    this(string msg) @safe { super(msg); }
+    this(string msg) pure @safe { super(msg); }
 }
 
 /// The command line (Rust parse_args_from). Throws `UsageError`.
@@ -845,7 +846,7 @@ import nano.ui : Verbosity, parseVerbosity, verbosityListing, providersListing;
 final class EditorUi : SettingsUi
 {
     private NotNull!LineEditor e;
-    this(LineEditor e) { this.e = e; }
+    this(LineEditor e) pure { this.e = e; }
 
     ptrdiff_t select(string prompt, const string[] labels, size_t initial)
     {
@@ -929,7 +930,8 @@ unittest
 void setVerbosity(Verbosity v) { atomicStore(gVerbosity, v); }
 
 // What the frame's status bar shows (status.rs).
-import nano.status : Stats, Activity, RateMeter, tildePath;
+import nano.status : Stats, Activity, RateMeter;
+import nano.paths : tildePath;
 import nano.agent_status : statusFromAgent;
 /// The frame renderer (`FrameUi.init` when off): set by the main thread,
 /// used by any.
@@ -1355,7 +1357,7 @@ class Console : AgentEvents
                     import std.regex : regex, replaceAll;
                     return fitText(v.str.replaceAll(regex(`\s+`), " ").strip, 121);
                 }
-        if (c.arguments.type == JSONType.object && c.arguments.toString == "{}") return "";
+        if (c.arguments.type == JSONType.object && c.arguments.jsonText == "{}") return "";
         return c.encodedArguments;
     }
 }
@@ -1414,11 +1416,11 @@ unittest
 
 /// A tool call's arguments as shown expanded: pretty JSON, or the raw text
 /// when the model's arguments weren't a JSON object.
-string argsText(const ref ToolCall c)
+string argsText(const ref ToolCall c) pure
 {
     if (c.invalidArguments.length) return c.invalidArguments;
-    if (c.arguments.type == JSONType.object && c.arguments.toString == "{}") return "";
-    return c.arguments.toPrettyString;
+    if (c.arguments.type == JSONType.object && c.arguments.jsonText == "{}") return "";
+    return c.arguments.jsonPretty;
 }
 
 /// `text` cut to `width` characters, ending in `…` when cut.
@@ -1790,7 +1792,8 @@ int runMain(string[] args)
             instructions = discoverInstructions(cfg, dir);
             if (agent !is null) agent.instructions = instructions;
         }
-        return buildSystemPrompt(cfg, dir, plan, skills, index, instructions.match!(pi => pi.render, () => string.init));
+        return buildSystemPrompt(cfg, dir, wallNow.toISOExtString[0 .. 10], plan, skills, index,
+            instructions.match!(pi => pi.render, () => string.init));
     }
     auto questions = QuestionBroker.make;
     tools.register(questionDefinition, (JSONValue a) => questions.run(a));
@@ -2443,7 +2446,7 @@ int runMain(string[] args)
                 {
                     auto note = commandRejection(input);
                     writeln(note !is null ? note : format("Can't run %s: unexpected arguments "
-                        ~ "(/help lists commands and their arguments)", JSONValue(input).toString(JSONOptions.doNotEscapeSlashes)));
+                        ~ "(/help lists commands and their arguments)", JSONValue(input).jsonText(JSONOptions.doNotEscapeSlashes)));
                     continue;
                 }
             }
@@ -2621,7 +2624,7 @@ int runMain(string[] args)
                     bool ok;
                     try { validateId(id); ok = path.exists && path.isFile; }
                     catch (Exception) {} // an invalid ID or unreadable path is reported as "no saved session" just below
-                    if (!ok) { writefln("No saved session %s: /resume without an ID lists them", JSONValue(id).toString); continue; }
+                    if (!ok) { writefln("No saved session %s: /resume without an ID lists them", JSONValue(id).jsonText); continue; }
                     try loadSession(path);
                     catch (Exception e) { writeln(e.msg); continue; }
                     writefln("Resumed session %s (resume later with --resume %s)", id, id);
@@ -2634,7 +2637,7 @@ int runMain(string[] args)
                     if (!logPath.length) { writeln("Session persistence is disabled: no trajectory to show"); continue; }
                     if (arg.length && arg != "--json" && arg != "--markdown" && arg != "--md")
                     {
-                        writefln("Unknown option %s; use /trajectory [--json|--markdown]", JSONValue(arg).toString);
+                        writefln("Unknown option %s; use /trajectory [--json|--markdown]", JSONValue(arg).jsonText);
                         continue;
                     }
                     nano.trajectory.Trajectory t;

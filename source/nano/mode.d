@@ -7,6 +7,7 @@
 module nano.mode;
 
 @safe:
+pure:
 
 import std.string : strip, toLower;
 import std.format : format;

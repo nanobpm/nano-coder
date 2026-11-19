@@ -8,6 +8,7 @@
 module nano.mdtable;
 
 @safe:
+pure:
 import nano.arith : saturatingSub;
 
 import std.array : appender, join, replicate;

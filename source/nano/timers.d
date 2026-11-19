@@ -37,7 +37,7 @@ bool isTimerTool(string name) pure { return toolNames.canFind(name); }
 /// A rejected timer call.
 class TimerError : Exception
 {
-    this(string msg) { super(msg); }
+    this(string msg) pure { super(msg); }
 }
 
 struct Timer
@@ -119,7 +119,7 @@ struct Timers
             t.id, clock(due), describe(delay)), true);
     }
 
-    private static long idArg(JSONValue args, string tool)
+    private static long idArg(JSONValue args, string tool) pure
     {
         if (args.type != JSONType.object || "id" !in args.objectNoRef) throw new TimerError(tool ~ " takes {id}");
         auto v = args["id"];
@@ -128,7 +128,7 @@ struct Timers
     }
 
     /// Mark a fired timer handled, ending its reminders.
-    private Outcome done(JSONValue args)
+    private Outcome done(JSONValue args) pure
     {
         auto id = idArg(args, "timer_done");
         foreach (i, t; pending)
@@ -143,7 +143,7 @@ struct Timers
             pending.length ? "; waiting to be done: " ~ pending.map!(t => t.id.to!string).join(", ") : ""));
     }
 
-    private Outcome cancel(JSONValue args, long now)
+    private Outcome cancel(JSONValue args, long now) pure
     {
         auto id = idArg(args, "timer_cancel");
         foreach (i, t; pending)
@@ -243,7 +243,7 @@ string firedNotice(const Timer[] due) pure
 }
 
 /// `30s`, `5m`, `1h30m`, `2h`, `90` (seconds), `1.5h`.
-long parseDelay(string s)
+long parseDelay(string s) pure
 {
     auto t = s.strip.toLower;
     if (!t.length) throw new TimerError("empty delay");

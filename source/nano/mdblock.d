@@ -6,6 +6,7 @@
 module nano.mdblock;
 
 @safe:
+pure:
 
 import nano.option : NotNull, notNull;
 import std.array : appender, join;

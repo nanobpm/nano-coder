@@ -312,7 +312,7 @@ final class FrameRenderer
     private size_t width, height;
     private bool started;
 
-    this(void delegate(string) @safe out_) { this.out_ = out_; }
+    this(void delegate(string) @safe out_) pure { this.out_ = out_; }
 
     /// The next render is a full redraw (something else drew on the screen).
     void invalidate() pure { started = false; }

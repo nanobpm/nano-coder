@@ -8,6 +8,7 @@
 module nano.muse;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 import nano.clock : wallNow;
 
 import std.json;
@@ -141,7 +142,7 @@ string saveCredentials(const StoredCredentials c, string dataDir = null)
 {
     import nano.copilot : writePrivateAtomic;
     auto path = credentialsPath(dataDir);
-    writePrivateAtomic(path, c.toJSON.toPrettyString);
+    writePrivateAtomic(path, c.toJSON.jsonPretty);
     return path;
 }
 
@@ -260,7 +261,7 @@ MintedKey mint(const Endpoints e, string oauth, bool onboard)
     req.headers["x-api-version"] = museApiVersion;
     req.headers["Content-Type"] = "application/json";
     req.headers["Authorization"] = "Bearer " ~ oauth;
-    req.body_ = JSONValue(["onboard": onboard]).toString;
+    req.body_ = JSONValue(["onboard": onboard]).jsonText;
     string text;
     auto status = perform(req, text);
     JSONValue v;
@@ -346,7 +347,7 @@ string login(scope void delegate(string) @safe note, scope void delegate(long se
     auto deviceCode = strField(device, "device_code"), userCode = strField(device, "user_code"),
         uri = strField(device, "verification_uri");
     if (deviceCode is null || userCode is null || uri is null)
-        throw new Exception("unexpected device code response: " ~ device.toString);
+        throw new Exception("unexpected device code response: " ~ device.jsonText);
     auto iv = intField(device, "interval");
     long interval = iv.isNull ? 5 : iv.get;
     if (interval < 1) interval = 1;
@@ -378,7 +379,7 @@ string login(scope void delegate(string) @safe note, scope void delegate(long se
             return path;
         }
         auto err = strField(poll, "error");
-        if (err is null) throw new Exception("unexpected token response: " ~ poll.toString);
+        if (err is null) throw new Exception("unexpected token response: " ~ poll.jsonText);
         switch (err)
         {
             case "authorization_pending": break;

@@ -18,6 +18,7 @@
 module nano.skills;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 import nano.clock : monoNow, sleepFor;
 
 import nano.safeio : listDir, readBytes;
@@ -293,7 +294,7 @@ final class Skills
         auto name = args["name"].str.strip;
         auto i = skills.countUntil!(s => s.name == name);
         if (i < 0)
-            throw new ToolError(format("no skill named %s; available: %s", JSONValue(name).toString, names.join(", ")));
+            throw new ToolError(format("no skill named %s; available: %s", JSONValue(name).jsonText, names.join(", ")));
         auto skill = skills[i];
         // Re-check containment at read time: SKILL.md may since have been
         // swapped for a symlink escaping the directory.
@@ -607,7 +608,7 @@ private string checkoutFor(const ref Locked locked, const ref SkillsConfig confi
     auto host = gitHost(locked.git);
     if (!config.allowedHosts.any!(h => h == "*" || h.toLower == host))
         throw new Exception(format("host %s is not in skills.allowed_hosts, so %s was not fetched",
-            JSONValue(host).toString, locked.git));
+            JSONValue(host).jsonText, locked.git));
     if (!locations.cache.length) throw new Exception("no cache directory");
     import std.process : thisProcessID;
     mkdirRecurse(locations.cache);

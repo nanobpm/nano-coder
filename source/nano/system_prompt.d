@@ -2,24 +2,22 @@
 /// instructions, the skills index, the memory index and the plan-mode note.
 module nano.system_prompt;
 @safe:
-import nano.clock : wallNow;
 
 import std.format : format;
 import nano.config : Config;
 import nano.mode : planPromptNote;
 import nano.skills : Skills;
 
-/// The prompt for `cwd`; `instructions` and `memoryIndex` are pre-rendered.
-string buildSystemPrompt(const ref Config c, string cwd, bool plan, const Skills skills, string memoryIndex = null,
-    string instructions = null)
+/// The prompt for `cwd` on the date `today` (YYYY-MM-DD); `instructions` and
+/// `memoryIndex` are pre-rendered.
+string buildSystemPrompt(const ref Config c, string cwd, string today, bool plan, const Skills skills,
+    string memoryIndex = null, string instructions = null) pure
 {
-    import std.datetime.systime : Clock;
     auto base = c.systemPrompt.length ? c.systemPrompt : "You are a helpful assistant with access to tools.";
     version (OSX) enum os = "macOS";
     else version (linux) enum os = "Linux";
     else enum os = "unknown";
-    auto s = format("%s\n\nWorking directory: %s\nPlatform: %s\nToday's date: %s", base, cwd, os,
-            wallNow.toISOExtString[0 .. 10]);
+    auto s = format("%s\n\nWorking directory: %s\nPlatform: %s\nToday's date: %s", base, cwd, os, today);
     s ~= instructions;
     s ~= skills.renderIndex;
     s ~= memoryIndex;
@@ -46,7 +44,7 @@ unittest
     c.systemPrompt = "base";
     SkillsConfig sc;
     auto skills = Skills.discoverIn(repo, sc, Locations.init);
-    auto s = buildSystemPrompt(c, repo, false, skills);
+    auto s = buildSystemPrompt(c, repo, "2026-01-02", false, skills);
     assert(s.canFind("- `release`: Cut a release.") && !s.canFind("Bump the version"), s);
     auto loaded = skills.load(parseJSON(`{"name": "release"}`));
     assert(loaded.canFind("Skill: release") && loaded.canFind("Bump the version, then tag it."), loaded);
@@ -80,7 +78,7 @@ unittest
     auto pi = ProjectInstructions.discover(repo, o);
     Config c;
     c.systemPrompt = "base";
-    auto sys = buildSystemPrompt(c, repo, false, new Skills, null, pi.render);
+    auto sys = buildSystemPrompt(c, repo, "2026-01-02", false, new Skills, null, pi.render);
     assert(sys.startsWith("base") && sys.canFind("Run make test") && !sys.canFind("Never edit"), sys);
 
     auto file = buildPath(repo, "pkg/lib.rs");

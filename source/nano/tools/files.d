@@ -5,6 +5,7 @@
 module nano.tools.files;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 import nano.arith : saturatingSub;
 
 import nano.safeio : ownText, readBytes, realPath, statMode, chmodPath;
@@ -105,7 +106,7 @@ string readFile(JSONValue args, ReadState state)
         img["width"] = dims[0];
         img["height"] = dims[1];
         img["bytes"] = data.length;
-        return JSONValue(["image": img]).toString;
+        return JSONValue(["image": img]).jsonText;
     }
     if (looksBinary(data)) throw new ToolError(format("read_file: %s looks like a binary file (%s bytes)", path, data.length));
     import std.utf : validate, UTFException;
@@ -296,7 +297,7 @@ struct Stripped
 /// When `old` is copied `read_file` output (every line prefixed, numbers
 /// consecutive), `old` with the prefixes removed and its first line number.
 /// A `new` line prefixed with a number in old's range is ambiguous: rejected.
-Stripped stripLineNumbers(string old, string new_)
+Stripped stripLineNumbers(string old, string new_) pure
 {
     ulong[] nums;
     foreach (l; textLines(old))
@@ -381,7 +382,7 @@ private bool chop(string s, string prefix, out string rest) pure
 /// Re-indent `text` from the replacement's base indentation `had` to the
 /// file's `want`, keeping tab/space structure; incompatible whitespace (neither
 /// a prefix of the other) is rejected.
-string reindent(string text, string had, string want)
+string reindent(string text, string had, string want) pure
 {
     import std.range : drop, walkLength;
     if (!want.startsWith(had) && !had.startsWith(want))
@@ -404,7 +405,7 @@ string reindent(string text, string had, string want)
 /// Match `old` line by line ignoring trailing whitespace (or, with
 /// `trimStart`, indentation too). Only a unique match counts; an
 /// indentation-relaxed one re-indents the replacement.
-private bool matchLines(string text, string old, string new_, bool trimStart, out Located found)
+private bool matchLines(string text, string old, string new_, bool trimStart, out Located found) pure
 {
     auto spans = lineSpans(text);
     bool endsNl;
@@ -484,7 +485,7 @@ private struct Attempt
 }
 
 /// Exact match of one attempt, in its literal and file-ending forms.
-private bool exactMatch(string text, const Attempt a, bool replaceAll, out Located found)
+private bool exactMatch(string text, const Attempt a, bool replaceAll, out Located found) pure
 {
     auto normalized = toFileEndings(text, a.old);
     auto cands = normalized != a.old ? [a.old, normalized] : [a.old];
@@ -518,7 +519,7 @@ private bool exactMatch(string text, const Attempt a, bool replaceAll, out Locat
 /// Find `old` in `text`: exactly (as given, then without `read_file` line
 /// numbers), then line by line ignoring trailing whitespace, then ignoring
 /// indentation. Relaxed matches must be unique and agree across attempts.
-Located locate(string text, string old, string new_, bool replaceAll)
+Located locate(string text, string old, string new_, bool replaceAll) pure
 {
     Located found;
     auto literal = Attempt(old, new_, "", 0);

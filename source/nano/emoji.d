@@ -5,6 +5,7 @@ module nano.emoji;
 import nano.emoji_table : emojiShortcodes;
 
 @safe:
+pure:
 
 /// The emoji for a shortcode name (without colons), or null.
 string emojiFor(string name) pure nothrow @nogc

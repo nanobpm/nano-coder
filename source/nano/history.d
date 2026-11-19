@@ -6,6 +6,7 @@ module nano.history;
 import std.string : strip;
 
 @safe:
+pure:
 
 struct InputHistory
 {

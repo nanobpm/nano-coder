@@ -288,7 +288,7 @@ private bool editContext(SettingsUi ui, ref SettingsHost h)
     return true;
 }
 
-private string[] scopes(Agent a)
+private string[] scopes(Agent a) pure
 {
     auto p = a.client.providerName, m = a.client.modelName;
     return [format("This model (%s/%s)", p, m), format("All %s models", p), "All models (global)"];

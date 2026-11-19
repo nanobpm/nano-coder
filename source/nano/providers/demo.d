@@ -4,6 +4,7 @@
 module nano.providers.demo;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 import nano.clock : sleepFor;
 
 import nano.llm;
@@ -22,7 +23,7 @@ class DemoClient : LLMClient, KindedClient
     /// Delay between streamed words (ms); 0 in tests.
     long textDelayMs = 15, thinkingDelayMs = 40;
 
-    this(string provider, string model)
+    this(string provider, string model) pure
     {
         this.provider = provider;
         this.model = model;
@@ -54,7 +55,7 @@ class DemoClient : LLMClient, KindedClient
         if (ms > 0) sleepFor(ms.msecs);
     }
 
-    private LLMResponse reply(const ref ChatRequest req)
+    private LLMResponse reply(const ref ChatRequest req) pure
     {
         auto callId = ++calls;
         static TokenUsage usage(long completion) { return TokenUsage(50, completion); }
@@ -97,7 +98,7 @@ class DemoClient : LLMClient, KindedClient
     }
 
     /// The tool a prompt's keywords ask for (name and JSON arguments).
-    static bool pickTool(string content, out string name, out string args)
+    static bool pickTool(string content, out string name, out string args) pure
     {
         content = content.toLower;
         // Whole words, so "task" doesn't match "ask".
@@ -124,7 +125,7 @@ class DemoClient : LLMClient, KindedClient
             auto command = content.canFind("echo") ? "echo hello world" : content.canFind("sleep") ? "sleep 3"
                 : content.canFind("pwd") ? "pwd" : "ls -la";
             name = "bash";
-            args = JSONValue(["command": command]).toString;
+            args = JSONValue(["command": command]).jsonText;
             return true;
         }
         return false;

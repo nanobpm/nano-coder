@@ -7,6 +7,8 @@
 module nano.goal;
 
 @safe:
+pure:
+import nano.safeio : jsonText, jsonPretty;
 
 import std.json;
 import std.string : strip, toLower;
@@ -48,7 +50,7 @@ string statusName(OutcomeStatus s) pure
 
 class OutcomeError : Exception
 {
-    this(string msg) { super(msg); }
+    this(string msg) pure { super(msg); }
 }
 
 struct Outcome
@@ -57,7 +59,7 @@ struct Outcome
     string summary;
 
     /// Parse the tool's arguments, tolerating arguments sent as a JSON string.
-    static Outcome fromArgs(JSONValue args)
+    static Outcome fromArgs(JSONValue args) pure
     {
         if (args.type == JSONType.string)
         {
@@ -70,7 +72,7 @@ struct Outcome
         Outcome o;
         if (!parseStatus(st.str, o.status))
             throw new OutcomeError(format!`report_outcome %sstatus%s must be "completed", "blocked" or "needs_input", got %s`(
-                "`", "`", JSONValue(st.str).toString));
+                "`", "`", JSONValue(st.str).jsonText));
         auto sm = "summary" in args.objectNoRef;
         o.summary = sm !is null && sm.type == JSONType.string ? sm.str.strip : "";
         if (!o.summary.length) throw new OutcomeError("report_outcome needs a `summary`");
@@ -94,7 +96,7 @@ struct Outcome
     }
 
     /// The latest successful `report_outcome` call among one turn's messages.
-    static bool reportedIn(const Message[] messages, out Outcome found)
+    static bool reportedIn(const Message[] messages, out Outcome found) pure
     {
         bool succeeded(string id)
         {

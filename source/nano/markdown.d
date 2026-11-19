@@ -24,6 +24,7 @@
 module nano.markdown;
 
 @safe:
+pure:
 
 import std.array : appender, join, replicate, split;
 import std.format : format;

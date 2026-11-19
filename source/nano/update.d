@@ -14,6 +14,7 @@
 module nano.update;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 import nano.clock : sleepFor, wallNow;
 import nano.arith : saturatingSub;
 
@@ -226,7 +227,7 @@ void saveState(string path, const State s)
     try
     {
         mkdirRecurse(path.dirName);
-        write(tmp, s.toJson.toPrettyString ~ "\n");
+        write(tmp, s.toJson.jsonPretty ~ "\n");
         rename(tmp, path);
     }
     // update state is a cache; failing to save it means checking again sooner

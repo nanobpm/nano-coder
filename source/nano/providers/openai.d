@@ -4,6 +4,7 @@
 module nano.providers.openai;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 import nano.clock : wallNow;
 
 import std.json;
@@ -21,7 +22,7 @@ class OpenAIClient : LLMClient, CapabilityProbe, KindedClient
 {
     protected ResolvedProvider p;
 
-    this(ResolvedProvider p) { this.p = p; }
+    this(ResolvedProvider p) pure { this.p = p; }
 
     string modelName() pure const { return p.model; }
     string providerName() pure const { return p.name; }
@@ -67,7 +68,7 @@ class OpenAIClient : LLMClient, CapabilityProbe, KindedClient
         return b;
     }
 
-    static JSONValue encode(const ref Message m, bool replayReasoning = false)
+    static JSONValue encode(const ref Message m, bool replayReasoning = false) pure
     {
         JSONValue j = ["role": roleName(m.role)];
         final switch (m.role)
@@ -184,7 +185,7 @@ class OpenAIClient : LLMClient, CapabilityProbe, KindedClient
     static LLMResponse parseWhole(JSONValue j, bool replay = false)
     {
         LLMResponse r;
-        if (auto e = "error" in j) throw new Exception("provider error: " ~ e.toString);
+        if (auto e = "error" in j) throw new Exception("provider error: " ~ e.jsonText);
         auto choice = j["choices"][0];
         auto msg = choice["message"];
         if (auto c = "content" in msg) if (c.type == JSONType.string) r.content = c.str;
@@ -292,7 +293,7 @@ class OpenAIClient : LLMClient, CapabilityProbe, KindedClient
         }
         else if (p.name == "ollama" || root.endsWith(":11434") || owner == "library" || owner == "ollama")
         {
-            auto show = probe(root ~ "/api/show", JSONValue(["model": p.model]).toString);
+            auto show = probe(root ~ "/api/show", JSONValue(["model": p.model]).jsonText);
             if (c.thinking.isNull) c.thinking = Reported.fromOllamaShow(show);
             if (c.vision.isNull) c.vision = Vision.fromOllamaShow(show);
             if (!c.window) ollamaWindow(probe(root ~ "/api/ps"), show, p.model, c);
@@ -352,7 +353,7 @@ struct StreamState
     {
         if (data == "[DONE]") return;
         auto j = parseJSON(data);
-        if (auto e = "error" in j) throw new Exception("provider stream error: " ~ e.toString);
+        if (auto e = "error" in j) throw new Exception("provider stream error: " ~ e.jsonText);
         if (auto u = "usage" in j) { readUsage(*u, r.usage); readCopilotAic(j, r.usage); }
         auto choices = "choices" in j;
         if (choices is null || choices.type != JSONType.array || choices.arrayNoRef.length == 0) return;

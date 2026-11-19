@@ -14,7 +14,7 @@ import nano.llm : ToolDefinition;
 /// A tool failure the model should see as an error result.
 class ToolError : Exception
 {
-    this(string msg) { super(msg); }
+    this(string msg) pure { super(msg); }
 }
 
 /// Decodes bytes as UTF-8, replacing each invalid sequence with U+FFFD
@@ -78,7 +78,7 @@ class ToolRegistry
 // Argument helpers
 // ---------------------------------------------------------------------------
 
-string requireString(JSONValue args, string name, string tool)
+string requireString(JSONValue args, string name, string tool) pure
 {
     auto v = name in args;
     if (v is null) throw new ToolError(format(`%s: missing required argument "%s"`, tool, name));
@@ -102,7 +102,7 @@ string jsonTypeName(const JSONValue v) pure nothrow
     }
 }
 
-string optString(JSONValue args, string name, string def = null)
+string optString(JSONValue args, string name, string def = null) pure
 {
     auto v = name in args;
     if (v is null || v.type == JSONType.null_) return def;
@@ -110,7 +110,7 @@ string optString(JSONValue args, string name, string def = null)
     return v.str;
 }
 
-long optInt(JSONValue args, string name, long def)
+long optInt(JSONValue args, string name, long def) pure
 {
     auto v = name in args;
     if (v is null || v.type == JSONType.null_) return def;
@@ -126,7 +126,7 @@ long optInt(JSONValue args, string name, long def)
     throw new ToolError(format(`argument "%s" must be an integer`, name));
 }
 
-bool optBool(JSONValue args, string name, bool def)
+bool optBool(JSONValue args, string name, bool def) pure
 {
     auto v = name in args;
     if (v is null || v.type == JSONType.null_) return def;

@@ -17,6 +17,7 @@
 ///   at the cause instead of wrapping into a wrong size downstream.
 module nano.arith;
 @safe:
+pure:
 
 import std.traits : isIntegral, isSigned;
 

@@ -7,6 +7,7 @@
 module nano.trajectory;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 import nano.arith : saturatingSub;
 
 import std.algorithm : canFind, map, max, sum, filter;
@@ -334,8 +335,8 @@ Trajectory load(string path, string expectedId = null)
                 throw new Exception(format("unsupported session format version %s (this build supports %s)", v, formatVersion));
             auto id = rec["data"]["id"].str;
             if (expectedId !is null && id != expectedId)
-                throw new Exception(format("session log header id %s does not match %s", JSONValue(id).toString,
-                    JSONValue(expectedId).toString));
+                throw new Exception(format("session log header id %s does not match %s", JSONValue(id).jsonText,
+                    JSONValue(expectedId).jsonText));
         }
         else if (!records.length)
             throw new Exception(format("session log %s does not start with a session header", path));
@@ -432,7 +433,7 @@ void appendMessageRows(ref Turn turn, const JSONValue m, ulong line, ref string 
             auto args = "arguments" in c;
             string raw = mal && mal.type == JSONType.string ? mal.str
                 : args is null ? "{}" : args.type == JSONType.string ? serdeString(args.str) // legacy: Rust re-encodes the string value
-                : args.toString(JSONOptions.doNotEscapeSlashes);
+                : args.jsonText(JSONOptions.doNotEscapeSlashes);
             Row r;
             r.kind = Kind.toolCall;
             r.callId = c["id"].str;
@@ -469,12 +470,12 @@ void appendMessageRows(ref Turn turn, const JSONValue m, ulong line, ref string 
     if (ts !is null) prevTs = ts;
 }
 
-string scalarText(const JSONValue m, string key)
+string scalarText(const JSONValue m, string key) pure
 {
     if (auto v = key in m)
     {
         if (v.type == JSONType.string) return v.str;
-        if (v.type != JSONType.null_) return v.toString;
+        if (v.type != JSONType.null_) return v.jsonText;
     }
     return null;
 }
@@ -491,14 +492,14 @@ long millisBetween(string a, string b)
     catch (Exception) return -1; // an unparsable timestamp has no duration (-1)
 }
 
-string compactText(const JSONValue data, string mode, string model)
+string compactText(const JSONValue data, string mode, string model) pure
 {
     string[] parts;
     if (mode !is null) parts ~= "mode: " ~ mode;
     if (model !is null) parts ~= "model: " ~ model;
     if (auto s = "summarized" in data)
         if (s.type == JSONType.array && s.arrayNoRef.length == 2)
-            parts ~= format("folded log lines %s–%s", s.arrayNoRef[0].toString, s.arrayNoRef[1].toString);
+            parts ~= format("folded log lines %s–%s", s.arrayNoRef[0].jsonText, s.arrayNoRef[1].jsonText);
     size_t n;
     if (auto ms = "messages" in data) if (ms.type == JSONType.array) n = ms.arrayNoRef.length;
     parts ~= format("%s message(s) retained", n);
@@ -780,7 +781,7 @@ string rawNumber(string line, string key) pure
     return i > start ? line[start .. i] : null;
 }
 
-double strtodOf(string text)
+double strtodOf(string text) pure
 {
     import nano.safeio : cStrtod;
     return cStrtod(text);
@@ -788,7 +789,7 @@ double strtodOf(string text)
 
 /// Whether decimal `text` reads back as exactly `d` (C `strtod` is correctly
 /// rounded; `std.conv.to!double` isn't always).
-bool parsesTo(string text, double d)
+bool parsesTo(string text, double d) pure
 {
     return strtodOf(text) == d;
 }
@@ -796,7 +797,7 @@ bool parsesTo(string text, double d)
 /// A finite double the way serde_json (ryu) prints it: the shortest digits
 /// that round-trip, always with a fraction or exponent (`2.0`, `1.3876`,
 /// `1e-7`, `1.5e300`).
-public string serdeFloat(double d)
+public string serdeFloat(double d) pure
 {
     import std.math : isFinite, fabs;
     import std.conv : to;

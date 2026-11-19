@@ -12,6 +12,7 @@
 module nano.shell;
 
 @safe:
+pure:
 
 import std.algorithm : canFind, startsWith, any;
 import std.array : split;
