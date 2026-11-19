@@ -29,6 +29,8 @@ enum size_t maxIgnoreRules = 1_024;
 /// Rules compiled across a whole walk; once spent, further .gitignore files
 /// add none (fail-open toward visibility, Rust #160).
 enum size_t maxTotalIgnoreRules = 16_384;
+/// A larger `.gitignore` is skipped whole, not read.
+enum ulong maxIgnoreFileBytes = 1 << 20;
 /// Longer rules are dropped: a rule compiles to a regex that grows with it.
 enum size_t maxIgnoreRuleChars = 1_024;
 
@@ -125,7 +127,7 @@ struct Ignores
         auto file = buildPath(root, relDir, ".gitignore");
         // Same checks as discovered files: no symlinks or special files, deny
         // rules apply, and the read is bounded.
-        if (!file.exists || file.isSymlink || !file.isFile || file.getSize > 1 << 20) return;
+        if (!file.exists || file.isSymlink || !file.isFile || file.getSize > maxIgnoreFileBytes) return;
         if (denied !is null && denied(file)) return;
         size_t added;
         foreach (raw; readText(file).lineSplitter)
@@ -222,12 +224,20 @@ private void readLimit(JSONValue args, out long limit)
     if (limit < 1 || limit > maxLimit) throw new ToolError(format("limit must be between 1 and %s", maxLimit));
 }
 
-/// A filename filter: patterns without `/` match the basename at any depth.
+/// A filename filter: patterns without `/` match the basename at any depth;
+/// a leading `./` or `/` anchors the pattern at the search root.
 private bool delegate(string) @safe globFilter(string pattern)
 {
     if (!pattern.length) return (string) => true;
-    auto re = regex(globToRegex(pattern));
+    // Decided from the original pattern: `./*.rs` is root-relative, not a name.
     bool byName = pattern.indexOf('/') < 0;
+    for (;;)
+    {
+        if (pattern.startsWith("./")) pattern = pattern[2 .. $];
+        else if (pattern.startsWith("/")) pattern = pattern[1 .. $];
+        else break;
+    }
+    auto re = regex(globToRegex(pattern));
     return (string rel) => !matchFirst(byName ? baseName(rel) : rel, re).empty;
 }
 
@@ -599,4 +609,92 @@ unittest
     assert(files("needle", alias2, s) == "open.txt", "root-relative alias rule not honoured");
     s = scanOf(["Read(other/secret.txt)"], cwd);
     assert(files("needle", alias2, s) == "open.txt\nsecret.txt");
+}
+
+version (unittest)
+{
+    private string run(string tool, string json, string root)
+    {
+        import std.array : replace;
+        import std.string : stripRight;
+        auto args = parseJSON(json);
+        args["path"] = args.type == JSONType.object && "path" in args ? buildPath(root, args["path"].str) : root;
+        auto out_ = tool == "glob" ? glob(args) : grep(args);
+        return out_.replace(root ~ "/", "").stripRight;
+    }
+}
+
+// rust: search.rs::early_return_is_correct_with_long_nonmatching_tail
+// rust: search.rs::search_file_discards_matches_past_byte_cap
+// rust: search.rs::slash_keeps_literal_backslashes_on_unix
+unittest
+{
+    import std.array : replicate;
+    import std.file : write, rmdirRecurse, remove;
+    auto root = tmpRoot("nano-d-search-modes");
+    scope (exit) rmdirRecurse(root);
+    write(buildPath(root, "big.txt"), "needle\nneedle\n" ~ "filler\n".replicate(5000));
+    assert(run("grep", `{"pattern":"needle","output_mode":"files"}`, root) == "big.txt");
+    assert(run("grep", `{"pattern":"needle","output_mode":"count"}`, root) == "big.txt:2");
+    assert(run("grep", `{"pattern":"needle","limit":1}`, root).startsWith("big.txt:1:needle"));
+    remove(buildPath(root, "big.txt"));
+
+    write(buildPath(root, "growing.log"), "needle\n" ~ "x".replicate(cast(size_t) maxFileBytes + 1024));
+    foreach (mode; ["content", "files", "count"])
+        assert(run("grep", `{"pattern":"needle","output_mode":"` ~ mode ~ `"}`, root) == "(no matches)", mode);
+    remove(buildPath(root, "growing.log"));
+
+    write(buildPath(root, `a\b.rs`), "needle\n");
+    assert(run("grep", `{"pattern":"needle","output_mode":"files"}`, root) == `a\b.rs`, "a backslash is a filename character");
+}
+
+// rust: search.rs::gitignore_rule_budget_stops_compilation
+// rust: search.rs::oversized_gitignore_is_skipped
+// rust: search.rs::symlinked_gitignore_is_not_followed
+unittest
+{
+    import std.array : replicate;
+    import std.file : write, rmdirRecurse, remove, symlink;
+    auto root = tmpRoot("nano-d-search-ignore");
+    scope (exit) rmdirRecurse(root);
+    string rules;
+    foreach (i; 0 .. maxIgnoreRules + 1) rules ~= format("f%s\n", i);
+    write(buildPath(root, ".gitignore"), rules);
+    write(buildPath(root, format("f%s", maxIgnoreRules)), "needle\n");
+    write(buildPath(root, "f0"), "needle\n");
+    assert(run("grep", `{"pattern":"needle","output_mode":"files"}`, root) == format("f%s", maxIgnoreRules),
+        "rules past the budget don't apply");
+    remove(buildPath(root, "f0"));
+    remove(buildPath(root, format("f%s", maxIgnoreRules)));
+
+    write(buildPath(root, ".gitignore"), "*.rs\n" ~ "#".replicate(cast(size_t) maxIgnoreFileBytes + 1024));
+    write(buildPath(root, "a.rs"), "needle\n");
+    assert(run("grep", `{"pattern":"needle","output_mode":"files"}`, root) == "a.rs", "an oversized .gitignore is skipped");
+
+    remove(buildPath(root, ".gitignore"));
+    write(buildPath(root, "rules.txt"), "*.rs\n");
+    symlink(buildPath(root, "rules.txt"), buildPath(root, ".gitignore"));
+    assert(run("grep", `{"pattern":"needle","output_mode":"files"}`, root) == "a.rs", "a symlinked .gitignore isn't read");
+}
+
+// rust: search.rs::root_qualified_glob_does_not_match_via_display_path
+// rust: search.rs::root_relative_pattern_is_not_name_matched
+unittest
+{
+    import std.file : write, rmdirRecurse, mkdirRecurse;
+    auto root = tmpRoot("nano-d-search-globs");
+    scope (exit) rmdirRecurse(root);
+    mkdirRecurse(buildPath(root, "src/src"));
+    write(buildPath(root, "src/lib.rs"), "x\n");
+    write(buildPath(root, "src/src/inner.rs"), "x\n");
+    assert(run("glob", `{"pattern":"src/**/*.rs","path":"src"}`, root) == "src/src/inner.rs");
+    assert(run("grep", `{"pattern":"x","glob":"src/**/*.rs","path":"src","output_mode":"files"}`, root) == "src/src/inner.rs");
+    rmdirRecurse(buildPath(root, "src"));
+
+    mkdirRecurse(buildPath(root, "sub"));
+    write(buildPath(root, "main.rs"), "x\n");
+    write(buildPath(root, "sub/main.rs"), "x\n");
+    foreach (pattern; ["./*.rs", "/main.rs"])
+        assert(run("glob", `{"pattern":"` ~ pattern ~ `"}`, root) == "main.rs", pattern ~ ": " ~ run("glob", `{"pattern":"` ~ pattern ~ `"}`, root));
+    assert(run("glob", `{"pattern":"main.rs"}`, root) == "main.rs\nsub/main.rs");
 }
