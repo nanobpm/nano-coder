@@ -300,7 +300,13 @@ double numberOrDefault(JSONValue v)
         if (v.str == "default") return double.nan;
         throw new Exception("temperature must be a number or \"default\"");
     }
-    return v.type == JSONType.integer ? cast(double) v.integer : v.floating;
+    if (v.type == JSONType.integer) return cast(double) v.integer;
+    if (v.type == JSONType.uinteger) return cast(double) v.uinteger;
+    if (v.type != JSONType.float_) throw new Exception("temperature must be a number or \"default\"");
+    // TOML reads nan/inf as floats; NaN here would silently mean "default".
+    import std.math : isFinite;
+    if (!isFinite(v.floating)) throw new Exception("temperature must be finite");
+    return v.floating;
 }
 
 ProviderConfig preset(ProviderKind kind, string url, string env, string model = null)
