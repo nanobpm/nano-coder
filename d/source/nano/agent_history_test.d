@@ -314,3 +314,99 @@ unittest
     auto images = kept.filter!(c => c.startsWith("img")).array.length;
     assert(images > 1 && images < 120, format("kept %s image turns", images));
 }
+
+// rust: agent.rs::a_failed_new_session_keeps_the_thinking_override
+// rust: agent.rs::a_title_is_requested_at_most_once_per_session_across_switches
+unittest
+{
+    import nano.thinking : Thinking;
+    import nano.session : SessionLog, restore;
+    import nano.providers.mock : MockClient;
+    import std.exception : collectExceptionMsg;
+    import std.file : tempDir, exists, rmdirRecurse;
+    import std.path : buildPath;
+    import std.typecons : nullable;
+
+    auto agent = new Agent(new MockClient([LLMResponse("one"), LLMResponse("two"), LLMResponse("three")]),
+        new ToolRegistry, Policy.init, "sys");
+    agent.sessionThinking = nullable(Thinking.parse("high"));
+    agent.messages ~= Message.user("earlier");
+    bool rendered;
+    auto msg = collectExceptionMsg(agent.restartWith(() @safe => (throw new Exception("blocked")),
+        () @safe { rendered = true; return "new"; }));
+    assert(msg == "blocked" && !rendered);
+    assert(!agent.sessionThinking.isNull && agent.messages.length == 2, "the live session survives a failed switch");
+
+    // A → B → A: A stays requested, so no second title request.
+    auto dir = buildPath(tempDir, "nano-d-agent-title-switch");
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) if (dir.exists) rmdirRecurse(dir);
+    auto a = new SessionLog(dir, "mock/m", "/w");
+    agent.restart("sys", some(a));
+    size_t requests;
+    agent.sessionTitles = true;
+    agent.titleClient = (string spec) { requests++; throw new Exception("titler offline"); };
+    auto ev = new NullEvents;
+    agent.run("Fix the flaky deploy test in CI", ev);
+    assert(requests == 1);
+    agent.restart("sys", some(new SessionLog(dir, "mock/m", "/w")));
+    auto ra = restore(a.path);
+    agent.loadRestored(ra, some(new SessionLog(a.path)));
+    agent.run("Fix the flaky deploy test in CI again", ev);
+    assert(requests == 1, "A stays requested across the switch");
+}
+
+// rust: agent.rs::stored_system_message_reflects_mode_change
+// rust: agent.rs::load_session_renders_prompt_with_default_mode_writability
+// rust: agent.rs::new_generation_clears_stale_output_rate
+// rust: agent.rs::one_shot_provider_publishes_usage_over_elapsed_rate
+// rust: agent.rs::the_title_fallback_uses_the_sessions_live_model (agent.d title test: spec "mock/mock")
+unittest
+{
+    import nano.mode : AgentMode;
+    import nano.session : SessionLog, restore;
+    import nano.status : RateMeter;
+    import nano.providers.mock : MockClient;
+    import std.algorithm : canFind;
+    import std.file : tempDir, exists, rmdirRecurse;
+    import std.path : buildPath;
+
+    string render(bool plan) @safe { return plan ? "sys\nPLAN MODE" : "sys\nmemory_save guidance"; }
+    auto agent = new Agent(new MockClient([LLMResponse("a")]), new ToolRegistry, Policy.init, render(false));
+    agent.control.mode = AgentMode.plan;
+    agent.syncModePrompt(&render);
+    assert(agent.messages[0].content.canFind("PLAN MODE") && !agent.messages[0].content.canFind("memory_save"));
+    agent.control.mode = AgentMode.normal;
+    agent.syncModePrompt(&render);
+    assert(agent.messages[0].content.canFind("memory_save") && !agent.messages[0].content.canFind("PLAN MODE"));
+
+    // Loading while in plan mode: the session is normal, its prompt writable.
+    auto dir = buildPath(tempDir, "nano-d-agent-mode-load");
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) if (dir.exists) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/w");
+    auto sysMsg = Message.system(render(false));
+    log.append(sysMsg);
+    agent.control.mode = AgentMode.plan;
+    agent.syncModePrompt(&render);
+    auto rl = restore(log.path);
+    agent.loadRestored(rl, some(new SessionLog(log.path)));
+    agent.syncModePrompt(&render);
+    assert(agent.control.mode == AgentMode.normal && agent.messages[0].content.canFind("memory_save"));
+
+    // Every generation announces itself (the console clears the stale rate),
+    // including the one a turn continues into without going idle.
+    auto call = ToolCall.fromRaw("t1", "nope", "{}");
+    auto steered = new Agent(new MockClient([LLMResponse("", "", [call]), LLMResponse("revised")]), new ToolRegistry,
+        Policy.init, "sys");
+    auto ev = new NullEvents;
+    steered.run("write", ev);
+    assert(ev.generations == 2 && steered.messages[$ - 1].content == "revised");
+
+    // One-shot reply: the whole answer in one delta at completion is rated
+    // over the call since generation start.
+    RateMeter m;
+    m.reset(0);
+    m.record(24, 1_000);
+    assert(m.finish(6, 1_000) == 6.0);
+}

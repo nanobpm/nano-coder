@@ -1309,6 +1309,15 @@ class Console : AgentEvents
     }
     /// Close the abandoned partial so the resent reply starts a fresh segment
     /// instead of joining the stale prefix.
+    /// The previous generation's rate is stale once the next one starts
+    /// (a steer continues the turn without going idle); the meter's clock
+    /// starts here so a one-shot reply is rated over the whole call.
+    void generationStart()
+    {
+        meter.reset(nowMs);
+        if (gFrame) updateStatus((ref Stats s) { s.tokensPerSec = 0; });
+    }
+
     void responseRestarted()
     {
         segmentDropped = false;
@@ -2039,14 +2048,8 @@ int runMain(string[] args)
 
     // The system prompt's plan section follows the mode; Shift-Tab mid-turn
     // only switches the live mode, so the prompt catches up at the next turn.
-    bool sysPlan = o.plan;
-    void syncMode()
-    {
-        bool plan = agent.control.mode == AgentMode.plan;
-        if (plan == sysPlan) return;
-        agent.messages[0].content = systemFor(cwd, plan);
-        sysPlan = plan;
-    }
+    agent.promptPlan = o.plan;
+    void syncMode() { agent.syncModePrompt((bool plan) => systemFor(cwd, plan)); }
 
     // `h.cfg` points at runMain's `cfg`, which outlives every settings
     // dialog (they all run inside runMain).
@@ -2060,7 +2063,7 @@ int runMain(string[] args)
             catch (Exception e) return e.msg;
         };
         h.listModels = (string name) => makeClient(resolve(cfg, name)).listModels();
-        h.refreshSystem = () { agent.messages[0].content = systemFor(cwd, sysPlan); };
+        h.refreshSystem = () { agent.messages[0].content = systemFor(cwd, agent.promptPlan); };
         h.refreshClient = (string name) {
             import nano.settings : editRebuilds;
             if (!editRebuilds(cfg, name, agent.client.providerName)) return cast(string) null;
@@ -2475,16 +2478,12 @@ int runMain(string[] args)
                     // prompt, default mode, empty plan, counters zeroed. The
                     // previous log stays on disk and is still resumable.
                     import nano.session : newSessionId;
-                    Option!SessionLog log;
-                    try
-                    {
-                        if (!o.noSession)
-                            log = some(new SessionLog(sessionDir, agent.client.providerName ~ "/" ~ agent.client.modelName, cwd));
-                    }
+                    try agent.restartWith(() => o.noSession ? Option!SessionLog(none)
+                            : some(new SessionLog(sessionDir, agent.client.providerName ~ "/" ~ agent.client.modelName, cwd)),
+                        () => systemFor(cwd, false));
                     catch (Exception e) { writeln(console.red("error: " ~ e.msg)); continue; }
-                    agent.restart(systemFor(cwd, false), log);
+                    auto log = agent.log;
                     updateStatus((ref Stats s) { s.historySearches = s.historyReads = 0; });
-                    sysPlan = false;
                     agent.useHooks(loadHooks(cwd), false);
                     if (gFrame) gFrame.clear();
                     refreshStatus();

@@ -63,6 +63,9 @@ interface AgentEvents
     /// A streamed reply broke off and is being asked again: the partial
     /// already shown is abandoned, and the restart begins a fresh segment.
     void responseRestarted();
+    /// A model call (one generation) is about to start: a rate shown for
+    /// the previous one is stale from here on.
+    void generationStart();
 }
 
 /// Wrap text the model should read as a system note, not user words.
@@ -661,6 +664,7 @@ class Agent
                 req.attachmentsDir = attachmentsDir();
                 auto tr = temperatureFor(th.anthropicThinkingOn);
                 req.temperature = tr.effective;
+                ev.generationStart();
                 try
                 {
                     r = client.chat(req, (bool t, string s) { ev.text(t, s); });
@@ -1721,10 +1725,36 @@ class Agent
     /// the conversation is just `system`, logged to `newLog` (none: not
     /// persisted); mode, session thinking, plan, timers, reminders, hook session,
     /// calibration, history tools and counters are reset. The old log stays.
+    /// Whether `messages[0]` was rendered for plan mode.
+    bool promptPlan;
+
+    /// Re-render the system prompt with `render` when the mode has changed
+    /// since it was rendered: plan mode drops the save guidance and adds the
+    /// plan note; leaving it restores them. A loaded session is in normal
+    /// mode, so this brings a prompt rendered for plan mode back.
+    void syncModePrompt(scope string delegate(bool plan) @safe render)
+    {
+        import nano.mode : AgentMode;
+        bool plan = control.mode == AgentMode.plan;
+        if (plan == promptPlan || !messages.length) return;
+        messages[0].content = render(plan);
+        promptPlan = plan;
+    }
+
+    /// `restart`, failure-atomic: the new session's log is created first,
+    /// and when that throws the live session (messages, mode, `/thinking`
+    /// override, plan, ...) is left untouched and the error propagates.
+    void restartWith(scope Option!SessionLog delegate() @safe makeLog, scope string delegate() @safe render)
+    {
+        auto newLog = makeLog();
+        restart(render(), newLog);
+    }
+
     void restart(string system, Option!SessionLog newLog)
     {
         import nano.mode : AgentMode;
         messages = [Message.system(system)];
+        promptPlan = false; // the caller renders `system` for normal mode
         log = newLog;
         log.ifSome((SessionLog l) { l.append(messages[0]); });
         control.mode = AgentMode.normal;
@@ -2091,6 +2121,8 @@ version (unittest)
         void assistantMessage(string t, string r) {}
         size_t restarts;
         void responseRestarted() { restarts++; }
+        size_t generations;
+        void generationStart() { generations++; }
     }
 }
 

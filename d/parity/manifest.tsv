@@ -19,7 +19,7 @@ agent.rs::a_configured_window_probes_only_the_thinking_levels	gap	D runs one com
 agent.rs::a_direct_model_switch_supersedes_a_stale_queued_request	test
 agent.rs::a_direct_model_switch_with_a_slow_key_command_does_not_stall_the_runtime	na	Tokio runtime races while a client builds asynchronously; D builds the client synchronously on the agent thread
 agent.rs::a_failed_direct_model_switch_still_clears_a_stale_queued_request	test
-agent.rs::a_failed_new_session_keeps_the_thinking_override	todo
+agent.rs::a_failed_new_session_keeps_the_thinking_override	test
 agent.rs::a_failed_repair_on_resume_leaves_the_live_session_untouched	test
 agent.rs::a_failed_tool_after_smart_compaction_points_to_history_once	test
 agent.rs::a_firing_persistence_failure_rolls_the_due_timers_back	test
@@ -54,7 +54,7 @@ agent.rs::a_summary_cut_off_at_the_output_limit_is_flagged	test
 agent.rs::a_thinking_level_set_mid_turn_applies_from_the_next_step	test
 agent.rs::a_timer_set_in_a_turn_fires_mid_turn_when_the_clock_passes_it	test
 agent.rs::a_timer_tool_persistence_failure_rolls_the_live_timers_back	test
-agent.rs::a_title_is_requested_at_most_once_per_session_across_switches	todo
+agent.rs::a_title_is_requested_at_most_once_per_session_across_switches	test
 agent.rs::a_tool_run_resets_the_continuation_accumulator	test
 agent.rs::a_truncated_final_assistant_is_not_replayed_as_a_clean_finish	test
 agent.rs::a_truncated_turns_stop_reason_survives_a_reload	test
@@ -109,7 +109,7 @@ agent.rs::idle_firing_resets_the_pending_nudge_counter	test
 agent.rs::idle_poll_cache_is_keyed_on_the_offered_tool_set	test
 agent.rs::idle_take_fired_timers_returns_due_timers_once	test
 agent.rs::indexes_skills_in_the_system_prompt_and_loads_them_on_request	test
-agent.rs::load_session_renders_prompt_with_default_mode_writability	todo
+agent.rs::load_session_renders_prompt_with_default_mode_writability	test
 agent.rs::logs_thinking_usage_and_duration_with_assistant_messages	test
 agent.rs::long_tool_output_is_cut_and_kept_on_disk	test
 agent.rs::malformed_tool_call_skips_handler_and_reports_actionable_error	test
@@ -129,13 +129,13 @@ agent.rs::model_switch_queued_before_manual_compaction_applies_to_the_summary	te
 agent.rs::model_switch_queued_during_a_call_applies_before_threshold_compaction	test
 agent.rs::model_switch_queued_during_an_overflow_applies_to_the_compaction_and_retry	test
 agent.rs::model_switch_to_an_unbuildable_spec_drops_the_request_and_reports_it	test
-agent.rs::new_generation_clears_stale_output_rate	todo
+agent.rs::new_generation_clears_stale_output_rate	test
 agent.rs::new_session_and_load_reset_the_mode	test
 agent.rs::new_session_resets_cumulative_counters	test
 agent.rs::no_room_for_a_budget_drops_the_level_everywhere	test
 agent.rs::no_titles_unless_enabled	test
 agent.rs::normal_mode_cap_stops_headless	test
-agent.rs::one_shot_provider_publishes_usage_over_elapsed_rate	todo
+agent.rs::one_shot_provider_publishes_usage_over_elapsed_rate	test
 agent.rs::only_read_file_decodes_image_results	test
 agent.rs::output_limit_continuations_accumulate_the_whole_answer	test
 agent.rs::overflow_retry_reresolves_thinking_against_the_post_compaction_room	test
@@ -210,7 +210,7 @@ agent.rs::status_line_reflects_the_level_the_request_sends_not_a_reread	test
 agent.rs::steer_during_final_answer_extends_the_turn	test
 agent.rs::steer_during_tool_call_joins_next_model_call	test
 agent.rs::steer_on_last_iteration_keeps_the_final_answer	test
-agent.rs::stored_system_message_reflects_mode_change	todo
+agent.rs::stored_system_message_reflects_mode_change	test
 agent.rs::streams_deltas_and_reports_thinking_before_the_answer	test
 agent.rs::switching_sessions_in_process_resets_totals_and_indexes	test
 agent.rs::switching_to_auto_mid_turn_keeps_the_headless_safety_cap	test
@@ -218,7 +218,7 @@ agent.rs::temperature_ignores_config_kind_for_a_kindless_client	test
 agent.rs::temperature_resolves_against_the_live_client	test
 agent.rs::temperature_resolves_for_a_custom_mock_provider	test
 agent.rs::the_loop_detector_resets_on_a_new_turn	test
-agent.rs::the_title_fallback_uses_the_sessions_live_model	todo
+agent.rs::the_title_fallback_uses_the_sessions_live_model	test
 agent.rs::thinking_level_is_sent_and_drops_the_temperature_on_anthropic	test
 agent.rs::timer_tools_are_hidden_when_timers_are_disabled	test
 agent.rs::timers_survive_resume_and_restart_clears_them	test

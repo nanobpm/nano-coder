@@ -406,6 +406,7 @@ final class AcpServer : AgentEvents
 
     /// Nothing to retract over ACP: the client has the streamed chunks.
     void responseRestarted() {}
+    void generationStart() {}
 
     void assistantMessage(string t, string reasoning)
     {
