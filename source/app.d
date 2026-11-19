@@ -51,7 +51,7 @@ import nano.control : TurnControl, FdLineReader;
 import nano.instructions : ProjectInstructions, InstructionOptions = Options, expandHome;
 import core.atomic : atomicLoad, atomicStore, cas;
 
-enum string packageVersion = "0.1.0";
+enum string packageVersion = "0.68.0";
 enum string versionString = "nano-coder " ~ packageVersion;
 
 enum string usage = `Usage: nano-coder [--model provider/model] [--config PATH] [-p PROMPT]

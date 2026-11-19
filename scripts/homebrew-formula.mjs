@@ -35,7 +35,7 @@ writeFileSync(
   out,
   `# Generated on each release by scripts/homebrew-formula.mjs in nanobpm/nano-coder. Don't edit.
 class NanoCoder < Formula
-  desc "6MB coding agent. Run a fleet on your laptop"
+  desc "4MB coding agent. Run a fleet on your laptop"
   homepage "https://github.com/nanobpm/nano-coder"
   license "Apache-2.0"
 
