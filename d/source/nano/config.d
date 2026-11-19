@@ -957,3 +957,28 @@ unittest
 }
 
 version (unittest) private string tomlQuote(string s) { return `"` ~ s ~ `"`; }
+
+// rust: config.rs::legacy_base_url_targets_an_openai_compatible_default
+// rust: config.rs::parses_partial_config_with_providers
+unittest
+{
+    import std.file : tempDir, write, remove;
+    import std.path : buildPath;
+    auto path = buildPath(tempDir, "nano-d-config-partial.toml");
+    scope (exit) remove(path);
+    write(path, "model = \"llama3\"\nbase_url = \"http://localhost:8080/v1\"\n");
+    auto c = Config.load(path);
+    auto r = resolve(c, c.model);
+    assert(r.name == "openai" && r.config.baseUrl == "http://localhost:8080/v1" && r.model == "llama3", r.name);
+
+    write(path, "model = \"work/gpt-oss-120b\"\n[providers.work]\nkind = \"openai\"\n"
+        ~ "base_url = \"http://merlin.local:8000/v1\"\napi_key_env = \"WORK_KEY\"\nheaders = { \"X-Team\" = \"nwf\" }\n"
+        ~ "[providers.anthropic]\nmax_retries = 2\n");
+    c = Config.load(path);
+    assert(c.maxTokens == 0 && c.providers["work"].headers["X-Team"] == "nwf");
+    assert(c.defaultProvider == "mock", c.defaultProvider);
+    r = resolve(c, c.model);
+    assert(r.name == "work" && r.model == "gpt-oss-120b");
+    auto anthropic = resolve(c, "anthropic/claude");
+    assert(anthropic.config.retryPolicy.maxRetries == 2 && anthropic.config.baseUrl == "https://api.anthropic.com/v1");
+}

@@ -750,3 +750,40 @@ unittest
         assert(pipelineKey("cmd | " ~ w) == "cmd | " ~ w);
     assert(pipelineKey("cmd | grep 'a b' | head -n 3") == "cmd");
 }
+
+// rust: reminders.rs::distinct_full_content_with_matching_bounded_preview_does_not_repeat
+// rust: reminders.rs::identical_large_history_read_with_per_call_spill_paths_still_counts
+// rust: reminders.rs::spill_normalisation_handles_ellipsis_in_directory
+unittest
+{
+    import std.file : remove, tempDir, mkdirRecurse, rmdirRecurse, exists;
+    import std.path : buildPath;
+    import std.regex : matchFirst;
+    import nano.tools : truncateOutput, setSpillDir;
+    // A session dir whose name holds `...` (and a generated-looking segment).
+    auto dir = buildPath(tempDir, "nano-d-rem", "tool-cache.txt...v1");
+    mkdirRecurse(dir);
+    setSpillDir(dir);
+    scope (exit) { setSpillDir(null); rmdirRecurse(buildPath(tempDir, "nano-d-rem")); }
+    string big(string middle, string label = "bash-stdout")
+    {
+        auto t = truncateOutput("HEAD " ~ middle ~ " TAIL", 10, label);
+        assert(t.matchFirst(`saved to (.*\.txt) \.\.\.\]`)[1].canFind("...v1/"), t);
+        return t;
+    }
+    RepeatVerdict last;
+    Reminders r;
+    foreach (i; 0 .. repeatWarnAfter) last = call(r, "cat big.log", true, big("the same middle"));
+    assert(last.warning, "a ... in the spill dir doesn't keep per-call names in the hash");
+
+    // history_read spills per call too; identical reads still count.
+    Reminders h;
+    foreach (i; 0 .. repeatWarnAfter)
+        last = h.afterRepeatCall("history_read", parseJSON(`{"id": 3}`), null, true, big("same history", "history"));
+    assert(last.warning);
+
+    // Same head, tail and size, different middle: the digest tells them apart.
+    Reminders d;
+    foreach (i; 0 .. repeatWarnAfter + 1)
+        assert(call(d, "cat big.log", true, big(format("middle %s", i))).none);
+}

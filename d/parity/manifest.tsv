@@ -327,12 +327,12 @@ commands.rs::tab_completes_unique_commands_and_common_prefixes	test
 commands.rs::unknown_commands_are_rejected_with_a_suggestion	test
 config.rs::a_retired_legacy_renderer_setting_still_loads_with_a_notice	test
 config.rs::app_dir_prefers_current_and_falls_back_to_legacy	na	the rusty-harness folder migration: D has always used its own nano-coder-d folders
-config.rs::create_compat_link_is_race_idempotent	todo
+config.rs::create_compat_link_is_race_idempotent	na	the rusty-harness folder migration: D has always used its own nano-coder-d folders
 config.rs::keeps_reporting_link_failure_while_legacy_path_stays_occupied	na	the rusty-harness folder migration: D has always used its own nano-coder-d folders
-config.rs::legacy_base_url_targets_an_openai_compatible_default	todo
+config.rs::legacy_base_url_targets_an_openai_compatible_default	test
 config.rs::migrates_legacy_dir_once_and_leaves_a_link	na	the rusty-harness folder migration: D has always used its own nano-coder-d folders
-config.rs::parses_partial_config_with_providers	todo
-config.rs::recreates_a_missing_compatibility_link_on_a_later_start	todo
+config.rs::parses_partial_config_with_providers	test
+config.rs::recreates_a_missing_compatibility_link_on_a_later_start	na	the rusty-harness folder migration: D has always used its own nano-coder-d folders
 config.rs::reports_link_failure_when_current_exists_and_legacy_is_occupied	na	the rusty-harness folder migration: D has always used its own nano-coder-d folders
 context.rs::clip_bytes_cuts_on_char_boundaries_within_budget	test	pinned user requests (#184)
 context.rs::clip_stays_within_a_sub_marker_budget	test
@@ -719,7 +719,7 @@ permissions.rs::blocks_destructive_database_commands	test
 permissions.rs::blocks_disk_and_device_writes	test
 permissions.rs::body_ifs_write_declines_unroll	test
 permissions.rs::brace_after_substitution_declines_unroll	test
-permissions.rs::builtin_rules_can_be_disabled	todo
+permissions.rs::builtin_rules_can_be_disabled	test
 permissions.rs::cd_into_symlink_tracks_physical_base	test
 permissions.rs::computed_program_words_do_not_bypass_guards	test
 permissions.rs::declaration_option_and_computed_destination_are_writes	test
@@ -783,13 +783,13 @@ permissions.rs::shred_normalizes_device_paths	test
 permissions.rs::static_guard_is_advisory_and_fails_closed_on_uninspectable_input	test
 permissions.rs::substituted_declaration_assignment_hard_blocks	test
 permissions.rs::tilde_values_are_not_unrolled	test
-permissions.rs::trailing_slash_follows_symlink_out_of_workspace	todo
+permissions.rs::trailing_slash_follows_symlink_out_of_workspace	test
 permissions.rs::underscore_loop_variable_is_not_unrolled	test
 permissions.rs::unrolled_loops_keep_assignments_sql_and_padded_ranges	test
 permissions.rs::unset_loop_binding_is_a_write	test
 permissions.rs::unverifiable_loops_fail_closed_on_rules_bindings_and_builtins	test
 permissions.rs::user_rules_deny_and_allow	test
-permissions.rs::wildcard_parent_follows_symlink_out_of_workspace	todo
+permissions.rs::wildcard_parent_follows_symlink_out_of_workspace	test
 permissions.rs::workspace_under_a_system_directory	test
 permissions.rs::wrapped_loop_body_writes_are_collected	test
 permissions.rs::wrapped_shell_faces_interpreter_hard_block	test
@@ -999,11 +999,11 @@ reminders.rs::changing_execution_arguments_is_not_a_repeat	test
 reminders.rs::changing_image_attachment_does_not_repeat	test
 reminders.rs::different_arguments_or_results_do_not_repeat	test
 reminders.rs::disabled_plan_tool_repeats_are_still_detected	test
-reminders.rs::distinct_full_content_with_matching_bounded_preview_does_not_repeat	todo
+reminders.rs::distinct_full_content_with_matching_bounded_preview_does_not_repeat	test
 reminders.rs::distinct_malformed_payloads_sharing_a_prefix_are_not_a_repeat	test
 reminders.rs::distinct_side_effecting_pipelines_do_not_hard_stop	test
 reminders.rs::exempt_tools_and_start_turn_reset_the_detector	test
-reminders.rs::identical_large_history_read_with_per_call_spill_paths_still_counts	todo
+reminders.rs::identical_large_history_read_with_per_call_spill_paths_still_counts	test
 reminders.rs::identical_large_output_with_per_call_spill_paths_still_counts	test
 reminders.rs::less_logfile_option_is_not_diagnostic	test
 reminders.rs::less_numeric_option_prefix_does_not_hide_a_writer_flag	test
@@ -1013,7 +1013,7 @@ reminders.rs::pipeline_key_keeps_stages_that_write_through_options_or_shell_cont
 reminders.rs::pipeline_key_only_collapses_read_only_diagnostic_stages	test
 reminders.rs::repeat_warning_only_names_report_outcome_when_it_is_offered	test
 reminders.rs::reset_repeat_breaks_a_building_streak	test
-reminders.rs::spill_normalisation_handles_ellipsis_in_directory	todo
+reminders.rs::spill_normalisation_handles_ellipsis_in_directory	test
 reminders.rs::spill_normalisation_handles_paths_with_spaces	test
 reminders.rs::spill_normalisation_only_touches_the_marker_not_arbitrary_output	test
 reminders.rs::spill_path_normalisation_collapses_per_call_names	test

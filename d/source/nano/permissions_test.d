@@ -2147,3 +2147,28 @@ unittest // never prompts: allowed under the OS sandbox, blocked without it (Rus
     auto eval = cmdArgs("for f in a b; do eval \"$f\"; done");
     assert(sandboxed.decideIn("bash", eval, "/work/project").match!((PermDeny _) => true, _ => false));
 }
+
+// rust: permissions.rs::builtin_rules_can_be_disabled
+// rust: permissions.rs::trailing_slash_follows_symlink_out_of_workspace
+// rust: permissions.rs::wildcard_parent_follows_symlink_out_of_workspace
+unittest
+{
+    import std.json : parseJSON, JSONValue;
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, symlink;
+    import std.path : buildPath, expandTilde;
+    import std.process : thisProcessID;
+    import std.format : format;
+    auto off = Policy.fromConfig(parseJSON(`{"builtin_rules": false}`));
+    assert(off.check("bash", JSONValue(["command": "rm -rf /"])) is null);
+
+    auto dir = buildPath(tempDir, format("nano-perm-link-%s", thisProcessID));
+    mkdirRecurse(buildPath(dir, "real"));
+    scope (exit) rmdirRecurse(dir);
+    symlink(expandTilde("~"), buildPath(dir, "link"));
+    Policy p;
+    string run(string cmd) { return p.checkIn("bash", JSONValue(["command": cmd]), dir); }
+    assert(run("rm -rf link/") !is null, "rm -rf link/ follows the symlink into $HOME");
+    assert(run("rm -rf link") is null, "rm -rf link only deletes the link");
+    assert(run("rm -rf link/*") !is null, "link/* expands through the symlink");
+    assert(run("rm -rf real/*") is null, "a wildcard inside the workspace is fine");
+}
