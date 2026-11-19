@@ -2824,7 +2824,7 @@ unittest
     agent.log = some(new SessionLog(dir, "m", dir, "sess-x"));
     agent.run("go", new NullEvents);
     auto tool = agent.messages[3];
-    assert(tool.content.indexOf("characters omitted; full output saved to " ~ buildPath(dir, "sess-x.spill")) > 0,
+    assert(tool.content.indexOf("); full output saved to " ~ buildPath(dir, "sess-x.spill")) > 0,
         tool.content);
     assert(dirEntries(buildPath(dir, "sess-x.spill"), SpanMode.shallow).array.length == 1);
 }

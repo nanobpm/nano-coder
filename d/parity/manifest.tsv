@@ -704,7 +704,7 @@ mode.rs::parses_mode_names	test
 mode.rs::plan_allows_every_timer_tool	test
 mode.rs::plan_allows_read_only_search_but_not_writes	test
 mode.rs::shift_tab_cycles_normal_plan_auto	test
-output.rs::is_utf8_safe_and_mentions_path	gap	Rust's cut marker is "<head>...N bytes truncated (sha256:D); complete output in PATH...<tail>"; D still writes "[... N characters omitted; full output saved to PATH ...]" without the digest
+output.rs::is_utf8_safe_and_mentions_path	test
 output.rs::keeps_head_and_tail	test
 output.rs::leaves_short_output_alone	test
 output.rs::spill_never_overwrites_an_existing_file	test
@@ -986,12 +986,12 @@ recents.rs::save_then_load_round_trips	todo
 recents.rs::switching_records_the_previous_model_just_behind_the_new_one	todo
 reminders.rs::a_bash_loop_that_appends_pipeline_stages_still_counts	test
 reminders.rs::a_fresh_streak_does_not_hard_stop_before_its_own_warnings	test
-reminders.rs::a_known_spill_marker_is_normalised_without_its_digest	gap	Rust's spill marker carries a sha256 digest the repeat detector keys on; D's marker has no digest (see output.rs gap)
-reminders.rs::a_known_spill_rewrite_leaves_an_untracked_lookalike_marker_intact	gap	Rust's spill marker carries a sha256 digest the repeat detector keys on; D's marker has no digest (see output.rs gap)
+reminders.rs::a_known_spill_marker_is_normalised_without_its_digest	test
+reminders.rs::a_known_spill_rewrite_leaves_an_untracked_lookalike_marker_intact	test
 reminders.rs::a_one_time_hint_on_the_first_failure_keeps_it_out_of_the_identical_streak	test
 reminders.rs::a_quoted_pipe_is_not_a_pipeline_boundary	test
 reminders.rs::an_appended_diagnostic_suffix_loop_is_detected	test
-reminders.rs::an_embedded_marker_cannot_hide_the_outer_spill_digest	gap	Rust's spill marker carries a sha256 digest the repeat detector keys on; D's marker has no digest (see output.rs gap)
+reminders.rs::an_embedded_marker_cannot_hide_the_outer_spill_digest	test
 reminders.rs::an_interleaved_exempt_call_breaks_the_streak	test
 reminders.rs::caps_the_warning_then_hard_stops	test
 reminders.rs::changing_a_diagnostic_stages_query_is_not_a_repeat	test

@@ -137,8 +137,42 @@ string truncateOutput(string text, size_t limit, string label)
     auto spill = spillFile(text, label);
     auto head = limit * 2 / 3;
     auto tail = limit - head;
-    return format("%s\n\n[... %s characters omitted; full output saved to %s ...]\n\n%s",
-            chars[0 .. head].toUTF8, chars.length - limit, spill, chars[$ - tail .. $].toUTF8);
+    return format("%s\n\n[... %s characters omitted (sha256:%s); full output saved to %s ...]\n\n%s",
+            chars[0 .. head].toUTF8, chars.length - limit, contentDigest(text), spill, chars[$ - tail .. $].toUTF8);
+}
+
+/// The first 16 hex digits of the text's SHA-256: the spill marker's
+/// identity, which the repeat detector keys on instead of the per-call path.
+string contentDigest(scope const(char)[] text)
+{
+    import std.digest.sha : sha256Of, toHexString;
+    import std.ascii : LetterCase;
+    auto d = sha256Of(text);
+    return toHexString!(LetterCase.lower)(d[0 .. 8]).idup;
+}
+
+/// The spill files this thread wrote (the agent's: tools run on it). The
+/// repeat detector rewrites only these markers' paths, so a look-alike
+/// marker in ordinary output stays as it is (Rust's out-of-band spills).
+private bool[string] spilled_;
+
+/// Whether `path` is a spill file this thread wrote.
+bool isSpill(string path) { return (path in spilled_) !is null; }
+
+// rust: output.rs::is_utf8_safe_and_mentions_path
+unittest
+{
+    import std.algorithm : canFind, startsWith, endsWith;
+    import std.array : replicate;
+    import std.file : remove;
+    import std.regex : matchFirst;
+    auto text = "é".replicate(10);
+    auto t = truncateOutput(text, 3, "test");
+    auto m = t.matchFirst(`full output saved to (.*\.txt) \.\.\.\]`);
+    scope (exit) remove(m[1]);
+    assert(t.startsWith("éé\n") && t.endsWith("\né"), "cut on character boundaries: " ~ t);
+    assert(t.canFind("[... 7 characters omitted (sha256:" ~ contentDigest(text) ~ "); full output saved to "), t);
+    assert(isSpill(m[1]) && !isSpill("/tmp/elsewhere.txt"));
 }
 
 /// Where cut outputs are saved: the session's `<id>.spill` directory when
@@ -171,6 +205,8 @@ private string spillFile(string text, string label)
     auto path = stem ~ ".txt";
     for (size_t n = 2; path.exists; n++) path = format("%s-%s.txt", stem, n);
     write(path, text);
+    if (spilled_.length > 10_000) spilled_ = null; // bounded: the oldest calls are long out of the repeat window
+    spilled_[path] = true;
     return path;
 }
 

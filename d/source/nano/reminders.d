@@ -187,14 +187,18 @@ private string fingerprint(string tool, JSONValue args, string rawArgs, bool ok,
 }
 
 /// Collapse the per-call path in D's truncation marker
-/// (`[... N characters omitted; full output saved to PATH ...]`), so two
-/// identical large outputs still match. Only the marker's own path is
-/// rewritten; the omitted count, head and tail stay in the hash.
+/// (`[... N characters omitted (sha256:D); full output saved to PATH ...]`),
+/// so two identical large outputs still match. Only the path of a file this
+/// session spilled is rewritten; the digest, count, head and tail stay in the
+/// hash.
 private string normaliseSpillPaths(string result)
 {
-    import std.regex : regex, replaceAll;
-    static re = regex(`(characters omitted; full output saved to )[^\n]*?(-\d+-\d+(?:-\d+)?\.txt) \.\.\.\]`);
-    return replaceAll(result, re, "$1<spill> ...]");
+    import std.regex : regex, replaceAll, Captures;
+    import nano.tools : isSpill;
+    static re = regex(`(characters omitted \(sha256:[0-9a-f]{16}\); full output saved to )([^\n]*?) \.\.\.\]`);
+    // Only a marker for a file this session spilled is rewritten; its digest
+    // stays, so different outputs with the same head and tail stay apart.
+    return replaceAll!((Captures!string m) => isSpill(m[2]) ? m[1] ~ "<spill> ...]" : m.hit)(result, re);
 }
 
 /// Read-only filters a retry loop commonly appends to the same base command.
@@ -633,13 +637,43 @@ unittest // distinct malformed payloads, exempt tools, reset, images
 // rust: reminders.rs::spill_path_normalisation_collapses_per_call_names
 unittest // identical large output with per-call spill paths still counts
 {
+    import std.file : remove;
+    import nano.tools : truncateOutput, contentDigest;
+    string[] made;
+    scope (exit) foreach (f; made) remove(f);
+    string big(string middle)
+    {
+        import std.regex : matchFirst;
+        auto t = truncateOutput("head " ~ middle ~ " tail", 10, "bash-stdout");
+        made ~= t.matchFirst(`saved to (.*\.txt) \.\.\.\]`)[1];
+        return t;
+    }
     Reminders r;
     RepeatVerdict last;
-    foreach (i; 0 .. repeatWarnAfter)
-        last = call(r, "cat big", true, format("head\n\n[... 900 characters omitted; full output saved to /tmp/x y/nano-coder-d/bash-%s-17%s-%s.txt ...]\n\ntail", 40 + i, i, i));
-    assert(last.warning);
+    foreach (i; 0 .. repeatWarnAfter) last = call(r, "cat big", true, big("the same long middle"));
+    assert(last.warning, "identical spilled output repeats despite per-call paths");
     // ...but a lookalike in ordinary output is left alone.
     assert(normaliseSpillPaths("saved to a.txt") == "saved to a.txt");
+
+    // rust: reminders.rs::a_known_spill_marker_is_normalised_without_its_digest
+    auto a = big("x"), b = big("x");
+    assert(a != b && normaliseSpillPaths(a) == normaliseSpillPaths(b) && normaliseSpillPaths(a).canFind("<spill>"));
+
+    // rust: reminders.rs::an_embedded_marker_cannot_hide_the_outer_spill_digest
+    // Same head and tail, different middles: the digest keeps them apart.
+    Reminders r2;
+    RepeatVerdict v;
+    foreach (i; 0 .. repeatWarnAfter + 1)
+    {
+        v = call(r2, "cat big", true, big(format("middle number %s of many", i)));
+        assert(v.none, "different outputs conflated");
+    }
+
+    // rust: reminders.rs::a_known_spill_rewrite_leaves_an_untracked_lookalike_marker_intact
+    auto lookalike = format("[... 3 characters omitted (sha256:%s); full output saved to /tmp/nano-coder-9/tool-aaa-1-2.txt ...]",
+        contentDigest("x"));
+    assert(normaliseSpillPaths(a ~ "\nStderr:\nnote " ~ lookalike).canFind("tool-aaa-1-2.txt"),
+        "a marker for a file this session didn't write is kept verbatim");
 }
 
 // rust: reminders.rs::less_logfile_option_is_not_diagnostic
