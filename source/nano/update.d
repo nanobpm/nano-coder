@@ -184,6 +184,7 @@ string brewTapRepo()
 {
     import std.process : execute;
     import std.file : exists;
+    import std.path : buildPath;
     auto r = execute(["brew", "--repository", brewTap]);
     if (r.status != 0) return null;
     auto dir = r.output.strip;
