@@ -108,12 +108,13 @@ string pickFromProvider(SettingsUi ui, ref SettingsHost h, string name)
     {
         auto labels = shown ~ ["Other (type a model ID)", "Back to providers"];
         auto at = models.countUntil(defaultModel);
-        auto i = ui.select(format("Model from %s (Esc to go back)", name), labels, at >= 0 ? at : 0);
-        if (i < 0 || i > models.length) return null;
-        model = i == models.length ? ui.input(typed, "") : models[i];
+        auto step = modelChoice(ui.select(format("Model from %s (Esc to go back)", name), labels, at >= 0 ? at : 0), models);
+        if (step.back) return null;
+        model = step.model.length ? step.model : ui.input(typed, "");
     }
-    if (model is null || !model.strip.length) return null;
-    return name ~ "/" ~ model.strip;
+    if (model is null) return null;
+    auto spec = modelSpec(name, model);
+    return spec.back ? null : spec.model;
 }
 
 /// The dialog. Returns notices to show after it closes.
@@ -237,6 +238,7 @@ private void saveAndReport(SettingsUi ui, ref SettingsHost h, ref Changes change
     {
         save(*h.cfg, changes, user, h.configPath);
         changes = Changes.init;
+        notices = clearSaveFailures(notices);
         ui.say(format("Saved to %s", h.configPath));
     }
     catch (Exception e) notices ~= format("Could not save settings: %s", e.msg);
@@ -449,16 +451,16 @@ private string editProvider(SettingsUi ui, ref SettingsHost h, ref string[] noti
     bool forceUrl;
     if (isQwenProvider(name, current))
     {
-        auto match = qwen.endpointForUrl(currentUrl);
-        string[] rows;
-        const(qwen.QwenEndpoint)*[] eps;
-        if (match !is null) { rows ~= match.label ~ "  (current)"; eps ~= match; }
-        foreach (ref e; qwen.endpoints) if (&e !is match) { rows ~= e.label; eps ~= &e; }
-        rows ~= "Custom URL (e.g. your workspace domain, a proxy)";
-        rows ~= match is null ? "Keep " ~ currentUrl : format("Keep current URL (%s)", currentUrl);
-        auto pick = ui.select("Qwen / Model Studio endpoint", rows, rows.length - 1);
-        if (pick >= 0 && pick < eps.length) chosen = eps[pick];
-        else if (pick == eps.length) forceUrl = true;
+        auto rows = qwenEndpointRows(currentUrl);
+        string[] rowLabels;
+        foreach (r; rows) rowLabels ~= r.label;
+        auto row = qwenEndpointPick(ui.select("Qwen / Model Studio endpoint", rowLabels, rows.length - 1), rows);
+        final switch (row.choice)
+        {
+            case QwenChoice.known: chosen = row.endpoint; break;
+            case QwenChoice.custom: forceUrl = true; break;
+            case QwenChoice.keep: break;
+        }
     }
     string baseUrl;
     if (chosen !is null) baseUrl = chosen.baseUrl;
@@ -483,12 +485,7 @@ private string editProvider(SettingsUi ui, ref SettingsHost h, ref string[] noti
     updated.hasKind = true;
     updated.kind = kind;
     updated.baseUrl = baseUrl;
-    if (chosen !is null)
-    {
-        bool known;
-        foreach (ref e; qwen.endpoints) if (e.apiKeyEnv == updated.apiKeyEnv) known = true;
-        if (updated.apiKeyEnv.length && known) updated.apiKeyEnv = chosen.apiKeyEnv;
-    }
+    if (chosen !is null) applyQwenEndpoint(updated, *chosen);
     auto sources = ["Environment variable (recommended)", "Shell command (e.g. `op read ...`, `gh auth token`)",
         "Literal key, saved in the config file", "No key", "Keep current"];
     size_t srcDefault = current.apiKeyEnv.length || current.apiKeyCommand.length || current.apiKey.length ? 4 : 0;
@@ -497,9 +494,7 @@ private string editProvider(SettingsUi ui, ref SettingsHost h, ref string[] noti
     switch (src)
     {
         case 0:
-            auto suggested = updated.apiKeyEnv.length ? updated.apiKeyEnv : chosen !is null ? chosen.apiKeyEnv
-                : name.toUpper.replace("-", "_") ~ "_API_KEY";
-            auto v = ui.input("Variable name", suggested);
+            auto v = ui.input("Variable name", suggestedKeyEnv(updated, chosen, name));
             if (v is null) return null;
             updated.apiKeyEnv = v.strip;
             updated.apiKeyEnvSet = true;

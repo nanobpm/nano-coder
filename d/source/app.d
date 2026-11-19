@@ -2062,8 +2062,12 @@ int runMain(string[] args)
         h.listModels = (string name) => makeClient(resolve(cfg, name)).listModels();
         h.refreshSystem = () { agent.messages[0].content = systemFor(cwd, sysPlan); };
         h.refreshClient = (string name) {
-            if (agent.client.providerName != name) return cast(string) null;
-            try { switchModel(name ~ "/" ~ agent.client.modelName); return ""; }
+            import nano.settings : editRebuilds;
+            if (!editRebuilds(cfg, name, agent.client.providerName)) return cast(string) null;
+            // The client's own provider was edited: keep its model. Otherwise the
+            // configured model now resolves to the edited provider: build that.
+            auto spec = agent.client.providerName == name ? name ~ "/" ~ agent.client.modelName : cfg.model;
+            try { switchModel(spec); return ""; }
             catch (Exception e) return e.msg;
         };
         onVerbosity = (Verbosity v) { setVerbosity(v); };

@@ -8,7 +8,9 @@ module nano.settings;
 import std.format : format;
 import std.math : isNaN;
 import std.typecons : Nullable, Tuple, tuple;
-import nano.config : Config, ProviderConfig, ProviderKind, ModelSettings, enabledProviderNames, isVisible;
+import nano.config : Config, ProviderConfig, ProviderKind, ModelSettings, enabledProviderNames, isVisible, parseModelSpec;
+import nano.qwen : QwenEndpoint;
+import std.string : strip;
 import nano.thinking : Thinking;
 import nano.toml_edit;
 
@@ -124,6 +126,102 @@ bool isQwenProvider(string name, const ref ProviderConfig p)
 {
     import nano.qwen : isModelStudioUrl;
     return name == "qwen" || (p.baseUrl.length && isModelStudioUrl(p.baseUrl));
+}
+
+/// What a row of the Qwen endpoint picker does.
+enum QwenChoice { known, custom, keep }
+
+/// One row of the Qwen / Model Studio endpoint picker.
+struct QwenRow
+{
+    string label;
+    QwenChoice choice;
+    /// The endpoint, for `QwenChoice.known`.
+    immutable(QwenEndpoint)* endpoint;
+}
+
+/// The endpoint picker for a provider now on `currentUrl`: the current
+/// endpoint first (so Enter keeps it), every other endpoint once, then
+/// Custom URL and Keep.
+QwenRow[] qwenEndpointRows(string currentUrl)
+{
+    import nano.qwen : endpointForUrl, endpoints;
+    auto match = endpointForUrl(currentUrl);
+    QwenRow[] rows;
+    if (match !is null) rows ~= QwenRow(match.label ~ "  (current)", QwenChoice.known, match);
+    foreach (ref e; endpoints) if (&e !is match) rows ~= QwenRow(e.label, QwenChoice.known, &e);
+    rows ~= QwenRow("Custom URL (e.g. your workspace domain, a proxy)", QwenChoice.custom);
+    rows ~= QwenRow(match is null ? "Keep " ~ currentUrl : format("Keep current URL (%s)", currentUrl), QwenChoice.keep);
+    return rows;
+}
+
+/// The row picked (`-1` for Esc); Esc or a stale index keeps the endpoint.
+QwenRow qwenEndpointPick(ptrdiff_t pick, const QwenRow[] rows)
+{
+    if (pick < 0 || pick >= rows.length) return QwenRow(null, QwenChoice.keep);
+    return QwenRow(rows[pick].label, rows[pick].choice, rows[pick].endpoint);
+}
+
+/// Point `p` at endpoint `e`. A plan variable (one of the known plan
+/// `api_key_env` names) moves to `e`'s plan; a custom variable, a literal key
+/// or a command stays, and no variable is introduced where there was none
+/// (an unused env var would shadow a key command: env ranks above command).
+void applyQwenEndpoint(ref ProviderConfig p, const ref QwenEndpoint e)
+{
+    import nano.qwen : endpoints;
+    p.baseUrl = e.baseUrl;
+    if (!p.apiKeyEnv.length) return;
+    foreach (ref k; endpoints) if (k.apiKeyEnv == p.apiKeyEnv) { p.apiKeyEnv = e.apiKeyEnv; return; }
+}
+
+/// The env-var prompt's default: the provider's variable, else the chosen
+/// endpoint's plan variable, else `<NAME>_API_KEY`.
+string suggestedKeyEnv(const ref ProviderConfig p, scope const(QwenEndpoint)* chosen, string name)
+{
+    import std.string : toUpper, replace;
+    if (p.apiKeyEnv.length) return p.apiKeyEnv;
+    if (chosen !is null) return chosen.apiKeyEnv;
+    return name.toUpper.replace("-", "_") ~ "_API_KEY";
+}
+
+/// A model-picker step: back to the providers, or a model ID ("" prompts for one).
+struct ModelStep
+{
+    bool back;
+    string model;
+}
+
+/// The model picker's row `pick` (`-1` for Esc) over `models`, followed by
+/// "Other (type a model ID)" and "Back to providers".
+ModelStep modelChoice(ptrdiff_t pick, const string[] models)
+{
+    if (pick < 0 || pick > models.length) return ModelStep(true);
+    return ModelStep(false, pick == models.length ? "" : models[pick]);
+}
+
+/// `provider/model` for a typed ID; a blank ID goes back.
+ModelStep modelSpec(string provider, string id)
+{
+    return id.strip.length ? ModelStep(false, provider ~ "/" ~ id.strip) : ModelStep(true);
+}
+
+/// Whether an edit to provider `name` must rebuild the running client: it
+/// built the client, or the configured model now resolves to it (a
+/// `work/foo` spec falls back to the default provider until `work` exists).
+/// `c.providers` is the effective table (presets and legacy keys applied).
+bool editRebuilds(const ref Config c, string name, string clientProvider)
+{
+    string provider, model;
+    parseModelSpec(c.model, c.providers, c.defaultProvider, provider, model);
+    return clientProvider == name || provider == name;
+}
+
+/// Notices after a successful save: an earlier save failure is resolved.
+string[] clearSaveFailures(string[] notices)
+{
+    import std.algorithm : filter, startsWith;
+    import std.array : array;
+    return notices.filter!(n => !n.startsWith("Could not save")).array;
 }
 
 /// The user's entry after an edit: only fields that differ from the preset,
