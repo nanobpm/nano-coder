@@ -100,6 +100,10 @@ string enforceSlashInvariant(ref string text)
     auto trimmed = text.strip;
     if (isCommand(trimmed))
     {
+        import nano.commands : rejection;
+        // An unknown command gets its did-you-mean; a known one reaches here
+        // only when ACP doesn't service it (or not with these arguments).
+        if (auto r = rejection(trimmed)) return r;
         auto sp = trimmed.indexOf(' ');
         auto word = sp > 0 ? trimmed[0 .. sp] : trimmed;
         if (acpCommandRoots.canFind(word)) return format("Can't run %s over ACP", debugQuote(trimmed));
@@ -886,7 +890,7 @@ unittest
     auto r3 = parseJSON(lines[$ - 2]);
     assert(r3["id"].integer == 3 && r3["result"]["stopReason"].str == "end_turn" && r3["result"]["response"].str == "done");
     auto r4 = parseJSON(lines[$ - 1]);
-    assert(r4["id"].integer == 4 && r4["result"]["response"].str.canFind("not available over ACP"));
+    assert(r4["id"].integer == 4 && r4["result"]["response"].str.canFind("Unknown command /nope"));
     assert(agent.messages[0].content == "sys");
 }
 
@@ -976,4 +980,60 @@ unittest
     foreach (x; updates(shown.lines)) if (x["sessionUpdate"].str == "tool_call_update") upd = x;
     auto raw = upd["rawOutput"].str;
     assert(raw.canFind("[image: x.png, 12×34]") && raw.canFind("saw it"), raw);
+}
+
+// rust: acp.rs::escaped_prompts_steer_mid_turn_while_commands_defer
+// rust: acp.rs::only_jsonrpc_requests_count_as_valid_acp
+// rust: acp.rs::only_unabsorbed_steers_are_requeued
+// rust: acp.rs::requeued_escaped_steers_are_re_escaped
+// rust: acp.rs::slash_prompts_never_reach_the_model_over_acp
+unittest
+{
+    JSONValue prompt(string t)
+    {
+        return parseJSON(`{"method":"session/prompt","params":{"prompt":[{"type":"text","text":` ~ JSONValue(t).toString ~ `}]}}`);
+    }
+    string s;
+    assert(classifyDuringTurn(prompt("//usr/lib is big"), null, s) == DuringTurn.steer && s == "/usr/lib is big");
+    assert(classifyDuringTurn(prompt("keep going"), null, s) == DuringTurn.steer && s == "keep going");
+    assert(classifyDuringTurn(prompt("/plan"), null, s) == DuringTurn.defer);
+    assert(classifyDuringTurn(prompt("   "), null, s) == DuringTurn.defer);
+
+    assert(isJsonRpcRequest(parseJSON(`{"jsonrpc": "2.0", "method": "initialize", "id": 1}`)));
+    assert(isJsonRpcRequest(parseJSON(`{"jsonrpc": "2.0", "method": "session/cancel"}`)));
+    foreach (bad; [`{}`, `null`, `42`, `{"method": "initialize"}`, `{"jsonrpc": "2.0"}`, `{"jsonrpc": "2.0", "method": 1}`])
+        assert(!isJsonRpcRequest(parseJSON(bad)), bad);
+
+    string[] order(JSONValue[] xs)
+    {
+        string[] o;
+        foreach (m; xs) o ~= getStr(m, "method") == "session/prompt" ? promptText(get(m, "params")) : getStr(m, "method");
+        return o;
+    }
+    // Three steers arrived; the first was absorbed into the turn.
+    auto q = requeueSteers([parseJSON(`{"method": "cmd"}`)], [Steer("b"), Steer("c")], [0, 0, 1], null);
+    assert(order(q) == ["b", "cmd", "c"], order(q).format!"%s");
+    q = requeueSteers(null, [Steer("/usr/lib is big")], [0], "s");
+    assert(promptText(get(q[0], "params")) == "//usr/lib is big");
+    q = requeueSteers(null, [Steer("keep going")], [0], "s");
+    assert(promptText(get(q[0], "params")) == "keep going");
+
+    string t = "/exin";
+    assert(enforceSlashInvariant(t).startsWith("Unknown command /exin. Did you mean /exit?"), enforceSlashInvariant(t));
+    foreach (h; ["/help", "/help me"])
+    {
+        t = h;
+        assert(enforceSlashInvariant(t) == "Can't run /help: this command is not available over ACP", h);
+    }
+    foreach (cmd; ["/settings foo", "/plan foo", "/tools foo", "/providers foo", "/model"])
+    {
+        t = cmd;
+        assert(enforceSlashInvariant(t) == format(`Can't run "%s" over ACP`, cmd), enforceSlashInvariant(t));
+    }
+    t = "  /exin";
+    assert(enforceSlashInvariant(t) !is null);
+    t = "//usr/lib is big";
+    assert(enforceSlashInvariant(t) is null && t == "/usr/lib is big");
+    t = "hello world\n";
+    assert(enforceSlashInvariant(t) is null && t == "hello world\n");
 }

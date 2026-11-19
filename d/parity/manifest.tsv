@@ -1,11 +1,11 @@
 # Rust test -> D port status; see d/scripts/check-parity.py. Columns: test, status, note
-acp.rs::escaped_prompts_steer_mid_turn_while_commands_defer	todo
+acp.rs::escaped_prompts_steer_mid_turn_while_commands_defer	test
 acp.rs::leftover_steers_keep_their_arrival_position	test
-acp.rs::only_jsonrpc_requests_count_as_valid_acp	todo
-acp.rs::only_unabsorbed_steers_are_requeued	todo
+acp.rs::only_jsonrpc_requests_count_as_valid_acp	test
+acp.rs::only_unabsorbed_steers_are_requeued	test
 acp.rs::path_leading_prompts_reach_the_model_over_acp	test
-acp.rs::requeued_escaped_steers_are_re_escaped	todo
-acp.rs::slash_prompts_never_reach_the_model_over_acp	todo
+acp.rs::requeued_escaped_steers_are_re_escaped	test
+acp.rs::slash_prompts_never_reach_the_model_over_acp	test
 acp.rs::thinking_value_reports_nothing_for_a_dropped_level	test
 acp.rs::turn_usage_is_the_delta_of_the_session_counters	test
 agent.rs::a_background_probe_refines_a_default_window_source	test
@@ -230,9 +230,9 @@ agent.rs::tools_snapshot_captured_without_history_still_lists_it_live	test
 agent.rs::verify_before_complete_can_be_turned_off	test
 agent.rs::zero_turn_cap_is_unbounded	test
 agent/idle_compact.rs::armed_until_spent_then_only_after_real_growth	test
-agent/probe.rs::a_stale_generation_publishes_nothing	todo	ProbeState refactor (#185); triage at the end
-agent/probe.rs::a_windowless_result_keeps_the_window_slot_but_publishes_the_rest	todo	ProbeState refactor (#185); triage at the end
-agent/probe.rs::begin_detect_clears_every_report_and_invalidates_in_flight_probes	todo	ProbeState refactor (#185); triage at the end
+agent/probe.rs::a_stale_generation_publishes_nothing	gap	D runs one combined capability probe synchronously when a client is built or switched, so there are no in-flight probe generations to invalidate (see the agent.rs background-probe gap rows)
+agent/probe.rs::a_windowless_result_keeps_the_window_slot_but_publishes_the_rest	gap	D runs one combined capability probe synchronously when a client is built or switched, so there are no in-flight probe generations to invalidate (see the agent.rs background-probe gap rows)
+agent/probe.rs::begin_detect_clears_every_report_and_invalidates_in_flight_probes	gap	D runs one combined capability probe synchronously when a client is built or switched, so there are no in-flight probe generations to invalidate (see the agent.rs background-probe gap rows)
 attachment.rs::crafted_metadata_cannot_escape_the_attachments_dir	test
 attachment.rs::exists_rejects_a_tampered_stored_file	test
 attachment.rs::jpeg_composites_transparency_onto_white_not_black	na	D composites in the external encoder: ImageMagick gets -background white -alpha remove; sips flattens transparent PNG to white (checked on macOS 2026-11-19)
