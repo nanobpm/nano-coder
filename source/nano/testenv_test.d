@@ -90,7 +90,8 @@ UnitTestResult runModuleTests() @trusted
     ModuleRun[] runs;
     ModuleRun r;
     while (results.take(r)) runs ~= r;
-    checkBudgets(runs);
+    const scaleText = environment.get("NANO_TEST_BUDGET_SCALE");
+    checkBudgets(runs, scaleText.length ? scaleText.to!double : 1.0);
     size_t passed;
     foreach (x; runs) if (x.passed) passed++;
     auto top = environment.get("NANO_TEST_TIMES");
@@ -139,7 +140,7 @@ enum defaultBudgetMs = 1000;
 /// Fail (mark not passed) each module whose tests took longer than its limit
 /// in scripts/slow-tests: a fixed sleep or a long real timeout in a test shows
 /// up here instead of slowly growing the suite.
-void checkBudgets(ModuleRun[] runs, bool report = true)
+void checkBudgets(ModuleRun[] runs, double scale, bool report = true)
 {
     import std.array : split;
     import std.conv : to;
@@ -150,8 +151,6 @@ void checkBudgets(ModuleRun[] runs, bool report = true)
     enum file = "scripts/slow-tests";
     if (!file.exists) return; // not run from the repo root: no budgets
     foreach (name, rest; listedModules(file)) limits[name] = rest.split[0].to!long;
-    const scaleText = environment.get("NANO_TEST_BUDGET_SCALE");
-    const scale = scaleText.length ? scaleText.to!double : 1.0;
     foreach (ref r; runs)
     {
         const limit = cast(long)(limits.get(r.name, defaultBudgetMs) * scale);
@@ -169,7 +168,7 @@ unittest // a module over its limit fails; listed modules get theirs
     auto runs = [ModuleRun("nano.nonesuch", defaultBudgetMs + 1, true), ModuleRun("nano.nonesuch2", 1, true)];
     import std.file : exists;
     if (!"scripts/slow-tests".exists) return;
-    checkBudgets(runs, false);
+    checkBudgets(runs, 1.0, false);
     assert(!runs[0].passed && runs[1].passed);
 }
 
