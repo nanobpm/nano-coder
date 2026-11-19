@@ -1234,3 +1234,158 @@ unittest
     p.nestedFor(buildPath(root, "a/x.rs"), root);
     assert(p.loadedPaths.count!(x => x.canFind("a/AGENTS.md")) == 1);
 }
+
+// rust: instructions.rs::a_rules_root_that_is_itself_an_out_of_root_symlink_is_not_walked
+// rust: instructions.rs::an_out_of_root_directory_symlink_in_rules_is_not_walked
+unittest // out-of-root symlinks in rules dirs aren't walked
+{
+    import std.algorithm : any;
+    import std.file : rmdirRecurse, mkdirRecurse, symlink;
+    import std.conv : to;
+    auto base = testDir("rulelinks");
+    scope (exit) rmdirRecurse(base);
+    auto ext = buildPath(base, "ext");
+    foreach (i; 0 .. 3) put(buildPath(ext, format("sub/f%s.md", i)), format("external rule %s", i));
+
+    auto root = buildPath(base, "repo");
+    mkdirRecurse(buildPath(root, ".claude"));
+    symlink(ext, buildPath(root, ".claude/rules"));
+    assert(markdownFiles(buildPath(root, ".claude/rules"), root, false).length == 0);
+    assert(markdownFiles(buildPath(root, ".claude/rules"), root, true).length == 3, "user rules dirs may leave the root");
+
+    rmdirRecurse(root);
+    mkdirRecurse(buildPath(root, ".git"));
+    put(buildPath(root, ".claude/rules/real.md"), "real rule body");
+    symlink(ext, buildPath(root, ".claude/rules/link"));
+    auto p = find(root);
+    assert(p.warnings.length == 0, p.warnings.to!string);
+    assert(texts(p) == ["real rule body"], texts(p).to!string);
+
+    put(buildPath(root, ".claude/rules/actual/inner.md"), "inner rule body");
+    symlink(buildPath(root, ".claude/rules/actual"), buildPath(root, ".claude/rules/alias"));
+    auto files = markdownFiles(buildPath(root, ".claude/rules"), root, false);
+    assert(files.any!(f => f.endsWith("inner.md")), files.to!string);
+}
+
+// rust: instructions.rs::nested_for_does_not_reorder_already_searched_startup_directories
+// rust: instructions.rs::nested_scope_heading_uses_search_dir_not_a_dot_claude_trim
+// rust: instructions.rs::on_demand_scoped_rules_are_bounded_with_a_single_marker
+unittest
+{
+    import std.algorithm : count;
+    import std.array : replicate;
+    import std.file : rmdirRecurse;
+    auto base = testDir("order");
+    scope (exit) rmdirRecurse(base);
+    auto root = buildPath(base, "repo");
+    put(buildPath(root, "CLAUDE.md"), "root main body");
+    put(buildPath(root, ".claude/rules/zzz.md"), "unscoped rule body");
+    auto p = find(root);
+    auto before = p.render;
+    assert(before.indexOf("root main body") < before.indexOf("unscoped rule body"));
+    p.nestedFor(buildPath(root, "x.rs"), root);
+    p.nestedFor(buildPath(root, "sub/y.rs"), root);
+    assert(p.render == before, "nestedFor doesn't reorder searched startup directories");
+
+    rmdirRecurse(base);
+    base = testDir("order");
+    put(buildPath(root, "AGENTS.md"), "root");
+    put(buildPath(root, "pkg.claude/AGENTS.md"), "scoped body");
+    auto nested = find(root).nestedFor(buildPath(root, "pkg.claude/src/main.rs"), root);
+    assert(nested.canFind("apply to files under pkg.claude/") && !nested.canFind("under pkg/"), nested);
+
+    rmdirRecurse(base);
+    base = testDir("order");
+    auto big = "x".replicate(maxFileBytes - 64);
+    foreach (i; 0 .. 8)
+        put(buildPath(root, format(".claude/rules/r%s.md", i)), format("---\npaths:\n  - \"src/**\"\n---\n%s rule%s", big, i));
+    auto out_ = find(root).nestedFor(buildPath(root, "src/x.rs"), root);
+    assert(out_.length <= maxTotalBytes && out_.count("[omitted: instruction size limit reached") == 1);
+}
+
+// rust: instructions.rs::overflow_directory_stays_pending_for_a_later_call
+// rust: instructions.rs::overflow_imported_file_in_subdir_stays_pending_for_a_later_call
+// rust: instructions.rs::overflow_scoped_rule_stays_pending_for_a_later_call
+// rust: instructions.rs::oversized_group_commits_what_fits_and_defers_the_first_unrendered_file
+unittest // files past the budget stay pending for a later call
+{
+    import std.algorithm : any;
+    import std.array : replicate;
+    import std.file : rmdirRecurse;
+    import std.conv : to;
+    enum marker = "[omitted: instruction size limit reached";
+    auto base = testDir("overflow");
+    scope (exit) rmdirRecurse(base);
+    auto root = buildPath(base, "repo");
+    bool warned(ProjectInstructions p, string name)
+    {
+        return p.warnings.any!(w => w.canFind("deferred") && w.canFind(name));
+    }
+    void reset() { rmdirRecurse(base); testDir("overflow"); }
+
+    auto big16 = "x".replicate(maxFileBytes - 16), big64 = "x".replicate(maxFileBytes - 64);
+    put(buildPath(root, "AGENTS.md"), "root file");
+    put(buildPath(root, "a/AGENTS.md"), big16 ~ " file_a");
+    put(buildPath(root, "a/b/AGENTS.md"), big16 ~ " file_b");
+    auto p = find(root);
+    auto first = p.nestedFor(buildPath(root, "a/b/x.rs"), root);
+    assert(first.canFind("file_a") && !first.canFind("file_b") && first.canFind(marker));
+    assert(warned(p, "a/b/AGENTS.md"), p.warnings.to!string);
+    assert(p.nestedFor(buildPath(root, "a/b/y.rs"), root).canFind("file_b"));
+
+    reset();
+    put(buildPath(root, "a/CLAUDE.md"), "@shared/foo.md\n" ~ big64 ~ " main_file");
+    put(buildPath(root, "a/shared/foo.md"), big64 ~ " import_file");
+    p = find(root);
+    first = p.nestedFor(buildPath(root, "a/x.rs"), root);
+    assert(first.canFind("main_file") && !first.canFind("import_file") && first.canFind(marker));
+    assert(warned(p, "foo.md"), p.warnings.to!string);
+    assert(!p.render.canFind("import_file"), "a pending import stays out of the system prompt");
+    assert(p.nestedFor(buildPath(root, "a/y.rs"), root).canFind("import_file"));
+
+    reset();
+    put(buildPath(root, ".claude/rules/a.md"), "---\npaths:\n  - \"src/**\"\n---\n" ~ big64 ~ " rule_a");
+    put(buildPath(root, ".claude/rules/b.md"), "---\npaths:\n  - \"src/**\"\n---\n" ~ big64 ~ " rule_b");
+    p = find(root);
+    first = p.nestedFor(buildPath(root, "src/x.rs"), root);
+    assert(first.canFind(marker));
+    bool aFirst = first.canFind("rule_a");
+    assert(aFirst != first.canFind("rule_b"), "exactly one rule fits");
+    assert(p.nestedFor(buildPath(root, "src/y.rs"), root).canFind(aFirst ? "rule_b" : "rule_a"));
+
+    reset();
+    put(buildPath(root, "a/AGENTS.md"), big16 ~ " main_file");
+    put(buildPath(root, "a/CLAUDE.local.md"), big16 ~ " local_file");
+    p = find(root);
+    first = p.nestedFor(buildPath(root, "a/x.rs"), root);
+    assert(first.canFind("main_file") != first.canFind("local_file") && first.canFind(marker), first);
+    assert(p.warnings.any!(w => w.canFind("deferred")));
+    auto second = p.nestedFor(buildPath(root, "a/y.rs"), root);
+    assert(second.canFind(first.canFind("main_file") ? "local_file" : "main_file") && !second.canFind(marker));
+}
+
+// rust: instructions.rs::compaction_while_a_file_is_deferred_reloads_without_duplicates
+unittest
+{
+    import std.algorithm : any, count;
+    import std.array : replicate;
+    import std.file : rmdirRecurse;
+    import std.conv : to;
+    auto base = testDir("compactdefer");
+    scope (exit) rmdirRecurse(base);
+    auto root = buildPath(base, "repo");
+    auto pad = "x".replicate(maxFileBytes - 168);
+    put(buildPath(root, "a/CLAUDE.md"), "@shared/foo.md\n@shared/bar.md\n" ~ pad ~ " main_file");
+    put(buildPath(root, "a/shared/foo.md"), pad ~ " foo_file");
+    put(buildPath(root, "a/shared/bar.md"), "bar_file");
+    auto p = find(root);
+    auto first = p.nestedFor(buildPath(root, "a/x.rs"), root);
+    assert(first.canFind("main_file") && first.canFind("foo_file") && !first.canFind("bar_file"), first[$ - 300 .. $]);
+    assert(p.warnings.any!(w => w.canFind("deferred") && w.canFind("bar.md")), p.warnings.to!string);
+    p.forgetNested();
+    auto second = p.nestedFor(buildPath(root, "a/y.rs"), root);
+    assert(second.count("main_file") == 1 && second.count("foo_file") == 1 && second.count("bar_file") == 0);
+    auto third = p.nestedFor(buildPath(root, "a/z.rs"), root);
+    assert(third.count("bar_file") == 1 && !third.canFind("main_file") && !third.canFind("foo_file"), third);
+    assert(p.nestedFor(buildPath(root, "a/w.rs"), root) is null);
+}
