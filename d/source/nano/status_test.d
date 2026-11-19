@@ -99,6 +99,7 @@ unittest
 }
 
 // rust: status.rs::shows_timers_only_when_set
+// rust: timers.rs::renders_the_status_segment
 unittest
 {
     auto s = stats();

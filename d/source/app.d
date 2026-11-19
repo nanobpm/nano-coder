@@ -1502,7 +1502,7 @@ string sessionText(Agent agent)
 string timersText(Agent agent)
 {
     return agent.timers.empty ? "No timers set. The agent sets one with the timer_set tool."
-        : agent.timers.list(agent.timerNow()).stripRight;
+        : agent.timers.list(agent.timerNow(), true).stripRight;
 }
 
 string planText(Agent agent)

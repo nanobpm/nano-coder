@@ -69,7 +69,10 @@ AgentMode parseMode(string text)
 /// Tools that stay available in plan mode: read-only analysis, planning and
 /// reporting. Everything else is gated.
 immutable string[] planAllowedTools = [
-    "read_file", "grep", "glob", "get_time", "plan_add", "plan_update", "plan_show", "load_skill",
+    "read_file", "grep", "glob", "get_time", "plan_add", "plan_update", "plan_show",
+    // Timers are session state, not workspace changes: a plan can wait.
+    "timer_set", "timer_list", "timer_cancel", "timer_done",
+    "load_skill",
     "report_outcome", "question", "history_search", "history_read", "memory_search",
 ];
 
@@ -92,6 +95,9 @@ unittest
 {
     assert(planAllows("grep") && planAllows("glob") && planAllows("read_file"));
     assert(!planAllows("bash") && !planAllows("write_file") && !planAllows("edit_file"));
+    // rust: mode.rs::plan_allows_every_timer_tool
+    import nano.timers : timerToolNames = toolNames;
+    foreach (name; timerToolNames) assert(planAllows(name), "plan mode must allow timer tool " ~ name);
     assert(parseMode(" plan ") == AgentMode.plan);
     assert(parseMode("Autonomous") == AgentMode.auto_);
     bool threw;

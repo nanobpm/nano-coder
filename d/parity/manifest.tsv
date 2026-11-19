@@ -701,7 +701,7 @@ memory.rs::tool_set_depends_on_writability	claimed	PORTING.md: all memory.rs tes
 memory.rs::write_all_creates_new_file_owner_only	claimed	PORTING.md: all memory.rs tests ported
 memory.rs::write_all_preserves_target_permissions	claimed	PORTING.md: all memory.rs tests ported
 mode.rs::parses_mode_names	test
-mode.rs::plan_allows_every_timer_tool	gap	ported (#151) without a matching D test; /timers listing does not strip escapes from notes
+mode.rs::plan_allows_every_timer_tool	test
 mode.rs::plan_allows_read_only_search_but_not_writes	test
 mode.rs::shift_tab_cycles_normal_plan_auto	test
 output.rs::is_utf8_safe_and_mentions_path	gap	Rust's cut marker is "<head>...N bytes truncated (sha256:D); complete output in PATH...<tail>"; D still writes "[... N characters omitted; full output saved to PATH ...]" without the digest
@@ -1254,11 +1254,11 @@ timers.rs::pending_survives_a_json_round_trip	test
 timers.rs::rejects_bad_calls_without_changing_the_timers	test
 timers.rs::rejects_oversized_delays_without_overflowing	test
 timers.rs::rejects_unparsable_delays	test
-timers.rs::renders_the_status_segment	gap	ported (#151) without a matching D test; /timers listing does not strip escapes from notes
+timers.rs::renders_the_status_segment	test
 timers.rs::set_list_and_cancel	test
 timers.rs::takes_due_timers_once_soonest_first	test
 timers.rs::timer_done_and_cancel_handle_pending_and_errors	test
-timers.rs::timers_listing_sanitizes_model_controlled_notes	gap	ported (#151) without a matching D test; /timers listing does not strip escapes from notes
+timers.rs::timers_listing_sanitizes_model_controlled_notes	test
 trajectory.rs::a_pager_that_could_not_start_falls_back	test
 trajectory.rs::compaction_becomes_a_row	test
 trajectory.rs::crashed_input_materializes_opening_user_row	test

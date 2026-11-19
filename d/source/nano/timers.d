@@ -162,15 +162,19 @@ struct Timers
     }
 
     /// The active timers, one per line.
-    string list(long now) const
+    /// One row per timer. `terminal` (the `/timers` listing) strips the
+    /// model-written notes' escapes and line breaks so they can't drive the
+    /// terminal or forge rows; the model's `timer_list` keeps them (#150).
+    string list(long now, bool terminal = false) const
     {
+        import nano.trajectory : terminalSafe;
         if (!items.length && !pending.length) return "No timers set.";
+        string note(const Timer t) { return (terminal ? terminalSafe(t.note) : t.note).oneLine(200); }
         string s;
         foreach (t; pending)
-            s ~= format("%s. fired at %s, not done yet: %s\n", t.id, clock(t.dueAt), t.note.oneLine(200));
+            s ~= format("%s. fired at %s, not done yet: %s\n", t.id, clock(t.dueAt), note(t));
         foreach (t; items)
-            s ~= format("%s. %s (in %s): %s\n", t.id, clock(t.dueAt), describe(saturatingSub(t.dueAt, now)),
-                t.note.oneLine(200));
+            s ~= format("%s. %s (in %s): %s\n", t.id, clock(t.dueAt), describe(saturatingSub(t.dueAt, now)), note(t));
         return s;
     }
 
@@ -445,4 +449,22 @@ unittest
     import std.uni : byGrapheme;
     import std.range : walkLength;
     assert(t.items[1].note.byGrapheme.walkLength <= maxNoteChars + 1);
+}
+
+// rust: timers.rs::timers_listing_sanitizes_model_controlled_notes
+unittest
+{
+    import std.algorithm : count;
+    Timers t;
+    enum now = 1_000_000L;
+    t.apply("timer_set", parseJSON(`{"after": "30m", "note": "evil\u001b[2Jline\ninjected"}`), now);
+    t.apply("timer_set", parseJSON(`{"after": "1m", "note": "done?\u001b]0;title\u0007"}`), now);
+    t.takeDue(now + 300);
+    auto shown = t.list(now + 600, true);
+    assert(!shown.canFind('\x1b') && !shown.canFind('\x07'), shown);
+    assert(shown.count('\n') == 2, "one row per timer: " ~ shown);
+    assert(shown.canFind("evillineinjected") || shown.canFind("evilline injected"), shown);
+    assert(!shown.canFind("[2J") && !shown.canFind("]0;title"), shown);
+    auto raw = t.list(now + 600);
+    assert(raw.canFind("evil\x1b[2J") && raw.canFind("done?\x1b]0;title\x07"), "the model's listing keeps the note");
 }
