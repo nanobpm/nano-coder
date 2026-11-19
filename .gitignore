@@ -1,4 +1,8 @@
-/target
+# dub build output
+.dub/
+/nano-coder
+/nano-coder-test-*
+*.o
 
 # TLC output
 tla/states/

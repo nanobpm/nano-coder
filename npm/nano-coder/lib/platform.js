@@ -11,7 +11,7 @@ const PLATFORMS = {
 function platformPackage() {
   const key = `${process.platform}-${process.arch}`;
   const pkg = PLATFORMS[key];
-  if (!pkg) throw new Error(`no prebuilt binary for ${key} (supported: ${Object.keys(PLATFORMS).join(', ')}); try \`cargo install nano-coder\``);
+  if (!pkg) throw new Error(`no prebuilt binary for ${key} (supported: ${Object.keys(PLATFORMS).join(', ')}); build it from source with \`dub build -b release\` in a checkout of https://github.com/nanobpm/nano-coder`);
   return pkg;
 }
 

@@ -57,7 +57,7 @@ def default_config():
 
 
 def default_binary():
-    for candidate in (REPO / "target/release/nano-coder", REPO / "target/debug/nano-coder"):
+    for candidate in (REPO / "nano-coder",):
         if candidate.is_file():
             return str(candidate)
     return shutil.which("nano-coder") or "nano-coder"

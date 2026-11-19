@@ -30,17 +30,17 @@ A scope is optional: `fix(sandbox): ...`.
 
 1. semantic-release reads the commits since the last `v*` tag. If none calls for a release,
    the workflow stops.
-2. Otherwise it sets the version in `Cargo.toml` and `Cargo.lock`
-   (`scripts/set-version.mjs`), commits `chore(release): X.Y.Z [skip ci]` to `main`, tags
+2. Otherwise it sets `packageVersion` in `source/app.d` (`scripts/set-version.mjs`), commits `chore(release): X.Y.Z [skip ci]` to `main`, tags
    `vX.Y.Z`, and creates the GitHub release with generated notes. Released PRs and issues get
    a comment.
 3. From the tag, the workflow:
-   - builds `nano-coder` for macOS (arm64, x64) and Linux (arm64, x64, glibc ≥ 2.35) and
-     attaches the tarballs and `SHA256SUMS` to the release;
-   - publishes the crate `nano-coder` to crates.io;
+   - runs `dub test` and builds `nano-coder` with LDC for macOS (arm64, x64) and Linux
+     (arm64, x64, glibc ≥ 2.35), smoke-tests `--version`, and attaches the tarballs and
+     `SHA256SUMS` to the release;
+   - points the Homebrew formula at them (below);
    - publishes `@nanobpm/nano-coder-<os>-<cpu>` for each platform, then `@nanobpm/nano-coder`.
 
-Publishing skips any crate or npm package whose version is already on the registry, so a
+Publishing skips any npm package whose version is already on the registry, so a
 failed publish job can simply be re-run.
 
 To preview, run the workflow manually (`workflow_dispatch`) with `dry_run` left on. It
@@ -52,8 +52,8 @@ Don't bump versions or push `v*` tags by hand: semantic-release owns both.
 ## Branch protection and the release app
 
 The `main` ruleset (Settings → Rules) requires a pull request, allows only squash merges,
-blocks force-pushes and deletion, and requires the `test (ubuntu-24.04)`, `test (macos-14)`,
-`rustfmt` and `commitlint` checks. The only actor allowed to bypass it is the **release GitHub App**,
+blocks force-pushes and deletion, and requires the `test (ubuntu-24.04)`, `test (macos-15)`,
+`lint` and `commitlint` checks (all in `ci.yml` and `commitlint.yml`). The only actor allowed to bypass it is the **release GitHub App**,
 which semantic-release uses to push the `chore(release)` commit and tag. The workflow's own
 `GITHUB_TOKEN` can't bypass a repository ruleset, and deploy keys are disabled in the org.
 
@@ -87,11 +87,10 @@ the tap by hand (e.g. after a failed job), run the script locally against the re
 
 ## Registry auth
 
-Both registries use trusted publishing (GitHub OIDC); there are no registry tokens. The
-publishers are configured for repository `nanobpm/nano-coder`, workflow `release.yml`, so the
-workflow file must keep that name:
+npm uses trusted publishing (GitHub OIDC); there are no registry tokens. The publishers are
+configured for repository `nanobpm/nano-coder`, workflow `release.yml`, so the workflow file
+must keep that name:
 
-- crates.io → `nano-coder` → Settings → Trusted Publishing.
 - npmjs.com → each of the five `@nanobpm/nano-coder*` packages → Settings → Trusted
   Publisher (or `npm trust github @nanobpm/<pkg> --file release.yml --repo nanobpm/nano-coder`).
 
@@ -99,6 +98,36 @@ A new platform package doesn't exist on npm yet, so it can't have a trusted publ
 its first version locally (`node scripts/npm-packages.mjs --version X.Y.Z --binaries <dir>
 --out npm-dist`, then `npm publish --access public` in its directory, with binaries from a
 `dry_run` run: `gh run download <run-id> -p 'bin-*'`), then add the publisher.
+
+## Binaries
+
+`dub build -b release` links druntime and Phobos statically
+(`-link-defaultlib-shared=false`; Debian's LDC links them shared by default). Bounds checks
+stay on. The binary dynamically links only the system libcurl, plus libz on Linux, and the C
+runtime. macOS ships libcurl; on Linux users need `libcurl4` (Debian/Ubuntu) or `libcurl`
+(Fedora). A binary built on Ubuntu 22.04 runs on any glibc ≥ 2.35.
+
+The npm launcher (`npm/nano-coder`) needs no install scripts: on its first run it replaces
+itself with the native binary when the install directory is writable, and otherwise keeps
+spawning it.
+
+## Checking the packaging locally
+
+```sh
+dub build -b release
+mkdir -p /tmp/bins && cp nano-coder /tmp/bins/nano-coder-darwin-arm64
+node scripts/npm-packages.mjs --version "$(./nano-coder --version | cut -d' ' -f2)" --binaries /tmp/bins --out /tmp/npm-dist
+npm pack --pack-destination /tmp /tmp/npm-dist/darwin-arm64 /tmp/npm-dist/nano-coder
+npm install -g --prefix /tmp/prefix /tmp/nanobpm-nano-coder-*.tgz
+/tmp/prefix/bin/nano-coder --version
+```
+
+## The Rust implementation
+
+Up to 0.69.0 nano-coder was written in Rust and also published to crates.io. That code is on
+the `rust` branch (tag `rust-final`); 0.69.0 tells cargo installs to switch to npm or Homebrew.
+1.0.0, the first D release, came from a `feat!` commit. Only fixes go to the `rust` branch,
+and nothing releases it automatically.
 
 ## Adding a platform
 

@@ -1,11 +1,11 @@
 {
   "name": "@nanobpm/nano-coder",
   "version": "0.0.0",
-  "description": "A 6MB coding agent. Run a fleet on your laptop.",
+  "description": "A 4MB coding agent. Run a fleet on your laptop.",
   "license": "Apache-2.0",
   "repository": { "type": "git", "url": "git+https://github.com/nanobpm/nano-coder.git" },
   "homepage": "https://github.com/nanobpm/nano-coder",
-  "keywords": ["ai", "agent", "coding-agent", "acp", "cli"],
+  "keywords": ["ai", "agent", "coding-agent", "acp", "cli", "dlang"],
   "bin": { "nano-coder": "bin/nano-coder" },
   "files": ["bin/", "lib/", "README.md"],
   "engines": { "node": ">=18" },

@@ -1,0 +1,899 @@
+/// @safe access to the process's standard streams and other small escapes
+/// from Phobos/POSIX calls that are not marked @safe. Each one is `@trusted`
+/// on its own, with the reason it is memory safe next to it, so the rest of
+/// the code base can be `@safe:` throughout (enforced by
+/// `scripts/check-safe.sh`).
+module nano.safeio;
+
+@safe:
+
+import std.stdio : File;
+
+/// `std.stdio.stdout`. Phobos marks it @system only because the `File` is a
+/// `__gshared` global; every `File` operation locks the stream itself.
+@property ref File stdOut() @trusted
+{
+    import std.stdio : stdout;
+    return stdout;
+}
+
+/// `std.stdio.stderr`; see `stdOut`.
+@property ref File stdErr() @trusted
+{
+    import std.stdio : stderr;
+    return stderr;
+}
+
+/// `std.file.read` as bytes. The `void[]` it returns is freshly allocated
+/// and untyped, so viewing it as `ubyte[]` aliases nothing else.
+ubyte[] readBytes(string path) @trusted
+{
+    import std.file : read;
+    return cast(ubyte[]) read(path);
+}
+
+/// A file's bytes, reading at most `cap + 1`; null when it holds more than
+/// `cap` (checked while reading, so a growing file can't slip past).
+ubyte[] readCapped(string path, ulong cap) @safe
+{
+    import std.algorithm : min;
+    import std.stdio : File;
+    auto f = File(path, "rb");
+    auto size = f.size; // a hint only: the file may grow while read
+    auto buf = new ubyte[cast(size_t) min(cap + 1, size == ulong.max ? 64 * 1024 : size + 1)];
+    size_t got;
+    for (;;)
+    {
+        if (got == buf.length)
+        {
+            if (buf.length > cap) break;
+            buf.length = cast(size_t) min(buf.length * 2, cap + 1);
+        }
+        auto r = f.rawRead(buf[got .. $]);
+        if (!r.length) break;
+        got += r.length;
+    }
+    if (got > cap) return null;
+    return got ? buf[0 .. got] : [];
+}
+
+/// Replaces this process with `path` run with `args` (argv[0] included).
+/// Returns only on failure, with the reason. `@trusted`: the strings are
+/// copied into NUL-terminated buffers that outlive the call, and the array
+/// ends in null as execv requires.
+string execProgram(string path, const string[] args) @trusted
+{
+    import core.stdc.errno : errno;
+    import core.stdc.string : strerror;
+    import core.sys.posix.unistd : execv;
+    import std.string : toStringz, fromStringz;
+    const(char)*[] argv;
+    foreach (a; args) argv ~= a.toStringz;
+    argv ~= null;
+    execv(path.toStringz, argv.ptr);
+    return strerror(errno).fromStringz.idup;
+}
+
+/// `std.file.read` as immutable bytes: the buffer is freshly allocated and
+/// only this result refers to it.
+immutable(ubyte)[] readImmutableBytes(string path) @trusted
+{
+    import std.file : read;
+    return cast(immutable(ubyte)[]) read(path);
+}
+
+/// `std.file.read` as (possibly invalid) UTF-8 text, without validating it.
+string readRawText(string path) @trusted
+{
+    import std.file : read;
+    return cast(string) read(path);
+}
+
+/// The bytes of `path` from byte `offset` to the end (`File.seek` and
+/// `byChunk`; each chunk is copied before the buffer is reused).
+ubyte[] readFrom(string path, ulong offset) @trusted
+{
+    import std.stdio : File;
+    auto f = File(path, "rb");
+    f.seek(offset);
+    return readToEnd(f);
+}
+
+import std.stdio : File;
+/// Everything left in `f` (a pipe or file), copied out of `byChunk`'s reused
+/// buffer.
+ubyte[] readToEnd(File f) @trusted
+{
+    ubyte[] r;
+    foreach (chunk; f.byChunk(64 * 1024)) r ~= chunk;
+    return r;
+}
+
+/// A byte buffer nothing else references, viewed as (possibly invalid) UTF-8
+/// text. The caller must hand over the only reference: the bytes become
+/// immutable, so a later write through another alias would break that.
+string ownText(ubyte[] unique) @trusted pure nothrow
+{
+    return cast(string) unique;
+}
+
+/// `ownText` for a `char[]` buffer.
+string ownText(char[] unique) @trusted pure nothrow
+{
+    return cast(string) unique;
+}
+
+// POSIX calls taking D strings and slices. Each passes a NUL-terminated copy
+// (`toStringz`) or a slice's own pointer and length, so the C side never reads
+// or writes past memory the caller owns.
+
+/// `open(2)`; returns the fd or -1 (errno set).
+int openPath(string path, int flags, uint mode = 0) @trusted nothrow
+{
+    import core.sys.posix.fcntl : open;
+    import std.string : toStringz;
+    import core.sys.posix.sys.types : mode_t;
+    return open(path.toStringz, flags, cast(mode_t) mode);
+}
+
+/// `chmod(2)`; returns 0 or -1.
+int chmodPath(string path, uint mode) @trusted nothrow
+{
+    import core.sys.posix.sys.stat : chmod;
+    import std.string : toStringz;
+    import core.sys.posix.sys.types : mode_t;
+    return chmod(path.toStringz, cast(mode_t) mode);
+}
+
+/// `fchmod(2)`; returns 0 or -1.
+int fchmodFd(int fd, uint mode) @trusted
+{
+    import core.sys.posix.sys.stat : fchmod;
+    import core.sys.posix.sys.types : mode_t;
+    return fchmod(fd, cast(mode_t) mode);
+}
+
+/// `stat(2)`'s `st_mode` for `path`; false when the path can't be stat'ed.
+bool statMode(string path, out uint mode) @trusted
+{
+    import core.sys.posix.sys.stat : stat, stat_t;
+    import std.string : toStringz;
+    stat_t st;
+    if (stat(path.toStringz, &st) != 0) return false;
+    mode = st.st_mode;
+    return true;
+}
+
+/// `write(2)` of (a prefix of) `data`; returns the bytes written or -1.
+ptrdiff_t writeFd(int fd, scope const(ubyte)[] data) @trusted
+{
+    import core.sys.posix.unistd : write;
+    return write(fd, data.ptr, data.length);
+}
+
+/// `dup(2)`; the new fd or -1.
+int dupFd(int fd) @trusted nothrow @nogc
+{
+    import core.sys.posix.unistd : dup;
+    return dup(fd);
+}
+
+/// `dup2(2)`; `to` or -1.
+int dup2Fd(int from, int to) @trusted nothrow @nogc
+{
+    import core.sys.posix.unistd : dup2;
+    return dup2(from, to);
+}
+
+/// `close(2)`; 0 or -1.
+int closeFd(int fd) @trusted nothrow @nogc
+{
+    import core.sys.posix.unistd : close;
+    return close(fd);
+}
+
+/// `pipe(2)` into `fds` (read end, write end); 0 or -1.
+int pipeFds(ref int[2] fds) @trusted nothrow @nogc
+{
+    import core.sys.posix.unistd : pipe;
+    return pipe(fds);
+}
+
+import core.sys.posix.termios : termios;
+/// `tcgetattr(3)` into `t`; false on error (not a terminal).
+bool tcGet(int fd, out termios t) @trusted nothrow @nogc
+{
+    import core.sys.posix.termios : tcgetattr;
+    return tcgetattr(fd, &t) == 0;
+}
+
+/// `tcsetattr(3)` with `TCSANOW`; false on error.
+bool tcSet(int fd, const ref termios t) @trusted nothrow @nogc
+{
+    import core.sys.posix.termios : tcsetattr, TCSANOW;
+    return tcsetattr(fd, TCSANOW, &t) == 0;
+}
+
+/// A C signal handler. It runs asynchronously, so it is @system and must
+/// only touch atomics and async-signal-safe calls.
+alias SignalHandler = extern (C) void function(int) nothrow @nogc @system;
+
+/// Install `handler` for `sig` with `sigaction(2)` (empty mask, no flags).
+void onSignal(int sig, SignalHandler handler) @trusted nothrow @nogc
+{
+    import core.sys.posix.signal : sigaction, sigaction_t, sigemptyset;
+    sigaction_t sa;
+    sa.sa_handler = handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(sig, &sa, null);
+}
+
+/// An `atexit(3)` handler.
+alias ExitHandler = extern (C) void function() nothrow @system;
+
+/// `atexit(3)`.
+void atExit(ExitHandler f) @trusted nothrow @nogc
+{
+    import core.stdc.stdlib : atexit;
+    atexit(f);
+}
+
+/// A `__gshared` value of a plain struct, read and written through @safe
+/// code as `name` (getter and setter) over the storage `name_`. A struct copy
+/// is not atomic, so this is only for state touched by one thread (or set
+/// before the others start); keep anything shared across threads atomic.
+mixin template GsharedValue(T, string name)
+{
+    mixin("private __gshared T " ~ name ~ "_;");
+    // `@trusted`: plain loads and stores of the storage above (see the doc).
+    mixin("@property T " ~ name ~ "() @trusted nothrow @nogc { return " ~ name ~ "_; }");
+    // `@trusted`: the matching store.
+    mixin("@property void " ~ name ~ "(T v) @trusted nothrow @nogc { " ~ name ~ "_ = v; }");
+}
+
+/// Line-buffer `stdout` (`setvbuf(_IOLBF)`), so a pipe gets whole lines.
+void lineBufferStdout() @trusted
+{
+    import std.stdio : stdout;
+    import core.stdc.stdio : _IOLBF;
+    stdout.setvbuf(4096, _IOLBF);
+}
+
+/// `write(2)` all of `s`, retrying short writes; stops at the first error.
+void writeAllFd(int fd, scope const(char)[] s) @trusted nothrow @nogc
+{
+    import core.sys.posix.unistd : write;
+    while (s.length)
+    {
+        auto n = write(fd, s.ptr, s.length);
+        if (n <= 0) return;
+        s = s[n .. $];
+    }
+}
+
+/// `read(2)` into `buf`; returns the bytes read, 0 at EOF, or -1.
+ptrdiff_t readFd(int fd, scope ubyte[] buf) @trusted
+{
+    import core.sys.posix.unistd : read;
+    return read(fd, buf.ptr, buf.length);
+}
+
+/// `kill(2)` (a negative `pid` signals the process group).
+int killPid(int pid, int sig) @trusted
+{
+    import core.sys.posix.signal : kill;
+    return kill(pid, sig);
+}
+
+/// `killpg(2)`.
+int killGroup(int pgrp, int sig) @trusted
+{
+    import core.sys.posix.signal : killpg;
+    return killpg(pgrp, sig);
+}
+
+/// `realpath(3)`: the canonical absolute path, or null when it can't be resolved.
+string realPath(string path) @trusted
+{
+    import core.sys.posix.stdlib : realpath;
+    import core.stdc.stdlib : free;
+    import std.string : fromStringz, toStringz;
+    auto p = realpath(path.toStringz, null);
+    if (p is null) return null;
+    scope (exit) free(p);
+    return p.fromStringz.idup;
+}
+
+import std.file : DirEntry, SpanMode;
+/// `std.file.dirEntries` collected into an array. Phobos marks the iterator
+/// @system only for its reference-counted handle; the entries themselves are
+/// plain values. Throws `FileException` as `dirEntries` does.
+DirEntry[] listDir(string dir, SpanMode mode, bool followSymlink = false) @trusted
+{
+    import std.file : dirEntries;
+    DirEntry[] r;
+    foreach (DirEntry e; dirEntries(dir, mode, followSymlink)) r ~= e;
+    return r;
+}
+
+/// Make `fd` non-blocking (`fcntl(F_SETFL, … | O_NONBLOCK)`).
+void setNonBlocking(int fd) @trusted
+{
+    import core.sys.posix.fcntl : fcntl, F_GETFL, F_SETFL, O_NONBLOCK;
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+}
+
+/// Ignore SIGPIPE, so a child that closes its stdin can't kill the process.
+void ignoreSigpipe() @trusted
+{
+    import core.stdc.signal : signal, SIG_IGN;
+    import core.sys.posix.signal : SIGPIPE;
+    signal(SIGPIPE, SIG_IGN);
+}
+
+import core.sys.posix.poll : pollfd;
+/// `poll(2)` on `fds`; returns the ready count, 0 on timeout, or -1.
+int pollFds(scope pollfd[] fds, int timeoutMs) @trusted
+{
+    import core.sys.posix.poll : poll, nfds_t;
+    return poll(fds.ptr, cast(nfds_t) fds.length, timeoutMs);
+}
+
+// druntime's Condition and Thread methods carry no attributes, so they are
+// @system; they only take the object's own lock and state.
+import core.sync.condition : Condition;
+import core.thread : Thread;
+
+/// `t.isRunning`.
+bool threadRunning(Thread t) @trusted { return t.isRunning; }
+
+/// Run `dg` with SIGPIPE ignored, restoring the previous handler after (so a
+/// child that exits early, like a pager, can't kill the process).
+T withSigpipeIgnored(T)(scope T delegate() @safe dg) @trusted
+{
+    import core.sys.posix.signal : signal, SIGPIPE, SIG_IGN;
+    auto old = signal(SIGPIPE, SIG_IGN);
+    scope (exit) signal(SIGPIPE, old);
+    return dg();
+}
+
+import std.process : Pid;
+/// `std.process.kill(pid)`. It is @system only because of the `Pid` class
+/// handle; the signal goes to the pid it holds.
+void killProcess(Pid pid) @trusted
+{
+    import std.process : kill;
+    kill(pid);
+}
+
+/// `fsync(2)`.
+int fsyncFd(int fd) @trusted nothrow @nogc
+{
+    import core.sys.posix.unistd : fsync;
+    return fsync(fd);
+}
+
+/// `c.notify()`.
+void signalOne(Condition c) @trusted { c.notify(); }
+/// `c.notifyAll()`.
+void signalAll(Condition c) @trusted { c.notifyAll(); }
+/// `c.wait()` (the caller holds `c`'s mutex).
+void waitOn(Condition c) @trusted { c.wait(); }
+/// `t.join()`; rethrows what the thread threw.
+void joinThread(Thread t) @trusted { t.join(); }
+
+/// `exit(3)`: run C atexit handlers and end the process.
+noreturn exitProcess(int status) @trusted
+{
+    import core.stdc.stdlib : exit;
+    exit(status);
+}
+
+/// `std.stdio.readln` on stdin (@system only for the `__gshared` stdin).
+string stdinLine() @trusted
+{
+    import std.stdio : readln;
+    return readln();
+}
+
+unittest
+{
+    import std.file : write, remove, tempDir;
+    import std.path : buildPath;
+    auto p = buildPath(tempDir, "nano-safeio-test");
+    write(p, "hi");
+    scope (exit) remove(p);
+    assert(readBytes(p) == cast(const(ubyte)[]) "hi");
+    assert(ownText(readBytes(p)) == "hi");
+    assert(stdOut.isOpen && stdErr.isOpen);
+}
+
+
+/// A value shared between threads that is only reachable under its lock.
+/// Declare it `shared` (`shared Locked!T x = new shared Locked!T;`): the
+/// compiler then rejects any access that bypasses `get`/`update`. `T` may
+/// not hold unshared mutable references, so neither a copy out of `get` nor
+/// anything `update` stores can alias the locked value from another thread.
+import std.traits : hasUnsharedAliasing;
+final class Locked(T) if (!hasUnsharedAliasing!T)
+{
+    import core.sync.mutex : Mutex;
+    private T value;
+    private Mutex mutex;
+    private Condition changed;
+
+    /// `@trusted`: casts away `shared` only on a freshly built object.
+    this(T v = T.init) shared @trusted
+    {
+        auto self = cast() this;
+        self.value = v;
+        self.mutex = new Mutex;
+        self.changed = new Condition(self.mutex);
+    }
+
+    /// A copy of the value.
+    /// `@trusted`: the unshared view of `value` is used only under the lock.
+    T get() shared @trusted
+    {
+        auto self = cast() this;
+        self.mutex.lock();
+        scope (exit) self.mutex.unlock();
+        return self.value;
+    }
+
+    /// Run `f` on the value under the lock, and wake `await`ers. `f` is
+    /// `scope`: it can't keep the reference.
+    /// `@trusted`: as for `get`; the `ref` can't outlive `f` (DIP1000).
+    R update(R = void)(scope R delegate(ref T) @safe f) shared @trusted
+    {
+        auto self = cast() this;
+        self.mutex.lock();
+        scope (exit) self.mutex.unlock();
+        scope (exit) self.changed.notifyAll();
+        return f(self.value);
+    }
+
+    /// Block until `ready(value)` holds, then run `f` under the same lock.
+    /// `@trusted`: as for `update`.
+    R await(R = void)(scope bool delegate(ref const T) @safe ready, scope R delegate(ref T) @safe f) shared @trusted
+    {
+        auto self = cast() this;
+        self.mutex.lock();
+        scope (exit) self.mutex.unlock();
+        while (!ready(self.value)) self.changed.wait();
+        scope (exit) self.changed.notifyAll();
+        return f(self.value);
+    }
+}
+
+/// A copyable, sendable handle to a `shared Locked!T` (like Rust's
+/// `Arc<Mutex<T>>`), so holders needn't spell `shared` or `atomicLoad`.
+struct Shared(T)
+{
+    import core.atomic : atomicLoad;
+    private shared Locked!T impl;
+    /// A new cell holding `v`.
+    static Shared make(T v = T.init) { return Shared(new shared Locked!T(v)); }
+    /// Whether this handle refers to a cell.
+    bool opCast(B : bool)() const { return atomicLoad(impl) !is null; }
+    /// See `Locked`.
+    T get() { return atomicLoad(impl).get(); }
+    /// ditto
+    R update(R = void)(scope R delegate(ref T) @safe f) { return atomicLoad(impl).update!R(f); }
+    /// ditto
+    R await(R = void)(scope bool delegate(ref const T) @safe ready, scope R delegate(ref T) @safe f)
+    {
+        return atomicLoad(impl).await!R(ready, f);
+    }
+}
+
+@safe unittest
+{
+    static struct S { int n; string s; }
+    shared Locked!S l = new shared Locked!S(S(1, "a"));
+    l.update((ref S v) { v.n++; });
+    assert(l.get == S(2, "a"));
+    static assert(!__traits(compiles, new shared Locked!(int[])));
+}
+
+// ---- Sendable-only threads ----------------------------------------------
+//
+// The "E profile": threads start only through `spawn`, which takes a plain
+// `function` (no hidden closure context) and arguments that are sendable,
+// and threads talk through `Channel`s of sendable values or `Locked` state.
+// check-safe.sh bans `new Thread` outside this module (bar a shrinking
+// budget), so data shared between threads is visible in the types.
+
+/// Whether a value of type `T` may be handed to another thread: it holds no
+/// unshared mutable references (immutable, `shared` or plain data, function
+/// pointers), or it is an `Isolated` whose holder gives it up. Delegates are
+/// not sendable: their context can reach anything.
+enum bool isSendable(T) = !hasUnsharedAliasing!T || is(T : Isolated!U, U);
+
+/// A value with exactly one owner: nothing outside it refers to it or to
+/// anything it reaches, so it may move to another thread. It can't be
+/// copied, only moved (`std.algorithm.move`) or taken with `unwrap`.
+struct Isolated(T)
+{
+    private T payload;
+    @disable this(this);
+
+    /// Claim that nothing else refers to `value` (e.g. it was just built).
+    /// The compiler can't check this; check-safe.sh counts every call
+    /// against scripts/isolation-budget, so each claim gets reviewed.
+    static Isolated assumeIsolated(T value)
+    {
+        Isolated r;
+        r.payload = value;
+        return r;
+    }
+
+    /// Take the value out (the holder is left empty).
+    T unwrap()
+    {
+        auto v = payload;
+        payload = T.init;
+        return v;
+    }
+
+    /// Make it immutable: sound because nothing else can still change it.
+    /// `@trusted`: the cast is what isolation licenses (`assumeUnique`).
+    immutable(T) freeze() @trusted
+    {
+        auto v = unwrap();
+        return cast(immutable) v;
+    }
+}
+
+/// A started thread, to wait for or poll; `join` returns what its function
+/// returned (an `R`, which must be sendable).
+struct Join(R)
+{
+    private Thread thread;
+    static if (!is(R == void)) private ResultBox!R box;
+
+    /// Wait for the thread to finish (rethrows what killed it).
+    R join()
+    {
+        joinThread(thread);
+        static if (!is(R == void)) return takeResult(box);
+    }
+
+    /// Whether the thread is still running.
+    bool running() { return threadRunning(thread); }
+}
+
+/// A thread whose function returns nothing.
+alias JoinHandle = Join!void;
+
+private final class ResultBox(R) { Unqual!R value; }
+
+/// `@trusted`: the thread wrote `box.value` before it ended, and `join`
+/// waited for that (a happens-before edge), so nothing else touches it now.
+private R takeResult(R)(ResultBox!R box) @trusted
+{
+    import core.lifetime : move;
+    return cast(R) move(box.value);
+}
+
+/// Run `fn(args)` on a new thread. `fn` is a plain function, so it can only
+/// reach what it is given (and `shared` or thread-local globals), and every
+/// argument, and the result, must be sendable.
+Join!R spawn(R, Args...)(R function(Args) @safe fn, auto ref Args args)
+    if (allSatisfy!(isSendable, Args) && (is(R == void) || isSendable!R))
+{
+    return startSpawned(fn, args, false);
+}
+
+/// `spawn` for a daemon thread, which doesn't keep the process alive.
+Join!R spawnDaemon(R, Args...)(R function(Args) @safe fn, auto ref Args args)
+    if (allSatisfy!(isSendable, Args) && (is(R == void) || isSendable!R))
+{
+    return startSpawned(fn, args, true);
+}
+
+import std.meta : allSatisfy, staticMap;
+import std.traits : Unqual;
+// `= void`: an argument type may have no default (`@disable this()`, as
+// NotNull does); each slot is filled by `moveEmplace` before any read.
+private final class SpawnBox(Args...) { staticMap!(Unqual, Args) args = void; }
+
+/// `@trusted`: the arguments (checked sendable by `spawn`) are moved into a
+/// box only the new thread can reach; `shared` is stripped for the move and
+/// restored for the call. `fn` is a context-free function. The result goes
+/// into a box read only after `join`.
+private Join!R startSpawned(R, Args...)(R function(Args) @safe fn, ref Args args, bool daemon) @trusted
+{
+    import core.lifetime : move, moveEmplace;
+    auto box = new SpawnBox!Args;
+    static foreach (i; 0 .. Args.length)
+        moveEmplace(*cast(Unqual!(Args[i])*) &args[i], box.args[i]);
+    Join!R h;
+    static if (is(R == void))
+        auto t = new Thread({ mixin("fn(" ~ callArgs!(Args.length) ~ ");"); });
+    else
+    {
+        auto rb = h.box = new ResultBox!R;
+        auto t = new Thread({ mixin("rb.value = cast(Unqual!R) fn(" ~ callArgs!(Args.length) ~ ");"); });
+    }
+    t.isDaemon = daemon;
+    h.thread = t.start();
+    return h;
+}
+
+private template callArgs(size_t n)
+{
+    import std.conv : to;
+    enum callArgs = () {
+        string r;
+        foreach (i; 0 .. n) r ~= (i ? ", " : "") ~ "cast(Args[" ~ i.to!string ~ "]) move(box.args[" ~ i.to!string ~ "])";
+        return r;
+    }();
+}
+
+/// A handle to a `Channel`: copyable and sendable, so each thread holds its
+/// own (like Rust's `Arc<Channel>`). `Chan!T.make` creates one.
+struct Chan(T)
+{
+    import core.atomic : atomicLoad;
+    private shared Channel!T impl;
+
+    /// A new, open channel.
+    static Chan make() { return Chan(new shared Channel!T); }
+    /// Whether this handle refers to a channel.
+    bool opCast(B : bool)() const { return atomicLoad(impl) !is null; }
+    /// See `Channel`.
+    void put(T v, bool front = false) { atomicLoad(impl).put(v, front); }
+    /// ditto
+    void close() { atomicLoad(impl).close(); }
+    /// ditto
+    bool take(out T v) { return atomicLoad(impl).take(v); }
+    /// ditto
+    bool tryTake(out T v) { return atomicLoad(impl).tryTake(v); }
+    /// ditto
+    void edit(scope void delegate(ref T[]) @safe f) { atomicLoad(impl).edit(f); }
+}
+
+/// A blocking queue of sendable values between threads, closable. Use it
+/// through `Chan`.
+final class Channel(T) if (!hasUnsharedAliasing!T)
+{
+    import core.sync.mutex : Mutex;
+    private Mutex lock;
+    private Condition ready;
+    private T[] items;
+    private bool closed;
+
+    /// `@trusted`: initialises the fresh object's own lock.
+    this() shared @trusted
+    {
+        auto self = cast() this;
+        self.lock = new Mutex;
+        self.ready = new Condition(self.lock);
+    }
+
+    /// Append `v` (or put it first); wakes one taker.
+    /// `@trusted`: the unshared view is used only while holding `lock`.
+    void put(T v, bool front = false) shared @trusted
+    {
+        auto self = cast() this;
+        self.lock.lock();
+        scope (exit) self.lock.unlock();
+        self.items = front ? v ~ self.items : self.items ~ v;
+        self.ready.notify();
+    }
+
+    /// No more values: takers drain what is left, then get false.
+    /// `@trusted`: as for `put`.
+    void close() shared @trusted
+    {
+        auto self = cast() this;
+        self.lock.lock();
+        scope (exit) self.lock.unlock();
+        self.closed = true;
+        self.ready.notifyAll();
+    }
+
+    /// Wait for the next value; false once closed and empty.
+    /// `@trusted`: as for `put`.
+    bool take(out T v) shared @trusted
+    {
+        auto self = cast() this;
+        self.lock.lock();
+        scope (exit) self.lock.unlock();
+        while (!self.items.length && !self.closed) self.ready.wait();
+        if (!self.items.length) return false;
+        v = self.items[0];
+        self.items = self.items[1 .. $];
+        return true;
+    }
+
+    /// The next value if one is waiting (doesn't block).
+    /// `@trusted`: as for `put`.
+    bool tryTake(out T v) shared @trusted
+    {
+        auto self = cast() this;
+        self.lock.lock();
+        scope (exit) self.lock.unlock();
+        if (!self.items.length) return false;
+        v = self.items[0];
+        self.items = self.items[1 .. $];
+        return true;
+    }
+
+    /// Run `f` on the queued values under the lock (e.g. to reorder them).
+    /// `@trusted`: as for `put`; `f` can't keep the reference (`scope`).
+    void edit(scope void delegate(ref T[]) @safe f) shared @trusted
+    {
+        auto self = cast() this;
+        self.lock.lock();
+        scope (exit) self.lock.unlock();
+        f(self.items);
+    }
+}
+
+@safe unittest // spawn moves an Isolated, Channel carries results back
+{
+    static void worker(Isolated!(int[]) xs, Chan!int ch)
+    {
+        auto a = xs.unwrap;
+        foreach (x; a) ch.put(x * 2);
+        ch.close();
+    }
+    import core.lifetime : move;
+    auto ch = Chan!int.make;
+    auto xs = Isolated!(int[]).assumeIsolated([1, 2, 3]);
+    auto h = spawn(&worker, move(xs), ch);
+    int v, sum;
+    while (ch.take(v)) sum += v;
+    h.join();
+    assert(sum == 12);
+    static assert(isSendable!(immutable(int)[]) && isSendable!string && isSendable!(Chan!int));
+    static assert(!isSendable!(int[]) && !isSendable!(void delegate()) && !isSendable!Object);
+    static int add(int a, int b) { return a + b; }
+    assert(spawn(&add, 2, 3).join() == 5);
+    static void bad(int[] a) {}
+    static assert(!__traits(compiles, spawn(&bad, [1])));
+}
+
+/// Rows and columns of the terminal on `fd` (TIOCGWINSZ), or zeros when
+/// unknown. `ioctl` only writes the local `winsize`.
+size_t[2] terminalSize(int fd = 1) @trusted nothrow @nogc
+{
+    import core.sys.posix.sys.ioctl : ioctl, winsize, TIOCGWINSZ;
+    winsize ws;
+    if (ioctl(fd, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0 && ws.ws_col > 0) return [ws.ws_row, ws.ws_col];
+    return [0, 0];
+}
+
+/// C `strtod` (correctly rounded, unlike `std.conv.to!double`) on `text`;
+/// `consumed` is how many characters it read. The string is copied to a
+/// NUL-terminated buffer, and `end` only points into that copy.
+double cStrtod(string text, out size_t consumed) @trusted
+{
+    import core.stdc.stdlib : strtod;
+    import std.string : toStringz;
+    auto z = text.toStringz;
+    immutable(char)* end;
+    auto v = strtod(z, &end);
+    consumed = end - z;
+    return v;
+}
+
+/// ditto
+double cStrtod(string text)
+{
+    size_t n;
+    return cStrtod(text, n);
+}
+
+import std.json : JSONValue, JSONType;
+/// `v[key]` when `v` is an object holding it, else null. Phobos marks
+/// `JSONValue.object` @system because it returns the AA by reference; this
+/// only looks a key up and returns a pointer into the GC-owned table.
+const(JSONValue)* jsonGet(return scope const ref JSONValue v, string key) @trusted
+{
+    if (v.type != JSONType.object) return null;
+    return key in v.object;
+}
+
+/// A deep, mutable copy of `v`, so a `const` tree can be merged into a
+/// mutable one without casting `const` away (and without the two sharing
+/// subtrees). Numbers are copied as stored, never re-parsed.
+JSONValue jsonCopy(const JSONValue v)
+{
+    final switch (v.type)
+    {
+        case JSONType.null_: return JSONValue(null);
+        case JSONType.string: return JSONValue(v.str);
+        case JSONType.integer: return JSONValue(v.integer);
+        case JSONType.uinteger: return JSONValue(v.uinteger);
+        case JSONType.float_: return JSONValue(v.floating);
+        case JSONType.true_: return JSONValue(true);
+        case JSONType.false_: return JSONValue(false);
+        case JSONType.array:
+            JSONValue[] a;
+            foreach (e; v.arrayNoRef) a ~= jsonCopy(e);
+            return JSONValue(a);
+        case JSONType.object:
+            JSONValue[string] o;
+            foreach (k, e; v.objectNoRef) o[k] = jsonCopy(e);
+            return JSONValue(o);
+    }
+}
+
+/// A mutable deep copy of a `const` value: arrays and maps are rebuilt,
+/// JSON is copied with `jsonCopy`, structs field by field. Data that is
+/// already immutable (strings) is shared. This replaces `cast()` copies out
+/// of `const`, which would let the copy write into the original.
+U deepCopy(U)(const U v)
+{
+    import std.traits : hasIndirections, isAssociativeArray, KeyType, ValueType;
+    import std.typecons : Nullable;
+    static if (!hasIndirections!U) return v;
+    else static if (is(U == JSONValue)) return jsonCopy(v);
+    else static if (is(U == E[], E))
+    {
+        static if (is(E == immutable)) return v;
+        else
+        {
+            U r;
+            r.reserve(v.length);
+            foreach (ref e; v) r ~= deepCopy!E(e);
+            return r;
+        }
+    }
+    else static if (isAssociativeArray!U)
+    {
+        U r;
+        foreach (k, ref e; v) r[deepCopy!(KeyType!U)(k)] = deepCopy!(ValueType!U)(e);
+        return r;
+    }
+    else static if (is(U == Nullable!X, X))
+    {
+        U r;
+        if (!v.isNull) r = deepCopy!X(v.get);
+        return r;
+    }
+    else static if (is(U == struct))
+    {
+        U r;
+        static foreach (i; 0 .. U.tupleof.length)
+            r.tupleof[i] = deepCopy!(typeof(U.tupleof[i]))(v.tupleof[i]);
+        return r;
+    }
+    else static assert(0, "deepCopy: unsupported type " ~ U.stringof);
+}
+
+@safe unittest
+{
+    static struct In { int[] xs; string s; }
+    static struct Out { In[] ins; string[string] m; int n; }
+    const Out o = Out([In([1, 2], "a")], ["k": "v"], 3);
+    auto c = deepCopy(o);
+    c.ins[0].xs[0] = 9;
+    assert(o.ins[0].xs[0] == 1 && c.m["k"] == "v" && c.n == 3 && c.ins[0].s == "a");
+}
+
+@safe unittest
+{
+    import std.json : parseJSON;
+    auto src = parseJSON(`{"a":[1,2.5,"x",true,null,{"b":18446744073709551615}]}`);
+    const c = src;
+    auto d = jsonCopy(c);
+    assert(d.toString == src.toString);
+    d["a"][0] = 9;
+    assert(src["a"][0].integer == 1);
+}
+
+@safe unittest
+{
+    import std.json : parseJSON;
+    size_t n;
+    assert(cStrtod("0.7") == 0.7);
+    assert(cStrtod("1.5x", n) == 1.5 && n == 3);
+    auto j = parseJSON(`{"a":1}`);
+    assert(jsonGet(j, "a").integer == 1 && jsonGet(j, "b") is null);
+    auto n1 = JSONValue(1);
+    assert(jsonGet(n1, "a") is null);
+}

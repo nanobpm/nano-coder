@@ -9,16 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  fmt:
-    name: rustfmt
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --check
-
+  # The job names `test (<os>)` are required checks in the main branch ruleset.
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -28,13 +19,27 @@ jobs:
         os: [ubuntu-24.04, macos-15]
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dlang-community/setup-dlang@v2
         with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+          compiler: ldc-1.43.0
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libcurl4-openssl-dev zlib1g-dev
+      - run: dub test
+      - run: dub build -b release
+      - run: ./nano-coder --version
       - name: compaction eval self-test (fake model)
-        run: cargo build && python3 eval/compaction/run.py --self-test --seeds 1 --filler-turns 4 --bin target/debug/nano-coder --out "$RUNNER_TEMP/eval"
+        run: python3 eval/compaction/run.py --self-test --seeds 1 --filler-turns 4 --bin ./nano-coder --out "$RUNNER_TEMP/eval"
       - name: npm launcher syntax
-        run: node --check npm/nano-coder/bin/nano-coder && node --check npm/nano-coder/lib/platform.js && node --check scripts/npm-packages.mjs && node --check scripts/homebrew-formula.mjs
+        run: node --check npm/nano-coder/bin/nano-coder && node --check npm/nano-coder/lib/platform.js && node --check scripts/npm-packages.mjs && node --check scripts/set-version.mjs && node --check scripts/homebrew-formula.mjs
+
+  lint:
+    name: lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dlang-community/setup-dlang@v2
+        with:
+          compiler: ldc-1.43.0
+      - run: ./scripts/check-safe.sh
+      - run: dub run -q dscanner@0.16.0-beta.5 -- --styleCheck --config dscanner.ini source

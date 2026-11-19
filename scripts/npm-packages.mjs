@@ -4,9 +4,9 @@
 //   node scripts/npm-packages.mjs --version 0.1.0 --binaries <dir> --out <dir>
 //
 // <dir> holds one native binary per platform, named `nano-coder-<os>-<cpu>`
-// (e.g. nano-coder-darwin-arm64). Writes <out>/<os>-<cpu>/ platform packages and
-// <out>/nano-coder/ (the main package, pinned to the same version). Platforms
-// without a binary are skipped (and left out of optionalDependencies).
+// (e.g. nano-coder-darwin-arm64). Writes <out>/<os>-<cpu>/ platform packages
+// and <out>/nano-coder/ (the main package, pinned to the same version).
+// Platforms without a binary are skipped (and left out of optionalDependencies).
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, chmodSync, copyFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,9 +19,9 @@ if (!version || !binaries || !out) {
   console.error('usage: npm-packages.mjs --version X.Y.Z --binaries <dir> --out <dir>');
   process.exit(2);
 }
-const cargoVersion = readFileSync(join(root, 'Cargo.toml'), 'utf8').match(/^version\s*=\s*"([^"]+)"/m)?.[1];
-if (cargoVersion !== version) {
-  console.error(`version ${version} does not match Cargo.toml (${cargoVersion})`);
+const appVersion = readFileSync(join(root, 'source/app.d'), 'utf8').match(/^enum string packageVersion = "([^"]+)";/m)?.[1];
+if (appVersion !== version) {
+  console.error(`version ${version} does not match source/app.d packageVersion (${appVersion})`);
   process.exit(1);
 }
 

@@ -1,0 +1,252 @@
+/// Recently used `provider/model` specs, persisted as JSON in the app data
+/// dir (recents.rs). The `/model` type-ahead offers them right after the
+/// current model. Best-effort: a corrupt or unreadable file starts empty.
+module nano.recents;
+
+@safe:
+
+import std.json;
+import std.string : strip;
+import nano.config : ProviderConfig, parseModelSpec;
+
+enum maxRecents = 8;
+
+/// The on-disk format version; 1 stores canonical `provider/model` entries.
+enum formatVersion = 1;
+
+/// `spec` as `provider/model` (or a bare provider without a default model),
+/// parsed the way every model spec is, so a slash-containing model on the
+/// default provider keeps its real provider prefix.
+string canonical(string spec, const ProviderConfig[string] all, string defaultProvider)
+{
+    string provider, model;
+    parseModelSpec(spec, all, defaultProvider, provider, model);
+    if (!model.length)
+        if (auto p = provider in all) model = p.defaultModel;
+    return model.length ? provider ~ "/" ~ model : provider;
+}
+
+struct Recents
+{
+    /// A file without the marker is legacy (0) and is canonicalized once.
+    uint version_ = formatVersion;
+    /// Most recent first.
+    string[] models;
+
+    /// Record a switch to `spec`: it becomes the most recent, without duplicates.
+    void record(string spec)
+    {
+        import std.algorithm : remove;
+        spec = spec.strip;
+        if (!spec.length) return;
+        string[] kept = [spec];
+        foreach (m; models) if (m != spec) kept ~= m;
+        models = kept.length > maxRecents ? kept[0 .. maxRecents] : kept;
+    }
+
+    /// Migrate a legacy list to canonical entries, exactly once (re-running it
+    /// on canonical entries would be lossy). True when it migrated.
+    bool canonicalize(const ProviderConfig[string] all, string defaultProvider)
+    {
+        if (version_ >= formatVersion) return false;
+        string[] out_;
+        bool[string] seen;
+        foreach (m; models)
+        {
+            auto c = canonical(m, all, defaultProvider);
+            if (!c.length || c in seen) continue;
+            seen[c] = true;
+            out_ ~= c;
+        }
+        models = out_.length > maxRecents ? out_[0 .. maxRecents] : out_;
+        version_ = formatVersion;
+        return true;
+    }
+
+    /// serde_json's pretty form, as Rust writes it.
+    string toJson() const
+    {
+        import nano.trajectory : serdeString;
+        auto s = "{\n  \"version\": " ~ (() { import std.conv : to; return version_.to!string; })() ~ ",\n  \"models\": ";
+        if (!models.length) return s ~ "[]\n}";
+        s ~= "[";
+        foreach (i, m; models) s ~= (i ? "," : "") ~ "\n    " ~ serdeString(m);
+        return s ~ "\n  ]\n}";
+    }
+}
+
+string defaultPath()
+{
+    import std.path : buildPath;
+    import nano.copilot : appDataDir;
+    return buildPath(appDataDir(), "recent-models.json");
+}
+
+Recents load(string path) nothrow
+{
+    import std.file : readText;
+    Recents r;
+    try
+    {
+        auto j = parseJSON(readText(path));
+        if (j.type != JSONType.object) return Recents.init;
+        r.version_ = 0;
+        if (auto v = "version" in j)
+        {
+            if (v.type != JSONType.integer && v.type != JSONType.uinteger) return Recents.init;
+            r.version_ = cast(uint) v.integer;
+        }
+        if (auto ms = "models" in j)
+        {
+            if (ms.type != JSONType.array) return Recents.init;
+            foreach (m; ms.arrayNoRef)
+            {
+                if (m.type != JSONType.string) return Recents.init;
+                r.models ~= m.str;
+            }
+        }
+    }
+    catch (Exception) return Recents.init; // no recents file, or a corrupt one: start empty
+    if (r.models.length > maxRecents) r.models = r.models[0 .. maxRecents];
+    return r;
+}
+
+/// Write the list, creating the parent directory; errors are ignored.
+void save(string path, const Recents r) nothrow
+{
+    import std.file : mkdirRecurse, write;
+    import std.path : dirName;
+    try
+    {
+        mkdirRecurse(path.dirName);
+        write(path, r.toJson);
+    }
+    catch (Exception) {} // recents are a convenience; failing to save them never fails a model switch
+}
+
+// rust: providers/mod.rs::parses_model_specs
+// rust: recents.rs::canonical_prefixes_the_real_provider
+// rust: recents.rs::canonicalize_migrates_a_legacy_raw_list
+unittest
+{
+    ProviderConfig[string] all;
+    foreach (n; ["openai", "together", "ollama"]) all[n] = ProviderConfig.init;
+    assert(canonical("meta-llama/llama-4", all, "together") == "together/meta-llama/llama-4");
+    assert(canonical("gpt-4o", all, "openai") == "openai/gpt-4o");
+    assert(canonical("openai/gpt-4o", all, "openai") == "openai/gpt-4o");
+    assert(canonical("ollama", all, "openai") == "ollama");
+    ProviderConfig work;
+    work.defaultModel = "foo";
+    all["work"] = work;
+    assert(canonical("work", all, "openai") == "work/foo");
+
+    Recents legacy = {version_: 0, models: ["meta-llama/llama-4", "gpt-4o", "together/gpt-4o"]};
+    assert(legacy.canonicalize(all, "together"));
+    assert(legacy.models == ["together/meta-llama/llama-4", "together/gpt-4o"]);
+    assert(!legacy.canonicalize(all, "together"));
+    Recents current = {models: ["work/foo"]};
+    assert(!current.canonicalize(all, "openai") && current.models == ["work/foo"]);
+
+    Recents r;
+    foreach (i; 0 .. 10) r.record(" m" ~ cast(char)('0' + i) ~ " ");
+    r.record("m5");
+    assert(r.models.length == maxRecents && r.models[0] == "m5" && r.models[1] == "m9");
+    r.record("  ");
+    assert(r.models[0] == "m5");
+
+    import std.file : tempDir, exists, remove, readText, write;
+    import std.path : buildPath;
+    auto path = buildPath(tempDir, "nano-recents-test", "recent-models.json");
+    save(path, r);
+    assert(readText(path).startsWith("{\n  \"version\": 1,\n  \"models\": [\n    \"m5\",\n    \"m9\""));
+    assert(load(path) == r);
+    write(path, "{\"models\":[\"a\"]}");
+    assert(load(path).version_ == 0 && load(path).models == ["a"]);
+    write(path, "not json");
+    assert(load(path) == Recents.init);
+    save(path, Recents.init);
+    assert(readText(path) == "{\n  \"version\": 1,\n  \"models\": []\n}");
+    remove(path);
+    assert(load(path) == Recents.init);
+}
+
+private bool startsWith(string s, string p) nothrow { return s.length >= p.length && s[0 .. p.length] == p; }
+
+// rust: recents.rs::canonical_expands_a_provider_only_spec_to_its_default_model
+// rust: recents.rs::canonicalize_dedupes_collapsed_entries_keeping_order
+// rust: recents.rs::canonicalize_runs_once_and_leaves_canonical_files_untouched
+unittest
+{
+    ProviderConfig[string] all;
+    all["openai"] = ProviderConfig.init;
+    ProviderConfig work;
+    work.defaultModel = "foo";
+    all["work"] = work;
+    assert(canonical("work", all, "openai") == "work/foo");
+    assert(canonical("openai", all, "work") == "openai");
+
+    ProviderConfig[string] only;
+    only["openai"] = ProviderConfig.init;
+    auto r = Recents(0, ["gpt-4o", "openai/gpt-4o"]);
+    r.canonicalize(only, "openai");
+    assert(r.models == ["openai/gpt-4o"]);
+
+    auto current = Recents(formatVersion, ["work/foo"]);
+    assert(!current.canonicalize(only, "openai") && current.models == ["work/foo"], "a removed provider's entry is kept verbatim");
+    auto legacy = Recents(0, ["gpt-4o"]);
+    assert(legacy.canonicalize(only, "openai") && legacy.models == ["openai/gpt-4o"]);
+    assert(!legacy.canonicalize(only, "openai"), "migrated once");
+}
+
+// rust: recents.rs::record_ignores_blank_and_trims
+// rust: recents.rs::record_moves_to_front_without_duplicates_and_caps
+// rust: recents.rs::switching_records_the_previous_model_just_behind_the_new_one
+unittest
+{
+    import std.algorithm : canFind;
+    import std.format : format;
+    Recents r;
+    r.record("   ");
+    r.record("  ollama/qwen3  ");
+    assert(r.models == ["ollama/qwen3"]);
+
+    Recents m;
+    m.record("openai/gpt-4o");
+    m.record("ollama/qwen3");
+    m.record("openai/gpt-4o");
+    assert(m.models == ["openai/gpt-4o", "ollama/qwen3"]);
+    foreach (i; 0 .. 20) m.record(format("p/m%s", i));
+    assert(m.models.length == maxRecents && m.models[0] == "p/m19" && !m.models.canFind("openai/gpt-4o"));
+
+    Recents s;
+    void switch_(string previous, string spec) { s.record(previous); s.record(spec); }
+    switch_("start/model", "a/one");
+    assert(s.models == ["a/one", "start/model"]);
+    switch_("a/one", "b/two");
+    switch_("b/two", "start/model");
+    assert(s.models == ["start/model", "b/two", "a/one"]);
+}
+
+// rust: recents.rs::load_tolerates_missing_and_corrupt_files
+// rust: recents.rs::save_then_load_round_trips
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, write, exists;
+    import std.path : buildPath, dirName;
+    import std.process : thisProcessID;
+    import std.format : format;
+    auto dir = buildPath(tempDir, format("nano-recents-%s", thisProcessID));
+    scope (exit) if (exists(dir)) rmdirRecurse(dir);
+    auto path = buildPath(dir, "nested", "recent-models.json");
+    assert(load(path) == Recents.init, "missing file starts empty");
+    mkdirRecurse(dirName(path));
+    write(path, "not json");
+    assert(load(path) == Recents.init, "corrupt file starts empty");
+
+    Recents r;
+    r.record("openai/gpt-4o");
+    r.record("ollama/qwen3");
+    rmdirRecurse(dir);
+    save(path, r);
+    assert(load(path) == r);
+}

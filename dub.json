@@ -1,0 +1,47 @@
+{
+  "name": "nano-coder",
+  "description": "A 4MB coding agent. Run a fleet on your laptop.",
+  "license": "Apache-2.0",
+  "targetName": "nano-coder",
+  "targetType": "executable",
+  "mainSourceFile": "source/entry.d",
+  "libs": [
+    "curl"
+  ],
+  "libs-linux": [
+    "z"
+  ],
+  "lflags-osx": [
+    "-exported_symbol",
+    "_main"
+  ],
+  "buildTypes": {
+    "release": {
+      "buildOptions": [
+        "releaseMode",
+        "optimize",
+        "inline"
+      ],
+      "dflags-ldc": [
+        "-boundscheck=on",
+        "-link-defaultlib-shared=false"
+      ]
+    }
+  },
+  "toolchainRequirements": {
+    "dmd": "no",
+    "gdc": "no",
+    "ldc": ">=1.43.0"
+  },
+  "dflags": [
+    "-allinst",
+    "-preview=dip1000",
+    "-preview=nosharedaccess"
+  ],
+  "dflags-ldc": [
+    "-fno-delete-null-pointer-checks"
+  ],
+  "preBuildCommands": [
+    "$PACKAGE_DIR/scripts/check-safe.sh"
+  ]
+}

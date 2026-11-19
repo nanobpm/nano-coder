@@ -1,24 +1,19 @@
 #!/usr/bin/env node
-// Set the nano-coder version in Cargo.toml and Cargo.lock (used by semantic-release).
-// Usage: node scripts/set-version.mjs 1.2.3
+// Set the release version (`packageVersion` in source/app.d).
+//
+//   node scripts/set-version.mjs 0.2.0
 import { readFileSync, writeFileSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const version = process.argv[2];
 if (!/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(version ?? '')) {
-  console.error(`usage: set-version.mjs X.Y.Z (got ${version})`);
-  process.exit(1);
+  console.error('usage: set-version.mjs X.Y.Z');
+  process.exit(2);
 }
-
-function replaceOnce(file, pattern, replacement) {
-  const text = readFileSync(file, 'utf8');
-  if (!pattern.test(text)) {
-    console.error(`${file}: nano-coder version not found`);
-    process.exit(1);
-  }
-  writeFileSync(file, text.replace(pattern, replacement));
-}
-
-// First `version` under [package].
-replaceOnce('Cargo.toml', /^(\[package\][^[]*?\nversion\s*=\s*")[^"]+(")/m, `$1${version}$2`);
-replaceOnce('Cargo.lock', /(\[\[package\]\]\nname = "nano-coder"\nversion = ")[^"]+(")/, `$1${version}$2`);
-console.log(`nano-coder version set to ${version}`);
+const file = join(dirname(fileURLToPath(import.meta.url)), '..', 'source/app.d');
+const text = readFileSync(file, 'utf8');
+const re = /^enum string packageVersion = "[^"]+";/m;
+if (!re.test(text)) { console.error(`no packageVersion in ${file}`); process.exit(1); }
+writeFileSync(file, text.replace(re, `enum string packageVersion = "${version}";`));
+console.log(`source/app.d packageVersion = ${version}`);

@@ -1,0 +1,546 @@
+/// Provider-neutral conversation types and the client interface.
+module nano.llm;
+
+@safe:
+
+import std.json;
+
+enum Role { system, user, assistant, tool }
+
+string roleName(Role r)
+{
+    final switch (r)
+    {
+        case Role.system: return "system";
+        case Role.user: return "user";
+        case Role.assistant: return "assistant";
+        case Role.tool: return "tool";
+    }
+}
+
+struct ToolCall
+{
+    string id;
+    string name;
+    /// Decoded arguments; an empty object when `invalidArguments` is set.
+    JSONValue arguments;
+    /// The raw text when the model's arguments were not a JSON object.
+    string invalidArguments;
+    /// Responses API output-item id (`fc_*`), replayed so reasoning models
+    /// can pair a preserved reasoning item with its call.
+    string itemId;
+
+    static ToolCall fromRaw(string id, string name, string raw)
+    {
+        ToolCall c = ToolCall(id, name);
+        import std.string : strip;
+        auto text = raw.strip;
+        if (text.length == 0)
+        {
+            c.arguments = JSONValue(string[string].init);
+            return c;
+        }
+        try
+        {
+            auto v = parseJSON(text);
+            if (v.type == JSONType.object)
+            {
+                c.arguments = v;
+                return c;
+            }
+        }
+        catch (Exception) {} // invalid argument JSON is kept in invalidArguments below for the model to see
+        c.arguments = JSONValue(string[string].init);
+        c.invalidArguments = raw;
+        return c;
+    }
+
+    string encodedArguments() const
+    {
+        return invalidArguments.length ? invalidArguments : arguments.toString;
+    }
+
+    /// The tool result for a call whose arguments were not a JSON object
+    /// (null when they were), with advice suited to why the reply ended.
+    string rawArgumentsError(string stopReason) const
+    {
+        import std.format : format;
+        import std.range : take;
+        import std.utf : count;
+        import std.conv : to;
+        if (!invalidArguments.length) return null;
+        auto shown = invalidArguments.take(300).to!string ~ (invalidArguments.count > 300 ? "…" : "");
+        if (isLengthStop(stopReason))
+            return format("the arguments for `%s` were cut off because the response hit the output-token "
+                ~ "limit (stop reason `%s`), so the call was not run: `%s`. "
+                ~ "Retrying the same call will hit the same limit — make a smaller call instead, "
+                ~ "for example by splitting the work across multiple `%s` calls or reducing the "
+                ~ "argument size so the full JSON fits within the limit.", name, stopReason, shown, name);
+        return format("the arguments for `%s` arrived as malformed JSON (usually a truncated "
+            ~ "response), so the call was not run: `%s`. "
+            ~ "If this was a transient transport error, simply retry the same `%s` call with "
+            ~ "the same arguments; if it keeps happening, the response was probably truncated "
+            ~ "by the output-token limit, so make a smaller call instead (for example by "
+            ~ "splitting the content).", name, shown, name);
+    }
+}
+
+/// Whether a stop reason means the reply hit the output-token limit: OpenAI
+/// chat `length`, Anthropic `max_tokens`, Responses `max_output_tokens`
+/// (a bare `incomplete` is not: providers resolve it to its reason first).
+bool isLengthStop(string reason) @safe pure nothrow
+{
+    return reason == "length" || reason == "max_tokens" || reason == "max_output_tokens";
+}
+
+struct Message
+{
+    Role role;
+    string content;
+    ToolCall[] toolCalls;
+    /// For `Role.tool`: the call this answers.
+    string toolCallId;
+    string toolName;
+    bool isError;
+    /// Images attached to a tool result (`read_file`). Not sent as text:
+    /// request builders encode the newest few per the model.
+    Attachment[] attachments;
+
+    // Session-log metadata (not sent to providers), as in Rust's `Message`.
+    /// When the message joined the conversation (RFC 3339 with offset).
+    string timestamp;
+    /// Assistant: the reasoning text of the reply.
+    string thinking;
+    /// Assistant: provider-reported usage for the request (if `hasUsage`).
+    TokenUsage usage;
+    bool hasUsage;
+    /// Assistant: wall-clock duration of the request in ms (-1: unknown).
+    long durationMs = -1;
+    /// Assistant: the provider's stop reason, normalised (`end_turn`, `tool_use`, `max_tokens`).
+    string stopReason;
+    /// Assistant: the temperature the request sent and why, e.g.
+    /// `0.3 (set for this model)`. Recorded so runs can be compared.
+    string temperature;
+    /// Assistant: the thinking level the request sent and why, e.g. `high
+    /// (set for this session)`; only when a level was sent or set.
+    string thinkingLevel;
+    /// The message's physical line in the session log (0: not logged), its
+    /// `#N` ID for smart compaction and the history tools.
+    ulong logLine;
+    /// User role: a harness-initiated turn (reminder, continuation, timer),
+    /// not user input (`auto_initiated`). Compaction never pins it.
+    bool autoInitiated;
+    /// An output-limit continuation reminder (`continuation`; implies automatic).
+    bool continuation;
+    /// A fired timer or pending-timer nudge (`timer`; implies automatic).
+    bool timer;
+    /// User role: entirely harness hook context (`hook_context`), never pinned.
+    bool hookContext;
+    /// User role: the user-typed text when hook context was appended to
+    /// `content` (`pin_text`); compaction pins this instead (issue #66).
+    string pinText;
+    /// Assistant: provider reasoning items replayed on later requests.
+    JSONValue[] thinkingBlocks;
+    /// Fields the D port doesn't model (e.g. Anthropic `thinking_blocks`),
+    /// kept so a resumed Rust log round-trips them.
+    JSONValue extra;
+
+    static Message system(string c) { return Message(Role.system, c); }
+    static Message user(string c) { return Message(Role.user, c); }
+    /// A harness-initiated user-role message (a reminder, continuation or timer).
+    static Message auto_(string c)
+    {
+        auto m = Message(Role.user, c);
+        m.autoInitiated = true;
+        return m;
+    }
+    static Message assistant(string c, ToolCall[] calls = null)
+    {
+        auto m = Message(Role.assistant, c);
+        m.toolCalls = calls;
+        return m;
+    }
+    static Message toolResult(string id, string name, string content, bool error = false)
+    {
+        auto m = Message(Role.tool, content);
+        m.toolCallId = id;
+        m.toolName = name;
+        m.isError = error;
+        return m;
+    }
+
+    JSONValue toJson() const
+    {
+        JSONValue j = ["role": roleName(role), "content": content];
+        if (toolCalls.length)
+        {
+            JSONValue[] calls;
+            foreach (c; toolCalls)
+            {
+                JSONValue cj = ["id": c.id, "name": c.name];
+                cj["arguments"] = c.encodedArguments;
+                calls ~= cj;
+            }
+            j["tool_calls"] = calls;
+        }
+        if (toolCallId.length) j["tool_call_id"] = toolCallId;
+        if (toolName.length) j["name"] = toolName;
+        if (isError) j["is_error"] = true;
+        return j;
+    }
+
+    static Message fromJson(JSONValue j)
+    {
+        import std.algorithm : countUntil;
+        Message m;
+        auto names = ["system", "user", "assistant", "tool"];
+        auto r = names.countUntil(j["role"].str);
+        if (r < 0) throw new Exception("unknown role " ~ j["role"].str);
+        m.role = cast(Role) r;
+        if (auto c = "content" in j) m.content = c.type == JSONType.string ? c.str : "";
+        if (auto calls = "tool_calls" in j)
+            foreach (c; calls.arrayNoRef)
+                m.toolCalls ~= ToolCall.fromRaw(c["id"].str, c["name"].str, c["arguments"].str);
+        if (auto v = "tool_call_id" in j) m.toolCallId = v.str;
+        if (auto v = "name" in j) m.toolName = v.str;
+        if (auto v = "is_error" in j) m.isError = v.boolean;
+        return m;
+    }
+}
+
+struct TokenUsage
+{
+    long inputTokens;
+    long outputTokens;
+    long cachedInputTokens;
+    /// AI Credits the request cost, when the provider reports them (GitHub
+    /// Copilot's `copilot_usage.total_nano_aiu`, converted to credits).
+    bool hasAic;
+    double aic = 0;
+}
+
+/// Read GitHub Copilot's `copilot_usage.total_nano_aiu` from a response body
+/// or terminal stream event (the parent of `usage`, or of `response` for the
+/// Responses API) into `usage`, as AI Credits (1 credit = 1e9 nano).
+/// Leaves `usage` alone when the field is absent (other providers).
+void readCopilotAic(const JSONValue parent, ref TokenUsage usage) @safe
+{
+    if (parent.type != JSONType.object) return;
+    auto cu = "copilot_usage" in parent.objectNoRef;
+    if (cu is null || cu.type != JSONType.object) return;
+    auto n = "total_nano_aiu" in cu.objectNoRef;
+    if (n is null) return;
+    double nano;
+    final switch (n.type)
+    {
+        case JSONType.integer: nano = n.integer; break;
+        case JSONType.uinteger: nano = n.uinteger; break;
+        case JSONType.float_: nano = n.floating; break;
+        case JSONType.null_, JSONType.string, JSONType.array, JSONType.object, JSONType.true_, JSONType.false_: return;
+    }
+    usage.hasAic = true;
+    usage.aic = nano / 1e9;
+}
+
+// rust: llm.rs::reads_copilot_aic_from_nano
+@safe unittest
+{
+    import std.math : isClose;
+    TokenUsage u;
+    readCopilotAic(parseJSON(`{"usage":{},"copilot_usage":{"total_nano_aiu":11600000}}`), u);
+    assert(u.hasAic && isClose(u.aic, 0.0116));
+    TokenUsage none;
+    readCopilotAic(parseJSON(`{"usage":{}}`), none);
+    assert(!none.hasAic);
+    TokenUsage zero;
+    readCopilotAic(parseJSON(`{"copilot_usage":{"total_nano_aiu":0}}`), zero);
+    assert(zero.hasAic && zero.aic == 0);
+}
+
+struct LLMResponse
+{
+    string content;
+    string reasoning;
+    ToolCall[] toolCalls;
+    TokenUsage usage;
+    string stopReason;
+    /// Provider reasoning items to replay with this reply (Anthropic signed
+    /// `thinking`/`redacted_thinking` blocks, OpenAI `reasoning_content`,
+    /// Responses `reasoning` items).
+    JSONValue[] thinkingBlocks;
+}
+
+struct ToolDefinition
+{
+    string name;
+    string description;
+    JSONValue parameters;
+}
+
+struct ChatRequest
+{
+    const(Message)[] messages;
+    const(ToolDefinition)[] tools;
+    long maxTokens;
+    /// NaN means "send none".
+    double temperature = double.nan;
+    /// The resolved thinking control (kind `none` sends nothing).
+    import nano.thinking : ThinkingRequest = Request;
+    ThinkingRequest thinking;
+    /// The model's vision capability; null sends every attachment as text.
+    import std.typecons : Nullable;
+    import nano.vision : Vision;
+    Nullable!Vision vision;
+    /// Where attachments are stored; null for requests that carry no images
+    /// (compaction).
+    string attachmentsDir;
+
+    /// The attachment occurrences this request sends as images: the newest
+    /// `vision.maxImages` that are intact on disk. Keyed by occurrence
+    /// (message index, attachment index), so the same image read twice
+    /// counts twice. Computed once per request (it hashes the stored files).
+    AttachmentPlan attachmentPlan() const
+    {
+        import nano.attachment : exists;
+        AttachmentPlan plan;
+        size_t[2][] available;
+        foreach (mi, ref m; messages)
+            foreach (ai, ref a; m.attachments)
+                if (attachmentsDir.length && exists(attachmentsDir, a))
+                {
+                    available ~= [mi, ai];
+                    plan.available[[mi, ai]] = true;
+                }
+        size_t max = vision.isNull ? 0 : vision.get.maxImages;
+        auto keep = max < available.length ? max : available.length;
+        foreach (k; available[$ - keep .. $]) plan.sendable[k] = true;
+        return plan;
+    }
+
+    /// Message `mi`'s attachments for the wire: image data, or the text
+    /// standing in for it (sent earlier, or no longer available).
+    ResolvedAttachment[] resolveAttachments(size_t mi, const ref AttachmentPlan plan) const
+    {
+        import nano.attachment : readForLimits, ImageLimits;
+        import std.format : format;
+        ResolvedAttachment[] out_;
+        foreach (ai, ref a; messages[mi].attachments)
+        {
+            auto gone = format("[image: %s, %s×%s (no longer available)]", a.path, a.width, a.height);
+            size_t[2] key = [mi, ai];
+            if (key in plan.sendable)
+            {
+                // Fit the stored bytes to the *active* model's limits.
+                auto limits = vision.isNull ? ImageLimits.init : vision.get.imageLimits;
+                auto ready = readForLimits(attachmentsDir, a, limits);
+                out_ ~= ready.isNull ? ResolvedAttachment(false, ImageData.init, gone) : ResolvedAttachment(true, ready.get, null);
+            }
+            else if (key in plan.available)
+                out_ ~= ResolvedAttachment(false, ImageData.init, format("[image omitted: %s (sent earlier)]", a.path));
+            else out_ ~= ResolvedAttachment(false, ImageData.init, gone);
+        }
+        return out_;
+    }
+}
+
+public import nano.attachment : Attachment, ImageData;
+
+/// One attachment on the wire: an image, or placeholder text.
+struct ResolvedAttachment
+{
+    bool isImage;
+    ImageData image;
+    string text;
+}
+
+/// Which attachment occurrences are intact on disk, and which of those are
+/// within the image quota.
+struct AttachmentPlan
+{
+    bool[size_t[2]] available, sendable;
+    /// Whether the request carries at least one real image.
+    bool carriesImage() const { return sendable.length > 0; }
+}
+
+/// Receives streamed text: `reasoning` is true for thinking output.
+alias StreamSink = void delegate(bool reasoning, string text) @safe;
+
+/// What an endpoint reports about the current model.
+struct Capabilities
+{
+    import std.typecons : Nullable;
+    import nano.thinking : Reported;
+    import nano.vision : Vision;
+    Nullable!Reported thinking;
+    Nullable!Vision vision;
+    /// The context window the endpoint reports (0 = none), and where from.
+    size_t window;
+    string windowSource;
+    /// `window` caps the prompt alone (Copilot `max_prompt_tokens`); output
+    /// tokens don't consume it. `totalWindow` is then the combined window, if known.
+    bool promptCap;
+    size_t totalWindow;
+    /// The model's published output-token cap (0 = none).
+    size_t maxOutput;
+}
+
+/// A client that can ask its endpoint what the model supports.
+interface CapabilityProbe
+{
+    Capabilities probeCapabilities();
+}
+
+interface LLMClient
+{
+    LLMResponse chat(const ref ChatRequest req, StreamSink sink);
+    string[] listModels();
+    string modelName() const;
+    string providerName() const;
+}
+
+/// Splits `<think>...</think>` out of streamed content, across chunk boundaries.
+struct ThinkSplitter
+{
+    private bool inThink;
+    private string pending;
+
+    void push(string text, scope void delegate(bool, string) @safe emit)
+    {
+        import std.string : indexOf;
+        pending ~= text;
+        for (;;)
+        {
+            string tag = inThink ? "</think>" : "<think>";
+            auto at = pending.indexOf(tag);
+            if (at >= 0)
+            {
+                if (at > 0) emit(inThink, pending[0 .. at]);
+                pending = pending[at + tag.length .. $];
+                inThink = !inThink;
+                continue;
+            }
+            // keep a possible partial tag at the end
+            size_t keep = 0;
+            foreach (n; 1 .. tag.length)
+                if (pending.length >= n && pending[$ - n .. $] == tag[0 .. n]) keep = n;
+            if (pending.length > keep) emit(inThink, pending[0 .. $ - keep]);
+            pending = pending[$ - keep .. $];
+            return;
+        }
+    }
+
+    void finish(scope void delegate(bool, string) @safe emit)
+    {
+        if (pending.length) emit(inThink, pending);
+        pending = null;
+    }
+
+    /// A whole reply split into [content, thinking]: the content loses the
+    /// blank lines after `</think>`, the thinking is trimmed.
+    static string[2] splitAll(string text)
+    {
+        import std.string : indexOf, strip, stripLeft;
+        if (text.indexOf("<think>") < 0) return [text, ""];
+        string said, thought;
+        ThinkSplitter s;
+        void emit(bool t, string x) { if (t) thought ~= x; else said ~= x; }
+        s.push(text, &emit);
+        s.finish(&emit);
+        return [said.stripLeft, thought.strip];
+    }
+}
+
+unittest
+{
+    auto ok = ToolCall.fromRaw("1", "bash", `{"command":"ls"}`);
+    assert(ok.invalidArguments is null && ok.arguments["command"].str == "ls");
+    auto bad = ToolCall.fromRaw("2", "bash", `{"command":`);
+    assert(bad.invalidArguments == `{"command":`);
+    assert(bad.encodedArguments == `{"command":`);
+}
+
+unittest
+{
+    string thought, said;
+    ThinkSplitter s;
+    void emit(bool r, string t) { if (r) thought ~= t; else said ~= t; }
+    foreach (chunk; ["hi <thi", "nk>pon", "der</th", "ink> done"]) s.push(chunk, &emit);
+    s.finish(&emit);
+    assert(thought == "ponder" && said == "hi  done");
+}
+
+// rust: llm.rs::splits_think_tags_across_chunks
+unittest
+{
+    string thought, said;
+    ThinkSplitter s;
+    void emit(bool r, string t) { if (r) thought ~= t; else said ~= t; }
+    foreach (chunk; ["<th", "ink>plan ", "it</thi", "nk>Answer <b>", "</b> done"]) s.push(chunk, &emit);
+    s.finish(&emit);
+    assert(thought == "plan it" && said == "Answer <b></b> done", said);
+    assert(ThinkSplitter.splitAll("<think>x</think>\n\nhi") == ["hi", "x"]);
+    assert(ThinkSplitter.splitAll("plain") == ["plain", ""]);
+}
+
+// rust: llm.rs::decodes_valid_arguments_and_marks_invalid_ones
+unittest
+{
+    import std.algorithm : canFind;
+    auto valid = ToolCall.fromRaw("c", "write_file", `{"path":"/tmp/x"}`);
+    assert(valid.arguments == parseJSON(`{"path":"/tmp/x"}`) && valid.invalidArguments is null);
+    assert(ToolCall.fromRaw("c", "t", "").arguments.type == JSONType.object);
+    assert(ToolCall.fromRaw("c", "t", "   ").invalidArguments is null);
+    enum raw = `{"path":"/tmp/x","content":"abc`;
+    auto call = ToolCall.fromRaw("c1", "write_file", raw);
+    assert(call.arguments == parseJSON(`{}`), "malformed args leave the object empty");
+    assert(call.invalidArguments == raw);
+    auto e = call.rawArgumentsError(null);
+    assert(e.canFind("write_file") && e.canFind("malformed JSON") && e.canFind("retry the same")
+        && e.canFind(`{"path":"/tmp/x`), e);
+    assert(valid.rawArgumentsError(null) is null);
+}
+
+// rust: llm.rs::raw_arguments_error_tailors_advice_to_stop_reason
+unittest
+{
+    import std.algorithm : canFind;
+    auto call = ToolCall.fromRaw("c1", "write_file", `{"path":"/tmp/x","content":"abc`);
+    foreach (reason; ["length", "max_tokens", "max_output_tokens"])
+    {
+        auto e = call.rawArgumentsError(reason);
+        assert(e.canFind("output-token limit") && e.canFind("smaller call") && !e.canFind("retry the same"), reason);
+    }
+    foreach (reason; ["tool_use", "incomplete"])
+    {
+        auto e = call.rawArgumentsError(reason);
+        assert(e.canFind("retry the same") && e.canFind("truncated by the output-token limit"), reason);
+    }
+}
+
+// rust: llm.rs::raw_arguments_error_truncates_long_payloads
+unittest
+{
+    import std.algorithm : canFind;
+    import std.array : replicate;
+    auto raw = `{"content":"` ~ "x".replicate(1000);
+    auto e = ToolCall.fromRaw("c", "write_file", raw).rawArgumentsError(null);
+    assert(e.canFind("…") && e.length < raw.length + 400);
+}
+
+unittest
+{
+    auto m = Message.assistant("x", [ToolCall.fromRaw("c1", "read_file", `{"path":"a"}`)]);
+    auto back = Message.fromJson(parseJSON(m.toJson.toString));
+    assert(back.toolCalls[0].arguments["path"].str == "a");
+}
+
+/// Show a whole (non-streamed) response through `sink`.
+LLMResponse reportWhole(LLMResponse r, StreamSink sink)
+{
+    if (sink !is null)
+    {
+        if (r.reasoning.length) sink(true, r.reasoning);
+        if (r.content.length) sink(false, r.content);
+    }
+    return r;
+}

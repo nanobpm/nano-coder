@@ -2,11 +2,12 @@ name: Release
 
 # Every push to main runs semantic-release. When the Conventional Commits since
 # the last tag call for a release (fix: -> patch, feat: -> minor, `!`/BREAKING
-# CHANGE -> major), it sets the version in Cargo.toml/Cargo.lock, commits
+# CHANGE -> major), it sets `packageVersion` in source/app.d, commits
 # `chore(release): X.Y.Z`, tags `vX.Y.Z` and creates the GitHub release. The jobs
-# below then build binaries, attach them to the release, and publish to
-# crates.io (`nano-coder`) and npm (`@nanobpm/nano-coder` plus one
-# `@nanobpm/nano-coder-<os>-<cpu>` package per platform).
+# below then build the D binaries with LDC, attach them to the release, update the
+# Homebrew formula and publish to npm (`@nanobpm/nano-coder` plus one
+# `@nanobpm/nano-coder-<os>-<cpu>` package per platform). The Rust implementation
+# (up to 0.69.0, still on crates.io) lives on the `rust` branch.
 #
 # Auth: main is protected by a ruleset that only the release GitHub App may
 # bypass, so semantic-release pushes with that app's token (vars.RELEASE_APP_CLIENT_ID,
@@ -86,7 +87,7 @@ jobs:
           fi
           if [ -z "$next" ] && [ "$DRY_RUN" = "true" ]; then
             # Nothing to release: dry-run the current version.
-            next="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+            next="$(sed -nE 's/^enum string packageVersion = "([^"]+)";/\1/p' source/app.d)"
           fi
           echo "version=$next" >> "$GITHUB_OUTPUT"
           echo "next version: ${next:-none}"
@@ -101,7 +102,7 @@ jobs:
       matrix:
         include:
           - { os: macos-15, target: aarch64-apple-darwin, npm: darwin-arm64 }
-          - { os: macos-15, target: x86_64-apple-darwin, npm: darwin-x64 }
+          - { os: macos-15-intel, target: x86_64-apple-darwin, npm: darwin-x64 }
           # Ubuntu 22.04 runners link against glibc 2.35 for broad compatibility.
           - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, npm: linux-x64 }
           - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, npm: linux-arm64 }
@@ -111,23 +112,23 @@ jobs:
           ref: ${{ needs.release.outputs.released == 'true' && format('v{0}', needs.release.outputs.version) || github.sha }}
       # No-op for a release (the tag already has it); sets the dry-run version.
       - run: node scripts/set-version.mjs ${{ needs.release.outputs.version }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dlang-community/setup-dlang@v2
         with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-      - run: cargo build --release --locked --target ${{ matrix.target }}
+          compiler: ldc-1.43.0
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libcurl4-openssl-dev zlib1g-dev
+      - run: dub test
+      - run: dub build -b release
       - name: Smoke test
-        if: matrix.target != 'x86_64-apple-darwin'
-        run: target/${{ matrix.target }}/release/nano-coder --help
+        run: ./nano-coder --version | grep -Fx "nano-coder ${{ needs.release.outputs.version }}"
       - name: Stage
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/nano-coder dist/nano-coder-${{ matrix.npm }}
-          tar -C target/${{ matrix.target }}/release -czf dist/nano-coder-${{ needs.release.outputs.version }}-${{ matrix.target }}.tar.gz nano-coder
+          cp nano-coder dist/nano-coder-${{ matrix.npm }}
+          tar -czf dist/nano-coder-${{ needs.release.outputs.version }}-${{ matrix.target }}.tar.gz nano-coder
       - uses: actions/upload-artifact@v4
         with:
           name: bin-${{ matrix.npm }}
@@ -193,35 +194,6 @@ jobs:
           git commit -qam "nano-coder $VERSION"
           git push
 
-  crates-io:
-    needs: [release, build]
-    if: needs.release.outputs.released == 'true'
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: v${{ needs.release.outputs.version }}
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Already published?
-        id: exists
-        run: |
-          v=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
-          if curl -sf -A "nano-coder-release (github.com/nanobpm/nano-coder)" "https://crates.io/api/v1/crates/nano-coder/$v" >/dev/null; then
-            echo "nano-coder $v already published; skipping"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          fi
-      - name: Trusted publishing token
-        id: auth
-        if: steps.exists.outputs.skip != 'true'
-        uses: rust-lang/crates-io-auth-action@v1
-      - if: steps.exists.outputs.skip != 'true'
-        run: cargo publish --locked
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-
   npm:
     needs: [release, build]
     runs-on: ubuntu-24.04
@@ -240,7 +212,7 @@ jobs:
           pattern: bin-*
           merge-multiple: true
           path: bins
-      # semantic-release bumped Cargo.toml on a new tag/commit we haven't checked out (and
+      # semantic-release bumped source/app.d on a new tag/commit we haven't checked out (and
       # on a dry run there is no tag at all), so set the version here before packing.
       - run: node scripts/set-version.mjs ${{ needs.release.outputs.version }}
       - run: node scripts/npm-packages.mjs --version ${{ needs.release.outputs.version }} --binaries bins --out npm-dist

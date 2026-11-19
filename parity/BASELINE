@@ -1,0 +1,9 @@
+6f1e680
+# rust-final (0.69.0). #191 (cargo switch notice) is n/a for D.
+# Before that, 80ca911 was the last Rust commit triaged for the D port (release 0.68.0, #190).
+# Since c18eb56: ported #184 #186 (#114 continuations and #147 trust
+# hardening too); n/a #188 (D ships via npm only); #185's probe tests are
+# todo rows. Ported between 0b4ad1f and c18eb56: #147 #149 #151 #153 #154 #156 #158 #159 #160 #161 #162 #165 #167
+# #168 #170 #171 #172 #175 #176 #177 #178 #180 #181. n/a: #157 (D never had
+# the replay stash), #183 (compaction eval tooling, Rust-only). The gaps left
+# by these ports are `gap` rows in manifest.tsv.

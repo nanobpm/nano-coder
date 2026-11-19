@@ -1,19 +1,25 @@
 # nano-coder
 
-**A 6MB coding agent. Run a fleet on your laptop.**
+**A 4MB coding agent. Run a fleet on your laptop.**
 
-nano-coder is a coding agent for the terminal, written in Rust. It uses about 6MB of resident memory, where Node-based agent CLIs take 150–660MB, so you can run dense fleets of agent workers on one machine. It runs interactively, or headless over ACP as a worker for [nano-workforce](https://github.com/nanobpm/nano-workforce) via c8ctl-nano.
+nano-coder is a coding agent for the terminal, written in D. Up to 0.69 it was written in Rust; 1.0 is the D rewrite, with the same commands, config (`~/.config/nano-coder/config.toml`, `NANO_CODER_*`), session logs and ACP protocol. It uses about 4MB of memory (peak footprint on macOS), where Node-based agent CLIs take 150–660MB, so you can run dense fleets of agent workers on one machine. It runs interactively, or headless over ACP as a worker for [nano-workforce](https://github.com/nanobpm/nano-workforce) via c8ctl-nano.
 
 ## Install
 
 ```sh
 npm install -g @nanobpm/nano-coder       # prebuilt binaries for macOS and Linux (x64, arm64)
 brew install nanobpm/tap/nano-coder      # the same binaries through Homebrew
-cargo install nano-coder                 # 0.69, the last Rust release
 ```
 
-From 1.0 nano-coder is written in D and published to npm and Homebrew only; crates.io keeps
-0.69, which tells cargo installs how to switch.
+The Linux binaries need glibc 2.35+ and the system libcurl (`libcurl4` on Debian/Ubuntu,
+`libcurl` on Fedora); macOS ships libcurl. To build from source, see
+[Building and Running](#building-and-running).
+
+```sh
+nano-coder --help
+```
+
+`cargo install nano-coder` still installs the last Rust release (0.69), which is no longer updated.
 
 ## Features
 
@@ -22,7 +28,7 @@ From 1.0 nano-coder is written in D and published to npm and Homebrew only; crat
 - **Providers**: OpenAI-compatible and Anthropic endpoints (remote or local), selected per model as `provider/model`, with retry/backoff
 - **Tool Calling**: Agent can invoke registered tools during conversation, including a real `bash` tool with timeouts and bounded output
 - **Sessions**: Append-only JSONL session logs with resume and input-ID deduplication
-- **Lifecycle Hooks**: 6 internal hook events for observing agent behavior, plus
+- **Lifecycle Hooks**: an `AgentEvents` interface for observing agent behavior, plus
   Claude Code–compatible external user hooks loaded from `.claude/settings.json`
 - **Configuration**: TOML-based config file at `~/.config/nano-coder/config.toml`
 - **Commands**: `/help`, `/version`, `/compact`, `/context`, `/verbosity`, `/settings`, `/tools`, `/skills`, `/queue`, `/restart`, `/update`, `/relaunch`, `/exit`
@@ -63,7 +69,7 @@ show in the same list (marked `steer`, with the id from the `↪ steer #N` note)
 be withdrawn or rewritten before the agent's next step. A queued message is never injected while the agent is
 asking for input (the `question` tool's picker owns the terminal until you answer).
 Slash commands work mid-turn too, where it is safe:
-- **Right away:** read-only ones (`/help`, `/version`, `/tools`, `/skills`, `/providers`, `/session`, `/plan`,
+- **Right away:** read-only ones (`/help`, `/tools`, `/skills`, `/providers`, `/session`, `/plan`,
   `/context`, `/trajectory` (`--json`/`--markdown`), and `/mode` or `/verbosity` without an
   argument) show the current state. `/plan` shows the plan as the agent updates it.
 - **From the agent's next step:** `/mode NAME` applies when the agent takes its next step.
@@ -80,13 +86,6 @@ Slash commands work mid-turn too, where it is safe:
 the running turn, killing any running bash command; a second Ctrl-C at the prompt exits.
 At the idle prompt, **Esc Esc** instead clears the input, so a half-typed or pasted prompt
 can be discarded without deleting it character by character.
-
-Tool calls, their results and thinking blocks are shown collapsed (`● bash ls -la`,
-`⎿ first line (+N lines)`, `∴ Thought for 3.1s · 812 chars`). **Ctrl-O** expands the
-latest one in place — the call's full arguments with every line of its result, or the
-full reasoning text — and pressing it again collapses it. It works at the idle prompt
-and mid-turn (where it expands the thinking block that is still streaming), and the
-expanded view reflows on resize. Piped output is unchanged.
 With piped (non-terminal) stdin, lines read during a turn are queued as later prompts
 (never steer).
 
@@ -121,9 +120,7 @@ A steer that arrives too late to join the turn runs as an ordinary prompt, or is
 answered with `stopReason: "cancelled"` if the turn was cancelled. Slash-command prompts
 and other requests that arrive mid-turn are handled after the turn ends. Everything
 handled after the turn, late steers included, runs in the order the client sent it.
-`stopReason` is `end_turn`, `cancelled`, or `max_turn_requests`. When the provider reported
-token counts, the result also carries ACP's `usage`: `{"inputTokens", "outputTokens", "totalTokens"}`,
-summed over the turn's model calls.
+`stopReason` is `end_turn`, `cancelled`, or `max_turn_requests`.
 
 **Streaming updates.** During a turn the harness sends `session/update` notifications:
 `agent_message_chunk` (with a `messageId`), `tool_call` (`toolCallId`, `title` = tool name,
@@ -169,49 +166,60 @@ explicitly (`input doesn't look like ACP JSON-RPC …`).
 ## Architecture
 
 ```
-src/
-├── main.rs      # Single binary entry point (interactive + ACP modes)
-├── agent.rs     # Agent core: conversation management, tool execution loop
-├── acp.rs       # ACP JSON-RPC protocol handler
-├── hooks.rs     # Internal (observe-only) lifecycle hook registry and events
-├── claude_hooks.rs # External Claude Code–compatible user hooks engine
-├── tools.rs     # Tool registration and dispatch system
-├── llm.rs       # Provider-neutral messages and the async LLMClient trait
-├── providers/   # Provider registry + presets, HTTP transport with retries
-│   ├── openai.rs    # OpenAI Chat Completions (and compatible servers)
-│   ├── anthropic.rs # Anthropic Messages API
-│   ├── github_copilot.rs # UNOFFICIAL Copilot-subscription provider
-│   ├── muse.rs      # UNOFFICIAL Meta Muse Code provider
-│   ├── retry.rs     # Retry classification and backoff
-│   └── mock.rs      # Offline scripted client
-├── bash.rs      # bash tool: timeout, file capture, bounded output
-├── files.rs     # read_file / write_file / edit_file tools
-├── shell.rs     # Bash parser used by the permission checks
-├── permissions.rs # Allow/deny rules and built-in guards against destructive commands
-├── sandbox.rs   # Seatbelt (macOS) / Landlock (Linux) sandbox for shell commands
-├── output.rs    # Head/tail output bounding, spilling long output to disk
-├── session.rs   # Versioned append-only JSONL session log
-├── session_index.rs # Session summaries (.index.jsonl) for the --resume picker
-├── resume.rs    # --resume picker, --resume last, --list-sessions
-├── context.rs   # Token accounting, context-window heuristics, overflow detection
-├── status.rs    # Status bar contents (the frame's last row)
-├── ui.rs        # Verbosity levels and the streaming output renderer
-├── frame.rs     # App-owned frame renderer: full redraw on resize
-├── lineedit.rs  # Key-by-key prompt input (editing, history, mid-turn steer/queue)
-├── input_history.rs # Up/Down recall of submitted lines (session-scoped)
-├── instructions.rs # AGENTS.md / CLAUDE.md discovery for the system prompt
-├── plan.rs      # Task plan and the plan_add / plan_update / plan_show tools
-├── queue.rs     # The interactive message queue and the /queue editor
-├── goal.rs      # report_outcome tool (completed / blocked / needs_input)
-├── memory.rs    # Cross-session memory: memory_save / memory_search / memory_forget
-├── mode.rs      # Agent mode (normal / plan / auto) and the plan-mode tool gate
-├── question.rs  # question tool and the mid-turn question / turn-cap rendezvous
-├── commands.rs  # Slash-command table for /help and the as-you-type menu
-├── skills.rs    # SKILL.md discovery, ai.lock sources and the load_skill tool
-├── reminders.rs # <system-reminder> notes appended to tool results
-├── settings.rs  # /settings menu and config-file writer
-└── config.rs    # Configuration file loading and management
+source/
+├── app.d        # Single binary entry point (interactive + ACP modes), REPL, key reader
+└── nano/
+    ├── agent.d      # Agent core: conversation management, tool execution loop
+    ├── acp.d        # ACP JSON-RPC protocol handler
+    ├── claude_hooks.d # External Claude Code–compatible user hooks engine
+    ├── llm.d        # Provider-neutral messages and the LLMClient interface
+    ├── http.d       # libcurl transport (streaming, timeouts)
+    ├── retry.d      # Retry classification and backoff
+    ├── providers/   # Provider registry + presets
+    │   ├── openai.d     # OpenAI Chat Completions (and compatible servers)
+    │   ├── responses.d  # OpenAI Responses API
+    │   ├── anthropic.d  # Anthropic Messages API
+    │   ├── muse.d       # UNOFFICIAL Meta Muse Code provider
+    │   ├── mock.d       # Offline scripted client
+    │   └── demo.d       # Offline demo model (`--model demo/demo`)
+    ├── copilot.d    # UNOFFICIAL Copilot-subscription provider (login, tokens)
+    ├── tools/       # Tool registry and the built-in tools
+    │   ├── bash.d       # bash tool: timeout, file capture, bounded output
+    │   ├── files.d      # read_file / write_file / edit_file
+    │   └── search.d     # glob / grep
+    ├── shell.d      # Bash parser used by the permission checks
+    ├── permissions.d, guard.d # Allow/deny rules and built-in guards against destructive commands
+    ├── sandbox.d, landlock.d  # Seatbelt (macOS) / Landlock (Linux) sandbox for shell commands
+    ├── session.d    # Versioned append-only JSONL session log
+    ├── session_index.d # Session summaries (.index.jsonl) for the --resume picker
+    ├── resume.d     # --resume picker, --resume last, --list-sessions
+    ├── context.d    # Token accounting, context-window heuristics, overflow detection
+    ├── status.d     # Status bar contents (the frame's last row)
+    ├── ui.d         # Verbosity levels and the streaming output renderer
+    ├── frame.d, frameui.d # App-owned frame renderer and its owner thread
+    ├── markdown.d, md*.d  # Markdown rendering of answers
+    ├── lineedit.d   # Key-by-key prompt input (editing, history, mid-turn steer/queue)
+    ├── control.d    # Turn control shared with the key reader: cancel, steers
+    ├── instructions.d # AGENTS.md / CLAUDE.md discovery for the system prompt
+    ├── plan.d       # Task plan and the plan_add / plan_update / plan_show tools
+    ├── queue.d      # The interactive message queue and the /queue editor
+    ├── goal.d       # report_outcome tool (completed / blocked / needs_input)
+    ├── memory.d     # Cross-session memory: memory_save / memory_search / memory_forget
+    ├── mode.d       # Agent mode (normal / plan / auto) and the plan-mode tool gate
+    ├── question.d   # question tool and the mid-turn question / turn-cap rendezvous
+    ├── commands.d   # Slash-command table for /help and the as-you-type menu
+    ├── skills.d     # SKILL.md discovery, ai.lock sources and the load_skill tool
+    ├── reminders.d  # <system-reminder> notes appended to tool results
+    ├── herdr.d      # Herdr state / resume / release reports
+    ├── settings.d, settings_dialog.d # /settings menu and config-file writer
+    ├── config.d, toml.d, toml_edit.d # Configuration file loading and editing
+    └── safeio.d     # The audited @trusted wrappers and thread-safe primitives
 ```
+
+nano-coder was written in Rust up to 0.69; 1.0 is a rewrite in D. The Rust code is on the
+`rust` branch. `PORTING.md` maps every Rust module to its D counterpart and lists the known
+differences, `REVIEW.md` compares the safety and architecture of the two implementations, and
+`parity/manifest.tsv` records how each Rust test was ported.
 
 Mode selection: `--acp` flag enables ACP headless mode; default is interactive CLI.
 
@@ -219,21 +227,14 @@ Mode selection: `--acp` flag enables ACP headless mode; default is interactive C
 
 nano-coder has two hook systems.
 
-### Internal hooks (observe-only)
+### Internal events (observe-only)
 
-The harness exposes 6 internal lifecycle hook events for in-process Rust
-callbacks. These are **observe-only**: a callback can inspect the event payload
-(for logging, metrics, debugging) but cannot block, modify, or redirect the
-agent. They are registered programmatically against `agent.hooks()`.
-
-| Hook | When it fires |
-|------|---------------|
-| `before_context_load` | Before processing user input |
-| `after_context_load` | After adding user message to conversation |
-| `before_llm_send` | Before sending messages to LLM |
-| `after_llm_response` | After receiving LLM response |
-| `before_tool_call` | Before executing a tool |
-| `after_tool_call` | After tool execution completes |
+The agent loop reports what it does through the `AgentEvents` interface
+(`nano/agent.d`): streamed text and reasoning, each tool call's start and end, token
+usage, steering messages and complete replies. The CLI and ACP front ends implement it
+to render output; an implementation can also log or collect metrics. These are
+**observe-only**: they cannot block, modify or redirect the agent. (The Rust version's
+six named internal hook events are replaced by this interface.)
 
 ### External user hooks (Claude Code–compatible)
 
@@ -324,9 +325,9 @@ the [permission rules and sandbox](#permissions-and-sandbox) instead.
 
 ## Permissions and Sandbox
 
-nano-coder never stops to ask for approval. Every tool call is checked before it runs
-instead, and a blocked call returns an error telling the model to stop and ask the user
-rather than work around the block.
+nano-coder never stops to ask for approval (it runs headless in agent fleets). Every tool call
+is checked before it runs instead, and a blocked call returns an error telling the model to
+stop and ask the user rather than work around the block.
 
 **Order of checks:** `deny` rules, then `allow` rules, then the built-in guards. Deny always
 wins. An allow rule approves a shell command only when *every* command in it matches, so
@@ -349,23 +350,6 @@ wins. An allow rule approves a shell command only when *every* command in it mat
 `bash -c '...'`, `eval`, `ssh host cmd`, `find -exec`, and here-documents fed to a shell. A command
 that cannot be parsed, or a script computed at run time (`bash -c "$CMD"`,
 `eval "$(curl ...)"`), is blocked.
-
-**Shell loops** (`for`/`select`/`while`/`until`) are checked by effect. A loop whose every
-condition and body command is provably read-only (`echo`, `grep`, `cat`, `wc`, ...) runs
-freely. A `for` loop over a *literal* word list (plain words, quoted strings, brace
-expansions — no globs, substitutions or unknown variables) is unrolled: each value is
-substituted for the loop variable and every resulting body command is checked exactly as if
-written out by hand, so `for q in "a b" "c d"; do gh search repos "$q"; done` is allowed
-wherever the two `gh` commands are, and an unrolled command that is denied or catastrophic
-is denied. The unroll is capped (64 iterations) and refuses a body that rebinds the loop
-variable or still expands something at run time after substitution; those fall through to
-the next rule. A loop that still cannot be verified — a non-literal list, or a static body
-command that is not a known read-only utility — **runs when the OS sandbox is on** (the
-sandbox confines what it can write) and is **blocked** with the usual guidance when it is
-off; nano-coder never prompts for it. The hard blocks always stand: a command name computed
-at run time, `eval`/interpreters (`sh -c`, `python -c`, ...), path-qualified programs outside
-`/bin`/`/usr/bin`, assignments to `PATH`/`IFS` and other dangerous names, arithmetic-assignment
-tricks, and writes/redirections to computed targets.
 
 **Built-in guards** (`builtin_rules = true`) block:
 
@@ -416,12 +400,11 @@ can fix it. To send a message that starts with `/`, such as a path, type `//`:
 
 Typing `/` at the prompt lists the commands under it, and each further character narrows the
 list. Tab completes the command, or the part all matches share. Esc hides the list. The
-list is built from the same table as `/help` (`src/commands.rs`). Commands with a known
+list is built from the same table as `/help` (`nano/commands.d`). Commands with a known
 argument set (`/model`, `/mode`, `/verbosity`, `/thinking`) get the same treatment for their first
 argument: a type-ahead list narrows as you type and Tab completes it.
 
 - `/help` - Show available commands
-- `/version` - Show the nano-coder version (the same string `nano-coder --version` prints)
 - `/compact [--smart|--standard] [focus]` - Summarize older messages with the current model,
   keeping the latest message. `--smart` / `--standard` override `compaction_mode` for this
   compaction (see [Smart compaction](#smart-compaction-experimental)). Optional text tells the
@@ -444,7 +427,6 @@ argument: a type-ahead list narrows as you type and Tab completes it.
 - `/tools` - List registered tools
 - `/skills` - List the skills the agent can load, where each lives, and any loading warnings
 - `/plan` - Show the agent's task plan with all notes
-- `/timers` - List the session's timers (the agent schedules them with `timer_set` to come back to you later); shows each timer's id, due time and note (see [Timers](#timers))
 - `/memory [forget ID]` - List cross-session memories with their ids, or delete one by id (see [Memory](#memory))
 - `/hooks` - List the loaded external user hooks (from `.claude/settings.json` and friends), the files they came from, and any skipped entries (see [Lifecycle Hooks](#lifecycle-hooks))
 - `/queue [list|add text|remove N...|edit N text|clear]` - Show or edit the queued messages and unread steers. Works while a turn runs, so a queued message or steer can be removed or rewritten before it is sent.
@@ -459,86 +441,26 @@ argument: a type-ahead list narrows as you type and Tab completes it.
 - `/trajectory` - Show this session's trajectory turn by turn: user input, thinking, answers, tool calls and results, tokens and timings. Each message row is labelled with its `#N` session-log ID, the same ID `history_read` and smart-compaction summaries use (compaction and crash-recovered input rows have no `#N`, as they aren't cited that way). It opens in your pager (`$PAGER`, default `less`), even when it would fit on the screen, so you dismiss it with `q` and it doesn't stay in the transcript or your scrollback — but only at an idle prompt on a terminal: invoked mid-turn (while a turn runs) or with piped output it prints inline instead. `/trajectory --json` or `/trajectory --markdown` prints an export instead; `nano-coder --trajectory SESSION_ID [--json|--markdown]` does the same for any saved session
 - `/resume [ID|last]` - Switch to a saved session without restarting: the same picker as `--resume` (leaving out the session in use), or the session with that ID, or `last` (the most recent other session in this directory). Run it at the prompt, not during a turn
 - `/restart` - Start a fresh session (clean context) without exiting
-- `/update` - Install the latest release through the channel nano-coder was installed from (`npm install -g @nanobpm/nano-coder@latest`, `brew upgrade nanobpm/tap/nano-coder`; a cargo install is told how to switch to one of those), with the installer's progress on the terminal; verifies the installed version afterwards and leaves the running session untouched on failure. On an install that is not managed by npm, Homebrew or cargo it prints the releases page and changes nothing. Run it at the prompt, not during a turn (see [Updates](#updates))
-- `/relaunch` - Restart the binary (re-resolved, so a just-installed update is picked up), resuming the current session — the transcript and scrollback carry over. Works whether or not an update was just installed. An unsent draft or queued messages are confirmed before being discarded. Run it at the prompt, not during a turn (see [Updates](#updates))
 - `/exit` - Exit the agent (prints the session's `--resume` command first, when session persistence is enabled)
-
-## Updates
-
-In an interactive terminal session, nano-coder checks in the background whether a newer
-release exists: once at startup (in a background task — the first prompt is never delayed)
-and then every hour. The last-check time and the latest-known version are persisted in
-`<platform data dir>/nano-coder/update-check.json`, so rapid restarts do not re-check
-inside the hour. When a newer version is found, a single non-modal hint per new version is
-shown at an idle prompt:
-
-> nano-coder 0.43.0 is available (you have 0.42.1) — /update to install it
-
-The check runs only in interactive TTY sessions — never in `-p`/headless, ACP or CI runs
-(automated runners use deliberately pinned versions) — and only when the binary is managed
-by a known install channel, detected once at startup from the executable's path:
-
-- **npm** (under a `node_modules/@nanobpm/` tree — both launcher states: the
-  platform-package binary and the self-replaced copy in `bin/`): the latest version comes
-  from `https://registry.npmjs.org/@nanobpm/nano-coder/latest`, and `/update` runs
-  `npm install -g @nanobpm/nano-coder@latest`.
-- **Homebrew** (the binary resolves into `<brew prefix>/Cellar/nano-coder/`): the latest
-  version is the one the [nanobpm/homebrew-tap](https://github.com/nanobpm/homebrew-tap)
-  formula points at (bumped by the release workflow a few minutes after each release), and
-  `/update` runs `brew upgrade nanobpm/tap/nano-coder`. `/relaunch` restarts through the
-  formula's `opt` link, so it finds the new version after brew removes the old one.
-- **cargo** (in `$CARGO_HOME/bin`, default `~/.cargo/bin`): 1.0 and later are not on
-  crates.io, so the latest version comes from npm, and `/update` prints how to switch to
-  npm or Homebrew (then `cargo uninstall nano-coder`) instead of running cargo.
-- **anything else** (standalone tarball, a dev build in `target/`, a distro package): no
-  background check and no self-modification. `/update` explains that the install is not
-  managed and points at the
-  [releases page](https://github.com/nanobpm/nano-coder/releases); a locally built binary
-  is never overwritten.
-
-`/update` runs only at an idle prompt. It suspends the frame UI while the installer owns
-the terminal, then verifies the result with `nano-coder --version`: on success it suggests
-`/relaunch`; on failure it shows the installer's exit status and leaves the running
-session untouched. If the channel's tool (`npm`/`cargo`) is not on `PATH`, `/update`
-prints the exact manual command instead. If you are already on the latest release (a fresh
-check, not the hourly cache), it says so.
-
-`/relaunch` restarts the harness without losing the session: it re-resolves the binary
-(so a just-installed update is picked up), restores the terminal modes, and replaces the
-process with the original arguments plus `--resume <current session>`. The session log,
-persisted timers and trust decisions live outside the process and carry over; ephemeral
-state — session-scoped permission grants and MCP connections — is re-established by the
-resume, as with any `--resume`. An unsent draft or queued messages are confirmed before
-being discarded. It also works with no update pending, as a "restart the harness, keep
-the session" verb (unlike `/restart`, which starts a fresh session with clean context).
-
-The check fails silently and quickly when the network is unavailable (a short timeout, no
-retries, no effect on turn latency). To opt out, either:
-
-```toml
-# ~/.config/nano-coder/config.toml
-check_updates = false
-```
-
-or set an environment variable — `NANO_CODER_NO_UPDATE_CHECK=1`, or the de-facto standard
-`NO_UPDATE_NOTIFIER=1`.
 
 ## Building and Running
 
+You need [LDC](https://github.com/ldc-developers/ldc) 1.43+ and dub, plus the libcurl
+development headers on Linux.
+
 ```bash
-cargo build --release
-./target/release/nano-coder
+dub build -b release   # ./nano-coder
+./nano-coder
 ```
 
-Or run directly:
+Then, for example:
 
 ```bash
-cargo run
-cargo run -- --model anthropic/claude-sonnet-4-5
-cargo run -- --model ollama/qwen2.5:1.5b
-cargo run -- --resume sess-20260923T012518-7e7923f8
-cargo run -- --resume        # pick a session
-cargo run -- --resume last   # the most recent session in this directory
+nano-coder --model anthropic/claude-sonnet-4-5
+nano-coder --model ollama/qwen2.5:1.5b
+nano-coder --resume sess-20260923T012518-7e7923f8
+nano-coder --resume        # pick a session
+nano-coder --resume last   # the most recent session in this directory
 ```
 
 **Resuming.** `--resume` without an ID opens a picker of this directory's saved sessions, most
@@ -564,16 +486,15 @@ asks again on the session's next turn.
 
 Flags: `--login github-copilot|muse`, `--list-models PROVIDER`, `--trajectory SESSION_ID [--json|--markdown]`, `--acp`, `--model provider/model` (or `AGENTIC_HARNESS_MODEL`), `--resume [SESSION_ID|last]`, `--list-sessions [--all] [--json]`,
 `--config PATH`, `--verbosity LEVEL` (`-v`), `--sandbox off|workspace|read-only` (or `NANO_CODER_SANDBOX`),
-`--allow RULE` and `--deny RULE` (repeatable; added to the config's rules), `--wait-timers`, `--version` (`-V`).
+`--allow RULE` and `--deny RULE` (repeatable; added to the config's rules), `--version` (`-V`).
 
-`--wait-timers` keeps the session alive for scheduled timers (see [Timers](#timers)) after input ends.
-In an interactive session the agent already waits at the prompt, but a piped or redirected run exits
-once stdin closes — so a run that reads its prompt from a pipe needs `--wait-timers` to keep waiting
-for timers set during the turn to come due, fire, and be delivered. Ctrl-C exits the wait.
-
-Before opening a PR, run `cargo fmt` (style in `rustfmt.toml`), `cargo clippy --all-targets -- -D warnings`
-and `cargo test`; CI checks all three. To keep `git blame` past the one-time reformat, run
-`git config blame.ignoreRevsFile .git-blame-ignore-revs` once.
+Before opening a PR, run `dub build` and `dub test` (both run `scripts/check-safe.sh`
+first) and D-Scanner (`dub run dscanner -- --styleCheck --config dscanner.ini source`); CI
+checks all three. All code is `@safe`: every module starts with `@safe:`, and calls the
+compiler can't check are wrapped in small, commented `@trusted` functions (shared ones in
+`source/nano/safeio.d`). `check-safe.sh` fails the build on a module without `@safe:`, an
+uncommented `@trusted`, raw threads or `__gshared` outside `safeio.d`, or more `@trusted` than
+the budgets in `scripts/` allow. The build uses `-preview=dip1000` and `-preview=nosharedaccess`.
 
 ## Configuration
 
@@ -593,10 +514,7 @@ session_titles = false                  # ask the model for a few-word title per
 # title_model = "openai/gpt-4o-mini"    # model for titles (default: the session's model)
 auto_compact = true                     # summarize automatically when the context fills up
 auto_compact_threshold = 0.8            # fraction of the context window
-idle_compact = true                     # already past the threshold? compact at the idle prompt, not on your next message (Esc Esc cancels)
-# idle_compact_hold_secs = 180          # how long the prompt (and any draft) must sit untouched first
 compaction_mode = "standard"            # standard | smart (experimental, see Smart compaction)
-# compaction_pin_requests = true        # re-attach the user's requests verbatim after each summary (issue #66)
 # context_window = 128000               # override the window (providers can set it too)
 verbosity = "normal"                    # quiet | normal | verbose | debug (or --verbosity)
 timestamps = true                       # prefix CLI messages with the local time (HH:MM:SS)
@@ -607,12 +525,10 @@ user_rules_dirs = ["~/.claude/rules"]
 instruction_imports_outside_project = false   # let project @imports / rule links leave the repo
 plan_tools = true                       # offer the plan_* tools (see Task Plans)
 outcome_tool = true                     # offer report_outcome (see Outcomes)
-verify_before_complete = true           # ask once for the check's evidence when completing after an unchecked edit (see Outcomes)
 reminders = true                        # append <system-reminder> notes to tool results
 memory = "on"                           # on | read_only | off — cross-session memory (see Memory)
 # memory_dir = "/path/to/memory"        # default: <platform data dir>/nano-coder/memory
 memory_expiry_days = 90                 # expire memories unused this long (0 = never)
-check_updates = true                    # hourly background release check, interactive sessions only (see Updates)
 
 [skills]                                # see Skills
 enabled = true
@@ -692,7 +608,7 @@ kind = "anthropic"
 base_url = "https://llm-gateway.example.com/anthropic/v1"
 api_key_env = "WORK_GATEWAY_KEY"        # or api_key = "..." (prefer the env var)
 # api_key_command = "op read op://vault/gateway/key"   # used when the env var is unset
-timeout_secs = 300                      # idle timeout: max silence between streamed bytes (default 120, or $NANO_CODER_PROVIDER_TIMEOUT_SECS)
+timeout_secs = 300                      # idle timeout: max silence between streamed bytes (default 600)
 max_retries = 3
 ```
 
@@ -736,45 +652,6 @@ api_key_env = "BAILIAN_TOKEN_PLAN_API_KEY"
 `replay_reasoning = true`, which sends each assistant message's `reasoning_content` back
 as thinking models like K3 require. Set `extra_body = { reasoning_effort = "low" }` to
 make K3 think less.
-
-#### Regional OpenRouter workspaces and curated model lists
-
-Some OpenRouter workspaces (e.g. Camunda's) reject the global `openrouter.ai` host, so
-the `openrouter` preset fails with them. They accept only the regional hosts
-`us.openrouter.ai` and `eu.openrouter.ai`, and each model is served on just one of them.
-Three provider settings cover this:
-
-- `[providers.<name>.models."<model>"]` takes a `base_url`, which overrides the
-  provider's for that model, and a display `name`.
-- `list_models = "configured"` makes `/model`, `--list-models` and `/model` Tab completion
-  offer only the models configured under `models`, with their names, instead of the
-  endpoint's whole `/models` catalogue. The default is `"endpoint"`.
-- `disabled = true` hides a provider (a preset too) from `/providers`, the pickers and
-  suggestions. A model spec that names it is an error.
-
-```toml
-model = "openrouter-camunda/moonshotai/kimi-k3"
-
-[providers.openrouter]
-disabled = true                         # the global host is rejected
-
-[providers.openrouter-camunda]
-kind = "openai"
-base_url = "https://us.openrouter.ai/api/v1"
-api_key_env = "OPENROUTER_API_KEY"
-list_models = "configured"
-
-[providers.openrouter-camunda.models."moonshotai/kimi-k3"]
-name = "Kimi K3"
-
-[providers.openrouter-camunda.models."amazon/nova-lite-v1"]
-name = "Nova Lite 1.0"
-base_url = "https://eu.openrouter.ai/api/v1"   # served in the EU only
-```
-
-[`examples/openrouter-camunda.toml`](examples/openrouter-camunda.toml) is the full
-equivalent of the `opencode.json` in Camunda's handbook. A model's `"provider": {"api": …}`
-there becomes its `base_url` here.
 
 ### Temperature
 
@@ -895,34 +772,8 @@ content hash), so session logs stay small and `--resume` still works; a missing 
 resume is sent as a text placeholder.
 
 Other per-provider fields: `replay_reasoning`, `max_tokens_param` (`max_tokens`, or `max_completion_tokens`
-which is the `openai` default), `retry_initial_backoff_ms`, `retry_max_backoff_ms`,
-`retryable_statuses` and `offline_budget_ms`.
-
-`timeout_secs` is an *idle* timeout: it resets on every received byte, so a slow but steady
-stream is never cut off — only a genuinely stalled connection trips it. The default is 120 s
-(`NANO_CODER_PROVIDER_TIMEOUT_SECS` overrides the default; an explicit `timeout_secs` wins
-over both). When nano-coder runs under a supervisor that idle-kills a silent run — e.g. the
-c8ctl-nano worker, which kills a run after 300 s of no output — `timeout_secs` must stay
-**below** that budget: at or above it the worker kills the whole run before a stalled stream
-is ever detected and retried. A supervising worker can pass its own derived budget (e.g. its
-idle-kill budget / 2) as `NANO_CODER_PROVIDER_TIMEOUT_SECS` so the two timeouts cannot drift.
-
-A transport failure with no HTTP response (DNS, connection refused or reset, connect or
-idle timeout) is treated as the network being down rather than a failed attempt: nano-coder
-backs off (`retry_initial_backoff_ms` doubling to `retry_max_backoff_ms`) and keeps waiting,
-reporting the outage on a single live line (`network unavailable (…); retrying in Ns
-(Ctrl-C to stop)`) when stderr is a terminal, or announcing it once when output is piped, so
-a long outage never floods the log. When a response finally arrives it announces the
-recovery, so a turn survives a laptop sleep, a Wi-Fi change or a VPN reconnect instead of
-failing after about a minute. A redirect-policy error (a redirect loop or a disallowed
-redirect) is *not* an outage — HTTP is flowing — so it surfaces its actionable error at once
-instead of being retried. These waits do not consume `max_retries` (which still bounds
-HTTP-status retries like 429 or 5xx), and the Copilot session-token refresh waits the same
-way. If a stream drops after it started replying, the partial reply is discarded (nothing
-reaches history) and the request is re-sent, up to ten times per model call. The wait is
-unbounded by default; set `offline_budget_ms` to give up after that many milliseconds
-offline — the budget bounds the whole wait, backoff sleeps included, and no further request
-is issued once it is spent.
+which is the `openai` default), `retry_initial_backoff_ms`, `retry_max_backoff_ms` and
+`retryable_statuses`.
 
 The old top-level `api_key` / `base_url` still work. They apply to `default_provider`,
 which becomes `openai` if it was `mock`.
@@ -1117,20 +968,6 @@ another 10% of the window, so a context that can't shrink isn't summarized on ev
 If summarizing fails, the older messages are dropped with a note. The session log records
 the new conversation, so `--resume` continues from it.
 
-After the summary, compaction re-attaches the **user's requests verbatim** (a pinned block,
-`compaction_pin_requests`, on by default). A summary of a summary would otherwise paraphrase
-the user's original words away over repeated compactions; the pinned block is rebuilt from the
-original messages each time, so an exact flag, number or phrase the user stated once survives
-intact. The block is bounded by an allowance derived from the context window (about an eighth
-of it): when a long session's requests outgrow it, the oldest follow-ups are dropped with an
-explicit omission note — the goal and the newest requests are kept — so the pin can never push
-the context past the window. The note names the dropped requests by one covering session-log span
-(`#2-#40`), so however many requests are dropped the note stays a fixed, small size. Hook output appended to a prompt is not pinned as the user's
-words — the user-typed text is recorded separately, so a prompt that itself mentions a
-`<system-reminder>` tag (even at its very start) keeps its whole task in the pin. In smart mode each pinned request is
-labelled with its `#N` log ID, so the full text is
-one `history_read` away.
-
 ### Smart compaction (experimental)
 
 A summary is lossy: whatever it leaves out is gone for the agent, even though the session
@@ -1323,30 +1160,6 @@ the result:
 
 Plan and outcome calls don't count. Set `reminders = false` to turn them off.
 
-## Timers
-
-The `timer_*` tools let the agent schedule a note to itself to come back to you later — for
-example to check on a long build, or to follow up after a delay. A timer lives only for the
-session (it is written to the session log, so `--resume` restores pending ones).
-
-- `timer_set` - schedule a timer. Give exactly one of `after` (a delay like `30m`, `1h30m`,
-  `90s`, `2 hours`, `1.5h`) or `at` (a time like `HH:MM` for the next occurrence, or an ISO
-  date-time such as `2026-10-25T14:30`, local unless you append an offset like `+02:00` or `Z`),
-  plus a `note` describing what to do when it fires. Up to 10 timers can be active at once.
-- `timer_list` - the session's timers with their ids, due times and notes.
-- `timer_cancel` - drop a timer by `id`.
-- `timer_done` - acknowledge a fired timer by `id` once it is handled.
-
-When a timer comes due it is delivered to the model as an automatic turn. If one fires while a
-turn is already running it is delivered mid-turn; otherwise it starts a fresh automatic turn
-when the session is idle. `/timers` shows the current timers in the terminal.
-
-In an interactive session the agent waits at the prompt, so due timers fire naturally. A piped
-or redirected (non-interactive) run, however, exits as soon as stdin closes — pass
-`--wait-timers` to keep such a run alive after input ends so timers set during the turn can come
-due, fire and be delivered; Ctrl-C exits the wait. The timer tools are available in interactive
-CLI sessions; ACP headless mode has no idle loop to fire them, so they are not offered there.
-
 ## Outcomes
 
 `report_outcome` is the model's explicit end-of-task signal: `status` is `completed` (the
@@ -1360,15 +1173,6 @@ stops after the call but before the turn ends, resuming the input finishes it wi
 recorded outcome without calling the model again. In the terminal the call shows as
 `✔ completed`, `■ blocked`, or `? needs input` followed by the summary. Set `outcome_tool = false` to leave the
 tool out.
-
-A `completed` report is expected to name its check: the `summary` description asks for what was done
-*and how it was checked* (the command run and its result). To back that up, `verify_before_complete`
-(on by default in the terminal) watches the turn: if the model edited a file (`write_file` / `edit_file`)
-after its last `bash` call and then reports `completed`, that one report is bounced with a reminder —
-"You changed files after your last check. Run the relevant tests/build, or report again if no check
-applies." The reminder fires at most once per turn, so a second `report_outcome` always goes through
-and the model is never trapped; `blocked` and `needs_input` are never intercepted. The ACP harness
-turns the flag off because the orchestrator runs its own verification there.
 
 `needs_input` is the structural "waiting on the user" signal: an orchestrator (or auto mode)
 can tell it apart from a clean `completed` without guessing from the text. For a richer,
@@ -1398,22 +1202,8 @@ evidence (a file path or command). Search is a case-insensitive regex
 over the text and the optional evidence, as in `history_search` - no embeddings or vector
 store.
 
-**Tools** (offered when `memory` is on): `memory_save(scope, text, evidence?, kind?, anchors?)`,
+**Tools** (offered when `memory` is on): `memory_save(scope, text, evidence?)`,
 `memory_search(pattern, scope?)`, `memory_forget(id)`.
-
-**Recall from tool calls.** Before relying on the model to search, each tool call's arguments
-are matched (lexically, no model call) against memory *anchors*: backticked spans, path-like
-tokens and host names in the text and evidence (common commands such as `git` are ignored), or
-the entry's explicit `anchors` list, which replaces the extracted ones. A match attaches a
-note to the tool result - `📌 note from an earlier session (verify ...)` with its `check:`
-command and how long ago it was last used. A `hint` (the default `kind`) is recalled once per
-context; a `rule` on every match. At most 2 notes are attached per turn. What has been seen is
-session state (persisted like timers, reset by compaction and new sessions), never stored in
-the memory file, and a `memory_search` result counts as seen. Recall works in read-only
-(headless/ACP) sessions too. Each recall, and each recall later followed by a `memory_search`
-of that memory, is appended to `<memory_dir>/recall.jsonl`; `/memory` shows the counts
-(`recalled N×, used M×`) so over-broad anchors can be spotted. Entries without `kind`/`anchors`
-load unchanged.
 
 **Prompt.** A capped, dated index (most-recently-used first, ~4 KB with the guidance) is
 appended to the system prompt at session start, framed as "notes from earlier sessions; may be
@@ -1489,27 +1279,25 @@ properties and findings.
 
 ### Adding Tools
 
-```rust
-let tool_def = ToolDefinition::new(
-    "my_tool",
-    "Description of what the tool does",
-    json!({ "type": "object", "properties": { ... } })
-);
-agent.tools().register(tool_def, Box::new(|args| {
-    // Tool implementation
-    Ok(json!({ "result": "..." }))
-}));
+```d
+agent.tools.register(ToolDefinition("my_tool", "Description of what the tool does",
+    parseJSON(`{"type": "object", "properties": { ... }}`)),
+    (JSONValue args) {
+        // Tool implementation; the string is what the model sees.
+        return "result";
+    });
 ```
 
-The model sees a JSON string result as plain text and any other value as serialized JSON.
+### Observing the agent
 
-### Adding internal (observe-only) hooks
+Pass your own `AgentEvents` to `agent.run`:
 
-```rust
-agent.hooks().register(HookEvent::BeforeToolCall, Box::new(|ctx| {
-    let tool_name = ctx.data.get("tool_name").and_then(|v| v.as_str());
-    println!("About to call tool: {}", tool_name);
-}));
+```d
+class Logger : AgentEvents
+{
+    void toolStart(const ref ToolCall call) { writeln("About to call tool: ", call.name); }
+    // text, toolEnd, usage, userMessage, assistantMessage ...
+}
 ```
 
 These callbacks observe only; to block, modify, or add context to a tool call
@@ -1518,16 +1306,15 @@ or prompt, use the external Claude-compatible user hooks described under
 
 ### Custom LLM Client
 
-Implement the async `LLMClient` trait (or add a `ProviderKind` in `src/providers/`):
+Implement the `LLMClient` interface (`nano/llm.d`), or add a provider in `nano/providers/`:
 
-```rust
-#[async_trait::async_trait]
-impl LLMClient for MyClient {
-    async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
-        // request.messages, request.tools, request.temperature, request.max_tokens
-    }
-    fn model_name(&self) -> &str { "my-model" }
-    fn provider_name(&self) -> &str { "mine" }
+```d
+class MyClient : LLMClient
+{
+    LLMResponse chat(const ref ChatRequest req, StreamSink sink) { /* req.messages, req.tools, ... */ }
+    string[] listModels() { return ["my-model"]; }
+    string modelName() const { return "my-model"; }
+    string providerName() const { return "mine"; }
 }
 ```
 
