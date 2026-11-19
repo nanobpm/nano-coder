@@ -35,7 +35,6 @@ struct Changes {
     system_prompt: bool,
     compaction: bool,
     verbosity: bool,
-    renderer: bool,
     providers: BTreeSet<String>,
 }
 
@@ -53,7 +52,6 @@ impl Changes {
             || self.system_prompt
             || self.compaction
             || self.verbosity
-            || self.renderer
             || !self.providers.is_empty()
     }
 }
@@ -189,7 +187,6 @@ pub async fn run(
                 config.compaction_mode.as_str()
             ),
             format!("Verbosity        {} ({})", config.verbosity, config.verbosity.describe()),
-            format!("Renderer         {} ({})", config.renderer, config.renderer.describe()),
             format!("Save to config file{}", if changes.any() { " (unsaved changes)" } else { "" }),
             "Done".to_string(),
         ];
@@ -376,29 +373,7 @@ pub async fn run(
                     Err(e) => return (notices, Err(e.into())),
                 }
             }
-            9 => {
-                let modes = crate::frame::RendererMode::ALL;
-                let labels: Vec<String> = modes.iter().map(|m| format!("{m:<7} {}", m.describe())).collect();
-                let current = modes.iter().position(|m| *m == agent.config().renderer).unwrap_or(0);
-                // Esc keeps the current renderer (`Ok(None)`); only a genuine I/O
-                // failure is `Err` and must surface.
-                match Select::new().with_prompt("Renderer").items(&labels).default(current).interact_opt() {
-                    Ok(Some(choice)) => {
-                        let previous = agent.config().renderer;
-                        agent.config_mut().renderer = modes[choice];
-                        changes.renderer = true;
-                        if modes[choice] != previous {
-                            // The switch is applied live by `main` (which detects the
-                            // changed `renderer` after the dialog returns and flips the
-                            // frame renderer, the line editor, and the scroll region).
-                            println!("Renderer set to {} — taking effect now.", modes[choice]);
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => return (notices, Err(e.into())),
-                }
-            }
-            10 => save_and_report(agent.config(), &mut changes, config_path, &mut notices),
+            9 => save_and_report(agent.config(), &mut changes, config_path, &mut notices),
             // `Done` and Esc share the one completion path (`finish!`), so both
             // offer to save when `changes.any()` before returning.
             _ => finish!(),
@@ -690,7 +665,11 @@ fn apply_qwen_endpoint(config: &mut ProviderConfig, endpoint: &providers::qwen::
 fn recent_models(recents: &[String], all: &std::collections::BTreeMap<String, ProviderConfig>) -> Vec<String> {
     recents
         .iter()
-        .filter(|spec| spec.split_once('/').is_none_or(|(provider, _)| all.contains_key(provider)))
+        // Skip a spec whose provider is no longer configured or is hidden:
+        // hidden entries neither appear nor consume a RECENT_MODELS_SHOWN slot.
+        .filter(|spec| {
+            spec.split_once('/').is_none_or(|(provider, _)| all.get(provider).is_some_and(|p| p.is_visible()))
+        })
         .take(RECENT_MODELS_SHOWN)
         .cloned()
         .collect()
@@ -709,6 +688,14 @@ enum ProviderChoice {
 /// highlight: the most recent model that isn't the current one, so `/model`
 /// then Enter flips back to the previous model; without one, the current
 /// provider.
+/// A configured model's picker row: its display name, then its id.
+fn model_label(id: &str, name: Option<&str>) -> String {
+    match name.filter(|n| !n.trim().is_empty()) {
+        Some(name) => format!("{}  ({id})", crate::sanitize_terminal_line(name)),
+        None => id.to_string(),
+    }
+}
+
 fn provider_rows(
     recent: &[String],
     current_spec: &str,
@@ -725,13 +712,14 @@ fn provider_rows(
     let first_provider = rows.len();
     rows.extend(
         all.iter()
+            .filter(|(_, p)| p.is_visible())
             .map(|(name, p)| (format!("{name:<14} {}", key_status(p)), Some(ProviderChoice::Provider(name.clone())))),
     );
     rows.push(("Cancel".to_string(), None));
-    let default = recent
-        .iter()
-        .position(|spec| spec != current_spec)
-        .unwrap_or_else(|| first_provider + all.keys().position(|name| name == current_provider).unwrap_or(0));
+    let default = recent.iter().position(|spec| spec != current_spec).unwrap_or_else(|| {
+        first_provider
+            + all.iter().filter(|(_, p)| p.is_visible()).position(|(name, _)| name == current_provider).unwrap_or(0)
+    });
     (rows, default)
 }
 
@@ -772,22 +760,30 @@ async fn pick_model_from_provider(
 ) -> Result<Step> {
     let default_model = all.get(name).and_then(|p| p.default_model.clone()).unwrap_or_default();
 
-    println!("Fetching models from {name}...");
-    let models = match providers::build_lister(name, user, default_provider) {
-        Ok(client) => match tokio::time::timeout(LIST_MODELS_TIMEOUT, client.list_models()).await {
-            Ok(Ok(models)) => models,
-            Ok(Err(e)) => {
-                println!("Could not list models: {e:#}");
+    // A curated list (`list_models = "configured"`) needs no request.
+    let configured = all.get(name).and_then(ProviderConfig::configured_models);
+    if configured.is_none() {
+        println!("Fetching models from {name}...");
+    }
+    let models = if let Some(list) = &configured {
+        list.iter().map(|(id, _)| id.clone()).collect()
+    } else {
+        match providers::build_lister(name, user, default_provider) {
+            Ok(client) => match tokio::time::timeout(LIST_MODELS_TIMEOUT, client.list_models()).await {
+                Ok(Ok(models)) => models,
+                Ok(Err(e)) => {
+                    println!("Could not list models: {e:#}");
+                    Vec::new()
+                }
+                Err(_) => {
+                    println!("Listing models timed out");
+                    Vec::new()
+                }
+            },
+            Err(e) => {
+                println!("Could not build a client for {name}: {e:#}");
                 Vec::new()
             }
-            Err(_) => {
-                println!("Listing models timed out");
-                Vec::new()
-            }
-        },
-        Err(e) => {
-            println!("Could not build a client for {name}: {e:#}");
-            Vec::new()
         }
     };
 
@@ -800,7 +796,10 @@ async fn pick_model_from_provider(
             .allow_empty(true)
             .interact_text()?
     } else {
-        let mut labels = models.clone();
+        let mut labels = match &configured {
+            Some(list) => list.iter().map(|(id, name)| model_label(id, name.as_deref())).collect(),
+            None => models.clone(),
+        };
         labels.push("Other (type a model ID)".into());
         labels.push("Back to providers".into());
         let default = models.iter().position(|m| *m == default_model).unwrap_or(0);
@@ -1069,7 +1068,7 @@ async fn edit_provider(agent: &mut Agent) -> Result<Option<ProviderEdit>> {
             // the saved settings no longer match the live client — is returned
             // for `main` to re-show through the renderer after the dialog's
             // exit redraw. It is NOT printed here: in frame mode a plain
-            // `println!` is wiped by `frame_resize`, and in legacy mode (where
+            // `println!` is wiped by `frame_resize`, and with plain output (where
             // `frame_resize` is a no-op) printing here too would show the same
             // warning twice — once inline and once via the retained notice.
             Err(e) => {
@@ -1412,9 +1411,9 @@ fn save(config: &Config, changes: &Changes, path: &Path) -> Result<()> {
     if changes.verbosity {
         doc["verbosity"] = toml_edit::value(config.verbosity.to_string());
     }
-    if changes.renderer {
-        doc["renderer"] = toml_edit::value(config.renderer.to_string());
-    }
+    // The renderer setting is retired (only the frame renderer remains): drop
+    // a stale key whenever the file is rewritten.
+    doc.remove("renderer");
     if changes.compaction {
         doc["auto_compact"] = toml_edit::value(config.auto_compact);
         doc["auto_compact_threshold"] = toml_edit::value(config.auto_compact_threshold);
@@ -1547,6 +1546,19 @@ mod tests {
     }
 
     #[test]
+    fn recent_models_skip_hidden_providers_without_consuming_slots() {
+        let mut all = providers(&["anthropic", "openai", "work"]);
+        all.get_mut("work").unwrap().hidden = Some(true);
+        let recents = specs(&["work/llama3", "anthropic/claude", "bare-model", "openai/gpt-5", "openai/o3"]);
+        // `work` is hidden: its recent neither appears nor eats one of the
+        // RECENT_MODELS_SHOWN slots, so all four visible entries are kept.
+        assert_eq!(
+            recent_models(&recents, &all),
+            specs(&["anthropic/claude", "bare-model", "openai/gpt-5", "openai/o3"])
+        );
+    }
+
+    #[test]
     fn thinking_choices_default_lands_on_the_existing_level() {
         use crate::thinking::Thinking;
         let levels = vec!["low".to_string(), "high".to_string()];
@@ -1591,6 +1603,20 @@ mod tests {
             labels.iter().all(|l| l.starts_with("unset") || l.starts_with("default")),
             "only default/unset: {labels:?}"
         );
+    }
+
+    #[test]
+    fn provider_rows_skip_disabled_providers_and_configured_models_show_names() {
+        let mut all = providers(&["anthropic", "openai", "openrouter"]);
+        all.get_mut("anthropic").unwrap().disabled = Some(true);
+        let (rows, default) = provider_rows(&[], "openai/gpt-5", "openai", &all);
+        let labels: Vec<&str> = rows.iter().map(|(label, _)| label.as_str()).collect();
+        assert!(labels[0].starts_with("openai ") && labels[1].starts_with("openrouter "), "{labels:?}");
+        assert_eq!(labels.len(), 3, "{labels:?}");
+        assert_eq!(default, 0, "the current provider, counted among the shown rows");
+        assert_eq!(model_label("amazon/nova-lite-v1", Some("Nova Lite 1.0")), "Nova Lite 1.0  (amazon/nova-lite-v1)");
+        assert_eq!(model_label("m", Some(" ")), "m");
+        assert_eq!(model_label("m", Some("A\x1b[2Jb")), "Ab  (m)", "escape sequence dropped");
     }
 
     #[test]

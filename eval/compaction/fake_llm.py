@@ -14,7 +14,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 LOSSY_SUMMARY = "The user and the agent worked on the lease crate and then did several unrelated follow-ups. Details were not recorded."
 
 # Question keyword -> pattern the oracle searches for.
-SEARCHES = [("method", "no method named"), ("branch", "branch"), ("command", "--features"), ("mutex", "mutex"), ("ticket", "ticket")]
+SEARCHES = [("method", "no method named"), ("branch", "branch"), ("command", "--features"), ("mutex", "mutex"),
+            ("ticket", "ticket"), ("flag", "--strict-lease")]
+
+# Marker a prompt can carry to get a fixed, content-free reply: the eval's
+# between-compactions follow-up uses it so the intermediate assistant message
+# echoes nothing from the visible context (a plain oracle reply would quote
+# the pinned block back, letting the retained tail pass the case's check even
+# when the second compaction failed to regenerate the pin — issue #66).
+ACK_PROMPT = "Reply with a bare acknowledgement and nothing else."
+ACK_REPLY = "Acknowledged."
 
 
 def reply(body):
@@ -25,6 +34,8 @@ def reply(body):
         return {"content": LOSSY_SUMMARY}
     last = messages[-1]
     question = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+    if last["role"] == "user" and question.strip() == ACK_PROMPT:
+        return {"content": ACK_REPLY}
     if last["role"] == "user" and "history_search" in tools:
         pattern = next((p for word, p in SEARCHES if word in question.lower()), question.split()[0])
         return {"tool_calls": [{"id": "call_oracle", "type": "function",

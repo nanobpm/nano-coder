@@ -117,11 +117,25 @@ pub struct RetryPolicy {
     pub max_retries: u32,
     pub initial_backoff: Duration,
     pub max_backoff: Duration,
+    /// How long to keep waiting out a *transport* failure that produced no HTTP
+    /// response (DNS, connection refused/reset, connect/idle timeout) before
+    /// giving up. Unlike HTTP-status retries, these do not consume
+    /// `max_retries`: the request backs off (`initial_backoff` doubling to
+    /// `max_backoff`) for as long as the network is down, so a turn survives a
+    /// laptop sleep or a Wi-Fi change instead of failing after about a minute.
+    /// Unbounded (`Duration::MAX`) by default; tests bound it so an
+    /// always-offline endpoint still fails.
+    pub offline_budget: Duration,
 }
 
 impl Default for RetryPolicy {
     fn default() -> Self {
-        Self { max_retries: 5, initial_backoff: Duration::from_secs(1), max_backoff: Duration::from_secs(30) }
+        Self {
+            max_retries: 5,
+            initial_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(30),
+            offline_budget: Duration::MAX,
+        }
     }
 }
 

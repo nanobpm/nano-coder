@@ -7,6 +7,12 @@
 //! `/queue clear` empties it. Edits apply between turns, so a removed
 //! message is never sent.
 //!
+//! Steers (plain Enter mid-turn) share the same id space and the same
+//! `/queue` surface: until the agent reads a steer at its next step it is
+//! listed as `steer`, and `remove`/`edit`/`clear` apply to it too — so a
+//! steer the running turn has made stale can be withdrawn or rewritten. A
+//! steer the agent has already read is gone from the list.
+//!
 //! A queued message is never injected while the agent is waiting for input:
 //! the drain happens only after the turn future has resolved (a pending
 //! `question`/turn-cap picker parks the loop inside the turn), and
@@ -38,6 +44,20 @@ impl MessageQueue {
         self.next_id += 1;
         self.entries.push_back(QueuedMessage { id, text: text.into() });
         id
+    }
+
+    /// Take an id without queueing anything (for a steer, so steers and
+    /// queued messages never share an id).
+    pub fn reserve_id(&mut self) -> usize {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    /// Queue a message under an id taken earlier with [`Self::reserve_id`]
+    /// (a steer the turn ended before reading keeps its id).
+    pub fn push_with_id(&mut self, id: usize, text: impl Into<String>) {
+        self.entries.push_back(QueuedMessage { id, text: text.into() });
     }
 
     /// The next message to run, if any.
@@ -81,6 +101,30 @@ impl MessageQueue {
         let n = self.entries.len();
         self.entries.clear();
         n
+    }
+}
+
+/// Steers sent to the running turn that the agent has not read yet. The
+/// queue edits apply to them as well as to queued messages.
+pub trait PendingSteers {
+    fn pending(&self) -> Vec<(usize, String)>;
+    fn remove(&self, ids: &[usize]) -> usize;
+    fn edit(&self, id: usize, text: &str) -> bool;
+    fn clear(&self) -> usize;
+}
+
+impl PendingSteers for crate::agent::TurnControl {
+    fn pending(&self) -> Vec<(usize, String)> {
+        self.pending_steers()
+    }
+    fn remove(&self, ids: &[usize]) -> usize {
+        self.remove_steers(ids)
+    }
+    fn edit(&self, id: usize, text: &str) -> bool {
+        self.edit_steer(id, text)
+    }
+    fn clear(&self) -> usize {
+        self.clear_steers()
     }
 }
 
@@ -143,54 +187,82 @@ pub fn parse(args: &str) -> Result<QueueOp, String> {
     }
 }
 
-/// Apply a parsed edit to the queue; the string says what happened.
-pub fn apply(queue: &mut MessageQueue, op: &QueueOp) -> String {
+/// Apply a parsed edit to the queue and any unread steers; the string says
+/// what happened.
+pub fn apply(queue: &mut MessageQueue, steers: Option<&dyn PendingSteers>, op: &QueueOp) -> String {
     match op {
-        QueueOp::List => describe(queue),
+        QueueOp::List => describe(queue, steers),
         QueueOp::Remove(ids) => {
+            let withdrawn = steers.map_or(0, |s| s.remove(ids));
             let removed = queue.remove(ids);
-            if removed == 0 {
-                format!("No queued message with {} ({})", ids_text(ids), queue_summary(queue))
-            } else {
-                format!("Removed {removed} queued message{} ({})", plural(removed), queue_summary(queue))
+            match (withdrawn, removed) {
+                (0, 0) => format!("No pending message with {} ({})", ids_text(ids), summary(queue, steers)),
+                (0, n) => format!("Removed {n} queued message{} ({})", plural(n), summary(queue, steers)),
+                (w, 0) => format!("Withdrew {w} steer{} ({})", plural(w), summary(queue, steers)),
+                (w, n) => format!(
+                    "Withdrew {w} steer{} and removed {n} queued message{} ({})",
+                    plural(w),
+                    plural(n),
+                    summary(queue, steers)
+                ),
             }
         }
         QueueOp::Edit { id, text } => {
-            if queue.edit(*id, text.clone()) {
+            if steers.is_some_and(|s| s.edit(*id, text)) {
+                format!("Steer #{id} updated: {}", preview(text, 60))
+            } else if queue.edit(*id, text.clone()) {
                 format!("Queue #{id} updated: {}", preview(text, 60))
             } else {
-                format!("No queued message with id {id} ({})", queue_summary(queue))
+                format!("No pending message with id {id} ({})", summary(queue, steers))
             }
         }
         QueueOp::Add(text) => {
             let id = queue.push(text.clone());
-            format!("↧ queued #{id} ({}) — /queue remove {id} to drop", queue_summary(queue))
+            format!("↧ queued #{id} ({}) — /queue remove {id} to drop", summary(queue, steers))
         }
         QueueOp::Clear => {
+            let w = steers.map_or(0, |s| s.clear());
             let n = queue.clear();
-            format!("Cleared {n} queued message{}", plural(n))
+            if w == 0 {
+                format!("Cleared {n} queued message{}", plural(n))
+            } else {
+                format!("Cleared {n} queued message{} and withdrew {w} steer{}", plural(n), plural(w))
+            }
         }
     }
 }
 
-/// One line per waiting message, oldest first.
-pub fn describe(queue: &MessageQueue) -> String {
-    if queue.is_empty() {
-        return "Queue is empty. Ctrl-Enter (or /queue add) while a turn runs queues a message; plain Enter steers."
-            .to_string();
+const EMPTY: &str =
+    "Queue is empty. Enter while a turn runs steers it; Ctrl-Enter (or /queue add) queues a message for after it.";
+
+/// One line per pending message: unread steers first (the agent reads them
+/// at its next step), then queued messages, oldest first.
+pub fn describe(queue: &MessageQueue, steers: Option<&dyn PendingSteers>) -> String {
+    let pending = steers.map(|s| s.pending()).unwrap_or_default();
+    if queue.is_empty() && pending.is_empty() {
+        return EMPTY.to_string();
     }
-    let mut out = format!("Queued ({}):", queue.len());
+    let mut out = format!("Pending ({}):", queue.len() + pending.len());
+    for (id, text) in &pending {
+        out.push_str(&format!("\n  {id:>3}  steer   {}", preview(text, 80)));
+    }
     for entry in queue.list() {
-        out.push_str(&format!("\n  {:>3}  {}", entry.id, preview(&entry.text, 80)));
+        out.push_str(&format!("\n  {:>3}  queued  {}", entry.id, preview(&entry.text, 80)));
+    }
+    if !pending.is_empty() {
+        out.push_str("\nSteers go to the agent at its next step; /queue remove or edit them before then.");
     }
     out
 }
 
-/// `N queued message[s]` / "queue is empty", for trailing summaries.
-fn queue_summary(queue: &MessageQueue) -> String {
-    match queue.len() {
-        0 => "queue is empty".to_string(),
-        n => format!("{n} queued"),
+/// "2 steers, 1 queued" / "queue is empty", for trailing summaries.
+fn summary(queue: &MessageQueue, steers: Option<&dyn PendingSteers>) -> String {
+    let w = steers.map_or(0, |s| s.pending().len());
+    match (w, queue.len()) {
+        (0, 0) => "queue is empty".to_string(),
+        (0, n) => format!("{n} queued"),
+        (w, 0) => format!("{w} steer{} pending", plural(w)),
+        (w, n) => format!("{w} steer{} pending, {n} queued", plural(w)),
     }
 }
 
@@ -278,26 +350,23 @@ mod tests {
         queue.push("beta");
         queue.push("gamma");
 
-        let listed = apply(&mut queue, &QueueOp::List);
-        assert!(listed.contains("Queued (3):"), "{listed}");
-        assert!(listed.contains("  0  alpha") && listed.contains("  2  gamma"), "{listed}");
+        let listed = apply(&mut queue, None, &QueueOp::List);
+        assert!(listed.contains("Pending (3):"), "{listed}");
+        assert!(listed.contains("  0  queued  alpha") && listed.contains("  2  queued  gamma"), "{listed}");
 
-        let removed = apply(&mut queue, &QueueOp::Remove(vec![1, 9]));
+        let removed = apply(&mut queue, None, &QueueOp::Remove(vec![1, 9]));
         assert!(removed.contains("Removed 1 queued message"), "{removed}");
         assert!(removed.contains("(2 queued)"), "{removed}");
 
-        let edited = apply(&mut queue, &QueueOp::Edit { id: 2, text: "GAMMA".into() });
+        let edited = apply(&mut queue, None, &QueueOp::Edit { id: 2, text: "GAMMA".into() });
         assert!(edited.contains("#2"), "{edited}");
         assert_eq!(queue.list()[1].text, "GAMMA");
 
-        let missing = apply(&mut queue, &QueueOp::Remove(vec![7]));
-        assert!(missing.contains("No queued message with id 7"), "{missing}");
+        let missing = apply(&mut queue, None, &QueueOp::Remove(vec![7]));
+        assert!(missing.contains("No pending message with id 7"), "{missing}");
 
-        assert!(apply(&mut queue, &QueueOp::Clear).contains("Cleared 2"));
-        assert_eq!(
-            apply(&mut queue, &QueueOp::List),
-            "Queue is empty. Ctrl-Enter (or /queue add) while a turn runs queues a message; plain Enter steers."
-        );
+        assert!(apply(&mut queue, None, &QueueOp::Clear).contains("Cleared 2"));
+        assert_eq!(apply(&mut queue, None, &QueueOp::List), EMPTY);
     }
 
     #[test]
@@ -315,8 +384,50 @@ mod tests {
         assert!(parse("add").is_err());
         assert!(parse("add   ").is_err());
         let mut queue = MessageQueue::default();
-        let note = apply(&mut queue, &QueueOp::Add("later".into()));
+        let note = apply(&mut queue, None, &QueueOp::Add("later".into()));
         assert!(note.starts_with("↧ queued #") && note.contains("/queue remove"), "{note}");
         assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn edits_reach_unread_steers_and_share_ids_with_the_queue() {
+        let control = crate::agent::TurnControl::default();
+        let mut queue = MessageQueue::default();
+        let s0 = queue.reserve_id();
+        control.steer_with_id("use the old api", s0);
+        let q1 = queue.push("then write docs");
+        let s2 = queue.reserve_id();
+        control.steer_with_id("skip the tests", s2);
+        control.steer("acp steer, not listed", None);
+        assert_eq!((s0, q1, s2), (0, 1, 2));
+        let steers: Option<&dyn PendingSteers> = Some(&control);
+
+        let listed = apply(&mut queue, steers, &QueueOp::List);
+        assert!(listed.starts_with("Pending (3):"), "{listed}");
+        assert!(listed.contains("  0  steer   use the old api"), "{listed}");
+        assert!(listed.contains("  1  queued  then write docs"), "{listed}");
+        assert!(!listed.contains("acp steer"), "{listed}");
+
+        let edited = apply(&mut queue, steers, &QueueOp::Edit { id: 0, text: "use the new api".into() });
+        assert!(edited.starts_with("Steer #0 updated"), "{edited}");
+        assert_eq!(control.pending_steers()[0].1, "use the new api");
+
+        let removed = apply(&mut queue, steers, &QueueOp::Remove(vec![2, 1]));
+        assert!(removed.contains("Withdrew 1 steer and removed 1 queued message"), "{removed}");
+        assert!(removed.contains("(1 steer pending)"), "{removed}");
+
+        // Once the agent reads a steer it is no longer editable.
+        let read = control.take_pending();
+        assert_eq!(read.len(), 2, "the edited steer and the untracked one are delivered");
+        assert_eq!(read[0].text, "use the new api");
+        let late = apply(&mut queue, steers, &QueueOp::Edit { id: 0, text: "too late".into() });
+        assert!(late.starts_with("No pending message with id 0"), "{late}");
+
+        let s3 = queue.reserve_id();
+        control.steer_with_id("one more", s3);
+        control.steer("untracked", None);
+        let cleared = apply(&mut queue, steers, &QueueOp::Clear);
+        assert!(cleared.contains("withdrew 1 steer"), "{cleared}");
+        assert_eq!(control.take_pending().len(), 1, "clear leaves untracked (ACP) steers alone");
     }
 }

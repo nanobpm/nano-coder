@@ -97,6 +97,13 @@ pub struct ModelSettings {
     /// the built-in table.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_levels: Option<Vec<String>>,
+    /// Display name in the model picker (`list_models = "configured"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Endpoint for this model, overriding the provider's `base_url` (e.g. an
+    /// OpenRouter workspace whose models are each served on one regional host).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
 }
 
 /// Where the temperature in effect came from.

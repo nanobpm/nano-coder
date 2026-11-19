@@ -1,13 +1,14 @@
-# nano-coder-d
+# nano-coder
 
 **A 4MB coding agent. Run a fleet on your laptop.**
 
-nano-coder-d is a coding agent for the terminal, written in D: a port of the Rust [nano-coder](https://github.com/nanobpm/nano-coder), installed as a separate `nano-coder-d` command so the two can sit side by side. It reads the same config (`~/.config/nano-coder/config.toml`, `NANO_CODER_*`), writes compatible session logs, and speaks the same ACP protocol. It uses about 4MB of memory (peak footprint on macOS), where Node-based agent CLIs take 150–660MB, so you can run dense fleets of agent workers on one machine. It runs interactively, or headless over ACP as a worker for [nano-workforce](https://github.com/nanobpm/nano-workforce) via c8ctl-nano.
+nano-coder is a coding agent for the terminal, written in D. Up to 0.69 it was written in Rust; 1.0 is the D rewrite, with the same commands, config (`~/.config/nano-coder/config.toml`, `NANO_CODER_*`), session logs and ACP protocol. It uses about 4MB of memory (peak footprint on macOS), where Node-based agent CLIs take 150–660MB, so you can run dense fleets of agent workers on one machine. It runs interactively, or headless over ACP as a worker for [nano-workforce](https://github.com/nanobpm/nano-workforce) via c8ctl-nano.
 
 ## Install
 
 ```sh
-npm install -g @nanobpm/nano-coder-d   # prebuilt binaries for macOS and Linux (x64, arm64)
+npm install -g @nanobpm/nano-coder       # prebuilt binaries for macOS and Linux (x64, arm64)
+brew install nanobpm/tap/nano-coder      # the same binaries through Homebrew
 ```
 
 The Linux binaries need glibc 2.35+ and the system libcurl (`libcurl4` on Debian/Ubuntu,
@@ -15,8 +16,10 @@ The Linux binaries need glibc 2.35+ and the system libcurl (`libcurl4` on Debian
 [Building and Running](#building-and-running).
 
 ```sh
-nano-coder-d --help
+nano-coder --help
 ```
+
+`cargo install nano-coder` still installs the last Rust release (0.69), which is no longer updated.
 
 ## Features
 
@@ -28,7 +31,7 @@ nano-coder-d --help
 - **Lifecycle Hooks**: an `AgentEvents` interface for observing agent behavior, plus
   Claude Code–compatible external user hooks loaded from `.claude/settings.json`
 - **Configuration**: TOML-based config file at `~/.config/nano-coder/config.toml`
-- **Commands**: `/help`, `/compact`, `/context`, `/verbosity`, `/settings`, `/tools`, `/skills`, `/queue`, `/restart`, `/exit`
+- **Commands**: `/help`, `/version`, `/compact`, `/context`, `/verbosity`, `/settings`, `/tools`, `/skills`, `/queue`, `/restart`, `/update`, `/relaunch`, `/exit`
 - **Streaming output**: answers stream in, thinking shows collapsed, tool calls show inline
 - **Status line** as the bottom row of the terminal, plus manual and automatic context compaction
 - **Task plans**: `plan_*` tools keep a plan with notes outside the conversation, so long tasks survive compaction, resume and a change of worker

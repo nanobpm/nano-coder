@@ -10,6 +10,8 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use chrono::Local;
+
 use crate::agent::Agent;
 use crate::context::ContextStats;
 use crate::plan::Plan;
@@ -43,7 +45,10 @@ pub enum Timing {
 pub fn timing(cmd: &str) -> Timing {
     let (name, arg) = split_cmd(cmd);
     match (name, arg) {
-        ("/help" | "/tools" | "/skills" | "/providers" | "/session" | "/plan" | "/context", "") => Timing::Immediate,
+        (
+            "/help" | "/version" | "/tools" | "/skills" | "/providers" | "/session" | "/plan" | "/timers" | "/context",
+            "",
+        ) => Timing::Immediate,
         // Only the supported export forms run early; anything else defers so
         // the between-turns command reports the unknown option (as it does for
         // every other command given arguments it doesn't take).
@@ -155,8 +160,14 @@ impl Snapshot {
     }
 
     /// The output of a read-only command (see [`timing`]), or `None` for any
-    /// other command. `stats` and `plan` are the live values.
-    pub fn output(&self, cmd: &str, stats: &ContextStats, plan: &Plan) -> Option<Output> {
+    /// other command. `stats`, `plan` and `timers` are the live values.
+    pub fn output(
+        &self,
+        cmd: &str,
+        stats: &ContextStats,
+        plan: &Plan,
+        timers: &crate::timers::Timers,
+    ) -> Option<Output> {
         let block = |text: String| Some(Output::Block(text));
         // Split on any whitespace, exactly as `timing` classifies the line, so
         // a tab/newline-separated form routes to the same arm its
@@ -164,6 +175,7 @@ impl Snapshot {
         let (name, arg) = split_cmd(cmd);
         match (name, arg) {
             ("/help", "") => block(crate::commands::help_text()),
+            ("/version", "") => block(crate::commands::version_string()),
             ("/tools", "") => block(self.tools(stats.mode, stats.history_available)),
             ("/skills", "") => block(self.skills.clone()),
             ("/providers", "") => block(self.providers()),
@@ -172,6 +184,7 @@ impl Snapshot {
                 block("No plan yet. The agent makes one with the plan_add tool.".into())
             }
             ("/plan", "") => block(plan.render(true, usize::MAX).trim_end().to_string()),
+            ("/timers", "") => block(timers.render_command(Local::now())),
             ("/context", "") => block(self.context(stats)),
             ("/mode", "") => {
                 let current = stats.mode;
@@ -221,7 +234,7 @@ impl Snapshot {
     /// actually requested, not when the snapshot is captured.
     fn providers(&self) -> String {
         let mut out = vec![format!("Providers (default: {}):", self.default_provider)];
-        for (name, provider) in &self.providers {
+        for (name, provider) in self.providers.iter().filter(|(_, p)| p.is_visible()) {
             let kind = provider.kind.map(|k| format!("{k:?}").to_lowercase()).unwrap_or_else(|| "?".into());
             let key = crate::settings::key_status(provider);
             let url = provider.base_url.clone().unwrap_or_else(|| crate::settings::derived_endpoint_source(provider));
@@ -315,11 +328,22 @@ impl Snapshot {
 mod tests {
     use super::*;
     use crate::mode::AgentMode;
+    use crate::timers::Timers;
 
     #[test]
     fn timing_sorts_commands_by_what_they_touch() {
-        for cmd in ["/help", "/tools", "/skills", "/providers", "/session", "/plan", "/context", "/mode", "/verbosity"]
-        {
+        for cmd in [
+            "/help",
+            "/version",
+            "/tools",
+            "/skills",
+            "/providers",
+            "/session",
+            "/plan",
+            "/context",
+            "/mode",
+            "/verbosity",
+        ] {
             assert_eq!(timing(cmd), Timing::Immediate, "{cmd}");
         }
         for cmd in ["/trajectory", "/trajectory --json", "/trajectory --markdown", "/trajectory --md"] {
@@ -338,6 +362,7 @@ mod tests {
         }
         // A read-only command given arguments it doesn't take is not run early.
         assert_eq!(timing("/plan extra"), Timing::AfterTurn);
+        assert_eq!(timing("/version extra"), Timing::AfterTurn);
         // Only the supported `/trajectory` forms run early: an unknown option
         // defers to the between-turns command, which reports the bad option.
         for cmd in ["/trajectory --bogus", "/trajectory extra", "/trajectory --json extra"] {
@@ -355,22 +380,39 @@ mod tests {
             window_source: "from config".into(),
             ..Default::default()
         };
-        let Some(Output::Block(mode)) = snapshot.output("/mode", &stats, &Plan::default()) else { panic!() };
+        let Some(Output::Block(mode)) = snapshot.output("/mode", &stats, &Plan::default(), &Timers::default()) else {
+            panic!()
+        };
         assert!(mode.starts_with("Mode: plan"), "{mode}");
-        let Some(Output::Block(context)) = snapshot.output("/context", &stats, &Plan::default()) else { panic!() };
+        let Some(Output::Block(context)) = snapshot.output("/context", &stats, &Plan::default(), &Timers::default())
+        else {
+            panic!()
+        };
         assert!(context.contains("500 of 1000 tokens (50.0%)"), "{context}");
         assert!(context.contains("Compaction:   smart mode"), "{context}");
         assert!(context.ends_with("(context window from config)"), "{context}");
 
-        let Some(Output::Block(empty)) = snapshot.output("/plan", &stats, &Plan::default()) else { panic!() };
+        let Some(Output::Block(empty)) = snapshot.output("/plan", &stats, &Plan::default(), &Timers::default()) else {
+            panic!()
+        };
         assert!(empty.starts_with("No plan yet"), "{empty}");
         let mut plan = Plan::default();
         plan.apply("plan_add", &serde_json::json!({"items": ["write the tests"]})).unwrap();
-        let Some(Output::Block(shown)) = snapshot.output("/plan", &stats, &plan) else { panic!() };
+        let Some(Output::Block(shown)) = snapshot.output("/plan", &stats, &plan, &Timers::default()) else { panic!() };
         assert!(shown.contains("write the tests"), "{shown}");
 
-        assert_eq!(snapshot.output("/compact", &stats, &plan), None);
-        assert_eq!(snapshot.output("hello", &stats, &plan), None);
+        // `/timers` is immediate too: empty, and with one set.
+        let Some(Output::Block(empty)) = snapshot.output("/timers", &stats, &plan, &Timers::default()) else {
+            panic!()
+        };
+        assert_eq!(empty, "No timers set. The agent sets one with the timer_set tool.");
+        let mut timers = Timers::default();
+        timers.apply("timer_set", &serde_json::json!({"after": "30m", "note": "check CI"}), Local::now()).unwrap();
+        let Some(Output::Block(listed)) = snapshot.output("/timers", &stats, &plan, &timers) else { panic!() };
+        assert!(listed.contains("check CI"), "{listed}");
+
+        assert_eq!(snapshot.output("/compact", &stats, &plan, &timers), None);
+        assert_eq!(snapshot.output("hello", &stats, &plan, &timers), None);
     }
 
     #[test]
@@ -382,7 +424,10 @@ mod tests {
         let snapshot = Snapshot::default();
         let fresh =
             ContextStats { window: 128_000, window_source: "known for the model name".into(), ..Default::default() };
-        let Some(Output::Block(before)) = snapshot.output("/context", &fresh, &Plan::default()) else { panic!() };
+        let Some(Output::Block(before)) = snapshot.output("/context", &fresh, &Plan::default(), &Timers::default())
+        else {
+            panic!()
+        };
         assert!(before.ends_with("(context window known for the model name)"), "{before}");
 
         let learned = ContextStats {
@@ -390,7 +435,10 @@ mod tests {
             window_source: "learned from a context-overflow error".into(),
             ..Default::default()
         };
-        let Some(Output::Block(after)) = snapshot.output("/context", &learned, &Plan::default()) else { panic!() };
+        let Some(Output::Block(after)) = snapshot.output("/context", &learned, &Plan::default(), &Timers::default())
+        else {
+            panic!()
+        };
         assert!(after.ends_with("(context window learned from a context-overflow error)"), "{after}");
     }
 
@@ -398,7 +446,9 @@ mod tests {
     fn trajectory_without_a_session_says_so() {
         let snapshot = Snapshot::default();
         for cmd in ["/trajectory", "/trajectory --json"] {
-            let Some(Output::Block(note)) = snapshot.output(cmd, &ContextStats::default(), &Plan::default()) else {
+            let Some(Output::Block(note)) =
+                snapshot.output(cmd, &ContextStats::default(), &Plan::default(), &Timers::default())
+            else {
                 panic!("{cmd}")
             };
             assert!(note.contains("Session persistence is disabled"), "{note}");
@@ -421,8 +471,8 @@ mod tests {
         let stats = ContextStats::default();
         for (tabbed, spaced) in [("/trajectory\t--json", "/trajectory --json"), ("/trajectory\t", "/trajectory")] {
             assert_eq!(
-                snapshot.output(tabbed, &stats, &Plan::default()),
-                snapshot.output(spaced, &stats, &Plan::default()),
+                snapshot.output(tabbed, &stats, &Plan::default(), &Timers::default()),
+                snapshot.output(spaced, &stats, &Plan::default(), &Timers::default()),
                 "{tabbed:?} must render like {spaced:?}",
             );
         }
@@ -443,11 +493,16 @@ mod tests {
         let normal = ContextStats { mode: AgentMode::Normal, ..Default::default() };
         let plan = ContextStats { mode: AgentMode::Plan, ..Default::default() };
 
-        let Some(Output::Block(all)) = snapshot.output("/tools", &normal, &Plan::default()) else { panic!() };
+        let Some(Output::Block(all)) = snapshot.output("/tools", &normal, &Plan::default(), &Timers::default()) else {
+            panic!()
+        };
         assert!(all.contains("read_file"), "{all}");
         assert!(all.contains("edit_file"), "{all}");
 
-        let Some(Output::Block(filtered)) = snapshot.output("/tools", &plan, &Plan::default()) else { panic!() };
+        let Some(Output::Block(filtered)) = snapshot.output("/tools", &plan, &Plan::default(), &Timers::default())
+        else {
+            panic!()
+        };
         assert!(filtered.contains("read_file"), "{filtered}");
         assert!(!filtered.contains("edit_file"), "{filtered}");
     }
@@ -469,12 +524,17 @@ mod tests {
         let without = ContextStats { history_available: false, ..Default::default() };
         let with = ContextStats { history_available: true, ..Default::default() };
 
-        let Some(Output::Block(hidden)) = snapshot.output("/tools", &without, &Plan::default()) else { panic!() };
+        let Some(Output::Block(hidden)) = snapshot.output("/tools", &without, &Plan::default(), &Timers::default())
+        else {
+            panic!()
+        };
         assert!(hidden.contains("read_file"), "{hidden}");
         assert!(!hidden.contains(crate::history::SEARCH_TOOL), "{hidden}");
         assert!(!hidden.contains(crate::history::READ_TOOL), "{hidden}");
 
-        let Some(Output::Block(shown)) = snapshot.output("/tools", &with, &Plan::default()) else { panic!() };
+        let Some(Output::Block(shown)) = snapshot.output("/tools", &with, &Plan::default(), &Timers::default()) else {
+            panic!()
+        };
         assert!(shown.contains(crate::history::SEARCH_TOOL), "{shown}");
         assert!(shown.contains(crate::history::READ_TOOL), "{shown}");
     }

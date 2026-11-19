@@ -66,7 +66,7 @@ The workflow needs repository variable `RELEASE_APP_CLIENT_ID` and secret
    Read and write; installable only on this account.
 2. On the app page note the **Client ID**, then **Generate a private key** (downloads a
    `.pem`).
-3. **Install App** → nanobpm → *Only select repositories* → `nano-coder`.
+3. **Install App** → nanobpm → *Only select repositories* → `nano-coder` and `homebrew-tap`.
 4. Store the credentials, then delete the `.pem`:
 
    ```sh
@@ -75,6 +75,15 @@ The workflow needs repository variable `RELEASE_APP_CLIENT_ID` and secret
    ```
 5. Add the app to the ruleset's bypass list (Settings → Rules → `main` → Bypass list → add
    the app, *Always allow*).
+
+## Homebrew tap
+
+The `homebrew` job regenerates `Formula/nano-coder.rb` in
+[nanobpm/homebrew-tap](https://github.com/nanobpm/homebrew-tap) from the release's `SHA256SUMS`
+(`scripts/homebrew-formula.mjs`) and pushes it with the release app's token, so the app must be
+installed on `homebrew-tap` too. Users install with `brew install nanobpm/tap/nano-coder`. To fix
+the tap by hand (e.g. after a failed job), run the script locally against the release's
+`SHA256SUMS` and push the result to the tap's `main`.
 
 ## Registry auth
 
@@ -94,5 +103,5 @@ its first version locally (`node scripts/npm-packages.mjs --version X.Y.Z --bina
 ## Adding a platform
 
 Add a row to the `build` matrix in `release.yml`, add the package name to `PLATFORMS` in
-`npm/nano-coder/lib/platform.js` and to `TARGETS` in `scripts/npm-packages.mjs`. Windows is not
+`npm/nano-coder/lib/platform.js` and to `TARGETS` in `scripts/npm-packages.mjs`, and add its block to `scripts/homebrew-formula.mjs`. Windows is not
 supported yet (the terminal and process-group code is Unix-only).

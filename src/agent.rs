@@ -3,8 +3,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+mod idle_compact;
+mod probe;
+
+#[cfg(test)]
+use crate::llm::DetectedWindow;
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Local, Utc};
+use idle_compact::IdleCompactGate;
+use probe::{Detected, ProbeState};
 use serde_json::{Value, json};
 
 use crate::claude_hooks;
@@ -14,9 +21,7 @@ use crate::goal::{self, Outcome};
 use crate::history;
 use crate::hooks::{HookContext, HookEvent, HookRegistry};
 use crate::instructions::ProjectInstructions;
-use crate::llm::{
-    ChatRequest, ContextCap, DetectedWindow, LLMClient, LLMResponse, Message, Role, StreamEvent, ToolCall,
-};
+use crate::llm::{ChatRequest, ContextCap, LLMClient, LLMResponse, Message, Role, StreamEvent, ToolCall};
 use crate::memory;
 use crate::output;
 use crate::permissions::Policy;
@@ -25,6 +30,7 @@ use crate::providers;
 use crate::reminders::{self, Reminders};
 use crate::session::{self, PendingInput, Record, SessionLog};
 use crate::skills::{self, Skills};
+use crate::timers::{self, Timers};
 use crate::tools::ToolRegistry;
 
 const INTERRUPTED_TOOL_RESULT: &str =
@@ -33,6 +39,11 @@ const CANCELLED_TOOL_RESULT: &str = "Error: the turn was cancelled before this t
 const LOOP_STOPPED_TOOL_RESULT: &str =
     "Error: the turn is ending as blocked (repeated-call loop detected); this tool call was not run.";
 pub const CANCELLED_RESPONSE: &str = "[turn cancelled]";
+
+/// Most times a single model call will be re-sent after the connection drops
+/// mid-reply (a `StreamInterrupted`) before the turn gives up. Bounds the
+/// "network came back but the stream keeps breaking" case.
+const MAX_STREAM_RESTARTS: u32 = 10;
 
 /// Turn cap for a headless (non-interactive) session whose configured cap is
 /// unbounded — `max_iterations = 0`, or Auto mode, which disables the cap.
@@ -240,6 +251,9 @@ impl RateMeter {
 pub struct Steer {
     pub text: String,
     pub tag: Option<Value>,
+    /// The interactive queue id (shared with queued messages) so `/queue`
+    /// can list, edit or withdraw the steer before the agent reads it.
+    pub id: Option<usize>,
 }
 
 /// Why a turn ended.
@@ -300,6 +314,10 @@ struct ControlInner {
     /// The plan as last published by the agent (every `AgentEvent::Plan`),
     /// so `/plan` can show it while a turn holds the agent.
     plan: Mutex<crate::plan::Plan>,
+    /// The timers as last published by the agent (every change and
+    /// `Agent::refresh_stats`), so `/timers` can list them while a turn holds
+    /// the agent.
+    timers: Mutex<crate::timers::Timers>,
     /// `/thinking LEVEL` for this session; wins over the config. Shared so a
     /// level set mid-turn applies from the agent's next model call.
     thinking: Mutex<Option<crate::thinking::Thinking>>,
@@ -324,6 +342,7 @@ impl Default for TurnControl {
                 model: Mutex::new(None),
                 model_tx: tokio::sync::watch::channel(0u64).0,
                 plan: Mutex::new(crate::plan::Plan::default()),
+                timers: Mutex::new(crate::timers::Timers::default()),
                 thinking: Mutex::new(None),
             }),
         }
@@ -333,7 +352,49 @@ impl Default for TurnControl {
 impl TurnControl {
     /// Queue a message for the running turn; it is added before the next model call.
     pub fn steer(&self, text: &str, tag: Option<Value>) {
-        self.inner.steers.lock().unwrap().push_back(Steer { text: text.to_string(), tag });
+        self.inner.steers.lock().unwrap().push_back(Steer { text: text.to_string(), tag, id: None });
+    }
+
+    /// Queue a steer carrying a `/queue` id, so it can be edited or withdrawn
+    /// until the agent reads it.
+    pub fn steer_with_id(&self, text: &str, id: usize) {
+        self.inner.steers.lock().unwrap().push_back(Steer { text: text.to_string(), tag: None, id: Some(id) });
+    }
+
+    /// Id-carrying steers the agent has not read yet, oldest first.
+    pub fn pending_steers(&self) -> Vec<(usize, String)> {
+        let steers = self.inner.steers.lock().unwrap();
+        steers.iter().filter_map(|s| s.id.map(|id| (id, s.text.clone()))).collect()
+    }
+
+    /// Withdraw unread steers by id; returns how many were removed. A steer
+    /// the agent already read is gone from the list, so it is not counted.
+    pub fn remove_steers(&self, ids: &[usize]) -> usize {
+        let mut steers = self.inner.steers.lock().unwrap();
+        let before = steers.len();
+        steers.retain(|s| !s.id.is_some_and(|id| ids.contains(&id)));
+        before - steers.len()
+    }
+
+    /// Rewrite an unread steer; false when none has that id (never sent, or
+    /// already read by the agent).
+    pub fn edit_steer(&self, id: usize, text: &str) -> bool {
+        let mut steers = self.inner.steers.lock().unwrap();
+        match steers.iter_mut().find(|s| s.id == Some(id)) {
+            Some(steer) => {
+                steer.text = text.to_string();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Withdraw every unread id-carrying steer; returns how many.
+    pub fn clear_steers(&self) -> usize {
+        let mut steers = self.inner.steers.lock().unwrap();
+        let before = steers.len();
+        steers.retain(|s| s.id.is_none());
+        before - steers.len()
     }
 
     pub fn has_steers(&self) -> bool {
@@ -418,6 +479,15 @@ impl TurnControl {
         *self.inner.plan.lock().unwrap() = plan.clone();
     }
 
+    /// The timers as the agent last published them.
+    pub fn timers(&self) -> crate::timers::Timers {
+        self.inner.timers.lock().unwrap().clone()
+    }
+
+    pub fn publish_timers(&self, timers: &crate::timers::Timers) {
+        *self.inner.timers.lock().unwrap() = timers.clone();
+    }
+
     /// Flag for synchronous tools (e.g. bash) to poll.
     pub fn cancel_flag(&self) -> Arc<AtomicBool> {
         self.inner.cancelled.clone()
@@ -458,6 +528,14 @@ pub enum AgentEvent<'a> {
     /// mid-turn.
     UserMessage {
         text: &'a str,
+    },
+    /// A timer fired mid-turn: its `⏰ timer N: <note>` notification. A
+    /// dedicated variant (not `UserMessage`) so a plain/redirected renderer
+    /// shows it — `UserMessage` is steer/replay chatter that plain output
+    /// intentionally suppresses, and a timer firing is not either (issue #150).
+    TimerFired {
+        id: u32,
+        note: &'a str,
     },
     AssistantMessage {
         message_id: &'a str,
@@ -509,6 +587,14 @@ pub enum AgentEvent<'a> {
         spec: &'a str,
         error: &'a str,
     },
+    /// A streamed reply broke after some output had already been shown
+    /// (`StreamInterrupted`) and the whole request is being re-sent from
+    /// scratch. The partial reply was displayed but never recorded in history,
+    /// so renderers must discard the abandoned text and reset any pending
+    /// thinking before accepting the restarted stream's deltas — otherwise the
+    /// replacement answer is appended to the stale prefix and the final
+    /// `AssistantMessage` is suppressed.
+    ResponseRestarted,
 }
 
 /// Result of a compaction.
@@ -526,6 +612,33 @@ pub struct CompactReport {
     pub truncated: bool,
     /// The mode the compaction ran in.
     pub mode: CompactionMode,
+}
+
+/// The outcome of an idle compaction, with context usage before and after as
+/// a percentage of the window for the transcript note.
+#[derive(Debug, Clone)]
+pub struct IdleCompactReport {
+    pub report: CompactReport,
+    pub percent_before: usize,
+    pub percent_after: usize,
+}
+
+impl IdleCompactReport {
+    fn new(report: CompactReport, window: usize) -> Self {
+        let pct = |tokens: usize| (tokens as f64 * 100.0 / window as f64).round() as usize;
+        Self { percent_before: pct(report.tokens_before), percent_after: pct(report.tokens_after), report }
+    }
+}
+
+impl std::fmt::Display for IdleCompactReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "compacted while idle (was {}% → {}%)", self.percent_before, self.percent_after)?;
+        // A degraded compaction is never reported as a clean one.
+        if self.report.fallback.is_some() || self.report.truncated {
+            write!(f, "; {}", self.report)?;
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Display for CompactReport {
@@ -555,18 +668,26 @@ enum CompactTrigger {
     Manual,
     Threshold,
     Overflow,
+    /// Opportunistic, at the idle prompt (issue #182). Folds like `Threshold`.
+    Idle,
 }
 
 /// What a compaction folded away, handed to `replace_keeping_pending` so the
 /// durable `Record::Replace` keeps the log-line range and mode while the real
 /// pre-compaction turns are stashed for `replay_history` to restore on a
-/// legacy → frame switch (which otherwise replays only the synthetic summary).
+/// legacy → frame switch (which otherwise replays only the synthetic summary)
+/// and persisted so a resume or /relaunch rebuilds the same transcript.
 struct CompactionRecord {
     /// First and last log line folded into the summary.
     range: Option<(u64, u64)>,
     mode: CompactionMode,
-    /// The folded messages (the real pre-compaction turns), in order.
+    /// The newly folded messages (the real pre-compaction turns), in order.
+    /// When `extends` is set these append to the existing replay stash rather
+    /// than replacing it, so a repeated compaction never copies the
+    /// accumulated transcript.
     folded: Vec<Message>,
+    /// Whether `folded` extends the current `pre_compaction_transcript`.
+    extends: bool,
     /// Index, in the new (compacted) conversation, of the synthetic
     /// restatement of the active input when it was itself folded into the
     /// summary. `replay_history` skips it so the one submitted prompt is not
@@ -598,6 +719,11 @@ fn status_thinking(thinking: &crate::thinking::Resolved) -> Option<String> {
         level => Some(level.to_string()),
     }
 }
+
+/// Inputs that change the in-memory context estimate: conversation length,
+/// calibration anchor, image quota, and the offered tool set (agent mode and
+/// history-tool availability) — see `Agent::idle_compact_due_polled`.
+type IdleEstimateKey = (usize, Option<(usize, usize)>, usize, crate::mode::AgentMode, bool);
 
 /// Agent manages the conversation loop, tool execution, and hooks
 pub struct Agent {
@@ -647,35 +773,21 @@ pub struct Agent {
     /// learning the cap from the first rejection lets the retry succeed without
     /// blocking the switch on the probe (issue #114).
     learned_max_output: Option<usize>,
-    /// Window reported by the endpoint (see `detect_context_window`). Shared
-    /// and locked because a mid-turn `/model` switch probes in a background
-    /// task (see `detect_context_window_for_switch`), which publishes here
-    /// when it lands.
-    detected_window: std::sync::Arc<std::sync::Mutex<Option<DetectedWindow>>>,
-    /// Monotonic switch counter, bumped on every model change (see
-    /// `detect_context_window_for_switch`). A background window probe captures
-    /// the generation it was spawned under and discards its result if a later
-    /// switch has since bumped it, so a slow probe for a superseded model can
-    /// never overwrite the current model's detected window.
-    detect_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Thinking levels reported by the endpoint (see `detect_context_window`).
-    /// Shared for the same reason as `detected_window`.
-    reported_thinking: std::sync::Arc<std::sync::Mutex<Option<crate::thinking::Reported>>>,
-    /// Vision capability reported by the endpoint (see `detect_context_window`).
-    /// Shared for the same reason as `detected_window`.
-    reported_vision: std::sync::Arc<std::sync::Mutex<Option<crate::vision::Vision>>>,
-    /// The model's own maximum output tokens as published by the endpoint,
-    /// captured on **both** probe paths — the default combined probe and the
-    /// configured-window path (which skips the window follow-up but still reads
-    /// the shared `/models` entry that carries this limit). Kept separate from
-    /// `detected_window` so a configured context window — which clears the
-    /// detected window — never discards the discovered output limit (issue
-    /// #114). Shared for the same reason as `detected_window`.
-    reported_max_output: std::sync::Arc<std::sync::Mutex<Option<usize>>>,
+    /// Capabilities reported by the endpoint (window, thinking levels, vision,
+    /// output limit) and the generation guard that stops a slow background
+    /// probe for a superseded model overwriting them (see `probe.rs`).
+    probe: ProbeState,
     /// Context size right after the last compaction; auto-compaction waits
     /// for real growth past it so an incompressible context is not
     /// re-summarized on every call.
     compact_floor: usize,
+    /// Once-per-crossing gate for opportunistic compaction at the idle
+    /// prompt (issue #182, see `idle_compact.rs`).
+    idle_gate: IdleCompactGate,
+    /// Memoized context estimate for the idle prompt's poll, keyed on
+    /// (conversation length, calibration, image quota) — see
+    /// `idle_compact_due_polled`.
+    idle_estimate_cache: std::cell::Cell<Option<(IdleEstimateKey, usize)>>,
     /// Stream model output as `TextDelta` / `ThinkingDelta` events.
     streaming: bool,
     /// AGENTS.md and similar files for the working directory.
@@ -684,7 +796,42 @@ pub struct Agent {
     skills: Skills,
     /// The agent's task plan (see `plan.rs`).
     plan: Plan,
+    /// The session's timers (see `timers.rs`); the harness owns the clock.
+    timers: Timers,
+    /// Test hook: a shared "now" for the timers, replacing the wall clock, so
+    /// a test (or a tool it registers) can advance time mid-turn.
+    #[cfg(test)]
+    timers_clock: Option<std::sync::Arc<std::sync::Mutex<DateTime<Local>>>>,
+    /// Test hook: forces the next timers/plan persist (`timers_changed` /
+    /// `record_plan`) to fail, so a test can exercise the apply-then-persist
+    /// rollback without a real I/O failure. Consumed (reset) on the first
+    /// failed persist.
+    #[cfg(test)]
+    fail_next_persist: bool,
+    /// Whether the `timer_*` tools are offered. Off in ACP, which has no idle
+    /// loop to fire them.
+    timers_enabled: bool,
+    /// Steps since the last timer fired or the pending set emptied, driving the
+    /// `PENDING_NUDGE_EVERY` reminder for fired timers not yet marked done.
+    pending_timer_steps: usize,
+    /// Set by the REPL before an automatic timer turn (a wakeup, mid-turn
+    /// firing, or pending nudge) so the user message `run_turn` pushes is
+    /// marked `auto_initiated` — billed as agent-initiated, not a premium
+    /// user request with no new user input. Consumed once per `run_turn`.
+    auto_turn: bool,
     reminders: Reminders,
+    /// Memory recall from tool calls (issue #166): which memories' full text
+    /// is already in this context. Persisted; reset by compaction.
+    recall: memory::Recall,
+    /// Recall notes attached so far this turn (capped per turn).
+    recall_turn_notes: usize,
+    /// Recall state as of before the current tool call's recall changes;
+    /// `Some` while those changes await the tool-result append, so they are
+    /// persisted only once that result (holding the notes) is durable.
+    recall_unpersisted: Option<memory::Recall>,
+    /// The spent-note count as of before the current tool call's recall,
+    /// restored with `recall_unpersisted` when the result append fails.
+    recall_notes_unpersisted: Option<usize>,
     /// Tool results longer than this are cut, with the whole kept on disk.
     tool_output_limit: usize,
     /// Checked before every tool call (see `permissions.rs`).
@@ -719,6 +866,14 @@ pub struct Agent {
     spill_digests: Arc<std::sync::Mutex<Vec<output::Spill>>>,
     /// History-tool calls in the current turn.
     turn_history_calls: u32,
+    /// Whether a file-changing tool (`write_file` / `edit_file`) succeeded after
+    /// the last `bash` call this turn. Drives the one-per-turn
+    /// verify-before-complete reminder (see `goal::VERIFY_REMINDER`).
+    edits_since_check: bool,
+    /// Whether the verify-before-complete reminder already fired this turn
+    /// (max-fires = 1), so a second `report_outcome(completed)` always goes
+    /// through and the model is never trapped.
+    verify_reminder_fired: bool,
     /// Session-log size when the current turn began; the session-index update
     /// in `finish_turn` folds the input records committed since into the
     /// cached summary (from the log's tail) instead of rescanning the whole
@@ -739,11 +894,13 @@ pub struct Agent {
     /// the summary) so a legacy → frame renderer switch rebuilds the visible
     /// transcript instead of exposing the summary as a user turn and dropping
     /// the folded turns — the frame's first full redraw clears the legacy
-    /// scrollback, so the replay is the only copy. Kept across replays (every
-    /// renderer rebuild needs it), replaced by the next compaction, and
-    /// cleared by any non-compaction conversation replacement (a plain rebuild
-    /// or system-prompt change) and on a new or resumed session. `None` when
-    /// no compaction has run (or none was captured).
+    /// scrollback, so the replay is the only copy. The same stash is persisted
+    /// in the compaction's `Record::Replace`, so a resume or /relaunch (a fresh
+    /// process over the session log) restores it and replays the real turns
+    /// too. Kept across replays (every renderer rebuild needs it), replaced by
+    /// the next compaction, and cleared by any non-compaction conversation
+    /// replacement (a plain rebuild or system-prompt change) and on a new
+    /// session. `None` when no compaction has run (or none was captured).
     pre_compaction_transcript: Option<Vec<Message>>,
     /// Index, in the compacted conversation, of the synthetic restatement of
     /// the active input the current `pre_compaction_transcript` compaction
@@ -762,7 +919,14 @@ pub struct Agent {
     /// store is mutated (save/search/forget) so a change still surfaces
     /// promptly; a `writable` flip (plan-mode toggle) rebuilds once to vary the
     /// save guidance.
-    memory_index_cache: Option<(bool, String)>,
+    memory_index_cache: Option<(bool, String, std::collections::BTreeSet<String>)>,
+    /// Ids the memory index *installed in the current system message* renders
+    /// in full. Recall treats them as already in context. Derived, never
+    /// persisted: replaced (not extended) each time the system message's index
+    /// is installed, so an entry a later save evicts becomes recallable again,
+    /// and it always describes the snapshot actually in the prompt rather than
+    /// a fresh disk read (Copilot findings, src/agent.rs).
+    index_shown: std::collections::BTreeSet<String>,
     /// Session IDs a title has already been requested for in this process, so
     /// a title is asked for at most once per session per process even as the
     /// agent switches between sessions (A → B → A) before the background task
@@ -785,41 +949,6 @@ no trailing period.";
 const DETECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
     providers::openai::MAX_PROBE_CHAIN as u64 * providers::openai::PROBE_TIMEOUT.as_secs() + 2,
 );
-
-/// The shared slots a background capability probe publishes into (see
-/// `Agent::detect_context_window_for_switch`).
-struct DetectSlots {
-    window: std::sync::Arc<std::sync::Mutex<Option<DetectedWindow>>>,
-    thinking: std::sync::Arc<std::sync::Mutex<Option<crate::thinking::Reported>>>,
-    vision: std::sync::Arc<std::sync::Mutex<Option<crate::vision::Vision>>>,
-    max_output: std::sync::Arc<std::sync::Mutex<Option<usize>>>,
-}
-
-/// What a background capability probe found.
-struct Detected {
-    window: Option<DetectedWindow>,
-    thinking: Option<crate::thinking::Reported>,
-    vision: Option<crate::vision::Vision>,
-    /// The model's published output-token limit, kept separate from `window`
-    /// so a configured window (which carries none) never discards it (#114).
-    max_output: Option<usize>,
-}
-
-#[cfg(test)]
-impl Detected {
-    /// A probe that reported only a window.
-    fn window(window: DetectedWindow) -> Self {
-        Detected { window: Some(window), thinking: None, vision: None, max_output: None }
-    }
-}
-
-#[cfg(test)]
-impl DetectSlots {
-    /// Slots around an existing window slot, with fresh thinking/vision slots.
-    fn window(window: std::sync::Arc<std::sync::Mutex<Option<DetectedWindow>>>) -> Self {
-        DetectSlots { window, thinking: Default::default(), vision: Default::default(), max_output: Default::default() }
-    }
-}
 
 impl Agent {
     pub fn new(client: Box<dyn LLMClient>, config: Config) -> Self {
@@ -857,22 +986,34 @@ impl Agent {
             calibration: None,
             learned_window: None,
             learned_max_output: None,
-            detected_window: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            detect_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            reported_thinking: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            reported_vision: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            reported_max_output: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            probe: ProbeState::default(),
             compact_floor: 0,
+            idle_gate: IdleCompactGate::default(),
+            idle_estimate_cache: std::cell::Cell::new(None),
             streaming: false,
             instructions: None,
             skills: Skills::default(),
             plan: Plan::default(),
+            timers: Timers::default(),
+            recall: memory::Recall::default(),
+            recall_turn_notes: 0,
+            recall_unpersisted: None,
+            recall_notes_unpersisted: None,
+            #[cfg(test)]
+            timers_clock: None,
+            #[cfg(test)]
+            fail_next_persist: false,
+            timers_enabled: true,
+            pending_timer_steps: 0,
+            auto_turn: false,
             reminders: Reminders::new(outcome_tool),
             tool_output_limit: output::DEFAULT_MAX_OUTPUT_LENGTH,
             questions: crate::question::QuestionBroker::new(),
             spill_dir: Arc::new(RwLock::new(output::spill_dir())),
             spill_digests: Arc::new(std::sync::Mutex::new(Vec::new())),
             turn_history_calls: 0,
+            edits_since_check: false,
+            verify_reminder_fired: false,
             turn_log_offset: None,
             history_available: false,
             history_hint_pending: false,
@@ -881,6 +1022,7 @@ impl Agent {
             titles_requested: HashSet::new(),
             memory,
             memory_index_cache: None,
+            index_shown: Default::default(),
         }
     }
 
@@ -1271,7 +1413,7 @@ impl Agent {
             self.client.kind(),
             &provider,
             self.model_name(),
-            self.reported_thinking.lock().unwrap().as_ref(),
+            self.probe.thinking().as_ref(),
         );
         // A fixed budget must stay below the output cap. Always check, even
         // when an earlier adjustment already warned: a level fitted down (e.g.
@@ -1370,9 +1512,10 @@ impl Agent {
         self.calibration = None;
         self.learned_window = None;
         self.learned_max_output = None;
-        *self.detected_window.lock().unwrap() = None;
-        *self.reported_thinking.lock().unwrap() = None;
+        *self.probe.window() = None;
+        *self.probe.thinking() = None;
         self.compact_floor = 0;
+        self.idle_gate.reset();
         self.detect_context_window().await;
     }
 
@@ -1510,8 +1653,9 @@ impl Agent {
                     self.calibration = None;
                     self.learned_window = None;
                     self.learned_max_output = None;
-                    *self.detected_window.lock().unwrap() = None;
+                    *self.probe.window() = None;
                     self.compact_floor = 0;
+                    self.idle_gate.reset();
                     self.detect_context_window_for_switch();
                     let spec = crate::recents::canonical(&spec, &all, &default_provider);
                     self.emit(AgentEvent::ModelSwitched { spec: &spec, previous: &previous });
@@ -1539,9 +1683,7 @@ impl Agent {
         // Bump the generation so any in-flight background probe from an earlier
         // mid-turn switch (see `detect_context_window_for_switch`) is discarded
         // and cannot overwrite what this blocking detect establishes.
-        self.detect_generation.fetch_add(1, Ordering::SeqCst);
-        *self.detected_window.lock().unwrap() = None;
-        *self.reported_max_output.lock().unwrap() = None;
+        self.probe.begin_blocking_detect();
         if self.configured_window().is_some() {
             // The configured window wins, so the window half of the combined
             // probe is discarded — running it anyway can only hurt: a
@@ -1561,17 +1703,14 @@ impl Agent {
         // cap with no recognized window field) or when a later configured
         // window clears the detected window (issue #114). Fall back to the
         // window's own cap when the probe returns none independently.
-        *self.reported_max_output.lock().unwrap() =
-            max_output.or_else(|| window.as_ref().and_then(|w| w.max_output_tokens));
-        *self.detected_window.lock().unwrap() = window;
-        *self.reported_thinking.lock().unwrap() = thinking;
+        let max_output = max_output.or_else(|| window.as_ref().and_then(|w| w.max_output_tokens));
         // Vision is derived from the same probe responses `detect_capabilities`
         // already fetched, so it costs no extra round trip. Storing the report
         // is always the right move: a `vision = false` override discards it at
         // resolution time, but `true`/none keep it (`true` forces the capability
         // on yet preserves the endpoint's reported limits), so keeping it here
         // lets `resolve` apply those limits on the default path too.
-        *self.reported_vision.lock().unwrap() = vision;
+        self.probe.store(Detected { window, thinking, vision, max_output });
         self.refresh_stats();
     }
 
@@ -1591,11 +1730,9 @@ impl Agent {
     async fn detect_thinking(&mut self) {
         let probe = self.client.detect_thinking_and_vision();
         let (thinking, vision, max_output) = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().unwrap_or_default();
-        *self.reported_thinking.lock().unwrap() = thinking;
-        *self.reported_vision.lock().unwrap() = vision;
         // The output limit is a separate budget from the window, so keep it even
         // though the configured window wins over the probed one (issue #114).
-        *self.reported_max_output.lock().unwrap() = max_output;
+        self.probe.store_without_window(thinking, vision, max_output);
         self.refresh_stats();
     }
 
@@ -1622,7 +1759,7 @@ impl Agent {
             self.client.kind(),
             &provider,
             self.model_name(),
-            self.reported_vision.lock().unwrap().as_ref(),
+            self.probe.vision().as_ref(),
         )
     }
 
@@ -1750,13 +1887,9 @@ impl Agent {
         // for the previous model is already invalidated: its `finish_detect`
         // re-reads the generation under the slot lock and discards a stale
         // result rather than clobbering this model's window.
-        let generation = self.detect_generation.fetch_add(1, Ordering::SeqCst) + 1;
-        *self.detected_window.lock().unwrap() = None;
         // The previous model's reports must not leak onto the new one; until
         // the background probe lands, the built-in assumptions apply.
-        *self.reported_thinking.lock().unwrap() = None;
-        *self.reported_vision.lock().unwrap() = None;
-        *self.reported_max_output.lock().unwrap() = None;
+        let generation = self.probe.begin_detect();
         // Publish the new model's fallback stats (provider/model name + the
         // model-name or default window) right away, so a slow or `None` probe
         // cannot leave the UI on the previous model's window.
@@ -1765,15 +1898,9 @@ impl Agent {
         // and vision are probed then (see `detect_thinking`).
         let configured = self.configured_window().is_some();
         let probe = self.client.clone_boxed();
-        let slots = DetectSlots {
-            window: self.detected_window.clone(),
-            thinking: self.reported_thinking.clone(),
-            vision: self.reported_vision.clone(),
-            max_output: self.reported_max_output.clone(),
-        };
+        let slots = self.probe.clone();
         let sink = self.event_sink.clone();
         let stats = self.stats.clone();
-        let current = self.detect_generation.clone();
         tokio::spawn(async move {
             let (detected, thinking, vision, max_output) = if configured {
                 let (thinking, vision, max_output) =
@@ -1795,7 +1922,6 @@ impl Agent {
             Self::finish_detect(
                 Detected { window: detected, thinking, vision, max_output },
                 generation,
-                current,
                 slots,
                 sink,
                 stats,
@@ -1821,31 +1947,15 @@ impl Agent {
     fn finish_detect(
         detected: Detected,
         generation: u64,
-        current: std::sync::Arc<std::sync::atomic::AtomicU64>,
-        slots: DetectSlots,
+        probe: ProbeState,
         sink: Option<EventSink>,
         stats: SharedStats,
     ) {
-        let Detected { window: detected, thinking, vision, max_output } = detected;
-        {
-            // Check the generation under the window slot lock so a switch
-            // racing this completion either bumps it before we read (we
-            // discard) or clears the slots after we write (it then refreshes to
-            // its own fallback). The window lock is held while the thinking
-            // and vision reports are written too, so all three land together.
-            let mut slot = slots.window.lock().unwrap();
-            if current.load(Ordering::SeqCst) != generation {
-                return;
-            }
-            *slots.thinking.lock().unwrap() = thinking;
-            *slots.vision.lock().unwrap() = vision;
-            // Published output limit lands with the rest; kept even when the
-            // window slot stays empty (configured-window path) (issue #114).
-            *slots.max_output.lock().unwrap() = max_output;
-            if let Some(detected) = &detected {
-                *slot = Some(detected.clone());
-            }
-        }
+        // `publish_if_current` checks the generation under the window slot
+        // lock and lands all four reports together (see `ProbeState`).
+        let Some(detected) = probe.publish_if_current(generation, detected) else {
+            return;
+        };
         let Some(detected) = detected else {
             if let Some(sink) = sink {
                 sink(None, &AgentEvent::Context);
@@ -1856,7 +1966,7 @@ impl Agent {
         {
             let mut stats = stats.lock().unwrap();
             // Re-check: a switch may have superseded us between the two locks.
-            if current.load(Ordering::SeqCst) != generation {
+            if !probe.is_current(generation) {
                 return;
             }
             if stats.window_source.starts_with("reported by the endpoint")
@@ -1915,7 +2025,7 @@ impl Agent {
     /// so the output reservation must count against it again.
     fn context_cap(&self) -> ContextCap {
         if self.configured_window().is_none()
-            && let Some(detected) = self.detected_window.lock().unwrap().as_ref()
+            && let Some(detected) = self.probe.window().as_ref()
             && self.learned_window.is_none_or(|learned| learned >= detected.tokens)
         {
             return detected.cap;
@@ -1938,7 +2048,7 @@ impl Agent {
     /// is not sized against the prompt-only cap and pushed past the learned
     /// total again.
     fn combined_window(&self) -> Option<usize> {
-        let advertised = self.detected_window.lock().unwrap().as_ref().and_then(|d| d.total_tokens);
+        let advertised = self.probe.window().as_ref().and_then(|d| d.total_tokens);
         match (advertised, self.learned_window) {
             (Some(advertised), Some(learned)) => Some(advertised.min(learned)),
             (Some(advertised), None) => Some(advertised),
@@ -1977,6 +2087,15 @@ impl Agent {
         for msg in tail {
             match msg.role {
                 Role::User if msg.continuation => count += 1,
+                // A fired timer or pending-timer nudge is a harness-injected
+                // user message delivered mid-turn, NOT a new answer segment:
+                // the truncated answer it interrupts is still the one being
+                // continued, so keep its prefix and do not count the message as
+                // a continuation attempt (issue #150). A genuine steer or a
+                // Stop-hook re-prompt (`auto_initiated` but not `timer`) stays a
+                // segment reset via the arm below, since those discard the
+                // cut-off prefix.
+                Role::User if msg.timer => {}
                 Role::User => answer.clear(),
                 Role::Assistant
                     if msg.tool_calls.is_empty() && crate::llm::stop_reason_is_length(msg.stop_reason.as_deref()) =>
@@ -2067,8 +2186,8 @@ impl Agent {
         // across the window lock here inverts that order and can deadlock a
         // background model-switch probe when the report is still `None`
         // (issue #114).
-        let reported = *self.reported_max_output.lock().unwrap();
-        reported.or_else(|| self.detected_window.lock().unwrap().as_ref().and_then(|d| d.max_output_tokens))
+        let reported = *self.probe.max_output();
+        reported.or_else(|| self.probe.window().as_ref().and_then(|d| d.max_output_tokens))
     }
 
     /// The effective `max_tokens` the next request would send before the
@@ -2085,7 +2204,7 @@ impl Agent {
         let (_, model) = providers::context_window(&self.config.model, &user, &default_provider);
         let (window, source) = if let Some((window, source)) = self.configured_window() {
             (window, source.to_string())
-        } else if let Some(detected) = &*self.detected_window.lock().unwrap() {
+        } else if let Some(detected) = &*self.probe.window() {
             (detected.tokens, format!("reported by the endpoint ({})", detected.source))
         } else if let Some(window) =
             context::window_for_model(&model).or_else(|| context::window_for_model(self.client.model_name()))
@@ -2178,6 +2297,7 @@ impl Agent {
             stats.smart_compact = self.config.compaction_mode == CompactionMode::Smart && self.session.is_some();
             stats.history_available = self.history_tools_enabled();
             stats.plan = (!self.plan.items.is_empty()).then(|| self.plan.progress());
+            stats.timers = (!self.timers.is_empty()).then(|| self.timers.status_segment());
             stats.cwd = cwd;
             stats.mode = self.control.mode();
             stats.thinking = status_thinking(&self.thinking());
@@ -2252,13 +2372,14 @@ impl Agent {
     fn apply_mode_to_system_prompt(&mut self) {
         // Compute the prompt before borrowing the conversation mutably, so the
         // immutable borrow of `self` (for `system_prompt`) does not conflict.
-        let base = self.system_prompt_cached();
+        let (base, shown) = self.system_prompt_cached();
         let content = match self.control.mode() {
             crate::mode::AgentMode::Plan => format!("{base}{}", crate::mode::PLAN_PROMPT_NOTE),
             _ => base,
         };
         let Some(first) = self.conversation.first_mut().filter(|m| m.role == Role::System) else { return };
         first.content = content;
+        self.index_shown = shown;
     }
 
     /// Rebuild the system message so the folded memory index reflects the
@@ -2289,6 +2410,34 @@ impl Agent {
             self.emit(AgentEvent::UserMessage { text: &steer.text });
             self.control.inner.absorbed.lock().unwrap().push(steer);
             absorbed = true;
+        }
+        // Timers fire at the start of a step, after the steers: their notes
+        // land as a user message the next model call sees. A fired timer is
+        // not a steer, so it does not reset the continuation accumulator.
+        //
+        // Skip the whole timer step when timers are disabled (an ACP-resumed
+        // CLI session has no idle loop and `disable_timers()` has hidden
+        // `timer_done`/`timer_cancel`): firing a restored timer or nudging here
+        // would ask the agent to acknowledge a timer it has no tool to clear,
+        // and would consume the restored state a later CLI resume still needs.
+        if !self.timers_enabled {
+            return Ok(absorbed);
+        }
+        let fired = self.fire_due_timers()?;
+        // Fired timers stay `pending` until the agent calls `timer_done`.
+        // Nudge about them every few steps so a note ignored mid-work is not
+        // forgotten; the counter resets when a timer fires or nothing pends.
+        if fired {
+            self.pending_timer_steps = 0;
+        } else if self.timers.has_pending() {
+            self.pending_timer_steps += 1;
+            if self.pending_timer_steps.is_multiple_of(timers::PENDING_NUDGE_EVERY)
+                && let Some(note) = self.timers.pending_nudge(self.timers_now())
+            {
+                self.push(Message::user(&reminders::wrap(&note)).timer())?;
+            }
+        } else {
+            self.pending_timer_steps = 0;
         }
         Ok(absorbed)
     }
@@ -2334,7 +2483,8 @@ impl Agent {
         // taken) so every renderer rebuild replays the real turns — a legacy →
         // frame → legacy → frame round trip must not fall back to exposing the
         // summary on the second switch. It is replaced by the next compaction
-        // and cleared on a new or resumed session.
+        // and cleared on a new session; a resume or /relaunch rebuilds it from
+        // the compaction's persisted replace record (see `load_session`).
         let pre_compaction = self.pre_compaction_transcript.clone();
         let skip_summary = pre_compaction.is_some();
         let conversation = self.conversation.clone();
@@ -2518,6 +2668,11 @@ impl Agent {
         self.completed_stop_reasons.clear();
         self.pending_input = None;
         self.plan = Plan::default();
+        // A fresh session starts with no timers (`/restart` clears them).
+        self.timers = Timers::default();
+        self.recall = memory::Recall::default();
+        self.control.publish_timers(&self.timers);
+        self.pending_timer_steps = 0;
         self.reminders = Reminders::new(self.config.outcome_tool);
         self.session = session;
         self.session_id = Some(id.clone());
@@ -2529,8 +2684,12 @@ impl Agent {
         self.persist_claude_hook_config();
         self.calibration = None;
         self.compact_floor = 0;
+        self.idle_gate.reset();
         self.history_available = false;
         self.history_hint_pending = false;
+        // The previous session's installed index no longer describes the
+        // prompt; the next request's prompt install sets it afresh.
+        self.index_shown.clear();
         // A fresh session has no compaction behind it, so there is no
         // pre-compaction transcript for `replay_history` to restore.
         self.pre_compaction_transcript = None;
@@ -2599,6 +2758,17 @@ impl Agent {
         self.completed_stop_reasons = restored.stop_reasons;
         self.pending_input = restored.pending_input;
         self.plan = restored.plan.unwrap_or_default();
+        // Restore the session's timers; one that came due while nano-coder was
+        // closed fires as overdue at the next step (or the idle prompt).
+        self.timers = restored.timers.unwrap_or_default();
+        self.control.publish_timers(&self.timers);
+        self.recall = restored.recall.unwrap_or_default();
+        self.recall_unpersisted = None;
+        self.recall_notes_unpersisted = None;
+        // The previous session's installed index no longer describes the
+        // prompt; the next request's prompt install sets it afresh.
+        self.index_shown.clear();
+        self.pending_timer_steps = 0;
         // Reminders belong to the session being left (`/resume` mid-process).
         self.reminders = Reminders::new(self.config.outcome_tool);
         // `/thinking` is session-scoped, so the previous session's override
@@ -2614,6 +2784,10 @@ impl Agent {
         self.set_spill_dir(id);
         self.calibration = None;
         self.compact_floor = 0;
+        self.idle_gate.reset();
+        // The resumed conversation is a different context: never serve the
+        // previous session's memoized idle-poll estimate for it.
+        self.idle_estimate_cache.set(None);
         // Whether the history tools are offered is durable state: restore it
         // from the log (the last replace's mode) rather than the message text.
         self.history_available = restored.history_available;
@@ -2621,13 +2795,16 @@ impl Agent {
         // already emitted (or a history tool already used) after the latest
         // smart compaction, a resume must not append it again.
         self.history_hint_pending = restored.history_available && !restored.history_hint_consumed;
-        // A resumed session does not rebuild the pre-compaction transcript
-        // (the folded turns are recoverable via the history tools, and the
-        // replace record's summarized range is not exposed here), so a
-        // post-resume legacy → frame switch replays the compacted
-        // conversation — the pre-change behaviour.
-        self.pre_compaction_transcript = None;
-        self.pre_compaction_restated = None;
+        // Rebuild the pre-compaction transcript from the folded turns the
+        // compaction persisted in its replace record, so a resumed (or
+        // /relaunch'd) session replays the real turns instead of exposing the
+        // synthetic summary — the same replay a same-process legacy → frame
+        // switch produces. Logs written before the folded turns were persisted
+        // carry none; those replay the compacted conversation, the pre-change
+        // behaviour (the folded turns remain recoverable via the history
+        // tools).
+        self.pre_compaction_transcript = restored.folded;
+        self.pre_compaction_restated = restored.restated;
         self.claude_session_started = false;
         self.pending_session_start_context = None;
         self.claude_session_resumed = true;
@@ -2686,21 +2863,27 @@ impl Agent {
     }
 
     fn replace_conversation(&mut self, messages: Vec<Message>) -> Result<()> {
-        self.replace_keeping_pending(messages, None, None)
+        self.replace_keeping_pending(messages, None, None)?;
+        // A new conversation starts a new crossing: a gate spent at the
+        // discarded context's size must not hold back the new one.
+        self.idle_gate.reset();
+        Ok(())
     }
 
     /// Replace the conversation; `pending_position` keeps the in-flight input
     /// alive with its user message at that index. `compaction` records the
     /// folded log-line range and mode, and carries the folded messages
     /// themselves (the real pre-compaction turns) so `replay_history` can
-    /// rebuild the visible transcript after a legacy → frame switch instead
-    /// of exposing the synthetic summary.
+    /// rebuild the visible transcript after a legacy → frame switch instead of
+    /// exposing the synthetic summary — and so the durable replace record can
+    /// persist them for a resume or /relaunch to rebuild the same transcript.
     fn replace_keeping_pending(
         &mut self,
         mut messages: Vec<Message>,
         pending_position: Option<usize>,
         compaction: Option<CompactionRecord>,
     ) -> Result<()> {
+        self.idle_estimate_cache.set(None);
         let now = session::now();
         for message in &mut messages {
             message.timestamp.get_or_insert(now);
@@ -2712,10 +2895,18 @@ impl Agent {
         // Destructure once: the folded turns go to the replay stash, the range
         // and mode to the durable replace record, and the restated-input index
         // to the replay skip.
-        let (range, mode, folded_turns, restated) = match compaction {
-            Some(CompactionRecord { range, mode, folded, restated }) => (range, Some(mode), Some(folded), restated),
-            None => (None, None, None, None),
+        let (range, mode, folded_turns, extends, restated) = match compaction {
+            Some(CompactionRecord { range, mode, folded, extends, restated }) => {
+                (range, Some(mode), Some(folded), extends, restated)
+            }
+            None => (None, None, None, false, None),
         };
+        // A repeated compaction logs only its newly folded turns plus the
+        // prefix length they extend, so the log grows linearly.
+        let base_len = self.pre_compaction_transcript.as_ref().map_or(0, Vec::len);
+        let extends = extends && base_len > 0;
+        let folded_base = extends.then_some(base_len);
+        let delta_folded = folded_turns.as_ref().filter(|f| !f.is_empty() || extends).cloned();
         if let Some(log) = &mut self.session {
             log.append(&Record::Replace {
                 messages: messages.clone(),
@@ -2731,6 +2922,23 @@ impl Agent {
                 // into the summary, so without this a post-compaction crash
                 // loses the answer prefix and resets the count (issue #114).
                 continuation: self.pending_input.as_ref().and_then(|p| p.continuation.clone()),
+                // Persist the folded real turns (and the restated-input skip)
+                // too: a resume or relaunch rebuilds the visible transcript
+                // from the log, and without them it would show the synthetic
+                // summary in place of the pre-compaction history.
+                // A repeated compaction's stash extends the previous one; log
+                // only the newly folded turns (plus the prefix length they
+                // extend) so the log grows linearly, not quadratically.
+                folded: delta_folded,
+                folded_base,
+                restated,
+                // Persist the surviving pending input's spent recall-note
+                // budget too: a crash between this record and the next recall
+                // record must not hand the resumed retry a fresh per-input
+                // budget (Copilot finding, src/agent.rs). Recorded even when
+                // `pending_position` is `None` — the decode then drops the
+                // pending input, and with it the budget.
+                pending_recall_notes: self.pending_input.as_ref().map_or(0, |p| p.recall_notes),
                 recorded_at: now,
             })?;
         }
@@ -2744,7 +2952,14 @@ impl Agent {
         // change, …) clears the stash so a later replay cannot resurrect the
         // previous conversation and skip the first new user turn as though it
         // were a synthetic summary.
-        self.pre_compaction_transcript = folded_turns.filter(|f| !f.is_empty());
+        self.pre_compaction_transcript = match folded_turns {
+            Some(new) if extends => {
+                let mut stash = self.pre_compaction_transcript.take().unwrap_or_default();
+                stash.extend(new);
+                Some(stash)
+            }
+            other => other.filter(|f| !f.is_empty()),
+        };
         // Track the restatement to skip alongside the stash; a cleared stash
         // (any non-compaction replacement) clears it too.
         self.pre_compaction_restated = self.pre_compaction_transcript.as_ref().and(restated);
@@ -2755,6 +2970,17 @@ impl Agent {
             _ => None,
         };
         self.calibration = None;
+        // Any replacement (compaction, a `/settings` system-prompt change, a
+        // rebuild) drops the recalled memories' full text from context, so
+        // every memory may be recalled again — except those the retained
+        // system message's index renders in full (`index_shown`, untouched
+        // here), which are still in context.
+        self.recall_unpersisted = None;
+        self.recall_notes_unpersisted = None;
+        if !self.recall.is_empty() {
+            self.recall = memory::Recall::default();
+            self.recall_changed();
+        }
         self.refresh_stats();
         Ok(())
     }
@@ -2826,29 +3052,30 @@ impl Agent {
     /// recomputing it each iteration would add filesystem work proportional to
     /// the whole store to every turn. Instructions and skills are already
     /// in-memory, so only the memory index is cached.
-    fn system_prompt_cached(&mut self) -> String {
-        let memory = self.cached_memory_index();
+    /// Also returns the ids that prompt's memory index renders in full.
+    fn system_prompt_cached(&mut self) -> (String, std::collections::BTreeSet<String>) {
+        let (memory, shown) = self.cached_memory_index();
         let extra = self.instructions.as_ref().map(ProjectInstructions::render).unwrap_or_default();
-        format!("{}{extra}{}{memory}", self.config.system_prompt, self.skills.render_index())
+        (format!("{}{extra}{}{memory}", self.config.system_prompt, self.skills.render_index()), shown)
     }
 
     /// The rendered memory index, cached for the current `writable` state. The
     /// cache is invalidated on any store mutation (see `refresh_memory_index`
     /// and the memory-tool dispatch); a `writable` flip rebuilds once so the
     /// save guidance matches the mode.
-    fn cached_memory_index(&mut self) -> String {
+    fn cached_memory_index(&mut self) -> (String, std::collections::BTreeSet<String>) {
         if self.memory.is_none() || !self.config.memory.enabled() {
-            return String::new();
+            return Default::default();
         }
         let writable = self.memory_writable();
-        if let Some((cached_writable, index)) = &self.memory_index_cache
+        if let Some((cached_writable, index, shown)) = &self.memory_index_cache
             && *cached_writable == writable
         {
-            return index.clone();
+            return (index.clone(), shown.clone());
         }
-        let index = self.memory.as_ref().map(|store| store.index(writable)).unwrap_or_default();
-        self.memory_index_cache = Some((writable, index.clone()));
-        index
+        let (index, shown) = self.memory.as_ref().map(|store| store.index_with_rendered(writable)).unwrap_or_default();
+        self.memory_index_cache = Some((writable, index.clone(), shown.clone()));
+        (index, shown)
     }
 
     /// Discover instruction files and skills for the current working directory,
@@ -2918,6 +3145,10 @@ impl Agent {
     }
 
     fn record_plan(&mut self) -> Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_persist) {
+            return Err(anyhow::anyhow!("forced plan persist failure (test)"));
+        }
         if let Some(log) = &mut self.session {
             log.append(&Record::Plan { plan: self.plan.clone(), recorded_at: session::now() })?;
         }
@@ -2925,8 +3156,11 @@ impl Agent {
     }
 
     fn plan_changed(&mut self) -> Result<()> {
-        self.reminders.plan_changed();
+        // Persist first: a failed append must leave no observable side effect
+        // (reminder reset, UI event) so `run_plan_tool` can cleanly roll the
+        // live plan back.
         self.record_plan()?;
+        self.reminders.plan_changed();
         self.emit(AgentEvent::Plan { plan: &self.plan });
         self.refresh_stats();
         Ok(())
@@ -2946,6 +3180,9 @@ impl Agent {
         let mut tools = self.tools.definitions();
         if self.config.plan_tools {
             tools.extend(plan::definitions());
+        }
+        if self.timers_enabled {
+            tools.extend(timers::definitions());
         }
         if self.config.outcome_tool {
             tools.push(goal::definition());
@@ -3031,7 +3268,7 @@ impl Agent {
         if let Some(id) = input_id
             && let Some(response) = self.completed_inputs.get(id)
         {
-            eprintln!("[agent] input {id:?} already processed; returning recorded response");
+            crate::ui::log(&format!("[agent] input {id:?} already processed; returning recorded response"));
             let stop_reason = self.completed_stop_reasons.get(id).copied().unwrap_or(StopReason::EndTurn);
             return Ok(TurnOutcome {
                 response: response.clone(),
@@ -3041,6 +3278,11 @@ impl Agent {
         }
         self.control.start_turn();
         self.reminders.start_turn();
+        // Consume the automatic-turn origin for this turn (an automatic timer
+        // wakeup/nudge): the main user message pushed below is marked
+        // `auto_initiated` so it bills as agent-initiated. Taken once here so it
+        // never leaks into the next, genuinely user-initiated turn.
+        let auto_turn = std::mem::take(&mut self.auto_turn);
         self.claude_stop_blocks = 0;
         self.sync_claude_hook_session();
         self.apply_mode_to_system_prompt();
@@ -3051,6 +3293,21 @@ impl Agent {
         // whole log.
         self.turn_log_offset = self.session.as_ref().map(|log| log.size());
         let resuming = self.pending_input.clone().filter(|pending| input_id == Some(pending.id.as_str()));
+        // The recall-note budget is per *input*, not per `run_turn` call — like
+        // the verify-before-complete state below: a retry of an interrupted
+        // prompt resumes its pending input, so it must resume the budget it
+        // already spent (carried on the pending input, persisted with it in a
+        // `Replace` record) rather than re-arm another two notes per retry
+        // (Copilot finding, src/agent.rs). Only a new input starts at zero.
+        self.recall_turn_notes = resuming.as_ref().map_or(0, |pending| pending.recall_notes);
+        // Verify-before-complete state (issue #68) is per *input*, not per
+        // `run_turn` call: a resumed input keeps its unchecked-edit flag and
+        // spent reminder, so a retry after a failure cannot forget an edit or
+        // re-fire the reminder. Only a new input starts clean.
+        if resuming.is_none() {
+            self.edits_since_check = false;
+            self.verify_reminder_fired = false;
+        }
         // Where a resumed turn's input sits, so after the replay shortcuts
         // below we can rebuild any in-flight output-limit continuation state
         // from the messages logged before the interrupt (issue #114).
@@ -3150,7 +3407,7 @@ impl Agent {
                     // logged *before* this point, not the conversation's new
                     // tail (issue #114).
                     hook_context_start = Some(self.conversation.len());
-                    self.push(Message::user(&reminders::wrap(&ctx)))?;
+                    self.push(Message::user(&reminders::wrap(&ctx)).hook_context())?;
                 }
             }
             None => {
@@ -3162,6 +3419,7 @@ impl Agent {
                             position: self.conversation.len(),
                             continuation: None,
                             continuation_base: None,
+                            recall_notes: 0,
                         });
                         if let Some(log) = &mut self.session {
                             log.append(&Record::Input {
@@ -3188,6 +3446,7 @@ impl Agent {
                     position: self.conversation.len(),
                     continuation: None,
                     continuation_base: None,
+                    recall_notes: 0,
                 });
                 if let Some(log) = &mut self.session {
                     log.append(&Record::Input {
@@ -3200,7 +3459,16 @@ impl Agent {
                     Some(extra) => format!("{user_input}\n\n{}", reminders::wrap(extra)),
                     None => user_input.to_string(),
                 };
-                self.push(Message::user(&message))?;
+                let mut message = Message::user(&message);
+                // Hook context was appended to the wire content: record the
+                // user-typed text separately so compaction pins the user's own
+                // words, even when they contain a literal `<system-reminder>`
+                // tag (issue #66).
+                if extra.is_some() {
+                    message = message.with_pin_text(user_input);
+                }
+                let message = if auto_turn { message.auto_initiated() } else { message };
+                self.push(message)?;
             }
         }
 
@@ -3423,6 +3691,10 @@ impl Agent {
             // actually sent, not a stale pre-compaction resolution.
             let mut sent_temperature = None;
             let mut sent_thinking = None;
+            // Re-sends after a mid-reply connection drop (`StreamInterrupted`),
+            // capped per model call so a persistently broken connection still
+            // ends the turn instead of asking forever.
+            let mut stream_restarts: u32 = 0;
             let response = loop {
                 self.set_activity(Activity::Thinking);
                 // Every attempt is a model call (and the overflow branch below
@@ -3606,6 +3878,38 @@ impl Agent {
                         break Some(response);
                     }
                     Some(Err(e)) => {
+                        // A stream that broke *after* visible output arrived: the
+                        // partial reply was shown but never added to history, so
+                        // discard it and re-send the same request (which itself
+                        // waits out any network outage). Capped per model call so
+                        // a persistently broken connection still ends the turn.
+                        if let Some(interrupted) = providers::stream_interrupted(&e) {
+                            if stream_restarts < MAX_STREAM_RESTARTS {
+                                stream_restarts += 1;
+                                let what = format!("{}/{}", self.client.provider_name(), self.client.model_name());
+                                // Route through `ui::log` (not a raw stderr
+                                // write): in frame mode the renderer owns the
+                                // screen, and the `ResponseRestarted` redraw
+                                // below would erase a stderr line that was never
+                                // added to the transcript. `ui::log` adds it to
+                                // the frame so the notice survives; off-frame it
+                                // falls back to stderr unchanged.
+                                crate::ui::log(&format!(
+                                    "[agent] {what}: {interrupted}; asking again ({stream_restarts}/{MAX_STREAM_RESTARTS})"
+                                ));
+                                // Tell the renderers to discard the abandoned
+                                // partial reply (and reset pending thinking)
+                                // before the re-sent stream's deltas arrive, so
+                                // the replacement answer starts fresh instead of
+                                // being appended to the stale prefix.
+                                if let Some(sink) = event_sink {
+                                    sink(session_id, &AgentEvent::ResponseRestarted);
+                                }
+                                continue;
+                            }
+                            self.set_activity(Activity::Idle);
+                            return Err(e);
+                        }
                         let message = format!("{e:#}");
                         // An output-token-limit rejection: the configured or
                         // fallback `max_tokens` exceeds the model's real output
@@ -3645,9 +3949,9 @@ impl Agent {
                             if learned < request_max_tokens {
                                 self.learned_max_output = Some(learned as usize);
                                 self.refresh_stats();
-                                eprintln!(
+                                crate::ui::log(&format!(
                                     "[agent] output-limit rejection ({message}); retrying with max_tokens={learned}"
-                                );
+                                ));
                                 continue;
                             }
                         }
@@ -3667,7 +3971,7 @@ impl Agent {
                         // without this refresh it keeps showing the old window
                         // and source for the whole client build and compaction.
                         self.refresh_stats();
-                        eprintln!("[agent] context overflow ({message}); compacting and retrying");
+                        crate::ui::log(&format!("[agent] context overflow ({message}); compacting and retrying"));
                         // The overflow compaction is a model call too;
                         // `compact_logged` applies a `/model` queued while the
                         // overflowing request was in flight before the summary
@@ -3826,9 +4130,9 @@ impl Agent {
                 // decision so observers can tell an allowed call from one the
                 // policy will deny (issue #92: `before_tool_call` fires before
                 // the permission check, so without this it couldn't).
-                let permission = match self.policy.check(&tool_call.name, &tool_call.arguments) {
-                    Ok(()) => "allow".to_string(),
-                    Err(reason) => format!("deny: {reason}"),
+                let permission = match self.policy.decide(&tool_call.name, &tool_call.arguments) {
+                    crate::permissions::Decision::Allow => "allow".to_string(),
+                    crate::permissions::Decision::Deny(message) => format!("deny: {message}"),
                 };
                 let ctx = HookContext::new(HookEvent::BeforeToolCall)
                     .with_data("tool_name", json!(&tool_call.name))
@@ -3845,11 +4149,13 @@ impl Agent {
                 let mut effective_arguments = tool_call.arguments.clone();
                 let mut hook_context: Vec<String> = Vec::new();
                 let mut pre_hook_deny: Option<String> = None;
+                // The decision of the first policy check on the original arguments.
+                let original_decision = self.policy.decide(&tool_call.name, &tool_call.arguments);
                 if let Some(claude_hooks) = self.claude_hooks.as_ref() {
                     let runnable = tool_call.raw_arguments_error(response.stop_reason.as_deref()).is_none()
                         && (self.control.mode() != crate::mode::AgentMode::Plan
                             || crate::mode::plan_allows(&tool_call.name))
-                        && self.policy.check(&tool_call.name, &tool_call.arguments).is_ok();
+                        && matches!(original_decision, crate::permissions::Decision::Allow);
                     if runnable {
                         let outcome =
                             claude_hooks.run_pre_tool_use(&tool_call.name, &tool_call.arguments, &tool_call.id);
@@ -3888,6 +4194,11 @@ impl Agent {
                     }
                 }
 
+                let mut permission_deny: Option<String> = match original_decision {
+                    crate::permissions::Decision::Allow => None,
+                    crate::permissions::Decision::Deny(message) => Some(message),
+                };
+
                 // A PreToolUse hook may have rewritten the arguments into
                 // `effective_arguments`. From here on that rewritten input is the
                 // single source of truth for what actually runs: build an
@@ -3906,6 +4217,7 @@ impl Agent {
                 let effective_call: &ToolCall = rewritten_call.as_ref().unwrap_or(tool_call);
 
                 let is_plan_tool = self.config.plan_tools && plan::is_plan_tool(&tool_call.name);
+                let is_timer_tool = self.timers_enabled && timers::is_timer_tool(&tool_call.name);
                 let is_outcome_tool = self.config.outcome_tool && tool_call.name == goal::TOOL_NAME;
                 let is_skill_tool = tool_call.name == skills::TOOL_NAME && !self.skills.is_empty();
                 let is_history_tool = history::is_history_tool(&tool_call.name) && self.history_tools_enabled();
@@ -3926,6 +4238,18 @@ impl Agent {
                 // digest parsed out of the rendered — model-influenceable —
                 // text (issue #65).
                 let mut spill_digests: Vec<output::Spill> = Vec::new();
+                // The policy is consulted before dispatching to any handler, so deny
+                // rules and the pre-tool check also cover plan, skill and outcome tools.
+                // Re-check the *effective* (possibly hook-rewritten) arguments here:
+                // the earlier check ran on the original input, so without this a
+                // PreToolUse hook could rewrite a bash command or a file path past
+                // the user's allow/deny rules.
+                if permission_deny.is_none() && rewritten_call.is_some() {
+                    permission_deny = match self.policy.decide(&effective_call.name, &effective_call.arguments) {
+                        crate::permissions::Decision::Allow => None,
+                        crate::permissions::Decision::Deny(message) => Some(message),
+                    };
+                }
                 let result = if let Some(error) = tool_call.raw_arguments_error(response.stop_reason.as_deref()) {
                     // The argument JSON arrived malformed (usually a truncated
                     // stream). Don't run anything against garbage arguments and
@@ -3938,13 +4262,7 @@ impl Agent {
                     // Backstop for a mutating call already in flight when plan
                     // mode was switched on mid-turn.
                     Err(anyhow::anyhow!("{} is disabled in plan mode (read-only)", tool_call.name))
-                } else if let Err(reason) = self.policy.check(&effective_call.name, &effective_call.arguments) {
-                    // The policy is consulted before dispatching to any handler, so deny
-                    // rules and the pre-tool check also cover plan, skill and outcome tools.
-                    // Re-check the *effective* (possibly hook-rewritten) arguments here:
-                    // the earlier check ran on the original input, so without this a
-                    // PreToolUse hook could rewrite a bash command or a file path past
-                    // the user's allow/deny rules.
+                } else if let Some(reason) = permission_deny {
                     Err(anyhow::anyhow!(reason))
                 } else if let Some(reason) = pre_hook_deny {
                     // A PreToolUse hook denied the call (or failed closed).
@@ -3952,6 +4270,9 @@ impl Agent {
                 } else if is_plan_tool {
                     dispatched = true;
                     self.run_plan_tool(effective_call)
+                } else if is_timer_tool {
+                    dispatched = true;
+                    self.run_timer_tool(effective_call)
                 } else if is_skill_tool {
                     dispatched = true;
                     self.skills.load(&effective_call.arguments).map(Value::String)
@@ -3966,11 +4287,32 @@ impl Agent {
                     self.run_memory_tool(effective_call).map(Value::String)
                 } else if is_outcome_tool {
                     dispatched = true;
-                    Outcome::from_args(&effective_call.arguments).map(|outcome| {
-                        let text = format!("Recorded outcome: {}. Your turn ends now.", outcome.status.as_str());
-                        reported = Some(outcome);
-                        Value::String(text)
-                    })
+                    match Outcome::from_args(&effective_call.arguments) {
+                        Err(e) => Err(e),
+                        Ok(outcome) => {
+                            // Verify-before-complete (issue #68): a `completed`
+                            // report that follows an edit with no later `bash`
+                            // check is bounced once per turn with a reminder, so
+                            // the model runs the relevant tests/build first. The
+                            // reminder fires at most once (max-fires = 1) — a
+                            // second `report_outcome` always goes through, so the
+                            // model is never trapped. `blocked` / `needs_input`
+                            // are never intercepted.
+                            if self.config.verify_before_complete
+                                && outcome.status == goal::Status::Completed
+                                && self.edits_since_check
+                                && !self.verify_reminder_fired
+                            {
+                                self.verify_reminder_fired = true;
+                                Err(anyhow::anyhow!(goal::VERIFY_REMINDER))
+                            } else {
+                                let text =
+                                    format!("Recorded outcome: {}. Your turn ends now.", outcome.status.as_str());
+                                reported = Some(outcome);
+                                Ok(Value::String(text))
+                            }
+                        }
+                    }
                 } else {
                     // Tool handlers are synchronous and may block (e.g. bash).
                     dispatched = true;
@@ -4015,6 +4357,20 @@ impl Agent {
                     },
                     other => other.to_string(),
                 };
+                // Verify-before-complete tracking (issue #68): a successful
+                // `write_file` / `edit_file` marks the tree as changed-since-last-
+                // check; a `bash` call is the check that clears it. Only a
+                // successful edit counts — a failed write changed nothing.
+                if ok && matches!(tool_call.name.as_str(), "write_file" | "edit_file") {
+                    self.edits_since_check = true;
+                } else if dispatched && ok && tool_call.name == "bash" {
+                    // Only a bash call that actually started counts as a check
+                    // (even one that then exited non-zero). A denied/malformed
+                    // call, or one the handler rejected before starting the
+                    // command (invalid arguments, spawn failure), is a failed
+                    // tool call (`ok == false`) and never ran.
+                    self.edits_since_check = false;
+                }
                 // A non-image binary file takes read_file's generic "looks
                 // like a binary file" error, which cannot name the model's
                 // image capability itself. Append that context here so the
@@ -4066,6 +4422,15 @@ impl Agent {
                     result_text.push_str("\n\n");
                     result_text.push_str(&reminders::wrap(ctx));
                 }
+                // Memory recall (issue #166): a note for each memory whose
+                // anchors appear in this call's arguments and whose full text
+                // is not already in context. Only for calls that reached a tool.
+                if dispatched {
+                    for note in self.recall_memories(&tool_call.name, &effective_arguments, ok, &result_text) {
+                        result_text.push_str("\n\n");
+                        result_text.push_str(&reminders::wrap(&note));
+                    }
+                }
                 // Consume the one-time "look in history" hint *before* the loop
                 // detector fingerprints the result (issue #65). The hint is
                 // appended to only the first failed call, so a result that
@@ -4085,10 +4450,10 @@ impl Agent {
                     result_text.push_str("\n\n");
                     result_text.push_str(history::FAILED_TOOL_HINT);
                 }
-                if self.config.reminders && (is_plan_tool || is_outcome_tool) {
-                    // Plan and outcome calls are never counted by the loop
+                if self.config.reminders && (is_plan_tool || is_outcome_tool || is_timer_tool) {
+                    // Plan, timer and outcome calls are never counted by the loop
                     // detector, but they must still break a repeat streak so an
-                    // interleaved plan/outcome call cannot mask otherwise
+                    // interleaved plan/timer/outcome call cannot mask otherwise
                     // consecutive repeats (issue #65).
                     self.reminders.reset_repeat();
                 } else if self.config.reminders {
@@ -4149,7 +4514,28 @@ impl Agent {
                     Message::tool_error(&tool_call.id, &tool_call.name, &result_text)
                 }
                 .with_attachments(attachments);
-                self.push(message)?;
+                // Commit this call's recall changes only once the tool result
+                // carrying their notes is durable: a failed append rolls them
+                // back, so a resume never treats unseen notes as seen.
+                let recall_before = self.recall_unpersisted.take();
+                let notes_before = self.recall_notes_unpersisted.take();
+                if let Err(err) = self.push(message) {
+                    if let Some(before) = recall_before {
+                        self.recall = before;
+                    }
+                    // The notes never entered the conversation: refund their
+                    // budget so a retry of this input may still attach them.
+                    if let Some(spent) = notes_before {
+                        self.recall_turn_notes = spent;
+                        if let Some(pending) = self.pending_input.as_mut() {
+                            pending.recall_notes = spent;
+                        }
+                    }
+                    return Err(err);
+                }
+                if recall_before.is_some() {
+                    self.recall_changed();
+                }
                 self.emit(AgentEvent::ToolResult { call: tool_call, ok, output: &display_output });
             }
             self.refresh_stats();
@@ -4274,12 +4660,121 @@ impl Agent {
         report
     }
 
+    /// Whether an opportunistic idle compaction is due (issue #182): idle
+    /// compaction and auto-compaction are both enabled, the context is already
+    /// past the auto-compaction threshold (with the usual `compact_floor`
+    /// hysteresis), and no idle attempt has already been spent on this
+    /// crossing. The caller owns the *idle* half of the gate — prompt open,
+    /// no fresh draft, steerable terminal (see `main::deliver_idle_compact`).
+    #[cfg(test)]
+    pub fn idle_compact_due(&self) -> bool {
+        if !self.config.idle_compact || !self.config.auto_compact {
+            return false;
+        }
+        let (tokens, _) = self.estimate_context_tokens();
+        self.idle_compact_due_at(tokens)
+    }
+
+    /// `idle_compact_due` for the prompt's periodic poll. The estimate reads
+    /// and hashes every stored attachment, so it is memoized on the inputs
+    /// that change it in memory (conversation length, calibration anchor,
+    /// image quota); the poll then costs no file I/O while the context is
+    /// unchanged. `idle_compact` itself re-checks with a fresh estimate before
+    /// compacting, so a stale cache can at most delay or skip a wake-up.
+    pub fn idle_compact_due_polled(&self) -> bool {
+        if !self.config.idle_compact || !self.config.auto_compact {
+            return false;
+        }
+        let key = (
+            self.conversation.len(),
+            self.calibration,
+            self.vision().map(|v| v.max_images).unwrap_or(0),
+            self.control.mode(),
+            self.history_tools_enabled(),
+        );
+        let tokens = match self.idle_estimate_cache.get() {
+            Some((cached, tokens)) if cached == key => tokens,
+            _ => {
+                let (tokens, _) = self.estimate_context_tokens();
+                self.idle_estimate_cache.set(Some((key, tokens)));
+                tokens
+            }
+        };
+        self.idle_compact_due_at(tokens)
+    }
+
+    fn idle_compact_due_at(&self, tokens: usize) -> bool {
+        if !self.config.idle_compact || !self.over_threshold_at(tokens) {
+            return false;
+        }
+        let window = self.context_window();
+        // `over_threshold` also subtracts the output reservation, which can
+        // put its limit *below* the configured threshold on a small total
+        // window. Idle compaction is opportunistic, so it additionally
+        // requires usage at or past `window × auto_compact_threshold` itself
+        // and never runs earlier than the user asked (issue #182).
+        let threshold = self.config.auto_compact_threshold.clamp(0.1, 0.99);
+        if (tokens as f64) < window as f64 * threshold {
+            return false;
+        }
+        self.idle_gate.armed(tokens, window)
+    }
+
+    /// Run the same compaction auto-compaction would, at the idle prompt.
+    /// Cancellable through the agent's control like a turn. Whatever the
+    /// outcome, an attempt that did not compact spends the gate for this
+    /// crossing so a cancelled or failed run is not retried in a loop.
+    pub async fn idle_compact(&mut self) -> Result<Option<IdleCompactReport>> {
+        self.control.start_turn();
+        // A `/model` left pending by the previous turn changes the window and
+        // so the threshold: apply it *before* re-checking eligibility and
+        // capturing the report window, so idle compaction never runs below
+        // the new model's threshold or reports against the old window.
+        let tokens_at_entry = self.estimate_context_tokens().0;
+        if self.apply_model_request().await {
+            self.refresh_stats();
+            self.set_activity(Activity::Idle);
+            self.idle_gate.spend(tokens_at_entry);
+            return Ok(None);
+        }
+        self.refresh_stats();
+        // Re-measure after the switch: installing a model clears calibration,
+        // so the unchanged transcript can estimate differently. Spending the
+        // gate at the stale size could re-arm it with no real growth.
+        let tokens_before = self.estimate_context_tokens().0;
+        if !self.idle_compact_due_at(tokens_before) || !self.config.auto_compact {
+            self.set_activity(Activity::Idle);
+            return Ok(None);
+        }
+        let window = self.context_window().max(1);
+        let result = self.compact_logged(CompactTrigger::Idle, self.config.compaction_mode, None).await;
+        self.set_activity(Activity::Idle);
+        let cancelled = self.control.is_cancelled();
+        match &result {
+            Ok(Some(_)) if !cancelled => {}
+            _ => self.idle_gate.spend(tokens_before),
+        }
+        let report = result?;
+        if cancelled {
+            return Ok(None);
+        }
+        Ok(report.map(|report| IdleCompactReport::new(report, window)))
+    }
+
     fn over_threshold(&self) -> bool {
         if !self.config.auto_compact {
             return false;
         }
-        let threshold = self.config.auto_compact_threshold.clamp(0.1, 0.99);
         let (tokens, _) = self.estimate_context_tokens();
+        self.over_threshold_at(tokens)
+    }
+
+    /// `over_threshold` for an already-estimated context size.
+    fn over_threshold_at(&self, tokens: usize) -> bool {
+        if !self.config.auto_compact {
+            return false;
+        }
+        let threshold = self.config.auto_compact_threshold.clamp(0.1, 0.99);
         let window = self.context_window();
         // Endpoints such as vLLM and Splash reject a request whose prompt plus
         // `max_tokens` exceeds the window, so the output reservation counts
@@ -4353,7 +4848,11 @@ impl Agent {
         mode: CompactionMode,
         instructions: Option<&str>,
     ) -> Result<Option<CompactReport>> {
-        self.set_activity(Activity::Compacting);
+        self.set_activity(if trigger == CompactTrigger::Idle {
+            Activity::IdleCompacting
+        } else {
+            Activity::Compacting
+        });
         // Compaction summarizes via a model call (`compact_with`), so a
         // `/model` queued but not yet applied — e.g. one typed during a turn's
         // final in-flight call, which `run_turn` never reaches a hook to apply,
@@ -4371,8 +4870,9 @@ impl Agent {
         let report = self.compact_with(trigger, mode, instructions).await?;
         if let Some(report) = &report {
             self.compact_floor = report.tokens_after;
+            self.idle_gate.reset();
             if trigger != CompactTrigger::Manual {
-                eprintln!("[agent] auto-{report}");
+                crate::ui::log(&format!("[agent] auto-{report}"));
             }
             self.stats.lock().unwrap().compactions += 1;
             self.emit(AgentEvent::Compacted);
@@ -4445,7 +4945,8 @@ impl Agent {
             return Ok(None);
         }
         // The real turns about to be folded into the summary, kept so a later
-        // legacy → frame switch can replay them (see `replace_keeping_pending`).
+        // legacy → frame switch can replay them (see `replace_keeping_pending`)
+        // and so the replace record can persist them for a resume or /relaunch.
         // On a *repeated* compaction the first summarized message is the
         // previous synthetic summary and the stash of real turns lives in
         // `pre_compaction_transcript`: expand that summary back to its real
@@ -4454,18 +4955,21 @@ impl Agent {
         // synthetic restatement a prior compaction appended (tracked by
         // `pre_compaction_restated`) is dropped from the stash too, so it never
         // carries forward as a replayed duplicate.
-        let summarized_msgs = match &self.pre_compaction_transcript {
-            Some(prev) => {
-                let mut turns = prev.clone();
-                for (offset, message) in summarized.iter().enumerate().skip(1) {
-                    if self.pre_compaction_restated == Some(body_start + offset) {
-                        continue;
-                    }
-                    turns.push(message.clone());
-                }
-                turns
-            }
-            None => summarized.to_vec(),
+        // Only the newly folded turns are carried: on a repeated compaction the
+        // first summarized message is the previous synthetic summary, whose
+        // real turns already live in the stash, and `replace_keeping_pending`
+        // extends that stash in place (no cumulative copy).
+        let extends_stash = self.pre_compaction_transcript.as_ref().is_some_and(|p| !p.is_empty());
+        let summarized_msgs: Vec<Message> = if extends_stash {
+            summarized
+                .iter()
+                .enumerate()
+                .skip(1)
+                .filter(|(offset, _)| self.pre_compaction_restated != Some(body_start + offset))
+                .map(|(_, m)| m.clone())
+                .collect()
+        } else {
+            summarized.to_vec()
         };
 
         // The summary's output budget and the transcript's share of the window
@@ -4481,7 +4985,10 @@ impl Agent {
         // `request_max_tokens()`'s cap handling. The model-dependent inputs
         // (`window`, `context_cap`, `combined_window`) are passed in per attempt
         // — not captured — so a `/model` switch honoured on a retry rebuilds
-        // them for the new model (issue #114).
+        // them for the new model (issue #114). `pin_requests` is likewise
+        // resolved once up front: the closure cannot borrow `self` (the retry
+        // loop mutates it), and the flag does not change mid-compaction.
+        let pin_requests = self.config.compaction_pin_requests;
         let build_request =
             |output_budget: i64, window: usize, context_cap: ContextCap, combined_window: Option<usize>| {
                 let input_window = match context_cap {
@@ -4497,11 +5004,26 @@ impl Agent {
                 if let Some(focus) = instructions.map(str::trim).filter(|f| !f.is_empty()) {
                     request_text.push_str(&format!("\n\nWhen summarizing, focus on: {focus}"));
                 }
-                let system_prompt = if smart {
+                let mut system_prompt = if smart {
                     format!("{}{}", context::SUMMARY_SYSTEM_PROMPT, context::SMART_SUMMARY_INSTRUCTIONS)
                 } else {
                     context::SUMMARY_SYSTEM_PROMPT.to_string()
                 };
+                // A repeated compaction folds the previous synthetic summary back
+                // in (rendered as `[earlier summary]`). Warn the summariser that
+                // block is lossy so it does not restate the user's goals from a
+                // paraphrase of a paraphrase — the harness pins the user's exact
+                // requests alongside the new summary (issue #66). With pinning
+                // off there is no pin to lean on, so the instruction instead
+                // tells the summariser to carry every requirement forward.
+                if summarized.iter().any(context::is_summary_message) {
+                    let lossy = if pin_requests {
+                        context::EARLIER_SUMMARY_LOSSY_INSTRUCTIONS
+                    } else {
+                        context::EARLIER_SUMMARY_LOSSY_NO_PIN_INSTRUCTIONS
+                    };
+                    system_prompt.push_str(lossy);
+                }
                 let summary_messages = [Message::system(&system_prompt), Message::user(&request_text)];
                 (summary_messages, output_budget)
             };
@@ -4523,6 +5045,16 @@ impl Agent {
         // dropped-history fallback, which would lose the summarized context
         // (issue #114).
         let mut summary_output_retried = false;
+        // Re-sends after a mid-summary connection drop (`StreamInterrupted`),
+        // capped like a chat turn's so a persistently broken connection still
+        // falls back instead of asking forever. Without this a disconnect after
+        // summary content arrived raised `StreamInterrupted` even with the
+        // discard sink, and compaction fell through to `dropped_note`, removing
+        // the earlier messages from the active context with no summary.
+        let mut summary_stream_restarts: u32 = 0;
+        // Wall clock for the summary call (all attempts), persisted on the
+        // replace record's synthetic summary message as `duration_ms`.
+        let summary_started = std::time::Instant::now();
         let result = loop {
             // Honour a `/model` switch queued while a previous summary attempt
             // was in flight, before building this attempt's request — the chat
@@ -4581,6 +5113,25 @@ impl Agent {
                 result = self.client.chat_stream(&request, &discard) => result,
             };
             match attempt {
+                // A stream that broke *after* summary content arrived: the
+                // partial summary was discarded (the sink drops every delta) and
+                // never added to history, so re-send the same request (which
+                // itself waits out any network outage). Capped per summary call
+                // so a persistently broken connection still ends in the
+                // `dropped_note` fallback instead of asking forever. A
+                // non-`StreamInterrupted` error falls through to the output-cap
+                // handling below.
+                Err(e)
+                    if summary_stream_restarts < MAX_STREAM_RESTARTS && providers::stream_interrupted(&e).is_some() =>
+                {
+                    let interrupted = providers::stream_interrupted(&e).expect("checked by the guard");
+                    summary_stream_restarts += 1;
+                    let what = format!("{}/{}", self.client.provider_name(), self.client.model_name());
+                    crate::ui::log(&format!(
+                        "[agent] {what}: {interrupted}; asking again ({summary_stream_restarts}/{MAX_STREAM_RESTARTS})"
+                    ));
+                    continue;
+                }
                 Err(e) if !summary_output_retried => {
                     let message = format!("{e:#}");
                     if context::is_output_cap_error(&message) && !context::is_context_overflow(&message) {
@@ -4603,9 +5154,9 @@ impl Agent {
                         if learned < budget {
                             self.learned_max_output = Some(learned as usize);
                             self.refresh_stats();
-                            eprintln!(
+                            crate::ui::log(&format!(
                                 "[agent] summary output-limit rejection ({message}); retrying with max_tokens={learned}"
-                            );
+                            ));
                             continue;
                         }
                     }
@@ -4614,9 +5165,20 @@ impl Agent {
                 other => break other,
             }
         };
+        // The summary request is a real model call whose cost the session log
+        // must carry: the compaction's `replace` record otherwise persists only
+        // the synthetic summary, and offline cost accounting (the compaction
+        // eval's `run_cost`, which reads `usage`/`duration_ms` off logged
+        // messages) would see a compaction as free, so a change that makes
+        // summarizing more expensive looks cost-neutral. Capture the usage and
+        // wall time of the *final* attempt (the one whose response produced —
+        // or failed to produce — the summary); they ride along on the synthetic
+        // summary message in the replace record below.
+        let mut summary_usage = None;
         let mut truncated = false;
         let (summary, fallback) = match result {
             Ok(response) if !response.content.trim().is_empty() => {
+                summary_usage = response.usage.clone();
                 self.record_usage(&response, false);
                 // A summary cut off at the output limit silently loses whatever
                 // it had not reached yet; say so, so the agent re-checks state
@@ -4645,11 +5207,13 @@ impl Agent {
                 } else {
                     "empty summary".to_string()
                 };
+                summary_usage = response.usage.clone();
                 self.record_usage(&response, false);
                 (dropped, Some(reason))
             }
             Err(e) => (self.dropped_note(summarized.len(), smart.then_some(range).flatten()), Some(format!("{e:#}"))),
         };
+        let summary_duration_ms = u64::try_from(summary_started.elapsed().as_millis()).ok();
 
         let mut messages: Vec<Message> = self.conversation[..body_start].to_vec();
         let summary = if self.config.plan_tools && !self.plan.is_empty() {
@@ -4657,7 +5221,34 @@ impl Agent {
         } else {
             summary
         };
-        messages.push(Message::user(&summary));
+        // Pin the user's requests verbatim after the summary, the same way the
+        // plan note is attached, so the user's actual words survive repeated
+        // compactions instead of being paraphrased away (a summary of a
+        // summary). Rebuilt from the original messages on every compaction —
+        // the earlier real turns in `pre_compaction_transcript` plus the turns
+        // this compaction is folding (`summarized_msgs`, which already excludes
+        // the previous summary and its synthetic restatement) — never from the
+        // previous summary itself (issue #66). The eval can disable it
+        // (`compaction_pin_requests = false`) to measure its effect. The block
+        // is bounded by an overall allowance derived from the context window,
+        // so a long session's pins cannot grow past the window.
+        let prior_turns = self.pre_compaction_transcript.as_deref().unwrap_or(&[]);
+        let summary = if self.config.compaction_pin_requests {
+            match context::pinned_user_requests(prior_turns, &summarized_msgs, smart, self.context_window()) {
+                Some(pinned) => format!("{summary}\n\n{pinned}"),
+                None => summary,
+            }
+        } else {
+            summary
+        };
+        // The synthetic summary stands in for the folded assistant turns in the
+        // persisted replace record; attach the summary request's cost to it so
+        // the log keeps that cost (usage/duration are log-only fields, never
+        // sent to a provider).
+        let mut summary_message = Message::user(&summary);
+        summary_message.usage = summary_usage;
+        summary_message.duration_ms = summary_duration_ms;
+        messages.push(summary_message);
         // When the active input is itself folded into the summary it is
         // restated after it; `restated_index` records where, so the replay can
         // skip that synthetic copy (the original is in `summarized_msgs`).
@@ -4689,11 +5280,18 @@ impl Agent {
         let summarized = split - body_start;
         // The folded turns ride along so `replay_history` can restore them on
         // a legacy → frame switch (the frame's first redraw clears the legacy
-        // scrollback, and the compacted conversation holds only the summary).
+        // scrollback, and the compacted conversation holds only the summary)
+        // and so the replace record persists them for a resume or /relaunch.
         self.replace_keeping_pending(
             messages,
             pending_position,
-            Some(CompactionRecord { range, mode, folded: summarized_msgs, restated: restated_index }),
+            Some(CompactionRecord {
+                range,
+                mode,
+                folded: summarized_msgs,
+                extends: extends_stash,
+                restated: restated_index,
+            }),
         )?;
         if let Some(instructions) = &mut self.instructions {
             instructions.forget_nested();
@@ -4711,11 +5309,215 @@ impl Agent {
     }
 
     fn run_plan_tool(&mut self, call: &ToolCall) -> Result<Value> {
-        let outcome = self.plan.apply(&call.name, &call.arguments)?;
-        if outcome.changed {
-            self.plan_changed()?;
+        // Same apply-then-persist atomicity as `run_timer_tool`: `apply`
+        // mutates the live plan in place, so snapshot first and roll back on an
+        // apply or persist failure rather than leaving the live plan changed
+        // while reporting an error (issue #150 review).
+        let snapshot = self.plan.clone();
+        let outcome = match self.plan.apply(&call.name, &call.arguments) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                self.plan = snapshot;
+                return Err(err);
+            }
+        };
+        if outcome.changed
+            && let Err(err) = self.plan_changed()
+        {
+            self.plan = snapshot;
+            self.control.publish_plan(&self.plan);
+            self.refresh_stats();
+            return Err(err);
         }
         Ok(Value::String(outcome.text))
+    }
+
+    /// "Now" for the timers: the wall clock, or the time a test set.
+    fn timers_now(&self) -> DateTime<Local> {
+        #[cfg(test)]
+        if let Some(fixed) = &self.timers_clock {
+            return *fixed.lock().unwrap();
+        }
+        Local::now()
+    }
+
+    /// Give the timers a shared clock for a test (`None` returns to the wall
+    /// clock); advancing the cell moves time, even mid-turn.
+    #[cfg(test)]
+    pub fn set_timers_now(&mut self, now: Option<std::sync::Arc<std::sync::Mutex<DateTime<Local>>>>) {
+        self.timers_clock = now;
+    }
+
+    /// Test hook: force the next timers/plan persist to fail, so a test can
+    /// drive the apply-then-persist rollback without a real I/O failure.
+    #[cfg(test)]
+    pub fn fail_next_persist(&mut self) {
+        self.fail_next_persist = true;
+    }
+
+    /// The session's timers.
+    pub fn timers(&self) -> &Timers {
+        &self.timers
+    }
+
+    /// Turn the timer tools off (ACP: no idle loop to fire them). Existing
+    /// timers keep their state but cannot fire without the tools loop.
+    pub fn disable_timers(&mut self) {
+        self.timers_enabled = false;
+    }
+
+    fn run_timer_tool(&mut self, call: &ToolCall) -> Result<Value> {
+        if !self.timers_enabled {
+            return Err(anyhow::anyhow!(
+                "{} is not available here: timers need the interactive harness's idle loop to fire",
+                call.name
+            ));
+        }
+        // `apply` mutates the live timers in place, and persisting them
+        // afterwards can still fail. Snapshot first so an apply *or* persist
+        // failure rolls the live timers back to their prior state — otherwise a
+        // failed cancel/acknowledge would drop the timer in memory while
+        // returning an error, leaving the published/persisted timers stale and
+        // the live state silently diverged (issue #150 review).
+        let snapshot = self.timers.clone();
+        let outcome = match self.timers.apply(&call.name, &call.arguments, self.timers_now()) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                self.timers = snapshot;
+                return Err(err);
+            }
+        };
+        if outcome.changed
+            && let Err(err) = self.timers_changed()
+        {
+            self.timers = snapshot;
+            self.control.publish_timers(&self.timers);
+            self.refresh_stats();
+            return Err(err);
+        }
+        Ok(Value::String(outcome.text))
+    }
+
+    /// Persist the memory-recall state after a change. Best-effort: a failed
+    /// append only means a resumed session may repeat a note.
+    fn recall_changed(&mut self) {
+        if let Some(log) = &mut self.session
+            && let Err(err) = log.append(&Record::Recall { recall: self.recall.clone(), recorded_at: session::now() })
+        {
+            crate::ui::log(&format!("[agent] could not persist memory recall state: {err}"));
+        }
+    }
+
+    /// Recall memories whose anchors appear in this tool call (issue #166),
+    /// returning the notes to attach to its result. Also marks memories whose
+    /// full text a memory tool just returned as seen.
+    fn recall_memories(&mut self, tool: &str, args: &Value, ok: bool, result: &str) -> Vec<String> {
+        let Some(store) = self.memory.as_ref() else {
+            return Vec::new();
+        };
+        let session = self.session_id.clone();
+        let before = self.recall.clone();
+        if memory::is_memory_tool(tool) {
+            if ok {
+                for id in self.recall.note_seen_in(result) {
+                    store.log_recall("used", &id, tool, session.as_deref());
+                }
+                if before != self.recall {
+                    self.recall_unpersisted.get_or_insert(before);
+                }
+            }
+            return Vec::new();
+        }
+        let budget = memory::RECALL_NOTES_PER_TURN.saturating_sub(self.recall_turn_notes);
+        let notes = store.recall(tool, args, &mut self.recall, &self.index_shown, budget);
+        for note in &notes {
+            store.log_recall("fired", &note.id, tool, session.as_deref());
+        }
+        if !notes.is_empty() {
+            self.recall_notes_unpersisted.get_or_insert(self.recall_turn_notes);
+            self.recall_turn_notes += notes.len();
+            // Carry the spent budget on the pending input too, so a retry of
+            // this (still in-flight) input resumes with it instead of
+            // re-arming the per-input cap (Copilot finding, src/agent.rs).
+            if let Some(pending) = self.pending_input.as_mut() {
+                pending.recall_notes = self.recall_turn_notes;
+            }
+            self.recall_unpersisted.get_or_insert(before);
+        }
+        notes.into_iter().map(|n| n.text).collect()
+    }
+
+    /// Persist and publish the timers after a change (like `plan_changed`).
+    fn timers_changed(&mut self) -> Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_persist) {
+            return Err(anyhow::anyhow!("forced timers persist failure (test)"));
+        }
+        if let Some(log) = &mut self.session {
+            log.append(&Record::Timers { timers: self.timers.clone(), recorded_at: session::now() })?;
+        }
+        self.control.publish_timers(&self.timers);
+        self.refresh_stats();
+        Ok(())
+    }
+
+    /// Timers due right now (they fire once), soonest first.
+    pub fn take_fired_timers(&mut self) -> Result<Vec<timers::Timer>> {
+        // `take_due` moves the due timers out of `items` and into `pending`
+        // in place. If the subsequent persist fails we must roll the live
+        // timers back: the caller (`fire_due_timers`) aborts on the error
+        // before delivering their messages, so without a rollback the firing is
+        // consumed in memory (gone from `items`, now `pending`) while never
+        // delivered — a retry then finds nothing due, silently losing the
+        // reminders and leaving the live state diverged from the
+        // published/persisted snapshot (issue #150 review). Snapshot first and
+        // reset the nudge counter only after persistence succeeds, so a failed
+        // firing is fully atomic (deliver + persist, or leave state untouched).
+        let snapshot = self.timers.clone();
+        let fired = self.timers.take_due(self.timers_now());
+        if !fired.is_empty() {
+            if let Err(err) = self.timers_changed() {
+                self.timers = snapshot;
+                self.control.publish_timers(&self.timers);
+                self.refresh_stats();
+                return Err(err);
+            }
+            // Restart the pending-nudge interval whenever a timer fires, so a
+            // counter left near the `PENDING_NUDGE_EVERY` threshold by an
+            // earlier pending timer does not make the first model step after an
+            // idle firing immediately re-nudge. `absorb_steers` resets it too;
+            // doing it here makes both delivery paths (mid-turn and the idle
+            // REPL loop, which calls this directly) share the reset. Only after
+            // a successful persist, so a rolled-back firing keeps its counter.
+            self.pending_timer_steps = 0;
+        }
+        Ok(fired)
+    }
+
+    /// Mark the next `run_turn` as an automatic timer turn (a wakeup, mid-turn
+    /// firing, or pending nudge) so its user message is billed as
+    /// agent-initiated rather than a premium user request (issue #150).
+    pub fn mark_auto_turn(&mut self) {
+        self.auto_turn = true;
+    }
+
+    /// Push the timers due at this step into the conversation as a user
+    /// message, after the steers. Returns whether any fired.
+    fn fire_due_timers(&mut self) -> Result<bool> {
+        let fired = self.take_fired_timers()?;
+        if fired.is_empty() {
+            return Ok(false);
+        }
+        let now = self.timers_now();
+        // The UI shows `⏰ timer N: <note>` per timer. A dedicated event (not
+        // `UserMessage`): plain/redirected output suppresses `UserMessage` as
+        // steer/replay chatter, but a mid-turn timer firing must be visible
+        // there too — including headless `--wait-timers` runs (issue #150).
+        for timer in &fired {
+            self.emit(AgentEvent::TimerFired { id: timer.id, note: &timer.note });
+        }
+        self.push(Message::user(&Timers::fired_batch_message(&fired, now)).timer())?;
+        Ok(true)
     }
 
     #[cfg(test)]
@@ -4974,6 +5776,148 @@ mod tests {
         assert!(users.contains(&"ping".to_string()), "first-compaction turn preserved: {users:?}");
         assert!(users.contains(&"pong".to_string()), "second-compaction turn preserved: {users:?}");
         assert!(!users.iter().any(|t| t.contains("SUMMARY")), "no synthetic summary exposed: {users:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replay_after_mid_turn_compaction_shows_the_folded_input_once() {
+        // When auto-compaction folds the active input, the compacted
+        // conversation restates it after the summary while the real copy rides
+        // along in the replay stash. A legacy → frame switch replays BOTH the
+        // stash and the conversation, so the synthetic restatement must be
+        // skipped or the one submitted prompt would be shown twice.
+        let dir = tempfile::tempdir().unwrap();
+        let big = LLMResponse {
+            tool_calls: vec![ToolCall {
+                id: "b1".into(),
+                name: "big".into(),
+                arguments: json!({}),
+                item_id: None,
+                malformed_arguments: None,
+            }],
+            ..Default::default()
+        };
+        let (mut agent, _seen) = agent(vec![big, text("SUMMARY"), text("done")], dir.path());
+        agent.config.context_window = Some(3_000);
+        agent.config.auto_compact_threshold = 0.5;
+        agent.tools().register(
+            ToolDefinition::new("big", "big", json!({"type": "object"})),
+            Box::new(|_| Ok(json!("x".repeat(8_000)))),
+        );
+        agent.new_session().unwrap();
+        agent.run_turn(Some("in-1"), "go").await.unwrap();
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_sink = seen.clone();
+        agent.set_event_sink(std::sync::Arc::new(move |_, event| {
+            if let AgentEvent::UserMessage { text } = event {
+                seen_sink.lock().unwrap().push(text.to_string());
+            }
+        }));
+        agent.replay_history();
+        let gos = seen.lock().unwrap().iter().filter(|t| t.as_str() == "go").count();
+        assert_eq!(gos, 1, "the folded input is replayed exactly once: {:?}", seen.lock().unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replay_after_resume_restores_the_persisted_pre_compaction_turns() {
+        // A /relaunch (or restart with --resume) reloads the session from its
+        // log in a fresh process: the in-memory replay stash is gone, so the
+        // folded turns must come from the compaction's persisted replace
+        // record. Without them the replay shows the synthetic summary where
+        // the real pre-compaction turns were.
+        let dir = tempfile::tempdir().unwrap();
+        let id = {
+            let (mut agent, _seen) = agent(vec![text("r1"), text("SUMMARY: pinged once"), text("r2")], dir.path());
+            agent.new_session().unwrap();
+            agent.send_message("ping").await.unwrap();
+            assert!(agent.compact(None, None).await.unwrap().is_some());
+            assert!(agent.conversation().iter().any(|m| m.role == Role::User && m.content.contains("SUMMARY")));
+            // A post-compaction turn: its user message lands right where a
+            // stale restated-skip index would point, so the replay must not
+            // drop it.
+            agent.send_message("afterwards").await.unwrap();
+            agent.session_id().unwrap().to_string()
+        };
+        // The relaunched process: a new agent over the same session log.
+        let (mut resumed, _seen) = agent(vec![], dir.path());
+        resumed.load_session(&id).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_sink = seen.clone();
+        resumed.set_event_sink(std::sync::Arc::new(move |_, event| {
+            if let AgentEvent::UserMessage { text } = event {
+                seen_sink.lock().unwrap().push(text.to_string());
+            }
+        }));
+        resumed.replay_history();
+        let users = seen.lock().unwrap().clone();
+        assert!(users.contains(&"ping".to_string()), "real pre-compaction turn restored after resume: {users:?}");
+        assert!(users.contains(&"afterwards".to_string()), "post-compaction turn replayed after resume: {users:?}");
+        assert!(!users.iter().any(|t| t.contains("SUMMARY")), "synthetic summary not exposed after resume: {users:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_after_repeated_compaction_rebuilds_the_stash_from_delta_records() {
+        // Each compaction logs only its newly folded turns (plus the prefix it
+        // extends), so the log does not re-persist the whole cumulative stash;
+        // the resume must stitch the deltas back into the full history.
+        let dir = tempfile::tempdir().unwrap();
+        let id = {
+            let (mut agent, _seen) =
+                agent(vec![text("r1"), text("SUMMARY: one"), text("r2"), text("SUMMARY: two")], dir.path());
+            agent.new_session().unwrap();
+            agent.send_message("ping-unique-marker").await.unwrap();
+            assert!(agent.compact(None, None).await.unwrap().is_some());
+            agent.send_message("pong").await.unwrap();
+            assert!(agent.compact(None, None).await.unwrap().is_some());
+            agent.session_id().unwrap().to_string()
+        };
+        // The first turn's text is persisted once per folded copy: a
+        // cumulative re-write would store it in both replace records. Parse each
+        // log line and inspect only the `folded` stash — the marker also appears
+        // in the second summary's pinned-request block (issue #66), which is a
+        // separate, legitimate copy that is not the folded stash.
+        let mut copies = 0;
+        for entry in walkdir_files(dir.path()) {
+            if let Ok(text) = std::fs::read_to_string(&entry)
+                && text.contains(&id)
+            {
+                for line in text.lines() {
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+                    let Some(folded) = value.get("data").and_then(|d| d.get("folded")).and_then(|f| f.as_array())
+                    else {
+                        continue;
+                    };
+                    copies += folded.iter().filter(|m| m.to_string().contains("ping-unique-marker")).count();
+                }
+            }
+        }
+        assert_eq!(copies, 1, "the first folded turn is logged once, not re-persisted per compaction");
+        let (mut resumed, _seen) = agent(vec![], dir.path());
+        resumed.load_session(&id).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_sink = seen.clone();
+        resumed.set_event_sink(std::sync::Arc::new(move |_, event| {
+            if let AgentEvent::UserMessage { text } = event {
+                seen_sink.lock().unwrap().push(text.to_string());
+            }
+        }));
+        resumed.replay_history();
+        let users = seen.lock().unwrap().clone();
+        assert!(users.contains(&"ping-unique-marker".to_string()), "first-compaction turn restored: {users:?}");
+        assert!(users.contains(&"pong".to_string()), "second-compaction turn restored: {users:?}");
+        assert!(!users.iter().any(|t| t.contains("SUMMARY")), "no synthetic summary exposed: {users:?}");
+    }
+
+    fn walkdir_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() { stack.push(path) } else { out.push(path) }
+            }
+        }
+        out
     }
 
     #[test]
@@ -5767,7 +6711,7 @@ mod tests {
             Box::new(Scripted { responses: Mutex::new(vec![]), seen: Arc::new(Mutex::new(vec![])) }),
             config,
         );
-        let reported = agent.reported_max_output.clone();
+        let reported = agent.probe.max_output_slot();
         let client = OutputCapClient {
             cap: 8_000,
             seen_max_tokens: seen.clone(),
@@ -5978,6 +6922,10 @@ mod tests {
             mode: Some(crate::config::CompactionMode::Standard),
             model: None,
             continuation: Some(("one two ".to_string(), 2)),
+            folded: None,
+            folded_base: None,
+            restated: None,
+            pending_recall_notes: 0,
             recorded_at: session::now(),
         })
         .unwrap();
@@ -6016,6 +6964,10 @@ mod tests {
             mode: Some(crate::config::CompactionMode::Standard),
             model: None,
             continuation: Some(("one two three ".to_string(), MAX_TRUNCATED_CONTINUATIONS)),
+            folded: None,
+            folded_base: None,
+            restated: None,
+            pending_recall_notes: 0,
             recorded_at: session::now(),
         })
         .unwrap();
@@ -6047,6 +6999,10 @@ mod tests {
             mode: Some(crate::config::CompactionMode::Standard),
             model: None,
             continuation: Some(("one ".to_string(), 1)),
+            folded: None,
+            folded_base: None,
+            restated: None,
+            pending_recall_notes: 0,
             recorded_at: session::now(),
         })
         .unwrap();
@@ -6084,6 +7040,10 @@ mod tests {
             mode: Some(crate::config::CompactionMode::Standard),
             model: None,
             continuation: Some(("one ".to_string(), 1)),
+            folded: None,
+            folded_base: None,
+            restated: None,
+            pending_recall_notes: 0,
             recorded_at: session::now(),
         })
         .unwrap();
@@ -6128,6 +7088,10 @@ mod tests {
             mode: Some(crate::config::CompactionMode::Standard),
             model: None,
             continuation: Some(("one ".to_string(), 1)),
+            folded: None,
+            folded_base: None,
+            restated: None,
+            pending_recall_notes: 0,
             recorded_at: session::now(),
         })
         .unwrap();
@@ -6140,6 +7104,40 @@ mod tests {
         let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
         assert_eq!(outcome.stop_reason, StopReason::EndTurn);
         assert_eq!(outcome.response, "one done", "the replay shortcut folds the persisted prefix into the answer");
+        assert!(seen.lock().unwrap().is_empty(), "a recorded answer is replayed, not re-run");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_preserves_the_prefix_across_an_interleaved_timer_message() {
+        // A timer fired mid-turn, between a truncated chunk and its final
+        // chunk, and the crash landed before `TurnEnd`. The fired-timer user
+        // message is a harness injection, not a new answer segment, so the
+        // replay must keep the interrupted answer's prefix across it instead of
+        // clearing it (issue #150).
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "timer-prefix").unwrap();
+        log.append(&Record::Message(Box::new(Message::system("sys")))).unwrap();
+        log.append(&Record::Input { id: "msg-1".into(), text: "run it".into(), recorded_at: session::now() }).unwrap();
+        log.append(&Record::Message(Box::new(Message::user("run it")))).unwrap();
+        // The in-flight turn: a truncated chunk, its continuation reminder, then
+        // a fired timer's user message lands before the clean final chunk.
+        log.append(&Record::Message(Box::new(truncated_assistant("one ")))).unwrap();
+        log.append(&Record::Message(Box::new(
+            Message::user(&reminders::wrap(&truncated_continuation_note(50))).continuation(),
+        )))
+        .unwrap();
+        log.append(&Record::Message(Box::new(Message::user(&Timers::fired_batch_message(&[], Local::now())).timer())))
+            .unwrap();
+        log.append(&Record::Message(Box::new(Message::assistant("two")))).unwrap();
+        drop(log);
+        let (mut agent, seen) = agent(vec![text("should not be called")], dir.path());
+        agent.load_session("timer-prefix").unwrap();
+        let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(
+            outcome.response, "one two",
+            "the fired-timer message does not clear the interrupted answer's prefix"
+        );
         assert!(seen.lock().unwrap().is_empty(), "a recorded answer is replayed, not re-run");
     }
 
@@ -6547,6 +7545,277 @@ mod tests {
             ..Config::default()
         };
         Agent::new(Box::new(client), config)
+    }
+
+    fn tool_texts(agent: &Agent) -> Vec<String> {
+        agent.conversation.iter().filter(|m| m.role == Role::Tool).map(|m| m.content.clone()).collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tool_calls_recall_matching_memories_once_per_context() {
+        // Issue #166: a tool call whose arguments carry a memory's anchor gets
+        // that memory as a note, once per context for a hint, every time for a
+        // rule; compaction resets it, and a resume restores it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = "/nonexistent/omarchy.local/worker.log";
+        let responses = vec![
+            read_call("r1", path),
+            text("one"),
+            read_call("r2", path),
+            text("two"),
+            text("SUMMARY: read logs"),
+            read_call("r3", path),
+            text("three"),
+        ];
+        // Read-only memory (the headless/ACP default) still recalls.
+        let mut agent = memory_agent(crate::config::MemoryMode::ReadOnly, responses, dir.path());
+        agent.new_session().unwrap();
+        let store = agent.memory().unwrap();
+        let hint = store
+            .save(
+                memory::Scope::User,
+                // Longer than the index's 200-char clip, so the index alone
+                // does not show it in full and it stays recallable.
+                &format!("worker logs on omarchy.local live under ~/.local/share/c8ctl-nano/logs {}", "x".repeat(200)),
+                None,
+                None,
+            )
+            .unwrap();
+        let rule = store
+            .save_with(
+                memory::Scope::User,
+                "never broad-kill on this host",
+                None,
+                None,
+                Some(memory::Kind::Rule),
+                Some(vec!["worker.log".into()]),
+            )
+            .unwrap();
+        agent.send_message("look").await.unwrap();
+        let first = tool_texts(&agent).pop().unwrap();
+        assert!(first.contains(&hint.id) && first.contains(&rule.id), "{first}");
+        assert!(first.contains("verify"), "{first}");
+
+        agent.send_message("again").await.unwrap();
+        let second = tool_texts(&agent).pop().unwrap();
+        assert!(!second.contains(&hint.id), "a hint fires once per context: {second}");
+        assert!(second.contains(&rule.id), "a rule fires on every match: {second}");
+
+        // A resume restores what was seen.
+        let id = agent.session_id().unwrap().to_string();
+        agent.load_session(&id).unwrap();
+        assert!(agent.recall.seen.contains(&hint.id));
+
+        agent.compact(None, None).await.unwrap().expect("compacted");
+        assert!(agent.recall.seen.is_empty(), "compaction resets recall");
+        agent.send_message("after compaction").await.unwrap();
+        let third = tool_texts(&agent).pop().unwrap();
+        assert!(third.contains(&hint.id), "a hint reappears after compaction: {third}");
+
+        let stats = agent.memory().unwrap().recall_stats();
+        assert_eq!(stats.get(&hint.id).map(|s| s.0), Some(2));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replacing_the_conversation_resets_and_persists_recall() {
+        // A `/settings` system-prompt change replaces the conversation, so the
+        // recalled notes leave context: recall must reset, durably.
+        let dir = tempfile::tempdir().unwrap();
+        let path = "/nonexistent/omarchy.local/worker.log";
+        let responses = vec![read_call("r1", path), text("one"), read_call("r2", path), text("two")];
+        let mut agent = memory_agent(crate::config::MemoryMode::ReadOnly, responses, dir.path());
+        agent.new_session().unwrap();
+        let hint = agent
+            .memory()
+            .unwrap()
+            .save(
+                memory::Scope::User,
+                &format!("worker logs on omarchy.local live elsewhere {}", "x".repeat(200)),
+                None,
+                None,
+            )
+            .unwrap();
+        agent.send_message("look").await.unwrap();
+        assert!(agent.recall.seen.contains(&hint.id));
+        agent.set_system_prompt("new prompt").unwrap();
+        assert!(agent.recall.is_empty(), "a conversation replacement resets recall");
+        let id = agent.session_id().unwrap().to_string();
+        agent.load_session(&id).unwrap();
+        assert!(agent.recall.is_empty(), "the reset is persisted");
+        agent.send_message("again").await.unwrap();
+        let again = tool_texts(&agent).pop().unwrap();
+        assert!(again.contains(&hint.id), "the clipped hint fires again: {again}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memories_rendered_in_full_by_the_index_do_not_refire() {
+        // The session-start index already shows a short memory's whole text
+        // and evidence, so a matching tool call must not spend a recall note
+        // re-showing it; a clipped memory (the index ellipsises it) stays
+        // eligible, and the seen set survives a resume (Copilot finding,
+        // src/agent.rs).
+        let dir = tempfile::tempdir().unwrap();
+        let path = "/nonexistent/omarchy.local/worker.log";
+        let responses = vec![read_call("r1", path), text("one"), read_call("r2", path), text("two")];
+        let mut agent = memory_agent(crate::config::MemoryMode::ReadOnly, responses, dir.path());
+        // Save before the session starts so the session-start index install
+        // sees both entries.
+        let (short, long) = {
+            let store = agent.memory().unwrap();
+            let short = store
+                .save(memory::Scope::User, "worker logs on omarchy.local live under ~/.local/share", None, None)
+                .unwrap();
+            let long = store
+                .save_with(
+                    memory::Scope::User,
+                    &format!("worker.log detail: {}", "x".repeat(300)),
+                    None,
+                    None,
+                    None,
+                    Some(vec!["worker.log".into()]),
+                )
+                .unwrap();
+            (short, long)
+        };
+        agent.new_session().unwrap();
+        // The index renders the short entry in full and clips the long one…
+        let (index, rendered) = agent.memory().unwrap().index_with_rendered(false);
+        let short_line = index.lines().find(|l| l.contains(&short.id)).unwrap_or("");
+        let long_line = index.lines().find(|l| l.contains(&long.id)).unwrap_or("");
+        assert!(short_line.ends_with("live under ~/.local/share"), "{index}");
+        assert!(long_line.ends_with('…'), "{index}");
+        assert!(rendered.contains(&short.id) && !rendered.contains(&long.id), "{rendered:?}");
+
+        agent.send_message("look").await.unwrap();
+        let first = tool_texts(&agent).pop().unwrap();
+        assert!(!first.contains(&short.id), "no duplicate recall of a fully rendered memory: {first}");
+        assert!(first.contains(&long.id), "the clipped memory still fires: {first}");
+        // Index visibility is derived from the installed prompt, never
+        // persisted into the session's recall state.
+        assert!(!agent.recall.seen.contains(&short.id), "index visibility is not recorded as seen");
+
+        let id = agent.session_id().unwrap().to_string();
+        agent.load_session(&id).unwrap();
+        agent.send_message("again").await.unwrap();
+        let second = tool_texts(&agent).pop().unwrap();
+        assert!(!second.contains(&short.id), "still no duplicate after resume: {second}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_memory_evicted_from_the_installed_index_becomes_recallable() {
+        // Index visibility is replaced, not accumulated, on each prompt
+        // install: once newer saves push a short memory out of the capped
+        // index, it is no longer in context and must recall again (Copilot
+        // finding, src/agent.rs).
+        let dir = tempfile::tempdir().unwrap();
+        let path = "/nonexistent/omarchy.local/worker.log";
+        let responses = vec![read_call("r1", path), text("one"), read_call("r2", path), text("two")];
+        let mut agent = memory_agent(crate::config::MemoryMode::ReadOnly, responses, dir.path());
+        let short = agent
+            .memory()
+            .unwrap()
+            .save(memory::Scope::User, "worker logs on omarchy.local live under ~/.local/share", None, None)
+            .unwrap();
+        agent.new_session().unwrap();
+        agent.send_message("look").await.unwrap();
+        assert!(!tool_texts(&agent).pop().unwrap().contains(&short.id), "shown by the index");
+        // Flood the index with newer, unrelated memories so it drops `short`.
+        for n in 0..60 {
+            agent
+                .memory()
+                .unwrap()
+                .save(memory::Scope::User, &format!("unrelated fact number {n} {}", "y".repeat(150)), None, None)
+                .unwrap();
+        }
+        let (index, _) = agent.memory().unwrap().index_with_rendered(false);
+        assert!(!index.contains(&short.id), "precondition: evicted from the index");
+        agent.refresh_memory_index();
+        agent.send_message("again").await.unwrap();
+        let second = tool_texts(&agent).pop().unwrap();
+        assert!(second.contains(&short.id), "an evicted memory recalls again: {second}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recall_attaches_at_most_two_notes_per_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = "/nonexistent/omarchy.local/x";
+        let responses = vec![read_call("r1", path), read_call("r2", path), text("done")];
+        let mut agent = memory_agent(crate::config::MemoryMode::On, responses, dir.path());
+        agent.new_session().unwrap();
+        for n in 0..4 {
+            agent
+                .memory()
+                .unwrap()
+                .save(memory::Scope::User, &format!("fact {n} about omarchy.local {}", "x".repeat(200)), None, None)
+                .unwrap();
+        }
+        agent.send_message("look").await.unwrap();
+        let notes: usize = tool_texts(&agent).iter().map(|t| t.matches("📌").count()).sum();
+        assert_eq!(notes, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retried_prompt_keeps_its_spent_recall_budget() {
+        // The two-notes cap is per *input*, not per `run_turn` call: a retry of
+        // an interrupted prompt resumes its pending input, so it resumes with
+        // the budget already spent rather than re-arming two more notes per
+        // retry (Copilot finding, src/agent.rs). The spent count rides with the
+        // pending input through the `Replace` record, so the cap holds across a
+        // session reload too.
+        let dir = tempfile::tempdir().unwrap();
+        let path = "/nonexistent/omarchy.local/x";
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let mut log = SessionLog::create(&sessions, "retry-budget").unwrap();
+        log.append(&Record::Message(Box::new(Message::system("sys")))).unwrap();
+        log.append(&Record::Input { id: "msg-1".into(), text: "look".into(), recorded_at: session::now() }).unwrap();
+        log.append(&Record::Message(Box::new(Message::user("look")))).unwrap();
+        // The interrupted turn had already attached both notes (two matching
+        // tool calls) when a compaction kept its input pending.
+        log.append(&Record::Replace {
+            messages: vec![
+                Message::system("sys"),
+                Message::user("summary"),
+                Message::user("look"), // restated pending input
+            ],
+            pending_position: Some(2),
+            summarized: Some((2, 6)),
+            mode: Some(crate::config::CompactionMode::Standard),
+            model: None,
+            continuation: None,
+            folded: None,
+            folded_base: None,
+            restated: None,
+            pending_recall_notes: 2,
+            recorded_at: session::now(),
+        })
+        .unwrap();
+        drop(log);
+        // Four memories match the retry's tool calls; with the spent budget
+        // restored, none of them may attach a note.
+        let responses = vec![read_call("r1", path), read_call("r2", path), text("done")];
+        let mut agent = memory_agent(crate::config::MemoryMode::On, responses, dir.path());
+        for n in 0..4 {
+            agent
+                .memory()
+                .unwrap()
+                .save(memory::Scope::User, &format!("fact {n} about omarchy.local {}", "x".repeat(200)), None, None)
+                .unwrap();
+        }
+        agent.load_session("retry-budget").unwrap();
+        assert_eq!(agent.pending_input.as_ref().map(|p| p.recall_notes), Some(2), "the budget survives the log");
+        agent.send_input(Some("msg-1"), "look").await.unwrap();
+        let notes: usize = tool_texts(&agent).iter().map(|t| t.matches("📌").count()).sum();
+        assert_eq!(notes, 0, "the retried input re-arms no notes: {notes}");
+        // A *new* input starts with a fresh budget.
+        // Built like `agent`, so its store already points at the temporary
+        // memory directory holding the four memories saved above.
+        let mut fresh =
+            memory_agent(crate::config::MemoryMode::On, vec![read_call("r3", path), text("next")], dir.path());
+        fresh.load_session("retry-budget").unwrap();
+        fresh.send_input(Some("msg-2"), "again").await.unwrap();
+        let notes: usize = tool_texts(&fresh).iter().map(|t| t.matches("📌").count()).sum();
+        assert_eq!(notes, 2, "a new input gets the full budget: {notes}");
     }
 
     #[test]
@@ -7125,7 +8394,10 @@ mod tests {
         let conversation = agent.conversation().to_vec();
         assert_eq!(conversation[1].role, Role::User);
         assert!(conversation[1].content.starts_with(context::SUMMARY_PREFIX));
-        assert!(conversation[1].content.ends_with("SUMMARY: pinged once"));
+        assert!(conversation[1].content.contains("SUMMARY: pinged once"));
+        // The user's request is pinned verbatim after the summary (issue #66).
+        assert!(conversation[1].content.contains(context::PINNED_REQUESTS_PREFIX));
+        assert!(conversation[1].content.contains("ping"));
         assert_eq!(unstamped(&conversation[2]), Message::assistant("done"));
         assert_eq!(agent.context_stats().lock().unwrap().compactions, 1);
 
@@ -8307,7 +9579,7 @@ mod tests {
         let (mut agent, seen) = budgeted_agent(vec![big_call("b1"), text("done")], window, 4_000, dir.path());
         agent.config_mut().max_tokens = 0;
         agent.config_mut().context_window = None;
-        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
+        *agent.probe.window() = Some(DetectedWindow {
             tokens: window,
             source: "Copilot /models max_context_window_tokens".into(),
             cap: ContextCap::Total,
@@ -8324,7 +9596,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut agent, seen) = budgeted_agent(vec![big_call("b1"), text("done")], window, 4_000, dir.path());
         agent.config_mut().context_window = None;
-        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
+        *agent.probe.window() = Some(DetectedWindow {
             tokens: window,
             source: "Copilot /models max_context_window_tokens".into(),
             cap: ContextCap::Total,
@@ -8365,9 +9637,9 @@ mod tests {
         let (mut agent, _seen) = budgeted_agent(vec![text("done")], 200_000, 4_000, dir.path());
         agent.config_mut().max_tokens = 0;
         // The configured-window probe path leaves the detected window empty.
-        assert!(agent.detected_window.lock().unwrap().is_none());
+        assert!(agent.probe.window().is_none());
         // ...yet the output limit it read from the shared `/models` entry stands.
-        *agent.reported_max_output.lock().unwrap() = Some(16_000);
+        *agent.probe.max_output() = Some(16_000);
         assert_eq!(agent.detected_max_output(), Some(16_000));
         assert_eq!(agent.effective_max_tokens(), 16_000);
     }
@@ -8395,7 +9667,7 @@ mod tests {
         let window = 24_000;
         let (mut agent, seen) = budgeted_agent(vec![big_call("b1"), text("done")], window, 40_000, dir.path());
         agent.config_mut().context_window = None;
-        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
+        *agent.probe.window() = Some(DetectedWindow {
             tokens: window,
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
@@ -8424,7 +9696,7 @@ mod tests {
         // trigger, yet close enough that the reservation caps `max_tokens`.
         let (mut agent, seen) = budgeted_agent(vec![big_call("b1"), text("done")], detected, 36_000, dir.path());
         agent.config_mut().context_window = None;
-        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
+        *agent.probe.window() = Some(DetectedWindow {
             tokens: detected,
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
@@ -8458,7 +9730,7 @@ mod tests {
         // combined window, so `max_tokens` is capped to the combined room.
         let (mut agent, seen) = budgeted_agent(vec![text("done")], prompt_window, 0, dir.path());
         agent.config_mut().context_window = None;
-        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
+        *agent.probe.window() = Some(DetectedWindow {
             tokens: prompt_window,
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
@@ -8490,7 +9762,7 @@ mod tests {
         let combined = 102_000;
         let (mut agent, seen) = budgeted_agent(vec![text("SUMMARY"), text("done")], prompt_window, 0, dir.path());
         agent.config_mut().context_window = None;
-        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
+        *agent.probe.window() = Some(DetectedWindow {
             tokens: prompt_window,
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
@@ -8526,7 +9798,7 @@ mod tests {
         let prompt_window = 100_000;
         let (mut agent, seen) = budgeted_agent(vec![text("SUMMARY"), text("done")], prompt_window, 0, dir.path());
         agent.config_mut().context_window = None;
-        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
+        *agent.probe.window() = Some(DetectedWindow {
             tokens: prompt_window,
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
@@ -8562,7 +9834,7 @@ mod tests {
         let learned = 110_000;
         let (mut agent, seen) = budgeted_agent(vec![text("done")], prompt_window, 0, dir.path());
         agent.config_mut().context_window = None;
-        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
+        *agent.probe.window() = Some(DetectedWindow {
             tokens: prompt_window,
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
@@ -8598,7 +9870,7 @@ mod tests {
         let learned = 110_000;
         let (mut agent, seen) = budgeted_agent(vec![text("done")], prompt_window, 0, dir.path());
         agent.config_mut().context_window = None;
-        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
+        *agent.probe.window() = Some(DetectedWindow {
             tokens: prompt_window,
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
@@ -8680,6 +9952,133 @@ mod tests {
         assert!(agent.context_stats().lock().unwrap().compactions >= 1);
     }
 
+    /// An agent left idle above the auto-compaction threshold: the turn ran
+    /// with auto-compaction off (so nothing compacted mid-turn), then it is
+    /// switched back on, as if the threshold were crossed by the turn's end.
+    async fn idle_above_threshold(responses: Vec<LLMResponse>, dir: &std::path::Path) -> Agent {
+        let (mut agent, _) = agent(std::iter::once(text("ok")).chain(responses).collect(), dir);
+        agent.config.context_window = Some(3_000);
+        agent.config.auto_compact = false;
+        agent.new_session().unwrap();
+        agent.run_turn(Some("in-1"), &"x ".repeat(4_000)).await.unwrap();
+        agent.config.auto_compact = true;
+        agent.config.auto_compact_threshold = 0.5;
+        agent
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_compaction_runs_once_per_crossing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = idle_above_threshold(vec![text("SUMMARY")], dir.path()).await;
+        assert!(agent.idle_compact_due(), "idle above the threshold is due");
+        let report = agent.idle_compact().await.unwrap().expect("compacted");
+        assert!(report.percent_before > 50, "{report}");
+        assert!(report.percent_after < report.percent_before, "{report}");
+        assert!(report.to_string().starts_with("compacted while idle (was "), "{report}");
+        assert!(!agent.idle_compact_due(), "not again until usage recrosses the floor");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_compaction_is_off_without_idle_or_auto_compact() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = idle_above_threshold(vec![], dir.path()).await;
+        assert!(agent.idle_compact_due());
+        agent.config.idle_compact = false;
+        assert!(!agent.idle_compact_due(), "idle_compact = false");
+        agent.config.idle_compact = true;
+        agent.config.auto_compact = false;
+        assert!(!agent.idle_compact_due(), "auto_compact = false turns it off too");
+        agent.config.auto_compact = true;
+        agent.config.context_window = Some(100_000);
+        assert!(!agent.idle_compact_due(), "below the threshold: never compacts early");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_compaction_never_runs_below_the_configured_threshold() {
+        // Issue #182: `over_threshold` subtracts the output reservation, so
+        // on a small total window it trips below the configured threshold.
+        // Idle compaction must still wait for the threshold itself.
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = idle_above_threshold(vec![], dir.path()).await;
+        let (tokens, _) = agent.estimate_context_tokens();
+        // A window where the reserve (≥ MIN_OUTPUT_RESERVE-capped output +
+        // margin) puts the limit under `tokens`, yet tokens < 99% of it.
+        agent.config.context_window = Some(tokens + 1_000);
+        agent.config.auto_compact_threshold = 0.99;
+        assert!(agent.over_threshold(), "the reservation trips mid-turn rescue");
+        assert!(
+            (tokens as f64) < agent.context_window() as f64 * 0.99,
+            "usage {tokens} is under the configured threshold"
+        );
+        assert!(!agent.idle_compact_due(), "idle compaction waits for the configured threshold");
+        agent.config.auto_compact_threshold = 0.5;
+        assert!(agent.idle_compact_due(), "past the configured threshold it is due");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_poll_cache_is_keyed_on_the_offered_tool_set() {
+        // The uncalibrated estimate includes the mode-filtered tool
+        // definitions, so a mode switch must miss the poll cache.
+        let dir = tempfile::tempdir().unwrap();
+        let agent = idle_above_threshold(vec![], dir.path()).await;
+        assert!(agent.idle_compact_due_polled());
+        // Poison the cached estimate as "below threshold" under the live key.
+        let (key, _) = agent.idle_estimate_cache.get().unwrap();
+        agent.idle_estimate_cache.set(Some((key, 0)));
+        assert!(!agent.idle_compact_due_polled(), "a key hit serves the cache");
+        let other = if agent.mode() == crate::mode::AgentMode::Plan {
+            crate::mode::AgentMode::default()
+        } else {
+            crate::mode::AgentMode::Plan
+        };
+        agent.control.set_mode(other);
+        assert_ne!(agent.idle_estimate_cache.get().unwrap().0.3, other);
+        let _ = agent.idle_compact_due_polled();
+        assert_eq!(
+            agent.idle_estimate_cache.get().unwrap().0.3,
+            other,
+            "a mode switch re-estimates instead of serving the stale entry"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_idle_compaction_is_not_retried_on_the_same_crossing() {
+        let dir = tempfile::tempdir().unwrap();
+        // Call 1 is the turn; call 2 is the idle summary, which Esc Esc
+        // cancels (and which never answers).
+        let (mut agent, seen) = interfering(
+            vec![text("ok")],
+            dir.path(),
+            |call, control| {
+                if call == 2 {
+                    control.cancel();
+                }
+            },
+            Some(2),
+        );
+        agent.config.context_window = Some(3_000);
+        agent.config.auto_compact = false;
+        agent.new_session().unwrap();
+        agent.run_turn(Some("in-1"), &"x ".repeat(4_000)).await.unwrap();
+        agent.config.auto_compact = true;
+        agent.config.auto_compact_threshold = 0.5;
+        assert!(agent.idle_compact_due());
+        let before = agent.estimate_context_tokens().0;
+
+        let report = agent.idle_compact().await.unwrap();
+        assert!(report.is_none(), "cancelled: {report:?}");
+        assert_eq!(seen.lock().unwrap().len(), 2, "the summary call was made, then cancelled");
+        assert_eq!(agent.estimate_context_tokens().0, before, "nothing was folded");
+        assert!(!agent.idle_compact_due(), "a cancelled attempt spends the crossing");
+        assert!(!agent.idle_compact_due_polled(), "the polled check agrees");
+
+        // A replaced conversation starts a fresh crossing.
+        let messages = agent.conversation.clone();
+        agent.replace_conversation(messages).unwrap();
+        assert!(agent.idle_compact_due(), "replacing the conversation re-arms the gate");
+        assert!(agent.idle_compact_due_polled(), "and the polled cache was invalidated");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn auto_compaction_mid_turn_keeps_the_turn_going() {
         let dir = tempfile::tempdir().unwrap();
@@ -8718,51 +10117,6 @@ mod tests {
         assert!(restored.pending_input.is_none());
         assert_eq!(restored.completed["in-1"], "done");
         assert_eq!(restored.conversation.last().map(unstamped), Some(Message::assistant("done")));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn replay_after_mid_turn_compaction_shows_the_folded_input_once() {
-        // When auto-compaction folds the active input, the compacted
-        // conversation restates it after the summary while the real copy rides
-        // along in the replay stash. A legacy → frame switch replays BOTH the
-        // stash and the conversation, so the synthetic restatement must be
-        // skipped or the one submitted prompt would be shown twice.
-        let dir = tempfile::tempdir().unwrap();
-        let big = LLMResponse {
-            tool_calls: vec![ToolCall {
-                id: "b1".into(),
-                name: "big".into(),
-                arguments: json!({}),
-                item_id: None,
-                malformed_arguments: None,
-            }],
-            ..Default::default()
-        };
-        let (mut agent, _seen) = agent(vec![big, text("SUMMARY"), text("done")], dir.path());
-        agent.config.context_window = Some(3_000);
-        agent.config.auto_compact_threshold = 0.5;
-        agent.tools().register(
-            ToolDefinition::new("big", "big", json!({"type": "object"})),
-            Box::new(|_| Ok(json!("x".repeat(8_000)))),
-        );
-        agent.new_session().unwrap();
-        agent.run_turn(Some("in-1"), "go").await.unwrap();
-
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let seen_sink = seen.clone();
-        agent.set_event_sink(std::sync::Arc::new(move |_, event| {
-            if let AgentEvent::UserMessage { text } = event {
-                seen_sink.lock().unwrap().push(text.to_string());
-            }
-        }));
-        agent.replay_history();
-        let gos = seen.lock().unwrap().iter().filter(|t| t.as_str() == "go").count();
-        assert_eq!(gos, 1, "the folded input is replayed exactly once: {:?}", seen.lock().unwrap());
-        assert!(
-            !seen.lock().unwrap().iter().any(|t| t.contains("SUMMARY")),
-            "synthetic summary not exposed: {:?}",
-            seen.lock().unwrap()
-        );
     }
     /// `chat_stream`: a non-streaming summary request gets an idle-timeout
     /// error, as through a tunnel that drops connections sending no bytes.
@@ -8813,7 +10167,102 @@ mod tests {
         let report = agent.compact(None, None).await.unwrap().expect("compacted");
         assert_eq!(report.fallback, None, "summary must not fall back to dropping messages");
         assert_eq!(*streamed.lock().unwrap(), 1);
-        assert!(agent.conversation()[1].content.ends_with("SUMMARY: streamed"));
+        assert!(agent.conversation()[1].content.contains("SUMMARY: streamed"));
+        // The user's requests are pinned verbatim after the summary (issue #66).
+        assert!(agent.conversation()[1].content.contains(context::PINNED_REQUESTS_PREFIX));
+        assert!(agent.conversation()[1].content.contains("one"));
+        assert!(agent.conversation()[1].content.contains("two"));
+    }
+
+    /// A summary stream that breaks mid-summary (`StreamInterrupted`) for its
+    /// first `breaks` attempts, then completes. Mirrors a network that cuts out
+    /// while the summary is streaming and then recovers.
+    struct BreaksMidSummary {
+        breaks_left: Mutex<u32>,
+        attempts: Arc<Mutex<u32>>,
+    }
+
+    #[async_trait]
+    impl LLMClient for BreaksMidSummary {
+        fn clone_boxed(&self) -> Box<dyn LLMClient> {
+            unimplemented!("test double is never cloned")
+        }
+        async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
+            self.chat_stream(request, &|_| {}).await
+        }
+        async fn chat_stream(
+            &self,
+            request: &ChatRequest<'_>,
+            sink: crate::llm::StreamSink<'_>,
+        ) -> Result<LLMResponse> {
+            // Only the compaction summary call is scripted to break; the
+            // `send_message` turns that precede it are ordinary chat calls and
+            // answer immediately.
+            if !request.messages[0].content.starts_with(context::SUMMARY_SYSTEM_PROMPT) {
+                return Ok(text("ok"));
+            }
+            *self.attempts.lock().unwrap() += 1;
+            // Deliver some summary text, as a real stream would before it breaks.
+            sink(StreamEvent::Text("partial summary "));
+            {
+                let mut left = self.breaks_left.lock().unwrap();
+                if *left > 0 {
+                    *left -= 1;
+                    return Err(anyhow::Error::new(providers::StreamInterrupted {
+                        reason: "connection reset by peer".into(),
+                    }));
+                }
+            }
+            sink(StreamEvent::Text("the summary"));
+            Ok(text("the summary"))
+        }
+        fn model_name(&self) -> &str {
+            "breaks-mid-summary"
+        }
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+    }
+
+    fn breaks_mid_summary_agent(breaks: u32, dir: &std::path::Path) -> (Agent, Arc<Mutex<u32>>) {
+        let attempts = Arc::new(Mutex::new(0));
+        let client = BreaksMidSummary { breaks_left: Mutex::new(breaks), attempts: attempts.clone() };
+        let config = Config { session_dir: Some(dir.to_path_buf()), ..Config::default() };
+        (Agent::new(Box::new(client), config), attempts)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compaction_retries_a_mid_summary_drop_instead_of_dropping_history() {
+        // The summary stream breaks twice, then completes: the agent re-sends
+        // the summary request rather than falling back to `dropped_note`, so
+        // compaction lands a real summary and no history is dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, attempts) = breaks_mid_summary_agent(2, dir.path());
+        agent.new_session().unwrap();
+        agent.send_message("one").await.unwrap();
+        agent.send_message("two").await.unwrap();
+        let report = agent.compact(None, None).await.unwrap().expect("compacted");
+        assert_eq!(report.fallback, None, "a mid-summary drop is retried, not a dropped-history fallback");
+        assert_eq!(*attempts.lock().unwrap(), 3, "two breaks then one successful summary");
+        assert!(agent.conversation()[1].content.contains("the summary"));
+        // The user's requests are pinned verbatim after the summary (issue #66).
+        assert!(agent.conversation()[1].content.contains(context::PINNED_REQUESTS_PREFIX));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compaction_falls_back_after_too_many_mid_summary_drops() {
+        // One more break than the cap (`MAX_STREAM_RESTARTS`) is not recovered:
+        // compaction falls back to `dropped_note` instead of asking forever.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, attempts) = breaks_mid_summary_agent(MAX_STREAM_RESTARTS + 1, dir.path());
+        agent.new_session().unwrap();
+        agent.send_message("one").await.unwrap();
+        agent.send_message("two").await.unwrap();
+        let report = agent.compact(None, None).await.unwrap().expect("compacted");
+        assert!(report.fallback.is_some(), "a persistently broken summary stream falls back");
+        // The cap bounds the re-sends: the initial send plus `MAX_STREAM_RESTARTS`
+        // retries, all of which broke.
+        assert_eq!(*attempts.lock().unwrap(), MAX_STREAM_RESTARTS + 1);
     }
 
     /// Replays scripted results, including errors.
@@ -9040,9 +10489,12 @@ mod tests {
         // The summary request never thinks.
         assert_eq!(seen[1].0, None);
         // The retry re-resolved against the post-compaction room and sends the
-        // full budget — not the stale pre-compaction drop.
+        // full budget — not the stale pre-compaction drop. The pinned-request
+        // block (issue #66) re-attaches the (clipped) giant user message after
+        // the summary, so the post-compaction room is a little under the bare
+        // budget; the assertion's floor leaves room for it.
         assert_eq!(seen[2].0, Some(Request::Budget(16_384)), "retry sends the level: {:?}", seen[2]);
-        assert!(seen[2].1.unwrap() >= 16_384, "room for the budget after compaction: {:?}", seen[2]);
+        assert!(seen[2].1.unwrap() >= 15_000, "room for the budget after compaction: {:?}", seen[2]);
         // The trajectory records what the successful retry sent, not the
         // pre-compaction drop.
         let last = agent.conversation().iter().rev().find(|m| m.role == Role::Assistant).unwrap();
@@ -9077,7 +10529,7 @@ mod tests {
         agent.config_mut().context_window = Some(32_000);
         agent.detect_context_window().await;
         assert_eq!(agent.context_window_with_source(), (32_000, "context_window in config".into()));
-        assert!(agent.detected_window.lock().unwrap().is_none(), "no probe when config sets the window");
+        assert!(agent.probe.window().is_none(), "no probe when config sets the window");
     }
 
     #[tokio::test]
@@ -9127,11 +10579,11 @@ mod tests {
         agent.detect_context_window().await;
         assert_eq!(*calls.lock().unwrap(), ["thinking"], "the discarded window half is not probed");
         assert_eq!(
-            agent.reported_thinking.lock().unwrap().as_ref().map(|r| r.levels.as_slice()),
+            agent.probe.thinking().as_ref().map(|r| r.levels.as_slice()),
             Some(["off".to_string(), "on".to_string()].as_slice()),
             "the thinking levels are still probed"
         );
-        assert!(agent.detected_window.lock().unwrap().is_none(), "the configured window stands");
+        assert!(agent.probe.window().is_none(), "the configured window stands");
     }
 
     #[test]
@@ -9168,7 +10620,7 @@ mod tests {
         // compaction early); the estimate must instead recompute the whole
         // conversation to mirror the real newest-N wire plan.
         let (mut agent, _) = agent(vec![], std::path::Path::new("/nonexistent"));
-        *agent.reported_vision.lock().unwrap() = Some(crate::vision::Vision {
+        *agent.probe.vision() = Some(crate::vision::Vision {
             max_images: 1,
             max_image_bytes: crate::attachment::DEFAULT_MAX_BYTES,
             media_types: Vec::new(),
@@ -9213,7 +10665,7 @@ mod tests {
         // than `KEEP_RECENT_TOKENS` intends.
         let dir = tempfile::tempdir().unwrap();
         let (mut agent, _) = agent(vec![text("SUMMARY"), text("done")], dir.path());
-        *agent.reported_vision.lock().unwrap() = Some(crate::vision::Vision {
+        *agent.probe.vision() = Some(crate::vision::Vision {
             max_images: 1,
             max_image_bytes: crate::attachment::DEFAULT_MAX_BYTES,
             media_types: Vec::new(),
@@ -9226,6 +10678,10 @@ mod tests {
         agent.config.auto_compact_threshold = 0.5;
         agent.config.project_instructions = false;
         agent.config.memory = crate::config::MemoryMode::Off;
+        // Pinning off keeps this test focused on the image tail budget: the
+        // large text turn would otherwise be pinned (clipped) into the summary
+        // and trip the "folded" assertion below (issue #66).
+        agent.config.compaction_pin_requests = false;
         agent.new_session().unwrap();
         // The image must be intact on disk for the wire plan (and so the kept-tail
         // budget) to count it as a sendable image rather than a placeholder.
@@ -9296,6 +10752,138 @@ mod tests {
         let update = crate::acp::update_for(&AgentEvent::Thinking { text: "r" }).unwrap();
         assert_eq!(update["sessionUpdate"], "agent_thought_chunk");
         assert!(crate::acp::update_for(&AgentEvent::TextDelta { text: "r" }).is_none());
+    }
+
+    /// A client whose `chat_stream` emits a visible partial delta and then
+    /// drops the connection (`StreamInterrupted`) for its first `breaks`
+    /// attempts, answering in full afterwards. Mirrors a network that cuts out
+    /// mid-reply and then recovers.
+    struct BreaksMidReply {
+        breaks_left: Mutex<u32>,
+        answer: String,
+        attempts: Arc<Mutex<u32>>,
+    }
+
+    #[async_trait]
+    impl LLMClient for BreaksMidReply {
+        fn clone_boxed(&self) -> Box<dyn LLMClient> {
+            unimplemented!("tests never clone this client")
+        }
+        async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
+            // Non-streaming fallback mirrors the streaming path's break/answer.
+            self.chat_stream(request, &|_| {}).await
+        }
+        async fn chat_stream(
+            &self,
+            _request: &ChatRequest<'_>,
+            sink: crate::llm::StreamSink<'_>,
+        ) -> Result<LLMResponse> {
+            *self.attempts.lock().unwrap() += 1;
+            // Deliver some visible output, as a real stream would before it breaks.
+            sink(StreamEvent::Text("partial reply "));
+            {
+                let mut left = self.breaks_left.lock().unwrap();
+                if *left > 0 {
+                    *left -= 1;
+                    return Err(anyhow::Error::new(providers::StreamInterrupted {
+                        reason: "connection reset by peer".into(),
+                    }));
+                }
+            }
+            sink(StreamEvent::Text(&self.answer));
+            Ok(LLMResponse { content: self.answer.clone(), stop_reason: Some("stop".into()), ..Default::default() })
+        }
+        fn model_name(&self) -> &str {
+            "breaks"
+        }
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+    }
+
+    fn breaks_mid_reply_agent(breaks: u32, answer: &str, dir: &std::path::Path) -> (Agent, Arc<Mutex<u32>>) {
+        let attempts = Arc::new(Mutex::new(0));
+        let client =
+            BreaksMidReply { breaks_left: Mutex::new(breaks), answer: answer.to_string(), attempts: attempts.clone() };
+        let config = Config {
+            session_dir: Some(dir.to_path_buf()),
+            project_instructions: false,
+            skills: crate::skills::SkillsConfig { enabled: false, ..Default::default() },
+            ..Config::default()
+        };
+        let mut agent = Agent::new(Box::new(client), config);
+        agent.set_streaming(true);
+        // Streaming is only taken when an event sink is present.
+        agent.set_event_sink(std::sync::Arc::new(|_, _| {}));
+        (agent, attempts)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mid_reply_drops_are_retried_and_leave_no_partial_text_in_history() {
+        // The stream breaks mid-reply twice, then answers: the agent discards
+        // each partial reply and re-sends, so the turn completes with the full
+        // answer and history holds no partial text.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, attempts) = breaks_mid_reply_agent(2, "the full answer", dir.path());
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "hi").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(*attempts.lock().unwrap(), 3, "two breaks then one successful answer");
+        let assistant: Vec<&str> =
+            agent.conversation().iter().filter(|m| m.role == Role::Assistant).map(|m| m.content.as_str()).collect();
+        assert_eq!(assistant, ["the full answer"], "only the full answer is recorded");
+        assert!(
+            !agent.conversation().iter().any(|m| m.content.contains("partial reply")),
+            "no partial, mid-reply text reaches history"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mid_reply_restart_emits_a_reset_event_before_resending() {
+        // On each mid-reply break the agent emits `ResponseRestarted` so the
+        // renderers discard the abandoned partial (and reset pending thinking)
+        // before the re-sent stream's deltas arrive. Without it the replacement
+        // answer is appended to the stale prefix and the final message is lost.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _attempts) = breaks_mid_reply_agent(2, "the full answer", dir.path());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        agent.set_event_sink(std::sync::Arc::new(move |_, event| {
+            let name = match event {
+                AgentEvent::TextDelta { text } => format!("text-delta:{text}"),
+                AgentEvent::ResponseRestarted => "restart".to_string(),
+                AgentEvent::AssistantMessage { text, .. } => format!("message:{text}"),
+                _ => return,
+            };
+            sink.lock().unwrap().push(name);
+        }));
+        agent.new_session().unwrap();
+        agent.run_turn(Some("in-1"), "hi").await.unwrap();
+        let seen = events.lock().unwrap().clone();
+        // Two breaks -> two resets, each emitted after a shown partial and
+        // before the request is re-sent.
+        assert_eq!(seen.iter().filter(|e| *e == "restart").count(), 2, "one reset per mid-reply break: {seen:?}");
+        assert_eq!(seen[0], "text-delta:partial reply ", "a partial is shown first: {seen:?}");
+        assert_eq!(seen[1], "restart", "the reset follows the abandoned partial: {seen:?}");
+        assert_eq!(seen.last().unwrap(), "message:the full answer", "the turn still completes whole: {seen:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn too_many_mid_reply_drops_end_the_turn() {
+        // One more break than the cap (`MAX_STREAM_RESTARTS`) is not recovered:
+        // the turn ends with an error instead of asking forever.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, attempts) = breaks_mid_reply_agent(MAX_STREAM_RESTARTS + 1, "never reached", dir.path());
+        agent.new_session().unwrap();
+        let error = agent.run_turn(Some("in-1"), "hi").await.unwrap_err();
+        assert!(format!("{error:#}").contains("connection lost mid-reply"), "{error:#}");
+        // The cap bounds the re-sends: the initial send plus `MAX_STREAM_RESTARTS`
+        // retries, all of which broke.
+        assert_eq!(*attempts.lock().unwrap(), MAX_STREAM_RESTARTS + 1);
+        assert!(
+            agent.conversation().iter().all(|m| m.role != Role::Assistant),
+            "a turn that never completed records no assistant message"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -9483,6 +11071,348 @@ mod tests {
         (agent, seen)
     }
 
+    /// 12:00 local today, for the timer tests' injected clock.
+    fn timer_noon() -> DateTime<Local> {
+        let date = Local::now().date_naive();
+        date.and_hms_opt(12, 0, 0).unwrap().and_local_timezone(Local).single().unwrap()
+    }
+
+    /// A shared clock at noon, so a tool the test registers can advance time
+    /// mid-turn.
+    fn timer_clock() -> std::sync::Arc<std::sync::Mutex<DateTime<Local>>> {
+        std::sync::Arc::new(std::sync::Mutex::new(timer_noon()))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_timer_set_in_a_turn_fires_mid_turn_when_the_clock_passes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = timer_clock();
+        let responses = vec![
+            call("t1", "timer_set", json!({"after": "30m", "note": "check CI"})),
+            // Advances the injected clock past the timer, so it fires at the
+            // start of the next step — a deploy finishing while the turn runs.
+            call("e1", "advance_clock", json!({})),
+            text("done"),
+        ];
+        let (mut agent, seen) = agent(responses, dir.path());
+        let events = record_events(&mut agent);
+        agent.set_timers_now(Some(clock.clone()));
+        let clock2 = clock.clone();
+        agent.tools().register(
+            ToolDefinition::new("advance_clock", "advance the clock", json!({"type": "object"})),
+            Box::new(move |_| {
+                *clock2.lock().unwrap() += chrono::Duration::minutes(31);
+                Ok(json!("advanced"))
+            }),
+        );
+        agent.new_session().unwrap();
+        agent.run_turn(Some("msg-1"), "watch the build").await.unwrap();
+
+        // The timer fired into the conversation as a user message the last
+        // model call saw.
+        let turns = seen.lock().unwrap();
+        let last = turns.last().unwrap();
+        let fired =
+            last.iter().find(|m| m.role == Role::User && m.content.contains("fired:")).expect("a fired timer message");
+        assert!(
+            fired.content.contains("Timer 1, set at 12:00, fired: check CI")
+                && fired.content.starts_with("<system-reminder>")
+                && fired.content.contains("call timer_done with its id"),
+            "{}",
+            fired.content
+        );
+        // The UI event shows `⏰ timer N: <note>` through the userMessage event.
+        let events = events.lock().unwrap();
+        assert!(
+            events.iter().any(|e| {
+                e["content"]["text"].as_str() == Some("⏰ timer 1: check CI")
+                    && e["sessionUpdate"].as_str() == Some("user_message_chunk")
+            }),
+            "{events:?}"
+        );
+        // It fired once: no active timers left, and it is now pending (waiting
+        // to be marked done).
+        assert!(agent.timers().is_empty());
+        assert!(agent.timers().has_pending());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disabled_timers_neither_fire_nor_nudge_on_a_turn() {
+        // An ACP-resumed CLI session has no idle loop to fire timers, so
+        // `disable_timers()` hides the timer tools. A due restored timer must
+        // then stay put: firing or nudging here would ask the agent to
+        // acknowledge a timer with a `timer_done` tool it no longer has, and
+        // would consume state a later CLI resume still needs.
+        let dir = tempfile::tempdir().unwrap();
+        let clock = timer_clock();
+        let (mut agent, seen) = agent(vec![text("done")], dir.path());
+        agent.set_timers_now(Some(clock.clone()));
+        agent.new_session().unwrap();
+        // A restored timer that is already due by the time the turn runs.
+        let now = *clock.lock().unwrap();
+        agent.timers.apply("timer_set", &json!({"after": "30m", "note": "check CI"}), now).unwrap();
+        *clock.lock().unwrap() += chrono::Duration::minutes(31);
+        agent.disable_timers();
+        agent.run_turn(Some("msg-1"), "look").await.unwrap();
+
+        // No fired-timer message or nudge reached the model, and the timer is
+        // untouched (still active, not fired/pending).
+        {
+            let turns = seen.lock().unwrap();
+            assert!(
+                turns.iter().all(|t| t.iter().all(|m| {
+                    !m.content.contains("fired:") && !m.content.contains("Fired timers you haven't marked done:")
+                })),
+                "a disabled timer must not fire or nudge: {turns:?}"
+            );
+        }
+        assert_eq!(agent.timers().len(), 1);
+        assert!(!agent.timers().has_pending());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pending_timer_nudges_every_few_steps_until_marked_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = timer_clock();
+        // timer_set, advance the clock so it fires at the next step, then run
+        // enough no-op steps to cross `PENDING_NUDGE_EVERY`, mark it done, and
+        // run more steps to confirm the nudges stop. Distinct `echo` arguments
+        // keep the repeat-loop detector from ending the turn.
+        let mut responses = vec![
+            call("t1", "timer_set", json!({"after": "30m", "note": "check CI"})),
+            call("adv", "advance_clock", json!({})),
+        ];
+        for i in 0..crate::timers::PENDING_NUDGE_EVERY {
+            responses.push(call(&format!("e{i}"), "echo", json!({"text": format!("step {i}")})));
+        }
+        responses.push(call("done", "timer_done", json!({"id": 1})));
+        for i in 0..crate::timers::PENDING_NUDGE_EVERY {
+            responses.push(call(&format!("f{i}"), "echo", json!({"text": format!("after {i}")})));
+        }
+        responses.push(text("ok"));
+
+        let (mut agent, seen) = agent(responses, dir.path());
+        agent.set_timers_now(Some(clock.clone()));
+        let clock2 = clock.clone();
+        agent.tools().register(
+            ToolDefinition::new("advance_clock", "advance the clock", json!({"type": "object"})),
+            Box::new(move |_| {
+                *clock2.lock().unwrap() += chrono::Duration::minutes(31);
+                Ok(json!("advanced"))
+            }),
+        );
+        agent.new_session().unwrap();
+        agent.run_turn(Some("msg-1"), "watch the build").await.unwrap();
+
+        // Exactly one nudge was pushed before `timer_done`, and none after.
+        let turns = seen.lock().unwrap();
+        let last = turns.last().unwrap();
+        let nudges = last
+            .iter()
+            .filter(|m| m.role == Role::User && m.content.contains("Fired timers you haven't marked done:"))
+            .count();
+        assert_eq!(nudges, 1, "one nudge total: {last:#?}");
+        // The timer was marked done, so nothing is pending anymore.
+        assert!(!agent.timers().has_pending());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_take_fired_timers_returns_due_timers_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = timer_clock();
+        let noon = *clock.lock().unwrap();
+        let (mut agent, _) = agent(vec![], dir.path());
+        agent.set_timers_now(Some(clock.clone()));
+        agent.new_session().unwrap();
+        agent.timers.apply("timer_set", &json!({"after": "30m", "note": "check CI"}), noon).unwrap();
+        // Not yet due.
+        assert!(agent.take_fired_timers().unwrap().is_empty());
+        *clock.lock().unwrap() += chrono::Duration::minutes(31);
+        let fired = agent.take_fired_timers().unwrap();
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].note, "check CI");
+        assert!(agent.take_fired_timers().unwrap().is_empty(), "a timer fires once");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_firing_resets_the_pending_nudge_counter() {
+        // Regression (PR #151): idle delivery calls `take_fired_timers`
+        // directly. If an earlier pending timer left the nudge counter near its
+        // threshold, a fresh idle firing must restart the interval so the next
+        // model step does not immediately re-nudge.
+        let dir = tempfile::tempdir().unwrap();
+        let clock = timer_clock();
+        let noon = *clock.lock().unwrap();
+        let (mut agent, _) = agent(vec![], dir.path());
+        agent.set_timers_now(Some(clock.clone()));
+        agent.new_session().unwrap();
+        // Simulate a counter advanced to the nudge threshold by an earlier
+        // pending timer.
+        agent.pending_timer_steps = timers::PENDING_NUDGE_EVERY - 1;
+        agent.timers.apply("timer_set", &json!({"after": "30m", "note": "check CI"}), noon).unwrap();
+        *clock.lock().unwrap() += chrono::Duration::minutes(31);
+        let fired = agent.take_fired_timers().unwrap();
+        assert_eq!(fired.len(), 1, "the timer fired via idle delivery");
+        assert_eq!(agent.pending_timer_steps, 0, "a fresh firing restarts the nudge interval");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_automatic_timer_turn_marks_its_message_auto_initiated() {
+        // Regression (PR #151): a timer wakeup carries no new user input, so
+        // its user message must bill as agent-initiated.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(vec![text("ok")], dir.path());
+        agent.new_session().unwrap();
+        agent.mark_auto_turn();
+        agent.run_turn(None, "⏰ timer 1: check CI").await.unwrap();
+        let auto = agent
+            .conversation
+            .iter()
+            .find(|m| m.role == Role::User && m.content.contains("timer 1"))
+            .expect("the timer user message");
+        assert!(auto.auto_initiated, "an automatic timer turn is agent-initiated");
+
+        // A following genuine user turn is NOT auto-initiated (the flag is
+        // consumed once).
+        let (mut agent2, _) = self::agent(vec![text("ok")], dir.path());
+        agent2.new_session().unwrap();
+        agent2.run_turn(None, "hello").await.unwrap();
+        let user = agent2
+            .conversation
+            .iter()
+            .find(|m| m.role == Role::User && m.content.contains("hello"))
+            .expect("the user message");
+        assert!(!user.auto_initiated, "a user-typed turn stays user-initiated");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn timers_survive_resume_and_restart_clears_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let noon = timer_noon();
+        let (mut agent, _) = agent(vec![], dir.path());
+        let id = agent.new_session().unwrap();
+        agent.timers.apply("timer_set", &json!({"after": "1h", "note": "check CI"}), noon).unwrap();
+        agent.timers_changed().unwrap();
+
+        let (mut resumed, _) = self::agent(vec![], dir.path());
+        resumed.load_session(&id).unwrap();
+        assert_eq!(resumed.timers().len(), 1);
+        assert_eq!(resumed.timers().items[0].note, "check CI");
+
+        // `/restart` (a new session) clears them.
+        resumed.new_session().unwrap();
+        assert!(resumed.timers().is_empty());
+    }
+
+    #[test]
+    fn timer_tools_are_hidden_when_timers_are_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut on, _) = agent(Vec::new(), dir.path());
+        assert!(on.tool_definitions().iter().any(|d| d.name == "timer_set"));
+        on.disable_timers();
+        assert!(!on.tool_definitions().iter().any(|d| d.name.starts_with("timer_")));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_timer_tool_persistence_failure_rolls_the_live_timers_back() {
+        // A cancel/ack that fails to persist must not drop the timer in memory
+        // while reporting an error: live and persisted/published state would
+        // diverge. The tool must roll the live timers back (issue #150 review).
+        let dir = tempfile::tempdir().unwrap();
+        let clock = timer_clock();
+        let (mut agent, _) = agent(Vec::new(), dir.path());
+        agent.set_timers_now(Some(clock.clone()));
+        agent.new_session().unwrap();
+
+        let set = ToolCall {
+            id: "s1".into(),
+            name: "timer_set".into(),
+            arguments: json!({"after": "30m", "note": "check CI"}),
+            item_id: None,
+            malformed_arguments: None,
+        };
+        agent.run_timer_tool(&set).unwrap();
+        assert_eq!(agent.timers().len(), 1);
+
+        // A cancel whose persist fails leaves the timer live (rolled back) and
+        // surfaces the error.
+        agent.fail_next_persist();
+        let cancel = ToolCall {
+            id: "c1".into(),
+            name: "timer_cancel".into(),
+            arguments: json!({"id": 1}),
+            item_id: None,
+            malformed_arguments: None,
+        };
+        assert!(agent.run_timer_tool(&cancel).is_err());
+        assert_eq!(agent.timers().len(), 1, "a failed persist must not drop the live timer");
+
+        // With persistence working, the same cancel succeeds and clears it.
+        agent.run_timer_tool(&cancel).unwrap();
+        assert!(agent.timers().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_plan_tool_persistence_failure_rolls_the_live_plan_back() {
+        // Same apply-then-persist atomicity for the plan tool (sibling class).
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(Vec::new(), dir.path());
+        agent.new_session().unwrap();
+
+        agent.fail_next_persist();
+        let add = ToolCall {
+            id: "p1".into(),
+            name: "plan_add".into(),
+            arguments: json!({"items": ["write the fix"]}),
+            item_id: None,
+            malformed_arguments: None,
+        };
+        assert!(agent.run_plan_tool(&add).is_err());
+        assert!(agent.plan.is_empty(), "a failed persist must not leave the live plan changed");
+
+        // With persistence working, the add lands.
+        agent.run_plan_tool(&add).unwrap();
+        assert!(!agent.plan.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_firing_persistence_failure_rolls_the_due_timers_back() {
+        // Same apply-then-persist atomicity for the idle firing path
+        // (`take_fired_timers`, sibling class). `take_due` moves the due timer
+        // out of `items`; if the persist fails, the timer must be restored so a
+        // retry re-fires it and delivers the reminder, and the nudge counter
+        // must not be reset (issue #150 review).
+        let dir = tempfile::tempdir().unwrap();
+        let clock = timer_clock();
+        let noon = *clock.lock().unwrap();
+        let (mut agent, _) = agent(Vec::new(), dir.path());
+        agent.set_timers_now(Some(clock.clone()));
+        agent.new_session().unwrap();
+        agent.pending_timer_steps = timers::PENDING_NUDGE_EVERY - 1;
+        agent.timers.apply("timer_set", &json!({"after": "30m", "note": "check CI"}), noon).unwrap();
+        agent.timers_changed().unwrap();
+        *clock.lock().unwrap() += chrono::Duration::minutes(31);
+
+        // The firing's persist fails: the due timer is rolled back (still an
+        // active item, not consumed into `pending`) and the nudge counter is
+        // untouched, so a later retry re-fires it.
+        agent.fail_next_persist();
+        assert!(agent.take_fired_timers().is_err());
+        assert_eq!(agent.timers().items.len(), 1, "a failed firing persist must not consume the due timer");
+        assert!(!agent.timers().has_pending(), "the rolled-back timer must not linger in pending");
+        assert_eq!(
+            agent.pending_timer_steps,
+            timers::PENDING_NUDGE_EVERY - 1,
+            "a rolled-back firing must not reset the nudge counter"
+        );
+
+        // With persistence working, the same firing delivers once.
+        let fired = agent.take_fired_timers().unwrap();
+        assert_eq!(fired.len(), 1, "the retry re-fires the previously-rolled-back timer");
+        assert_eq!(fired[0].note, "check CI");
+        assert_eq!(agent.pending_timer_steps, 0, "a successful firing resets the nudge counter");
+    }
+
     fn report(id: &str, status: &str, summary: &str) -> ToolCall {
         ToolCall {
             id: id.into(),
@@ -9530,6 +11460,293 @@ mod tests {
         let again = resumed.run_turn(Some("msg-1"), "ship it").await.unwrap();
         assert_eq!(again.outcome, outcome.outcome);
         assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// An agent with trivial `write_file`, `edit_file` and `bash` tools (the
+    /// names the verify-before-complete tracker keys on) and a scripted client.
+    /// The handlers succeed unconditionally; the tracker only reads the name and
+    /// the ok flag.
+    fn edit_agent(responses: Vec<LLMResponse>, dir: &std::path::Path) -> (Agent, Seen) {
+        let (agent, seen) = agent(responses, dir);
+        for name in ["write_file", "edit_file"] {
+            agent.tools().register(
+                ToolDefinition::new(name, name, json!({"type": "object"})),
+                Box::new(|_| Ok(json!("written"))),
+            );
+        }
+        agent
+            .tools()
+            .register(ToolDefinition::new("bash", "bash", json!({"type": "object"})), Box::new(|_| Ok(json!("ok"))));
+        (agent, seen)
+    }
+
+    /// The tool-result message text for the call `id` in this conversation.
+    fn tool_text(agent: &Agent, id: &str) -> String {
+        agent
+            .conversation()
+            .iter()
+            .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some(id))
+            .map(|m| m.content.clone())
+            .unwrap_or_else(|| panic!("no tool result for {id}"))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unverifiable_loop_in_plan_mode_is_rejected_without_prompting() {
+        // Round-3 review of #164: the Ask prompt is gated on the same
+        // eligibility as the PreToolUse hooks. In plan mode a Bash loop is
+        // rejected by the plan-mode backstop regardless of the answer, so the
+        // turn must not park on a permission prompt whose outcome cannot
+        // matter — it goes straight to the read-only rejection.
+        let dir = tempfile::tempdir().unwrap();
+        let batch = call("b1", "bash", json!({"command": "for f in $(git ls-files); do sed -i s/x/y/ \"$f\"; done"}));
+        let (mut agent, _) = edit_agent(vec![batch, text("done")], dir.path());
+        agent.new_session().unwrap();
+        agent.set_mode(crate::mode::AgentMode::Plan);
+        // Interactive, but no answerer: a prompt would block forever, so the
+        // turn completing at all proves no question was raised.
+        agent.questions().set_interactive(true);
+        agent.run_turn(Some("m1"), "run it").await.unwrap();
+        let text = tool_text(&agent, "b1");
+        assert!(text.contains("plan mode") || text.contains("read-only"), "{text}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unverifiable_loop_is_blocked_without_asking_when_unsandboxed() {
+        let dir = tempfile::tempdir().unwrap();
+        let batch = call("b1", "bash", json!({"command": "for f in $(git ls-files); do sed -i s/x/y/ \"$f\"; done"}));
+        let (mut agent, _) = edit_agent(vec![batch, text("done")], dir.path());
+        agent.new_session().unwrap();
+        // Interactive but with no answerer: a prompt would hang the turn, so
+        // completing proves none is raised. Without the OS sandbox the loop is
+        // blocked with the guidance message.
+        agent.questions().set_interactive(true);
+        agent.run_turn(Some("m1"), "run it").await.unwrap();
+        let text = tool_text(&agent, "b1");
+        assert!(text.contains("Blocked by nano-coder permissions"), "{text}");
+        assert!(text.contains("not a known read-only command"), "{text}");
+        assert!(agent.questions().pending().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_literal_list_loop_runs_without_asking() {
+        let dir = tempfile::tempdir().unwrap();
+        // A literal-list loop whose unrolled commands are allowed needs no
+        // approval, even where no one could answer.
+        let batch = call("b1", "bash", json!({"command": "for f in a.txt b.txt; do wc -l \"$f\"; done"}));
+        let (mut agent, _) = edit_agent(vec![batch, text("done")], dir.path());
+        agent.new_session().unwrap();
+        agent.run_turn(Some("m1"), "count").await.unwrap();
+        assert_eq!(tool_text(&agent, "b1"), "ok");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completed_after_an_unverified_edit_is_reminded_once_then_goes_through() {
+        let dir = tempfile::tempdir().unwrap();
+        // edit, then report completed (reminded), then report completed again
+        // (max-fires spent: goes through and ends the turn).
+        let batch1 = call("e1", "edit_file", json!({"path": "a.rs"}));
+        let batch2 = call("o1", goal::TOOL_NAME, json!({"status": "completed", "summary": "done"}));
+        let batch3 = call("o2", goal::TOOL_NAME, json!({"status": "completed", "summary": "done, cargo test passes"}));
+        let (mut agent, _) = edit_agent(vec![batch1, batch2, batch3], dir.path());
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("m1"), "ship it").await.unwrap();
+        // The first report was bounced with the reminder, as a tool error.
+        let first = tool_text(&agent, "o1");
+        assert!(first.contains(goal::VERIFY_REMINDER), "reminder shown once: {first}");
+        // The second report went through and ended the turn.
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(outcome.outcome.map(|o| o.status), Some(goal::Status::Completed));
+        assert_eq!(outcome.response, "done, cargo test passes");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completed_after_an_edit_and_a_check_is_not_reminded() {
+        let dir = tempfile::tempdir().unwrap();
+        // edit, then a bash check, then report completed: no reminder.
+        let batch = LLMResponse {
+            tool_calls: vec![
+                ToolCall {
+                    id: "e1".into(),
+                    name: "edit_file".into(),
+                    arguments: json!({"path": "a.rs"}),
+                    item_id: None,
+                    malformed_arguments: None,
+                },
+                ToolCall {
+                    id: "b1".into(),
+                    name: "bash".into(),
+                    arguments: json!({"command": "cargo test"}),
+                    item_id: None,
+                    malformed_arguments: None,
+                },
+                ToolCall {
+                    id: "o1".into(),
+                    name: goal::TOOL_NAME.into(),
+                    arguments: json!({"status": "completed", "summary": "done, cargo test passes"}),
+                    item_id: None,
+                    malformed_arguments: None,
+                },
+            ],
+            ..Default::default()
+        };
+        // No further responses: another model call would panic, proving the turn ended.
+        let (mut agent, _) = edit_agent(vec![batch], dir.path());
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("m1"), "ship it").await.unwrap();
+        let text = tool_text(&agent, "o1");
+        assert!(!text.contains(goal::VERIFY_REMINDER), "a bash check clears the edit: {text}");
+        assert!(text.contains("Recorded outcome"), "accepted: {text}");
+        assert_eq!(outcome.outcome.map(|o| o.status), Some(goal::Status::Completed));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completed_after_an_edit_and_a_rejected_bash_is_still_reminded() {
+        let dir = tempfile::tempdir().unwrap();
+        // edit, then a malformed (never-run) bash, then completed: still reminded.
+        let batch = LLMResponse {
+            tool_calls: vec![
+                ToolCall {
+                    id: "e1".into(),
+                    name: "edit_file".into(),
+                    arguments: json!({"path": "a.rs"}),
+                    item_id: None,
+                    malformed_arguments: None,
+                },
+                ToolCall::from_raw_arguments("b1".into(), "bash".into(), r#"{"command":"cargo te"#, None),
+                ToolCall {
+                    id: "o1".into(),
+                    name: goal::TOOL_NAME.into(),
+                    arguments: json!({"status": "completed", "summary": "done"}),
+                    item_id: None,
+                    malformed_arguments: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let batch2 = call("o2", goal::TOOL_NAME, json!({"status": "completed", "summary": "done"}));
+        let (mut agent, _) = edit_agent(vec![batch, batch2], dir.path());
+        agent.new_session().unwrap();
+        agent.run_turn(Some("m1"), "ship it").await.unwrap();
+        let text = tool_text(&agent, "o1");
+        assert!(text.contains(goal::VERIFY_REMINDER), "a bash call that never ran is no check: {text}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completed_after_an_edit_and_an_invalid_real_bash_is_still_reminded() {
+        // The real bash handler rejects `bash({})` before starting any command;
+        // that call never ran, so it must not clear the unchecked edit.
+        for args in [json!({}), json!({"command": 1}), json!({"command": "true", "timeout_seconds": 0})] {
+            let dir = tempfile::tempdir().unwrap();
+            let batch = LLMResponse {
+                tool_calls: vec![
+                    ToolCall {
+                        id: "e1".into(),
+                        name: "edit_file".into(),
+                        arguments: json!({"path": "a.rs"}),
+                        item_id: None,
+                        malformed_arguments: None,
+                    },
+                    ToolCall {
+                        id: "b1".into(),
+                        name: "bash".into(),
+                        arguments: args.clone(),
+                        item_id: None,
+                        malformed_arguments: None,
+                    },
+                    ToolCall {
+                        id: "o1".into(),
+                        name: goal::TOOL_NAME.into(),
+                        arguments: json!({"status": "completed", "summary": "done"}),
+                        item_id: None,
+                        malformed_arguments: None,
+                    },
+                ],
+                ..Default::default()
+            };
+            let batch2 = call("o2", goal::TOOL_NAME, json!({"status": "completed", "summary": "done"}));
+            let (mut agent, _) = edit_agent(vec![batch, batch2], dir.path());
+            let bash_config = crate::bash::BashConfig::default();
+            agent.tools().register(
+                crate::bash::definition(),
+                Box::new(move |args| {
+                    crate::bash::run_checked(&bash_config, &args).map(|text| json!(text)).map_err(anyhow::Error::msg)
+                }),
+            );
+            agent.new_session().unwrap();
+            agent.run_turn(Some("m1"), "ship it").await.unwrap();
+            assert!(
+                tool_text(&agent, "b1").contains("bash argument")
+                    || tool_text(&agent, "b1").contains("timeout_seconds")
+            );
+            let text = tool_text(&agent, "o1");
+            assert!(text.contains(goal::VERIFY_REMINDER), "invalid bash {args} is no check: {text}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocked_and_needs_input_are_never_intercepted() {
+        for (status, prefix) in [("blocked", "Blocked: "), ("needs_input", "Question: ")] {
+            let dir = tempfile::tempdir().unwrap();
+            // An unverified edit, then a non-completed report: no reminder.
+            let batch = LLMResponse {
+                tool_calls: vec![
+                    ToolCall {
+                        id: "e1".into(),
+                        name: "write_file".into(),
+                        arguments: json!({"path": "a.rs"}),
+                        item_id: None,
+                        malformed_arguments: None,
+                    },
+                    ToolCall {
+                        id: "o1".into(),
+                        name: goal::TOOL_NAME.into(),
+                        arguments: json!({"status": status, "summary": "no token"}),
+                        item_id: None,
+                        malformed_arguments: None,
+                    },
+                ],
+                ..Default::default()
+            };
+            let (mut agent, _) = edit_agent(vec![batch], dir.path());
+            agent.new_session().unwrap();
+            let outcome = agent.run_turn(Some("m1"), "ship it").await.unwrap();
+            let text = tool_text(&agent, "o1");
+            assert!(!text.contains(goal::VERIFY_REMINDER), "{status} is never intercepted: {text}");
+            assert!(text.contains("Recorded outcome"), "{status} accepted: {text}");
+            assert!(outcome.response.starts_with(prefix), "{status} response: {}", outcome.response);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_before_complete_can_be_turned_off() {
+        let dir = tempfile::tempdir().unwrap();
+        // An unverified edit, then completed — but the flag is off, so no reminder.
+        let batch = LLMResponse {
+            tool_calls: vec![
+                ToolCall {
+                    id: "e1".into(),
+                    name: "edit_file".into(),
+                    arguments: json!({"path": "a.rs"}),
+                    item_id: None,
+                    malformed_arguments: None,
+                },
+                ToolCall {
+                    id: "o1".into(),
+                    name: goal::TOOL_NAME.into(),
+                    arguments: json!({"status": "completed", "summary": "done"}),
+                    item_id: None,
+                    malformed_arguments: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let (mut agent, _) = edit_agent(vec![batch], dir.path());
+        agent.config_mut().verify_before_complete = false;
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("m1"), "ship it").await.unwrap();
+        let text = tool_text(&agent, "o1");
+        assert!(!text.contains(goal::VERIFY_REMINDER), "flag off: no reminder: {text}");
+        assert_eq!(outcome.outcome.map(|o| o.status), Some(goal::Status::Completed));
     }
 
     /// Build an agent with custom permission `deny` rules (and no helper
@@ -10362,10 +12579,13 @@ mod tests {
                         kind: Some(crate::providers::ProviderKind::Openai),
                         default_model: Some("x".to_string()),
                         base_url: Some("http://127.0.0.1:9/v1".to_string()),
-                        // Fail fast: no retries, a short timeout, so the test
-                        // does not wait out the default backoff schedule.
+                        // Fail fast: no retries, a short timeout, and no offline
+                        // wait (`offline_budget_ms: 0`) so the unreachable
+                        // endpoint surfaces its connect failure at once instead
+                        // of waiting for the network to come back.
                         max_retries: Some(0),
                         timeout_secs: Some(2),
+                        offline_budget_ms: Some(0),
                         ..Default::default()
                     },
                 );
@@ -10537,6 +12757,147 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn compaction_persists_the_summary_request_usage_on_the_replace_record() {
+        // The summary request is a real model call whose cost the session log
+        // must carry: offline cost accounting (the compaction eval's
+        // `run_cost`) reads `usage`/`duration_ms` off logged messages, and a
+        // replace record that persists only the synthetic summary would make
+        // compaction look free (PR #183 review). The summary response's usage
+        // and the call's wall time ride along on the synthetic summary message
+        // inside the replace record.
+        let summary_response = LLMResponse {
+            content: "SUMMARY: pinged once".into(),
+            usage: Some(crate::llm::TokenUsage {
+                prompt_tokens: 321,
+                completion_tokens: 45,
+                total_tokens: 366,
+                aic: None,
+            }),
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _seen) = agent(vec![tool_call("c1"), text("done"), summary_response], dir.path());
+        agent.new_session().unwrap();
+        agent.send_message("ping").await.unwrap();
+        let report = agent.compact_logged(CompactTrigger::Manual, CompactionMode::Standard, None).await.unwrap();
+        assert!(report.is_some(), "compaction ran");
+
+        let session_id = agent.session_id().expect("a session is active").to_string();
+        let records = crate::session::read_records(dir.path(), &session_id).unwrap();
+        let replace = records
+            .iter()
+            .rev()
+            .find_map(|r| match r {
+                crate::session::Record::Replace { messages, mode: Some(_), .. } => Some(messages),
+                _ => None,
+            })
+            .expect("the compaction logged a replace record");
+        let summary = replace
+            .iter()
+            .find(|m| m.role == Role::User && m.content.contains("SUMMARY: pinged once"))
+            .expect("the synthetic summary is in the replace record");
+        let usage = summary.usage.as_ref().expect("the summary request's usage is persisted");
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (321, 45));
+        assert!(summary.duration_ms.is_some(), "the summary request's wall time is persisted");
+        // No other message in the record carries a cost: the folded turns keep
+        // their own (absent) usage rather than double counting the summary's.
+        assert!(replace.iter().filter(|m| m.usage.is_some()).count() == 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compaction_pins_the_users_requests_across_a_second_compaction() {
+        // The user's exact words must survive being compacted twice: each
+        // compaction re-summarizes the previous summary, so without pinning the
+        // original request survives only as a paraphrase of a paraphrase. The
+        // pinned block is rebuilt from the original messages on every
+        // compaction and attached verbatim after the summary (issue #66).
+        let dir = tempfile::tempdir().unwrap();
+        // Turn, turn, summary #1, turn, summary #2.
+        let (mut agent, _) = agent(
+            vec![
+                text("working on the lease"),
+                text("more work"),
+                text("SUMMARY ONE: the user mentioned a port"),
+                text("even more work"),
+                text("SUMMARY TWO: something about a lease and a port"),
+            ],
+            dir.path(),
+        );
+        agent.new_session().unwrap();
+        // The exact detail lives in the first user message.
+        agent.send_message("Fix the lease renewal race. Run the dev server on port 8123, never 5173.").await.unwrap();
+        agent.send_message("Now add a regression test.").await.unwrap();
+        agent.compact_logged(CompactTrigger::Manual, CompactionMode::Standard, None).await.unwrap();
+        agent.send_message("Also update the docs.").await.unwrap();
+        agent.compact_logged(CompactTrigger::Manual, CompactionMode::Standard, None).await.unwrap();
+
+        // After two compactions the summary message still carries the user's
+        // exact words verbatim, not just the summariser's paraphrase.
+        let summary = agent
+            .conversation()
+            .iter()
+            .find(|m| context::is_summary_message(m))
+            .expect("a synthetic summary is in context")
+            .content
+            .clone();
+        assert!(summary.contains(context::PINNED_REQUESTS_PREFIX), "pinned block attached: {summary}");
+        assert!(summary.contains("Run the dev server on port 8123, never 5173."), "exact detail pinned: {summary}");
+        assert!(summary.contains("Now add a regression test."), "later request pinned: {summary}");
+        assert!(summary.contains("Also update the docs."), "request folded by the second compaction pinned: {summary}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_repeated_compaction_warns_the_summariser_the_earlier_summary_is_lossy() {
+        // The second compaction folds the first summary back in (rendered as
+        // `[earlier summary]`). The summariser must be told that block is lossy
+        // and not to restate the user's goals from it (issue #66).
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, seen) =
+            agent(vec![text("work"), text("SUMMARY ONE"), text("more"), text("SUMMARY TWO")], dir.path());
+        agent.new_session().unwrap();
+        agent.send_message("first request").await.unwrap();
+        agent.compact_logged(CompactTrigger::Manual, CompactionMode::Standard, None).await.unwrap();
+        agent.send_message("second request").await.unwrap();
+        agent.compact_logged(CompactTrigger::Manual, CompactionMode::Standard, None).await.unwrap();
+
+        // The last summary request's system prompt carries the lossy warning.
+        let summary_request = seen.lock().unwrap().last().expect("a summary request was sent").clone();
+        let system = &summary_request[0].content;
+        assert!(
+            system.contains("lossy") && system.contains("Do not restate the user's goals"),
+            "the summariser is warned: {system}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_repeated_compaction_without_the_pin_tells_the_summariser_to_preserve_requirements() {
+        // With `compaction_pin_requests = false` there is no pinned block to
+        // lean on, so the lossy warning must NOT tell the summariser to skip
+        // the user's goals — the new summary is the only place requirements
+        // still in the earlier summary survive (issue #66).
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, seen) =
+            agent(vec![text("work"), text("SUMMARY ONE"), text("more"), text("SUMMARY TWO")], dir.path());
+        agent.config.compaction_pin_requests = false;
+        agent.new_session().unwrap();
+        agent.send_message("first request").await.unwrap();
+        agent.compact_logged(CompactTrigger::Manual, CompactionMode::Standard, None).await.unwrap();
+        agent.send_message("second request").await.unwrap();
+        agent.compact_logged(CompactTrigger::Manual, CompactionMode::Standard, None).await.unwrap();
+
+        let summary_request = seen.lock().unwrap().last().expect("a summary request was sent").clone();
+        let system = &summary_request[0].content;
+        assert!(
+            system.contains("lossy") && system.contains("Preserve every goal, requirement"),
+            "the no-pin warning preserves requirements: {system}"
+        );
+        assert!(
+            !system.contains("pinned verbatim alongside your summary"),
+            "no pin is promised when pinning is off: {system}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn mid_turn_model_switch_with_a_configured_window_skips_the_probe() {
         // A mid-turn `/model` switch must not stall the agent loop on the
         // context-window probe. When the new spec carries a configured window
@@ -10572,7 +12933,7 @@ mod tests {
         let (window, source) = agent.context_window_with_source();
         assert_eq!(window, 111_111, "{source}");
         assert_eq!(source, "provider context_window");
-        assert!(agent.detected_window.lock().unwrap().is_none(), "a configured window skips the endpoint probe");
+        assert!(agent.probe.window().is_none(), "a configured window skips the endpoint probe");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -10598,7 +12959,7 @@ mod tests {
         assert_eq!(agent.provider_name(), "mock", "switched mid-turn");
         // The mock client reports no window, so the background probe publishes
         // nothing and the model-name fallback stays in effect.
-        assert!(agent.detected_window.lock().unwrap().is_none());
+        assert!(agent.probe.window().is_none());
     }
 
     #[test]
@@ -10617,8 +12978,7 @@ mod tests {
         Agent::finish_detect(
             Detected::window(DetectedWindow::total(999, "stale")),
             3,
-            current.clone(),
-            DetectSlots::window(slot.clone()),
+            ProbeState::with_window(slot.clone(), current.clone()),
             None,
             stats.clone(),
         );
@@ -10629,8 +12989,7 @@ mod tests {
         Agent::finish_detect(
             Detected::window(DetectedWindow::total(4096, "fresh")),
             5,
-            current.clone(),
-            DetectSlots::window(slot.clone()),
+            ProbeState::with_window(slot.clone(), current.clone()),
             None,
             stats.clone(),
         );
@@ -10653,8 +13012,7 @@ mod tests {
         Agent::finish_detect(
             Detected::window(DetectedWindow::total(8192, "max_model_len")),
             1,
-            current.clone(),
-            DetectSlots::window(slot.clone()),
+            ProbeState::with_window(slot.clone(), current.clone()),
             None,
             stats.clone(),
         );
@@ -10679,8 +13037,7 @@ mod tests {
         Agent::finish_detect(
             Detected::window(DetectedWindow::total(128_000, "max_model_len")),
             1,
-            current.clone(),
-            DetectSlots::window(slot.clone()),
+            ProbeState::with_window(slot.clone(), current.clone()),
             None,
             stats.clone(),
         );
@@ -10705,8 +13062,7 @@ mod tests {
         Agent::finish_detect(
             Detected::window(DetectedWindow::total(200_000, "max_model_len")),
             1,
-            current.clone(),
-            DetectSlots::window(slot.clone()),
+            ProbeState::with_window(slot.clone(), current.clone()),
             None,
             stats.clone(),
         );
@@ -10734,8 +13090,7 @@ mod tests {
         Agent::finish_detect(
             Detected::window(DetectedWindow::total(128_000, "max_model_len")),
             1,
-            current.clone(),
-            DetectSlots::window(slot.clone()),
+            ProbeState::with_window(slot.clone(), current.clone()),
             None,
             stats.clone(),
         );
@@ -10914,7 +13269,9 @@ mod tests {
         let bash_config = crate::bash::BashConfig { cancel: Some(agent.control().cancel_flag()), ..Default::default() };
         agent.tools().register(
             crate::bash::definition(),
-            Box::new(move |args| Ok(json!(crate::bash::run(&bash_config, &args)))),
+            Box::new(move |args| {
+                crate::bash::run_checked(&bash_config, &args).map(|text| json!(text)).map_err(anyhow::Error::msg)
+            }),
         );
         agent.new_session().unwrap();
         let control = agent.control();
@@ -11019,7 +13376,7 @@ mod tests {
         // then list the mutating tool the Plan-time capture would have dropped.
         let normal = crate::context::ContextStats { mode: crate::mode::AgentMode::Normal, ..Default::default() };
         let Some(crate::turn_commands::Output::Block(listing)) =
-            snapshot.output("/tools", &normal, &crate::plan::Plan::default())
+            snapshot.output("/tools", &normal, &crate::plan::Plan::default(), &crate::timers::Timers::default())
         else {
             panic!("/tools produced no block");
         };
@@ -11028,7 +13385,7 @@ mod tests {
         // And under a live Plan mode it is still filtered out.
         let plan = crate::context::ContextStats { mode: crate::mode::AgentMode::Plan, ..Default::default() };
         let Some(crate::turn_commands::Output::Block(filtered)) =
-            snapshot.output("/tools", &plan, &crate::plan::Plan::default())
+            snapshot.output("/tools", &plan, &crate::plan::Plan::default(), &crate::timers::Timers::default())
         else {
             panic!("/tools produced no block");
         };
@@ -11052,7 +13409,7 @@ mod tests {
         // capture-time availability would have dropped.
         let available = crate::context::ContextStats { history_available: true, ..Default::default() };
         let Some(crate::turn_commands::Output::Block(listing)) =
-            snapshot.output("/tools", &available, &crate::plan::Plan::default())
+            snapshot.output("/tools", &available, &crate::plan::Plan::default(), &crate::timers::Timers::default())
         else {
             panic!("/tools produced no block");
         };
@@ -11064,7 +13421,7 @@ mod tests {
         // And while history is unavailable they are still filtered out.
         let unavailable = crate::context::ContextStats { history_available: false, ..Default::default() };
         let Some(crate::turn_commands::Output::Block(hidden)) =
-            snapshot.output("/tools", &unavailable, &crate::plan::Plan::default())
+            snapshot.output("/tools", &unavailable, &crate::plan::Plan::default(), &crate::timers::Timers::default())
         else {
             panic!("/tools produced no block");
         };

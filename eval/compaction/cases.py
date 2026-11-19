@@ -92,6 +92,22 @@ def buried_error(seed, filler_turns):
     return log.records, "Earlier, a cargo build of the lease crate failed. Quote the exact method name from that error message.", [method], []
 
 
+def long_log_error(seed, filler_turns):
+    """The answer is an error line from the middle of a ~50k-character build
+    log — past the 2,000-char head clip a compacted transcript applies, so the
+    summariser only sees it if error lines are pinned (issue #67)."""
+    rng = random.Random(seed)
+    method = f"renew_lease_v{rng.randint(10, 99)}_{rng.choice(['sync', 'fast', 'lazy'])}"
+    log = Log()
+    log.user("The release build is broken. Find the compile error.")
+    # ~25k chars of noise, one error line, then ~25k more: head+tail clipping
+    # alone drops the middle.
+    log.bash("cargo build --release", noise(rng, 700) + f"\nerror[E0599]: no method named `{method}` found for struct `LeaseStore` in the current scope\n" + noise(rng, 700), error=True)
+    log.answer("The release build fails in one crate. I'll dig into the error next.")
+    filler(log, rng, filler_turns)
+    return log.records, "The release build failed earlier. Quote the exact method name from the compile error.", [method], []
+
+
 def user_constraint(seed, filler_turns):
     rng = random.Random(seed)
     branch = f"jw/lease-fix-{rng.randint(1000, 9999)}"
@@ -143,18 +159,52 @@ def recent_control(seed, filler_turns):
     return log.records, "What ticket number did you give me just now?", [code], []
 
 
+def pinned_request(seed, filler_turns):
+    """A goal whose exact detail (a flag, a number, a phrase) is stated once in
+    the first user message, then compacted TWICE, then questioned (issue #66).
+
+    Each compaction re-summarizes the previous summary, so without the pinned
+    block of the user's requests the exact detail survives only as a paraphrase
+    of a paraphrase — and is usually gone by the second compaction. With the
+    pinned block, the user's original words are re-attached verbatim after every
+    summary, so the detail is still in context. The harness compacts twice
+    (``compactions: 2``); the filler between the detail and the question is what
+    the summaries fold away."""
+    rng = random.Random(seed)
+    flag = f"--strict-lease-v{rng.randint(10, 99)}"
+    count = rng.randint(3, 9)
+    phrase = f"operation-{rng.choice(['amber', 'cobalt', 'ember'])}-{rng.randint(1000, 9999)}"
+    log = Log()
+    log.user(
+        f"Set up the lease migration. It must use the {flag} flag, run exactly {count} passes, "
+        f"and be labelled {phrase}. Don't start until I confirm."
+    )
+    log.bash("git status", "On branch main\nnothing to commit, working tree clean")
+    log.answer("Understood. I'll wait for your confirmation before starting.")
+    filler(log, rng, filler_turns)
+    return log.records, (
+        "Before we begin: what exact flag, how many passes, and what label did I ask for at the very start?"
+    ), [flag, f"{count} passes", phrase], []
+
+
 CASES = {
     "buried-error": buried_error,
+    "long-log-error": long_log_error,
     "user-constraint": user_constraint,
     "working-command": working_command,
     "rejected-approach": rejected_approach,
     "recent-control": recent_control,
+    "pinned-request": pinned_request,
 }
 
 
 def build(name, seed, filler_turns):
     records, question, expect, forbid = CASES[name](seed, filler_turns)
-    return {"name": name, "records": records, "question": question, "expect": expect, "forbid": forbid}
+    case = {"name": name, "records": records, "question": question, "expect": expect, "forbid": forbid}
+    # The pinned-request case is the issue-#66 scenario: compacted twice.
+    if name == "pinned-request":
+        case["compactions"] = 2
+    return case
 
 
 if __name__ == "__main__":

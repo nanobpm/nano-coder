@@ -197,6 +197,30 @@ pub struct HookManager {
     permission_mode: String,
 }
 
+/// Whether `command` runs a hook script installed by a Herdr integration
+/// (`herdr integration install …`): its name is Herdr's `herdr-agent-state.sh`,
+/// or a script it names carries the `HERDR_INTEGRATION_ID=` marker.
+fn is_herdr_integration(command: &str) -> bool {
+    command.split_whitespace().map(|word| word.trim_matches(|c| c == '\'' || c == '"')).any(|word| {
+        if word.ends_with("herdr-agent-state.sh") {
+            return true;
+        }
+        let path = match word.strip_prefix("~/") {
+            Some(rest) => match dirs::home_dir() {
+                Some(home) => home.join(rest),
+                None => return false,
+            },
+            None => PathBuf::from(word),
+        };
+        if !path.is_absolute() || !path.is_file() {
+            return false;
+        }
+        let mut head = [0u8; 1024];
+        let n = std::fs::File::open(&path).and_then(|mut f| std::io::Read::read(&mut f, &mut head)).unwrap_or(0);
+        String::from_utf8_lossy(&head[..n]).contains("HERDR_INTEGRATION_ID=")
+    })
+}
+
 impl HookManager {
     /// Load hooks from every source: project `.claude/settings.json` and
     /// `.claude/settings.local.json` (at the repository root), the user's
@@ -306,6 +330,17 @@ impl HookManager {
                         });
                         continue;
                     };
+                    // Herdr's Claude integration reports this pane to Herdr as
+                    // `claude`, so Herdr would restore a nano session with
+                    // `claude --resume`. nano-coder reports itself (src/herdr.rs).
+                    if is_herdr_integration(&command) {
+                        self.skipped.push(Skipped {
+                            event_name: event_name.clone(),
+                            reason: "Herdr's Claude integration; nano-coder reports to Herdr itself".to_string(),
+                            source,
+                        });
+                        continue;
+                    }
                     // Validate the `if` filter now rather than at call time:
                     // `permissions::rule_matches` returns `false` for a malformed
                     // rule, so a broken filter (e.g. `Bash(git push *`, missing
@@ -1878,6 +1913,38 @@ mod tests {
         assert_eq!(manager.hooks()[0].command, "echo good");
         assert_eq!(manager.skipped.len(), 1, "the malformed filter is reported, not dropped silently");
         assert!(manager.skipped[0].reason.contains("invalid `if` filter"), "the skip reason names the parse error");
+    }
+
+    #[test]
+    fn herdr_integration_hooks_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        // A renamed script is still recognised by Herdr's marker.
+        let script = dir.path().join("renamed.sh");
+        std::fs::write(&script, "#!/bin/sh\n# installed by herdr\n# HERDR_INTEGRATION_ID=claude\n").unwrap();
+        let settings = format!(
+            r#"{{"hooks":{{"SessionStart":[{{"matcher":"*","hooks":[
+                {{"type":"command","command":"bash '/home/u/.claude/hooks/herdr-agent-state.sh' session"}},
+                {{"type":"command","command":"sh \"{}\" session"}},
+                {{"type":"command","command":"echo mine"}}
+            ]}}]}}}}"#,
+            script.display()
+        );
+        std::fs::write(dir.path().join(".claude/settings.json"), settings).unwrap();
+        let nano = NanoHooks::new();
+        let opts = LoadOptions {
+            disable_hooks: false,
+            disable_project_hooks: false,
+            claude_user_hooks: false,
+            nano_hooks: &nano,
+            sandbox: SandboxConfig::default(),
+        };
+        let manager = HookManager::load(&opts, dir.path());
+        assert_eq!(manager.hooks().len(), 1, "other hooks still load");
+        assert_eq!(manager.hooks()[0].command, "echo mine");
+        assert_eq!(manager.skipped.len(), 2);
+        assert!(manager.skipped.iter().all(|s| s.reason.contains("Herdr")));
     }
 
     #[test]

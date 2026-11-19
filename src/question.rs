@@ -377,7 +377,7 @@ mod tests {
         let questions =
             vec![Question { question: "pick\x1b[2Jone".into(), header: String::new(), options: vec![], custom: true }];
         let answered = result_text(&questions, &QuestionAnswer::Answers(vec!["ans\x07wer".into()]));
-        assert!(answered.contains("\"pick[2Jone\"=\"answer\""), "{answered}");
+        assert!(answered.contains("\"pickone\"=\"answer\""), "{answered}");
         assert!(!answered.contains('\x1b'), "escape leaked: {answered:?}");
         assert!(!answered.contains('\x07'), "control leaked: {answered:?}");
     }

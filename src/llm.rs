@@ -97,6 +97,14 @@ pub struct Message {
     /// fresh reply (issue #114). Log only; not sent to providers.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub continuation: bool,
+    /// Marks a fired-timer or pending-timer-nudge user message (implies
+    /// `auto_initiated`), so recovery's continuation replay can tell it apart
+    /// from a Stop-hook re-prompt: a timer message is delivered mid-turn but
+    /// does NOT begin a new answer segment, so the replay keeps the interrupted
+    /// answer's prefix across it rather than clearing it (issue #150). Log
+    /// only; not sent to providers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub timer: bool,
     /// Provider-specific reasoning blocks that must be replayed with this
     /// assistant message (Anthropic `thinking` blocks with signatures).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -110,6 +118,25 @@ pub struct Message {
     /// to the log only inside `replace` records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_line: Option<u64>,
+    /// The user-typed text of a genuine request, recorded separately when the
+    /// harness appends hook context to the prompt (agent.rs wraps it as a
+    /// `<system-reminder>` block on the wire `content`). Compaction pins the
+    /// request from this pristine text rather than clipping `content` at the
+    /// first `<system-reminder>` tag, so a user who *types* that tag (e.g.
+    /// `Rename <system-reminder> to …`) keeps their whole task in the pin
+    /// instead of losing everything from the tag on (issue #66). `None` when no
+    /// hook context was appended — then the pin is taken from `content` itself.
+    /// Log only; not sent to providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin_text: Option<String>,
+    /// Marks a user-role message that is *entirely* harness hook context (a
+    /// resume `SessionStart` hook's `<system-reminder>` block), not user
+    /// input. Compaction identifies such messages by this origin flag rather
+    /// than by a `<system-reminder>` text prefix, so a genuine prompt that
+    /// starts with a literal tag is still pinned (issue #66). Log only; not
+    /// sent to providers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hook_context: bool,
     /// Assistant messages: the reasoning text the model produced for this
     /// response. Kept in the session log (for the trajectory view and
     /// `history_read`); not sent to providers.
@@ -152,11 +179,14 @@ impl Message {
             is_error: false,
             auto_initiated: false,
             continuation: false,
+            timer: false,
             thinking_blocks: vec![],
             tool_call_id: None,
             name: None,
             timestamp: None,
             log_line: None,
+            pin_text: None,
+            hook_context: false,
             thinking: String::new(),
             usage: None,
             duration_ms: None,
@@ -208,6 +238,24 @@ impl Message {
         self
     }
 
+    /// Record the user-typed text of this request separately, because the
+    /// harness appended hook context to the wire `content` (a `<system-reminder>`
+    /// block, agent.rs). Compaction pins the request from this pristine text, so
+    /// a user who *types* a `<system-reminder>` tag keeps their whole task in the
+    /// pin (issue #66).
+    pub fn with_pin_text(mut self, text: &str) -> Self {
+        self.pin_text = Some(text.to_string());
+        self
+    }
+
+    /// Mark this (user-role) message as pure harness hook context (a resume
+    /// `SessionStart` block), so compaction never pins it as a user request
+    /// (issue #66).
+    pub fn hook_context(mut self) -> Self {
+        self.hook_context = true;
+        self
+    }
+
     /// Mark this (user-role) reminder as a truncated-output *continuation*
     /// reminder specifically (implies `auto_initiated`), so recovery can tell
     /// it apart from a Stop-hook re-prompt and rebuild the cut-off answer
@@ -215,6 +263,16 @@ impl Message {
     pub fn continuation(mut self) -> Self {
         self.auto_initiated = true;
         self.continuation = true;
+        self
+    }
+
+    /// Mark this (user-role) message as a fired-timer or pending-timer-nudge
+    /// injection (implies `auto_initiated`), so recovery's continuation replay
+    /// keeps the interrupted answer's prefix across it instead of treating it
+    /// as a new answer segment (issue #150).
+    pub fn timer(mut self) -> Self {
+        self.auto_initiated = true;
+        self.timer = true;
         self
     }
 }

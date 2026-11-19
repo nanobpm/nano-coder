@@ -1,7 +1,8 @@
-//! App-owned frame renderer (approach (a) from #46).
+//! App-owned frame renderer (approach (a) from #46), used whenever stdout is a
+//! terminal (piped output is plain text, see `ui::Renderer`).
 //!
-//! Instead of writing output into the terminal's scrollback and pinning the
-//! status bar with a scroll region, this renderer *owns* the screen: every
+//! Instead of writing output into the terminal's scrollback, this renderer
+//! *owns* the screen: every
 //! render turns the current state into a `Vec<String>` of lines at the current
 //! width (the transcript, then the input editor, then the status bar as the
 //! last line), diffs it against the previous frame and rewrites only what
@@ -17,52 +18,9 @@
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthChar;
 
 use crate::plan::{Plan, Status};
-
-/// Which renderer the interactive CLI drives.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum RendererMode {
-    /// The scroll-region renderer: the terminal owns scrollback and reflow.
-    Legacy,
-    /// The app-owned frame renderer: nano-coder re-renders on a width change.
-    #[default]
-    Frame,
-}
-
-impl RendererMode {
-    pub const ALL: [RendererMode; 2] = [RendererMode::Legacy, RendererMode::Frame];
-
-    pub fn describe(self) -> &'static str {
-        match self {
-            RendererMode::Legacy => "terminal owns scrollback and reflow (scroll region)",
-            RendererMode::Frame => "app re-renders the frame on a width change",
-        }
-    }
-}
-
-impl std::fmt::Display for RendererMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            RendererMode::Legacy => "legacy",
-            RendererMode::Frame => "frame",
-        })
-    }
-}
-
-impl std::str::FromStr for RendererMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        RendererMode::ALL
-            .into_iter()
-            .find(|m| m.to_string() == s.trim().to_lowercase())
-            .ok_or_else(|| format!("unknown renderer {s:?} (legacy, frame)"))
-    }
-}
 
 // Synchronized output: the terminal buffers everything between these and paints
 // it in one go, so a half-drawn frame is never visible. Terminals that don't
@@ -77,7 +35,7 @@ const GREEN: &str = "\x1b[38;5;114m";
 const RED: &str = "\x1b[38;5;203m";
 const RESET: &str = "\x1b[0m";
 
-/// Result-preview lines shown per tool result (matches the legacy renderer).
+/// Result-preview lines shown per tool result (matches plain output).
 const PREVIEW_LINES: usize = 10;
 
 // --- The transcript model: items → lines at a width -----------------------
@@ -95,24 +53,25 @@ pub enum Role {
 pub enum Item {
     /// A user or assistant message (plain text, wrapped to width).
     Message { role: Role, text: String },
-    /// A finished reasoning block, shown collapsed as a one-line summary.
-    Thinking { chars: usize, seconds: f64 },
-    /// A tool invocation: the tool name and a one-line argument summary.
-    ToolCall { name: String, summary: String },
+    /// A finished reasoning block, shown collapsed as a one-line summary, or
+    /// with its full `text` when `expanded` (Ctrl-O).
+    Thinking { chars: usize, seconds: f64, text: String, expanded: bool },
+    /// A tool invocation: the tool name and a one-line argument summary, plus
+    /// the full (pretty-printed) arguments shown when `expanded` (Ctrl-O).
+    /// `call_id` pairs the call with its result (Ctrl-O toggles them together,
+    /// matched by id — mid-turn output can separate the two).
+    ToolCall { call_id: String, name: String, summary: String, args: String, expanded: bool },
     /// A tool result: its first line plus a "+N lines" count (or a preview
-    /// when `verbose`).
-    ToolResult { ok: bool, output: String, verbose: bool },
+    /// when `verbose`); every line when `expanded` (Ctrl-O). `call_id` is the
+    /// id of the call it answers.
+    ToolResult { call_id: String, ok: bool, output: String, verbose: bool, expanded: bool },
     /// The current plan checklist.
     Plan(Plan),
     /// A short diagnostic / lifecycle note.
     Note(String),
     /// The `report_outcome` status marker (`✔ completed` etc.). Distinct from
     /// [`Item::Note`] because it is derived from a CONVERSATION event (the
-    /// tool call), not renderer-only output. It is part of the captured
-    /// transcript all the same: on a frame → legacy switch `set_mode` copies
-    /// the WHOLE `items` list and `replay_transcript` reprints it directly
-    /// (the caller does not re-derive history from the conversation on that
-    /// path), so this marker is restored in place, exactly once.
+    /// tool call), not renderer-only output.
     OutcomeMark(String),
     /// Verbatim command / informational output (e.g. `/help`, `/context`),
     /// captured into the transcript so it can't corrupt the owned frame.
@@ -130,7 +89,7 @@ pub enum Item {
 /// created (empty when timestamps are off). Pairing the stamp with the item —
 /// rather than storing it per-variant — keeps every transcript item (messages,
 /// tool calls, results, plans, thinking, notes, and command output) stamped
-/// consistently, mirroring the legacy renderer's `ui::stamp_block`.
+/// consistently, mirroring plain output's `ui::stamp_block`.
 #[derive(Debug, Clone)]
 pub struct StampedItem {
     pub stamp: String,
@@ -139,7 +98,7 @@ pub struct StampedItem {
 
 /// Render one stamped transcript item: its content at the reduced width, with
 /// the timestamp on the first row and continuation rows indented under it
-/// (mirroring the legacy `ui::stamp_block`). Every assembled row is bounded to
+/// (mirroring plain output's `ui::stamp_block`). Every assembled row is bounded to
 /// `width` so an extremely narrow frame can't overflow and wrap natively. With
 /// timestamps off the stamp is empty, so this collapses to plain `render_item`.
 pub fn render_stamped(si: &StampedItem, width: usize) -> Vec<String> {
@@ -178,7 +137,12 @@ pub fn render_item(item: &Item, width: usize) -> Vec<String> {
             // Reserve the `› ` marker column for the first line so no row
             // overflows `width`; continuation rows start at column 0.
             let inner = width.saturating_sub(prefix.chars().count()).max(1);
-            let body = wrap_block(text, inner);
+            // Assistant text has its markdown rendered at this width; a width
+            // change re-renders the item, so it reflows too.
+            let body = match role {
+                Role::Assistant => wrap_block(&crate::markdown::render_cached(text, inner), inner),
+                Role::User => wrap_block(text, inner),
+            };
             body.into_iter()
                 .enumerate()
                 .map(
@@ -188,15 +152,30 @@ pub fn render_item(item: &Item, width: usize) -> Vec<String> {
                 )
                 .collect()
         }
-        Item::Thinking { chars, seconds } => {
-            vec![fit(&format!("{THINK}∴ Thought for {seconds:.1}s{RESET}{DIM} · {chars} chars{RESET}"), width)]
+        Item::Thinking { chars, seconds, text, expanded } => {
+            let mut out =
+                vec![fit(&format!("{THINK}∴ Thought for {seconds:.1}s{RESET}{DIM} · {chars} chars{RESET}"), width)];
+            if *expanded {
+                out.extend(expanded_body(text, width, THINK));
+            }
+            out
         }
-        Item::ToolCall { name, summary } => {
+        Item::ToolCall { name, summary, args, expanded, .. } => {
             let used = name.chars().count() + 4;
             let summary = fit(summary, width.saturating_sub(used));
-            vec![fit(&format!("{GREEN}●{RESET} {BOLD}{name}{RESET} {DIM}{summary}{RESET}"), width)]
+            let mut out = vec![fit(&format!("{GREEN}●{RESET} {BOLD}{name}{RESET} {DIM}{summary}{RESET}"), width)];
+            if *expanded {
+                out.extend(expanded_body(args, width, DIM));
+            }
+            out
         }
-        Item::ToolResult { ok, output, verbose } => tool_result_lines(*ok, output, *verbose, width),
+        Item::ToolResult { ok, output, verbose, expanded, .. } => {
+            if *expanded {
+                expanded_result_lines(*ok, output, width)
+            } else {
+                tool_result_lines(*ok, output, *verbose, width)
+            }
+        }
         Item::Plan(plan) => plan_lines(plan, width),
         Item::Note(text) | Item::OutcomeMark(text) => {
             wrap_block(text, width).into_iter().map(|line| format!("{DIM}{line}{RESET}")).collect()
@@ -209,8 +188,96 @@ pub fn render_item(item: &Item, width: usize) -> Vec<String> {
     }
 }
 
+/// Render a sanitized, fully wrapped body (expanded thinking text or tool
+/// arguments) indented under its header row, in `color`. Folding happens here,
+/// at render time, so an expanded item reflows on resize like any other.
+pub(crate) fn expanded_body(text: &str, width: usize, color: &str) -> Vec<String> {
+    let inner = width.saturating_sub(4).max(1);
+    let clean: Vec<String> = text.trim().lines().map(crate::sanitize_terminal_line).collect();
+    if clean.is_empty() {
+        return Vec::new();
+    }
+    wrap_block(&clean.join("\n"), inner)
+        .into_iter()
+        .map(|line| fit(&format!("    {color}{line}{RESET}"), width))
+        .collect()
+}
+
+/// A tool result with every line shown (wrapped, never truncated).
+fn expanded_result_lines(ok: bool, output: &str, width: usize) -> Vec<String> {
+    let clean: Vec<String> = output.trim_end().lines().map(crate::sanitize_terminal_line).collect();
+    let (mark, color) = if ok { ("⎿", DIM) } else { ("⎿ error:", RED) };
+    if clean.is_empty() {
+        return vec![fit(&format!("  {color}{mark} (no output){RESET}"), width)];
+    }
+    let lead = mark.chars().count() + 3;
+    let body = width.saturating_sub(lead).max(1);
+    let pad = " ".repeat(lead);
+    wrap_block(&clean.join("\n"), body)
+        .into_iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let row =
+                if i == 0 { format!("  {color}{mark} {line}{RESET}") } else { format!("{pad}{color}{line}{RESET}") };
+            fit(&row, width)
+        })
+        .collect()
+}
+
+/// Toggle the expansion of the latest collapsible item in `items` (a tool
+/// call/result pair or a thinking block). Returns whether anything changed.
+pub fn toggle_latest(items: &mut [StampedItem]) -> bool {
+    let Some(i) = items
+        .iter()
+        .rposition(|si| matches!(si.item, Item::Thinking { .. } | Item::ToolCall { .. } | Item::ToolResult { .. }))
+    else {
+        return false;
+    };
+    // A result's matching call is found by tool-call id, not adjacency:
+    // mid-turn command output can separate the two, and a replayed multi-tool
+    // response emits every call before any result.
+    let pair = match &items[i].item {
+        Item::ToolResult { call_id, .. } => {
+            items.iter().rposition(|si| matches!(&si.item, Item::ToolCall { call_id: id, .. } if id == call_id))
+        }
+        _ => None,
+    };
+    let next = match &items[i].item {
+        Item::Thinking { expanded, .. } | Item::ToolCall { expanded, .. } | Item::ToolResult { expanded, .. } => {
+            !*expanded
+        }
+        _ => unreachable!(),
+    };
+    match &mut items[i].item {
+        Item::Thinking { expanded, .. } | Item::ToolCall { expanded, .. } | Item::ToolResult { expanded, .. } => {
+            *expanded = next
+        }
+        _ => unreachable!(),
+    }
+    // Keep the matching call's arguments in step with its result.
+    if let Some(j) = pair
+        && let Item::ToolCall { expanded, .. } = &mut items[j].item
+    {
+        *expanded = next;
+    }
+    true
+}
+
+/// The expansion state of the tool call with `call_id`, when it is in the
+/// transcript. A result arriving after Ctrl-O expanded its call inherits
+/// this so the pair stays in step.
+pub fn expanded_state_of_call(items: &[StampedItem], call_id: &str) -> Option<bool> {
+    items.iter().rev().find_map(|si| match &si.item {
+        Item::ToolCall { call_id: id, expanded, .. } if id == call_id => Some(*expanded),
+        _ => None,
+    })
+}
+
 fn tool_result_lines(ok: bool, output: &str, verbose: bool, width: usize) -> Vec<String> {
-    let lines: Vec<&str> = output.trim_end().lines().collect();
+    // Tool output is model-/tool-controlled; strip control and escape bytes so a
+    // result preview can't drive the terminal. Only the displayed preview is
+    // sanitized — the model-facing output is kept intact elsewhere (#150).
+    let lines: Vec<String> = output.trim_end().lines().map(crate::sanitize_terminal_line).collect();
     let (mark, color) = if ok { ("⎿", DIM) } else { ("⎿ error:", RED) };
     // The prefix is two leading spaces, the marker, and one space; reserve its
     // real width so the longer `⎿ error:` marker can't overflow `width` and
@@ -231,7 +298,7 @@ fn tool_result_lines(ok: bool, output: &str, verbose: bool, width: usize) -> Vec
         return out;
     }
     let more = if lines.len() > 1 { format!(" (+{} lines)", lines.len() - 1) } else { String::new() };
-    vec![fit(&format!("  {color}{mark} {}{more}{RESET}", fit(lines[0], body.saturating_sub(more.len()))), width)]
+    vec![fit(&format!("  {color}{mark} {}{more}{RESET}", fit(&lines[0], body.saturating_sub(more.len()))), width)]
 }
 
 /// Plans longer than this show finished items as one summary line.
@@ -326,8 +393,8 @@ pub fn compose(transcript: &[String], editor: &[String], status: &str) -> Vec<St
     frame
 }
 
-/// The dim queue indicator row shown under the editor in frame mode, mirroring
-/// the legacy status line's `⏸N queued · /queue to edit` hint. Returns `None`
+/// The dim queue indicator row shown under the editor (`⏸N queued · /queue to
+/// edit`). Returns `None`
 /// when nothing is queued.
 pub fn queue_indicator(queued: usize, width: usize) -> Option<String> {
     (queued > 0).then(|| fit(&format!("{DIM}⏸{queued} queued · /queue to edit{RESET}"), width.max(1)))
@@ -515,34 +582,6 @@ fn sanitize(line: &str) -> String {
     out
 }
 
-/// Sanitize one captured transcript field for the legacy replay on a frame →
-/// legacy switch, sharing the frame layout's per-line rules so the reprinted
-/// text matches what the frame showed. Unlike
-/// [`crate::sanitize_terminal_text`] — which deletes `\t` outright and strips
-/// only the ESC byte (leaving a literal `[32m` fragment behind) — this expands
-/// tabs to spaces (8-stop) and keeps SGR styling sequences, so a replayed
-/// `read_file` result keeps its indentation and a styled line keeps its colour
-/// instead of degrading to `[32mhello[0m`. Newlines are kept (a transcript
-/// field is multi-line content), the U+2028/U+2029 forged-line-break protection
-/// is preserved, and every other cursor/erase/OSC escape and C0/C1/DEL control
-/// is dropped so model/tool-controlled text cannot move the legacy cursor or
-/// clear the screen. `Item::Raw` exports do NOT come here — they stay
-/// byte-exact.
-pub(crate) fn sanitize_replay(text: &str) -> String {
-    let mut out = String::new();
-    for line in text.split('\n') {
-        // `sanitize` expands tabs and keeps SGR styling but drops every
-        // control, `\n` included; re-add the line feed between logical lines.
-        out.push_str(&sanitize(line));
-        out.push('\n');
-    }
-    out.pop(); // drop the trailing newline `split` does not imply
-    // `sanitize` keeps control chars it has a rule for; U+2028/U+2029 are not
-    // control chars, so strip the forged line breaks here to match
-    // `sanitize_terminal_text`.
-    out.chars().filter(|c| *c != '\u{2028}' && *c != '\u{2029}').collect()
-}
-
 /// Wrap one logical line to `width` visible columns, preserving ANSI escape
 /// sequences (they take no columns) and breaking on spaces where possible.
 fn wrap_ansi(line: &str, width: usize) -> Vec<String> {
@@ -672,10 +711,9 @@ impl<W: Write> FrameRenderer<W> {
 
     fn full_redraw(&mut self, frame: &[String], width: usize, height: usize) -> std::io::Result<()> {
         let mut buf = String::from(SYNC_START);
-        // Drop any scroll region a prior renderer (e.g. `StatusLine::install`,
-        // which pins DECSTBM to rows 1..rows-1) left set: this renderer owns
-        // the whole screen, so `CRLF` scrolling must span every row or the
-        // bottom status line can be pushed out of place.
+        // Drop any scroll region a previous program left set: this renderer
+        // owns the whole screen, so `CRLF` scrolling must span every row or
+        // the bottom status line can be pushed out of place.
         buf.push_str("\x1b[r");
         // Clear the screen AND scrollback: a full redraw re-emits the whole
         // transcript, so any surplus that scrolls off must not sit behind a
@@ -840,6 +878,23 @@ mod tests {
     use super::*;
     use crate::plan::PlanItem;
 
+    #[test]
+    fn assistant_tables_are_laid_out_and_reflow_with_width() {
+        let text = "Sizes:\n| Name | Notes |\n|---|---|\n| alpha | first entry in the list |";
+        let item = Item::Message { role: Role::Assistant, text: text.into() };
+        let wide: Vec<String> = render_item(&item, 80).iter().map(|l| strip(l)).collect();
+        assert_eq!(wide[0], "Sizes:");
+        assert_eq!(wide[1], "");
+        assert_eq!(wide[2], "┌───────┬─────────────────────────┐");
+        assert_eq!(wide[5], "│ alpha │ first entry in the list │");
+        let narrow: Vec<String> = render_item(&item, 24).iter().map(|l| strip(l)).collect();
+        assert!(narrow.len() > wide.len(), "{narrow:?}");
+        assert!(narrow.iter().all(|l| visible_width(l) <= 24), "{narrow:?}");
+        // A user's own message is shown as typed.
+        let user = Item::Message { role: Role::User, text: text.into() };
+        assert!(render_item(&user, 80).iter().any(|l| strip(l).contains("| Name | Notes |")));
+    }
+
     fn strip(text: &str) -> String {
         let mut out = String::new();
         let mut chars = text.chars().peekable();
@@ -860,53 +915,156 @@ mod tests {
         out
     }
 
-    #[test]
-    fn parses_and_displays_renderer_mode() {
-        assert_eq!("frame".parse::<RendererMode>(), Ok(RendererMode::Frame));
-        assert_eq!("Legacy".parse::<RendererMode>(), Ok(RendererMode::Legacy));
-        assert!("fancy".parse::<RendererMode>().is_err());
-        assert_eq!(RendererMode::default(), RendererMode::Frame);
-        assert_eq!(RendererMode::Frame.to_string(), "frame");
+    fn expandable_items() -> Vec<StampedItem> {
+        let s = |item| StampedItem { stamp: String::new(), item };
+        vec![
+            s(Item::Thinking { chars: 11, seconds: 1.5, text: "first idea\nsecond".into(), expanded: false }),
+            s(Item::ToolCall {
+                call_id: "call_1".into(),
+                name: "bash".into(),
+                summary: "ls".into(),
+                args: "{\n  \"command\": \"ls\"\n}".into(),
+                expanded: false,
+            }),
+            s(Item::ToolResult {
+                call_id: "call_1".into(),
+                ok: true,
+                output: (1..=15).map(|i| format!("row {i}")).collect::<Vec<_>>().join("\n"),
+                verbose: false,
+                expanded: false,
+            }),
+        ]
     }
 
     #[test]
-    fn sanitize_replay_expands_tabs_and_keeps_sgr_styling() {
-        // A replayed `read_file` result keeps its tab indentation (expanded to
-        // the next 8-stop) instead of losing it, and a styled line keeps its
-        // SGR colour instead of degrading to a literal `[32m` fragment.
-        // `"     1"` is 7 visible columns, so the tab adds 2 spaces (7 → 8).
-        assert_eq!(sanitize_replay("     1\treturn 1"), "     1  return 1");
-        assert_eq!(sanitize_replay("\x1b[32mhello\x1b[0m"), "\x1b[32mhello\x1b[0m");
-        assert_eq!(sanitize_replay("\thello"), "        hello");
+    fn ctrl_o_toggles_the_latest_tool_call_and_result_in_place() {
+        let mut items = expandable_items();
+        let collapsed: Vec<String> = transcript_lines(&items, 40).iter().map(|l| strip(l)).collect();
+        assert_eq!(collapsed.len(), 3, "{collapsed:?}");
+        assert!(collapsed[2].contains("row 1 (+14 lines)"), "{collapsed:?}");
+
+        assert!(toggle_latest(&mut items));
+        let expanded: Vec<String> = transcript_lines(&items, 40).iter().map(|l| strip(l)).collect();
+        // Thinking stays collapsed; the call shows its arguments, the result every row.
+        assert_eq!(expanded[0], collapsed[0]);
+        assert!(expanded.iter().any(|l| l.contains("\"command\": \"ls\"")), "{expanded:?}");
+        for i in 1..=15 {
+            assert!(expanded.iter().any(|l| l.trim_end().ends_with(&format!("row {i}"))), "row {i}: {expanded:?}");
+        }
+        assert!(!expanded.iter().any(|l| l.contains("+14 lines")));
+        // Expanded content is folded at render time, so it reflows at any width.
+        for w in [12, 20, 80] {
+            assert!(transcript_lines(&items, w).iter().all(|l| visible_width(l) <= w), "width {w}");
+        }
+
+        assert!(toggle_latest(&mut items));
+        let again: Vec<String> = transcript_lines(&items, 40).iter().map(|l| strip(l)).collect();
+        assert_eq!(again, collapsed);
     }
 
     #[test]
-    fn sanitize_replay_keeps_newlines_but_drops_cursor_erase_and_controls() {
-        // Newlines are multi-line content to keep; cursor/erase CSI and stray
-        // C0 controls are dropped so replayed text cannot move the legacy
-        // cursor or clear the screen. This shares `frame::sanitize`, which only
-        // special-cases CSI escapes — matching exactly what the frame displayed.
-        assert_eq!(sanitize_replay("line one\nline two"), "line one\nline two");
-        assert_eq!(sanitize_replay("a\x1b[2Jb"), "ab");
-        assert_eq!(sanitize_replay("a\x1b[Hb"), "ab");
-        assert_eq!(sanitize_replay("a\x07\x08b"), "ab");
-        // The forged-line-break protection matches `sanitize_terminal_text`.
-        assert_eq!(sanitize_replay("a\u{2028}b\u{2029}c"), "abc");
+    fn ctrl_o_toggles_the_latest_thinking_block() {
+        let mut items = expandable_items();
+        items.truncate(1);
+        assert_eq!(transcript_lines(&items, 40).len(), 1);
+        assert!(toggle_latest(&mut items));
+        let lines: Vec<String> = transcript_lines(&items, 40).iter().map(|l| strip(l)).collect();
+        assert!(lines[0].contains("Thought for 1.5s"));
+        assert_eq!(lines[1].trim(), "first idea");
+        assert_eq!(lines[2].trim(), "second");
+        assert!(!toggle_latest(&mut Vec::new()));
     }
 
     #[test]
-    fn sanitize_replay_rejects_malformed_sgr_parameters() {
+    fn expanded_content_is_sanitized() {
+        let mut items = vec![StampedItem {
+            stamp: String::new(),
+            item: Item::ToolResult {
+                call_id: "call_1".into(),
+                ok: true,
+                output: "a\nb\x1b]0;pwn\x07\x1b[2J".into(),
+                verbose: false,
+                expanded: false,
+            },
+        }];
+        toggle_latest(&mut items);
+        assert!(transcript_lines(&items, 40).iter().all(|l| !l.contains("\x1b]") && !l.contains("[2J")));
+    }
+
+    #[test]
+    fn ctrl_o_matches_the_call_by_id_not_adjacency() {
+        // Mid-turn command output can sit between a call and its result; a
+        // replayed multi-tool response emits every call before any result.
+        // Ctrl-O must still expand the result together with ITS call's
+        // arguments, not whatever item happens to precede the result.
+        let s = |item| StampedItem { stamp: String::new(), item };
+        let mut items = vec![
+            s(Item::ToolCall {
+                call_id: "call_1".into(),
+                name: "bash".into(),
+                summary: "ls".into(),
+                args: "{\n  \"command\": \"ls\"\n}".into(),
+                expanded: false,
+            }),
+            s(Item::ToolCall {
+                call_id: "call_2".into(),
+                name: "read".into(),
+                summary: "a.rs".into(),
+                args: "{\n  \"path\": \"a.rs\"\n}".into(),
+                expanded: false,
+            }),
+            s(Item::Output("interleaved command output".into())),
+            s(Item::ToolResult {
+                call_id: "call_1".into(),
+                ok: true,
+                output: "file-a\nfile-b".into(),
+                verbose: false,
+                expanded: false,
+            }),
+        ];
+
+        assert!(toggle_latest(&mut items));
+        let lines: Vec<String> = transcript_lines(&items, 40).iter().map(|l| strip(l)).collect();
+        // The matching call (call_1) expanded with its result; the adjacent
+        // item (Output) and the other call (call_2) are untouched.
+        assert!(lines.iter().any(|l| l.contains("\"command\": \"ls\"")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.trim_end().ends_with("file-b")), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("\"path\": \"a.rs\"")), "{lines:?}");
+        match &items[1].item {
+            Item::ToolCall { expanded, .. } => assert!(!expanded),
+            other => panic!("unexpected item: {other:?}"),
+        }
+
+        // Toggling again collapses the same pair.
+        assert!(toggle_latest(&mut items));
+        let again: Vec<String> = transcript_lines(&items, 40).iter().map(|l| strip(l)).collect();
+        assert!(!again.iter().any(|l| l.contains("\"command\": \"ls\"")), "{again:?}");
+        assert!(again.iter().any(|l| l.contains("(+1 lines)")), "{again:?}");
+    }
+
+    #[test]
+    fn expanded_state_of_call_reports_the_matching_call() {
+        let items = expandable_items();
+        assert_eq!(expanded_state_of_call(&items, "call_1"), Some(false));
+        assert_eq!(expanded_state_of_call(&items, "call_missing"), None);
+        let mut items = items;
+        toggle_latest(&mut items);
+        assert_eq!(expanded_state_of_call(&items, "call_1"), Some(true));
+    }
+
+    #[test]
+    fn sanitize_rejects_malformed_sgr_parameters() {
         // A CSI sequence that ends in `m` but hides a control byte in its
-        // parameters (e.g. a `\r` in `\x1b[\r31m`) must NOT be replayed: the
-        // embedded CR would execute during replay and let model/tool output
+        // parameters (e.g. a `\r` in `\x1b[\r31m`) must NOT survive: the
+        // embedded CR would execute when drawn and let model/tool output
         // overwrite earlier content. Only digits, `;` and `:` are valid SGR
         // params, so the whole malformed sequence is dropped.
-        assert_eq!(sanitize_replay("prefix\x1b[\r31mOVERWRITE"), "prefixOVERWRITE");
-        assert_eq!(sanitize_replay("a\x1b[31\x08mb"), "ab");
+        assert_eq!(sanitize("prefix\x1b[\r31mOVERWRITE"), "prefixOVERWRITE");
+        assert_eq!(sanitize("a\x1b[31\x08mb"), "ab");
         // A space (an SGR intermediate byte, not a parameter byte) is rejected.
-        assert_eq!(sanitize_replay("a\x1b[31 mb"), "ab");
+        assert_eq!(sanitize("a\x1b[31 mb"), "ab");
         // A real, well-formed SGR sequence with digits/`;`/`:` still survives.
-        assert_eq!(sanitize_replay("\x1b[1;38:5:200mhi\x1b[0m"), "\x1b[1;38:5:200mhi\x1b[0m");
+        assert_eq!(sanitize("\x1b[1;38:5:200mhi\x1b[0m"), "\x1b[1;38:5:200mhi\x1b[0m");
     }
 
     #[test]
@@ -1112,13 +1270,22 @@ mod tests {
             StampedItem {
                 stamp: format!("{DIM}12:34:56{RESET} "),
                 item: Item::ToolCall {
+                    call_id: "call_1".into(),
                     name: "bash".into(),
                     summary: "ls -la /some/very/long/path/that/overflows".into(),
+                    args: String::new(),
+                    expanded: false,
                 },
             },
             StampedItem {
                 stamp: format!("{DIM}12:34:56{RESET} "),
-                item: Item::ToolResult { ok: true, output: "line1\nline2\nline3".into(), verbose: false },
+                item: Item::ToolResult {
+                    call_id: "call_1".into(),
+                    ok: true,
+                    output: "line1\nline2\nline3".into(),
+                    verbose: false,
+                    expanded: false,
+                },
             },
             StampedItem {
                 stamp: String::new(),
@@ -1129,9 +1296,43 @@ mod tests {
             assert!(visible_width(&line) <= 20, "{line:?} ({} cols)", visible_width(&line));
         }
         // The single-line tool result summarises the extra lines.
-        let result = render_item(&Item::ToolResult { ok: true, output: "a\nb\nc".into(), verbose: false }, 40);
+        let result = render_item(
+            &Item::ToolResult {
+                call_id: String::new(),
+                ok: true,
+                output: "a\nb\nc".into(),
+                verbose: false,
+                expanded: false,
+            },
+            40,
+        );
         assert_eq!(result.len(), 1);
         assert!(strip(&result[0]).contains("(+2 lines)"));
+    }
+
+    #[test]
+    fn tool_result_preview_strips_terminal_escapes() {
+        // A model/tool-controlled result (e.g. a `timer_list` note) must not
+        // reach the terminal with live escape/control bytes: the frame preview
+        // strips them while still showing the surviving text (#150). Strip the
+        // renderer's own styling first, then assert the content carries no raw
+        // ESC/BEL of its own.
+        let hostile = "note \x1b]0;pwned\x07 \x1b[2J done";
+        let out = render_item(
+            &Item::ToolResult {
+                call_id: String::new(),
+                ok: true,
+                output: hostile.into(),
+                verbose: true,
+                expanded: false,
+            },
+            120,
+        );
+        let content = strip(&out.join("\n"));
+        assert!(!content.contains('\x1b'), "ESC survived the preview: {content:?}");
+        assert!(!content.contains('\x07'), "BEL survived the preview: {content:?}");
+        assert!(content.contains("note"), "visible text was dropped: {content:?}");
+        assert!(content.contains("done"), "visible text was dropped: {content:?}");
     }
 
     #[test]

@@ -18,6 +18,8 @@ Examples:
   eval/compaction/run.py --cases my-cases.json --models ollama/qwen3:8b
   eval/compaction/run.py turns ~/…/sessions/sess-X.jsonl                   # pick fork lines
   eval/compaction/run.py report results/2026-….jsonl                      # re-print a table
+  eval/compaction/run.py calibrate --trials 5 --models …                  # noise band δ
+  eval/compaction/run.py report --baseline A.jsonl B.jsonl --delta results/….calibration.json
 """
 import argparse
 import concurrent.futures
@@ -43,7 +45,7 @@ import cases as synthetic  # noqa: E402
 # Denied unless --tools all: synthetic logs describe a project that doesn't
 # exist, so without history tools the agent would explore the real disk.
 WORK_TOOLS = ("bash", "read_file", "write_file", "edit_file")
-OVERRIDDEN = ("session_dir", "compaction_mode", "auto_compact", "persist_sessions", "project_instructions", "model")
+OVERRIDDEN = ("session_dir", "compaction_mode", "compaction_pin_requests", "auto_compact", "persist_sessions", "project_instructions", "model")
 
 
 def default_config():
@@ -211,7 +213,7 @@ def extra_body_arg(text):
     return value
 
 
-def config_text(base, session_dir, mode, extra_body=None, providers=()):
+def config_text(base, session_dir, mode, extra_body=None, providers=(), pin=True):
     """The user's config (for providers and keys) with eval overrides on top.
     Overridden top-level keys are removed from the base so TOML stays valid."""
     lines = []
@@ -227,6 +229,8 @@ def config_text(base, session_dir, mode, extra_body=None, providers=()):
     head = [
         f"session_dir = {json.dumps(str(session_dir))}",
         f'compaction_mode = "{mode}"',
+        # The pinned-block A/B (issue #66): a `-nopin` mode suffix turns it off.
+        f"compaction_pin_requests = {'true' if pin else 'false'}",
         "auto_compact = false",
         "persist_sessions = true",
         "project_instructions = false",
@@ -539,6 +543,12 @@ def read_log(path):
 
 
 def run_one(args, index, case, model, mode, repeat, work_root):
+    # A `-nopin` suffix on the mode (e.g. `smart-nopin`) runs that compaction
+    # mode with the pinned-request block disabled, for the with/without-pin A/B
+    # (issue #66). The reported `mode` keeps the suffix so the cells stay
+    # distinct; the `/compact` command and config use the bare mode.
+    pin = not mode.endswith("-nopin")
+    compact_mode = mode[:-len("-nopin")] if not pin else mode
     run_dir = work_root / f"{case['name'].replace('/', '_')}-{model.replace('/', '_').replace(':', '_')}-{mode}-r{repeat}-j{index}"
     session_dir, cwd = run_dir / "sessions", run_dir / "cwd"
     cwd.mkdir(parents=True, exist_ok=True)
@@ -547,7 +557,7 @@ def run_one(args, index, case, model, mode, repeat, work_root):
     session_id = f"eval-{uuid.uuid4().hex[:12]}"
     write_log(case["records"], session_dir, session_id)
     config = run_dir / "config.toml"
-    config.write_text(config_text(args.config, session_dir, mode, args.extra_body, [provider_for(model, args.config)]))
+    config.write_text(config_text(args.config, session_dir, compact_mode, args.extra_body, [provider_for(model, args.config)], pin))
     result = {"case": case["name"], "model": model, "mode": mode, "repeat": repeat, "tools": args.tools,
               "question": case["question"], "expect": case["expect"], "forbid": case["forbid"], "session": str(session_dir / f"{session_id}.jsonl")}
     started = time.monotonic()
@@ -561,9 +571,41 @@ def run_one(args, index, case, model, mode, repeat, work_root):
         if case.get("precompacted"):
             result["compacted"], result["fallback"] = True, None
         else:
-            compacted = acp.call("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": f"/compact --{mode}"}]})
-            result["compacted"] = bool(compacted and compacted.get("compacted"))
-            result["fallback"] = compacted.get("fallback") if compacted else None
+            # A case can ask to be compacted more than once (issue #66: a detail
+            # in the first message, compacted twice, then questioned). Between
+            # compactions a short follow-up turn runs so the next compaction has
+            # new work to fold — compacting twice back-to-back would leave the
+            # second with nothing new to summarize. The follow-up asks for a
+            # bare acknowledgement: a content-bearing reply would echo the
+            # visible context (the pinned block) into the retained tail, and the
+            # case could then pass on that echo even when the next compaction
+            # failed to regenerate the pin.
+            compactions = int(case.get("compactions", 1))
+            outcomes = []
+            for n in range(compactions):
+                if n:
+                    followup = case.get("between", "Reply with a bare acknowledgement and nothing else.")
+                    acp.call("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": followup}]})
+                compacted = acp.call("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": f"/compact --{compact_mode}"}]})
+                outcomes.append((bool(compacted and compacted.get("compacted")), compacted.get("fallback") if compacted else None))
+            result["compacted"], result["fallback"] = outcomes[-1]
+            if compactions > 1:
+                # A repeated-compaction case proves an EARLIER summary was
+                # summarized again. That only holds when EVERY requested
+                # compaction actually completed: a skipped one leaves the prior
+                # pin in place for grading, and a fallback (a later success
+                # overwriting an earlier failure) means the chain broke. Reject
+                # the run as soon as any requested compaction is skipped or
+                # reports ANY fallback (whatever its wording, e.g. "empty
+                # summary"), so a pass can only mean the full chain completed
+                # (issue #66).
+                for k, (ok, fb) in enumerate(outcomes):
+                    if not ok:
+                        result["error"] = f"compaction {k + 1} of {compactions} was skipped; the run cannot prove an earlier summary was summarized again"
+                        break
+                    if fb is not None:
+                        result["error"] = f"compaction {k + 1} of {compactions} fell back: {str(fb)[:300]}"
+                        break
         question = case["question"] + (" Answer in one line." if args.terse else "")
         acp.call("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": question}]})
     except Exception as e:
@@ -582,6 +624,20 @@ def run_one(args, index, case, model, mode, repeat, work_root):
         summary = next((m["content"] for m in remaining if m["role"] == "user" and m["content"].startswith("[")), "")
         # Everything left in context: summary plus the recent messages compaction keeps.
         kept = "\n".join(str(m.get("content") or "") + json.dumps(m.get("tool_calls") or []) for m in remaining)
+        if int(case.get("compactions", 1)) > 1:
+            # A repeated compaction must REGENERATE the pin, not ride on an
+            # echo: check the messages kept verbatim after the summary carry
+            # none of the expected values, so a pass can only come from the
+            # regenerated block (or a history lookup), never from a retained
+            # intermediate reply quoting the first pin (issue #66).
+            summary_at = next((i for i, m in enumerate(remaining)
+                               if m["role"] == "user" and m["content"].startswith("[")), len(remaining))
+            tail = "\n".join(str(m.get("content") or "") + json.dumps(m.get("tool_calls") or [])
+                             for m in remaining[summary_at + 1:])
+            leaked = [e for e in case["expect"] if re.search(e, tail, re.IGNORECASE)]
+            if leaked and "error" not in result:
+                result["error"] = (f"the retained tail echoes the target values {leaked}: "
+                                   "the run cannot prove the pin was regenerated")
     tool_calls = [c["name"] for r in after if r["type"] == "message" for c in r["data"].get("tool_calls", [])]
     turn_end = next((r["data"] for r in reversed(after) if r["type"] == "turn_end"), None)
     answer = turn_end["response"] if turn_end else ""
@@ -598,10 +654,117 @@ def run_one(args, index, case, model, mode, repeat, work_root):
         "summary_chars": len(summary),
         "history_calls": sum(1 for n in tool_calls if n.startswith("history_")),
         "tool_calls": tool_calls,
+        **run_cost(records[len(case["records"]):], records[:len(case["records"])]),
     })
     if not args.keep and cwd == run_dir / "cwd":
         shutil.rmtree(cwd, ignore_errors=True)
     return result
+
+
+def run_cost(new_records, seeded_records=()):
+    """Tokens and request time of the requests this run made, from the
+    `usage` / `duration_ms` nano-coder logs on assistant messages (#58).
+    Seeded records are excluded, so a fork of a real log is not counted.
+
+    Ordinary requests are counted only from `message` records. A compaction
+    summary request issues no assistant message of its own, so nano-coder
+    persists its usage and duration on the synthetic summary (a user message)
+    inside the mode-bearing `replace` record. Each new compaction's summary
+    is counted exactly once: a replace's message list also retains earlier
+    summaries and conversation messages, so only user messages carrying usage
+    or duration (timing is kept even when the provider omits usage or the
+    summary request fails) and not already present in an earlier replace (seeded or new) are counted."""
+    cost = {"input_tokens": 0, "output_tokens": 0, "request_ms": 0, "requests": 0}
+
+    def add(data):
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            cost["requests"] += 1
+            cost["input_tokens"] += int(usage.get("prompt_tokens") or 0)
+            cost["output_tokens"] += int(usage.get("completion_tokens") or 0)
+        if isinstance(data.get("duration_ms"), (int, float)):
+            cost["request_ms"] += int(data["duration_ms"])
+
+    def summaries(r):
+        data = r.get("data") or {}
+        if r.get("type") != "replace" or "mode" not in data:
+            return []
+        return [m for m in data.get("messages") or []
+                if isinstance(m, dict) and m.get("role") == "user"
+                and (isinstance(m.get("usage"), dict) or isinstance(m.get("duration_ms"), (int, float)))]
+
+    def key(m):
+        return json.dumps(m, sort_keys=True)
+
+    seen = {key(m) for r in seeded_records for m in summaries(r)}
+    for r in new_records:
+        if r.get("type") == "message":
+            add(r.get("data") or {})
+        for m in summaries(r):
+            if key(m) not in seen:
+                seen.add(key(m))
+                add(m)
+    return cost
+
+
+Z95 = 1.959963984540054
+
+
+def wilson(k, n, z=Z95):
+    """95% Wilson score interval for k successes in n trials, as (lo, hi)."""
+    if not n:
+        return (0.0, 1.0)
+    p = k / n
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    half = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5) / denom
+    return (max(0.0, centre - half), min(1.0, centre + half))
+
+
+def diff_interval(k1, n1, k0, n0, z=Z95):
+    """95% interval for p1 - p0 (Newcombe's hybrid score method, from the
+    two Wilson intervals). Returns (delta, lo, hi), or None without data."""
+    if not n1 or not n0:
+        return None
+    p1, p0 = k1 / n1, k0 / n0
+    l1, u1 = wilson(k1, n1, z)
+    l0, u0 = wilson(k0, n0, z)
+    d = p1 - p0
+    lo = d - ((p1 - l1) ** 2 + (u0 - p0) ** 2) ** 0.5
+    hi = d + ((u1 - p1) ** 2 + (p0 - l0) ** 2) ** 0.5
+    return (d, lo, hi)
+
+
+def cell_stats(rs):
+    """Per (model, mode) cell: pass|lost counts and mean cost per run.
+    `has_cost` is set only when every run carries both token fields, so a
+    baseline that predates cost logging (or a cell mixing old and new
+    records) is not read as zero cost."""
+    ok = [r for r in rs if "error" not in r]
+    lost = [r for r in ok if not r.get("kept", r.get("summary_kept"))]
+    n = len(rs) or 1
+    return {
+        "runs": len(rs), "ok": len(ok),
+        "lost": len(lost), "pass_lost": sum(bool(r["passed"]) for r in lost),
+        "in_tok": sum(r.get("input_tokens", 0) for r in rs) / n,
+        "out_tok": sum(r.get("output_tokens", 0) for r in rs) / n,
+        "secs": sum(r.get("seconds", 0) for r in rs) / n,
+        "has_cost": bool(rs) and all("input_tokens" in r and "output_tokens" in r for r in rs),
+    }
+
+
+def group(results):
+    groups = defaultdict(list)
+    for r in results:
+        groups[(r["model"], r["mode"])].append(r)
+    return groups
+
+
+def interval_text(k, n):
+    if not n:
+        return "-"
+    lo, hi = wilson(k, n)
+    return f"[{100 * lo:.0f},{100 * hi:.0f}]"
 
 
 def pct(n, d):
@@ -614,7 +777,8 @@ def report(results, out=sys.stdout):
         groups[(r["model"], r["mode"])].append(r)
     width = max([len(m) for m, _ in groups] + [5])
     header = (f"{'model':<{width}}  {'mode':<8} {'runs':>4} {'errors':>6} {'pass':>7} {'kept':>9} "
-              f"{'pass|lost':>9} {'lost':>4} {'used hist':>9} {'hist/run':>8} {'secs':>6}")
+              f"{'pass|lost':>9} {'95% CI':>9} {'lost':>4} {'used hist':>9} {'hist/run':>8} {'secs':>6} "
+              f"{'in tok':>8} {'out tok':>7}")
     print(header, file=out)
     print("-" * len(header), file=out)
     for (model, mode), rs in sorted(groups.items()):
@@ -622,12 +786,16 @@ def report(results, out=sys.stdout):
         lost = [r for r in ok if not r.get("kept", r["summary_kept"])]
         print(f"{model:<{width}}  {mode:<8} {len(rs):>4} {len(rs) - len(ok):>6} "
               f"{pct(sum(r['passed'] for r in ok), len(ok)):>7} {pct(sum(r['summary_kept'] for r in ok), len(ok)):>9} "
-              f"{pct(sum(r['passed'] for r in lost), len(lost)):>9} {len(lost):>4} "
+              f"{pct(sum(r['passed'] for r in lost), len(lost)):>9} "
+              f"{interval_text(sum(r['passed'] for r in lost), len(lost)):>9} {len(lost):>4} "
               f"{pct(sum(r['history_calls'] > 0 for r in ok), len(ok)):>9} "
               f"{(sum(r['history_calls'] for r in ok) / len(ok) if ok else 0):>8.2f} "
-              f"{(sum(r['seconds'] for r in rs) / len(rs)):>6.1f}", file=out)
+              f"{(sum(r['seconds'] for r in rs) / len(rs)):>6.1f} "
+              f"{sum(r.get('input_tokens', 0) for r in rs) / len(rs):>8.0f} "
+              f"{sum(r.get('output_tokens', 0) for r in rs) / len(rs):>7.0f}", file=out)
     print("\nkept = the detail survived compaction (in the summary or the recent messages kept verbatim).\n"
-          "pass|lost = pass rate among runs where it did not (where retrieval can matter).", file=out)
+          "pass|lost = pass rate among runs where it did not (where retrieval can matter);\n"
+          "95% CI = its Wilson interval. in/out tok = mean tokens per run (0 when the log has no usage).", file=out)
     by_case = defaultdict(lambda: defaultdict(list))
     for r in results:
         by_case[r["case"].split("/")[0]][(r["model"], r["mode"])].append(r)
@@ -645,23 +813,160 @@ def report(results, out=sys.stdout):
         print(f"  {case:<20}" + "".join(cells), file=out)
 
 
+def calibration_deltas(trials):
+    """Noise band per (model, mode) cell from repeated runs of an unchanged
+    baseline. `trials` is a list of result lists. δ is the 95th percentile of
+    |Δpass|lost| between two bootstrap resamples, floored at the observed
+    spread (max - min) of the per-trial rates.
+
+    The resample redraws *repetitions within each case*, preserving kept/lost
+    membership and the fixed case mix: pooling outcomes across cases would
+    treat fixed differences in case difficulty as run-to-run noise (five
+    identical trials of five always-passing and five always-failing cases
+    would yield δ = 0.4, labelling a deterministic 30-point improvement
+    "within noise"). Each arm resamples one trial per case, and the arm's
+    rate pools those trials' lost runs, so δ reflects repetition noise at the
+    same case mix a comparison sees. Values are stored at full precision —
+    rounding the saved δ can lower it below the observed spread and turn an
+    unchanged baseline's own variation into a "gain"."""
+    import random
+    rng = random.Random(0)
+    cells = defaultdict(lambda: {"trials": [], "cases": defaultdict(list)})
+    for results in trials:
+        for key, rs in group(results).items():
+            st = cell_stats(rs)
+            cells[key]["trials"].append(st["pass_lost"] / st["lost"] if st["lost"] else None)
+            for r in rs:
+                if "error" in r or r.get("kept", r.get("summary_kept")):
+                    continue
+                case = cells[key]["cases"][r["case"]]
+                while len(case) < len(cells[key]["trials"]):
+                    case.append([])
+                case[-1].append(bool(r["passed"]))
+    out = {}
+    for (model, mode), c in sorted(cells.items()):
+        # Pad every case to the cell's full trial count: a trial in which the
+        # case had no lost run contributes an empty outcome list, so trailing
+        # trials are sampled as often as leading ones (no trial-order bias).
+        for case in c["cases"].values():
+            case.extend([] for _ in range(len(c["trials"]) - len(case)))
+        rates = [x for x in c["trials"] if x is not None]
+        cases = list(c["cases"].values())
+        diffs = []
+        if cases:
+            def arm_rate():
+                k = n = 0
+                for case in cases:
+                    outcomes = rng.choice(case)
+                    k += sum(outcomes)
+                    n += len(outcomes)
+                return k / n if n else None
+            for _ in range(2000):
+                a, b = arm_rate(), arm_rate()
+                if a is not None and b is not None:
+                    diffs.append(abs(a - b))
+            diffs.sort()
+        boot = diffs[int(0.95 * (len(diffs) - 1))] if diffs else 1.0
+        spread = (max(rates) - min(rates)) if rates else 1.0
+        out[f"{model}|{mode}"] = {"model": model, "mode": mode, "trials": c["trials"],
+                                  "spread": spread, "bootstrap": boot,
+                                  "delta": max(spread, boot)}
+    return out
+
+
+def load_deltas(spec):
+    """--delta: a number (applies to every cell) or a calibration JSON file."""
+    if spec is None:
+        return None
+    try:
+        return float(spec)
+    except ValueError:
+        return {k: v["delta"] for k, v in json.loads(Path(spec).read_text())["cells"].items()}
+
+
+def compare(baseline, candidate, deltas=None, out=sys.stdout):
+    """Δpass|lost and Δcost per (model, mode) cell, candidate minus baseline.
+    A change is *within noise* when |Δ| ≤ δ (from --delta or calibrate) or,
+    without δ, when the 95% interval of Δ contains zero."""
+    base, cand = group(baseline), group(candidate)
+    keys = sorted(set(base) | set(cand))
+    width = max([len(m) for m, _ in keys] + [5])
+    header = (f"{'model':<{width}}  {'mode':<8} {'base':>6} {'new':>6} {'Δpass':>7} {'95% CI':>13} "
+              f"{'δ':>5} {'Δin tok':>8} {'Δout tok':>8} {'Δsecs':>6}  verdict")
+    print(header, file=out)
+    print("-" * len(header), file=out)
+    for key in keys:
+        model, mode = key
+        if key not in base or key not in cand:
+            print(f"{model:<{width}}  {mode:<8} (only in {'new' if key in cand else 'baseline'})", file=out)
+            continue
+        b, c = cell_stats(base[key]), cell_stats(cand[key])
+        d = diff_interval(c["pass_lost"], c["lost"], b["pass_lost"], b["lost"])
+        delta = deltas.get(f"{model}|{mode}") if isinstance(deltas, dict) else deltas
+        # Token deltas are meaningful only when every run on BOTH sides has
+        # input and output token fields; an old baseline (or a cell mixing old
+        # and new records) otherwise reads as zero and an unchanged candidate
+        # is reported as adding cost.
+        cost_known = b["has_cost"] and c["has_cost"]
+        din, dout, dsec = c["in_tok"] - b["in_tok"], c["out_tok"] - b["out_tok"], c["secs"] - b["secs"]
+        if d is None:
+            verdict, dtext, ci = "no lost runs", "     -", "-"
+        else:
+            dp, lo, hi = d
+            dtext, ci = f"{100 * dp:+6.1f}", f"[{100 * lo:+.0f},{100 * hi:+.0f}]"
+            noise = abs(dp) <= delta if delta is not None else lo <= 0 <= hi
+            extra = cost_known and din + dout > 0
+            if noise:
+                verdict = "within noise" + ("; adds cost" if extra else "")
+            elif dp > 0:
+                verdict = "gain" + ("; check cost" if extra else "")
+            else:
+                verdict = "regression"
+        dlt = f"{100 * delta:4.1f}" if delta is not None else "    -"
+        tok = (f"{din:>+8.0f} {dout:>+8.0f}" if cost_known else f"{'n/a':>8} {'n/a':>8}")
+        print(f"{model:<{width}}  {mode:<8} {pct(b['pass_lost'], b['lost']):>6} {pct(c['pass_lost'], c['lost']):>6} "
+              f"{dtext:>7} {ci:>13} {dlt:>5} {tok} {dsec:>+6.1f}  {verdict}", file=out)
+    print("\nΔpass = change in pass|lost (new - baseline), percentage points; 95% CI by Newcombe's method.\n"
+          "δ = noise band (--delta or `run.py calibrate`); without it, within noise = the CI contains 0.\n"
+          "Δtok/Δsecs = change in mean tokens and seconds per run (n/a when any run on either side lacks\n"
+          "token fields — e.g. a baseline from before cost logging). See the README's acceptance rule.", file=out)
+
+
 def self_test_verdict(results):
     """With the oracle: standard fails buried cases, smart passes them via the
     history tools, and both pass the control. Returns a process exit code."""
+    # Cases whose detail is stated in a *user* message (not a tool output). The
+    # pinned-request block (issue #66, on by default) keeps such a detail
+    # verbatim across compaction, so with the pin ON the oracle passes these in
+    # both modes with no history lookup; with it OFF (`-nopin`) they are buried
+    # cases — standard loses the detail, smart recovers it via the history
+    # tools. Cases whose detail is in a tool output (buried-error,
+    # long-log-error, working-command) are not pinned and always follow the
+    # buried-case rule.
+    user_detail_cases = {"user-constraint", "rejected-approach", "pinned-request"}
     problems = []
     for r in results:
         base = r["case"].split("/")[0]
+        mode = r["mode"]
+        nopin = mode.endswith("-nopin")
+        bare_mode = mode[:-len("-nopin")] if nopin else mode
         if "error" in r:
-            problems.append(f"{r['case']} {r['mode']}: {r['error']}")
+            problems.append(f"{r['case']} {mode}: {r['error']}")
         elif base == "recent-control":
             if not (r["passed"] and r["kept"]):
-                problems.append(f"{r['case']} {r['mode']}: control failed (passed={r['passed']} kept={r['kept']})")
+                problems.append(f"{r['case']} {mode}: control failed (passed={r['passed']} kept={r['kept']})")
+        elif base in user_detail_cases and not nopin:
+            # Pinned: the user's exact words survive, so the oracle passes in
+            # both modes without needing the history tools.
+            if not (r["passed"] and r["kept"]):
+                problems.append(f"{r['case']} {mode}: pinned detail should survive and pass "
+                                f"(passed={r['passed']} kept={r['kept']})")
         elif r["kept"]:
-            problems.append(f"{r['case']} {r['mode']}: the detail survived a lossy summary?")
-        elif r["mode"] == "standard" and (r["passed"] or r["history_calls"]):
-            problems.append(f"{r['case']} standard: passed={r['passed']} history_calls={r['history_calls']}")
-        elif r["mode"] == "smart" and not (r["passed"] and r["history_calls"]):
-            problems.append(f"{r['case']} smart: passed={r['passed']} history_calls={r['history_calls']}")
+            problems.append(f"{r['case']} {mode}: the detail survived a lossy summary?")
+        elif bare_mode == "standard" and (r["passed"] or r["history_calls"]):
+            problems.append(f"{r['case']} {mode}: passed={r['passed']} history_calls={r['history_calls']}")
+        elif bare_mode == "smart" and not (r["passed"] and r["history_calls"]):
+            problems.append(f"{r['case']} {mode}: passed={r['passed']} history_calls={r['history_calls']}")
     print("\nself-test:", "OK" if not problems else "FAILED\n  " + "\n  ".join(problems))
     return 1 if problems else 0
 
@@ -682,7 +987,21 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "turns":
         return list_turns(sys.argv[2])
     if len(sys.argv) > 1 and sys.argv[1] == "report":
-        return report([json.loads(l) for f in sys.argv[2:] for l in open(f) if l.strip()])
+        rp = argparse.ArgumentParser(prog="run.py report", description="print the table for results files, "
+                                     "or compare against a baseline")
+        rp.add_argument("files", nargs="+", metavar="RESULTS")
+        rp.add_argument("--baseline", action="append", metavar="RESULTS",
+                        help="baseline results file (repeatable); FILES are then the candidate")
+        rp.add_argument("--delta", metavar="FLOAT|CALIBRATION",
+                        help="noise band δ: a fraction (e.g. 0.1) or a `run.py calibrate` JSON file")
+        ra = rp.parse_args(sys.argv[2:])
+        load = lambda files: [json.loads(l) for f in files for l in open(f) if l.strip()]
+        if ra.baseline:
+            return compare(load(ra.baseline), load(ra.files), load_deltas(ra.delta))
+        return report(load(ra.files))
+    calibrate = len(sys.argv) > 1 and sys.argv[1] == "calibrate"
+    if calibrate:
+        del sys.argv[1]
 
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--models", help="comma-separated provider/model specs, as for --model")
@@ -712,6 +1031,8 @@ def main():
     p.add_argument("--bin", default=default_binary())
     p.add_argument("--out", default=str(HERE / "results"))
     p.add_argument("--keep", action="store_true", help="keep each run's working directory")
+    p.add_argument("--trials", type=int, default=5,
+                   help="calibrate only: how many times to run the unchanged baseline")
     args = p.parse_args()
     # Runs start in their own working directory, so resolve paths now.
     if os.sep in args.bin:
@@ -737,6 +1058,26 @@ def main():
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+    if calibrate:
+        trials = []
+        for t in range(args.trials):
+            print(f"calibrate: trial {t + 1}/{args.trials}", file=sys.stderr)
+            trials.append(run_eval(args, cases, models, modes, f"{stamp}-t{t}", out_dir, quiet=True))
+        cal_path = out_dir / f"{stamp}.calibration.json"
+        cells = calibration_deltas(trials)
+        cal_path.write_text(json.dumps({"trials": args.trials, "cells": cells}, indent=2) + "\n")
+        print(f"{'cell':<40} {'trials pass|lost':<30} {'δ':>6}")
+        for k, v in cells.items():
+            rates = " ".join("-" if x is None else f"{100 * x:.0f}" for x in v["trials"])
+            print(f"{k:<40} {rates:<30} {100 * v['delta']:5.1f}%")
+        print(f"\ncalibration: {cal_path}\nuse: run.py report --baseline A.jsonl B.jsonl --delta {cal_path}")
+        return
+    results = run_eval(args, cases, models, modes, stamp, out_dir)
+    if args.self_test:
+        sys.exit(self_test_verdict(results))
+
+
+def run_eval(args, cases, models, modes, stamp, out_dir, quiet=False):
     results_path = out_dir / f"{stamp}.jsonl"
     work_root = Path(tempfile.mkdtemp(prefix=f"compaction-eval-{stamp}-"))
     # A unique index per job keeps run_dir distinct even when two cases share a
@@ -772,11 +1113,11 @@ def main():
             status = "ERROR " + r["error"] if "error" in r else ("pass" if r["passed"] else "FAIL")
             print(f"[{done}/{len(jobs)}] {r['case']} {r['model']} {r['mode']}: {status} "
                   f"(kept: {r.get('kept')}, history calls: {r.get('history_calls')})", file=sys.stderr)
-    print()
-    report(results)
-    print(f"\nresults: {results_path}\nsession logs: {work_root}")
-    if args.self_test:
-        sys.exit(self_test_verdict(results))
+    if not quiet:
+        print()
+        report(results)
+        print(f"\nresults: {results_path}\nsession logs: {work_root}")
+    return results
 
 
 if __name__ == "__main__":

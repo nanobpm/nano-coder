@@ -90,11 +90,49 @@ pub enum Record {
         /// #114). Absent when no continuation is in flight.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         continuation: Option<(String, usize)>,
+        /// Compaction only: the folded messages (the real pre-compaction
+        /// turns), so a resume or relaunch can rebuild the visible transcript
+        /// instead of showing the synthetic summary in their place. Omitted
+        /// from older logs; those resume with the summary, as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folded: Option<Vec<Message>>,
+        /// Compaction only: when set, `folded` holds only the *newly* folded
+        /// turns and extends the first `n` turns of the previous replace
+        /// record's folded stash, so repeated compactions do not re-persist
+        /// the whole cumulative history (which would grow the log
+        /// quadratically). Absent means `folded` is the complete stash.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folded_base: Option<usize>,
+        /// Compaction only: index in `messages` of the synthetic restatement
+        /// of the folded active input, so the replay skips it (its original is
+        /// in `folded`). Meaningful only alongside `folded`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restated: Option<usize>,
+        /// Recall notes already attached for the surviving pending input (the
+        /// per-input cap is `RECALL_NOTES_PER_TURN`). Persisted whenever a
+        /// replacement keeps a pending input — not only mid-turn compaction —
+        /// so a crash between the replace and the next recall record does not
+        /// hand a resumed retry a fresh two-note budget (Copilot finding,
+        /// src/agent.rs). Absent in older logs (restores to 0, the pre-fix
+        /// behaviour).
+        #[serde(default, skip_serializing_if = "is_zero")]
+        pending_recall_notes: usize,
         recorded_at: DateTime<FixedOffset>,
     },
     /// The task plan after a change; the latest one wins.
     Plan {
         plan: crate::plan::Plan,
+        recorded_at: DateTime<FixedOffset>,
+    },
+    /// The session's timers after a change; the latest one wins.
+    Timers {
+        timers: crate::timers::Timers,
+        recorded_at: DateTime<FixedOffset>,
+    },
+    /// The memory-recall state after a change (issue #166); the latest one
+    /// wins. A compaction appends an empty one, resetting what was seen.
+    Recall {
+        recall: crate::memory::Recall,
         recorded_at: DateTime<FixedOffset>,
     },
     /// The external hook configuration files loaded for this session (audit
@@ -145,6 +183,12 @@ pub struct PendingInput {
     /// (persisted path, no compaction) means recovery replays from the input
     /// `position` with an empty snapshot.
     pub continuation_base: Option<usize>,
+    /// Recall notes already attached for this input (the per-input cap is
+    /// `RECALL_NOTES_PER_TURN`). Carried on the pending input — and persisted
+    /// with it in a `Replace` record — so retrying an interrupted prompt
+    /// resumes with the budget already spent rather than re-arming another two
+    /// notes per retry (Copilot finding, src/agent.rs). Zero for a new input.
+    pub recall_notes: usize,
 }
 
 /// State rebuilt from a session log.
@@ -163,6 +207,11 @@ pub struct Restored {
     /// An input accepted but not completed before the log ended.
     pub pending_input: Option<PendingInput>,
     pub plan: Option<crate::plan::Plan>,
+    /// The session's timers as of the latest timers record (absent when the
+    /// session never set one).
+    pub timers: Option<crate::timers::Timers>,
+    /// The memory-recall state as of the latest recall record.
+    pub recall: Option<crate::memory::Recall>,
     /// Whether the last replacement was a smart compaction, so the resumed
     /// session should offer the history tools without re-sniffing message text.
     pub history_available: bool,
@@ -170,10 +219,19 @@ pub struct Restored {
     /// (or a history tool was already used) after the latest smart compaction,
     /// so a resume does not append it a second time.
     pub history_hint_consumed: bool,
+    /// The real pre-compaction turns persisted with the latest compaction's
+    /// `Replace` record, so a resumed (or relaunched) session replays them
+    /// instead of the synthetic summary. `None` for a log written before this
+    /// was persisted (or with no compaction): the compacted conversation is
+    /// replayed as-is, the pre-change behaviour.
+    pub folded: Option<Vec<Message>>,
+    /// Index in `conversation` of the synthetic restatement of the folded
+    /// active input; the replay skips it (its original is in `folded`).
+    pub restated: Option<usize>,
 }
 
-fn is_zero(n: &u32) -> bool {
-    *n == 0
+fn is_zero<N: PartialEq + Default>(n: &N) -> bool {
+    *n == N::default()
 }
 
 pub struct SessionLog {
@@ -427,11 +485,57 @@ fn backfill_log_lines(messages: &mut [Message], originals: &[Message], summarize
     }
 }
 
+/// Recover `pin_text` for a user message written before it was recorded
+/// (issue #66): a legacy log stores a prompt with hook context appended
+/// (`<input>\n\n<system-reminder>…`) and no `pin_text`, so the pin would treat
+/// the hook output as the user's words. When the content is a logged input's
+/// exact text followed by a harness reminder block, that input text is the
+/// pristine user part. Messages that already carry `pin_text`, or whose
+/// content is exactly an input, are left alone.
+fn backfill_pin_text(message: &mut Message, inputs: &[String]) {
+    if message.role != crate::llm::Role::User || message.pin_text.is_some() || message.hook_context {
+        return;
+    }
+    // Fast paths (keep resume linear): an ordinary prompt is usually the
+    // latest input verbatim, and a message without any reminder wrapper can
+    // never be "input + hook output", so neither needs a full input scan.
+    if inputs.last() == Some(&message.content) || !message.content.contains(crate::reminders::WRAP_START) {
+        return;
+    }
+    // A message whose content is exactly some logged input is that input's
+    // own pristine text (e.g. a user typing a literal reminder tag) — never
+    // reinterpret it as an older, shorter input plus hook output.
+    if inputs.contains(&message.content) {
+        return;
+    }
+    // Among candidate prefixes, the longest is the most specific match.
+    let found = inputs
+        .iter()
+        .rev()
+        .filter(|input| {
+            message
+                .content
+                .strip_prefix(input.as_str())
+                .is_some_and(|rest| !rest.is_empty() && rest.trim_start().starts_with(crate::reminders::WRAP_START))
+        })
+        .max_by_key(|input| input.len());
+    if let Some(input) = found {
+        message.pin_text = Some(input.clone());
+    }
+}
+
 fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
     let mut restored = Restored::default();
     // Every direct message record seen so far, with its assigned `log_line`, so
     // a later `replace` from a legacy log can recover the IDs of retained messages.
     let mut originals: Vec<Message> = Vec::new();
+    // The most recent compaction's full folded stash. A delta record extends
+    // it even if a plain rebuild cleared `restored.folded` in between (the
+    // writer's in-memory stash survives such rebuilds too).
+    let mut last_stash: Vec<Message> = Vec::new();
+    let mut stash_active = false;
+    // Every logged input's text, to backfill `pin_text` on legacy messages.
+    let mut inputs: Vec<String> = Vec::new();
     // Record ordinals count only decodable records (the session header is
     // record 1), but a message's `log_line` is its PHYSICAL line number:
     // `history_read`/`history_search` enumerate physical lines and skip empty
@@ -456,12 +560,14 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
             }
             _ if index == 0 => bail!("session log does not start with a session header"),
             Record::Input { id, text, .. } => {
+                inputs.push(text.clone());
                 restored.pending_input = Some(PendingInput {
                     id,
                     text,
                     position: restored.conversation.len(),
                     continuation: None,
                     continuation_base: None,
+                    recall_notes: 0,
                 });
             }
             Record::Message(mut message) => {
@@ -471,6 +577,7 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
                 // tools would cite. Embedded IDs are meaningful only on
                 // messages nested inside `replace` records.
                 message.log_line = Some(line_no as u64 + 1);
+                backfill_pin_text(&mut message, &inputs);
                 if crate::history::consumes_hint(&message) {
                     restored.history_hint_consumed = true;
                 }
@@ -497,8 +604,22 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
                 }
                 restored.completed.insert(input_id, response);
             }
-            Record::Replace { mut messages, pending_position, summarized, mode, continuation, .. } => {
+            Record::Replace {
+                mut messages,
+                pending_position,
+                summarized,
+                mode,
+                continuation,
+                folded,
+                folded_base,
+                restated,
+                pending_recall_notes,
+                ..
+            } => {
                 backfill_log_lines(&mut messages, &originals, summarized);
+                for message in messages.iter_mut() {
+                    backfill_pin_text(message, &inputs);
+                }
                 restored.conversation = messages;
                 restored.pending_input = match (restored.pending_input.take(), pending_position) {
                     // Restore the persisted continuation state too: the chunks it
@@ -511,6 +632,7 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
                         position,
                         continuation,
                         continuation_base: Some(restored.conversation.len()),
+                        recall_notes: pending_recall_notes,
                         ..pending
                     }),
                     _ => None,
@@ -521,13 +643,55 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
                 // The one-time hint re-arms with each compaction; only messages
                 // recorded after this replace can consume it.
                 restored.history_hint_consumed = false;
+                // The folded real turns (and the restated-input skip) ride with
+                // the record, so a resume rebuilds the visible transcript. A
+                // replace without them (a plain rebuild, or an older log)
+                // clears the stash: replaying must not resurrect turns a newer
+                // replacement folded away nor skip a real first turn.
+                // The cumulative stash lives in one owned vector, extended in
+                // place by each delta, and moves into `restored` once decoding
+                // finishes — no per-compaction deep copy of the transcript.
+                stash_active = match (folded, folded_base) {
+                    // A delta record: the previous stash's first `base` turns
+                    // plus the new turns.
+                    (Some(mut delta), Some(base)) if base.min(last_stash.len()) + delta.len() > 0 => {
+                        for message in delta.iter_mut() {
+                            backfill_pin_text(message, &inputs);
+                        }
+                        last_stash.truncate(base);
+                        last_stash.extend(delta);
+                        true
+                    }
+                    (Some(mut full), None) if !full.is_empty() => {
+                        for message in full.iter_mut() {
+                            backfill_pin_text(message, &inputs);
+                        }
+                        last_stash = full;
+                        true
+                    }
+                    _ => false,
+                };
+                // The replacement drops the recalled memories' full text from
+                // context, so recall resets here, while decoding — not only in
+                // the empty `Recall` record the writer appends afterwards: a
+                // crash or failed append between the two would otherwise
+                // resume with `seen`/`fired` state whose notes have left the
+                // conversation, suppressing their recall for good (Copilot
+                // finding, src/session.rs). A `Recall` record logged after the
+                // replace still overrides this (an older log's trailing one
+                // only re-confirms the reset).
+                restored.recall = Some(crate::memory::Recall::default());
+                restored.restated = if stash_active { restated } else { None };
             }
             Record::Plan { plan, .. } => restored.plan = Some(plan),
+            Record::Timers { timers, .. } => restored.timers = Some(timers),
+            Record::Recall { recall, .. } => restored.recall = Some(recall),
             // Audit-only: records the loaded hook config, not conversation state.
             Record::Hooks { .. } => {}
         }
         index += 1;
     }
+    restored.folded = stash_active.then_some(last_stash);
     Ok(restored)
 }
 
@@ -689,7 +853,8 @@ mod tests {
                 text: "hi".into(),
                 position: 3,
                 continuation: None,
-                continuation_base: None
+                continuation_base: None,
+                recall_notes: 0
             })
         );
         assert!(SessionLog::create(dir.path(), "s1").is_err(), "create must not clobber");
@@ -707,12 +872,57 @@ mod tests {
             mode: None,
             model: None,
             continuation: None,
+            folded: None,
+            folded_base: None,
+            restated: None,
+            pending_recall_notes: 0,
             recorded_at: now(),
         })
         .unwrap();
         drop(log);
         let (_, restored) = SessionLog::open(dir.path(), "s2").unwrap();
         assert_eq!(restored.conversation, vec![Message::system("new")]);
+    }
+
+    #[test]
+    fn legacy_logs_recover_pin_text_from_the_input_record() {
+        // A pre-#66 log has a prompt with hook output appended and no
+        // `pin_text`; decoding must recover the user-typed part from the
+        // `Input` record — for direct, retained and folded messages alike.
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "s66").unwrap();
+        let wire = "Fix the race.\n\n<system-reminder>\nuse nightly\n</system-reminder>";
+        log.append(&Record::Input { id: "in-1".into(), text: "Fix the race.".into(), recorded_at: now() }).unwrap();
+        log.append(&Record::Message(Box::new(Message::user(wire)))).unwrap();
+        // A user who typed the tag themselves (content == input) is untouched.
+        let typed = "Rename <system-reminder> to <note>";
+        log.append(&Record::Input { id: "in-2".into(), text: typed.into(), recorded_at: now() }).unwrap();
+        log.append(&Record::Message(Box::new(Message::user(typed)))).unwrap();
+        drop(log);
+        let (_, restored) = SessionLog::open(dir.path(), "s66").unwrap();
+        let direct = restored.conversation.iter().find(|m| m.content == wire).unwrap();
+        assert_eq!(direct.pin_text.as_deref(), Some("Fix the race."));
+        let typed_msg = restored.conversation.iter().find(|m| m.content == typed).unwrap();
+        assert_eq!(typed_msg.pin_text, None);
+
+        let mut message = Message::user(wire);
+        backfill_pin_text(&mut message, &["Fix the race.".to_string()]);
+        assert_eq!(message.pin_text.as_deref(), Some("Fix the race."));
+        let mut tool = Message::assistant(wire);
+        backfill_pin_text(&mut tool, &["Fix the race.".to_string()]);
+        assert_eq!(tool.pin_text, None);
+
+        // A genuine follow-up that extends an older input with a literal tag
+        // has its own exact input: it must not match the older shorter one.
+        let follow = "Fix the race.\n\n<system-reminder>Rename this tag to <note>.</system-reminder>";
+        let inputs = ["Fix the race.".to_string(), follow.to_string()];
+        let mut m = Message::user(follow);
+        backfill_pin_text(&mut m, &inputs);
+        assert_eq!(m.pin_text, None);
+        let inputs = [follow.to_string(), "Fix the race.".to_string()];
+        let mut m = Message::user(follow);
+        backfill_pin_text(&mut m, &inputs);
+        assert_eq!(m.pin_text, None);
     }
 
     #[test]
@@ -738,6 +948,10 @@ mod tests {
             mode: None,
             model: None,
             continuation: None,
+            folded: None,
+            folded_base: None,
+            restated: None,
+            pending_recall_notes: 0,
             recorded_at: now(),
         })
         .unwrap();
@@ -763,6 +977,10 @@ mod tests {
             mode: None,
             model: None,
             continuation: None,
+            folded: None,
+            folded_base: None,
+            restated: None,
+            pending_recall_notes: 0,
             recorded_at: now(),
         })
         .unwrap();
@@ -779,9 +997,74 @@ mod tests {
                 text: "go".into(),
                 position: 2,
                 continuation: None,
-                continuation_base: Some(3)
+                continuation_base: Some(3),
+                recall_notes: 0
             })
         );
+    }
+
+    #[test]
+    fn replace_clears_recall_state_while_decoding() {
+        // A crash (or a failed append) after the `Replace` record but before
+        // the empty `Recall` record that follows it must not resume with the
+        // pre-replacement `seen`/`fired` state: the replacement dropped the
+        // recalled notes from context, so the decode itself resets recall
+        // (Copilot finding, src/session.rs).
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "s7").unwrap();
+        log.append(&Record::Message(Box::new(Message::system("sys")))).unwrap();
+        let mut recall = crate::memory::Recall::default();
+        recall.seen.insert("mem-1".to_string());
+        recall.fired.insert("mem-1".to_string());
+        log.append(&Record::Recall { recall, recorded_at: now() }).unwrap();
+        log.append(&Record::Replace {
+            messages: vec![Message::system("sys"), Message::user("summary")],
+            pending_position: None,
+            summarized: Some((2, 2)),
+            mode: Some(crate::config::CompactionMode::Standard),
+            model: None,
+            continuation: None,
+            folded: None,
+            folded_base: None,
+            restated: None,
+            pending_recall_notes: 0,
+            recorded_at: now(),
+        })
+        .unwrap();
+        // No trailing empty `Recall` record: the log ends mid-write, as a
+        // crash between the two appends would leave it.
+        drop(log);
+        let (_, restored) = SessionLog::open(dir.path(), "s7").unwrap();
+        assert_eq!(restored.recall, Some(crate::memory::Recall::default()), "the replace alone resets recall");
+    }
+
+    #[test]
+    fn replace_restores_the_pending_inputs_spent_recall_budget() {
+        // The recall-note budget is per input: a replacement that keeps the
+        // pending input persists how many notes it already attached, so a
+        // resumed retry cannot spend the per-input cap a second time (Copilot
+        // finding, src/agent.rs).
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "s8").unwrap();
+        log.append(&Record::Input { id: "in-1".into(), text: "go".into(), recorded_at: now() }).unwrap();
+        log.append(&Record::Message(Box::new(Message::user("go")))).unwrap();
+        log.append(&Record::Replace {
+            messages: vec![Message::system("sys"), Message::user("summary"), Message::user("go")],
+            pending_position: Some(2),
+            summarized: Some((2, 3)),
+            mode: Some(crate::config::CompactionMode::Standard),
+            model: None,
+            continuation: None,
+            folded: None,
+            folded_base: None,
+            restated: None,
+            pending_recall_notes: 2,
+            recorded_at: now(),
+        })
+        .unwrap();
+        drop(log);
+        let (_, restored) = SessionLog::open(dir.path(), "s8").unwrap();
+        assert_eq!(restored.pending_input.map(|p| p.recall_notes), Some(2));
     }
 
     #[test]
@@ -802,6 +1085,10 @@ mod tests {
             mode: Some(crate::config::CompactionMode::Smart),
             model: None,
             continuation: None,
+            folded: None,
+            folded_base: None,
+            restated: None,
+            pending_recall_notes: 0,
             recorded_at: now(),
         })
         .unwrap();
@@ -874,6 +1161,10 @@ mod tests {
             mode: Some(crate::config::CompactionMode::Standard),
             model: None,
             continuation: None,
+            folded: None,
+            folded_base: None,
+            restated: None,
+            pending_recall_notes: 0,
             recorded_at: now(),
         })
         .unwrap();
@@ -894,6 +1185,10 @@ mod tests {
             mode: Some(crate::config::CompactionMode::Smart),
             model: None,
             continuation: None,
+            folded: None,
+            folded_base: None,
+            restated: None,
+            pending_recall_notes: 0,
             recorded_at: now(),
         })
         .unwrap();
@@ -933,6 +1228,10 @@ mod tests {
             mode: None,
             model: None,
             continuation: None,
+            folded: None,
+            folded_base: None,
+            restated: None,
+            pending_recall_notes: 0,
             recorded_at: now(),
         })
         .unwrap();

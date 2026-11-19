@@ -352,6 +352,10 @@ impl Trajectory {
                 }
                 // The plan is surfaced by `/plan`; it is not a ledger row.
                 Record::Plan { .. } => {}
+                // Timers are surfaced by `/timers` and the status line; not a
+                // ledger row.
+                Record::Timers { .. } => {}
+                Record::Recall { .. } => {}
                 // Audit metadata, not a conversation row.
                 Record::Hooks { .. } => {}
             }
@@ -1136,6 +1140,10 @@ mod tests {
             mode: Some(CompactionMode::Smart),
             model: Some("copilot/gpt".into()),
             continuation: None,
+            folded: None,
+            folded_base: None,
+            restated: None,
+            pending_recall_notes: 0,
             recorded_at: now(),
         });
         let traj = Trajectory::from_records(&recs);

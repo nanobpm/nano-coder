@@ -403,6 +403,10 @@ mod tests {
             mode: Some(crate::config::CompactionMode::Smart),
             model: None,
             continuation: None,
+            folded: None,
+            folded_base: None,
+            restated: None,
+            pending_recall_notes: 0,
             recorded_at: now(),
         };
         log.append(&replace).unwrap();

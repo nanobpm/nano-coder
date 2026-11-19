@@ -60,7 +60,7 @@ fn prompt_text(params: &Value) -> String {
 /// leading `/`, anything else passed through unchanged).
 fn enforce_slash_invariant(text: String) -> Result<String, String> {
     let trimmed = text.trim();
-    if trimmed.starts_with('/') && crate::commands::unescape_prompt(trimmed).is_none() {
+    if crate::commands::is_command(trimmed) {
         return Err(crate::commands::rejection(trimmed).unwrap_or_else(|| {
             // `rejection` returns None only for a *known* command that reached
             // this fallback because `handle_inner` didn't service it. Two very
@@ -106,7 +106,7 @@ fn classify_during_turn(msg: &Value, active: Option<&str>) -> DuringTurn {
             let trimmed = text.trim();
             if trimmed.is_empty() {
                 DuringTurn::Defer
-            } else if trimmed.starts_with('/') && crate::commands::unescape_prompt(trimmed).is_none() {
+            } else if crate::commands::is_command(trimmed) {
                 // A real slash command operates on the agent itself, so it
                 // waits for the turn. A `//…` escaped prompt is an ordinary
                 // message, so it steers instead (below), as the terminal does.
@@ -129,6 +129,7 @@ fn tool_kind(name: &str) -> &'static str {
         "grep" | "glob" => "search",
         "write_file" | "edit_file" => "edit",
         name if crate::plan::is_plan_tool(name) || name == crate::goal::TOOL_NAME => "think",
+        name if crate::timers::is_timer_tool(name) => "think",
         _ => "other",
     }
 }
@@ -141,6 +142,11 @@ pub fn update_for(event: &AgentEvent) -> Option<Value> {
     Some(match event {
         AgentEvent::UserMessage { text: body } => {
             json!({ "sessionUpdate": "user_message_chunk", "content": text(body) })
+        }
+        // A mid-turn timer firing is shown to the client as the same
+        // `⏰ timer N: <note>` user-message chunk the CLI renders.
+        AgentEvent::TimerFired { id, note } => {
+            json!({ "sessionUpdate": "user_message_chunk", "content": text(&format!("⏰ timer {id}: {note}")) })
         }
         AgentEvent::AssistantMessage { message_id, text: body } => json!({
             "sessionUpdate": "agent_message_chunk",
@@ -179,7 +185,11 @@ pub fn update_for(event: &AgentEvent) -> Option<Value> {
         // Interactive-only (a `/model` typed mid-turn); an ACP client switches
         // models between turns, so these never fire here.
         | AgentEvent::ModelSwitched { .. }
-        | AgentEvent::ModelSwitchFailed { .. } => {
+        | AgentEvent::ModelSwitchFailed { .. }
+        // A stream restart affects only the live delta renderers; ACP reports a
+        // completed message at `AssistantMessage`, not per-delta, so there is no
+        // partial to discard here.
+        | AgentEvent::ResponseRestarted => {
             return None;
         }
     })
@@ -450,7 +460,10 @@ async fn handle_inner(agent: &mut Agent, msg: &Value) -> Option<Value> {
 
             if command == "/providers" {
                 let (user, _) = agent.config().effective_providers();
-                let names: Vec<String> = providers::effective_providers(&user).into_keys().collect();
+                // Honor visibility: hidden/disabled providers stay usable via
+                // an explicit spec but are not listed.
+                let names: Vec<String> =
+                    providers::enabled(&providers::effective_providers(&user)).into_keys().collect();
                 return Some(result(id, json!({ "stopReason": "end_turn", "providers": names })));
             }
 
@@ -602,6 +615,8 @@ async fn run_turn(
 ) {
     let control = agent.control();
     let active = agent.session_id().map(str::to_string);
+    let stats = agent.context_stats();
+    let tokens_before = session_tokens(&stats.lock().unwrap());
     // Length of `deferred` when each steer arrived, so a steer that runs as its
     // own prompt keeps its place among messages deferred during the turn.
     let mut steer_marks: Vec<usize> = Vec::new();
@@ -637,6 +652,9 @@ async fn run_turn(
     // A prompt sent as a notification runs but gets no reply.
     if let Some(id) = &id {
         let mut reply = json!({ "stopReason": stop.as_acp(), "response": response });
+        if let Some(usage) = turn_usage(tokens_before, session_tokens(&stats.lock().unwrap())) {
+            reply["usage"] = usage;
+        }
         // Extension: the model's explicit completed/blocked report.
         if let Some(reported) = reported {
             reply["_meta"] = json!({ "outcome": reported });
@@ -713,12 +731,40 @@ fn thinking_value(resolved: &crate::thinking::Resolved) -> serde_json::Value {
     }
 }
 
+/// Session token counters (input, output) as reported by the provider.
+fn session_tokens(stats: &crate::context::ContextStats) -> (u64, u64) {
+    (stats.session_input_tokens, stats.session_output_tokens)
+}
+
+/// ACP `PromptResponse.usage` for one turn: the tokens the provider reported
+/// between the turn's start and end, summed over its model calls. `None` when
+/// the provider reported nothing (the field is optional in ACP).
+fn turn_usage(before: (u64, u64), after: (u64, u64)) -> Option<Value> {
+    let input = after.0.saturating_sub(before.0);
+    let output = after.1.saturating_sub(before.1);
+    if input == 0 && output == 0 {
+        return None;
+    }
+    Some(json!({ "inputTokens": input, "outputTokens": output, "totalTokens": input + output }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn turn_usage_is_the_delta_of_the_session_counters() {
+        assert_eq!(
+            turn_usage((1_000, 50), (13_087, 54)),
+            Some(json!({ "inputTokens": 12_087, "outputTokens": 4, "totalTokens": 12_091 }))
+        );
+        assert_eq!(turn_usage((10, 5), (10, 5)), None, "nothing reported, no usage field");
+        // Counters reset by /clear mid-turn never go negative.
+        assert_eq!(turn_usage((10, 5), (3, 7)), Some(json!({ "inputTokens": 0, "outputTokens": 2, "totalTokens": 2 })));
+    }
+
     fn steer(text: &str, tag: i64) -> Steer {
-        Steer { text: text.to_string(), tag: Some(json!(tag)) }
+        Steer { text: text.to_string(), tag: Some(json!(tag)), id: None }
     }
 
     fn order(deferred: &VecDeque<Value>) -> Vec<String> {
@@ -789,6 +835,15 @@ mod tests {
     }
 
     #[test]
+    fn path_leading_prompts_reach_the_model_over_acp() {
+        // Issue #173: a prompt starting with a path is a prompt, not a command.
+        let text = "\n/workspace is the only path you share with the user.\n\nWrite a FEEL expression to /workspace/answer.feel";
+        assert_eq!(enforce_slash_invariant(text.to_string()).unwrap(), text);
+        let single = "/tmp/foo is empty, why?";
+        assert_eq!(enforce_slash_invariant(single.to_string()).unwrap(), single);
+    }
+
+    #[test]
     fn slash_prompts_never_reach_the_model_over_acp() {
         // Unknown command: rejected with a suggestion, not sent as a turn.
         let note = enforce_slash_invariant("/exin".to_string()).unwrap_err();
@@ -811,8 +866,8 @@ mod tests {
             assert_eq!(note, format!("Can't run {cmd:?} over ACP"), "{cmd}");
             assert!(!note.contains("not available over ACP"), "{cmd}");
         }
-        // A path-like slash line is rejected with the `//` escape hint.
-        assert!(enforce_slash_invariant("/usr/lib is big".to_string()).unwrap_err().contains("type //usr/lib"));
+        // A path-like slash line is a prompt, passed through unchanged (#173).
+        assert_eq!(enforce_slash_invariant("/usr/lib is big".to_string()).unwrap(), "/usr/lib is big");
         // Leading whitespace doesn't smuggle a slash line past the check.
         assert!(enforce_slash_invariant("  /exin".to_string()).is_err());
         // `//…` is an escaped prompt: the turn sees it with one `/` removed.

@@ -60,11 +60,26 @@ pub struct Config {
     pub auto_compact_threshold: f64,
     /// How compaction treats the history it folds away (see `CompactionMode`).
     pub compaction_mode: CompactionMode,
+    /// Pin the user's requests verbatim after each compaction summary, rebuilt
+    /// from the original messages rather than re-summarized from the previous
+    /// summary (issue #66). The eval turns this off to measure the pinned
+    /// block's effect ("with and without the pinned block").
+    pub compaction_pin_requests: bool,
+    /// Run the auto-compaction at the idle prompt, while the user is away,
+    /// instead of on the critical path of their next message (issue #182).
+    /// Only when the context is already past `auto_compact_threshold`, never
+    /// while a fresh draft is being typed, and off when `auto_compact` is.
+    pub idle_compact: bool,
+    /// How long the prompt (and any draft in it) must sit untouched before an
+    /// idle compaction may run. Unset: `lineedit::IDLE_COMPACT_HOLD`.
+    pub idle_compact_hold_secs: Option<u64>,
     /// How much the interactive CLI prints (and whether hook events are logged).
     pub verbosity: crate::ui::Verbosity,
-    /// Which interactive renderer to use: `frame` (the default; app-owned,
-    /// re-renders on a width change) or `legacy` (scroll region).
-    pub renderer: crate::frame::RendererMode,
+    /// The retired `renderer` setting. Only the frame renderer remains (#133);
+    /// the key is still read so an old `renderer = "legacy"` loads and gets a
+    /// one-line notice instead of silently changing nothing. Never written.
+    #[serde(rename = "renderer", skip_serializing)]
+    pub retired_renderer: Option<String>,
     /// Start each message in the interactive CLI with the local time.
     pub timestamps: bool,
     /// Add AGENTS.md (and the like) from the git root down to the working
@@ -84,6 +99,11 @@ pub struct Config {
     pub plan_tools: bool,
     /// Offer the `report_outcome` tool (an explicit completed/blocked signal).
     pub outcome_tool: bool,
+    /// Before accepting `report_outcome(completed)`, ask once per turn for the
+    /// check's evidence when files were edited after the last `bash` call (see
+    /// `goal.rs`). On in the terminal; the ACP harness turns it off because the
+    /// orchestrator verifies there.
+    pub verify_before_complete: bool,
     /// Append `<system-reminder>` notes to tool results (e.g. a stale plan).
     pub reminders: bool,
     /// Agent skills (`SKILL.md` folders and `ai.lock` entries).
@@ -109,6 +129,11 @@ pub struct Config {
     pub claude_user_hooks: bool,
     /// nano's own hooks, in Claude's structure: event name -> matcher groups.
     pub hooks: crate::claude_hooks::NanoHooks,
+    /// Check hourly whether a newer release exists and hint at it (interactive
+    /// TTY sessions only; never in headless/ACP/CI runs). The
+    /// `NANO_CODER_NO_UPDATE_CHECK` / `NO_UPDATE_NOTIFIER` env vars also turn
+    /// it off. See `update.rs`.
+    pub check_updates: bool,
 }
 
 /// Whether cross-session memory is available, and whether the model may write
@@ -167,8 +192,11 @@ impl Default for Config {
             auto_compact: true,
             auto_compact_threshold: 0.8,
             compaction_mode: CompactionMode::Standard,
+            compaction_pin_requests: true,
+            idle_compact: true,
+            idle_compact_hold_secs: None,
             verbosity: crate::ui::Verbosity::Normal,
-            renderer: crate::frame::RendererMode::default(),
+            retired_renderer: None,
             timestamps: true,
             project_instructions: true,
             project_instruction_files: crate::instructions::DEFAULT_FILES.iter().map(|s| s.to_string()).collect(),
@@ -177,6 +205,7 @@ impl Default for Config {
             instruction_imports_outside_project: false,
             plan_tools: true,
             outcome_tool: true,
+            verify_before_complete: true,
             reminders: true,
             skills: crate::skills::SkillsConfig::default(),
             permissions: crate::permissions::PermissionsConfig::default(),
@@ -188,11 +217,21 @@ impl Default for Config {
             disable_project_hooks: false,
             claude_user_hooks: true,
             hooks: crate::claude_hooks::NanoHooks::new(),
+            check_updates: true,
         }
     }
 }
 
 impl Config {
+    /// A notice for a config that still sets the retired `renderer` option to
+    /// anything but `frame` (the only renderer left).
+    pub fn retired_renderer_notice(&self) -> Option<String> {
+        let value = self.retired_renderer.as_deref()?;
+        (value.trim() != "frame").then(|| {
+            format!("Note: renderer = {value:?} is no longer available; using the frame renderer (remove the setting)")
+        })
+    }
+
     /// Provider table and default provider after applying legacy
     /// top-level `api_key` / `base_url`.
     pub fn effective_providers(&self) -> (HashMap<String, ProviderConfig>, String) {
@@ -594,10 +633,13 @@ mod tests {
     }
 
     #[test]
-    fn defaults_to_the_frame_renderer_and_parses_legacy() {
+    fn a_retired_legacy_renderer_setting_still_loads_with_a_notice() {
         let default: Config = toml::from_str("model = \"work/x\"").unwrap();
-        assert_eq!(default.renderer, crate::frame::RendererMode::Frame);
+        assert_eq!(default.retired_renderer_notice(), None);
+        let frame: Config = toml::from_str("model = \"work/x\"\nrenderer = \"frame\"").unwrap();
+        assert_eq!(frame.retired_renderer_notice(), None);
         let legacy: Config = toml::from_str("model = \"work/x\"\nrenderer = \"legacy\"").unwrap();
-        assert_eq!(legacy.renderer, crate::frame::RendererMode::Legacy);
+        assert!(legacy.retired_renderer_notice().unwrap().contains("no longer available"));
+        assert!(!toml::to_string(&legacy).unwrap().contains("renderer"));
     }
 }

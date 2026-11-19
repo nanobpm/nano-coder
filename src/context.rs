@@ -68,6 +68,28 @@ The agent can later read any message in full by that ID, so the summary can stay
 may matter (an error message, a command and its output, a file's contents, the user's exact wording), cite its source \
 as (#N) instead of copying long text. Cite only IDs that appear in the transcript.";
 
+/// Added to the summarizer prompt when the transcript holds an `[earlier
+/// summary]` block (a repeated compaction): that block is a paraphrase of a
+/// paraphrase, so the user's goals must not be restated from it — the harness
+/// pins the user's original requests verbatim alongside the new summary
+/// (issue #66). Only appended when pinning is actually on
+/// (`compaction_pin_requests`): the instruction leans on the pinned block.
+pub const EARLIER_SUMMARY_LOSSY_INSTRUCTIONS: &str = "\n\nA block labelled [earlier summary] is a summary of a \
+summary: it is lossy and may have blurred or dropped the user's original requests. Do not restate the user's goals \
+or requirements from it. The user's exact requests are pinned verbatim alongside your summary by the harness, so you \
+need not reproduce them; summarize only the work and decisions the [earlier summary] covers.";
+
+/// The same warning for a repeated compaction when the pinned block is
+/// disabled (`compaction_pin_requests = false`): with no pin to lean on, the
+/// new summary is the only place the user's requirements survive, so the
+/// summarizer must carry forward every requirement the [earlier summary]
+/// still holds instead of dropping them (issue #66).
+pub const EARLIER_SUMMARY_LOSSY_NO_PIN_INSTRUCTIONS: &str = "\n\nA block labelled [earlier summary] is a summary of a \
+summary: it is lossy and may have blurred or dropped the user's original requests. Preserve every goal, requirement \
+and constraint the [earlier summary] still records — quote exact wording where it matters — because your summary is \
+the only place they survive; do not drop one because it looks already satisfied. For the rest, summarize only the \
+work and decisions the [earlier summary] covers.";
+
 /// Note after a smart summary telling the agent how to recover originals.
 pub fn smart_summary_note(range: Option<(u64, u64)>) -> String {
     let covered = match range {
@@ -95,6 +117,8 @@ pub enum Activity {
     Thinking,
     Tool(String),
     Compacting,
+    /// An opportunistic compaction at the idle prompt (issue #182).
+    IdleCompacting,
 }
 
 /// Context and usage figures, shared with the status line.
@@ -136,6 +160,9 @@ pub struct ContextStats {
     pub activity: Activity,
     /// Plan progress as (done, total), when there is a plan.
     pub plan: Option<(usize, usize)>,
+    /// The timers status segment (`⏰ HH:MM`, `⏰ N next HH:MM`), when timers
+    /// are set.
+    pub timers: Option<String>,
     /// Working directory shown on the status line.
     pub cwd: String,
     /// Live output rate while generating (completion tokens per second),
@@ -400,16 +427,265 @@ pub fn output_cap_from_error(error: &str) -> Option<usize> {
     patterns.iter().find_map(|p| Regex::new(p).ok()?.captures(error)?.get(1)?.as_str().parse().ok())
 }
 
+/// [`clip`] bounded by UTF-8 *bytes* rather than characters, so a budget
+/// measured with the byte-based [`text_tokens`] estimate holds for non-ASCII
+/// text too (issue #66). The cut always lands on a character boundary because
+/// it is made by [`clip`] on characters; the character budget shrinks until
+/// the rendered result fits `max_bytes`.
+fn clip_bytes(text: &str, max_bytes: usize) -> String {
+    let mut chars = max_bytes;
+    loop {
+        let out = clip(text, chars);
+        if out.len() <= max_bytes || chars == 0 {
+            return out;
+        }
+        // Strictly decreasing: scale by the overshoot, at least one char less.
+        let scaled = chars.saturating_mul(max_bytes) / out.len();
+        chars = scaled.min(chars - 1);
+    }
+}
+
 fn clip(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
+    let total = text.chars().count();
+    if total <= max_chars {
         return text.to_string();
     }
-    let head: String = text.chars().take(max_chars * 2 / 3).collect();
+    // The omission marker is charged against the character allowance, so the
+    // result never exceeds `max_chars`.
+    let marker = format!("\n…[{} characters omitted]…\n", total - max_chars);
+    let marker_len = marker.chars().count();
+    if marker_len >= max_chars {
+        // The allowance is smaller than the marker itself (reachable through a
+        // nearly-exhausted pin budget): a full marker would exceed it, so fall
+        // back to a bare head cut with no marker at all.
+        return text.chars().take(max_chars).collect();
+    }
+    let budget = max_chars - marker_len;
+    let head: String = text.chars().take(budget * 2 / 3).collect();
     let tail: String = {
         let chars: Vec<char> = text.chars().collect();
-        chars[chars.len() - max_chars / 3..].iter().collect()
+        chars[chars.len() - budget / 3..].iter().collect()
     };
-    format!("{head}\n…[{} characters omitted]…\n{tail}", text.chars().count() - max_chars)
+    format!("{head}{marker}{tail}")
+}
+
+/// Maximum error lines pinned when clipping a tool result (issue #67).
+const CLIP_ERROR_LINES: usize = 20;
+/// Context lines kept around each pinned error line.
+const CLIP_ERROR_CONTEXT: usize = 1;
+
+/// A line worth pinning when a long tool result is clipped: the lines that
+/// matter in build/test output (`error[E0308]`, `panicked at`, `FAILED`,
+/// `Traceback`, …) usually sit in the middle, where head+tail clipping drops
+/// them. The list stays small and fixed — no per-language logic. `warning:`
+/// lines (e.g. `warning: unused`) are noise here and never pinned — even when
+/// they name an error (`warning: unused import: std::error::Error`), so a
+/// warning-heavy log cannot exhaust the pin allowance ahead of a real error.
+fn is_error_line(line: &str) -> bool {
+    let lower = line.trim_start().to_lowercase();
+    if lower.starts_with("warning:") {
+        return false;
+    }
+    lower.contains("error")
+        || lower.contains("panic")
+        || lower.contains("failed")
+        || lower.contains("traceback")
+        || lower.contains("exception")
+}
+
+/// Clip a tool result for the compaction transcript, keeping the head and tail
+/// as `clip` does but also pinning up to [`CLIP_ERROR_LINES`] error lines from
+/// the omitted middle, each with [`CLIP_ERROR_CONTEXT`] lines of context.
+///
+/// Structurally, the result is a *selection of whole lines* of the original
+/// text (in order, each rendered at most once) with every omitted run replaced
+/// by a gap marker — so a line can never be duplicated, and coverage is a
+/// property of the one selection rather than of separately computed ranges.
+/// Every line is admitted through a single charge against one `max_chars`
+/// budget (its exact characters, newline/CRLF included, plus any change in the
+/// number of gap markers), so the result can never exceed the budget.
+/// Admission order: a small head and tail floor, then error lines not already
+/// kept (whole; an oversized first one is budget-clipped), then their context,
+/// then the remaining allowance grows the head (2/3) and tail (1/3).
+fn clip_tool_result(text: &str, max_chars: usize) -> String {
+    let total = text.chars().count();
+    if total <= max_chars {
+        return text.to_string();
+    }
+    // Newline-inclusive slices: every offset/length is in the original text's
+    // own coordinates (a CRLF line is charged both bytes' characters).
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let bare = |i: usize| lines[i].trim_end_matches('\n').trim_end_matches('\r');
+    let error_lines: Vec<usize> = (0..lines.len()).filter(|&i| is_error_line(bare(i))).collect();
+    let marker = format!("…[{} characters omitted; error lines pinned]…\n", total - max_chars);
+    let marker_len = marker.chars().count();
+    if error_lines.is_empty() || max_chars < marker_len + 64 {
+        return clip(text, max_chars);
+    }
+    const GAP: usize = 2; // "…\n" for every gap after the first
+    let n = lines.len();
+    let lens: Vec<usize> = lines.iter().map(|l| l.chars().count()).collect();
+    let mut kept = vec![false; n];
+    let mut clipped: Vec<Option<String>> = vec![None; n];
+    // Nothing kept: one gap, rendered as the full marker.
+    let mut used = marker_len;
+    // The exact cost of keeping line `i` at `len` characters.
+    let cost = |kept: &[bool], i: usize, len: usize| -> isize {
+        let left = i > 0 && !kept[i - 1];
+        let right = i + 1 < n && !kept[i + 1];
+        let gaps_delta = left as isize + right as isize - 1;
+        len as isize + gaps_delta * GAP as isize
+    };
+    let try_keep = |kept: &mut Vec<bool>, used: &mut usize, i: usize| -> bool {
+        if kept[i] {
+            return true;
+        }
+        let c = cost(kept, i, lens[i]);
+        if (*used as isize + c) as usize > max_chars {
+            return false;
+        }
+        *used = (*used as isize + c) as usize;
+        kept[i] = true;
+        true
+    };
+    // 1. Head and tail floors (whole lines), so both ends always show.
+    let floor = (max_chars - marker_len) / 6;
+    let mut head_end = 0; // first line index not in the head
+    while head_end < n && lens[..=head_end].iter().sum::<usize>() <= floor && try_keep(&mut kept, &mut used, head_end) {
+        head_end += 1;
+    }
+    let mut tail_start = n; // first line index of the tail
+    while tail_start > head_end
+        && lens[tail_start - 1..].iter().sum::<usize>() <= floor
+        && try_keep(&mut kept, &mut used, tail_start - 1)
+    {
+        tail_start -= 1;
+    }
+    // 1b. An oversized boundary line would leave its end bare: keep a budgeted
+    //     excerpt instead (head: prefix; tail: suffix), so the opening command
+    //     and the closing exit status survive even when whole lines cannot fit.
+    let excerpt = |s: &str, keep: usize, from_end: bool| -> String {
+        let cs: Vec<char> = s.chars().collect();
+        let k = keep.min(cs.len());
+        if from_end {
+            format!("…{}", cs[cs.len() - k..].iter().collect::<String>())
+        } else {
+            format!("{}…", cs[..k].iter().collect::<String>())
+        }
+    };
+    let ends_nl = |i: usize| if lines[i].ends_with('\n') { 1 } else { 0 };
+    if head_end == 0 && n > 1 && floor > 8 && !is_error_line(bare(0)) {
+        let base = cost(&kept, 0, 0);
+        let room = floor.min((max_chars as isize - used as isize - base).max(0) as usize);
+        if room > 8 {
+            let s = format!("{}{}", excerpt(bare(0), room - 2, false), if ends_nl(0) == 1 { "\n" } else { "" });
+            let l = s.chars().count();
+            if (used as isize + base + l as isize) as usize <= max_chars {
+                used = (used as isize + base + l as isize) as usize;
+                kept[0] = true;
+                clipped[0] = Some(s);
+                head_end = 1;
+            }
+        }
+    }
+    if tail_start == n && n > 1 && head_end < n && !kept[n - 1] && floor > 8 && !is_error_line(bare(n - 1)) {
+        let i = n - 1;
+        let base = cost(&kept, i, 0);
+        let room = floor.min((max_chars as isize - used as isize - base).max(0) as usize);
+        if room > 8 {
+            let nl = ends_nl(i);
+            let s = format!("{}{}", excerpt(bare(i), room - 1 - nl, true), if nl == 1 { "\n" } else { "" });
+            let l = s.chars().count();
+            if (used as isize + base + l as isize) as usize <= max_chars {
+                used = (used as isize + base + l as isize) as usize;
+                kept[i] = true;
+                clipped[i] = Some(s);
+                tail_start = i;
+            }
+        }
+    }
+    // 2. Pin error lines not already kept, whole while they fit; only the very
+    //    first pin may be budget-clipped (keeping the line's head and end).
+    let mut pinned: Vec<usize> = Vec::new();
+    for &i in &error_lines {
+        if kept[i] {
+            continue; // already retained: no pin, no duplicate, no allowance spent
+        }
+        if pinned.len() == CLIP_ERROR_LINES {
+            break;
+        }
+        if try_keep(&mut kept, &mut used, i) {
+            pinned.push(i);
+            continue;
+        }
+        if pinned.is_empty() {
+            // Charge the clipped rendering (plus its newline) exactly.
+            let base = cost(&kept, i, 0);
+            let room = (max_chars as isize - used as isize - base - 1).max(0) as usize;
+            let c = format!("{}\n", clip(bare(i), room));
+            let c_len = c.chars().count();
+            if (used as isize + base + c_len as isize) as usize <= max_chars {
+                used = (used as isize + base + c_len as isize) as usize;
+                kept[i] = true;
+                clipped[i] = Some(c);
+                pinned.push(i);
+            }
+        }
+        break; // a later error that cannot fit whole stops pinning
+    }
+    // 3. Context around each pin, whole lines only, while they fit. A context
+    //    line that is itself an unpinned error is not admitted.
+    for &i in &pinned {
+        let lo = i.saturating_sub(CLIP_ERROR_CONTEXT);
+        let hi = (i + CLIP_ERROR_CONTEXT).min(n - 1);
+        for j in lo..=hi {
+            if !kept[j] && !is_error_line(bare(j)) {
+                try_keep(&mut kept, &mut used, j);
+            }
+        }
+    }
+    // 4. Grow the head (2/3 of what is left) then the tail, then the head again.
+    let spare = max_chars - used;
+    let head_target = used + spare * 2 / 3;
+    while head_end < n && !kept[head_end] {
+        if (used as isize + cost(&kept, head_end, lens[head_end])) as usize > head_target {
+            break;
+        }
+        try_keep(&mut kept, &mut used, head_end);
+        head_end += 1;
+    }
+    while head_end < n && kept[head_end] {
+        head_end += 1;
+    }
+    while tail_start > head_end && (kept[tail_start - 1] || try_keep(&mut kept, &mut used, tail_start - 1)) {
+        tail_start -= 1;
+    }
+    while head_end < tail_start && (kept[head_end] || try_keep(&mut kept, &mut used, head_end)) {
+        head_end += 1;
+    }
+    // Render: kept lines in order, the first gap as the full marker.
+    let mut out = String::with_capacity(max_chars + 16);
+    let mut first_gap = true;
+    let mut in_gap = false;
+    for i in 0..n {
+        if kept[i] {
+            in_gap = false;
+            match &clipped[i] {
+                Some(c) => out.push_str(c),
+                None => out.push_str(lines[i]),
+            }
+        } else if !in_gap {
+            in_gap = true;
+            if first_gap {
+                out.push_str(&marker);
+                first_gap = false;
+            } else {
+                out.push_str("…\n");
+            }
+        }
+    }
+    debug_assert!(out.chars().count() <= max_chars, "clip budget exceeded");
+    out
 }
 
 /// Shorten an oversized message in place (tool output kept head and tail).
@@ -444,7 +720,7 @@ pub fn render_transcript(messages: &[Message], max_chars: usize, ids: bool) -> S
             Role::Tool => {
                 let name = message.name.as_deref().unwrap_or("tool");
                 let label = if message.is_error { "failed" } else { "result" };
-                let mut block = format!("TOOL {label} ({name}):\n{}", clip(&message.content, 2_000));
+                let mut block = format!("TOOL {label} ({name}):\n{}", clip_tool_result(&message.content, 2_000));
                 // The summary request never includes images; render each as a
                 // placeholder so the transcript still notes it was seen.
                 for attachment in &message.attachments {
@@ -478,6 +754,261 @@ pub fn render_transcript(messages: &[Message], max_chars: usize, ids: bool) -> S
     }
     kept.reverse();
     kept.join("\n\n")
+}
+
+/// Starts the pinned block of the user's own requests, attached verbatim after
+/// a compaction summary so the user's actual words survive repeated
+/// compactions (a summary of a summary paraphrases them away — issue #66).
+pub const PINNED_REQUESTS_PREFIX: &str = "[The user's requests, kept verbatim by the harness — not the summariser's words. These are the exact \
+     originals; the summary above may paraphrase or lose them. Treat this block as the authoritative statement \
+     of what the user asked for.]";
+
+/// Character budget for the *first* pinned request, which usually states the
+/// task's goal and carries the exact detail (a flag, a number, a phrase) a
+/// later question depends on. Later requests get one line each (below).
+const PINNED_FIRST_CHARS: usize = 1_500;
+
+/// Character budget for each later pinned request: one line's worth.
+const PINNED_LATER_CHARS: usize = 200;
+
+/// The pinned block's share of the model's context window, in tokens. The
+/// per-request budgets above do not bound the *block*: every request the
+/// session has seen is appended again on each compaction, so a long session
+/// would otherwise grow the block past the window — and compaction could never
+/// reclaim that space, because it regenerates the same oversized block. The
+/// overall allowance is derived from the window instead (see
+/// [`pinned_user_requests`]).
+const PINNED_WINDOW_SHARE: usize = 8;
+
+/// The smallest overall allowance [`pinned_user_requests`] works with, in
+/// tokens: below this the share above would leave too little for even the
+/// first request, so the allowance is raised to this floor (the window is
+/// tiny, and the summary the pin rides on is proportionally small too).
+const PINNED_MIN_ALLOWANCE_TOKENS: usize = 600;
+
+/// Marks the requests dropped to fit the overall allowance, so the agent
+/// knows the block is partial (and, in smart mode, which session-log IDs to
+/// `history_read` for the full text).
+fn omitted_note(count: usize, whereabouts: &str) -> String {
+    format!("[… {count} earlier request(s) omitted from this pin to fit its context allowance{whereabouts} …]")
+}
+
+/// True when a message is a genuine user request — a turn the user initiated —
+/// rather than a harness injection: an automatic reminder/continuation/timer
+/// (`auto_initiated` and its sub-kinds), a previous compaction's synthetic
+/// summary, or a harness plan note (a carried-over or restated plan). Only
+/// genuine requests are pinned; re-pinning a summary would re-introduce the
+/// paraphrase-of-a-paraphrase drift this block exists to prevent (issue #66).
+/// A user prompt that merely *starts* with a bracket (e.g. `[constraint] …`)
+/// is still a genuine request and is pinned.
+///
+/// Hook output is not user input, so a message whose text carries harness
+/// additions is pinned only in its user-typed part: a fresh prompt with
+/// `SessionStart`/`UserPromptSubmit` context appended (wrapped as a
+/// `<system-reminder>`, agent.rs) is pinned from its recorded `pin_text` (the
+/// user-typed part), and a message that *is* hook context (a resume
+/// `SessionStart` block, flagged `hook_context` at its origin) is excluded
+/// outright. Otherwise compaction would preserve transient hook instructions as the user's authoritative original words.
+fn is_user_request(message: &Message) -> bool {
+    if message.role != Role::User || message.auto_initiated || message.continuation || message.timer {
+        return false;
+    }
+    let content = message.content.trim_start();
+    if content.starts_with(SUMMARY_PREFIX) || content.starts_with(SMART_SUMMARY_PREFIX) {
+        return false;
+    }
+    // Harness plan notes, not user requests.
+    if content.starts_with("[Your plan, kept by the harness") || content.starts_with("[A plan carried over") {
+        return false;
+    }
+    // A harness hook-context block (a resume `SessionStart` hook's context),
+    // identified by its origin flag — never by a `<system-reminder>` text
+    // prefix, which a user can type at the start of a genuine prompt.
+    !message.hook_context
+}
+
+/// The user-typed text of a genuine request, so the pin holds the user's words
+/// only — never harness additions. When the harness appended hook context to the
+/// prompt (agent.rs wraps it as a `<system-reminder>` block on the wire
+/// `content`), the pristine user text was recorded separately in `pin_text` and
+/// is used directly. Otherwise the content is used as-is. This deliberately does
+/// NOT clip `content` at the first `<system-reminder>` tag: a user can *type*
+/// that tag (e.g. `Rename <system-reminder> to <harness-note> in reminders.rs`),
+/// and clipping there would pin just `Rename`, losing the actual task (issue
+/// #66). Only known harness additions — recorded as `pin_text` — are excluded.
+fn request_text(message: &Message) -> &str {
+    match &message.pin_text {
+        Some(text) => text.trim(),
+        None => message.content.trim(),
+    }
+}
+
+/// True when a message is a previous compaction's synthetic summary — the
+/// block `render_transcript` labels `[earlier summary]`. Used to warn the
+/// summariser that such a block is lossy (issue #66).
+pub fn is_summary_message(message: &Message) -> bool {
+    message.role == Role::User
+        && (message.content.starts_with(SUMMARY_PREFIX) || message.content.starts_with(SMART_SUMMARY_PREFIX))
+}
+
+/// Render the pinned block of the user's requests, rebuilt from the original
+/// messages on every compaction — never from the previous summary (issue #66).
+///
+/// `prior` is the stash of real turns from earlier compactions
+/// (`pre_compaction_transcript`), `new` the turns this compaction is folding.
+/// Together they hold every genuine user request the session has seen, so the
+/// block is regenerated from originals each time rather than carried forward as
+/// a paraphrase. The first request (which usually states the goal) keeps up to
+/// [`PINNED_FIRST_CHARS`] characters; each later request is clipped to one
+/// line. With `smart`, each request is labelled with its `#N` session-log ID so
+/// the full text is one `history_read` away. Returns `None` when there is
+/// nothing to pin.
+///
+/// The whole block — header and labels included — is bounded by an overall
+/// allowance derived from the model's context `window` (`window_tokens` /
+/// [`PINNED_WINDOW_SHARE`], floored at [`PINNED_MIN_ALLOWANCE_TOKENS`]):
+/// without it a long session's block would grow past the window, and further
+/// compaction could never reclaim that space because it regenerates the same
+/// oversized block. When the requests do not fit, the *oldest* ones are
+/// dropped (the newest requests are the likeliest to steer the next steps;
+/// the first request keeps its larger budget while it fits), the first is
+/// clipped harder if it alone overflows, and an explicit omission note records
+/// how many were dropped and their session-log IDs. Requests are pinned
+/// through [`request_text`], so hook output appended to a prompt is never
+/// pinned as the user's words.
+pub fn pinned_user_requests(prior: &[Message], new: &[Message], smart: bool, window_tokens: usize) -> Option<String> {
+    let requests: Vec<&Message> = prior.iter().chain(new.iter()).filter(|m| is_user_request(m)).collect();
+    if requests.is_empty() {
+        return None;
+    }
+    // The overall allowance, in UTF-8 bytes: the same accounting as
+    // [`text_tokens`] (~4 bytes/token), so multibyte text cannot overrun the
+    // intended token share. The header and each line's joining newline are
+    // charged against it.
+    let allowance = (window_tokens / PINNED_WINDOW_SHARE).max(PINNED_MIN_ALLOWANCE_TOKENS).saturating_mul(4).max(1);
+    let remaining = allowance.saturating_sub(PINNED_REQUESTS_PREFIX.len() + 1);
+
+    // One rendered line per request, clipped to its per-request budget. The
+    // first request keeps its structure up to the larger budget; later ones
+    // are collapsed onto one line.
+    let render = |index: usize, request: &Message, first_budget: usize| -> String {
+        let budget = if index == 0 { first_budget } else { PINNED_LATER_CHARS };
+        let text = request_text(request);
+        let label = match (smart, request.log_line) {
+            (true, Some(line)) => format!("#{line}: "),
+            _ => String::new(),
+        };
+        // Budgets are bytes (token-consistent); the label is charged too.
+        let budget = budget.saturating_sub(label.len());
+        let clipped = if index == 0 {
+            clip_bytes(text, budget)
+        } else {
+            clip_bytes(&text.split_whitespace().collect::<Vec<_>>().join(" "), budget)
+        };
+        format!("{label}{clipped}")
+    };
+    let mut lines: Vec<String> = (0..requests.len()).map(|i| render(i, requests[i], PINNED_FIRST_CHARS)).collect();
+    let cost = |line: &str| line.len() + 1;
+
+    // The explicit omission policy: drop the *oldest later* requests first
+    // (the newest requests steer the next steps; the first request states the
+    // goal), then the first request itself only when it is the last one left.
+    //
+    // Selection runs in linear time even when most requests are omitted: the
+    // dropped set is always a contiguous run of requests (the oldest later
+    // ones, plus the first when it too must go), so suffix sums give each
+    // candidate's line cost in O(1), and the omission note names the dropped
+    // requests by one *covering* session-log span (`#lo-#hi`) whose bounds are
+    // prefix minima/maxima — also O(1) per candidate. A covering span keeps the
+    // note's size independent of how many requests were dropped or how their
+    // IDs interleave with other log records, so the note can never crowd out
+    // the requests it accompanies (issue #66). The note is rendered once, after
+    // selection.
+    //
+    // `keep_first`: whether the first (goal) request survives.
+    // `tail_start`: the first later request kept; `tail_start..n` are kept.
+    let n = requests.len();
+    let line_costs: Vec<usize> = lines.iter().map(|l| cost(l)).collect();
+    // suffix[i] = cost of lines[i..n].
+    let mut suffix = vec![0usize; n + 1];
+    for i in (0..n).rev() {
+        suffix[i] = suffix[i + 1] + line_costs[i];
+    }
+    // span[i] = (min, max) log ID over requests[1..i] (None when no IDs).
+    let mut span: Vec<Option<(u64, u64)>> = vec![None; n + 1];
+    for i in 1..n {
+        let merged = match (span[i], requests[i].log_line) {
+            (Some((lo, hi)), Some(id)) => Some((lo.min(id), hi.max(id))),
+            (None, Some(id)) => Some((id, id)),
+            (cur, None) => cur,
+        };
+        span[i + 1] = merged;
+    }
+    let dropped_span = |keep_first: bool, tail_start: usize| -> Option<(u64, u64)> {
+        let later = span[tail_start.max(1)];
+        let first = if keep_first { None } else { requests[0].log_line.map(|id| (id, id)) };
+        match (first, later) {
+            (Some((a, b)), Some((c, d))) => Some((a.min(c), b.max(d))),
+            (x, None) | (None, x) => x,
+        }
+    };
+    let omitted_count =
+        |keep_first: bool, tail_start: usize| -> usize { (tail_start.max(1) - 1) + usize::from(!keep_first) };
+    let note = |keep_first: bool, tail_start: usize| -> Option<String> {
+        let omitted = omitted_count(keep_first, tail_start);
+        if omitted == 0 {
+            return None;
+        }
+        let whereabouts = match (smart, dropped_span(keep_first, tail_start)) {
+            (true, Some((lo, hi))) if lo == hi => format!("; full text at #{lo}"),
+            (true, Some((lo, hi))) => format!("; full text within session log #{lo}-#{hi}"),
+            _ => String::new(),
+        };
+        Some(omitted_note(omitted, &whereabouts))
+    };
+    let total = |keep_first: bool, tail_start: usize| -> usize {
+        (if keep_first { line_costs[0] } else { 0 })
+            + suffix[tail_start.max(1)]
+            + note(keep_first, tail_start).map_or(0, |t| cost(&t))
+    };
+
+    let mut keep_first = true;
+    let mut tail_start = 1usize;
+    // Drop the oldest later requests until the block (lines + note) fits.
+    while tail_start < n && total(keep_first, tail_start) > remaining {
+        tail_start += 1;
+    }
+    // Still too large with only the first request kept: drop the first too and
+    // keep shrinking the tail from the oldest remaining.
+    if total(keep_first, tail_start) > remaining {
+        keep_first = false;
+        while tail_start < n && total(keep_first, tail_start) > remaining {
+            tail_start += 1;
+        }
+    }
+
+    if !keep_first && tail_start >= n {
+        // Not even one request fits — nothing usable to pin.
+        return None;
+    }
+
+    // The first request alone can still overflow a tiny allowance: clip it
+    // harder, to what is actually left, rather than exceed the allowance.
+    if keep_first && tail_start >= n && line_costs[0] > remaining {
+        lines[0] = render(0, requests[0], remaining.saturating_sub(1));
+    }
+
+    let mut body: Vec<String> = Vec::new();
+    // The note sits where the dropped requests were: ahead of the kept lines.
+    // Room for it was reserved by the selection above.
+    body.extend(note(keep_first, tail_start));
+    if keep_first {
+        body.push(lines[0].clone());
+    }
+    for line in &lines[tail_start.max(1)..] {
+        body.push(line.clone());
+    }
+    Some(format!("{PINNED_REQUESTS_PREFIX}\n{}", body.join("\n")))
 }
 
 #[cfg(test)]
@@ -634,6 +1165,451 @@ mod tests {
     }
 
     #[test]
+    fn clipped_tool_result_pins_an_error_line_from_the_middle() {
+        // Issue #67: a 50k-character tool result with one `error:` line in the
+        // middle — the clipped transcript must contain that line.
+        let mut content = String::new();
+        while content.len() < 30_000 {
+            content.push_str("   Compiling lease-0.1.0 (/work/lease)\n");
+        }
+        content.push_str("error[E0599]: no method named `refresh_lease_v42_fast` found for struct `TokenCache`\n");
+        while content.len() < 50_000 {
+            content.push_str("test lease::tests::case_123 ... ok\n");
+        }
+        let message = Message::tool_result("call_1", "bash", &content);
+        let text = render_transcript(&[message], 100_000, false);
+        assert!(
+            text.contains("error[E0599]: no method named `refresh_lease_v42_fast` found for struct `TokenCache`"),
+            "the middle error line must survive clipping:\n{text}"
+        );
+        assert!(text.contains("error lines pinned"), "{text}");
+    }
+
+    #[test]
+    fn clipped_tool_result_without_error_lines_clips_as_before() {
+        let content = "x".repeat(50_000);
+        let message = Message::tool_result("call_1", "bash", &content);
+        let text = render_transcript(&[message], 100_000, false);
+        assert!(text.contains("characters omitted"), "{text}");
+        assert!(!text.contains("error lines pinned"), "{text}");
+        assert_eq!(text, format!("TOOL result (bash):\n{}", clip(&content, 2_000)));
+    }
+
+    #[test]
+    fn clipped_tool_result_never_exceeds_the_budget() {
+        // Many error lines: pins are capped and the total stays within budget.
+        let mut content = String::new();
+        for i in 0..200 {
+            content.push_str(&format!("error: failure number {i} in the middle of the log\n"));
+            content.push_str(&"padding line to spread the diagnostics out across the log\n".repeat(20));
+        }
+        let message = Message::tool_result("call_1", "bash", &content);
+        let text = render_transcript(std::slice::from_ref(&message), 1_000_000, false);
+        let body = text.strip_prefix("TOOL result (bash):\n").unwrap();
+        assert!(body.chars().count() <= 2_000, "budget exceeded: {} chars", body.chars().count());
+        // Pins are capped at CLIP_ERROR_LINES error lines (each with context);
+        // the head and tail (one padded error each per ~1,200 chars) may
+        // naturally hold a couple more.
+        assert!(body.matches("error: failure number").count() <= CLIP_ERROR_LINES + 4);
+        // Directly: an error line in the omitted middle is pinned within budget.
+        let buried = format!(
+            "{}\ncompiling crate-a\nerror: boom\nnote: see above\n{}",
+            "ordinary build output line\n".repeat(200),
+            "test crate::case ... ok\n".repeat(200)
+        );
+        let clipped = clip_tool_result(&buried, 2_000);
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {} chars", clipped.chars().count());
+        assert!(clipped.contains("error: boom"), "{clipped}");
+        assert!(clipped.contains("note: see above"), "context line pinned too:\n{clipped}");
+    }
+
+    #[test]
+    fn clipped_tool_result_pins_respect_cumulative_budget() {
+        // Many separated windows, each small: together they must stay within
+        // the pin budget, and the tail must survive (no plain-clip fallback).
+        let mut content = "head line\n".repeat(300);
+        for i in 0..20 {
+            content
+                .push_str(&format!("ctx before {i}\nerror: separated failure {i} {}\nctx after {i}\n", "x".repeat(40)));
+            content.push_str(&"plain padding\n".repeat(30));
+        }
+        content.push_str("FINAL TAIL MARKER\n");
+        let clipped = clip_tool_result(&content, 2_000);
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
+        assert!(clipped.contains("error lines pinned"), "{clipped}");
+        assert!(clipped.contains("FINAL TAIL MARKER"), "tail lost:\n{clipped}");
+        assert!(clipped.contains("separated failure 0 "), "{clipped}");
+    }
+
+    #[test]
+    fn clipped_tool_result_shrunk_window_does_not_drop_later_windows() {
+        // First window has huge context and shrinks to its error line; the
+        // second, small window still fits and must be kept.
+        let content = format!(
+            "{}\n{}\nerror: first failure\n{}\n{}\nnote: a\nerror: second failure\nnote: b\n{}",
+            "head\n".repeat(400),
+            "c".repeat(1_200),
+            "d".repeat(1_200),
+            "pad\n".repeat(50),
+            "tail\n".repeat(400)
+        );
+        let clipped = clip_tool_result(&content, 2_000);
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
+        assert!(clipped.contains("error: first failure"), "{clipped}");
+        assert!(clipped.contains("error: second failure"), "{clipped}");
+    }
+
+    #[test]
+    fn clipped_tool_result_keeps_context_and_tail() {
+        let mut content = String::new();
+        for _ in 0..400 {
+            content.push_str("ordinary build output line that nobody cares about\n");
+        }
+        content.push_str("  --> src/lease.rs:41:9\n");
+        content.push_str("error[E0308]: mismatched types: expected `Lease`, found `()`\n");
+        content.push_str("  = note: this error originates in the macro\n");
+        for _ in 0..400 {
+            content.push_str("more ordinary output after the failure\n");
+        }
+        content.push_str("error: could not compile `lease` due to 1 previous error\n");
+        content.push_str("exit status: 101\n");
+        let clipped = clip_tool_result(&content, 2_000);
+        // The error line and one line of context on each side are pinned.
+        assert!(clipped.contains("error[E0308]: mismatched types"), "{clipped}");
+        assert!(clipped.contains("--> src/lease.rs:41:9"), "{clipped}");
+        assert!(clipped.contains("= note: this error originates"), "{clipped}");
+        // The tail (exit status) survives.
+        assert!(clipped.contains("exit status: 101"), "{clipped}");
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
+    }
+
+    #[test]
+    fn error_line_detection_is_small_and_fixed() {
+        assert!(is_error_line("error[E0308]: mismatched types"));
+        assert!(is_error_line("thread 'main' panicked at src/store.rs:10"));
+        assert!(is_error_line("test result: FAILED. 3 passed; 2 failed"));
+        assert!(is_error_line("Traceback (most recent call last):"));
+        assert!(is_error_line("java.lang.IllegalStateException: boom"));
+        assert!(!is_error_line("warning: unused variable: `tmp`"));
+        assert!(!is_error_line("warning: unused import: std::error::Error"));
+        assert!(!is_error_line("  warning: previous error occurred here"));
+        assert!(!is_error_line("WARNING: the build failed to cache"));
+        assert!(!is_error_line("   Compiling lease-0.1.0 (/work/lease)"));
+        assert!(!is_error_line("test lease::tests::case_123 ... ok"));
+    }
+
+    #[test]
+    fn clipped_tool_result_ignores_warnings_that_name_errors() {
+        // A warning-heavy log must not exhaust the pin allowance: twenty
+        // warnings containing error keywords precede the real compiler error.
+        let mut content = String::new();
+        for i in 0..40 {
+            content.push_str(&format!("warning: unused import: std::error::Error (number {i})\n"));
+        }
+        content.push_str("error[E0308]: mismatched types: expected `Lease`, found `()`\n");
+        for _ in 0..400 {
+            content.push_str("ordinary build output line that nobody cares about\n");
+        }
+        let clipped = clip_tool_result(&content, 2_000);
+        assert!(clipped.contains("error[E0308]: mismatched types"), "{clipped}");
+        // The head still shows the log's opening warnings (that is plain
+        // head/tail clipping), but the pinned window around the error must
+        // hold no warning line.
+        let window = clipped.lines().skip_while(|l| !l.contains("error[E0308]")).take(3).collect::<Vec<_>>();
+        assert!(window.iter().all(|l| !l.contains("warning:")), "warnings must not be pinned:\n{clipped}");
+    }
+
+    #[test]
+    fn clipped_tool_result_clips_context_before_the_error_line() {
+        // A 56-character error between two 1,200-character context lines: the
+        // window cannot fit the pin budget, so the context clips — the error
+        // line itself is reserved and must survive whole.
+        let pad = "x".repeat(1_200);
+        let mut content = "ordinary build output line\n".repeat(200);
+        content.push_str(&format!("{pad}\nerror[E0308]: mismatched types: expected `Lease`, found `()`\n{pad}\n"));
+        content.push_str(&"more ordinary output after the failure\n".repeat(200));
+        let clipped = clip_tool_result(&content, 2_000);
+        assert!(clipped.contains("error[E0308]: mismatched types: expected `Lease`, found `()`"), "{clipped}");
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
+    }
+
+    #[test]
+    fn clipped_tool_result_keeps_every_error_of_a_merged_window() {
+        // Two errors three lines apart merge into one window whose context
+        // cannot fit: both error lines survive even when the context drops.
+        let pad = "y".repeat(900);
+        let mut content = "ordinary build output line\n".repeat(200);
+        content.push_str(&format!(
+            "{pad}\nerror[E0308]: first failure here\n{pad}\nerror[E0599]: second failure here\n{pad}\n"
+        ));
+        content.push_str(&"more ordinary output after the failure\n".repeat(200));
+        let clipped = clip_tool_result(&content, 2_000);
+        assert!(clipped.contains("error[E0308]: first failure here"), "{clipped}");
+        assert!(clipped.contains("error[E0599]: second failure here"), "{clipped}");
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
+    }
+
+    #[test]
+    fn clip_stays_within_budget_marker_included() {
+        // The omission marker is charged against the allowance: the result of
+        // `clip` never exceeds `max_chars`, even for a single oversized line.
+        for max in [40, 100, 2_000] {
+            let big = "x".repeat(10_000);
+            let clipped = clip(&big, max);
+            assert!(clipped.chars().count() <= max, "clip exceeded {max}: {}", clipped.chars().count());
+            assert!(clipped.contains("characters omitted"), "{clipped}");
+        }
+        // A multi-line text clips the same way.
+        let text = "line of build output\n".repeat(500);
+        assert!(clip(&text, 300).chars().count() <= 300);
+    }
+
+    #[test]
+    fn clip_stays_within_a_sub_marker_budget() {
+        // An allowance smaller than the omission marker itself (reachable
+        // through a nearly-exhausted pin budget): the marker must not push
+        // the result over the limit — `clip` falls back to a bare head cut.
+        let big = "x".repeat(10_000);
+        for max in [0, 1, 8, 20, 28] {
+            let clipped = clip(&big, max);
+            assert!(clipped.chars().count() <= max, "clip exceeded {max}: {}", clipped.chars().count());
+        }
+        // Just above the marker length the marker fits again.
+        let clipped = clip(&big, 40);
+        assert!(clipped.contains("characters omitted"), "{clipped}");
+        assert!(clipped.chars().count() <= 40);
+    }
+
+    #[test]
+    fn clipped_tool_result_does_not_pin_errors_the_head_already_retains() {
+        // Twenty short errors at the start of the log already fit in the
+        // rendered head: pinning them would duplicate them and exhaust the
+        // pin allowance, losing the diagnostic buried in the middle.
+        let mut content = String::new();
+        for i in 0..20 {
+            content.push_str(&format!("error: NN {i}\n"));
+        }
+        content.push_str(&"ordinary build output line that pads the log out\n".repeat(300));
+        content.push_str("error: buried middle diagnostic\n");
+        content.push_str(&"more ordinary output after the failure\n".repeat(300));
+        let clipped = clip_tool_result(&content, 2_000);
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
+        assert!(clipped.contains("error: buried middle diagnostic"), "middle diagnostic lost:\n{clipped}");
+        // The head errors appear once each — pinned copies would double them.
+        assert_eq!(clipped.matches("error: NN 0\n").count(), 1, "head error duplicated by a pin:\n{clipped}");
+    }
+
+    #[test]
+    fn clipped_tool_result_does_not_pin_an_error_the_tail_already_retains() {
+        // Errors at the very end of the log are retained by the tail; the
+        // buried one must get the pin allowance instead.
+        let mut content = "ordinary build output line that pads the log out\n".repeat(300);
+        content.push_str("error: buried middle diagnostic\n");
+        content.push_str(&"more ordinary output after the failure\n".repeat(300));
+        for i in 0..5 {
+            content.push_str(&format!("error: final failure {i}\n"));
+        }
+        let clipped = clip_tool_result(&content, 2_000);
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
+        assert!(clipped.contains("error: buried middle diagnostic"), "middle diagnostic lost:\n{clipped}");
+        assert!(clipped.contains("error: final failure 4"), "tail error lost:\n{clipped}");
+        assert_eq!(clipped.matches("error: final failure 4").count(), 1, "tail error duplicated:\n{clipped}");
+    }
+
+    #[test]
+    fn clipped_tool_result_borrows_head_tail_allowance_for_a_long_error_line() {
+        // A buried error line longer than the pin share but shorter than the
+        // whole budget: it is kept *complete* — the head and tail lend it
+        // their unused allowance — instead of being cut mid-line.
+        let diagnostic = "MID-LINE-DIAGNOSTIC-THAT-MUST-SURVIVE";
+        let mut content = "ordinary build output line that pads the log out\n".repeat(300);
+        content.push_str(&format!("error: {} {diagnostic} {}\n", "x".repeat(600), "y".repeat(600)));
+        content.push_str(&"more ordinary output after the failure\n".repeat(300));
+        let clipped = clip_tool_result(&content, 2_000);
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
+        assert!(clipped.contains(diagnostic), "mid-line diagnostic lost:\n{clipped}");
+        // Kept whole: no omission marker inside the error line.
+        let line = clipped.lines().find(|l| l.contains(diagnostic)).unwrap();
+        assert!(!line.contains("characters omitted"), "error line clipped mid-line:\n{line}");
+    }
+
+    #[test]
+    fn clipped_tool_result_keeps_tail_excerpt_when_all_preceding_lines_fit() {
+        let content = format!("cargo test\nerror: boom\n{}exit status: 101", "x".repeat(2500));
+        let clipped = clip_tool_result(&content, 2000);
+        assert!(clipped.chars().count() <= 2000, "{}", clipped.chars().count());
+        assert!(clipped.starts_with("cargo test\n"), "{clipped}");
+        assert!(clipped.contains("exit status: 101"), "{clipped}");
+    }
+
+    #[test]
+    fn clipped_tool_result_keeps_a_budgeted_excerpt_of_a_context_line_at_the_budget_edge() {
+        // The original finding's shape: the single context line is at least
+        // `context_budget` long, so the excerpt necessarily clips. With the
+        // marker charged to the allowance the excerpt fits and is kept.
+        // (Small explicit budget: pin_budget = 100. The error is the first
+        // line, so the window is exactly [error, oversized-context] and the
+        // excerpt lands between the error and the window separator.)
+        let error = "error: boom happened here";
+        let content = format!("{error}\n{}\n{}", "c".repeat(260), "tail line of test output\n".repeat(40));
+        let clipped = clip_tool_result(&content, 200);
+        assert!(clipped.chars().count() <= 200, "budget exceeded: {}", clipped.chars().count());
+        assert!(clipped.contains(error), "{clipped}");
+        // The pinned window holds the budgeted excerpt (marker and all) —
+        // unless the head retained the error line whole, in which case the
+        // pin is redundant and the excerpt drops with it.
+        if clipped.starts_with(&format!("{error}\n")) {
+            // Retained by the head: nothing to pin, no excerpt owed.
+            return;
+        }
+        let pinned = clipped.split_once("error lines pinned]…\n").expect("pin marker").1;
+        let window: Vec<&str> = pinned.split_once("\n…\n").map(|(w, _)| w).unwrap_or(pinned).lines().collect();
+        assert!(
+            window.iter().any(|l| l.contains("characters omitted]…")),
+            "context excerpt lost from the pinned window: {window:?}\nfull output:\n{clipped}"
+        );
+        assert!(window.iter().any(|l| l.contains(error)), "error line lost from the pinned window:\n{clipped}");
+    }
+
+    #[test]
+    fn clipped_tool_result_drops_multi_context_that_cannot_fit_but_keeps_the_error() {
+        // Two oversized context lines around the error: per-line excerpts would
+        // cost a marker line each, so the context drops whole — the error line
+        // is reserved and must survive, within budget.
+        let error = "error[E0308]: mismatched types";
+        let pad = "c".repeat(1_500);
+        let mut content = "head\n".repeat(600);
+        content.push_str(&format!("{pad}\n{error}\n{pad}\n"));
+        content.push_str(&"tail\n".repeat(600));
+        let clipped = clip_tool_result(&content, 2_000);
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
+        assert!(clipped.contains(error), "{clipped}");
+        let window =
+            clipped.lines().skip_while(|l| !l.contains("error lines pinned")).skip(1).take(3).collect::<Vec<_>>();
+        assert!(window.iter().any(|l| l.contains(error)), "error line lost from the pinned window:\n{clipped}");
+    }
+
+    #[test]
+    fn clipped_tool_result_window_ends_before_the_first_unselected_error() {
+        // A matching line right after the 20th selected error must not ride
+        // along inside the last window uncharged: with a huge such line the
+        // budget must still hold, and that line must not be rendered.
+        let mut content = "head\n".repeat(300);
+        for i in 0..CLIP_ERROR_LINES {
+            content.push_str(&format!("error: selected failure {i}\n"));
+            content.push_str("ctx\n");
+        }
+        content.push_str(&format!("error: unselected huge {}\n", "u".repeat(5_000)));
+        content.push_str(&"tail\n".repeat(300));
+        let clipped = clip_tool_result(&content, 2_000);
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
+        assert!(clipped.contains("error: selected failure 0"), "{clipped}");
+        assert!(!clipped.contains("uuuu"), "unselected error leaked into a window:\n{clipped}");
+        assert!(clipped.contains("error lines pinned"), "{clipped}");
+    }
+
+    #[test]
+    fn clipped_tool_result_keeps_complete_diagnostics_before_clipping() {
+        // Twenty adjacent 80-character errors form one window whose bare error
+        // lines overflow the pin budget: complete lines are kept while they
+        // fit instead of every diagnostic being cut to a sliver.
+        let mut content = "head\n".repeat(300);
+        for i in 0..20 {
+            content.push_str(&format!("error: adjacent failure {i:02} {}\n", "e".repeat(50)));
+        }
+        content.push_str(&"tail\n".repeat(300));
+        let clipped = clip_tool_result(&content, 2_000);
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
+        assert!(clipped.contains("error: adjacent failure 00 "), "{clipped}");
+        let kept = (0..20).filter(|i| clipped.contains(&format!("error: adjacent failure {i:02} "))).count();
+        assert!(kept >= 10, "complete lines must be kept while they fit, kept {kept}:\n{clipped}");
+        // A kept line is complete, not a 49-character sliver.
+        assert!(clipped.contains(&format!("error: adjacent failure 00 {}", "e".repeat(50))), "{clipped}");
+    }
+
+    #[test]
+    fn clipped_tool_result_budget_clip_keeps_the_end_of_an_oversized_error_line() {
+        // A single error line longer than the whole pin budget: the budgeted
+        // head-and-tail clip keeps a diagnostic near the line's *end*.
+        let mut content = "head\n".repeat(300);
+        content.push_str(&format!("error: {} TAIL-DIAGNOSTIC-AT-END\n", "x".repeat(3_000)));
+        content.push_str(&"tail\n".repeat(300));
+        let clipped = clip_tool_result(&content, 2_000);
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
+        assert!(clipped.contains("TAIL-DIAGNOSTIC-AT-END"), "the line's end is lost:\n{clipped}");
+    }
+
+    #[test]
+    fn clipped_tool_result_long_errors_at_both_ends_stay_within_budget() {
+        // Long errors at both boundaries plus a buried pin: head and tail
+        // growth share one allowance, so the budget holds.
+        let long = |tag: &str| format!("error: {tag} {}\n", "z".repeat(700));
+        let mut content = "intro\n".repeat(40);
+        content.push_str(&long("HEAD-END"));
+        content.push_str(&"pad line\n".repeat(400));
+        content.push_str("error: buried pin\n");
+        content.push_str(&"pad line\n".repeat(400));
+        content.push_str(&long("TAIL-START"));
+        content.push_str(&"outro\n".repeat(40));
+        let clipped = clip_tool_result(&content, 2_000);
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
+        assert!(clipped.contains("error: buried pin"), "{clipped}");
+    }
+
+    #[test]
+    fn clipped_tool_result_handles_crlf_offsets() {
+        // CRLF lines: coverage must use the original coordinates, so a buried
+        // error is never mistaken for one the head already retains.
+        let mut content = "ordinary build output line\r\n".repeat(300);
+        content.push_str("error: crlf buried diagnostic\r\n");
+        content.push_str(&"more output after\r\n".repeat(300));
+        let clipped = clip_tool_result(&content, 2_000);
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
+        assert_eq!(clipped.matches("error: crlf buried diagnostic").count(), 1, "{clipped}");
+    }
+
+    #[test]
+    fn clipped_tool_result_keeps_head_errors_when_a_long_pin_needs_room() {
+        // An early diagnostic retained by the head must not vanish when a long
+        // middle error needs room, and no error is ever rendered twice.
+        let mut content = "intro\n".repeat(30);
+        content.push_str("error: early diagnostic\n");
+        content.push_str(&"pad line\n".repeat(400));
+        content.push_str(&format!("error: long middle {}\n", "m".repeat(1_300)));
+        content.push_str(&"pad line\n".repeat(400));
+        let clipped = clip_tool_result(&content, 2_000);
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
+        assert_eq!(clipped.matches("error: early diagnostic").count(), 1, "{clipped}");
+        assert_eq!(clipped.matches("error: long middle").count(), 1, "{clipped}");
+    }
+
+    #[test]
+    fn clipped_tool_result_never_duplicates_a_line_and_holds_the_budget() {
+        // Property sweep over adjacent long errors near the head/tail
+        // boundaries: every rendered error line is unique and the budget holds.
+        for budget in [300, 700, 2_000] {
+            for pad in [0, 5, 37, 120] {
+                for err_len in [10, 400, 900] {
+                    let mut content = "h\n".repeat(pad);
+                    for k in 0..4 {
+                        content.push_str(&format!("error: E{k} {}\n", "q".repeat(err_len)));
+                    }
+                    content.push_str(&"m\n".repeat(500));
+                    for k in 4..8 {
+                        content.push_str(&format!("error: E{k} {}\n", "q".repeat(err_len)));
+                    }
+                    content.push_str(&"t\n".repeat(pad));
+                    let clipped = clip_tool_result(&content, budget);
+                    assert!(clipped.chars().count() <= budget, "{budget}/{pad}/{err_len}: {}", clipped.chars().count());
+                    for k in 0..8 {
+                        assert!(clipped.matches(&format!("error: E{k} ")).count() <= 1, "dup E{k}:\n{clipped}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn transcript_labels_log_lines_when_asked() {
         let mut first = Message::user("find the bug");
         first.log_line = Some(7);
@@ -647,6 +1623,290 @@ mod tests {
         bracketed.log_line = None;
         assert!(!render_transcript(&[bracketed], 10_000, true).contains("[earlier summary]"));
         assert!(smart_summary_note(Some((2, 40))).contains("#2–#40"));
+    }
+
+    #[test]
+    fn pinned_requests_keep_the_users_words_not_the_summary() {
+        // A genuine first request with an exact detail, a later request, a
+        // reminder and a previous summary: only the two genuine requests are
+        // pinned, the summary and reminder excluded (issue #66).
+        let mut first = Message::user("Fix the lease race. Use port 8123, never 5173.");
+        first.log_line = Some(2);
+        let reminder = Message::user("remember to be careful").auto_initiated();
+        let summary = Message::user(&format!("{SUMMARY_PREFIX} the user wanted something about a port"));
+        let mut later = Message::user("Now add a test for it.");
+        later.log_line = Some(40);
+        let pinned = pinned_user_requests(&[], &[first, reminder, summary, later], false, DEFAULT_CONTEXT_WINDOW)
+            .expect("requests to pin");
+        assert!(pinned.starts_with(PINNED_REQUESTS_PREFIX), "{pinned}");
+        assert!(pinned.contains("Use port 8123, never 5173."), "exact detail pinned: {pinned}");
+        assert!(pinned.contains("Now add a test for it."), "{pinned}");
+        assert!(!pinned.contains("wanted something about a port"), "summary not pinned: {pinned}");
+        assert!(!pinned.contains("be careful"), "reminder not pinned: {pinned}");
+    }
+
+    #[test]
+    fn pinned_requests_label_log_lines_in_smart_mode() {
+        let mut first = Message::user("first request");
+        first.log_line = Some(3);
+        let mut later = Message::user("second request");
+        later.log_line = Some(9);
+        let pinned = pinned_user_requests(&[], &[first, later], true, DEFAULT_CONTEXT_WINDOW).unwrap();
+        assert!(pinned.contains("#3: first request"), "{pinned}");
+        assert!(pinned.contains("#9: second request"), "{pinned}");
+        // Standard mode carries no IDs.
+        let plain =
+            pinned_user_requests(&[], &[Message::user("first request")], false, DEFAULT_CONTEXT_WINDOW).unwrap();
+        assert!(!plain.contains('#'), "{plain}");
+    }
+
+    #[test]
+    fn pinned_requests_clip_the_first_and_one_line_the_rest() {
+        let long_first = Message::user(&"x".repeat(PINNED_FIRST_CHARS + 500));
+        let multi_line_later = Message::user("line one\nline two\nline three");
+        let pinned = pinned_user_requests(&[], &[long_first, multi_line_later], false, DEFAULT_CONTEXT_WINDOW).unwrap();
+        let body = pinned.strip_prefix(PINNED_REQUESTS_PREFIX).unwrap();
+        // The first request is clipped to its budget (the clip marker is
+        // charged against it, so the rendered head+marker+tail stays within).
+        let first_block: String = body.trim().lines().take_while(|l| *l != "line one line two line three").collect();
+        assert!(first_block.chars().count() <= PINNED_FIRST_CHARS + 60, "first clipped: {}", first_block.len());
+        assert!(first_block.contains("omitted"), "long first request is clipped: {first_block}");
+        // A later request is collapsed onto one line, at the end.
+        assert_eq!(body.trim().lines().last(), Some("line one line two line three"));
+    }
+
+    #[test]
+    fn pinned_requests_combine_prior_and_new_turns() {
+        // A repeated compaction: the earlier real turns come from the stash, the
+        // newly folded ones from this span, so all genuine requests are pinned.
+        let prior = vec![Message::user("the original goal")];
+        let new = vec![Message::user("a follow-up")];
+        let pinned = pinned_user_requests(&prior, &new, false, DEFAULT_CONTEXT_WINDOW).unwrap();
+        assert!(pinned.contains("the original goal"), "{pinned}");
+        assert!(pinned.contains("a follow-up"), "{pinned}");
+        // Nothing genuine to pin yields no block.
+        assert!(
+            pinned_user_requests(&[], &[Message::user(&format!("{SUMMARY_PREFIX} x"))], false, DEFAULT_CONTEXT_WINDOW)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pinned_requests_keep_a_bracketed_user_prompt() {
+        // A genuine request that happens to start with a bracket is pinned; only
+        // the harness's own bracketed notes are excluded.
+        let request = Message::user("[constraint] use port 8080");
+        let plan_note = Message::user("[Your plan, kept by the harness. …]\n- do a thing");
+        let pinned = pinned_user_requests(&[], &[request, plan_note], false, DEFAULT_CONTEXT_WINDOW).unwrap();
+        assert!(pinned.contains("[constraint] use port 8080"), "{pinned}");
+        assert!(!pinned.contains("do a thing"), "plan note not pinned: {pinned}");
+    }
+
+    #[test]
+    fn pinned_requests_stay_within_the_overall_allowance() {
+        // The per-request budgets do not bound the *block*: many requests would
+        // otherwise grow it past the window, and compaction could never reclaim
+        // that space. The oldest later requests are dropped with an explicit
+        // omission note; the goal (first) and the newest survive.
+        let first = Message::user("the original goal");
+        let later: Vec<Message> = (0..500).map(|i| Message::user(&format!("follow-up request number {i}"))).collect();
+        let all: Vec<Message> = std::iter::once(first).chain(later).collect();
+        // A small window forces a small allowance.
+        let window = 8_000; // allowance: 8_000/8 = 1_000 tokens = 4_000 chars
+        let pinned = pinned_user_requests(&[], &all, false, window).expect("requests to pin");
+        let allowance = (window / PINNED_WINDOW_SHARE).max(PINNED_MIN_ALLOWANCE_TOKENS) * 4;
+        assert!(
+            pinned.chars().count() <= allowance,
+            "block within the allowance: {} <= {allowance}",
+            pinned.chars().count()
+        );
+        assert!(pinned.contains("the original goal"), "the goal survives: {pinned}");
+        assert!(pinned.contains("follow-up request number 499"), "the newest request survives: {pinned}");
+        assert!(pinned.contains("omitted from this pin"), "the omission is explicit: {pinned}");
+        assert!(!pinned.contains("follow-up request number 0\n"), "the oldest later requests are dropped: {pinned}");
+    }
+
+    #[test]
+    fn pinned_requests_allowance_tracks_the_window() {
+        // The allowance is context-aware: a larger window pins more requests.
+        let requests: Vec<Message> = (0..500).map(|i| Message::user(&format!("request {i}"))).collect();
+        let small = pinned_user_requests(&[], &requests, false, 8_000).unwrap();
+        let large = pinned_user_requests(&[], &requests, false, 200_000).unwrap();
+        assert!(large.len() > small.len(), "a larger window pins more: {} > {}", large.len(), small.len());
+        // And a block is never larger than the window-derived allowance.
+        let allowance = (200_000 / PINNED_WINDOW_SHARE) * 4;
+        assert!(large.chars().count() <= allowance, "{large}");
+    }
+
+    #[test]
+    fn pinned_requests_omission_note_names_ids_in_smart_mode() {
+        let mut first = Message::user("the goal");
+        first.log_line = Some(2);
+        let mut dropped = Message::user("an old follow-up that no longer fits");
+        dropped.log_line = Some(9);
+        let mut newest = Message::user("the latest ask");
+        newest.log_line = Some(40);
+        // A tiny window drops the middle request; smart mode points at its ID.
+        let pinned = pinned_user_requests(&[], &[first, dropped, newest], true, 4_800).unwrap();
+        if pinned.contains("omitted from this pin") {
+            assert!(pinned.contains("#9"), "the dropped request's ID is named: {pinned}");
+        }
+        assert!(pinned.contains("#40: the latest ask"), "the newest request is pinned with its ID: {pinned}");
+    }
+
+    #[test]
+    fn pinned_requests_strip_hook_output_from_a_prompt() {
+        // A fresh prompt with SessionStart/UserPromptSubmit hook context
+        // appended (agent.rs) records the user-typed text separately, so the
+        // pin holds the user's words only; a resume SessionStart context block
+        // (a bare reminder message) is not a user request at all.
+        let prompt = Message::user(&format!(
+            "Fix the lease race.\n\n{}",
+            crate::reminders::wrap("hook says: always use nightly")
+        ))
+        .with_pin_text("Fix the lease race.");
+        let hook_only = Message::user(&crate::reminders::wrap("resumed session context from a hook")).hook_context();
+        let pinned = pinned_user_requests(&[], &[prompt, hook_only], false, DEFAULT_CONTEXT_WINDOW).unwrap();
+        assert!(pinned.contains("Fix the lease race."), "the user's words are pinned: {pinned}");
+        assert!(!pinned.contains("nightly"), "hook output is not pinned as the user's words: {pinned}");
+        assert!(!pinned.contains("resumed session context"), "a hook-only message is not pinned: {pinned}");
+    }
+
+    #[test]
+    fn pinned_requests_preserve_a_user_typed_reminder_tag() {
+        // A user can *type* the `<system-reminder>` tag (e.g. asking to rename
+        // it). With no hook context appended there is no `pin_text`, so the pin
+        // must keep the WHOLE user text — clipping at the tag would lose the
+        // actual task (issue #66).
+        let request = Message::user("Rename <system-reminder> to <harness-note> in reminders.rs");
+        let pinned = pinned_user_requests(&[], &[request], false, DEFAULT_CONTEXT_WINDOW).unwrap();
+        assert!(
+            pinned.contains("Rename <system-reminder> to <harness-note> in reminders.rs"),
+            "the user-typed tag survives in the pin: {pinned}"
+        );
+
+        // And when hook context IS appended, the recorded user text keeps its
+        // own literal tag while the appended reminder block stays out.
+        let with_hook = Message::user(&format!(
+            "Rename <system-reminder> to <harness-note>.\n\n{}",
+            crate::reminders::wrap("hook says: use nightly")
+        ))
+        .with_pin_text("Rename <system-reminder> to <harness-note>.");
+        let pinned = pinned_user_requests(&[], &[with_hook], false, DEFAULT_CONTEXT_WINDOW).unwrap();
+        assert!(pinned.contains("Rename <system-reminder> to <harness-note>."), "user tag pinned: {pinned}");
+        assert!(!pinned.contains("nightly"), "appended hook output not pinned: {pinned}");
+    }
+
+    #[test]
+    fn pinned_requests_a_hook_only_message_left_alone_pins_nothing() {
+        let hook_only = Message::user(&crate::reminders::wrap("hook context")).hook_context();
+        assert!(pinned_user_requests(&[], &[hook_only], false, DEFAULT_CONTEXT_WINDOW).is_none());
+    }
+
+    #[test]
+    fn pinned_requests_omission_note_stays_within_the_allowance() {
+        // Copilot's case: 1,000 short requests with a 4,800-token window must
+        // not let the omission note's ID list push the block past the
+        // allowance. The note names the dropped IDs as one covering span, and the
+        // total budget (lines + note) is enforced before returning.
+        let mut requests: Vec<Message> = Vec::new();
+        let mut first = Message::user("the original goal");
+        first.log_line = Some(1);
+        requests.push(first);
+        for i in 1..1000u64 {
+            let mut m = Message::user("x"); // one-char follow-ups
+            m.log_line = Some(i + 1);
+            requests.push(m);
+        }
+        let window = 4_800;
+        let allowance = (window / PINNED_WINDOW_SHARE).max(PINNED_MIN_ALLOWANCE_TOKENS) * 4;
+        let pinned = pinned_user_requests(&[], &requests, true, window).expect("requests to pin");
+        assert!(
+            pinned.chars().count() <= allowance,
+            "block (note included) within the allowance: {} <= {allowance}",
+            pinned.chars().count()
+        );
+        assert!(pinned.contains("omitted from this pin"), "the omission is explicit: {pinned}");
+
+        // The invariant holds across a sweep of window sizes and both modes:
+        // whatever the selection keeps, the rendered block — omission note and
+        // all — never exceeds the allowance.
+        for window in [4_800, 8_000, 16_000, 32_000, 128_000] {
+            let allowance = (window / PINNED_WINDOW_SHARE).max(PINNED_MIN_ALLOWANCE_TOKENS) * 4;
+            for smart in [true, false] {
+                if let Some(pinned) = pinned_user_requests(&[], &requests, smart, window) {
+                    assert!(
+                        pinned.chars().count() <= allowance,
+                        "window {window} smart {smart}: {} <= {allowance}",
+                        pinned.chars().count()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_requests_omission_note_uses_a_span_in_smart_mode() {
+        // Many dropped requests are named by one `#lo-#hi` span, not a long list.
+        let mut requests: Vec<Message> = Vec::new();
+        let mut first = Message::user("the original goal");
+        first.log_line = Some(1);
+        requests.push(first);
+        for i in 1..200u64 {
+            let mut m = Message::user("follow-up");
+            m.log_line = Some(i + 1);
+            requests.push(m);
+        }
+        let pinned = pinned_user_requests(&[], &requests, true, 4_800).expect("requests to pin");
+        if pinned.contains("omitted from this pin") {
+            assert!(pinned.contains("-#"), "dropped IDs are named by a covering span: {pinned}");
+            assert!(!pinned.contains("#2, #3, #4"), "no long uncompressed list: {pinned}");
+        }
+    }
+
+    #[test]
+    fn pinned_requests_keep_a_prompt_starting_with_a_literal_reminder_tag() {
+        // Only the origin flag marks hook context: a genuine prompt that begins
+        // with a literal `<system-reminder>` tag is still the user's request,
+        // with or without recorded `pin_text` (issue #66).
+        let plain = Message::user("<system-reminder> blocks leak into the TUI; hide them");
+        let pinned = pinned_user_requests(&[], &[plain], false, DEFAULT_CONTEXT_WINDOW).unwrap();
+        assert!(pinned.contains("<system-reminder> blocks leak into the TUI; hide them"), "{pinned}");
+
+        let with_hook = Message::user(&format!(
+            "<system-reminder>x</system-reminder> rename this tag\n\n{}",
+            crate::reminders::wrap("hook says: use nightly")
+        ))
+        .with_pin_text("<system-reminder>x</system-reminder> rename this tag");
+        let pinned = pinned_user_requests(&[], &[with_hook], false, DEFAULT_CONTEXT_WINDOW).unwrap();
+        assert!(pinned.contains("rename this tag"), "{pinned}");
+        assert!(!pinned.contains("nightly"), "{pinned}");
+    }
+
+    #[test]
+    fn pinned_requests_nonconsecutive_ids_keep_the_newest_request() {
+        // Real request IDs interleave with other log records (#3, #7, #11, …):
+        // the omission note must stay bounded so it never discards the whole
+        // pin when the header, goal and newest request fit (issue #66).
+        let mut requests: Vec<Message> = Vec::new();
+        for i in 0..1000u64 {
+            let mut m = Message::user(if i == 0 {
+                "g"
+            } else if i == 999 {
+                "z"
+            } else {
+                "x"
+            });
+            m.log_line = Some(3 + 4 * i);
+            requests.push(m);
+        }
+        let window = 4_800;
+        let allowance = (window / PINNED_WINDOW_SHARE).max(PINNED_MIN_ALLOWANCE_TOKENS) * 4;
+        let pinned = pinned_user_requests(&[], &requests, true, window).expect("the pin survives");
+        assert!(pinned.chars().count() <= allowance, "{pinned}");
+        assert!(pinned.contains("#3: g"), "goal kept: {pinned}");
+        assert!(pinned.contains("#3999: z"), "newest kept: {pinned}");
+        assert!(pinned.contains("full text within session log #"), "covering span named: {pinned}");
     }
 
     #[test]
@@ -668,5 +1928,53 @@ mod tests {
         assert_eq!(output_limit_for_model("gpt-4.1"), None);
         assert_eq!(output_limit_for_model("claude-sonnet-4-5"), None);
         assert_eq!(output_limit_for_model("some-unlisted-model"), None);
+    }
+}
+
+#[cfg(test)]
+mod boundary_excerpt_tests {
+    use super::*;
+
+    #[test]
+    fn clipped_tool_result_keeps_excerpts_of_oversized_boundary_lines() {
+        let first = format!("$ cargo test {}", "a".repeat(2500));
+        let last = format!("{} exit status: 101", "b".repeat(2500));
+        let text = format!("{first}\nerror: boom\n{last}");
+        let out = clip_tool_result(&text, 2000);
+        assert!(out.chars().count() <= 2000);
+        assert!(out.starts_with("$ cargo test"), "{out}");
+        assert!(out.ends_with("exit status: 101"), "{out}");
+        assert_eq!(out.matches("error: boom").count(), 1);
+
+        let text = format!("{first}\nerror: boom\n{last}\n");
+        let out = clip_tool_result(&text, 2000);
+        assert!(out.chars().count() <= 2000);
+        assert!(out.starts_with("$ cargo test"));
+        assert!(out.ends_with("exit status: 101\n"));
+    }
+
+    #[test]
+    fn pinned_requests_budget_counts_utf8_bytes_for_multibyte_text() {
+        // 1,500 CJK characters (3 bytes each) fit a character budget but not
+        // the byte/token-consistent one: the block must stay within the
+        // allowance measured as `text_tokens` does (issue #66).
+        let first = Message::user(&"漢".repeat(1_500));
+        let later = Message::user(&"字".repeat(400));
+        for window in [4_800usize, 16_000, 128_000] {
+            for smart in [false, true] {
+                let block = pinned_user_requests(&[], &[first.clone(), later.clone()], smart, window).unwrap();
+                let allowance = (window / PINNED_WINDOW_SHARE).max(PINNED_MIN_ALLOWANCE_TOKENS);
+                assert!(text_tokens(&block) <= allowance, "window {window}: {} > {allowance}", text_tokens(&block));
+                assert!(block.contains('漢'));
+            }
+        }
+    }
+
+    #[test]
+    fn clip_bytes_cuts_on_char_boundaries_within_budget() {
+        for max in [0usize, 1, 2, 3, 10, 100, 1_000] {
+            let out = clip_bytes(&"é漢x".repeat(200), max);
+            assert!(out.len() <= max, "{max}: {}", out.len());
+        }
     }
 }

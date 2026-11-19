@@ -8,6 +8,7 @@ use std::env;
 use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
+use unicode_width::UnicodeWidthChar;
 
 mod acp;
 mod agent;
@@ -20,12 +21,15 @@ mod context;
 mod files;
 mod frame;
 mod goal;
+mod herdr;
 mod history;
 mod hooks;
 mod input_history;
 mod instructions;
 mod lineedit;
 mod llm;
+mod markdown;
+mod mdtable;
 mod memory;
 mod mode;
 mod output;
@@ -47,10 +51,13 @@ mod skills;
 mod status;
 mod temperature;
 mod thinking;
+mod timers;
 mod tools;
 mod trajectory;
+mod trust;
 mod turn_commands;
 mod ui;
+mod update;
 mod vision;
 
 use agent::Agent;
@@ -81,7 +88,12 @@ fn register_builtin_tools(agent: &mut Agent) {
         spill_digests: Some(agent.spill_digests_handle()),
         ..Default::default()
     };
-    agent.tools().register(bash::definition(), Box::new(move |args| Ok(json!(bash::run(&bash_config, &args)))));
+    agent.tools().register(
+        bash::definition(),
+        Box::new(move |args| {
+            bash::run_checked(&bash_config, &args).map(|text| json!(text)).map_err(anyhow::Error::msg)
+        }),
+    );
 
     // question tool: blocks until the turn loop answers (see question.rs).
     // Headless (ACP) sessions have no one to answer, so it errors instead.
@@ -152,8 +164,6 @@ enum TermInput {
     Queue(String),
     Eof,
     Interrupt,
-    /// Ctrl-O: expand or collapse thinking.
-    ToggleThinking,
     /// A lone Esc press.
     Escape,
     /// Shift+Tab: cycle the agent mode (normal/plan/auto).
@@ -333,19 +343,27 @@ impl DoublePress {
 /// gesture does not need.
 type DoubleEscape = lineedit::DoubleEscape;
 
-/// The terminal-owning state shared between the SIGWINCH resize task and a live
-/// renderer switch (`Terminal::renderer_switched`). Both must serialise against
-/// each other: a resize that passes its `is_frame()` check and then debounces
-/// must not draw while a transition is mid flip/clear/replay (on frame → legacy
-/// that would reprint the prompt before `replay_transcript`, placing history
-/// after it). `lock` is that serialisation point; the remaining fields are the
-/// state the two draw paths touch, grouped so `Terminal::start` stays lean.
-#[derive(Clone)]
-struct TransitionShared {
-    view: lineedit::SharedView,
-    status: Option<std::sync::Arc<status::StatusLine>>,
-    renderer: std::sync::Arc<ui::Renderer>,
-    lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+/// Wrap an idle terminal read so a background update hint is shown as soon
+/// as it lands, without abandoning the pending read. Shared by every idle
+/// wait (the prompt loop and the timer wait).
+async fn with_update_hints<F: std::future::Future>(
+    next: F,
+    checker: Option<Arc<update::Checker>>,
+    renderer: Arc<ui::Renderer>,
+) -> F::Output {
+    tokio::pin!(next);
+    let Some(checker) = checker else { return next.await };
+    loop {
+        tokio::select! {
+            biased;
+            event = &mut next => return event,
+            _ = checker.hint_ready() => {
+                if let Some(hint) = checker.take_hint() {
+                    renderer.note(&hint);
+                }
+            }
+        }
+    }
 }
 
 struct Terminal {
@@ -359,8 +377,13 @@ struct Terminal {
     /// Editable mid-turn with `/queue` (including removing entries).
     messages: queue::MessageQueue,
     /// Lines typed during a turn join the message queue (only when stdin is a
-    /// terminal); piped lines keep the legacy "queued as later prompts" path.
+    /// terminal); piped lines keep the "queued as later prompts" path.
     steerable: bool,
+    /// The key reader (and so `view`) is live: both stdin and stdout are a
+    /// terminal. With stdout redirected input falls back to `read_line` and
+    /// the editor view never sees keystrokes, so anything relying on its
+    /// quiet timestamps (idle compaction, issue #182) must require this.
+    key_mode: bool,
     /// Where `/settings` saves changes.
     config_path: std::path::PathBuf,
     /// The line being typed (terminal stdin only).
@@ -370,12 +393,6 @@ struct Terminal {
     recents: recents::SharedRecents,
     recents_path: std::path::PathBuf,
     renderer: std::sync::Arc<ui::Renderer>,
-    /// The renderer mode active when the session started; a live `renderer`
-    /// switch in `/settings` is detected against it.
-    renderer_before: crate::frame::RendererMode,
-    /// The status line, kept so a live renderer switch can re-anchor the
-    /// scroll region (legacy) or let the frame clear it (frame).
-    status: Option<std::sync::Arc<status::StatusLine>>,
     /// Set to make the stdin reader yield the terminal to a foreground picker
     /// (a `question`/turn-cap prompt), so the two never race for keystrokes.
     suspend: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -416,10 +433,10 @@ impl Terminal {
         config_path: std::path::PathBuf,
         recents: recents::SharedRecents,
         recents_path: std::path::PathBuf,
-        renderer_before: crate::frame::RendererMode,
-        transition: TransitionShared,
+        view: lineedit::SharedView,
+        renderer: std::sync::Arc<ui::Renderer>,
+        picker_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     ) -> Self {
-        let TransitionShared { view, status, renderer, lock: picker_lock } = transition;
         let (tx, events) = mpsc::unbounded_channel();
         let (want, want_rx) = std::sync::mpsc::channel::<()>();
         let lines = tx.clone();
@@ -427,18 +444,25 @@ impl Terminal {
         let reader_view = view.clone();
         let suspend = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reader_suspend = suspend.clone();
+        let reader_renderer = renderer.clone();
         std::thread::spawn(move || {
             if key_mode {
                 let mut reader = lineedit::LineReader::with_suspend(reader_suspend);
                 let send = |key: lineedit::Key| {
+                    // Ctrl-O is display-only: toggle and redraw right here, at
+                    // the idle prompt and mid-turn alike.
+                    if matches!(key, lineedit::Key::ToggleExpand) {
+                        reader_renderer.toggle_latest();
+                        return;
+                    }
                     let _ = lines.send(match key {
                         lineedit::Key::Line(line) => TermInput::Line(line),
                         lineedit::Key::Queue(line) => TermInput::Queue(line),
                         lineedit::Key::Eof => TermInput::Eof,
                         lineedit::Key::Interrupt => TermInput::Interrupt,
-                        lineedit::Key::ToggleThinking => TermInput::ToggleThinking,
                         lineedit::Key::Escape => TermInput::Escape,
                         lineedit::Key::CycleMode => TermInput::CycleMode,
+                        lineedit::Key::ToggleExpand => return,
                         lineedit::Key::Rejected(note) => TermInput::Rejected(note),
                     });
                 };
@@ -481,13 +505,12 @@ impl Terminal {
             queued: VecDeque::new(),
             messages: queue::MessageQueue::default(),
             steerable: io::stdin().is_terminal(),
+            key_mode,
             config_path,
             view,
             recents,
             recents_path,
             renderer,
-            renderer_before,
-            status,
             suspend,
             suspend_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             picker_lock,
@@ -524,145 +547,6 @@ impl Terminal {
     fn sync_context(&mut self, agent: &Agent) {
         let context = self.view.lock().unwrap().context_handle();
         context.lock().unwrap().config = agent.config().clone();
-    }
-
-    /// Apply a live `renderer` switch from `/settings`: flip the app-owned
-    /// frame renderer, match the line editor's drawing path (frame hook vs
-    /// inline), re-anchor the status line / scroll region, and replay the
-    /// transcript into the now-active renderer. No-op when the mode is
-    /// unchanged. The transcript state is preserved across the flip, so the
-    /// conversation is simply re-emitted into whichever renderer is active.
-    ///
-    /// The whole flip/clear/replay runs under `picker_lock` — the same lock the
-    /// SIGWINCH resize task takes before drawing — so a resize cannot pass its
-    /// `is_frame()` check, finish debouncing mid-transition, and `view.resize()`
-    /// while the screen is being cleared/replayed (which on frame → legacy would
-    /// redraw the prompt before `replay_transcript`, placing history after it).
-    async fn renderer_switched(&mut self, agent: &mut Agent) {
-        let mode = agent.config().renderer;
-        if mode == self.renderer_before {
-            return;
-        }
-        // Serialize against the SIGWINCH resize task: hold the terminal-owning
-        // lock for the whole multi-step transition so no resize redraw can
-        // interleave with the mode flip, screen clear, and transcript replay.
-        let _transition_guard = self.picker_lock.lock().await;
-        self.renderer_before = mode;
-        let switching_to_frame = mode == crate::frame::RendererMode::Frame;
-        // Leaving frame mode: the frame's full redraws cleared the legacy
-        // scrollback, so the legacy transcript is gone — the conversation is
-        // replayed below, once legacy owns the screen again. The interactive
-        // prompt's current line is NOT in the conversation (it is recorded
-        // only when submitted), so replaying every user message cannot
-        // duplicate the line being edited.
-        //
-        // Entering frame mode: legacy output that exists only in renderer
-        // state (deferred notes, the collapsed thinking summary) must move
-        // into the frame transcript BEFORE the frame is activated — once it
-        // is, `drain_pending` (a legacy-state accessor) returns empty, and
-        // the frame's first full redraw clears the scrollback those notes
-        // were headed for.
-        let pending = if switching_to_frame { self.renderer.drain_pending() } else { Vec::new() };
-        // Whether a frame is ACTIVE right now (before the switch). Off a tty
-        // `set_mode(Frame)` leaves `is_frame()` false, so this — not the
-        // configured mode — tells whether the post-switch replay/cleanup is
-        // needed: with no frame ever active, legacy scrollback was never
-        // cleared and replaying would print the whole conversation again.
-        let frame_was_active = self.renderer.is_frame();
-        self.renderer.set_mode(mode);
-        let on = self.renderer.is_frame();
-        // Rebuild the frame hook to match: frame routes every edit through the
-        // single frame writer; legacy draws inline with its own command menu.
-        let renderer = self.renderer.clone();
-        let hook: Option<lineedit::EditHook> = on.then(|| {
-            let h: lineedit::EditHook =
-                std::sync::Arc::new(move |line: &str, cursor: usize, queued: usize, menu: &[String]| {
-                    renderer.set_editor(line, cursor, queued, menu)
-                });
-            h
-        });
-        self.view.lock().unwrap().set_frame_mode(on, hook);
-        // Leaving an active frame: re-own the screen for legacy BEFORE the
-        // editor/status redraw below. The frame's last redraw is still
-        // visible (dropping it emits nothing), so this clears the screen and
-        // scrollback — the replay and the migrated frame-only items reprint
-        // everything — then re-pins the scroll region the frame's redraws
-        // reset, leaving the cursor on the last scrollable row. Doing it
-        // before `view.resize()` (not after) means there is no fresh prompt
-        // for the clear to wipe, and the replay can't start writing on the
-        // reserved status row. When no status line is installed (a TTY with
-        // `AGENTIC_NO_STATUS` or fewer than five rows) there is no region to
-        // re-pin, but the frame's display must STILL be cleared — skipping it
-        // would leave the replay writing over the stale frame copy.
-        if !on && frame_was_active {
-            match &self.status {
-                Some(status) => status.repin_scroll_region(),
-                None => crate::status::clear_display(),
-            }
-        }
-        // Re-anchor the scroll region (legacy) / let the frame re-own the
-        // screen (frame), and recompute the prompt at the current size.
-        if let Some(status) = &self.status {
-            status.resize();
-        }
-        if !on {
-            // The frame left the cursor on the bottom row and the editor's
-            // drawn state refers to rows the frame owned: reset it to the
-            // single prompt row the next loop print establishes, or the
-            // resize redraw would climb into the status row / frame content.
-            self.view.lock().unwrap().reset_drawing();
-        }
-        // Leaving an ACTIVE frame, skip the editor's resize redraw: it would
-        // reprint the inline prompt NOW, before `replay_transcript` below
-        // restores the history — the renderer still counts itself at a line
-        // start, so the first restored item lands after that prompt and the
-        // next loop print draws a second one. `reset_drawing` above already
-        // re-anchored the editor to the single prompt row, so replaying first
-        // and letting the next loop print the prompt keeps it where it
-        // belongs. Every other path (entering frame mode, or legacy with no
-        // frame ever active) still needs the redraw to recompute the prompt at
-        // the current size.
-        if on || !frame_was_active {
-            self.view.lock().unwrap().resize();
-        }
-        if on {
-            // A fresh frame starts empty, so the transcript must be rebuilt
-            // into it (its first full redraw clears scrollback and re-owns the
-            // screen). Seed the drained legacy output first so it lands ahead
-            // of the conversation, then replay the conversation as one batch:
-            // rendering per event would redo the whole transcript layout each
-            // time (O(events²) on a long session). The emitted events reach the
-            // installed sink (`Renderer::event`), which routes them into the
-            // now-active frame — no separate per-event tap is needed (a tap via
-            // `replay_event` would no-op here: it early-returns while the frame
-            // is active).
-            //
-            // DOCUMENTED LIMITATION: only `drain_pending` (deferred notes + the
-            // collapsed reasoning summary) migrates into the frame here.
-            // Transient legacy output that `print_block`/`print_raw` wrote
-            // straight to scrollback in legacy mode — `/help`, the banner, raw
-            // JSON exports — was never recorded, so it is erased when the
-            // frame's first redraw clears scrollback. Keeping a renderer-owned
-            // ordered transcript in BOTH modes and replaying it here without
-            // duplicating the conversation entries `replay_history` re-derives
-            // is a substantial redesign with real double-print hazards; we
-            // accept the incidental loss on a live legacy → frame switch.
-            self.renderer.push_items(pending);
-            self.renderer.frame_batch(|| agent.replay_history());
-        } else if frame_was_active {
-            // Legacy scrollback was cleared by the frame's redraws: reprint
-            // the visible transcript so it stays accessible. `set_mode`
-            // captured the frame's full transcript (in on-screen order), and
-            // `replay_transcript` reprints it now — AFTER the clear above, so
-            // nothing is erased. Replaying the captured transcript rather than
-            // `Agent::conversation` keeps the switch lossless: frame-only
-            // items, turns and plan updates stay in their shown order, the
-            // real pre-compaction turns are restored (the compacted
-            // conversation would print the synthetic summary as a user turn
-            // and drop the compacted-away turns), and the current plan prints
-            // exactly once (it is simply the last `Item::Plan`).
-            self.renderer.replay_transcript();
-        }
     }
 
     /// Make the stdin reader yield the terminal so a foreground picker can own
@@ -717,13 +601,13 @@ impl Terminal {
     }
 
     /// Apply a `/queue` edit (`remove`/`edit`/`clear`) and say what happened.
-    fn edit_queue(&mut self, op: &queue::QueueOp) -> String {
-        let result = queue::apply(&mut self.messages, op);
+    fn edit_queue(&mut self, steers: Option<&dyn queue::PendingSteers>, op: &queue::QueueOp) -> String {
+        let result = queue::apply(&mut self.messages, steers, op);
         self.set_queue_status();
         result
     }
 
-    /// Keep the status line's queue count in sync (None hides the segment).
+    /// Keep the editor's queue count in sync (None hides the indicator).
     fn set_queue_status(&self) {
         let count = self.messages.len();
         self.view.lock().unwrap().set_queue_count((count > 0).then_some(count));
@@ -737,14 +621,7 @@ impl Terminal {
         // or the next `request_line` would queue a second concurrent reader
         // that could race a dialoguer picker for stdin. CycleMode (Shift+Tab)
         // is emitted the same way and belongs in this set.
-        if !matches!(
-            input,
-            TermInput::Interrupt
-                | TermInput::ToggleThinking
-                | TermInput::Escape
-                | TermInput::CycleMode
-                | TermInput::Rejected(_)
-        ) {
+        if !matches!(input, TermInput::Interrupt | TermInput::Escape | TermInput::CycleMode | TermInput::Rejected(_)) {
             self.outstanding = false;
         }
         input
@@ -760,14 +637,15 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
     let stats = agent.context_stats();
     let renderer = terminal.renderer.clone();
     if terminal.steerable && ui::verbosity() >= ui::Verbosity::Verbose {
-        renderer.note("[running: Enter sends a message to steer the agent, Ctrl-Enter queues it for later (/queue lists, edits, removes), Esc Esc or Ctrl-C to cancel, Ctrl-O to expand thinking]");
+        renderer.note("[running: Enter sends a message to steer the agent, Ctrl-Enter queues it for later (/queue lists, edits, removes), Esc Esc or Ctrl-C to cancel]");
     }
-    // Blank line after LLM output (legacy renderer only; the frame renderer
-    // owns the screen and must not receive stray direct writes).
+    // Blank line after LLM output (plain output only; the frame renderer owns
+    // the screen and must not receive stray direct writes).
     if !renderer.is_frame() {
         println!();
     }
     renderer.begin_turn();
+    herdr::report(herdr::State::Working, None, None);
     // Keep the prompt's busy spinner moving while the turn runs, even when no
     // output arrives (frame renderer only; `tick` is a no-op otherwise).
     // A picker (a question from the agent, the turn cap) holds `picker_lock`
@@ -836,6 +714,8 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                         // Yield stdin to the picker so the line reader does not
                         // race it for the answer keystrokes.
                         let gate = terminal.suspend_input();
+                        let reason = request.questions().first().map(|q| sanitize_terminal_line(&q.question));
+                        herdr::report(herdr::State::Blocked, reason.as_deref(), None);
                         // The picker's clock is the user's, not the agent's:
                         // stop counting working time while it owns the terminal.
                         let work = WorkClock::pause(&renderer);
@@ -845,6 +725,7 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                         // reader never resumes while a dialoguer is still active.
                         let answer = prompt_question(request.questions(), &control, &renderer, terminal.picker_lock(), gate).await;
                         questions.resolve(answer);
+                        herdr::report(herdr::State::Working, None, None);
                         drop(work);
                         // The picker wrote over the owned frame via dialoguer;
                         // force a full redraw so the next differential render
@@ -863,8 +744,10 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                     }
                     let gate = terminal.suspend_input();
                     let work = WorkClock::pause(&renderer);
+                    herdr::report(herdr::State::Blocked, Some("turn limit reached: continue?"), None);
                     let decision = prompt_cap_reached(&renderer, terminal.picker_lock(), gate).await;
                     cap.decide(decision);
+                    herdr::report(herdr::State::Working, None, None);
                     drop(work);
                     // Repaint after the dialoguer picker clobbered the frame,
                     // deferred behind the picker lock so it never races an
@@ -884,9 +767,6 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                         } else {
                             renderer.urgent_note("[Esc again to cancel]");
                         }
-                    }
-                    TermInput::ToggleThinking => {
-                        renderer.toggle_thinking();
                     }
                     TermInput::Rejected(note) => renderer.transient_note(&note),
                     TermInput::CycleMode => {
@@ -920,7 +800,7 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                                 // `/queue` only touches the message queue, so it is
                                 // safe — and most useful — while a turn is running.
                                 match op {
-                                    Ok(op) => renderer.note(&terminal.edit_queue(&op)),
+                                    Ok(op) => renderer.note(&terminal.edit_queue(Some(&control), &op)),
                                     Err(usage) => renderer.note(&format!("[{usage}]")),
                                 }
                             }
@@ -936,6 +816,7 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                                 turn_commands::Timing::Immediate => {
                                     let stats = stats.lock().unwrap().clone();
                                     let plan = control.plan();
+                                    let timers = control.timers();
                                     // Some immediate commands do synchronous disk
                                     // I/O while rendering — `/trajectory` reads and
                                     // decodes the whole session log, and `/providers`
@@ -950,7 +831,7 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                                     let snap = snapshot.clone();
                                     let cmd = text.to_string();
                                     let label = cmd.clone();
-                                    let out = tokio::task::spawn_blocking(move || snap.output(&cmd, &stats, &plan))
+                                    let out = tokio::task::spawn_blocking(move || snap.output(&cmd, &stats, &plan, &timers))
                                         .await
                                         .unwrap_or_else(|_| {
                                             Some(turn_commands::Output::Block(format!(
@@ -962,7 +843,7 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                                         // Raw exports must stay byte-exact: route
                                         // them through `turn_raw`, which prints
                                         // verbatim in frame mode and defers a
-                                        // stamp/DIM-free write in legacy mode
+                                        // stamp/DIM-free write in plain output
                                         // (routing via `turn_block` would decorate
                                         // the payload and corrupt JSON/Markdown).
                                         Some(turn_commands::Output::Raw(out)) => renderer.turn_raw(&out),
@@ -983,14 +864,19 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                                 // queued (see below).
                                 // `//…` steers with a message that starts with `/`.
                                 let text = commands::unescape_prompt(text).unwrap_or(text);
-                                control.steer(text, None);
+                                let id = terminal.messages.reserve_id();
+                                control.steer_with_id(text, id);
                                 // The frame renderer shows the steer as a user
-                                // message once absorbed; the legacy one shows only
+                                // message once absorbed; plain output shows only
                                 // this note, so it carries the text.
                                 if renderer.is_frame() {
-                                    renderer.note("↪ steering: the agent reads this at its next step (Ctrl-Enter queues instead)");
+                                    renderer.note(&format!(
+                                        "↪ steer #{id}: the agent reads this at its next step — /queue remove {id} to withdraw"
+                                    ));
                                 } else {
-                                    renderer.note(&format!("↪ steer: {text} — read at the agent's next step (Ctrl-Enter queues instead)"));
+                                    renderer.note(&format!(
+                                        "↪ steer #{id}: {text} — read at the agent's next step; /queue remove {id} to withdraw"
+                                    ));
                                 }
                             }
                             SteerRoute::Enqueue => {
@@ -1037,7 +923,15 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
             // Queued lines run through `run_command`: re-escape a steer that
             // starts with `/` so it is sent as a message, not refused.
             let text = if steer.text.starts_with('/') { format!("/{}", steer.text) } else { steer.text.clone() };
-            terminal.queue_message(&text);
+            match steer.id {
+                Some(id) => {
+                    terminal.messages.push_with_id(id, text);
+                    terminal.set_queue_status();
+                }
+                None => {
+                    terminal.queue_message(&text);
+                }
+            }
         }
     }
     outcome
@@ -1070,8 +964,16 @@ const AUTO_AWAY_SECS: u64 = 15;
 /// (`memory::is_line_break`) fold them as line breaks, so a hand-edited value
 /// could otherwise smuggle a forged extra line (e.g. a fake `/memory` row) past
 /// the filter.
+///
+/// Horizontal tabs (`\t`) are the one control that is *expanded* rather than
+/// dropped: a tab is legitimate column layout (e.g. numbered `read_file` output
+/// `   1\tcode`), so deleting it would merge adjacent columns into one unreadable
+/// run. Each tab is replaced by the spaces needed to reach the next 8-column tab
+/// stop — exactly what a terminal renders — which keeps the columns separated
+/// while still removing the raw control byte, preserving the terminal-safety
+/// protection (a space can neither move the cursor nor begin an escape).
 pub(crate) fn sanitize_terminal_text(s: &str) -> String {
-    s.chars().filter(|c| (!c.is_control() || *c == '\n') && *c != '\u{2028}' && *c != '\u{2029}').collect()
+    sanitize_terminal_chars(s, true)
 }
 
 /// Like [`sanitize_terminal_text`], but for single-line fields: drops every
@@ -1080,13 +982,249 @@ pub(crate) fn sanitize_terminal_text(s: &str) -> String {
 /// model-controlled text rendered on one row — picker prompts, option
 /// labels/descriptions and plan titles — where a line feed is not multi-line
 /// content to keep but injected layout that would spill an unprefixed extra row
-/// or move an interactive selector's cursor.
+/// or move an interactive selector's cursor. Horizontal tabs are expanded to
+/// spaces (next 8-column tab stop) just as in [`sanitize_terminal_text`], so
+/// tab-separated columns stay separated instead of merging.
 pub(crate) fn sanitize_terminal_line(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control() && *c != '\u{2028}' && *c != '\u{2029}').collect()
+    sanitize_terminal_chars(s, false)
+}
+
+/// Shared core of [`sanitize_terminal_text`]/[`sanitize_terminal_line`]: strip
+/// control characters and the U+2028/U+2029 line separators, but expand each
+/// horizontal tab to spaces (next 8-column tab stop) so tab-separated columns
+/// survive the filter. `keep_newlines` keeps `\n` (and resets the tab-stop
+/// column) for multi-line text; a single-line field drops `\n` with the other
+/// controls. Tab stops are measured in terminal **cell** widths (via
+/// `UnicodeWidthChar::width`, as the frame sanitizer does), not character
+/// counts, so a wide CJK glyph advances two columns and a zero-width combining
+/// mark advances none — otherwise `界\tX` would misplace `X` and tab-aligned
+/// Unicode columns would drift.
+fn sanitize_terminal_chars(s: &str, keep_newlines: bool) -> String {
+    const TAB_WIDTH: usize = 8;
+    let mut out = String::with_capacity(s.len());
+    let mut col = 0usize;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // Consume a *complete* ANSI escape sequence rather than dropping
+            // only the ESC byte and leaving its body (e.g. `[31m`) as visible
+            // text. A bare drop turns `\x1b[31mred\x1b[0m` into `[31mred[0m`,
+            // whose stray `[31m…[0m` eats preview width and can truncate real
+            // tool output; stripping the whole sequence keeps the text clean
+            // while still letting nothing drive the terminal (issue #150).
+            '\u{1b}' => match chars.peek() {
+                // CSI: `\x1b[` … final byte in `@`..=`~`.
+                Some('[') => {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: `\x1b]` … terminated by BEL (`\x07`) or ST (`\x1b\`).
+                Some(']') => {
+                    chars.next();
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' {
+                            break;
+                        }
+                        if c == '\u{1b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // A lone/unrecognized ESC drops just the ESC byte, as before;
+                // any following printable stays and control bytes are filtered.
+                _ => {}
+            },
+            '\t' => {
+                let spaces = TAB_WIDTH - (col % TAB_WIDTH);
+                for _ in 0..spaces {
+                    out.push(' ');
+                }
+                col += spaces;
+            }
+            '\n' if keep_newlines => {
+                out.push('\n');
+                col = 0;
+            }
+            '\u{2028}' | '\u{2029}' => {}
+            c if c.is_control() => {}
+            c => {
+                out.push(c);
+                // Advance by the glyph's terminal cell width so tab stops stay
+                // aligned with what the terminal actually renders (wide glyph =
+                // 2 cells, zero-width mark = 0); unknown/non-printing falls back
+                // to 0, matching the frame sanitizer's `cell_width`.
+                col += UnicodeWidthChar::width(c).unwrap_or(0);
+            }
+        }
+    }
+    out
+}
+
+/// Whether a due idle timer may start its turn now, or must yield. The two idle
+/// paths (the preliminary `--wait-timers` wait and the prompt-read loop) both
+/// use this so the rule stays identical across them: a queued Ctrl-C always
+/// wins — the interrupt must route through the exit/double-press handler instead
+/// of starting a timer turn, which reads only new channel events and would run
+/// its tools despite the stop request — a *fresh* half-typed draft holds the
+/// timer back until the line is sent, cleared, or goes stale (no keystrokes for
+/// [`lineedit::DRAFT_HOLD`]; an abandoned AFK draft is parked and restored
+/// after the turn), and an **armed Ctrl-C exit window** (a first press waiting
+/// for its pair) holds the timer back too: otherwise a timer coming due inside
+/// the two-press window would start an automatic turn, and the user's confirming
+/// second Ctrl-C would merely cancel that surprise turn instead of exiting as
+/// promised (issue #150).
+pub(crate) fn deliver_due_timer(due: bool, draft_holds: bool, interrupt_queued: bool, exit_armed: bool) -> bool {
+    due && !draft_holds && !interrupt_queued && !exit_armed
+}
+
+/// Whether the idle prompt may start an opportunistic compaction now (issue
+/// #182). `due` is the agent's half of the gate (`Agent::idle_compact_due`:
+/// enabled, past the auto-compaction threshold, once per crossing) already
+/// combined with the terminal being steerable. The prompt must then have been
+/// quiet — no keystrokes, including in a draft — for `hold`, so a fresh draft
+/// holds it back and a stale one is parked. Like a due timer it yields to a
+/// queued Ctrl-C and to an armed exit window.
+pub(crate) fn deliver_idle_compact(
+    due: bool,
+    quiet_for: std::time::Duration,
+    hold: std::time::Duration,
+    interrupt_queued: bool,
+    exit_armed: bool,
+) -> bool {
+    due && quiet_for >= hold && !interrupt_queued && !exit_armed
+}
+
+/// Bounded idle-compaction eligibility recheck while not yet due (issue #182).
+const IDLE_COMPACT_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether an idle compaction may start now, and when to recheck if not
+/// (issue #182). Requires the key reader (`Terminal::key_mode`), since only
+/// it keeps the editor's quiet timestamps current. Non-mutating: the caller
+/// that acts on it re-checks and parks the draft under one view lock.
+fn idle_compact_poll(
+    agent: &Agent,
+    terminal: &Terminal,
+    shown: std::time::Instant,
+    hold: std::time::Duration,
+    interrupt_queued: bool,
+    exit_armed: bool,
+) -> (bool, Option<std::time::Instant>) {
+    let due = terminal.key_mode && agent.idle_compact_due_polled();
+    if !due {
+        // A background capability probe can shrink the window and make idle
+        // compaction eligible without waking the prompt (its `Context` event
+        // only updates the renderer), so while idle compaction could apply,
+        // keep a bounded eligibility recheck instead of waiting indefinitely.
+        let config = agent.config();
+        let recheck = (terminal.key_mode && config.idle_compact && config.auto_compact)
+            .then(|| std::time::Instant::now() + IDLE_COMPACT_RECHECK);
+        return (false, recheck);
+    }
+    let quiet = terminal.view.lock().unwrap().quiet_since(shown);
+    let now = std::time::Instant::now();
+    let deliver = deliver_idle_compact(due, now.saturating_duration_since(quiet), hold, interrupt_queued, exit_armed);
+    // Wake when the hold would elapse, so the compaction starts without
+    // waiting for a keystroke (bounded below to avoid a busy spin).
+    (deliver, Some((quiet + hold).max(now + std::time::Duration::from_millis(200))))
+}
+
+/// The idle-compaction hold: `idle_compact_hold_secs`, else
+/// [`lineedit::IDLE_COMPACT_HOLD`].
+fn idle_compact_hold(config: &config::Config) -> std::time::Duration {
+    config.idle_compact_hold_secs.map_or(lineedit::IDLE_COMPACT_HOLD, std::time::Duration::from_secs)
+}
+
+/// Run the idle compaction with the same Esc Esc / Ctrl-C cancel as
+/// `/compact`, and say what happened in the transcript — it is never silent.
+async fn run_idle_compaction(agent: &mut Agent, terminal: &mut Terminal) {
+    let control = agent.control();
+    let stats = agent.context_stats();
+    let _phase = lineedit::NonIdlePhase::enter(&terminal.view);
+    terminal.renderer.transient_note("compacting (idle)… Esc Esc to cancel");
+    let result = drive_compaction(agent.idle_compact(), control.clone(), stats, terminal).await;
+    terminal.renderer.clear_transient();
+    // `idle_compact` applies a `/model` left pending by the previous turn,
+    // which updates the agent's config but not the shared editor context.
+    // Resync on every outcome — report, no report, or error — so `/model`
+    // completion treats the newly switched model as `current`, as the
+    // between-turns path does after `run_interactive_turn`.
+    terminal.sync_context(agent);
+    match result {
+        Ok(Some(report)) => terminal.renderer.note(&format!("[{report}]")),
+        Ok(None) if control.is_cancelled() => terminal.renderer.note("[idle compaction cancelled]"),
+        Ok(None) => {}
+        Err(e) => terminal.renderer.note(&format!("[idle compaction failed: {e:#}]")),
+    }
+}
+
+/// Whether an end-of-input (Ctrl-D / closed pipe) seen during the idle timer
+/// wait should be *suppressed* (remembered, and the wait resumed) rather than
+/// ending the session. Only a headless `--wait-timers` run suppresses it: its
+/// driver may hold stdin open while the timers — the whole point of the run —
+/// are still pending. On an interactive terminal Ctrl-D must always exit
+/// normally, so a steerable session never suppresses EOF even under
+/// `--wait-timers` (issue #150).
+pub(crate) fn suppress_eof_for_timers(wait_timers: bool, steerable: bool) -> bool {
+    wait_timers && !steerable
+}
+
+/// The current session as Herdr should resume it, if it is saved to disk
+/// (an unsaved session cannot be resumed).
+fn herdr_session(agent: &Agent, extra: &[String]) -> Option<herdr::Session> {
+    if !herdr::active() {
+        return None;
+    }
+    agent.session_path()?;
+    let id = agent.session_id()?;
+    let model = format!("{}/{}", agent.provider_name(), agent.model_name());
+    let resume = herdr::resume_argv(id, Some(&model), extra)?;
+    Some(herdr::Session { id: id.to_string(), resume })
+}
+
+/// How a question is shown above its picker: `(body, prompt)`. A plain,
+/// single-line question that fits stays inline as the picker prompt. Anything
+/// else (several lines, markdown, too wide) is rendered as markdown into a body
+/// printed above the picker, with a short prompt: dialoguer's prompt is one
+/// row, so a long or structured question would otherwise collapse into a
+/// single unreadable line. The text is sanitised first (escapes dropped, line
+/// feeds kept), so the model cannot smuggle terminal controls through it.
+fn question_prompt(question: &str, width: usize) -> (Option<String>, String) {
+    // `trim_end` only: leading indentation is markdown-significant (an
+    // indented first line is a code block), so `trim()` would silently
+    // degrade a question that opens with indented code to paragraph text.
+    let text = sanitize_terminal_text(question.trim_end());
+    // Leave room for dialoguer's `? ` prefix and the `›` after the prompt.
+    let rendered = markdown::render(&text, width.saturating_sub(4).max(20));
+    // Inline only if the question genuinely fits one row: no line breaks,
+    // unchanged by markdown, and narrow enough for the prompt row itself
+    // (text + `? ` prefix + `› ` suffix). Measure terminal cells, not bytes,
+    // so wide glyphs count double. Without the width check an over-wide
+    // question stays inline on a narrow terminal and the picker wraps.
+    let fits = text_width(&text) <= width.saturating_sub(4);
+    if fits && !rendered.contains('\n') && rendered == text {
+        return (None, text);
+    }
+    (Some(rendered), "Your answer".to_string())
+}
+
+/// Terminal-cell width of the widest line of `s` (unicode-aware).
+fn text_width(s: &str) -> usize {
+    s.lines().map(|line| line.chars().map(|c| UnicodeWidthChar::width(c).unwrap_or(0)).sum()).max().unwrap_or(0)
 }
 
 fn ask_one(q: &question::Question) -> Result<Option<String>> {
     use dialoguer::{Input, Select};
+    let width = status::stderr_terminal_size().map_or(80, |(_, cols)| cols as usize);
+    let (body, prompt) = question_prompt(&q.question, width);
+    if let Some(body) = body {
+        // Dialoguer draws on stderr; the body goes just above it.
+        eprintln!("\n{body}\n");
+    }
     let mut labels: Vec<String> = q
         .options
         .iter()
@@ -1105,8 +1243,7 @@ fn ask_one(q: &question::Question) -> Result<Option<String>> {
     } else {
         None
     };
-    let choice =
-        Select::new().with_prompt(sanitize_terminal_line(&q.question)).items(&labels).default(0).interact_opt()?;
+    let choice = Select::new().with_prompt(prompt).items(&labels).default(0).interact_opt()?;
     match choice {
         None => Ok(None),
         Some(i) if Some(i) == custom_index => {
@@ -1343,7 +1480,7 @@ fn classify_steer_input(text: &str, steer: bool) -> SteerRoute {
         SteerRoute::QueueCommand(op)
     } else if let Some(arg) = text.strip_prefix("/thinking ").map(str::trim).filter(|a| !a.is_empty()) {
         SteerRoute::Thinking(thinking_arg(arg))
-    } else if text.starts_with('/') && commands::unescape_prompt(text).is_none() {
+    } else if commands::is_command(text) {
         SteerRoute::DeferCommand
     } else if steer {
         SteerRoute::Steer
@@ -1352,8 +1489,9 @@ fn classify_steer_input(text: &str, steer: bool) -> SteerRoute {
     }
 }
 
-/// Whether `/trajectory` / `--trajectory` should open a pager: both ends are
-/// a terminal and the ledger doesn't fit on one screen.
+/// Whether `--trajectory` should open a pager: both ends are a terminal and
+/// the ledger doesn't fit on one screen. (In a session, `/trajectory` always
+/// pages on a terminal, so it doesn't stay in the scrollback.)
 fn trajectory_pageable(traj: &trajectory::Trajectory) -> bool {
     io::stdin().is_terminal()
         && io::stdout().is_terminal()
@@ -1393,12 +1531,32 @@ async fn run_compaction(
     // either).
     let _phase = lineedit::NonIdlePhase::enter(&terminal.view);
     let compaction = agent.compact(mode, instructions);
+    drive_compaction(compaction, control, stats, terminal).await
+}
+
+/// Drive a compaction future to completion while the terminal stays live:
+/// Ctrl-C or Esc Esc cancels it through `control`, `/queue` edits apply, and
+/// other input is queued for the prompt loop. Shared by `/compact` and the
+/// idle compaction (issue #182) so both cancel the same way.
+async fn drive_compaction<R>(
+    compaction: impl std::future::Future<Output = R>,
+    control: agent::TurnControl,
+    stats: context::SharedStats,
+    terminal: &mut Terminal,
+) -> R {
     tokio::pin!(compaction);
     let mut escape = DoubleEscape::default();
     // The loop only exits by resolving the compaction future; the guard above
     // restores the idle `Prompt` mode when it drops at function exit, so there
     // is no explicit restore to skip even if a future edit adds an early return.
     let report = loop {
+        // Keep a read outstanding: a submitted line ends the reader's current
+        // read, and without a fresh request further keys — Esc Esc, `/queue`
+        // edits — would go unread until the compaction finished. Same EOF
+        // guard as `run_interactive_turn`: never re-request after end of input.
+        if !terminal.queued.iter().any(|i| matches!(i, TermInput::Eof)) {
+            terminal.request_line();
+        }
         tokio::select! {
             biased;
             report = &mut compaction => break report,
@@ -1415,9 +1573,6 @@ async fn run_compaction(
                     } else {
                         diag(&terminal.renderer, "[Esc again to cancel]");
                     }
-                }
-                TermInput::ToggleThinking => {
-                    terminal.renderer.toggle_thinking();
                 }
                 TermInput::Rejected(note) => terminal.renderer.transient_note(&note),
                 TermInput::CycleMode => {
@@ -1441,7 +1596,7 @@ async fn run_compaction(
                         terminal.renderer.clear_transient();
                         match op {
                             Ok(op) => {
-                                let result = terminal.edit_queue(&op);
+                                let result = terminal.edit_queue(None, &op);
                                 terminal.renderer.note(&result);
                             }
                             Err(usage) => terminal.renderer.note(&format!("[{usage}]")),
@@ -1462,8 +1617,8 @@ async fn run_compaction(
             },
         }
     };
-    // The `NonIdlePhase` guard restores the idle prompt when it drops here, so
-    // the next read's Esc Esc gesture is live again.
+    // The caller's `NonIdlePhase` guard restores the idle prompt when it
+    // drops, so the next read's Esc Esc gesture is live again.
     report
 }
 
@@ -1551,6 +1706,7 @@ fn memory_command(agent: &mut Agent, args: &str) -> String {
             )
         };
     }
+    let stats = store.recall_stats();
     let mut out = vec![format!(
         "{} memor{} (memory is {}; edit the files under {}{}):",
         entries.len(),
@@ -1562,7 +1718,7 @@ fn memory_command(agent: &mut Agent, args: &str) -> String {
     for (scope, entry) in &entries {
         // Sanitise every interpolated field before it reaches the terminal: the
         // JSONL is documented as human-editable, so a record can carry `\r`, ESC,
-        // or other control bytes that the legacy renderer would otherwise print
+        // or other control bytes that plain output would otherwise print
         // verbatim (`print_block` → `println!`), enabling terminal escape
         // sequences or forged list lines. The ID and evidence are single-line
         // fields, so they use `sanitize_terminal_line`, which drops `\n` too:
@@ -1579,6 +1735,14 @@ fn memory_command(agent: &mut Agent, args: &str) -> String {
         );
         if let Some(evidence) = &entry.evidence {
             line.push_str(&format!(" (check: {})", sanitize_terminal_line(evidence)));
+        }
+        if let Some(kind) = entry.kind.filter(|k| *k != memory::Kind::Hint) {
+            line.push_str(&format!(" [{}]", kind.as_str()));
+        }
+        // Recall noise (issue #166): how often a memory was recalled from a
+        // tool call, and how often that recall was followed by reading it.
+        if let Some((fired, used)) = stats.get(&entry.id) {
+            line.push_str(&format!(" (recalled {fired}×, used {used}×)"));
         }
         out.push(line);
     }
@@ -1622,7 +1786,7 @@ fn resume_command(agent: &mut Agent, arg: &str, terminal: &mut Terminal) -> Resu
                 resume::Pick::Selected(id) => id,
                 // The picker already printed "No saved sessions to resume." to
                 // stderr. In frame mode the repaint above painted over it, so
-                // repeat it where the user can see it; with the legacy renderer
+                // repeat it where the user can see it; with plain output
                 // frame_resize() is a no-op and the stderr notice is still on
                 // screen, so printing again would duplicate it. Keep
                 // "Session unchanged" for an actual Esc.
@@ -1652,7 +1816,7 @@ fn resume_command(agent: &mut Agent, arg: &str, terminal: &mut Terminal) -> Resu
     agent.load_session(&id)?;
     terminal.renderer.clear_screen();
     // As at startup with --resume: the frame renderer rebuilds the
-    // transcript from the loaded conversation; the legacy one starts clean.
+    // transcript from the loaded conversation; plain output starts clean.
     if terminal.renderer.is_frame() {
         agent.replay_history();
     }
@@ -1660,7 +1824,178 @@ fn resume_command(agent: &mut Agent, arg: &str, terminal: &mut Terminal) -> Resu
     Ok(())
 }
 
-async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> Result<bool> {
+/// `/update`: install the latest release through the channel this binary was
+/// installed from (`npm install -g`, `brew upgrade` or `cargo install`), with the installer's
+/// progress attached to the terminal. Only at idle; on failure the running
+/// session is untouched.
+async fn update_command(terminal: &mut Terminal, checker: Option<&update::Checker>) -> Result<()> {
+    if terminal.outstanding {
+        terminal.renderer.print_block("/update runs the installer: run it at the prompt once the turn is over");
+        return Ok(());
+    }
+    // Never install from an automated run: piped input or output, or a CI
+    // runner, uses a deliberately pinned version (the same rule that gates
+    // the background check).
+    if !update_allowed(io::stdin().is_terminal(), io::stdout().is_terminal(), update::is_ci()) {
+        terminal.renderer.print_block(
+            "/update only runs in an interactive terminal outside CI; install the update with your package manager",
+        );
+        return Ok(());
+    }
+    let channel = checker.map(update::Checker::channel).unwrap_or_else(update::Channel::detect);
+    if channel == update::Channel::Other {
+        // Never touch a standalone/tarball/dev install; say where releases live.
+        let outcome = update::run_installer(channel, &update::launch_exe(), update::spawn_installer).await;
+        for line in outcome.lines() {
+            terminal.renderer.print_block(&line);
+        }
+        return Ok(());
+    }
+    // A fresh check, so an "already up to date" answer is not the hourly
+    // cache. When the background checker is disabled (`check_updates = false`
+    // or an opt-out env var) there is no shared checker, so build a transient
+    // one for this explicit command: without it `/update` would run the
+    // installer even when the running version is current. Failure is silent
+    // here too: the install below is the real test.
+    let transient;
+    let checker = match checker {
+        Some(checker) => checker,
+        None => {
+            transient = update::Checker::new(channel, update::default_state_path());
+            &transient
+        }
+    };
+    let latest = checker.force_check().await;
+    if let Some(latest) = latest.filter(|v| !update::is_newer(v, env!("CARGO_PKG_VERSION"))) {
+        terminal.renderer.print_block(&format!("nano-coder is up to date ({latest})"));
+        return Ok(());
+    }
+    // Hand the terminal to the installer the way the pager handoff does: the
+    // stdin reader yields, the frame UI releases the screen, and the terminal
+    // modes are restored so the installer sees a normal terminal (and Ctrl-C
+    // interrupts it like any long command). The frame is repainted afterwards
+    // on every path.
+    let gate = terminal.suspend_input();
+    let _picker_guard = terminal.picker_lock().lock_owned().await;
+    // No clear_screen() here: it drops the frame's transcript, and the
+    // repaint below must restore the session history on every path.
+    lineedit::restore_terminal();
+    let outcome = update::run_installer(channel, &update::launch_exe(), update::spawn_installer).await;
+    gate.release();
+    drop(_picker_guard);
+    terminal.renderer.frame_resize();
+    for line in outcome.lines() {
+        terminal.renderer.print_block(&line);
+    }
+    Ok(())
+}
+
+/// Whether `/update` may run the installer: only in an interactive terminal
+/// (both ends) outside CI.
+fn update_allowed(stdin_tty: bool, stdout_tty: bool, ci: bool) -> bool {
+    stdin_tty && stdout_tty && !ci
+}
+
+/// `/relaunch`: exec the binary again — re-resolved, so a just-installed
+/// update is picked up — with the original argv plus `--resume <current
+/// session>`, keeping the session's scrollback and transcript. Only at idle;
+/// an unsent draft or queued messages are confirmed before being discarded.
+async fn relaunch_command(agent: &mut Agent, terminal: &mut Terminal) -> Result<()> {
+    if terminal.outstanding {
+        terminal.renderer.print_block("/relaunch restarts nano-coder: run it at the prompt once the turn is over");
+        return Ok(());
+    }
+    // Warn and confirm before discarding an unsent draft or queued messages.
+    let draft = terminal.view.lock().unwrap().has_draft();
+    let queued = terminal.messages.len();
+    if draft || queued > 0 {
+        let what = match (draft, queued) {
+            (true, 0) => "your unsent draft".to_string(),
+            (false, n) => format!("{n} queued message(s)"),
+            (true, n) => format!("your unsent draft and {n} queued message(s)"),
+        };
+        let gate = terminal.suspend_input();
+        let _picker_guard = terminal.picker_lock().lock_owned().await;
+        let confirmed = tokio::task::spawn_blocking(move || {
+            dialoguer::Confirm::new()
+                .with_prompt(format!("Relaunching discards {what}. Relaunch now?"))
+                .default(false)
+                .interact_opt()
+                .ok()
+                .flatten()
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false);
+        gate.release();
+        drop(_picker_guard);
+        terminal.renderer.frame_resize();
+        if !confirmed {
+            terminal.renderer.print_block("Relaunch cancelled");
+            return Ok(());
+        }
+        terminal.view.lock().unwrap().clear_input_if_any();
+    }
+    // The session must be on disk for `--resume` to replay it. With
+    // persistence off there is nothing to resume into, so a relaunch would
+    // silently start clean — refuse instead.
+    let Some(id) = agent.session_id().map(str::to_string).filter(|_| agent.session_path().is_some()) else {
+        terminal.renderer.print_block(
+            "This session isn't saved (persist_sessions = false), so a relaunch cannot resume it. \
+             Set persist_sessions = true, or use /restart for a fresh session.",
+        );
+        return Ok(());
+    };
+    // The session log is appended unbuffered (turn ends are synced), so
+    // nothing needs flushing; the new process reopens the file.
+    // The launch path, captured at startup: after an update replaced the
+    // binary, `current_exe()` names the unlinked old inode on Linux, while
+    // the launch path holds the new install.
+    let exe = update::launch_exe();
+    let argv: Vec<String> = env::args().skip(1).collect();
+    let argv = update::relaunch_argv(&argv, &id);
+    terminal.renderer.print_block(&format!("Relaunching into session {id} (resume later with --resume {id})"));
+    // Restore the terminal modes (raw mode, bracketed paste, key reporting)
+    // before handing over; the new process re-enters them itself.
+    lineedit::restore_terminal();
+    herdr::release();
+    let err = exec(&exe, &argv);
+    // Only reached when the exec itself failed.
+    terminal.renderer.frame_resize();
+    terminal.renderer.print_block(&format!("Relaunch failed: could not exec {}: {err}", exe.display()));
+    Ok(())
+}
+
+/// Replace this process with `exe` running `argv` (same cwd and environment).
+#[cfg(unix)]
+fn exec(exe: &std::path::Path, argv: &[String]) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    std::process::Command::new(exe).args(argv).exec()
+}
+
+/// Windows has no `exec`: spawn the new process and exit with its status.
+#[cfg(not(unix))]
+fn exec(exe: &std::path::Path, argv: &[String]) -> std::io::Error {
+    match std::process::Command::new(exe).args(argv).status() {
+        Ok(status) => std::process::exit(status.code().unwrap_or(0)),
+        Err(err) => err,
+    }
+}
+
+/// A copy of the agent's context stats with the live mode. A function, not an
+/// inline expression, so the stats lock is released before it returns.
+fn live_stats(agent: &Agent) -> context::ContextStats {
+    let stats = agent.context_stats().lock().unwrap().clone();
+    context::ContextStats { mode: agent.mode(), ..stats }
+}
+
+async fn run_command(
+    agent: &mut Agent,
+    cmd: &str,
+    terminal: &mut Terminal,
+    wait_timers: bool,
+    update_checker: Option<&update::Checker>,
+) -> Result<bool> {
     // Split name from argument on ANY whitespace, the same rule `timing` and
     // `Snapshot::output` use, so a tab/newline-separated form (e.g.
     // `/trajectory\t--json`) dispatches identically to its space-separated twin
@@ -1673,18 +2008,21 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             && terminal.renderer.is_frame()
             && io::stdin().is_terminal() =>
         {
-            // Page a trajectory that doesn't fit on screen. The pager owns the
-            // screen until it exits; force a full redraw so the frame
-            // renderer's next differential render isn't diffed against what
-            // the pager left (as /settings does). Typed during a turn, a stdin
-            // read is still pending and would race the pager for keys, so it
-            // prints instead (below); the legacy renderer's status line pins a
-            // scroll region a full-screen pager would disturb, so it prints too.
+            // Show the trajectory in the pager even when it would fit on
+            // screen (unlike `--trajectory`, which pages only a long one):
+            // printed into the session, the ledger would stay in the
+            // transcript and the terminal's scrollback, while the pager is a
+            // view you dismiss with `q`. The pager owns the screen until it
+            // exits; force a full redraw so the frame renderer's next
+            // differential render isn't diffed against what the pager left
+            // (as /settings does). Typed during a turn, a stdin read is still
+            // pending and would race the pager for keys, so it prints instead
+            // (below), as it does for plain output.
             match turn_commands::Snapshot::capture(agent).load_trajectory() {
                 Err(note) => terminal.renderer.print_block(&note),
                 Ok(traj) => {
                     let text = traj.to_plain();
-                    if trajectory_pageable(&traj) {
+                    if io::stdout().is_terminal() {
                         let paged = trajectory::page(&text);
                         terminal.renderer.frame_resize();
                         if !paged {
@@ -1704,9 +2042,9 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
         // restrict which forms run — that restriction (see `timing`) exists
         // only to decide what is safe *mid-turn*.
         _ if name == "/trajectory" => {
-            let stats = context::ContextStats { mode: agent.mode(), ..agent.context_stats().lock().unwrap().clone() };
+            let stats = live_stats(agent);
             match turn_commands::Snapshot::capture(agent)
-                .output(cmd, &stats, agent.plan())
+                .output(cmd, &stats, agent.plan(), agent.timers())
                 .expect("/trajectory always produces an output")
             {
                 turn_commands::Output::Block(text) => terminal.renderer.print_block(&text),
@@ -1720,8 +2058,13 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
         _ if turn_commands::timing(cmd) == turn_commands::Timing::Immediate
             && let Some(output) = turn_commands::Snapshot::capture(agent).output(
                 cmd,
-                &context::ContextStats { mode: agent.mode(), ..agent.context_stats().lock().unwrap().clone() },
+                // Not an inline `lock()`: a temporary in an `if let` guard
+                // lives through the arm body, so the guard would still hold
+                // the stats mutex when `print_block` redraws the status line,
+                // which locks it again and deadlocks.
+                &live_stats(agent),
                 agent.plan(),
+                agent.timers(),
             ) =>
         {
             match output {
@@ -1761,32 +2104,19 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             Ok(true)
         }
         "/settings" => {
-            let renderer_before = agent.config().renderer;
-            // Capture the dialog result rather than `?`-returning it: when the
-            // user changed `renderer` and a LATER prompt errors or is
-            // cancelled, the config already records the new mode, so the
-            // switch must still be applied here — returning early would leave
-            // the renderer and editor in the old mode with no diff left to
-            // retrigger the switch on the next visit.
+            // Capture the dialog result rather than `?`-returning it, so the
+            // redraw and the retained notices below happen on every exit.
             let (notices, outcome) =
                 settings::run(agent, &terminal.config_path, &terminal.recents, &terminal.recents_path).await;
             // The settings dialog (dialoguer) wrote directly over the owned
             // frame; force a full redraw so the frame renderer's next update
             // isn't diffed against stale screen coordinates.
             terminal.renderer.frame_resize();
-            // A renderer switch in the settings dialog takes effect live: flip
-            // the frame renderer, the line editor's drawing path, and the
-            // scroll region, and replay the transcript into the new renderer.
-            if agent.config().renderer != renderer_before {
-                terminal.renderer_switched(agent).await;
-            }
             // Re-show any notice the dialog retained (e.g. a client-rebuild
             // failure) THROUGH the renderer, now that the redraw has run. The
             // dialog does NOT print these itself (a plain `println!` would be
-            // wiped by `frame_resize` in frame mode, and would double-print in
-            // legacy); `print_block` captures the notice into the frame
-            // transcript (or prints inline in legacy) so it is shown exactly
-            // once. `run` returns the notices on EVERY exit — even a
+            // wiped by `frame_resize`); `print_block` captures the notice into
+            // the frame transcript so it is shown exactly once. `run` returns the notices on EVERY exit — even a
             // cancel/error at a later prompt — so a rebuild failure already
             // recorded is never dropped.
             for notice in &notices {
@@ -1809,7 +2139,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
         }
         "/hooks" => {
             // The listing embeds config-derived commands, matchers, skip
-            // reasons and paths. In legacy renderer mode `print_block` writes
+            // reasons and paths. In plain output `print_block` writes
             // straight to the terminal (`println!`), so an escaped
             // terminal-control sequence in project settings would become active
             // when `/hooks` is displayed. Sanitize before printing; the frame
@@ -1822,9 +2152,9 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             // already applied mid-turn when typed then, and apply here at the
             // prompt.
             match op {
-                Ok(queue::QueueOp::List) => terminal.renderer.print_block(&queue::describe(&terminal.messages)),
+                Ok(queue::QueueOp::List) => terminal.renderer.print_block(&queue::describe(&terminal.messages, None)),
                 Ok(op) => {
-                    let msg = terminal.edit_queue(&op);
+                    let msg = terminal.edit_queue(None, &op);
                     terminal.renderer.print_block(&msg);
                 }
                 Err(usage) => terminal.renderer.print_block(&usage),
@@ -1906,6 +2236,14 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             }
             Ok(true)
         }
+        "/update" => {
+            update_command(terminal, update_checker).await?;
+            Ok(true)
+        }
+        "/relaunch" => {
+            relaunch_command(agent, terminal).await?;
+            Ok(true)
+        }
         _ if name == "/thinking" && arg.is_empty() => {
             terminal.renderer.print_block(&thinking_status_text(agent));
             Ok(true)
@@ -1938,7 +2276,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             }
             Ok(true)
         }
-        _ if cmd.starts_with('/') && commands::unescape_prompt(cmd).is_none() => {
+        _ if commands::is_command(cmd) => {
             // Never send a `/…` line to the model: the editor refuses unknown
             // commands, and this catches the rest (a known command with
             // arguments it doesn't take, or a line queued before this check).
@@ -1952,13 +2290,21 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             // `//…` is a prompt that starts with `/`.
             let cmd = commands::unescape_prompt(cmd).unwrap_or(cmd);
             let outcome = run_interactive_turn(agent, cmd, terminal).await?;
+            // Issue #150: in a headless `--wait-timers` run a Ctrl-C that lands
+            // *during* the turn cancels it (the outcome is `Cancelled`). With no
+            // interactive session to steer, that interrupt means exit — propagate
+            // it to the outer loop rather than resuming the wait on the remaining
+            // timers.
+            if !terminal.steerable && wait_timers && outcome.stop_reason == agent::StopReason::Cancelled {
+                return Ok(false);
+            }
             print_turn_outcome(&outcome, &terminal.renderer);
             Ok(true)
         }
     }
 }
 
-/// What the legacy turn-end print should emit for a finished turn.
+/// What the plain turn-end print should emit for a finished turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TurnPrint {
     /// Frame mode: the response is already rendered from its events; print
@@ -1970,7 +2316,7 @@ enum TurnPrint {
     LastLineDim,
 }
 
-/// Chooses what the legacy turn-end print emits. The truncation repair runs
+/// Chooses what the plain turn-end print emits. The truncation repair runs
 /// before the max-turn fallback: a response stopped at the request cap still
 /// carries its full final content in `outcome.response`, so when part of it was
 /// quiet-suppressed the authoritative full text must be reprinted — printing
@@ -1995,12 +2341,15 @@ fn turn_print(outcome: &agent::TurnOutcome, renderer: &ui::Renderer) -> TurnPrin
     }
 }
 
-/// Prints a finished turn's response in legacy (non-frame) mode per
+/// Prints a finished turn's response in plain (non-frame) mode per
 /// [`turn_print`].
 fn print_turn_outcome(outcome: &agent::TurnOutcome, renderer: &ui::Renderer) {
     match turn_print(outcome, renderer) {
         TurnPrint::Nothing => {}
-        TurnPrint::Full { dim: false } => println!("{}", ui::stamp_block(&outcome.response)),
+        TurnPrint::Full { dim: false } => {
+            // Plain output keeps the response's markdown verbatim.
+            println!("{}", ui::stamp_block(&outcome.response));
+        }
         TurnPrint::Full { dim: true } => {
             println!("{}", ui::stamp_block(&format!("\x1b[2m{}\x1b[0m", outcome.response)));
         }
@@ -2011,15 +2360,12 @@ fn print_turn_outcome(outcome: &agent::TurnOutcome, renderer: &ui::Renderer) {
     }
 }
 
-/// Restores the full screen and terminal modes when the interactive loop ends.
-struct StatusGuard(Option<std::sync::Arc<status::StatusLine>>);
+/// Restores the terminal modes when the interactive loop ends.
+struct TerminalGuard;
 
-impl Drop for StatusGuard {
+impl Drop for TerminalGuard {
     fn drop(&mut self) {
         lineedit::restore_terminal();
-        if let Some(status) = &self.0 {
-            status.teardown();
-        }
     }
 }
 
@@ -2030,6 +2376,9 @@ struct Args {
     model: Option<String>,
     /// `Some("")`: `--resume` without an ID (pick one).
     resume: Option<String>,
+    /// Headless: after the last prompt's turn, sleep until each timer is due
+    /// and run its fired message as the next turn, until no timers are left.
+    wait_timers: bool,
     list_sessions: bool,
     all: bool,
     config: Option<std::path::PathBuf>,
@@ -2038,26 +2387,31 @@ struct Args {
     allow: Vec<String>,
     deny: Vec<String>,
     no_hooks: bool,
+    yolo: bool,
     trajectory: Option<String>,
     json: bool,
     markdown: bool,
 }
 
 fn print_version() {
-    println!("nano-coder {}", env!("CARGO_PKG_VERSION"));
+    println!("{}", commands::version_string());
 }
 
 fn print_help() {
     println!(
         "Usage: nano-coder [--acp] [--model provider/model] [--resume [SESSION_ID|last] | --resume=SESSION_ID] [--config PATH]"
     );
-    println!("                  [--verbosity quiet|normal|verbose|debug]");
+    println!("                  [--verbosity quiet|normal|verbose|debug] [--wait-timers]");
     println!("                  [--sandbox off|workspace|read-only] [--allow RULE]... [--deny RULE]... [--no-hooks]");
+    println!("                  [--yolo]");
     println!("       nano-coder --list-sessions [--all] [--json]");
     println!("       nano-coder --trajectory SESSION_ID [--json|--markdown]");
     println!("       nano-coder --login github-copilot|muse");
     println!("       nano-coder --list-models PROVIDER[/model]");
     println!("       nano-coder --version");
+    println!();
+    println!("On an interactive start in a repository that ships skills or `.claude` hooks, nano-coder asks");
+    println!("\"Trust this repo?\" before loading them (default no). --yolo trusts without asking.");
 }
 
 fn parse_args() -> Result<Args> {
@@ -2088,6 +2442,7 @@ fn parse_args_from<I: IntoIterator<Item = String>>(argv: I) -> Result<Args> {
         list_models: None,
         model: None,
         resume: None,
+        wait_timers: false,
         list_sessions: false,
         all: false,
         config: None,
@@ -2096,6 +2451,7 @@ fn parse_args_from<I: IntoIterator<Item = String>>(argv: I) -> Result<Args> {
         allow: Vec::new(),
         deny: Vec::new(),
         no_hooks: false,
+        yolo: false,
         trajectory: None,
         json: false,
         markdown: false,
@@ -2115,6 +2471,7 @@ fn parse_args_from<I: IntoIterator<Item = String>>(argv: I) -> Result<Args> {
             // be rejected as an unknown argument.
             "--resume" => args.resume = Some(iter.next_if(|next| !next.starts_with('-')).unwrap_or_default()),
             _ if let Some(id) = arg.strip_prefix("--resume=") => args.resume = Some(id.to_string()),
+            "--wait-timers" => args.wait_timers = true,
             "--list-sessions" => args.list_sessions = true,
             "--all" => args.all = true,
             "--config" => args.config = Some(value("--config")?.into()),
@@ -2128,6 +2485,7 @@ fn parse_args_from<I: IntoIterator<Item = String>>(argv: I) -> Result<Args> {
             "--allow" => args.allow.push(value("--allow")?),
             "--deny" => args.deny.push(value("--deny")?),
             "--no-hooks" => args.no_hooks = true,
+            "--yolo" => args.yolo = true,
             "-V" | "--version" => {
                 print_version();
                 std::process::exit(0);
@@ -2203,6 +2561,9 @@ fn parse_args_from<I: IntoIterator<Item = String>>(argv: I) -> Result<Args> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Pin the launch path before anything (e.g. /update) can replace the
+    // binary underneath this process.
+    let _ = update::launch_exe();
     // Detect execution mode from command-line args
     let mut args = parse_args()?;
     // Before anything reads the config or data directories.
@@ -2248,6 +2609,11 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let cwd = env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
+    // The working directory as a real path: the trust decision and project-hook
+    // loading must resolve the actual directory, not a display-string
+    // round-trip that rewrites non-UTF-8 bytes to replacement characters and so
+    // points resource detection at a different (empty) path.
+    let cwd_path = env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(&cwd));
     if args.list_sessions {
         resume::print_list(&config.session_dir(), &cwd, args.all, args.json)?;
         return Ok(());
@@ -2270,6 +2636,18 @@ async fn main() -> Result<()> {
     }
     if let Some(spec) = &args.list_models {
         let (user, default_provider) = config.effective_providers();
+        // A curated list (`list_models = "configured"`) is printed as configured.
+        let all = providers::effective_providers(&user);
+        let (name, _) = providers::parse_model_spec(spec, &all, &default_provider);
+        if let Some(list) = all.get(name).and_then(providers::ProviderConfig::configured_models) {
+            if all[name].is_disabled() {
+                anyhow::bail!("provider {name:?} is disabled (`disabled = true` in [providers.{name}])");
+            }
+            for (model, _) in list {
+                println!("{name}/{model}");
+            }
+            return Ok(());
+        }
         let client = providers::build_lister(spec, &user, &default_provider)?;
         for model in client.list_models().await? {
             println!("{}/{model}", client.provider_name());
@@ -2300,6 +2678,34 @@ async fn main() -> Result<()> {
     if args.no_hooks {
         config.disable_hooks = true;
     }
+
+    // Trust gate: before building the agent (which loads skills and project
+    // hooks), decide whether this repository's gated resources may run. An
+    // untrusted repo keeps its workspace skills and `.claude` project hooks out
+    // of the agent; user-level skills/hooks and nano's own `[hooks]` are
+    // unaffected. `--acp` defers to the client; `--yolo` trusts without asking.
+    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+    // Project hooks are gated only when they could actually load: `--no-hooks`
+    // (`disable_hooks`) and a configured `disable_project_hooks` both mean a
+    // repo's `.claude` hooks are inert, so they must not drive the trust prompt
+    // or the non-interactive warning.
+    let hooks_enabled = !config.disable_hooks && !config.disable_project_hooks;
+    // Workspace skills are gated only when they could actually load: the
+    // `NANO_CODER_NO_SKILLS` override (honoured by skill discovery) and a
+    // disabled skills config both mean a repo's skill dirs and `ai.lock` are
+    // inert, so they must not drive the trust prompt or the warning.
+    let skills_enabled = config.skills.enabled && std::env::var_os("NANO_CODER_NO_SKILLS").is_none();
+    let trusted = trust::decide(
+        &cwd_path,
+        &config.skills,
+        &trust::Options { yolo: args.yolo, acp: args.acp, interactive, hooks_enabled, skills_enabled },
+    );
+    if !trusted {
+        config.skills.dirs.clear();
+        config.skills.ai_lock = false;
+        config.disable_project_hooks = true;
+    }
+
     ui::set_verbosity(config.verbosity);
     ui::set_timestamps(config.timestamps);
 
@@ -2311,13 +2717,20 @@ async fn main() -> Result<()> {
     // Register tools and hooks
     register_builtin_tools(&mut agent);
     register_hooks(&mut agent);
-    agent.load_claude_hooks(std::path::Path::new(&cwd));
+    agent.load_claude_hooks(&cwd_path);
 
     if args.acp {
         // ACP headless mode; sessions start with session/new or session/load.
         // No human vets a memory save live here, so full memory is downgraded
         // to read-only (the model can still consult earlier notes).
         agent.restrict_memory_to_read_only();
+        // ACP has no idle loop to fire timers, so the timer tools are not
+        // offered at all.
+        agent.disable_timers();
+        // The ACP orchestrator runs its own verification before accepting a
+        // completed report, so the harness's verify-before-complete reminder is
+        // off here (it stays on in the terminal, where nothing else checks).
+        agent.config_mut().verify_before_complete = false;
         if let Some(id) = &args.resume {
             agent.load_session(id)?;
         }
@@ -2353,19 +2766,26 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        // A resumed session's timers survive in its log; say so, and note that
+        // one that came due while nano-coder was closed fires as overdue.
+        let timers_notice = (!agent.timers().is_empty())
+            .then(|| format!("{} timer(s) still set (/timers lists them)", agent.timers().len()));
 
         // Interactive CLI mode: build the startup banner. In frame mode the
         // renderer owns the screen and its first full redraw clears the
         // scrollback, so `println!`-ing the banner here would wipe it before it
         // is ever seen. Collect the lines now and emit them once the renderer
         // exists (below): seeded into the owned transcript in frame mode, or
-        // printed inline as before in legacy mode.
+        // printed inline for plain output.
         let mut banner = vec![
             format!("nano-coder v{}", env!("CARGO_PKG_VERSION")),
             format!("Model: {} (provider: {})", agent.model_name(), agent.provider_name()),
         ];
         if let Some(id) = agent.session_id() {
             banner.push(format!("Session: {id} (resume with --resume {id})"));
+        }
+        if let Some(notice) = &timers_notice {
+            banner.push(notice.clone());
         }
         for file in agent.project_instruction_files() {
             banner.push(format!("Instructions: {file}"));
@@ -2393,15 +2813,24 @@ async fn main() -> Result<()> {
         }
         banner.push("Type /help for commands".to_string());
 
+        // Flags a resumed session needs to behave the same under Herdr.
+        let herdr_extra: Vec<String> = match &args.config {
+            Some(path) => {
+                let path = std::path::absolute(path).unwrap_or_else(|_| path.clone());
+                vec!["--config".into(), path.display().to_string()]
+            }
+            None => Vec::new(),
+        };
+
         // Main loop
         let status = status::StatusLine::install(agent.context_stats());
-        let _status_guard = StatusGuard(status.clone());
+        let _terminal_guard = TerminalGuard;
         let previous_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             lineedit::restore_terminal();
             previous_hook(info);
         }));
-        let renderer = ui::Renderer::new(status.clone(), agent.config().renderer);
+        let renderer = ui::Renderer::new(status);
         ui::install(renderer.clone());
         let recents_path = recents::default_path();
         let recents: recents::SharedRecents = {
@@ -2439,25 +2868,52 @@ async fn main() -> Result<()> {
         agent.set_streaming(true);
         agent.refresh_stats();
         let frame_mode = renderer.is_frame();
+        // A config still naming the removed legacy renderer loads, with a note.
+        if let Some(notice) = agent.config().retired_renderer_notice() {
+            banner.push(notice);
+        }
         // Emit the startup banner now the renderer exists. In frame mode seed it
         // into the owned transcript via `print_block` so the first full redraw
-        // (which clears the scrollback) cannot erase it; in legacy mode print it
+        // (which clears the scrollback) cannot erase it; plain output prints it
         // inline, with the trailing blank line the banner has always had.
         if frame_mode {
             renderer.print_block(&banner.join("\n"));
         } else {
             println!("{}\n", banner.join("\n"));
         }
+        // The hourly background update check: interactive TTY sessions only,
+        // never in headless/ACP/CI runs (automated runners pin versions on
+        // purpose), and only for a cargo/npm-managed install. It runs in a
+        // background task, so the first prompt is never delayed, and every
+        // failure is silent.
+        let update_checker = if interactive
+            && !args.acp
+            && agent.config().check_updates
+            && !update::disabled_by_env()
+            && !update::is_ci()
+        {
+            // An unmanaged install (`Channel::Other`) gets no checker at all:
+            // neither checks nor hints cached by a managed session.
+            match update::Channel::detect() {
+                update::Channel::Other => None,
+                channel => {
+                    let checker = Arc::new(update::Checker::new(channel, update::default_state_path()));
+                    checker.clone().spawn();
+                    Some(checker)
+                }
+            }
+        } else {
+            None
+        };
         let view = {
             let context = Arc::new(Mutex::new(lineedit::EditContext {
                 config: agent.config().clone(),
                 recents: recents.clone(),
             }));
-            lineedit::EditView::shared(status.clone(), context)
+            lineedit::EditView::shared(context)
         };
         if frame_mode {
-            // The app-owned frame renderer draws the editor row itself; route
-            // every edit through it instead of the inline/scroll-region path.
+            // The frame renderer draws the editor row; route every edit to it.
             let renderer = renderer.clone();
             view.lock().unwrap().set_edit_hook(Arc::new(
                 move |line: &str, cursor: usize, queued: usize, menu: &[String]| {
@@ -2465,43 +2921,21 @@ async fn main() -> Result<()> {
                 },
             ));
         }
-        // Serialises every terminal-owning operation that must not interleave
-        // with a multi-step renderer transition: the SIGWINCH resize task takes
-        // it before drawing, and `Terminal::renderer_switched` holds it across
-        // the flip/clear/replay. Created here (before `Terminal::start`) so both
-        // sides share one lock. The SIGWINCH task and `Terminal` each get a clone.
-        let transition = TransitionShared {
-            view: view.clone(),
-            status: status.clone(),
-            renderer: renderer.clone(),
-            lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-        };
-        if let Ok(mut resized) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()) {
-            let transition = transition.clone();
+        // Serialises the SIGWINCH redraw against foreground pickers, which own
+        // the terminal while they run (see `Terminal::picker_lock`).
+        let picker_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        if frame_mode
+            && let Ok(mut resized) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+        {
+            let view = view.clone();
+            let picker_lock = picker_lock.clone();
             tokio::spawn(async move {
-                let TransitionShared { view, status, renderer, lock: transition_lock } = &transition;
                 // Debounce a burst of resizes (a window drag) into one render at
                 // the final size: after a resize, wait for ~40 ms of quiet.
                 let quiet = std::time::Duration::from_millis(40);
                 let mut debounce = frame::Debouncer::new(quiet);
                 while resized.recv().await.is_some() {
-                    // Hold the transition lock from the `is_frame()` check through
-                    // the draw, so a renderer switch cannot flip the mode, clear
-                    // the screen, and replay the transcript in between (which would
-                    // let this redraw interleave with the transition — on frame →
-                    // legacy it would reprint the prompt before `replay_transcript`,
-                    // placing history after it). The lock is uncontended except
-                    // during that brief transition, so this costs nothing in the
-                    // common case.
-                    let _transition_guard = transition_lock.lock().await;
-                    if !renderer.is_frame() {
-                        // Legacy: re-anchor immediately, as before.
-                        if let Some(status) = &status {
-                            status.resize();
-                        }
-                        view.lock().unwrap().resize();
-                        continue;
-                    }
+                    let _picker_guard = picker_lock.lock().await;
                     debounce.record(std::time::Instant::now());
                     // Coalesce further resizes arriving within the quiet window.
                     while debounce.pending() {
@@ -2528,7 +2962,7 @@ async fn main() -> Result<()> {
                     // entire transcript a second time — a redundant O(history)
                     // redraw on every resize — so the hook-driven redraw is the
                     // sole one here.
-                    view.lock().unwrap().resize();
+                    view.lock().unwrap().redraw();
                 }
             });
         }
@@ -2536,69 +2970,417 @@ async fn main() -> Result<()> {
         // so the app-owned frame opens empty. Replay the loaded history now
         // (the sink is installed) to reconstruct the transcript into
         // `FrameState`; `frame_event` populates user, assistant, tool and plan
-        // items. Only in frame mode — the legacy renderer would dump the whole
-        // conversation inline, which it has never done on resume. Batched into
+        // items. Only in frame mode — plain output never reprints the
+        // conversation on resume. Batched into
         // one render: per-event renders would redo the whole transcript layout
         // for every replayed event.
         if frame_mode && args.resume.is_some() {
             renderer.frame_batch(|| agent.replay_history());
         }
-        let mut terminal = Terminal::start(config_path, recents, recents_path, agent.config().renderer, transition);
+        let mut terminal = Terminal::start(config_path, recents, recents_path, view, renderer.clone(), picker_lock);
         let mut running = true;
         // Ctrl-C twice within the window exits; time-based so an interleaved
         // key or a queued/empty line cannot silently disarm it (see
         // `DoublePress`). The note stays visible until the window lapses.
         let mut exit_press = DoublePress::new(DOUBLE_INTERRUPT_WINDOW);
         let mut separate = false;
+        // Piped stdin emits its end-of-input exactly once. Under
+        // `--wait-timers` the timer wait below swallows that EOF to keep
+        // sleeping for timers, so remember it here: once the queued input and
+        // scheduled timers are both exhausted, the normal prompt read would
+        // otherwise block forever on a reader that never emits EOF again
+        // (the signal task holds the event channel open).
+        let mut stdin_closed = false;
         while running {
-            if let Some(status) = &status
-                && !terminal.renderer.is_frame()
-            {
-                status.draw();
-            }
             let prompt = |terminal: &Terminal, separate: bool| {
                 if terminal.queued.is_empty() && terminal.messages.is_empty() {
-                    let mut view = terminal.view.lock().unwrap();
                     if terminal.renderer.is_frame() {
-                        // The frame renderer owns the screen: refresh the editor
-                        // row (and thus the whole frame) instead of writing an
-                        // inline prompt.
-                        // `prompt_redrawn` re-renders the editor (and its
-                        // command menu) through the edit hook.
-                        view.prompt_redrawn();
+                        // Refresh the editor row (and its command menu), and
+                        // with it the whole frame.
+                        terminal.view.lock().unwrap().redraw();
                         return;
                     }
-                    let prompt = view.prompt();
-                    // Serialise the prompt write under the terminal lock so it
-                    // cannot move the cursor mid-way through the SIGWINCH
-                    // anchor's query-to-scroll critical section (status::anchor).
+                    // Plain output: print the prompt line.
+                    let prompt = format!("{}{}> ", if separate { "\n" } else { "" }, ui::stamp());
                     crate::status::with_term_lock(|| {
                         let mut out = io::stdout().lock();
-                        if separate {
-                            let _ = out.write_all(b"\n");
-                        }
                         let _ = out.write_all(prompt.as_bytes());
                         let _ = out.flush();
                     });
-                    view.prompt_redrawn();
                 }
             };
             prompt(&terminal, separate);
             separate = false;
+            // A newer release found by the background check is hinted at here,
+            // at an idle prompt only — never mid-stream or mid-tool-call — and
+            // at most once per version.
+            if let Some(checker) = &update_checker
+                && let Some(hint) = checker.take_hint()
+            {
+                terminal.renderer.note(&hint);
+            }
+            // Ready for input: tell Herdr, with the session to resume (re-read
+            // each time so `/resume` and `/restart` are picked up).
+            herdr::report(herdr::State::Idle, None, herdr_session(&agent, &herdr_extra));
+
+            // The harness owns the timers' clock. With the prompt idle, a due
+            // timer ends the read and runs as a new turn — but a half-typed
+            // line holds it back. In a headless run (piped stdin), stdin stays
+            // open while a driver composes its next prompt, so the read would
+            // never end on its own: `--wait-timers` instead sleeps until the
+            // next timer is due and runs it, repeating until none are left.
+            let wait_timers = args.wait_timers;
+            // When this idle prompt went up (timer wait included): an idle
+            // compaction waits for the prompt (and any draft) to sit
+            // untouched for its hold from here.
+            let prompt_shown = std::time::Instant::now();
+            let idle_hold = idle_compact_hold(agent.config());
+            let (fired, parked) = if agent.timers().is_empty() {
+                // No timers to wait for: skip the wait entirely so piped input
+                // flows straight to the normal read below.
+                (Vec::new(), None)
+            } else {
+                loop {
+                    let now = Local::now();
+                    // A Ctrl-C requeued out of the wait below (it is pushed to
+                    // `terminal.queued` so the prompt read can apply the
+                    // double-press gesture) must still win over a timer that
+                    // came due at the same moment: the running timer turn reads
+                    // new channel events, not `terminal.queued`, so starting the
+                    // turn here would run its tools instead of honouring the
+                    // interrupt. Abandon the wait *without consuming the
+                    // interrupt* and let the prompt loop's interrupt handler act
+                    // on it — headless `--wait-timers` exits, a steerable session
+                    // arms the double-press gesture. Deleting it here (even in
+                    // the headless case) would strand the still-due timer, which
+                    // the prompt loop would then fire despite the stop request
+                    // (issue #150).
+                    if terminal.queued.iter().any(|i| matches!(i, TermInput::Interrupt)) {
+                        break (Vec::new(), None);
+                    }
+                    // Peek whether a timer is due *before* consuming it: a
+                    // fresh half-typed draft holds delivery back, and taking
+                    // the timer here would persist its removal and drop the
+                    // note undelivered. Only consume once delivery is allowed.
+                    // A stale draft (no keystrokes for DRAFT_HOLD) does not
+                    // hold: the user is AFK, so the timer may fire.
+                    let due_now = agent.timers().next_due().is_some_and(|d| d <= now);
+                    // The freshness check and the park happen under one view
+                    // lock: the reader thread keeps typing into the editor
+                    // during the turn, so a separate `holds_timer()` then
+                    // `park_draft()` could snapshot a draft the user resumed
+                    // between the two — their next keystroke would then bump
+                    // the generation and make `restore_draft` discard the
+                    // parked text. Parking here (rather than after the notes
+                    // print) carries the snapshot through the whole turn.
+                    let mut parked = None;
+                    let fired = {
+                        let mut view = terminal.view.lock().unwrap();
+                        let draft_holds = view.holds_timer(std::time::Instant::now());
+                        // No interrupt is queued here (it would have broken the
+                        // wait above), so pass `false`; the armed Ctrl-C exit
+                        // window, however, must hold a due timer back exactly
+                        // as in the prompt loop below (a timer firing
+                        // mid-window would steal the user's confirming second
+                        // press).
+                        if deliver_due_timer(due_now, draft_holds, false, exit_press.deadline().is_some()) {
+                            let fired = agent.take_fired_timers()?;
+                            if !fired.is_empty() {
+                                parked = view.park_draft();
+                            }
+                            fired
+                        } else {
+                            Vec::new()
+                        }
+                    };
+                    if !fired.is_empty() {
+                        break (fired, parked);
+                    }
+                    // Nothing deliverable right now. Without `--wait-timers` a
+                    // headless run is done once its input is; an interactive one
+                    // waits on the terminal instead.
+                    let steerable = terminal.steerable;
+                    if !steerable && !wait_timers {
+                        break (Vec::new(), None);
+                    }
+                    let Some(next_due) = agent.timers().next_due() else {
+                        // No timers left: a `--wait-timers` run ends here.
+                        break (Vec::new(), None);
+                    };
+                    // A timer already due but held back by a draft must not
+                    // busy-spin on its elapsed deadline: recheck on a short
+                    // bounded interval so clearing the draft still delivers
+                    // promptly, while a not-yet-due timer waits exactly until it
+                    // comes due.
+                    let timer_deadline = std::time::Instant::now()
+                        + if due_now {
+                            std::time::Duration::from_millis(200)
+                        } else {
+                            (next_due - now).to_std().unwrap_or(std::time::Duration::ZERO)
+                        };
+                    // Bound the wait on the soonest of the timer recheck and the
+                    // Ctrl-C exit window, exactly as the prompt loop below does:
+                    // after a first Ctrl-C with an active timer, control returns
+                    // here, so an armed exit hint that is never confirmed must
+                    // clear here too rather than linger on the status bar for the
+                    // (possibly hours-away) timer's whole wait.
+                    // Idle compaction (issue #182) must not wait out a
+                    // far-off timer: once it is deliverable, leave the wait
+                    // so the prompt loop below runs it (that loop re-checks
+                    // and parks a stale draft under one view lock); until
+                    // then wake when its hold would elapse.
+                    let (idle_now, idle_deadline) = idle_compact_poll(
+                        &agent,
+                        &terminal,
+                        prompt_shown,
+                        idle_hold,
+                        false,
+                        exit_press.deadline().is_some(),
+                    );
+                    if idle_now {
+                        break (Vec::new(), None);
+                    }
+                    let deadline = [exit_press.deadline(), Some(timer_deadline), idle_deadline]
+                        .into_iter()
+                        .flatten()
+                        .min()
+                        .expect("timer_deadline is always present");
+                    // Wait for terminal input or the deadline, whichever comes
+                    // first. The wait is scoped so the future's borrows end
+                    // before the agent/terminal are touched again.
+                    let event = {
+                        // Hint-aware like the prompt loop below, so an update
+                        // found during a long timer wait shows promptly.
+                        let hint_renderer = terminal.renderer.clone();
+                        let next = with_update_hints(terminal.next(&agent), update_checker.clone(), hint_renderer);
+                        tokio::pin!(next);
+                        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut next).await.ok()
+                    };
+                    match event {
+                        Some(event) => {
+                            // Real input arrived first; handle it below. Under
+                            // a *headless* `--wait-timers` run an end-of-input
+                            // is not the end: the driver may hold stdin open,
+                            // and the timers are the point, so the wait resumes.
+                            // On an interactive terminal Ctrl-D (EOF) must still
+                            // exit normally, so only suppress it when the session
+                            // is non-steerable — otherwise `--wait-timers` would
+                            // trap an interactive user, unable to quit while it
+                            // waits out and runs the timer (issue #150).
+                            if suppress_eof_for_timers(wait_timers, terminal.steerable)
+                                && matches!(event, TermInput::Eof)
+                            {
+                                // Remember the EOF rather than discard it: the
+                                // reader won't emit another, so without this the
+                                // post-timer prompt read would hang. Keep
+                                // waiting for the remaining timers.
+                                stdin_closed = true;
+                                continue;
+                            }
+                            terminal.queued.push_front(event);
+                            break (Vec::new(), None);
+                        }
+                        None => {
+                            // A deadline elapsed. If it was the Ctrl-C exit
+                            // window, clear the stale "(Ctrl-C again to exit)"
+                            // hint and disarm (a later press re-arms rather than
+                            // exits), mirroring the prompt loop below. Otherwise
+                            // it was the timer interval/deadline and the loop top
+                            // re-evaluates due/draft and consumes the timer when
+                            // delivery is allowed.
+                            if exit_press.deadline().is_some_and(|d| d <= std::time::Instant::now()) {
+                                exit_press.disarm();
+                                terminal.renderer.clear_transient();
+                            }
+                        }
+                    }
+                }
+            };
+            if !fired.is_empty() {
+                // Show the fired timers and run their message as a new turn.
+                // Sanitize the model-controlled note: it can carry control or
+                // escape bytes that a terminal would otherwise interpret
+                // (issue #150). The stored note is left intact.
+                for timer in &fired {
+                    terminal.renderer.note(&format!("⏰ timer {}: {}", timer.id, sanitize_terminal_line(&timer.note)));
+                }
+                let text = timers::Timers::fired_batch_message(&fired, Local::now());
+                // The stale draft was parked under the same view lock as the
+                // freshness check above, so the timer turn cannot treat it as
+                // a steer; restore it after the turn (unless the user typed
+                // something new in the meantime).
+                // An API/network error during this idle timer turn must not
+                // tear down the REPL: show it and return to the prompt, exactly
+                // as `run_command`'s error arm below does for a user turn.
+                agent.mark_auto_turn();
+                match run_interactive_turn(&mut agent, &text, &mut terminal).await {
+                    Ok(outcome) => {
+                        // Issue #150: in a headless `--wait-timers` run a Ctrl-C
+                        // that lands *during* the turn cancels it (the outcome is
+                        // `Cancelled`). With no interactive session to steer, that
+                        // interrupt means exit — break rather than resume the
+                        // outer loop and keep waiting on the remaining timers.
+                        if !terminal.steerable
+                            && args.wait_timers
+                            && outcome.stop_reason == agent::StopReason::Cancelled
+                        {
+                            if let Some(parked) = parked {
+                                terminal.view.lock().unwrap().restore_draft(parked);
+                            }
+                            break;
+                        }
+                        print_turn_outcome(&outcome, &terminal.renderer)
+                    }
+                    Err(e) => {
+                        if terminal.renderer.is_frame() {
+                            terminal.renderer.note(&format!("Error: {:#}", e));
+                        } else {
+                            eprintln!("Error: {:#}", e);
+                        }
+                    }
+                }
+                if let Some(parked) = parked {
+                    terminal.view.lock().unwrap().restore_draft(parked);
+                }
+                separate = true;
+                continue;
+            }
+
+            // What ended the prompt read: terminal input, or a due timer. A
+            // due timer also carries the draft parked under the same view lock
+            // as the freshness check (see below), so the reader thread cannot
+            // slip a keystroke between the check and the park.
+            enum Prompt {
+                Input(TermInput),
+                TimerDue(Option<lineedit::ParkedDraft>),
+                /// Idle compaction is due (issue #182); carries the stale
+                /// draft parked under the same view lock as the quiet check.
+                IdleCompact(Option<lineedit::ParkedDraft>),
+            }
 
             let input = loop {
+                // An idle timer that is due ends the prompt read, unless the
+                // editor holds a *fresh* half-typed draft — that keeps the
+                // timer back until the draft is sent, cleared, or goes stale
+                // (no keystrokes for DRAFT_HOLD; an AFK draft is parked).
+                // Checked before borrowing the terminal for the read.
+                let timer_due = agent.timers().next_due().is_some_and(|due| due <= Local::now());
+                // A queued Ctrl-C (requeued out of the timer wait above, or
+                // arriving just as the timer comes due) must beat timer
+                // delivery here too: the timer turn reads only new channel
+                // events, so firing it would run its tools despite the stop
+                // request. Leave the interrupt for `terminal.next()` to surface
+                // so it routes through the exit/double-press handler below
+                // rather than starting a turn (issue #150).
+                let interrupt_queued = terminal.queued.iter().any(|i| matches!(i, TermInput::Interrupt));
+                // An armed Ctrl-C exit window also holds the timer back: after a
+                // first Ctrl-C arms the double-press gesture, a timer coming due
+                // before the window lapses must not start an automatic turn that
+                // the confirming second press would then cancel instead of
+                // exiting (issue #150).
+                //
+                // The freshness check and the park happen under one view lock:
+                // the reader thread keeps typing into the editor during the
+                // turn, so a separate `holds_timer()` then `park_draft()` could
+                // snapshot a draft the user resumed between the two — their
+                // next keystroke would then bump the generation and make
+                // `restore_draft` discard the parked text.
+                let timer = {
+                    let mut view = terminal.view.lock().unwrap();
+                    let draft_holds = view.holds_timer(std::time::Instant::now());
+                    if deliver_due_timer(timer_due, draft_holds, interrupt_queued, exit_press.deadline().is_some()) {
+                        Some(view.park_draft())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(parked) = timer {
+                    break Prompt::TimerDue(parked);
+                }
+                // Idle compaction (issue #182): the same compaction auto would
+                // run on the next message, moved here while the user is away.
+                // Only with the key reader live (headless `--wait-timers`, ACP
+                // and a redirected stdout never idle-compact), past the threshold, once per
+                // crossing, and never while the prompt saw recent activity —
+                // a fresh draft holds it, a stale one is parked like a timer's.
+                let idle_due = terminal.key_mode && agent.idle_compact_due_polled();
+                let idle = {
+                    let mut view = terminal.view.lock().unwrap();
+                    let quiet = view.quiet_since(prompt_shown);
+                    let quiet_for = std::time::Instant::now().saturating_duration_since(quiet);
+                    if deliver_idle_compact(
+                        idle_due,
+                        quiet_for,
+                        idle_hold,
+                        interrupt_queued,
+                        exit_press.deadline().is_some(),
+                    ) {
+                        Some(view.park_draft())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(parked) = idle {
+                    break Prompt::IdleCompact(parked);
+                }
+                // Wake when the hold would elapse, so the compaction starts
+                // without waiting for a keystroke.
+                let (_, idle_deadline) = idle_compact_poll(
+                    &agent,
+                    &terminal,
+                    prompt_shown,
+                    idle_hold,
+                    interrupt_queued,
+                    exit_press.deadline().is_some(),
+                );
+                // Piped stdin already closed during the timer wait and no timers
+                // remain to fire: with nothing queued, no further input will
+                // arrive, so end the session rather than block on a read that
+                // can never complete. (A not-yet-due timer still bounds the wait
+                // below and fires; a real Interrupt still breaks this loop.)
+                if stdin_closed
+                    && terminal.queued.is_empty()
+                    && terminal.messages.is_empty()
+                    && agent.timers().next_due().is_none()
+                {
+                    break Prompt::Input(TermInput::Eof);
+                }
+                // Cloned before `terminal.next(&agent)` mutably borrows the
+                // terminal: the hint wrapper below needs an Arc of its own.
+                let hint_renderer = terminal.renderer.clone();
                 let next = terminal.next(&agent);
-                // While the Ctrl-C exit hint is armed, bound the wait on the
-                // exit window: if the second press never comes, clear the stale
-                // "(Ctrl-C again to exit)" hint and disarm the detector so the
-                // visible instruction stays in sync with the armed state (a
-                // press after the window re-arms rather than exits).
-                let event = if let Some(deadline) = exit_press.deadline() {
+                // Bound this wait on the soonest of two deadlines, recomputed
+                // each wakeup, so an event that doesn't break the loop (a
+                // consumed Esc/CycleMode/Rejected) can't strand us waiting
+                // without a deadline:
+                //   * the next timer's due time, so a timer coming due while we
+                //     idle still ends the read and fires (the idle reminder);
+                //   * the Ctrl-C exit window, so a second press that never comes
+                //     clears the stale "(Ctrl-C again to exit)" hint and disarms
+                //     the detector (a later press re-arms rather than exits).
+                let timer_deadline = agent.timers().next_due().map(|due| {
+                    let wait = (due - Local::now()).to_std().unwrap_or(std::time::Duration::ZERO);
+                    // Floor the recheck: a timer that is already due but held
+                    // back by a draft (the loop top only breaks when there is
+                    // no draft) would otherwise elapse instantly and busy-spin,
+                    // so recheck on a short interval instead.
+                    std::time::Instant::now() + wait.max(std::time::Duration::from_millis(200))
+                });
+                let deadline = [exit_press.deadline(), timer_deadline, idle_deadline].into_iter().flatten().min();
+                // Show a background-check hint as soon as it lands while the
+                // prompt is idle, without abandoning the pending read.
+                let next = with_update_hints(next, update_checker.clone(), hint_renderer);
+                let event = if let Some(deadline) = deadline {
                     match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), next).await {
                         Ok(event) => event,
                         Err(_) => {
-                            exit_press.disarm();
-                            terminal.renderer.clear_transient();
+                            // A deadline elapsed. If it was the Ctrl-C window,
+                            // clear the hint and disarm; otherwise it was the
+                            // timer deadline and the loop top fires it.
+                            if exit_press.deadline().is_some_and(|d| d <= std::time::Instant::now()) {
+                                exit_press.disarm();
+                                terminal.renderer.clear_transient();
+                            }
                             continue;
                         }
                     }
@@ -2606,27 +3388,11 @@ async fn main() -> Result<()> {
                     next.await
                 };
                 match event {
-                    TermInput::ToggleThinking => {
-                        if terminal.renderer.toggle_thinking() {
-                            prompt(&terminal, false);
-                        }
-                    }
-                    TermInput::Rejected(note) => {
-                        terminal.renderer.transient_note(&note);
-                        if !frame_mode {
-                            // Legacy: the note printed a line; redraw the
-                            // prompt with the refused text still in it.
-                            prompt(&terminal, false);
-                        }
-                    }
+                    TermInput::Rejected(note) => terminal.renderer.transient_note(&note),
                     TermInput::CycleMode => {
                         let mode = agent.control().cycle_mode();
                         agent.set_mode(mode);
-                        if terminal.renderer.is_frame() {
-                            terminal.renderer.note(&format!("Mode: {mode} ({})", mode.describe()));
-                        } else {
-                            println!("\nMode: {mode} ({})", mode.describe());
-                        }
+                        terminal.renderer.note(&format!("Mode: {mode} ({})", mode.describe()));
                         prompt(&terminal, false);
                     }
                     TermInput::Escape => {
@@ -2635,19 +3401,101 @@ async fn main() -> Result<()> {
                         // place that sees every Esc. An Escape that surfaces
                         // here means the buffer was already empty, so there is
                         // nothing to clear. Consume it in place like the other
-                        // mid-line events (ToggleThinking/CycleMode) rather than
+                        // mid-line events (CycleMode/Rejected) rather than
                         // breaking out to the outer loop's `continue`, which
                         // would restart the loop and re-emit `prompt()` — a
                         // spurious redraw that contradicts the inert-empty
                         // no-op contract. Staying in the inner loop keeps the
                         // empty-buffer Esc a true zero-redraw no-op.
                     }
-                    other => break other,
+                    other => break Prompt::Input(other),
                 }
             };
+            // A due timer fires as a new turn carrying its message; loop back
+            // to the prompt afterwards.
+            if let Prompt::TimerDue(parked) = input {
+                let fired = agent.take_fired_timers()?;
+                if !fired.is_empty() {
+                    // As above: sanitize the model-controlled note before it
+                    // reaches the terminal (issue #150).
+                    for timer in &fired {
+                        terminal.renderer.note(&format!(
+                            "⏰ timer {}: {}",
+                            timer.id,
+                            sanitize_terminal_line(&timer.note)
+                        ));
+                    }
+                    let text = timers::Timers::fired_batch_message(&fired, Local::now());
+                    // The stale draft was parked under the same view lock as
+                    // the freshness check above, so the timer turn cannot
+                    // treat it as a steer; restore it after the turn (unless
+                    // the user typed something new in the meantime).
+                    // As above: an idle timer turn's error returns to the
+                    // prompt rather than terminating the REPL.
+                    agent.mark_auto_turn();
+                    match run_interactive_turn(&mut agent, &text, &mut terminal).await {
+                        Ok(outcome) => {
+                            // Issue #150: as above — a Ctrl-C that cancels this
+                            // timer turn in a headless `--wait-timers` run exits
+                            // rather than resuming the wait on remaining timers.
+                            if !terminal.steerable
+                                && args.wait_timers
+                                && outcome.stop_reason == agent::StopReason::Cancelled
+                            {
+                                if let Some(parked) = parked {
+                                    terminal.view.lock().unwrap().restore_draft(parked);
+                                }
+                                break;
+                            }
+                            print_turn_outcome(&outcome, &terminal.renderer)
+                        }
+                        Err(e) => {
+                            if terminal.renderer.is_frame() {
+                                terminal.renderer.note(&format!("Error: {:#}", e));
+                            } else {
+                                eprintln!("Error: {:#}", e);
+                            }
+                        }
+                    }
+                    if let Some(parked) = parked {
+                        terminal.view.lock().unwrap().restore_draft(parked);
+                    }
+                    separate = true;
+                }
+                continue;
+            }
+            if let Prompt::IdleCompact(parked) = input {
+                run_idle_compaction(&mut agent, &mut terminal).await;
+                // A stale draft parked for the compaction comes back (unless
+                // the user typed something new meanwhile).
+                if let Some(parked) = parked {
+                    terminal.view.lock().unwrap().restore_draft(parked);
+                }
+                separate = true;
+                continue;
+            }
+            let Prompt::Input(input) = input else { unreachable!("timer and idle compaction are handled above") };
             let input = match input {
-                TermInput::Eof => break,
+                TermInput::Eof => {
+                    // Confirmed end of input. A headless run that still has
+                    // timers set reports the ones that never fired (empty input
+                    // queues alone are not EOF, so this is the only place it is
+                    // safe to say so).
+                    let left = agent.timers().len();
+                    if left > 0 && !args.wait_timers {
+                        eprintln!("[{left} timer(s) didn't fire: the run ended first (--wait-timers waits for them)]");
+                    }
+                    break;
+                }
                 TermInput::Interrupt => {
+                    // Issue #150: a headless `--wait-timers` run has no
+                    // interactive session to steer, so the first Ctrl-C exits
+                    // (the interrupt is requeued out of the timer wait and
+                    // lands here). The interactive double-press-to-exit gesture
+                    // below is kept for steerable sessions.
+                    if !terminal.steerable && args.wait_timers {
+                        break;
+                    }
                     if exit_press.press(std::time::Instant::now()) {
                         break;
                     }
@@ -2662,10 +3510,10 @@ async fn main() -> Result<()> {
                     // Escape is now consumed in the inner event loop above (a
                     // true no-op on an empty buffer), so it never breaks out to
                     // here. This arm is retained only for match exhaustiveness,
-                    // mirroring the ToggleThinking/CycleMode/Rejected arm below.
+                    // mirroring the CycleMode/Rejected arm below.
                     continue;
                 }
-                TermInput::ToggleThinking | TermInput::CycleMode | TermInput::Rejected(_) => {
+                TermInput::CycleMode | TermInput::Rejected(_) => {
                     continue;
                 }
                 TermInput::Line(line) | TermInput::Queue(line) => line.trim().to_string(),
@@ -2675,11 +3523,11 @@ async fn main() -> Result<()> {
             }
             // A refused `/command` note no longer applies once a line is sent.
             terminal.renderer.clear_transient();
-            if frame_mode && (!input.starts_with('/') || commands::unescape_prompt(&input).is_some()) {
+            if frame_mode && !commands::is_command(&input) {
                 terminal.renderer.frame_user_message(commands::unescape_prompt(&input).unwrap_or(&input));
             }
 
-            match run_command(&mut agent, &input, &mut terminal).await {
+            match run_command(&mut agent, &input, &mut terminal, args.wait_timers, update_checker.as_deref()).await {
                 Ok(continue_running) => {
                     running = continue_running;
                 }
@@ -2694,6 +3542,7 @@ async fn main() -> Result<()> {
             separate = true;
         }
 
+        herdr::release();
         println!("\nGoodbye!");
         // Repeat the resume instruction on exit so it is still on screen (and
         // in scrollback) after a long session has pushed the start-up banner
@@ -2714,6 +3563,14 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn update_is_refused_outside_an_interactive_non_ci_terminal() {
+        assert!(super::update_allowed(true, true, false));
+        assert!(!super::update_allowed(false, true, false), "piped stdin");
+        assert!(!super::update_allowed(true, false, false), "piped stdout");
+        assert!(!super::update_allowed(true, true, true), "CI");
+    }
+
     use super::*;
     use std::time::{Duration, Instant};
 
@@ -2787,10 +3644,46 @@ mod tests {
 
     #[test]
     fn sanitize_terminal_text_strips_control_and_escape_sequences() {
-        // A prompt-injected ANSI/OSC payload is neutralised, printable text kept.
-        assert_eq!(sanitize_terminal_text("hi\x1b[2Jthere"), "hi[2Jthere");
-        assert_eq!(sanitize_terminal_text("a\x07\x00b\tc"), "abc");
+        // A prompt-injected ANSI/OSC payload is stripped whole, printable text kept.
+        assert_eq!(sanitize_terminal_text("hi\x1b[2Jthere"), "hithere");
+        // Tabs are expanded to spaces (not dropped), so columns stay separated;
+        // other C0 controls are still removed.
+        assert_eq!(sanitize_terminal_text("a\x07\x00b\tc"), "ab      c");
         assert_eq!(sanitize_terminal_text("plain — label"), "plain — label");
+    }
+
+    #[test]
+    fn sanitize_terminal_expands_tabs_to_spaces() {
+        // A tab is legitimate column layout, so it is expanded to the next
+        // 8-column tab stop rather than deleted — otherwise numbered `read_file`
+        // output like `   1\tcode` would merge into `   1code` (Copilot finding,
+        // src/frame.rs:175 / src/ui.rs:1351). Both renderers sanitize via these
+        // helpers, so the fix covers both.
+        assert_eq!(sanitize_terminal_text("     1\tleft\tright"), "     1  left    right");
+        assert_eq!(sanitize_terminal_line("     1\tleft\tright"), "     1  left    right");
+        // Tab stops are absolute 8-column stops, resetting after a kept `\n`.
+        assert_eq!(sanitize_terminal_text("a\tb"), "a       b");
+        assert_eq!(sanitize_terminal_text("ab\tc\nx\ty"), "ab      c\nx       y");
+        // A tab surviving an escape strip still can't move the cursor (it became
+        // spaces), so the terminal-safety protection is preserved. The CSI
+        // sequence itself is stripped whole, so the tab aligns to `hi`'s width.
+        assert_eq!(sanitize_terminal_line("hi\x1b[2J\tthere"), "hi      there");
+    }
+
+    #[test]
+    fn sanitize_terminal_tab_stops_track_unicode_cell_width() {
+        // Tab stops are measured in terminal cells, not characters (Copilot
+        // finding, src/main.rs): a wide CJK glyph is two cells, so after `界`
+        // (col 2) the tab fills to the next 8-column stop — counting it as one
+        // character would misplace the next column by a cell.
+        for sanitize in [sanitize_terminal_line, sanitize_terminal_text] {
+            // `界` = 2 cells → tab fills 6 spaces to reach column 8.
+            assert_eq!(sanitize("界\tX"), format!("界{}X", " ".repeat(6)));
+            // `界界` = 4 cells → tab fills 4 spaces to reach column 8.
+            assert_eq!(sanitize("界界\tX"), format!("界界{}X", " ".repeat(4)));
+            // `e` + U+0301 (zero-width combining mark) = 1 cell → tab fills 7.
+            assert_eq!(sanitize("e\u{0301}\tX"), format!("e\u{0301}{}X", " ".repeat(7)));
+        }
     }
 
     #[test]
@@ -2890,7 +3783,84 @@ mod tests {
         // replay re-prints it as the lines the frame showed, so stripping `\n`
         // would concatenate the lines. Other controls are still dropped.
         assert_eq!(sanitize_terminal_text("one\ntwo\nthree"), "one\ntwo\nthree");
-        assert_eq!(sanitize_terminal_text("one\x1b[2J\ntwo"), "one[2J\ntwo");
+        // A complete CSI sequence is stripped whole (not left as a visible
+        // `[2J` body), while the surrounding text and line feed survive.
+        assert_eq!(sanitize_terminal_text("one\x1b[2J\ntwo"), "one\ntwo");
+    }
+
+    #[test]
+    fn sanitize_strips_whole_ansi_sequences() {
+        // The ESC byte and the entire sequence body are removed, so a colored
+        // tool note renders as clean text rather than a width-eating `[31m…[0m`.
+        assert_eq!(sanitize_terminal_line("\x1b[31mred\x1b[0m"), "red");
+        // OSC (here a clipboard-set) is consumed whole on both terminators:
+        // BEL (`\x07`) and ST (`\x1b\`).
+        assert_eq!(sanitize_terminal_line("a\x1b]52;c;Zm8=\x07b"), "ab");
+        assert_eq!(sanitize_terminal_line("a\x1b]0;title\x1b\\b"), "ab");
+        // A lone/unterminated ESC still drops only the ESC byte; trailing
+        // printable text is preserved.
+        assert_eq!(sanitize_terminal_line("a\x1bZb"), "aZb");
+    }
+
+    #[test]
+    fn a_plain_one_line_question_stays_the_picker_prompt() {
+        let (body, prompt) = question_prompt("Which database should I use?", 80);
+        assert_eq!(body, None);
+        assert_eq!(prompt, "Which database should I use?");
+    }
+
+    #[test]
+    fn leading_indentation_is_preserved_for_markdown() {
+        // `trim()` would strip the first line's indent, degrading an indented
+        // code block to paragraph text; only trailing whitespace may go.
+        let q = "    indented\n    code";
+        let (body, prompt) = question_prompt(q, 80);
+        let body = body.expect("an indented code block renders above the picker");
+        assert_eq!(prompt, "Your answer");
+        assert!(body.contains("indented"), "{body:?}");
+        assert!(body.contains("code"), "{body:?}");
+        // Trailing whitespace is still trimmed.
+        let (body, prompt) = question_prompt("Plain question?   \n", 80);
+        assert_eq!(body, None);
+        assert_eq!(prompt, "Plain question?");
+    }
+
+    #[test]
+    fn an_over_wide_question_leaves_the_inline_prompt_on_a_narrow_terminal() {
+        // 19 cells of question on an 18-column terminal must not stay inline:
+        // the picker prompt row would wrap.
+        let (body, prompt) = question_prompt("Which should I use?", 18);
+        assert!(body.is_some(), "over-wide question renders above the picker");
+        assert_eq!(prompt, "Your answer");
+        // Exactly at the limit (14 cells of text on an 18-col terminal) fits.
+        let (body, _) = question_prompt("fits exactly!?", 18);
+        assert_eq!(body, None);
+        // Wide glyphs count by terminal cells, not chars: 10 CJK chars = 20 cells.
+        let (body, prompt) = question_prompt("数据库用哪个比较好呢？", 19);
+        assert!(body.is_some(), "20 cells on a 19-col terminal is over-wide");
+        assert_eq!(prompt, "Your answer");
+    }
+
+    #[test]
+    fn a_structured_question_is_rendered_as_markdown_above_the_picker() {
+        let q = "I found two options:\n\n- **Postgres**: already in `docker-compose.yml`\n- SQLite: simpler\n\nWhich should I use?";
+        let (body, prompt) = question_prompt(q, 80);
+        let body = body.expect("a multi-line question gets a body");
+        assert_eq!(prompt, "Your answer");
+        let lines: Vec<&str> = body.lines().collect();
+        assert!(lines.len() >= 4, "line breaks kept: {body:?}");
+        assert!(lines.iter().any(|l| l.contains("Postgres") && !l.contains("**")), "markdown rendered: {body:?}");
+        assert!(lines.iter().any(|l| l.contains("Which should I use?")), "{body:?}");
+    }
+
+    #[test]
+    fn a_long_question_wraps_and_escapes_are_dropped() {
+        let q = format!("\x1b[2J{}", "word ".repeat(40));
+        let (body, prompt) = question_prompt(&q, 40);
+        let body = body.expect("too wide for one row");
+        assert_eq!(prompt, "Your answer");
+        assert!(body.lines().count() > 1, "{body:?}");
+        assert!(!body.contains("\x1b[2J"), "escapes dropped: {body:?}");
     }
 
     #[test]
@@ -2900,8 +3870,67 @@ mod tests {
         // spill an unprefixed extra row or move a selector's cursor, not
         // multi-line content to keep. Other controls are dropped as well.
         assert_eq!(sanitize_terminal_line("first\nsecond"), "firstsecond");
-        assert_eq!(sanitize_terminal_line("hi\x1b[2J\nthere"), "hi[2Jthere");
+        // The whole CSI sequence is stripped; `\n` is dropped on this path.
+        assert_eq!(sanitize_terminal_line("hi\x1b[2J\nthere"), "hithere");
         assert_eq!(sanitize_terminal_line("plain — label"), "plain — label");
+    }
+
+    #[test]
+    fn deliver_idle_compact_waits_for_a_quiet_prompt() {
+        let hold = std::time::Duration::from_secs(180);
+        let quiet = hold;
+        let fresh = std::time::Duration::from_secs(5);
+        assert!(deliver_idle_compact(true, quiet, hold, false, false), "due and quiet for the hold → compact");
+        assert!(!deliver_idle_compact(true, fresh, hold, false, false), "a fresh draft or keystroke holds it");
+        assert!(!deliver_idle_compact(false, quiet, hold, false, false), "not due (off, under threshold, spent)");
+        assert!(!deliver_idle_compact(true, quiet, hold, true, false), "a queued Ctrl-C wins");
+        assert!(!deliver_idle_compact(true, quiet, hold, false, true), "an armed exit window holds it");
+    }
+
+    #[test]
+    fn idle_compact_hold_defaults_to_the_named_constant() {
+        let mut config = config::Config::default();
+        assert!(config.idle_compact, "on by default");
+        assert_eq!(idle_compact_hold(&config), lineedit::IDLE_COMPACT_HOLD);
+        config.idle_compact_hold_secs = Some(7);
+        assert_eq!(idle_compact_hold(&config), std::time::Duration::from_secs(7));
+    }
+
+    #[test]
+    fn deliver_due_timer_yields_to_interrupt_and_draft() {
+        // The core of the issue #150 guard, deterministically: a due timer may
+        // start its turn only when nothing else must win first. A queued Ctrl-C
+        // (the race the harness test can't reliably reproduce), a *fresh*
+        // half-typed draft, and an armed Ctrl-C exit window each hold the timer
+        // back; with none of them, a due timer fires. A stale (AFK) draft is
+        // not a hold — `holds_timer` is false for it — so it does not appear
+        // here; park/restore is the idle-loop's job once delivery is allowed.
+        assert!(deliver_due_timer(true, false, false, false), "due, nothing else → fire");
+        assert!(!deliver_due_timer(true, false, true, false), "queued interrupt must beat a due timer");
+        assert!(!deliver_due_timer(true, true, false, false), "a fresh draft holds the timer back");
+        assert!(!deliver_due_timer(true, true, true, false), "interrupt wins even with a draft");
+        // An armed exit window (first Ctrl-C awaiting its pair) defers the timer
+        // so the confirming second press exits instead of cancelling a surprise
+        // timer turn.
+        assert!(!deliver_due_timer(true, false, false, true), "armed exit window holds the timer back");
+        assert!(!deliver_due_timer(true, true, true, true), "exit window wins alongside draft/interrupt");
+        // Not-yet-due timers never fire regardless of the other inputs.
+        assert!(!deliver_due_timer(false, false, false, false), "a not-due timer never fires");
+        assert!(!deliver_due_timer(false, false, true, false));
+        assert!(!deliver_due_timer(false, false, false, true));
+    }
+
+    #[test]
+    fn eof_suppression_is_headless_wait_timers_only() {
+        // Only a headless `--wait-timers` run holds a closed pipe's EOF back to
+        // keep waiting for its timers.
+        assert!(suppress_eof_for_timers(true, false), "headless --wait-timers suppresses EOF");
+        // An interactive `--wait-timers` session must let Ctrl-D exit (issue
+        // #150): suppressing it would trap the user while a timer runs.
+        assert!(!suppress_eof_for_timers(true, true), "interactive EOF still exits under --wait-timers");
+        // Without `--wait-timers`, EOF is never suppressed either way.
+        assert!(!suppress_eof_for_timers(false, false), "headless without --wait-timers exits on EOF");
+        assert!(!suppress_eof_for_timers(false, true), "interactive without --wait-timers exits on EOF");
     }
 
     #[test]
@@ -2948,7 +3977,7 @@ mod tests {
         // tab- or newline-separated line, silently dropping the switch.
         let control = agent::TurnControl::default();
         let stats: context::SharedStats = std::sync::Arc::new(std::sync::Mutex::new(context::ContextStats::default()));
-        let renderer = ui::Renderer::legacy_for_test();
+        let renderer = ui::Renderer::plain_for_test();
         let snapshot = turn_commands::Snapshot::default();
 
         // Every NextStep command, separated by a tab rather than a space.
@@ -2974,7 +4003,7 @@ mod tests {
     #[test]
     fn turn_print_repairs_truncation_before_the_max_turn_fallback() {
         let _lock = ui::tests::verbosity_lock();
-        let r = ui::Renderer::legacy_for_test();
+        let r = ui::Renderer::plain_for_test();
         let outcome = agent::TurnOutcome {
             response: "full final answer\n[stopped after 3 LLM calls without a final answer]".into(),
             stop_reason: agent::StopReason::MaxTurnRequests,
@@ -2997,7 +4026,7 @@ mod tests {
 
         // Without the truncation flag the max-turn fallback still prints only
         // the dimmed stop-note line.
-        let r2 = ui::Renderer::legacy_for_test();
+        let r2 = ui::Renderer::plain_for_test();
         r2.begin_turn();
         assert_eq!(
             turn_print(&outcome, &r2),
@@ -3120,7 +4149,7 @@ mod tests {
     fn the_work_clock_guard_brackets_a_picker() {
         // The guard the question/cap pickers hold: the clock only counts while
         // it is not held, and it is harmless when no turn is running (the
-        // picker paths run at the prompt too, and in legacy mode).
+        // picker paths run at the prompt too, and with plain output).
         let renderer = ui::Renderer::frame_for_test();
         renderer.begin_turn();
         assert_eq!(renderer.work_paused_for_test(), Some(false), "a running turn counts working time");
@@ -3133,7 +4162,7 @@ mod tests {
         assert_eq!(renderer.work_paused_for_test(), Some(false), "dropping the guard resumes the working clock");
         renderer.end_turn();
         assert_eq!(renderer.work_paused_for_test(), None, "no turn, no clock");
-        // Idle/legacy: the guard is a no-op, not a panic.
+        // Idle: the guard is a no-op, not a panic.
         let _work = WorkClock::pause(&renderer);
     }
 }

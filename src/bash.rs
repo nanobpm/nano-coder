@@ -113,34 +113,27 @@ fn validate(config: &BashConfig, args: &Value) -> Result<Arguments, String> {
     Ok(Arguments { command, timeout, limit })
 }
 
-/// Execute a bash tool call and return the model-facing result text.
+/// Execute a bash tool call and return the model-facing result text, with a
+/// never-started call rendered as `Error: …` text (see [`run_checked`]).
+#[cfg(test)]
 pub fn run(config: &BashConfig, args: &Value) -> String {
-    run_digest(config, args).0
+    run_checked(config, args).unwrap_or_else(|message| format!("Error: {message}"))
 }
 
-/// [`run`], also returning the [`Spill`] identity (digest + exact marker path)
-/// of each capture that was truncated and spilled (stdout first, then stderr),
-/// so the caller can hand the loop detector the spills' identity **out of
-/// band** instead of the detector re-parsing the rendered markers (issue #65).
-pub fn run_digest(config: &BashConfig, args: &Value) -> (String, Vec<Spill>) {
-    let arguments = match validate(config, args) {
-        Ok(arguments) => arguments,
-        Err(message) => {
-            return (
-                format!("Error: {}", output::bound_output(&message, output::DEFAULT_MAX_OUTPUT_LENGTH).0),
-                Vec::new(),
-            );
-        }
-    };
-    match execute(config, &arguments) {
-        Ok(done) => {
-            if let Some(slot) = &config.spill_digests {
-                *slot.lock().unwrap() = done.spills.clone();
-            }
-            (done.text, done.spills)
-        }
-        Err(message) => (format!("Error: {message}"), Vec::new()),
+/// Execute a bash tool call. A call whose command never started — invalid arguments, or a
+/// failure to set up / spawn the process — is an `Err` (the message without the
+/// `Error: ` prefix) instead of `Ok` text. A command that started is always
+/// `Ok`, even when it then exited non-zero, timed out, or was killed. The tool
+/// registry uses this so a bash call that never ran is a failed tool call and
+/// is never mistaken for a verification check (issue #68).
+pub fn run_checked(config: &BashConfig, args: &Value) -> Result<String, String> {
+    let arguments = validate(config, args)
+        .map_err(|message| output::bound_output(&message, output::DEFAULT_MAX_OUTPUT_LENGTH).0)?;
+    let done = execute(config, &arguments)?;
+    if let Some(slot) = &config.spill_digests {
+        *slot.lock().unwrap() = done.spills.clone();
     }
+    Ok(done.text)
 }
 
 /// The model-facing result text plus the identity of each spilled capture.
@@ -430,6 +423,18 @@ mod tests {
             run(&config, &json!({"command": "echo out; echo err >&2; exit 3"})),
             "out\n\nStderr:\nerr\n\nExit code: 3"
         );
+    }
+
+    #[test]
+    fn run_checked_rejects_commands_that_never_started() {
+        let (_dir, config) = config();
+        assert!(run_checked(&config, &json!({})).unwrap_err().contains("must be set"));
+        assert!(run_checked(&config, &json!({"command": 1})).is_err());
+        assert!(run_checked(&config, &json!({"command": "a\u{0}b"})).is_err());
+        assert!(run_checked(&config, &json!({"command": "ls", "timeout_seconds": 0})).is_err());
+        assert!(run_checked(&config, &json!("ls")).is_err());
+        // A command that started is Ok even when it fails.
+        assert!(run_checked(&config, &json!({"command": "exit 3"})).unwrap().contains("Exit code: 3"));
     }
 
     #[test]
