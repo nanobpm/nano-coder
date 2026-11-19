@@ -47,10 +47,18 @@ Duration heartbeatInterval = defaultHeartbeatSecs.seconds;
 /// so the supervisor can tell which call is alive.
 string heartbeatText(string command, Duration elapsed)
 {
+    import std.array : array;
+    import std.conv : to;
+    import std.regex : regex, replaceAll;
     import std.string : strip;
+    import std.utf : byDchar;
     auto total = elapsed.total!"seconds";
-    auto head = command.strip;
-    if (head.length > 60) head = head[0 .. 60] ~ "…";
+    // Decode (invalid bytes become U+FFFD) and cut by code points, never by
+    // bytes, so the line stays valid UTF-8; collapse whitespace so a
+    // multi-line command stays on one heartbeat line.
+    auto chars = command.byDchar.array.to!string
+        .replaceAll(regex(`\s+`), " ").strip.to!dstring;
+    auto head = chars.length > 60 ? (chars[0 .. 60] ~ "…"d).to!string : chars.to!string;
     return format("… still running (%sm%02ss, %s)", total / 60, total % 60, head);
 }
 
@@ -236,6 +244,22 @@ unittest
     assert(result.startsWith("1\n2\n3\n4\n5\n") && result.endsWith("100000\n"), result);
     auto path = result.findSplitAfter("full output saved to ")[1].findSplitBefore(" ...]")[0];
     assert(readText(path).lineSplitter.walkLength == 100000);
+}
+
+// Truncation cuts by code points: a multibyte char crossing the 60th byte is
+// kept whole, invalid input bytes are replaced, and newlines are collapsed.
+unittest
+{
+    import std.utf : validate;
+    import std.array : replicate;
+    import std.algorithm : canFind;
+    auto t = heartbeatText("x".replicate(59) ~ "éééé", 61.seconds);
+    validate(t);
+    assert(t.canFind("x".replicate(59) ~ "é…"), t);
+    auto bad = heartbeatText("echo \xff\xfe", 1.seconds);
+    validate(bad);
+    auto ml = heartbeatText("a\nb\r\n  c", 1.seconds);
+    assert(!ml.canFind('\n') && ml.canFind("a b c"), ml);
 }
 
 // The heartbeat's interval math: the default 60 s stays below the 300 s
