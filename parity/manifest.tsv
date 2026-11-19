@@ -1372,6 +1372,8 @@ update.rs::a_brew_check_reads_the_tap_formula	test
 update.rs::a_due_background_check_waits_for_an_in_flight_one_without_spinning	na	D checker is one thread sending hints over a channel; no shared in-flight state or waiter
 update.rs::a_failed_check_is_silent_and_cheap	test
 update.rs::a_failing_installer_reports_and_changes_nothing	test
+update.rs::cargo_installs_are_told_to_switch_and_never_run_cargo	na	cargo-only notice in the last Rust release (0.69.0, #191); D is not on crates.io
+update.rs::the_cargo_hint_points_at_the_switch	na	cargo-only notice in the last Rust release (0.69.0, #191); D is not on crates.io
 update.rs::a_keg_path_maps_to_the_stable_opt_link	test
 update.rs::a_ready_hint_wakes_an_idle_waiter	na	D checker is one thread sending hints over a channel; no shared in-flight state or waiter
 update.rs::a_restart_inside_the_interval_defers_the_startup_check	test
