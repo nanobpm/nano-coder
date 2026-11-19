@@ -300,3 +300,44 @@ unittest
     auto stale = 5_000 + ctx.messagesTokens(agent.messages[$ - 1 .. $], 1, avail[$ - 1 .. $]);
     assert(tokens < stale, "no double charge");
 }
+
+// How a probed window merges with the other sources. D derives the window on
+// demand, so the "stats" follow automatically.
+// rust: agent.rs::a_background_probe_refines_a_default_window_source
+// rust: agent.rs::a_looser_probe_does_not_replace_a_learned_window_stat
+// rust: agent.rs::a_stricter_probe_replaces_a_learned_window_stat
+// rust: agent.rs::an_equal_probe_replaces_a_learned_window_stat_source
+unittest
+{
+    import std.algorithm : startsWith;
+    auto mock = new MockClient(null);
+    auto agent = new Agent(mock, new ToolRegistry, Policy.init, null);
+    string source;
+    agent.contextWindow(source);
+    // A probe refines a default (or model-name) window.
+    agent.capabilities.window = 8_192;
+    agent.capabilities.windowSource = "max_model_len";
+    assert(agent.contextWindow(source) == 8_192 && source.startsWith("reported by the endpoint"), source);
+    // A learned window is binding against a looser probe...
+    agent.learnedWindow = 100_000;
+    agent.capabilities.window = 200_000;
+    assert(agent.contextWindow(source) == 100_000 && source == "learned from a context-overflow error", source);
+    // ...a stricter one replaces it...
+    agent.learnedWindow = 200_000;
+    agent.capabilities.window = 128_000;
+    assert(agent.contextWindow(source) == 128_000 && source.startsWith("reported by the endpoint"), source);
+    // ...and an equal one relabels the source as the endpoint's.
+    agent.learnedWindow = 128_000;
+    assert(agent.contextWindow(source) == 128_000 && source.startsWith("reported by the endpoint"), source);
+}
+
+// rust: agent.rs::a_configured_window_preserves_the_probed_output_limit
+unittest
+{
+    auto agent = new Agent(new MockClient(null), new ToolRegistry, Policy.init, null);
+    agent.setConfiguredWindow(ConfiguredWindow(200_000, "context_window in config"));
+    agent.capabilities.maxOutput = 16_000;
+    string source;
+    assert(agent.contextWindow(source) == 200_000 && source == "context_window in config");
+    assert(agent.effectiveMaxTokens == 16_000, "the endpoint's output limit stands beside a configured window");
+}

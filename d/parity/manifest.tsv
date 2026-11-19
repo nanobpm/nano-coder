@@ -8,14 +8,14 @@ acp.rs::requeued_escaped_steers_are_re_escaped	todo
 acp.rs::slash_prompts_never_reach_the_model_over_acp	todo
 acp.rs::thinking_value_reports_nothing_for_a_dropped_level	test
 acp.rs::turn_usage_is_the_delta_of_the_session_counters	test
-agent.rs::a_background_probe_refines_a_default_window_source	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
+agent.rs::a_background_probe_refines_a_default_window_source	test
 agent.rs::a_cancelled_idle_compaction_is_not_retried_on_the_same_crossing	test
 agent.rs::a_chat_output_cap_fallback_halves_the_sent_budget	test
 agent.rs::a_compaction_summary_cap_fallback_halves_the_sent_budget	test
 agent.rs::a_compaction_summary_is_retried_after_learning_the_output_cap	test
 agent.rs::a_compaction_summary_retry_honours_a_pending_model_switch	test
-agent.rs::a_configured_window_preserves_the_probed_output_limit	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
-agent.rs::a_configured_window_probes_only_the_thinking_levels	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
+agent.rs::a_configured_window_preserves_the_probed_output_limit	test
+agent.rs::a_configured_window_probes_only_the_thinking_levels	gap	D runs one combined capability probe synchronously when a client is built or switched (a mid-turn switch waits on it; a configured window still makes the window half run); Rust probes in the background with generations and skips the window half when configured
 agent.rs::a_direct_model_switch_supersedes_a_stale_queued_request	test
 agent.rs::a_direct_model_switch_with_a_slow_key_command_does_not_stall_the_runtime	na	Tokio runtime races while a client builds asynchronously; D builds the client synchronously on the agent thread
 agent.rs::a_failed_direct_model_switch_still_clears_a_stale_queued_request	test
@@ -28,7 +28,7 @@ agent.rs::a_headless_turn_with_no_cap_stops_at_the_safety_cap	test
 agent.rs::a_learned_window_is_the_combined_cap_when_no_total_is_advertised	test
 agent.rs::a_learned_window_tightens_the_effective_combined_window	test
 agent.rs::a_literal_list_loop_runs_without_asking	test
-agent.rs::a_looser_probe_does_not_replace_a_learned_window_stat	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
+agent.rs::a_looser_probe_does_not_replace_a_learned_window_stat	test
 agent.rs::a_lower_learned_window_restores_the_output_reservation	test
 agent.rs::a_memory_evicted_from_the_installed_index_becomes_recallable	test
 agent.rs::a_mid_turn_thinking_change_applies_from_the_next_step_and_drops_the_temperature	test
@@ -47,9 +47,9 @@ agent.rs::a_same_agent_retry_after_a_provider_error_does_not_replay_the_snapshot
 agent.rs::a_second_overflow_is_returned	test
 agent.rs::a_small_max_tokens_caps_the_thinking_budget_with_a_warning	test
 agent.rs::a_spoofed_summary_prefix_does_not_unlock_history_tools	test
-agent.rs::a_stale_background_probe_is_discarded_after_a_later_switch	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
+agent.rs::a_stale_background_probe_is_discarded_after_a_later_switch	gap	D runs one combined capability probe synchronously when a client is built or switched (a mid-turn switch waits on it; a configured window still makes the window half run); Rust probes in the background with generations and skips the window half when configured
 agent.rs::a_steer_between_continuations_drops_the_cut_off_prefix	test
-agent.rs::a_stricter_probe_replaces_a_learned_window_stat	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
+agent.rs::a_stricter_probe_replaces_a_learned_window_stat	test
 agent.rs::a_summary_cut_off_at_the_output_limit_is_flagged	test
 agent.rs::a_thinking_level_set_mid_turn_applies_from_the_next_step	test
 agent.rs::a_timer_set_in_a_turn_fires_mid_turn_when_the_clock_passes_it	test
@@ -61,7 +61,7 @@ agent.rs::a_truncated_turns_stop_reason_survives_a_reload	test
 agent.rs::adds_project_instructions_to_the_system_prompt_and_nested_ones_to_file_results	test
 agent.rs::an_automatic_timer_turn_marks_its_message_auto_initiated	test
 agent.rs::an_empty_summary_at_the_output_limit_names_the_cause	test
-agent.rs::an_equal_probe_replaces_a_learned_window_stat_source	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
+agent.rs::an_equal_probe_replaces_a_learned_window_stat_source	test
 agent.rs::an_interactive_session_keeps_an_unbounded_zero_cap	test
 agent.rs::an_output_limit_rejection_is_learned_and_retried	test
 agent.rs::an_output_limit_rejection_is_retried_against_the_sent_budget	test
@@ -122,8 +122,8 @@ agent.rs::memory_save_persists_and_surfaces_in_the_prompt	test
 agent.rs::memory_tools_track_the_configured_mode	test
 agent.rs::mid_reply_drops_are_retried_and_leave_no_partial_text_in_history	test
 agent.rs::mid_reply_restart_emits_a_reset_event_before_resending	test
-agent.rs::mid_turn_model_switch_with_a_configured_window_skips_the_probe	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
-agent.rs::mid_turn_model_switch_without_a_configured_window_probes_in_the_background	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
+agent.rs::mid_turn_model_switch_with_a_configured_window_skips_the_probe	gap	D runs one combined capability probe synchronously when a client is built or switched (a mid-turn switch waits on it; a configured window still makes the window half run); Rust probes in the background with generations and skips the window half when configured
+agent.rs::mid_turn_model_switch_without_a_configured_window_probes_in_the_background	gap	D runs one combined capability probe synchronously when a client is built or switched (a mid-turn switch waits on it; a configured window still makes the window half run); Rust probes in the background with generations and skips the window half when configured
 agent.rs::model_switch_during_tool_call_applies_at_the_next_model_call	test
 agent.rs::model_switch_queued_before_manual_compaction_applies_to_the_summary	test
 agent.rs::model_switch_queued_during_a_call_applies_before_threshold_compaction	test
