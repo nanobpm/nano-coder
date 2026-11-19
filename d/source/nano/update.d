@@ -7,9 +7,10 @@
 /// fails quietly within five seconds. `check_updates = false` or
 /// `NANO_CODER_NO_UPDATE_CHECK` / `NO_UPDATE_NOTIFIER` turn it off.
 ///
-/// The D port ships only through npm (`@nanobpm/nano-coder`), so there is
-/// no cargo or Homebrew channel (Rust #188): anything else (a release tarball, a dev build) is
-/// "other" and is never changed by `/update`.
+/// Two managed channels: npm (`@nanobpm/nano-coder`) and Homebrew
+/// (`nanobpm/tap/nano-coder`, Rust #188). The D build is not on crates.io, so
+/// there is no cargo channel; anything else (a release tarball, a dev build)
+/// is "other" and is never changed by `/update`.
 module nano.update;
 
 @safe:
@@ -26,19 +27,54 @@ enum long checkIntervalSecs = 60 * 60;
 enum npmPackage = "@nanobpm/nano-coder";
 enum npmLatestUrl = "https://registry.npmjs.org/" ~ npmPackage ~ "/latest";
 enum releasesUrl = "https://github.com/nanobpm/nano-coder/releases";
+/// The tap's formula. `brew upgrade` installs whatever it points at, which the
+/// release workflow bumps a few minutes after a release, so this (not the
+/// GitHub release) is the latest version a brew install can get.
+enum brewFormulaUrl = "https://raw.githubusercontent.com/nanobpm/homebrew-tap/main/Formula/nano-coder.rb";
+/// The formula `/update` upgrades (tap-qualified, never another tap's).
+enum brewFormula = "nanobpm/tap/nano-coder";
 
 /// How this binary was installed, so `/update` knows what may replace it.
-enum Channel { npm, other }
+enum Channel { npm, brew, other }
 
 /// The channel for an executable path: npm when it, or the file it links to,
 /// lies under a `node_modules/@nanobpm/` tree (macOS reports the global bin
-/// symlink npm launched it through: Rust #172).
+/// symlink npm launched it through: Rust #172); brew when either lies in a
+/// `Cellar/nano-coder/` keg (the `<prefix>/bin` and `opt` links resolve there).
 Channel channelFor(string exe)
 {
     import nano.paths : resolveSymlinks;
-    foreach (p; [exe, exe.length ? resolveSymlinks(exe) : null])
+    auto paths = [exe, exe.length ? resolveSymlinks(exe) : null];
+    foreach (p; paths)
         if (hasComponents(p, ["node_modules", "@nanobpm"])) return Channel.npm;
+    foreach (p; paths)
+        if (hasComponents(p, ["Cellar", "nano-coder"])) return Channel.brew;
     return Channel.other;
+}
+
+/// For `<prefix>/Cellar/nano-coder/<version>/bin/nano-coder`, the stable
+/// `<prefix>/opt/nano-coder/bin/nano-coder` link that follows upgrades (the
+/// versioned keg is gone after `brew upgrade` cleans up); null otherwise.
+string brewOptExe(string exe)
+{
+    import std.algorithm : splitter;
+    import std.array : array, join;
+    auto parts = exe.splitter('/').array;
+    if (parts.length < 6) return null;
+    auto t = parts[$ - 5 .. $];
+    if (t[0] != "Cellar" || t[1] != "nano-coder" || t[3] != "bin" || t[4] != "nano-coder") return null;
+    return (parts[0 .. $ - 5] ~ ["opt", "nano-coder", "bin", "nano-coder"]).join("/");
+}
+
+/// The release a formula installs, read from its download URL
+/// (`…/releases/download/v<version>/…`); null when there is none.
+string formulaVersion(string formula)
+{
+    import std.algorithm : findSplit;
+    auto r = formula.findSplit("/releases/download/v");
+    if (!r[1].length) return null;
+    auto v = r[2].findSplit("/")[0];
+    return v.length ? v : null;
 }
 
 private bool hasComponents(string path, string[] want)
@@ -71,13 +107,50 @@ unittest
 string launchExe()
 {
     import std.file : thisExePath;
-    try return stripDeletedSuffix(thisExePath());
+    import std.file : exists;
+    string exe;
+    try exe = stripDeletedSuffix(thisExePath());
     catch (Exception) return null; // no executable path: updates can't relaunch, the caller says so
+    // Linux names the versioned keg; after `brew upgrade` only `opt` is valid.
+    auto opt = brewOptExe(exe);
+    return opt.length && opt.exists ? opt : exe;
+}
+
+/// The installer program `/update` runs (null for other).
+string installer(Channel c)
+{
+    final switch (c)
+    {
+        case Channel.npm: return "npm";
+        case Channel.brew: return "brew";
+        case Channel.other: return null;
+    }
+}
+
+/// The installer's arguments that install the latest release.
+string[] installArgs(Channel c)
+{
+    final switch (c)
+    {
+        case Channel.npm: return ["install", "-g", npmPackage ~ "@latest"];
+        case Channel.brew: return ["upgrade", brewFormula];
+        case Channel.other: return null;
+    }
 }
 
 /// The update command for a channel ("" for other).
-string installCommand(Channel c) { return c == Channel.npm ? "npm " ~ installArgs(c).joinWords : ""; }
-string[] installArgs(Channel c) { return c == Channel.npm ? ["install", "-g", npmPackage ~ "@latest"] : null; }
+string installCommand(Channel c) { return c == Channel.other ? "" : installer(c) ~ " " ~ installArgs(c).joinWords; }
+
+/// Where the channel's latest version is read (null for other).
+string latestUrl(Channel c)
+{
+    final switch (c)
+    {
+        case Channel.npm: return npmLatestUrl;
+        case Channel.brew: return brewFormulaUrl;
+        case Channel.other: return null;
+    }
+}
 
 private string joinWords(string[] a) { import std.array : join; return a.join(" "); }
 
@@ -200,8 +273,9 @@ string probeOutcome(ref State s, string running, string latest, long now)
     return s.hinted == latest ? null : latest;
 }
 
-/// The latest version the registry reports, or null (offline, bad answer).
-string fetchLatest(string url)
+/// The latest version the channel's source at `url` reports (npm's registry
+/// JSON, or the tap formula's download URL), or null (offline, bad answer).
+string fetchLatest(Channel channel, string url)
 {
     import core.time : seconds;
     import nano.http : Request, perform;
@@ -215,6 +289,7 @@ string fetchLatest(string url)
     {
         string body_;
         if (perform(req, body_) != 200) return null;
+        if (channel == Channel.brew) return formulaVersion(body_);
         auto j = parseJSON(body_);
         if (auto v = "version" in j) if (v.type == JSONType.string && v.str.strip.length) return v.str.strip;
     }
@@ -233,12 +308,12 @@ final class Checker
     private long nextDue;
     Channel channel;
 
-    this(Channel channel, string statePath, string running, string url = npmLatestUrl, long now = unixNow())
+    this(Channel channel, string statePath, string running, string url = null, long now = unixNow())
     {
         this.channel = channel;
         this.statePath = statePath;
         this.running = running;
-        this.url = url;
+        this.url = url.length ? url : latestUrl(channel);
         state = loadState(statePath);
         // A restart inside the interval waits out the rest of it.
         nextDue = state.lastCheck && now - state.lastCheck < checkIntervalSecs ? state.lastCheck + checkIntervalSecs : now;
@@ -272,7 +347,7 @@ final class Checker
     string check(bool force, long now = unixNow())
     {
         if (!force && now < nextDue) return latestKnown();
-        auto latest = fetchLatest(url);
+        auto latest = fetchLatest(channel, url);
         state = loadState(statePath);
         auto found = probeOutcome(state, running, latest, now);
         saveState(statePath, state);
@@ -321,13 +396,14 @@ string[] runInstaller(Channel channel, string exe, string running,
     int delegate(string program, string[] args) @safe runner, string delegate(string exe) @safe versionOf = null)
 {
     if (channel == Channel.other)
-        return [format("This nano-coder was not installed with npm (install channel: other), so it cannot update itself. "
+        return [format("This nano-coder was not installed with npm or Homebrew (install channel: other), so it cannot update itself. "
             ~ "Download the latest release from %s — a locally built binary is never overwritten.", releasesUrl)];
-    if (which("npm") is null)
-        return [format("`npm` is not on PATH, so nano-coder cannot run the update itself. Install it manually with: %s",
-            installCommand(channel))];
+    auto program = installer(channel);
+    if (which(program) is null)
+        return [format("`%s` is not on PATH, so nano-coder cannot run the update itself. Install it manually with: %s",
+            program, installCommand(channel))];
     int status;
-    try status = runner("npm", installArgs(channel));
+    try status = runner(program, installArgs(channel));
     catch (Exception e) return [format("Could not run `%s`: %s", installCommand(channel), e.msg)];
     if (status != 0)
         return [format("`%s` exited with status %s; the running session is unchanged. Try it by hand to see the full error: %s",
@@ -570,4 +646,75 @@ unittest
         assert(checker.latestKnown is null, "the hint cache stays newer-only");
         assert(checker.takeHint() is null);
     }
+}
+
+// rust: update.rs::a_brew_check_reads_the_tap_formula
+unittest
+{
+    import std.algorithm : canFind;
+    import std.file : rmdirRecurse;
+    import std.path : buildPath;
+    import nano.testserver : serve, Reply;
+    auto srv = serve([immutable Reply(200, "content-type: text/plain\r\n",
+        "url \"https://github.com/nanobpm/nano-coder/releases/download/v0.43.0/nano-coder-0.43.0-x86_64-apple-darwin.tar.gz\"\n")]);
+    auto dir = fakeRegistryDir("brew");
+    scope (exit) rmdirRecurse(dir);
+    auto checker = new Checker(Channel.brew, buildPath(dir, "s.json"), "0.42.1", srv.url ~ "/nano-coder.rb");
+    assert(checker.check(true) == "0.43.0");
+    srv.finish();
+    assert(checker.takeHint().canFind("0.43.0 is available"));
+}
+
+// rust: update.rs::a_keg_path_maps_to_the_stable_opt_link
+unittest
+{
+    assert(brewOptExe("/home/linuxbrew/.linuxbrew/Cellar/nano-coder/0.67.0/bin/nano-coder")
+        == "/home/linuxbrew/.linuxbrew/opt/nano-coder/bin/nano-coder");
+    assert(brewOptExe("/opt/homebrew/bin/nano-coder") is null);
+    assert(brewOptExe("/opt/homebrew/Cellar/other/1.0/bin/nano-coder") is null);
+    assert(brewOptExe("nano-coder") is null);
+}
+
+// rust: update.rs::detects_the_brew_channel_on_versioned_keg_paths
+unittest
+{
+    assert(channelFor("/home/linuxbrew/.linuxbrew/Cellar/nano-coder/0.67.0/bin/nano-coder") == Channel.brew);
+    assert(channelFor("/opt/homebrew/Cellar/nano-coder/0.67.0/bin/nano-coder") == Channel.brew);
+    assert(channelFor("/opt/homebrew/Cellar/nano-coder-x/1.0/bin/nano-coder") == Channel.other, "another formula's keg");
+}
+
+// rust: update.rs::detects_the_brew_channel_through_the_bin_and_opt_links
+unittest
+{
+    import std.file : mkdirRecurse, write, symlink, rmdirRecurse;
+    import std.path : buildPath;
+    auto dir = fakeRegistryDir("brewlinks");
+    scope (exit) rmdirRecurse(dir);
+    auto kegBin = buildPath(dir, "Cellar/nano-coder/0.67.0/bin");
+    mkdirRecurse(kegBin);
+    write(buildPath(kegBin, "nano-coder"), "");
+    mkdirRecurse(buildPath(dir, "bin"));
+    symlink("../Cellar/nano-coder/0.67.0/bin/nano-coder", buildPath(dir, "bin/nano-coder"));
+    assert(channelFor(buildPath(dir, "bin/nano-coder")) == Channel.brew);
+    mkdirRecurse(buildPath(dir, "opt"));
+    symlink("../Cellar/nano-coder/0.67.0", buildPath(dir, "opt/nano-coder"));
+    assert(channelFor(buildPath(dir, "opt/nano-coder/bin/nano-coder")) == Channel.brew);
+}
+
+// rust: update.rs::the_brew_channel_upgrades_the_tap_formula
+unittest
+{
+    assert(installCommand(Channel.brew) == "brew upgrade nanobpm/tap/nano-coder");
+    assert(latestUrl(Channel.brew) == brewFormulaUrl);
+    assert(installCommand(Channel.npm) == "npm install -g @nanobpm/nano-coder@latest");
+    assert(installCommand(Channel.other) == "");
+}
+
+// rust: update.rs::the_formula_version_is_read_from_its_download_url
+unittest
+{
+    auto formula = "class NanoCoder < Formula\n  on_macos do\n    on_arm do\n"
+        ~ "      url \"https://github.com/nanobpm/nano-coder/releases/download/v0.68.1/nano-coder-0.68.1-aarch64-apple-darwin.tar.gz\"\n";
+    assert(formulaVersion(formula) == "0.68.1");
+    assert(formulaVersion("class NanoCoder < Formula\nend\n") is null);
 }

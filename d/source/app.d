@@ -749,7 +749,7 @@ void updateCommand(bool frameUi)
         return;
     }
     auto channel = channelFor(launchExe());
-    if (channel == Channel.npm)
+    if (channel != Channel.other)
     {
         auto latest = new Checker(channel, defaultStatePath(), packageVersion).check(true);
         if (latest.length && !isNewer(latest, packageVersion))
@@ -2212,8 +2212,8 @@ int runMain(string[] args)
         // The background update check (Rust #154): interactive terminal
         // sessions installed through npm only.
         import nano.update : channelFor, launchExe, disabledByEnv, isCi, startChecker, Channel;
-        if (!o.acp && cfg.checkUpdates && !disabledByEnv && !isCi && channelFor(launchExe) == Channel.npm)
-            updateHints = startChecker(Channel.npm, packageVersion);
+        if (!o.acp && cfg.checkUpdates && !disabledByEnv && !isCi && channelFor(launchExe) != Channel.other)
+            updateHints = startChecker(channelFor(launchExe), packageVersion);
     }
     scope (exit) leaveKeyMode();
     scope (exit) if (gFrame) { gFrame.uninstall(); gFrame = FrameUi.init; }
