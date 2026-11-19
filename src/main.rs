@@ -1866,8 +1866,12 @@ async fn update_command(terminal: &mut Terminal, checker: Option<&update::Checke
         }
     };
     let latest = checker.force_check().await;
-    if let Some(latest) = latest.filter(|v| !update::is_newer(v, env!("CARGO_PKG_VERSION"))) {
+    if let Some(latest) = latest.clone().filter(|v| !update::is_newer(v, env!("CARGO_PKG_VERSION"))) {
         terminal.renderer.print_block(&format!("nano-coder is up to date ({latest})"));
+        return Ok(());
+    }
+    if channel == update::Channel::Cargo {
+        terminal.renderer.print_block(&update::cargo_moved(latest.as_deref()));
         return Ok(());
     }
     // Hand the terminal to the installer the way the pager handoff does: the

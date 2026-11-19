@@ -19,8 +19,8 @@
 //! `NANO_CODER_NO_UPDATE_CHECK` / `NO_UPDATE_NOTIFIER` environment variables.
 //!
 //! `/update` runs the channel's installer (`npm install -g
-//! @nanobpm/nano-coder@latest`, `brew upgrade nanobpm/tap/nano-coder` or
-//! `cargo install nano-coder`) attached to the
+//! @nanobpm/nano-coder@latest` or `brew upgrade nanobpm/tap/nano-coder`;
+//! a cargo install, which can't get 1.0+, is told how to switch) attached to the
 //! terminal so its progress is visible and Ctrl-C cancels it, then verifies
 //! the installed binary's `--version`. `/relaunch` re-`exec`s the binary
 //! at its launch path (captured at startup, so a just-installed update at
@@ -42,7 +42,6 @@ pub const CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 /// The registry endpoints, overridable in tests.
 const NPM_LATEST_URL: &str = "https://registry.npmjs.org/@nanobpm/nano-coder/latest";
-const CRATES_URL: &str = "https://crates.io/api/v1/crates/nano-coder";
 /// The tap's formula. `brew upgrade` installs whatever it points at, which the
 /// release workflow bumps a few minutes after a release, so this (not the
 /// GitHub release) is the latest version a brew install can get.
@@ -190,7 +189,10 @@ impl Channel {
         match self {
             Channel::Npm => Some(NPM_LATEST_URL),
             Channel::Brew => Some(BREW_FORMULA_URL),
-            Channel::Cargo => Some(CRATES_URL),
+            // 1.0 and later are not on crates.io (nano-coder moved to D), so
+            // a cargo install watches npm to learn about them; see
+            // [`cargo_moved`].
+            Channel::Cargo => Some(NPM_LATEST_URL),
             Channel::Other => None,
         }
     }
@@ -304,15 +306,9 @@ async fn fetch_latest(channel: Channel, url: Option<&str>) -> Option<String> {
     let client = reqwest::Client::builder().timeout(HTTP_TIMEOUT).user_agent(USER_AGENT).build().ok()?;
     let response = client.get(url).send().await.ok()?.error_for_status().ok()?;
     let version = match channel {
-        Channel::Npm => response.json::<serde_json::Value>().await.ok()?.get("version")?.as_str()?.to_string(),
-        Channel::Cargo => response
-            .json::<serde_json::Value>()
-            .await
-            .ok()?
-            .get("crate")?
-            .get("max_stable_version")?
-            .as_str()?
-            .to_string(),
+        Channel::Npm | Channel::Cargo => {
+            response.json::<serde_json::Value>().await.ok()?.get("version")?.as_str()?.to_string()
+        }
         Channel::Brew => formula_version(&response.text().await.ok()?)?.to_string(),
         Channel::Other => return None,
     };
@@ -437,6 +433,12 @@ impl Checker {
             state.hinted = Some(version.clone());
             save_state(&self.state_path, &state);
         }
+        if self.channel == Channel::Cargo {
+            return Some(format!(
+                "nano-coder {version} is available (you have {}), but it is no longer published to crates.io — /update shows how to switch",
+                self.running
+            ));
+        }
         Some(format!("nano-coder {version} is available (you have {}) — /update to install it", self.running))
     }
 
@@ -530,6 +532,9 @@ pub async fn run_installer(
     exe: &Path,
     runner: impl FnOnce(&str, &[&str]) -> Result<std::process::ExitStatus> + Send + 'static,
 ) -> UpdateOutcome {
+    if channel == Channel::Cargo {
+        return UpdateOutcome::NoInstaller(cargo_moved(None));
+    }
     let Some(program) = channel.installer() else {
         return UpdateOutcome::Unmanaged(format!(
             "This nano-coder was not installed with npm, Homebrew or cargo (install channel: other), so it cannot update itself. \
@@ -577,6 +582,18 @@ pub async fn run_installer(
                 .to_string(),
         ),
     }
+}
+
+/// What `/update` says to a `cargo install`: from 1.0 nano-coder is written in
+/// D and published to npm and Homebrew only, so `cargo install` would just
+/// reinstall the last Rust release.
+pub fn cargo_moved(latest: Option<&str>) -> String {
+    let release = latest.map(|v| format!("nano-coder {v}")).unwrap_or_else(|| "nano-coder 1.0 and later".to_string());
+    format!(
+        "{release} is no longer published to crates.io (from 1.0 nano-coder is written in D). \
+         Switch to npm or Homebrew: `npm install -g @nanobpm/nano-coder` or `brew install {BREW_FORMULA}`, \
+         then `cargo uninstall nano-coder`. Your config and sessions carry over."
+    )
 }
 
 /// The default installer runner: spawn the program attached to the terminal.
@@ -963,14 +980,47 @@ mod tests {
         // The fake installer fails; /update must report the exit status and
         // leave the session untouched (no verification attempt needed).
         let fail: fn(&str, &[&str]) -> Result<std::process::ExitStatus> = |_, _| Ok(exit_status(1));
-        let outcome = run_installer(Channel::Cargo, Path::new("/nonexistent/nano-coder"), fail).await;
-        // `cargo` may or may not be on PATH in the test environment; both
+        let outcome = run_installer(Channel::Npm, Path::new("/nonexistent/nano-coder"), fail).await;
+        // `npm` may or may not be on PATH in the test environment; both
         // paths are acceptable outcomes here.
         match outcome {
-            UpdateOutcome::Failed(text) => assert!(text.contains("cargo install nano-coder"), "{text}"),
-            UpdateOutcome::NoInstaller(text) => assert!(text.contains("cargo install nano-coder"), "{text}"),
+            UpdateOutcome::Failed(text) => {
+                assert!(text.contains("npm install -g @nanobpm/nano-coder@latest"), "{text}")
+            }
+            UpdateOutcome::NoInstaller(text) => {
+                assert!(text.contains("npm install -g @nanobpm/nano-coder@latest"), "{text}")
+            }
             other => panic!("unexpected outcome: {}", other.lines().join("\n")),
         }
+    }
+
+    #[tokio::test]
+    async fn cargo_installs_are_told_to_switch_and_never_run_cargo() {
+        let never: fn(&str, &[&str]) -> Result<std::process::ExitStatus> = |p, _| panic!("ran {p}");
+        let UpdateOutcome::NoInstaller(text) =
+            run_installer(Channel::Cargo, Path::new("/nonexistent/nano-coder"), never).await
+        else {
+            panic!("cargo /update must not install")
+        };
+        for want in [
+            "no longer published to crates.io",
+            "npm install -g @nanobpm/nano-coder",
+            "brew install nanobpm/tap/nano-coder",
+            "cargo uninstall nano-coder",
+        ] {
+            assert!(text.contains(want), "{want}: {text}");
+        }
+        assert!(cargo_moved(Some("1.0.0")).starts_with("nano-coder 1.0.0 is no longer published"));
+        assert_eq!(Channel::Cargo.latest_url(), Some(NPM_LATEST_URL));
+    }
+
+    #[test]
+    fn the_cargo_hint_points_at_the_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let checker = Checker::with_url(Channel::Cargo, dir.path().join("s.json"), "0.69.0".into(), None);
+        *checker.hint.lock().unwrap() = Some("1.0.0".into());
+        let hint = checker.take_hint().unwrap();
+        assert!(hint.contains("no longer published to crates.io") && hint.contains("/update"), "{hint}");
     }
 
     /// An exit status for `code`, cross-platform enough for the tests.
