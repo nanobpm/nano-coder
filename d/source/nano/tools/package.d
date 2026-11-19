@@ -214,7 +214,7 @@ private string spillFile(string text, string label)
     import std.process : thisProcessID;
     import std.datetime.systime : Clock;
     static size_t counter;
-    auto dir = spillDir_.length ? spillDir_ : buildPath(tempDir, format("nano-coder-d-%s", thisProcessID));
+    auto dir = spillDir_.length ? spillDir_ : buildPath(tempDir, format("nano-coder-%s", thisProcessID));
     mkdirRecurse(dir);
     // Never overwrite: a recorded path must keep pointing at its output.
     auto stem = buildPath(dir, format("%s-%s-%s", label, Clock.currStdTime, ++counter));

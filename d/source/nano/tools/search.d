@@ -386,7 +386,7 @@ unittest
 // rust: search.rs::binary_exclusion_is_independent_of_mode_and_limit
 unittest
 {
-    auto root = buildPath(tempDir, "nano-coder-d-search-test");
+    auto root = buildPath(tempDir, "nano-coder-search-test");
     if (root.exists) rmdirRecurse(root);
     mkdirRecurse(buildPath(root, "src/deep"));
     mkdirRecurse(buildPath(root, "target"));

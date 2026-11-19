@@ -1,8 +1,8 @@
 {
-  "name": "nano-coder-d",
+  "name": "nano-coder",
   "description": "nano-coder, reimplemented in D (port in progress; see PORTING.md)",
   "license": "Apache-2.0",
-  "targetName": "nano-coder-d",
+  "targetName": "nano-coder",
   "targetType": "executable",
   "mainSourceFile": "source/entry.d",
   "libs": [

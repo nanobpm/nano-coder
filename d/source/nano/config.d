@@ -655,7 +655,7 @@ unittest
 unittest
 {
     import std.file : write, tempDir, remove;
-    auto path = buildPath(tempDir, "nano-coder-d-config-test.toml");
+    auto path = buildPath(tempDir, "nano-coder-config-test.toml");
     write(path, "model = \"box/m1\"\ntemperature = \"default\"\n[providers.box]\nkind = \"openai\"\nbase_url = \"http://x/v1\"\napi_key = \"k\"\n[providers.anthropic]\ndefault_model = \"c9\"\n");
     scope (exit) remove(path);
     auto c = Config.load(path);
@@ -672,7 +672,7 @@ unittest
     import std.file : write, tempDir, remove;
     Config d;
     assert(d.persistSessions && d.sessionDir is null && d.verifyBeforeComplete && d.idleCompact && d.idleCompactHoldSecs == 0);
-    auto path = buildPath(tempDir, "nano-coder-d-keys-test.toml");
+    auto path = buildPath(tempDir, "nano-coder-keys-test.toml");
     write(path, "persist_sessions = false\nsession_dir = \"~/logs\"\nverify_before_complete = false\n"
         ~ "idle_compact = false\nidle_compact_hold_secs = 30\n");
     scope (exit) remove(path);
@@ -686,7 +686,7 @@ unittest
 version (unittest) Config regionalConfig(string extra = "")
 {
     import std.file : write, tempDir, remove;
-    auto path = buildPath(tempDir, "nano-coder-d-regional-test.toml");
+    auto path = buildPath(tempDir, "nano-coder-regional-test.toml");
     write(path, `default_provider = "mock"
 [providers.openrouter]
 disabled = true
@@ -823,7 +823,7 @@ unittest // a retired `renderer = "legacy"` still loads, with a notice
 {
     import std.algorithm : canFind;
     import std.file : write, tempDir, remove;
-    auto path = buildPath(tempDir, "nano-coder-d-renderer-test.toml");
+    auto path = buildPath(tempDir, "nano-coder-renderer-test.toml");
     scope (exit) remove(path);
     write(path, "model = \"work/x\"\n");
     assert(Config.load(path).retiredRendererNotice is null);
@@ -933,7 +933,7 @@ unittest
     assert(b["output_config"]["effort"].str == "high" && b["output_config"]["format"].str == "json");
     assert(b["temperature"].toString == parseJSON(`0.3`).toString, b.toString);
 
-    auto path = buildPath(tempDir, "nano-coder-d-config-test2.toml");
+    auto path = buildPath(tempDir, "nano-coder-config-test2.toml");
     scope (exit) remove(path);
     string cfg(string body_) { write(path, body_); return path; }
     foreach (url; ["not a url", "ftp://host/v1", "https://host/v1?token=x", " https://host/v1", "   "])

@@ -37,7 +37,7 @@ string runKeyCommand(string provider, string command, Duration timeout = keyComm
 
     static shared size_t counter;
     import core.atomic : atomicOp;
-    auto errPath = buildPath(tempDir, format("nano-coder-d-key-%s-%s.err", thisProcessID, atomicOp!"+="(counter, 1)));
+    auto errPath = buildPath(tempDir, format("nano-coder-key-%s-%s.err", thisProcessID, atomicOp!"+="(counter, 1)));
     scope (exit) if (errPath.exists) remove(errPath);
     // Stdout is a pipe: EOF comes only once every process holding it has
     // closed it, including one that left the process group (`setsid`).

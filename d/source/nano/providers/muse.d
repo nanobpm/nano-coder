@@ -45,7 +45,7 @@ class MuseClient : LLMClient, CapabilityProbe, KindedClient
         if (p.apiKey.length) return;
         StoredCredentials c;
         if (!loadCredentials(c, credentialsDir))
-            throw new Exception("not logged in to Muse Code: run `nano-coder-d --login muse` or set META_API_KEY");
+            throw new Exception("not logged in to Muse Code: run `nano-coder --login muse` or set META_API_KEY");
         grant = c.grant;
         haveGrant = true;
         // Reuse the key the login minted; a 401 re-mints.

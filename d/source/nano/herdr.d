@@ -21,7 +21,7 @@ private enum source = "nano-coder";
 /// The agent name Herdr shows for the pane.
 private enum agent = "nano-coder";
 /// The command a resume runs: this binary, not the Rust one.
-enum resumeCommand = "nano-coder-d";
+enum resumeCommand = "nano-coder";
 /// How long one report may run before it is abandoned.
 private enum timeout = 2.seconds;
 /// Herdr's limits on a resume command.
@@ -316,15 +316,15 @@ unittest // the session report puts the resume argv after `--`
     assert(args[0 .. 2] == ["pane", "report-agent-session"]);
     auto dash = args.countUntil("--");
     assert(args[dash - 4 .. dash] == ["--seq", "2", "--agent-session-id", "s1"]);
-    assert(args[dash + 1 .. $] == ["nano-coder-d", "--resume", "s1", "--model", "openai/gpt-5"]);
+    assert(args[dash + 1 .. $] == ["nano-coder", "--resume", "s1", "--model", "openai/gpt-5"]);
 }
 
 // rust: herdr.rs::resume_argv_respects_herdr_rules
 unittest // the resume argv follows Herdr's rules
 {
     import std.array : replicate;
-    assert(resumeArgv("s1", null, null) == ["nano-coder-d", "--resume", "s1"]);
-    assert(resumeArgv("s1", "", ["--config", "/tmp/c.toml"]) == ["nano-coder-d", "--resume", "s1", "--config", "/tmp/c.toml"]);
+    assert(resumeArgv("s1", null, null) == ["nano-coder", "--resume", "s1"]);
+    assert(resumeArgv("s1", "", ["--config", "/tmp/c.toml"]) == ["nano-coder", "--resume", "s1", "--config", "/tmp/c.toml"]);
     assert(resumeArgv("s1", "it's", null) is null);
     assert(resumeArgv("s\n1", null, null) is null);
     string[] many;

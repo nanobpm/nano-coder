@@ -1,4 +1,4 @@
-/// nano-coder-d command line: a plain line-based REPL, one-shot `-p`, and the
+/// nano-coder command line: a plain line-based REPL, one-shot `-p`, and the
 /// flags of the Rust CLI that this port implements.
 module app;
 
@@ -52,17 +52,17 @@ import nano.instructions : ProjectInstructions, InstructionOptions = Options, ex
 import core.atomic : atomicLoad, atomicStore, cas;
 
 enum string packageVersion = "0.1.0";
-enum string versionString = "nano-coder-d " ~ packageVersion ~ " (D port of nano-coder; see PORTING.md)";
+enum string versionString = "nano-coder " ~ packageVersion;
 
-enum string usage = `Usage: nano-coder-d [--model provider/model] [--config PATH] [-p PROMPT]
+enum string usage = `Usage: nano-coder [--model provider/model] [--config PATH] [-p PROMPT]
                     [--resume [SESSION_ID|last]] [--plan] [--sandbox off|workspace|read-only]
                     [--allow RULE]... [--deny RULE]...
                     [--no-session] [--no-hooks] [--yolo] [--wait-timers] [--verbosity quiet|normal|verbose|debug] [--acp]
-       nano-coder-d --list-sessions [--all] [--json]
-       nano-coder-d --trajectory SESSION_ID [--json|--markdown]
-       nano-coder-d --list-models PROVIDER[/model]
-       nano-coder-d --login github-copilot|muse
-       nano-coder-d --version
+       nano-coder --list-sessions [--all] [--json]
+       nano-coder --trajectory SESSION_ID [--json|--markdown]
+       nano-coder --list-models PROVIDER[/model]
+       nano-coder --login github-copilot|muse
+       nano-coder --version
 
 Reads the Rust nano-coder's config (~/.config/nano-coder/config.toml).
 -p runs one prompt and exits (--wait-timers: first wait for the timers the agent set,
@@ -255,7 +255,7 @@ void showTrajectory(const ref imported!"nano.trajectory".Trajectory t, bool inSe
 
 noreturn die(string msg)
 {
-    stdErr.writeln("nano-coder-d: ", msg);
+    stdErr.writeln("nano-coder: ", msg);
     exitProcess(2);
 }
 
@@ -754,7 +754,7 @@ void updateCommand(bool frameUi)
         auto latest = new Checker(channel, defaultStatePath(), packageVersion).check(true);
         if (latest.length && !isNewer(latest, packageVersion))
         {
-            writefln("nano-coder-d is up to date (%s)", latest);
+            writefln("nano-coder is up to date (%s)", latest);
             return;
         }
     }
@@ -1612,6 +1612,9 @@ int runMain(string[] args)
 
     // `session_dir` relocates the logs; `persist_sessions = false` saves none.
     immutable sessionDir = nano.session.sessionDir(cfg.sessionDir);
+    if (sessionDir == nano.session.sessionDir())
+        if (auto n = nano.session.adoptPreviewSessions(nano.session.previewSessionDir(), sessionDir))
+            stdErr.writefln("nano-coder: moved %s session(s) from the nano-coder-d preview into %s", n, sessionDir);
     if (!cfg.persistSessions) o.noSession = true;
     if (o.trajectory !is null) return printTrajectory(sessionDir, o.trajectory, o.json, o.markdown);
     if (o.listSessions) return printSessions(sessionDir, o.all, o.json);
@@ -1725,7 +1728,7 @@ int runMain(string[] args)
             auto line = stdinLine();
             return line.length && isYes(line);
         }
-        void note(string msg) { stdErr.writeln("nano-coder-d: ", msg); }
+        void note(string msg) { stdErr.writeln("nano-coder: ", msg); }
         auto ok = decideRoot(root, cfg.skills.dirs, cfg.skills.aiLock, to, trustFile, &confirm, &note);
         decided[root] = ok;
         return ok;
@@ -1741,7 +1744,7 @@ int runMain(string[] args)
         auto sc = cfg.skills;
         if (!trusted(dir)) { sc.dirs = null; sc.aiLock = false; }
         auto s = Skills.discover(dir, sc);
-        foreach (w; s.warnings) stdErr.writeln("nano-coder-d: skills: ", w);
+        foreach (w; s.warnings) stdErr.writeln("nano-coder: skills: ", w);
         return s;
     }
     skills = discoverSkills(cwd);
@@ -1889,7 +1892,7 @@ int runMain(string[] args)
     {
         auto restored = restore(path);
         foreach (note; agent.loadRestored(restored, o.noSession ? Option!SessionLog(none) : some(new SessionLog(path))))
-            stdErr.writeln("nano-coder-d: ignoring ", note);
+            stdErr.writeln("nano-coder: ignoring ", note);
         updateStatus((ref Stats s) { s.historySearches = s.historyReads = 0; });
         if (!agent.timers.empty)
             stdErr.writefln("%s timer%s still set (/timers lists them)", agent.timers.items.length,
@@ -2227,7 +2230,7 @@ int runMain(string[] args)
         import std.algorithm : map;
         import std.array : join;
         string[] banner = [
-            "nano-coder-d v" ~ packageVersion,
+            "nano-coder v" ~ packageVersion,
             format("Model: %s (provider: %s)", client.modelName, client.providerName),
         ];
         agent.log.ifSome((SessionLog l) { banner ~= format("Session: %s (resume with --resume %s)", l.id, l.id); });

@@ -438,7 +438,7 @@ class CopilotClient : OpenAIClient
         StoredCredentials c;
         if (!oauth.length && loadCredentials(c) && c.domain == d) oauth = c.oauthToken;
         if (!oauth.length)
-            throw new Exception("not logged in to GitHub Copilot: run `nano-coder-d --login github-copilot` "
+            throw new Exception("not logged in to GitHub Copilot: run `nano-coder --login github-copilot` "
                 ~ "or set GITHUB_COPILOT_OAUTH_TOKEN");
         endpoints = Endpoints.forDomain(d);
     }

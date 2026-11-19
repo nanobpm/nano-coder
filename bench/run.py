@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parent.parent
 D_DIR = ROOT / "d"
 RUST_TARGET = ROOT / "target-bench"
 RUST_BIN = RUST_TARGET / "release" / "nano-coder"
-D_BIN = D_DIR / "nano-coder-d"
+D_BIN = D_DIR / "nano-coder"
 PROMPT = "Update notes.txt: replace beta with gamma, show it, and confirm."
 
 

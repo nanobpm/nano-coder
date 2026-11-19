@@ -731,7 +731,7 @@ version (unittest)
     private string tmpFile(string name, string content)
     {
         import std.path : buildPath;
-        auto dir = buildPath(tempDir, "nano-coder-d-files-test");
+        auto dir = buildPath(tempDir, "nano-coder-files-test");
         mkdirRecurse(dir);
         auto p = buildPath(dir, name);
         if (content !is null) write(p, content);
@@ -1025,7 +1025,7 @@ unittest
 unittest
 {
     auto st = new ReadState;
-    auto sub = buildPath(tempDir, "nano-coder-d-files-test", "subdir");
+    auto sub = buildPath(tempDir, "nano-coder-files-test", "subdir");
     mkdirRecurse(sub);
     bool threw;
     try writeFile(j("path", sub, "content", "x"), st); catch (ToolError e) threw = e.msg.indexOf("read ") >= 0;

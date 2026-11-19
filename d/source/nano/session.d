@@ -20,16 +20,73 @@ import std.array : array;
 import nano.llm;
 import nano.option : Option, some, ifSome;
 
-/// The session log directory: `NANO_CODER_D_SESSIONS`, else the configured
+/// The session log directory: `NANO_CODER_SESSIONS`, else the configured
 /// `session_dir` (`~` expanded), else the platform data folder.
 string sessionDir(string configured = null)
 {
-    if (auto x = environment.get("NANO_CODER_D_SESSIONS")) return x;
+    if (auto x = environment.get("NANO_CODER_SESSIONS")) return x;
     if (configured.length) return expandTilde(configured);
+    version (OSX)
+        return buildPath(expandTilde("~"), "Library", "Application Support", "nano-coder", "sessions");
+    else
+        return buildPath(environment.get("XDG_DATA_HOME", buildPath(expandTilde("~"), ".local", "share")), "nano-coder", "sessions");
+}
+
+/// Where the D preview (`nano-coder-d`) kept its logs before it became
+/// `nano-coder`: the default `sessions` folder under the old app name.
+string previewSessionDir()
+{
     version (OSX)
         return buildPath(expandTilde("~"), "Library", "Application Support", "nano-coder-d", "sessions");
     else
         return buildPath(environment.get("XDG_DATA_HOME", buildPath(expandTilde("~"), ".local", "share")), "nano-coder-d", "sessions");
+}
+
+/// Move the D preview's session logs (with their spill and attachment
+/// folders) from `from` into `to`, once. An entry whose name already exists
+/// in `to` stays behind; the preview's index cache is dropped (the listing
+/// rescans unindexed logs). `from` is removed when it ends up empty, so later
+/// starts find nothing to do. Returns how many entries moved.
+size_t adoptPreviewSessions(string from, string to)
+{
+    import std.exception : collectException;
+    import nano.session_index : indexFile;
+    if (!from.exists || !from.isDir) return 0;
+    mkdirRecurse(to);
+    size_t moved;
+    foreach (name; dirEntries(from, SpanMode.shallow).map!(e => e.name.baseName).array)
+    {
+        auto src = buildPath(from, name), dst = buildPath(to, name);
+        if (name == indexFile) { collectException(remove(src)); continue; }
+        if (dst.exists) continue;
+        if (collectException(rename(src, dst)) is null) ++moved;
+    }
+    if (dirEntries(from, SpanMode.shallow).empty) collectException(rmdir(from));
+    return moved;
+}
+
+unittest
+{
+    auto root = buildPath(tempDir, "nano-coder-adopt-test");
+    if (root.exists) rmdirRecurse(root);
+    scope (exit) rmdirRecurse(root);
+    auto from = buildPath(root, "old"), to = buildPath(root, "new");
+    mkdirRecurse(buildPath(from, "sess-a.spill"));
+    write(buildPath(from, "sess-a.jsonl"), "a");
+    write(buildPath(from, "sess-b.jsonl"), "old b");
+    write(buildPath(from, ".index.jsonl"), "{}");
+    mkdirRecurse(to);
+    write(buildPath(to, "sess-b.jsonl"), "new b");
+    assert(adoptPreviewSessions(from, to) == 2);
+    assert(readText(buildPath(to, "sess-a.jsonl")) == "a");
+    assert(buildPath(to, "sess-a.spill").isDir);
+    assert(readText(buildPath(to, "sess-b.jsonl")) == "new b", "an existing log is never overwritten");
+    assert(!buildPath(to, ".index.jsonl").exists);
+    assert(readText(buildPath(from, "sess-b.jsonl")) == "old b");
+    remove(buildPath(from, "sess-b.jsonl"));
+    assert(adoptPreviewSessions(from, to) == 0);
+    assert(!from.exists, "an emptied preview folder is removed");
+    assert(adoptPreviewSessions(from, to) == 0);
 }
 
 /// Session log format version (Rust `session::FORMAT_VERSION`).
@@ -741,7 +798,7 @@ string listRow(const ref Summary s, SysTime now)
 // rust: providers/openai.rs::parses_tool_calls_and_bad_arguments
 unittest
 {
-    auto dir = buildPath(tempDir, "nano-coder-d-session-test");
+    auto dir = buildPath(tempDir, "nano-coder-session-test");
     if (dir.exists) rmdirRecurse(dir);
     auto log = new SessionLog(dir, "mock/m", "/x");
     assert(log.id.startsWith("sess-"));
@@ -817,7 +874,7 @@ unittest
 // rust: session.rs::replace_clears_recall_state_while_decoding
 unittest // replace_clears_recall_state_while_decoding
 {
-    auto dir = buildPath(tempDir, "nano-coder-d-session-recall");
+    auto dir = buildPath(tempDir, "nano-coder-session-recall");
     if (dir.exists) rmdirRecurse(dir);
     auto log = new SessionLog(dir, "mock/m", "/x");
     auto sys = Message.system("sys");

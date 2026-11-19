@@ -58,7 +58,7 @@ BashResult run(string command, Duration timeout, string cwd = null, const Sandbo
     import std.process : thisProcessID;
     import std.datetime.systime : Clock;
     static size_t n;
-    auto stem = buildPath(tempDir, format("nano-coder-d-bash-%s-%s-%s", thisProcessID, Clock.currStdTime, ++n));
+    auto stem = buildPath(tempDir, format("nano-coder-bash-%s-%s-%s", thisProcessID, Clock.currStdTime, ++n));
     auto outPath = stem ~ ".out", errPath = stem ~ ".err";
     scope (exit)
     {

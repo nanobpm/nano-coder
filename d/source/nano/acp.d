@@ -484,7 +484,7 @@ final class AcpServer : AgentEvents
         case "initialize":
             reply(rpcResult(id, JSONValue([
                 "protocolVersion": JSONValue(protocolVersion),
-                "agentInfo": JSONValue(["name": "nano-coder-d", "version": host.version_]),
+                "agentInfo": JSONValue(["name": "nano-coder", "version": host.version_]),
                 "agentCapabilities": JSONValue(["loadSession": JSONValue(host.sessionDir !is null),
                     "tools": JSONValue(true), "hooks": JSONValue(false), "compact": JSONValue(true),
                     "_meta": JSONValue(["planSeed": JSONValue(agent.planTools)])]),

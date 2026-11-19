@@ -1,13 +1,13 @@
 /// Background update check, `/update` and `/relaunch` (update.rs, Rust #154
 /// and #172). Interactive terminal sessions only (never `-p`, ACP or CI):
 /// a check at startup and then hourly, in the background; the last check and
-/// the latest known version persist in `<data dir>/nano-coder-d/
+/// the latest known version persist in `<data dir>/nano-coder/
 /// update-check.json`, so a quick restart doesn't check again. A newer
 /// release gives one hint per version, at an idle prompt. Offline, the check
 /// fails quietly within five seconds. `check_updates = false` or
 /// `NANO_CODER_NO_UPDATE_CHECK` / `NO_UPDATE_NOTIFIER` turn it off.
 ///
-/// The D port ships only through npm (`@nanobpm/nano-coder-d`), so there is
+/// The D port ships only through npm (`@nanobpm/nano-coder`), so there is
 /// no cargo or Homebrew channel (Rust #188): anything else (a release tarball, a dev build) is
 /// "other" and is never changed by `/update`.
 module nano.update;
@@ -23,7 +23,7 @@ import nano.safeio : Chan;
 
 /// How often a running session checks again.
 enum long checkIntervalSecs = 60 * 60;
-enum npmPackage = "@nanobpm/nano-coder-d";
+enum npmPackage = "@nanobpm/nano-coder";
 enum npmLatestUrl = "https://registry.npmjs.org/" ~ npmPackage ~ "/latest";
 enum releasesUrl = "https://github.com/nanobpm/nano-coder/releases";
 
@@ -125,14 +125,14 @@ struct State
     }
 }
 
-/// `<data dir>/nano-coder-d/update-check.json`.
+/// `<data dir>/nano-coder/update-check.json`.
 string defaultStatePath()
 {
     import std.path : buildPath, expandTilde;
     import std.process : environment;
     version (OSX) auto base = buildPath(expandTilde("~"), "Library", "Application Support");
     else auto base = environment.get("XDG_DATA_HOME", buildPath(expandTilde("~"), ".local", "share"));
-    return buildPath(base, "nano-coder-d", "update-check.json");
+    return buildPath(base, "nano-coder", "update-check.json");
 }
 
 State loadState(string path)
@@ -208,7 +208,7 @@ string fetchLatest(string url)
     Request req;
     req.method = "GET";
     req.url = url;
-    req.headers = ["Accept": "application/json", "User-Agent": "nano-coder-d (https://github.com/nanobpm/nano-coder)"];
+    req.headers = ["Accept": "application/json", "User-Agent": "nano-coder (https://github.com/nanobpm/nano-coder)"];
     req.connectTimeout = 5.seconds;
     req.idleTimeout = 5.seconds;
     try
@@ -265,7 +265,7 @@ final class Checker
         state = loadState(statePath);
         state.hinted = v;
         saveState(statePath, state);
-        return format("nano-coder-d %s is available (you have %s) — /update to install it", v, running);
+        return format("nano-coder %s is available (you have %s) — /update to install it", v, running);
     }
 
     /// Checks when due (or `force`); returns the registry's latest version.
@@ -321,10 +321,10 @@ string[] runInstaller(Channel channel, string exe, string running,
     int delegate(string program, string[] args) @safe runner, string delegate(string exe) @safe versionOf = null)
 {
     if (channel == Channel.other)
-        return [format("This nano-coder-d was not installed with npm (install channel: other), so it cannot update itself. "
+        return [format("This nano-coder was not installed with npm (install channel: other), so it cannot update itself. "
             ~ "Download the latest release from %s — a locally built binary is never overwritten.", releasesUrl)];
     if (which("npm") is null)
-        return [format("`npm` is not on PATH, so nano-coder-d cannot run the update itself. Install it manually with: %s",
+        return [format("`npm` is not on PATH, so nano-coder cannot run the update itself. Install it manually with: %s",
             installCommand(channel))];
     int status;
     try status = runner("npm", installArgs(channel));
@@ -334,12 +334,12 @@ string[] runInstaller(Channel channel, string exe, string running,
             installCommand(channel), status, installCommand(channel))];
     auto v = versionOf is null ? installedVersion(exe) : versionOf(exe);
     if (v is null)
-        return ["The installer finished but the installed `nano-coder-d --version` could not be read; the running session is unchanged."];
+        return ["The installer finished but the installed `nano-coder --version` could not be read; the running session is unchanged."];
     auto bare = v;
     while (bare.length && (bare[0] == 'v' || bare[0] == 'V')) bare = bare[1 .. $];
     if (bare != running)
         return [format("Updated to %s — /relaunch to restart into it; your session will resume.", v)];
-    return [format("The installer succeeded but `nano-coder-d --version` still reports %s (this process is %s). "
+    return [format("The installer succeeded but `nano-coder --version` still reports %s (this process is %s). "
         ~ "The new version takes effect on the next start.", v, running)];
 }
 
@@ -360,8 +360,8 @@ string installedVersion(string exe)
         auto r = execute([exe, "--version"]);
         if (r.status != 0) return null;
         auto t = r.output.strip;
-        if (!t.startsWith("nano-coder-d ")) return null;
-        return t["nano-coder-d ".length .. $].findSplit(" ")[0];
+        if (!t.startsWith("nano-coder ")) return null;
+        return t["nano-coder ".length .. $].findSplit(" ")[0];
     }
     catch (Exception) return null; // not runnable or not ours: unknown version
 }
@@ -416,21 +416,21 @@ version (unittest)
 // rust: update.rs::standalone_and_dev_builds_are_unmanaged
 unittest
 {
-    assert(channelFor("/usr/lib/node_modules/@nanobpm/nano-coder-d/bin/nano-coder-d") == Channel.npm);
-    assert(channelFor("/usr/lib/node_modules/@nanobpm/nano-coder-d-darwin-arm64/bin/nano-coder-d") == Channel.npm);
-    assert(channelFor("/home/u/src/nano-coder/d/nano-coder-d") == Channel.other);
-    assert(channelFor("/opt/nano/nano-coder-d") == Channel.other);
+    assert(channelFor("/usr/lib/node_modules/@nanobpm/nano-coder/bin/nano-coder") == Channel.npm);
+    assert(channelFor("/usr/lib/node_modules/@nanobpm/nano-coder-darwin-arm64/bin/nano-coder") == Channel.npm);
+    assert(channelFor("/home/u/src/nano-coder/d/nano-coder") == Channel.other);
+    assert(channelFor("/opt/nano/nano-coder") == Channel.other);
     assert(channelFor("") == Channel.other);
     // Through the global bin symlink (macOS reports the link, not its target).
     auto root = buildPath(tempDir, "nano-d-update-chan");
     if (root.exists) rmdirRecurse(root);
     scope (exit) rmdirRecurse(root);
-    auto pkg = buildPath(root, "lib", "node_modules", "@nanobpm", "nano-coder-d", "bin");
+    auto pkg = buildPath(root, "lib", "node_modules", "@nanobpm", "nano-coder", "bin");
     mkdirRecurse(pkg);
     mkdirRecurse(buildPath(root, "bin"));
-    write(buildPath(pkg, "nano-coder-d"), "");
-    symlink(buildPath(pkg, "nano-coder-d"), buildPath(root, "bin", "nano-coder-d"));
-    assert(channelFor(buildPath(root, "bin", "nano-coder-d")) == Channel.npm);
+    write(buildPath(pkg, "nano-coder"), "");
+    symlink(buildPath(pkg, "nano-coder"), buildPath(root, "bin", "nano-coder"));
+    assert(channelFor(buildPath(root, "bin", "nano-coder")) == Channel.npm);
 }
 
 // rust: update.rs::version_comparison_orders_dotted_releases
@@ -481,7 +481,7 @@ unittest
     assert(c.hintPending());
     assert(!new Checker(Channel.other, p, "0.1.0", "x", 1060).hintPending(), "an unmanaged install never hints");
     auto h = c.takeHint();
-    assert(h == "nano-coder-d 0.3.0 is available (you have 0.1.0) — /update to install it", h);
+    assert(h == "nano-coder 0.3.0 is available (you have 0.1.0) — /update to install it", h);
     assert(c.takeHint() is null && loadState(p).hinted == "0.3.0");
     // Not due: answered from the cache, no request.
     assert(c.check(false, 1100) == "0.3.0");
