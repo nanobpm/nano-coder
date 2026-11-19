@@ -141,4 +141,25 @@ if [ -n "$missing" ]; then
     status=1
 fi
 ratchet "outside *_test.d" "$(find source -name '*.d' ! -name '*_test.d' | xargs grep -hE '^[[:space:]]*@nullable\(' | wc -l | tr -d ' ')" scripts/nullable-mark-budget "\`@nullable\` marks"
+# Test-only imports stay inside the tests. A file-level `version (unittest)`
+# import is in scope for the whole module in the test build only, so non-test
+# code can use it, pass `dub test` and fail the release build. Put the import
+# inside the unittest block or test helper that uses it. Modules that are
+# test-only from the top (`version (unittest):`) are exempt.
+leaks=$(find source -name '*.d' | sort | while read -r f; do
+    grep -qE '^version *\(unittest\) *:' "$f" && continue
+    awk -v f="$f" '
+        /^version *\(unittest\) *((private|public|static) +)*import[[:space:]]/ { print f "(" NR "): " $0; next }
+        /^version *\(unittest\) *\{?[[:space:]]*$/ { pending = 1; if ($0 ~ /\{/) { inblock = 1; pending = 0 }; next }
+        pending && /^\{/ { inblock = 1; pending = 0; next }
+        { pending = 0 }
+        inblock && /^\}/ { inblock = 0; next }
+        inblock && /^    ((private|public|static) +)*import[[:space:]]/ { print f "(" NR "): " $0 }
+    ' "$f"
+done)
+if [ -n "$leaks" ]; then
+    echo "$leaks" >&2
+    echo "Error: file-level \`version (unittest)\` imports leak into non-test code in the test build only; import inside the unittest block or test helper instead" >&2
+    status=1
+fi
 exit $status

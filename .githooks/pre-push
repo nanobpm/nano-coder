@@ -1,0 +1,5 @@
+#!/bin/sh
+# Run the fast subset of CI (scripts/ci.sh quick: check-safe, release and
+# unittest typecheck, unit tests) before every push. Skip deliberately with
+# `git push --no-verify`. Enable once per clone: git config core.hooksPath .githooks
+exec "$(git rev-parse --show-toplevel)/scripts/ci.sh" quick

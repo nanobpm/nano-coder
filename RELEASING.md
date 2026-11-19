@@ -11,7 +11,8 @@ The repository only allows squash merges, and the PR title becomes the commit su
 [commitlint](https://commitlint.js.org/) (`commitlint.config.mjs`, the conventional preset) on
 both. Subjects start lowercase (`feat: add ...`, not `feat: Add ...`).
 
-To check messages as you commit (needs Node), enable the hook once per clone:
+To check messages as you commit (needs Node), and run `scripts/ci.sh quick` before each
+push, enable the hooks once per clone:
 
 ```sh
 git config core.hooksPath .githooks
