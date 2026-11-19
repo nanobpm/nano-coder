@@ -611,6 +611,7 @@ unittest // tables
     assert(show("- item\n\n  " ~ TABLE.replace("\n", "\n  "), 80).canFind("  ┌───────┬──────┐"));
 }
 
+// rust: markdown.rs::every_line_fits_the_width
 unittest // every line fits the width
 {
     auto text = format("# A heading that is fairly long\n\n> quote with words %s\n\n- list %s\n  1. nested %s\n\n%s\n\n```\n%s\n```",

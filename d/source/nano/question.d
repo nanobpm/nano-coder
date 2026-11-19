@@ -285,6 +285,7 @@ unittest // parses_questions_and_requires_text
 }
 
 // rust: question.rs::ask_blocks_until_resolved
+// rust: question.rs::sequential_questions_each_wake_the_watcher
 unittest // ask_blocks_until_resolved, and sequential questions each register
 {
     import core.thread : Thread;

@@ -384,6 +384,7 @@ unittest
     assert(c.mode == SandboxMode.readOnly && !c.network && c.toolCaches);
 }
 
+// rust: sandbox.rs::workspace_mode_confines_writes
 version (HasOsSandbox) unittest // workspace mode confines writes
 {
     import std.file : write, exists;
@@ -407,6 +408,7 @@ version (HasOsSandbox) unittest // workspace mode confines writes
     assert(!c.allowsWrite("../x", ws));
 }
 
+// rust: sandbox.rs::read_only_mode_blocks_workspace_writes
 version (HasOsSandbox) unittest // read-only mode blocks workspace writes
 {
     import std.file : exists;
@@ -422,6 +424,26 @@ version (HasOsSandbox) unittest // read-only mode blocks workspace writes
     assert(!c.allowsWrite("inside.txt", ws));
 }
 
+// rust: sandbox.rs::os_sandbox_contains_static_guard_bypasses
+version (HasOsSandbox) unittest // an encoded write the static guard can't see is still contained
+{
+    import std.file : exists;
+    import std.array : replace;
+    auto ws = outsideDir(), other = outsideDir();
+    scope (exit) { rmTree(ws); rmTree(other); }
+    SandboxConfig c = { mode: SandboxMode.workspace, toolCaches: false };
+    auto target = other ~ "/escape.txt";
+    auto script = format(`printf pwned > $'%s' 2>/dev/null; echo done`, target.replace("/", `\x2f`));
+    bool ok; string text;
+    if (run(c, ws, script, ok, text))
+    {
+        assert(text.canFind("done"), text);
+        assert(!exists(target), "OS sandbox let an encoded write escape the workspace: " ~ text);
+    }
+    assert(!c.allowsWrite(target, ws));
+}
+
+// rust: sandbox.rs::extra_writable_paths
 version (HasOsSandbox) unittest // extra writable paths
 {
     import std.file : exists;
@@ -436,6 +458,7 @@ version (HasOsSandbox) unittest // extra writable paths
     }
 }
 
+// rust: sandbox.rs::read_only_mode_does_not_grant_device_directories
 unittest // device directories only in workspace mode, never /dev/shm or /dev/pts
 {
     import std.file : exists;
@@ -453,6 +476,7 @@ unittest // device directories only in workspace mode, never /dev/shm or /dev/pt
     assert(!w.allowsWrite("/dev/shm/x", ws));
 }
 
+// rust: sandbox.rs::external_git_dir_is_not_granted
 unittest // a poisoned .git pointer to an external repo isn't granted
 {
     import std.file : write, mkdirRecurse;
@@ -507,6 +531,7 @@ version (HasOsSandbox) unittest // the OS sandbox contains what the static guard
     assert(!c.allowsWrite(target, ws));
 }
 
+// rust: sandbox.rs::root_cwd_is_not_a_writable_root
 unittest // a root cwd is never a writable root
 {
     SandboxConfig c = { mode: SandboxMode.workspace, toolCaches: false };

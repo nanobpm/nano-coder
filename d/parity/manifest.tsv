@@ -268,31 +268,31 @@ bash.rs::read_bounded_honours_the_frozen_length_not_the_growing_file	na	Rust's s
 bash.rs::run_checked_rejects_commands_that_never_started	test
 bash.rs::truncates_and_keeps_full_capture	test
 bash.rs::validates_arguments	test
-claude_hooks.rs::blank_if_filter_is_normalized_to_none	claimed	PORTING.md: all claude_hooks.rs tests ported
+claude_hooks.rs::blank_if_filter_is_normalized_to_none	test
 claude_hooks.rs::cap_counts_characters_not_bytes	test
-claude_hooks.rs::dedup_distinguishes_shell_from_direct_exec	claimed	PORTING.md: all claude_hooks.rs tests ported
+claude_hooks.rs::dedup_distinguishes_shell_from_direct_exec	test
 claude_hooks.rs::dedup_keeps_entries_with_distinct_if_rules	test
-claude_hooks.rs::dedup_preserves_empty_argument_boundaries	claimed	PORTING.md: all claude_hooks.rs tests ported
-claude_hooks.rs::detached_descendant_does_not_hang_past_timeout	claimed	PORTING.md: all claude_hooks.rs tests ported
+claude_hooks.rs::dedup_preserves_empty_argument_boundaries	test
+claude_hooks.rs::detached_descendant_does_not_hang_past_timeout	test
 claude_hooks.rs::disable_all_hooks_in_a_file_is_honored	test
 claude_hooks.rs::disable_flags_turn_hooks_off	test
-claude_hooks.rs::drain_bounded_reports_read_errors_instead_of_eof	claimed	PORTING.md: all claude_hooks.rs tests ported
-claude_hooks.rs::drain_bounded_retries_interrupted_reads	claimed	PORTING.md: all claude_hooks.rs tests ported
-claude_hooks.rs::grep_and_glob_hooks_match_claude_names	claimed	PORTING.md: all claude_hooks.rs tests ported
+claude_hooks.rs::drain_bounded_reports_read_errors_instead_of_eof	test
+claude_hooks.rs::drain_bounded_retries_interrupted_reads	test
+claude_hooks.rs::grep_and_glob_hooks_match_claude_names	test
 claude_hooks.rs::herdr_integration_hooks_are_skipped	test
 claude_hooks.rs::hook_receives_env_and_updated_input	test
-claude_hooks.rs::hook_runs_in_a_new_session_without_controlling_terminal	claimed	PORTING.md: all claude_hooks.rs tests ported
-claude_hooks.rs::hook_that_ignores_large_stdin_does_not_deadlock	claimed	PORTING.md: all claude_hooks.rs tests ported
+claude_hooks.rs::hook_runs_in_a_new_session_without_controlling_terminal	test
+claude_hooks.rs::hook_that_ignores_large_stdin_does_not_deadlock	test
 claude_hooks.rs::if_rule_narrows_tool_hooks	test
 claude_hooks.rs::listing_neutralises_line_breaks_in_config_fields	test
-claude_hooks.rs::loads_and_dedups_from_settings_files	claimed	PORTING.md: all claude_hooks.rs tests ported
+claude_hooks.rs::loads_and_dedups_from_settings_files	test
 claude_hooks.rs::malformed_if_filter_is_reported_as_skipped	test
 claude_hooks.rs::matcher_matches_claude_and_nano_names	test
-claude_hooks.rs::missing_settings_file_is_not_a_skip	claimed	PORTING.md: all claude_hooks.rs tests ported
-claude_hooks.rs::over_cap_hook_output_fails_closed_for_pre_tool_use	claimed	PORTING.md: all claude_hooks.rs tests ported
-claude_hooks.rs::over_cap_hook_output_is_bounded	claimed	PORTING.md: all claude_hooks.rs tests ported
-claude_hooks.rs::post_tool_use_crash_is_non_blocking	claimed	PORTING.md: all claude_hooks.rs tests ported
-claude_hooks.rs::pre_tool_use_fails_closed_on_crash	claimed	PORTING.md: all claude_hooks.rs tests ported
+claude_hooks.rs::missing_settings_file_is_not_a_skip	test
+claude_hooks.rs::over_cap_hook_output_fails_closed_for_pre_tool_use	test
+claude_hooks.rs::over_cap_hook_output_is_bounded	test
+claude_hooks.rs::post_tool_use_crash_is_non_blocking	test
+claude_hooks.rs::pre_tool_use_fails_closed_on_crash	test
 claude_hooks.rs::pre_tool_use_json_permission_decision	test
 claude_hooks.rs::read_error_on_stdout_fails_pre_tool_use_closed	test
 claude_hooks.rs::reads_tool_input_command_like_a_claude_script	test
@@ -300,11 +300,11 @@ claude_hooks.rs::session_start_matcher_selects_on_source_trigger	test
 claude_hooks.rs::session_start_plain_text_becomes_context	test
 claude_hooks.rs::source_matcher_alternation_and_wildcard	test
 claude_hooks.rs::stop_block_keeps_going	test
-claude_hooks.rs::timeout_blocks_pre_tool_use_only	claimed	PORTING.md: all claude_hooks.rs tests ported
+claude_hooks.rs::timeout_blocks_pre_tool_use_only	test
 claude_hooks.rs::translates_tool_input_both_ways	test
-claude_hooks.rs::unfinished_hook_io_fails_closed_and_kills_descendants	claimed	PORTING.md: all claude_hooks.rs tests ported
+claude_hooks.rs::unfinished_hook_io_fails_closed_and_kills_descendants	test
 claude_hooks.rs::unreadable_settings_file_is_reported_not_silently_skipped	test
-claude_hooks.rs::unrepresentable_timeout_fails_closed_instead_of_panicking	claimed	PORTING.md: all claude_hooks.rs tests ported
+claude_hooks.rs::unrepresentable_timeout_fails_closed_instead_of_panicking	test
 claude_hooks.rs::user_prompt_submit_exit_2_blocks_with_stderr	test
 commands.rs::closest_skips_the_matrix_for_oversized_input	test
 commands.rs::compact_args_take_an_optional_mode_then_focus	test
@@ -314,7 +314,7 @@ commands.rs::help_lists_every_command	test
 commands.rs::help_lists_version	test
 commands.rs::mode_and_verbosity_arguments_are_suggested	test
 commands.rs::model_suggestions_hoist_current_recent_and_defaults	test
-commands.rs::model_suggestions_offer_configured_models_and_skip_disabled_providers	claimed	app.d modelSuggestionSource closure (not unit-testable); configuredModels/enabledProviderNames tested in config.d
+commands.rs::model_suggestions_offer_configured_models_and_skip_disabled_providers	test
 commands.rs::model_suggestions_skip_hidden_current_and_recent_models	test
 commands.rs::only_known_or_plausible_commands_are_commands	test
 commands.rs::oversized_words_skip_edit_distance_and_suggest_nothing	test
@@ -640,11 +640,11 @@ main.rs::turn_print_repairs_truncation_before_the_max_turn_fallback	test
 main.rs::update_is_refused_outside_an_interactive_non_ci_terminal	test
 markdown.rs::a_table_may_follow_a_paragraph_line_directly	test
 markdown.rs::block_quotes_get_a_bar	test
-markdown.rs::cached_rendering_matches_and_tracks_width	claimed	PORTING.md: all markdown.rs tests ported
+markdown.rs::cached_rendering_matches_and_tracks_width	na	D renders markdown without a render cache (the frame re-renders only changed items), so there is no cache to match or key by width
 markdown.rs::code_blocks_are_verbatim_between_dim_fences	test
 markdown.rs::controls_in_model_text_are_dropped	test
 markdown.rs::emoji_shortcodes	test
-markdown.rs::every_line_fits_the_width	claimed	PORTING.md: all markdown.rs tests ported
+markdown.rs::every_line_fits_the_width	test
 markdown.rs::headings_paragraphs_and_rules	test
 markdown.rs::inline_markup_is_styled_and_markers_removed	test
 markdown.rs::links_show_their_url_unless_it_is_the_text	test
@@ -657,49 +657,49 @@ markdown.rs::table_cells_handle_escapes_code_markup_and_wide_chars	test
 markdown.rs::tables_in_code_and_lists	test
 markdown.rs::tables_render_as_grids_with_alignment	test
 markdown.rs::wide_tables_wrap_then_stack	test
-memory.rs::absurd_expiry_days_errors_instead_of_panicking	claimed	PORTING.md: all memory.rs tests ported
+memory.rs::absurd_expiry_days_errors_instead_of_panicking	test
 memory.rs::anchors_come_from_backticks_paths_and_hosts	test
 memory.rs::anchors_match_on_word_boundaries	test
-memory.rs::default_dir_never_falls_back_to_shared_temp	claimed	PORTING.md: all memory.rs tests ported
+memory.rs::default_dir_never_falls_back_to_shared_temp	test
 memory.rs::entries_without_kind_or_anchors_load_unchanged	test
 memory.rs::expires_unused_entries_on_load	test
-memory.rs::forget_sanitises_control_chars_in_id	claimed	PORTING.md: all memory.rs tests ported
+memory.rs::forget_sanitises_control_chars_in_id	test
 memory.rs::index_is_dated_framed_and_capped	test
-memory.rs::index_on_read_failure_is_empty_not_misreported_as_empty_store	claimed	PORTING.md: all memory.rs tests ported
+memory.rs::index_on_read_failure_is_empty_not_misreported_as_empty_store	test
 memory.rs::index_rendered_set_excludes_clipped_and_multiline_entries	test
 memory.rs::index_sanitises_control_chars_in_label_and_tag	test
-memory.rs::index_sanitises_unicode_line_separators_in_label_and_text	claimed	PORTING.md: all memory.rs tests ported
+memory.rs::index_sanitises_unicode_line_separators_in_label_and_text	test
 memory.rs::log_recall_writes_whole_records	test
 memory.rs::memory_directories_created_owner_only	test
 memory.rs::memory_directories_lock_path_owner_only	test
 memory.rs::normalizes_remotes_to_a_stable_key	test
 memory.rs::note_seen_in_only_counts_record_prefixes_and_full_hits	test
 memory.rs::preexisting_memory_directory_permissions_preserved	test
-memory.rs::preserves_complete_entry_with_extra_field	claimed	PORTING.md: all memory.rs tests ported
+memory.rs::preserves_complete_entry_with_extra_field	test
 memory.rs::preserves_malformed_utf8_records_byte_for_byte	test
 memory.rs::preserves_unknown_records_across_rewrites	test
 memory.rs::project_scope_needs_a_repo_key	test
-memory.rs::read_only_index_omits_save_guidance	claimed	PORTING.md: all memory.rs tests ported
+memory.rs::read_only_index_omits_save_guidance	test
 memory.rs::recall_note_renders_full_text_and_evidence	test
 memory.rs::recall_respects_kind_seen_and_budget	test
 memory.rs::rejects_a_credential_split_across_text_and_evidence	test
 memory.rs::rejects_multiline_evidence	test
 memory.rs::rejects_secrets_and_overlong_text	test
 memory.rs::relative_local_origin_resolves_against_git_root	test
-memory.rs::relative_local_origin_resolves_symlinked_parent	claimed	PORTING.md: all memory.rs tests ported
+memory.rs::relative_local_origin_resolves_symlinked_parent	test
 memory.rs::run_dispatches_and_reports_saves	test
 memory.rs::sanitize_key_is_collision_resistant	test
 memory.rs::saves_searches_and_forgets_across_scopes	test
-memory.rs::search_bumps_last_used	claimed	PORTING.md: all memory.rs tests ported
+memory.rs::search_bumps_last_used	test
 memory.rs::search_marks_dropped_evidence_lines_as_incomplete	test
 memory.rs::search_returns_previous_mru_order	test
 memory.rs::search_sanitises_escaped_line_breaks_in_evidence	test
-memory.rs::search_snippet_strips_terminal_control_chars	claimed	PORTING.md: all memory.rs tests ported
-memory.rs::shared_relative_origin_normalizes_to_one_key	claimed	PORTING.md: all memory.rs tests ported
-memory.rs::stale_lock_file_does_not_block_acquisition	claimed	PORTING.md: all memory.rs tests ported
-memory.rs::tool_set_depends_on_writability	claimed	PORTING.md: all memory.rs tests ported
-memory.rs::write_all_creates_new_file_owner_only	claimed	PORTING.md: all memory.rs tests ported
-memory.rs::write_all_preserves_target_permissions	claimed	PORTING.md: all memory.rs tests ported
+memory.rs::search_snippet_strips_terminal_control_chars	test
+memory.rs::shared_relative_origin_normalizes_to_one_key	test
+memory.rs::stale_lock_file_does_not_block_acquisition	test
+memory.rs::tool_set_depends_on_writability	test
+memory.rs::write_all_creates_new_file_owner_only	test
+memory.rs::write_all_preserves_target_permissions	test
 mode.rs::parses_mode_names	test
 mode.rs::plan_allows_every_timer_tool	test
 mode.rs::plan_allows_read_only_search_but_not_writes	test
@@ -966,7 +966,7 @@ question.rs::away_and_dismissed_have_stable_wording	test
 question.rs::parses_questions_and_requires_text	test
 question.rs::result_text_strips_control_sequences_from_model_and_user_text	test
 question.rs::result_text_strips_newlines_from_quoted_question_and_answer	test
-question.rs::sequential_questions_each_wake_the_watcher	claimed	PORTING.md: all question.rs tests ported
+question.rs::sequential_questions_each_wake_the_watcher	test
 queue.rs::add_queues_a_message	test
 queue.rs::apply_reports_what_happened	test
 queue.rs::edits_reach_unread_steers_and_share_ids_with_the_queue	test
@@ -1040,15 +1040,15 @@ resume.rs::title_drops_control_characters	test
 resume.rs::title_leads_the_topic	test
 resume.rs::truncate_counts_variation_selector_width_as_a_string	test
 resume.rs::truncate_never_exceeds_width_even_zero	test
-sandbox.rs::external_git_dir_is_not_granted	claimed	PORTING.md: all sandbox.rs tests ported
-sandbox.rs::extra_writable_paths	claimed	PORTING.md: all sandbox.rs tests ported
+sandbox.rs::external_git_dir_is_not_granted	test
+sandbox.rs::extra_writable_paths	test
 sandbox.rs::linked_worktree_git_dirs_are_granted	test
-sandbox.rs::os_sandbox_contains_static_guard_bypasses	claimed	PORTING.md: all sandbox.rs tests ported
+sandbox.rs::os_sandbox_contains_static_guard_bypasses	test
 sandbox.rs::parses_modes	test
-sandbox.rs::read_only_mode_blocks_workspace_writes	claimed	PORTING.md: all sandbox.rs tests ported
-sandbox.rs::read_only_mode_does_not_grant_device_directories	claimed	PORTING.md: all sandbox.rs tests ported
-sandbox.rs::root_cwd_is_not_a_writable_root	claimed	PORTING.md: all sandbox.rs tests ported
-sandbox.rs::workspace_mode_confines_writes	claimed	PORTING.md: all sandbox.rs tests ported
+sandbox.rs::read_only_mode_blocks_workspace_writes	test
+sandbox.rs::read_only_mode_does_not_grant_device_directories	test
+sandbox.rs::root_cwd_is_not_a_writable_root	test
+sandbox.rs::workspace_mode_confines_writes	test
 search.rs::binary_exclusion_is_independent_of_mode_and_limit	test
 search.rs::capped_reader_stops_at_cap_plus_one_for_over_cap_lines	test
 search.rs::display_path_preserves_filesystem_root	na	D shows result paths relative to the working directory (or absolute), not root-as-given plus suffix, so there is no prefix to collapse
@@ -1379,7 +1379,7 @@ update.rs::a_restart_re_arms_a_pending_hint_from_the_persisted_state	test
 update.rs::a_symlinked_cargo_home_is_still_the_cargo_channel	na	D ships only through npm: no cargo channel
 update.rs::an_unmanaged_install_never_inherits_a_cached_hint	test
 update.rs::check_against_a_fake_registry_hints_once_and_caches	test
-update.rs::deleted_suffix_is_stripped_from_the_launch_path	claimed	launchExe strips " (deleted)"; thisExePath is not injectable for a test
+update.rs::deleted_suffix_is_stripped_from_the_launch_path	test
 update.rs::detects_the_brew_channel_on_versioned_keg_paths	na	D ships only via npm (@nanobpm/nano-coder-d); no tarballs or Homebrew formula, so no brew channel (Rust #188)
 update.rs::detects_the_brew_channel_through_the_bin_and_opt_links	na	D ships only via npm (@nanobpm/nano-coder-d); no tarballs or Homebrew formula, so no brew channel (Rust #188)
 update.rs::detects_the_cargo_channel_with_and_without_cargo_home	na	D ships only through npm: no cargo channel

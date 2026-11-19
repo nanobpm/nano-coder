@@ -675,6 +675,73 @@ extern (C) private int setsid() nothrow @nogc;
 /// close before the hook's process group is killed and the run fails closed.
 enum graceTime = 2.seconds;
 
+/// Read everything a non-blocking pipe has ready into `buf`, bounded by
+/// `outputCap` (the excess sets `overflow`). `read(chunk, err)` returns the
+/// byte count, 0 at EOF, or < 0 with `err` set. EINTR is retried; EAGAIN
+/// waits for the next poll; any other error is recorded in `readError` (the
+/// first one wins) and closes the stream rather than passing for a clean EOF.
+void drainReady(R)(scope R read, ubyte[] chunk, ref ubyte[] buf, ref bool open, ref bool overflow, ref string readError)
+{
+    import core.stdc.errno : EINTR, EAGAIN;
+    for (;;)
+    {
+        int err;
+        auto n = read(chunk, err);
+        if (n > 0)
+        {
+            auto room = buf.length < outputCap ? outputCap - buf.length : 0;
+            buf ~= chunk[0 .. n < room ? n : room];
+            if (n > room) overflow = true;
+            continue;
+        }
+        if (n == 0) open = false;
+        else if (err == EINTR) continue;
+        else if (err != EAGAIN)
+        {
+            if (readError is null) readError = format("read failed (errno %s)", err);
+            open = false;
+        }
+        return;
+    }
+}
+
+// rust: claude_hooks.rs::drain_bounded_reports_read_errors_instead_of_eof
+// rust: claude_hooks.rs::drain_bounded_retries_interrupted_reads
+unittest
+{
+    import core.stdc.errno : EINTR, EPIPE;
+    // Yields `data`, then fails once with `fail`, then reports EOF.
+    struct Flaky
+    {
+        string data;
+        int fail;
+        int calls;
+        ptrdiff_t opCall(ubyte[] c, out int err)
+        {
+            switch (calls++)
+            {
+                case 0: c[0 .. data.length] = cast(const(ubyte)[]) data; return data.length;
+                case 1: err = fail; return -1;
+                default: return 0;
+            }
+        }
+    }
+    auto chunk = new ubyte[64];
+    ubyte[] buf;
+    bool open = true, overflow;
+    string error;
+    auto broken = Flaky("partial", EPIPE);
+    drainReady(&broken.opCall, chunk, buf, open, overflow, error);
+    assert(buf == cast(const(ubyte)[]) "partial", "bytes read before the error are kept");
+    assert(!overflow && !open && error !is null, "a read error is reported, not treated as EOF");
+
+    buf = null; open = true; error = null;
+    auto interrupted = Flaky("hello", EINTR);
+    drainReady(&interrupted.opCall, chunk, buf, open, overflow, error);
+    assert(buf == cast(const(ubyte)[]) "hello" && !overflow && error is null, error);
+    assert(!open && interrupted.calls == 3, "EINTR is retried through to EOF");
+}
+
 /// Run `hook` with `input` on stdin, in a new session (no controlling
 /// terminal) and its own process group, bounded by its timeout. Output past
 /// `outputCap`, a descendant still holding a pipe past the deadline, or a read
@@ -750,25 +817,8 @@ ProcessRun execute(const ref Hook hook, string input, string projectDir, const S
 
     void drain(int fd, ref ubyte[] buf, ref bool open)
     {
-        for (;;)
-        {
-            auto n = readFd(fd, chunk);
-            if (n > 0)
-            {
-                auto room = buf.length < outputCap ? outputCap - buf.length : 0;
-                buf ~= chunk[0 .. n < room ? n : room];
-                if (n > room) overflow = true;
-                continue;
-            }
-            if (n == 0) open = false;
-            else if (errno == EINTR) continue;
-            else if (errno != EAGAIN)
-            {
-                if (readError is null) readError = format("read failed (errno %s)", errno);
-                open = false;
-            }
-            return;
-        }
+        drainReady((ubyte[] c, out int err) { auto n = readFd(fd, c); err = errno; return n; },
+            chunk, buf, open, overflow, readError);
     }
 
     for (;;)
@@ -1106,6 +1156,7 @@ unittest
 }
 
 // rust: claude_hooks.rs::reads_tool_input_command_like_a_claude_script
+// rust: claude_hooks.rs::grep_and_glob_hooks_match_claude_names
 unittest // grep_and_glob_hooks_match_claude_names, reads_tool_input_command_like_a_claude_script
 {
     auto dir = tdir("grep");
@@ -1122,6 +1173,8 @@ unittest // grep_and_glob_hooks_match_claude_names, reads_tool_input_command_lik
 }
 
 // rust: claude_hooks.rs::pre_tool_use_json_permission_decision
+// rust: claude_hooks.rs::pre_tool_use_fails_closed_on_crash
+// rust: claude_hooks.rs::post_tool_use_crash_is_non_blocking
 unittest // pre_tool_use_json_permission_decision, fails closed on crash; post crash non-blocking
 {
     auto dir = tdir("json");
@@ -1150,6 +1203,7 @@ unittest // session_start_matcher_selects_on_source_trigger, plain text becomes 
 }
 
 // rust: claude_hooks.rs::user_prompt_submit_exit_2_blocks_with_stderr
+// rust: claude_hooks.rs::hook_that_ignores_large_stdin_does_not_deadlock
 unittest // hook_that_ignores_large_stdin_does_not_deadlock; user_prompt_submit_exit_2_blocks_with_stderr
 {
     auto dir = tdir("stdin");
@@ -1185,6 +1239,7 @@ unittest // exec form expands ${CLAUDE_PROJECT_DIR} and passes args verbatim
 
 // rust: claude_hooks.rs::if_rule_narrows_tool_hooks
 // rust: claude_hooks.rs::stop_block_keeps_going
+// rust: claude_hooks.rs::timeout_blocks_pre_tool_use_only
 unittest // if_rule_narrows_tool_hooks; stop_block_keeps_going; timeout_blocks_pre_tool_use_only
 {
     auto dir = tdir("if");
@@ -1207,6 +1262,8 @@ unittest // if_rule_narrows_tool_hooks; stop_block_keeps_going; timeout_blocks_p
 
 // rust: claude_hooks.rs::disable_all_hooks_in_a_file_is_honored
 // rust: claude_hooks.rs::disable_flags_turn_hooks_off
+// rust: claude_hooks.rs::loads_and_dedups_from_settings_files
+// rust: claude_hooks.rs::missing_settings_file_is_not_a_skip
 unittest // loads_and_dedups_from_settings_files; disable flags; disableAllHooks
 {
     auto dir = tdir("load");
@@ -1265,6 +1322,8 @@ unittest // unreadable_settings_file_is_reported_not_silently_skipped
 }
 
 // rust: claude_hooks.rs::dedup_keeps_entries_with_distinct_if_rules
+// rust: claude_hooks.rs::dedup_distinguishes_shell_from_direct_exec
+// rust: claude_hooks.rs::dedup_preserves_empty_argument_boundaries
 unittest // dedup_keeps_entries_with_distinct_if_rules, shell vs exec, empty-argument boundaries
 {
     auto dir = tdir("dedup");
@@ -1295,6 +1354,8 @@ unittest // dedup_keeps_entries_with_distinct_if_rules, shell vs exec, empty-arg
     assert(m.hooks.length == 4);
 }
 
+// rust: claude_hooks.rs::over_cap_hook_output_fails_closed_for_pre_tool_use
+// rust: claude_hooks.rs::over_cap_hook_output_is_bounded
 unittest // over-cap output fails closed for PreToolUse and is bounded
 {
     auto dir = tdir("cap");
@@ -1304,6 +1365,8 @@ unittest // over-cap output fails closed for PreToolUse and is bounded
         .runPostToolUse("bash", j(`{"command": "ls"}`), "ok", "t1").blocked);
 }
 
+// rust: claude_hooks.rs::detached_descendant_does_not_hang_past_timeout
+// rust: claude_hooks.rs::unfinished_hook_io_fails_closed_and_kills_descendants
 unittest // detached descendant / unfinished I/O cannot hang the runner and fails closed
 {
     auto dir = tdir("detached");
@@ -1319,6 +1382,8 @@ unittest // detached descendant / unfinished I/O cannot hang the runner and fail
     assert(with_([ok], dir).runPreToolUse("bash", j(`{"command": "ls"}`), "t1").denies, "unfinished I/O fails closed");
 }
 
+// rust: claude_hooks.rs::unrepresentable_timeout_fails_closed_instead_of_panicking
+// rust: claude_hooks.rs::hook_runs_in_a_new_session_without_controlling_terminal
 unittest // unrepresentable_timeout_fails_closed_instead_of_panicking; new session
 {
     auto dir = tdir("timeout");
@@ -1330,6 +1395,18 @@ unittest // unrepresentable_timeout_fails_closed_instead_of_panicking; new sessi
     assert(run.launchError is null);
     auto parts = run.stdout_.strip.split(' ');
     assert(parts.length >= 3 && parts[0] == parts[2], "the hook leads its own process group: " ~ run.stdout_);
+    // macOS `ps` reports no session id; Linux shows the hook leads its own session.
+    version (linux) assert(parts[0] == parts[1], "setsid makes the hook its own session leader: " ~ run.stdout_);
+}
+
+// rust: claude_hooks.rs::blank_if_filter_is_normalized_to_none
+unittest
+{
+    auto dir = tdir("blankif");
+    auto m = loadProject(dir, `{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"exit 2","if":"   "}]}]}}`);
+    assert(m.hooks.length == 1, "the blank filter still loads the hook");
+    assert(m.hooks[0].ifRule is null, "a blank `if` is stored as no filter");
+    assert(m.runPreToolUse("bash", j(`{"command": "ls"}`), "t1").denies, "a blank-filtered hook is not silently disabled");
 }
 
 // rust: claude_hooks.rs::herdr_integration_hooks_are_skipped

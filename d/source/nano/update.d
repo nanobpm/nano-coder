@@ -52,12 +52,26 @@ private bool hasComponents(string path, string[] want)
     return false;
 }
 
+/// `path` without the " (deleted)" Linux appends to /proc/self/exe once the
+/// running binary was replaced (as an update does), so a relaunch finds the new one.
+string stripDeletedSuffix(string path)
+{
+    import std.string : chomp;
+    return path.chomp(" (deleted)");
+}
+
+// rust: update.rs::deleted_suffix_is_stripped_from_the_launch_path
+unittest
+{
+    assert(stripDeletedSuffix("/home/u/.cargo/bin/nano-coder (deleted)") == "/home/u/.cargo/bin/nano-coder");
+    assert(stripDeletedSuffix("/home/u/.cargo/bin/nano-coder") == "/home/u/.cargo/bin/nano-coder");
+}
+
 /// This process's executable.
 string launchExe()
 {
     import std.file : thisExePath;
-    import std.string : chomp;
-    try return thisExePath().chomp(" (deleted)");
+    try return stripDeletedSuffix(thisExePath());
     catch (Exception) return null; // no executable path: updates can't relaunch, the caller says so
 }
 

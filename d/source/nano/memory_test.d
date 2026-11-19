@@ -209,6 +209,7 @@ unittest // expires_unused_entries_on_load
 }
 
 // rust: memory.rs::search_returns_previous_mru_order
+// rust: memory.rs::search_bumps_last_used
 unittest // search_bumps_last_used, search_returns_previous_mru_order
 {
     auto s = new Store(buildPath(tmp("bump"), "memory"), null, 0);
@@ -228,6 +229,7 @@ unittest // search_bumps_last_used, search_returns_previous_mru_order
 }
 
 // rust: memory.rs::search_sanitises_escaped_line_breaks_in_evidence
+// rust: memory.rs::search_snippet_strips_terminal_control_chars
 unittest // search sanitises evidence and control chars
 {
     auto s = new Store(buildPath(tmp("sanitise"), "memory"), null, 0);
@@ -246,6 +248,9 @@ unittest // search sanitises evidence and control chars
 // rust: memory.rs::memory_directories_created_owner_only
 // rust: memory.rs::memory_directories_lock_path_owner_only
 // rust: memory.rs::preexisting_memory_directory_permissions_preserved
+// rust: memory.rs::stale_lock_file_does_not_block_acquisition
+// rust: memory.rs::write_all_creates_new_file_owner_only
+// rust: memory.rs::write_all_preserves_target_permissions
 unittest // file and directory permissions; stale lock file
 {
     import nano.safeio : chmodPath, statMode;
@@ -272,6 +277,7 @@ unittest // file and directory permissions; stale lock file
 }
 
 // rust: memory.rs::index_is_dated_framed_and_capped
+// rust: memory.rs::read_only_index_omits_save_guidance
 unittest // index_is_dated_framed_and_capped, read-only guidance
 {
     auto s = store(tmp("index"));
@@ -292,6 +298,7 @@ unittest // index_is_dated_framed_and_capped, read-only guidance
 
 import std.conv : to;
 
+// rust: memory.rs::index_on_read_failure_is_empty_not_misreported_as_empty_store
 unittest // index_on_read_failure_is_empty
 {
     auto s = store(tmp("readfail"));
@@ -301,6 +308,8 @@ unittest // index_on_read_failure_is_empty
 }
 
 // rust: memory.rs::index_sanitises_control_chars_in_label_and_tag
+// rust: memory.rs::forget_sanitises_control_chars_in_id
+// rust: memory.rs::index_sanitises_unicode_line_separators_in_label_and_text
 unittest // index and forget sanitise control chars and unicode separators
 {
     auto s = store(tmp("scrub"));
@@ -326,6 +335,7 @@ unittest // index and forget sanitise control chars and unicode separators
 
 // rust: memory.rs::preserves_malformed_utf8_records_byte_for_byte
 // rust: memory.rs::preserves_unknown_records_across_rewrites
+// rust: memory.rs::preserves_complete_entry_with_extra_field
 unittest // preserves unknown, malformed UTF-8 and extra-field records
 {
     auto s = new Store(buildPath(tmp("unknown"), "memory"), null, 0);
@@ -348,6 +358,7 @@ unittest // preserves unknown, malformed UTF-8 and extra-field records
 }
 
 // rust: memory.rs::project_scope_needs_a_repo_key
+// rust: memory.rs::absurd_expiry_days_errors_instead_of_panicking
 unittest // absurd_expiry_days_errors, project_scope_needs_a_repo_key
 {
     auto s = new Store(buildPath(tmp("absurd"), "memory"), null, ulong.max);
@@ -445,6 +456,9 @@ unittest // normalizes_remotes_to_a_stable_key
 // rust: memory.rs::relative_local_origin_resolves_against_git_root
 // rust: memory.rs::run_dispatches_and_reports_saves
 // rust: memory.rs::sanitize_key_is_collision_resistant
+// rust: memory.rs::relative_local_origin_resolves_symlinked_parent
+// rust: memory.rs::shared_relative_origin_normalizes_to_one_key
+// rust: memory.rs::tool_set_depends_on_writability
 unittest // sanitize_key, project keys, tool set, run
 {
     assert(sanitizeKey("github.com/acme/a-b/c") != sanitizeKey("github.com/acme/a/b-c"));
@@ -704,4 +718,13 @@ unittest
     assert(!memoryCommand(s, "", true, true, true).canFind("/memory forget"), "plan mode hides the forget hint");
     assert(memoryCommand(s, "", true, false, true).canFind("/memory forget"));
     assert(memoryCommand(s, "bogus", true, false, true).canFind("Unknown /memory argument \"bogus\""));
+}
+
+// rust: memory.rs::default_dir_never_falls_back_to_shared_temp
+unittest
+{
+    import std.file : tempDir;
+    import nano.memory : defaultDir;
+    auto dir = defaultDir();
+    assert(dir is null || !dir.startsWith(tempDir), dir);
 }
