@@ -11,6 +11,10 @@
 #   all    lint + test
 set -eu
 cd "$(dirname "$0")/.."
+# Run from a git hook, git's repository variables (GIT_DIR, GIT_INDEX_FILE, ...)
+# are set; tests that run git in temp directories would act on this repository.
+# shellcheck disable=SC2046 # one name per word
+unset $(git rev-parse --local-env-vars)
 
 step() { printf '\n==> %s\n' "$*"; }
 
