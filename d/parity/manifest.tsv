@@ -360,14 +360,14 @@ context.rs::clipped_tool_result_pins_respect_cumulative_budget	test
 context.rs::clipped_tool_result_shrunk_window_does_not_drop_later_windows	test
 context.rs::clipped_tool_result_window_ends_before_the_first_unselected_error	test
 context.rs::clipped_tool_result_without_error_lines_clips_as_before	test
-context.rs::detects_output_cap_errors_and_their_limits	todo
-context.rs::detects_overflow_errors_and_limits	todo
+context.rs::detects_output_cap_errors_and_their_limits	test
+context.rs::detects_overflow_errors_and_limits	test
 context.rs::error_line_detection_is_small_and_fixed	test
-context.rs::image_tokens_counts_a_max_dimension_square_fully	todo
+context.rs::image_tokens_counts_a_max_dimension_square_fully	test
 context.rs::messages_tokens_charge_the_backfilled_image_when_the_newest_is_unavailable	test
 context.rs::messages_tokens_with_vision_honors_the_newest_n_plan	test
-context.rs::model_output_limits	todo
-context.rs::model_windows	todo
+context.rs::model_output_limits	test
+context.rs::model_windows	test
 context.rs::pinned_requests_a_hook_only_message_left_alone_pins_nothing	test	pinned user requests (#184)
 context.rs::pinned_requests_allowance_tracks_the_window	test	pinned user requests (#184)
 context.rs::pinned_requests_budget_counts_utf8_bytes_for_multibyte_text	test	pinned user requests (#184)
@@ -384,9 +384,9 @@ context.rs::pinned_requests_omission_note_uses_a_span_in_smart_mode	test	pinned 
 context.rs::pinned_requests_preserve_a_user_typed_reminder_tag	test	pinned user requests (#184)
 context.rs::pinned_requests_stay_within_the_overall_allowance	test	pinned user requests (#184)
 context.rs::pinned_requests_strip_hook_output_from_a_prompt	test	pinned user requests (#184)
-context.rs::summary_budget_leaves_room_for_reasoning	todo
+context.rs::summary_budget_leaves_room_for_reasoning	test
 context.rs::transcript_keeps_the_newest_messages	test
-context.rs::transcript_labels_log_lines_when_asked	todo
+context.rs::transcript_labels_log_lines_when_asked	test
 files.rs::a_failed_read_does_not_authorize_edits	test
 files.rs::a_miss_shows_the_closest_lines	test
 files.rs::a_misspelled_single_line_still_gets_a_closest_hint	test

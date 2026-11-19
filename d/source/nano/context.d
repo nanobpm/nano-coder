@@ -1199,3 +1199,61 @@ unittest
     foreach (mx; [0, 1, 2, 3, 10, 100, 1_000])
         assert(clipBytes("é漢x".replicate(200), mx).length <= mx);
 }
+
+// rust: context.rs::detects_output_cap_errors_and_their_limits
+// rust: context.rs::detects_overflow_errors_and_limits
+unittest
+{
+    import std.typecons : tuple;
+    foreach (c; [tuple("HTTP 400: max_tokens: 32768 > 8192, which is the maximum allowed number of output tokens for claude-3-5-haiku", 8_192),
+            tuple("HTTP 400: max_tokens is too large: 32768. This model supports at most 16384 completion tokens", 16_384),
+            tuple("HTTP 400: max_tokens must be less than or equal to 4096", 4_096)])
+        assert(isOutputCapError(c[0]) && outputCapFromError(c[0]) == c[1], c[0]);
+    auto overflow = "HTTP 400: This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens.";
+    assert(!isOutputCapError(overflow) && !isOutputCapError("HTTP 401: invalid api key"));
+    foreach (c; [tuple(overflow, 128_000), tuple("HTTP 400: prompt is too long: 210000 tokens > 200000 maximum", 200_000),
+            tuple("HTTP 400: the request exceeds the available context size (8192 tokens), try increasing it", 8_192)])
+        assert(isContextOverflow(c[0]) && limitFromError(c[0]) == c[1], c[0]);
+    assert(!isContextOverflow("HTTP 401: invalid api key"));
+}
+
+// rust: context.rs::image_tokens_counts_a_max_dimension_square_fully
+// rust: context.rs::model_output_limits
+// rust: context.rs::model_windows
+// rust: context.rs::summary_budget_leaves_room_for_reasoning
+unittest
+{
+    import nano.attachment : Attachment, MAX_DIMENSION;
+    Attachment img(uint w, uint h) { Attachment a = {mediaType: "image/png", path: "x.png", width: w, height: h, extension: "png"}; return a; }
+    auto max_ = img(MAX_DIMENSION, MAX_DIMENSION), hundred = img(100, 100), one = img(1, 1);
+    assert(imageTokens(max_) == 3_279 && imageTokens(hundred) == 14 && imageTokens(one) == 1);
+
+    foreach (m; ["gpt-4o", "gpt-4o-mini", "GPT-4O-MINI"]) assert(outputLimitForModel(m) == 16_384, m);
+    foreach (m; ["gpt-4-turbo", "gpt-3.5-turbo"]) assert(outputLimitForModel(m) == 4_096, m);
+    foreach (m; ["gpt-4.1", "claude-sonnet-4-5", "some-unlisted-model"]) assert(outputLimitForModel(m) == 0, m);
+
+    assert(windowForModel("claude-sonnet-4-5") == 200_000 && windowForModel("gpt-4.1-mini") == 1_047_576);
+    assert(windowForModel("llama3") == 0);
+
+    assert(summaryOutputBudget(65_536, 16_384) == 12_288);
+    assert(summaryOutputBudget(200_000, 8_000) == 8_000);
+    assert(summaryOutputBudget(32_000, 16_384) == 8_000);
+    assert(summaryOutputBudget(8_000, 16_384) == summaryMaxTokens);
+    assert(summaryOutputBudget(8_000, 1_000) == 1_000);
+}
+
+// rust: context.rs::transcript_labels_log_lines_when_asked
+unittest
+{
+    import std.algorithm : canFind, startsWith;
+    auto first = Message.user("find the bug");
+    first.logLine = 7;
+    auto summary = Message.user(summaryPrefix ~ " ...");
+    auto text = renderTranscript([summary, first], 10_000, true);
+    assert(text.startsWith("[earlier summary] USER:"), text);
+    assert(text.canFind("[#7] USER:\nfind the bug"), text);
+    assert(!renderTranscript([first], 10_000, false).canFind("#7"));
+    auto bracketed = Message.user("[constraint] use port 8080");
+    assert(!renderTranscript([bracketed], 10_000, true).canFind("[earlier summary]"));
+    assert(smartSummaryNote(2, 40).canFind("#2–#40"));
+}
