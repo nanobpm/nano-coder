@@ -24,7 +24,8 @@ import nano.llm;
 import nano.agent;
 import nano.providers;
 import nano.tools;
-import nano.tools.bash : bashDefinition = definition, bashExecute = execute;
+import nano.tools.bash : bashDefinition = definition, bashExecute = execute,
+    bashHeartbeatSink = heartbeatSink, bashHeartbeatInterval = heartbeatInterval;
 import nano.tools.files : ReadState, registerFiles = register;
 import nano.tools.search : DenyScan, registerSearch = register;
 import nano.permissions;
@@ -1877,6 +1878,12 @@ int runMain(string[] args)
             return meta;
         };
         auto server = new AcpServer(agent, host);
+        // The bash heartbeat keeps a supervising worker (c8ctl-nano) from
+        // idle-killing a healthy long command: a `session/update` note on the
+        // JSON-RPC stream every interval, never in the model's context or the
+        // tool result.
+        bashHeartbeatInterval = bashHeartbeatIntervalSecs(cfg.bashHeartbeatSecs).seconds;
+        bashHeartbeatSink = (string line) => server.heartbeat(line);
         stdErr.writefln("ACP harness ready (provider: %s, model: %s)", client.providerName, client.modelName);
         if (!server.serveStdio())
         {
@@ -1917,6 +1924,11 @@ int runMain(string[] args)
     agent.useHooks(loadHooks(cwd), o.hasResume);
 
     auto console = new Console(isTerminal(1) && environment.get("NO_COLOR") is null, isTerminal(1));
+    // The bash heartbeat keeps a supervising worker (c8ctl-nano) from
+    // idle-killing a healthy long command: a "still running" note on stdout
+    // every interval, never in the model's context or the tool result.
+    bashHeartbeatInterval = bashHeartbeatIntervalSecs(cfg.bashHeartbeatSecs).seconds;
+    bashHeartbeatSink = (string line) => console.note(console.dim(line));
     setVerbosity(cfg.verbosity);
     atomicStore(gTimestamps, cfg.timestamps);
     if (o.verbosity.length)

@@ -18,8 +18,41 @@ import nano.tools;
 import nano.control : cancelRequested;
 import nano.llm : ToolDefinition;
 import nano.sandbox : SandboxConfig, looksDenied;
+import nano.config : defaultBashHeartbeatSecsValue;
 
 enum long defaultTimeoutSecs = 600;
+
+/// The default heartbeat interval: a "still running" note goes to the
+/// supervisor-visible stream this often while a command runs. It must stay
+/// below common idle-kill windows (the c8ctl-nano worker kills a run after
+/// 300 s of silence), so a healthy long command never looks dead. The value
+/// lives in `nano.config` (`defaultBashHeartbeatSecsValue`), beside the
+/// idle-kill budget it is checked against.
+enum long defaultHeartbeatSecs = defaultBashHeartbeatSecsValue;
+
+/// Where a heartbeat line goes: the supervising process's output stream, set
+/// by the front-end (the CLI's console, the ACP server's `session/update`).
+/// It is NEVER the tool result or the model's context — a heartbeat costs no
+/// tokens. Null (the default) means no heartbeat, so embedded uses and unit
+/// tests are silent unless they wire a sink.
+void delegate(string) @safe heartbeatSink;
+
+/// How often `run` emits a heartbeat. Configurable (`bash_heartbeat_secs` /
+/// `NANO_CODER_BASH_HEARTBEAT_SECS`, resolved by
+/// `nano.config.bashHeartbeatIntervalSecs`); must stay below the idle-kill
+/// window.
+Duration heartbeatInterval = defaultHeartbeatSecs.seconds;
+
+/// The heartbeat line for `elapsed` running `command`: a head of the command
+/// so the supervisor can tell which call is alive.
+string heartbeatText(string command, Duration elapsed)
+{
+    import std.string : strip;
+    auto total = elapsed.total!"seconds";
+    auto head = command.strip;
+    if (head.length > 60) head = head[0 .. 60] ~ "…";
+    return format("… still running (%sm%02ss, %s)", total / 60, total % 60, head);
+}
 
 ToolDefinition definition(long defaultTimeout = defaultTimeoutSecs)
 {
@@ -80,7 +113,11 @@ BashResult run(string command, Duration timeout, string cwd = null, const Sandbo
     outF.close();
     errF.close();
     BashResult r;
-    auto deadline = MonoTime.currTime + timeout;
+    auto started = MonoTime.currTime;
+    auto deadline = started + timeout;
+    // The next heartbeat is due one interval in; it stops the moment the loop
+    // below breaks (the command finished, timed out or was cancelled).
+    auto nextBeat = started + heartbeatInterval;
     for (;;)
     {
         auto st = tryWait(pid);
@@ -98,6 +135,12 @@ BashResult run(string command, Duration timeout, string cwd = null, const Sandbo
             r.cancelled = cancelled;
             r.timedOut = !cancelled;
             break;
+        }
+        auto now = MonoTime.currTime;
+        if (heartbeatSink !is null && now >= nextBeat)
+        {
+            heartbeatSink(heartbeatText(command, now - started));
+            nextBeat = now + heartbeatInterval;
         }
         Thread.sleep(20.msecs);
     }
@@ -193,4 +236,68 @@ unittest
     assert(result.startsWith("1\n2\n3\n4\n5\n") && result.endsWith("100000\n"), result);
     auto path = result.findSplitAfter("full output saved to ")[1].findSplitBefore(" ...]")[0];
     assert(readText(path).lineSplitter.walkLength == 100000);
+}
+
+// The heartbeat's interval math: the default 60 s stays below the 300 s
+// idle-kill window, and a 150 s silent command crosses it at least twice.
+unittest
+{
+    import nano.config : workerIdleKillSecs;
+    assert(defaultHeartbeatSecs < workerIdleKillSecs);
+    // 150 s of silence with a 60 s interval fires at 60 s and 120 s: ≥ 2 beats.
+    assert(150 / defaultHeartbeatSecs >= 2);
+}
+
+// A long silent command heartbeats on the wired sink, never in its result, and
+// stops when it finishes. The interval is injected short so the test is fast;
+// the emission logic is interval-driven, so this stands in for a 150 s run at
+// the 60 s default.
+unittest
+{
+    import std.algorithm.searching : canFind;
+    import std.conv : to;
+    auto savedSink = heartbeatSink;
+    auto savedInterval = heartbeatInterval;
+    scope (exit) { heartbeatSink = savedSink; heartbeatInterval = savedInterval; }
+    string[] beats;
+    heartbeatSink = (string line) { beats ~= line; };
+    heartbeatInterval = 100.msecs;
+    // ~350 ms of silence at a 100 ms interval: at least 2 heartbeats.
+    auto r = run("sleep 0.35", 5.seconds);
+    assert(!r.timedOut && r.exitCode == 0);
+    assert(beats.length >= 2, "expected ≥2 heartbeats, got " ~ beats.length.to!string);
+    foreach (b; beats) assert(b.canFind("still running"), b);
+    // The beat names the command head so the supervisor can tell calls apart.
+    assert(beats[0].canFind("sleep 0.35"), beats[0]);
+    // No heartbeat after the command finished.
+    auto n = beats.length;
+    Thread.sleep(250.msecs);
+    assert(beats.length == n, "heartbeat kept firing after the command ended");
+}
+
+// The tool result carries no heartbeat text: it is supervisor-only.
+unittest
+{
+    import std.algorithm.searching : canFind;
+    auto savedSink = heartbeatSink;
+    auto savedInterval = heartbeatInterval;
+    scope (exit) { heartbeatSink = savedSink; heartbeatInterval = savedInterval; }
+    string[] beats;
+    heartbeatSink = (string line) { beats ~= line; };
+    heartbeatInterval = 50.msecs;
+    auto text = execute(parseJSON(`{"command":"sleep 0.2; printf done"}`));
+    assert(beats.length >= 1);
+    assert(text.canFind("done") && !text.canFind("still running"), text);
+}
+
+// No sink wired (the default): a long command runs silent, no heartbeat.
+unittest
+{
+    auto savedSink = heartbeatSink;
+    auto savedInterval = heartbeatInterval;
+    scope (exit) { heartbeatSink = savedSink; heartbeatInterval = savedInterval; }
+    heartbeatSink = null;
+    heartbeatInterval = 20.msecs;
+    auto r = run("sleep 0.1", 5.seconds);
+    assert(r.exitCode == 0); // no crash, no output, no heartbeat
 }

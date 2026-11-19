@@ -511,6 +511,7 @@ max_tokens = 4096
 max_iterations = 0                      # LLM calls per user input (0 = unbounded; headless runs get a 300-call safety cap)
 system_prompt = "You are a helpful assistant with access to tools."
 bash_timeout_secs = 600
+# bash_heartbeat_secs = 60               # supervisor-visible "still running" note interval (or NANO_CODER_BASH_HEARTBEAT_SECS)
 persist_sessions = true
 # session_dir = "/path/to/sessions"    # default: <platform data dir>/nano-coder/sessions
 session_titles = false                  # ask the model for a few-word title per session (--resume picker)
