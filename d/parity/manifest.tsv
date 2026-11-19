@@ -1329,7 +1329,7 @@ turn_commands.rs::tools_listing_follows_the_live_mode	todo
 turn_commands.rs::trajectory_without_a_session_says_so	todo
 ui.rs::a_paused_work_clock_freezes_the_prompt_and_resumes	test
 ui.rs::a_spinner_tick_reuses_the_wrapped_transcript	na	D has no item model or wrapped-transcript cache: the frame thread re-wraps the byte transcript per render
-ui.rs::assistant_message_reconciles_a_partial_stream	todo
+ui.rs::assistant_message_reconciles_a_partial_stream	test
 ui.rs::begin_turn_supersedes_a_transient_hint	na	D transient hints are the line editor hint, outside the transcript and cleared per read
 ui.rs::clear_transient_drops_a_hint_before_the_turn_ends	na	D transient hints are the line editor hint, outside the transcript and cleared per read
 ui.rs::deferred_notes_and_raw_exports_keep_submission_order	na	D has no deferral queue: a note or export ends the answer line and prints at once, in order

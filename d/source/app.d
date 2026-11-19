@@ -484,6 +484,38 @@ unittest
     auto none = PickerPause(null); // no frame: nothing to pause
 }
 
+/// What of a model call's `full` answer still needs printing after `streamed`
+/// (Rust's assistant-message reconciliation): the missing tail of a
+/// cut-short stream; the whole answer (`fresh`: on its own line) when the
+/// stream disagrees; nothing when it matched or nothing streamed (a quiet
+/// stretch, whose answer the turn's end reprints).
+string answerCatchUp(string streamed, string full, out bool fresh) pure nothrow @nogc
+{
+    import std.algorithm : startsWith;
+    import std.string : strip, stripRight;
+    fresh = false;
+    // Whitespace at either end isn't a difference (providers trim the answer).
+    import std.string : stripLeft;
+    auto shown = streamed.stripLeft, answer = full.strip;
+    if (!shown.length || shown.stripRight == answer) return null;
+    if (answer.startsWith(shown)) return answer[shown.length .. $];
+    fresh = true;
+    return answer;
+}
+
+// rust: ui.rs::assistant_message_reconciles_a_partial_stream
+unittest
+{
+    bool fresh;
+    assert(answerCatchUp("Here ", "Here is the answer.", fresh) == "is the answer." && !fresh, "the missing tail");
+    assert(answerCatchUp("answer.", "Here is the answer.", fresh) == "Here is the answer." && fresh,
+        "a stream that disagrees is followed by the whole answer");
+    assert(answerCatchUp("Here is the answer.", "Here is the answer.", fresh) is null && !fresh);
+    assert(answerCatchUp("", "Here is the answer.", fresh) is null, "nothing streamed: nothing to reconcile");
+    assert(answerCatchUp("\n Here is the answer.\n", "Here is the answer.", fresh) is null, "trimmed, not different");
+    assert(answerCatchUp("Here ", "Here is", fresh) == "is");
+}
+
 /// What a finished plain turn reprints (Rust turn_print): nothing unless the
 /// answer was hidden (quiet) or partly dropped (it got louder mid-answer);
 /// then the final answer, or the whole response at the turn cap so its stop
@@ -945,6 +977,8 @@ struct Screen
     // (its first line got a stamp, so later lines are padded under it).
     private string blockStamp;
     private bool answering;
+    // The answer text streamed since the model call began (for `reconcile`).
+    private string streamedAnswer;
     // Answers on a color terminal have their markdown rendered a block at a
     // time (markdown.rs MarkdownStream); piped and NO_COLOR output keep it raw.
     private MarkdownStream markdown;
@@ -1048,6 +1082,7 @@ struct Screen
             return;
         }
         if (!chunk.length) return;
+        streamedAnswer ~= chunk;
         finishThinking();
         if (!answering)
         {
@@ -1081,6 +1116,23 @@ struct Screen
         midLine = false;
         answering = false;
     }
+
+    /// The model call's full answer: what the stream missed shows now. A
+    /// cut-short stream gets its missing tail; one that disagrees with the
+    /// answer is followed by the whole answer on a line of its own.
+    void reconcile(string full)
+    {
+        bool fresh;
+        auto rest = answerCatchUp(streamedAnswer, full, fresh);
+        streamedAnswer = null;
+        if (!rest.length) return;
+        if (fresh) endLine();
+        text(false, rest);
+        streamedAnswer = null;
+    }
+
+    /// A resent reply follows: what streamed before is abandoned.
+    void restart() { streamedAnswer = null; }
 
     /// The model call ended: reasoning that didn't stream shows now, like a
     /// block that just ended.
@@ -1248,6 +1300,7 @@ class Console : AgentEvents
     void responseRestarted()
     {
         segmentDropped = false;
+        link.screen.update((ref Screen s) { s.restart(); });
         if (!quiet) endLine();
     }
 
@@ -1259,8 +1312,13 @@ class Console : AgentEvents
         segmentDropped = false;
         // Quiet still closes a segment that streamed before the switch, so
         // the next answer starts its own line (ui.rs).
-        if (quiet) { endLine(); return; }
-        link.screen.update((ref Screen s) { s.endReasoning(reasoning); });
+        if (quiet)
+        {
+            link.screen.update((ref Screen s) { s.restart(); });
+            endLine();
+            return;
+        }
+        link.screen.update((ref Screen s) { s.reconcile(text); s.endReasoning(reasoning); });
     }
 
     static string summary(const ref ToolCall c)
