@@ -1077,6 +1077,10 @@ struct Screen
     {
         if (reasoning)
         {
+            import std.string : strip;
+            // Blank reasoning opens no block and doesn't count as streamed:
+            // the call's full reasoning still shows at its end.
+            if (!thinking && !chunk.strip.length) return;
             streamedThinking = true;
             thinkingDelta(chunk);
             return;
@@ -1143,6 +1147,14 @@ struct Screen
         finishThinking();
         streamedThinking = false;
     }
+}
+
+// rust: ui.rs::trailing_thinking_never_overwrites_previous_response_reasoning
+unittest
+{
+    Screen s;
+    s.text(true, "  ");
+    assert(!s.thinking && !s.streamedThinking, "blank reasoning must not hide the call's full reasoning");
 }
 
 private size_t answerPad() { return atomicLoad(gTimestamps) ? stampWidth : 0; }
