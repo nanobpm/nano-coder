@@ -171,3 +171,82 @@ unittest
 }
 
 private bool startsWith(string s, string p) nothrow { return s.length >= p.length && s[0 .. p.length] == p; }
+
+// rust: recents.rs::canonical_expands_a_provider_only_spec_to_its_default_model
+// rust: recents.rs::canonicalize_dedupes_collapsed_entries_keeping_order
+// rust: recents.rs::canonicalize_runs_once_and_leaves_canonical_files_untouched
+unittest
+{
+    ProviderConfig[string] all;
+    all["openai"] = ProviderConfig.init;
+    ProviderConfig work;
+    work.defaultModel = "foo";
+    all["work"] = work;
+    assert(canonical("work", all, "openai") == "work/foo");
+    assert(canonical("openai", all, "work") == "openai");
+
+    ProviderConfig[string] only;
+    only["openai"] = ProviderConfig.init;
+    auto r = Recents(0, ["gpt-4o", "openai/gpt-4o"]);
+    r.canonicalize(only, "openai");
+    assert(r.models == ["openai/gpt-4o"]);
+
+    auto current = Recents(formatVersion, ["work/foo"]);
+    assert(!current.canonicalize(only, "openai") && current.models == ["work/foo"], "a removed provider's entry is kept verbatim");
+    auto legacy = Recents(0, ["gpt-4o"]);
+    assert(legacy.canonicalize(only, "openai") && legacy.models == ["openai/gpt-4o"]);
+    assert(!legacy.canonicalize(only, "openai"), "migrated once");
+}
+
+// rust: recents.rs::record_ignores_blank_and_trims
+// rust: recents.rs::record_moves_to_front_without_duplicates_and_caps
+// rust: recents.rs::switching_records_the_previous_model_just_behind_the_new_one
+unittest
+{
+    import std.algorithm : canFind;
+    import std.format : format;
+    Recents r;
+    r.record("   ");
+    r.record("  ollama/qwen3  ");
+    assert(r.models == ["ollama/qwen3"]);
+
+    Recents m;
+    m.record("openai/gpt-4o");
+    m.record("ollama/qwen3");
+    m.record("openai/gpt-4o");
+    assert(m.models == ["openai/gpt-4o", "ollama/qwen3"]);
+    foreach (i; 0 .. 20) m.record(format("p/m%s", i));
+    assert(m.models.length == maxRecents && m.models[0] == "p/m19" && !m.models.canFind("openai/gpt-4o"));
+
+    Recents s;
+    void switch_(string previous, string spec) { s.record(previous); s.record(spec); }
+    switch_("start/model", "a/one");
+    assert(s.models == ["a/one", "start/model"]);
+    switch_("a/one", "b/two");
+    switch_("b/two", "start/model");
+    assert(s.models == ["start/model", "b/two", "a/one"]);
+}
+
+// rust: recents.rs::load_tolerates_missing_and_corrupt_files
+// rust: recents.rs::save_then_load_round_trips
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, write, exists;
+    import std.path : buildPath, dirName;
+    import std.process : thisProcessID;
+    import std.format : format;
+    auto dir = buildPath(tempDir, format("nano-recents-%s", thisProcessID));
+    scope (exit) if (exists(dir)) rmdirRecurse(dir);
+    auto path = buildPath(dir, "nested", "recent-models.json");
+    assert(load(path) == Recents.init, "missing file starts empty");
+    mkdirRecurse(dirName(path));
+    write(path, "not json");
+    assert(load(path) == Recents.init, "corrupt file starts empty");
+
+    Recents r;
+    r.record("openai/gpt-4o");
+    r.record("ollama/qwen3");
+    rmdirRecurse(dir);
+    save(path, r);
+    assert(load(path) == r);
+}
