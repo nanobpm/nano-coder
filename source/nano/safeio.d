@@ -475,7 +475,7 @@ struct Shared(T)
     /// A new cell holding `v`.
     static Shared make(T v = T.init) { return Shared(new shared Locked!T(v)); }
     /// Whether this handle refers to a cell.
-    bool opCast(B : bool)() const { return atomicLoad(impl) !is null; }
+    bool opCast(B : bool)() pure const { return atomicLoad(impl) !is null; }
     /// See `Locked`.
     T get() { return atomicLoad(impl).get(); }
     /// ditto
@@ -521,7 +521,7 @@ struct Isolated(T)
     /// Claim that nothing else refers to `value` (e.g. it was just built).
     /// The compiler can't check this; check-safe.sh counts every call
     /// against scripts/isolation-budget, so each claim gets reviewed.
-    static Isolated assumeIsolated(T value)
+    static Isolated assumeIsolated(T value) pure
     {
         Isolated r;
         r.payload = value;
@@ -529,7 +529,7 @@ struct Isolated(T)
     }
 
     /// Take the value out (the holder is left empty).
-    T unwrap()
+    T unwrap() pure
     {
         auto v = payload;
         payload = T.init;
@@ -538,7 +538,7 @@ struct Isolated(T)
 
     /// Make it immutable: sound because nothing else can still change it.
     /// `@trusted`: the cast is what isolation licenses (`assumeUnique`).
-    immutable(T) freeze() @trusted
+    immutable(T) freeze() pure @trusted
     {
         auto v = unwrap();
         return cast(immutable) v;
@@ -570,7 +570,7 @@ private final class ResultBox(R) { Unqual!R value; }
 
 /// `@trusted`: the thread wrote `box.value` before it ended, and `join`
 /// waited for that (a happens-before edge), so nothing else touches it now.
-private R takeResult(R)(ResultBox!R box) @trusted
+private R takeResult(R)(ResultBox!R box) pure @trusted
 {
     import core.lifetime : move;
     return cast(R) move(box.value);
@@ -641,7 +641,7 @@ struct Chan(T)
     /// A new, open channel.
     static Chan make() { return Chan(new shared Channel!T); }
     /// Whether this handle refers to a channel.
-    bool opCast(B : bool)() const { return atomicLoad(impl) !is null; }
+    bool opCast(B : bool)() pure const { return atomicLoad(impl) !is null; }
     /// See `Channel`.
     void put(T v, bool front = false) { atomicLoad(impl).put(v, front); }
     /// ditto
@@ -791,7 +791,7 @@ import std.json : JSONValue, JSONType;
 /// `v[key]` when `v` is an object holding it, else null. Phobos marks
 /// `JSONValue.object` @system because it returns the AA by reference; this
 /// only looks a key up and returns a pointer into the GC-owned table.
-const(JSONValue)* jsonGet(return scope const ref JSONValue v, string key) @trusted
+const(JSONValue)* jsonGet(return scope const ref JSONValue v, string key) pure @trusted
 {
     if (v.type != JSONType.object) return null;
     return key in v.object;
@@ -800,7 +800,7 @@ const(JSONValue)* jsonGet(return scope const ref JSONValue v, string key) @trust
 /// A deep, mutable copy of `v`, so a `const` tree can be merged into a
 /// mutable one without casting `const` away (and without the two sharing
 /// subtrees). Numbers are copied as stored, never re-parsed.
-JSONValue jsonCopy(const JSONValue v)
+JSONValue jsonCopy(const JSONValue v) pure
 {
     final switch (v.type)
     {
@@ -826,7 +826,7 @@ JSONValue jsonCopy(const JSONValue v)
 /// JSON is copied with `jsonCopy`, structs field by field. Data that is
 /// already immutable (strings) is shared. This replaces `cast()` copies out
 /// of `const`, which would let the copy write into the original.
-U deepCopy(U)(const U v)
+U deepCopy(U)(const U v) pure
 {
     import std.traits : hasIndirections, isAssociativeArray, KeyType, ValueType;
     import std.typecons : Nullable;

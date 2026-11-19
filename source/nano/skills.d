@@ -65,7 +65,7 @@ struct SkillsConfig
     string[] allowedHosts = ["github.com"];
 
     /// Read the `[skills]` table (absent keys keep their defaults).
-    static SkillsConfig fromToml(JSONValue t)
+    static SkillsConfig fromToml(JSONValue t) pure
     {
         SkillsConfig c;
         if (t.type != JSONType.object) return c;
@@ -87,7 +87,7 @@ struct Source
     Kind kind;
     string git, commit;
 
-    string label() const
+    string label() pure const
     {
         final switch (kind)
         {
@@ -186,7 +186,7 @@ final class Skills
         }
     }
 
-    private void push(Skill sk)
+    private void push(Skill sk) pure
     {
         if (sk.name in seen) return;
         seen[sk.name] = true;
@@ -256,12 +256,12 @@ final class Skills
         }
     }
 
-    bool empty() const { return skills.length == 0; }
+    bool empty() pure const { return skills.length == 0; }
 
-    string[] names() const { return skills.map!(s => s.name.idup).array; }
+    string[] names() pure const { return skills.map!(s => s.name.idup).array; }
 
     /// The skill index appended to the system prompt (empty without skills).
-    string renderIndex() const
+    string renderIndex() pure const
     {
         if (!skills.length) return "";
         string out_ = "\n\n# Skills\n\nSkills are instructions for specific kinds of task. When a task matches a skill below, "
@@ -319,7 +319,7 @@ final class Skills
     }
 }
 
-ToolDefinition definition()
+ToolDefinition definition() pure
 {
     return ToolDefinition(toolName,
         "Load a skill: step-by-step instructions for a kind of task, listed under \"Skills\" in the system prompt. "
@@ -336,7 +336,7 @@ string canonical(string p)
     return realPath(p);
 }
 
-private bool startsWithPath(string path, string root)
+private bool startsWithPath(string path, string root) pure
 {
     return path == root || path.startsWith(root.endsWith("/") ? root : root ~ "/");
 }
@@ -415,7 +415,7 @@ private bool readSkill(string dir, string nameOverride, Source source, out Skill
 
 /// Split YAML front matter (`---` … `---`) into top-level `key: value` pairs
 /// and the body. Handles quoted values and `>` / `|` blocks.
-string frontMatter(string text, out string[2][] fields)
+string frontMatter(string text, out string[2][] fields) pure
 {
     text = text.chompPrefix("\uFEFF");
     auto lines = text.lineSplitter!(KeepTerminator.yes).array;
@@ -467,7 +467,7 @@ string frontMatter(string text, out string[2][] fields)
     return text[offset < text.length ? offset : $ .. $];
 }
 
-private string truncateUtf8(string s, size_t max)
+private string truncateUtf8(string s, size_t max) pure
 {
     if (s.length <= max) return s;
     auto end = max;
@@ -475,7 +475,7 @@ private string truncateUtf8(string s, size_t max)
     return s[0 .. end];
 }
 
-private string cap(string text, size_t max)
+private string cap(string text, size_t max) pure
 {
     if (text.length <= max) return text;
     auto total = text.length;
@@ -506,14 +506,14 @@ private void listFiles(string root, string dir, size_t depth, ref string[] out_)
     }
 }
 
-private bool relativeInside(string path)
+private bool relativeInside(string path) pure
 {
     if (!path.length || path.isAbsolute) return false;
     return path.pathSplitter.all!(c => c != ".." && c != "/");
 }
 
 /// spm's store key: `<repo-name hint>-<FNV-1a 64 of the URL>@<sha>`.
-string storeKey(string url, string sha)
+string storeKey(string url, string sha) pure
 {
     ulong h = 0xcbf2_9ce4_8422_2325UL;
     foreach (ubyte b; cast(const(ubyte)[]) url)
@@ -540,7 +540,7 @@ private struct Locked
 {
     string git, commit, path, store;
 
-    static Locked parse(JSONValue e)
+    static Locked parse(JSONValue e) pure
     {
         if (e.type != JSONType.object) throw new Exception("entry must be a table");
         string req(string k)
@@ -557,7 +557,7 @@ private struct Locked
     }
 
     /// `ai.lock` is committed to the repository, so it is untrusted input.
-    void validate(string name) const
+    void validate(string name) pure const
     {
         if (!name.length || name == "." || name == ".." || name.any!(c => c == '/' || c == '\\' || c == '\0'))
             throw new Exception("invalid name");
@@ -630,7 +630,7 @@ private string checkoutFor(const ref Locked locked, const ref SkillsConfig confi
 }
 
 /// Host of a git URL (`https://host/...`, `ssh://user@host:port/...`, `user@host:path`), or `file`.
-string gitHost(string url)
+string gitHost(string url) pure
 {
     if (url.startsWith("file://")) return "file";
     string authority;
@@ -718,17 +718,17 @@ version (unittest)
         std.file.write(path, text);
     }
 
-    private string skillMd(string name, string description)
+    private string skillMd(string name, string description) pure
     {
         return format("---\nname: %s\ndescription: %s\n---\n\n# %s\n\nDo the %s thing.\n", name, description, name, name);
     }
 
-    private Locations locs(string base)
+    private Locations locs(string base) pure
     {
         return Locations(buildPath(base, "home"), buildPath(base, "spm/store"), buildPath(base, "cache"));
     }
 
-    private SkillsConfig cfg()
+    private SkillsConfig cfg() pure
     {
         SkillsConfig c;
         c.allowedHosts = ["file"];

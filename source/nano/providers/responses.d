@@ -14,14 +14,14 @@ import nano.llm;
 import nano.config : ResolvedProvider, reasonsOverResponses;
 import thinking = nano.thinking;
 
-private string strOf(const JSONValue v, string key)
+private string strOf(const JSONValue v, string key) pure
 {
     import nano.safeio : jsonGet;
     auto p = jsonGet(v, key);
     return p && p.type == JSONType.string ? p.str : "";
 }
 
-private string typeOf(const JSONValue v) { return strOf(v, "type"); }
+private string typeOf(const JSONValue v) pure { return strOf(v, "type"); }
 
 /// The Responses request body for `req`, with provider overrides applied.
 JSONValue responsesBody(const ref ChatRequest req, const ref ResolvedProvider p, bool stream)
@@ -104,7 +104,7 @@ JSONValue responsesBody(const ref ChatRequest req, const ref ResolvedProvider p,
 }
 
 /// Text of a content-part list (refusals skipped).
-private string partsText(const JSONValue content)
+private string partsText(const JSONValue content) pure
 {
     string s;
     if (content.type == JSONType.array)
@@ -113,7 +113,7 @@ private string partsText(const JSONValue content)
     return s;
 }
 
-private string reasoningText(const JSONValue item)
+private string reasoningText(const JSONValue item) pure
 {
     string s;
     foreach (key; ["summary", "content"])
@@ -122,7 +122,7 @@ private string reasoningText(const JSONValue item)
 }
 
 /// `incomplete` surfaces its nested reason (e.g. `max_output_tokens`).
-private string stopReason(const JSONValue response)
+private string stopReason(const JSONValue response) pure
 {
     auto status = strOf(response, "status");
     if (status == "incomplete")
@@ -134,7 +134,7 @@ private string stopReason(const JSONValue response)
     return status;
 }
 
-private void readUsage(const JSONValue u, ref TokenUsage usage)
+private void readUsage(const JSONValue u, ref TokenUsage usage) pure
 {
     if (u.type != JSONType.object) return;
     if (auto v = "input_tokens" in u.objectNoRef) if (v.type == JSONType.integer) usage.inputTokens = v.integer;
@@ -144,7 +144,7 @@ private void readUsage(const JSONValue u, ref TokenUsage usage)
             if (auto v = "cached_tokens" in d.objectNoRef) if (v.type == JSONType.integer) usage.cachedInputTokens = v.integer;
 }
 
-private ToolCall callFrom(const JSONValue item, string raw)
+private ToolCall callFrom(const JSONValue item, string raw) pure
 {
     auto id = strOf(item, "call_id");
     if (!id.length) id = strOf(item, "id");
@@ -244,7 +244,7 @@ struct ResponsesStream
         }
     }
 
-    LLMResponse finish()
+    LLMResponse finish() pure
     {
         import std.algorithm : sort;
         size_t position;

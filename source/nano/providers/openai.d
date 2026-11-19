@@ -23,9 +23,9 @@ class OpenAIClient : LLMClient, CapabilityProbe, KindedClient
 
     this(ResolvedProvider p) { this.p = p; }
 
-    string modelName() const { return p.model; }
-    string providerName() const { return p.name; }
-    ProviderKind kind() const { return ProviderKind.openai; }
+    string modelName() pure const { return p.model; }
+    string providerName() pure const { return p.name; }
+    ProviderKind kind() pure const { return ProviderKind.openai; }
 
     protected string baseUrl() { return p.config.baseUrl.stripRight("/"); }
 
@@ -109,7 +109,7 @@ class OpenAIClient : LLMClient, CapabilityProbe, KindedClient
     }
 
     /// A `thinking_blocks` entry holding `reasoning_content` for replay.
-    static JSONValue reasoningBlock(string text)
+    static JSONValue reasoningBlock(string text) pure
     {
         return JSONValue(["type": "reasoning_content", "text": text]);
     }
@@ -240,7 +240,7 @@ class OpenAIClient : LLMClient, CapabilityProbe, KindedClient
 
     /// Whether probing is worth a startup round trip: Copilot, or a local
     /// server (Ollama, llama.cpp, LM Studio, or any loopback endpoint).
-    protected bool shouldProbe()
+    protected bool shouldProbe() pure
     {
         import nano.vision : baseUrlHost;
         auto host = baseUrlHost(p.config.baseUrl);
@@ -249,7 +249,7 @@ class OpenAIClient : LLMClient, CapabilityProbe, KindedClient
     }
 
     /// Copilot reads its window from `capabilities.limits` instead.
-    protected bool copilotLimits() { return false; }
+    protected bool copilotLimits() pure { return false; }
 
     /// Thinking levels and vision from `/models`, then (by server) llama.cpp
     /// `/props` or Ollama `/api/show` (port of `detect_capabilities`).
@@ -326,7 +326,7 @@ class OpenAIClient : LLMClient, CapabilityProbe, KindedClient
     }
 }
 
-void readUsage(JSONValue u, ref TokenUsage usage)
+void readUsage(JSONValue u, ref TokenUsage usage) pure
 {
     if (u.type != JSONType.object) return;
     if (auto v = "prompt_tokens" in u) if (v.type == JSONType.integer) usage.inputTokens = v.integer;
@@ -426,7 +426,7 @@ class CopilotClient : OpenAIClient
     private SessionToken session;
     private bool forceRefresh;
 
-    override ProviderKind kind() const { return ProviderKind.githubCopilot; }
+    override ProviderKind kind() pure const { return ProviderKind.githubCopilot; }
 
     this(ResolvedProvider p)
     {
@@ -454,14 +454,14 @@ class CopilotClient : OpenAIClient
     }
 
     /// A configured `base_url` wins over the session's endpoint.
-    private string apiBase()
+    private string apiBase() pure
     {
         return p.config.baseUrl.length ? p.config.baseUrl.stripRight("/") : session.baseUrl;
     }
 
-    override protected bool shouldProbe() { return true; }
+    override protected bool shouldProbe() pure { return true; }
 
-    override protected bool copilotLimits() { return true; }
+    override protected bool copilotLimits() pure { return true; }
 
     override protected string baseUrl()
     {
@@ -609,7 +609,7 @@ unittest
 
 /// The `/models` entry for `model`; a server listing a single model (such
 /// as ds4, which accepts aliases) is taken to be serving it.
-JSONValue modelEntry(JSONValue models, string model, bool onlyFallback = true)
+JSONValue modelEntry(JSONValue models, string model, bool onlyFallback = true) pure
 {
     JSONValue items = models;
     if (models.type == JSONType.object)
@@ -629,7 +629,7 @@ JSONValue modelEntry(JSONValue models, string model, bool onlyFallback = true)
 }
 
 /// A positive integer at `path`, else 0.
-size_t tokensAt(JSONValue v, string[] path)
+size_t tokensAt(JSONValue v, string[] path) pure
 {
     foreach (k; path)
     {
@@ -644,7 +644,7 @@ size_t tokensAt(JSONValue v, string[] path)
 }
 
 /// The window listed on a `/models` entry (vLLM, OpenRouter, Groq, Mistral, ...).
-void windowInEntry(JSONValue entry, ref Capabilities c)
+void windowInEntry(JSONValue entry, ref Capabilities c) pure
 {
     static immutable string[][] paths = [["max_model_len"], ["loaded_context_length"], ["context_length"],
         ["top_provider", "context_length"], ["context_window"], ["max_context_length"]];
@@ -658,7 +658,7 @@ void windowInEntry(JSONValue entry, ref Capabilities c)
 }
 
 /// The model's published output cap on its `/models` entry (0 = none).
-size_t outputLimitInEntry(JSONValue entry)
+size_t outputLimitInEntry(JSONValue entry) pure
 {
     static immutable string[][] paths = [["max_output_tokens"], ["max_completion_tokens"],
         ["top_provider", "max_completion_tokens"], ["top_provider", "max_output_tokens"]];
@@ -669,7 +669,7 @@ size_t outputLimitInEntry(JSONValue entry)
 
 /// Copilot: `max_prompt_tokens` caps the prompt alone (with the larger
 /// `max_context_window_tokens` as a second, combined limit).
-void copilotWindow(JSONValue entry, ref Capabilities c)
+void copilotWindow(JSONValue entry, ref Capabilities c) pure
 {
     auto limit = (string f) => tokensAt(entry, ["capabilities", "limits", f]);
     auto prompt = limit("max_prompt_tokens"), combined = limit("max_context_window_tokens");
@@ -690,7 +690,7 @@ void copilotWindow(JSONValue entry, ref Capabilities c)
 
 /// Ollama: the loaded model's context from `/api/ps`, else `num_ctx` from
 /// the model's parameters (the model's maximum is not what Ollama runs with).
-void ollamaWindow(JSONValue ps, JSONValue show, string model, ref Capabilities c)
+void ollamaWindow(JSONValue ps, JSONValue show, string model, ref Capabilities c) pure
 {
     import std.string : lineSplitter, strip;
     import std.algorithm : startsWith;

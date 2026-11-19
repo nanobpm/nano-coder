@@ -22,7 +22,7 @@ struct Changes
     /// "provider\0model" pairs.
     bool[string] modelTemperatures, modelThinking;
 
-    bool any() const
+    bool any() pure const
     {
         return model || temperature || thinking || maxTokens || maxIterations || systemPrompt || compaction
             || verbosity || providerTemperatures.length || providerThinking.length || providers.length
@@ -30,15 +30,15 @@ struct Changes
     }
 }
 
-string pairKey(string provider, string model) { return provider ~ "\0" ~ model; }
+string pairKey(string provider, string model) pure { return provider ~ "\0" ~ model; }
 
-string turnCapLabel(long maxIterations)
+string turnCapLabel(long maxIterations) pure
 {
     return maxIterations <= 0 ? "unbounded" : format("%s LLM calls per input (normal mode asks before stopping)", maxIterations);
 }
 
 /// `0` is "unset": shown as what it resolves to.
-string maxTokensLabel(long configured, string effective)
+string maxTokensLabel(long configured, string effective) pure
 {
     return configured > 0 ? format("%s", configured) : format("auto (%s)", effective);
 }
@@ -46,7 +46,7 @@ string maxTokensLabel(long configured, string effective)
 enum size_t recentModelsShown = 4;
 
 /// Recent specs whose provider still exists and is visible, newest first, at most four.
-string[] recentModels(const string[] recents, const ProviderConfig[string] all)
+string[] recentModels(const string[] recents, const ProviderConfig[string] all) pure
 {
     import std.string : indexOf;
     string[] out_;
@@ -103,7 +103,7 @@ ProviderRow[] providerRows(const string[] recent, string currentSpec, string cur
 /// for the narrower scopes, "default", the model's levels, and the existing
 /// value if it isn't among them; plus the existing value's row.
 Tuple!(Nullable!Thinking, string)[] thinkingChoices(size_t scope_, const string[] levels, Nullable!Thinking existing,
-    out size_t initial)
+    out size_t initial) pure
 {
     alias C = Tuple!(Nullable!Thinking, string);
     C[] choices;
@@ -122,7 +122,7 @@ Tuple!(Nullable!Thinking, string)[] thinkingChoices(size_t scope_, const string[
 }
 
 /// Is this the Qwen / Model Studio provider (by name or URL)?
-bool isQwenProvider(string name, const ref ProviderConfig p)
+bool isQwenProvider(string name, const ref ProviderConfig p) pure
 {
     import nano.qwen : isModelStudioUrl;
     return name == "qwen" || (p.baseUrl.length && isModelStudioUrl(p.baseUrl));
@@ -143,7 +143,7 @@ struct QwenRow
 /// The endpoint picker for a provider now on `currentUrl`: the current
 /// endpoint first (so Enter keeps it), every other endpoint once, then
 /// Custom URL and Keep.
-QwenRow[] qwenEndpointRows(string currentUrl)
+QwenRow[] qwenEndpointRows(string currentUrl) pure
 {
     import nano.qwen : endpointForUrl, endpoints;
     auto match = endpointForUrl(currentUrl);
@@ -156,7 +156,7 @@ QwenRow[] qwenEndpointRows(string currentUrl)
 }
 
 /// The row picked (`-1` for Esc); Esc or a stale index keeps the endpoint.
-QwenRow qwenEndpointPick(ptrdiff_t pick, const QwenRow[] rows)
+QwenRow qwenEndpointPick(ptrdiff_t pick, const QwenRow[] rows) pure
 {
     if (pick < 0 || pick >= rows.length) return QwenRow(null, QwenChoice.keep);
     return QwenRow(rows[pick].label, rows[pick].choice, rows[pick].endpoint);
@@ -166,7 +166,7 @@ QwenRow qwenEndpointPick(ptrdiff_t pick, const QwenRow[] rows)
 /// `api_key_env` names) moves to `e`'s plan; a custom variable, a literal key
 /// or a command stays, and no variable is introduced where there was none
 /// (an unused env var would shadow a key command: env ranks above command).
-void applyQwenEndpoint(ref ProviderConfig p, const ref QwenEndpoint e)
+void applyQwenEndpoint(ref ProviderConfig p, const ref QwenEndpoint e) pure
 {
     import nano.qwen : endpoints;
     p.baseUrl = e.baseUrl;
@@ -176,7 +176,7 @@ void applyQwenEndpoint(ref ProviderConfig p, const ref QwenEndpoint e)
 
 /// The env-var prompt's default: the provider's variable, else the chosen
 /// endpoint's plan variable, else `<NAME>_API_KEY`.
-string suggestedKeyEnv(const ref ProviderConfig p, scope const(QwenEndpoint)* chosen, string name)
+string suggestedKeyEnv(const ref ProviderConfig p, scope const(QwenEndpoint)* chosen, string name) pure
 {
     import std.string : toUpper, replace;
     if (p.apiKeyEnv.length) return p.apiKeyEnv;
@@ -193,14 +193,14 @@ struct ModelStep
 
 /// The model picker's row `pick` (`-1` for Esc) over `models`, followed by
 /// "Other (type a model ID)" and "Back to providers".
-ModelStep modelChoice(ptrdiff_t pick, const string[] models)
+ModelStep modelChoice(ptrdiff_t pick, const string[] models) pure
 {
     if (pick < 0 || pick > models.length) return ModelStep(true);
     return ModelStep(false, pick == models.length ? "" : models[pick]);
 }
 
 /// `provider/model` for a typed ID; a blank ID goes back.
-ModelStep modelSpec(string provider, string id)
+ModelStep modelSpec(string provider, string id) pure
 {
     return id.strip.length ? ModelStep(false, provider ~ "/" ~ id.strip) : ModelStep(true);
 }
@@ -209,7 +209,7 @@ ModelStep modelSpec(string provider, string id)
 /// built the client, or the configured model now resolves to it (a
 /// `work/foo` spec falls back to the default provider until `work` exists).
 /// `c.providers` is the effective table (presets and legacy keys applied).
-bool editRebuilds(const ref Config c, string name, string clientProvider)
+bool editRebuilds(const ref Config c, string name, string clientProvider) pure
 {
     string provider, model;
     parseModelSpec(c.model, c.providers, c.defaultProvider, provider, model);
@@ -217,7 +217,7 @@ bool editRebuilds(const ref Config c, string name, string clientProvider)
 }
 
 /// Notices after a successful save: an earlier save failure is resolved.
-string[] clearSaveFailures(string[] notices)
+string[] clearSaveFailures(string[] notices) pure
 {
     import std.algorithm : filter, startsWith;
     import std.array : array;
@@ -226,7 +226,7 @@ string[] clearSaveFailures(string[] notices)
 
 /// The user's entry after an edit: only fields that differ from the preset,
 /// with key sources replaced and an emptied preset `api_key_env` kept as "".
-ProviderConfig diffFrom(const ref ProviderConfig preset, const ref ProviderConfig existing, const ref ProviderConfig updated)
+ProviderConfig diffFrom(const ref ProviderConfig preset, const ref ProviderConfig existing, const ref ProviderConfig updated) pure
 {
     import nano.safeio : deepCopy;
     ProviderConfig e = deepCopy(existing);
@@ -242,7 +242,7 @@ ProviderConfig diffFrom(const ref ProviderConfig preset, const ref ProviderConfi
     return e;
 }
 
-string kindName(ProviderKind k)
+string kindName(ProviderKind k) pure
 {
     final switch (k)
     {
@@ -254,16 +254,16 @@ string kindName(ProviderKind k)
     }
 }
 
-private string temperatureLiteral(double t) { return isNaN(t) ? tomlString("default") : tomlFloat(t); }
+private string temperatureLiteral(double t) pure { return isNaN(t) ? tomlString("default") : tomlFloat(t); }
 
-private string thinkingLiteral(const Nullable!Thinking t)
+private string thinkingLiteral(const Nullable!Thinking t) pure
 {
     return t.isNull ? null : tomlString(t.get.toString);
 }
 
 /// The config text with `changes` applied (settings.rs `save`, minus the
 /// write). `user` holds each changed provider's own entry.
-string applyChanges(string doc, const ref Config c, const ref Changes ch, const ProviderConfig[string] user)
+string applyChanges(string doc, const ref Config c, const ref Changes ch, const ProviderConfig[string] user) pure
 {
     import std.string : indexOf;
     import nano.ui : vname = name;

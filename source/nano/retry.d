@@ -46,19 +46,19 @@ struct ErrorInfo
         return e;
     }
 
-    bool overloaded() const
+    bool overloaded() pure const
     {
         return code == "server_is_overloaded" || code == "slow_down" || kind == "overloaded_error" || status == 529;
     }
 
-    bool rateLimited() const
+    bool rateLimited() pure const
     {
         return code == "rate_limit_exceeded" || kind == "rate_limit_error" || status == 429;
     }
 }
 
 /// Whether an error is worth retrying.
-bool retryable(const ErrorInfo e, const(ushort)[] statuses) nothrow
+bool retryable(const ErrorInfo e, const(ushort)[] statuses) pure nothrow
 {
     static immutable fatalCodes = ["context_length_exceeded", "insufficient_quota", "usage_not_included",
         "usage_limit_reached", "credit_balance_exhausted", "billing_hard_limit_reached", "cyber_policy",
@@ -83,7 +83,7 @@ struct RetryPolicy
     Duration offlineBudget = Duration.max;
 
     /// Exponential backoff for a zero-based attempt.
-    Duration backoff(long attempt) const
+    Duration backoff(long attempt) pure const
     {
         auto factor = 1L << (attempt < 20 ? attempt : 20);
         auto d = initialBackoff * factor;
@@ -117,7 +117,7 @@ Duration retryDelay(RetryPolicy policy, long attempt, scope const(ErrorInfo)* er
     return delay - usecsOf((delay / 5).total!"usecs" * jitter);
 }
 
-private Duration usecsOf(double n) { return (cast(long) n).usecs; }
+private Duration usecsOf(double n) pure { return (cast(long) n).usecs; }
 
 /// `Retry-After`: seconds (integer or decimal) or an HTTP date.
 Duration parseRetryAfterHeader(string value, long nowUnix)

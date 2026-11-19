@@ -55,10 +55,10 @@ immutable QwenEndpoint[] endpoints = [
     QwenEndpoint(QwenPlan.codingPlan, "Singapore (International)", "https://coding-intl.dashscope.aliyuncs.com/v1"),
 ];
 
-immutable(QwenEndpoint) defaultEndpoint() { return endpoints[0]; }
+immutable(QwenEndpoint) defaultEndpoint() pure { return endpoints[0]; }
 
 /// The endpoint whose base URL is exactly `url` (ignoring a trailing slash).
-immutable(QwenEndpoint)* endpointForUrl(string url)
+immutable(QwenEndpoint)* endpointForUrl(string url) pure
 {
     url = url.stripRight('/');
     foreach (ref e; endpoints) if (e.baseUrl == url) return &e;
@@ -68,7 +68,7 @@ immutable(QwenEndpoint)* endpointForUrl(string url)
 /// Whether `url` is a Model Studio host: a plan endpoint, the
 /// `dashscope.aliyuncs.com` / `maas.aliyuncs.com` apex, or a workspace host
 /// under either (dot boundary, so look-alikes don't match).
-bool isModelStudioUrl(string url)
+bool isModelStudioUrl(string url) pure
 {
     if (endpointForUrl(url) !is null) return true;
     auto t = url.strip;

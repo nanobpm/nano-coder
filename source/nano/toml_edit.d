@@ -11,7 +11,7 @@ import std.format : format;
 import std.string : indexOf, strip, stripLeft, startsWith;
 
 /// A TOML basic string.
-string tomlString(string s)
+string tomlString(string s) pure
 {
     string out_ = "\"";
     foreach (dchar c; s)
@@ -36,7 +36,7 @@ string tomlString(string s)
 }
 
 /// A TOML float (always with a fraction or exponent).
-string tomlFloat(double v)
+string tomlFloat(double v) pure
 {
     auto s = format("%.15g", v);
     if (s.indexOf('.') < 0 && s.indexOf('e') < 0 && s.indexOf("inf") < 0 && s.indexOf("nan") < 0) s ~= ".0";
@@ -44,7 +44,7 @@ string tomlFloat(double v)
 }
 
 /// A key as written in TOML: bare when it can be, quoted otherwise.
-string tomlKey(string k)
+string tomlKey(string k) pure
 {
     import std.ascii : isAlphaNum;
     bool bare = k.length > 0;
@@ -54,7 +54,7 @@ string tomlKey(string k)
 
 /// The dotted segments of a header like `[providers."my x".models]`, or null
 /// when `line` is not a plain table header (`[[array]]` tables too are null).
-string[] headerPath(string line) nothrow
+string[] headerPath(string line) pure nothrow
 {
     auto t = line.strip;
     if (!t.startsWith("[") || t.startsWith("[[")) return null;
@@ -94,7 +94,7 @@ string[] headerPath(string line) nothrow
 }
 
 /// The key a `key = value` line sets (unquoted), or null.
-private string lineKey(string line)
+private string lineKey(string line) pure
 {
     auto t = line.stripLeft;
     if (!t.length || t[0] == '#' || t[0] == '[') return null;
@@ -115,7 +115,7 @@ private string lineKey(string line)
 
 /// Where a value starting at `v` ends (exclusive), counting multi-line
 /// strings and arrays across `lines` from `row`; also the row it ends on.
-private size_t valueEnd(const string[] lines, size_t row, size_t col, out size_t endRow)
+private size_t valueEnd(const string[] lines, size_t row, size_t col, out size_t endRow) pure
 {
     endRow = row;
     auto line = lines[row];
@@ -164,7 +164,7 @@ private size_t valueEnd(const string[] lines, size_t row, size_t col, out size_t
 /// literal `value`, or removed when `value` is null. A missing table is
 /// appended. Throws when the key is set some way a line edit can't follow
 /// (a dotted key or an inline table).
-string tomlSet(string doc, const string[] path, string key, string value)
+string tomlSet(string doc, const string[] path, string key, string value) pure
 {
     import std.algorithm : equal;
     auto lines = doc.length ? doc.split("\n") : [];
@@ -257,7 +257,7 @@ string tomlSet(string doc, const string[] path, string key, string value)
 /// `text` (starting at an inline table's `{`) with `key` under the nested
 /// inline tables `path` removed, entry and separating comma; `found` says
 /// whether it was there. Everything after the table is kept as it was.
-private string inlineRemove(string text, const string[] path, string key, out bool found)
+private string inlineRemove(string text, const string[] path, string key, out bool found) pure
 {
     // Where the value starting at `i` ends (exclusive).
     static size_t valueStop(string t, size_t i)
@@ -338,7 +338,7 @@ unittest
 }
 
 /// The header path in force at line `row`.
-private string[] tableAt(const string[] lines, size_t row) nothrow
+private string[] tableAt(const string[] lines, size_t row) pure nothrow
 {
     string[] cur;
     foreach (l; lines[0 .. row])

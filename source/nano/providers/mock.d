@@ -43,7 +43,7 @@ class MockClient : LLMClient
         return r;
     }
 
-    string[] listModels() { return ["mock"]; }
-    string modelName() const { return "mock"; }
-    string providerName() const { return "mock"; }
+    string[] listModels() pure { return ["mock"]; }
+    string modelName() pure const { return "mock"; }
+    string providerName() pure const { return "mock"; }
 }

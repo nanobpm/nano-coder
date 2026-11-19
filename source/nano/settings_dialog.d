@@ -77,7 +77,7 @@ string pickModel(SettingsUi ui, ref SettingsHost h)
 }
 
 /// A configured model's picker row: its display name, then its id.
-string modelLabel(string id, string name)
+string modelLabel(string id, string name) pure
 {
     import nano.trajectory : terminalSafe;
     return name.strip.length ? format("%s  (%s)", terminalSafe(name), id) : id;
@@ -206,7 +206,7 @@ string[] runSettings(SettingsUi ui, ref SettingsHost h)
 /// Applies a verbosity picked in the dialog (set by the app).
 void delegate(imported!"nano.ui".Verbosity) @safe onVerbosity;
 
-private bool parseCount(string t, out long v)
+private bool parseCount(string t, out long v) pure
 {
     import std.conv : to;
     try { v = t.strip.to!long; return v >= 0; }
@@ -540,7 +540,7 @@ private string editProvider(SettingsUi ui, ref SettingsHost h, ref string[] noti
     return name;
 }
 
-private string kindLabelOf(ProviderKind k) nothrow
+private string kindLabelOf(ProviderKind k) pure nothrow
 {
     final switch (k)
     {

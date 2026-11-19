@@ -35,21 +35,21 @@ private struct Parser
 
     noreturn fail(string msg) { throw new TomlException(msg, line); }
 
-    bool eof() const { return i >= s.length; }
-    char peek(size_t off = 0) const { return i + off < s.length ? s[i + off] : '\0'; }
+    bool eof() pure const { return i >= s.length; }
+    char peek(size_t off = 0) pure const { return i + off < s.length ? s[i + off] : '\0'; }
 
-    void skipWs()
+    void skipWs() pure
     {
         while (!eof && (peek == ' ' || peek == '\t')) i++;
     }
 
-    void skipComment()
+    void skipComment() pure
     {
         if (peek == '#') while (!eof && peek != '\n') i++;
     }
 
     /// Skip whitespace, newlines and comments (inside arrays).
-    void skipAll()
+    void skipAll() pure
     {
         for (;;)
         {
@@ -127,7 +127,7 @@ private struct Parser
 
     /// Append an empty table to the array of tables `parent[k]` (created if
     /// missing); its index, or -1 when `parent[k]` is not an array.
-    static ptrdiff_t appendTable(ref JSONValue parent, string k)
+    static ptrdiff_t appendTable(ref JSONValue parent, string k) pure
     {
         if (k !in parent) parent[k] = JSONValue(JSONValue[].init);
         if (parent[k].type != JSONType.array) return -1;
@@ -137,7 +137,7 @@ private struct Parser
     }
 
     /// Set `t[k] = v` unless `k` is already there (false).
-    static bool putNew(ref JSONValue t, string k, JSONValue v)
+    static bool putNew(ref JSONValue t, string k, JSONValue v) pure
     {
         if (k in t) return false;
         t[k] = v;
@@ -146,7 +146,7 @@ private struct Parser
 
     /// `t.a.b.c = v` for the dotted key `path` of an inline table, creating
     /// the intermediate tables.
-    static void setDotted(ref JSONValue t, string[] path, JSONValue v)
+    static void setDotted(ref JSONValue t, string[] path, JSONValue v) pure
     {
         if (path.length == 1) { t[path[0]] = v; return; }
         if (path[0] !in t) t[path[0]] = JSONValue(string[string].init);

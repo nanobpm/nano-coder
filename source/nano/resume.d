@@ -19,7 +19,7 @@ import nano.session_index : Summary, list;
 import nano.lineedit : Key, K, ByteSource, decode;
 
 /// Sessions that ran in `cwd`, plus those from older logs that don't say where they ran.
-const(Summary)[] inDir(const Summary[] sessions, string cwd)
+const(Summary)[] inDir(const Summary[] sessions, string cwd) pure
 {
     return sessions.filter!(s => s.cwd is null || s.cwd == cwd).array;
 }
@@ -35,7 +35,7 @@ string last(string dir, string cwd, string exclude = null)
 
 /// `text` without control characters (C0, DEL and C1): persisted or
 /// filesystem text must not inject terminal escape sequences.
-string sanitize(string text)
+string sanitize(string text) pure
 {
     import std.uni : isControl;
     string o;
@@ -58,7 +58,7 @@ string ago(SysTime then, SysTime now)
 }
 
 /// The last component of the session's directory, or `?` when unknown.
-string project(const ref Summary s)
+string project(const ref Summary s) pure
 {
     if (s.cwd is null) return "?";
     auto name = s.cwd.baseName;
@@ -66,7 +66,7 @@ string project(const ref Summary s)
 }
 
 /// One line of prompt text: whitespace collapsed, control characters dropped.
-string oneLine(string text)
+string oneLine(string text) pure
 {
     return sanitize(text.split.join(" "));
 }
@@ -74,7 +74,7 @@ string oneLine(string text)
 /// What the session was last about: the title (when there is one) and the
 /// last prompt, else the last prompt and, when that says little, the more
 /// telling one before it.
-string topic(const ref Summary s)
+string topic(const ref Summary s) pure
 {
     auto lastP = oneLine(s.lastPrompt);
     if (s.title !is null) return oneLine(s.title) ~ " · " ~ lastP;
@@ -87,7 +87,7 @@ string topic(const ref Summary s)
 
 /// Whether `c` takes no cell of its own: combining marks, zero-width
 /// joiners/spaces and variation selectors join the preceding character.
-private bool zeroWidth(dchar c)
+private bool zeroWidth(dchar c) pure
 {
     import std.uni : combiningClass, unicode;
     if (c == 0x200B || c == 0x200C || c == 0x200D || c == 0x2060 || c == 0xFEFF) return true;
@@ -98,7 +98,7 @@ private bool zeroWidth(dchar c)
 }
 
 /// Whether `c` is East Asian wide/fullwidth or a wide emoji (two cells).
-private bool wide(dchar c)
+private bool wide(dchar c) pure
 {
     return (c >= 0x1100 && c <= 0x115F) || (c >= 0x231A && c <= 0x231B) || (c >= 0x2329 && c <= 0x232A)
         || (c >= 0x23E9 && c <= 0x23EC) || c == 0x23F0 || c == 0x23F3 || (c >= 0x25FD && c <= 0x25FE)
@@ -130,7 +130,7 @@ private bool wide(dchar c)
 /// Terminal cells `text` occupies. Measured over the string, not per
 /// character: an emoji-presentation selector (U+FE0F) widens the narrow
 /// character before it to two cells, as terminals render `#️`.
-size_t cells(string text)
+size_t cells(string text) pure
 {
     import std.uni : isControl;
     size_t n;
@@ -153,7 +153,7 @@ size_t cells(string text)
 
 /// `text` fitted to at most `width` cells, with an ellipsis when truncated.
 /// Never splits a wide glyph or a joining sequence across the boundary.
-string truncate(string text, size_t width)
+string truncate(string text, size_t width) pure
 {
     if (width == 0) return "";
     if (cells(text) <= width) return text;
@@ -169,7 +169,7 @@ string truncate(string text, size_t width)
 }
 
 /// Width of `line` with ANSI CSI sequences skipped.
-private size_t visibleCells(string line)
+private size_t visibleCells(string line) pure
 {
     string plain;
     for (size_t i = 0; i < line.length; i++)
@@ -186,7 +186,7 @@ private size_t visibleCells(string line)
 }
 
 /// Terminal rows a written line occupies once wrapped at `cols`.
-size_t physicalRows(string line, size_t cols)
+size_t physicalRows(string line, size_t cols) pure
 {
     if (cols == 0) return 1;
     return max(1, (visibleCells(line) + cols - 1) / cols);
@@ -194,13 +194,13 @@ size_t physicalRows(string line, size_t cols)
 
 /// Item rows that fit beneath a `promptRows`-tall prompt, capped at
 /// `maxVisible`; zero when the prompt already fills the screen.
-size_t itemWindow(size_t rows, size_t promptRows, size_t maxVisible)
+size_t itemWindow(size_t rows, size_t promptRows, size_t maxVisible) pure
 {
     return min(maxVisible, saturatingSub(rows, promptRows));
 }
 
 /// The scroll offset that keeps `sel` inside a `maxVisible`-row window.
-size_t scrollTop(size_t top, size_t sel, size_t maxVisible)
+size_t scrollTop(size_t top, size_t sel, size_t maxVisible) pure
 {
     if (sel < top) return sel;
     if (maxVisible > 0 && sel >= top + maxVisible) return sel + 1 - maxVisible;
@@ -214,7 +214,7 @@ size_t scrollTop(size_t top, size_t sel, size_t maxVisible)
 /// only when the pattern has an uppercase letter), filling `positions` with
 /// the matched character indices. Null when there is no match. Consecutive
 /// runs, word starts and early matches score higher; gaps cost a little.
-long fuzzyMatch(string text, string pattern, out size_t[] positions)
+long fuzzyMatch(string text, string pattern, out size_t[] positions) pure
 {
     import std.uni : toLower, isUpper, isAlphaNum;
     import std.algorithm : any;
@@ -258,7 +258,7 @@ long fuzzyMatch(string text, string pattern, out size_t[] positions)
 
 /// Indices of `items` matching `search`, best first; equal scores keep input
 /// order, so the newest-first default survives until the user narrows it.
-size_t[] rank(const string[] items, string search)
+size_t[] rank(const string[] items, string search) pure
 {
     struct Hit { size_t i; long score; }
     Hit[] hits;
@@ -312,7 +312,7 @@ struct Picker
     size_t sel, top;
 
     /// The frame's lines for a `rows`×`cols` terminal.
-    string[] frame(size_t rows, size_t cols, size_t maxVisible)
+    string[] frame(size_t rows, size_t cols, size_t maxVisible) pure
     {
         auto filtered = rank(items, search);
         auto promptLine = (color ? "\x1b[32m?\x1b[0m \x1b[1m" : "? ") ~ prompt ~ (color ? "\x1b[0m" : "") ~ " › " ~ search;
@@ -332,7 +332,7 @@ struct Picker
         return lines;
     }
 
-    private string renderItem(string text, bool active)
+    private string renderItem(string text, bool active) pure
     {
         auto label = truncate(text, width);
         size_t[] matched;
@@ -352,7 +352,7 @@ struct Picker
 
     /// Apply a key. Returns -1 to keep going, -2 when cancelled, or the
     /// chosen item's index.
-    long handle(Key k)
+    long handle(Key k) pure
     {
         auto filtered = rank(items, search);
         final switch (k.kind)
@@ -383,7 +383,7 @@ struct Picker
     }
 }
 
-private string stripAnsi(string line)
+private string stripAnsi(string line) pure
 {
     string plain;
     for (size_t i = 0; i < line.length; i++)

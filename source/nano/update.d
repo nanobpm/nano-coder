@@ -56,7 +56,7 @@ Channel channelFor(string exe)
 /// For `<prefix>/Cellar/nano-coder/<version>/bin/nano-coder`, the stable
 /// `<prefix>/opt/nano-coder/bin/nano-coder` link that follows upgrades (the
 /// versioned keg is gone after `brew upgrade` cleans up); null otherwise.
-string brewOptExe(string exe)
+string brewOptExe(string exe) pure
 {
     import std.algorithm : splitter;
     import std.array : array, join;
@@ -69,7 +69,7 @@ string brewOptExe(string exe)
 
 /// The release a formula installs, read from its download URL
 /// (`…/releases/download/v<version>/…`); null when there is none.
-string formulaVersion(string formula)
+string formulaVersion(string formula) pure
 {
     import std.algorithm : findSplit;
     auto r = formula.findSplit("/releases/download/v");
@@ -78,7 +78,7 @@ string formulaVersion(string formula)
     return v.length ? v : null;
 }
 
-private bool hasComponents(string path, string[] want)
+private bool hasComponents(string path, string[] want) pure
 {
     import std.algorithm : splitter;
     import std.array : array;
@@ -91,7 +91,7 @@ private bool hasComponents(string path, string[] want)
 
 /// `path` without the " (deleted)" Linux appends to /proc/self/exe once the
 /// running binary was replaced (as an update does), so a relaunch finds the new one.
-string stripDeletedSuffix(string path)
+string stripDeletedSuffix(string path) pure
 {
     import std.string : chomp;
     return path.chomp(" (deleted)");
@@ -118,7 +118,7 @@ string launchExe()
 }
 
 /// The installer program `/update` runs (null for other).
-string installer(Channel c)
+string installer(Channel c) pure
 {
     final switch (c)
     {
@@ -129,7 +129,7 @@ string installer(Channel c)
 }
 
 /// The installer's arguments that install the latest release.
-string[] installArgs(Channel c)
+string[] installArgs(Channel c) pure
 {
     final switch (c)
     {
@@ -140,10 +140,10 @@ string[] installArgs(Channel c)
 }
 
 /// The update command for a channel ("" for other).
-string installCommand(Channel c) { return c == Channel.other ? "" : installer(c) ~ " " ~ installArgs(c).joinWords; }
+string installCommand(Channel c) pure { return c == Channel.other ? "" : installer(c) ~ " " ~ installArgs(c).joinWords; }
 
 /// Where the channel's latest version is read (null for other).
-string latestUrl(Channel c)
+string latestUrl(Channel c) pure
 {
     final switch (c)
     {
@@ -153,7 +153,7 @@ string latestUrl(Channel c)
     }
 }
 
-private string joinWords(string[] a) { import std.array : join; return a.join(" "); }
+private string joinWords(string[] a) pure { import std.array : join; return a.join(" "); }
 
 /// Checks are off by environment.
 bool disabledByEnv()
@@ -171,7 +171,7 @@ bool isCi()
 }
 
 /// Whether `/update` may run: both ends a terminal, not CI.
-bool updateAllowed(bool stdinTty, bool stdoutTty, bool ci) { return stdinTty && stdoutTty && !ci; }
+bool updateAllowed(bool stdinTty, bool stdoutTty, bool ci) pure { return stdinTty && stdoutTty && !ci; }
 
 /// What a check remembers between runs.
 struct State
@@ -179,7 +179,7 @@ struct State
     long lastCheck; /// Unix seconds; 0 = never
     string latestKnown, hinted;
 
-    JSONValue toJson() const
+    JSONValue toJson() pure const
     {
         JSONValue j = parseJSON("{}");
         if (lastCheck) j["last_check"] = lastCheck;
@@ -188,7 +188,7 @@ struct State
         return j;
     }
 
-    static State fromJson(JSONValue j)
+    static State fromJson(JSONValue j) pure
     {
         State s;
         if (j.type != JSONType.object) return s;
@@ -266,7 +266,7 @@ bool isNewer(string candidate, string running) pure
 }
 
 /// Records a check's result; the version to hint, if it's newer and not yet hinted.
-string probeOutcome(ref State s, string running, string latest, long now)
+string probeOutcome(ref State s, string running, string latest, long now) pure
 {
     s.lastCheck = now;
     if (!latest.length || !isNewer(latest, running)) return null;
@@ -325,12 +325,12 @@ final class Checker
     }
 
     /// The newest known release, when newer than this one.
-    string latestKnown()
+    string latestKnown() pure
     {
         return state.latestKnown.length && isNewer(state.latestKnown, running) ? state.latestKnown : null;
     }
 
-    bool hintPending() { return hint.length > 0; }
+    bool hintPending() pure { return hint.length > 0; }
 
     /// The hint text, once per version (remembered as hinted).
     string takeHint()
@@ -358,7 +358,7 @@ final class Checker
     }
 
     /// Seconds until the next check is due.
-    long dueIn(long now = unixNow()) { return saturatingSub(nextDue, now); }
+    long dueIn(long now = unixNow()) pure { return saturatingSub(nextDue, now); }
 }
 
 long unixNow()
@@ -463,7 +463,7 @@ string which(string program)
 
 /// The relaunch argv (without argv[0]): the original arguments with any
 /// `--resume`/`--continue` replaced by `--resume <session>`.
-string[] relaunchArgv(const string[] argv, string session)
+string[] relaunchArgv(const string[] argv, string session) pure
 {
     string[] out_;
     for (size_t i = 0; i < argv.length; ++i)

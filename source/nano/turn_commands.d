@@ -14,7 +14,7 @@ import std.algorithm : canFind;
 
 /// Split a trimmed `/…` line into its name and trimmed argument on the first
 /// whitespace, so `/trajectory\t--json` classifies like `/trajectory --json`.
-string[2] splitCmd(string cmd) nothrow
+string[2] splitCmd(string cmd) pure nothrow
 {
     import std.ascii : isWhite;
     // Any whitespace separates (a vertical tab too, as Rust's split_whitespace).
@@ -36,7 +36,7 @@ enum Timing
 }
 
 /// When `cmd` (a trimmed `/…` line) can run during a turn (Rust's table).
-Timing timing(string cmd) nothrow
+Timing timing(string cmd) pure nothrow
 {
     auto p = splitCmd(cmd);
     auto name = p[0], arg = p[1];

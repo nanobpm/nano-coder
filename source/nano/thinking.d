@@ -35,12 +35,12 @@ struct Thinking
     Kind kind;
     string level;
 
-    static Thinking off() { return Thinking(Kind.off); }
-    static Thinking of(string l) { return Thinking(Kind.level, l); }
-    bool isDefault() const { return kind == Kind.default_; }
+    static Thinking off() pure { return Thinking(Kind.off); }
+    static Thinking of(string l) pure { return Thinking(Kind.level, l); }
+    bool isDefault() pure const { return kind == Kind.default_; }
 
     /// Parse a setting; throws with Rust's message on a bad one.
-    static Thinking parse(string s)
+    static Thinking parse(string s) pure
     {
         s = s.strip.toLower;
         switch (s)
@@ -54,7 +54,7 @@ struct Thinking
         }
     }
 
-    string toString() const
+    string toString() pure const
     {
         final switch (kind)
         {
@@ -65,7 +65,7 @@ struct Thinking
     }
 
     /// The config spelling (`default` rather than `model default`).
-    string configValue() const { return kind == Kind.default_ ? "default" : toString(); }
+    string configValue() pure const { return kind == Kind.default_ ? "default" : toString(); }
 }
 
 /// How an Anthropic Messages model takes a level.
@@ -77,7 +77,7 @@ enum Format { effort, templateSwitch, templateEffort }
 /// Which request format a client sends.
 enum Wire { chatCompletions, responses, anthropicMessages }
 
-Wire wireFor(ProviderKind kind, string model)
+Wire wireFor(ProviderKind kind, string model) pure
 {
     if (kind == ProviderKind.githubCopilot)
     {
@@ -104,7 +104,7 @@ struct Request
 }
 
 /// Anthropic thinking budget for a level on budget-style models.
-uint budgetTokens(string level)
+uint budgetTokens(string level) pure
 {
     switch (level)
     {
@@ -120,7 +120,7 @@ uint budgetTokens(string level)
 
 /// The budget to send under an output cap of `maxTokens` (it must stay below
 /// it); 0 when the cap leaves no room for the minimum.
-uint cappedBudget(uint budget, long maxTokens)
+uint cappedBudget(uint budget, long maxTokens) pure
 {
     long room = maxTokens - 1;
     if (room < 0) room = 0;
@@ -137,13 +137,13 @@ struct Profile
     AnthropicStyle anthropic;
 }
 
-private Profile profile(string[] levels, bool claude = false, AnthropicStyle s = AnthropicStyle.adaptive)
+private Profile profile(string[] levels, bool claude = false, AnthropicStyle s = AnthropicStyle.adaptive) pure
 {
     return Profile(levels, claude, s);
 }
 
 /// A one- or two-digit number at the start of `s`, and what follows it.
-private bool number(string s, out uint n, out string rest)
+private bool number(string s, out uint n, out string rest) pure
 {
     size_t d;
     while (d < s.length && isDigit(s[d])) d++;
@@ -153,7 +153,7 @@ private bool number(string s, out uint n, out string rest)
     return true;
 }
 
-private uint minorOf(string s)
+private uint minorOf(string s) pure
 {
     if (!s.length || (s[0] != '.' && s[0] != '-')) return 0;
     uint m; string after;
@@ -163,7 +163,7 @@ private uint minorOf(string s)
 
 /// `(family, major, minor)` of a Claude id: `claude-sonnet-4-5-20250929` is
 /// sonnet 4.5, `claude-3-7-sonnet-latest` sonnet 3.7.
-bool claudeVersion(string id, out string family, out uint major, out uint minor)
+bool claudeVersion(string id, out string family, out uint major, out uint minor) pure
 {
     auto at = id.indexOf("claude-");
     if (at < 0) return false;
@@ -190,7 +190,7 @@ bool claudeVersion(string id, out string family, out uint major, out uint minor)
 }
 
 /// `(major, minor)` of `gpt-<major>[.<minor>]` with the prefix stripped.
-private bool gptVersion(string rest, out uint major, out uint minor)
+private bool gptVersion(string rest, out uint major, out uint minor) pure
 {
     size_t d;
     while (d < rest.length && isDigit(rest[d])) d++;
@@ -207,7 +207,7 @@ private bool gptVersion(string rest, out uint major, out uint minor)
 }
 
 /// The built-in profile for a model id, if its family is known.
-Nullable!Profile builtin(string model)
+Nullable!Profile builtin(string model) pure
 {
     alias A = AnthropicStyle;
     Nullable!Profile none;
@@ -249,7 +249,7 @@ struct Reported
     Format format;
 
     /// Copilot-style `/models` entry: `capabilities.supports.reasoning_effort`.
-    static Nullable!Reported fromModelEntry(const JSONValue entry)
+    static Nullable!Reported fromModelEntry(const JSONValue entry) pure
     {
         Nullable!Reported none;
         auto caps = objGet(entry, "capabilities");
@@ -272,7 +272,7 @@ struct Reported
     }
 
     /// Ollama `/api/show`: the `thinking` capability takes `reasoning_effort`.
-    static Nullable!Reported fromOllamaShow(const JSONValue show)
+    static Nullable!Reported fromOllamaShow(const JSONValue show) pure
     {
         auto caps = objGet(show, "capabilities");
         if (caps !is null && caps.type == JSONType.array)
@@ -283,7 +283,7 @@ struct Reported
     }
 
     /// llama.cpp `/props`: what the chat template accepts.
-    static Nullable!Reported fromLlamacppProps(const JSONValue props)
+    static Nullable!Reported fromLlamacppProps(const JSONValue props) pure
     {
         auto t = objGet(props, "chat_template");
         if (t is null || t.type != JSONType.string) return Nullable!Reported.init;
@@ -299,7 +299,7 @@ struct Reported
 public import nano.safeio : objGet = jsonGet;
 
 /// `extra_body` keys that carry a thinking setting for `wire`.
-immutable(string[]) extraBodyKeys(Wire wire)
+immutable(string[]) extraBodyKeys(Wire wire) pure
 {
     final switch (wire)
     {
@@ -313,7 +313,7 @@ immutable(string[]) extraBodyKeys(Wire wire)
 /// thinking. A present control thinks unless it explicitly turns thinking off
 /// (`disabled`, `off`, `none` or `false`); `output_config` counts only through
 /// its `effort` field (null otherwise: not a thinking control).
-Nullable!bool anthropicExtraBodyThinks(string key, const JSONValue v)
+Nullable!bool anthropicExtraBodyThinks(string key, const JSONValue v) pure
 {
     static bool isOff(string s)
     {
@@ -346,7 +346,7 @@ Nullable!bool anthropicExtraBodyThinks(string key, const JSONValue v)
 
 /// Whether `extra_body[key]` replaces the generated control (not just an
 /// unrelated sibling field of a nested one).
-private bool extraBodyOverridesGenerated(string key, Wire wire, Format fmt, const(JSONValue)* value)
+private bool extraBodyOverridesGenerated(string key, Wire wire, Format fmt, const(JSONValue)* value) pure
 {
     string nested;
     if (wire == Wire.responses && key == "reasoning") nested = "effort";
@@ -361,7 +361,7 @@ private bool extraBodyOverridesGenerated(string key, Wire wire, Format fmt, cons
     return objGet(*value, nested) !is null;
 }
 
-private Request generatedRequest(const Thinking eff, Wire wire, AnthropicStyle anthropic, Format fmt)
+private Request generatedRequest(const Thinking eff, Wire wire, AnthropicStyle anthropic, Format fmt) pure
 {
     alias K = Request.Kind;
     final switch (eff.kind)
@@ -380,7 +380,7 @@ private Request generatedRequest(const Thinking eff, Wire wire, AnthropicStyle a
     }
 }
 
-private immutable(string[]) requestFieldKeys(Wire wire, const Request r)
+private immutable(string[]) requestFieldKeys(Wire wire, const Request r) pure
 {
     alias K = Request.Kind;
     final switch (wire)
@@ -395,7 +395,7 @@ private immutable(string[]) requestFieldKeys(Wire wire, const Request r)
 /// Where the level in effect came from.
 enum Source { session, model, provider, global }
 
-string label(Source s)
+string label(Source s) pure
 {
     final switch (s)
     {
@@ -428,7 +428,7 @@ struct Resolved
     string warning;
 
     /// What to put in the request (kind `none` for nothing).
-    Request request() const
+    Request request() pure const
     {
         if (dropped) return Request.init;
         if (extraBodyOverride.length)
@@ -445,20 +445,20 @@ struct Resolved
         return generatedRequest(effective, wire, anthropic, format);
     }
 
-    private bool modelAlwaysThinks() const
+    private bool modelAlwaysThinks() pure const
     {
         return wire == Wire.anthropicMessages && levels.length && !levels.canFind("off");
     }
 
-    private bool extraBodyEnables() const { return !extraBodyThinkingOn.isNull && extraBodyThinkingOn.get; }
+    private bool extraBodyEnables() pure const { return !extraBodyThinkingOn.isNull && extraBodyThinkingOn.get; }
 
-    private bool extraBodyControlComplete() const
+    private bool extraBodyControlComplete() pure const
     {
         return extraBodyThinkingKey != "output_config" || request().kind == Request.Kind.adaptiveOn;
     }
 
     /// Whether Anthropic Messages is asked to think (no custom temperature then).
-    bool anthropicThinkingOn() const
+    bool anthropicThinkingOn() pure const
     {
         if (modelAlwaysThinks) return true;
         if (extraBodyEnables && request().kind != Request.Kind.off && !dropped && extraBodyControlComplete) return true;
@@ -468,14 +468,14 @@ struct Resolved
 
     /// Whether the model thinks on Anthropic Messages even with no thinking
     /// field in the request (compaction).
-    bool alwaysAnthropicThinking() const
+    bool alwaysAnthropicThinking() pure const
     {
         if (wire != Wire.anthropicMessages) return false;
         return modelAlwaysThinks || (extraBodyEnables && extraBodyControlComplete);
     }
 
     /// One line for `/context`, e.g. `high (set for this model)`.
-    string describe() const
+    string describe() pure const
     {
         auto t = std.format.format("%s (%s)", effective, source.label);
         if (effective != requested) t ~= std.format.format(", %s requested", requested);
@@ -485,18 +485,18 @@ struct Resolved
     }
 
     /// The levels `/thinking` can set, for display.
-    string choices() const { return (["default"] ~ levels.dup).join(", "); }
+    string choices() pure const { return (["default"] ~ levels.dup).join(", "); }
 }
 
 /// The level sent, for ACP and logs: null when nothing reaches the wire.
-JSONValue wireValue(const ref Resolved r)
+JSONValue wireValue(const ref Resolved r) pure
 {
     if (r.overridden || r.dropped || r.effective.isDefault) return JSONValue(null);
     return JSONValue(r.effective.toString);
 }
 
 /// `/thinking` with no argument: the level, the model's levels and how to change it.
-string statusText(const ref Resolved r, string model)
+string statusText(const ref Resolved r, string model) pure
 {
     string[] out_ = ["Thinking: " ~ r.describe];
     if (!r.levels.length)
@@ -508,7 +508,7 @@ string statusText(const ref Resolved r, string model)
 }
 
 /// Apply a `/thinking ARG` (`reset` clears the session level).
-void setSession(ref Nullable!Thinking session, string arg)
+void setSession(ref Nullable!Thinking session, string arg) pure
 {
     arg = arg.strip;
     if (arg.toLower == "reset") session.nullify;
@@ -517,7 +517,7 @@ void setSession(ref Nullable!Thinking session, string arg)
 
 /// The level in `levels` nearest to `wanted`: the highest at or below it on
 /// ORDER, else the lowest above it. A name off the scale matches only itself.
-string nearest(const string[] levels, string wanted)
+string nearest(const string[] levels, string wanted) pure
 {
     if (levels.canFind(wanted)) return wanted;
     static ptrdiff_t rank(string l) { return ORDER.countUntil(l); }
@@ -536,14 +536,14 @@ string nearest(const string[] levels, string wanted)
     return below !is null ? below : above;
 }
 
-private string quoted(string s) { return format("%s", [s])[1 .. $ - 1]; }
+private string quoted(string s) pure { return format("%s", [s])[1 .. $ - 1]; }
 
 /// The level for `model` on `provider`: the session override, else the
 /// model's setting, else the provider's, else `global`, fitted to the levels
 /// the model supports (config `thinking_levels`, else `reported`, else the
 /// built-in table).
 Resolved resolve(const Thinking global, scope const(Thinking)* session, ProviderKind kind,
-    const ref ProviderConfig provider, string model, scope const(Reported)* reported = null)
+    const ref ProviderConfig provider, string model, scope const(Reported)* reported = null) pure
 {
     Resolved r;
     auto ms = model in provider.models;
@@ -675,7 +675,7 @@ Resolved resolve(const Thinking global, scope const(Thinking)* session, Provider
 }
 
 /// Write `req` into a Chat Completions body.
-void applyChat(const Request req, ref JSONValue body)
+void applyChat(const Request req, ref JSONValue body) pure
 {
     alias K = Request.Kind;
     final switch (req.kind)
@@ -693,7 +693,7 @@ void applyChat(const Request req, ref JSONValue body)
 /// `max_tokens` the Anthropic client sends when none is configured (as Rust).
 enum anthropicDefaultMaxTokens = 8192;
 
-bool applyAnthropic(const Request req, ref JSONValue body, long maxTokens)
+bool applyAnthropic(const Request req, ref JSONValue body, long maxTokens) pure
 {
     alias K = Request.Kind;
     final switch (req.kind)
@@ -728,17 +728,17 @@ version (unittest)
         p.merge(parseToml(toml));
         return p;
     }
-    private Thinking lv(string l) { return Thinking.of(l); }
-    private string levelsOf(string m)
+    private Thinking lv(string l) pure { return Thinking.of(l); }
+    private string levelsOf(string m) pure
     {
         auto p = builtin(m);
         return p.isNull ? null : p.get.levels.join(",");
     }
-    private Resolved res(Thinking global, Thinking* session, ProviderKind kind, ProviderConfig p, string model)
+    private Resolved res(Thinking global, Thinking* session, ProviderKind kind, ProviderConfig p, string model) pure
     {
         return resolve(global, session, kind, p, model);
     }
-    private Resolved sess(Thinking t, ProviderKind kind, ProviderConfig p, string model)
+    private Resolved sess(Thinking t, ProviderKind kind, ProviderConfig p, string model) pure
     {
         return resolve(Thinking.init, &t, kind, p, model);
     }
@@ -940,19 +940,19 @@ version (unittest)
 {
     private enum Request reqNone = Request.init, reqOff = Request(Request.Kind.off),
         reqAdaptiveOn = Request(Request.Kind.adaptiveOn);
-    private Request reqEffort(string l) { return Request(Request.Kind.effort, l); }
-    private Thinking off_() { return Thinking.parse("off"); }
+    private Request reqEffort(string l) pure { return Request(Request.Kind.effort, l); }
+    private Thinking off_() pure { return Thinking.parse("off"); }
     /// resolve with Rust's argument order: global, session (or none), kind, provider, model.
     private Resolved rv(Thinking global, Thinking session, bool hasSession, ProviderKind kind, ProviderConfig p,
-        string model, scope Reported* reported = null)
+        string model, scope Reported* reported = null) pure
     {
         return resolve(global, hasSession ? &session : null, kind, p, model, reported);
     }
-    private Resolved rs(Thinking session, ProviderKind kind, ProviderConfig p, string model, scope Reported* rep = null)
+    private Resolved rs(Thinking session, ProviderKind kind, ProviderConfig p, string model, scope Reported* rep = null) pure
     {
         return rv(Thinking.init, session, true, kind, p, model, rep);
     }
-    private Resolved rd(ProviderKind kind, ProviderConfig p, string model)
+    private Resolved rd(ProviderKind kind, ProviderConfig p, string model) pure
     {
         return rv(Thinking.init, Thinking.init, false, kind, p, model);
     }

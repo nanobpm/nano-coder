@@ -29,10 +29,10 @@ class HistoryError : Exception
     this(string msg) @safe { super(msg); }
 }
 
-bool isHistoryTool(string name) @safe { return name == searchTool || name == readTool; }
+bool isHistoryTool(string name) pure @safe { return name == searchTool || name == readTool; }
 
 /// A call that failed, including a bash command that ran but reported failure.
-bool looksFailed(string tool, bool ok, string result) @safe
+bool looksFailed(string tool, bool ok, string result) pure @safe
 {
     if (isHistoryTool(tool)) return false;
     if (!ok) return true;
@@ -43,7 +43,7 @@ bool looksFailed(string tool, bool ok, string result) @safe
 }
 
 /// Whether this message already consumed the one-time post-compaction hint.
-bool consumesHint(const ref Message m) @safe
+bool consumesHint(const ref Message m) pure @safe
 {
     if (m.role == Role.tool) return m.content.canFind(failedToolHint) || isHistoryTool(m.toolName);
     if (m.role == Role.assistant)
@@ -51,7 +51,7 @@ bool consumesHint(const ref Message m) @safe
     return false;
 }
 
-ToolDefinition[] definitions()
+ToolDefinition[] definitions() pure
 {
     return [
         ToolDefinition(searchTool,
@@ -96,7 +96,7 @@ Entry[] load(string path)
     return out_;
 }
 
-string roleName(Role r) @safe
+string roleName(Role r) pure @safe
 {
     final switch (r)
     {
@@ -108,7 +108,7 @@ string roleName(Role r) @safe
 }
 
 /// `#N role [name] (failed) (YYYY-MM-DD HH:MM:SS)`.
-private string label(ulong id, const ref Message m) @safe
+private string label(ulong id, const ref Message m) pure @safe
 {
     auto s = format("#%s %s", id, roleName(m.role));
     if (m.toolName.length) s ~= " " ~ m.toolName;
@@ -148,7 +148,7 @@ private ulong idArg(JSONValue args, string key, bool required)
 }
 
 /// ~240 characters around a match, whitespace collapsed, `…` where cut.
-private string snippet(string text, size_t start, size_t end)
+private string snippet(string text, size_t start, size_t end) pure
 {
     import std.utf : toUTF32, toUTF8, count;
     auto pre = text[0 .. start].toUTF32;

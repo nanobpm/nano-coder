@@ -130,7 +130,7 @@ class DemoClient : LLMClient, KindedClient
         return false;
     }
 
-    private static bool hasWord(string haystack, string needle)
+    private static bool hasWord(string haystack, string needle) pure
     {
         size_t start;
         foreach (i, dchar c; haystack)
@@ -145,7 +145,7 @@ class DemoClient : LLMClient, KindedClient
     }
 
     /// Mock reasoning when the latest user message mentions "think".
-    private static string thinkingFor(const ref ChatRequest req)
+    private static string thinkingFor(const ref ChatRequest req) pure
     {
         foreach_reverse (ref m; req.messages)
             if (m.role == Role.user)
@@ -157,10 +157,10 @@ class DemoClient : LLMClient, KindedClient
         return "";
     }
 
-    string[] listModels() { return [model]; }
-    string modelName() const { return model; }
-    string providerName() const { return provider; }
-    ProviderKind kind() const { return ProviderKind.mock; }
+    string[] listModels() pure { return [model]; }
+    string modelName() pure const { return model; }
+    string providerName() pure const { return provider; }
+    ProviderKind kind() pure const { return ProviderKind.mock; }
 }
 
 unittest

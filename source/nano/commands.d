@@ -52,7 +52,7 @@ immutable Command[] commands = [
 
 /// `/compact` arguments: an optional `--smart`/`--standard`, then a focus.
 /// Returns whether a mode was given.
-bool parseCompactArgs(string args, out CompactionMode mode, out string focus)
+bool parseCompactArgs(string args, out CompactionMode mode, out string focus) pure
 {
     import std.string : strip, indexOf;
     args = args.strip;
@@ -79,7 +79,7 @@ unittest
 /// Why a submitted `/…` line can't be sent: its first word isn't a command.
 /// null for anything else (not a `/` line, a known command, or a `//` escape).
 /// Such a line is never sent to the model.
-string rejection(string line)
+string rejection(string line) pure
 {
     auto word = firstWord(line.strip);
     if (!isCommand(line) || commands.any!(c => c.name == word))
@@ -96,7 +96,7 @@ string rejection(string line)
 /// so a prompt such as `/workspace is shared.\n...` or `/tmp/foo is empty,
 /// why?` reaches the model instead of being swallowed (Rust #173). A `//…`
 /// line is an escaped prompt, never a command.
-bool isCommand(string line)
+bool isCommand(string line) pure
 {
     auto t = line.strip;
     auto word = firstWord(t);
@@ -107,14 +107,14 @@ bool isCommand(string line)
 
 /// A `//…` line is a prompt that starts with `/`: the text with one `/`
 /// removed. null for other lines.
-string unescapePrompt(string line)
+string unescapePrompt(string line) pure
 {
     import std.string : stripLeft;
     auto t = line.stripLeft;
     return t.startsWith("//") ? t[1 .. $] : null;
 }
 
-const(Command)[] matching(string prefix)
+const(Command)[] matching(string prefix) pure
 {
     return commands.filter!(c => c.name.startsWith(prefix)).array;
 }
@@ -122,7 +122,7 @@ const(Command)[] matching(string prefix)
 /// What Tab turns `prefix` into: the command (plus a space when it takes
 /// arguments) if only one matches, else the longest common prefix (null when
 /// that adds nothing).
-string complete(string prefix)
+string complete(string prefix) pure
 {
     auto found = matching(prefix);
     if (!found.length) return null;
@@ -138,7 +138,7 @@ string complete(string prefix)
 }
 
 /// The `/help` text.
-string helpText()
+string helpText() pure
 {
     auto width = columnWidth();
     auto out_ = "Commands:";
@@ -159,7 +159,7 @@ struct Suggestion
 Suggestion[] delegate() @safe modelSuggestionSource;
 
 /// The line as `command` + the start of its first argument; null past it.
-string[2] splitCommand(string line, out bool ok)
+string[2] splitCommand(string line, out bool ok) pure
 {
     ok = false;
     size_t i;
@@ -176,7 +176,7 @@ string[2] splitCommand(string line, out bool ok)
 /// enabled provider's default model, curated models, and bare provider
 /// names (configured providers first). Hidden providers aren't offered, and
 /// each value appears once.
-Suggestion[] modelSuggestions(const ref imported!"nano.config".Config cfg, string current, const string[] recents)
+Suggestion[] modelSuggestions(const ref imported!"nano.config".Config cfg, string current, const string[] recents) pure
 {
     import nano.config : specVisible, enabledProviderNames, ProviderKind;
     import std.algorithm : sort;
@@ -256,7 +256,7 @@ Suggestion[] suggestions(string line)
 
 /// True past the name of a command with a known argument set (its type-ahead
 /// is drawn even when nothing matches, to say so).
-bool hasArgumentMenu(string line)
+bool hasArgumentMenu(string line) pure
 {
     bool ok;
     auto parts = splitCommand(line, ok);
@@ -296,7 +296,7 @@ string completeLine(string line)
 }
 
 /// Menu rows for an argument type-ahead: typed part bold, the rest of the value cyan, the note dim.
-string[] suggestionMenu(const Suggestion[] found, string line, size_t cols, size_t maxRows)
+string[] suggestionMenu(const Suggestion[] found, string line, size_t cols, size_t maxRows) pure
 {
     if (maxRows == 0) return null;
     bool ok;
@@ -345,14 +345,14 @@ private:
 
 struct Style { size_t at; string sgr; }
 
-string firstWord(string s)
+string firstWord(string s) pure
 {
     foreach (i, dchar c; s)
         if (isWhite(c)) return s[0 .. i];
     return s;
 }
 
-string synopsis(const Command c) nothrow
+string synopsis(const Command c) pure nothrow
 {
     return c.args.length ? c.name ~ " " ~ c.args : c.name;
 }
@@ -360,7 +360,7 @@ string synopsis(const Command c) nothrow
 /// Synopses longer than this overflow the name column instead of widening it.
 enum nameColumn = 20;
 
-size_t columnWidth()
+size_t columnWidth() pure
 {
     size_t w;
     foreach (c; commands)
@@ -373,7 +373,7 @@ size_t columnWidth()
 
 /// The command closest to a mistyped `word`: the only one it is a prefix of,
 /// else the nearest within two edits (ties go to the same length).
-string closest(string word)
+string closest(string word) pure
 {
     auto m = matching(word);
     if (m.length == 1) return m[0].name;
@@ -400,7 +400,7 @@ string closest(string word)
 }
 
 /// Optimal string alignment distance (adjacent swaps count as one edit).
-size_t editDistance(string as, string bs)
+size_t editDistance(string as, string bs) pure
 {
     import std.conv : to;
     auto a = as.to!dstring, b = bs.to!dstring;
@@ -420,7 +420,7 @@ size_t editDistance(string as, string bs)
 
 /// `plain` cut to `cols - 1` characters, with a style switched on at each
 /// character offset in `styles`.
-string fit(string plain, size_t cols, const Style[] styles)
+string fit(string plain, size_t cols, const Style[] styles) pure
 {
     string out_;
     size_t i;

@@ -69,10 +69,10 @@ struct Gated
         return g;
     }
 
-    bool empty() const { return !skills && !hooks; }
+    bool empty() pure const { return !skills && !hooks; }
 
     /// The `<resources>` phrase for the trust question.
-    string describe() const
+    string describe() pure const
     {
         return skills && hooks ? "skills and hooks" : skills ? "skills" : hooks ? "hooks" : "nothing";
     }
@@ -85,17 +85,17 @@ private bool isFileAt(string p)
 }
 
 /// Whether `answer` is an affirmative (`y`/`yes`, any case and padding).
-bool isYes(string answer) { return ["y", "yes"].canFind(answer.strip.toLower); }
+bool isYes(string answer) pure { return ["y", "yes"].canFind(answer.strip.toLower); }
 
 /// The trust question for `root`.
-string trustQuestion(string root, Gated gated)
+string trustQuestion(string root, Gated gated) pure
 {
     return "Trust this repo? " ~ escapeDebug(root) ~ " has " ~ gated.describe
         ~ " that can run commands or steer the agent.\nLoad its skills and hooks? [y/N] ";
 }
 
 /// `s` with control characters escaped, so a crafted path can't drive the terminal.
-string escapeDebug(string s)
+string escapeDebug(string s) pure
 {
     import std.format : format;
     string o;
@@ -142,7 +142,7 @@ private bool withinBoundary(string path, string boundary)
     return real_ !is null && underPath(real_, boundary) && !real_.pathSplitter.canFind(".git") && isFileAt(real_);
 }
 
-private bool underPath(string path, string root)
+private bool underPath(string path, string root) pure
 {
     return path == root || path.startsWith(root.endsWith("/") ? root : root ~ "/");
 }
@@ -185,7 +185,7 @@ bool dirHasSkill(string repoRoot, string dir)
 /// The exact line persisting `root`, or null when the line-based file can't
 /// hold it losslessly (invalid UTF-8, a line break, empty): such a root is
 /// never matched or remembered.
-string trustKey(string root)
+string trustKey(string root) pure
 {
     if (!root.length || root.canFind('\n') || root.canFind('\r')) return null;
     try validate(root);
@@ -284,7 +284,7 @@ version (unittest)
         write(buildPath(dir, "SKILL.md"), "# x\n");
     }
 
-    private Options opts(bool interactive, bool yolo, bool acp)
+    private Options opts(bool interactive, bool yolo, bool acp) pure
     {
         Options o;
         o.interactive = interactive;
@@ -299,8 +299,8 @@ version (unittest)
         string answer;
         bool asked;
         string noted;
-        bool confirm(string root, Gated gated) { asked = true; return answer !is null && isYes(answer); }
-        void note(string msg) { noted = msg; }
+        bool confirm(string root, Gated gated) pure { asked = true; return answer !is null && isYes(answer); }
+        void note(string msg) pure { noted = msg; }
     }
 
     private bool decide(string root, Options o, string file, ref Asker a)

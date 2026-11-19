@@ -336,7 +336,7 @@ string takeLine(Chan!string inbox)
 
 /// Keys during a turn (runs on its own thread until `done`).
 /// `/queue …` (not `/queueX`): the parsed edit, or null.
-string queueArgs(string text)
+string queueArgs(string text) pure
 {
     if (!text.startsWith("/queue")) return null;
     auto rest = text["/queue".length .. $];
@@ -441,7 +441,7 @@ string midTurnCommand(string text, MidTurn ctx)
 /// The turn's key reader (its own thread): owns the line editor until
 /// `*done`, then hands it back. Lines that wait for the turn go to `held`.
 /// The idle-compaction hold: `idle_compact_hold_secs`, or the default.
-imported!"core.time".Duration idleCompactHoldFor(const ref Config cfg) @safe
+imported!"core.time".Duration idleCompactHoldFor(const ref Config cfg) pure @safe
 {
     import core.time : seconds;
     import nano.lineedit : idleCompactHold;
@@ -716,7 +716,7 @@ private void readTurnKeys(LineEditor editor, ConsoleLink console, shared(bool)* 
 /// (`midTurnCommand`); text steers on Enter and queues on Ctrl-Enter.
 enum SteerRoute { ignore, queueCommand, command, enqueue, steer }
 
-SteerRoute steerRoute(string text, bool steer)
+SteerRoute steerRoute(string text, bool steer) pure
 {
     if (!text.length) return SteerRoute.ignore;
     if (queueArgs(text) !is null) return SteerRoute.queueCommand;
@@ -794,7 +794,7 @@ LineEditor makeEditor(ConsoleLink console, shared TurnControl control)
 }
 
 /// A frozen copy of `cfg`, for another thread.
-immutable(Config) frozenConfig(const ref Config cfg)
+immutable(Config) frozenConfig(const ref Config cfg) pure
 {
     // Isolated: a deep copy made just here.
     return Isolated!Config.assumeIsolated(deepCopy(cfg)).freeze;
@@ -884,7 +884,7 @@ string stamp(bool color)
 }
 
 /// `text` with `stamp` before the first line and its width in spaces before the rest.
-string stampBlock(string stamp, string text)
+string stampBlock(string stamp, string text) pure
 {
     import std.array : replace;
     if (!stamp.length) return text;
@@ -900,7 +900,7 @@ unittest
     assert(stampBlock("", "x\n") == "x\n");
 }
 
-private string spaces(size_t n) { import std.array : replicate; return " ".replicate(n); }
+private string spaces(size_t n) pure { import std.array : replicate; return " ".replicate(n); }
 Verbosity verbosity() { return atomicLoad(gVerbosity); }
 /// The built-in tools every session offers: bash, the file tools and
 /// search (`deny` hides read-denied paths from search results).
@@ -985,7 +985,7 @@ struct Screen
     // time (markdown.rs MarkdownStream); piped and NO_COLOR output keep it raw.
     private MarkdownStream markdown;
     bool verbose() const { return verbosity >= Verbosity.verbose; }
-    bool renderMarkdown() const { return tty && color; }
+    bool renderMarkdown() pure const { return tty && color; }
 
     /// Prints any streamed markdown still held back (the answer segment
     /// ended, or the turn stopped mid-block).
@@ -997,7 +997,7 @@ struct Screen
     }
 
     string stamp() { return .stamp(color); }
-    string dim(string s) { return color ? "\x1b[2m" ~ s ~ "\x1b[0m" : s; }
+    string dim(string s) pure { return color ? "\x1b[2m" ~ s ~ "\x1b[0m" : s; }
 
     /// Writes `t` with every line that starts here indented by `pad`.
     private void writeAligned(string t, size_t pad)
@@ -1023,7 +1023,7 @@ struct Screen
         return monoNow.ticks / (MonoTime.ticksPerSecond / 1000);
     }
 
-    private string thinkStyle(string s) { return color ? "\x1b[38;5;245m" ~ s ~ "\x1b[0m" : s; }
+    private string thinkStyle(string s) pure { return color ? "\x1b[38;5;245m" ~ s ~ "\x1b[0m" : s; }
 
     private void thinkingDelta(string chunk)
     {
@@ -1138,7 +1138,7 @@ struct Screen
     }
 
     /// A resent reply follows: what streamed before is abandoned.
-    void restart() { streamedAnswer = null; }
+    void restart() pure { streamedAnswer = null; }
 
     /// The model call ended: reasoning that didn't stream shows now, like a
     /// block that just ended.
@@ -1171,7 +1171,7 @@ struct ConsoleLink
 {
     private Shared!Screen screen;
     bool color;
-    string dim(string s) { return color ? "\x1b[2m" ~ s ~ "\x1b[0m" : s; }
+    string dim(string s) pure { return color ? "\x1b[2m" ~ s ~ "\x1b[0m" : s; }
     /// A line of its own, mid-stream or not (the live thinking line redraws below it).
     void note(string text) { screen.update((ref Screen s) { s.note(text); }); }
     void endLine() { screen.update((ref Screen s) { s.endLine(); }); }
@@ -1197,11 +1197,11 @@ class Console : AgentEvents
     private bool segmentDropped;
 
     /// A new turn: nothing dropped yet.
-    void beginAnswerGuard() { droppedAnswer = segmentDropped = false; }
+    void beginAnswerGuard() pure { droppedAnswer = segmentDropped = false; }
 
     /// Whether the turn's final answer has to be printed again at the end.
-    bool answerMayBeTruncated() const { return segmentDropped || droppedAnswer; }
-    bool renderMarkdown() const { return tty && color; }
+    bool answerMayBeTruncated() pure const { return segmentDropped || droppedAnswer; }
+    bool renderMarkdown() pure const { return tty && color; }
 
     /// A whole answer as shown on this console: markdown rendered for a
     /// color terminal, verbatim otherwise.
@@ -1222,9 +1222,9 @@ class Console : AgentEvents
         return monoNow.ticks / (MonoTime.ticksPerSecond / 1000);
     }
 
-    string dim(string s) { return color ? "\x1b[2m" ~ s ~ "\x1b[0m" : s; }
-    string bold(string s) { return color ? "\x1b[1m" ~ s ~ "\x1b[0m" : s; }
-    string red(string s) { return color ? "\x1b[31m" ~ s ~ "\x1b[0m" : s; }
+    string dim(string s) pure { return color ? "\x1b[2m" ~ s ~ "\x1b[0m" : s; }
+    string bold(string s) pure { return color ? "\x1b[1m" ~ s ~ "\x1b[0m" : s; }
+    string red(string s) pure { return color ? "\x1b[31m" ~ s ~ "\x1b[0m" : s; }
 
     private RateMeter meter;
 
@@ -1362,7 +1362,7 @@ class Console : AgentEvents
 
 /// A tool result as Rust's `tool_result`: `⎿ first line (+N lines)` (red
 /// `⎿ error:` for failures); verbose shows up to ten lines.
-string toolResult(bool ok, string output, bool verbose, size_t width, bool color = true)
+string toolResult(bool ok, string output, bool verbose, size_t width, bool color = true) pure
 {
     import std.algorithm : min;
     import std.array : split;
@@ -1422,7 +1422,7 @@ string argsText(const ref ToolCall c)
 }
 
 /// `text` cut to `width` characters, ending in `…` when cut.
-string fitText(string text, size_t width)
+string fitText(string text, size_t width) pure
 {
     import std.range : walkLength, take;
     import std.conv : to;
@@ -1441,7 +1441,7 @@ unittest
 
 /// The configured context window: top-level `context_window`, else the
 /// provider's (0: none), and which one it is.
-ConfiguredWindow windowFor(const ref Config c, const ref ProviderConfig p)
+ConfiguredWindow windowFor(const ref Config c, const ref ProviderConfig p) pure
 {
     if (c.contextWindow > 0) return ConfiguredWindow(cast(size_t) c.contextWindow, "context_window in config");
     if (p.contextWindow > 0) return ConfiguredWindow(cast(size_t) p.contextWindow, "provider context_window");
@@ -1450,26 +1450,26 @@ ConfiguredWindow windowFor(const ref Config c, const ref ProviderConfig p)
 
 /// Untrusted multi-line text for the terminal: lines kept, every other
 /// control character (so any escape sequence) dropped, tabs expanded.
-string sanitizeBlock(string s)
+string sanitizeBlock(string s) pure
 {
     import nano.trajectory : terminalSafe;
     return terminalSafe(s, true);
 }
 
-size_t lineCount(string s)
+size_t lineCount(string s) pure
 {
     import std.algorithm : count;
     return s.length ? s.count('\n') + (s[$ - 1] == '\n' ? 0 : 1) : 0;
 }
 
-string firstLine(string s)
+string firstLine(string s) pure
 {
     auto nl = s.indexOf('\n');
     auto l = nl >= 0 ? s[0 .. nl] : s;
     return l.length > 160 ? l[0 .. 160] ~ "…" : l;
 }
 
-string indent(string s)
+string indent(string s) pure
 {
     import std.array : replace;
     auto t = s.length > 2000 ? s[0 .. 2000] ~ "\n…" : s;
@@ -1506,9 +1506,9 @@ Option!ProjectInstructions discoverInstructions(const ref Config c, string dir)
 }
 
 /// `/context`: window use, token totals, compaction settings.
-string toolsListing(Agent agent) { return agent.toolsListing; }
+string toolsListing(Agent agent) pure { return agent.toolsListing; }
 
-string skillsListing(const Skills skills)
+string skillsListing(const Skills skills) pure
 {
     if (skills.empty) return "No skills found.";
     string[] out_;
@@ -1516,7 +1516,7 @@ string skillsListing(const Skills skills)
     return out_.join("\n");
 }
 
-string sessionText(Agent agent)
+string sessionText(Agent agent) pure
 {
     return agent.log.match!(l => format("session %s\nlog: %s", l.id, l.path), () => "not recording (--no-session)");
 }
@@ -1528,13 +1528,13 @@ string timersText(Agent agent)
         : agent.timers.list(agent.timerNow(), true).stripRight;
 }
 
-string planText(Agent agent)
+string planText(Agent agent) pure
 {
     return agent.plan.empty ? "No plan yet. The agent makes one with the plan_add tool."
         : agent.plan.render(true, size_t.max).stripRight;
 }
 
-string modeListing(AgentMode current)
+string modeListing(AgentMode current) pure
 {
     string[] out_ = [format("Mode: %s (%s)", current.name, current.describe)];
     foreach (m; allModes) out_ ~= format("  %-8s %s", m.name, m.describe);

@@ -50,16 +50,16 @@ class ToolRegistry
     private ToolDefinition[string] defs;
     private ToolHandler[string] handlers;
 
-    void register(ToolDefinition def, ToolHandler handler)
+    void register(ToolDefinition def, ToolHandler handler) pure
     {
         defs[def.name] = def;
         handlers[def.name] = handler;
     }
 
-    bool has(string name) const { return (name in defs) !is null; }
+    bool has(string name) pure const { return (name in defs) !is null; }
 
     /// Sorted by name so requests are stable across turns (prompt caching).
-    ToolDefinition[] definitions()
+    ToolDefinition[] definitions() pure
     {
         auto all = defs.values;
         all.sort!((a, b) => a.name < b.name);
@@ -160,7 +160,7 @@ string truncateOutput(string text, size_t limit, string label)
 
 /// The first 16 hex digits of the text's SHA-256: the spill marker's
 /// identity, which the repeat detector keys on instead of the per-call path.
-string contentDigest(scope const(char)[] text)
+string contentDigest(scope const(char)[] text) pure
 {
     import std.digest.sha : sha256Of, toHexString;
     import std.ascii : LetterCase;
@@ -202,7 +202,7 @@ void setSpillDir(string dir) { spillDir_ = dir; }
 
 /// The spill directory of the session logged at `logPath` (`<id>.spill`
 /// beside `<id>.jsonl`, as Rust's `session::spill_dir_for`).
-string spillDirFor(string logPath)
+string spillDirFor(string logPath) pure
 {
     import std.path : stripExtension;
     return logPath.stripExtension ~ ".spill";

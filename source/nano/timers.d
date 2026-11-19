@@ -32,7 +32,7 @@ immutable string[] toolNames = ["timer_set", "timer_list", "timer_cancel", "time
 /// Steps between reminders about a fired timer the agent hasn't marked done.
 enum pendingNudgeEvery = 5;
 
-bool isTimerTool(string name) { return toolNames.canFind(name); }
+bool isTimerTool(string name) pure { return toolNames.canFind(name); }
 
 /// A rejected timer call.
 class TimerError : Exception
@@ -62,15 +62,15 @@ struct Timers
     Timer[] pending;
     uint lastId;
 
-    bool empty() const { return items.length == 0; }
+    bool empty() pure const { return items.length == 0; }
 
     /// The earliest due time, or 0 with no timers.
-    long nextDue() const { return items.length ? items[0].dueAt : 0; }
+    long nextDue() pure const { return items.length ? items[0].dueAt : 0; }
 
-    bool anyDue(long now) const { return items.length && items[0].dueAt <= now; }
+    bool anyDue(long now) pure const { return items.length && items[0].dueAt <= now; }
 
     /// Remove and return the timers due at `now`.
-    Timer[] takeDue(long now)
+    Timer[] takeDue(long now) pure
     {
         size_t n;
         while (n < items.length && items[n].dueAt <= now) n++;
@@ -179,7 +179,7 @@ struct Timers
         return s;
     }
 
-    JSONValue toJSON() const
+    JSONValue toJSON() pure const
     {
         static JSONValue[] list(const Timer[] ts)
         {
@@ -193,7 +193,7 @@ struct Timers
             "pending": JSONValue(list(pending))]);
     }
 
-    static Timers fromJSON(const JSONValue v)
+    static Timers fromJSON(const JSONValue v) pure
     {
         Timers r;
         if (v.type != JSONType.object) return r;
@@ -228,7 +228,7 @@ string firedMessage(const Timer[] due, long now)
 }
 
 /// The reminder about fired timers not yet marked done.
-string pendingNudge(const Timer[] pending, long now)
+string pendingNudge(const Timer[] pending, long now) pure
 {
     string s = "Fired timers you haven't marked done:\n";
     foreach (t; pending)
@@ -237,7 +237,7 @@ string pendingNudge(const Timer[] pending, long now)
 }
 
 /// A one-line notice for the user.
-string firedNotice(const Timer[] due)
+string firedNotice(const Timer[] due) pure
 {
     return due.map!(t => format("⏰ timer %s: %s", t.id, t.note.oneLine(100))).join("\n");
 }
@@ -315,7 +315,7 @@ string clock(long unix)
 }
 
 /// `45s`, `5m`, `1h30m`.
-string describe(long secs)
+string describe(long secs) pure
 {
     if (secs < 60) return format("%ss", secs);
     if (secs < 3600) return secs % 60 ? format("%sm%02ss", secs / 60, secs % 60) : format("%sm", secs / 60);
@@ -323,7 +323,7 @@ string describe(long secs)
     return m ? format("%sh%02sm", secs / 3600, m) : format("%sh", secs / 3600);
 }
 
-private string str(JSONValue o, string key)
+private string str(JSONValue o, string key) pure
 {
     auto v = key in o.objectNoRef;
     if (v is null) return null;
@@ -332,7 +332,7 @@ private string str(JSONValue o, string key)
     return null;
 }
 
-private string oneLine(string s, size_t max)
+private string oneLine(string s, size_t max) pure
 {
     import std.array : replace;
     import std.utf : count;
@@ -343,7 +343,7 @@ private string oneLine(string s, size_t max)
     return l[0 .. i] ~ "…";
 }
 
-ToolDefinition[] definitions()
+ToolDefinition[] definitions() pure
 {
     return [
         ToolDefinition("timer_set",

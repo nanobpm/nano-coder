@@ -54,12 +54,12 @@ struct Option(T)
     /// Absent.
     this(None) {}
 
-    void opAssign(None) { value = T.init; present = false; }
+    void opAssign(None) pure { value = T.init; present = false; }
 
     /// `opt = null` doesn't compile: absent is `none`.
     @disable void opAssign(typeof(null));
 
-    void opAssign(Option!T o) { value = o.value; present = o.present; }
+    void opAssign(Option!T o) pure { value = o.value; present = o.present; }
 
     /// `foreach (x; opt) { ... }` runs the body once with the value when
     /// present: D's `if let Some(x) = opt`. A `return` in the body returns
@@ -70,9 +70,9 @@ struct Option(T)
         return present ? dg(value) : 0;
     }
 
-    bool isSome() const { return present; }
+    bool isSome() pure const { return present; }
 
-    bool isNone() const { return !present; }
+    bool isNone() pure const { return !present; }
 }
 
 /// Marks a class-typed field or global that may be null on purpose, with
@@ -97,7 +97,7 @@ struct NotNull(T) if (is(T == class) || is(T == interface))
         store(value, x);
     }
 
-    void opAssign(T x)
+    void opAssign(T x) pure
     {
         if (load(x) is null) assert(0, "NotNull!" ~ T.stringof ~ " given null");
         store(value, x);
@@ -114,18 +114,18 @@ struct NotNull(T) if (is(T == class) || is(T == interface))
             store(value, x);
         }
 
-        T nonNull() const { return load(value); }
-        T nonNull() const shared { return load(value); }
+        T nonNull() pure const { return load(value); }
+        T nonNull() pure const shared { return load(value); }
     }
     else
-        inout(T) nonNull() inout { return value; }
+        inout(T) nonNull() pure inout { return value; }
 
     alias nonNull this;
 }
 
 /// Reads and writes of a reference, atomic when it is `shared`
 /// (-preview=nosharedaccess treats even reading a shared parameter as access).
-private auto load(R)(ref R r)
+private auto load(R)(ref R r) pure
 {
     static if (is(R == shared))
     {
@@ -136,7 +136,7 @@ private auto load(R)(ref R r)
         return r;
 }
 
-private void store(R)(ref R r, ref R v)
+private void store(R)(ref R r, ref R v) pure
 {
     static if (is(R == shared))
     {
@@ -148,7 +148,7 @@ private void store(R)(ref R r, ref R v)
 }
 
 /// `NotNull!T(x)` with the type inferred; halts on null.
-NotNull!T notNull(T)(T x) { return NotNull!T(load(x)); }
+NotNull!T notNull(T)(T x) pure { return NotNull!T(load(x)); }
 
 unittest
 {
@@ -172,7 +172,7 @@ unittest
 }
 
 /// A present `Option`; halts on a null reference.
-Option!T some(T)(T x) { return Option!T(x); }
+Option!T some(T)(T x) pure { return Option!T(x); }
 
 enum isOption(O) = is(O : Option!T, T);
 
@@ -189,13 +189,13 @@ void ifSome(T, F)(Option!T o, scope F f)
 }
 
 /// The value, or `fallback` when absent.
-T orElse(T)(Option!T o, T fallback)
+T orElse(T)(Option!T o, T fallback) pure
 {
     return o.present ? o.value : fallback;
 }
 
 /// `f(value)` wrapped in an `Option`, or `none`.
-auto map(alias f, T)(Option!T o)
+auto map(alias f, T)(Option!T o) pure
 {
     alias R = typeof(f(T.init));
     return o.present ? Option!R(f(o.value)) : Option!R(none);
@@ -203,7 +203,7 @@ auto map(alias f, T)(Option!T o)
 
 /// The value; halts when absent. `why` says why it can't be: the caller has
 /// ruled the absent case out, and a reviewer checks that claim.
-T unwrap(T)(Option!T o, string why)
+T unwrap(T)(Option!T o, string why) pure
 {
     if (!o.present) assert(0, "unwrap on none: " ~ why);
     return o.value;

@@ -24,7 +24,7 @@ enum AgentMode
 immutable AgentMode[] allModes = [AgentMode.normal, AgentMode.plan, AgentMode.auto_];
 
 /// The next mode in the Shift+Tab cycle.
-AgentMode next(AgentMode m) nothrow
+AgentMode next(AgentMode m) pure nothrow
 {
     final switch (m)
     {
@@ -34,7 +34,7 @@ AgentMode next(AgentMode m) nothrow
     }
 }
 
-string name(AgentMode m)
+string name(AgentMode m) pure
 {
     final switch (m)
     {
@@ -44,7 +44,7 @@ string name(AgentMode m)
     }
 }
 
-string describe(AgentMode m)
+string describe(AgentMode m) pure
 {
     final switch (m)
     {
@@ -55,7 +55,7 @@ string describe(AgentMode m)
 }
 
 /// Parse a mode name; throws with Rust's message for an unknown one.
-AgentMode parseMode(string text)
+AgentMode parseMode(string text) pure
 {
     switch (text.strip.toLower)
     {
@@ -77,7 +77,7 @@ immutable string[] planAllowedTools = [
 ];
 
 /// Whether `tool` may run in plan mode.
-bool planAllows(string tool) nothrow
+bool planAllows(string tool) pure nothrow
 {
     foreach (t; planAllowedTools) if (t == tool) return true;
     return false;

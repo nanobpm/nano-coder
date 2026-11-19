@@ -74,7 +74,7 @@ struct OauthGrant
     Nullable!long expiresAt;
 
     /// Past (or within a margin of) expiry, with a refresh token to renew it.
-    bool needsRefresh(long now) const
+    bool needsRefresh(long now) pure const
     {
         return refreshToken !is null && !expiresAt.isNull && now >= expiresAt.get - refreshMarginSecs;
     }
@@ -87,9 +87,9 @@ struct StoredCredentials
     Nullable!long expiresAt;
     string apiKey, apiBase, createdAt;
 
-    OauthGrant grant() const { return OauthGrant(oauthToken, refreshToken, expiresAt); }
+    OauthGrant grant() pure const { return OauthGrant(oauthToken, refreshToken, expiresAt); }
 
-    JSONValue toJSON() const
+    JSONValue toJSON() pure const
     {
         JSONValue j = ["oauth_token": oauthToken];
         if (refreshToken !is null) j["refresh_token"] = refreshToken;
@@ -100,7 +100,7 @@ struct StoredCredentials
         return j;
     }
 
-    static StoredCredentials fromJSON(const JSONValue j)
+    static StoredCredentials fromJSON(const JSONValue j) pure
     {
         string str(string k)
         {
@@ -171,20 +171,20 @@ Nullable!OauthGrant reloadRenewedGrant(const OauthGrant grant, string dataDir = 
 }
 
 /// A later expiry, or a non-expiring grant replacing an expiring one.
-bool isFresher(const OauthGrant candidate, const OauthGrant prior)
+bool isFresher(const OauthGrant candidate, const OauthGrant prior) pure
 {
     if (!candidate.expiresAt.isNull && !prior.expiresAt.isNull) return candidate.expiresAt.get > prior.expiresAt.get;
     return candidate.expiresAt.isNull && !prior.expiresAt.isNull;
 }
 
 /// RFC 8628 §3.5: each `slow_down` adds at least 5 s to the poll interval.
-long slowDownInterval(long current, long advertised)
+long slowDownInterval(long current, long advertised) pure
 {
     return advertised > current + 5 ? advertised : current + 5;
 }
 
 /// Muse's client headers, minus any the provider overrides.
-string[string] withClientHeaders(string[string] h, const string[string] overrides = null)
+string[string] withClientHeaders(string[string] h, const string[string] overrides = null) pure
 {
     foreach (pair; clientHeaders)
     {
@@ -221,14 +221,14 @@ private JSONValue postForm(string url, string[2][] fields, bool requireOk, out i
     }
 }
 
-private string strField(const JSONValue j, string k)
+private string strField(const JSONValue j, string k) pure
 {
     if (j.type != JSONType.object) return null;
     auto v = k in j;
     return v && v.type == JSONType.string ? v.str : null;
 }
 
-private Nullable!long intField(const JSONValue j, string k)
+private Nullable!long intField(const JSONValue j, string k) pure
 {
     if (j.type != JSONType.object) return Nullable!long.init;
     auto v = k in j;
@@ -290,7 +290,7 @@ MintedKey mint(const Endpoints e, string oauth, bool onboard)
 
 /// An actionable message for a refused mint. Never echoes the body: a
 /// refused 2xx can still carry the key.
-string mintRefusal(int status, const JSONValue v)
+string mintRefusal(int status, const JSONValue v) pure
 {
     string field(string k)
     {
@@ -396,7 +396,7 @@ string login(scope void delegate(string) @safe note, scope void delegate(long se
 // ---- Catalog rows (`GET {mint}/muse-code/models`) ----
 
 /// Rows of a catalog reply: a bare array, or one under `data`/`models`/`rows`.
-const(JSONValue)[] catalogRows(const JSONValue v)
+const(JSONValue)[] catalogRows(const JSONValue v) pure
 {
     if (v.type == JSONType.object)
         foreach (k; ["data", "models", "rows"])
@@ -404,14 +404,14 @@ const(JSONValue)[] catalogRows(const JSONValue v)
     return v.type == JSONType.array ? v.arrayNoRef : null;
 }
 
-string modelId(const JSONValue row)
+string modelId(const JSONValue row) pure
 {
     foreach (k; ["id", "model_id", "modelId"]) if (auto s = strField(row, k)) return s;
     return null;
 }
 
 /// `metadata["muse-code"].is_hidden`, or `visibility: "hidden"`.
-bool isHiddenRow(const JSONValue row)
+bool isHiddenRow(const JSONValue row) pure
 {
     if (row.type != JSONType.object) return false;
     if (auto m = "metadata" in row)
@@ -425,7 +425,7 @@ bool isHiddenRow(const JSONValue row)
 }
 
 /// An image-generation model (its image flag is not input vision).
-bool isImageGenerationRow(const JSONValue row)
+bool isImageGenerationRow(const JSONValue row) pure
 {
     if (row.type != JSONType.object) return false;
     foreach (k; ["supports_image_generation", "supportsImageGeneration"])
@@ -434,18 +434,18 @@ bool isImageGenerationRow(const JSONValue row)
 }
 
 /// Contributor rows need a per-request opt-in this client never sends.
-bool isContributorRow(const JSONValue row)
+bool isContributorRow(const JSONValue row) pure
 {
     return modelId(row).toLower.canFind("contributor");
 }
 
 /// Chat rows accept images; generation, hidden and contributor rows don't.
-bool museVision(const JSONValue row)
+bool museVision(const JSONValue row) pure
 {
     return !isImageGenerationRow(row) && !isHiddenRow(row) && !isContributorRow(row);
 }
 
-private long positive(const JSONValue row, string[] keys)
+private long positive(const JSONValue row, string[] keys) pure
 {
     if (row.type != JSONType.object) return 0;
     foreach (k; keys)
@@ -455,13 +455,13 @@ private long positive(const JSONValue row, string[] keys)
 }
 
 /// The context window (0 when unknown).
-long contextLimit(const JSONValue row)
+long contextLimit(const JSONValue row) pure
 {
     return positive(row, ["context_limit", "contextLimit", "context_window", "contextWindow", "max_context_window_tokens"]);
 }
 
 /// The published output cap (0 when unknown).
-long outputLimit(const JSONValue row)
+long outputLimit(const JSONValue row) pure
 {
     return positive(row, ["output_limit", "outputLimit", "max_output_tokens", "maxOutputTokens",
         "max_completion_tokens", "maxCompletionTokens"]);
@@ -469,7 +469,7 @@ long outputLimit(const JSONValue row)
 
 /// Reasoning tiers: `reasoning_effort_variants` (`[{tier}]`, `[{effort}]` or
 /// strings), else a flat `reasoning_effort` list; `none` reads as `off`.
-string[] effortLevels(const JSONValue row)
+string[] effortLevels(const JSONValue row) pure
 {
     if (row.type != JSONType.object) return null;
     const(JSONValue)[] raw;
@@ -492,7 +492,7 @@ string[] effortLevels(const JSONValue row)
 }
 
 /// Model ids worth offering: no generation, hidden or contributor rows.
-string[] listableModels(const JSONValue catalog)
+string[] listableModels(const JSONValue catalog) pure
 {
     import std.algorithm : sort, uniq;
     import std.array : array;

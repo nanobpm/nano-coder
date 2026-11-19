@@ -18,11 +18,11 @@ class AnthropicClient : LLMClient, KindedClient
 
     this(ResolvedProvider p) { this.p = p; }
 
-    string modelName() const { return p.model; }
-    string providerName() const { return p.name; }
-    ProviderKind kind() const { return ProviderKind.anthropic; }
+    string modelName() pure const { return p.model; }
+    string providerName() pure const { return p.name; }
+    ProviderKind kind() pure const { return ProviderKind.anthropic; }
 
-    private string[string] headers()
+    private string[string] headers() pure
     {
         string[string] h;
         if (p.apiKey.length) h["x-api-key"] = p.apiKey;
@@ -119,14 +119,14 @@ class AnthropicClient : LLMClient, KindedClient
         return b;
     }
 
-    private static JSONValue textBlock(string t)
+    private static JSONValue textBlock(string t) pure
     {
         return JSONValue(["type": "text", "text": t]);
     }
 
     /// Append a content block, merging consecutive same-role messages (the API
     /// requires alternation, and parallel tool results share one user turn).
-    private static void push(ref JSONValue[] msgs, string role, JSONValue block)
+    private static void push(ref JSONValue[] msgs, string role, JSONValue block) pure
     {
         if (msgs.length && msgs[$ - 1]["role"].str == role)
         {
@@ -160,7 +160,7 @@ class AnthropicClient : LLMClient, KindedClient
         return st.finish();
     }
 
-    static LLMResponse parseWhole(JSONValue j)
+    static LLMResponse parseWhole(JSONValue j) pure
     {
         LLMResponse r;
         foreach (block; j["content"].arrayNoRef)
@@ -200,7 +200,7 @@ class AnthropicClient : LLMClient, KindedClient
     }
 }
 
-private void readUsage(JSONValue u, ref TokenUsage usage)
+private void readUsage(JSONValue u, ref TokenUsage usage) pure
 {
     long get(string k) { auto v = k in u; return v && v.type == JSONType.integer ? v.integer : 0; }
     // input_tokens excludes cached reads/writes; report the full prompt size.
@@ -287,7 +287,7 @@ struct AnthropicStream
         }
     }
 
-    LLMResponse finish()
+    LLMResponse finish() pure
     {
         foreach (idx; order) r.toolCalls ~= ToolCall.fromRaw(ids[idx], names[idx], inputs[idx]);
         foreach (idx; reasoningOrder)

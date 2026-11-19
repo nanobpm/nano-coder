@@ -62,7 +62,7 @@ string heartbeatText(string command, Duration elapsed)
     return format("… still running (%sm%02ss, %s)", total / 60, total % 60, head);
 }
 
-ToolDefinition definition(long defaultTimeout = defaultTimeoutSecs)
+ToolDefinition definition(long defaultTimeout = defaultTimeoutSecs) pure
 {
     return ToolDefinition("bash",
         "Run a shell command with `bash -c` and return its stdout, stderr and exit code. "

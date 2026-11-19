@@ -24,11 +24,11 @@ enum long summaryReasoningAllowance = 8_192;
 enum size_t minOutputReserve = 4096;
 
 /// Tokens kept free beyond prompt + output: the prompt estimate can undercount.
-size_t outputMargin(size_t window) { return window / 50; }
+size_t outputMargin(size_t window) pure { return window / 50; }
 
 /// `max_tokens` for a summary request: room for the summary plus reasoning,
 /// never above the configured value, at most a quarter of the window.
-long summaryOutputBudget(size_t window, long configured)
+long summaryOutputBudget(size_t window, long configured) pure
 {
     configured = max(configured, 1L);
     auto floor = min(summaryMaxTokens, configured);
@@ -64,7 +64,7 @@ enum string smartSummaryInstructions = "\n\nEach message in the transcript is la
 
 /// Note after a smart summary telling the agent how to recover originals.
 /// `first`/`last` are 0 when the range is unknown.
-string smartSummaryNote(ulong first, ulong last)
+string smartSummaryNote(ulong first, ulong last) pure
 {
     auto covered = first ? format("messages #%s–#%s", first, last) : "the earlier messages";
     return format("[This summary covers %s. The originals are kept verbatim in the session log; the summary is "
@@ -81,9 +81,9 @@ string smartSummaryNote(ulong first, ulong last)
 /// How compaction treats the history it folds away.
 enum CompactionMode { standard, smart }
 
-string modeName(CompactionMode m) { return m == CompactionMode.smart ? "smart" : "standard"; }
+string modeName(CompactionMode m) pure { return m == CompactionMode.smart ? "smart" : "standard"; }
 
-bool parseCompactionMode(string s, out CompactionMode m)
+bool parseCompactionMode(string s, out CompactionMode m) pure
 {
     switch (s.toLower)
     {
@@ -94,7 +94,7 @@ bool parseCompactionMode(string s, out CompactionMode m)
 }
 
 /// `12.3k`-style token count.
-string formatTokens(size_t tokens)
+string formatTokens(size_t tokens) pure
 {
     if (tokens < 1_000) return tokens.to!string;
     if (tokens < 100_000) return format("%.1fk", tokens / 1_000.0);
@@ -103,7 +103,7 @@ string formatTokens(size_t tokens)
 }
 
 /// `512 B` / `14 KB` / `2.3 MB`.
-string formatBytes(size_t bytes)
+string formatBytes(size_t bytes) pure
 {
     if (bytes < 1024) return format("%s B", bytes);
     if (bytes < 1_048_576) return format("%.0f KB", bytes / 1024.0);
@@ -111,7 +111,7 @@ string formatBytes(size_t bytes)
 }
 
 /// Rough token count for text (about four characters per token).
-size_t textTokens(string text) { return (text.length + 3) / 4; }
+size_t textTokens(string text) pure { return (text.length + 3) / 4; }
 
 /// Tokens for one message: content, each tool call, framing overhead.
 size_t messageTokens(const ref Message m)
@@ -123,7 +123,7 @@ size_t messageTokens(const ref Message m)
 
 /// Token estimate for one image from its dimensions (Anthropic's ~w*h/750),
 /// capped at the largest image `read_file` sends.
-size_t imageTokens(const ref imported!"nano.attachment".Attachment a)
+size_t imageTokens(const ref imported!"nano.attachment".Attachment a) pure
 {
     import nano.attachment : MAX_DIMENSION;
     enum size_t max = (cast(size_t) MAX_DIMENSION * MAX_DIMENSION + 749) / 750;
@@ -162,7 +162,7 @@ size_t messagesTokens(const Message[] ms, size_t maxImages = 0, const(bool[])[] 
 }
 
 /// Available attachment occurrences in `ms` (`avail` as for `messagesTokens`).
-size_t availableCount(const Message[] ms, const(bool[])[] avail)
+size_t availableCount(const Message[] ms, const(bool[])[] avail) pure
 {
     size_t n;
     foreach (i, ref m; ms)
@@ -230,7 +230,7 @@ enum long defaultMaxOutputTokens = 32_768;
 
 /// A known output cap for a model whose `/models` doesn't publish one
 /// (most specific needle first).
-size_t outputLimitForModel(string model)
+size_t outputLimitForModel(string model) pure
 {
     import std.uni : toLower;
     import std.algorithm : canFind;
@@ -247,7 +247,7 @@ unittest
     assert(outputLimitForModel("claude") == 0);
 }
 
-size_t windowForModel(string model)
+size_t windowForModel(string model) pure
 {
     static immutable string[] needles = ["claude", "gpt-4.1", "gpt-5", "gpt-4o", "o4-mini", "o3", "o1", "gemini",
         "deepseek", "grok", "mistral-large", "codestral", "kimi-k3", "kimi", "gpt-oss", "mock"];
@@ -259,7 +259,7 @@ size_t windowForModel(string model)
 }
 
 /// Does this provider error say the request did not fit the context window?
-bool isContextOverflow(string error)
+bool isContextOverflow(string error) pure
 {
     auto e = error.toLower;
     foreach (n; ["context_length_exceeded", "maximum context length", "context length", "context window", "context size",
@@ -292,7 +292,7 @@ size_t limitFromError(string error)
 }
 
 /// Does this error say `max_tokens` exceeded the model's output cap?
-bool isOutputCapError(string error)
+bool isOutputCapError(string error) pure
 {
     auto e = error.toLower;
     foreach (n; ["maximum allowed number of output tokens", "maximum number of output tokens", "maximum output tokens",
@@ -313,7 +313,7 @@ size_t outputCapFromError(string error)
 /// Keep the head (2/3) and tail (1/3) of text longer than `maxChars`. The
 /// omission marker is charged against the allowance, so the result never
 /// exceeds `maxChars` (Rust #161).
-string clip(string text, size_t maxChars)
+string clip(string text, size_t maxChars) pure
 {
     import std.utf : toUTF32, toUTF8;
     if (text.length <= maxChars) return text;
@@ -335,7 +335,7 @@ enum clipErrorContext = 1;
 /// A line worth pinning when a long tool result is clipped (`error`,
 /// `panic`, `failed`, `traceback`, `exception`); `warning:` lines never are,
 /// even when they name an error, so warnings can't exhaust the pins.
-bool isErrorLine(string line)
+bool isErrorLine(string line) pure
 {
     import std.string : stripLeft;
     auto lower = line.stripLeft.toLower;
@@ -354,7 +354,7 @@ bool isErrorLine(string line)
 /// change in the number of gaps), so the budget always holds. Order: a small
 /// head and tail floor, error lines not already kept, their context, then the
 /// rest of the allowance grows the head (2/3) and tail.
-string clipToolResult(string text, size_t maxChars)
+string clipToolResult(string text, size_t maxChars) pure
 {
     import std.utf : toUTF32, toUTF8;
     auto all = text.toUTF32;
@@ -511,7 +511,7 @@ string clipToolResult(string text, size_t maxChars)
 }
 
 /// Shorten an oversized message in place. Returns whether it was clipped.
-bool clipMessage(ref Message m, size_t maxTokens)
+bool clipMessage(ref Message m, size_t maxTokens) pure
 {
     if (textTokens(m.content) <= maxTokens) return false;
     m.content = clip(m.content, maxTokens * 4);
@@ -607,8 +607,8 @@ unittest // transcripts: roles, tool calls, ids, newest kept
 
 version (unittest)
 {
-    private size_t nchars(string s) { import std.utf : count; return s.count; }
-    private size_t occurrences(string hay, string needle) { import std.algorithm : count; return hay.count(needle); }
+    private size_t nchars(string s) pure { import std.utf : count; return s.count; }
+    private size_t occurrences(string hay, string needle) pure { import std.algorithm : count; return hay.count(needle); }
 }
 
 // Rust #161: error lines pinned when a tool result is clipped for compaction.
@@ -930,7 +930,7 @@ enum size_t pinnedMinAllowanceTokens = 600;
 
 /// `clip` bounded by UTF-8 bytes rather than characters, cut on a character
 /// boundary, so a byte/token budget holds for non-ASCII text too.
-string clipBytes(string text, size_t maxBytes)
+string clipBytes(string text, size_t maxBytes) pure
 {
     size_t chars = maxBytes;
     for (;;)
@@ -943,7 +943,7 @@ string clipBytes(string text, size_t maxBytes)
 }
 
 /// A previous compaction's synthetic summary (`[earlier summary]`).
-bool isSummaryMessage(const ref Message m)
+bool isSummaryMessage(const ref Message m) pure
 {
     return m.role == Role.user && (m.content.startsWith(summaryPrefix) || m.content.startsWith(smartSummaryPrefix));
 }
@@ -951,7 +951,7 @@ bool isSummaryMessage(const ref Message m)
 /// A genuine user request, not a harness injection (automatic turn, summary,
 /// plan note or hook context). A prompt that merely starts with a bracket or
 /// a literal `<system-reminder>` tag is still a request.
-bool isUserRequest(const ref Message m)
+bool isUserRequest(const ref Message m) pure
 {
     import std.string : stripLeft;
     if (m.role != Role.user || m.autoInitiated || m.continuation || m.timer || m.hookContext) return false;
@@ -961,10 +961,10 @@ bool isUserRequest(const ref Message m)
 }
 
 /// ditto
-bool isUserRequest(const Message m) { return isUserRequest(m); }
+bool isUserRequest(const Message m) pure { return isUserRequest(m); }
 
 /// The user-typed text of a request: `pinText` when hook context was appended.
-private string requestText(const ref Message m) { return (m.pinText.length ? m.pinText : m.content).strip; }
+private string requestText(const ref Message m) pure { return (m.pinText.length ? m.pinText : m.content).strip; }
 
 /// The pinned block of the user's requests, rebuilt from the original
 /// messages (`prior`: earlier compactions' requests; `new_`: the turns being
@@ -973,7 +973,7 @@ private string requestText(const ref Message m) { return (m.pinText.length ? m.p
 /// `#N`. The whole block fits an allowance of window/8 tokens (floored):
 /// the oldest later requests are dropped first, with an omission note naming
 /// them by one covering log span.
-string pinnedUserRequests(const Message[] prior, const Message[] new_, bool smart, size_t windowTokens)
+string pinnedUserRequests(const Message[] prior, const Message[] new_, bool smart, size_t windowTokens) pure
 {
     const(Message)[] requests;
     foreach (ref m; prior) if (isUserRequest(m)) requests ~= m;
@@ -1051,13 +1051,13 @@ string pinnedUserRequests(const Message[] prior, const Message[] new_, bool smar
 
 version (unittest)
 {
-    private Message req(string text, ulong id = 0)
+    private Message req(string text, ulong id = 0) pure
     {
         auto m = Message.user(text);
         m.logLine = id;
         return m;
     }
-    private size_t nchars_(string s) { import std.range : walkLength; return s.walkLength; }
+    private size_t nchars_(string s) pure { import std.range : walkLength; return s.walkLength; }
 }
 
 // rust: context.rs::pinned_requests_keep_the_users_words_not_the_summary

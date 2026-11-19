@@ -17,7 +17,7 @@ enum formatVersion = 1;
 /// `spec` as `provider/model` (or a bare provider without a default model),
 /// parsed the way every model spec is, so a slash-containing model on the
 /// default provider keeps its real provider prefix.
-string canonical(string spec, const ProviderConfig[string] all, string defaultProvider)
+string canonical(string spec, const ProviderConfig[string] all, string defaultProvider) pure
 {
     string provider, model;
     parseModelSpec(spec, all, defaultProvider, provider, model);
@@ -34,7 +34,7 @@ struct Recents
     string[] models;
 
     /// Record a switch to `spec`: it becomes the most recent, without duplicates.
-    void record(string spec)
+    void record(string spec) pure
     {
         import std.algorithm : remove;
         spec = spec.strip;
@@ -46,7 +46,7 @@ struct Recents
 
     /// Migrate a legacy list to canonical entries, exactly once (re-running it
     /// on canonical entries would be lossy). True when it migrated.
-    bool canonicalize(const ProviderConfig[string] all, string defaultProvider)
+    bool canonicalize(const ProviderConfig[string] all, string defaultProvider) pure
     {
         if (version_ >= formatVersion) return false;
         string[] out_;
@@ -64,7 +64,7 @@ struct Recents
     }
 
     /// serde_json's pretty form, as Rust writes it.
-    string toJson() const
+    string toJson() pure const
     {
         import nano.trajectory : serdeString;
         auto s = "{\n  \"version\": " ~ (() { import std.conv : to; return version_.to!string; })() ~ ",\n  \"models\": ";
@@ -170,7 +170,7 @@ unittest
     assert(load(path) == Recents.init);
 }
 
-private bool startsWith(string s, string p) nothrow { return s.length >= p.length && s[0 .. p.length] == p; }
+private bool startsWith(string s, string p) pure nothrow { return s.length >= p.length && s[0 .. p.length] == p; }
 
 // rust: recents.rs::canonical_expands_a_provider_only_spec_to_its_default_model
 // rust: recents.rs::canonicalize_dedupes_collapsed_entries_keeping_order

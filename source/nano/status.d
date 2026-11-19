@@ -39,11 +39,11 @@ struct Stats
     string tool; /// the running tool (activity == tool)
     double tokensPerSec = 0; /// live output rate (0: none)
 
-    double percent() const { return window == 0 ? 0.0 : tokens * 100.0 / window; }
+    double percent() pure const { return window == 0 ? 0.0 : tokens * 100.0 / window; }
 }
 
 /// `12.3 tok/s` / `45 tok/s`.
-string formatRate(double r)
+string formatRate(double r) pure
 {
     return r >= 10.0 ? format("%.0f tok/s", r) : format("%.1f tok/s", r);
 }
@@ -64,7 +64,7 @@ private enum cwdSegment = 2;
 private enum cwdMinCells = 16;
 
 /// Total terminal cells of `text`.
-size_t cellWidth(string text)
+size_t cellWidth(string text) pure
 {
     size_t w;
     foreach (dchar c; text) w += charWidth(c);
@@ -73,7 +73,7 @@ size_t cellWidth(string text)
 
 /// `text` cut to at most `budget` cells, never splitting a wide glyph;
 /// control characters are dropped (they would move the cursor).
-string fitCells(string text, size_t budget)
+string fitCells(string text, size_t budget) pure
 {
     string out_;
     size_t used;
@@ -120,7 +120,7 @@ string tildePath(string path, string home)
 /// `path` shortened to `budget` cells by replacing middle directories with
 /// `…` (`~/…/src/providers`), or, when even that won't fit, the end of the
 /// last component (`…providers`).
-string elidePath(string path, size_t budget)
+string elidePath(string path, size_t budget) pure
 {
     import std.array : split, join;
     if (cellWidth(path) <= budget) return path;
@@ -152,7 +152,7 @@ string elidePath(string path, size_t budget)
     return "…" ~ kept.to!string;
 }
 
-private string repeatStr(string s, size_t n)
+private string repeatStr(string s, size_t n) pure
 {
     string r;
     foreach (_; 0 .. n) r ~= s;
@@ -160,7 +160,7 @@ private string repeatStr(string s, size_t n)
 }
 
 /// The status bar at `cols` columns (no cursor positioning).
-string render(const ref Stats stats, size_t cols)
+string render(const ref Stats stats, size_t cols) pure
 {
     import std.math : round;
     auto percent = stats.percent;
@@ -262,10 +262,10 @@ struct RateMeter
     private size_t bytes;
 
     /// Start metering a new generation (one model call) begun at `nowMs`.
-    void reset(long nowMs = -1) { this = RateMeter.init; startMs = nowMs; }
+    void reset(long nowMs = -1) pure { this = RateMeter.init; startMs = nowMs; }
 
     /// Record `n` bytes at `nowMs`; the rate when one is due, else 0.
-    double record(size_t n, long nowMs)
+    double record(size_t n, long nowMs) pure
     {
         // An empty delta doesn't start the clock: the idle gap before real
         // output would depress the rate.
@@ -281,7 +281,7 @@ struct RateMeter
     }
 
     /// The rate at `nowMs` with no new delta: it falls while output pauses.
-    double sample(long nowMs) const
+    double sample(long nowMs) pure const
     {
         if (firstMs < 0 || nowMs <= firstMs) return 0;
         return ((bytes + 3) / 4) / ((nowMs - firstMs) / 1000.0);
@@ -291,7 +291,7 @@ struct RateMeter
     /// byte estimate when <= 0) over the time since the first delta for a real
     /// stream, or since the generation began for a one-shot reply. 0 when no
     /// output streamed.
-    double finish(long tokens, long nowMs) const
+    double finish(long tokens, long nowMs) pure const
     {
         if (firstMs < 0) return 0;
         auto from = lastMs - firstMs >= 250 || startMs < 0 ? firstMs : startMs;

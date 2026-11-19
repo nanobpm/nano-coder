@@ -437,7 +437,7 @@ class SessionLog
 /// legacy prompt with hook context appended (`<input>\n\n<system-reminder>…`)
 /// gets the logged input it starts with (the longest such) as its user-typed
 /// part. A message that already has one, or is exactly an input, is left alone.
-void backfillPinText(ref Message m, const string[] inputs)
+void backfillPinText(ref Message m, const string[] inputs) pure
 {
     import std.algorithm : canFind, startsWith;
     import std.string : stripLeft;
@@ -772,7 +772,7 @@ string ago(SysTime then, SysTime now)
 }
 
 /// One line of text: whitespace collapsed and control characters dropped.
-string oneLine(string text)
+string oneLine(string text) pure
 {
     import std.array : split, join;
     import std.uni : isControl;

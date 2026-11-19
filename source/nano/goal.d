@@ -25,7 +25,7 @@ enum verifyReminder = "You changed files after your last check. Run the relevant
     ~ "or report again if no check applies.";
 
 /// Parse a status leniently (Rust `Status::parse`); false when unknown.
-bool parseStatus(string text, out OutcomeStatus s)
+bool parseStatus(string text, out OutcomeStatus s) pure
 {
     switch (text.strip.toLower.replace("-", "_").replace(" ", "_"))
     {
@@ -36,7 +36,7 @@ bool parseStatus(string text, out OutcomeStatus s)
     }
 }
 
-string statusName(OutcomeStatus s)
+string statusName(OutcomeStatus s) pure
 {
     final switch (s)
     {
@@ -78,7 +78,7 @@ struct Outcome
     }
 
     /// The turn's final answer.
-    string response() const
+    string response() pure const
     {
         final switch (status)
         {
@@ -88,7 +88,7 @@ struct Outcome
         }
     }
 
-    JSONValue toJSON() const
+    JSONValue toJSON() pure const
     {
         return JSONValue(["status": statusName(status), "summary": summary]);
     }
@@ -120,7 +120,7 @@ struct Outcome
     }
 }
 
-ToolDefinition definition()
+ToolDefinition definition() pure
 {
     return ToolDefinition(toolName,
         "Report the outcome of the task you were given. This ends your turn: the summary becomes your final "

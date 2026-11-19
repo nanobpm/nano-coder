@@ -41,7 +41,7 @@ struct FrameUi
     private int tty = -1, writeEnd = -1, wake = -1;
 
     /// Whether this is a running frame.
-    bool opCast(B : bool)() const { return cast(bool) requests; }
+    bool opCast(B : bool)() pure const { return cast(bool) requests; }
 
     /// Takes over the terminal: fd 1 and 2 now feed the transcript. Returns
     /// `FrameUi.init` if it can't.
