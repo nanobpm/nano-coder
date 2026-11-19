@@ -80,9 +80,25 @@ class ToolRegistry
 string requireString(JSONValue args, string name, string tool)
 {
     auto v = name in args;
-    if (v is null) throw new ToolError(format(`%s argument "%s" must be set`, tool, name));
-    if (v.type != JSONType.string) throw new ToolError(format(`%s argument "%s" must be a string`, tool, name));
+    if (v is null) throw new ToolError(format(`%s: missing required argument "%s"`, tool, name));
+    if (v.type == JSONType.null_) throw new ToolError(format(`%s: argument "%s" is null; provide a string value`, tool, name));
+    if (v.type != JSONType.string)
+        throw new ToolError(format(`%s: argument "%s" must be a string, got %s`, tool, name, jsonTypeName(*v)));
     return v.str;
+}
+
+/// "a number", "an array", ...: what a wrongly typed argument was.
+string jsonTypeName(const JSONValue v) pure nothrow
+{
+    final switch (v.type)
+    {
+        case JSONType.null_: return "null";
+        case JSONType.true_, JSONType.false_: return "a boolean";
+        case JSONType.integer, JSONType.uinteger, JSONType.float_: return "a number";
+        case JSONType.string: return "a string";
+        case JSONType.array: return "an array";
+        case JSONType.object: return "an object";
+    }
 }
 
 string optString(JSONValue args, string name, string def = null)

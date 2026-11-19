@@ -160,7 +160,7 @@ unittest
 {
     import std.exception : collectExceptionMsg;
     import std.algorithm.searching : startsWith;
-    assert(collectExceptionMsg(execute(parseJSON(`{}`))) == `bash argument "command" must be set`);
+    assert(collectExceptionMsg(execute(parseJSON(`{}`))) == `bash: missing required argument "command"`);
     assert(collectExceptionMsg(execute(parseJSON(`"{bad"`))).startsWith("bash arguments must be a JSON object"));
     foreach (bad; [`0`, `-1`, `1000001`])
         assert(collectExceptionMsg(execute(parseJSON(`{"command":"ls","max_output_length":` ~ bad ~ `}`))).length);
@@ -174,7 +174,7 @@ unittest
 {
     import std.exception : collectExceptionMsg;
     import std.algorithm.searching : canFind;
-    assert(collectExceptionMsg(execute(parseJSON(`{}`))).canFind("must be set"));
+    assert(collectExceptionMsg(execute(parseJSON(`{}`))).canFind("missing required argument"));
     assert(collectExceptionMsg(execute(parseJSON(`{"command":1}`))).length);
     assert(collectExceptionMsg(execute(parseJSON(`{"command":"a\u0000b"}`))).length);
     assert(collectExceptionMsg(execute(parseJSON(`{"command":"ls","timeout_seconds":0}`))).length);

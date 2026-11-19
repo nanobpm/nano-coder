@@ -1220,3 +1220,58 @@ unittest
     try readFile(j("path", p), st); catch (ToolError e) threw = e.msg.indexOf("binary") > 0;
     assert(threw);
 }
+
+// rust: files.rs::string_arg_distinguishes_missing_null_and_wrong_type
+// rust: files.rs::read_returns_images_by_magic_bytes
+// rust: files.rs::read_detects_image_despite_text_extension
+// rust: files.rs::read_image_stores_absolute_source_path
+// rust: files.rs::image_reads_authorize_writes_only_once_dispatched_to_the_model
+unittest
+{
+    import std.exception : collectExceptionMsg;
+    import std.algorithm : canFind;
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, readText, getcwd, chdir;
+    import std.process : thisProcessID;
+    import std.path : isAbsolute;
+    import nano.attachment : fakePng, fakeJpeg;
+    import std.typecons : tuple;
+    auto st = new ReadState;
+    auto msg(string json) { return collectExceptionMsg(writeFile(parseJSON(json), st)); }
+    assert(msg(`{"content": "x"}`).canFind(`missing required argument "path"`));
+    assert(msg(`{"path": null, "content": "x"}`).canFind(`"path" is null`));
+    assert(msg(`{"path": 42, "content": "x"}`).canFind("must be a string, got a number"));
+
+    auto dir = buildPath(tempDir, format("nano-files-img-%s", thisProcessID));
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    ubyte[] gif = cast(ubyte[]) "GIF89a".dup ~ cast(ubyte[]) [40, 0, 20, 0] ~ new ubyte[16];
+    ubyte[] webp = cast(ubyte[]) "RIFF\0\0\0\0WEBPVP8X".dup ~ new ubyte[8] ~ cast(ubyte[]) [39, 0, 0, 19, 0, 0];
+    foreach (c; [tuple("a.png", fakePng(40, 20), "image/png"), tuple("a.jpg", fakeJpeg(40, 20), "image/jpeg"),
+            tuple("a.gif", gif.idup, "image/gif"), tuple("a.webp", webp.idup, "image/webp"),
+            tuple("misleading.txt", fakePng(8, 8), "image/png")])
+    {
+        auto p = buildPath(dir, c[0]);
+        write(p, c[1]);
+        auto img = parseJSON(readFile(JSONValue(["path": p]), st))["image"];
+        assert(img["media_type"].str == c[2], c[0]);
+        if (c[0] != "misleading.txt") assert(img["width"].integer == 40 && img["height"].integer == 20, c[0]);
+        assert(img["bytes"].integer > 0 && "data_base64" !in img, c[0]);
+    }
+
+    // A relative path is stored absolute (it survives a resume elsewhere).
+    auto old = getcwd;
+    chdir(dir);
+    scope (exit) chdir(old);
+    mkdirRecurse("sub");
+    write("sub/rel.png", fakePng(8, 8));
+    auto stored = parseJSON(readFile(JSONValue(["path": "sub/rel.png"]), st))["image"]["path"].str;
+    assert(stored.isAbsolute && stored.endsWith("sub/rel.png"), stored);
+
+    // Reading an image doesn't authorize a write; delivering it does (the
+    // agent's markRead, once the model can view it).
+    auto pic = buildPath(dir, "a.png");
+    assert(msg(JSONValue(["path": pic, "content": "x"]).toString).canFind("has not been read"));
+    st.record(pic, fakePng(40, 20));
+    writeFile(JSONValue(["path": pic, "content": "replaced"]), st);
+    assert(readText(pic) == "replaced");
+}
