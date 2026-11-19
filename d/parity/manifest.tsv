@@ -1396,15 +1396,15 @@ update.rs::the_brew_channel_upgrades_the_tap_formula	na	D ships only via npm (@n
 update.rs::the_formula_version_is_read_from_its_download_url	na	D ships only via npm (@nanobpm/nano-coder-d); no tarballs or Homebrew formula, so no brew channel (Rust #188)
 update.rs::update_outcome_messages_cover_every_path	test
 update.rs::version_comparison_orders_dotted_releases	test
-vision.rs::anthropic_vision_families_match_whole_segments	todo
+vision.rs::anthropic_vision_families_match_whole_segments	test
 vision.rs::built_in_anthropic_assumption_is_scoped_to_the_first_party_api	test
 vision.rs::built_in_openai_assumption_is_scoped_to_the_first_party_api	test
-vision.rs::copilot_entry_reads_vision_and_limits	todo
-vision.rs::dotted_gpt5_revisions_are_vision_families	todo
-vision.rs::forced_true_keeps_reported_endpoint_limits	todo
-vision.rs::o1_family_is_vision_except_mini_and_preview	todo
-vision.rs::o3_mini_is_text_only_not_vision	todo
-vision.rs::ollama_and_llamacpp_detection	todo
-vision.rs::openai_vision_families_match_whole_segments	todo
+vision.rs::copilot_entry_reads_vision_and_limits	test
+vision.rs::dotted_gpt5_revisions_are_vision_families	test
+vision.rs::forced_true_keeps_reported_endpoint_limits	test
+vision.rs::o1_family_is_vision_except_mini_and_preview	test
+vision.rs::o3_mini_is_text_only_not_vision	test
+vision.rs::ollama_and_llamacpp_detection	test
+vision.rs::openai_vision_families_match_whole_segments	test
 vision.rs::override_wins_over_detection	test
-vision.rs::per_model_override_is_most_specific	todo
+vision.rs::per_model_override_is_most_specific	test
