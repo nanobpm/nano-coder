@@ -609,12 +609,12 @@ main.rs::a_plain_one_line_question_stays_the_picker_prompt	test
 main.rs::a_structured_question_is_rendered_as_markdown_above_the_picker	test
 main.rs::an_over_wide_question_leaves_the_inline_prompt_on_a_narrow_terminal	test
 main.rs::builtin_tools_include_search_and_no_echo	test
-main.rs::classify_steer_input_routes_line_queue_and_commands	todo
+main.rs::classify_steer_input_routes_line_queue_and_commands	test
 main.rs::deliver_due_timer_yields_to_interrupt_and_draft	test
 main.rs::deliver_idle_compact_waits_for_a_quiet_prompt	test
-main.rs::double_escape_needs_two_presses_within_the_window	todo
-main.rs::double_press_deadline_arms_and_disarm_clears_it	todo
-main.rs::double_press_is_time_based_not_disarmed_by_other_input	todo
+main.rs::double_escape_needs_two_presses_within_the_window	test
+main.rs::double_press_deadline_arms_and_disarm_clears_it	test
+main.rs::double_press_is_time_based_not_disarmed_by_other_input	test
 main.rs::eof_suppression_is_headless_wait_timers_only	test
 main.rs::forget_id_requires_a_token_boundary	test
 main.rs::idle_compact_hold_defaults_to_the_named_constant	test
@@ -634,7 +634,7 @@ main.rs::sanitize_terminal_tab_stops_track_unicode_cell_width	test
 main.rs::sanitize_terminal_text_preserves_line_feeds	test
 main.rs::sanitize_terminal_text_strips_control_and_escape_sequences	test
 main.rs::sanitize_terminal_text_strips_unicode_line_separators	test
-main.rs::slash_escaped_lines_steer_or_queue_instead_of_deferring	todo
+main.rs::slash_escaped_lines_steer_or_queue_instead_of_deferring	test
 main.rs::the_work_clock_guard_brackets_a_picker	todo
 main.rs::turn_print_repairs_truncation_before_the_max_turn_fallback	todo
 main.rs::update_is_refused_outside_an_interactive_non_ci_terminal	test

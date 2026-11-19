@@ -17,6 +17,72 @@ import std.uni : isWhite, isAlphaNum;
 import nano.history : HistoryBrowsing, InputHistory;
 import core.time : Duration, MonoTime, seconds;
 
+/// Two presses of a key within a window (Rust DoublePress / DoubleEscape):
+/// the first arms, a second inside the window completes and disarms, and a
+/// later one re-arms. Time-based, so other keys in between don't disarm it.
+/// Times are milliseconds on any monotonic clock.
+struct DoublePress
+{
+    long windowMs;
+    private long armedAt = long.min;
+
+    /// Whether this press completes the pair.
+    bool press(long nowMs) @safe pure nothrow @nogc
+    {
+        if (armedAt != long.min && nowMs - armedAt <= windowMs)
+        {
+            armedAt = long.min;
+            return true;
+        }
+        armedAt = nowMs;
+        return false;
+    }
+
+    /// When the armed window lapses; none when not armed.
+    imported!"nano.option".Option!long deadline() const @safe pure nothrow
+    {
+        import nano.option : Option, none;
+        return armedAt == long.min ? Option!long(none) : Option!long(armedAt + windowMs);
+    }
+
+    bool armed() const @safe pure nothrow @nogc { return armedAt != long.min; }
+
+    void disarm() @safe pure nothrow @nogc { armedAt = long.min; }
+}
+
+/// The window for Esc Esc (clear the line, or cancel the turn).
+enum escapeWindowMs = 500;
+/// The window for Ctrl-C Ctrl-C at the idle prompt (exit).
+enum interruptWindowMs = 2000;
+
+// rust: main.rs::double_escape_needs_two_presses_within_the_window
+unittest
+{
+    auto esc = DoublePress(escapeWindowMs);
+    assert(!esc.press(0) && esc.press(400));
+    assert(!esc.press(500) && !esc.press(1600) && esc.press(1700));
+}
+
+// rust: main.rs::double_press_deadline_arms_and_disarm_clears_it
+// rust: main.rs::double_press_is_time_based_not_disarmed_by_other_input
+unittest
+{
+    auto exit = DoublePress(interruptWindowMs);
+    assert(exit.deadline.isNone, "not armed before any press");
+    assert(!exit.press(0), "first press arms");
+    foreach (d; exit.deadline) assert(d == 2000, "armed: deadline is press + window");
+    exit.disarm();
+    assert(exit.deadline.isNone && !exit.armed, "disarmed: no pending deadline");
+    assert(!exit.press(2500), "post-timeout press re-arms");
+    foreach (d; exit.deadline) assert(d == 4500);
+
+    auto again = DoublePress(interruptWindowMs);
+    assert(!again.press(0) && again.press(1200), "a second press inside the window completes");
+    assert(!again.press(1300));
+    auto late = DoublePress(interruptWindowMs);
+    assert(!late.press(0) && !late.press(2500) && late.press(2600), "outside the window re-arms; the next completes");
+}
+
 /// How long a half-typed line holds back a due timer. After this long with
 /// no keystrokes the draft counts as abandoned: the timer fires, and the
 /// draft is parked for the automatic turn and restored after it (Rust #178).
@@ -294,7 +360,7 @@ size_t charWidth(dchar ch) pure nothrow
 
 /// Emoji with East Asian Width "W" outside the CJK blocks (Unicode 15), e.g.
 /// U+23F0 ⏰ in the timers status segment: terminals draw these two cells wide.
-private bool isWideEmoji(dchar ch) pure nothrow @nogc
+private bool isWideEmoji(dchar ch) @safe pure nothrow @nogc
 {
     static immutable uint[2][] ranges = [
         [0x231A, 0x231B], [0x2329, 0x232A], [0x23E9, 0x23EC], [0x23F0, 0x23F0], [0x23F3, 0x23F3],
@@ -602,7 +668,7 @@ final class LineEditor
     string hint;
     private ubyte[] utf8;
     private int pushback = -1;
-    private long lastEscMs = long.min / 2;
+    private DoublePress esc = DoublePress(escapeWindowMs);
     long delegate() @safe nowMs;
     /// Shift-Tab: run with the input erased, then the input is redrawn.
     void delegate(K) @safe onAction;
@@ -700,7 +766,7 @@ final class LineEditor
         this.styledPrompt = styledPrompt;
         // Each read starts a fresh Esc pair: an arm from before a turn (or a
         // turn-time press) must not complete an idle clear after it.
-        lastEscMs = long.min / 2;
+        esc.disarm();
         inTurn = turn;
         notice = hint;
         hint = null;
@@ -780,8 +846,7 @@ final class LineEditor
                     if (key.text.length) pushback = 0x1b;
                     if (plain) { state.clear(); erase(); return Result(Outcome.cancel); }
                     auto now = nowMs();
-                    bool second = now - lastEscMs <= 500;
-                    lastEscMs = second ? long.min / 2 : now;
+                    bool second = esc.press(now);
                     if (!inTurn && state.menu(80, menuRows).length) { state.menuHidden = true; break; }
                     if (!second) break;
                     if (turn) { erase(); return Result(Outcome.cancel); }

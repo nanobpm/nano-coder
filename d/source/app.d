@@ -527,6 +527,38 @@ Isolated!LineEditor turnKeys(Isolated!LineEditor owned, ConsoleLink console, sha
 private void readTurnKeys(LineEditor editor, ConsoleLink console, shared(bool)* done, Chan!string held,
     QuestionBroker questions, MessageQueue queue, MidTurn mid)
 {
+    // A command or text line typed during the turn (see `steerRoute`).
+    void routeTurnLine(string text, Outcome outcome)
+    {
+        if (isCommand(text))
+        {
+            // Read-only commands and settings run now (turn_commands.rs).
+            if (auto shown = midTurnCommand(text, mid))
+            {
+                console.note(shown);
+                return;
+            }
+            held.put(text);
+            stdErr.writeln(console.dim("[waits for the turn to finish: " ~ text ~ "]"));
+        }
+        else if (outcome == Outcome.queue)
+        {
+            auto id = queue.push(text);
+            stdErr.writeln(console.dim(format("↧ queued #%s (%s waiting) — /queue remove %s to drop",
+                id, queue.length, id)));
+        }
+        else
+        {
+            // `//…` steers with a message that starts with `/`.
+            if (auto unescaped = unescapePrompt(text)) text = unescaped;
+            auto id = queue.reserveId();
+            gControl.steerWithId(text, id);
+            // The frame shows the steer as a user message once the
+            // agent reads it, so the note needn't repeat the text.
+            stdErr.writeln(console.dim(format("↪ steer #%s: the agent reads this at its next step — "
+                ~ "/queue remove %s to withdraw", id, id)));
+        }
+    }
     while (!atomicLoad(*done))
     {
         // The glyph placeholder becomes the busy spinner (nano.frame).
@@ -571,43 +603,48 @@ private void readTurnKeys(LineEditor editor, ConsoleLink console, shared(bool)* 
                 break;
             case Outcome.line, Outcome.queue:
                 auto text = r.text.strip;
-                if (!text.length) break;
-                if (auto qa = queueArgs(text))
+                final switch (steerRoute(text, r.outcome == Outcome.line))
                 {
-                    // `/queue` only touches the queue, so it runs at once.
-                    stdErr.writeln(console.dim(runQueueCommand(queue, gControl, qa[0 .. $ - 1])));
-                    break;
-                }
-                if (isCommand(text))
-                {
-                    // Read-only commands and settings run now (turn_commands.rs).
-                    if (auto shown = midTurnCommand(text, mid))
-                    {
-                        console.note(shown);
+                    case SteerRoute.ignore: break;
+                    case SteerRoute.queueCommand:
+                        // `/queue` only touches the queue, so it runs at once.
+                        stdErr.writeln(console.dim(runQueueCommand(queue, gControl, queueArgs(text)[0 .. $ - 1])));
                         break;
-                    }
-                    held.put(text);
-                    stdErr.writeln(console.dim("[waits for the turn to finish: " ~ text ~ "]"));
-                }
-                else if (r.outcome == Outcome.queue)
-                {
-                    auto id = queue.push(text);
-                    stdErr.writeln(console.dim(format("↧ queued #%s (%s waiting) — /queue remove %s to drop",
-                        id, queue.length, id)));
-                }
-                else
-                {
-                    // `//…` steers with a message that starts with `/`.
-                    if (auto unescaped = unescapePrompt(text)) text = unescaped;
-                    auto id = queue.reserveId();
-                    gControl.steerWithId(text, id);
-                    // The frame shows the steer as a user message once the
-                    // agent reads it, so the note needn't repeat the text.
-                    stdErr.writeln(console.dim(format("↪ steer #%s: the agent reads this at its next step — "
-                        ~ "/queue remove %s to withdraw", id, id)));
+                    case SteerRoute.command, SteerRoute.enqueue, SteerRoute.steer:
+                        routeTurnLine(text, r.outcome);
+                        break;
                 }
                 break;
         }
+    }
+}
+
+/// Where a line typed during a turn goes (Rust classify_steer_input): `/queue`
+/// edits run at once on either key; other commands run now or wait
+/// (`midTurnCommand`); text steers on Enter and queues on Ctrl-Enter.
+enum SteerRoute { ignore, queueCommand, command, enqueue, steer }
+
+SteerRoute steerRoute(string text, bool steer)
+{
+    if (!text.length) return SteerRoute.ignore;
+    if (queueArgs(text) !is null) return SteerRoute.queueCommand;
+    if (isCommand(text)) return SteerRoute.command;
+    return steer ? SteerRoute.steer : SteerRoute.enqueue;
+}
+
+// rust: main.rs::classify_steer_input_routes_line_queue_and_commands
+// rust: main.rs::slash_escaped_lines_steer_or_queue_instead_of_deferring
+unittest
+{
+    with (SteerRoute)
+    {
+        assert(steerRoute("keep going", true) == steer && steerRoute("keep going", false) == enqueue);
+        assert(steerRoute("/thinking off", true) == command && steerRoute("/thinking", true) == command);
+        assert(steerRoute("/queue add hello", true) == queueCommand && steerRoute("/queue add hello", false) == queueCommand);
+        assert(steerRoute("/help", true) == command && steerRoute("/model", false) == command);
+        assert(steerRoute("", true) == ignore && steerRoute("", false) == ignore);
+        assert(steerRoute("//usr/lib is big", true) == steer && steerRoute("//usr/lib is big", false) == enqueue);
+        assert(steerRoute("/plan", true) == command);
     }
 }
 
@@ -2105,8 +2142,9 @@ int runMain(string[] args)
         writeln(stampBlock(console.stamp(), banner.join("\n")));
     }
     import core.time : MonoTime, msecs;
-    enum exitWindow = 2000.msecs; // Rust's DOUBLE_INTERRUPT_WINDOW
-    MonoTime exitArmedAt;         // first idle Ctrl-C of a pending pair (zero = disarmed)
+    import nano.lineedit : DoublePress, interruptWindowMs;
+    auto exitPress = DoublePress(interruptWindowMs); // idle Ctrl-C twice exits
+    static long monoMs() @safe { return (MonoTime.currTime - MonoTime.zero).total!"msecs"; }
     ParkedDraft parkedDraft;      // a stale draft set aside for a timer turn
     bool hasParkedDraft;
     bool quietPrompt;             // redraw the prompt in place (no separating blank line)
@@ -2185,14 +2223,14 @@ int runMain(string[] args)
             bool idleNow() @safe
             {
                 return deliverIdleCompact(agent.idleCompactDuePolled(), MonoTime.currTime - ed.quietSince(promptShown),
-                    idleHold, false, exitArmedAt != MonoTime.zero);
+                    idleHold, false, exitPress.armed);
             }
             bool timerNow() @safe
             {
                 return deliverDueTimer(agent.timers.anyDue(agent.timerNow()), ed.holdsTimer(MonoTime.currTime), false,
-                    exitArmedAt != MonoTime.zero);
+                    exitPress.armed);
             }
-            lapse = () @safe => (exitArmedAt != MonoTime.zero && MonoTime.currTime - exitArmedAt > exitWindow)
+            lapse = () @safe => exitPress.deadline.match!(d => monoMs() > d, () => false)
                 || timerNow()
                 || idleNow()
                 || (updateHints && updateHints.tryTake(updateHint));
@@ -2241,15 +2279,13 @@ int runMain(string[] args)
             }
             else if (r.outcome == Outcome.stopped)
             {
-                exitArmedAt = MonoTime.zero; // window lapsed: drop the hint, re-arm on the next press
+                exitPress.disarm(); // window lapsed: drop the hint, re-arm on the next press
                 quietPrompt = true;
                 continue;
             }
             if (r.outcome == Outcome.interrupt)
             {
-                auto now = MonoTime.currTime;
-                if (exitArmedAt != MonoTime.zero && now - exitArmedAt <= exitWindow) break;
-                exitArmedAt = now;
+                if (exitPress.press(monoMs())) break;
                 ed.hint = console.dim("(Ctrl-C again to exit)");
                 quietPrompt = true;
                 continue;
