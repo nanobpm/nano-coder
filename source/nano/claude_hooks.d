@@ -9,6 +9,7 @@
 module nano.claude_hooks;
 
 @safe:
+import nano.clock : monoNow, sleepFor;
 
 import nano.safeio : ignoreSigpipe, killGroup, pollFds, readFd, setNonBlocking, writeFd;
 
@@ -102,6 +103,9 @@ struct Hook
     string[] args;
     Duration timeout = defaultTimeoutSecs.seconds;
     Source source = Source.userNano;
+    /// How long the hook's pipes may stay open after its deadline or exit
+    /// (`graceTime`; tests shorten it).
+    Duration grace = graceTime;
 }
 
 /// A hook nano could not run, and why.
@@ -808,7 +812,7 @@ ProcessRun execute(const ref Hook hook, string input, string projectDir, const S
         inP.writeEnd.close();
         inOpen = false;
     }
-    auto start = MonoTime.currTime;
+    auto start = monoNow;
     auto deadline = start + hook.timeout;
     bool exited;
     MonoTime exitedAt;
@@ -829,22 +833,22 @@ ProcessRun execute(const ref Hook hook, string input, string projectDir, const S
             if (st.terminated)
             {
                 exited = true;
-                exitedAt = MonoTime.currTime;
+                exitedAt = monoNow;
                 r.exited = st.status >= 0;
                 r.exit = st.status;
                 r.signalled = st.status < 0;
             }
         }
         if (exited && !outOpen && !errOpen && !inOpen) break;
-        auto now = MonoTime.currTime;
+        auto now = monoNow;
         if (!exited && now >= deadline)
         {
             killGroup(pid.processID, SIGKILL);
             // Bounded reap; a stuck reap is abandoned.
-            auto reapBy = MonoTime.currTime + graceTime;
-            while (!tryWait(pid).terminated && MonoTime.currTime < reapBy) {
+            auto reapBy = monoNow + hook.grace;
+            while (!tryWait(pid).terminated && monoNow < reapBy) {
                 import core.thread : Thread;
-                Thread.sleep(10.msecs);
+                sleepFor(10.msecs);
             }
             r = ProcessRun.init;
             r.timedOut = true;
@@ -852,7 +856,7 @@ ProcessRun execute(const ref Hook hook, string input, string projectDir, const S
         }
         // The hook exited but a descendant still holds a pipe: wait out the
         // deadline plus a grace period, then fail closed.
-        auto ioLimit = (deadline > exitedAt ? deadline : exitedAt) + graceTime;
+        auto ioLimit = (deadline > exitedAt ? deadline : exitedAt) + hook.grace;
         if (exited && now >= ioLimit)
         {
             killGroup(pid.processID, SIGKILL);
@@ -1254,9 +1258,9 @@ unittest // if_rule_narrows_tool_hooks; stop_block_keeps_going; timeout_blocks_p
     assert(s.blocked && s.blockReason == "keep going");
     auto t = cmd(Event.preToolUse, "sleep 5");
     t.timeout = 200.msecs;
-    auto start = MonoTime.currTime;
+    auto start = monoNow;
     assert(with_([t], dir).runPreToolUse("bash", j(`{"command": "ls"}`), "t1").denies);
-    assert(MonoTime.currTime - start < 3.seconds);
+    assert(monoNow - start < 3.seconds);
     auto tp = cmd(Event.postToolUse, "sleep 5");
     tp.timeout = 200.msecs;
     assert(!with_([tp], dir).runPostToolUse("bash", j(`{"command": "ls"}`), "ok", "t1").blocked);
@@ -1378,12 +1382,14 @@ unittest // detached descendant / unfinished I/O cannot hang the runner and fail
     // macOS has no setsid(1); perl's POSIX::setsid leaves the hook's group too.
     auto h = cmd(Event.preToolUse, `printf '%s' '{"hookSpecificOutput":{"permissionDecision":"deny"}}'; perl -MPOSIX -e 'setsid; sleep 3' & exit 0`);
     h.timeout = 300.msecs;
-    auto start = MonoTime.currTime;
+    h.grace = 100.msecs;
+    auto start = monoNow;
     auto o = with_([h], dir).runPreToolUse("bash", j(`{"command": "ls"}`), "t1");
-    assert(MonoTime.currTime - start < 3.seconds);
+    assert(monoNow - start < 3.seconds);
     assert(o.denies);
     auto ok = cmd(Event.preToolUse, `perl -MPOSIX -e 'setsid; sleep 3' & exit 0`);
     ok.timeout = 300.msecs;
+    ok.grace = 100.msecs;
     assert(with_([ok], dir).runPreToolUse("bash", j(`{"command": "ls"}`), "t1").denies, "unfinished I/O fails closed");
 }
 

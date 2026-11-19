@@ -3,6 +3,7 @@
 module nano.copilot;
 
 @safe:
+import nano.clock : wallNow;
 
 import std.algorithm : startsWith, any;
 import std.ascii : isDigit;
@@ -258,7 +259,7 @@ SessionToken exchange(const Endpoints e, string oauth)
     SessionToken s;
     s.token = t.str;
     auto expires = "expires_at" in j && j["expires_at"].type == JSONType.integer ? j["expires_at"].integer
-        : Clock.currTime.toUnixTime + 1500;
+        : wallNow.toUnixTime + 1500;
     s.refreshAt = expires - refreshMarginSecs;
     if (auto ep = "endpoints" in j)
         if (ep.type == JSONType.object)
@@ -310,13 +311,13 @@ string login(scope void delegate(string) @safe note, scope void delegate(long se
     }
     long interval = num(device, "interval", 5);
     if (interval < 1) interval = 1;
-    auto deadline = Clock.currTime.toUnixTime + num(device, "expires_in", 900);
+    auto deadline = wallNow.toUnixTime + num(device, "expires_in", 900);
     note("UNOFFICIAL: this signs in as the VS Code Copilot extension; use at your own risk.");
     note(format("Open %s and enter code: %s", uri, userCode));
     note("Waiting for authorization...");
     while (true)
     {
-        if (Clock.currTime.toUnixTime > deadline) throw new Exception("device code expired before authorization");
+        if (wallNow.toUnixTime > deadline) throw new Exception("device code expired before authorization");
         sleep(interval);
         auto poll = postForm(e.accessToken, [["client_id", id], ["device_code", deviceCode],
             ["grant_type", "urn:ietf:params:oauth:grant-type:device_code"]], false);
@@ -325,7 +326,7 @@ string login(scope void delegate(string) @safe note, scope void delegate(long se
             {
                 // Prove the account actually has Copilot before reporting success.
                 auto session = exchange(e, t.str);
-                auto path = saveCredentials(StoredCredentials(t.str, d, Clock.currTime.toISOExtString), dataDir);
+                auto path = saveCredentials(StoredCredentials(t.str, d, wallNow.toISOExtString), dataDir);
                 note("Logged in; Copilot API endpoint " ~ session.baseUrl);
                 return path;
             }

@@ -8,6 +8,7 @@
 module nano.muse;
 
 @safe:
+import nano.clock : wallNow;
 
 import std.json;
 import std.format : format;
@@ -238,7 +239,7 @@ private Nullable!long intField(const JSONValue j, string k)
 private long now()
 {
     import std.datetime.systime : Clock;
-    return Clock.currTime.toUnixTime;
+    return wallNow.toUnixTime;
 }
 
 /// A minted Meta API key and the endpoint it is valid for.
@@ -371,7 +372,7 @@ string login(scope void delegate(string) @safe note, scope void delegate(long se
             if (!expiresIn.isNull) c.expiresAt = now + expiresIn.get;
             c.apiKey = minted.apiKey;
             c.apiBase = minted.baseUrl;
-            c.createdAt = Clock.currTime(UTC()).toISOExtString;
+            c.createdAt = wallNow(UTC()).toISOExtString;
             auto path = saveCredentials(c, dataDir);
             note("Logged in; Muse API endpoint " ~ c.apiBase);
             return path;

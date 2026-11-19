@@ -3,6 +3,7 @@
 module nano.http;
 
 @safe:
+import nano.clock : monoNow, sleepFor, wallNow;
 
 import nano.safeio : stdErr, stdOut;
 
@@ -205,7 +206,7 @@ string postJson(string url, string[string] headers, JSONValue body_, string what
             }
         }
         auto delay = retryDelay(policy, attempt, info, meta.retryAfter,
-            Clock.currTime.toUnixTime, uniform01());
+            wallNow.toUnixTime, uniform01());
         stdErr.writefln("[%s] attempt %s failed: %s; retrying in %.1fs", what, attempt + 1, failure.msg,
             delay.total!"msecs" / 1000.0);
         pause(delay);
@@ -275,7 +276,7 @@ private struct OfflineWait
     Duration remaining() const
     {
         if (failures == 0 || policy.offlineBudget == Duration.max) return Duration.max;
-        auto spent = MonoTime.currTime - since;
+        auto spent = monoNow - since;
         return spent >= policy.offlineBudget ? Duration.zero : policy.offlineBudget - spent;
     }
 
@@ -298,7 +299,7 @@ private struct OfflineWait
     {
         import std.algorithm : min;
         import std.uni : toLower;
-        auto now = MonoTime.currTime;
+        auto now = monoNow;
         reason = curlReason(e.msg);
         if (reason.toLower.indexOf("redirect") >= 0) throw new Exception(format("%s: %s", what, reason));
         if (failures == 0)
@@ -313,11 +314,11 @@ private struct OfflineWait
         auto backoff = policy.backoff(failures++);
         auto pauseFor = min(backoff, remaining());
         auto until = now + pauseFor;
-        while (MonoTime.currTime < until)
+        while (monoNow < until)
         {
             if (cancelRequested()) throw new Cancelled;
-            if (live && MonoTime.currTime - shown >= 1.seconds) draw();
-            Thread.sleep(min(50.msecs, until - MonoTime.currTime));
+            if (live && monoNow - shown >= 1.seconds) draw();
+            sleepFor(min(50.msecs, until - monoNow));
         }
         // No further request once the budget is gone.
         if (spent()) throw outOfBudget();
@@ -325,7 +326,7 @@ private struct OfflineWait
 
     private void draw()
     {
-        shown = MonoTime.currTime;
+        shown = monoNow;
         import core.sys.posix.unistd : isatty;
         import nano.frame : fit;
         import nano.lineedit : terminalWidth;
@@ -347,7 +348,7 @@ private struct OfflineWait
     void end()
     {
         if (failures == 0) return;
-        auto took = formatElapsed(MonoTime.currTime - since);
+        auto took = formatElapsed(monoNow - since);
         if (live) stdErr.writef("\r\x1b[K");
         stdErr.writefln("[%s] network back after %s", what, took);
         failures = 0;
@@ -445,11 +446,11 @@ unittest
 private void pause(Duration d)
 {
     import core.time : MonoTime;
-    auto until = MonoTime.currTime + d;
-    while (MonoTime.currTime < until)
+    auto until = monoNow + d;
+    while (monoNow < until)
     {
         if (cancelRequested()) throw new Cancelled;
-        Thread.sleep(50.msecs);
+        sleepFor(50.msecs);
     }
 }
 
@@ -523,14 +524,14 @@ unittest
     p.initialBackoff = 20.msecs;
     p.maxBackoff = 40.msecs;
     p.offlineBudget = 300.msecs;
-    auto start = MonoTime.currTime;
+    auto start = monoNow;
     string msg;
     try postJson("http://127.0.0.1:9/x", null, JSONValue(1), "probe", p, [], 5);
     catch (StreamInterrupted) assert(0);
     catch (Exception e) msg = e.msg;
     assert(msg.length && msg[0 .. 6] == "probe:", msg);
     // Retried well past maxRetries = 0 before giving up.
-    assert(MonoTime.currTime - start >= 300.msecs);
+    assert(monoNow - start >= 300.msecs);
 }
 
 // rust: providers/mod.rs::transport_waits_out_an_offline_endpoint_past_max_retries_then_fails
@@ -544,24 +545,25 @@ unittest
     p.initialBackoff = 1000.msecs;
     p.maxBackoff = 1000.msecs;
     p.offlineBudget = 100.msecs;
-    auto start = MonoTime.currTime;
+    auto start = monoNow;
     import std.exception : collectExceptionMsg;
     auto msg = collectExceptionMsg(postJson("http://127.0.0.1:9/x", null, JSONValue(1), "probe", p, [], 5));
-    auto took = MonoTime.currTime - start;
+    auto took = monoNow - start;
     assert(msg.canFind("network unavailable"), msg);
     assert(took >= 80.msecs && took < 600.msecs, "the backoff is clamped to the budget");
 }
 
-private void holdStalledListener(ushort port)
+private void holdStalledListener(ushort port, imported!"nano.safeio".Chan!bool done)
 {
     import std.socket : TcpSocket, InternetAddress, SocketOptionLevel, SocketOption;
-    Thread.sleep(30.msecs);
+    sleepFor(30.msecs);
     auto l = new TcpSocket;
     scope (exit) l.close();
     l.setOption(SocketOptionLevel.SOCKET, SocketOption.REUSEADDR, true);
     l.bind(new InternetAddress("127.0.0.1", port));
     l.listen(4); // never accepted: connections complete and then hear nothing
-    Thread.sleep(3.seconds);
+    bool v;
+    done.take(v); // until the test is finished with it
 }
 
 // rust: providers/mod.rs::offline_budget_bounds_an_in_flight_resend
@@ -578,16 +580,19 @@ unittest
         port = (cast(InternetAddress) probe.localAddress).port;
         probe.close(); // the first attempt is refused: the outage starts
     }
-    auto h = spawn(&holdStalledListener, port);
+    import nano.safeio : Chan;
+    auto done = Chan!bool.make;
+    auto h = spawn(&holdStalledListener, port, done);
     RetryPolicy p;
     p.maxRetries = 0;
     p.initialBackoff = 20.msecs;
     p.maxBackoff = 20.msecs;
     p.offlineBudget = 150.msecs;
-    auto start = MonoTime.currTime;
+    auto start = monoNow;
     import std.exception : collectExceptionMsg;
     auto msg = collectExceptionMsg(postJson(format("http://127.0.0.1:%s/x", port), null, JSONValue(1), "probe", p, [], 30));
-    auto took = MonoTime.currTime - start;
+    auto took = monoNow - start;
+    done.close();
     h.join();
     assert(msg.canFind("network unavailable"), msg);
     assert(took >= 120.msecs && took < 5.seconds, "a stalled resend outlived the budget");
@@ -606,9 +611,10 @@ unittest
     RetryPolicy p;
     p.maxRetries = 0;
     p.offlineBudget = 10.seconds;
-    auto start = MonoTime.currTime;
+    auto start = monoNow;
     import std.exception : collectExceptionMsg;
     auto msg = collectExceptionMsg(postJson(srv.url ~ "/x", null, JSONValue(1), "probe", p, [], 5));
-    assert(MonoTime.currTime - start < 3.seconds, "a redirect loop was waited out as an outage: " ~ msg);
+    assert(monoNow - start < 3.seconds, "a redirect loop was waited out as an outage: " ~ msg);
     assert(msg.length && !msg.canFind("network unavailable"), msg);
+    srv.finish();
 }

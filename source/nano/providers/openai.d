@@ -4,6 +4,7 @@
 module nano.providers.openai;
 
 @safe:
+import nano.clock : wallNow;
 
 import std.json;
 import std.format : format;
@@ -447,7 +448,7 @@ class CopilotClient : OpenAIClient
     {
         import nano.copilot : exchange;
         import std.datetime.systime : Clock;
-        if (!forceRefresh && session.token.length && Clock.currTime.toUnixTime < session.refreshAt) return;
+        if (!forceRefresh && session.token.length && wallNow.toUnixTime < session.refreshAt) return;
         session = exchange(endpoints, oauth);
         forceRefresh = false;
     }

@@ -3,6 +3,7 @@
 module nano.permissions_test;
 
 @safe:
+import nano.clock : stdTimeNow;
 
 version (unittest):
 
@@ -83,7 +84,7 @@ string tmpDir(string prefix)
 {
     import core.atomic : atomicOp;
     import std.datetime.systime : Clock;
-    return buildPath(tempDir, format("%s-%s-%s-%s", prefix, thisProcessID, Clock.currStdTime, atomicOp!"+="(counter, 1)));
+    return buildPath(tempDir, format("%s-%s-%s-%s", prefix, thisProcessID, stdTimeNow, atomicOp!"+="(counter, 1)));
 }
 
 public import nano.safeio : realPath;

@@ -4,6 +4,7 @@
 module nano.providers.demo;
 
 @safe:
+import nano.clock : sleepFor;
 
 import nano.llm;
 import std.format : format;
@@ -50,7 +51,7 @@ class DemoClient : LLMClient, KindedClient
     {
         import core.thread : Thread;
         import core.time : msecs;
-        if (ms > 0) Thread.sleep(ms.msecs);
+        if (ms > 0) sleepFor(ms.msecs);
     }
 
     private LLMResponse reply(const ref ChatRequest req)

@@ -9,10 +9,11 @@ module nano.null_audit_test;
 import nano.nullaudit;
 static import nano.acp;
 static import nano.agent;
+static import nano.clock;
 static import nano.agent_status;
 static import nano.system_prompt;
 static import nano.testserver;
-static import nano.testenv;
+static import nano.testenv_test;
 static import nano.arith;
 static import nano.attachment;
 static import nano.claude_hooks;
@@ -93,9 +94,10 @@ private alias modules = imported!"std.meta".AliasSeq!(
     nano.acp,
     nano.agent,
     nano.agent_status,
+    nano.clock,
     nano.system_prompt,
     nano.testserver,
-    nano.testenv,
+    nano.testenv_test,
     nano.arith,
     nano.attachment,
     nano.claude_hooks,

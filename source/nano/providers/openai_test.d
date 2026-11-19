@@ -140,7 +140,8 @@ unittest
 {
     string[] events;
     foreach (piece; ["hel", "lo", " wor", "ld"]) events ~= `{"choices":[{"delta":{"content":"` ~ piece ~ `"}}]}`;
-    auto srv = serve([immutable Reply(200, streamHeaders, sse(events, true), 500)]);
+    // 4 x 300 ms: the stream outlasts the 1 s idle timeout, no gap reaches it.
+    auto srv = serve([immutable Reply(200, streamHeaders, sse(events, true), 300)]);
     auto c = against(srv.url, true, 1);
     auto req = hello("hi");
     auto r = c.chat(req, (bool t, string x) {});

@@ -3,6 +3,7 @@
 module nano.providers.muse;
 
 @safe:
+import nano.clock : wallNow;
 
 import nano.llm;
 import nano.config;
@@ -89,7 +90,7 @@ class MuseClient : LLMClient, CapabilityProbe, KindedClient
     private static long nowSecs()
     {
         import std.datetime.systime : Clock;
-        return Clock.currTime.toUnixTime;
+        return wallNow.toUnixTime;
     }
 
     private string apiBase(const SessionKey s) const

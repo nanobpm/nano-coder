@@ -15,6 +15,7 @@
 module nano.attachment;
 
 @safe:
+import nano.clock : stdTimeNow;
 
 import nano.safeio : readBytes, readImmutableBytes;
 import std.format : format;
@@ -315,7 +316,7 @@ private immutable(ubyte)[] runEncoder(const(ubyte)[] src, ImageFormat codec,
     import core.atomic : atomicOp;
     static shared ulong counter;
     auto stem = buildPath(tempDir, format("nano-coder-img-%s-%s-%s", thisProcessID,
-            Clock.currStdTime, atomicOp!"+="(counter, 1)));
+            stdTimeNow, atomicOp!"+="(counter, 1)));
     auto input = stem ~ ".in", output = stem ~ "." ~ codec.extension;
     scope (exit)
     {
@@ -430,7 +431,7 @@ string store(string dir, const ref Attachment a, const(ubyte)[] bytes)
     catch (Exception) {} // a missing or unreadable copy counts as not intact and is rewritten below
     if (!intact)
     {
-        auto tmp = buildPath(dir, format(".tmp-%s-%s", thisProcessID, Clock.currStdTime));
+        auto tmp = buildPath(dir, format(".tmp-%s-%s", thisProcessID, stdTimeNow));
         scope (failure) if (exists(tmp)) remove(tmp);
         write(tmp, bytes);
         rename(tmp, path);

@@ -1,0 +1,19 @@
+# Modules whose unit tests change process-wide state, so the test runner
+# (source/nano/testenv_test.d) runs them one at a time, before the others run
+# in parallel (NANO_TEST_JOBS). One module per line; say why.
+nano.control the cancel flag
+nano.agent the cancel flag
+nano.agent_loop_test the cancel flag
+nano.agent_idle_test the cancel flag
+nano.agent_compaction_test the cancel flag
+nano.acp the cancel flag; environment variables
+nano.http the cancel flag
+nano.keycmd the cancel flag; environment variables
+nano.tools.bash the cancel flag; environment variables
+nano.tools.files environment variables
+nano.claude_hooks environment variables
+nano.cmdexpand environment variables
+nano.config environment variables
+nano.trust environment variables
+nano.testenv_test environment variables
+nano.herdr the Herdr reporter

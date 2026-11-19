@@ -3,6 +3,7 @@
 module nano.resume;
 
 @safe:
+import nano.clock : wallNow;
 import nano.arith : saturatingSub;
 
 import nano.safeio : stdErr, stdOut;
@@ -294,7 +295,7 @@ string idRow(const ref Summary s, SysTime now)
 /// without a terminal; `exclude` (the session in use) is left out.
 string[] listRows(string dir, string cwd, string exclude = null)
 {
-    auto now = Clock.currTime;
+    auto now = wallNow;
     auto all = list(dir);
     return inDir(all, cwd).filter!(s => s.id != exclude).map!(s => idRow(s, now)).array;
 }
@@ -448,7 +449,7 @@ Pick pickOutcome(string dir, string cwd, string exclude, out string id)
         stdErr.writeln("No saved sessions to resume.");
         return Pick.empty;
     }
-    auto now = Clock.currTime;
+    auto now = wallNow;
     auto cols = terminalWidth(2), rows = terminalHeight(2);
     auto maxVisible = rows > 2 ? min(max(rows - 2, 1), 15) : 1;
     bool wasRaw = inKeyMode;
@@ -493,7 +494,7 @@ void printList(string dir, string cwd, bool all, bool json)
         stdErr.writefln("No saved sessions%s.", all ? "" : " for " ~ sanitize(cwd) ~ " (--all lists every directory)");
         return;
     }
-    auto now = Clock.currTime;
+    auto now = wallNow;
     foreach (ref s; shown) stdOut.writeln(idRow(s, now));
 }
 
@@ -588,7 +589,7 @@ unittest
     auto rows = listRows(dir, "/proj/a");
     assert(rows.length == 1 && rows[0].canFind("a  just now") && rows[0].canFind("Fix the [31mflaky[0m deploy"));
     assert(listRows(dir, "/proj/a", "a").length == 0);
-    auto now = Clock.currTime;
+    auto now = wallNow;
     assert(ago(now - 90.minutes, now) == "1h ago" && ago(now - 1.days - 2.minutes, now) == "yesterday");
     Summary s;
     s.title = "Deploy\nfix";
@@ -652,17 +653,17 @@ unittest
         Summary s;
         s.id = "s";
         s.cwd = cwd;
-        s.lastUsed = Clock.currTime;
+        s.lastUsed = wallNow;
         s.prompts = 3;
         s.lastPrompt = last;
         s.contextPrompt = context;
         return s;
     }
     auto s = summary("/work/rusty-harness", "do it\nnow", "Fix the flaky\n deploy test");
-    auto wide = row(s, Clock.currTime, 200);
+    auto wide = row(s, wallNow, 200);
     assert(wide.startsWith("just now    rusty-harness  3 prompts"), wide);
     assert(wide.canFind("3 prompts  do it now  ← Fix the flaky deploy test"), wide);
-    auto narrow = row(s, Clock.currTime, 70);
+    auto narrow = row(s, wallNow, 70);
     assert(narrow.endsWith("…") && cells(narrow) <= 70, narrow);
     auto none = summary(null, "x", null);
     assert(project(none) == "?");

@@ -3,6 +3,7 @@
 module nano.session;
 
 @safe:
+import nano.clock : wallNow;
 
 import nano.safeio : readBytes;
 
@@ -96,7 +97,7 @@ enum int formatVersion = 1;
 /// chrono writes it (`2026-10-21T11:24:12.855560+13:00`).
 string nowStamp()
 {
-    return stamp(Clock.currTime);
+    return stamp(wallNow);
 }
 
 /// `t` in local time as RFC 3339 with offset and microseconds (chrono's form).
@@ -116,7 +117,7 @@ string newSessionId()
 {
     import std.random : uniform;
     import std.datetime.timezone : UTC;
-    auto t = Clock.currTime(UTC());
+    auto t = wallNow(UTC());
     return format("sess-%04d%02d%02dT%02d%02d%02d-%08x", t.year, cast(int) t.month, t.day, t.hour, t.minute,
         t.second, uniform!uint);
 }
@@ -852,7 +853,7 @@ unittest
 unittest
 {
     assert(isTerse("do it") && isTerse("/model x") && !isTerse("Fix the flaky deploy test"));
-    auto now = Clock.currTime;
+    auto now = wallNow;
     import core.time : minutes, hours;
     assert(ago(now - 5.minutes, now) == "5m ago" && ago(now - 3.hours, now) == "3h ago");
 }

@@ -104,6 +104,7 @@ struct ParkedDraft
 import commands = nano.commands;
 
 @safe:
+import nano.clock : monoNow;
 
 // ---------------------------------------------------------------------------
 // Keys
@@ -455,7 +456,7 @@ struct EditState
         history.restoreBrowsing(parked.browsing);
     }
 
-    private void active() { lastEdit = MonoTime.currTime; }
+    private void active() { lastEdit = monoNow; }
 
     /// Run a cursor move; moving counts as activity, a no-op doesn't.
     private void move(scope void delegate() @safe f)
@@ -695,7 +696,7 @@ final class LineEditor
         this.width = width;
         nowMs = () {
             import core.time : MonoTime;
-            return MonoTime.currTime.ticks / (MonoTime.ticksPerSecond / 1000);
+            return monoNow.ticks / (MonoTime.ticksPerSecond / 1000);
         };
     }
 
@@ -780,7 +781,7 @@ final class LineEditor
                 continue;
             }
             // Every key is activity for the idle-compaction quiet check.
-            state.keySeen(MonoTime.currTime);
+            state.keySeen(monoNow);
             notice = null;
             final switch (key.kind)
             {
@@ -1343,10 +1344,10 @@ unittest
     // Fresh vs stale.
     {
         EditState e;
-        auto t0 = MonoTime.currTime;
+        auto t0 = monoNow;
         assert(!e.holdsTimer(t0) && !e.draftIsStale(t0), "an empty buffer never holds a timer");
         e.insert("half-typed");
-        auto now = MonoTime.currTime;
+        auto now = monoNow;
         assert(e.holdsTimer(now) && !e.draftIsStale(now), "a just-typed draft holds the timer");
         e.lastEdit = now - draftHold;
         assert(e.draftIsStale(now) && !e.holdsTimer(now), "a stale draft no longer holds the timer");
@@ -1377,7 +1378,7 @@ unittest
     {
         EditState e;
         e.insert("a long draft being reviewed");
-        auto now = MonoTime.currTime;
+        auto now = monoNow;
         e.lastEdit = now - draftHold;
         assert(e.draftIsStale(now));
         e.left();
@@ -1482,14 +1483,14 @@ unittest
     {
         EditState e;
         e.insert("abandoned draft");
-        auto t0 = MonoTime.currTime;
+        auto t0 = monoNow;
         e.lastEdit = t0 - draftHold;
         assert(e.parkDraft(parked));
         e.restoreDraft(parked);
         assert(e.text == "abandoned draft" && e.draftIsStale(t0) && !e.holdsTimer(t0), "a restored AFK draft stays stale");
         EditState f;
         f.insert("fresh draft");
-        auto t1 = MonoTime.currTime;
+        auto t1 = monoNow;
         assert(f.parkDraft(parked));
         f.restoreDraft(parked);
         assert(f.holdsTimer(t1), "a restored fresh draft stays fresh");
@@ -1503,7 +1504,7 @@ unittest
 {
     EditState v;
     v.insert("draft");
-    auto shown = MonoTime.currTime;
+    auto shown = monoNow;
     v.lastEdit = shown - draftHold;
     assert(v.quietSince(shown) == shown, "shown wins over an older edit");
     auto later = shown + 5.seconds;

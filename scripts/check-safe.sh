@@ -53,6 +53,13 @@ if code '\b__gshared\b|(^|[^[:alnum:]_])union\b' >&2; then
     status=1
 fi
 ratchet "outside safeio.d" "$(code '\bassumeIsolated\(' | wc -l | tr -d ' ')" scripts/isolation-budget "\`assumeIsolated\` calls"
+# Time: only nano/clock.d reads the clock or sleeps. Everything else calls
+# wallNow/stdTimeNow/monoNow/since/sleepFor, so a test can run any
+# time-dependent path under a FakeClock (instant sleeps, chosen "now").
+if code '\bClock\.curr(Std)?Time\b|\bMonoTime\.currTime\b|\bThread\.sleep\b|\bStopWatch\b' | grep -v '^source/nano/clock.d:' >&2; then
+    echo "Error: read the clock and sleep through nano.clock (wallNow, monoNow, since, sleepFor) so tests can fake time" >&2
+    status=1
+fi
 # Every `@trusted` needs a comment right above its declaration saying why it
 # is memory safe (blank lines and the earlier lines of a wrapped signature
 # may come between). The compiler can't check a `@trusted` body; a reviewer

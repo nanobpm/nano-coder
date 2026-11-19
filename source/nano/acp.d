@@ -15,6 +15,7 @@
 module nano.acp;
 
 @safe:
+import nano.clock : stdTimeNow;
 import nano.arith : saturatingSub;
 import nano.option : Option, some, none, match, ifSome, NotNull;
 
@@ -707,7 +708,7 @@ final class AcpServer : AgentEvents
         else
         {
             import std.datetime.systime : Clock;
-            sessionId = format("session-%x", Clock.currStdTime);
+            sessionId = format("session-%x", stdTimeNow);
         }
         if (host.loadHooks !is null) agent.useHooks(host.loadHooks(cwd), false);
     }

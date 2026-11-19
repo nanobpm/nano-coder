@@ -5,6 +5,7 @@
 module nano.frameui;
 
 @safe:
+import nano.clock : monoNow;
 
 import nano.option : NotNull;
 import nano.frame;
@@ -297,7 +298,7 @@ private final class FrameState
     static long nowMs()
     {
         import core.time : MonoTime;
-        return MonoTime.currTime.ticks / (MonoTime.ticksPerSecond / 1000);
+        return monoNow.ticks / (MonoTime.ticksPerSecond / 1000);
     }
 
     /// Watches the size; a burst of changes renders once, 150 ms after the last.

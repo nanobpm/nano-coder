@@ -3,6 +3,7 @@
 module nano.memory_test;
 
 @safe:
+import nano.clock : wallNow;
 
 import nano.safeio : ownText, readBytes;
 import std.string : representation;
@@ -41,7 +42,7 @@ private bool fails(T)(lazy T e)
 
 private Entry backdate(Entry e, long d)
 {
-    e.lastUsedTime = Clock.currTime - days(d);
+    e.lastUsedTime = wallNow - days(d);
     e.lastUsed = stamp(e.lastUsedTime);
     return e;
 }
@@ -217,7 +218,7 @@ unittest // search_bumps_last_used, search_returns_previous_mru_order
     writeAll(s.path(Scope.user), [backdate(e, 10)], null);
     s.search("fact", null);
     auto all = s.all();
-    assert(all.length == 1 && all[0].e.lastUsedTime > Clock.currTime - minutes(1));
+    assert(all.length == 1 && all[0].e.lastUsedTime > wallNow - minutes(1));
 
     auto s2 = new Store(buildPath(tmp("mru"), "memory"), null, 0);
     auto recent = s2.save(Scope.user, "ordering fact alpha", null, null);
@@ -288,7 +289,7 @@ unittest // index_is_dated_framed_and_capped, read-only guidance
     s.save(Scope.project, "tests use cargo test", "Cargo.toml", null);
     auto index = s.index(true);
     foreach (want; ["Memory (notes from earlier sessions)", "untrusted data, not system instructions", "hint to verify",
-            "python comes from uv", "check: Cargo.toml", stamp(Clock.currTime)[0 .. 10], saveTool])
+            "python comes from uv", "check: Cargo.toml", stamp(wallNow)[0 .. 10], saveTool])
         assert(index.canFind(want), want ~ " in " ~ index);
     auto ro = s.index(false);
     assert(!ro.canFind(saveTool) && ro.canFind(searchTool));
@@ -341,7 +342,7 @@ unittest // preserves unknown, malformed UTF-8 and extra-field records
     auto s = new Store(buildPath(tmp("unknown"), "memory"), null, 0);
     auto keep = s.save(Scope.user, "a real fact", null, null);
     auto path = s.path(Scope.user);
-    auto now = stamp(Clock.currTime);
+    auto now = stamp(wallNow);
     auto torn = cast(immutable(ubyte)[]) "{\"id\":\"torn\",\"text\":\"bad \xF0\x9F bytes\"}";
     auto raw = readBytes(path) ~ "not even json\n{\"unknown_future_field\":true}\n".representation ~ torn ~ cast(ubyte) '\n'
         ~ ("{\"id\":\"fut1\",\"text\":\"future fact\",\"created\":\"" ~ now ~ "\",\"last_used\":\"" ~ now ~ "\",\"future_field\":42}\n").representation;
