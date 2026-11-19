@@ -108,3 +108,21 @@ unittest
     v.set("/plan", "p");
     assert(v.get("/plan") == "p");
 }
+
+// rust: turn_commands.rs::timing_sorts_commands_by_what_they_touch
+unittest
+{
+    with (Timing)
+    {
+        foreach (c; ["/help", "/version", "/tools", "/skills", "/providers", "/session", "/plan", "/context", "/mode",
+                "/verbosity", "/trajectory", "/trajectory --json", "/trajectory --markdown", "/trajectory --md"])
+            assert(timing(c) == immediate, c);
+        foreach (c; ["/mode plan", "/verbosity quiet", "/mode  auto ", "/model mock/x", "/model  anthropic/claude-x "])
+            assert(timing(c) == nextStep, c);
+        foreach (c; ["/compact", "/compact --smart", "/restart", "/settings", "/model", "/exit", "/quit",
+                "/plan extra", "/version extra", "/trajectory --bogus", "/trajectory extra", "/trajectory --json extra"])
+            assert(timing(c) == afterTurn, c);
+        assert(splitCmd("/model\nmock/x") == ["/model", "mock/x"] && splitCmd("/help") == ["/help", ""]);
+        assert(timing("/trajectory\t--json") == timing("/trajectory --json") && timing("/model\tmock/x") == nextStep);
+    }
+}

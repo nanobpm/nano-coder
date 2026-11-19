@@ -1320,13 +1320,13 @@ trust.rs::trust_file_honours_env_override	test
 trust.rs::yes_variants_trust_and_remember_once	test
 trust.rs::yolo_and_acp_trust_even_an_empty_root	test
 trust.rs::yolo_trusts_without_asking	test
-turn_commands.rs::context_window_source_follows_live_stats	todo
-turn_commands.rs::non_space_whitespace_routes_like_a_space	todo
-turn_commands.rs::output_uses_the_live_stats_and_plan	todo
-turn_commands.rs::timing_sorts_commands_by_what_they_touch	todo
-turn_commands.rs::tools_listing_follows_live_history_availability	todo
-turn_commands.rs::tools_listing_follows_the_live_mode	todo
-turn_commands.rs::trajectory_without_a_session_says_so	todo
+turn_commands.rs::context_window_source_follows_live_stats	test
+turn_commands.rs::non_space_whitespace_routes_like_a_space	test
+turn_commands.rs::output_uses_the_live_stats_and_plan	test
+turn_commands.rs::timing_sorts_commands_by_what_they_touch	test
+turn_commands.rs::tools_listing_follows_live_history_availability	test
+turn_commands.rs::tools_listing_follows_the_live_mode	test
+turn_commands.rs::trajectory_without_a_session_says_so	test
 ui.rs::a_paused_work_clock_freezes_the_prompt_and_resumes	test
 ui.rs::a_spinner_tick_reuses_the_wrapped_transcript	na	D has no item model or wrapped-transcript cache: the frame thread re-wraps the byte transcript per render
 ui.rs::assistant_message_reconciles_a_partial_stream	test

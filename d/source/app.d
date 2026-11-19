@@ -2836,3 +2836,30 @@ unittest
     assert(midTurnCommand("/mode bogus", ctx).canFind("bogus"), "a bad mode is reported");
     assert(midTurnCommand("/modex plan", ctx) is null, "not a setting: held for after the turn");
 }
+
+// Read-only commands mid-turn show what the agent thread last rendered
+// after a step (refreshView), so they follow the live stats, plan and timers;
+// /trajectory without a session log says so, whatever whitespace splits it.
+// rust: turn_commands.rs::non_space_whitespace_routes_like_a_space
+// rust: turn_commands.rs::trajectory_without_a_session_says_so
+// rust: turn_commands.rs::output_uses_the_live_stats_and_plan
+// rust: turn_commands.rs::context_window_source_follows_live_stats
+unittest
+{
+    import std.algorithm : canFind, startsWith;
+    import nano.option : notNull;
+    Config c;
+    auto ctx = MidTurn(notNull(new shared TurnControl), LiveView.make, [frozenConfig(c)]);
+    foreach (cmd; ["/trajectory", "/trajectory --json", "/trajectory\t--json", "/trajectory\t"])
+        assert(midTurnCommand(cmd, ctx).canFind("Session persistence is disabled"), cmd);
+    assert(midTurnCommand("/trajectory\t--json", ctx) == midTurnCommand("/trajectory --json", ctx));
+    ctx.view.set("/context", "500 of 1000 tokens (context window known for the model name)");
+    assert(midTurnCommand("/context", ctx).canFind("known for the model name"));
+    ctx.view.set("/context", "500 of 8000 tokens (context window learned from a context-overflow error)");
+    assert(midTurnCommand("/context", ctx).canFind("learned from a context-overflow error"), "the latest render is shown");
+    ctx.view.set("/plan", "1. write the tests");
+    assert(midTurnCommand("/plan", ctx).canFind("write the tests"));
+    atomicLoad(ctx.control).mode = AgentMode.plan;
+    assert(midTurnCommand("/mode", ctx).startsWith("Mode: plan"), midTurnCommand("/mode", ctx));
+    assert(midTurnCommand("/compact", ctx) is null && midTurnCommand("/plan extra", ctx) is null);
+}

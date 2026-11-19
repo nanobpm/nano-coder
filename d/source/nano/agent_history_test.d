@@ -151,6 +151,8 @@ unittest
 // renders the listing from the live state after each step.)
 // rust: agent.rs::tools_snapshot_captured_in_plan_mode_still_lists_mutating_tools_live
 // rust: agent.rs::tools_snapshot_captured_without_history_still_lists_it_live
+// rust: turn_commands.rs::tools_listing_follows_live_history_availability
+// rust: turn_commands.rs::tools_listing_follows_the_live_mode
 unittest
 {
     import nano.mode : AgentMode;
