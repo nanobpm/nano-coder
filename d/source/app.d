@@ -447,6 +447,65 @@ imported!"core.time".Duration idleCompactHoldFor(const ref Config cfg) @safe
 }
 
 /// Whether the idle prompt runs a due idle compaction now: quiet for the
+/// The working clock stops while a picker waits on the user, and resumes
+/// when this guard leaves scope, however it leaves (Rust WorkClock::pause).
+struct PickerPause
+{
+    private void delegate(bool) @safe set;
+    @disable this(this);
+    this(void delegate(bool) @safe set)
+    {
+        this.set = set;
+        if (set) set(true);
+    }
+    ~this()
+    {
+        if (set) set(false);
+    }
+}
+
+// rust: main.rs::the_work_clock_guard_brackets_a_picker
+unittest
+{
+    bool[] seen;
+    void record(bool p) @safe { seen ~= p; }
+    {
+        auto p = PickerPause(&record);
+        assert(seen == [true], "a picker pauses the working clock");
+    }
+    assert(seen == [true, false], "leaving the scope resumes it");
+    import std.exception : collectException;
+    auto e = collectException({
+        auto p = PickerPause(&record);
+        throw new Exception("picker failed");
+    }());
+    assert(e.msg == "picker failed");
+    assert(seen == [true, false, true, false], "an exception resumes it too");
+    auto none = PickerPause(null); // no frame: nothing to pause
+}
+
+/// What a finished plain turn reprints (Rust turn_print): nothing unless the
+/// answer was hidden (quiet) or partly dropped (it got louder mid-answer);
+/// then the final answer, or the whole response at the turn cap so its stop
+/// note isn't lost with the dropped deltas.
+string turnReprint(bool quiet, bool truncated, string finalAnswer, string response, bool maxTurns) pure nothrow @nogc
+{
+    if (!quiet && !truncated) return null;
+    return maxTurns && response.length ? response : finalAnswer;
+}
+
+// rust: main.rs::turn_print_repairs_truncation_before_the_max_turn_fallback
+unittest
+{
+    enum response = "full final answer\n[stopped after 3 LLM calls without a final answer]";
+    assert(turnReprint(false, true, "full final answer", response, true) == response,
+        "a truncated max-turn answer is reprinted in full, stop note included");
+    assert(turnReprint(true, false, "full final answer", response, true) == response);
+    assert(turnReprint(false, false, "full final answer", response, true) is null,
+        "an untruncated answer was streamed (its stop note too)");
+    assert(turnReprint(true, false, "answer", "answer", false) == "answer");
+}
+
 /// Whether a due timer runs now at the idle prompt (Rust deliver_due_timer):
 /// a queued interrupt, a fresh draft and an armed Ctrl-C exit window each
 /// hold it back (a timer firing mid-window would steal the second press).
@@ -572,7 +631,7 @@ private void readTurnKeys(LineEditor editor, ConsoleLink console, shared(bool)* 
                     console.endLine();
                     nano.herdr.report(nano.herdr.State.blocked, qs.length ? terminalSafe(qs[0].question) : null);
                     // The user's time at the picker isn't working time.
-                    if (gFrame) gFrame.pauseWork(true);
+                    auto paused = PickerPause((bool p) @safe { if (gFrame) gFrame.pauseWork(p); });
                     bool delegate() @safe away = null;
                     if (mid.control.mode() == AgentMode.auto_)
                     {
@@ -586,7 +645,6 @@ private void readTurnKeys(LineEditor editor, ConsoleLink console, shared(bool)* 
                     if (answer.match!((Away _) => true, _ => false))
                         console.note("[auto: no answer — making the best decision]");
                     questions.resolve(answer);
-                    if (gFrame) gFrame.pauseWork(false);
                     nano.herdr.report(nano.herdr.State.working);
                     break;
                 }
@@ -2023,7 +2081,8 @@ int runMain(string[] args)
             bool ok = true;
             console.finalAnswer = null;
             console.beginAnswerGuard();
-            try agent.run(input, console);
+            string response;
+            try response = agent.run(input, console);
             catch (Exception e)
             {
                 console.endLine();
@@ -2033,9 +2092,11 @@ int runMain(string[] args)
             console.endLine();
             // Quiet shows only the final answer; a turn that got louder after
             // answer deltas were dropped reprints the whole answer (ui.rs).
-            if ((console.quiet || console.answerMayBeTruncated) && console.finalAnswer.length)
+            auto reprint = turnReprint(console.quiet, console.answerMayBeTruncated, console.finalAnswer, response,
+                agent.lastStop == StopReason.maxTurnRequests);
+            if (reprint.length)
             {
-                writeln(console.display(console.finalAnswer));
+                writeln(console.display(reprint));
                 stdOut.flush();
             }
             return ok;

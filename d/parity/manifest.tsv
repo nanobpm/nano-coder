@@ -635,8 +635,8 @@ main.rs::sanitize_terminal_text_preserves_line_feeds	test
 main.rs::sanitize_terminal_text_strips_control_and_escape_sequences	test
 main.rs::sanitize_terminal_text_strips_unicode_line_separators	test
 main.rs::slash_escaped_lines_steer_or_queue_instead_of_deferring	test
-main.rs::the_work_clock_guard_brackets_a_picker	todo
-main.rs::turn_print_repairs_truncation_before_the_max_turn_fallback	todo
+main.rs::the_work_clock_guard_brackets_a_picker	test
+main.rs::turn_print_repairs_truncation_before_the_max_turn_fallback	test
 main.rs::update_is_refused_outside_an_interactive_non_ci_terminal	test
 markdown.rs::a_table_may_follow_a_paragraph_line_directly	test
 markdown.rs::block_quotes_get_a_bar	test
