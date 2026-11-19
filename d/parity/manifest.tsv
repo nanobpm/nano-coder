@@ -309,11 +309,11 @@ claude_hooks.rs::user_prompt_submit_exit_2_blocks_with_stderr	test
 commands.rs::closest_skips_the_matrix_for_oversized_input	test
 commands.rs::compact_args_take_an_optional_mode_then_focus	test
 commands.rs::complete_line_handles_arguments	test
-commands.rs::edit_distance_counts_edits	todo
+commands.rs::edit_distance_counts_edits	test
 commands.rs::help_lists_every_command	test
 commands.rs::help_lists_version	test
-commands.rs::mode_and_verbosity_arguments_are_suggested	todo
-commands.rs::model_suggestions_hoist_current_recent_and_defaults	todo
+commands.rs::mode_and_verbosity_arguments_are_suggested	test
+commands.rs::model_suggestions_hoist_current_recent_and_defaults	test
 commands.rs::model_suggestions_offer_configured_models_and_skip_disabled_providers	claimed	app.d modelSuggestionSource closure (not unit-testable); configuredModels/enabledProviderNames tested in config.d
 commands.rs::model_suggestions_skip_hidden_current_and_recent_models	test
 commands.rs::only_known_or_plausible_commands_are_commands	test
@@ -488,11 +488,11 @@ history.rs::read_returns_one_message_whole_or_bounded	test
 history.rs::reports_matches_hidden_by_the_role_filter	test
 history.rs::search_finds_text_and_tool_calls_newest_first	test
 history.rs::search_shows_later_matches_in_a_message	test
-input_history.rs::an_edit_resets_browsing_to_the_newest	todo
-input_history.rs::down_returns_to_the_draft	todo
+input_history.rs::an_edit_resets_browsing_to_the_newest	test
+input_history.rs::down_returns_to_the_draft	test
 input_history.rs::parking_round_trips_the_browsing_state	test
-input_history.rs::skips_blanks_and_immediate_repeats_and_bounds_the_list	todo
-input_history.rs::up_walks_back_then_stops_at_the_oldest	todo
+input_history.rs::skips_blanks_and_immediate_repeats_and_bounds_the_list	test
+input_history.rs::up_walks_back_then_stops_at_the_oldest	test
 instructions.rs::a_closing_fence_must_match_the_openers_blockquote_container	test
 instructions.rs::a_committed_instruction_file_symlinked_outside_the_repo_is_skipped	test
 instructions.rs::a_dormant_scoped_rules_import_does_not_suppress_a_rendered_file	test

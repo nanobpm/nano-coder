@@ -1940,52 +1940,15 @@ int runMain(string[] args)
 
     // Recently used models lead the `/model` type-ahead (recents.rs).
     static import nano.recents;
-    import nano.commands : Suggestion, modelSuggestionSource;
+    import nano.commands : modelSuggestionSource, modelSuggestions;
     auto recentsPath = nano.recents.defaultPath();
     auto recents = nano.recents.load(recentsPath);
     if (recents.canonicalize(cfg.providers, cfg.defaultProvider)) nano.recents.save(recentsPath, recents);
     string currentSpec() { return nano.recents.canonical(client.providerName ~ "/" ~ client.modelName, cfg.providers, cfg.defaultProvider); }
     modelSuggestionSource = () {
-        import std.algorithm : canFind, sort;
-        Suggestion[] out_;
-        void push(string value, string note)
-        {
-            if (value.length && !out_.canFind!(x => x.value == value)) out_ ~= Suggestion(value, note);
-        }
-        // A current or recent model on a hidden provider stays usable but isn't offered.
-        import nano.config : specVisible;
-        if (specVisible(currentSpec(), cfg.providers, cfg.defaultProvider)) push(currentSpec(), "current");
-        synchronized foreach (r; recents.models)
-            if (specVisible(r, cfg.providers, cfg.defaultProvider)) push(r, "recent");
-        bool configured(string n) { return cfg.userProviders.canFind(n) || n == cfg.defaultProvider; }
-        auto names = enabledProviderNames(cfg.providers);
-        names.sort!((a, b) => configured(a) != configured(b) ? configured(a) : a < b);
-        string kindOf(string n)
-        {
-            auto p = cfg.providers[n];
-            if (!p.hasKind) return "provider";
-            final switch (p.kind)
-            {
-                case ProviderKind.openai: return "openai";
-                case ProviderKind.anthropic: return "anthropic";
-                case ProviderKind.githubCopilot: return "githubcopilot";
-                case ProviderKind.muse: return "muse";
-                case ProviderKind.mock: return "mock";
-            }
-        }
-        string providerNote(string n)
-        {
-            auto m = cfg.providers[n].defaultModel;
-            return kindOf(n) ~ (m.length ? " -> " ~ m : "") ~ (n == cfg.defaultProvider ? ", default provider" : "");
-        }
-        foreach (n; names)
-            if (auto m = cfg.providers[n].defaultModel)
-                push(n ~ "/" ~ m, n == cfg.defaultProvider ? "default provider" : providerNote(n));
-        // A curated list (`list_models = "configured"`) offers each of its models.
-        foreach (n; names)
-            foreach (m; cfg.providers[n].configuredModels) push(n ~ "/" ~ m[0], m[1]);
-        foreach (n; names) push(n, providerNote(n));
-        return out_;
+        string[] recent;
+        synchronized recent = recents.models.dup;
+        return modelSuggestions(cfg, currentSpec(), recent);
     };
 
     /// Switch the model (history carries over); the "Model set to" text.

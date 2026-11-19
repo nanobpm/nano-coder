@@ -172,6 +172,54 @@ string[2] splitCommand(string line, out bool ok)
     return [line[0 .. i], rest];
 }
 
+/// The `/model` candidates: the current model, then recents, then each
+/// enabled provider's default model, curated models, and bare provider
+/// names (configured providers first). Hidden providers aren't offered, and
+/// each value appears once.
+Suggestion[] modelSuggestions(const ref imported!"nano.config".Config cfg, string current, const string[] recents)
+{
+    import nano.config : specVisible, enabledProviderNames, ProviderKind;
+    import std.algorithm : sort;
+    Suggestion[] out_;
+    void push(string value, string note)
+    {
+        if (value.length && !out_.canFind!(x => x.value == value)) out_ ~= Suggestion(value, note);
+    }
+    // A current or recent model on a hidden provider stays usable but isn't offered.
+    if (specVisible(current, cfg.providers, cfg.defaultProvider)) push(current, "current");
+    foreach (r; recents)
+        if (specVisible(r, cfg.providers, cfg.defaultProvider)) push(r, "recent");
+    bool configured(string n) { return cfg.userProviders.canFind(n) || n == cfg.defaultProvider; }
+    auto names = enabledProviderNames(cfg.providers);
+    names.sort!((a, b) => configured(a) != configured(b) ? configured(a) : a < b);
+    string kindOf(string n)
+    {
+        auto p = cfg.providers[n];
+        if (!p.hasKind) return "provider";
+        final switch (p.kind)
+        {
+            case ProviderKind.openai: return "openai";
+            case ProviderKind.anthropic: return "anthropic";
+            case ProviderKind.githubCopilot: return "githubcopilot";
+            case ProviderKind.muse: return "muse";
+            case ProviderKind.mock: return "mock";
+        }
+    }
+    string providerNote(string n)
+    {
+        auto m = cfg.providers[n].defaultModel;
+        return kindOf(n) ~ (m.length ? " -> " ~ m : "") ~ (n == cfg.defaultProvider ? ", default provider" : "");
+    }
+    foreach (n; names)
+        if (auto m = cfg.providers[n].defaultModel)
+            push(n ~ "/" ~ m, n == cfg.defaultProvider ? "default provider" : providerNote(n));
+    // A curated list (`list_models = "configured"`) offers each of its models.
+    foreach (n; names)
+        foreach (m; cfg.providers[n].configuredModels) push(n ~ "/" ~ m[0], m[1]);
+    foreach (n; names) push(n, providerNote(n));
+    return out_;
+}
+
 /// Argument candidates for the line being typed, filtered by the typed prefix.
 Suggestion[] suggestions(string line)
 {
@@ -479,4 +527,36 @@ unittest // argument type-ahead (Rust suggestions / complete_line / suggestion_m
     assert(rows.length == 1 && rows[0].canFind("no match (any provider/model ID works)"));
     rows = menu("/model oll", 80, 2);
     assert(rows.length == 2 && rows[1].canFind("... 2 more") && rows[0].canFind("llama3"));
+}
+
+// rust: commands.rs::edit_distance_counts_edits
+// rust: commands.rs::mode_and_verbosity_arguments_are_suggested
+// rust: commands.rs::model_suggestions_hoist_current_recent_and_defaults
+unittest
+{
+    import nano.config : Config;
+    import std.file : tempDir, write, remove;
+    import std.path : buildPath;
+    assert(editDistance("/exin", "/exit") == 1);
+    assert(editDistance("/modle", "/model") == 1, "a swap is one edit");
+    assert(editDistance("/modle", "/mode") == 1);
+    assert(editDistance("", "abc") == 3 && editDistance("same", "same") == 0);
+
+    string[] values(Suggestion[] xs) { return xs.map!(x => x.value).array; }
+    assert(values(suggestions("/mode ")) == ["normal", "plan", "auto"]);
+    assert(values(suggestions("/mode p")) == ["plan"]);
+    assert(values(suggestions("/verbosity v")) == ["verbose"]);
+
+    auto path = buildPath(tempDir, "nano-d-model-suggestions.toml");
+    write(path, "model = \"openai/gpt-4o\"\ndefault_provider = \"openai\"\n[providers.work]\nkind = \"openai\"\n"
+        ~ "base_url = \"http://merlin.local:8000/v1\"\ndefault_model = \"gpt-oss-120b\"\n");
+    scope (exit) remove(path);
+    auto cfg = Config.load(path);
+    auto found = values(modelSuggestions(cfg, "openai/gpt-4o", ["ollama/qwen3:8b", "anthropic/claude-sonnet-4-5"]));
+    assert(found[0 .. 3] == ["openai/gpt-4o", "ollama/qwen3:8b", "anthropic/claude-sonnet-4-5"], found[0]);
+    import std.algorithm : countUntil;
+    assert(found.countUntil("work/gpt-oss-120b") < found.countUntil("work") && found.countUntil("work") > 0, found[3]);
+    assert(!found.canFind("mock/mock") && !found.canFind("mock"), "hidden mock not offered");
+    found = values(modelSuggestions(cfg, "openai/gpt-4o", ["work/gpt-oss-120b"]));
+    assert(found.filter!(v => v == "work/gpt-oss-120b").array.length == 1);
 }

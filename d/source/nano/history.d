@@ -124,3 +124,30 @@ unittest // ports input_history.rs tests
     }
     assert(h.lines.length == InputHistory.maxEntries && h.lines[$ - 1] == "249");
 }
+
+// rust: input_history.rs::an_edit_resets_browsing_to_the_newest
+// rust: input_history.rs::down_returns_to_the_draft
+// rust: input_history.rs::skips_blanks_and_immediate_repeats_and_bounds_the_list
+// rust: input_history.rs::up_walks_back_then_stops_at_the_oldest
+unittest
+{
+    import std.format : format;
+    InputHistory h;
+    assert(h.up("") is null, "empty history");
+    h.record("first");
+    h.record("second");
+    assert(h.up("") == "second");
+    h.edited();
+    assert(h.up("") == "second");
+    assert(h.down() == "" && h.down() is null);
+
+    assert(h.up("typed so far") == "second" && h.up("second") == "first");
+    assert(h.up("") is null, "at the oldest: stay");
+    assert(h.down() == "second" && h.down() == "typed so far" && h.down() is null);
+
+    InputHistory b;
+    foreach (l; ["  ", "one", "one", " one "]) b.record(l);
+    assert(b.lines == ["one", " one "], "whitespace variants are kept verbatim");
+    foreach (i; 0 .. InputHistory.maxEntries + 10) b.record(format("line %s", i));
+    assert(b.lines.length == InputHistory.maxEntries && b.lines[0] == "line 10");
+}
