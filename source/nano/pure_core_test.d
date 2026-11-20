@@ -17,6 +17,7 @@ static import nano.emoji;
 static import nano.emoji_table;
 static import nano.goal;
 static import nano.history;
+static import nano.instruction_state;
 static import nano.markdown;
 static import nano.mdblock;
 static import nano.mdinline;
@@ -41,6 +42,7 @@ alias pureCore = AliasSeq!(
     nano.emoji_table,
     nano.goal,
     nano.history,
+    nano.instruction_state,
     nano.markdown,
     nano.mdblock,
     nano.mdinline,
