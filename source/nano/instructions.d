@@ -475,15 +475,15 @@ private struct Reader
     }
 
     /// One file and what it imports, added to `graph`; returns its key. A
-    /// file reached again at the same depth, by any spelling (symlinks,
-    /// `..`), is read once: the graph holds at most one node per file and
-    /// depth. Every import edge stays (which one shows is `State`'s choice),
+    /// file reached again at the same depth through a symlinked directory or
+    /// `..` is read once: nodes are keyed by the real directory and the name,
+    /// which together decide how it imports (relative base, Claude format). Every import edge stays (which one shows is `State`'s choice),
     /// and `maxImportDepth` ends cycles. `body` (when not null) replaces the
     /// on-disk text (a rule without its front matter).
     string file(string path, Kind kind, bool user, size_t depth, string body = null)
     {
         const real_ = canonOr(path);
-        const key = format("%s\0%s\0%s\0%s", kind, user, depth, real_);
+        const key = format("%s\0%s\0%s\0%s\0%s", kind, user, depth, canonOr(path.dirName), path.baseName);
         if (key in graph) return key;
         auto r = Read(path, real_, null, kind, user);
         auto disk = readCapped(path);
@@ -1387,4 +1387,17 @@ unittest // the same file through symlinked spellings is one node per depth
     assert(p.render.canFind("file 9"));
     // CLAUDE.md, the missing CLAUDE.local.md, and each f.md once per depth.
     assert(p.startup.graph.length <= 2 + 10 * maxImportDepth, p.startup.graph.length.to!string);
+}
+
+unittest // a file symlinked under another name keeps its own import rules
+{
+    import std.file : rmdirRecurse, symlink;
+    auto base = testDir("alias-name");
+    scope (exit) rmdirRecurse(base);
+    auto root = buildPath(base, "repo");
+    put(buildPath(root, "CLAUDE.md"), "root, see @detail.md");
+    put(buildPath(root, "detail.md"), "the detail");
+    put(buildPath(root, "child/keep.txt"), "");
+    symlink("../CLAUDE.md", buildPath(root, "child/AGENTS.md"));
+    assert(find(buildPath(root, "child")).render.canFind("the detail"));
 }
