@@ -5,6 +5,7 @@ module nano.agent;
 @safe:
 import nano.safeio : jsonText, jsonPretty;
 import nano.clock : monoNow, since, sleepFor, stdTimeNow, wallNow;
+import core.time : MonoTime;
 import nano.arith : checkedMul, checkedSub, saturatingSub;
 import nano.option : Option, some, none, match, ifSome, orElse, unwrap, NotNull;
 import nano.result : orThrow, toOption, match, unwrap;
@@ -149,17 +150,11 @@ struct CompactReport
 enum string loopStoppedToolResult =
     "Error: the turn is ending as blocked (repeated-call loop detected); this tool call was not run.";
 
-/// Why a turn ended (ACP `stopReason`).
-/// The turn cap for runs nobody can answer a "keep going?" prompt in.
-enum headlessSafetyCap = 300;
-
-enum StopReason : string
-{
-    endTurn = "end_turn",
-    cancelled = "cancelled",
-    maxTurnRequests = "max_turn_requests",
-    maxTokens = "max_tokens",
-}
+/// The turn loop's state machine; `StopReason` and the turn limits live there.
+public import nano.turn : StopReason, headlessSafetyCap, maxTruncatedContinuations, maxStreamRestarts;
+import nano.turn : TurnState, Limits, Event, CallDue, KeepGoing, Replied, CallFailed, Failure, Compacted, StopHookRan,
+    ToolsRan, Next, AskKeepGoing, CallModel, Restarting, LimitOutput, CompactForOverflow, Rethrow, Cancel,
+    ContinueCutOff, SyncContinuation, Notice, RunStopHook, StopBlocked, RunTools, FinishOutcome, Finish, step;
 
 /// A `context_window` from the configuration and which key set it.
 struct ConfiguredWindow
@@ -612,320 +607,262 @@ class Agent
                 return continued;
             }
         }
-        // The turn cap: interactive normal mode asks to keep going; auto mode
-        // has none; headless runs (ACP, -p) stop at the cap, or at a safety
-        // cap when there is none. Re-read from the live mode each iteration.
-        long granted, iteration, budget;
+        // The loop's decisions are nano.turn.step's; this performs its
+        // effects and feeds what happened back in.
+        import nano.claude_hooks : maxStopBlocks;
+        auto state = TurnState.start(Limits(maxIterations, headless, maxStopBlocks), continued, truncations);
+        // The next event, in a slice: SumType assignment is @system when a
+        // member holds a pointer, but appending builds a fresh one.
+        Event[] event = [Event(CallDue(control.mode, control.isCancelled))];
+        LLMResponse r;
+        Exception failure; // what a `Rethrow` re-raises
+        MonoTime swStart;
+        string loopStop;
         for (;;)
         {
-            iteration++;
-            auto mode = control.mode;
-            bool headlessCap = headless && (maxIterations <= 0 || mode == AgentMode.auto_);
-            budget = headlessCap ? headlessSafetyCap + granted
-                : (mode == AgentMode.auto_ || maxIterations <= 0) ? long.max : maxIterations + granted;
-            if (iteration > budget)
+            assert(event.length == 1, "every step ends the turn or asks for the next event");
+            auto t = step(state, event[0]);
+            state = t.state;
+            Event[] next;
+            foreach (effect; t.effects)
             {
-                if (mode == AgentMode.normal && !headless && askKeepGoing())
-                {
-                    ev.text(false, "\n[continuing past the turn cap]\n");
-                    granted += maxIterations;
-                    iteration--;
-                    continue;
-                }
-                break;
-            }
-            if (control.isCancelled) return cancelled(ev);
-            foreach (s; control.takePending)
-            {
-                push(Message.user(s.text));
-                ev.userMessage(s.text);
-                control.absorbed(s);
-            }
-            fireDueTimers(ev);
-            if (overThreshold())
-            {
-                CompactReport rep;
-                compact(rep, CompactTrigger.threshold);
-                if (control.isCancelled) return cancelled(ev);
-            }
-            applyModelRequest();
-            if (auto level = control.takeThinkingRequest())
-            {
-                import nano.thinking : sessionSetting;
-                // Checked when it was typed, so this can't fail.
-                sessionThinking = sessionSetting(level).unwrap("validated when typed");
-            }
-            LLMResponse r;
-            const swStart = monoNow;
-            bool overflowRetried, capRetried;
-            size_t dropped;
-            // What the request that answered sent (a retry re-resolves).
-            ThinkingResolved sentThinking;
-            temp.Resolved sentTemperature;
-            for (;;)
-            {
-                ChatRequest req;
-                req.messages = messages;
-                req.tools = offeredTools();
-                req.maxTokens = requestMaxTokens();
-                auto th = thinking();
-                req.thinking = th.request();
-                requestThinking = some(shownLevel(th));
-                req.vision = vision();
-                req.attachmentsDir = attachmentsDir();
-                auto tr = temperatureFor(th.anthropicThinkingOn);
-                req.temperature = tr.effective;
-                ev.generationStart();
-                try
-                {
-                    r = client.chat(req, (bool t, string s) { ev.text(t, s); });
-                    sentThinking = th;
-                    sentTemperature = tr;
-                    break;
-                }
-                catch (Cancelled) return cancelled(ev);
-                catch (StreamInterrupted e)
-                {
-                    // The connection dropped mid-reply. Nothing of it was kept, so
-                    // ask again (the request itself waits for the network).
-                    if (control.isCancelled) return cancelled(ev);
-                    if (++dropped > maxStreamRestarts) throw e;
-                    stdErr.writefln("[agent] %s; asking again (%s/%s)", e.msg, dropped, maxStreamRestarts);
-                    ev.responseRestarted();
-                    continue;
-                }
-                catch (Exception e)
-                {
-                    if (control.isCancelled) return cancelled(ev);
-                    if (!capRetried && ctx.isOutputCapError(e.msg) && !ctx.isContextOverflow(e.msg))
-                    {
-                        // The provider caps output below the max_tokens this request
-                        // sent: learn the cap (else halve what was sent) and retry once.
-                        capRetried = true;
-                        long sent = req.maxTokens;
-                        long cap = ctx.outputCapFromError(e.msg);
-                        if (cap <= 0) cap = sent / 2 > 1_024 ? sent / 2 : 1_024;
-                        if (cap < 256) cap = 256;
-                        if (cap < sent)
+                // Each effect either answers with the next event, ends the
+                // turn (`done`), or does its work and moves on.
+                bool done;
+                string answer;
+                effect.match!(
+                    (Next _) { next ~= Event(CallDue(control.mode, control.isCancelled)); },
+                    (AskKeepGoing _) { next ~= Event(KeepGoing(askKeepGoing())); },
+                    (CallModel c) {
+                        if (c.fresh)
                         {
-                            learnedMaxOutput = cap;
-                            import std.stdio : stderr;
-                            stdErr.writefln("[agent] output-limit rejection (%s); retrying with max_tokens=%s", e.msg, cap);
-                            continue;
+                            if (!prepareCall(ev)) { done = true; answer = cancelled(ev); return; }
+                            swStart = monoNow;
                         }
-                    }
-                    if (overflowRetried || !ctx.isContextOverflow(e.msg)) throw e;
-                    // A `/model` queued during the call applies to the
-                    // compaction and the retry, not the model being left.
-                    applyModelRequest();
-                    // The request did not fit: learn the window, compact, retry once.
-                    overflowRetried = true;
-                    auto learned = ctx.limitFromError(e.msg);
-                    if (!learned) learned = estimateContextTokens() * 9 / 10;
-                    learnedWindow = learned > 1_000 ? learned : 1_000;
-                    CompactReport rep;
-                    if (!compact(rep, CompactTrigger.overflow))
-                    {
-                        if (control.isCancelled) return cancelled(ev);
-                        throw e;
-                    }
-                    if (control.isCancelled) return cancelled(ev);
-                }
-            }
-            lastUsage = r.usage;
-            recordUsage(r.usage);
-            if (r.usage.inputTokens > 0)
-            {
-                // Anchored at the assistant message about to be pushed.
-                calibLen = messages.length + 1;
-                calibTokens = cast(size_t)(r.usage.inputTokens + (r.usage.outputTokens > 0 ? r.usage.outputTokens : 0));
-            }
-            ev.usage(r.usage);
-            auto reply = Message.assistant(r.content, r.toolCalls);
-            reply.thinking = r.reasoning;
-            reply.thinkingBlocks = r.thinkingBlocks;
-            reply.usage = r.usage;
-            reply.hasUsage = r.usage != TokenUsage.init;
-            reply.durationMs = since(swStart).total!"msecs";
-            reply.temperature = sentTemperature.describe;
-            // Only when a level is sent or set somewhere, so logs without
-            // thinking levels stay unchanged.
-            if (sentThinking.effective != Thinking.init || sentThinking.source != ThinkingSource.global)
-                reply.thinkingLevel = sentThinking.describe;
-            reply.stopReason = r.toolCalls.length ? "tool_use"
-                : (r.stopReason == "length" || r.stopReason == "max_tokens") ? "max_tokens" : "end_turn";
-            push(reply);
-            last = r.content;
-            if (r.content.length || r.reasoning.length) ev.assistantMessage(r.content, r.reasoning);
-            if (r.toolCalls.length == 0)
-            {
-                bool cut = r.stopReason == "length" || r.stopReason == "max_tokens";
-                // A steer that arrived while the answer was written extends the
-                // turn; the reply after it is a fresh answer. On the last
-                // allowed call the answer stands and the steer stays queued
-                // for the caller.
-                if (iteration < budget && control.hasSteers && !control.isCancelled)
-                {
-                    continued = null;
-                    syncPendingContinuation(continued, truncations);
-                    continue;
-                }
-                // A reply cut off at the output-token limit isn't finished (any
-                // tool call in it was dropped): ask for the rest, in smaller
-                // pieces, up to maxTruncatedContinuations times.
-                if (cut && iteration < budget && !control.isCancelled && truncations < maxTruncatedContinuations)
-                {
-                    truncations++;
-                    continued ~= r.content;
-                    push(continuationReminder(r.usage.outputTokens));
-                    syncPendingContinuation(continued, truncations);
-                    continue;
-                }
-                if (cut) ev.text(false, "\n[the reply hit the output-token limit]");
-                // The whole answer: the chunks carried across continuations, then this one.
-                last = continued ~ r.content;
-                // A blocking Stop hook keeps the turn going (capped per turn).
-                if (!cut && stopBlocks < maxStopBlocks && !control.isCancelled && iteration < budget)
-                {
-                    // Not `foreach (h; hooks)`: the `continue` below is for the turn loop.
-                    auto o = hooks.match!(h => h.runStop(stopBlocks > 0), () => HookOutcome.init);
-                    if (o.blocked)
-                    {
-                        stopBlocks++;
-                        continued = null;
-                        syncPendingContinuation(continued, truncations);
-                        auto reason = o.blockReason.strip.length ? o.blockReason : "A Stop hook asked the agent to keep going.";
-                        push(Message.auto_(wrapReminder(reason)));
-                        ev.userMessage(reason);
-                        continue;
-                    }
-                }
-                lastStop = cut ? StopReason.maxTokens : StopReason.endTurn;
-                return last;
-            }
-            // Tool calls begin a new answer: dropped call markup mustn't prefix it.
-            continued = null;
-            syncPendingContinuation(continued, truncations);
-            string loopStop;
-            foreach (call; r.toolCalls)
-            {
-                ev.toolStart(call);
-                bool isError = true;
-                string result;
-                Attachment[] attachments;
-                bool dispatched;
-                JSONValue effectiveArgs;
-                auto recallBefore = recallState.dup;
-                auto notesBefore = recallTurnNotes;
-                if (control.isCancelled) result = cancelledToolResult;
-                else if (loopStop !is null) result = loopStoppedToolResult;
-                else
-                {
-                    {
-                        import nano.tools : setSpillDir, spillDirFor, truncateOutput;
-                        // Cut outputs are kept beside a persisted session's log.
-                        setSpillDir(log.match!(l => spillDirFor(l.path), () => string.init));
-                        result = runTool(call, r.stopReason, isError, dispatched, effectiveArgs);
-                        // bash, read_file and history_read bound their own output.
-                        if (call.name != "bash" && call.name != "read_file" && call.name != hist.readTool
-                            && call.name != "load_skill")
-                            result = truncateOutput(result, toolOutputLimit,
-                                format("tool-%s-%s", safeName(call.id), safeName(call.name)));
-                    }
-                    // A successful edit marks the tree unchecked; a bash call
-                    // that started (even one exiting non-zero) is the check.
-                    if (!isError && (call.name == "write_file" || call.name == "edit_file")) editsSinceCheck = true;
-                    else if (dispatched && !isError && call.name == "bash") editsSinceCheck = false;
-                    if (call.name == "read_file") result = imageResult(result, isError, attachments);
-                    // Deeper instruction files and scoped rules attach to the first
-                    // file-tool result that touches a matching path.
-                    if (!isError && (call.name == "read_file" || call.name == "write_file" || call.name == "edit_file"))
-                        if (auto p = "path" in call.arguments)
-                            if (p.type == JSONType.string)
-                            {
-                                import std.file : getcwd;
-                                instructions.ifSome((ProjectInstructions pi) {
-                                    if (auto nested = pi.nestedFor(p.str, getcwd())) result ~= nested;
-                                });
-                            }
-                    // Memory recall (Rust #167): a note for each memory whose
-                    // anchors appear in this call's arguments and whose full
-                    // text is not already in context. Only calls that ran.
-                    if (dispatched)
-                        foreach (note; recallMemories(call.name, effectiveArgs, !isError, result))
-                            result ~= "\n\n" ~ wrap(note);
-                    if (hist.isHistoryTool(call.name)) historyHintPending = false;
-                    else if (historyHintPending && historyEnabled && hist.looksFailed(call.name, !isError, result))
-                    {
-                        historyHintPending = false;
-                        result ~= "\n\n" ~ hist.failedToolHint;
-                    }
-                    if (remindersEnabled) result ~= remind(call, !isError, result, loopStop);
-                }
-                ev.toolEnd(call, toolResultDisplay(result, attachments), isError);
-                auto msg = Message.toolResult(call.id, call.name, result, isError);
-                msg.attachments = attachments;
-                // Commit this call's recall changes only once the result
-                // carrying their notes is durable: a failed append rolls them
-                // back, so a resume never treats unseen notes as seen.
-                try push(msg);
-                catch (Exception e)
-                {
-                    recallState = recallBefore;
-                    recallTurnNotes = notesBefore;
-                    throw e;
-                }
-                if (recallState != recallBefore) recallChanged();
-            }
-            if (loopStop !is null)
-            {
-                // The loop detector's hard stop: end the turn as blocked rather
-                // than burning budget until the turn cap.
-                reported = Outcome(OutcomeStatus.blocked, loopStop);
-                auto response = reported.response;
-                push(Message.assistant(response, null));
-                ev.text(false, response);
-                ev.assistantMessage(response, null);
-                lastOutcome = reported;
-                hasOutcome = true;
-                hasReported = false;
-                lastStop = StopReason.endTurn;
-                return response;
-            }
-            if (hasReported)
-            {
-                // A reported outcome ends the turn like a tool-free answer, so
-                // it passes the same Stop gate.
-                if (stopBlocks < maxStopBlocks && !control.isCancelled && iteration < budget)
-                {
-                    // Not `foreach (h; hooks)`: the `continue` below is for the turn loop.
-                    auto o = hooks.match!(h => h.runStop(stopBlocks > 0), () => HookOutcome.init);
-                    if (o.blocked)
-                    {
-                        stopBlocks++;
+                        next ~= callModel(ev, swStart, r, failure);
+                    },
+                    (Restarting x) {
+                        stdErr.writefln("[agent] %s; asking again (%s/%s)", x.message, x.attempt, maxStreamRestarts);
+                        ev.responseRestarted();
+                    },
+                    (LimitOutput l) {
+                        learnedMaxOutput = l.cap;
+                        stdErr.writefln("[agent] output-limit rejection (%s); retrying with max_tokens=%s", l.message, l.cap);
+                    },
+                    (CompactForOverflow c) {
+                        // A `/model` queued during the call applies to the
+                        // compaction and the retry, not the model being left.
+                        applyModelRequest();
+                        auto learned = c.learned ? c.learned : estimateContextTokens() * 9 / 10;
+                        learnedWindow = learned > 1_000 ? learned : 1_000;
+                        CompactReport rep;
+                        const ok = compact(rep, CompactTrigger.overflow);
+                        next ~= Event(Compacted(ok, control.isCancelled));
+                    },
+                    (Rethrow _) { throw failure; },
+                    (Cancel _) { done = true; answer = cancelled(ev); },
+                    (ContinueCutOff c) { push(continuationReminder(c.outputTokens)); },
+                    (SyncContinuation c) { syncPendingContinuation(c.continued, c.truncations); },
+                    (Notice n) { ev.text(false, n.text); },
+                    (RunStopHook h) {
+                        auto o = hooks.match!(m => m.runStop(h.again), () => HookOutcome.init);
+                        next ~= Event(StopHookRan(o.blocked, o.blockReason, control.isCancelled));
+                    },
+                    (StopBlocked b) {
                         hasReported = false;
-                        auto reason = o.blockReason.strip.length ? o.blockReason : "A Stop hook asked the agent to keep going.";
-                        push(Message.auto_(wrapReminder(reason)));
-                        ev.userMessage(reason);
-                        last = reported.response;
-                        continue;
-                    }
-                }
-                auto response = reported.response;
-                push(Message.assistant(response, null));
-                ev.text(false, response);
-                ev.assistantMessage(response, null);
-                lastOutcome = reported;
-                hasOutcome = true;
-                hasReported = false;
-                lastStop = StopReason.endTurn;
-                return response;
+                        push(Message.auto_(wrapReminder(b.reason)));
+                        ev.userMessage(b.reason);
+                    },
+                    (RunTools _) { next ~= runToolCalls(r, ev, loopStop); },
+                    (FinishOutcome f) {
+                        if (f.loopStopped) reported = Outcome(OutcomeStatus.blocked, loopStop);
+                        auto response = reported.response;
+                        push(Message.assistant(response, null));
+                        ev.text(false, response);
+                        ev.assistantMessage(response, null);
+                        lastOutcome = reported;
+                        hasOutcome = true;
+                        hasReported = false;
+                        lastStop = StopReason.endTurn;
+                        done = true;
+                        answer = response;
+                    },
+                    (Finish f) {
+                        lastStop = f.stop;
+                        done = true;
+                        answer = f.answer;
+                    },
+                );
+                if (done) return answer;
             }
+            event = next;
         }
-        auto note = format("[stopped after %s LLM calls without a final answer]", iteration - 1);
-        ev.text(false, "\n" ~ note);
-        lastStop = StopReason.maxTurnRequests;
-        return (last ~ "\n" ~ note).stripLeft;
+    }
+
+    /// Before a fresh model call: absorb queued steers, fire due timers,
+    /// compact at the threshold, and apply queued model and thinking
+    /// changes. False if the turn was cancelled meanwhile.
+    private bool prepareCall(AgentEvents ev)
+    {
+        foreach (s; control.takePending)
+        {
+            push(Message.user(s.text));
+            ev.userMessage(s.text);
+            control.absorbed(s);
+        }
+        fireDueTimers(ev);
+        if (overThreshold())
+        {
+            CompactReport rep;
+            compact(rep, CompactTrigger.threshold);
+            if (control.isCancelled) return false;
+        }
+        applyModelRequest();
+        if (auto level = control.takeThinkingRequest())
+        {
+            import nano.thinking : sessionSetting;
+            // Checked when it was typed, so this can't fail.
+            sessionThinking = sessionSetting(level).unwrap("validated when typed");
+        }
+        return true;
+    }
+
+    /// One model call: the reply recorded in the conversation (`Replied`), or
+    /// how it failed (`CallFailed`, with the exception kept in `failure`).
+    private Event callModel(AgentEvents ev, MonoTime swStart, out LLMResponse r, out Exception failure)
+    {
+        ChatRequest req;
+        req.messages = messages;
+        req.tools = offeredTools();
+        req.maxTokens = requestMaxTokens();
+        auto th = thinking();
+        req.thinking = th.request();
+        requestThinking = some(shownLevel(th));
+        req.vision = vision();
+        req.attachmentsDir = attachmentsDir();
+        auto tr = temperatureFor(th.anthropicThinkingOn);
+        req.temperature = tr.effective;
+        ev.generationStart();
+        try r = client.chat(req, (bool t, string s) { ev.text(t, s); });
+        catch (Cancelled e)
+        {
+            failure = e;
+            return Event(CallFailed(Failure.cancelled, e.msg, req.maxTokens, true));
+        }
+        catch (StreamInterrupted e)
+        {
+            failure = e;
+            return Event(CallFailed(Failure.interrupted, e.msg, req.maxTokens, control.isCancelled));
+        }
+        catch (Exception e) // classified by nano.turn.step: retried, compacted for, or re-raised
+        {
+            failure = e;
+            return Event(CallFailed(Failure.error, e.msg, req.maxTokens, control.isCancelled));
+        }
+        lastUsage = r.usage;
+        recordUsage(r.usage);
+        if (r.usage.inputTokens > 0)
+        {
+            // Anchored at the assistant message about to be pushed.
+            calibLen = messages.length + 1;
+            calibTokens = cast(size_t)(r.usage.inputTokens + (r.usage.outputTokens > 0 ? r.usage.outputTokens : 0));
+        }
+        ev.usage(r.usage);
+        auto reply = Message.assistant(r.content, r.toolCalls);
+        reply.thinking = r.reasoning;
+        reply.thinkingBlocks = r.thinkingBlocks;
+        reply.usage = r.usage;
+        reply.hasUsage = r.usage != TokenUsage.init;
+        reply.durationMs = since(swStart).total!"msecs";
+        reply.temperature = tr.describe;
+        // Only when a level is sent or set somewhere, so logs without
+        // thinking levels stay unchanged.
+        if (th.effective != Thinking.init || th.source != ThinkingSource.global)
+            reply.thinkingLevel = th.describe;
+        const cut = r.stopReason == "length" || r.stopReason == "max_tokens";
+        reply.stopReason = r.toolCalls.length ? "tool_use" : cut ? "max_tokens" : "end_turn";
+        push(reply);
+        if (r.content.length || r.reasoning.length) ev.assistantMessage(r.content, r.reasoning);
+        return Event(Replied(r.content, cut, r.toolCalls.length, r.usage.outputTokens, control.hasSteers,
+            control.isCancelled));
+    }
+
+    /// Run a reply's tool calls in order, each result pushed as it lands.
+    /// The loop detector's hard stop sets `loopStop` and skips the rest.
+    private Event runToolCalls(const ref LLMResponse r, AgentEvents ev, ref string loopStop)
+    {
+        loopStop = null;
+        foreach (call; r.toolCalls)
+        {
+            ev.toolStart(call);
+            bool isError = true;
+            string result;
+            Attachment[] attachments;
+            bool dispatched;
+            JSONValue effectiveArgs;
+            auto recallBefore = recallState.dup;
+            auto notesBefore = recallTurnNotes;
+            if (control.isCancelled) result = cancelledToolResult;
+            else if (loopStop !is null) result = loopStoppedToolResult;
+            else
+            {
+                {
+                    import nano.tools : setSpillDir, spillDirFor, truncateOutput;
+                    // Cut outputs are kept beside a persisted session's log.
+                    setSpillDir(log.match!(l => spillDirFor(l.path), () => string.init));
+                    result = runTool(call, r.stopReason, isError, dispatched, effectiveArgs);
+                    // bash, read_file and history_read bound their own output.
+                    if (call.name != "bash" && call.name != "read_file" && call.name != hist.readTool
+                        && call.name != "load_skill")
+                        result = truncateOutput(result, toolOutputLimit,
+                            format("tool-%s-%s", safeName(call.id), safeName(call.name)));
+                }
+                // A successful edit marks the tree unchecked; a bash call
+                // that started (even one exiting non-zero) is the check.
+                if (!isError && (call.name == "write_file" || call.name == "edit_file")) editsSinceCheck = true;
+                else if (dispatched && !isError && call.name == "bash") editsSinceCheck = false;
+                if (call.name == "read_file") result = imageResult(result, isError, attachments);
+                // Deeper instruction files and scoped rules attach to the first
+                // file-tool result that touches a matching path.
+                if (!isError && (call.name == "read_file" || call.name == "write_file" || call.name == "edit_file"))
+                    if (auto p = "path" in call.arguments)
+                        if (p.type == JSONType.string)
+                        {
+                            import std.file : getcwd;
+                            instructions.ifSome((ProjectInstructions pi) {
+                                if (auto nested = pi.nestedFor(p.str, getcwd())) result ~= nested;
+                            });
+                        }
+                // Memory recall (Rust #167): a note for each memory whose
+                // anchors appear in this call's arguments and whose full
+                // text is not already in context. Only calls that ran.
+                if (dispatched)
+                    foreach (note; recallMemories(call.name, effectiveArgs, !isError, result))
+                        result ~= "\n\n" ~ wrap(note);
+                if (hist.isHistoryTool(call.name)) historyHintPending = false;
+                else if (historyHintPending && historyEnabled && hist.looksFailed(call.name, !isError, result))
+                {
+                    historyHintPending = false;
+                    result ~= "\n\n" ~ hist.failedToolHint;
+                }
+                if (remindersEnabled) result ~= remind(call, !isError, result, loopStop);
+            }
+            ev.toolEnd(call, toolResultDisplay(result, attachments), isError);
+            auto msg = Message.toolResult(call.id, call.name, result, isError);
+            msg.attachments = attachments;
+            // Commit this call's recall changes only once the result
+            // carrying their notes is durable: a failed append rolls them
+            // back, so a resume never treats unseen notes as seen.
+            try push(msg);
+            catch (Exception e)
+            {
+                recallState = recallBefore;
+                recallTurnNotes = notesBefore;
+                throw e;
+            }
+            if (recallState != recallBefore) recallChanged();
+        }
+        return Event(ToolsRan(loopStop !is null, hasReported, reported.response, control.isCancelled));
     }
 
     /// System reminders for one finished call: plan/memory nudges and the
@@ -948,8 +885,7 @@ class Agent
         if (v.warning) extra ~= "\n\n" ~ wrap(v.text);
         else if (v.hardStop)
         {
-            extra ~= "\n\n" ~ wrap("This call already ran, but it has repeated too many times: the turn is ending "
-                    ~ "as blocked and any further retries are being stopped. Do not retry it.");
+            extra ~= "\n\n" ~ wrap(loopHardStopNote);
             loopStop = v.text;
         }
         return extra;
@@ -2886,12 +2822,6 @@ unittest
     assert(dirEntries(buildPath(dir, "sess-x.spill"), SpanMode.shallow).array.length == 1);
 }
 
-/// Continuations asked for after replies cut off at the output-token limit, per turn.
-enum maxTruncatedContinuations = 3;
-/// Replies re-requested in one step after the connection dropped mid-stream.
-enum maxStreamRestarts = 10;
-
-/// The nudge after a reply cut off at the output-token limit (Rust's wording).
 /// The stop reason a log records by value (`max_tokens`); unknown: end_turn.
 StopReason stopReasonFrom(string value) @safe pure nothrow
 {
@@ -2901,7 +2831,9 @@ StopReason stopReasonFrom(string value) @safe pure nothrow
     return StopReason.endTurn;
 }
 
-/// A stop reason meaning the reply was cut off at the output-token limit.
+/// The note appended to a tool result when the loop detector ends the turn.
+enum string loopHardStopNote = "This call already ran, but it has repeated too many times: the turn is ending "
+    ~ "as blocked and any further retries are being stopped. Do not retry it.";
 
 /// The reminder asking the model to continue a cut-off reply.
 Message continuationReminder(long completionTokens) pure
