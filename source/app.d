@@ -2050,12 +2050,8 @@ int runMain(string[] args)
         const sameText = instructionsDir == cwd && text(fresh) == text(instructions);
         if (sameText && freshRules == instructionRules)
         {
-            // Nested files that attached: compare against a second, spare
-            // discovery, so `fresh` can still attach them if they changed.
-            bool nested;
-            foreach (old; instructions)
-                foreach (probe; discoverInstructions(cfg, cwd)) nested = old.nestedChanged(probe);
-            if (!nested) return false;
+            // Nested directories searched for tool calls, read again.
+            if (!instructions.match!(pi => pi.nestedChanged, () => false)) return false;
         }
         instructionsDir = cwd;
         instructions = fresh;

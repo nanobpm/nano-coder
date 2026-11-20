@@ -569,9 +569,7 @@ class ProjectInstructions
         }
         foreach (n; localFiles) load(buildPath(dir, n), Kind.local, null, false, 0, false, null);
         currentSearchDir = null;
-        string digest;
-        foreach (f; loaded[start .. $]) digest ~= f.path ~ "\0" ~ f.text ~ "\0";
-        found[dir] = digest;
+        found[dir] = dirDigest(dir);
         return [start, loaded.length];
     }
 
@@ -856,6 +854,7 @@ class ProjectInstructions
         loaded = kept;
         nestedAttached = null;
         foreach (ref r; scoped) r.attached = false;
+        foreach (d; found.keys) if (d !in initial) found.remove(d);
     }
 
     /// What the rules scoped with `paths:` say, imports included, which
@@ -894,17 +893,43 @@ class ProjectInstructions
         return out_;
     }
 
-    /// Whether a directory whose files attached to a tool result reads
-    /// differently now (a file edited, added or removed, imports included).
-    /// `probe` is a fresh discovery for the same directory, spent on the check.
-    bool nestedChanged(ProjectInstructions probe)
+    /// What `dir`'s instruction files say on disk now, imports included: read
+    /// apart from `seen` and pending state, so identical files compare equal.
+    private string dirDigest(string dir)
+    {
+        const warned = warnings.length; // a probe, not a load
+        scope (exit) warnings = warnings[0 .. warned];
+        string out_;
+        bool[string] visited;
+        void file(string path, Kind kind, size_t depth)
+        {
+            auto text = readCapped(path);
+            out_ ~= path ~ "\0" ~ text ~ "\0";
+            if (text is null || depth >= maxImportDepth || !expandsImports(path, kind)) return;
+            foreach (r; importRefs(text))
+            {
+                auto target = resolveImport(path, r, false);
+                if (target is null || canonOr(target) in visited) continue;
+                visited[canonOr(target)] = true;
+                file(target, Kind.imported, depth + 1);
+            }
+        }
+        foreach (n; options.names)
+        {
+            auto path = buildPath(dir, n);
+            if (readCapped(path) !is null) { file(path, Kind.project, 0); break; }
+        }
+        foreach (n; localFiles) file(buildPath(dir, n), Kind.local, 0);
+        return out_;
+    }
+
+    /// Whether a directory searched for a tool call (attached, deferred or
+    /// empty) reads differently now: a file edited, added or removed,
+    /// imports included.
+    bool nestedChanged()
     {
         foreach (d, digest; found)
-        {
-            if (d in initial || d !in searched) continue;
-            probe.search(d);
-            if (probe.found.get(d, null) != digest) return true;
-        }
+            if (d !in initial && dirDigest(d) != digest) return true;
         return false;
     }
 
@@ -1188,15 +1213,26 @@ unittest // the scoped-rule fingerprint sees rule and import edits
     put(buildPath(root, "pkg/AGENTS.md"), "pkg rule");
     auto withNested = find(root);
     assert(withNested.nestedFor(buildPath(root, "pkg/x"), root).canFind("pkg rule"));
-    assert(!withNested.nestedChanged(find(root)));
+    assert(!withNested.nestedChanged());
     put(buildPath(root, "pkg/AGENTS.md"), "pkg rule, revised");
-    assert(withNested.nestedChanged(find(root)));
+    assert(withNested.nestedChanged());
+    // A file a scoped rule imported first is not a change when its directory is searched.
+    put(buildPath(root, ".claude/rules/s.md"), "---\npaths: \"s/**\"\n---\nsee @../../pkg/AGENTS.md");
+    auto shared_ = find(root);
+    assert(shared_.nestedFor(buildPath(root, "s/x"), root).canFind("pkg rule, revised"));
+    shared_.nestedFor(buildPath(root, "pkg/x"), root);
+    assert(!shared_.nestedChanged());
+    // Compaction drops the snapshots with the attachments.
+    put(buildPath(root, "pkg/AGENTS.md"), "pkg rule, third");
+    assert(shared_.nestedChanged());
+    shared_.forgetNested();
+    assert(!shared_.nestedChanged());
     // A file added where a search found nothing is seen too.
     auto empty = find(root);
     assert(empty.nestedFor(buildPath(root, "none/x"), root) is null);
-    assert(!empty.nestedChanged(find(root)));
+    assert(!empty.nestedChanged());
     put(buildPath(root, "none/AGENTS.md"), "new here");
-    assert(empty.nestedChanged(find(root)));
+    assert(empty.nestedChanged());
     // A fresh discovery attaches the current text.
     assert(find(root).nestedFor(buildPath(root, "a/x"), root).canFind("rule a, revised"));
 }
