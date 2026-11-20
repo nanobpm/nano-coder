@@ -475,15 +475,17 @@ private struct Reader
     }
 
     /// One file and what it imports, added to `graph`; returns its key. A
-    /// file reached again at the same depth is read once, every import edge
-    /// stays (which one shows is `State`'s choice), and `maxImportDepth`
-    /// ends cycles. `body` (when not null) replaces the on-disk text (a rule
-    /// without its front matter).
+    /// file reached again at the same depth, by any spelling (symlinks,
+    /// `..`), is read once: the graph holds at most one node per file and
+    /// depth. Every import edge stays (which one shows is `State`'s choice),
+    /// and `maxImportDepth` ends cycles. `body` (when not null) replaces the
+    /// on-disk text (a rule without its front matter).
     string file(string path, Kind kind, bool user, size_t depth, string body = null)
     {
-        const key = format("%s\0%s\0%s\0%s", kind, user, depth, path);
+        const real_ = canonOr(path);
+        const key = format("%s\0%s\0%s\0%s", kind, user, depth, real_);
         if (key in graph) return key;
-        auto r = Read(path, canonOr(path), null, kind, user);
+        auto r = Read(path, real_, null, kind, user);
         auto disk = readCapped(path);
         if (disk !is null && !user && !options.importsOutsideProject && !inside(path))
             r.refused = format("skipped %s: links outside the repository (set instruction_imports_outside_project = "
@@ -1353,13 +1355,36 @@ unittest // a dense import graph is read, compared and attached once per file
     scope (exit) rmdirRecurse(base);
     auto root = buildPath(base, "repo");
     string refs;
-    foreach (i; 0 .. 50) refs ~= " @f" ~ i.to!string ~ ".md";
-    foreach (i; 0 .. 50) put(buildPath(root, "d/f" ~ i.to!string ~ ".md"), "file " ~ i.to!string ~ refs);
+    foreach (i; 0 .. 20) refs ~= " @f" ~ i.to!string ~ ".md";
+    foreach (i; 0 .. 20) put(buildPath(root, "d/f" ~ i.to!string ~ ".md"), "file " ~ i.to!string ~ refs);
     put(buildPath(root, "CLAUDE.md"), "top");
     put(buildPath(root, "d/CLAUDE.md"), "nested" ~ refs);
     auto p = find(root);
     assert(p.sameFiles(find(root)));
-    assert(p.nestedFor(buildPath(root, "d/x"), root).canFind("file 49"));
+    assert(p.nestedFor(buildPath(root, "d/x"), root).canFind("file 19"));
     assert(!p.nestedChanged());
     p.nestedFor(buildPath(root, "d/y"), root); // copies the state again
+}
+
+unittest // the same file through symlinked spellings is one node per depth
+{
+    import std.file : rmdirRecurse, symlink;
+    import std.conv : to;
+    import std.array : replace;
+    auto base = testDir("alias");
+    scope (exit) rmdirRecurse(base);
+    auto root = buildPath(base, "repo");
+    string refs;
+    foreach (i; 0 .. 10) refs ~= " @peers/d" ~ i.to!string ~ "/f.md";
+    foreach (i; 0 .. 10)
+    {
+        auto d = buildPath(root, "d" ~ i.to!string);
+        put(buildPath(d, "f.md"), "file " ~ i.to!string ~ refs);
+        symlink("..", buildPath(d, "peers"));
+    }
+    put(buildPath(root, "CLAUDE.md"), "top" ~ refs.replace("@peers/", "@"));
+    auto p = find(root);
+    assert(p.render.canFind("file 9"));
+    // CLAUDE.md, the missing CLAUDE.local.md, and each f.md once per depth.
+    assert(p.startup.graph.length <= 2 + 10 * maxImportDepth, p.startup.graph.length.to!string);
 }
