@@ -118,7 +118,10 @@ jobs:
       - name: Linux build dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y -qq libcurl4-openssl-dev zlib1g-dev
+      # Same time-limit scale as scripts/ci.sh on CI: shared runners are slower.
       - run: dub test
+        env:
+          NANO_TEST_BUDGET_SCALE: 3
       - run: dub build -b release
       - name: Smoke test
         run: ./nano-coder --version | grep -Fx "nano-coder ${{ needs.release.outputs.version }}"
