@@ -82,7 +82,8 @@ private string[] checkWeak(alias P, string name)(string path)
     import std.traits : Parameters, ParameterStorageClass, ParameterStorageClassTuple, hasAliasing,
         isMutable;
     string[] found;
-    static if (name.length >= 2 && name[0 .. 2] == "__") {}
+    // Constructors take arguments too; other `__` names are compiler-generated.
+    static if (name.length >= 2 && name[0 .. 2] == "__" && name != "__ctor") {}
     else static if ((is(__traits(getMember, P, name) == struct) || is(__traits(getMember, P, name) == class))
         && __traits(getVisibility, __traits(getMember, P, name)) == "private") {} // inside a pure entry point
     else static if (is(__traits(getMember, P, name) == struct) || is(__traits(getMember, P, name) == class))
@@ -172,6 +173,9 @@ private struct Holder { int[] xs; }
 private void weakField(Holder h) pure { }
 private int strongConst(const int[] xs, const(int)* p, const Holder h) pure { return 0; }
 private int strongValue(int x, string s, immutable(int)[] xs, const ref Holder h) pure { return x; }
+/// A constructor that changes its argument (package, so the private-struct
+/// exemption doesn't hide it).
+package struct CtorProbe { int n; this(ref int x) pure { n = x++; } }
 private struct Counter { int n; void bump() pure { n++; } } // a method may update its own struct
 
 private int freePure() pure { return 0; }
@@ -183,7 +187,7 @@ unittest
     static assert(impureFunctions!(nano.pureaudit)() == ["pureaudit.Probe.get", "pureaudit.Probe.Inner.touch", "pureaudit.Probe.__ctor",
         "pureaudit.Probe.__postblit", "pureaudit.Probe.__dtor", "pureaudit.Probe.opAssign"]);
     static assert(weaklyPureFunctions!(nano.pureaudit)() == ["pureaudit.weakRef", "pureaudit.weakOut",
-        "pureaudit.weakSlice", "pureaudit.weakPointer", "pureaudit.weakField"]);
+        "pureaudit.weakSlice", "pureaudit.weakPointer", "pureaudit.weakField", "pureaudit.CtorProbe.__ctor"]);
     static assert(reachesMutable!(int[]) && reachesMutable!(int*) && reachesMutable!Holder && reachesMutable!(int[string]));
     static assert(!reachesMutable!(const(int)[]) && !reachesMutable!string && !reachesMutable!(const Holder)
         && !reachesMutable!int && !reachesMutable!(int delegate() pure));

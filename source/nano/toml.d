@@ -30,6 +30,8 @@ Result!(JSONValue, string) parseToml(string src) pure
     auto p = Parser(src);
     try return R.ok(p.document());
     catch (TomlException e) return R.err(e.msg);
+    // A tree operation the parser didn't check first; still a bad document.
+    catch (JSONException e) return R.err(format("config line %s: %s", p.line, e.msg));
 }
 
 private struct Parser
@@ -153,9 +155,15 @@ private struct Parser
 
     /// `t.a.b.c = v` for the dotted key `path` of an inline table, creating
     /// the intermediate tables.
-    static void setDotted(ref JSONValue t, string[] path, JSONValue v) pure
+    void setDotted(ref JSONValue t, string[] path, JSONValue v) pure
     {
-        if (path.length == 1) { t[path[0]] = v; return; }
+        if (t.type != JSONType.object) fail("key " ~ path[0] ~ " is inside a value that isn't a table");
+        if (path.length == 1)
+        {
+            if (path[0] in t) fail("duplicate key " ~ path[0]);
+            t[path[0]] = v;
+            return;
+        }
         if (path[0] !in t) t[path[0]] = JSONValue(string[string].init);
         setDotted(t[path[0]], path[1 .. $], v);
     }
@@ -435,6 +443,10 @@ unittest
     assert(doc["rules"].arrayNoRef.length == 2 && doc["rules"][1]["name"].str == "b");
     bool threw;
     threw = parseToml("x = 1\nx = 2\n").isErr;
+    // Inline tables: a dotted key under a non-table, or a repeated key, is an error.
+    assert(parseToml("x = { a = 1, a.b = 2 }").isErr);
+    assert(parseToml("x = { a = 1, a = 2 }").isErr);
+    assert(parseToml("x = { a.b = 1, a.c = 2 }").unwrap("valid TOML")["x"]["a"]["c"].integer == 2);
     // Bad escapes are errors, not exceptions escaping the Result.
     assert(parseToml("x = \"\\uZZZZ\"").isErr);
     assert(parseToml("x = \"\\uD800\"").isErr);
