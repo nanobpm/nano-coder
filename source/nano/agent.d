@@ -7,6 +7,7 @@ import nano.safeio : jsonText, jsonPretty;
 import nano.clock : monoNow, since, sleepFor, stdTimeNow, wallNow;
 import nano.arith : checkedMul, checkedSub, saturatingSub;
 import nano.option : Option, some, none, match, ifSome, orElse, unwrap, NotNull;
+import nano.result : orThrow, toOption;
 
 import nano.safeio : Isolated, JoinHandle, spawnDaemon, stdErr, stdOut;
 
@@ -250,13 +251,13 @@ class Agent
             foreach_reverse (ref c; m.toolCalls)
                 if (c.name == outcomeToolName)
                 {
-                    try
+                    // Malformed outcome arguments are not a recorded outcome: keep scanning.
+                    foreach (o; Outcome.fromArgs(c.arguments).toOption)
                     {
-                        lastOutcome = Outcome.fromArgs(c.arguments);
+                        lastOutcome = o;
                         hasOutcome = true;
                         return true;
                     }
-                    catch (Exception) {} // malformed outcome arguments: not a recorded outcome, keep scanning
                 }
         return false;
     }
@@ -346,8 +347,10 @@ class Agent
                 auto st = givenId in completedStops;
                 lastStop = st is null ? StopReason.endTurn : stopReasonFrom(*st);
                 auto oc = givenId in completedOutcomes;
-                hasOutcome = oc !is null;
-                if (hasOutcome) lastOutcome = Outcome.fromArgs(*oc);
+                // A recorded outcome that no longer parses is treated as none.
+                auto recorded = oc is null ? Option!Outcome.init : Outcome.fromArgs(*oc).toOption;
+                hasOutcome = recorded.isSome;
+                foreach (o; recorded) lastOutcome = o;
                 return *done;
             }
         // Every input carries an id; the log pairs it with a turn_end record,
@@ -640,9 +643,9 @@ class Agent
             applyModelRequest();
             if (auto level = control.takeThinkingRequest())
             {
-                import nano.thinking : setSession;
+                import nano.thinking : sessionSetting;
                 // Checked when it was typed, so this can't fail.
-                try setSession(sessionThinking, level);
+                try sessionThinking = sessionSetting(level);
                 catch (Exception) {} // the level was validated when typed, so this can't fail
             }
             LLMResponse r;
@@ -1483,8 +1486,10 @@ class Agent
         {
             auto clipTo = window / 8 > 1_000 ? window / 8 : 1_000;
             foreach (ref x; next[bodyStart + 1 .. $])
-                if (x.role == Role.tool && ctx.clipMessage(x, clipTo) && smart && x.logLine)
-                    x.content ~= format("\n[clipped at compaction; history_read #%s has it whole]", x.logLine);
+                if (x.role == Role.tool)
+                    foreach (c; ctx.clippedContent(x, clipTo))
+                        x.content = smart && x.logLine
+                            ? c ~ format("\n[clipped at compaction; history_read #%s has it whole]", x.logLine) : c;
         }
         messages = next;
         calibLen = 0;
@@ -1610,7 +1615,7 @@ class Agent
         {
             if (isOutcome)
             {
-                auto o = Outcome.fromArgs(args);
+                auto o = Outcome.fromArgs(args).orThrow!(e => new OutcomeError(e));
                 // Verify-before-complete (Rust #158): `completed` after an
                 // edit with no later bash check is bounced once per turn.
                 if (verifyBeforeComplete && o.status == OutcomeStatus.completed && editsSinceCheck && !verifyReminderFired)

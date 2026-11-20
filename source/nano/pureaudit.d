@@ -57,6 +57,69 @@ private string[] check(alias P, string name)(string path)
     return found;
 }
 
+/// Functions of module `M` (as `impureFunctions` walks them) that are only
+/// weakly pure: a parameter (`ref`, `out`, or a type reaching mutable
+/// memory) lets a call change what the caller passed. A method may still
+/// update its own struct. Results and errors come back as return values
+/// (`Option`, `Result`, a new value) instead.
+string[] weaklyPureFunctions(alias M)()
+{
+    string[] found;
+    static foreach (name; __traits(allMembers, M))
+    {{
+        static if (__traits(compiles, __traits(getMember, M, name)))
+        {
+            alias S = __traits(getMember, M, name);
+            static if (__traits(compiles, __traits(parent, S)) && __traits(isSame, __traits(parent, S), M))
+                found ~= checkWeak!(M, name)(M.stringof[7 .. $]);
+        }
+    }}
+    return found;
+}
+
+private string[] checkWeak(alias P, string name)(string path)
+{
+    import std.traits : Parameters, ParameterStorageClass, ParameterStorageClassTuple, hasAliasing,
+        isMutable;
+    string[] found;
+    static if (name.length >= 2 && name[0 .. 2] == "__") {}
+    else static if ((is(__traits(getMember, P, name) == struct) || is(__traits(getMember, P, name) == class))
+        && __traits(getVisibility, __traits(getMember, P, name)) == "private") {} // inside a pure entry point
+    else static if (is(__traits(getMember, P, name) == struct) || is(__traits(getMember, P, name) == class))
+    {
+        alias A = __traits(getMember, P, name);
+        static foreach (m; __traits(allMembers, A))
+        {{
+            static if (__traits(compiles, __traits(getMember, A, m)))
+            {
+                static if (__traits(compiles, __traits(parent, __traits(getMember, A, m)))
+                    && __traits(isSame, __traits(parent, __traits(getMember, A, m)), A))
+                    found ~= checkWeak!(A, m)(path ~ "." ~ name);
+            }
+        }}
+    }
+    else
+    {
+        static foreach (f; __traits(getOverloads, P, name))
+        {{
+            static if (isSomeFunction!f && (functionAttributes!f & FunctionAttribute.pure_))
+            {
+                bool weak; // a method may update its own struct (`this`): parsers and state machines do
+                alias stc = ParameterStorageClassTuple!f;
+                static foreach (i, T; Parameters!f)
+                {
+                    static if ((stc[i] & (ParameterStorageClass.ref_ | ParameterStorageClass.out_)) && isMutable!T)
+                        weak = true;
+                    else static if (hasAliasing!T && isMutable!T && !__traits(compiles, { immutable(T) x = T.init; }))
+                        weak = true;
+                }
+                if (weak) found ~= path ~ "." ~ name;
+            }
+        }}
+    }
+    return found;
+}
+
 private struct Probe
 {
     int n;

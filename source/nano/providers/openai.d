@@ -16,7 +16,7 @@ import std.array : join;
 import nano.llm;
 import nano.http;
 import nano.config;
-import nano.thinking : applyChat, applyAnthropic;
+import nano.thinking : chatFields;
 
 class OpenAIClient : LLMClient, CapabilityProbe, KindedClient
 {
@@ -63,7 +63,7 @@ class OpenAIClient : LLMClient, CapabilityProbe, KindedClient
             b["stream"] = true;
             b["stream_options"] = ["include_usage": true];
         }
-        applyChat(req.thinking, b);
+        foreach (k, v; chatFields(req.thinking)) b[k] = v;
         p.config.finishBody(b);
         return b;
     }

@@ -64,8 +64,8 @@ unittest
     ModelSettings ms;
     ms.vision = Nullable!bool(true);
     p.models["m"] = ms;
-    Source s;
-    assert(configuredOverride(Nullable!bool.init, p, "m", s).get == true && s == Source.model);
-    assert(configuredOverride(Nullable!bool.init, p, "other", s).get == false && s == Source.provider);
-    assert(configuredOverride(Nullable!bool(true), plain, "m", s).get == true && s == Source.global);
+    assert(configuredOverride(Nullable!bool.init, p, "m") == Override(Nullable!bool(true), Source.model));
+    assert(configuredOverride(Nullable!bool.init, p, "other") == Override(Nullable!bool(false), Source.provider));
+    assert(configuredOverride(Nullable!bool(true), plain, "m") == Override(Nullable!bool(true), Source.global));
+    assert(configuredOverride(Nullable!bool.init, plain, "m").source == Source.detected);
 }

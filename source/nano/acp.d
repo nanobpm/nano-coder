@@ -39,7 +39,7 @@ enum int protocolVersion = 1;
 
 import nano.paths : debugQuote;
 import nano.commands : isCommand;
-import nano.thinking : wireValue, setSession, label;
+import nano.thinking : wireValue, sessionSetting, label;
 import nano.temperature : label;
 import std.array : join;
 
@@ -660,7 +660,7 @@ final class AcpServer : AgentEvents
             auto arg = text["/thinking".length .. $].strip;
             if (arg.length)
             {
-                try setSession(agent.sessionThinking, arg);
+                try agent.sessionThinking = sessionSetting(arg);
                 catch (Exception e) return rpcError(id, -32602, e.msg);
             }
             auto th = agent.thinking();

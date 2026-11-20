@@ -418,9 +418,9 @@ string midTurnCommand(string text, MidTurn ctx)
             if (name == "/thinking")
             {
                 import std.typecons : Nullable;
-                import nano.thinking : Thinking, setSession;
+                import nano.thinking : Thinking, sessionSetting;
                 Nullable!Thinking check;
-                try setSession(check, arg);
+                try check = sessionSetting(arg);
                 catch (Exception e) return format("[thinking: %s]", e.msg);
                 control.requestThinking(arg);
                 auto shown = check.isNull ? "the config level" : check.get.toString;
@@ -1837,8 +1837,8 @@ int runMain(string[] args)
     agent.autoCompactThreshold = cfg.autoCompactThreshold;
     {
         import nano.context : parseCompactionMode;
-        if (!parseCompactionMode(cfg.compactionMode, agent.compactionMode))
-            die(`compaction_mode must be "standard" or "smart", got "` ~ cfg.compactionMode ~ `"`);
+        agent.compactionMode = parseCompactionMode(cfg.compactionMode).match!(m => m, () => die(
+            `compaction_mode must be "standard" or "smart", got "` ~ cfg.compactionMode ~ `"`));
     }
     bool compactingByHand;
     agent.onCompacted = (ref const CompactReport r) {
@@ -2538,10 +2538,10 @@ int runMain(string[] args)
                     continue;
                 }
                 case "/thinking":
-                    import nano.thinking : statusText, setSession;
+                    import nano.thinking : statusText, sessionSetting;
                     if (arg.length)
                     {
-                        try setSession(agent.sessionThinking, arg);
+                        try agent.sessionThinking = sessionSetting(arg);
                         catch (Exception e) { writeln(e.msg); continue; }
                         auto r = agent.thinking();
                         writeln("Thinking set to ", r.describe);

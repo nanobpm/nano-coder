@@ -20,6 +20,7 @@ static import std.format;
 import std.json;
 import std.string : strip, toLower, indexOf, startsWith, lastIndexOf;
 import std.typecons : Nullable;
+import nano.option : Option, unwrap;
 import nano.config : ProviderConfig, ProviderKind;
 
 /// Named levels from least to most thinking.
@@ -162,32 +163,37 @@ private uint minorOf(string s) pure
     return 0;
 }
 
-/// `(family, major, minor)` of a Claude id: `claude-sonnet-4-5-20250929` is
-/// sonnet 4.5, `claude-3-7-sonnet-latest` sonnet 3.7.
-bool claudeVersion(string id, out string family, out uint major, out uint minor) pure
+/// A Claude model's family and version.
+struct ClaudeVersion
 {
+    string family;
+    uint major, minor;
+}
+
+/// The family and version of a Claude id: `claude-sonnet-4-5-20250929` is
+/// sonnet 4.5, `claude-3-7-sonnet-latest` sonnet 3.7.
+Option!ClaudeVersion claudeVersion(string id) pure
+{
+    import nano.option : some;
+    alias R = Option!ClaudeVersion;
     auto at = id.indexOf("claude-");
-    if (at < 0) return false;
+    if (at < 0) return R.init;
     auto rest = id[at + 7 .. $];
+    uint major;
     foreach (f; ["opus", "sonnet", "haiku", "fable"])
     {
         if (rest.startsWith(f ~ "-"))
         {
             string tail;
             if (number(rest[f.length + 1 .. $], major, tail))
-            {
-                family = f;
-                minor = minorOf(tail);
-                return true;
-            }
+                return some(ClaudeVersion(f, major, minorOf(tail)));
         }
     }
     string tail;
-    if (!number(rest, major, tail)) return false;
-    minor = minorOf(tail);
+    if (!number(rest, major, tail)) return R.init;
     foreach (f; ["opus", "sonnet", "haiku"])
-        if (tail.canFind(f)) { family = f; return true; }
-    return false;
+        if (tail.canFind(f)) return some(ClaudeVersion(f, major, minorOf(tail)));
+    return R.init;
 }
 
 /// `(major, minor)` of `gpt-<major>[.<minor>]` with the prefix stripped.
@@ -213,10 +219,13 @@ Nullable!Profile builtin(string model) pure
     alias A = AnthropicStyle;
     Nullable!Profile none;
     auto id = model.toLower;
-    string family; uint major, minor;
-    if (claudeVersion(id, family, major, minor))
+    uint major, minor;
+    auto claude = claudeVersion(id);
+    if (claude.isSome)
     {
-        auto v = major * 100 + minor;
+        auto cv = claude.unwrap("isSome");
+        auto family = cv.family;
+        auto v = cv.major * 100 + cv.minor;
         immutable full = ["low", "medium", "high", "xhigh", "max"];
         if (family == "fable") return Nullable!Profile(profile(full.dup, true));
         if ((family == "opus" || family == "sonnet") && v >= 505) return Nullable!Profile(profile(full.dup, true));
@@ -508,12 +517,11 @@ string statusText(const ref Resolved r, string model) pure
     return out_.join("\n");
 }
 
-/// Apply a `/thinking ARG` (`reset` clears the session level).
-void setSession(ref Nullable!Thinking session, string arg) pure
+/// The session level after `/thinking ARG` (`reset` clears it).
+Nullable!Thinking sessionSetting(string arg) pure
 {
     arg = arg.strip;
-    if (arg.toLower == "reset") session.nullify;
-    else session = Thinking.parse(arg);
+    return arg.toLower == "reset" ? Nullable!Thinking.init : Nullable!Thinking(Thinking.parse(arg));
 }
 
 /// The level in `levels` nearest to `wanted`: the highest at or below it on
@@ -675,48 +683,51 @@ Resolved resolve(const Thinking global, scope const(Thinking)* session, Provider
     return r;
 }
 
-/// Write `req` into a Chat Completions body.
-void applyChat(const Request req, ref JSONValue body) pure
+/// The Chat Completions body fields for `req`.
+JSONValue[string] chatFields(const Request req) pure
 {
     alias K = Request.Kind;
     final switch (req.kind)
     {
-        case K.effort: body["reasoning_effort"] = req.level; break;
-        case K.off: body["reasoning_effort"] = "none"; break;
-        case K.templateSwitch: body["chat_template_kwargs"] = JSONValue(["enable_thinking": JSONValue(req.on)]); break;
-        case K.templateEffort: body["chat_template_kwargs"] = JSONValue(["reasoning_effort": JSONValue(req.level)]); break;
-        case K.budget, K.adaptiveOn, K.none: break;
+        case K.effort: return ["reasoning_effort": JSONValue(req.level)];
+        case K.off: return ["reasoning_effort": JSONValue("none")];
+        case K.templateSwitch: return ["chat_template_kwargs": JSONValue(["enable_thinking": JSONValue(req.on)])];
+        case K.templateEffort: return ["chat_template_kwargs": JSONValue(["reasoning_effort": JSONValue(req.level)])];
+        case K.budget, K.adaptiveOn, K.none: return null;
     }
 }
 
-/// Write `req` into an Anthropic Messages body; returns whether thinking is on
-/// (which rules out a custom temperature).
 /// `max_tokens` the Anthropic client sends when none is configured (as Rust).
 enum anthropicDefaultMaxTokens = 8192;
 
-bool applyAnthropic(const Request req, ref JSONValue body, long maxTokens) pure
+/// The Anthropic Messages body fields for `req`, and whether thinking is on
+/// (which rules out a custom temperature).
+struct AnthropicThinking
+{
+    JSONValue[string] fields;
+    bool on;
+}
+
+/// ditto
+AnthropicThinking anthropicFields(const Request req, long maxTokens) pure
 {
     alias K = Request.Kind;
+    alias A = AnthropicThinking;
     final switch (req.kind)
     {
         case K.effort:
-            body["thinking"] = JSONValue(["type": "adaptive"]);
-            body["output_config"] = JSONValue(["effort": req.level]);
-            return true;
+            return A(["thinking": JSONValue(["type": "adaptive"]), "output_config": JSONValue(["effort": req.level])], true);
         case K.adaptiveOn:
-            body["thinking"] = JSONValue(["type": "adaptive"]);
-            return true;
+            return A(["thinking": JSONValue(["type": "adaptive"])], true);
         case K.budget:
             auto b = cappedBudget(req.budget, maxTokens);
-            if (!b) return false;
+            if (!b) return A.init;
             JSONValue t = ["type": "enabled"];
             t["budget_tokens"] = cast(long) b;
-            body["thinking"] = t;
-            return true;
+            return A(["thinking": t], true);
         case K.off:
-            body["thinking"] = JSONValue(["type": "disabled"]);
-            return false;
-        case K.templateSwitch, K.templateEffort, K.none: return false;
+            return A(["thinking": JSONValue(["type": "disabled"])], false);
+        case K.templateSwitch, K.templateEffort, K.none: return A.init;
     }
 }
 
@@ -899,20 +910,15 @@ unittest
 {
     assert(budgetTokens("custom") == 16384);
     assert(cappedBudget(16384, 4096) == 4095 && cappedBudget(16384, 1000) == 0 && cappedBudget(2048, 64000) == 2048);
-    JSONValue b = parseJSON("{}");
-    assert(applyAnthropic(Request(Request.Kind.budget, null, 16384), b, 4096));
-    assert(b["thinking"]["budget_tokens"].integer == 4095);
-    b = parseJSON("{}");
-    assert(!applyAnthropic(Request(Request.Kind.budget, null, 16384), b, 1000) && "thinking" !in b);
-    b = parseJSON("{}");
-    assert(applyAnthropic(Request(Request.Kind.effort, "high"), b, 8000));
-    assert(b["thinking"]["type"].str == "adaptive" && b["output_config"]["effort"].str == "high");
-    b = parseJSON("{}");
-    applyChat(Request(Request.Kind.off), b);
-    assert(b["reasoning_effort"].str == "none");
-    b = parseJSON("{}");
-    applyChat(Request(Request.Kind.templateSwitch, null, 0, false), b);
-    assert(b["chat_template_kwargs"]["enable_thinking"].boolean == false);
+    auto a = anthropicFields(Request(Request.Kind.budget, null, 16384), 4096);
+    assert(a.on && a.fields["thinking"]["budget_tokens"].integer == 4095);
+    a = anthropicFields(Request(Request.Kind.budget, null, 16384), 1000);
+    assert(!a.on && "thinking" !in a.fields);
+    a = anthropicFields(Request(Request.Kind.effort, "high"), 8000);
+    assert(a.on && a.fields["thinking"]["type"].str == "adaptive" && a.fields["output_config"]["effort"].str == "high");
+    assert(chatFields(Request(Request.Kind.off))["reasoning_effort"].str == "none");
+    assert(chatFields(Request(Request.Kind.templateSwitch, null, 0, false))["chat_template_kwargs"]["enable_thinking"]
+        .boolean == false);
 }
 
 // rust: thinking.rs::reads_levels_from_ollama_and_llama_cpp
