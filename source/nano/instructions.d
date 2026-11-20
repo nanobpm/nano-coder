@@ -23,11 +23,12 @@ import std.regex : Regex, regex, matchFirst;
 import std.string : strip, stripLeft, stripRight, indexOf, lineSplitter, KeepTerminator;
 import std.uni : isWhite;
 import nano.paths : canonicalize, startsWithPath, isSymlink, homeDir;
+public import nano.instruction_state : InstructionFile, Kind, Options, maxTotalBytes;
+import nano.instruction_state : Graph, Read, DirRead, RuleRead, Source, Startup, State, begin, attach, forget, needsRead;
+static import st = nano.instruction_state;
 
 /// Per-file cap; longer files are truncated with a note.
 enum size_t maxFileBytes = 32 * 1024;
-/// Cap on everything added to the system prompt (and to one tool result).
-enum size_t maxTotalBytes = 64 * 1024;
 /// Imports nest at most this deep (Claude Code: four hops).
 enum size_t maxImportDepth = 4;
 /// Patterns one rule's `paths` may expand to (brace expansion).
@@ -40,50 +41,6 @@ immutable string[] defaultUserFiles = ["~/.claude/CLAUDE.md", "~/.agents/AGENTS.
 immutable string[] defaultUserRulesDirs = ["~/.claude/rules"];
 /// Project rules directory, relative to the git root.
 enum projectRulesDir = ".claude/rules";
-
-private enum omittedMarker = "\n\n[omitted: instruction size limit reached; read the remaining files with read_file]";
-
-/// Where a loaded file came from.
-enum Kind { user, project, local, rule, imported }
-
-struct InstructionFile
-{
-    string path, text;
-    Kind kind;
-    /// For `Kind.imported`: the file whose `@path` imported this one.
-    string importedBy;
-    /// From the user's own configuration rather than the repository.
-    bool user;
-    /// The directory whose search loaded this file (also via imports), or
-    /// null for user files loaded outside any directory search.
-    string searchDir;
-}
-
-/// What to load besides the per-directory project files.
-struct Options
-{
-    /// File names tried in each directory; the first that exists is used.
-    string[] names;
-    /// User instruction files (`~` already expanded); all that exist load.
-    string[] userFiles;
-    /// User rules directories.
-    string[] userRulesDirs;
-    /// Let imports in project files resolve outside the repository.
-    bool importsOutsideProject;
-
-    static Options project(const string[] names) pure { Options o; o.names = names.dup; return o; }
-}
-
-private struct ScopedRule
-{
-    string path;
-    /// The body alone; imports resolve when the rule attaches.
-    string body;
-    Regex!char[] patterns;
-    bool attached, user;
-    /// The whole file, front matter included: a changed rule attaches again.
-    string source;
-}
 
 /// The nearest ancestor (or `start`) holding `.git`, or null.
 string gitRoot(string start)
@@ -498,82 +455,18 @@ private string canonicalizeExisting(string path)
     }
 }
 
-/// The instruction files for one working directory.
-class ProjectInstructions
+/// Reads instruction files from disk into a `Graph`: imports resolved (and
+/// refused, with the warning, outside the repository unless allowed) and
+/// read too, down to `maxImportDepth`. Reading has no memory of what was
+/// shown; that is `State`'s job.
+private struct Reader
 {
-    /// Git root (or the working directory outside a repository).
-    string root;
+    string root, home;
     Options options;
-    /// Files in the system prompt, in order.
-    InstructionFile[] loaded;
-    /// Files skipped, with the reason (imports outside the repository, ...).
-    string[] warnings;
-    private bool[string] searched, initial, seen, initialSeen;
-    private string currentSearchDir;
-    private ScopedRule[] scoped;
-    /// Nested files already attached to a tool result by `nestedFor`.
-    private string[] nestedAttached;
-    /// What each directory search found (paths and texts, imports included),
-    /// so a re-read can tell when a directory reads differently.
-    private string[string] found;
+    /// What this reader has read, by key.
+    Graph graph;
 
-    /// Find the user's and the project's instruction files for `cwd`.
-    static ProjectInstructions discover(string cwd, Options options)
-    {
-        auto p = new ProjectInstructions;
-        cwd = canonOr(cwd);
-        p.root = gitRoot(cwd);
-        if (p.root is null) p.root = cwd;
-        p.options = options;
-        foreach (f; options.userFiles) p.load(f, Kind.user, null, true, 0, false, null);
-        foreach (d; options.userRulesDirs) p.loadRules(d, true);
-        string[] dirs;
-        for (auto d = cwd; startsWithPath(d, p.root);)
-        {
-            dirs = d ~ dirs;
-            auto up = d.dirName;
-            if (up == d) break;
-            d = up;
-        }
-        foreach (i, d; dirs)
-        {
-            p.search(d);
-            if (i == 0) p.loadRules(buildPath(p.root, projectRulesDir), false);
-        }
-        p.initial = p.searched.dup;
-        p.initialSeen = p.seen.dup;
-        return p;
-    }
-
-    /// Load one directory's files (the first of `names`, then the local
-    /// files); returns the range added to `loaded`.
-    private size_t[2] search(string dir)
-    {
-        if (dir in searched) return [loaded.length, loaded.length];
-        searched[dir] = true;
-        // Files deferred by an earlier budget overflow come back first.
-        InstructionFile[] pending, kept;
-        foreach (f; loaded) (f.searchDir !is null && f.searchDir == dir ? pending : kept) ~= f;
-        loaded = kept;
-        auto start = loaded.length;
-        loaded ~= pending;
-        currentSearchDir = dir;
-        foreach (n; options.names)
-        {
-            auto path = buildPath(dir, n);
-            if (readCapped(path) !is null)
-            {
-                load(path, Kind.project, null, false, 0, false, null);
-                break;
-            }
-        }
-        foreach (n; localFiles) load(buildPath(dir, n), Kind.local, null, false, 0, false, null);
-        currentSearchDir = null;
-        // The first snapshot stands until compaction: a deferred file keeps
-        // the text read then, so a retry must not hide a later edit.
-        if (dir !in found) found[dir] = dirDigest(dir);
-        return [start, loaded.length];
-    }
+    private string display(string path) { return st.display(path, root, home); }
 
     private bool inside(string path)
     {
@@ -581,62 +474,56 @@ class ProjectInstructions
         return real_ !is null && startsWithPath(real_, canonOr(root));
     }
 
-    /// Load one file (if it exists and is new) and, for Claude-format files,
-    /// its imports. `body` (when `hasBody`) replaces the on-disk text.
-    private void load(string path, Kind kind, string importedBy, bool user, size_t depth, bool hasBody, string body)
+    /// One file and what it imports, added to `graph`; returns its key. A
+    /// file reached again at the same depth through a symlinked directory or
+    /// `..` is read once: nodes are keyed by the real directory and the name,
+    /// which together decide how it imports (relative base, Claude format). Every import edge stays (which one shows is `State`'s choice),
+    /// and `maxImportDepth` ends cycles. `body` (when not null) replaces the
+    /// on-disk text (a rule without its front matter).
+    string file(string path, Kind kind, bool user, size_t depth, string body = null)
     {
+        const real_ = canonOr(path);
+        const key = format("%s\0%s\0%s\0%s\0%s", kind, user, depth, canonOr(path.dirName), path.baseName);
+        if (key in graph) return key;
+        auto r = Read(path, real_, null, kind, user);
         auto disk = readCapped(path);
-        if (disk is null) return;
-        if (!user && !options.importsOutsideProject && !inside(path))
+        if (disk !is null && !user && !options.importsOutsideProject && !inside(path))
+            r.refused = format("skipped %s: links outside the repository (set instruction_imports_outside_project = "
+                ~ "true to allow)", display(path));
+        else if (disk !is null)
         {
-            warn(format("skipped %s: links outside the repository (set instruction_imports_outside_project = true to allow)",
-                display(path)));
-            return;
+            r.text = body !is null ? body : disk;
+            if (depth < maxImportDepth && expandsImports(path, kind))
+                r.imports = imports(path, r.text, user, depth);
         }
-        auto real_ = canonOr(path);
-        if (real_ in seen) return;
-        seen[real_] = true;
-        auto text = hasBody ? body : disk;
-        auto refs = expandsImports(path, kind) ? importRefs(text) : null;
-        loaded ~= InstructionFile(path, text, kind, importedBy, user, currentSearchDir);
-        if (depth >= maxImportDepth) return;
-        foreach (r; refs)
-            if (auto target = resolveImport(path, r, user))
-                load(target, Kind.imported, path, user, depth + 1, false, null);
+        graph[key] = r;
+        return key;
     }
 
-    /// A scoped rule's body with its imports, resolved when it attaches.
-    private string resolveScopedRule(string path, string body, bool user)
+    /// The files `text` (in `from`, at `depth`) imports, in order: keys into
+    /// `graph`.
+    string[] imports(string from, string text, bool user, size_t depth)
     {
-        auto real_ = canonOr(path);
-        if (real_ in seen) return null;
-        seen[real_] = true;
-        auto out_ = body;
-        appendRuleImports(path, body, user, 0, out_);
+        string[] out_;
+        bool[string] done; // the same file named twice in one text loads once
+        foreach (ref_; importRefs(text))
+        {
+            string warning;
+            auto target = resolve(from, ref_, user, warning);
+            if (warning !is null) out_ ~= refuse(warning);
+            if (target is null) continue;
+            auto real_ = canonOr(target);
+            if (real_ in done) continue;
+            done[real_] = true;
+            out_ ~= file(target, Kind.imported, user, depth + 1);
+        }
         return out_;
     }
 
-    private void appendRuleImports(string from, string text, bool user, size_t depth, ref string out_)
-    {
-        if (depth >= maxImportDepth) return;
-        foreach (r; importRefs(text))
-        {
-            auto target = resolveImport(from, r, user);
-            if (target is null) continue;
-            auto real_ = canonOr(target);
-            if (real_ in seen) continue;
-            seen[real_] = true;
-            auto imported = readCapped(target);
-            if (imported is null) continue;
-            out_ ~= format("\n\n## %s (imported by %s)\n\n%s", display(target), display(from), imported);
-            appendRuleImports(target, imported, user, depth + 1, out_);
-        }
-    }
-
     /// Resolve `@reference` in `from`. Missing files are mentions and are
-    /// ignored; project imports outside the repository are skipped with a
-    /// warning unless allowed.
-    private string resolveImport(string from, string reference, bool user)
+    /// ignored; project imports outside the repository are refused (with
+    /// `warning`) unless allowed.
+    string resolve(string from, string reference, bool user, out string warning)
     {
         auto trimmed = reference;
         while (trimmed.length && ".,;:)!?".canFind(trimmed[$ - 1])) trimmed = trimmed[0 .. $ - 1];
@@ -654,112 +541,148 @@ class ProjectInstructions
             if (real_ is null) return null;
             if (!startsWithPath(real_, canonOr(root)))
             {
-                warn(format("skipped import @%s in %s: outside the repository (set instruction_imports_outside_project = true to allow)",
-                    reference, display(from)));
+                warning = format("skipped import @%s in %s: outside the repository (set "
+                    ~ "instruction_imports_outside_project = true to allow)", reference, display(from));
                 return null;
             }
         }
         return target;
     }
 
-    /// Rules under `dir`: unscoped ones load now, `paths:` ones on demand.
-    private void loadRules(string dir, bool user)
+    /// One directory's files: the first of `options.names` that exists,
+    /// then the personal files.
+    /// A warning in `graph`; returns its key.
+    string refuse(string warning)
+    {
+        const key = "!" ~ warning;
+        graph[key] = Read(null, null, null, Kind.imported, false, warning);
+        return key;
+    }
+
+    /// One directory's files, in a graph of their own.
+    DirRead dir(string d)
+    {
+        auto sub = Reader(root, home, options);
+        auto r = DirRead(d);
+        foreach (n; options.names)
+        {
+            auto path = buildPath(d, n);
+            if (readCapped(path) is null) continue;
+            r.files ~= sub.file(path, Kind.project, false, 0);
+            break;
+        }
+        foreach (n; localFiles)
+        {
+            r.files ~= sub.file(buildPath(d, n), Kind.local, false, 0);
+        }
+        r.graph = sub.graph;
+        return r;
+    }
+
+    /// Rules under `d`: unscoped ones go to `sources` (loaded at start),
+    /// `paths:` ones to `rules` with their compiled patterns.
+    void rules(string d, bool user, ref Source[] sources, ref RuleRead[] rules, ref Regex!char[][] patterns)
     {
         auto rootc = canonOr(root);
         auto allowOutside = user || options.importsOutsideProject;
-        foreach (path; markdownFiles(dir, rootc, allowOutside))
+        void skip(string warning) { sources ~= Source(null, refuse(warning)); }
+        foreach (path; markdownFiles(d, rootc, allowOutside))
         {
             if (!allowOutside)
             {
                 auto real_ = canonicalize(path);
                 if (real_ is null || !startsWithPath(real_, rootc))
                 {
-                    warn(format("skipped rule %s: links outside the repository (set instruction_imports_outside_project = true to allow)",
-                        display(path)));
+                    skip(format("skipped rule %s: links outside the repository (set "
+                        ~ "instruction_imports_outside_project = true to allow)", display(path)));
                     continue;
                 }
             }
             auto text = readCapped(path);
             if (text is null) continue;
             bool hasPaths;
-            string[] patterns;
-            auto body = ruleFrontMatter(text, hasPaths, patterns).strip;
+            string[] globs;
+            auto body = ruleFrontMatter(text, hasPaths, globs).strip;
             if (!body.length) continue;
             if (hasPaths)
             {
-                auto compiled = compilePatterns(patterns);
+                auto compiled = compilePatterns(globs);
                 if (!compiled.length)
                 {
-                    warn(format("rule %s has no usable paths patterns", display(path)));
+                    skip(format("rule %s has no usable paths patterns", display(path)));
                     continue;
                 }
-                scoped ~= ScopedRule(path, body, compiled, false, user, text);
+                auto real_ = canonOr(path);
+                rules ~= RuleRead(path, real_, text, body, user, imports(path, body, user, 0));
+                patterns ~= compiled;
             }
             // Front matter without `paths` is dropped; imports expand from the body only.
-            else load(path, Kind.rule, null, user, 0, true, body);
+            else sources ~= Source(null, file(path, Kind.rule, user, 0, body));
         }
     }
+}
 
-    /// Record a diagnostic once.
-    private void warn(string message) pure
-    {
-        if (!warnings.canFind(message)) warnings ~= message;
-    }
+/// The instruction files for one working directory: what was read at start,
+/// and what has been shown since. The reading is here; the decisions are the
+/// pure functions of `nano.instruction_state`.
+class ProjectInstructions
+{
+    Options options;
+    private Startup startup;
+    private State state;
+    /// Compiled `paths:` patterns, one list per `startup.rules`.
+    private Regex!char[][] patterns;
 
-    /// Repository-relative, `~/`-relative, or as given.
-    string display(string path)
-    {
-        if (path == root) return "";
-        if (startsWithPath(path, root)) return path[root.length + (root.endsWith("/") ? 0 : 1) .. $];
-        auto home = homeDir();
-        if (home !is null && startsWithPath(path, home) && path != home)
-            return "~/" ~ path[home.length + (home.endsWith("/") ? 0 : 1) .. $];
-        return path;
-    }
+    /// Git root (or the working directory outside a repository).
+    string root() const pure { return startup.root; }
+    /// Files in the system prompt, in order.
+    InstructionFile[] loaded() pure { return state.loaded; }
+    /// Files skipped, with the reason (imports outside the repository, ...).
+    string[] warnings() pure { return state.warnings; }
 
-    private string heading(const ref InstructionFile f)
+    private Reader reader() { return Reader(startup.root, startup.home, options); }
+
+    /// Find the user's and the project's instruction files for `cwd`.
+    static ProjectInstructions discover(string cwd, Options options)
     {
-        final switch (f.kind)
+        auto p = new ProjectInstructions;
+        cwd = canonOr(cwd);
+        auto git = gitRoot(cwd);
+        p.options = options;
+        p.startup.root = git !is null ? git : cwd;
+        p.startup.home = homeDir();
+        auto r = p.reader();
+        with (p.startup)
         {
-            case Kind.imported: return format("%s (imported by %s)", display(f.path), display(f.importedBy));
-            case Kind.rule: return display(f.path) ~ " (rule)";
-            case Kind.local: return display(f.path) ~ " (personal, not committed)";
-            case Kind.user, Kind.project: return display(f.path);
-        }
-    }
-
-    /// Text appended to the system prompt (empty when nothing was found).
-    string render()
-    {
-        string out_;
-        size_t budget = maxTotalBytes - omittedMarker.length;
-        bool truncated;
-        static immutable groups = [
-            "\n\n# Your instructions\n\nThese instruction files are the user's own, for every project. Follow them.",
-            "\n\n# Repository instructions\n\nThese instruction files come from the repository you are working in. "
-                ~ "Read and follow them before and while making changes. Files in deeper directories refine the ones above them.",
-        ];
-        outer: foreach (g, header; groups)
-        {
-            bool user = g == 0;
-            InstructionFile[] files;
-            foreach (f; loaded)
-                if (f.user == user && (f.searchDir is null || f.searchDir in initial)) files ~= f;
-            if (!files.length) continue;
-            if (header.length > budget) { truncated = true; break; }
-            budget -= header.length;
-            out_ ~= header;
-            foreach (ref f; files)
+            foreach (f; options.userFiles)
             {
-                auto section = format("\n\n## %s\n\n%s", heading(f), f.text);
-                if (section.length > budget) { truncated = true; break outer; }
-                budget -= section.length;
-                out_ ~= section;
+                sources ~= Source(null, r.file(f, Kind.user, true, 0));
+            }
+            foreach (d; options.userRulesDirs) r.rules(d, true, sources, rules, p.patterns);
+            foreach (i, d; dirsDown(cwd, p.startup.root))
+            {
+                auto read = r.dir(d);
+                foreach (k, v; read.graph) r.graph[k] = v;
+                foreach (f; read.files) sources ~= Source(d, f);
+                initialDirs ~= d;
+                if (i == 0) r.rules(buildPath(p.startup.root, projectRulesDir), false, sources, rules, p.patterns);
             }
         }
-        if (truncated) out_ ~= omittedMarker;
-        return out_;
+        p.startup.graph = r.graph;
+        p.state = begin(p.startup);
+        return p;
     }
+
+    /// Whether `other` read the same files at its start (same texts, same
+    /// imports, same rules): if so, nothing in the prompt or the on-demand
+    /// rules changed.
+    bool sameFiles(const ProjectInstructions other) const pure { return st.sameFiles(startup, other.startup); }
+
+    /// Repository-relative, `~/`-relative, or as given.
+    string display(string path) const pure { return st.display(path, startup.root, startup.home); }
+
+    /// Text appended to the system prompt (empty when nothing was found).
+    string render() const pure { return st.render(startup, state); }
 
     /// Instructions that apply to `path` and were not shown yet: files in the
     /// directories between it and the root (outermost first), then rules whose
@@ -768,193 +691,59 @@ class ProjectInstructions
     {
         auto absolute = canonicalizeExisting(path.startsWith("/") ? path : buildPath(cwd, path));
         auto dir = isDir_(absolute) ? absolute : absolute.dirName;
-        string[] dirs;
-        for (auto d = dir; startsWithPath(d, root);)
-        {
-            dirs = d ~ dirs;
-            auto up = d.dirName;
-            if (up == d) break;
-            d = up;
-        }
+        auto dirs = dirsDown(dir, root);
         if (!dirs.length) return null;
-        string out_;
-        size_t budget = maxTotalBytes - omittedMarker.length;
-        bool truncated;
-        foreach (d; dirs)
+        auto r = reader();
+        DirRead[] reads;
+        foreach (d; dirs) if (needsRead(state, startup, d)) reads ~= r.dir(d);
+        const inRoot = startsWithPath(absolute, root);
+        auto rel = !inRoot || absolute == root ? "" : display(absolute);
+        bool[] hits;
+        foreach (compiled; patterns)
         {
-            auto range = search(d);
-            auto files = loaded[range[0] .. range[1]].dup;
-            loaded = loaded[0 .. range[0]] ~ loaded[range[1] .. $];
-            size_t rendered;
-            foreach (ref f; files)
-            {
-                string note;
-                if (f.kind == Kind.imported)
-                    note = format("[%s (imported by %s) applies with it:]", display(f.path), display(f.importedBy));
-                else
-                {
-                    auto scope_ = display(f.searchDir !is null ? f.searchDir : f.path.dirName);
-                    note = format("[Instructions from %s apply to files under %s/. Follow them for changes there:]",
-                        display(f.path), scope_.length ? scope_ : ".");
-                }
-                auto section = format("\n\n%s\n%s", note, f.text);
-                if (section.length > budget)
-                {
-                    searched.remove(d);
-                    warn(format("deferred %s: instruction size limit reached; it stays pending and attaches once budget "
-                        ~ "frees (e.g. after compaction)", display(f.path)));
-                    truncated = true;
-                    break;
-                }
-                budget -= section.length;
-                out_ ~= section;
-                ++rendered;
-            }
-            foreach (ref f; files[0 .. rendered]) nestedAttached ~= f.path;
-            loaded ~= files[rendered .. $];
-            if (truncated) break;
+            bool hit;
+            if (inRoot) foreach (re; compiled) if (!matchFirst(rel, re).empty) { hit = true; break; }
+            hits ~= hit;
         }
-        if (!truncated && startsWithPath(absolute, root))
-        {
-            auto rel = absolute == root ? "" : display(absolute);
-            foreach (i; 0 .. scoped.length)
-            {
-                if (scoped[i].attached) continue;
-                bool hit;
-                foreach (re; scoped[i].patterns) if (!matchFirst(rel, re).empty) { hit = true; break; }
-                if (!hit) continue;
-                auto checkpoint = seen.dup;
-                auto text = resolveScopedRule(scoped[i].path, scoped[i].body, scoped[i].user);
-                if (text is null) { scoped[i].attached = true; continue; }
-                auto section = format("\n\n[Rule %s applies to %s. Follow it for changes to matching files:]\n%s",
-                    display(scoped[i].path), rel, text);
-                if (section.length > budget)
-                {
-                    seen = checkpoint;
-                    warn(format("deferred rule %s: instruction size limit reached; it stays pending and attaches once "
-                        ~ "budget frees (e.g. after compaction)", display(scoped[i].path)));
-                    truncated = true;
-                    break;
-                }
-                budget -= section.length;
-                out_ ~= section;
-                scoped[i].attached = true;
-            }
-        }
-        if (truncated) out_ ~= omittedMarker;
-        return out_.length ? out_ : null;
+        auto a = attach(state, startup, reads, hits, rel, inRoot);
+        state = a.state;
+        return a.text;
     }
 
     /// After compaction, nested instructions attached to old tool results may
     /// be gone: let them attach again.
-    void forgetNested() pure
-    {
-        searched = initial.dup;
-        seen = initialSeen.dup;
-        InstructionFile[] kept;
-        foreach (f; loaded) if (f.searchDir is null || f.searchDir in initial) kept ~= f;
-        loaded = kept;
-        nestedAttached = null;
-        foreach (ref r; scoped) r.attached = false;
-        foreach (d; found.keys) if (d !in initial) found.remove(d);
-    }
+    void forgetNested() pure { state = forget(state); }
 
-    /// What the rules scoped with `paths:` say, imports included, which
-    /// `render` leaves out: with it, a re-read can tell that an on-demand
-    /// rule (or a file it imports) changed.
-    string scopedFingerprint()
-    {
-        const warned = warnings.length; // resolving here is a probe, not a load
-        scope (exit) warnings = warnings[0 .. warned];
-        string out_;
-        // Each file once per rule, as `appendRuleImports` does: repeats and
-        // cycles cost nothing, and the rule's own import policy applies.
-        // Shallowest depth each file was reached at: a shallower route is
-        // walked again, since it can reach imports the deeper one could not.
-        size_t[string] visited;
-        void imports(string from, string text, bool user, size_t depth)
-        {
-            if (depth >= maxImportDepth) return;
-            foreach (r; importRefs(text))
-            {
-                auto target = resolveImport(from, r, user);
-                if (target is null) continue;
-                auto real_ = canonOr(target);
-                if (auto at = real_ in visited) if (*at <= depth + 1) continue;
-                visited[real_] = depth + 1;
-                auto imported = readCapped(target);
-                out_ ~= target ~ "\0" ~ imported ~ "\0";
-                if (imported !is null) imports(target, imported, user, depth + 1);
-            }
-        }
-        foreach (r; scoped)
-        {
-            out_ ~= r.path ~ "\0" ~ r.source ~ "\0";
-            visited = null;
-            visited[canonOr(r.path)] = 0;
-            imports(r.path, r.body, r.user, 0);
-        }
-        return out_;
-    }
-
-    /// What `dir`'s instruction files say on disk now, imports included: read
-    /// apart from `seen` and pending state, so identical files compare equal.
-    private string dirDigest(string dir)
-    {
-        const warned = warnings.length; // a probe, not a load
-        scope (exit) warnings = warnings[0 .. warned];
-        string out_;
-        size_t[string] visited; // shallowest depth, as in `scopedFingerprint`
-        void file(string path, Kind kind, size_t depth)
-        {
-            auto text = readCapped(path);
-            out_ ~= path ~ "\0" ~ text ~ "\0";
-            if (text is null || depth >= maxImportDepth || !expandsImports(path, kind)) return;
-            foreach (r; importRefs(text))
-            {
-                auto target = resolveImport(path, r, false);
-                if (target is null) continue;
-                if (auto at = canonOr(target) in visited) if (*at <= depth + 1) continue;
-                visited[canonOr(target)] = depth + 1;
-                file(target, Kind.imported, depth + 1);
-            }
-        }
-        foreach (n; options.names)
-        {
-            auto path = buildPath(dir, n);
-            if (readCapped(path) !is null) { file(path, Kind.project, 0); break; }
-        }
-        foreach (n; localFiles) file(buildPath(dir, n), Kind.local, 0);
-        return out_;
-    }
-
-    /// Whether a directory searched for a tool call (attached, deferred or
-    /// empty) reads differently now: a file edited, added or removed,
-    /// imports included.
+    /// Whether a directory searched for a tool call (attached or deferred)
+    /// reads differently now: a file edited, added or removed, imports
+    /// included.
     bool nestedChanged()
     {
-        foreach (d, digest; found)
-            if (d !in initial && dirDigest(d) != digest) return true;
+        auto r = reader();
+        foreach (read; state.searchedReads) if (r.dir(read.dir) != read) return true;
         return false;
     }
 
     /// Files in the prompt, for the banner, `/context` and ACP.
-    string[] loadedPaths() pure
-    {
-        string[] out_;
-        foreach (f; loaded) out_ ~= f.path;
-        out_ ~= nestedAttached;
-        foreach (r; scoped) if (r.attached) out_ ~= r.path;
-        return out_;
-    }
+    string[] loadedPaths() const pure { return st.loadedPaths(startup, state); }
 
     /// Rules attached only when a matching file is touched.
-    string[] onDemandPaths() pure
+    string[] onDemandPaths() const pure { return st.onDemandPaths(startup, state); }
+}
+
+/// `from` and its ancestors up to `root`, outermost first (none when `from`
+/// is outside `root`).
+private string[] dirsDown(string from, string root)
+{
+    string[] dirs;
+    for (auto d = from; startsWithPath(d, root);)
     {
-        string[] out_;
-        foreach (r; scoped) if (!r.attached) out_ ~= r.path;
-        return out_;
+        dirs = d ~ dirs;
+        auto up = d.dirName;
+        if (up == d) break;
+        d = up;
     }
+    return dirs;
 }
 
 version (unittest)
@@ -1189,7 +978,7 @@ unittest // scoped rules attach once per compaction; imports resolve on attach
     assert(p.nestedFor(buildPath(root, "src/api/y.ts"), root) !is null);
 }
 
-unittest // the scoped-rule fingerprint sees rule and import edits
+unittest // comparing reads sees rule and import edits
 {
     import std.file : rmdirRecurse;
     import std.array : replicate;
@@ -1199,21 +988,19 @@ unittest // the scoped-rule fingerprint sees rule and import edits
     put(buildPath(root, ".claude/rules/a.md"), "---\npaths: \"a/**\"\n---\nrule a, see @../detail.md");
     put(buildPath(root, ".claude/detail.md"), "detail");
     put(buildPath(root, "AGENTS.md"), "top");
-    // Fingerprints are taken when read: computed later they read today's files.
+    // What was read is kept: later reads of the same files compare equal.
     auto old = find(root);
-    const before = old.scopedFingerprint;
-    assert(find(root).scopedFingerprint == before);
-    // An imported file changes: the fingerprint does, the system text doesn't.
+    assert(find(root).sameFiles(old));
+    // An imported file changes: the reads differ, the system text doesn't.
     put(buildPath(root, ".claude/detail.md"), "detail, revised");
     auto fresh = find(root);
-    const afterImport = fresh.scopedFingerprint;
-    assert(afterImport != before && fresh.render == old.render);
+    assert(!fresh.sameFiles(old) && fresh.render == old.render);
     // The rule itself changes.
     put(buildPath(root, ".claude/rules/a.md"), "---\npaths: \"a/**\"\n---\nrule a, revised");
-    assert(find(root).scopedFingerprint != afterImport);
-    // A cycle of self-imports is read once.
+    assert(!find(root).sameFiles(fresh));
+    // A cycle of self-imports is read once, not 100^4 times.
     put(buildPath(root, ".claude/rules/loop.md"), "---\npaths: \"l/**\"\n---\n" ~ "@loop.md ".replicate(100));
-    assert(find(root).scopedFingerprint.length < afterImport.length + 2_000, "not 100^4 expansions");
+    assert(find(root).sameFiles(find(root)));
     // A nested directory that attached: edits there are seen.
     put(buildPath(root, "pkg/AGENTS.md"), "pkg rule");
     auto withNested = find(root);
@@ -1529,4 +1316,88 @@ unittest
     auto third = p.nestedFor(buildPath(root, "a/z.rs"), root);
     assert(third.count("bar_file") == 1 && !third.canFind("main_file") && !third.canFind("foo_file"), third);
     assert(p.nestedFor(buildPath(root, "a/w.rs"), root) is null);
+}
+
+unittest // an import reached again through another file still loads
+{
+    import std.file : rmdirRecurse;
+    auto base = testDir("alt-edge");
+    scope (exit) rmdirRecurse(base);
+    auto root = buildPath(base, "repo");
+    put(buildPath(root, "AGENTS.md"), "agents, see @detail.md");
+    put(buildPath(root, "CLAUDE.local.md"), "@AGENTS.md @wrapper.md");
+    put(buildPath(root, "wrapper.md"), "wrapper, see @detail.md");
+    put(buildPath(root, "detail.md"), "the detail");
+    assert(find(root).render.canFind("the detail"));
+}
+
+unittest // a deferred directory edited before its retry is still a change
+{
+    import std.file : rmdirRecurse;
+    import std.array : replicate;
+    auto base = testDir("defer-edit");
+    scope (exit) rmdirRecurse(base);
+    auto root = buildPath(base, "repo");
+    put(buildPath(root, "a/CLAUDE.md"), "@big.md\n" ~ "x".replicate(maxFileBytes - 64) ~ " main_file");
+    put(buildPath(root, "a/big.md"), "x".replicate(maxFileBytes - 64) ~ " import_file");
+    auto p = find(root);
+    assert(!p.nestedFor(buildPath(root, "a/x"), root).canFind("import_file"));
+    put(buildPath(root, "a/big.md"), "import_file, revised");
+    assert(p.nestedFor(buildPath(root, "a/y"), root).canFind("import_file"));
+    assert(p.nestedChanged(), "the retry attached the pending text, not the edit");
+}
+
+unittest // a dense import graph is read, compared and attached once per file
+{
+    import std.file : rmdirRecurse;
+    import std.conv : to;
+    auto base = testDir("dense");
+    scope (exit) rmdirRecurse(base);
+    auto root = buildPath(base, "repo");
+    string refs;
+    foreach (i; 0 .. 20) refs ~= " @f" ~ i.to!string ~ ".md";
+    foreach (i; 0 .. 20) put(buildPath(root, "d/f" ~ i.to!string ~ ".md"), "file " ~ i.to!string ~ refs);
+    put(buildPath(root, "CLAUDE.md"), "top");
+    put(buildPath(root, "d/CLAUDE.md"), "nested" ~ refs);
+    auto p = find(root);
+    assert(p.sameFiles(find(root)));
+    assert(p.nestedFor(buildPath(root, "d/x"), root).canFind("file 19"));
+    assert(!p.nestedChanged());
+    p.nestedFor(buildPath(root, "d/y"), root); // copies the state again
+}
+
+unittest // the same file through symlinked spellings is one node per depth
+{
+    import std.file : rmdirRecurse, symlink;
+    import std.conv : to;
+    import std.array : replace;
+    auto base = testDir("alias");
+    scope (exit) rmdirRecurse(base);
+    auto root = buildPath(base, "repo");
+    string refs;
+    foreach (i; 0 .. 10) refs ~= " @peers/d" ~ i.to!string ~ "/f.md";
+    foreach (i; 0 .. 10)
+    {
+        auto d = buildPath(root, "d" ~ i.to!string);
+        put(buildPath(d, "f.md"), "file " ~ i.to!string ~ refs);
+        symlink("..", buildPath(d, "peers"));
+    }
+    put(buildPath(root, "CLAUDE.md"), "top" ~ refs.replace("@peers/", "@"));
+    auto p = find(root);
+    assert(p.render.canFind("file 9"));
+    // CLAUDE.md, the missing CLAUDE.local.md, and each f.md once per depth.
+    assert(p.startup.graph.length <= 2 + 10 * maxImportDepth, p.startup.graph.length.to!string);
+}
+
+unittest // a file symlinked under another name keeps its own import rules
+{
+    import std.file : rmdirRecurse, symlink;
+    auto base = testDir("alias-name");
+    scope (exit) rmdirRecurse(base);
+    auto root = buildPath(base, "repo");
+    put(buildPath(root, "CLAUDE.md"), "root, see @detail.md");
+    put(buildPath(root, "detail.md"), "the detail");
+    put(buildPath(root, "child/keep.txt"), "");
+    symlink("../CLAUDE.md", buildPath(root, "child/AGENTS.md"));
+    assert(find(buildPath(root, "child")).render.canFind("the detail"));
 }

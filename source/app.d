@@ -1776,10 +1776,6 @@ int runMain(string[] args)
     // before each turn (`reloadInstructions`).
     Option!ProjectInstructions instructions;
     string instructionsDir;
-    // The on-demand rules' fingerprint when `instructions` was read: computed
-    // again later it would read today's files, so it is kept.
-    string instructionRules;
-    static string rulesOf(Option!ProjectInstructions i) { return i.match!(pi => pi.scopedFingerprint, () => string.init); }
     // Every caller installs the prompt it builds at once, so the ids its
     // memory index renders in full go straight to the agent (recall skips them).
     bool[string] indexShown;
@@ -1793,7 +1789,6 @@ int runMain(string[] args)
         {
             instructionsDir = dir;
             instructions = discoverInstructions(cfg, dir);
-            instructionRules = rulesOf(instructions);
             if (agent !is null) agent.instructions = instructions;
         }
         return buildSystemPrompt(cfg, dir, wallNow.toISOExtString[0 .. 10], plan, skills, index,
@@ -2046,16 +2041,15 @@ int runMain(string[] args)
     {
         static string text(Option!ProjectInstructions i) { return i.match!(pi => pi.render, () => string.init); }
         auto fresh = discoverInstructions(cfg, cwd);
-        const freshRules = rulesOf(fresh);
+        // Same files read (texts, imports, rules), and the nested directories
+        // searched for tool calls still read the same: nothing to do.
+        const sameFiles = instructionsDir == cwd && instructions.match!(
+            old => fresh.match!(f => old.sameFiles(f), () => false),
+            () => fresh.match!(f => false, () => true));
+        if (sameFiles && !instructions.match!(pi => pi.nestedChanged, () => false)) return false;
         const sameText = instructionsDir == cwd && text(fresh) == text(instructions);
-        if (sameText && freshRules == instructionRules)
-        {
-            // Nested directories searched for tool calls, read again.
-            if (!instructions.match!(pi => pi.nestedChanged, () => false)) return false;
-        }
         instructionsDir = cwd;
         instructions = fresh;
-        instructionRules = freshRules;
         agent.instructions = fresh;
         if (sameText) return false;
         agent.installSystem(systemFor(cwd, agent.promptPlan), indexShown);
