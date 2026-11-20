@@ -81,6 +81,8 @@ private struct ScopedRule
     string body;
     Regex!char[] patterns;
     bool attached, user;
+    /// The whole file, front matter included: a changed rule attaches again.
+    string source;
 }
 
 /// The nearest ancestor (or `start`) holding `.git`, or null.
@@ -511,6 +513,9 @@ class ProjectInstructions
     private ScopedRule[] scoped;
     /// Nested files already attached to a tool result by `nestedFor`.
     private string[] nestedAttached;
+    /// What each directory search found (paths and texts, imports included),
+    /// so a re-read can tell when a directory reads differently.
+    private string[string] found;
 
     /// Find the user's and the project's instruction files for `cwd`.
     static ProjectInstructions discover(string cwd, Options options)
@@ -564,6 +569,9 @@ class ProjectInstructions
         }
         foreach (n; localFiles) load(buildPath(dir, n), Kind.local, null, false, 0, false, null);
         currentSearchDir = null;
+        // The first snapshot stands until compaction: a deferred file keeps
+        // the text read then, so a retry must not hide a later edit.
+        if (dir !in found) found[dir] = dirDigest(dir);
         return [start, loaded.length];
     }
 
@@ -685,7 +693,7 @@ class ProjectInstructions
                     warn(format("rule %s has no usable paths patterns", display(path)));
                     continue;
                 }
-                scoped ~= ScopedRule(path, body, compiled, false, user);
+                scoped ~= ScopedRule(path, body, compiled, false, user, text);
             }
             // Front matter without `paths` is dropped; imports expand from the body only.
             else load(path, Kind.rule, null, user, 0, true, body);
@@ -848,6 +856,86 @@ class ProjectInstructions
         loaded = kept;
         nestedAttached = null;
         foreach (ref r; scoped) r.attached = false;
+        foreach (d; found.keys) if (d !in initial) found.remove(d);
+    }
+
+    /// What the rules scoped with `paths:` say, imports included, which
+    /// `render` leaves out: with it, a re-read can tell that an on-demand
+    /// rule (or a file it imports) changed.
+    string scopedFingerprint()
+    {
+        const warned = warnings.length; // resolving here is a probe, not a load
+        scope (exit) warnings = warnings[0 .. warned];
+        string out_;
+        // Each file once per rule, as `appendRuleImports` does: repeats and
+        // cycles cost nothing, and the rule's own import policy applies.
+        // Shallowest depth each file was reached at: a shallower route is
+        // walked again, since it can reach imports the deeper one could not.
+        size_t[string] visited;
+        void imports(string from, string text, bool user, size_t depth)
+        {
+            if (depth >= maxImportDepth) return;
+            foreach (r; importRefs(text))
+            {
+                auto target = resolveImport(from, r, user);
+                if (target is null) continue;
+                auto real_ = canonOr(target);
+                if (auto at = real_ in visited) if (*at <= depth + 1) continue;
+                visited[real_] = depth + 1;
+                auto imported = readCapped(target);
+                out_ ~= target ~ "\0" ~ imported ~ "\0";
+                if (imported !is null) imports(target, imported, user, depth + 1);
+            }
+        }
+        foreach (r; scoped)
+        {
+            out_ ~= r.path ~ "\0" ~ r.source ~ "\0";
+            visited = null;
+            visited[canonOr(r.path)] = 0;
+            imports(r.path, r.body, r.user, 0);
+        }
+        return out_;
+    }
+
+    /// What `dir`'s instruction files say on disk now, imports included: read
+    /// apart from `seen` and pending state, so identical files compare equal.
+    private string dirDigest(string dir)
+    {
+        const warned = warnings.length; // a probe, not a load
+        scope (exit) warnings = warnings[0 .. warned];
+        string out_;
+        size_t[string] visited; // shallowest depth, as in `scopedFingerprint`
+        void file(string path, Kind kind, size_t depth)
+        {
+            auto text = readCapped(path);
+            out_ ~= path ~ "\0" ~ text ~ "\0";
+            if (text is null || depth >= maxImportDepth || !expandsImports(path, kind)) return;
+            foreach (r; importRefs(text))
+            {
+                auto target = resolveImport(path, r, false);
+                if (target is null) continue;
+                if (auto at = canonOr(target) in visited) if (*at <= depth + 1) continue;
+                visited[canonOr(target)] = depth + 1;
+                file(target, Kind.imported, depth + 1);
+            }
+        }
+        foreach (n; options.names)
+        {
+            auto path = buildPath(dir, n);
+            if (readCapped(path) !is null) { file(path, Kind.project, 0); break; }
+        }
+        foreach (n; localFiles) file(buildPath(dir, n), Kind.local, 0);
+        return out_;
+    }
+
+    /// Whether a directory searched for a tool call (attached, deferred or
+    /// empty) reads differently now: a file edited, added or removed,
+    /// imports included.
+    bool nestedChanged()
+    {
+        foreach (d, digest; found)
+            if (d !in initial && dirDigest(d) != digest) return true;
+        return false;
     }
 
     /// Files in the prompt, for the banner, `/context` and ACP.
@@ -1099,6 +1187,59 @@ unittest // scoped rules attach once per compaction; imports resolve on attach
     assert(p.nestedFor(buildPath(root, "sub/README.md"), root) is null);
     p.forgetNested();
     assert(p.nestedFor(buildPath(root, "src/api/y.ts"), root) !is null);
+}
+
+unittest // the scoped-rule fingerprint sees rule and import edits
+{
+    import std.file : rmdirRecurse;
+    import std.array : replicate;
+    auto base = testDir("reread");
+    scope (exit) rmdirRecurse(base);
+    auto root = buildPath(base, "repo");
+    put(buildPath(root, ".claude/rules/a.md"), "---\npaths: \"a/**\"\n---\nrule a, see @../detail.md");
+    put(buildPath(root, ".claude/detail.md"), "detail");
+    put(buildPath(root, "AGENTS.md"), "top");
+    // Fingerprints are taken when read: computed later they read today's files.
+    auto old = find(root);
+    const before = old.scopedFingerprint;
+    assert(find(root).scopedFingerprint == before);
+    // An imported file changes: the fingerprint does, the system text doesn't.
+    put(buildPath(root, ".claude/detail.md"), "detail, revised");
+    auto fresh = find(root);
+    const afterImport = fresh.scopedFingerprint;
+    assert(afterImport != before && fresh.render == old.render);
+    // The rule itself changes.
+    put(buildPath(root, ".claude/rules/a.md"), "---\npaths: \"a/**\"\n---\nrule a, revised");
+    assert(find(root).scopedFingerprint != afterImport);
+    // A cycle of self-imports is read once.
+    put(buildPath(root, ".claude/rules/loop.md"), "---\npaths: \"l/**\"\n---\n" ~ "@loop.md ".replicate(100));
+    assert(find(root).scopedFingerprint.length < afterImport.length + 2_000, "not 100^4 expansions");
+    // A nested directory that attached: edits there are seen.
+    put(buildPath(root, "pkg/AGENTS.md"), "pkg rule");
+    auto withNested = find(root);
+    assert(withNested.nestedFor(buildPath(root, "pkg/x"), root).canFind("pkg rule"));
+    assert(!withNested.nestedChanged());
+    put(buildPath(root, "pkg/AGENTS.md"), "pkg rule, revised");
+    assert(withNested.nestedChanged());
+    // A file a scoped rule imported first is not a change when its directory is searched.
+    put(buildPath(root, ".claude/rules/s.md"), "---\npaths: \"s/**\"\n---\nsee @../../pkg/AGENTS.md");
+    auto shared_ = find(root);
+    assert(shared_.nestedFor(buildPath(root, "s/x"), root).canFind("pkg rule, revised"));
+    shared_.nestedFor(buildPath(root, "pkg/x"), root);
+    assert(!shared_.nestedChanged());
+    // Compaction drops the snapshots with the attachments.
+    put(buildPath(root, "pkg/AGENTS.md"), "pkg rule, third");
+    assert(shared_.nestedChanged());
+    shared_.forgetNested();
+    assert(!shared_.nestedChanged());
+    // A file added where a search found nothing is seen too.
+    auto empty = find(root);
+    assert(empty.nestedFor(buildPath(root, "none/x"), root) is null);
+    assert(!empty.nestedChanged());
+    put(buildPath(root, "none/AGENTS.md"), "new here");
+    assert(empty.nestedChanged());
+    // A fresh discovery attaches the current text.
+    assert(find(root).nestedFor(buildPath(root, "a/x"), root).canFind("rule a, revised"));
 }
 
 // rust: instructions.rs::render_cap_bounds_total_with_header_and_single_marker

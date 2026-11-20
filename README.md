@@ -1074,6 +1074,17 @@ makes any change, without having to decide to read them. Block-level `<!-- ... -
 are removed first. Each file is capped at 32 KiB and the total at 64 KiB; a file over the
 limit is named, with a note to read it with `read_file`.
 
+**Edits take effect at the next turn.** Before each prompt the files are read again. If what
+they add to the system prompt has changed (a file was edited, added or removed), the system
+prompt is rebuilt and a dim `[instruction files changed: ...]` line says so, so there's no
+need to restart and lose the conversation. Resuming a session (`--resume`) also rebuilds it
+from the current files. The provider's prompt cache misses once, on the turn after a change.
+Edits to rules scoped with `paths:` and the files they import are picked up too, as are edits
+to nested directories' files that already attached (including a file added there). After any
+change, rules and nested files attach afresh the next time a matching file is touched, so one
+already in the conversation may appear once more, but never in an old version.
+ACP sessions (`--acp`) still read the files once, when the session starts.
+
 **Imports.** `CLAUDE.md`, `CLAUDE.local.md`, rules and imported files can pull in other files
 with `@path`, as in Claude Code: relative to the importing file, `~/` allowed, up to four
 levels deep, each file once. Code spans and fenced code blocks are skipped, `\ ` escapes a

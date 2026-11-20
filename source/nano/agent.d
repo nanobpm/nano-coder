@@ -1690,6 +1690,7 @@ class Agent
         bool plan = control.mode == AgentMode.plan;
         if (plan == promptPlan || !messages.length) return;
         messages[0].content = render(plan);
+        calibLen = calibTokens = 0; // the usage anchor counted the old prompt
         promptPlan = plan;
     }
 
@@ -1750,7 +1751,12 @@ class Agent
     /// renders in full.
     void installSystem(string system, bool[string] shown) pure
     {
-        if (messages.length && messages[0].role == Role.system) messages[0].content = system;
+        if (messages.length && messages[0].role == Role.system && messages[0].content != system)
+        {
+            messages[0].content = system;
+            // The usage anchor counted the old system text.
+            calibLen = calibTokens = 0;
+        }
         indexShown = shown;
     }
 
@@ -3134,6 +3140,24 @@ unittest // the installed index's fully rendered memories don't refire; clipped 
     agent.restoreRecall(agent.recallState.toJSON);
     agent.run("again", new NullEvents);
     assert(!toolTexts(agent)[$ - 1].canFind(short_.id));
+}
+
+unittest // a new system text drops the usage anchor, so estimates count it
+{
+    import nano.providers.mock : MockClient;
+    LLMResponse[] none;
+    auto agent = new Agent(new MockClient(none), new ToolRegistry, Policy.init, "short");
+    agent.push(Message.user("hi"));
+    agent.calibLen = agent.messages.length;
+    agent.calibTokens = 10;
+    bool calibrated;
+    assert(agent.estimateContextTokens(calibrated) == 10 && calibrated);
+    agent.installSystem("short", null); // unchanged: kept
+    assert(agent.calibLen);
+    import std.array : replicate;
+    agent.installSystem("long ".replicate(4000), null);
+    auto estimate = agent.estimateContextTokens(calibrated);
+    assert(!calibrated && estimate > 500, "the longer system text is counted");
 }
 
 // rust: agent.rs::a_memory_evicted_from_the_installed_index_becomes_recallable
