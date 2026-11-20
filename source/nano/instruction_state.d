@@ -228,7 +228,9 @@ Attached attach(const State s, const Startup st, const DirRead[] dirs, const boo
         }
         foreach (f; acc.files[0 .. rendered]) n.nestedAttached ~= f.path;
         n.pending ~= acc.files[rendered .. $];
-        n.searchedReads = replaceRead(n.searchedReads, d);
+        // The first read stands until compaction: a retried deferral keeps
+        // its pending text, so a later read must not hide an edit.
+        if (!n.searchedReads.canFind!(r => r.dir == d.dir)) n.searchedReads ~= dupRead(d);
         if (truncated) break;
         n.searched ~= d.dir;
     }
@@ -374,13 +376,6 @@ string heading(const ref InstructionFile f, const Startup st)
         case Kind.local: return show(f.path) ~ " (personal, not committed)";
         case Kind.user, Kind.project: return show(f.path);
     }
-}
-
-DirRead[] replaceRead(const DirRead[] reads, const DirRead d)
-{
-    DirRead[] out_;
-    foreach (r; reads) if (r.dir != d.dir) out_ ~= dupRead(r);
-    return out_ ~ dupRead(d);
 }
 
 DirRead dupRead(const DirRead d)

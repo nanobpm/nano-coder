@@ -473,10 +473,11 @@ private struct Reader
     }
 
     /// One file and what it imports. `body` (when not null) replaces the
-    /// on-disk text (a rule without its front matter). `visited` holds the
-    /// shallowest depth each file was reached at in this read: reaching it
-    /// again no shallower adds nothing, so cycles and repeats stop.
-    Read file(string path, Kind kind, string importedBy, bool user, size_t depth, ref size_t[string] visited,
+    /// on-disk text (a rule without its front matter). `memo` holds each
+    /// file's imports per depth, so a file reached again reads nothing new;
+    /// every edge stays (which one shows is `State`'s choice) and
+    /// `maxImportDepth` ends cycles.
+    Read file(string path, Kind kind, string importedBy, bool user, size_t depth, ref Read[][string] memo,
         string body = null)
     {
         auto r = Read(path, canonOr(path), null, kind, importedBy, user);
@@ -490,14 +491,20 @@ private struct Reader
         }
         r.text = body !is null ? body : disk;
         if (depth < maxImportDepth && expandsImports(path, kind))
-            r.imports = imports(path, r.text, user, depth, visited);
+        {
+            // Keyed by the text too: a rule's body differs from its file.
+            const key = format("%s\0%s\0%s", path, depth, r.text);
+            if (auto known = key in memo) r.imports = *known;
+            else memo[key] = r.imports = imports(path, r.text, user, depth, memo);
+        }
         return r;
     }
 
     /// The files `text` (in `from`, at `depth`) imports, in order.
-    Read[] imports(string from, string text, bool user, size_t depth, ref size_t[string] visited)
+    Read[] imports(string from, string text, bool user, size_t depth, ref Read[][string] memo)
     {
         Read[] out_;
+        bool[string] done; // the same file named twice in one text loads once
         foreach (ref_; importRefs(text))
         {
             string warning;
@@ -505,9 +512,9 @@ private struct Reader
             if (warning !is null) out_ ~= Read(null, null, null, Kind.imported, from, user, warning);
             if (target is null) continue;
             auto real_ = canonOr(target);
-            if (auto at = real_ in visited) if (*at <= depth + 1) continue;
-            visited[real_] = depth + 1;
-            out_ ~= file(target, Kind.imported, from, user, depth + 1, visited);
+            if (real_ in done) continue;
+            done[real_] = true;
+            out_ ~= file(target, Kind.imported, from, user, depth + 1, memo);
         }
         return out_;
     }
@@ -550,14 +557,14 @@ private struct Reader
         {
             auto path = buildPath(d, n);
             if (readCapped(path) is null) continue;
-            size_t[string] visited;
-            r.files ~= file(path, Kind.project, null, false, 0, visited);
+            Read[][string] memo;
+            r.files ~= file(path, Kind.project, null, false, 0, memo);
             break;
         }
         foreach (n; localFiles)
         {
-            size_t[string] visited;
-            r.files ~= file(buildPath(d, n), Kind.local, null, false, 0, visited);
+            Read[][string] memo;
+            r.files ~= file(buildPath(d, n), Kind.local, null, false, 0, memo);
         }
         return r;
     }
@@ -587,7 +594,7 @@ private struct Reader
             string[] globs;
             auto body = ruleFrontMatter(text, hasPaths, globs).strip;
             if (!body.length) continue;
-            size_t[string] visited;
+            Read[][string] memo;
             if (hasPaths)
             {
                 auto compiled = compilePatterns(globs);
@@ -597,12 +604,11 @@ private struct Reader
                     continue;
                 }
                 auto real_ = canonOr(path);
-                visited[real_] = 0;
-                rules ~= RuleRead(path, real_, text, body, user, imports(path, body, user, 0, visited));
+                rules ~= RuleRead(path, real_, text, body, user, imports(path, body, user, 0, memo));
                 patterns ~= compiled;
             }
             // Front matter without `paths` is dropped; imports expand from the body only.
-            else sources ~= Source(null, file(path, Kind.rule, null, user, 0, visited, body));
+            else sources ~= Source(null, file(path, Kind.rule, null, user, 0, memo, body));
         }
     }
 }
@@ -641,8 +647,8 @@ class ProjectInstructions
         {
             foreach (f; options.userFiles)
             {
-                size_t[string] visited;
-                sources ~= Source(null, r.file(f, Kind.user, null, true, 0, visited));
+                Read[][string] memo;
+                sources ~= Source(null, r.file(f, Kind.user, null, true, 0, memo));
             }
             foreach (d; options.userRulesDirs) r.rules(d, true, sources, rules, p.patterns);
             foreach (i, d; dirsDown(cwd, p.startup.root))
@@ -1299,4 +1305,33 @@ unittest
     auto third = p.nestedFor(buildPath(root, "a/z.rs"), root);
     assert(third.count("bar_file") == 1 && !third.canFind("main_file") && !third.canFind("foo_file"), third);
     assert(p.nestedFor(buildPath(root, "a/w.rs"), root) is null);
+}
+
+unittest // an import reached again through another file still loads
+{
+    import std.file : rmdirRecurse;
+    auto base = testDir("alt-edge");
+    scope (exit) rmdirRecurse(base);
+    auto root = buildPath(base, "repo");
+    put(buildPath(root, "AGENTS.md"), "agents, see @detail.md");
+    put(buildPath(root, "CLAUDE.local.md"), "@AGENTS.md @wrapper.md");
+    put(buildPath(root, "wrapper.md"), "wrapper, see @detail.md");
+    put(buildPath(root, "detail.md"), "the detail");
+    assert(find(root).render.canFind("the detail"));
+}
+
+unittest // a deferred directory edited before its retry is still a change
+{
+    import std.file : rmdirRecurse;
+    import std.array : replicate;
+    auto base = testDir("defer-edit");
+    scope (exit) rmdirRecurse(base);
+    auto root = buildPath(base, "repo");
+    put(buildPath(root, "a/CLAUDE.md"), "@big.md\n" ~ "x".replicate(maxFileBytes - 64) ~ " main_file");
+    put(buildPath(root, "a/big.md"), "x".replicate(maxFileBytes - 64) ~ " import_file");
+    auto p = find(root);
+    assert(!p.nestedFor(buildPath(root, "a/x"), root).canFind("import_file"));
+    put(buildPath(root, "a/big.md"), "import_file, revised");
+    assert(p.nestedFor(buildPath(root, "a/y"), root).canFind("import_file"));
+    assert(p.nestedChanged(), "the retry attached the pending text, not the edit");
 }
