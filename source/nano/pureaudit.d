@@ -30,7 +30,9 @@ string[] impureFunctions(alias M)()
 private string[] check(alias P, string name)(string path)
 {
     string[] found;
-    static if (name.length >= 2 && name[0 .. 2] == "__") {} // compiler-generated
+    // Other `__` names are compiler-generated; user-written constructors,
+    // destructors and postblits are `__ctor`, `__dtor` and `__postblit`.
+    static if (name.length >= 2 && name[0 .. 2] == "__" && name != "__ctor" && name != "__dtor" && name != "__postblit") {}
     else static if (is(__traits(getMember, P, name) == struct) || is(__traits(getMember, P, name) == class))
     {
         alias A = __traits(getMember, P, name);
@@ -61,6 +63,9 @@ private struct Probe
     int get() const { return n; }
     int twice() const pure { return 2 * n; }
     struct Inner { void touch() { } }
+    this(int x) { n = x; }
+    this(this) { }
+    ~this() { }
 }
 
 private int freeImpure() { return 0; }
@@ -70,5 +75,6 @@ unittest
 {
     // This module is `pure:`, which covers freeImpure; the struct members are
     // what the label misses.
-    static assert(impureFunctions!(nano.pureaudit)() == ["pureaudit.Probe.get", "pureaudit.Probe.Inner.touch"]);
+    static assert(impureFunctions!(nano.pureaudit)() == ["pureaudit.Probe.get", "pureaudit.Probe.Inner.touch", "pureaudit.Probe.__ctor",
+        "pureaudit.Probe.__postblit", "pureaudit.Probe.__dtor", "pureaudit.Probe.opAssign"]);
 }
