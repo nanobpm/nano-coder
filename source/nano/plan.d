@@ -167,7 +167,7 @@ struct Plan
     }
 
     /// Run a plan tool. On an error the plan is left unchanged.
-    PlanResult!Outcome apply(string tool, JSONValue args) pure
+    PlanResult!Outcome apply(string tool, const JSONValue args) pure
     {
         switch (tool)
         {
@@ -386,7 +386,7 @@ struct Plan
 
     /// Accept a plan from a client or a session log: this harness's own shape
     /// (`{goal, items}`) or bare ACP entries.
-    static PlanResult!Plan fromJSON(JSONValue v) pure
+    static PlanResult!Plan fromJSON(const JSONValue v) pure
     {
         alias R = PlanResult!Plan;
         enum shape = "plan must be {goal, items: [{id, title, status}]}";

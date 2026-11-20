@@ -110,7 +110,7 @@ private string[] checkWeak(alias P, string name)(string path)
                 {
                     static if ((stc[i] & (ParameterStorageClass.ref_ | ParameterStorageClass.out_)) && isMutable!T)
                         weak = true;
-                    else static if (hasAliasing!T && isMutable!T && !__traits(compiles, { immutable(T) x = T.init; }))
+                    else static if (reachesMutable!T)
                         weak = true;
                 }
                 if (weak) found ~= path ~ "." ~ name;
@@ -118,6 +118,35 @@ private string[] checkWeak(alias P, string name)(string path)
         }}
     }
     return found;
+}
+
+/// Whether a value of type `T` reaches memory it may change: a pointer,
+/// slice, associative array or class reference whose target is mutable,
+/// directly or through fields. (`T.init` can't tell: a null slice converts to
+/// immutable.) Delegates and functions are callbacks, not data, so they pass.
+template reachesMutable(T, Seen...)
+{
+    import std.traits : isMutable, isPointer, isDynamicArray, isAssociativeArray, isStaticArray, isSomeFunction,
+        FieldTypeTuple, KeyType, ValueType, PointerTarget, Unqual;
+    import std.meta : anySatisfy, staticIndexOf;
+    // A recursive type (a message holding messages) is decided at its first
+    // visit; seeing it again adds nothing.
+    static if (staticIndexOf!(Unqual!T, Seen) >= 0) enum reachesMutable = false;
+    else
+    {
+        template inner(U) { enum inner = reachesMutable!(U, Unqual!T, Seen); }
+        static if (isSomeFunction!T || is(T == delegate)) enum reachesMutable = false;
+        else static if (isPointer!T)
+            enum reachesMutable = isMutable!(PointerTarget!T) || inner!(PointerTarget!T);
+        else static if (isDynamicArray!T)
+            enum reachesMutable = isMutable!(typeof(T.init[0])) || inner!(typeof(T.init[0]));
+        else static if (isStaticArray!T) enum reachesMutable = inner!(typeof(T.init[0]));
+        else static if (isAssociativeArray!T)
+            enum reachesMutable = isMutable!(ValueType!T) || inner!(ValueType!T) || inner!(KeyType!T);
+        else static if (is(T == class) || is(T == interface)) enum reachesMutable = isMutable!T;
+        else static if (is(T == struct)) enum reachesMutable = anySatisfy!(inner, FieldTypeTuple!T);
+        else enum reachesMutable = false;
+    }
 }
 
 private struct Probe
@@ -132,6 +161,19 @@ private struct Probe
 }
 
 private int freeImpure() { return 0; }
+
+// Probes for weaklyPureFunctions: mutable through ref/out, a slice, a
+// pointer, or a struct field; const and immutable inputs and plain values pass.
+private void weakRef(ref int x) pure { }
+private void weakOut(out int x) pure { x = 1; }
+private void weakSlice(int[] xs) pure { }
+private void weakPointer(int* p) pure { }
+private struct Holder { int[] xs; }
+private void weakField(Holder h) pure { }
+private int strongConst(const int[] xs, const(int)* p, const Holder h) pure { return 0; }
+private int strongValue(int x, string s, immutable(int)[] xs, const ref Holder h) pure { return x; }
+private struct Counter { int n; void bump() pure { n++; } } // a method may update its own struct
+
 private int freePure() pure { return 0; }
 
 unittest
@@ -140,4 +182,9 @@ unittest
     // what the label misses.
     static assert(impureFunctions!(nano.pureaudit)() == ["pureaudit.Probe.get", "pureaudit.Probe.Inner.touch", "pureaudit.Probe.__ctor",
         "pureaudit.Probe.__postblit", "pureaudit.Probe.__dtor", "pureaudit.Probe.opAssign"]);
+    static assert(weaklyPureFunctions!(nano.pureaudit)() == ["pureaudit.weakRef", "pureaudit.weakOut",
+        "pureaudit.weakSlice", "pureaudit.weakPointer", "pureaudit.weakField"]);
+    static assert(reachesMutable!(int[]) && reachesMutable!(int*) && reachesMutable!Holder && reachesMutable!(int[string]));
+    static assert(!reachesMutable!(const(int)[]) && !reachesMutable!string && !reachesMutable!(const Holder)
+        && !reachesMutable!int && !reachesMutable!(int delegate() pure));
 }

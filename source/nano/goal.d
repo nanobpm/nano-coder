@@ -58,14 +58,17 @@ struct Outcome
 
     /// Parse the tool's arguments, tolerating arguments sent as a JSON
     /// string; the error is the message for the model.
-    static Result!(Outcome, string) fromArgs(JSONValue args) pure
+    static Result!(Outcome, string) fromArgs(const JSONValue given) pure
     {
         alias R = Result!(Outcome, string);
-        if (args.type == JSONType.string)
+        // Some models send the arguments as a JSON string.
+        static const(JSONValue) decoded(const JSONValue v) pure
         {
-            try args = parseJSON(args.str);
-            catch (Exception) args = JSONValue(null); // a non-JSON string argument has no outcome fields
+            if (v.type != JSONType.string) return v;
+            try return parseJSON(v.str);
+            catch (Exception) return JSONValue(null); // a non-JSON string argument has no outcome fields
         }
+        const args = decoded(given);
         auto st = args.type == JSONType.object ? "status" in args.objectNoRef : null;
         if (st is null || st.type != JSONType.string)
             return R.err(`report_outcome needs ` ~ "`status`" ~ `: "completed", "blocked" or "needs_input"`);

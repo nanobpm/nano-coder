@@ -384,11 +384,15 @@ private struct Parser
             case 'U':
                 size_t n = e == 'u' ? 4 : 8;
                 if (i + n > s.length) fail("bad unicode escape");
-                dchar cp = cast(dchar) s[i .. i + n].to!uint(16);
+                import std.ascii : isHexDigit;
+                import std.algorithm.searching : all;
+                import std.utf : encode, isValidDchar;
+                if (!s[i .. i + n].all!isHexDigit) fail("bad unicode escape");
+                const code = s[i .. i + n].to!uint(16);
+                if (!isValidDchar(cast(dchar) code)) fail("bad unicode escape: not a Unicode scalar value");
                 i += n;
-                import std.utf : encode;
                 char[4] buf;
-                auto len = encode(buf, cp);
+                auto len = encode(buf, cast(dchar) code);
                 out_.put(buf[0 .. len]);
                 break;
             default:
@@ -431,6 +435,11 @@ unittest
     assert(doc["rules"].arrayNoRef.length == 2 && doc["rules"][1]["name"].str == "b");
     bool threw;
     threw = parseToml("x = 1\nx = 2\n").isErr;
+    // Bad escapes are errors, not exceptions escaping the Result.
+    assert(parseToml("x = \"\\uZZZZ\"").isErr);
+    assert(parseToml("x = \"\\uD800\"").isErr);
+    assert(parseToml("x = \"\\U00110000\"").isErr);
+    assert(parseToml("x = \"\\u00e9\"").unwrap("valid TOML")["x"].str == "\u00e9");
     assert(threw);
 }
 

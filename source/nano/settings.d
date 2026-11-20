@@ -13,7 +13,7 @@ import nano.qwen : QwenEndpoint;
 import std.string : strip;
 import nano.thinking : Thinking;
 import nano.toml_edit;
-import nano.result : unwrap;
+import nano.result : toOption, unwrap;
 
 /// What a visit changed (each saved as its own key).
 struct Changes
@@ -110,7 +110,8 @@ Tuple!(Nullable!Thinking, string)[] thinkingChoices(size_t scope_, const string[
     C[] choices;
     if (scope_ < 2) choices ~= C(Nullable!Thinking.init, "unset (use the broader setting)");
     choices ~= C(Nullable!Thinking(Thinking.parse("default").unwrap("a valid level")), "default (send no level; the model decides)");
-    foreach (l; levels) choices ~= C(Nullable!Thinking(Thinking.parse(l).unwrap("a valid level")), l);
+    // Levels can come from the endpoint, so one that doesn't parse is skipped.
+    foreach (l; levels) foreach (t; Thinking.parse(l).toOption) choices ~= C(Nullable!Thinking(t), l);
     bool has(Nullable!Thinking v)
     {
         foreach (c; choices) if (c[0] == v) return true;
@@ -408,6 +409,9 @@ unittest
     assert(ch.length == 5 && ch[0][1].canFind("unset") && ch[4][1] == "medium" && initial == 4);
     ch = thinkingChoices(2, ["low"], Nullable!Thinking.init, initial);
     assert(ch.length == 2 && initial == 0);
+    // A level the endpoint reports but that doesn't parse is left out.
+    ch = thinkingChoices(2, ["low", "very high"], typeof(ch[0][0]).init, initial);
+    assert(ch.length == 2 && !ch.canFind!(c => c[1] == "very high"));
 
     Config c;
     c.model = "x/y";
