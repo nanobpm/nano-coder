@@ -54,8 +54,8 @@ struct Options
     static Options project(const string[] names) pure { Options o; o.names = names.dup; return o; }
 }
 
-/// One file as read, with the imports it reaches (resolved and read too).
-/// A read is a snapshot: two reads are equal when the files say the same.
+/// One file as read. Its imports are keys into the same `Graph`: a file
+/// imported from many places is read, stored and compared once.
 struct Read
 {
     /// As found, and canonical (the key that shows a file only once).
@@ -63,20 +63,25 @@ struct Read
     /// Null when the file is missing, unreadable or empty.
     string text;
     Kind kind;
-    string importedBy;
     bool user;
     /// Set when the file, or the import leading to it, was refused (outside
     /// the repository, ...): the warning to record. Nothing loads.
     string refused;
-    Read[] imports;
+    /// What this file imports, in order.
+    string[] imports;
 }
 
-/// A file read in a directory search, or a warning raised while reading.
+/// Files read together, by key. Two graphs are equal when the files say
+/// the same; comparing them visits each file once.
+alias Graph = Read[string];
+
+/// A file read at session start, or a warning raised while reading.
 struct Source
 {
     /// The directory searched, or null (user files, rules).
     string searchDir;
-    Read read;
+    /// Key into `Startup.graph`.
+    string key;
 }
 
 /// One directory's files as read: the first of the configured names that
@@ -85,7 +90,9 @@ struct Source
 struct DirRead
 {
     string dir;
-    Read[] files;
+    /// Keys into `graph`.
+    string[] files;
+    Graph graph;
 }
 
 /// A rule scoped with `paths:`, attached when a matching file is touched.
@@ -95,8 +102,8 @@ struct RuleRead
     /// The whole file, and the body after the front matter.
     string source, body;
     bool user;
-    /// What the body imports.
-    Read[] imports;
+    /// What the body imports: keys into `Startup.graph`.
+    string[] imports;
 }
 
 /// Everything read at session start, fixed for the session.
@@ -110,6 +117,8 @@ struct Startup
     /// The directories searched at start.
     string[] initialDirs;
     RuleRead[] rules;
+    /// Every file read at start, by key.
+    Graph graph;
 }
 
 /// What has been shown to the model.
@@ -137,7 +146,7 @@ struct State
 /// Whether two session starts read the same files (instructions unchanged).
 bool sameFiles(const Startup a, const Startup b)
 {
-    return a.root == b.root && a.sources == b.sources && a.rules == b.rules;
+    return a.root == b.root && a.sources == b.sources && a.rules == b.rules && a.graph == b.graph;
 }
 
 /// Repository-relative, `~/`-relative, or as given.
@@ -154,7 +163,7 @@ string display(string path, string root, string home)
 State begin(const Startup st)
 {
     Acc acc;
-    foreach (s; st.sources) acc.flatten(s.read, s.searchDir);
+    foreach (s; st.sources) acc.flatten(st.graph, s.key, null, s.searchDir);
     State s;
     s.loaded = acc.files;
     s.seen = acc.seen;
@@ -198,7 +207,7 @@ Attached attach(const State s, const Startup st, const DirRead[] dirs, const boo
         n.pending = stillPending;
         acc.seen = n.seen;
         acc.warnings = n.warnings;
-        foreach (f; d.files) acc.flatten(f, d.dir);
+        foreach (f; d.files) acc.flatten(d.graph, f, null, d.dir);
         n.warnings = acc.warnings;
         n.seen = acc.seen;
         size_t rendered;
@@ -242,7 +251,7 @@ Attached attach(const State s, const Startup st, const DirRead[] dirs, const boo
             auto seen = n.seen ~ rule.real_;
             auto warnings = n.warnings.dup;
             string text = rule.body;
-            ruleImports(rule.imports, rule.path, st, seen, warnings, text);
+            ruleImports(st.graph, rule.imports, rule.path, st, seen, warnings, text);
             auto section = format("\n\n[Rule %s applies to %s. Follow it for changes to matching files:]\n%s",
                 show(rule.path), rel, text);
             n.warnings = warnings;
@@ -334,30 +343,35 @@ struct Acc
     InstructionFile[] files;
     string[] seen, warnings;
 
-    /// `r` and its imports, depth first, as the model sees them.
-    void flatten(const Read r, string searchDir) pure
+    /// The file at `key` and its imports, depth first, as the model sees
+    /// them. A file expands only when first shown, so this is linear.
+    void flatten(const Graph g, string key, string importedBy, string searchDir) pure
     {
+        const r = key in g;
+        if (r is null) return;
         if (r.refused.length) { warn(warnings, r.refused); return; }
         if (r.text is null || seen.canFind(r.real_)) return;
         seen ~= r.real_;
-        files ~= InstructionFile(r.path, r.text, r.kind, r.importedBy, r.user, searchDir);
-        foreach (c; r.imports) flatten(c, searchDir);
+        files ~= InstructionFile(r.path, r.text, r.kind, importedBy, r.user, searchDir);
+        foreach (c; r.imports) flatten(g, c, r.path, searchDir);
     }
 }
 
 /// A scoped rule's imports, appended under headings; each file once.
-void ruleImports(const Read[] imports, string from, const Startup st, ref string[] seen, ref string[] warnings,
-    ref string out_)
+void ruleImports(const Graph g, const string[] imports, string from, const Startup st, ref string[] seen,
+    ref string[] warnings, ref string out_)
 {
-    foreach (c; imports)
+    foreach (key; imports)
     {
+        const c = key in g;
+        if (c is null) continue;
         if (c.refused.length) { warn(warnings, c.refused); continue; }
         if (seen.canFind(c.real_)) continue;
         seen ~= c.real_;
         if (c.text is null) continue;
         out_ ~= format("\n\n## %s (imported by %s)\n\n%s", display(c.path, st.root, st.home),
             display(from, st.root, st.home), c.text);
-        ruleImports(c.imports, c.path, st, seen, warnings, out_);
+        ruleImports(g, c.imports, c.path, st, seen, warnings, out_);
     }
 }
 
@@ -380,16 +394,8 @@ string heading(const ref InstructionFile f, const Startup st)
 
 DirRead dupRead(const DirRead d)
 {
-    DirRead r;
-    r.dir = d.dir;
-    foreach (f; d.files) r.files ~= dupRead(f);
-    return r;
-}
-
-Read dupRead(const Read f)
-{
-    Read r = Read(f.path, f.real_, f.text, f.kind, f.importedBy, f.user, f.refused);
-    foreach (c; f.imports) r.imports ~= dupRead(c);
+    auto r = DirRead(d.dir, d.files.dup);
+    foreach (k, f; d.graph) r.graph[k] = Read(f.path, f.real_, f.text, f.kind, f.user, f.refused, f.imports.dup);
     return r;
 }
 
@@ -410,22 +416,35 @@ State copy(const State s)
 
 // Tests of the transitions on hand-made reads, with no disk.
 
-version (unittest) Read file(string path, string text, Read[] imports = null)
+version (unittest) string file(ref Graph g, string path, string text, string[] imports = null, Kind kind = Kind.project)
 {
-    return Read(path, path, text, Kind.project, null, false, null, imports);
+    g[path] = Read(path, path, text, kind, false, null, imports);
+    return path;
 }
 
 unittest // begin shows each file once, imports depth first, warnings once
 {
     Startup st;
     st.root = "/r";
-    auto shared_ = Read("/r/s.md", "/r/s.md", "shared", Kind.imported, "/r/CLAUDE.md");
-    auto refused = Read(null, null, null, Kind.imported, null, false, "skipped import");
-    st.sources = [Source("/r", file("/r/CLAUDE.md", "top", [shared_, refused, shared_]))];
+    file(st.graph, "/r/s.md", "shared", null, Kind.imported);
+    st.graph["!refused"] = Read(null, null, null, Kind.imported, false, "skipped import");
+    st.sources = [Source("/r", file(st.graph, "/r/CLAUDE.md", "top", ["/r/s.md", "!refused", "/r/s.md"]))];
     st.initialDirs = ["/r"];
     auto s = begin(st);
     assert(s.loaded.length == 2 && s.loaded[1].text == "shared" && s.warnings == ["skipped import"]);
     assert(render(st, s).canFind("## s.md (imported by CLAUDE.md)"));
+}
+
+unittest // a dense import graph flattens in linear time
+{
+    import std.conv : to;
+    Startup st;
+    string[] all;
+    foreach (i; 0 .. 50) all ~= "/r/" ~ i.to!string;
+    foreach (k; all) file(st.graph, k, "t" ~ k, all, Kind.imported);
+    st.sources = [Source(null, file(st.graph, "/r/CLAUDE.md", "top", all))];
+    assert(begin(st).loaded.length == 51);
+    assert(sameFiles(st, st));
 }
 
 unittest // attach: a directory once, deferral re-reads, forget starts over
@@ -434,7 +453,8 @@ unittest // attach: a directory once, deferral re-reads, forget starts over
     st.root = "/r";
     st.initialDirs = ["/r"];
     auto s = begin(st);
-    auto pkg = DirRead("/r/pkg", [file("/r/pkg/AGENTS.md", "pkg rule")]);
+    DirRead pkg = DirRead("/r/pkg");
+    pkg.files = [file(pkg.graph, "/r/pkg/AGENTS.md", "pkg rule")];
     assert(needsRead(s, st, "/r/pkg") && !needsRead(s, st, "/r"));
     auto a = attach(s, st, [pkg], null, "pkg/x", true);
     assert(a.text.canFind("pkg rule") && !needsRead(a.state, st, "/r/pkg"));
@@ -445,11 +465,13 @@ unittest // attach: a directory once, deferral re-reads, forget starts over
     // Too big: deferred and pending, retried on the next call; after
     // compaction the directory is read afresh.
     import std.array : replicate;
-    auto big = DirRead("/r/big", [file("/r/big/AGENTS.md", "x".replicate(maxTotalBytes))]);
+    DirRead big = DirRead("/r/big");
+    big.files = [file(big.graph, "/r/big/AGENTS.md", "x".replicate(maxTotalBytes))];
     auto d = attach(s, st, [big], null, "big/x", true);
     assert(d.text == omittedMarker && needsRead(d.state, st, "/r/big") && d.state.warnings[0].canFind("deferred"));
     assert(d.state.pending.length == 1 && attach(d.state, st, [big], null, "big/x", true).text == omittedMarker);
-    auto small = DirRead("/r/big", [file("/r/big/AGENTS.md", "fits now")]);
+    DirRead small = DirRead("/r/big");
+    small.files = [file(small.graph, "/r/big/AGENTS.md", "fits now")];
     assert(attach(forget(d.state), st, [small], null, "big/x", true).text.canFind("fits now"));
 }
 
@@ -457,8 +479,8 @@ unittest // scoped rules: matched ones attach once with their imports
 {
     Startup st;
     st.root = "/r";
-    auto detail = Read("/r/d.md", "/r/d.md", "detail", Kind.imported, "/r/rules/a.md");
-    st.rules = [RuleRead("/r/rules/a.md", "/r/rules/a.md", "src", "rule a", false, [detail]),
+    file(st.graph, "/r/d.md", "detail", null, Kind.imported);
+    st.rules = [RuleRead("/r/rules/a.md", "/r/rules/a.md", "src", "rule a", false, ["/r/d.md"]),
         RuleRead("/r/rules/b.md", "/r/rules/b.md", "src", "rule b", false)];
     auto s = begin(st);
     auto a = attach(s, st, null, [true, false], "a/x", true);
@@ -472,12 +494,12 @@ unittest // sameFiles compares what was read
 {
     Startup a, b;
     a.root = b.root = "/r";
-    a.sources = [Source("/r", file("/r/AGENTS.md", "one"))];
-    b.sources = [Source("/r", file("/r/AGENTS.md", "one"))];
+    a.sources = [Source("/r", file(a.graph, "/r/AGENTS.md", "one"))];
+    b.sources = [Source("/r", file(b.graph, "/r/AGENTS.md", "one"))];
     assert(sameFiles(a, b));
-    b.sources[0].read.text = "two";
+    b.graph["/r/AGENTS.md"].text = "two";
     assert(!sameFiles(a, b));
-    b.sources[0].read.text = "one";
+    b.graph["/r/AGENTS.md"].text = "one";
     b.rules = [RuleRead("/r/x.md", "/r/x.md", "s", "b", false)];
     assert(!sameFiles(a, b));
 }

@@ -24,7 +24,7 @@ import std.string : strip, stripLeft, stripRight, indexOf, lineSplitter, KeepTer
 import std.uni : isWhite;
 import nano.paths : canonicalize, startsWithPath, isSymlink, homeDir;
 public import nano.instruction_state : InstructionFile, Kind, Options, maxTotalBytes;
-import nano.instruction_state : Read, DirRead, RuleRead, Source, Startup, State, begin, attach, forget, needsRead;
+import nano.instruction_state : Graph, Read, DirRead, RuleRead, Source, Startup, State, begin, attach, forget, needsRead;
 static import st = nano.instruction_state;
 
 /// Per-file cap; longer files are truncated with a note.
@@ -455,14 +455,16 @@ private string canonicalizeExisting(string path)
     }
 }
 
-/// Reads instruction files from disk into `Read` values: imports resolved
-/// (and refused, with the warning, outside the repository unless allowed)
-/// and read too, down to `maxImportDepth`. Reading has no memory of what was
+/// Reads instruction files from disk into a `Graph`: imports resolved (and
+/// refused, with the warning, outside the repository unless allowed) and
+/// read too, down to `maxImportDepth`. Reading has no memory of what was
 /// shown; that is `State`'s job.
 private struct Reader
 {
     string root, home;
     Options options;
+    /// What this reader has read, by key.
+    Graph graph;
 
     private string display(string path) { return st.display(path, root, home); }
 
@@ -472,49 +474,46 @@ private struct Reader
         return real_ !is null && startsWithPath(real_, canonOr(root));
     }
 
-    /// One file and what it imports. `body` (when not null) replaces the
-    /// on-disk text (a rule without its front matter). `memo` holds each
-    /// file's imports per depth, so a file reached again reads nothing new;
-    /// every edge stays (which one shows is `State`'s choice) and
-    /// `maxImportDepth` ends cycles.
-    Read file(string path, Kind kind, string importedBy, bool user, size_t depth, ref Read[][string] memo,
-        string body = null)
+    /// One file and what it imports, added to `graph`; returns its key. A
+    /// file reached again at the same depth is read once, every import edge
+    /// stays (which one shows is `State`'s choice), and `maxImportDepth`
+    /// ends cycles. `body` (when not null) replaces the on-disk text (a rule
+    /// without its front matter).
+    string file(string path, Kind kind, bool user, size_t depth, string body = null)
     {
-        auto r = Read(path, canonOr(path), null, kind, importedBy, user);
+        const key = format("%s\0%s\0%s\0%s", kind, user, depth, path);
+        if (key in graph) return key;
+        auto r = Read(path, canonOr(path), null, kind, user);
         auto disk = readCapped(path);
-        if (disk is null) return r;
-        if (!user && !options.importsOutsideProject && !inside(path))
-        {
+        if (disk !is null && !user && !options.importsOutsideProject && !inside(path))
             r.refused = format("skipped %s: links outside the repository (set instruction_imports_outside_project = "
                 ~ "true to allow)", display(path));
-            return r;
-        }
-        r.text = body !is null ? body : disk;
-        if (depth < maxImportDepth && expandsImports(path, kind))
+        else if (disk !is null)
         {
-            // Keyed by the text too: a rule's body differs from its file.
-            const key = format("%s\0%s\0%s", path, depth, r.text);
-            if (auto known = key in memo) r.imports = *known;
-            else memo[key] = r.imports = imports(path, r.text, user, depth, memo);
+            r.text = body !is null ? body : disk;
+            if (depth < maxImportDepth && expandsImports(path, kind))
+                r.imports = imports(path, r.text, user, depth);
         }
-        return r;
+        graph[key] = r;
+        return key;
     }
 
-    /// The files `text` (in `from`, at `depth`) imports, in order.
-    Read[] imports(string from, string text, bool user, size_t depth, ref Read[][string] memo)
+    /// The files `text` (in `from`, at `depth`) imports, in order: keys into
+    /// `graph`.
+    string[] imports(string from, string text, bool user, size_t depth)
     {
-        Read[] out_;
+        string[] out_;
         bool[string] done; // the same file named twice in one text loads once
         foreach (ref_; importRefs(text))
         {
             string warning;
             auto target = resolve(from, ref_, user, warning);
-            if (warning !is null) out_ ~= Read(null, null, null, Kind.imported, from, user, warning);
+            if (warning !is null) out_ ~= refuse(warning);
             if (target is null) continue;
             auto real_ = canonOr(target);
             if (real_ in done) continue;
             done[real_] = true;
-            out_ ~= file(target, Kind.imported, from, user, depth + 1, memo);
+            out_ ~= file(target, Kind.imported, user, depth + 1);
         }
         return out_;
     }
@@ -550,22 +549,31 @@ private struct Reader
 
     /// One directory's files: the first of `options.names` that exists,
     /// then the personal files.
+    /// A warning in `graph`; returns its key.
+    string refuse(string warning)
+    {
+        const key = "!" ~ warning;
+        graph[key] = Read(null, null, null, Kind.imported, false, warning);
+        return key;
+    }
+
+    /// One directory's files, in a graph of their own.
     DirRead dir(string d)
     {
+        auto sub = Reader(root, home, options);
         auto r = DirRead(d);
         foreach (n; options.names)
         {
             auto path = buildPath(d, n);
             if (readCapped(path) is null) continue;
-            Read[][string] memo;
-            r.files ~= file(path, Kind.project, null, false, 0, memo);
+            r.files ~= sub.file(path, Kind.project, false, 0);
             break;
         }
         foreach (n; localFiles)
         {
-            Read[][string] memo;
-            r.files ~= file(buildPath(d, n), Kind.local, null, false, 0, memo);
+            r.files ~= sub.file(buildPath(d, n), Kind.local, false, 0);
         }
+        r.graph = sub.graph;
         return r;
     }
 
@@ -575,7 +583,7 @@ private struct Reader
     {
         auto rootc = canonOr(root);
         auto allowOutside = user || options.importsOutsideProject;
-        void refuse(string warning) { sources ~= Source(null, Read(null, null, null, Kind.rule, null, user, warning)); }
+        void skip(string warning) { sources ~= Source(null, refuse(warning)); }
         foreach (path; markdownFiles(d, rootc, allowOutside))
         {
             if (!allowOutside)
@@ -583,7 +591,7 @@ private struct Reader
                 auto real_ = canonicalize(path);
                 if (real_ is null || !startsWithPath(real_, rootc))
                 {
-                    refuse(format("skipped rule %s: links outside the repository (set "
+                    skip(format("skipped rule %s: links outside the repository (set "
                         ~ "instruction_imports_outside_project = true to allow)", display(path)));
                     continue;
                 }
@@ -594,21 +602,20 @@ private struct Reader
             string[] globs;
             auto body = ruleFrontMatter(text, hasPaths, globs).strip;
             if (!body.length) continue;
-            Read[][string] memo;
             if (hasPaths)
             {
                 auto compiled = compilePatterns(globs);
                 if (!compiled.length)
                 {
-                    refuse(format("rule %s has no usable paths patterns", display(path)));
+                    skip(format("rule %s has no usable paths patterns", display(path)));
                     continue;
                 }
                 auto real_ = canonOr(path);
-                rules ~= RuleRead(path, real_, text, body, user, imports(path, body, user, 0, memo));
+                rules ~= RuleRead(path, real_, text, body, user, imports(path, body, user, 0));
                 patterns ~= compiled;
             }
             // Front matter without `paths` is dropped; imports expand from the body only.
-            else sources ~= Source(null, file(path, Kind.rule, null, user, 0, memo, body));
+            else sources ~= Source(null, file(path, Kind.rule, user, 0, body));
         }
     }
 }
@@ -647,17 +654,19 @@ class ProjectInstructions
         {
             foreach (f; options.userFiles)
             {
-                Read[][string] memo;
-                sources ~= Source(null, r.file(f, Kind.user, null, true, 0, memo));
+                sources ~= Source(null, r.file(f, Kind.user, true, 0));
             }
             foreach (d; options.userRulesDirs) r.rules(d, true, sources, rules, p.patterns);
             foreach (i, d; dirsDown(cwd, p.startup.root))
             {
-                foreach (f; r.dir(d).files) sources ~= Source(d, f);
+                auto read = r.dir(d);
+                foreach (k, v; read.graph) r.graph[k] = v;
+                foreach (f; read.files) sources ~= Source(d, f);
                 initialDirs ~= d;
                 if (i == 0) r.rules(buildPath(p.startup.root, projectRulesDir), false, sources, rules, p.patterns);
             }
         }
+        p.startup.graph = r.graph;
         p.state = begin(p.startup);
         return p;
     }
@@ -1334,4 +1343,23 @@ unittest // a deferred directory edited before its retry is still a change
     put(buildPath(root, "a/big.md"), "import_file, revised");
     assert(p.nestedFor(buildPath(root, "a/y"), root).canFind("import_file"));
     assert(p.nestedChanged(), "the retry attached the pending text, not the edit");
+}
+
+unittest // a dense import graph is read, compared and attached once per file
+{
+    import std.file : rmdirRecurse;
+    import std.conv : to;
+    auto base = testDir("dense");
+    scope (exit) rmdirRecurse(base);
+    auto root = buildPath(base, "repo");
+    string refs;
+    foreach (i; 0 .. 50) refs ~= " @f" ~ i.to!string ~ ".md";
+    foreach (i; 0 .. 50) put(buildPath(root, "d/f" ~ i.to!string ~ ".md"), "file " ~ i.to!string ~ refs);
+    put(buildPath(root, "CLAUDE.md"), "top");
+    put(buildPath(root, "d/CLAUDE.md"), "nested" ~ refs);
+    auto p = find(root);
+    assert(p.sameFiles(find(root)));
+    assert(p.nestedFor(buildPath(root, "d/x"), root).canFind("file 49"));
+    assert(!p.nestedChanged());
+    p.nestedFor(buildPath(root, "d/y"), root); // copies the state again
 }
