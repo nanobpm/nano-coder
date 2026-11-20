@@ -13,6 +13,7 @@ import std.format : format;
 import std.string : toLower, strip, startsWith;
 import std.uni : asLowerCase;
 import nano.llm : Message, Role;
+import nano.option : Option;
 
 /// Used when neither config nor the model name gives a window.
 enum size_t defaultContextWindow = 128_000;
@@ -85,13 +86,15 @@ enum CompactionMode { standard, smart }
 
 string modeName(CompactionMode m) pure { return m == CompactionMode.smart ? "smart" : "standard"; }
 
-bool parseCompactionMode(string s, out CompactionMode m) pure
+/// The mode named `s` (any case), or none.
+Option!CompactionMode parseCompactionMode(string s) pure
 {
+    import nano.option : some;
     switch (s.toLower)
     {
-        case "standard": m = CompactionMode.standard; return true;
-        case "smart": m = CompactionMode.smart; return true;
-        default: return false;
+        case "standard": return some(CompactionMode.standard);
+        case "smart": return some(CompactionMode.smart);
+        default: return Option!CompactionMode.init;
     }
 }
 
@@ -516,12 +519,12 @@ string clipToolResult(string text, size_t maxChars) pure
     return out_[];
 }
 
-/// Shorten an oversized message in place. Returns whether it was clipped.
-bool clipMessage(ref Message m, size_t maxTokens) pure
+/// `m`'s content shortened to about `maxTokens`, or none when it fits.
+Option!string clippedContent(const ref Message m, size_t maxTokens) pure
 {
-    if (textTokens(m.content) <= maxTokens) return false;
-    m.content = clip(m.content, maxTokens * 4);
-    return true;
+    import nano.option : some;
+    if (textTokens(m.content) <= maxTokens) return Option!string.init;
+    return some(clip(m.content, maxTokens * 4));
 }
 
 /// Render messages as a plain transcript for the summarizer, newest content

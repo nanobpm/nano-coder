@@ -15,6 +15,7 @@ import std.string : lineSplitter;
 import nano.agent;
 import nano.llm;
 import nano.option : some, unwrap;
+import nano.result : unwrap;
 import nano.permissions : Policy;
 import nano.providers.mock : MockClient;
 import nano.session : SessionLog, restore;
@@ -329,7 +330,7 @@ unittest
 
     auto agent = new Agent(new MockClient([LLMResponse("one"), LLMResponse("two"), LLMResponse("three")]),
         new ToolRegistry, Policy.init, "sys");
-    agent.sessionThinking = nullable(Thinking.parse("high"));
+    agent.sessionThinking = nullable(Thinking.parse("high").unwrap("a valid level"));
     agent.messages ~= Message.user("earlier");
     bool rendered;
     auto msg = collectExceptionMsg(agent.restartWith(() @safe => (throw new Exception("blocked")),

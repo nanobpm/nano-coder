@@ -70,6 +70,12 @@ struct Option(T)
         return present ? dg(value) : 0;
     }
 
+    /// ditto, from pure code.
+    int opApply(scope int delegate(T) pure @safe dg) pure
+    {
+        return present ? dg(value) : 0;
+    }
+
     bool isSome() pure const { return present; }
 
     bool isNone() pure const { return !present; }

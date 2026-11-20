@@ -20,6 +20,8 @@ static import std.format;
 import std.json;
 import std.string : strip, toLower, indexOf, startsWith, lastIndexOf;
 import std.typecons : Nullable;
+import nano.option : Option, unwrap;
+import nano.result : Result, match, map, unwrap;
 import nano.config : ProviderConfig, ProviderKind;
 
 /// Named levels from least to most thinking.
@@ -40,18 +42,19 @@ struct Thinking
     static Thinking of(string l) pure { return Thinking(Kind.level, l); }
     bool isDefault() pure const { return kind == Kind.default_; }
 
-    /// Parse a setting; throws with Rust's message on a bad one.
-    static Thinking parse(string s) pure
+    /// Parse a setting; the error is Rust's message for a bad one.
+    static Result!(Thinking, string) parse(string s) pure
     {
+        alias R = Result!(Thinking, string);
         s = s.strip.toLower;
         switch (s)
         {
-            case "default", "model default", "auto": return Thinking.init;
-            case "off", "none", "disabled": return Thinking.off;
-            case "": throw new Exception(`thinking level is empty; use "default", "off" or a level such as "high"`);
+            case "default", "model default", "auto": return R.ok(Thinking.init);
+            case "off", "none", "disabled": return R.ok(Thinking.off);
+            case "": return R.err(`thinking level is empty; use "default", "off" or a level such as "high"`);
             default:
-                if (s.all!(c => isAlphaNum(c) || c == '-' || c == '_')) return Thinking.of(s);
-                throw new Exception(format(`thinking must be "default", "off" or a level name such as "high"; got "%s"`, s));
+                if (s.all!(c => isAlphaNum(c) || c == '-' || c == '_')) return R.ok(Thinking.of(s));
+                return R.err(format(`thinking must be "default", "off" or a level name such as "high"; got "%s"`, s));
         }
     }
 
@@ -162,32 +165,37 @@ private uint minorOf(string s) pure
     return 0;
 }
 
-/// `(family, major, minor)` of a Claude id: `claude-sonnet-4-5-20250929` is
-/// sonnet 4.5, `claude-3-7-sonnet-latest` sonnet 3.7.
-bool claudeVersion(string id, out string family, out uint major, out uint minor) pure
+/// A Claude model's family and version.
+struct ClaudeVersion
 {
+    string family;
+    uint major, minor;
+}
+
+/// The family and version of a Claude id: `claude-sonnet-4-5-20250929` is
+/// sonnet 4.5, `claude-3-7-sonnet-latest` sonnet 3.7.
+Option!ClaudeVersion claudeVersion(string id) pure
+{
+    import nano.option : some;
+    alias R = Option!ClaudeVersion;
     auto at = id.indexOf("claude-");
-    if (at < 0) return false;
+    if (at < 0) return R.init;
     auto rest = id[at + 7 .. $];
+    uint major;
     foreach (f; ["opus", "sonnet", "haiku", "fable"])
     {
         if (rest.startsWith(f ~ "-"))
         {
             string tail;
             if (number(rest[f.length + 1 .. $], major, tail))
-            {
-                family = f;
-                minor = minorOf(tail);
-                return true;
-            }
+                return some(ClaudeVersion(f, major, minorOf(tail)));
         }
     }
     string tail;
-    if (!number(rest, major, tail)) return false;
-    minor = minorOf(tail);
+    if (!number(rest, major, tail)) return R.init;
     foreach (f; ["opus", "sonnet", "haiku"])
-        if (tail.canFind(f)) { family = f; return true; }
-    return false;
+        if (tail.canFind(f)) return some(ClaudeVersion(f, major, minorOf(tail)));
+    return R.init;
 }
 
 /// `(major, minor)` of `gpt-<major>[.<minor>]` with the prefix stripped.
@@ -213,10 +221,13 @@ Nullable!Profile builtin(string model) pure
     alias A = AnthropicStyle;
     Nullable!Profile none;
     auto id = model.toLower;
-    string family; uint major, minor;
-    if (claudeVersion(id, family, major, minor))
+    uint major, minor;
+    auto claude = claudeVersion(id);
+    if (claude.isSome)
     {
-        auto v = major * 100 + minor;
+        auto cv = claude.unwrap("isSome");
+        auto family = cv.family;
+        auto v = cv.major * 100 + cv.minor;
         immutable full = ["low", "medium", "high", "xhigh", "max"];
         if (family == "fable") return Nullable!Profile(profile(full.dup, true));
         if ((family == "opus" || family == "sonnet") && v >= 505) return Nullable!Profile(profile(full.dup, true));
@@ -508,12 +519,13 @@ string statusText(const ref Resolved r, string model) pure
     return out_.join("\n");
 }
 
-/// Apply a `/thinking ARG` (`reset` clears the session level).
-void setSession(ref Nullable!Thinking session, string arg) pure
+/// The session level after `/thinking ARG` (`reset` clears it).
+Result!(Nullable!Thinking, string) sessionSetting(string arg) pure
 {
+    alias R = Result!(Nullable!Thinking, string);
     arg = arg.strip;
-    if (arg.toLower == "reset") session.nullify;
-    else session = Thinking.parse(arg);
+    if (arg.toLower == "reset") return R.ok(Nullable!Thinking.init);
+    return Thinking.parse(arg).map!(t => Nullable!Thinking(t));
 }
 
 /// The level in `levels` nearest to `wanted`: the highest at or below it on
@@ -561,14 +573,12 @@ Resolved resolve(const Thinking global, scope const(Thinking)* session, Provider
         foreach (raw; *configured)
         {
             auto l = raw.strip.toLower;
-            try
-            {
-                auto t = Thinking.parse(l);
+            // A malformed level is listed as invalid, reported by the caller.
+            Thinking.parse(l).match!((t) {
                 if (t.kind == Thinking.Kind.off && l != "off") aliases ~= l;
                 else if (t.isDefault) reserved ~= l;
                 else r.levels ~= l;
-            }
-            catch (Exception) invalid ~= l; // a malformed level is listed as invalid, reported by the caller
+            }, (e) { invalid ~= l; });
         }
     }
     else if (reported !is null) r.levels = reported.levels.dup;
@@ -675,48 +685,51 @@ Resolved resolve(const Thinking global, scope const(Thinking)* session, Provider
     return r;
 }
 
-/// Write `req` into a Chat Completions body.
-void applyChat(const Request req, ref JSONValue body) pure
+/// The Chat Completions body fields for `req`.
+JSONValue[string] chatFields(const Request req) pure
 {
     alias K = Request.Kind;
     final switch (req.kind)
     {
-        case K.effort: body["reasoning_effort"] = req.level; break;
-        case K.off: body["reasoning_effort"] = "none"; break;
-        case K.templateSwitch: body["chat_template_kwargs"] = JSONValue(["enable_thinking": JSONValue(req.on)]); break;
-        case K.templateEffort: body["chat_template_kwargs"] = JSONValue(["reasoning_effort": JSONValue(req.level)]); break;
-        case K.budget, K.adaptiveOn, K.none: break;
+        case K.effort: return ["reasoning_effort": JSONValue(req.level)];
+        case K.off: return ["reasoning_effort": JSONValue("none")];
+        case K.templateSwitch: return ["chat_template_kwargs": JSONValue(["enable_thinking": JSONValue(req.on)])];
+        case K.templateEffort: return ["chat_template_kwargs": JSONValue(["reasoning_effort": JSONValue(req.level)])];
+        case K.budget, K.adaptiveOn, K.none: return null;
     }
 }
 
-/// Write `req` into an Anthropic Messages body; returns whether thinking is on
-/// (which rules out a custom temperature).
 /// `max_tokens` the Anthropic client sends when none is configured (as Rust).
 enum anthropicDefaultMaxTokens = 8192;
 
-bool applyAnthropic(const Request req, ref JSONValue body, long maxTokens) pure
+/// The Anthropic Messages body fields for `req`, and whether thinking is on
+/// (which rules out a custom temperature).
+struct AnthropicThinking
+{
+    JSONValue[string] fields;
+    bool on;
+}
+
+/// ditto
+AnthropicThinking anthropicFields(const Request req, long maxTokens) pure
 {
     alias K = Request.Kind;
+    alias A = AnthropicThinking;
     final switch (req.kind)
     {
         case K.effort:
-            body["thinking"] = JSONValue(["type": "adaptive"]);
-            body["output_config"] = JSONValue(["effort": req.level]);
-            return true;
+            return A(["thinking": JSONValue(["type": "adaptive"]), "output_config": JSONValue(["effort": req.level])], true);
         case K.adaptiveOn:
-            body["thinking"] = JSONValue(["type": "adaptive"]);
-            return true;
+            return A(["thinking": JSONValue(["type": "adaptive"])], true);
         case K.budget:
             auto b = cappedBudget(req.budget, maxTokens);
-            if (!b) return false;
+            if (!b) return A.init;
             JSONValue t = ["type": "enabled"];
             t["budget_tokens"] = cast(long) b;
-            body["thinking"] = t;
-            return true;
+            return A(["thinking": t], true);
         case K.off:
-            body["thinking"] = JSONValue(["type": "disabled"]);
-            return false;
-        case K.templateSwitch, K.templateEffort, K.none: return false;
+            return A(["thinking": JSONValue(["type": "disabled"])], false);
+        case K.templateSwitch, K.templateEffort, K.none: return A.init;
     }
 }
 
@@ -725,8 +738,9 @@ version (unittest)
     private ProviderConfig prov(string toml) pure
     {
         import nano.toml : parseToml;
+        import nano.result : unwrap;
         ProviderConfig p;
-        p.merge(parseToml(toml));
+        p.merge(parseToml(toml).unwrap("valid TOML"));
         return p;
     }
     private Thinking lv(string l) pure { return Thinking.of(l); }
@@ -748,12 +762,12 @@ version (unittest)
 // rust: thinking.rs::parses_and_round_trips
 unittest
 {
-    assert(Thinking.parse("default").isDefault);
-    assert(Thinking.parse(" Off ").kind == Thinking.Kind.off);
-    assert(Thinking.parse("HIGH") == lv("high"));
+    assert(Thinking.parse("default").unwrap("valid").isDefault);
+    assert(Thinking.parse(" Off ").unwrap("valid").kind == Thinking.Kind.off);
+    assert(Thinking.parse("HIGH").unwrap("a valid level") == lv("high"));
     import std.exception : assertThrown;
-    assertThrown(Thinking.parse(""));
-    assertThrown(Thinking.parse("very high!"));
+    assert(Thinking.parse("").isErr);
+    assert(Thinking.parse("very high!").isErr);
 }
 
 // rust: thinking.rs::gpt_5_family_reasoning_levels_split_by_variant
@@ -899,20 +913,15 @@ unittest
 {
     assert(budgetTokens("custom") == 16384);
     assert(cappedBudget(16384, 4096) == 4095 && cappedBudget(16384, 1000) == 0 && cappedBudget(2048, 64000) == 2048);
-    JSONValue b = parseJSON("{}");
-    assert(applyAnthropic(Request(Request.Kind.budget, null, 16384), b, 4096));
-    assert(b["thinking"]["budget_tokens"].integer == 4095);
-    b = parseJSON("{}");
-    assert(!applyAnthropic(Request(Request.Kind.budget, null, 16384), b, 1000) && "thinking" !in b);
-    b = parseJSON("{}");
-    assert(applyAnthropic(Request(Request.Kind.effort, "high"), b, 8000));
-    assert(b["thinking"]["type"].str == "adaptive" && b["output_config"]["effort"].str == "high");
-    b = parseJSON("{}");
-    applyChat(Request(Request.Kind.off), b);
-    assert(b["reasoning_effort"].str == "none");
-    b = parseJSON("{}");
-    applyChat(Request(Request.Kind.templateSwitch, null, 0, false), b);
-    assert(b["chat_template_kwargs"]["enable_thinking"].boolean == false);
+    auto a = anthropicFields(Request(Request.Kind.budget, null, 16384), 4096);
+    assert(a.on && a.fields["thinking"]["budget_tokens"].integer == 4095);
+    a = anthropicFields(Request(Request.Kind.budget, null, 16384), 1000);
+    assert(!a.on && "thinking" !in a.fields);
+    a = anthropicFields(Request(Request.Kind.effort, "high"), 8000);
+    assert(a.on && a.fields["thinking"]["type"].str == "adaptive" && a.fields["output_config"]["effort"].str == "high");
+    assert(chatFields(Request(Request.Kind.off))["reasoning_effort"].str == "none");
+    assert(chatFields(Request(Request.Kind.templateSwitch, null, 0, false))["chat_template_kwargs"]["enable_thinking"]
+        .boolean == false);
 }
 
 // rust: thinking.rs::reads_levels_from_ollama_and_llama_cpp
@@ -942,7 +951,7 @@ version (unittest)
     private enum Request reqNone = Request.init, reqOff = Request(Request.Kind.off),
         reqAdaptiveOn = Request(Request.Kind.adaptiveOn);
     private Request reqEffort(string l) pure { return Request(Request.Kind.effort, l); }
-    private Thinking off_() pure { return Thinking.parse("off"); }
+    private Thinking off_() pure { return Thinking.off; }
     /// resolve with Rust's argument order: global, session (or none), kind, provider, model.
     private Resolved rv(Thinking global, Thinking session, bool hasSession, ProviderKind kind, ProviderConfig p,
         string model, scope Reported* reported = null) pure

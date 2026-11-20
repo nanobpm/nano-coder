@@ -15,6 +15,8 @@ import std.string : strip, toLower;
 import std.array : replace;
 import std.format : format;
 import nano.llm : Message, Role, ToolDefinition;
+import nano.option : Option, some, unwrap, match;
+import nano.result : Result, toOption, unwrap, match;
 
 enum toolName = "report_outcome";
 
@@ -26,15 +28,15 @@ enum OutcomeStatus { completed, blocked, needsInput }
 enum verifyReminder = "You changed files after your last check. Run the relevant tests/build, "
     ~ "or report again if no check applies.";
 
-/// Parse a status leniently (Rust `Status::parse`); false when unknown.
-bool parseStatus(string text, out OutcomeStatus s) pure
+/// Parse a status leniently (Rust `Status::parse`); none when unknown.
+Option!OutcomeStatus parseStatus(string text) pure
 {
     switch (text.strip.toLower.replace("-", "_").replace(" ", "_"))
     {
-        case "completed", "complete", "done", "success", "succeeded": s = OutcomeStatus.completed; return true;
-        case "blocked", "stuck", "failed", "failure", "needs_help": s = OutcomeStatus.blocked; return true;
-        case "needs_input", "question", "ask", "clarify", "needs_decision": s = OutcomeStatus.needsInput; return true;
-        default: return false;
+        case "completed", "complete", "done", "success", "succeeded": return some(OutcomeStatus.completed);
+        case "blocked", "stuck", "failed", "failure", "needs_help": return some(OutcomeStatus.blocked);
+        case "needs_input", "question", "ask", "clarify", "needs_decision": return some(OutcomeStatus.needsInput);
+        default: return Option!OutcomeStatus.init;
     }
 }
 
@@ -48,35 +50,36 @@ string statusName(OutcomeStatus s) pure
     }
 }
 
-class OutcomeError : Exception
-{
-    this(string msg) pure { super(msg); }
-}
 
 struct Outcome
 {
     OutcomeStatus status;
     string summary;
 
-    /// Parse the tool's arguments, tolerating arguments sent as a JSON string.
-    static Outcome fromArgs(JSONValue args) pure
+    /// Parse the tool's arguments, tolerating arguments sent as a JSON
+    /// string; the error is the message for the model.
+    static Result!(Outcome, string) fromArgs(const JSONValue given) pure
     {
-        if (args.type == JSONType.string)
+        alias R = Result!(Outcome, string);
+        // Some models send the arguments as a JSON string.
+        static const(JSONValue) decoded(const JSONValue v) pure
         {
-            try args = parseJSON(args.str);
-            catch (Exception) args = JSONValue(null); // a non-JSON string argument has no outcome fields
+            if (v.type != JSONType.string) return v;
+            try return parseJSON(v.str);
+            catch (Exception) return JSONValue(null); // a non-JSON string argument has no outcome fields
         }
+        const args = decoded(given);
         auto st = args.type == JSONType.object ? "status" in args.objectNoRef : null;
         if (st is null || st.type != JSONType.string)
-            throw new OutcomeError(`report_outcome needs ` ~ "`status`" ~ `: "completed", "blocked" or "needs_input"`);
-        Outcome o;
-        if (!parseStatus(st.str, o.status))
-            throw new OutcomeError(format!`report_outcome %sstatus%s must be "completed", "blocked" or "needs_input", got %s`(
+            return R.err(`report_outcome needs ` ~ "`status`" ~ `: "completed", "blocked" or "needs_input"`);
+        auto status = parseStatus(st.str);
+        if (status.isNone)
+            return R.err(format!`report_outcome %sstatus%s must be "completed", "blocked" or "needs_input", got %s`(
                 "`", "`", JSONValue(st.str).jsonText));
         auto sm = "summary" in args.objectNoRef;
-        o.summary = sm !is null && sm.type == JSONType.string ? sm.str.strip : "";
-        if (!o.summary.length) throw new OutcomeError("report_outcome needs a `summary`");
-        return o;
+        auto summary = sm !is null && sm.type == JSONType.string ? sm.str.strip : "";
+        if (!summary.length) return R.err("report_outcome needs a `summary`");
+        return R.ok(Outcome(status.unwrap("checked above"), summary));
     }
 
     /// The turn's final answer.
@@ -96,7 +99,7 @@ struct Outcome
     }
 
     /// The latest successful `report_outcome` call among one turn's messages.
-    static bool reportedIn(const Message[] messages, out Outcome found) pure
+    static Option!Outcome reportedIn(const Message[] messages) pure
     {
         bool succeeded(string id)
         {
@@ -110,15 +113,11 @@ struct Outcome
             foreach_reverse (ref c; m.toolCalls)
             {
                 if (c.name != toolName || !succeeded(c.id)) continue;
-                try
-                {
-                    found = fromArgs(c.arguments);
-                    return true;
-                }
-                catch (OutcomeError) {}
+                auto o = fromArgs(c.arguments).toOption;
+                if (o.isSome) return o;
             }
         }
-        return false;
+        return Option!Outcome.init;
     }
 }
 
@@ -148,14 +147,15 @@ ToolDefinition definition() pure
 // rust: goal.rs::parses_arguments_leniently
 unittest // parses arguments leniently
 {
-    import std.exception : assertThrown;
-    auto o = Outcome.fromArgs(parseJSON(`{"status": "Done", "summary": " opened #12 "}`));
+    import std.algorithm : canFind;
+    auto o = Outcome.fromArgs(parseJSON(`{"status": "Done", "summary": " opened #12 "}`)).unwrap("valid");
     assert(o.status == OutcomeStatus.completed && o.summary == "opened #12");
-    o = Outcome.fromArgs(JSONValue(`{"status": "stuck", "summary": "no token"}`));
+    o = Outcome.fromArgs(JSONValue(`{"status": "stuck", "summary": "no token"}`)).unwrap("valid");
     assert(o.status == OutcomeStatus.blocked && o.response == "Blocked: no token");
-    assertThrown(Outcome.fromArgs(parseJSON(`{"status": "maybe", "summary": "x"}`)));
-    assertThrown(Outcome.fromArgs(parseJSON(`{"status": "completed"}`)));
-    assertThrown(Outcome.fromArgs(parseJSON(`{}`)));
+    assert(Outcome.fromArgs(parseJSON(`{"status": "maybe", "summary": "x"}`)).match!(v => "", e => e)
+        .canFind(`got "maybe"`));
+    assert(Outcome.fromArgs(parseJSON(`{"status": "completed"}`)).isErr);
+    assert(Outcome.fromArgs(parseJSON(`{}`)).isErr);
 }
 
 // rust: goal.rs::finds_the_last_successful_report
@@ -177,7 +177,6 @@ unittest // finds the last successful report
         Message.assistant("", [call("b", "completed")]),
         Message.toolResult("b", toolName, "failed", true),
     ];
-    Outcome o;
-    assert(Outcome.reportedIn(messages, o) && o.summary == "a");
-    assert(!Outcome.reportedIn(messages[0 .. 1], o));
+    assert(Outcome.reportedIn(messages).match!(o => o.summary, () => "") == "a");
+    assert(Outcome.reportedIn(messages[0 .. 1]).isNone);
 }

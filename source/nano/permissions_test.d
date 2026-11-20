@@ -2129,7 +2129,8 @@ unittest // escaped_dollar_is_literal
     r = check(p, "other=.; for f in safe; do touch \"$other/\\$f\"; done");
     assert(r.isErr);
     import nano.shell : parse;
-    auto w = parse("echo \"\\$a\"$'\\x24b'$c")[0].words[1];
+    import nano.result : unwrap;
+    auto w = parse("echo \"\\$a\"$'\\x24b'$c").unwrap("valid")[0].words[1];
     assert(w.literalDollars == [0, 2], w.literalDollars.to!string);
 }
 

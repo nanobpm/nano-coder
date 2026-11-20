@@ -9,11 +9,12 @@ import std.math : isNaN;
 import nano.config : ProviderConfig, ProviderKind, Config, numberOrDefault;
 import nano.temperature;
 import nano.toml : parseToml;
+import nano.result : unwrap;
 
 private ProviderConfig provider(string toml)
 {
     ProviderConfig p;
-    p.merge(parseToml(toml));
+    p.merge(parseToml(toml).unwrap("valid TOML"));
     return p;
 }
 
@@ -123,12 +124,12 @@ unittest
 unittest
 {
     import std.exception : collectExceptionMsg;
-    assert(numberOrDefault(parseToml("temperature = 1")["temperature"]) == 1);
-    assert(numberOrDefault(parseToml("temperature = 0.2")["temperature"]) == 0.2);
-    assert(isNaN(numberOrDefault(parseToml("temperature = \"default\"")["temperature"])));
-    assert(collectExceptionMsg(numberOrDefault(parseToml("temperature = \"warm\"")["temperature"])).canFind("number or \"default\""));
+    assert(numberOrDefault(parseToml("temperature = 1").unwrap("valid TOML")["temperature"]) == 1);
+    assert(numberOrDefault(parseToml("temperature = 0.2").unwrap("valid TOML")["temperature"]) == 0.2);
+    assert(isNaN(numberOrDefault(parseToml("temperature = \"default\"").unwrap("valid TOML")["temperature"])));
+    assert(collectExceptionMsg(numberOrDefault(parseToml("temperature = \"warm\"").unwrap("valid TOML")["temperature"])).canFind("number or \"default\""));
     foreach (t; ["nan", "inf", "-inf"])
-        assert(collectExceptionMsg(numberOrDefault(parseToml("temperature = " ~ t)["temperature"])) == "temperature must be finite", t);
+        assert(collectExceptionMsg(numberOrDefault(parseToml("temperature = " ~ t).unwrap("valid TOML")["temperature"])) == "temperature must be finite", t);
     // A provider-level non-finite value is rejected the same way.
     assert(collectExceptionMsg(provider("temperature = nan\n")) == "temperature must be finite");
     // "default" round-trips through the config file.
@@ -144,7 +145,7 @@ unittest
 unittest
 {
     auto merged = provider("temperature = 0.2\n[models.\"a\"]\ntemperature = 0.1\n");
-    merged.merge(parseToml("[models.\"b\"]\ntemperature = \"default\"\n"));
+    merged.merge(parseToml("[models.\"b\"]\ntemperature = \"default\"\n").unwrap("valid TOML"));
     assert(merged.temperature.get == 0.2);
     assert(merged.models["a"].temperature.get == 0.1);
     assert(isNaN(merged.models["b"].temperature.get));

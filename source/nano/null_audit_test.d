@@ -51,6 +51,7 @@ static import nano.paths;
 static import nano.permissions;
 static import nano.plan;
 static import nano.pureaudit;
+static import nano.result;
 static import nano.providers.anthropic;
 static import nano.providers.demo;
 static import nano.providers.mock;
@@ -136,6 +137,7 @@ private alias modules = imported!"std.meta".AliasSeq!(
     nano.permissions,
     nano.plan,
     nano.pureaudit,
+    nano.result,
     nano.providers.anthropic,
     nano.providers.demo,
     nano.providers.mock,

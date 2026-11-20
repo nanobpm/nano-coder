@@ -253,7 +253,7 @@ private bool interrupts(string l) pure
 // --- Block parsing -----------------------------------------------------------
 
 /// Blocks of `lines` (already tab-expanded).
-Parsed[] parseLines(string[] lines) pure
+Parsed[] parseLines(const string[] lines) pure
 {
     Parsed[] out_;
     size_t i;
@@ -418,7 +418,7 @@ Parsed[] parseLines(string[] lines) pure
 
 /// The list starting at `lines[i]`; sets `end` to the line after it and
 /// `items` to each item's first line.
-private Block parseList(string[] lines, size_t i, out size_t end, out size_t[] items) pure
+private Block parseList(const string[] lines, size_t i, out size_t end, out size_t[] items) pure
 {
     auto first = listMarker(lines[i]);
     auto b = new Block(BK.list);

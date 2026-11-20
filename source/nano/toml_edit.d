@@ -7,6 +7,7 @@ module nano.toml_edit;
 @safe:
 pure:
 
+import nano.result : Result, unwrap;
 import std.array : join, split;
 import std.format : format;
 import std.string : indexOf, strip, stripLeft, startsWith;
@@ -163,10 +164,11 @@ private size_t valueEnd(const string[] lines, size_t row, size_t col, out size_t
 
 /// `doc` with `key` in table `path` (empty: the root) set to the TOML
 /// literal `value`, or removed when `value` is null. A missing table is
-/// appended. Throws when the key is set some way a line edit can't follow
-/// (a dotted key or an inline table).
-string tomlSet(string doc, const string[] path, string key, string value) pure
+/// appended. An error when the key is set some way a line edit can't
+/// follow (a dotted key or an inline table).
+Result!(string, string) tomlSet(string doc, const string[] path, string key, string value) pure
 {
+    alias R = Result!(string, string);
     import std.algorithm : equal;
     auto lines = doc.length ? doc.split("\n") : [];
     bool trailingNl = doc.length && doc[$ - 1] == '\n';
@@ -200,11 +202,11 @@ string tomlSet(string doc, const string[] path, string key, string value) pure
                 if (col >= l.length || l[col] != '{') continue;
                 bool found;
                 auto edited = inlineRemove(l[col .. $], path[h.length + 1 .. $], key, found);
-                if (!found) return doc;
+                if (!found) return R.ok(doc);
                 lines[i] = l[0 .. col] ~ edited;
-                return lines.join("\n") ~ (trailingNl ? "\n" : "");
+                return R.ok(lines.join("\n") ~ (trailingNl ? "\n" : ""));
             }
-            return doc;
+            return R.ok(doc);
         }
         // A dotted or inline definition elsewhere would make a new header a
         // redefinition: refuse rather than corrupt the file.
@@ -214,7 +216,7 @@ string tomlSet(string doc, const string[] path, string key, string value) pure
             if (k is null) continue;
             auto h = tableAt(lines, i);
             if (h.length < path.length && equal(h, path[0 .. h.length]) && (k == path[h.length] || k == "\0" ~ path[h.length]))
-                throw new Exception(format("%s is written as an inline or dotted table; edit it by hand", path.join(".")));
+                return R.err(format("%s is written as an inline or dotted table; edit it by hand", path.join(".")));
         }
         string[] tail;
         if (lines.length && lines[$ - 1].strip.length) tail ~= "";
@@ -222,13 +224,13 @@ string tomlSet(string doc, const string[] path, string key, string value) pure
         foreach (p; path) keys ~= tomlKey(p);
         tail ~= "[" ~ keys.join(".") ~ "]";
         tail ~= tomlKey(key) ~ " = " ~ value;
-        return (lines ~ tail).join("\n") ~ "\n";
+        return R.ok((lines ~ tail).join("\n") ~ "\n");
     }
     foreach (i; cast(size_t) start .. end)
     {
         auto k = lineKey(lines[i]);
         if (k == "\0" ~ key)
-            throw new Exception(format("%s is written as a dotted key; edit it by hand", key));
+            return R.err(format("%s is written as a dotted key; edit it by hand", key));
         if (k != key) continue;
         auto eq = lines[i].indexOf('=');
         auto col = eq + 1;
@@ -244,15 +246,15 @@ string tomlSet(string doc, const string[] path, string key, string value) pure
             replaced = [lines[i][0 .. col] ~ value ~ (c.length ? " " ~ c : "")];
         }
         auto res = lines[0 .. i] ~ replaced ~ lines[endRow + 1 .. $];
-        return res.join("\n") ~ (trailingNl || !doc.length || res.length ? "\n" : "");
+        return R.ok(res.join("\n") ~ (trailingNl || !doc.length || res.length ? "\n" : ""));
     }
-    if (value is null) return doc;
+    if (value is null) return R.ok(doc);
     // Insert after the table's last key line (before trailing blanks/comments).
     size_t at = start;
     foreach (i; cast(size_t) start .. end)
         if (lineKey(lines[i]) !is null) { size_t er; valueEnd(lines, i, lines[i].indexOf('=') + 1, er); at = er + 1; }
     auto res = lines[0 .. at] ~ [tomlKey(key) ~ " = " ~ value] ~ lines[at .. $];
-    return res.join("\n") ~ "\n";
+    return R.ok(res.join("\n") ~ "\n");
 }
 
 /// `text` (starting at an inline table's `{`) with `key` under the nested
@@ -356,23 +358,22 @@ unittest
     assert(tomlFloat(1) == "1.0" && tomlFloat(0.25) == "0.25");
 
     auto doc = "# top\nmodel = \"a/b\" # mine\n\n[providers.x]\nkind = \"openai\"\n\n# end\n";
-    assert(tomlSet(doc, [], "model", `"c/d"`) == "# top\nmodel = \"c/d\" # mine\n\n[providers.x]\nkind = \"openai\"\n\n# end\n");
-    assert(tomlSet(doc, [], "max_tokens", "5") == "# top\nmodel = \"a/b\" # mine\nmax_tokens = 5\n\n[providers.x]\nkind = \"openai\"\n\n# end\n");
-    assert(tomlSet(doc, ["providers", "x"], "base_url", `"u"`)
+    assert(tomlSet(doc, [], "model", `"c/d"`).unwrap("editable") == "# top\nmodel = \"c/d\" # mine\n\n[providers.x]\nkind = \"openai\"\n\n# end\n");
+    assert(tomlSet(doc, [], "max_tokens", "5").unwrap("editable") == "# top\nmodel = \"a/b\" # mine\nmax_tokens = 5\n\n[providers.x]\nkind = \"openai\"\n\n# end\n");
+    assert(tomlSet(doc, ["providers", "x"], "base_url", `"u"`).unwrap("editable")
         == "# top\nmodel = \"a/b\" # mine\n\n[providers.x]\nkind = \"openai\"\nbase_url = \"u\"\n\n# end\n");
-    assert(tomlSet(doc, ["providers", "x"], "kind", null) == "# top\nmodel = \"a/b\" # mine\n\n[providers.x]\n\n# end\n");
-    assert(tomlSet(doc, ["providers", "y", "models", "m:1"], "temperature", "0.5")
+    assert(tomlSet(doc, ["providers", "x"], "kind", null).unwrap("editable") == "# top\nmodel = \"a/b\" # mine\n\n[providers.x]\n\n# end\n");
+    assert(tomlSet(doc, ["providers", "y", "models", "m:1"], "temperature", "0.5").unwrap("editable")
         == doc ~ "\n[providers.y.models.\"m:1\"]\ntemperature = 0.5\n");
-    assert(tomlSet("", [], "verbosity", `"quiet"`) == "verbosity = \"quiet\"\n");
+    assert(tomlSet("", [], "verbosity", `"quiet"`).unwrap("editable") == "verbosity = \"quiet\"\n");
     // Multi-line values are replaced whole.
-    assert(tomlSet("system_prompt = \"\"\"\nhi\nthere\"\"\"\nx = 1\n", [], "system_prompt", `"new"`) == "system_prompt = \"new\"\nx = 1\n");
-    assert(tomlSet("a = [1,\n 2] # c\nb = 2\n", [], "a", "[3]") == "a = [3] # c\nb = 2\n");
+    assert(tomlSet("system_prompt = \"\"\"\nhi\nthere\"\"\"\nx = 1\n", [], "system_prompt", `"new"`).unwrap("editable") == "system_prompt = \"new\"\nx = 1\n");
+    assert(tomlSet("a = [1,\n 2] # c\nb = 2\n", [], "a", "[3]").unwrap("editable") == "a = [3] # c\nb = 2\n");
     // A hash inside a string is not a comment.
-    assert(tomlSet("a = \"x#y\" # c\n", [], "a", "1") == "a = 1 # c\n");
-    import std.exception : assertThrown;
-    assertThrown(tomlSet("providers.x.kind = \"openai\"\n", ["providers", "x"], "kind", `"anthropic"`));
-    assertThrown(tomlSet("providers = { x = { kind = \"openai\" } }\n", ["providers", "x"], "kind", `"a"`));
-    assert(tomlSet("a.b = 1\n", ["c"], "k", "1") == "a.b = 1\n\n[c]\nk = 1\n");
-    assertThrown(tomlSet("[providers]\nx = { kind = \"openai\" }\n", ["providers", "x"], "kind", `"a"`));
-    assert(tomlSet("[providers]\n", ["providers", "x"], "kind", `"a"`) == "[providers]\n\n[providers.x]\nkind = \"a\"\n");
+    assert(tomlSet("a = \"x#y\" # c\n", [], "a", "1").unwrap("editable") == "a = 1 # c\n");
+    assert(tomlSet("providers.x.kind = \"openai\"\n", ["providers", "x"], "kind", `"anthropic"`).isErr);
+    assert(tomlSet("providers = { x = { kind = \"openai\" } }\n", ["providers", "x"], "kind", `"a"`).isErr);
+    assert(tomlSet("a.b = 1\n", ["c"], "k", "1").unwrap("editable") == "a.b = 1\n\n[c]\nk = 1\n");
+    assert(tomlSet("[providers]\nx = { kind = \"openai\" }\n", ["providers", "x"], "kind", `"a"`).isErr);
+    assert(tomlSet("[providers]\n", ["providers", "x"], "kind", `"a"`).unwrap("editable") == "[providers]\n\n[providers.x]\nkind = \"a\"\n");
 }

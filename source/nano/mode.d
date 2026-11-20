@@ -9,6 +9,7 @@ module nano.mode;
 @safe:
 pure:
 
+import nano.result : Result;
 import std.string : strip, toLower;
 import std.format : format;
 
@@ -55,15 +56,16 @@ string describe(AgentMode m) pure
     }
 }
 
-/// Parse a mode name; throws with Rust's message for an unknown one.
-AgentMode parseMode(string text) pure
+/// Parse a mode name; the error is Rust's message for an unknown one.
+Result!(AgentMode, string) parseMode(string text) pure
 {
+    alias R = Result!(AgentMode, string);
     switch (text.strip.toLower)
     {
-        case "normal": return AgentMode.normal;
-        case "plan", "planning": return AgentMode.plan;
-        case "auto", "autonomous": return AgentMode.auto_;
-        default: throw new Exception(format!"unknown mode \"%s\" (normal, plan or auto)"(text.strip.toLower));
+        case "normal": return R.ok(AgentMode.normal);
+        case "plan", "planning": return R.ok(AgentMode.plan);
+        case "auto", "autonomous": return R.ok(AgentMode.auto_);
+        default: return R.err(format!"unknown mode \"%s\" (normal, plan or auto)"(text.strip.toLower));
     }
 }
 
@@ -99,11 +101,9 @@ unittest
     // rust: mode.rs::plan_allows_every_timer_tool
     import nano.timers : timerToolNames = toolNames;
     foreach (name; timerToolNames) assert(planAllows(name), "plan mode must allow timer tool " ~ name);
-    assert(parseMode(" plan ") == AgentMode.plan);
-    assert(parseMode("Autonomous") == AgentMode.auto_);
-    bool threw;
-    try parseMode("x");
-    catch (Exception e) threw = e.msg == "unknown mode \"x\" (normal, plan or auto)";
-    assert(threw);
+    import nano.result : match;
+    assert(parseMode(" plan ") == Result!(AgentMode, string).ok(AgentMode.plan));
+    assert(parseMode("Autonomous") == Result!(AgentMode, string).ok(AgentMode.auto_));
+    assert(parseMode("x").match!(m => "", e => e) == "unknown mode \"x\" (normal, plan or auto)");
     assert(AgentMode.auto_.next == AgentMode.normal);
 }

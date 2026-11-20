@@ -39,7 +39,8 @@ enum int protocolVersion = 1;
 
 import nano.paths : debugQuote;
 import nano.commands : isCommand;
-import nano.thinking : wireValue, setSession, label;
+import nano.thinking : wireValue, sessionSetting, label;
+import nano.result : orThrow, unwrap, unwrapErr;
 import nano.temperature : label;
 import std.array : join;
 
@@ -510,7 +511,12 @@ final class AcpServer : AgentEvents
                     if (auto m = "_meta" in params.objectNoRef)
                         if (m.type == JSONType.object)
                             if (auto p = "plan" in m.objectNoRef)
-                                if (p.type != JSONType.null_) { seed = Plan.fromJSON(*p); seeded = true; }
+                                if (p.type != JSONType.null_)
+                                {
+                                    // A bad plan fails the request, as below.
+                                    seed = Plan.fromJSON(*p).orThrow!(e => new Exception(e));
+                                    seeded = true;
+                                }
                 newSession();
                 if (seeded)
                 {
@@ -660,8 +666,9 @@ final class AcpServer : AgentEvents
             auto arg = text["/thinking".length .. $].strip;
             if (arg.length)
             {
-                try setSession(agent.sessionThinking, arg);
-                catch (Exception e) return rpcError(id, -32602, e.msg);
+                auto setting = sessionSetting(arg);
+                if (setting.isErr) return rpcError(id, -32602, setting.unwrapErr("isErr"));
+                agent.sessionThinking = setting.unwrap("isOk");
             }
             auto th = agent.thinking();
             JSONValue body_ = ["stopReason": "end_turn"];

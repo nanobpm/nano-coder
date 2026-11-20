@@ -1295,6 +1295,7 @@ unittest // nano [hooks] and ~/.claude/settings.json load alongside the project;
 {
     import std.file : mkdirRecurse, write;
     import nano.toml : parseToml;
+    import nano.result : unwrap;
     auto dir = tdir("sources");
     auto home = buildPath(dir, "home");
     mkdirRecurse(buildPath(home, ".claude"));
@@ -1305,7 +1306,7 @@ unittest // nano [hooks] and ~/.claude/settings.json load alongside the project;
     write(buildPath(proj, ".claude", "settings.json"), `{"hooks":{"Stop":[{"hooks":[{"command":"echo nano"}]}]}}`);
     LoadOptions o;
     o.home = home;
-    o.nanoHooks = parseToml("[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ncommand = \"echo nano\"\ntimeout = 5\n")["hooks"];
+    o.nanoHooks = parseToml("[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ncommand = \"echo nano\"\ntimeout = 5\n").unwrap("valid TOML")["hooks"];
     auto m = HookManager.load(o, proj);
     assert(m.hooks.length == 2, m.listing);
     assert(m.hooks[0].source == Source.userNano && m.hooks[0].timeout == 5.seconds);

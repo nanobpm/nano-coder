@@ -286,13 +286,14 @@ unittest
     string[] beats;
     heartbeatSink = (string line) { beats ~= line; };
     heartbeatInterval = 40.msecs;
-    // ~150 ms of silence at a 40 ms interval: at least 2 heartbeats.
-    auto r = run("sleep 0.15", 5.seconds);
+    // ~300 ms of silence at a 40 ms interval: nominally 7 beats; at least 2
+    // even on a loaded CI runner.
+    auto r = run("sleep 0.3", 5.seconds);
     assert(!r.timedOut && r.exitCode == 0);
     assert(beats.length >= 2, "expected ≥2 heartbeats, got " ~ beats.length.to!string);
     foreach (b; beats) assert(b.canFind("still running"), b);
     // The beat names the command head so the supervisor can tell calls apart.
-    assert(beats[0].canFind("sleep 0.15"), beats[0]);
+    assert(beats[0].canFind("sleep 0.3"), beats[0]);
     // Beats come only from run's polling loop, on this thread, so none can
     // follow its return: nothing to wait for here.
 }

@@ -11,7 +11,7 @@ import std.math : isNaN;
 import nano.llm;
 import nano.http;
 import nano.config;
-import nano.thinking : anthropicDefaultMaxTokens, applyChat, applyAnthropic;
+import nano.thinking : anthropicDefaultMaxTokens, anthropicFields;
 
 class AnthropicClient : LLMClient, KindedClient
 {
@@ -115,7 +115,9 @@ class AnthropicClient : LLMClient, KindedClient
         if (!isNaN(req.temperature)) b["temperature"] = req.temperature < 0 ? 0.0 : req.temperature > 1 ? 1.0 : req.temperature;
         if (stream) b["stream"] = true;
         // Thinking rules out a custom temperature.
-        if (applyAnthropic(req.thinking, b, b["max_tokens"].integer)) b.objectNoRef.remove("temperature");
+        auto thinking = anthropicFields(req.thinking, b["max_tokens"].integer);
+        foreach (k, v; thinking.fields) b[k] = v;
+        if (thinking.on) b.objectNoRef.remove("temperature");
         p.config.finishBody(b);
         return b;
     }

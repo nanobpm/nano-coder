@@ -7,6 +7,7 @@ import nano.safeio : jsonText, jsonPretty;
 import nano.clock : monoNow, since, sleepFor, stdTimeNow, wallNow;
 import nano.arith : checkedMul, checkedSub, saturatingSub;
 import nano.option : Option, some, none, match, ifSome, orElse, unwrap, NotNull;
+import nano.result : orThrow, toOption, match, unwrap;
 
 import nano.safeio : Isolated, JoinHandle, spawnDaemon, stdErr, stdOut;
 
@@ -24,7 +25,7 @@ import nano.tools;
 import nano.question : QuestionError, QuestionBroker, Question, QuestionOption, Answer, Answered;
 import std.sumtype : match;
 import nano.mode : AgentMode, planAllows;
-import nano.goal : Outcome, OutcomeError, OutcomeStatus, verifyReminder, outcomeToolName = toolName, outcomeDefinition = definition;
+import nano.goal : Outcome, OutcomeStatus, verifyReminder, outcomeToolName = toolName, outcomeDefinition = definition;
 import nano.reminders : Reminders, wrap;
 import mem = nano.memory;
 import ctx = nano.context;
@@ -44,7 +45,7 @@ string toolResultDisplay(string text, const(Attachment)[] attachments) pure
 import nano.config : KindedClient, ProviderConfig, ProviderKind;
 import std.typecons : Nullable;
 import std.algorithm : min, max, clamp;
-import nano.plan : Plan, PlanError, isPlanTool, planDefinitions = definitions;
+import nano.plan : Plan, isPlanTool, planDefinitions = definitions;
 import nano.timers : Timers, TimerError, isTimerTool, timerDefinitions = definitions, firedMessage, firedNotice, pendingNudge, pendingNudgeEvery;
 import nano.permissions;
 import nano.session;
@@ -74,6 +75,14 @@ interface AgentEvents
 string wrapReminder(string text) pure nothrow
 {
     return "<system-reminder>\n" ~ text ~ "\n</system-reminder>";
+}
+
+
+/// A `report_outcome` call the agent rejects: `Outcome.fromArgs`'s error, or
+/// the verify reminder. Its message is the tool result for the model.
+class OutcomeError : Exception
+{
+    this(string msg) pure { super(msg); }
 }
 
 /// Why compaction was requested.
@@ -250,13 +259,13 @@ class Agent
             foreach_reverse (ref c; m.toolCalls)
                 if (c.name == outcomeToolName)
                 {
-                    try
+                    // Malformed outcome arguments are not a recorded outcome: keep scanning.
+                    foreach (o; Outcome.fromArgs(c.arguments).toOption)
                     {
-                        lastOutcome = Outcome.fromArgs(c.arguments);
+                        lastOutcome = o;
                         hasOutcome = true;
                         return true;
                     }
-                    catch (Exception) {} // malformed outcome arguments: not a recorded outcome, keep scanning
                 }
         return false;
     }
@@ -346,8 +355,10 @@ class Agent
                 auto st = givenId in completedStops;
                 lastStop = st is null ? StopReason.endTurn : stopReasonFrom(*st);
                 auto oc = givenId in completedOutcomes;
-                hasOutcome = oc !is null;
-                if (hasOutcome) lastOutcome = Outcome.fromArgs(*oc);
+                // A recorded outcome that no longer parses is treated as none.
+                auto recorded = oc is null ? Option!Outcome.init : Outcome.fromArgs(*oc).toOption;
+                hasOutcome = recorded.isSome;
+                foreach (o; recorded) lastOutcome = o;
                 return *done;
             }
         // Every input carries an id; the log pairs it with a turn_end record,
@@ -640,10 +651,9 @@ class Agent
             applyModelRequest();
             if (auto level = control.takeThinkingRequest())
             {
-                import nano.thinking : setSession;
+                import nano.thinking : sessionSetting;
                 // Checked when it was typed, so this can't fail.
-                try setSession(sessionThinking, level);
-                catch (Exception) {} // the level was validated when typed, so this can't fail
+                sessionThinking = sessionSetting(level).unwrap("validated when typed");
             }
             LLMResponse r;
             const swStart = monoNow;
@@ -1483,8 +1493,10 @@ class Agent
         {
             auto clipTo = window / 8 > 1_000 ? window / 8 : 1_000;
             foreach (ref x; next[bodyStart + 1 .. $])
-                if (x.role == Role.tool && ctx.clipMessage(x, clipTo) && smart && x.logLine)
-                    x.content ~= format("\n[clipped at compaction; history_read #%s has it whole]", x.logLine);
+                if (x.role == Role.tool)
+                    foreach (c; ctx.clippedContent(x, clipTo))
+                        x.content = smart && x.logLine
+                            ? c ~ format("\n[clipped at compaction; history_read #%s has it whole]", x.logLine) : c;
         }
         messages = next;
         calibLen = 0;
@@ -1610,7 +1622,7 @@ class Agent
         {
             if (isOutcome)
             {
-                auto o = Outcome.fromArgs(args);
+                auto o = Outcome.fromArgs(args).orThrow!(e => new OutcomeError(e));
                 // Verify-before-complete (Rust #158): `completed` after an
                 // edit with no later bash check is bounced once per turn.
                 if (verifyBeforeComplete && o.status == OutcomeStatus.completed && editsSinceCheck && !verifyReminderFired)
@@ -1634,7 +1646,6 @@ class Agent
             isError = false;
         }
         catch (ToolError e) out_ = e.msg;
-        catch (PlanError e) out_ = e.msg;
         catch (TimerError e) out_ = e.msg;
         catch (hist.HistoryError e) out_ = e.msg;
         catch (OutcomeError e) out_ = e.msg;
@@ -1709,8 +1720,8 @@ class Agent
         plan = Plan.init;
         if (r.plan.type == JSONType.object)
         {
-            try plan = Plan.fromJSON(r.plan);
-            catch (Exception e) dropped ~= "the saved plan: " ~ e.msg; // a malformed plan is dropped, the session resumes
+            // A malformed plan is dropped; the session resumes.
+            Plan.fromJSON(r.plan).match!((p) { plan = p; }, (e) { dropped ~= "the saved plan: " ~ e; });
         }
         Timers t;
         try t = Timers.fromJSON(r.timers);
@@ -2047,7 +2058,8 @@ class Agent
     package string runPlanTool(string name, JSONValue args)
     {
         auto before = plan.dup;
-        auto o = plan.apply(name, args);
+        // The plan's error is the tool's message to the model.
+        auto o = plan.apply(name, args).orThrow!(e => new ToolError(e));
         if (o.changed)
         {
             // As for timers: an unrecorded change is rolled back.

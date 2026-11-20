@@ -4,12 +4,13 @@
 /// impure free functions; this rejects impure member functions, which the
 /// label doesn't reach. A pure function's result depends only on its
 /// arguments, so the clock, environment, files and other I/O stay in callers.
+/// They are also strongly pure (see the end of this file).
 module nano.pure_core_test;
 @safe:
 
 import std.array : join;
 import std.meta : AliasSeq;
-import nano.pureaudit : impureFunctions;
+import nano.pureaudit : impureFunctions, weaklyPureFunctions;
 static import nano.arith;
 static import nano.context;
 static import nano.emoji;
@@ -23,6 +24,7 @@ static import nano.mdtable;
 static import nano.mode;
 static import nano.plan;
 static import nano.qwen;
+static import nano.result;
 static import nano.shell;
 static import nano.status;
 static import nano.temperature;
@@ -45,6 +47,7 @@ alias pureCore = AliasSeq!(
     nano.mode,
     nano.plan,
     nano.qwen,
+    nano.result,
     nano.shell,
     nano.status,
     nano.temperature,
@@ -56,3 +59,12 @@ alias pureCore = AliasSeq!(
 
 static foreach (M; pureCore)
     static assert(impureFunctions!M().length == 0, "not pure: " ~ impureFunctions!M().join(", "));
+
+// Strongly pure: no public function takes a `ref`/`out` or mutable-pointing
+// argument, so a call can't change what its caller passed. Results and
+// errors come back as values (`Option`, `Result`, a new struct). A method
+// may still update its own struct, and private helper structs (a parser's
+// cursor) are exempt.
+static foreach (M; pureCore)
+    static assert(weaklyPureFunctions!M().length == 0,
+        "takes mutable arguments (return the result instead): " ~ weaklyPureFunctions!M().join(", "));

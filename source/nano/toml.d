@@ -14,16 +14,24 @@ import std.ascii : isDigit, isAlphaNum;
 import std.format : format;
 import std.string : strip;
 import std.algorithm : canFind;
+import nano.result : Result, unwrap;
 
-class TomlException : Exception
+/// How the recursive-descent parser unwinds from deep inside; `parseToml`
+/// turns it into an error result, so it never leaves this module.
+private class TomlException : Exception
 {
     this(string msg, size_t line) pure { super(format("config line %s: %s", line, msg)); }
 }
 
-JSONValue parseToml(string src) pure
+/// The document as JSON; the error says which line is wrong and why.
+Result!(JSONValue, string) parseToml(string src) pure
 {
+    alias R = Result!(JSONValue, string);
     auto p = Parser(src);
-    return p.document();
+    try return R.ok(p.document());
+    catch (TomlException e) return R.err(e.msg);
+    // A tree operation the parser didn't check first; still a bad document.
+    catch (JSONException e) return R.err(format("config line %s: %s", p.line, e.msg));
 }
 
 private struct Parser
@@ -147,9 +155,15 @@ private struct Parser
 
     /// `t.a.b.c = v` for the dotted key `path` of an inline table, creating
     /// the intermediate tables.
-    static void setDotted(ref JSONValue t, string[] path, JSONValue v) pure
+    void setDotted(ref JSONValue t, string[] path, JSONValue v) pure
     {
-        if (path.length == 1) { t[path[0]] = v; return; }
+        if (t.type != JSONType.object) fail("key " ~ path[0] ~ " is inside a value that isn't a table");
+        if (path.length == 1)
+        {
+            if (path[0] in t) fail("duplicate key " ~ path[0]);
+            t[path[0]] = v;
+            return;
+        }
         if (path[0] !in t) t[path[0]] = JSONValue(string[string].init);
         setDotted(t[path[0]], path[1 .. $], v);
     }
@@ -378,11 +392,17 @@ private struct Parser
             case 'U':
                 size_t n = e == 'u' ? 4 : 8;
                 if (i + n > s.length) fail("bad unicode escape");
-                dchar cp = cast(dchar) s[i .. i + n].to!uint(16);
+                import std.ascii : isHexDigit;
+                import std.algorithm.searching : all;
+                import std.utf : encode, isValidDchar;
+                import std.string : representation;
+                // Bytes, not decoded characters: the slice may end inside a multibyte one.
+                if (!s[i .. i + n].representation.all!(b => isHexDigit(b))) fail("bad unicode escape");
+                const code = s[i .. i + n].to!uint(16);
+                if (!isValidDchar(cast(dchar) code)) fail("bad unicode escape: not a Unicode scalar value");
                 i += n;
-                import std.utf : encode;
                 char[4] buf;
-                auto len = encode(buf, cp);
+                auto len = encode(buf, cast(dchar) code);
                 out_.put(buf[0 .. len]);
                 break;
             default:
@@ -408,7 +428,7 @@ headers = { "X-Title" = "nano", y = 2 }
 base_url = """
 multi
 line"""
-`);
+`).unwrap("valid TOML");
     assert(doc["model"].str == "github-copilot/claude");
     assert(doc["auto_compact"].boolean);
     assert(doc["threshold"].floating == 0.8);
@@ -421,10 +441,20 @@ line"""
 
 unittest
 {
-    auto doc = parseToml("[[rules]]\nname = \"a\"\n[[rules]]\nname = \"b\"\n");
+    auto doc = parseToml("[[rules]]\nname = \"a\"\n[[rules]]\nname = \"b\"\n").unwrap("valid TOML");
     assert(doc["rules"].arrayNoRef.length == 2 && doc["rules"][1]["name"].str == "b");
     bool threw;
-    try parseToml("x = 1\nx = 2\n"); catch (TomlException) threw = true;
+    threw = parseToml("x = 1\nx = 2\n").isErr;
+    // Inline tables: a dotted key under a non-table, or a repeated key, is an error.
+    assert(parseToml("x = { a = 1, a.b = 2 }").isErr);
+    assert(parseToml("x = { a = 1, a = 2 }").isErr);
+    assert(parseToml("x = { a.b = 1, a.c = 2 }").unwrap("valid TOML")["x"]["a"]["c"].integer == 2);
+    // Bad escapes are errors, not exceptions escaping the Result.
+    assert(parseToml("x = \"\\uZZZZ\"").isErr);
+    assert(parseToml("x = \"\\u0\U0001F600\"").isErr);
+    assert(parseToml("x = \"\\uD800\"").isErr);
+    assert(parseToml("x = \"\\U00110000\"").isErr);
+    assert(parseToml("x = \"\\u00e9\"").unwrap("valid TOML")["x"].str == "\u00e9");
     assert(threw);
 }
 
@@ -441,6 +471,6 @@ private double parseDouble(string s) pure
 
 unittest
 {
-    assert(parseToml("t = 0.7")["t"].floating == 0.7);
-    assert(parseToml("t = 1e-3")["t"].floating == 1e-3);
+    assert(parseToml("t = 0.7").unwrap("valid TOML")["t"].floating == 0.7);
+    assert(parseToml("t = 1e-3").unwrap("valid TOML")["t"].floating == 1e-3);
 }

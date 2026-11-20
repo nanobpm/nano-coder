@@ -80,22 +80,28 @@ enum Source { model, provider, global, detected }
 
 private Vision copy(const Vision v) pure { return Vision(v.maxImages, v.maxImageBytes, v.mediaTypes.dup); }
 
-/// The configured override (model, provider, global) and where it came from.
-Nullable!bool configuredOverride(Nullable!bool global, const ref ProviderConfig provider, string model, out Source source) pure
+/// A configured vision override and where it came from (`detected`, with no
+/// value, when nothing is configured).
+struct Override
+{
+    Nullable!bool value;
+    Source source;
+}
+
+/// The configured override: model, then provider, then global.
+Override configuredOverride(Nullable!bool global, const ref ProviderConfig provider, string model) pure
 {
     if (auto ms = model in provider.models)
-        if (!ms.vision.isNull) { source = Source.model; return Nullable!bool(ms.vision.get); }
-    if (!provider.vision.isNull) { source = Source.provider; return Nullable!bool(provider.vision.get); }
-    if (!global.isNull) { source = Source.global; return global; }
-    source = Source.detected;
-    return Nullable!bool.init;
+        if (!ms.vision.isNull) return Override(ms.vision, Source.model);
+    if (!provider.vision.isNull) return Override(provider.vision, Source.provider);
+    if (!global.isNull) return Override(global, Source.global);
+    return Override(global, Source.detected);
 }
 
 Nullable!Vision resolve(Nullable!bool global, ProviderKind kind, const ref ProviderConfig provider, string model,
     scope const(Vision)* reported = null) pure
 {
-    Source s;
-    auto o = configuredOverride(global, provider, model, s);
+    auto o = configuredOverride(global, provider, model).value;
     if (!o.isNull)
     {
         if (!o.get) return Nullable!Vision.init;

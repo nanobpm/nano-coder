@@ -17,6 +17,7 @@ import std.format : format;
 import std.regex : regex, matchFirst, ctRegex;
 import std.string : indexOf, lastIndexOf, stripLeft;
 import nano.shell;
+import nano.result : orThrow, toOption, unwrap;
 
 /// A reason a command is blocked or cannot be inspected.
 class Blocked : Exception
@@ -237,8 +238,7 @@ void parseInner(string script, size_t depth, ref Simple[] out_)
 {
     if (depth >= maxExpandDepth) throw new Blocked("commands nest too deeply");
     Simple[] parsed;
-    try parsed = parseNested(script, depth);
-    catch (ShellParseError e) throw new Blocked(e.msg);
+    parsed = parseNested(script, depth).orThrow!(e => new Blocked(e));
     expandSequence(parsed, depth + 1, out_);
 }
 
@@ -1727,10 +1727,9 @@ void collectAssignments(const Simple[] commands, size_t depth, ref Known[string]
         if (depth >= maxExpandDepth) continue;
         foreach (script; nestedScripts(cmd))
         {
-            Simple[] inner;
-            try inner = parseNested(script, depth);
-            catch (Exception) continue; // an unparsable nested script contributes no assignments
-            collectAssignments(inner, depth + 1, out_);
+            // An unparsable nested script contributes no assignments.
+            foreach (inner; parseNested(script, depth).toOption)
+                collectAssignments(inner, depth + 1, out_);
         }
     }
 }
@@ -1811,10 +1810,9 @@ void collectLoopBoundVars(const Simple[] commands, size_t depth, ref bool[string
         if (depth < maxExpandDepth)
             foreach (script; nestedScripts(cmd))
             {
-                Simple[] inner;
-                try inner = parseNested(script, depth);
-                catch (Exception) continue; // an unparsable nested script binds no loop variables
-                collectLoopBoundVars(inner, depth + 1, out_);
+                // An unparsable nested script binds no loop variables.
+                foreach (inner; parseNested(script, depth).toOption)
+                    collectLoopBoundVars(inner, depth + 1, out_);
             }
     }
 }
