@@ -14,16 +14,22 @@ import std.ascii : isDigit, isAlphaNum;
 import std.format : format;
 import std.string : strip;
 import std.algorithm : canFind;
+import nano.result : Result, unwrap;
 
-class TomlException : Exception
+/// How the recursive-descent parser unwinds from deep inside; `parseToml`
+/// turns it into an error result, so it never leaves this module.
+private class TomlException : Exception
 {
     this(string msg, size_t line) pure { super(format("config line %s: %s", line, msg)); }
 }
 
-JSONValue parseToml(string src) pure
+/// The document as JSON; the error says which line is wrong and why.
+Result!(JSONValue, string) parseToml(string src) pure
 {
+    alias R = Result!(JSONValue, string);
     auto p = Parser(src);
-    return p.document();
+    try return R.ok(p.document());
+    catch (TomlException e) return R.err(e.msg);
 }
 
 private struct Parser
@@ -408,7 +414,7 @@ headers = { "X-Title" = "nano", y = 2 }
 base_url = """
 multi
 line"""
-`);
+`).unwrap("valid TOML");
     assert(doc["model"].str == "github-copilot/claude");
     assert(doc["auto_compact"].boolean);
     assert(doc["threshold"].floating == 0.8);
@@ -421,10 +427,10 @@ line"""
 
 unittest
 {
-    auto doc = parseToml("[[rules]]\nname = \"a\"\n[[rules]]\nname = \"b\"\n");
+    auto doc = parseToml("[[rules]]\nname = \"a\"\n[[rules]]\nname = \"b\"\n").unwrap("valid TOML");
     assert(doc["rules"].arrayNoRef.length == 2 && doc["rules"][1]["name"].str == "b");
     bool threw;
-    try parseToml("x = 1\nx = 2\n"); catch (TomlException) threw = true;
+    threw = parseToml("x = 1\nx = 2\n").isErr;
     assert(threw);
 }
 
@@ -441,6 +447,6 @@ private double parseDouble(string s) pure
 
 unittest
 {
-    assert(parseToml("t = 0.7")["t"].floating == 0.7);
-    assert(parseToml("t = 1e-3")["t"].floating == 1e-3);
+    assert(parseToml("t = 0.7").unwrap("valid TOML")["t"].floating == 0.7);
+    assert(parseToml("t = 1e-3").unwrap("valid TOML")["t"].floating == 1e-3);
 }

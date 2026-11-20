@@ -8,6 +8,7 @@ module nano.agent_resume_test;
 version (unittest):
 
 import nano.option : match, some, unwrap;
+import nano.result : unwrap;
 import std.json;
 import std.file : tempDir, exists, rmdirRecurse;
 import std.path : buildPath;
@@ -523,11 +524,11 @@ unittest
     agent.log = some(log);
     agent.run("alpha question here", new NullEvents);
 
-    agent.sessionThinking = Nullable!Thinking(Thinking.parse("high"));
+    agent.sessionThinking = Nullable!Thinking(Thinking.parse("high").unwrap("a valid level"));
     agent.restart("sys", Option!SessionLog.init);
     assert(agent.sessionThinking.isNull, "a restart clears the override");
 
-    agent.sessionThinking = Nullable!Thinking(Thinking.parse("high"));
+    agent.sessionThinking = Nullable!Thinking(Thinking.parse("high").unwrap("a valid level"));
     agent.sessionInputTokens = 99;
     agent.sessionOutputTokens = 77;
     agent.compactions = 2;

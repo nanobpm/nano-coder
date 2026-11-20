@@ -21,6 +21,7 @@ import std.json;
 import std.string : strip, toLower, indexOf, startsWith, lastIndexOf;
 import std.typecons : Nullable;
 import nano.option : Option, unwrap;
+import nano.result : Result, match, map, unwrap;
 import nano.config : ProviderConfig, ProviderKind;
 
 /// Named levels from least to most thinking.
@@ -41,18 +42,19 @@ struct Thinking
     static Thinking of(string l) pure { return Thinking(Kind.level, l); }
     bool isDefault() pure const { return kind == Kind.default_; }
 
-    /// Parse a setting; throws with Rust's message on a bad one.
-    static Thinking parse(string s) pure
+    /// Parse a setting; the error is Rust's message for a bad one.
+    static Result!(Thinking, string) parse(string s) pure
     {
+        alias R = Result!(Thinking, string);
         s = s.strip.toLower;
         switch (s)
         {
-            case "default", "model default", "auto": return Thinking.init;
-            case "off", "none", "disabled": return Thinking.off;
-            case "": throw new Exception(`thinking level is empty; use "default", "off" or a level such as "high"`);
+            case "default", "model default", "auto": return R.ok(Thinking.init);
+            case "off", "none", "disabled": return R.ok(Thinking.off);
+            case "": return R.err(`thinking level is empty; use "default", "off" or a level such as "high"`);
             default:
-                if (s.all!(c => isAlphaNum(c) || c == '-' || c == '_')) return Thinking.of(s);
-                throw new Exception(format(`thinking must be "default", "off" or a level name such as "high"; got "%s"`, s));
+                if (s.all!(c => isAlphaNum(c) || c == '-' || c == '_')) return R.ok(Thinking.of(s));
+                return R.err(format(`thinking must be "default", "off" or a level name such as "high"; got "%s"`, s));
         }
     }
 
@@ -518,10 +520,12 @@ string statusText(const ref Resolved r, string model) pure
 }
 
 /// The session level after `/thinking ARG` (`reset` clears it).
-Nullable!Thinking sessionSetting(string arg) pure
+Result!(Nullable!Thinking, string) sessionSetting(string arg) pure
 {
+    alias R = Result!(Nullable!Thinking, string);
     arg = arg.strip;
-    return arg.toLower == "reset" ? Nullable!Thinking.init : Nullable!Thinking(Thinking.parse(arg));
+    if (arg.toLower == "reset") return R.ok(Nullable!Thinking.init);
+    return Thinking.parse(arg).map!(t => Nullable!Thinking(t));
 }
 
 /// The level in `levels` nearest to `wanted`: the highest at or below it on
@@ -569,14 +573,12 @@ Resolved resolve(const Thinking global, scope const(Thinking)* session, Provider
         foreach (raw; *configured)
         {
             auto l = raw.strip.toLower;
-            try
-            {
-                auto t = Thinking.parse(l);
+            // A malformed level is listed as invalid, reported by the caller.
+            Thinking.parse(l).match!((t) {
                 if (t.kind == Thinking.Kind.off && l != "off") aliases ~= l;
                 else if (t.isDefault) reserved ~= l;
                 else r.levels ~= l;
-            }
-            catch (Exception) invalid ~= l; // a malformed level is listed as invalid, reported by the caller
+            }, (e) { invalid ~= l; });
         }
     }
     else if (reported !is null) r.levels = reported.levels.dup;
@@ -736,8 +738,9 @@ version (unittest)
     private ProviderConfig prov(string toml) pure
     {
         import nano.toml : parseToml;
+        import nano.result : unwrap;
         ProviderConfig p;
-        p.merge(parseToml(toml));
+        p.merge(parseToml(toml).unwrap("valid TOML"));
         return p;
     }
     private Thinking lv(string l) pure { return Thinking.of(l); }
@@ -759,12 +762,12 @@ version (unittest)
 // rust: thinking.rs::parses_and_round_trips
 unittest
 {
-    assert(Thinking.parse("default").isDefault);
-    assert(Thinking.parse(" Off ").kind == Thinking.Kind.off);
-    assert(Thinking.parse("HIGH") == lv("high"));
+    assert(Thinking.parse("default").unwrap("valid").isDefault);
+    assert(Thinking.parse(" Off ").unwrap("valid").kind == Thinking.Kind.off);
+    assert(Thinking.parse("HIGH").unwrap("a valid level") == lv("high"));
     import std.exception : assertThrown;
-    assertThrown(Thinking.parse(""));
-    assertThrown(Thinking.parse("very high!"));
+    assert(Thinking.parse("").isErr);
+    assert(Thinking.parse("very high!").isErr);
 }
 
 // rust: thinking.rs::gpt_5_family_reasoning_levels_split_by_variant
@@ -948,7 +951,7 @@ version (unittest)
     private enum Request reqNone = Request.init, reqOff = Request(Request.Kind.off),
         reqAdaptiveOn = Request(Request.Kind.adaptiveOn);
     private Request reqEffort(string l) pure { return Request(Request.Kind.effort, l); }
-    private Thinking off_() pure { return Thinking.parse("off"); }
+    private Thinking off_() pure { return Thinking.off; }
     /// resolve with Rust's argument order: global, session (or none), kind, provider, model.
     private Resolved rv(Thinking global, Thinking session, bool hasSession, ProviderKind kind, ProviderConfig p,
         string model, scope Reported* reported = null) pure

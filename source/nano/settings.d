@@ -13,6 +13,7 @@ import nano.qwen : QwenEndpoint;
 import std.string : strip;
 import nano.thinking : Thinking;
 import nano.toml_edit;
+import nano.result : unwrap;
 
 /// What a visit changed (each saved as its own key).
 struct Changes
@@ -108,8 +109,8 @@ Tuple!(Nullable!Thinking, string)[] thinkingChoices(size_t scope_, const string[
     alias C = Tuple!(Nullable!Thinking, string);
     C[] choices;
     if (scope_ < 2) choices ~= C(Nullable!Thinking.init, "unset (use the broader setting)");
-    choices ~= C(Nullable!Thinking(Thinking.parse("default")), "default (send no level; the model decides)");
-    foreach (l; levels) choices ~= C(Nullable!Thinking(Thinking.parse(l)), l);
+    choices ~= C(Nullable!Thinking(Thinking.parse("default").unwrap("a valid level")), "default (send no level; the model decides)");
+    foreach (l; levels) choices ~= C(Nullable!Thinking(Thinking.parse(l).unwrap("a valid level")), l);
     bool has(Nullable!Thinking v)
     {
         foreach (c; choices) if (c[0] == v) return true;
@@ -267,6 +268,12 @@ string applyChanges(string doc, const ref Config c, const ref Changes ch, const 
 {
     import std.string : indexOf;
     import nano.ui : vname = name;
+    import nano.result : orThrow;
+    // The edge for toml_edit: a key a line edit can't follow fails the save.
+    string tomlSet(string doc, const string[] path, string key, string value)
+    {
+        return nano.toml_edit.tomlSet(doc, path, key, value).orThrow!(e => new Exception(e));
+    }
     if (ch.model) doc = tomlSet(doc, [], "model", tomlString(c.model));
     if (ch.temperature) doc = tomlSet(doc, [], "temperature", temperatureLiteral(c.temperature));
     foreach (name; ch.providerTemperatures.byKey)
@@ -397,7 +404,7 @@ unittest
         assert(!modelLabel("m", "A\x1b[2Jb").canFind('\x1b'), "escape dropped");
     }
 
-    auto ch = thinkingChoices(1, ["low", "high"], Nullable!Thinking(Thinking.parse("medium")), initial);
+    auto ch = thinkingChoices(1, ["low", "high"], Nullable!Thinking(Thinking.parse("medium").unwrap("a valid level")), initial);
     assert(ch.length == 5 && ch[0][1].canFind("unset") && ch[4][1] == "medium" && initial == 4);
     ch = thinkingChoices(2, ["low"], Nullable!Thinking.init, initial);
     assert(ch.length == 2 && initial == 0);
@@ -454,7 +461,7 @@ unittest
     c.providers["anthropic"] = ProviderConfig.init;
     c.providers["anthropic"].models["claude"] = ModelSettings.init;
     c.providers["anthropic"].models["claude"].temperature = 0.3;
-    c.providers["anthropic"].models["claude"].thinking = Thinking.parse("xhigh");
+    c.providers["anthropic"].models["claude"].thinking = Thinking.parse("xhigh").unwrap("a valid level");
     Changes ch;
     ch.temperature = true;
     ch.providerTemperatures["groq"] = true;
@@ -476,6 +483,7 @@ unittest
     import std.algorithm : canFind;
     import std.math : isNaN;
     import nano.toml : parseToml;
+    import nano.result : unwrap;
     auto doc = "temperature = 0.2 # global tune\n\n[providers.groq] # fast\nmax_retries = 2\n"
         ~ "temperature = 0.1 # tuned for this provider\n\n[providers.kimi]\nmodels = { \"k3\" = { temperature = 0.5 } }\n";
     Config c;
@@ -498,7 +506,7 @@ unittest
     assert(text.canFind("[providers.anthropic.models.claude]\ntemperature = 0.3"), text);
     assert(!text.canFind("[providers]\n") && !text.canFind("[providers.anthropic]\n"), text);
     assert(!text.canFind("0.5"), "unsetting inside an inline table removes the key: " ~ text);
-    parseToml(text); // still valid TOML
+    parseToml(text).unwrap("valid TOML"); // still valid TOML
 }
 
 // rust: settings.rs::save_creates_a_missing_file

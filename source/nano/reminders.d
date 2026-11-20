@@ -14,6 +14,7 @@ import std.format : format;
 import std.json;
 import std.string : strip;
 import nano.plan : Plan, Status;
+import nano.result : unwrap;
 
 /// Remind about a stale plan after this many tool calls without a plan change.
 enum size_t planStaleAfter = 12;
@@ -484,18 +485,18 @@ unittest // suggests a plan once per session; memory once unless saved
 unittest // nudges a stale plan until it changes
 {
     Plan plan;
-    plan.apply("plan_add", parseJSON(`{"items": ["read", "fix"]}`));
-    plan.apply("plan_update", parseJSON(`{"id": 1, "status": "in_progress"}`));
+    plan.apply("plan_add", parseJSON(`{"items": ["read", "fix"]}`)).unwrap("valid");
+    plan.apply("plan_update", parseJSON(`{"id": 1, "status": "in_progress"}`)).unwrap("valid");
     Reminders r;
     size_t[] fired;
     foreach (i; 1 .. planStaleAfter * 2 + 1) if (r.afterToolCall(plan, false).length) fired ~= i;
     assert(fired == [planStaleAfter, planStaleAfter * 2], fired.to!string);
     r.planChanged();
-    plan.apply("plan_update", parseJSON(`{"id": 1, "status": "done"}`));
+    plan.apply("plan_update", parseJSON(`{"id": 1, "status": "done"}`)).unwrap("valid");
     string note;
     foreach (_; 0 .. planStaleAfter) foreach (n; r.afterToolCall(plan, false)) note = n;
     assert(note.canFind(`next is #2 "fix"`), note);
-    plan.apply("plan_update", parseJSON(`{"id": 2, "status": "done"}`));
+    plan.apply("plan_update", parseJSON(`{"id": 2, "status": "done"}`)).unwrap("valid");
     foreach (_; 0 .. planStaleAfter * 2) assert(!r.afterToolCall(plan, false).length);
 }
 

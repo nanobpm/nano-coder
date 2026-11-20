@@ -8,6 +8,7 @@ version (unittest):
 import std.algorithm : canFind, filter, map;
 import std.array : array, replicate;
 import std.json : JSONValue, parseJSON;
+import nano.result : unwrap;
 import std.math : isNaN;
 import std.typecons : Nullable;
 import nano.agent;
@@ -59,7 +60,7 @@ LLMResponse toolCall(string id) { return LLMResponse("", "", [ToolCall.fromRaw(i
 
 Request effort(string l) { Request r; r.kind = Request.Kind.effort; r.level = l; return r; }
 
-Nullable!Thinking session(string l) { return Nullable!Thinking(Thinking.parse(l)); }
+Nullable!Thinking session(string l) { return Nullable!Thinking(Thinking.parse(l).unwrap("a valid level")); }
 
 string[] loggedLevels(Agent agent)
 {

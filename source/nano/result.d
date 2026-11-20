@@ -16,26 +16,9 @@
 /// says what went wrong, or `string` for a message.
 module nano.result;
 @safe:
-pure:
 
-import nano.option : Option, some, none;
-
-struct Result(T, E)
-{
-    private T value;
-    private E error;
-    private bool good;
-
-    static Result ok(T v) { Result r; r.value = v; r.good = true; return r; }
-
-    static Result err(E e) { Result r; r.error = e; return r; }
-
-    bool isOk() const { return good; }
-
-    bool isErr() const { return !good; }
-}
-
-enum isResult(R) = is(R : Result!(T, E), T, E);
+// The higher-order functions come before `pure:` so they infer purity from
+// their callbacks: pure with a pure one, usable from I/O code with any other.
 
 /// Both cases: `onOk` gets the value, `onErr` the error.
 auto match(alias onOk, alias onErr, T, E)(Result!(T, E) r)
@@ -65,6 +48,35 @@ auto andThen(alias f, T, E)(Result!(T, E) r)
     return r.good ? f(r.value) : R.err(r.error);
 }
 
+/// The value, or throws `mk(error)`: for the I/O edge, where code that
+/// reports failure by throwing calls into code that returns it.
+T orThrow(alias mk, T, E)(Result!(T, E) r)
+{
+    if (!r.good) throw mk(r.error);
+    return r.value;
+}
+
+pure:
+
+import nano.option : Option, some, none;
+
+struct Result(T, E)
+{
+    private T value;
+    private E error;
+    private bool good;
+
+    static Result ok(T v) { Result r; r.value = v; r.good = true; return r; }
+
+    static Result err(E e) { Result r; r.error = e; return r; }
+
+    bool isOk() const { return good; }
+
+    bool isErr() const { return !good; }
+}
+
+enum isResult(R) = is(R : Result!(T, E), T, E);
+
 /// The value, or `fallback` on an error.
 T orElse(T, E)(Result!(T, E) r, T fallback)
 {
@@ -90,19 +102,19 @@ T unwrap(T, E)(Result!(T, E) r, string why)
     return r.value;
 }
 
-/// The value, or throws `mk(error)`: for the I/O edge, where code that
-/// reports failure by throwing calls into code that returns it. Not pure
-/// only in that throwing an exception allocated by `mk` is allowed here.
-T orThrow(alias mk, T, E)(Result!(T, E) r)
+/// The error; halts on a value. For passing an error up after `isErr`:
+/// `if (r.isErr) return Result!(U, E).err(r.unwrapErr("isErr"));`.
+E unwrapErr(T, E)(Result!(T, E) r, string why)
 {
-    if (!r.good) throw mk(r.error);
-    return r.value;
+    if (r.good) assert(0, "unwrapErr on ok: " ~ why);
+    return r.error;
 }
 
 unittest
 {
     alias R = Result!(int, string);
     auto a = R.ok(3), b = R.err("bad");
+    assert(b.unwrapErr("err") == "bad");
     assert(a.isOk && !a.isErr && b.isErr);
     assert(a.match!(v => v * 2, e => -1) == 6);
     assert(b.match!(v => v * 2, e => cast(int) e.length) == 3);

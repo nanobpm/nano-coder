@@ -173,6 +173,16 @@ floor "in source" "$(printf '%s\n' "$pure_mods" | grep -c .)" scripts/pure-modul
 for m in $pure_mods; do
     grep -q "^    $m,$" source/nano/pure_core_test.d || { echo "Error: $m starts with \`pure:\`; add it to pureCore in source/nano/pure_core_test.d" >&2; status=1; }
 done
+# Errors as values: a pure-core module returns a Result (nano.result) rather
+# than throwing. What throws there is a parser unwinding to its own entry
+# point, which turns it into the error result, so its exception class must be
+# private; the throws themselves are capped by scripts/pure-throw-budget.
+pure_files=$(grep -lE '^pure:$' $(find source -name '*.d' ! -name '*_test.d') | grep -v 'pureaudit.d$')
+if grep -nE '^[[:space:]]*class[[:space:]]+[A-Za-z_]+[[:space:]]*:[[:space:]]*(Exception|Error)\b' $pure_files; then
+    echo "Error: an exception class in a pure-core module must be private; return a Result (nano.result) instead of throwing" >&2
+    status=1
+fi
+ratchet "in pure-core modules" "$(cat $pure_files | grep -vE '^[[:space:]]*//' | grep -cE '\bthrow\b')" scripts/pure-throw-budget "\`throw\`s (return a Result instead)"
 for m in $(sed -n 's/^    \(nano\.[a-z_.]*\),$/\1/p' source/nano/pure_core_test.d); do
     printf '%s\n' "$pure_mods" | grep -qx "$m" || { echo "Error: $m is in pure_core_test.d but doesn't start with \`pure:\`" >&2; status=1; }
 done

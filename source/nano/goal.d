@@ -50,12 +50,6 @@ string statusName(OutcomeStatus s) pure
     }
 }
 
-/// Thrown by the agent (the edge) for an outcome it rejects; `fromArgs`
-/// returns its errors as values.
-class OutcomeError : Exception
-{
-    this(string msg) pure { super(msg); }
-}
 
 struct Outcome
 {

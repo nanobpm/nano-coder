@@ -381,7 +381,8 @@ unittest
     try parseMode("nope"); catch (Exception) threw = true; // expected: an unknown mode must throw, which is what this test checks
     assert(threw);
     import nano.toml : parseToml;
-    auto c = SandboxConfig.fromJSON(parseToml("mode = \"read-only\"\nnetwork = false"));
+    import nano.result : unwrap;
+    auto c = SandboxConfig.fromJSON(parseToml("mode = \"read-only\"\nnetwork = false").unwrap("valid TOML"));
     assert(c.mode == SandboxMode.readOnly && !c.network && c.toolCaches);
 }
 

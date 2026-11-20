@@ -7,8 +7,8 @@
 /// words that contain `$...` or command substitutions are marked dynamic, and
 /// unquoted glob characters are recorded.
 ///
-/// Anything it cannot parse (an unterminated quote, an unmatched `)`) throws
-/// `ShellParseError`, so callers can fail closed.
+/// Anything it cannot parse (an unterminated quote, an unmatched `)`) is an
+/// error result, so callers can fail closed.
 module nano.shell;
 
 @safe:
@@ -18,8 +18,11 @@ import std.algorithm : canFind, startsWith, any;
 import std.array : split;
 import std.format : format;
 import std.conv : to;
+import nano.result : Result, orThrow, unwrap;
 
-class ShellParseError : Exception
+/// How the recursive-descent parser unwinds from deep inside; `parseNested`
+/// turns it into an error result, so it never leaves this module.
+private class ShellParseError : Exception
 {
     this(string msg) pure nothrow { super(msg); }
 }
@@ -323,17 +326,20 @@ bool heredocBodyAssigns(string body) pure
 
 /// Parse a command line into its simple commands, including those inside
 /// command substitutions.
-Simple[] parse(string source) pure { return parseNested(source, 0); }
+Result!(Simple[], string) parse(string source) pure { return parseNested(source, 0); }
 
-Simple[] parseNested(string source, size_t depth) pure
+/// ditto, `depth` levels down already.
+Result!(Simple[], string) parseNested(string source, size_t depth) pure
 {
-    if (depth > maxDepth) throw new ShellParseError("command nests too deeply to inspect");
+    alias R = Result!(Simple[], string);
+    if (depth > maxDepth) return R.err("command nests too deeply to inspect");
     dchar[] chars;
     try chars = source.to!(dchar[]);
-    catch (Exception) throw new ShellParseError("command is not valid UTF-8");
+    catch (Exception) return R.err("command is not valid UTF-8"); // std.utf reports bad UTF-8 by throwing
     auto p = Parser(chars, 0, depth);
-    p.script(false);
-    return p.out_;
+    try p.script(false);
+    catch (ShellParseError e) return R.err(e.msg);
+    return R.ok(p.out_);
 }
 
 private struct PendingHeredoc
@@ -686,7 +692,8 @@ private struct Parser
                 ++pos;
             }
         }
-        out_ ~= parseNested(inner.to!string, depth + 1);
+        // Keep unwinding: the outer parseNested turns this into the error result.
+        out_ ~= parseNested(inner.to!string, depth + 1).orThrow!(e => new ShellParseError(e));
     }
 
     /// Skip a balanced `${...}` or `$((...))` body, returning its text, while
@@ -988,7 +995,7 @@ version (unittest)
     private string[][] words(string source) pure
     {
         string[][] r;
-        foreach (s; parse(source))
+        foreach (s; parse(source).unwrap("a valid test command"))
         {
             string[] ws;
             foreach (w; s.words) ws ~= w.text;
@@ -997,13 +1004,12 @@ version (unittest)
         return r;
     }
 
-    private Word wordAt(string source, size_t cmd, size_t idx) pure { return parse(source)[cmd].words[idx]; }
-
-    private bool fails(string source) pure
+    private Word wordAt(string source, size_t cmd, size_t idx) pure
     {
-        try { parse(source); return false; }
-        catch (ShellParseError) return true;
+        return parse(source).unwrap("a valid test command")[cmd].words[idx];
     }
+
+    private bool fails(string source) pure { return parse(source).isErr; }
 }
 
 // rust: shell.rs::splits_on_operators
@@ -1016,7 +1022,7 @@ unittest // splits_on_operators
 // rust: shell.rs::unquotes_and_marks_dynamic_and_glob
 unittest // unquotes_and_marks_dynamic_and_glob
 {
-    auto w = parse(`rm -rf "$HOME"/x \* '*' * ${D:?}/y`)[0].words;
+    auto w = parse(`rm -rf "$HOME"/x \* '*' * ${D:?}/y`).unwrap("a valid test command")[0].words;
     assert(w[2].text == "$HOME/x");
     assert(w[2].dynamic && w[2].quoted);
     assert(!w[3].glob && w[3].text == "*");
@@ -1044,13 +1050,13 @@ unittest // nested_command_substitutions_are_inspected
 // rust: shell.rs::records_redirects_and_heredocs
 unittest // records_redirects_and_heredocs
 {
-    auto p = parse("cat > /dev/sda 2>&1 <<EOF\nDROP DATABASE x;\nEOF\necho done");
+    auto p = parse("cat > /dev/sda 2>&1 <<EOF\nDROP DATABASE x;\nEOF\necho done").unwrap("a valid test command");
     assert(p[0].redirects[0].op == ">");
     assert(p[0].redirects[0].target.text == "/dev/sda");
     assert(p[0].redirects[1].op == ">&");
     assert(p[0].heredocs == [Heredoc("DROP DATABASE x;\n", true)]);
     assert(p[1].words[0].text == "echo");
-    p = parse("psql <<-'SQL' && echo ok\n\tDROP TABLE t;\n\tSQL\n");
+    p = parse("psql <<-'SQL' && echo ok\n\tDROP TABLE t;\n\tSQL\n").unwrap("a valid test command");
     assert(p[0].heredocs == [Heredoc("\tDROP TABLE t;\n", false)]);
     assert(p[1].words[0].text == "echo");
 }
@@ -1096,10 +1102,10 @@ unittest // nested_and_substring_expansions_assign
 unittest // logical_operators_stay_inside_conditional
 {
     import std.algorithm : any;
-    auto cmds = parse("while [[ -f marker && -r marker ]]; do cat marker; break; done");
+    auto cmds = parse("while [[ -f marker && -r marker ]]; do cat marker; break; done").unwrap("a valid test command");
     assert(cmds.any!(s => s.words.any!(w => w.text == "&&")));
     assert(!cmds.any!(s => s.words.length && s.words[0].text == "-r"));
-    cmds = parse(`for f in a z; do [[ "$f" == a || "$f" == z ]]; done`);
+    cmds = parse(`for f in a z; do [[ "$f" == a || "$f" == z ]]; done`).unwrap("a valid test command");
     assert(cmds.any!(s => s.words.any!(w => w.text == "||")));
 }
 
@@ -1107,7 +1113,7 @@ unittest // logical_operators_stay_inside_conditional
 unittest // brace_expansion_preserves_inner_parsing
 {
     import std.algorithm : any;
-    assert(parse("echo {a,`mktemp`}").any!(s => s.words.length && s.words[0].text == "mktemp"));
+    assert(parse("echo {a,`mktemp`}").unwrap("a valid test command").any!(s => s.words.length && s.words[0].text == "mktemp"));
     assert(wordAt("echo {x,${d:=/etc}}", 0, 1).assigns);
     assert(wordAt("echo {x,$((PATH=0))}", 0, 1).assigns);
     assert(wordAt(`echo {a,"b,c"}`, 0, 1).splits);
@@ -1133,7 +1139,7 @@ unittest // substring_length_arithmetic_assigns
 unittest // backtick_inside_brace_splits
 {
     import std.algorithm : find;
-    auto cmds = parse("sort -T {`printf '/tmp -oresult'`} input");
+    auto cmds = parse("sort -T {`printf '/tmp -oresult'`} input").unwrap("a valid test command");
     auto outer = cmds.find!(s => s.words.length && s.words[0].text == "sort");
     assert(outer.length);
     assert(outer[0].words[2].splits && outer[0].words[2].dynamic);
@@ -1216,7 +1222,7 @@ unittest // brace_wildcard_keeps_glob_metadata
 
 unittest // ANSI-C escapes decode to the real command
 {
-    auto w = parse(`bash -c $'\x72m -rf /'`)[0].words;
+    auto w = parse(`bash -c $'\x72m -rf /'`).unwrap("a valid test command")[0].words;
     assert(w[2].text == "rm -rf /" && w[2].quoted && !w[2].dynamic);
-    assert(parse(`echo $'\q'`)[0].words[1].dynamic);
+    assert(parse(`echo $'\q'`).unwrap("a valid test command")[0].words[1].dynamic);
 }

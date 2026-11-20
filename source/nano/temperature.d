@@ -136,8 +136,9 @@ unittest
 {
     import std.algorithm : canFind;
     import nano.toml : parseToml;
+    import nano.result : unwrap;
     ProviderConfig p;
-    p.merge(parseToml("temperature = 0.4\n[models.\"m\"]\ntemperature = 0.2\n[models.\"d\"]\ntemperature = \"default\"\n"));
+    p.merge(parseToml("temperature = 0.4\n[models.\"m\"]\ntemperature = 0.2\n[models.\"d\"]\ntemperature = \"default\"\n").unwrap("valid TOML"));
     auto r = resolve(0.9, ProviderKind.openai, p, "m");
     assert(r.effective == 0.2 && r.source == Source.model && r.describe == "0.2 (set for this model)");
     r = resolve(0.9, ProviderKind.openai, p, "other");
@@ -151,13 +152,13 @@ unittest
     assert(r.effective == 1 && r.warning.canFind("sending 1"));
     // drop_params: only the default; a provider value is reported ignored.
     ProviderConfig d;
-    d.merge(parseToml("temperature = 0.3\ndrop_params = [\"temperature\"]\n"));
+    d.merge(parseToml("temperature = 0.3\ndrop_params = [\"temperature\"]\n").unwrap("valid TOML"));
     r = resolve(0.9, ProviderKind.openai, d, "x");
     assert(isNaN(r.effective) && r.source == Source.required && r.warning.canFind("is ignored"));
     assert(resolve(0.9, ProviderKind.openai, none, "x").fixedBy("thinking").warning is null);
     // extra_body wins.
     ProviderConfig e;
-    e.merge(parseToml("[extra_body]\ntemperature = 0.7\n"));
+    e.merge(parseToml("[extra_body]\ntemperature = 0.7\n").unwrap("valid TOML"));
     r = resolve(0.1, ProviderKind.openai, e, "x");
     assert(r.effective == 0.7 && r.source == Source.extraBody);
     r = r.fixedBy("thinking is on");

@@ -13,6 +13,8 @@ import std.string : strip, toLower, startsWith, stripLeft;
 import std.uni : toUpper;
 
 import nano.llm : ToolDefinition;
+import nano.option : Option, match;
+import nano.result : Result, unwrap, unwrapErr, match;
 
 @safe:
 pure:
@@ -31,11 +33,8 @@ immutable string[] toolNames = ["plan_add", "plan_update", "plan_show"];
 
 bool isPlanTool(string name) pure { return toolNames.canFind(name); }
 
-/// A rejected plan call (Rust `bail!`).
-class PlanError : Exception
-{
-    this(string msg) pure { super(msg); }
-}
+/// A plan result: the error is the message for the model (Rust `bail!`).
+alias PlanResult(T) = Result!(T, string);
 
 enum Status { pending, inProgress, done, blocked, dropped }
 
@@ -51,18 +50,19 @@ string statusName(Status s) pure nothrow
     }
 }
 
-Status parseStatus(string text) pure
+PlanResult!Status parseStatus(string text) pure
 {
+    alias R = PlanResult!Status;
     auto t = text.strip.toLower.replace("-", "_").replace(" ", "_");
     switch (t)
     {
-        case "pending", "todo": return Status.pending;
-        case "in_progress", "active", "doing", "started": return Status.inProgress;
-        case "done", "completed", "complete": return Status.done;
-        case "blocked": return Status.blocked;
-        case "dropped", "cancelled", "canceled", "skipped": return Status.dropped;
+        case "pending", "todo": return R.ok(Status.pending);
+        case "in_progress", "active", "doing", "started": return R.ok(Status.inProgress);
+        case "done", "completed", "complete": return R.ok(Status.done);
+        case "blocked": return R.ok(Status.blocked);
+        case "dropped", "cancelled", "canceled", "skipped": return R.ok(Status.dropped);
         default:
-            throw new PlanError(format!"unknown status %s; use pending, in_progress, done, blocked or dropped"(
+            return R.err(format!"unknown status %s; use pending, in_progress, done, blocked or dropped"(
                     JSONValue(t).jsonText));
     }
 }
@@ -139,11 +139,12 @@ struct Plan
         return [done, total];
     }
 
-    private size_t item(uint id) pure
+    private PlanResult!size_t item(uint id) pure const
     {
-        foreach (k, ref i; items) if (i.id == id) return k;
-        if (!items.length) throw new PlanError(format!"no item %s: the plan is empty; add items with plan_add"(id));
-        throw new PlanError(format!"no item %s; items are %s"(id, items.map!(i => i.id.to!string).join(", ")));
+        alias R = PlanResult!size_t;
+        foreach (k, ref i; items) if (i.id == id) return R.ok(k);
+        if (!items.length) return R.err(format!"no item %s: the plan is empty; add items with plan_add"(id));
+        return R.err(format!"no item %s; items are %s"(id, items.map!(i => i.id.to!string).join(", ")));
     }
 
     private bool isReady(const ref PlanItem it) pure const
@@ -165,20 +166,21 @@ struct Plan
         return null;
     }
 
-    /// Run a plan tool. Throws PlanError (the plan is left unchanged).
-    Outcome apply(string tool, JSONValue args) pure
+    /// Run a plan tool. On an error the plan is left unchanged.
+    PlanResult!Outcome apply(string tool, JSONValue args) pure
     {
         switch (tool)
         {
             case "plan_add": return add(args);
             case "plan_update": return update(args);
-            case "plan_show": return Outcome(render(true, size_t.max), false);
-            default: throw new PlanError("unknown plan tool " ~ tool);
+            case "plan_show": return PlanResult!Outcome.ok(Outcome(render(true, size_t.max), false));
+            default: return PlanResult!Outcome.err("unknown plan tool " ~ tool);
         }
     }
 
-    private Outcome add(JSONValue args) pure
+    private PlanResult!Outcome add(JSONValue args) pure
     {
+        alias R = PlanResult!Outcome;
         auto plan = dup();
         string[] summary;
         if (auto g = field(args, "goal"))
@@ -190,15 +192,17 @@ struct Plan
         JSONValue[] list;
         if (auto v = field(args, "items"))
         {
-            auto d = decoded(*v);
+            auto dr = decoded(*v);
+            if (dr.isErr) return R.err(dr.unwrapErr("isErr"));
+            auto d = dr.unwrap("isOk");
             if (d.type == JSONType.array) list = d.arrayNoRef;
             else if (d.type != JSONType.null_) list = [d];
         }
         if (!list.length && !summary.length)
-            throw new PlanError("plan_add needs `items` (a list of step titles or {title, after} objects) or a `goal`");
+            return R.err("plan_add needs `items` (a list of step titles or {title, after} objects) or a `goal`");
         uint firstId = (plan.items.length ? plan.items.map!(i => i.id).maxElement : 0) + 1;
         if (list.length > maxItems || plan.items.length + list.length > maxItems)
-            throw new PlanError(format!"a plan holds at most %s items; drop or merge some first"(maxItems));
+            return R.err(format!"a plan holds at most %s items; drop or merge some first"(maxItems));
         uint[] added;
         foreach (offset, it; list)
         {
@@ -209,15 +213,20 @@ struct Plan
             else if (it.type == JSONType.object)
             {
                 if (auto t = field(it, "title")) if (t.type == JSONType.string) title = t.str;
-                if (auto a = field(it, "after")) after = idsOf(*a);
+                if (auto a = field(it, "after"))
+                {
+                    auto ids = idsOf(*a);
+                    if (ids.isErr) return R.err(ids.unwrapErr("isErr"));
+                    after = ids.unwrap("isOk");
+                }
                 if (auto n = field(it, "note")) if (n.type == JSONType.string) note = n.str;
             }
-            else throw new PlanError("each item must be a title string or an object with a `title`");
+            else return R.err("each item must be a title string or an object with a `title`");
             title = title.strip;
-            if (!title.length) throw new PlanError(format!"item %s has an empty title"(offset + 1));
+            if (!title.length) return R.err(format!"item %s has an empty title"(offset + 1));
             foreach (dep; after)
                 if (dep >= id || !plan.items.any!(i => i.id == dep))
-                    throw new PlanError(format!"item %s: `after` must name earlier items, not %s"(
+                    return R.err(format!"item %s: `after` must name earlier items, not %s"(
                             JSONValue(title).jsonText, dep));
             PlanItem p = {id: id, title: clip(title, maxTitleChars), status: Status.pending, after: after};
             if (note.strip.length) p.notes = [clip(note.strip, maxNoteChars)];
@@ -227,17 +236,20 @@ struct Plan
         if (added.length == 1) summary ~= format!"added item %s"(added[0]);
         else if (added.length > 1) summary ~= format!"added items %s-%s"(added[0], added[$ - 1]);
         this = plan;
-        return outcome(summary.join(", "));
+        return R.ok(outcome(summary.join(", ")));
     }
 
-    private Outcome update(JSONValue args) pure
+    private PlanResult!Outcome update(JSONValue args) pure
     {
+        alias R = PlanResult!Outcome;
         JSONValue[] updates;
         auto u = field(args, "updates");
         if (u is null) updates = [args];
         else
         {
-            auto d = decoded(*u);
+            auto dr = decoded(*u);
+            if (dr.isErr) return R.err(dr.unwrapErr("isErr"));
+            auto d = dr.unwrap("isOk");
             if (d.type == JSONType.array) updates = d.arrayNoRef;
             else if (d.type == JSONType.null_) updates = [args];
             else updates = [d];
@@ -248,13 +260,17 @@ struct Plan
         {
             auto idv = field(up, "id");
             uint id;
-            if (idv is null || !idOf(*idv, id)) throw new PlanError("plan_update needs the item `id`");
-            auto it = &plan.items[plan.item(id)];
+            if (idv is null || !idOf(*idv, id)) return R.err("plan_update needs the item `id`");
+            auto at = plan.item(id);
+            if (at.isErr) return R.err(at.unwrapErr("isErr"));
+            auto it = &plan.items[at.unwrap("isOk")];
             string[] did;
             if (auto s = field(up, "status"))
                 if (s.type == JSONType.string)
                 {
-                    it.status = parseStatus(s.str);
+                    auto st = parseStatus(s.str);
+                    if (st.isErr) return R.err(st.unwrapErr("isErr"));
+                    it.status = st.unwrap("isOk");
                     did ~= statusName(it.status);
                 }
             if (auto t = field(up, "title"))
@@ -269,11 +285,11 @@ struct Plan
                     it.notes ~= clip(n.str.strip, maxNoteChars);
                     did ~= "noted";
                 }
-            if (!did.length) throw new PlanError(format!"item %s: give a `status`, `note` or `title` to change"(id));
+            if (!did.length) return R.err(format!"item %s: give a `status`, `note` or `title` to change"(id));
             summary ~= format!"%s %s"(id, did.join(" + "));
         }
         this = plan;
-        return outcome("updated " ~ summary.join(", "));
+        return R.ok(outcome("updated " ~ summary.join(", ")));
     }
 
     private Outcome outcome(string summary) pure const
@@ -370,13 +386,15 @@ struct Plan
 
     /// Accept a plan from a client or a session log: this harness's own shape
     /// (`{goal, items}`) or bare ACP entries.
-    static Plan fromJSON(JSONValue v) pure
+    static PlanResult!Plan fromJSON(JSONValue v) pure
     {
+        alias R = PlanResult!Plan;
+        enum shape = "plan must be {goal, items: [{id, title, status}]}";
         Plan plan;
         if (v.type == JSONType.object && "items" in v)
         {
             if (auto g = field(v, "goal")) if (g.type == JSONType.string) plan.goal = g.str;
-            if (v["items"].type != JSONType.array) throw new PlanError("plan must be {goal, items: [{id, title, status}]}");
+            if (v["items"].type != JSONType.array) return R.err(shape);
             foreach (it; v["items"].arrayNoRef)
             {
                 PlanItem p;
@@ -385,22 +403,34 @@ struct Plan
                 auto s = field(it, "status");
                 if (idv is null || idv.type != JSONType.integer && idv.type != JSONType.uinteger || t is null
                         || t.type != JSONType.string || s is null || s.type != JSONType.string)
-                    throw new PlanError("plan must be {goal, items: [{id, title, status}]}");
+                    return R.err(shape);
                 auto raw = idv.type == JSONType.integer ? idv.integer : cast(long) idv.uinteger;
-                if (raw <= 0 || raw > maxId) throw new PlanError(format!"plan item id %s is out of range 1-%s"(raw, maxId));
+                if (raw <= 0 || raw > maxId) return R.err(format!"plan item id %s is out of range 1-%s"(raw, maxId));
                 p.id = cast(uint) raw;
                 p.title = t.str;
-                p.status = parseStatus(s.str);
-                if (auto n = field(it, "notes")) if (n.type == JSONType.array) foreach (x; n.arrayNoRef) p.notes ~= x.str;
-                if (auto a = field(it, "after")) p.after = idsOf(*a);
+                auto st = parseStatus(s.str);
+                if (st.isErr) return R.err(st.unwrapErr("isErr"));
+                p.status = st.unwrap("isOk");
+                if (auto n = field(it, "notes"))
+                    if (n.type == JSONType.array)
+                        foreach (x; n.arrayNoRef)
+                        {
+                            if (x.type != JSONType.string) return R.err(shape);
+                            p.notes ~= x.str;
+                        }
+                if (auto a = field(it, "after"))
+                {
+                    auto ids = idsOf(*a);
+                    if (ids.isErr) return R.err(ids.unwrapErr("isErr"));
+                    p.after = ids.unwrap("isOk");
+                }
                 plan.items ~= p;
             }
-            plan.validate();
-            return plan;
+            return plan.invalidity.match!(e => R.err(e), () => R.ok(plan));
         }
         JSONValue entries = v;
         if (v.type == JSONType.object && "entries" in v) entries = v["entries"];
-        if (entries.type != JSONType.array) throw new PlanError("plan must be {goal, items} or a list of ACP plan entries");
+        if (entries.type != JSONType.array) return R.err("plan must be {goal, items} or a list of ACP plan entries");
         foreach (index, e; entries.arrayNoRef)
         {
             string title;
@@ -409,26 +439,35 @@ struct Plan
             title = title.strip;
             if (!title.length) continue;
             auto st = Status.pending;
-            if (auto s = field(e, "status")) if (s.type == JSONType.string) st = parseStatus(s.str);
+            if (auto s = field(e, "status"))
+                if (s.type == JSONType.string)
+                {
+                    auto parsed = parseStatus(s.str);
+                    if (parsed.isErr) return R.err(parsed.unwrapErr("isErr"));
+                    st = parsed.unwrap("isOk");
+                }
             plan.items ~= PlanItem(cast(uint) index + 1, clip(title, maxTitleChars), st);
         }
-        return plan;
+        return R.ok(plan);
     }
 
-    /// Check a plan from outside (ids unique and in range, dependencies known).
-    private void validate() pure const
+    /// What is wrong with a plan from outside (ids unique and in range,
+    /// dependencies known), if anything.
+    private Option!string invalidity() pure const
     {
-        if (items.length > maxItems) throw new PlanError(format!"a plan holds at most %s items"(maxItems));
+        import nano.option : some;
+        if (items.length > maxItems) return some(format!"a plan holds at most %s items"(maxItems));
         bool[uint] seen;
         foreach (ref i; items)
         {
-            if (i.id == 0 || i.id > maxId) throw new PlanError(format!"plan item id %s is out of range 1-%s"(i.id, maxId));
-            if (i.id in seen) throw new PlanError(format!"plan item id %s is used twice"(i.id));
+            if (i.id == 0 || i.id > maxId) return some(format!"plan item id %s is out of range 1-%s"(i.id, maxId));
+            if (i.id in seen) return some(format!"plan item id %s is used twice"(i.id));
             seen[i.id] = true;
         }
         foreach (ref i; items)
             foreach (d; i.after)
-                if (d !in seen) throw new PlanError(format!"plan item %s is after unknown item %s"(i.id, d));
+                if (d !in seen) return some(format!"plan item %s is after unknown item %s"(i.id, d));
+        return Option!string.init;
     }
 }
 
@@ -436,20 +475,22 @@ import nano.safeio : jsonGet;
 private alias field = jsonGet;
 
 /// Models sometimes send a nested list as a JSON string; decode it.
-private JSONValue decoded(const JSONValue v) pure
+private PlanResult!JSONValue decoded(const JSONValue v) pure
 {
+    alias R = PlanResult!JSONValue;
     if (v.type == JSONType.string)
     {
         auto t = v.str.stripLeft;
         if (t.startsWith("[") || t.startsWith("{"))
         {
-            try return parseJSON(v.str);
+            // std.json reports malformed input by throwing; turn it into a value here.
+            try return R.ok(parseJSON(v.str));
             catch (Exception e)
-                throw new PlanError(format!"could not parse %s as JSON: %s; pass a list, not a string"(
+                return R.err(format!"could not parse %s as JSON: %s; pass a list, not a string"(
                         JSONValue(v.str).jsonText, e.msg));
         }
     }
-    return cast(JSONValue) v;
+    return R.ok(cast(JSONValue) v);
 }
 
 private bool idOf(const JSONValue v, out uint id) pure
@@ -470,8 +511,9 @@ private bool idOf(const JSONValue v, out uint id) pure
     return false;
 }
 
-private uint[] idsOf(const JSONValue v) pure
+private PlanResult!(uint[]) idsOf(const JSONValue v) pure
 {
+    alias R = PlanResult!(uint[]);
     const(JSONValue)[] list;
     if (v.type == JSONType.array) list = v.arrayNoRef;
     else if (v.type != JSONType.null_) list = [v];
@@ -479,10 +521,10 @@ private uint[] idsOf(const JSONValue v) pure
     foreach (x; list)
     {
         uint id;
-        if (!idOf(x, id)) throw new PlanError("`after` must list item ids, got " ~ x.jsonText);
+        if (!idOf(x, id)) return R.err("`after` must list item ids, got " ~ x.jsonText);
         out_ ~= id;
     }
-    return out_;
+    return R.ok(out_);
 }
 
 private string clip(string text, size_t max) pure
@@ -525,22 +567,22 @@ unittest // adds_updates_and_tracks_what_is_next
 {
     Plan plan;
     auto o = plan.apply("plan_add",
-        parseJSON(`{"goal": "Ship it", "items": ["Read code", {"title": "Write fix", "after": [1]}, "Open PR"]}`));
+        parseJSON(`{"goal": "Ship it", "items": ["Read code", {"title": "Write fix", "after": [1]}, "Open PR"]}`)).unwrap("valid");
     assert(o.changed);
     assert(o.text.startsWith("Set the goal, added items 1-3.\n"), o.text);
     assert(o.text.canFind("[ ] 2. Write fix (after 1)"));
     assert(o.text.canFind("Next: 1. Read code"));
 
-    o = plan.apply("plan_update", parseJSON(`{"updates": [{"id": 1, "status": "done", "note": "bug in parser.rs:40"}, {"id": "2", "status": "in-progress"}]}`));
+    o = plan.apply("plan_update", parseJSON(`{"updates": [{"id": 1, "status": "done", "note": "bug in parser.rs:40"}, {"id": "2", "status": "in-progress"}]}`)).unwrap("valid");
     assert(o.text.startsWith("Updated 1 done + noted, 2 in_progress."), o.text);
     assert(o.text.canFind("[x] 1. Read code\n      (1 note)"));
     assert(o.text.canFind("In progress: 2. Write fix"));
     assert(plan.progress == [1, 3]);
 
-    auto full = plan.apply("plan_show", parseJSON(`{}`));
+    auto full = plan.apply("plan_show", parseJSON(`{}`)).unwrap("valid");
     assert(!full.changed && full.text.canFind("- bug in parser.rs:40"));
-    plan.apply("plan_update", parseJSON(`{"id": 3, "status": "dropped"}`));
-    plan.apply("plan_update", parseJSON(`{"id": 2, "status": "done"}`));
+    plan.apply("plan_update", parseJSON(`{"id": 3, "status": "dropped"}`)).unwrap("valid");
+    plan.apply("plan_update", parseJSON(`{"id": 2, "status": "done"}`)).unwrap("valid");
     import std.algorithm : endsWith;
     assert(plan.render(false, size_t.max).endsWith("All items are done.\n"));
 }
@@ -548,25 +590,24 @@ unittest // adds_updates_and_tracks_what_is_next
 // rust: plan.rs::rejects_bad_calls_without_changing_the_plan
 unittest // rejects_bad_calls_without_changing_the_plan
 {
-    import std.exception : collectExceptionMsg, assertThrown;
     Plan plan;
-    plan.apply("plan_add", parseJSON(`{"items": ["a"]}`));
+    plan.apply("plan_add", parseJSON(`{"items": ["a"]}`)).unwrap("valid");
     auto before = plan.dup;
-    assert(collectExceptionMsg(plan.apply("plan_update", parseJSON(`{"id": 9, "status": "done"}`))).canFind("items are 1"));
-    assertThrown(plan.apply("plan_update", parseJSON(`{"updates": [{"id": 1, "status": "done"}, {"id": 1, "status": "nope"}]}`)));
-    assertThrown(plan.apply("plan_add", parseJSON(`{"items": [{"title": "b", "after": [5]}]}`)));
-    assertThrown(plan.apply("plan_add", parseJSON(`{}`)));
-    assertThrown(plan.apply("plan_add", parseJSON(`{"items": "[\"unclosed"}`)));
+    assert(plan.apply("plan_update", parseJSON(`{"id": 9, "status": "done"}`)).match!(v => "", e => e).canFind("items are 1"));
+    assert(plan.apply("plan_update", parseJSON(`{"updates": [{"id": 1, "status": "done"}, {"id": 1, "status": "nope"}]}`)).isErr);
+    assert(plan.apply("plan_add", parseJSON(`{"items": [{"title": "b", "after": [5]}]}`)).isErr);
+    assert(plan.apply("plan_add", parseJSON(`{}`)).isErr);
+    assert(plan.apply("plan_add", parseJSON(`{"items": "[\"unclosed"}`)).isErr);
     assert(plan == before);
 
-    plan.apply("plan_add", parseJSON(`{"items": "[\"b\", {\"title\": \"c\", \"after\": [2]}]"}`));
-    plan.apply("plan_update", parseJSON(`{"updates": "[{\"id\": 2, \"status\": \"done\"}]"}`));
+    plan.apply("plan_add", parseJSON(`{"items": "[\"b\", {\"title\": \"c\", \"after\": [2]}]"}`)).unwrap("valid");
+    plan.apply("plan_update", parseJSON(`{"updates": "[{\"id\": 2, \"status\": \"done\"}]"}`)).unwrap("valid");
     assert(plan.items.map!(i => i.title).array == ["a", "b", "c"]);
     assert(plan.items[1].status == Status.done);
 
-    assertThrown(Plan.fromJSON(parseJSON(`{"items": [{"id": 4294967295, "title": "x", "status": "pending"}]}`)));
-    assertThrown(Plan.fromJSON(parseJSON(`{"items": [{"id": 1, "title": "x", "status": "pending"}, {"id": 1, "title": "y", "status": "done"}]}`)));
-    assertThrown(Plan.fromJSON(parseJSON(`{"items": [{"id": 1, "title": "x", "status": "pending", "after": [3]}]}`)));
+    assert(Plan.fromJSON(parseJSON(`{"items": [{"id": 4294967295, "title": "x", "status": "pending"}]}`)).isErr);
+    assert(Plan.fromJSON(parseJSON(`{"items": [{"id": 1, "title": "x", "status": "pending"}, {"id": 1, "title": "y", "status": "done"}]}`)).isErr);
+    assert(Plan.fromJSON(parseJSON(`{"items": [{"id": 1, "title": "x", "status": "pending", "after": [3]}]}`)).isErr);
 }
 
 // rust: plan.rs::context_note_drops_finished_notes_first_and_round_trips_through_acp
@@ -574,17 +615,17 @@ unittest // context_note_drops_finished_notes_first_and_round_trips_through_acp
 {
     import std.array : replicate;
     Plan plan;
-    plan.apply("plan_add", parseJSON(`{"items": ["a", "b"]}`));
-    plan.apply("plan_update", JSONValue(["id": JSONValue(1), "status": JSONValue("done"), "note": JSONValue("x".replicate(900))]));
-    plan.apply("plan_update", parseJSON(`{"id": 2, "note": "keep me"}`));
+    plan.apply("plan_add", parseJSON(`{"items": ["a", "b"]}`)).unwrap("valid");
+    plan.apply("plan_update", JSONValue(["id": JSONValue(1), "status": JSONValue("done"), "note": JSONValue("x".replicate(900))])).unwrap("valid");
+    plan.apply("plan_update", parseJSON(`{"id": 2, "note": "keep me"}`)).unwrap("valid");
     auto tight = plan.render(true, 300);
     assert(tight.canFind("- keep me") && tight.canFind("(1 note)"), tight);
 
     import nano.safeio : jsonText;
-    assert(Plan.fromJSON(parseJSON(plan.toJSON.jsonText)) == plan);
+    assert(Plan.fromJSON(parseJSON(plan.toJSON.jsonText)).unwrap("valid") == plan);
     auto entries = plan.acpEntries;
     assert(entries[0]["status"].str == "completed");
-    auto seeded = Plan.fromJSON(entries);
+    auto seeded = Plan.fromJSON(entries).unwrap("valid");
     assert(seeded.items[1].title == "b");
     assert(seeded.items[0].status == Status.done);
 }
@@ -648,8 +689,8 @@ private string fitWidth(string s, size_t width) pure
 unittest // checklist
 {
     Plan plan;
-    plan.apply("plan_add", parseJSON(`{"items": ["one", "two\u001b[2J", "three"]}`));
-    plan.apply("plan_update", parseJSON(`{"updates": [{"id": 1, "status": "done"}, {"id": 2, "status": "in_progress"}]}`));
+    plan.apply("plan_add", parseJSON(`{"items": ["one", "two\u001b[2J", "three"]}`)).unwrap("valid");
+    plan.apply("plan_update", parseJSON(`{"updates": [{"id": 1, "status": "done"}, {"id": 2, "status": "in_progress"}]}`)).unwrap("valid");
     auto text = checklist(plan, 80, false);
     assert(text == "● Plan 1/3 done\n  ✔ one\n  ◼ two\n  ☐ three\n", text);
 }

@@ -518,6 +518,15 @@ runs a compile-time audit (`nano.pureaudit`) over those modules. check-safe keep
 step with the `pure:` modules, and the `pure` count and the number of pure modules can only
 grow (`scripts/pure-floor`, `scripts/pure-module-floor`).
 
+The pure core is also strongly pure: no public function takes a `ref`, `out` or other mutable
+argument (the audit fails the build on one), so a call can't change what its caller passed.
+Results come back as values, and so do errors: a function that can fail returns
+`nano.result.Result!(T, E)` (`ok`/`err`, `match`, `map`, `andThen`, `toOption`, and
+`orThrow!(e => new X(e))` for the code that still reports errors by throwing). A missing value is
+`Option!T`. Inside the core, only the shell and TOML parsers throw, to unwind to their own entry
+point, which returns the error. Their exception classes are private, and check-safe caps those
+`throw`s (`scripts/pure-throw-budget`).
+
 ## Configuration
 
 Create `~/.config/nano-coder/config.toml` (every field is optional). Directories from before the rename (`agentic-harness`, for config and for data such as sessions) are moved to `nano-coder` at startup when the new ones don't exist yet. A symlink is left at the old path so an older nano-coder still finds them. If that compatibility symlink can't be created, a warning is printed and the link is retried on later starts; if the move itself fails, the old directory is used:

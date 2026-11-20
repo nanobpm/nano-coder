@@ -27,6 +27,7 @@ import std.array : array, join;
 import std.algorithm : map;
 import std.sumtype : SumType, match;
 import nano.shell : parse, Simple;
+import nano.result : orThrow, toOption;
 import nano.cmdexpand;
 import nano.guard;
 import nano.paths;
@@ -187,12 +188,16 @@ bool ruleMatches(string ruleSrc, string tool, JSONValue args)
         auto c = stringArg(args, "command");
         if (c is null) return false;
         if (rule.matches(c.strip)) return true;
-        try
+        // Unparsable: only the whole-command match above applies (as in Rust).
+        foreach (parsed; parse(c).toOption)
         {
-            foreach (cmd; expandAll(parse(c)))
-                if (rule.matches(commandText(cmd))) return true;
+            try
+            {
+                foreach (cmd; expandAll(parsed))
+                    if (rule.matches(commandText(cmd))) return true;
+            }
+            catch (Exception) {} // unexpandable: likewise only the whole-command match applies
         }
-        catch (Exception) {} // unparsable: only the whole-command match above applies (as in Rust)
         return false;
     case Subject.path:
         auto path = stringArg(args, "path");
@@ -402,7 +407,7 @@ struct Policy
         foreach (r; denyRules)
             if (r.matches(command.strip)) throw new Blocked(format("rule `%s` denies this command", r.source));
         Expansion e;
-        try e = expandAllChecked(parse(command));
+        try e = expandAllChecked(parse(command).orThrow!(m => new Exception(m)));
         catch (Exception ex) throw new Blocked(format("could not inspect this command (%s); simplify it", ex.msg));
         auto commands = e.commands;
         foreach (cmd; commands)

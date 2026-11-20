@@ -21,6 +21,7 @@ import std.math : isNaN;
 import nano.toml;
 import std.typecons : Nullable;
 import nano.thinking : Thinking;
+import nano.result : orThrow, unwrap;
 
 /// A temperature setting: null = unset, NaN = "default" (send none).
 alias TemperatureSetting = Nullable!double;
@@ -52,7 +53,7 @@ struct ModelSettings
     void overlay(JSONValue o) pure
     {
         if (auto v = "temperature" in o) temperature = numberOrDefault(*v);
-        if (auto v = "thinking" in o) thinking = Thinking.parse(v.str);
+        if (auto v = "thinking" in o) thinking = Thinking.parse(v.str).orThrow!(e => new Exception(e));
         if (auto v = "vision" in o) vision = v.boolean;
         if (auto v = "thinking_levels" in o) thinkingLevels = strings(*v), hasThinkingLevels = true;
         if (auto v = "name" in o) name = v.str;
@@ -191,7 +192,7 @@ struct ProviderConfig
         if (auto v = "context_window" in o) contextWindow = v.integer;
         if (auto v = "stream" in o) stream = v.boolean;
         if (auto v = "temperature" in o) temperature = numberOrDefault(*v);
-        if (auto v = "thinking" in o) thinking = Thinking.parse(v.str);
+        if (auto v = "thinking" in o) thinking = Thinking.parse(v.str).orThrow!(e => new Exception(e));
         if (auto v = "vision" in o) vision = v.boolean;
         if (auto v = "thinking_levels" in o) thinkingLevels = strings(*v), hasThinkingLevels = true;
         if (auto v = "models" in o)
@@ -487,12 +488,12 @@ struct Config
         c.providers = presets();
         c.path = path;
         if (!path.exists) return c;
-        auto doc = parseToml(readText(path));
+        auto doc = parseToml(readText(path)).orThrow!(e => new Exception(e));
         if (auto v = "model" in doc) c.model = v.str;
         if (auto v = "default_provider" in doc) c.defaultProvider = v.str;
         if (auto v = "temperature" in doc) c.temperature = numberOrDefault(*v);
         if (auto v = "max_tokens" in doc) c.maxTokens = v.integer;
-        if (auto v = "thinking" in doc) c.thinking = Thinking.parse(v.str);
+        if (auto v = "thinking" in doc) c.thinking = Thinking.parse(v.str).orThrow!(e => new Exception(e));
         if (auto v = "vision" in doc) c.vision = v.boolean;
         if (auto v = "timestamps" in doc) c.timestamps = v.boolean;
         if (auto v = "context_window" in doc) c.contextWindow = v.integer;
@@ -768,7 +769,7 @@ unittest // the mock preset is hidden from listings, yet `mock/...` still resolv
     assert(!shown.canFind("mock") && shown.canFind("openai"));
     resolve(c, "mock/test");
     ProviderConfig internal;
-    internal.merge(parseToml("hidden = true\n"));
+    internal.merge(parseToml("hidden = true\n").unwrap("valid TOML"));
     c.providers["internal"] = internal;
     assert(!enabledProviderNames(c.providers).canFind("internal"));
 }
@@ -810,7 +811,7 @@ unittest // the stream idle timeout: 120 s default, env override, explicit confi
         environment[providerTimeoutSecsEnv] = "90";
         assert(resolve(c, "mock/m").config.timeoutSecs == 90);
         ProviderConfig x;
-        x.merge(parseToml("kind = \"openai\"\nbase_url = \"http://localhost:1\"\ntimeout_secs = 45\n"));
+        x.merge(parseToml("kind = \"openai\"\nbase_url = \"http://localhost:1\"\ntimeout_secs = 45\n").unwrap("valid TOML"));
         c.providers["x"] = x;
         assert(resolve(c, "x/m").config.timeoutSecs == 45);
         foreach (v; ["", "abc", "-5", "0", "  "])
@@ -846,10 +847,10 @@ unittest
     assert(c.providers["openai"].configuredModels is null, "presets list from the endpoint");
     // A later layer sets only some fields of a model: the rest survive.
     ProviderConfig p;
-    p.merge(parseToml("list_models = \"configured\"\n[models.m]\nname = \"M\"\nbase_url = \"https://a/v1\"\n"));
-    p.merge(parseToml("list_models = \"endpoint\"\n[models.m]\nname = \"Em\"\n"));
+    p.merge(parseToml("list_models = \"configured\"\n[models.m]\nname = \"M\"\nbase_url = \"https://a/v1\"\n").unwrap("valid TOML"));
+    p.merge(parseToml("list_models = \"endpoint\"\n[models.m]\nname = \"Em\"\n").unwrap("valid TOML"));
     assert(!p.configuredList && p.models["m"].name == "Em" && p.models["m"].baseUrl == "https://a/v1");
-    assert(collectExceptionMsg(p.merge(parseToml("list_models = \"all\"\n"))).canFind("list_models must be"));
+    assert(collectExceptionMsg(p.merge(parseToml("list_models = \"all\"\n").unwrap("valid TOML"))).canFind("list_models must be"));
 }
 
 // rust: config.rs::a_retired_legacy_renderer_setting_still_loads_with_a_notice
@@ -873,6 +874,7 @@ unittest // a retired `renderer = "legacy"` still loads, with a notice
 unittest
 {
     import nano.toml : parseToml;
+    import nano.result : unwrap;
     // replay_reasoning defaults on only for Copilot reasoning models.
     Config c;
     c.providers = presets();
@@ -880,9 +882,9 @@ unittest
     assert(resolve(c, "github-copilot/gpt-6-astra").replayReasoning);
     assert(!resolve(c, "github-copilot/gpt-4.1").replayReasoning);
     assert(!resolve(c, "github-copilot/o4-mini").replayReasoning);
-    c.providers["github-copilot"].merge(parseToml("replay_reasoning = false"));
+    c.providers["github-copilot"].merge(parseToml("replay_reasoning = false").unwrap("valid TOML"));
     assert(!resolve(c, "github-copilot/gpt-5").replayReasoning);
-    c.providers["deepseek"].merge(parseToml("replay_reasoning = true"));
+    c.providers["deepseek"].merge(parseToml("replay_reasoning = true").unwrap("valid TOML"));
     assert(resolve(c, "deepseek/deepseek-reasoner").replayReasoning);
 }
 

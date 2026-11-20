@@ -14,6 +14,7 @@ import std.regex : regex, matchFirst, ctRegex, replaceAll;
 import std.string : strip, toLower, indexOf;
 import std.uni : asLowerCase;
 import nano.shell;
+import nano.result : orThrow;
 import nano.cmdexpand;
 import nano.paths;
 
@@ -136,7 +137,7 @@ struct Guard
                     auto line = resolved;
                     foreach (w; cmd.words[1 .. $]) line ~= " " ~ w.text;
                     Simple[] reparsed;
-                    try reparsed = expandAll(parse(line));
+                    try reparsed = expandAll(parse(line).orThrow!(m => new Exception(m)));
                     catch (Exception e) throw new Blocked(format("could not inspect `%s` (%s)", line, e.msg));
                     ++depth;
                     scope (exit) --depth;

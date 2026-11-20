@@ -7,7 +7,7 @@ import nano.safeio : jsonText, jsonPretty;
 import nano.clock : monoNow, since, sleepFor, stdTimeNow, wallNow;
 import nano.arith : checkedMul, checkedSub, saturatingSub;
 import nano.option : Option, some, none, match, ifSome, orElse, unwrap, NotNull;
-import nano.result : orThrow, toOption;
+import nano.result : orThrow, toOption, match, unwrap;
 
 import nano.safeio : Isolated, JoinHandle, spawnDaemon, stdErr, stdOut;
 
@@ -25,7 +25,7 @@ import nano.tools;
 import nano.question : QuestionError, QuestionBroker, Question, QuestionOption, Answer, Answered;
 import std.sumtype : match;
 import nano.mode : AgentMode, planAllows;
-import nano.goal : Outcome, OutcomeError, OutcomeStatus, verifyReminder, outcomeToolName = toolName, outcomeDefinition = definition;
+import nano.goal : Outcome, OutcomeStatus, verifyReminder, outcomeToolName = toolName, outcomeDefinition = definition;
 import nano.reminders : Reminders, wrap;
 import mem = nano.memory;
 import ctx = nano.context;
@@ -45,7 +45,7 @@ string toolResultDisplay(string text, const(Attachment)[] attachments) pure
 import nano.config : KindedClient, ProviderConfig, ProviderKind;
 import std.typecons : Nullable;
 import std.algorithm : min, max, clamp;
-import nano.plan : Plan, PlanError, isPlanTool, planDefinitions = definitions;
+import nano.plan : Plan, isPlanTool, planDefinitions = definitions;
 import nano.timers : Timers, TimerError, isTimerTool, timerDefinitions = definitions, firedMessage, firedNotice, pendingNudge, pendingNudgeEvery;
 import nano.permissions;
 import nano.session;
@@ -75,6 +75,14 @@ interface AgentEvents
 string wrapReminder(string text) pure nothrow
 {
     return "<system-reminder>\n" ~ text ~ "\n</system-reminder>";
+}
+
+
+/// A `report_outcome` call the agent rejects: `Outcome.fromArgs`'s error, or
+/// the verify reminder. Its message is the tool result for the model.
+class OutcomeError : Exception
+{
+    this(string msg) pure { super(msg); }
 }
 
 /// Why compaction was requested.
@@ -645,8 +653,7 @@ class Agent
             {
                 import nano.thinking : sessionSetting;
                 // Checked when it was typed, so this can't fail.
-                try sessionThinking = sessionSetting(level);
-                catch (Exception) {} // the level was validated when typed, so this can't fail
+                sessionThinking = sessionSetting(level).unwrap("validated when typed");
             }
             LLMResponse r;
             const swStart = monoNow;
@@ -1639,7 +1646,6 @@ class Agent
             isError = false;
         }
         catch (ToolError e) out_ = e.msg;
-        catch (PlanError e) out_ = e.msg;
         catch (TimerError e) out_ = e.msg;
         catch (hist.HistoryError e) out_ = e.msg;
         catch (OutcomeError e) out_ = e.msg;
@@ -1714,8 +1720,8 @@ class Agent
         plan = Plan.init;
         if (r.plan.type == JSONType.object)
         {
-            try plan = Plan.fromJSON(r.plan);
-            catch (Exception e) dropped ~= "the saved plan: " ~ e.msg; // a malformed plan is dropped, the session resumes
+            // A malformed plan is dropped; the session resumes.
+            Plan.fromJSON(r.plan).match!((p) { plan = p; }, (e) { dropped ~= "the saved plan: " ~ e; });
         }
         Timers t;
         try t = Timers.fromJSON(r.timers);
@@ -2052,7 +2058,8 @@ class Agent
     package string runPlanTool(string name, JSONValue args)
     {
         auto before = plan.dup;
-        auto o = plan.apply(name, args);
+        // The plan's error is the tool's message to the model.
+        auto o = plan.apply(name, args).orThrow!(e => new ToolError(e));
         if (o.changed)
         {
             // As for timers: an unrecorded change is rolled back.

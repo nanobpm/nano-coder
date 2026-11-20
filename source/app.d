@@ -7,6 +7,7 @@ import nano.safeio : jsonText, jsonPretty;
 import nano.clock : monoNow, sleepFor, wallNow;
 import nano.arith : saturatingSub;
 import nano.option : Option, some, none, match, ifSome, unwrap, notNull, NotNull, nullable;
+import nano.result : match, unwrap, unwrapErr, orThrow;
 
 import nano.safeio : Chan, Isolated, Join, JoinHandle, Locked, Shared, deepCopy, spawn, spawnDaemon, exitProcess, stdErr, stdinLine, stdOut;
 
@@ -397,13 +398,10 @@ string midTurnCommand(string text, MidTurn ctx)
         case Timing.nextStep:
             if (name == "/mode")
             {
-                try
-                {
-                    auto m = parseMode(arg);
+                return parseMode(arg).match!((m) {
                     control.mode = m;
                     return format("Mode set to %s (%s); applies from the agent's next step", m.name, m.describe);
-                }
-                catch (Exception e) return e.msg;
+                }, e => e);
             }
             if (name == "/verbosity")
             {
@@ -419,9 +417,9 @@ string midTurnCommand(string text, MidTurn ctx)
             {
                 import std.typecons : Nullable;
                 import nano.thinking : Thinking, sessionSetting;
-                Nullable!Thinking check;
-                try check = sessionSetting(arg);
-                catch (Exception e) return format("[thinking: %s]", e.msg);
+                auto setting = sessionSetting(arg);
+                if (setting.isErr) return format("[thinking: %s]", setting.unwrapErr("isErr"));
+                auto check = setting.unwrap("isOk");
                 control.requestThinking(arg);
                 auto shown = check.isNull ? "the config level" : check.get.toString;
                 return format("[thinking: %s — from the agent's next step]", shown);
@@ -1610,7 +1608,7 @@ int runMain(string[] args)
     try
     {
         cfg = Config.load(cfgPath);
-        if (cfgPath.exists) rawConfig = parseToml(readText(cfgPath));
+        if (cfgPath.exists) rawConfig = parseToml(readText(cfgPath)).orThrow!(e => new Exception(e));
     }
     catch (Exception e) die(e.msg);
 
@@ -2541,8 +2539,9 @@ int runMain(string[] args)
                     import nano.thinking : statusText, sessionSetting;
                     if (arg.length)
                     {
-                        try agent.sessionThinking = sessionSetting(arg);
-                        catch (Exception e) { writeln(e.msg); continue; }
+                        auto setting = sessionSetting(arg);
+                        if (setting.isErr) { writeln(setting.unwrapErr("isErr")); continue; }
+                        agent.sessionThinking = setting.unwrap("isOk");
                         auto r = agent.thinking();
                         writeln("Thinking set to ", r.describe);
                         if (r.warning.length) writeln("Warning: ", r.warning);
@@ -2571,14 +2570,11 @@ int runMain(string[] args)
                         writeln(modeListing(agent.control.mode));
                         continue;
                     }
-                    try
-                    {
-                        auto m = parseMode(arg);
+                    parseMode(arg).match!((m) {
                         agent.control.mode = m;
                         syncMode();
                         writefln("Mode set to %s (%s)", m.name, m.describe);
-                    }
-                    catch (Exception e) writeln(e.msg);
+                    }, e => writeln(e));
                     continue;
                 case "/version":
                     writeln(versionString);
