@@ -513,6 +513,9 @@ class ProjectInstructions
     private ScopedRule[] scoped;
     /// Nested files already attached to a tool result by `nestedFor`.
     private string[] nestedAttached;
+    /// What each directory search found (paths and texts, imports included),
+    /// so a re-read can tell when a directory reads differently.
+    private string[string] found;
 
     /// Find the user's and the project's instruction files for `cwd`.
     static ProjectInstructions discover(string cwd, Options options)
@@ -566,6 +569,9 @@ class ProjectInstructions
         }
         foreach (n; localFiles) load(buildPath(dir, n), Kind.local, null, false, 0, false, null);
         currentSearchDir = null;
+        string digest;
+        foreach (f; loaded[start .. $]) digest ~= f.path ~ "\0" ~ f.text ~ "\0";
+        found[dir] = digest;
         return [start, loaded.length];
     }
 
@@ -860,24 +866,46 @@ class ProjectInstructions
         const warned = warnings.length; // resolving here is a probe, not a load
         scope (exit) warnings = warnings[0 .. warned];
         string out_;
-        void imports(string from, string text, size_t depth)
+        // Each file once per rule, as `appendRuleImports` does: repeats and
+        // cycles cost nothing, and the rule's own import policy applies.
+        bool[string] visited;
+        void imports(string from, string text, bool user, size_t depth)
         {
             if (depth >= maxImportDepth) return;
             foreach (r; importRefs(text))
             {
-                auto target = resolveImport(from, r, false);
+                auto target = resolveImport(from, r, user);
                 if (target is null) continue;
+                auto real_ = canonOr(target);
+                if (real_ in visited) continue;
+                visited[real_] = true;
                 auto imported = readCapped(target);
                 out_ ~= target ~ "\0" ~ imported ~ "\0";
-                if (imported !is null) imports(target, imported, depth + 1);
+                if (imported !is null) imports(target, imported, user, depth + 1);
             }
         }
         foreach (r; scoped)
         {
             out_ ~= r.path ~ "\0" ~ r.source ~ "\0";
-            imports(r.path, r.body, 0);
+            visited = null;
+            visited[canonOr(r.path)] = true;
+            imports(r.path, r.body, r.user, 0);
         }
         return out_;
+    }
+
+    /// Whether a directory whose files attached to a tool result reads
+    /// differently now (a file edited, added or removed, imports included).
+    /// `probe` is a fresh discovery for the same directory, spent on the check.
+    bool nestedChanged(ProjectInstructions probe)
+    {
+        foreach (d, digest; found)
+        {
+            if (d in initial || d !in searched) continue;
+            probe.search(d);
+            if (probe.found.get(d, null) != digest) return true;
+        }
+        return false;
     }
 
     /// Files in the prompt, for the banner, `/context` and ACP.
@@ -1134,6 +1162,7 @@ unittest // scoped rules attach once per compaction; imports resolve on attach
 unittest // the scoped-rule fingerprint sees rule and import edits
 {
     import std.file : rmdirRecurse;
+    import std.array : replicate;
     auto base = testDir("reread");
     scope (exit) rmdirRecurse(base);
     auto root = buildPath(base, "repo");
@@ -1152,6 +1181,22 @@ unittest // the scoped-rule fingerprint sees rule and import edits
     // The rule itself changes.
     put(buildPath(root, ".claude/rules/a.md"), "---\npaths: \"a/**\"\n---\nrule a, revised");
     assert(find(root).scopedFingerprint != afterImport);
+    // A cycle of self-imports is read once.
+    put(buildPath(root, ".claude/rules/loop.md"), "---\npaths: \"l/**\"\n---\n" ~ "@loop.md ".replicate(100));
+    assert(find(root).scopedFingerprint.length < afterImport.length + 2_000, "not 100^4 expansions");
+    // A nested directory that attached: edits there are seen.
+    put(buildPath(root, "pkg/AGENTS.md"), "pkg rule");
+    auto withNested = find(root);
+    assert(withNested.nestedFor(buildPath(root, "pkg/x"), root).canFind("pkg rule"));
+    assert(!withNested.nestedChanged(find(root)));
+    put(buildPath(root, "pkg/AGENTS.md"), "pkg rule, revised");
+    assert(withNested.nestedChanged(find(root)));
+    // A file added where a search found nothing is seen too.
+    auto empty = find(root);
+    assert(empty.nestedFor(buildPath(root, "none/x"), root) is null);
+    assert(!empty.nestedChanged(find(root)));
+    put(buildPath(root, "none/AGENTS.md"), "new here");
+    assert(empty.nestedChanged(find(root)));
     // A fresh discovery attaches the current text.
     assert(find(root).nestedFor(buildPath(root, "a/x"), root).canFind("rule a, revised"));
 }
