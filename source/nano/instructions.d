@@ -81,6 +81,8 @@ private struct ScopedRule
     string body;
     Regex!char[] patterns;
     bool attached, user;
+    /// The whole file, front matter included: a changed rule attaches again.
+    string source;
 }
 
 /// The nearest ancestor (or `start`) holding `.git`, or null.
@@ -685,7 +687,7 @@ class ProjectInstructions
                     warn(format("rule %s has no usable paths patterns", display(path)));
                     continue;
                 }
-                scoped ~= ScopedRule(path, body, compiled, false, user);
+                scoped ~= ScopedRule(path, body, compiled, false, user, text);
             }
             // Front matter without `paths` is dropped; imports expand from the body only.
             else load(path, Kind.rule, null, user, 0, true, body);
@@ -848,6 +850,31 @@ class ProjectInstructions
         loaded = kept;
         nestedAttached = null;
         foreach (ref r; scoped) r.attached = false;
+    }
+
+    /// What the rules scoped with `paths:` say, which `render` leaves out:
+    /// with it, a re-read can tell that only an on-demand rule changed.
+    string scopedFingerprint() const pure
+    {
+        string out_;
+        foreach (r; scoped) out_ ~= r.path ~ "\0" ~ r.source ~ "\0";
+        return out_;
+    }
+
+    /// Carry what `old` already attached to tool results over to this fresh
+    /// discovery: nested files, and scoped rules whose file is unchanged. A
+    /// changed or new rule attaches again when a matching file is touched.
+    void inheritAttachments(ProjectInstructions old)
+    {
+        foreach (ref r; scoped)
+            foreach (o; old.scoped)
+                if (o.attached && o.path == r.path && o.source == r.source) r.attached = true;
+        foreach (d, _; old.searched) if (d !in old.initial) searched[d] = true;
+        bool[string] again; // rules that must be able to attach again
+        foreach (r; scoped) if (!r.attached) again[canonOr(r.path)] = true;
+        foreach (k, _; old.seen) if (k !in old.initialSeen && k !in again) seen[k] = true;
+        foreach (f; old.loaded) if (f.searchDir !is null && f.searchDir !in old.initial) loaded ~= f;
+        nestedAttached ~= old.nestedAttached;
     }
 
     /// Files in the prompt, for the banner, `/context` and ACP.
@@ -1099,6 +1126,33 @@ unittest // scoped rules attach once per compaction; imports resolve on attach
     assert(p.nestedFor(buildPath(root, "sub/README.md"), root) is null);
     p.forgetNested();
     assert(p.nestedFor(buildPath(root, "src/api/y.ts"), root) !is null);
+}
+
+unittest // a re-read sees scoped-rule edits and keeps what already attached
+{
+    import std.file : rmdirRecurse;
+    auto base = testDir("reread");
+    scope (exit) rmdirRecurse(base);
+    auto root = buildPath(base, "repo");
+    put(buildPath(root, ".claude/rules/a.md"), "---\npaths: \"a/**\"\n---\nrule a");
+    put(buildPath(root, ".claude/rules/b.md"), "---\npaths: \"b/**\"\n---\nrule b");
+    put(buildPath(root, "sub/AGENTS.md"), "nested");
+    auto old = find(root);
+    assert(old.nestedFor(buildPath(root, "a/x"), root).canFind("rule a"));
+    assert(old.nestedFor(buildPath(root, "b/x"), root).canFind("rule b"));
+    assert(old.nestedFor(buildPath(root, "sub/x"), root).canFind("nested"));
+    // Unchanged: same fingerprint and render.
+    assert(find(root).scopedFingerprint == old.scopedFingerprint);
+    // Rule b edited: the fingerprint changes, though the system text doesn't.
+    put(buildPath(root, ".claude/rules/b.md"), "---\npaths: \"b/**\"\n---\nrule b, revised");
+    auto fresh = find(root);
+    assert(fresh.scopedFingerprint != old.scopedFingerprint && fresh.render == old.render);
+    fresh.inheritAttachments(old);
+    // Unchanged rule a and the nested file stay attached; b attaches again.
+    assert(fresh.nestedFor(buildPath(root, "a/y"), root) is null);
+    assert(fresh.nestedFor(buildPath(root, "sub/y"), root) is null);
+    assert(fresh.nestedFor(buildPath(root, "b/y"), root).canFind("rule b, revised"));
+    assert(fresh.render == old.render, "nested files stay out of the system text");
 }
 
 // rust: instructions.rs::render_cap_bounds_total_with_header_and_single_marker

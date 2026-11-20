@@ -2033,16 +2033,24 @@ int runMain(string[] args)
     void syncMode() { agent.syncModePrompt((bool plan) => systemFor(cwd, plan)); }
 
     // Re-read the instruction files (AGENTS.md, CLAUDE.md, rules, your own
-    // files): when what they put in the system prompt changed, rebuild it so
-    // the next call follows them, without a restart. True when it changed.
+    // files) so edits apply without a restart. A change to what they put in
+    // the system prompt rebuilds it (true); a change to on-demand rules only
+    // swaps the rules. Either way what already attached to tool results
+    // stays attached, unless its rule changed.
     bool reloadInstructions()
     {
         static string text(Option!ProjectInstructions i) { return i.match!(pi => pi.render, () => string.init); }
+        static string rules(Option!ProjectInstructions i) { return i.match!(pi => pi.scopedFingerprint, () => string.init); }
         auto fresh = discoverInstructions(cfg, cwd);
-        if (instructionsDir == cwd && text(fresh) == text(instructions)) return false;
+        const sameDir = instructionsDir == cwd;
+        const sameText = sameDir && text(fresh) == text(instructions);
+        if (sameText && rules(fresh) == rules(instructions)) return false;
+        if (sameDir)
+            foreach (pi; fresh) foreach (old; instructions) pi.inheritAttachments(old);
         instructionsDir = cwd;
         instructions = fresh;
         agent.instructions = fresh;
+        if (sameText) return false;
         agent.installSystem(systemFor(cwd, agent.promptPlan), indexShown);
         return true;
     }
