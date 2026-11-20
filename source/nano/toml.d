@@ -395,7 +395,9 @@ private struct Parser
                 import std.ascii : isHexDigit;
                 import std.algorithm.searching : all;
                 import std.utf : encode, isValidDchar;
-                if (!s[i .. i + n].all!isHexDigit) fail("bad unicode escape");
+                import std.string : representation;
+                // Bytes, not decoded characters: the slice may end inside a multibyte one.
+                if (!s[i .. i + n].representation.all!(b => isHexDigit(b))) fail("bad unicode escape");
                 const code = s[i .. i + n].to!uint(16);
                 if (!isValidDchar(cast(dchar) code)) fail("bad unicode escape: not a Unicode scalar value");
                 i += n;
@@ -449,6 +451,7 @@ unittest
     assert(parseToml("x = { a.b = 1, a.c = 2 }").unwrap("valid TOML")["x"]["a"]["c"].integer == 2);
     // Bad escapes are errors, not exceptions escaping the Result.
     assert(parseToml("x = \"\\uZZZZ\"").isErr);
+    assert(parseToml("x = \"\\u0\U0001F600\"").isErr);
     assert(parseToml("x = \"\\uD800\"").isErr);
     assert(parseToml("x = \"\\U00110000\"").isErr);
     assert(parseToml("x = \"\\u00e9\"").unwrap("valid TOML")["x"].str == "\u00e9");

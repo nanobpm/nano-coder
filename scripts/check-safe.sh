@@ -178,7 +178,7 @@ done
 # point, which turns it into the error result, so its exception class must be
 # private; the throws themselves are capped by scripts/pure-throw-budget.
 pure_files=$(grep -lE '^pure:$' $(find source -name '*.d' ! -name '*_test.d') | grep -v 'pureaudit.d$')
-if grep -nE '^[[:space:]]*class[[:space:]]+[A-Za-z_]+[[:space:]]*:[[:space:]]*(Exception|Error)\b' $pure_files; then
+if grep -nE '^[[:space:]]*((public|final|abstract|static)[[:space:]]+)*class[[:space:]]+[A-Za-z_]+[[:space:]]*:[[:space:]]*(Exception|Error)\b' $pure_files; then
     echo "Error: an exception class in a pure-core module must be private; return a Result (nano.result) instead of throwing" >&2
     status=1
 fi

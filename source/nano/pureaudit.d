@@ -143,7 +143,9 @@ template reachesMutable(T, Seen...)
             enum reachesMutable = isMutable!(typeof(T.init[0])) || inner!(typeof(T.init[0]));
         else static if (isStaticArray!T) enum reachesMutable = inner!(typeof(T.init[0]));
         else static if (isAssociativeArray!T)
-            enum reachesMutable = isMutable!(ValueType!T) || inner!(ValueType!T) || inner!(KeyType!T);
+            // A table is shared, not copied: a mutable one lets the callee
+            // `remove` entries from its caller's table whatever its values are.
+            enum reachesMutable = isMutable!T || isMutable!(ValueType!T) || inner!(ValueType!T) || inner!(KeyType!T);
         else static if (is(T == class) || is(T == interface)) enum reachesMutable = isMutable!T;
         else static if (is(T == struct)) enum reachesMutable = anySatisfy!(inner, FieldTypeTuple!T);
         else enum reachesMutable = false;
@@ -188,7 +190,9 @@ unittest
         "pureaudit.Probe.__postblit", "pureaudit.Probe.__dtor", "pureaudit.Probe.opAssign"]);
     static assert(weaklyPureFunctions!(nano.pureaudit)() == ["pureaudit.weakRef", "pureaudit.weakOut",
         "pureaudit.weakSlice", "pureaudit.weakPointer", "pureaudit.weakField", "pureaudit.CtorProbe.__ctor"]);
-    static assert(reachesMutable!(int[]) && reachesMutable!(int*) && reachesMutable!Holder && reachesMutable!(int[string]));
+    static assert(reachesMutable!(int[]) && reachesMutable!(int*) && reachesMutable!Holder && reachesMutable!(int[string])
+        && reachesMutable!(const(int)[string]) && reachesMutable!(immutable(int)[string]));
+    static assert(!reachesMutable!(const(int[string])) && !reachesMutable!(immutable(int[string])));
     static assert(!reachesMutable!(const(int)[]) && !reachesMutable!string && !reachesMutable!(const Holder)
         && !reachesMutable!int && !reachesMutable!(int delegate() pure));
 }
