@@ -1,0 +1,11 @@
+# Unit-test time limits per module, in ms (the test runner in
+# source/nano/testenv_test.d fails a module that takes longer; the default
+# limit is 1000 ms). A module is listed only when its tests must wait on real
+# processes, sockets or timeouts; say why. Shorten the waits before raising a
+# limit: make the timeout or grace period a parameter, or use nano.clock's
+# FakeClock. NANO_TEST_BUDGET_SCALE multiplies every limit (slow machines).
+nano.claude_hooks 4000 real hook processes run into their timeouts
+nano.providers.openai_test 3000 a stream must outlast the 1 s idle timeout
+nano.http 3000 real sockets: refused, stalled and redirected connections
+nano.providers.anthropic_test 2500 scripted streaming server with drip delays
+nano.keycmd 2500 key commands run into their timeouts and drain grace

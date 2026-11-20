@@ -8,6 +8,7 @@
 module nano.timers;
 
 @safe:
+import nano.clock : wallNow;
 import nano.arith : saturatingSub;
 
 import std.algorithm : canFind, sort, filter, map, any;
@@ -308,7 +309,7 @@ string clock(long unix)
     import std.datetime.systime : SysTime, Clock;
     import std.datetime.timezone : LocalTime;
     auto t = SysTime.fromUnixTime(unix, LocalTime());
-    auto now = Clock.currTime(LocalTime());
+    auto now = wallNow(LocalTime());
     auto hm = format("%02d:%02d", t.hour, t.minute);
     return t.year == now.year && t.dayOfYear == now.dayOfYear ? hm : format("%04d-%02d-%02d %s", t.year, t.month, t.day, hm);
 }

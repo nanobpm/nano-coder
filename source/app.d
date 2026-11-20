@@ -3,6 +3,7 @@
 module app;
 
 @safe:
+import nano.clock : monoNow, sleepFor, wallNow;
 import nano.arith : saturatingSub;
 import nano.option : Option, some, none, match, ifSome, unwrap, notNull, NotNull, nullable;
 
@@ -186,7 +187,7 @@ int runLogin(string provider)
     import core.time : seconds;
     import std.functional : toDelegate;
     void delegate(string) @safe note = toDelegate((string s) { stdErr.writeln(s); });
-    void delegate(long) @safe sleep = toDelegate((long n) { Thread.sleep(n.seconds); });
+    void delegate(long) @safe sleep = toDelegate((long n) { sleepFor(n.seconds); });
     try
     {
         switch (provider)
@@ -671,8 +672,8 @@ private void readTurnKeys(LineEditor editor, ConsoleLink console, shared(bool)* 
                         // Auto mode: give the user a chance to answer, then
                         // answer for them (Rust's AUTO_AWAY_SECS).
                         console.note(format("[auto: answering for you in %ss — the user is away]", autoAwaySecs));
-                        auto deadline = MonoTime.currTime + autoAwaySecs.seconds;
-                        away = () @safe => MonoTime.currTime >= deadline;
+                        auto deadline = monoNow + autoAwaySecs.seconds;
+                        away = () @safe => monoNow >= deadline;
                     }
                     auto answer = askQuestions(editor, qs, away);
                     if (answer.match!((Away _) => true, _ => false))
@@ -877,7 +878,7 @@ string stamp(bool color)
 {
     import std.datetime.systime : Clock;
     if (!atomicLoad(gTimestamps)) return "";
-    auto t = Clock.currTime;
+    auto t = wallNow;
     auto s = format("%02d:%02d:%02d", t.hour, t.minute, t.second);
     return color ? "\x1b[2m" ~ s ~ "\x1b[0m " : s ~ " ";
 }
@@ -1019,7 +1020,7 @@ struct Screen
     private static long nowMs()
     {
         import core.time : MonoTime;
-        return MonoTime.currTime.ticks / (MonoTime.ticksPerSecond / 1000);
+        return monoNow.ticks / (MonoTime.ticksPerSecond / 1000);
     }
 
     private string thinkStyle(string s) { return color ? "\x1b[38;5;245m" ~ s ~ "\x1b[0m" : s; }
@@ -1218,7 +1219,7 @@ class Console : AgentEvents
     private static long nowMs()
     {
         import core.time : MonoTime;
-        return MonoTime.currTime.ticks / (MonoTime.ticksPerSecond / 1000);
+        return monoNow.ticks / (MonoTime.ticksPerSecond / 1000);
     }
 
     string dim(string s) { return color ? "\x1b[2m" ~ s ~ "\x1b[0m" : s; }
@@ -2175,7 +2176,7 @@ int runMain(string[] args)
                 stdErr.writeln(console.dim(format("[waiting %s for timer %s]", imported!"nano.timers".describe(wait),
                     agent.timers.items[0].id)));
                 // Idle Ctrl-C exits (130) via the SIGINT handler.
-                while (agent.timers.nextDue > agent.timerNow()) Thread.sleep(500.msecs);
+                while (agent.timers.nextDue > agent.timerNow()) sleepFor(500.msecs);
             }
             string notice;
             auto fired = agent.takeFiredTimers(notice);
@@ -2260,7 +2261,7 @@ int runMain(string[] args)
     import core.time : MonoTime, msecs;
     import nano.lineedit : DoublePress, interruptWindowMs;
     auto exitPress = DoublePress(interruptWindowMs); // idle Ctrl-C twice exits
-    static long monoMs() @safe { return (MonoTime.currTime - MonoTime.zero).total!"msecs"; }
+    static long monoMs() @safe { return (monoNow - MonoTime.zero).total!"msecs"; }
     ParkedDraft parkedDraft;      // a stale draft set aside for a timer turn
     bool hasParkedDraft;
     bool quietPrompt;             // redraw the prompt in place (no separating blank line)
@@ -2334,16 +2335,16 @@ int runMain(string[] args)
             updateHint = null;
             // An idle compaction is due once the prompt (and any draft) sat
             // untouched for the hold, unless the exit window is armed (#186).
-            auto promptShown = MonoTime.currTime;
+            auto promptShown = monoNow;
             auto idleHold = idleCompactHoldFor(cfg);
             bool idleNow() @safe
             {
-                return deliverIdleCompact(agent.idleCompactDuePolled(), MonoTime.currTime - ed.quietSince(promptShown),
+                return deliverIdleCompact(agent.idleCompactDuePolled(), monoNow - ed.quietSince(promptShown),
                     idleHold, false, exitPress.armed);
             }
             bool timerNow() @safe
             {
-                return deliverDueTimer(agent.timers.anyDue(agent.timerNow()), ed.holdsTimer(MonoTime.currTime), false,
+                return deliverDueTimer(agent.timers.anyDue(agent.timerNow()), ed.holdsTimer(monoNow), false,
                     exitPress.armed);
             }
             lapse = () @safe => exitPress.deadline.match!(d => monoMs() > d, () => false)

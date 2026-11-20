@@ -8,6 +8,7 @@
 module nano.question;
 
 @safe:
+import nano.clock : sleepFor;
 
 import std.sumtype : SumType, match;
 import core.sync.condition : Condition;
@@ -297,7 +298,7 @@ unittest // ask_blocks_until_resolved, and sequential questions each register
     {
         auto t = spawn(&askOne, broker, expected);
         immutable(Question)[] req;
-        while ((req = broker.pending()) is null) Thread.sleep(1.msecs);
+        while ((req = broker.pending()) is null) sleepFor(1.msecs);
         assert(req[0].question == expected);
         broker.resolve(Answer(Answered(["yes"])));
         assert(mutableAnswer(t.join()[0]) == Answer(Answered(["yes"])));

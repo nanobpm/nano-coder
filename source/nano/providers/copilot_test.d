@@ -2,6 +2,7 @@
 /// (providers/github_copilot.rs tests).
 module nano.providers.copilot_test;
 @safe:
+import nano.clock : wallNow;
 
 version (unittest):
 
@@ -35,7 +36,7 @@ string tokenBody(string api, string token, long expiresIn = 1800)
 {
     import std.datetime.systime : Clock;
     return format(`{"token":"%s","expires_at":%s,"endpoints":{"api":"%s"}}`, token,
-        Clock.currTime.toUnixTime + expiresIn, api);
+        wallNow.toUnixTime + expiresIn, api);
 }
 
 immutable(Reply) ok(string body_, string headers = "") { return immutable Reply(200, headers, body_); }

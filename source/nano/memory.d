@@ -14,6 +14,7 @@
 module nano.memory;
 
 @safe:
+import nano.clock : monoNow, sleepFor, wallNow;
 import nano.arith : saturatingSub;
 
 import nano.safeio : chmodPath, fchmodFd, openPath, statMode, writeFd;
@@ -205,7 +206,7 @@ final class Store
         // SysTime covers about ±29k years; refuse rather than wrap.
         if (expiryDays > 365UL * 10_000)
             throw new Exception(format("memory expiry_days (%s) is out of range", expiryDays));
-        return Clock.currTime - days(cast(long) expiryDays);
+        return wallNow - days(cast(long) expiryDays);
     }
 
     private ScopeFile readScopeFile(Scope s, bool prune)
@@ -278,7 +279,7 @@ final class Store
                     ~ "across fields. Save where to find it instead.");
         }
         import std.random : uniform;
-        auto now = Clock.currTime;
+        auto now = wallNow;
         Entry e;
         e.id = format("mem-%016x%016x", uniform!ulong, uniform!ulong);
         e.text = text;
@@ -334,7 +335,7 @@ final class Store
         auto shown = hits[0 .. hits.length < defaultLimit ? $ : defaultLimit];
         if (!readOnly)
         {
-            auto now = Clock.currTime;
+            auto now = wallNow;
             foreach (ref l; loaded)
             {
                 bool bumped;
@@ -765,18 +766,18 @@ struct FileLock
         createDirAllPrivate(lock.dirName);
         fd = openPath(lock, O_WRONLY | O_CREAT, octal!600);
         if (fd < 0) throw new Exception("opening " ~ lock);
-        auto deadline = MonoTime.currTime + 5.seconds;
+        auto deadline = monoNow + 5.seconds;
         for (;;)
         {
             if (flock(fd, LOCK_EX | LOCK_NB) == 0) return;
             if (errno != EWOULDBLOCK) { close(fd); fd = -1; throw new Exception("locking " ~ lock); }
-            if (MonoTime.currTime >= deadline)
+            if (monoNow >= deadline)
             {
                 close(fd);
                 fd = -1;
                 throw new Exception(format("memory scope is locked by another process (timed out acquiring %s)", lock));
             }
-            Thread.sleep(20.msecs);
+            sleepFor(20.msecs);
         }
     }
 
@@ -1072,7 +1073,7 @@ RecallNote[] recall(Store store, string tool, const JSONValue args, ref Recall s
             matched ~= x;
     import std.algorithm : SwapStrategy;
     matched.sort!((a, b) => a.e.isRule && !b.e.isRule, SwapStrategy.stable);
-    auto now = Clock.currTime;
+    auto now = wallNow;
     RecallNote[] notes;
     foreach (x; matched[0 .. matched.length < budget ? $ : budget])
     {
@@ -1094,7 +1095,7 @@ void logRecall(Store store, string event, string id, string tool, string session
     {
         createDirAllPrivate(store.root);
         // Keys sorted, as serde_json's `json!` map writes them.
-        JSONValue j = ["at": JSONValue(stamp(Clock.currTime)), "event": JSONValue(event), "id": JSONValue(id),
+        JSONValue j = ["at": JSONValue(stamp(wallNow)), "event": JSONValue(event), "id": JSONValue(id),
             "session": session !is null ? JSONValue(session) : JSONValue(null), "tool": JSONValue(tool)];
         auto line = cast(const(ubyte)[]) (j.toString(JSONOptions.doNotEscapeSlashes) ~ "\n");
         auto fd = openPath(buildPath(store.root, recallLog), O_WRONLY | O_CREAT | O_APPEND, octal!600);

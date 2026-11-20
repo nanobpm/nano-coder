@@ -2,6 +2,7 @@
 module nano.tools;
 
 @safe:
+import nano.clock : stdTimeNow;
 
 import nano.safeio : ownText;
 
@@ -217,7 +218,7 @@ private string spillFile(string text, string label)
     auto dir = spillDir_.length ? spillDir_ : buildPath(tempDir, format("nano-coder-%s", thisProcessID));
     mkdirRecurse(dir);
     // Never overwrite: a recorded path must keep pointing at its output.
-    auto stem = buildPath(dir, format("%s-%s-%s", label, Clock.currStdTime, ++counter));
+    auto stem = buildPath(dir, format("%s-%s-%s", label, stdTimeNow, ++counter));
     auto path = stem ~ ".txt";
     for (size_t n = 2; path.exists; n++) path = format("%s-%s.txt", stem, n);
     write(path, text);

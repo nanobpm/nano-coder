@@ -499,6 +499,17 @@ compiler can't check are wrapped in small, commented `@trusted` functions (share
 uncommented `@trusted`, raw threads or `__gshared` outside `safeio.d`, or more `@trusted` than
 the budgets in `scripts/` allow. The build uses `-preview=dip1000` and `-preview=nosharedaccess`.
 
+Time goes through `nano.clock`: `wallNow`, `monoNow`, `since` and `sleepFor` instead of
+`Clock.currTime`, `MonoTime.currTime`, `StopWatch` and `Thread.sleep`, which check-safe bans
+elsewhere. A test can then install a `FakeClock` (per thread) to pick "now" and make sleeps
+instant. Timeouts and grace periods that tests run into are parameters, so a test passes a
+short one rather than waiting out the production value. The test runner
+(`source/nano/testenv_test.d`) fails a module whose tests take over 1 s, unless
+`scripts/slow-tests` gives it a higher limit and a reason; `NANO_TEST_TIMES=N dub test` lists the
+N slowest modules. `NANO_TEST_JOBS=N` runs modules in parallel (`scripts/ci.sh` uses 4); modules
+that change process-wide state (the cancel flag, environment variables) are listed in
+`scripts/serial-tests` and run alone first.
+
 ## Configuration
 
 Create `~/.config/nano-coder/config.toml` (every field is optional). Directories from before the rename (`agentic-harness`, for config and for data such as sessions) are moved to `nano-coder` at startup when the new ones don't exist yet. A symlink is left at the old path so an older nano-coder still finds them. If that compatibility symlink can't be created, a warning is printed and the link is retried on later starts; if the move itself fails, the old directory is used:

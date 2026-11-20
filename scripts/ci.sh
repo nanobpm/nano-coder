@@ -37,9 +37,13 @@ lint() {
     dub run -q dscanner@0.16.0-beta.5 -- --styleCheck --config dscanner.ini source
 }
 
+# Unit tests run modules in parallel (scripts/serial-tests lists the ones that
+# run alone) and fail a module over its time limit (scripts/slow-tests); CI
+# machines get 3x the limits. The 10 slowest modules are listed.
 unit() {
     step "dub test"
-    dub test -q
+    NANO_TEST_JOBS=${NANO_TEST_JOBS:-4} NANO_TEST_TIMES=${NANO_TEST_TIMES:-10} \
+        NANO_TEST_BUDGET_SCALE=${NANO_TEST_BUDGET_SCALE:-${CI:+3}} dub test -q
 }
 
 test_() {

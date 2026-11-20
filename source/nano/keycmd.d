@@ -10,6 +10,7 @@
 module nano.keycmd;
 
 @safe:
+import nano.clock : monoNow, sleepFor;
 
 import core.time : Duration, MonoTime, msecs, seconds;
 import std.format : format;
@@ -22,7 +23,8 @@ enum keyCommandDrainGrace = 500.msecs;
 extern (C) private int setsid() nothrow @nogc;
 
 /// The trimmed key `command` prints; throws with an actionable message.
-string runKeyCommand(string provider, string command, Duration timeout = keyCommandTimeout)
+string runKeyCommand(string provider, string command, Duration timeout = keyCommandTimeout,
+    Duration drainGrace = keyCommandDrainGrace)
 {
     import core.sys.posix.poll : pollfd, POLLIN;
     import core.sys.posix.signal : SIGKILL;
@@ -79,7 +81,7 @@ string runKeyCommand(string provider, string command, Duration timeout = keyComm
         }
     }
 
-    auto deadline = MonoTime.currTime + timeout;
+    auto deadline = monoNow + timeout;
     MonoTime grace;
     for (;;)
     {
@@ -87,16 +89,16 @@ string runKeyCommand(string provider, string command, Duration timeout = keyComm
         else
         {
             import core.thread : Thread;
-            Thread.sleep(10.msecs);
+            sleepFor(10.msecs);
         }
         if (!exited)
         {
             auto st = tryWait(pid);
-            if (st.terminated) { exited = true; status = st.status; grace = MonoTime.currTime + keyCommandDrainGrace; }
+            if (st.terminated) { exited = true; status = st.status; grace = monoNow + drainGrace; }
         }
         if (exited && eof) break;
         if (cancelRequested()) fail("was cancelled");
-        auto now = MonoTime.currTime;
+        auto now = monoNow;
         if (!exited && now >= deadline) fail(format("timed out after %s and was killed", timeout));
         if (exited && (now >= grace || now >= deadline))
             fail("exited but a background process it started is still running (and holding stdout open), "
@@ -128,13 +130,13 @@ unittest
     import std.exception : collectExceptionMsg;
     assert(runKeyCommand("cmd", `printf '  sk-ok\n'`, 5.seconds) == "sk-ok");
     assert(collectExceptionMsg(runKeyCommand("cmd", "echo nope >&2; exit 3", 5.seconds)).canFind("nope"));
-    auto t0 = MonoTime.currTime;
+    auto t0 = monoNow;
     assert(collectExceptionMsg(runKeyCommand("cmd", "sleep 30", 100.msecs)).canFind("timed out"));
     assert(collectExceptionMsg(runKeyCommand("cmd", "sleep 30; printf sk", 100.msecs)).canFind("timed out"));
-    assert(collectExceptionMsg(runKeyCommand("cmd", "sleep 30 &", 5.seconds)).canFind("holding stdout open"));
-    assert(collectExceptionMsg(runKeyCommand("cmd", "printf sk-part; sleep 30 &", 5.seconds)).canFind("holding stdout open"));
-    assert(collectExceptionMsg(runKeyCommand("cmd", "sleep 30 & printf sk-good", 100.msecs)).canFind("holding stdout open"));
-    assert(MonoTime.currTime - t0 < 10.seconds, "the failures are prompt");
+    assert(collectExceptionMsg(runKeyCommand("cmd", "sleep 30 &", 5.seconds, 50.msecs)).canFind("holding stdout open"));
+    assert(collectExceptionMsg(runKeyCommand("cmd", "printf sk-part; sleep 30 &", 5.seconds, 50.msecs)).canFind("holding stdout open"));
+    assert(collectExceptionMsg(runKeyCommand("cmd", "sleep 30 & printf sk-good", 100.msecs, 50.msecs)).canFind("holding stdout open"));
+    assert(monoNow - t0 < 10.seconds, "the failures are prompt");
     // A large output doesn't deadlock; a background job that finishes in
     // the grace period is fine.
     import std.array : replicate;
@@ -155,11 +157,11 @@ unittest
     auto c = new shared TurnControl;
     c.cancel();
     scope (exit) c.startTurn();
-    auto t0 = MonoTime.currTime;
+    auto t0 = monoNow;
     assert(collectExceptionMsg(runKeyCommand("cmd", "sleep 30", 20.seconds)).canFind("cancelled"));
     assert(collectExceptionMsg(runKeyCommand("cmd", "sleep 30; printf sk", 20.seconds)).canFind("cancelled"));
     assert(collectExceptionMsg(runKeyCommand("cmd", "sleep 30 & printf sk", 20.seconds)).canFind("cancelled"));
-    assert(MonoTime.currTime - t0 < 5.seconds);
+    assert(monoNow - t0 < 5.seconds);
 }
 
 /// A command fragment that backgrounds a process outside the command's
@@ -182,14 +184,14 @@ unittest
     import nano.control : TurnControl;
     auto e = escapee();
     if (e is null) return;
-    auto t0 = MonoTime.currTime;
+    auto t0 = monoNow;
     // The key printed, then an escapee holds stdout: not confirmed complete.
     auto msg = collectExceptionMsg(runKeyCommand("cmd", "printf sk-maybe-partial; " ~ e, 100.msecs));
     assert(msg.canFind("holding stdout open"), msg);
     // No key at all: fails promptly rather than hanging on the open pipe.
     msg = collectExceptionMsg(runKeyCommand("cmd", e, 100.msecs));
     assert(msg.canFind("holding stdout open"), msg);
-    assert(MonoTime.currTime - t0 < 4.seconds, "an escapee blocked the bound");
+    assert(monoNow - t0 < 4.seconds, "an escapee blocked the bound");
     // Cancellation applies too.
     auto c = new shared TurnControl;
     c.cancel();

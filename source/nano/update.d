@@ -14,6 +14,7 @@
 module nano.update;
 
 @safe:
+import nano.clock : sleepFor, wallNow;
 import nano.arith : saturatingSub;
 
 import std.json;
@@ -363,7 +364,7 @@ final class Checker
 long unixNow()
 {
     import std.datetime.systime : Clock;
-    return Clock.currTime.toUnixTime;
+    return wallNow.toUnixTime;
 }
 
 /// The background checker's thread: checks whenever one is due and sends
@@ -377,7 +378,7 @@ void runChecker(Channel channel, string statePath, string running, Chan!string h
     {
         if (auto h = c.takeHint()) hints.put(h);
         auto wait = c.dueIn();
-        if (wait > 0) Thread.sleep(wait.seconds);
+        if (wait > 0) sleepFor(wait.seconds);
         c.check(false);
     }
 }

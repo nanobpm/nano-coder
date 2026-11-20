@@ -5,6 +5,7 @@
 module nano.trust;
 
 @safe:
+import nano.clock : monoNow;
 
 import std.algorithm : canFind, any, startsWith, endsWith;
 import std.array : array;
@@ -551,9 +552,9 @@ unittest
     auto skills = buildPath(root, ".claude/skills");
     mkdirRecurse(skills);
     foreach (i; 0 .. 8) symlink(skills, buildPath(skills, format("loop%s", i)));
-    auto t0 = MonoTime.currTime;
+    auto t0 = monoNow;
     assert(!detect(root).skills, "a cycle with no SKILL.md carries no skill");
-    assert(MonoTime.currTime - t0 < 5.seconds, "the cycle must not blow up the scan");
+    assert(monoNow - t0 < 5.seconds, "the cycle must not blow up the scan");
     addSkill(buildPath(skills, "real"));
     assert(detect(root).skills, "a real skill is found even alongside a cycle");
 }

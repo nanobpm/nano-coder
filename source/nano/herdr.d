@@ -11,6 +11,7 @@
 module nano.herdr;
 
 @safe:
+import nano.clock : monoNow, sleepFor, wallNow;
 
 import core.atomic : atomicLoad, atomicStore, cas;
 import core.time : Duration, MonoTime, msecs, seconds;
@@ -173,7 +174,7 @@ private ulong nextSeq(ref Reporter r)
     import std.datetime.systime : Clock;
     import std.datetime : SysTime, UTC;
     import std.algorithm : max;
-    auto now = cast(ulong)((Clock.currTime(UTC()) - SysTime.fromUnixTime(0, UTC())).total!"usecs");
+    auto now = cast(ulong)((wallNow(UTC()) - SysTime.fromUnixTime(0, UTC())).total!"usecs");
     r.seq = max(now, r.seq + 1);
     return r.seq;
 }
@@ -250,19 +251,19 @@ private void run(string bin, string[] args)
         pid = spawnProcess([bin] ~ args, devNull, devNull, devNull, null, Config.none);
     }
     catch (Exception) return; // herdr missing or not runnable: the integration is best effort
-    auto deadline = MonoTime.currTime + timeout;
+    auto deadline = monoNow + timeout;
     try
     {
         for (;;)
         {
             if (tryWait(pid).terminated) return;
-            if (MonoTime.currTime >= deadline)
+            if (monoNow >= deadline)
             {
                 killProcess(pid);
                 wait(pid);
                 return;
             }
-            Thread.sleep(10.msecs);
+            sleepFor(10.msecs);
         }
     }
     catch (Exception) return; // waiting on herdr is best effort; never block or fail a turn on it

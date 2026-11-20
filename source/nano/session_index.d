@@ -11,6 +11,7 @@
 module nano.session_index;
 
 @safe:
+import nano.clock : wallNow;
 
 import std.json;
 import std.file;
@@ -685,7 +686,7 @@ unittest
     std.file.write(hidden, `{"type":"input","data":{"id":"i1","text":"hi"}}` ~ "\n");
     Summary cached;
     cached.id = ".hidden";
-    cached.lastUsed = Clock.currTime;
+    cached.lastUsed = wallNow;
     cached.prompts = 1;
     cached.firstPrompt = cached.lastPrompt = "hi";
     cached.logBytes = getSize(hidden);

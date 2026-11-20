@@ -18,6 +18,7 @@
 module nano.skills;
 
 @safe:
+import nano.clock : monoNow, sleepFor;
 
 import nano.safeio : listDir, readBytes;
 
@@ -674,12 +675,12 @@ private void git(string dir, string[] args)
     import std.exception : collectException;
     auto env = ["GIT_TERMINAL_PROMPT": "0"];
     auto devnull = File("/dev/null", "r");
-    auto errPath = buildPath(tempDir, format("nano-d-git-%s.err", MonoTime.currTime.ticks));
+    auto errPath = buildPath(tempDir, format("nano-d-git-%s.err", monoNow.ticks));
     auto errF = File(errPath, "w");
     scope (exit) collectException(remove(errPath));
     import std.process : spawnProcess;
     auto pid = spawnProcess(["git"] ~ args, devnull, File("/dev/null", "w"), errF, env, Config.none, dir);
-    auto deadline = MonoTime.currTime + fetchTimeoutSecs.seconds;
+    auto deadline = monoNow + fetchTimeoutSecs.seconds;
     for (;;)
     {
         auto r = tryWait(pid);
@@ -689,13 +690,13 @@ private void git(string dir, string[] args)
             errF.close();
             throw new Exception(format("git %s: %s", args.join(" "), readText(errPath).strip));
         }
-        if (MonoTime.currTime > deadline)
+        if (monoNow > deadline)
         {
             { import nano.safeio : killProcess; killProcess(pid); }
             wait(pid);
             throw new Exception(format("git %s timed out", args.join(" ")));
         }
-        Thread.sleep(50.msecs);
+        sleepFor(50.msecs);
     }
 }
 

@@ -2,6 +2,7 @@
 /// instructions, the skills index, the memory index and the plan-mode note.
 module nano.system_prompt;
 @safe:
+import nano.clock : wallNow;
 
 import std.format : format;
 import nano.config : Config;
@@ -18,7 +19,7 @@ string buildSystemPrompt(const ref Config c, string cwd, bool plan, const Skills
     else version (linux) enum os = "Linux";
     else enum os = "unknown";
     auto s = format("%s\n\nWorking directory: %s\nPlatform: %s\nToday's date: %s", base, cwd, os,
-            Clock.currTime.toISOExtString[0 .. 10]);
+            wallNow.toISOExtString[0 .. 10]);
     s ~= instructions;
     s ~= skills.renderIndex;
     s ~= memoryIndex;

@@ -3,6 +3,7 @@
 module nano.agent;
 
 @safe:
+import nano.clock : monoNow, since, sleepFor, stdTimeNow, wallNow;
 import nano.arith : checkedMul, checkedSub, saturatingSub;
 import nano.option : Option, some, none, match, ifSome, orElse, unwrap, NotNull;
 
@@ -351,7 +352,7 @@ class Agent
         // Every input carries an id; the log pairs it with a turn_end record,
         // so an input without one marks a turn a crash interrupted.
         auto inputId = givenId.length ? givenId
-            : format("in-%s-%s", (Clock.currStdTime - 621_355_968_000_000_000L) / 10_000, ++inputCounter);
+            : format("in-%s-%s", (stdTimeNow - 621_355_968_000_000_000L) / 10_000, ++inputCounter);
         ulong from = logSize();
         // Redelivering the id of an interrupted turn resumes it (its input
         // was logged already).
@@ -453,12 +454,12 @@ class Agent
     bool settleTitles(Duration max)
     {
         import core.time : MonoTime, msecs;
-        auto deadline = MonoTime.currTime + max;
+        auto deadline = monoNow + max;
         foreach (t; titleThreads)
             while (t.running)
             {
-                if (MonoTime.currTime >= deadline) return false;
-                Thread.sleep(20.msecs);
+                if (monoNow >= deadline) return false;
+                sleepFor(20.msecs);
             }
         return true;
     }
@@ -644,8 +645,7 @@ class Agent
                 catch (Exception) {} // the level was validated when typed, so this can't fail
             }
             LLMResponse r;
-            import std.datetime.stopwatch : StopWatch, AutoStart;
-            auto sw = StopWatch(AutoStart.yes);
+            const swStart = monoNow;
             bool overflowRetried, capRetried;
             size_t dropped;
             // What the request that answered sent (a retry re-resolves).
@@ -735,7 +735,7 @@ class Agent
             reply.thinkingBlocks = r.thinkingBlocks;
             reply.usage = r.usage;
             reply.hasUsage = r.usage != TokenUsage.init;
-            reply.durationMs = sw.peek.total!"msecs";
+            reply.durationMs = since(swStart).total!"msecs";
             reply.temperature = sentTemperature.describe;
             // Only when a level is sent or set somewhere, so logs without
             // thinking levels stay unchanged.
@@ -1225,16 +1225,21 @@ class Agent
     void delegate(string path, const(ubyte)[] bytes) markRead;
 
     /// Where this session's images are stored: beside a persisted log (so
-    /// its references stay valid), else a process-local temp dir.
+    /// its references stay valid), else a temp dir of this agent's own (two
+    /// agents in one process don't share, or clean up, each other's images).
     string attachmentsDir()
     {
         import std.path : buildPath, dirName;
         import std.file : tempDir;
         import std.process : thisProcessID;
+        import std.random : uniform;
         string dir = log.match!(l => l.path.length ? buildPath(dirName(l.path), l.id ~ ".attachments") : null, () => string.init);
         if (dir.length) return dir;
-        return buildPath(tempDir, format("nano-coder-attachments-%s", thisProcessID));
+        if (!tempAttachments.length)
+            tempAttachments = buildPath(tempDir, format("nano-coder-attachments-%s-%08x", thisProcessID, uniform!uint));
+        return tempAttachments;
     }
+    private string tempAttachments; /// see attachmentsDir
 
     /// Turn a `read_file` image result (`{"image": {...}}`, metadata only)
     /// into the tool-result text plus its attachment: re-read the file, fit
@@ -1378,10 +1383,9 @@ class Agent
             req.temperature = temperatureFor(thinking().alwaysAnthropicThinking).effective;
             try
             {
-                import std.datetime.stopwatch : StopWatch, AutoStart;
-                auto sw = StopWatch(AutoStart.yes);
+                const swStart = monoNow;
                 auto r = client.chat(req, (bool, string) {});
-                summaryMs = sw.peek.total!"msecs";
+                summaryMs = since(swStart).total!"msecs";
                 summaryUsage = r.usage;
                 recordUsage(r.usage);
                 truncated = r.stopReason == "length" || r.stopReason == "max_tokens";
@@ -1967,7 +1971,7 @@ class Agent
     long timerNow()
     {
         import std.datetime.systime : Clock;
-        return now !is null ? now() : Clock.currTime.toUnixTime;
+        return now !is null ? now() : wallNow.toUnixTime;
     }
 
     package string runTimerTool(string name, JSONValue args)

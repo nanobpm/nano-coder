@@ -2,6 +2,7 @@
 /// each connection gets the next reply; requests are captured.
 module nano.testserver;
 @safe:
+import nano.clock : sleepFor;
 
 version (unittest):
 
@@ -30,24 +31,30 @@ struct TestServer
 {
     string url;
     private Join!(immutable(Captured)[]) handle;
+    private Chan!bool stop;
 
-    /// Wait for the scripted replies to be served (or the server to give up
-    /// waiting for a connection) and return the requests.
-    immutable(Captured)[] finish() { return handle.join(); }
+    /// Stop serving (replies nobody asked for are dropped) and return the
+    /// requests seen.
+    immutable(Captured)[] finish()
+    {
+        stop.put(true);
+        return handle.join();
+    }
 }
 
 /// Serve `replies` in order, one per connection, on 127.0.0.1.
 TestServer serve(immutable(Reply)[] replies)
 {
     auto port = Chan!ushort.make;
-    auto h = spawn(&run, replies, port);
+    auto stop = Chan!bool.make;
+    auto h = spawn(&run, replies, port, stop);
     ushort p;
     port.take(p);
     import std.format : format;
-    return TestServer(format("http://127.0.0.1:%s", p), h);
+    return TestServer(format("http://127.0.0.1:%s", p), h, stop);
 }
 
-private immutable(Captured)[] run(immutable(Reply)[] replies, Chan!ushort port)
+private immutable(Captured)[] run(immutable(Reply)[] replies, Chan!ushort port, Chan!bool stop)
 {
     import core.time : seconds;
     import std.algorithm : canFind;
@@ -64,9 +71,7 @@ private immutable(Captured)[] run(immutable(Reply)[] replies, Chan!ushort port)
     immutable(Captured)[] seen;
     foreach (ref r; replies)
     {
-        auto set = new SocketSet;
-        set.add(listener);
-        if (Socket.select(set, null, null, 10.seconds) <= 0) break; // the client stopped asking
+        if (!awaitClient(listener, stop)) break;
         auto conn = listener.accept();
         scope (exit) conn.close();
         char[] buf;
@@ -102,7 +107,7 @@ private immutable(Captured)[] run(immutable(Reply)[] replies, Chan!ushort port)
             {
                 auto end = rest.indexOf("\n\n");
                 auto n = end < 0 ? rest.length : end + 2;
-                Thread.sleep(r.dripMs.msecs);
+                sleepFor(r.dripMs.msecs);
                 conn.send(rest[0 .. n]);
                 rest = rest[n .. $];
             }
@@ -115,6 +120,26 @@ private immutable(Captured)[] run(immutable(Reply)[] replies, Chan!ushort port)
         conn.send(response);
     }
     return seen;
+}
+
+/// Wait for a connection on `listener`: false once the test calls `finish`
+/// or after 10 s with no client (the client stopped asking).
+private bool awaitClient(imported!"std.socket".Socket listener, Chan!bool stop)
+{
+    import core.time : msecs, seconds;
+    import std.socket : Socket, SocketSet;
+    import nano.clock : monoNow, since;
+    const start = monoNow;
+    auto set = new SocketSet;
+    while (since(start) < 10.seconds)
+    {
+        bool v;
+        if (stop.tryTake(v)) return false;
+        set.reset();
+        set.add(listener);
+        if (Socket.select(set, null, null, 20.msecs) > 0) return true;
+    }
+    return false;
 }
 
 unittest
