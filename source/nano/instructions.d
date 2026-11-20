@@ -569,7 +569,9 @@ class ProjectInstructions
         }
         foreach (n; localFiles) load(buildPath(dir, n), Kind.local, null, false, 0, false, null);
         currentSearchDir = null;
-        found[dir] = dirDigest(dir);
+        // The first snapshot stands until compaction: a deferred file keeps
+        // the text read then, so a retry must not hide a later edit.
+        if (dir !in found) found[dir] = dirDigest(dir);
         return [start, loaded.length];
     }
 
@@ -867,7 +869,9 @@ class ProjectInstructions
         string out_;
         // Each file once per rule, as `appendRuleImports` does: repeats and
         // cycles cost nothing, and the rule's own import policy applies.
-        bool[string] visited;
+        // Shallowest depth each file was reached at: a shallower route is
+        // walked again, since it can reach imports the deeper one could not.
+        size_t[string] visited;
         void imports(string from, string text, bool user, size_t depth)
         {
             if (depth >= maxImportDepth) return;
@@ -876,8 +880,8 @@ class ProjectInstructions
                 auto target = resolveImport(from, r, user);
                 if (target is null) continue;
                 auto real_ = canonOr(target);
-                if (real_ in visited) continue;
-                visited[real_] = true;
+                if (auto at = real_ in visited) if (*at <= depth + 1) continue;
+                visited[real_] = depth + 1;
                 auto imported = readCapped(target);
                 out_ ~= target ~ "\0" ~ imported ~ "\0";
                 if (imported !is null) imports(target, imported, user, depth + 1);
@@ -887,7 +891,7 @@ class ProjectInstructions
         {
             out_ ~= r.path ~ "\0" ~ r.source ~ "\0";
             visited = null;
-            visited[canonOr(r.path)] = true;
+            visited[canonOr(r.path)] = 0;
             imports(r.path, r.body, r.user, 0);
         }
         return out_;
@@ -900,7 +904,7 @@ class ProjectInstructions
         const warned = warnings.length; // a probe, not a load
         scope (exit) warnings = warnings[0 .. warned];
         string out_;
-        bool[string] visited;
+        size_t[string] visited; // shallowest depth, as in `scopedFingerprint`
         void file(string path, Kind kind, size_t depth)
         {
             auto text = readCapped(path);
@@ -909,8 +913,9 @@ class ProjectInstructions
             foreach (r; importRefs(text))
             {
                 auto target = resolveImport(path, r, false);
-                if (target is null || canonOr(target) in visited) continue;
-                visited[canonOr(target)] = true;
+                if (target is null) continue;
+                if (auto at = canonOr(target) in visited) if (*at <= depth + 1) continue;
+                visited[canonOr(target)] = depth + 1;
                 file(target, Kind.imported, depth + 1);
             }
         }
