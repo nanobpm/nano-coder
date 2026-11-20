@@ -2,6 +2,7 @@
 module nano.providers.anthropic;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 
 import std.json;
 import std.format : format;
@@ -16,13 +17,13 @@ class AnthropicClient : LLMClient, KindedClient
 {
     private ResolvedProvider p;
 
-    this(ResolvedProvider p) { this.p = p; }
+    this(ResolvedProvider p) pure { this.p = p; }
 
-    string modelName() const { return p.model; }
-    string providerName() const { return p.name; }
-    ProviderKind kind() const { return ProviderKind.anthropic; }
+    string modelName() pure const { return p.model; }
+    string providerName() pure const { return p.name; }
+    ProviderKind kind() pure const { return ProviderKind.anthropic; }
 
-    private string[string] headers()
+    private string[string] headers() pure
     {
         string[string] h;
         if (p.apiKey.length) h["x-api-key"] = p.apiKey;
@@ -55,7 +56,7 @@ class AnthropicClient : LLMClient, KindedClient
                     foreach (ref tb; m.thinkingBlocks)
                         if (tb.type == JSONType.object && "type" in tb && tb["type"].type == JSONType.string
                                 && (tb["type"].str == "thinking" || tb["type"].str == "redacted_thinking"))
-                            blocks ~= parseJSON(tb.toString);
+                            blocks ~= parseJSON(tb.jsonText);
                     if (m.content.length) blocks ~= textBlock(m.content);
                     foreach (c; m.toolCalls)
                     {
@@ -119,14 +120,14 @@ class AnthropicClient : LLMClient, KindedClient
         return b;
     }
 
-    private static JSONValue textBlock(string t)
+    private static JSONValue textBlock(string t) pure
     {
         return JSONValue(["type": "text", "text": t]);
     }
 
     /// Append a content block, merging consecutive same-role messages (the API
     /// requires alternation, and parallel tool results share one user turn).
-    private static void push(ref JSONValue[] msgs, string role, JSONValue block)
+    private static void push(ref JSONValue[] msgs, string role, JSONValue block) pure
     {
         if (msgs.length && msgs[$ - 1]["role"].str == role)
         {
@@ -160,7 +161,7 @@ class AnthropicClient : LLMClient, KindedClient
         return st.finish();
     }
 
-    static LLMResponse parseWhole(JSONValue j)
+    static LLMResponse parseWhole(JSONValue j) pure
     {
         LLMResponse r;
         foreach (block; j["content"].arrayNoRef)
@@ -200,7 +201,7 @@ class AnthropicClient : LLMClient, KindedClient
     }
 }
 
-private void readUsage(JSONValue u, ref TokenUsage usage)
+private void readUsage(JSONValue u, ref TokenUsage usage) pure
 {
     long get(string k) { auto v = k in u; return v && v.type == JSONType.integer ? v.integer : 0; }
     // input_tokens excludes cached reads/writes; report the full prompt size.
@@ -281,13 +282,13 @@ struct AnthropicStream
                 if (auto u = "usage" in j) { readUsage(*u, r.usage); readCopilotAic(j, r.usage); }
                 break;
             case "error":
-                throw new Exception("anthropic stream error: " ~ j["error"].toString);
+                throw new Exception("anthropic stream error: " ~ j["error"].jsonText);
             default:
                 break;
         }
     }
 
-    LLMResponse finish()
+    LLMResponse finish() pure
     {
         foreach (idx; order) r.toolCalls ~= ToolCall.fromRaw(ids[idx], names[idx], inputs[idx]);
         foreach (idx; reasoningOrder)

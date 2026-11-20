@@ -3,6 +3,7 @@
 module nano.copilot;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 import nano.clock : wallNow;
 
 import std.algorithm : startsWith, any;
@@ -211,7 +212,7 @@ string saveCredentials(const StoredCredentials c, string dataDir = null)
 {
     auto path = credentialsPath(dataDir);
     JSONValue j = ["oauth_token": c.oauthToken, "domain": c.domain, "created_at": c.createdAt];
-    writePrivateAtomic(path, j.toPrettyString);
+    writePrivateAtomic(path, j.jsonPretty);
     return path;
 }
 
@@ -303,7 +304,7 @@ string login(scope void delegate(string) @safe note, scope void delegate(long se
     string field(string k) { auto v = k in device; return v && v.type == JSONType.string ? v.str : null; }
     auto deviceCode = field("device_code"), userCode = field("user_code"), uri = field("verification_uri");
     if (!deviceCode.length || !userCode.length || !uri.length)
-        throw new Exception("unexpected device code response: " ~ device.toString);
+        throw new Exception("unexpected device code response: " ~ device.jsonText);
     long num(JSONValue j, string k, long dflt)
     {
         auto v = k in j;
@@ -331,7 +332,7 @@ string login(scope void delegate(string) @safe note, scope void delegate(long se
                 return path;
             }
         auto err = "error" in poll;
-        if (err is null || err.type != JSONType.string) throw new Exception("unexpected token response: " ~ poll.toString);
+        if (err is null || err.type != JSONType.string) throw new Exception("unexpected token response: " ~ poll.jsonText);
         switch (err.str)
         {
             case "authorization_pending": break;

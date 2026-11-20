@@ -3,6 +3,7 @@
 module nano.providers.muse;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 import nano.clock : wallNow;
 
 import nano.llm;
@@ -53,11 +54,11 @@ class MuseClient : LLMClient, CapabilityProbe, KindedClient
         if (c.apiKey.length) session = SessionKey(c.apiKey, c.apiBase.length ? c.apiBase : defaultApiBase);
     }
 
-    string modelName() const { return p.model; }
-    string providerName() const { return p.name; }
-    ProviderKind kind() const { return ProviderKind.muse; }
+    string modelName() pure const { return p.model; }
+    string providerName() pure const { return p.name; }
+    ProviderKind kind() pure const { return ProviderKind.muse; }
 
-    private string configuredBase() const { return p.config.baseUrl.stripRight('/'); }
+    private string configuredBase() pure const { return p.config.baseUrl.stripRight('/'); }
 
     /// The key for model calls: `META_API_KEY` outright, else the cached
     /// minted key, else a mint (renewing a stale OAuth token first).
@@ -93,12 +94,12 @@ class MuseClient : LLMClient, CapabilityProbe, KindedClient
         return wallNow.toUnixTime;
     }
 
-    private string apiBase(const SessionKey s) const
+    private string apiBase(const SessionKey s) pure const
     {
         return configuredBase.length ? configuredBase : s.baseUrl;
     }
 
-    private string[string] headers(const SessionKey s)
+    private string[string] headers(const SessionKey s) pure
     {
         string[string] h;
         foreach (k, v; p.config.headers) h[k] = v;
@@ -185,7 +186,7 @@ class MuseClient : LLMClient, CapabilityProbe, KindedClient
         try
         {
             foreach (r; catalogRows(catalogJson(true)))
-                if (modelId(r) == p.model) { row = parseJSON(r.toString); break; }
+                if (modelId(r) == p.model) { row = parseJSON(r.jsonText); break; }
         }
         catch (Exception) return c; // the catalogue is optional: keep the defaults
         if (row.type != JSONType.object) return c;

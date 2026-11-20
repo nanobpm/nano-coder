@@ -62,13 +62,13 @@ alias Answer = SumType!(Answered, Away, Dismissed);
 
 class QuestionError : Exception
 {
-    this(string msg) @safe { super(msg); }
+    this(string msg) pure @safe { super(msg); }
 }
 
 /// Drop control characters (newlines too) and line/paragraph separators from
 /// a single-line field the model reads back (question.rs). Text bound for the
 /// terminal uses `nano.trajectory.terminalSafe`, which drops whole escapes.
-string sanitizeLine(string s) @safe
+string sanitizeLine(string s) pure @safe
 {
     string out_;
     foreach (dchar c; s)
@@ -83,7 +83,7 @@ string sanitizeLine(string s) @safe
 /// prompt, since the prompt is one row and would otherwise collapse a
 /// structured question into one unreadable line. The text is sanitised first
 /// (escapes dropped, line feeds kept), so the model cannot inject controls.
-string questionPrompt(string question, size_t width, out string[] body_)
+string questionPrompt(string question, size_t width, out string[] body_) pure
 {
     import std.array : split;
     import std.string : stripRight;
@@ -103,7 +103,7 @@ string questionPrompt(string question, size_t width, out string[] body_)
 }
 
 /// Parse the tool's arguments, tolerating a JSON-string body.
-Question[] parse(JSONValue args)
+Question[] parse(JSONValue args) pure
 {
     if (args.type == JSONType.string)
     {
@@ -159,7 +159,7 @@ Question[] parse(JSONValue args)
 }
 
 /// The tool result text for an answer.
-string resultText(const Question[] questions, Answer a) @safe
+string resultText(const Question[] questions, Answer a) pure @safe
 {
     return a.match!(
         (Away _) => "The user is away from the keyboard; make the best decision you can and continue.",
@@ -177,7 +177,7 @@ string resultText(const Question[] questions, Answer a) @safe
 }
 
 /// An immutable copy of `a`.
-immutable(Answer) immutableAnswer(Answer a)
+immutable(Answer) immutableAnswer(Answer a) pure
 {
     return a.match!(
         (Answered x) => immutable Answer(Answered(x.answers)),
@@ -187,7 +187,7 @@ immutable(Answer) immutableAnswer(Answer a)
 }
 
 /// A mutable copy of `a`.
-Answer mutableAnswer(immutable Answer a)
+Answer mutableAnswer(immutable Answer a) pure
 {
     return a.match!(
         (immutable Answered x) => Answer(Answered(x.answers)),
@@ -214,7 +214,7 @@ struct QuestionBroker
     /// A new broker.
     static QuestionBroker make() { return QuestionBroker(Shared!State.make); }
     /// Whether this handle refers to a broker.
-    bool opCast(B : bool)() const { return cast(bool) state; }
+    bool opCast(B : bool)() pure const { return cast(bool) state; }
 
     void interactive(bool on) { state.update((ref State s) { s.interactive = on; }); }
     bool interactive() { return state.get.interactive; }
@@ -262,7 +262,7 @@ struct QuestionBroker
     }
 }
 
-ToolDefinition definition()
+ToolDefinition definition() pure
 {
     return ToolDefinition(toolName,
         "Ask the user a question and wait for the answer, without ending your turn. Use when you need a "

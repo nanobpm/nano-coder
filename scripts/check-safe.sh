@@ -60,6 +60,11 @@ if code '\bClock\.curr(Std)?Time\b|\bMonoTime\.currTime\b|\bThread\.sleep\b|\bSt
     echo "Error: read the clock and sleep through nano.clock (wallNow, monoNow, since, sleepFor) so tests can fake time" >&2
     status=1
 fi
+# The C locale stays "C": safeio.cStrtod is pure on that promise.
+if grep -rnE '\bsetlocale\b' source | grep -vE ':[0-9]+:[[:space:]]*//' >&2; then
+    echo "Error: don't call setlocale; cStrtod (toml, trajectory) is pure only while the C locale is \"C\"" >&2
+    status=1
+fi
 # Every `@trusted` needs a comment right above its declaration saying why it
 # is memory safe (blank lines and the earlier lines of a wrapped signature
 # may come between). The compiler can't check a `@trusted` body; a reviewer
@@ -148,6 +153,29 @@ if [ -n "$missing" ]; then
     status=1
 fi
 ratchet "outside *_test.d" "$(find source -name '*.d' ! -name '*_test.d' | xargs grep -hE '^[[:space:]]*@nullable\(' | wc -l | tr -d ' ')" scripts/nullable-mark-budget "\`@nullable\` marks"
+# Purity. Functions marked `pure` (outside tests) and pure-core modules (ones
+# starting with `pure:`) may only grow in number: removing `pure` makes a
+# function depend on hidden state, a reviewed choice (lower the floor). Each
+# `pure:` module is listed in pure_core_test.d, whose compile-time audit
+# (nano.pureaudit) also checks the member functions the label doesn't reach.
+floor() { # name count floor-file what
+    want=$(cat "$3")
+    if [ "$2" -lt "$want" ]; then
+        echo "Error: $2 $4 $1, the floor is $want ($3); keep functions pure (move I/O to the caller), or justify and lower it" >&2
+        status=1
+    elif [ "$2" -gt "$want" ]; then
+        echo "check-safe: $2 $4 $1, above the floor of $want; raise $3 to $2" >&2
+    fi
+}
+floor "outside *_test.d" "$(find source -name '*.d' ! -name '*_test.d' | xargs grep -hE '\bpure\b' | grep -vE '^[[:space:]]*(//|\*|/\+)' | grep -vE '^pure:$' | grep -oE '\bpure\b' | wc -l | tr -d ' ')" scripts/pure-floor "\`pure\` attributes"
+pure_mods=$(grep -lE '^pure:$' $(find source -name '*.d' ! -name '*_test.d') | sort | xargs sed -n 's/^module \([a-z_.]*\);.*/\1/p' | grep -v '^nano\.pureaudit$')
+floor "in source" "$(printf '%s\n' "$pure_mods" | grep -c .)" scripts/pure-module-floor "pure-core modules (\`pure:\`)"
+for m in $pure_mods; do
+    grep -q "^    $m,$" source/nano/pure_core_test.d || { echo "Error: $m starts with \`pure:\`; add it to pureCore in source/nano/pure_core_test.d" >&2; status=1; }
+done
+for m in $(sed -n 's/^    \(nano\.[a-z_.]*\),$/\1/p' source/nano/pure_core_test.d); do
+    printf '%s\n' "$pure_mods" | grep -qx "$m" || { echo "Error: $m is in pure_core_test.d but doesn't start with \`pure:\`" >&2; status=1; }
+done
 # Test-only imports stay inside the tests. A file-level `version (unittest)`
 # import is in scope for the whole module in the test build only, so non-test
 # code can use it, pass `dub test` and fail the release build. Put the import

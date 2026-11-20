@@ -312,10 +312,10 @@ final class FrameRenderer
     private size_t width, height;
     private bool started;
 
-    this(void delegate(string) @safe out_) { this.out_ = out_; }
+    this(void delegate(string) @safe out_) pure { this.out_ = out_; }
 
     /// The next render is a full redraw (something else drew on the screen).
-    void invalidate() { started = false; }
+    void invalidate() pure { started = false; }
 
     void render(const string[] frame, size_t width, size_t height)
     {
@@ -373,14 +373,14 @@ struct Debouncer
     long quiet;
     private long last = long.min;
 
-    void record(long nowMs) { last = nowMs; }
-    bool ready(long nowMs) const { return last == long.min || nowMs - last >= quiet; }
-    void clear() { last = long.min; }
-    bool pending() const { return last != long.min; }
+    void record(long nowMs) pure { last = nowMs; }
+    bool ready(long nowMs) pure const { return last == long.min || nowMs - last >= quiet; }
+    void clear() pure { last = long.min; }
+    bool pending() pure const { return last != long.min; }
 }
 
 /// Untrusted text with every line kept and control characters dropped.
-string sanitizeLines(string s)
+string sanitizeLines(string s) pure
 {
     import nano.trajectory : terminalSafe;
     import std.algorithm : map;
@@ -389,7 +389,7 @@ string sanitizeLines(string s)
 }
 
 /// Expanded detail under a call or thought: sanitized lines, indented by four.
-string expandedBody(string text, string style)
+string expandedBody(string text, string style) pure
 {
     import std.algorithm : splitter;
     import std.string : strip;
@@ -402,7 +402,7 @@ string expandedBody(string text, string style)
 }
 
 /// A tool result with every line shown (`output` already sanitized).
-string expandedResult(bool ok, string output, bool color = true)
+string expandedResult(bool ok, string output, bool color = true) pure
 {
     import std.array : replicate, split;
     import std.range : walkLength;
@@ -469,7 +469,7 @@ struct Transcript
     private size_t cacheWidth;
     private Fold[] folds;
 
-    void clear()
+    void clear() pure
     {
         folds = null;
         lines = null;
@@ -478,7 +478,7 @@ struct Transcript
         cr = false;
     }
 
-    void feed(scope const(ubyte)[] bytes)
+    void feed(scope const(ubyte)[] bytes) pure
     {
         import std.string : indexOf;
         auto buf = pending ~ bytes;
@@ -538,7 +538,7 @@ struct Transcript
         }
     }
 
-    private void endLine()
+    private void endLine() pure
     {
         lines ~= cur;
         cur = null;
@@ -556,7 +556,7 @@ struct Transcript
     }
 
     /// A fold mark (`foldMark`); anything else is dropped.
-    private void osc(string body)
+    private void osc(string body) pure
     {
         import std.algorithm : splitter;
         import std.array : array, split;
@@ -585,7 +585,7 @@ struct Transcript
 
     /// Ctrl-O: swap the latest fold (with the others sharing its id) between
     /// collapsed and expanded. False when there is none.
-    bool toggleLatest()
+    bool toggleLatest() pure
     {
         if (!folds.length) return false;
         auto latest = folds[$ - 1];
@@ -596,7 +596,7 @@ struct Transcript
     }
 
     /// Shows fold `k` expanded (`want`) or collapsed.
-    private void swap(size_t k, bool want)
+    private void swap(size_t k, bool want) pure
     {
         {
             auto f = &folds[k];
@@ -614,7 +614,7 @@ struct Transcript
     }
 
     /// Every line wrapped to `width` (the unfinished line last, if any).
-    string[] render(size_t width)
+    string[] render(size_t width) pure
     {
         if (width != cacheWidth) { cache = null; cacheWidth = width; }
         while (cache.length < lines.length) cache ~= wrapAnsi(lines[cache.length], width);

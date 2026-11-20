@@ -510,6 +510,14 @@ N slowest modules. `NANO_TEST_JOBS=N` runs modules in parallel (`scripts/ci.sh` 
 that change process-wide state (the cancel flag, environment variables) are listed in
 `scripts/serial-tests` and run alone first.
 
+Functions are `pure` wherever they can be: the result depends only on the arguments, with no
+clock, environment, files or global state. Modules that start with `pure:` (parsing, markdown,
+plans, context arithmetic, the status line and others) make up a pure core, and the I/O stays
+in their callers. `pure:` doesn't reach member functions, so `source/nano/pure_core_test.d`
+runs a compile-time audit (`nano.pureaudit`) over those modules. check-safe keeps that list in
+step with the `pure:` modules, and the `pure` count and the number of pure modules can only
+grow (`scripts/pure-floor`, `scripts/pure-module-floor`).
+
 ## Configuration
 
 Create `~/.config/nano-coder/config.toml` (every field is optional). Directories from before the rename (`agentic-harness`, for config and for data such as sessions) are moved to `nano-coder` at startup when the new ones don't exist yet. A symlink is left at the old path so an older nano-coder still finds them. If that compatibility symlink can't be created, a warning is printed and the link is retried on later starts; if the move itself fails, the old directory is used:

@@ -7,6 +7,7 @@
 module nano.trajectory;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 import nano.arith : saturatingSub;
 
 import std.algorithm : canFind, map, max, sum, filter;
@@ -42,12 +43,12 @@ struct Row
     string thinkingLevel;
     string timestamp;
 
-    string cited() const
+    string cited() pure const
     {
         return id ? format("#%s %s", id, label) : label;
     }
 
-    string label() const
+    string label() pure const
     {
         final switch (kind)
         {
@@ -64,7 +65,7 @@ struct Row
     }
 
     /// The per-request metric suffix (`1.2k tok, 3.4s`), when known.
-    string metric() const
+    string metric() pure const
     {
         string[] bits;
         if (hasUsage && totalTokens > 0) bits ~= formatTokens(totalTokens) ~ " tok";
@@ -85,7 +86,7 @@ struct Turn
     Row[] rows;
 
     /// Tool count, model calls, output tokens, request time, outcome.
-    string summary() const
+    string summary() pure const
     {
         bool[string] callIds;
         size_t callRows;
@@ -198,7 +199,7 @@ struct Trajectory
     }
 
     /// The whole ledger as plain text, every row in full.
-    string toPlain() const
+    string toPlain() pure const
     {
         string[] o = ["Trajectory — session " ~ sessionId];
         if (createdAt !is null) o ~= "Started " ~ plainTime(createdAt);
@@ -234,7 +235,7 @@ struct Trajectory
     }
 
     /// The ledger as JSON, shaped (and ordered) like Rust's serde output.
-    string toJson() const
+    string toJson() pure const
     {
         J root = J.obj;
         root.add("session_id", J.s(sessionId));
@@ -263,7 +264,7 @@ struct Trajectory
     }
 
     /// The ledger as Markdown.
-    string toMarkdown() const
+    string toMarkdown() pure const
     {
         string[] o = ["# Trajectory — session `" ~ sessionId ~ "`"];
         if (createdAt !is null) o ~= ["", "_Started " ~ plainTime(createdAt) ~ " " ~ offsetOf(createdAt) ~ "_"];
@@ -334,8 +335,8 @@ Trajectory load(string path, string expectedId = null)
                 throw new Exception(format("unsupported session format version %s (this build supports %s)", v, formatVersion));
             auto id = rec["data"]["id"].str;
             if (expectedId !is null && id != expectedId)
-                throw new Exception(format("session log header id %s does not match %s", JSONValue(id).toString,
-                    JSONValue(expectedId).toString));
+                throw new Exception(format("session log header id %s does not match %s", JSONValue(id).jsonText,
+                    JSONValue(expectedId).jsonText));
         }
         else if (!records.length)
             throw new Exception(format("session log %s does not start with a session header", path));
@@ -348,7 +349,7 @@ Trajectory load(string path, string expectedId = null)
 
 private:
 
-string str(const JSONValue j, string key, string dflt)
+string str(const JSONValue j, string key, string dflt) pure
 {
     if (j.type != JSONType.object) return dflt;
     if (auto v = key in j) if (v.type == JSONType.string) return v.str;
@@ -432,7 +433,7 @@ void appendMessageRows(ref Turn turn, const JSONValue m, ulong line, ref string 
             auto args = "arguments" in c;
             string raw = mal && mal.type == JSONType.string ? mal.str
                 : args is null ? "{}" : args.type == JSONType.string ? serdeString(args.str) // legacy: Rust re-encodes the string value
-                : args.toString(JSONOptions.doNotEscapeSlashes);
+                : args.jsonText(JSONOptions.doNotEscapeSlashes);
             Row r;
             r.kind = Kind.toolCall;
             r.callId = c["id"].str;
@@ -469,12 +470,12 @@ void appendMessageRows(ref Turn turn, const JSONValue m, ulong line, ref string 
     if (ts !is null) prevTs = ts;
 }
 
-string scalarText(const JSONValue m, string key)
+string scalarText(const JSONValue m, string key) pure
 {
     if (auto v = key in m)
     {
         if (v.type == JSONType.string) return v.str;
-        if (v.type != JSONType.null_) return v.toString;
+        if (v.type != JSONType.null_) return v.jsonText;
     }
     return null;
 }
@@ -491,32 +492,32 @@ long millisBetween(string a, string b)
     catch (Exception) return -1; // an unparsable timestamp has no duration (-1)
 }
 
-string compactText(const JSONValue data, string mode, string model)
+string compactText(const JSONValue data, string mode, string model) pure
 {
     string[] parts;
     if (mode !is null) parts ~= "mode: " ~ mode;
     if (model !is null) parts ~= "model: " ~ model;
     if (auto s = "summarized" in data)
         if (s.type == JSONType.array && s.arrayNoRef.length == 2)
-            parts ~= format("folded log lines %s–%s", s.arrayNoRef[0].toString, s.arrayNoRef[1].toString);
+            parts ~= format("folded log lines %s–%s", s.arrayNoRef[0].jsonText, s.arrayNoRef[1].jsonText);
     size_t n;
     if (auto ms = "messages" in data) if (ms.type == JSONType.array) n = ms.arrayNoRef.length;
     parts ~= format("%s message(s) retained", n);
     return parts.join(", ");
 }
 
-string turnTitle(const ref Turn t)
+string turnTitle(const ref Turn t) pure
 {
     return t.number == 0 ? "Preamble" : format("Turn %s", t.number);
 }
 
-string turnHeader(const ref Turn t)
+string turnHeader(const ref Turn t) pure
 {
     auto title = turnTitle(t);
     return t.input !is null ? format("── %s ──  %s", title, oneLine(t.input, 60)) : format("── %s ──", title);
 }
 
-string bullet(const ref Row r)
+string bullet(const ref Row r) pure
 {
     final switch (r.kind)
     {
@@ -528,7 +529,7 @@ string bullet(const ref Row r)
     }
 }
 
-string fence(string text)
+string fence(string text) pure
 {
     size_t longest;
     foreach (l; text.lineSplitter)
@@ -546,7 +547,7 @@ string fence(string text)
 }
 
 /// Split on `\n` like Rust's `str::split`: always at least one piece.
-string[] splitNl(string s)
+string[] splitNl(string s) pure
 {
     string[] o;
     size_t start;
@@ -555,41 +556,41 @@ string[] splitNl(string s)
     return o ~ s[start .. $];
 }
 
-string quoteLines(string s) { import std.array : replace; return s.replace("\n", "\n> "); }
+string quoteLines(string s) pure { import std.array : replace; return s.replace("\n", "\n> "); }
 
-bool isWs(dchar c) { import std.uni : isWhite; return isWhite(c); }
+bool isWs(dchar c) pure { import std.uni : isWhite; return isWhite(c); }
 
-string trim(string s)
+string trim(string s) pure
 {
     import std.string : strip;
     return strip(s);
 }
 
-string trimStart(const(char)[] s)
+string trimStart(const(char)[] s) pure
 {
     import std.string : stripLeft;
     return stripLeft(s).idup;
 }
 
-string oneLine(string text, size_t maxChars)
+string oneLine(string text, size_t maxChars) pure
 {
     import std.array : split;
     return truncate(text.split.join(" "), maxChars);
 }
 
-public string truncate(string text, size_t maxChars)
+public string truncate(string text, size_t maxChars) pure
 {
     import std.range : walkLength, take;
     if (text.walkLength <= maxChars) return text;
     return text.take(maxChars ? maxChars - 1 : 0).to!string ~ "…";
 }
 
-public string formatTokens(long t)
+public string formatTokens(long t) pure
 {
     return t >= 1000 ? format("%.1fk", t / 1000.0) : t.to!string;
 }
 
-public string formatDuration(long ms)
+public string formatDuration(long ms) pure
 {
     if (ms < 1000) return format("%sms", ms);
     if (ms < 60_000) return format("%.1fs", ms / 1000.0);
@@ -597,19 +598,19 @@ public string formatDuration(long ms)
 }
 
 /// `YYYY-MM-DD HH:MM:SS` of an RFC 3339 stamp, in its own offset.
-string plainTime(string ts)
+string plainTime(string ts) pure
 {
     return ts.length >= 19 ? ts[0 .. 10] ~ " " ~ ts[11 .. 19] : ts;
 }
 
 /// The `+HH:MM` offset of an RFC 3339 stamp (`Z` reads as `+00:00`).
-string offsetOf(string ts)
+string offsetOf(string ts) pure
 {
     if (ts.length && (ts[$ - 1] == 'Z' || ts[$ - 1] == 'z')) return "+00:00";
     return ts.length >= 6 ? ts[$ - 6 .. $] : "";
 }
 
-string sanitizeMarkdown(string text)
+string sanitizeMarkdown(string text) pure
 {
     return splitNl(text).map!sanitizeTerminal.join("\n");
 }
@@ -620,7 +621,7 @@ string sanitizeMarkdown(string text)
 /// row; expand tabs to 8-column stops measured in cells. `keepNewlines`
 /// keeps `\n` (resetting the column) for multi-line text (main.rs
 /// sanitize_terminal_text / sanitize_terminal_line).
-public string terminalSafe(string text, bool keepNewlines = false)
+public string terminalSafe(string text, bool keepNewlines = false) pure
 {
     import std.uni : isControl;
     import std.utf : decode, encode;
@@ -712,7 +713,7 @@ unittest
 /// Drop control characters (C0/C1, so no escape sequence survives) and expand
 /// tabs to 8-column stops (trajectory.rs sanitize_terminal: escape bodies
 /// stay as text, only the bytes that drive a terminal go).
-public string sanitizeTerminal(string text)
+public string sanitizeTerminal(string text) pure
 {
     import std.uni : isControl;
     import std.utf : encode;
@@ -742,7 +743,7 @@ public string sanitizeTerminal(string text)
 /// A JSON string literal escaped exactly as serde_json does: `"` and `\\`,
 /// the short escapes for \b \f \n \r \t, `\u00xx` (lowercase hex) for the
 /// other C0 controls, and everything else (DEL, `/`, non-ASCII) verbatim.
-public string serdeString(string v)
+public string serdeString(string v) pure
 {
     static immutable hex = "0123456789abcdef";
     string o = `"`;
@@ -766,7 +767,7 @@ public string serdeString(string v)
 }
 
 /// The literal text of the last numeric member `key` in a compact JSON line.
-string rawNumber(string line, string key)
+string rawNumber(string line, string key) pure
 {
     import std.string : lastIndexOf;
     if (line is null) return null;
@@ -780,7 +781,7 @@ string rawNumber(string line, string key)
     return i > start ? line[start .. i] : null;
 }
 
-double strtodOf(string text)
+double strtodOf(string text) pure
 {
     import nano.safeio : cStrtod;
     return cStrtod(text);
@@ -788,7 +789,7 @@ double strtodOf(string text)
 
 /// Whether decimal `text` reads back as exactly `d` (C `strtod` is correctly
 /// rounded; `std.conv.to!double` isn't always).
-bool parsesTo(string text, double d)
+bool parsesTo(string text, double d) pure
 {
     return strtodOf(text) == d;
 }
@@ -796,7 +797,7 @@ bool parsesTo(string text, double d)
 /// A finite double the way serde_json (ryu) prints it: the shortest digits
 /// that round-trip, always with a fraction or exponent (`2.0`, `1.3876`,
 /// `1e-7`, `1.5e300`).
-public string serdeFloat(double d)
+public string serdeFloat(double d) pure
 {
     import std.math : isFinite, fabs;
     import std.conv : to;
@@ -837,13 +838,13 @@ struct J
     J[] vals;
     J[] items;
 
-    static J raw(string s) { J j; j.t = T.raw; j.text = s; return j; }
-    static J s(string v) { return raw(serdeString(v)); }
-    static J obj() { J j; j.t = T.obj; return j; }
-    static J arr() { J j; j.t = T.arr; return j; }
-    void add(string k, J v) { keys ~= k; vals ~= v; }
+    static J raw(string s) pure { J j; j.t = T.raw; j.text = s; return j; }
+    static J s(string v) pure { return raw(serdeString(v)); }
+    static J obj() pure { J j; j.t = T.obj; return j; }
+    static J arr() pure { J j; j.t = T.arr; return j; }
+    void add(string k, J v) pure { keys ~= k; vals ~= v; }
 
-    string pretty(size_t indent) const
+    string pretty(size_t indent) pure const
     {
         auto pad = "  ".replicate(indent);
         auto inner = "  ".replicate(indent + 1);
@@ -865,7 +866,7 @@ struct J
     }
 }
 
-J rowJson(const ref Row r)
+J rowJson(const ref Row r) pure
 {
     J j = J.obj;
     if (r.id) j.add("id", J.raw(r.id.to!string));
@@ -941,10 +942,10 @@ size_t[2] terminalSize(int fd = 1) nothrow
     return safeio.terminalSize(fd);
 }
 
-bool pagerRan(int code) nothrow { return code != 126 && code != 127; }
+bool pagerRan(int code) pure nothrow { return code != 126 && code != 127; }
 
 /// Whether `text` would not fit on a `rows` x `cols` screen with room for the prompt.
-bool needsPager(string text, size_t rows, size_t cols)
+bool needsPager(string text, size_t rows, size_t cols) pure
 {
     cols = max(cols, 1);
     auto limit = saturatingSub(rows, 2);
@@ -959,7 +960,7 @@ bool needsPager(string text, size_t rows, size_t cols)
 
 /// Terminal rows `line` takes when wrapped at `cols` (a wide glyph never
 /// straddles the boundary).
-size_t wrappedRows(string line, size_t cols)
+size_t wrappedRows(string line, size_t cols) pure
 {
     import std.utf : encode;
     import nano.resume : cells;

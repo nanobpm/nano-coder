@@ -36,7 +36,7 @@ enum size_t maxIgnoreRuleChars = 1_024;
 
 /// Translate a glob to an anchored regex. `*` and `?` stay within one path
 /// segment; `**/` matches zero or more directories; `**` alone matches anything.
-string globToRegex(string glob)
+string globToRegex(string glob) pure
 {
     auto r = appender!string;
     r.put('^');
@@ -88,13 +88,13 @@ string globToRegex(string glob)
     return r.data;
 }
 
-private string[] split_(string s, char sep)
+private string[] split_(string s, char sep) pure
 {
     import std.array : split;
     return s.split(sep);
 }
 
-private string escapeRe(string s)
+private string escapeRe(string s) pure
 {
     auto r = appender!string;
     foreach (c; s)
@@ -142,7 +142,7 @@ struct Ignores
     }
 
     /// Is `rel` (relative to root) ignored? Last matching rule wins.
-    bool ignored(string rel, bool isDir) const
+    bool ignored(string rel, bool isDir) pure const
     {
         bool result;
         foreach (r; rules)
@@ -218,7 +218,7 @@ string[] walk(string root, Denied denied = null)
     return found;
 }
 
-private void readLimit(JSONValue args, out long limit)
+private void readLimit(JSONValue args, out long limit) pure
 {
     limit = optInt(args, "limit", defaultLimit);
     if (limit < 1 || limit > maxLimit) throw new ToolError(format("limit must be between 1 and %s", maxLimit));

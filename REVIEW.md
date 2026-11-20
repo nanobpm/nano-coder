@@ -211,6 +211,7 @@ Bugs found:
 | Session log | Versioned and torn-line safe, with input IDs. | The same format; `--list-sessions --json` output is byte-identical to Rust's. | **=** |
 | HTTP | reqwest and rustls, compiled in. Supply chain: 288 crates. | System libcurl. Supply chain: Phobos and libcurl (plus libz on Linux). | **D** on dependency surface, **R** on not needing a system library |
 | Packaging | One static binary per platform. | One binary per platform with druntime and Phobos static. It needs the system libcurl (bundled on macOS, `libcurl4` on Linux). Finding: Debian/Ubuntu's LDC links Phobos as a shared library by default, so the release build forces `-link-defaultlib-shared=false` and links libz. | **R** |
+| Purity | Shared `&` references and the borrow checker restrict mutation, but any function can do I/O. | `pure` is checked by the compiler: no globals, I/O or clock. 1194 `pure` attributes; 20 modules are a pure core (`pure:` plus a compile-time audit of member functions, `nano.pureaudit`), and the clock and file system are passed in from callers. check-safe keeps both counts from falling. | **D** |
 | Build | 64 s clean release, 43 s to rebuild one file (fat LTO). | 12 s clean release. It is one compilation unit, so touching one file also takes 12 s. | **D** |
 
 Toolchain notes:

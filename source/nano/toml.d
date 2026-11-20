@@ -5,6 +5,7 @@
 module nano.toml;
 
 @safe:
+pure:
 
 import std.json;
 import std.conv : to;
@@ -16,10 +17,10 @@ import std.algorithm : canFind;
 
 class TomlException : Exception
 {
-    this(string msg, size_t line) { super(format("config line %s: %s", line, msg)); }
+    this(string msg, size_t line) pure { super(format("config line %s: %s", line, msg)); }
 }
 
-JSONValue parseToml(string src)
+JSONValue parseToml(string src) pure
 {
     auto p = Parser(src);
     return p.document();
@@ -31,25 +32,25 @@ private struct Parser
     size_t i;
     size_t line = 1;
 
-    this(string src) { s = src; }
+    this(string src) pure { s = src; }
 
-    noreturn fail(string msg) { throw new TomlException(msg, line); }
+    noreturn fail(string msg) pure { throw new TomlException(msg, line); }
 
-    bool eof() const { return i >= s.length; }
-    char peek(size_t off = 0) const { return i + off < s.length ? s[i + off] : '\0'; }
+    bool eof() pure const { return i >= s.length; }
+    char peek(size_t off = 0) pure const { return i + off < s.length ? s[i + off] : '\0'; }
 
-    void skipWs()
+    void skipWs() pure
     {
         while (!eof && (peek == ' ' || peek == '\t')) i++;
     }
 
-    void skipComment()
+    void skipComment() pure
     {
         if (peek == '#') while (!eof && peek != '\n') i++;
     }
 
     /// Skip whitespace, newlines and comments (inside arrays).
-    void skipAll()
+    void skipAll() pure
     {
         for (;;)
         {
@@ -61,7 +62,7 @@ private struct Parser
         }
     }
 
-    void endOfLine()
+    void endOfLine() pure
     {
         skipWs();
         skipComment();
@@ -72,7 +73,7 @@ private struct Parser
         line++;
     }
 
-    JSONValue document()
+    JSONValue document() pure
     {
         JSONValue root = JSONValue(string[string].init);
         string[] current;
@@ -127,7 +128,7 @@ private struct Parser
 
     /// Append an empty table to the array of tables `parent[k]` (created if
     /// missing); its index, or -1 when `parent[k]` is not an array.
-    static ptrdiff_t appendTable(ref JSONValue parent, string k)
+    static ptrdiff_t appendTable(ref JSONValue parent, string k) pure
     {
         if (k !in parent) parent[k] = JSONValue(JSONValue[].init);
         if (parent[k].type != JSONType.array) return -1;
@@ -137,7 +138,7 @@ private struct Parser
     }
 
     /// Set `t[k] = v` unless `k` is already there (false).
-    static bool putNew(ref JSONValue t, string k, JSONValue v)
+    static bool putNew(ref JSONValue t, string k, JSONValue v) pure
     {
         if (k in t) return false;
         t[k] = v;
@@ -146,7 +147,7 @@ private struct Parser
 
     /// `t.a.b.c = v` for the dotted key `path` of an inline table, creating
     /// the intermediate tables.
-    static void setDotted(ref JSONValue t, string[] path, JSONValue v)
+    static void setDotted(ref JSONValue t, string[] path, JSONValue v) pure
     {
         if (path.length == 1) { t[path[0]] = v; return; }
         if (path[0] !in t) t[path[0]] = JSONValue(string[string].init);
@@ -155,7 +156,7 @@ private struct Parser
 
     /// The table at `path`, created on demand. A "\0" segment followed by an
     /// index selects an element of an array of tables.
-    ref JSONValue tableAt(return ref JSONValue t, string[] path)
+    ref JSONValue tableAt(return ref JSONValue t, string[] path) pure
     {
         if (!path.length) return t;
         if (path[0] == "\0")
@@ -172,7 +173,7 @@ private struct Parser
         return tableAt(t[key], path[1 .. $]);
     }
 
-    string[] keyPath()
+    string[] keyPath() pure
     {
         string[] parts;
         for (;;)
@@ -186,7 +187,7 @@ private struct Parser
         return parts;
     }
 
-    string key()
+    string key() pure
     {
         if (peek == '"') return basicString();
         if (peek == '\'') return literalString();
@@ -196,7 +197,7 @@ private struct Parser
         return s[start .. i];
     }
 
-    JSONValue value()
+    JSONValue value() pure
     {
         char c = peek;
         if (c == '"') return JSONValue(peek(1) == '"' && peek(2) == '"' ? multiBasic() : basicString());
@@ -208,7 +209,7 @@ private struct Parser
         return number();
     }
 
-    JSONValue number()
+    JSONValue number() pure
     {
         size_t start = i;
         while (!eof && !" \t\r\n,]}#".canFind(peek)) i++;
@@ -237,7 +238,7 @@ private struct Parser
         }
     }
 
-    JSONValue array()
+    JSONValue array() pure
     {
         i++;
         JSONValue[] items;
@@ -254,7 +255,7 @@ private struct Parser
         return JSONValue(items);
     }
 
-    JSONValue inlineTable()
+    JSONValue inlineTable() pure
     {
         i++;
         JSONValue t = JSONValue(string[string].init);
@@ -278,7 +279,7 @@ private struct Parser
         return t;
     }
 
-    string literalString()
+    string literalString() pure
     {
         i++;
         size_t start = i;
@@ -289,7 +290,7 @@ private struct Parser
         return r;
     }
 
-    string multiLiteral()
+    string multiLiteral() pure
     {
         i += 3;
         if (peek == '\n') { i++; line++; }
@@ -305,7 +306,7 @@ private struct Parser
         return r;
     }
 
-    string basicString()
+    string basicString() pure
     {
         i++;
         auto out_ = appender!string;
@@ -320,7 +321,7 @@ private struct Parser
         return out_.data;
     }
 
-    string multiBasic()
+    string multiBasic() pure
     {
         i += 3;
         if (peek == '\n') { i++; line++; }
@@ -359,7 +360,7 @@ private struct Parser
         return out_.data;
     }
 
-    void escape(A)(ref A out_)
+    void escape(A)(ref A out_) pure
     {
         if (eof) fail("bad escape");
         char e = s[i++];
@@ -429,7 +430,7 @@ unittest
 
 /// A correctly rounded double (`std.conv.to!double` is not: "0.7" came back
 /// as 0.700000000000000067); throws on trailing junk.
-private double parseDouble(string s)
+private double parseDouble(string s) pure
 {
     import nano.safeio : cStrtod;
     size_t used;

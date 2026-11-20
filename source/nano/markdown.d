@@ -24,6 +24,7 @@
 module nano.markdown;
 
 @safe:
+pure:
 
 import std.array : appender, join, replicate, split;
 import std.format : format;
@@ -226,7 +227,7 @@ private string[] prefixLines(string[] lines, string first, string rest) pure
 
 private immutable string[] BULLETS = ["•", "◦", "▪"];
 
-private string[] renderBlocks(const Block[] blocks, size_t width, size_t depth, bool separate)
+private string[] renderBlocks(const Block[] blocks, size_t width, size_t depth, bool separate) pure
 {
     string[] out_;
     foreach (i, b; blocks)
@@ -237,7 +238,7 @@ private string[] renderBlocks(const Block[] blocks, size_t width, size_t depth, 
     return out_;
 }
 
-private string[] renderBlock(const Block block, size_t width, size_t depth)
+private string[] renderBlock(const Block block, size_t width, size_t depth) pure
 {
     if (width < 1) width = 1;
     final switch (block.kind)
@@ -280,13 +281,13 @@ private string[] renderBlock(const Block block, size_t width, size_t depth)
 }
 
 /// The lines of `text` drawn for a terminal `width` cells wide.
-string[] renderLines(string text, size_t width)
+string[] renderLines(string text, size_t width) pure
 {
     return renderBlocks(parse(text), width < 10 ? 10 : width, 0, true);
 }
 
 /// `text` rendered for a terminal `width` cells wide (no trailing newline).
-string render(string text, size_t width)
+string render(string text, size_t width) pure
 {
     return renderLines(text, width).join("\n");
 }
@@ -303,7 +304,7 @@ private struct TopBlock
 }
 
 /// The top-level blocks of `src`, in order, with where each starts.
-private TopBlock[] topBlocks(string src)
+private TopBlock[] topBlocks(string src) pure
 {
     auto raw = src.split("\n");
     auto offsets = new size_t[raw.length];
@@ -339,7 +340,7 @@ struct MarkdownStream
     private string code;
 
     /// Feed a fragment; returns the text that can be printed now.
-    string push(string text, size_t width)
+    string push(string text, size_t width) pure
     {
         src ~= text;
         auto out_ = appender!string;
@@ -349,7 +350,7 @@ struct MarkdownStream
 
     /// Everything still held, rendered, at the end of a message. Leaves the
     /// stream ready for the next message.
-    string finish(size_t width)
+    string finish(size_t width) pure
     {
         auto out_ = appender!string;
         drain(out_, width < 10 ? 10 : width, true);
@@ -358,9 +359,9 @@ struct MarkdownStream
     }
 
     /// Whether anything is held back.
-    bool holding() const { return src.length || code.length; }
+    bool holding() pure const { return src.length || code.length; }
 
-    private void emit(ref Appender!string out_, string chunk, size_t width, bool partialList)
+    private void emit(ref Appender!string out_, string chunk, size_t width, bool partialList) pure
     {
         auto lines = renderLines(chunk, width);
         if (!lines.length) return;
@@ -370,7 +371,7 @@ struct MarkdownStream
         listCont = partialList;
     }
 
-    private void drain(ref Appender!string out_, size_t width, bool last)
+    private void drain(ref Appender!string out_, size_t width, bool last) pure
     {
         for (;;)
         {
@@ -476,7 +477,7 @@ import std.array : Appender;
 
 version (unittest)
 {
-    private string plain(string s)
+    private string plain(string s) pure
     {
         auto o = appender!string;
         for (size_t i; i < s.length; i++)
@@ -487,16 +488,16 @@ version (unittest)
         return o[];
     }
 
-    private string[] show(string text, size_t width)
+    private string[] show(string text, size_t width) pure
     {
         string[] out_;
         foreach (l; renderLines(text, width)) out_ ~= plain(l);
         return out_;
     }
 
-    private size_t w(string s) { return textWidth(plain(s)); }
+    private size_t w(string s) pure { return textWidth(plain(s)); }
 
-    private string stream(string[] chunks, size_t width)
+    private string stream(string[] chunks, size_t width) pure
     {
         MarkdownStream s;
         string all;
@@ -504,7 +505,7 @@ version (unittest)
         return all ~ s.finish(width);
     }
 
-    private string[] chunked(string text, size_t size)
+    private string[] chunked(string text, size_t size) pure
     {
         import std.conv : to;
         auto d = text.to!dstring;

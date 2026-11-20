@@ -65,7 +65,7 @@ struct FakeTime
     MonoTime mono;
 
     /// Move both clocks forward.
-    void advance(Duration d) nothrow
+    void advance(Duration d) pure nothrow
     {
         if (d <= Duration.zero) return;
         wall += d;
@@ -101,9 +101,9 @@ struct FakeClock
         if (time !is null && fake is time) fake = saved;
     }
 
-    void advance(Duration d) { time.advance(d); }
-    SysTime wall() const { return time.wall; }
-    MonoTime mono() const { return time.mono; }
+    void advance(Duration d) pure { time.advance(d); }
+    SysTime wall() pure const { return time.wall; }
+    MonoTime mono() pure const { return time.mono; }
 }
 
 unittest // a fake clock reads, advances and pauses without sleeping, then restores the real one

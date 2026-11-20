@@ -3,6 +3,7 @@
 module nano.agent;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 import nano.clock : monoNow, since, sleepFor, stdTimeNow, wallNow;
 import nano.arith : checkedMul, checkedSub, saturatingSub;
 import nano.option : Option, some, none, match, ifSome, orElse, unwrap, NotNull;
@@ -35,7 +36,7 @@ import nano.vision : Vision, resolveVision = resolve;
 import nano.llm : Attachment;
 
 /// A tool result as displayed: the text plus each attached image's placeholder.
-string toolResultDisplay(string text, const(Attachment)[] attachments)
+string toolResultDisplay(string text, const(Attachment)[] attachments) pure
 {
     foreach (ref a; attachments) text ~= (text.length ? "\n" : "") ~ a.placeholder;
     return text;
@@ -70,7 +71,7 @@ interface AgentEvents
 }
 
 /// Wrap text the model should read as a system note, not user words.
-string wrapReminder(string text) nothrow
+string wrapReminder(string text) pure nothrow
 {
     return "<system-reminder>\n" ~ text ~ "\n</system-reminder>";
 }
@@ -85,9 +86,9 @@ struct IdleCompactGate
 {
     private bool spent;
     private size_t spentAt;
-    bool armed(size_t tokens, size_t window) const { return !spent || tokens > spentAt + window / 10; }
-    void spend(size_t tokens) { spent = true; spentAt = tokens; }
-    void reset() { spent = false; }
+    bool armed(size_t tokens, size_t window) pure const { return !spent || tokens > spentAt + window / 10; }
+    void spend(size_t tokens) pure { spent = true; spentAt = tokens; }
+    void reset() pure { spent = false; }
 }
 
 /// An idle compaction's outcome, with usage before and after as a percentage
@@ -97,7 +98,7 @@ struct IdleCompactReport
     CompactReport report;
     size_t percentBefore, percentAfter;
 
-    this(CompactReport r, size_t window)
+    this(CompactReport r, size_t window) pure
     {
         import std.math : round;
         size_t pct(size_t t) { return cast(size_t) round(t * 100.0 / (window ? window : 1)); }
@@ -106,7 +107,7 @@ struct IdleCompactReport
         percentAfter = pct(r.tokensAfter);
     }
 
-    string toString() const
+    string toString() pure const
     {
         auto s = format("compacted while idle (was %s%% → %s%%)", percentBefore, percentAfter);
         // A degraded compaction is never reported as a clean one.
@@ -124,7 +125,7 @@ struct CompactReport
     bool truncated;
     ctx.CompactionMode mode;
 
-    string toString() const
+    string toString() pure const
     {
         auto s = format("%scompacted %s messages: ~%s -> ~%s tokens (%s -> %s messages)",
             mode == ctx.CompactionMode.smart ? "smart-" : "", summarized, ctx.formatTokens(tokensBefore),
@@ -213,7 +214,7 @@ class Agent
     /// Take a restored log's pending input. Its positions index the logged
     /// conversation; the agent keeps its own system prompt in place of any
     /// logged system message, so remap them.
-    void adoptPending(const ref Restored r)
+    void adoptPending(const ref Restored r) pure
     {
         // A loaded conversation starts a fresh crossing.
         resetIdleCompaction();
@@ -232,7 +233,7 @@ class Agent
 
     /// Mirror the live continuation into the pending input (so a mid-turn
     /// compaction persists it) and advance its replay boundary.
-    private void syncPendingContinuation(string answer, size_t count)
+    private void syncPendingContinuation(string answer, size_t count) pure
     {
         if (!hasPending) return;
         pending.hasContinuation = answer.length || count;
@@ -243,7 +244,7 @@ class Agent
     }
 
     /// Take a reported outcome from a resumed turn's messages; true when found.
-    private bool outcomeFrom(const Message[] tail)
+    private bool outcomeFrom(const Message[] tail) pure
     {
         foreach_reverse (ref m; tail)
             foreach_reverse (ref c; m.toolCalls)
@@ -284,7 +285,7 @@ class Agent
     size_t configuredWindow;
     string configuredWindowSource = "context_window in config";
 
-    void setConfiguredWindow(ConfiguredWindow w)
+    void setConfiguredWindow(ConfiguredWindow w) pure
     {
         configuredWindow = w.tokens;
         if (w.source.length) configuredWindowSource = w.source;
@@ -341,7 +342,7 @@ class Agent
             if (auto done = givenId in completedInputs)
             {
                 import std.stdio : stderr;
-                stdErr.writefln("[agent] input %s already processed; returning recorded response", JSONValue(givenId).toString);
+                stdErr.writefln("[agent] input %s already processed; returning recorded response", JSONValue(givenId).jsonText);
                 auto st = givenId in completedStops;
                 lastStop = st is null ? StopReason.endTurn : stopReasonFrom(*st);
                 auto oc = givenId in completedOutcomes;
@@ -945,9 +946,9 @@ class Agent
     }
 
     /// The context window and where it came from.
-    size_t contextWindow() const { string _; return contextWindow(_); }
+    size_t contextWindow() pure const { string _; return contextWindow(_); }
 
-    size_t contextWindow(out string source) const
+    size_t contextWindow(out string source) pure const
     {
         size_t w;
         if (configuredWindow) { w = configuredWindow; source = configuredWindowSource; }
@@ -984,7 +985,7 @@ class Agent
         }
         size_t tools_;
         foreach (d; offeredTools())
-            tools_ += ctx.textTokens(d.name) + ctx.textTokens(d.description) + ctx.textTokens(() { return d.parameters.toString; }());
+            tools_ += ctx.textTokens(d.name) + ctx.textTokens(d.description) + ctx.textTokens(() { return d.parameters.jsonText; }());
         return ctx.messagesTokens(messages, slots, avail) + tools_;
     }
 
@@ -1007,12 +1008,12 @@ class Agent
 
     size_t estimateContextTokens() { bool _; return estimateContextTokens(_); }
 
-    private size_t outputBase() const { return cast(size_t) effectiveMaxTokens(); }
+    private size_t outputBase() pure const { return cast(size_t) effectiveMaxTokens(); }
 
     /// The output budget before the context-window clamp: `max_tokens` when
     /// configured, else the model's published cap, a known cap for the model
     /// name, or the large default; never above a cap learned from an error.
-    long effectiveMaxTokens() const
+    long effectiveMaxTokens() pure const
     {
         long base = maxTokens > 0 ? maxTokens
             : capabilities.maxOutput ? cast(long) capabilities.maxOutput
@@ -1022,14 +1023,14 @@ class Agent
     }
 
     /// The endpoint's prompt-only cap is in force (Copilot `max_prompt_tokens`).
-    private bool promptCapped() const
+    private bool promptCapped() pure const
     {
         return !configuredWindow && capabilities.promptCap && capabilities.window
             && (!learnedWindow || learnedWindow >= capabilities.window);
     }
 
     /// The combined prompt + output window to enforce alongside a prompt cap (0 = none).
-    private size_t combinedWindow() const
+    private size_t combinedWindow() pure const
     {
         auto a = capabilities.totalWindow;
         if (a && learnedWindow) return a < learnedWindow ? a : learnedWindow;
@@ -1071,13 +1072,13 @@ class Agent
     }
 
     /// Forget the poll's memoized estimate (a different conversation).
-    void resetIdleCompaction()
+    void resetIdleCompaction() pure
     {
         idleGate.reset();
         idleCached = false;
     }
 
-    private bool idleCompactDueAt(size_t tokens)
+    private bool idleCompactDueAt(size_t tokens) pure
     {
         if (!idleCompact || !overThresholdAt(tokens)) return false;
         auto window = contextWindow();
@@ -1113,7 +1114,7 @@ class Agent
     }
 
     /// `overThreshold` for an already-estimated context size.
-    bool overThresholdAt(size_t tokens)
+    bool overThresholdAt(size_t tokens) pure
     {
         if (!autoCompact) return false;
         auto threshold = autoCompactThreshold < 0.1 ? 0.1 : autoCompactThreshold > 0.99 ? 0.99 : autoCompactThreshold;
@@ -1194,7 +1195,7 @@ class Agent
     /// a level the provider drops).
     string shownThinking() { return requestThinking.orElse(shownLevel(thinking())); }
 
-    private static string shownLevel(const ThinkingResolved th)
+    private static string shownLevel(const ThinkingResolved th) pure
     {
         import nano.thinking : wireValue;
         auto w = wireValue(th);
@@ -1521,7 +1522,7 @@ class Agent
         return true;
     }
 
-    private void recordUsage(TokenUsage u)
+    private void recordUsage(TokenUsage u) pure
     {
         sessionInputTokens += u.inputTokens;
         sessionOutputTokens += u.outputTokens;
@@ -1534,7 +1535,7 @@ class Agent
 
     /// Zero the per-session totals (tokens, credits, compactions), as a new
     /// or resumed session starts counting from scratch.
-    void resetSessionCounters()
+    void resetSessionCounters() pure
     {
         sessionInputTokens = sessionOutputTokens = 0;
         hasSessionAic = false;
@@ -1654,12 +1655,12 @@ class Agent
     bool historyAvailable;
     /// Append the "look in history" hint to the next failed tool result.
     bool historyHintPending;
-    bool historyEnabled() const { return log.isSome && historyAvailable; }
+    bool historyEnabled() pure const { return log.isSome && historyAvailable; }
 
     /// The messages a replay shows (Rust `replay_history`): the stashed
     /// pre-compaction turns, then the conversation without its synthetic
     /// summary (the first non-system message) or the restated input.
-    const(Message)[] replayMessages() const
+    const(Message)[] replayMessages() pure const
     {
         if (!replayStash.length) return messages;
         const(Message)[] o = replayStash;
@@ -1800,7 +1801,7 @@ class Agent
 
     /// Install `system` as the system message, with the ids its memory index
     /// renders in full.
-    void installSystem(string system, bool[string] shown)
+    void installSystem(string system, bool[string] shown) pure
     {
         if (messages.length && messages[0].role == Role.system) messages[0].content = system;
         indexShown = shown;
@@ -1808,7 +1809,7 @@ class Agent
 
     /// Restore recall state from a session log (null: none recorded). The
     /// installed system message (and so `indexShown`) is kept.
-    void restoreRecall(JSONValue j)
+    void restoreRecall(JSONValue j) pure
     {
         recallState = mem.Recall.fromJSON(j);
         recallTurnNotes = 0;
@@ -1875,7 +1876,7 @@ class Agent
     private bool hasReported;
 
     /// The tools offered to the model: plan mode keeps only the read-only ones.
-    ToolDefinition[] offeredTools()
+    ToolDefinition[] offeredTools() pure
     {
         auto all = tools.definitions ~ (planTools ? planDefinitions() : null)
             ~ (outcomeTool ? [outcomeDefinition()] : null) ~ (historyEnabled ? hist.definitions() : null)
@@ -1889,7 +1890,7 @@ class Agent
     /// The `/tools` listing: the tools offered right now (plan mode hides
     /// the mutating ones; plan, outcome, history and timer tools as enabled),
     /// one line each with the description's first line.
-    string toolsListing()
+    string toolsListing() pure
     {
         import std.string : indexOf;
         string[] out_;
@@ -2072,7 +2073,7 @@ class Agent
         log.ifSome((SessionLog l) { l.plan(plan.toJSON); });
     }
 
-    private static string withContext(string text, string[] context)
+    private static string withContext(string text, string[] context) pure
     {
         foreach (c; context) text ~= "\n\n" ~ wrapReminder(c);
         return text;
@@ -2094,13 +2095,13 @@ class Agent
         log.ifSome((SessionLog l) { l.hooks(files); });
     }
 
-    private void syncHookSession(HookManager h)
+    private void syncHookSession(HookManager h) pure
     {
         h.setSession(log.match!(l => l.id, () => ""), log.match!(l => l.path, () => ""),
             control.mode == AgentMode.plan ? "plan" : "default");
     }
 
-    private string toolNames()
+    private string toolNames() pure
     {
         string s;
         foreach (d; tools.definitions) s ~= (s.length ? ", " : "") ~ d.name;
@@ -2115,17 +2116,17 @@ version (unittest)
     {
         string shown;
         string[] tools;
-        void text(bool r, string s) { if (!r) shown ~= s; }
-        void toolStart(const ref ToolCall c) { tools ~= c.name; }
-        void toolEnd(const ref ToolCall c, string res, bool err) {}
-        void usage(TokenUsage u) {}
+        void text(bool r, string s) pure { if (!r) shown ~= s; }
+        void toolStart(const ref ToolCall c) pure { tools ~= c.name; }
+        void toolEnd(const ref ToolCall c, string res, bool err) pure {}
+        void usage(TokenUsage u) pure {}
         string[] steered;
-        void userMessage(string t) { steered ~= t; }
-        void assistantMessage(string t, string r) {}
+        void userMessage(string t) pure { steered ~= t; }
+        void assistantMessage(string t, string r) pure {}
         size_t restarts;
-        void responseRestarted() { restarts++; }
+        void responseRestarted() pure { restarts++; }
         size_t generations;
-        void generationStart() { generations++; }
+        void generationStart() pure { generations++; }
     }
 }
 
@@ -2805,7 +2806,7 @@ enum interruptedToolResult = "Error: the harness stopped before this tool call c
 
 /// Error results for the tool calls of the last assistant message with calls
 /// that no later message answers.
-Message[] danglingRepairs(const Message[] conversation)
+Message[] danglingRepairs(const Message[] conversation) pure
 {
     ptrdiff_t at = -1;
     foreach_reverse (i, ref m; conversation)
@@ -2832,7 +2833,7 @@ unittest
 }
 
 /// `s` with anything but [A-Za-z0-9_-] replaced, for a file name.
-private string safeName(string s)
+private string safeName(string s) pure
 {
     import std.array : appender;
     auto o = appender!string;
@@ -2891,7 +2892,7 @@ StopReason stopReasonFrom(string value) @safe pure nothrow
 /// A stop reason meaning the reply was cut off at the output-token limit.
 
 /// The reminder asking the model to continue a cut-off reply.
-Message continuationReminder(long completionTokens)
+Message continuationReminder(long completionTokens) pure
 {
     auto m = Message.auto_(wrapReminder(truncatedContinuationNote(completionTokens)));
     m.continuation = true;
@@ -2902,7 +2903,7 @@ Message continuationReminder(long completionTokens)
 /// carried across cut-off chunks and how many continuations ran. A fired
 /// timer keeps the prefix; any other user message, a tool run or a finished
 /// reply starts a new answer segment (issue #114).
-auto replayContinuation(const ref PendingInput snapshot, const Message[] tail)
+auto replayContinuation(const ref PendingInput snapshot, const Message[] tail) pure
 {
     static struct Replayed { string answer; size_t count; }
     auto r = Replayed(snapshot.hasContinuation ? snapshot.answer : null, snapshot.hasContinuation ? snapshot.count : 0);
@@ -2923,7 +2924,7 @@ auto replayContinuation(const ref PendingInput snapshot, const Message[] tail)
     return r;
 }
 
-string truncatedContinuationNote(long completionTokens)
+string truncatedContinuationNote(long completionTokens) pure
 {
     auto at = completionTokens > 0 ? format(" at the output-token limit (%s tokens)", completionTokens)
         : " at the output-token limit";
@@ -2933,7 +2934,7 @@ string truncatedContinuationNote(long completionTokens)
         ~ "fits within the limit.";
 }
 
-private LLMResponse cutText(string content, long tokens)
+private LLMResponse cutText(string content, long tokens) pure
 {
     auto r = LLMResponse(content);
     r.stopReason = "length";
@@ -3077,26 +3078,26 @@ version (unittest)
         return new mem.Store(buildPath(dir, "memory"), null, 0);
     }
 
-    private LLMResponse probeCall(string id, string path)
+    private LLMResponse probeCall(string id, string path) pure
     {
-        return LLMResponse("", "", [ToolCall.fromRaw(id, "probe", JSONValue(["path": path]).toString)]);
+        return LLMResponse("", "", [ToolCall.fromRaw(id, "probe", JSONValue(["path": path]).jsonText)]);
     }
 
-    private ToolRegistry probeTools()
+    private ToolRegistry probeTools() pure
     {
         auto reg = new ToolRegistry;
         reg.register(ToolDefinition("probe", "", parseJSON(`{}`)), (JSONValue a) => "no such file");
         return reg;
     }
 
-    private string[] toolTexts(Agent a)
+    private string[] toolTexts(Agent a) pure
     {
         string[] r;
         foreach (m; a.messages) if (m.role == Role.tool) r ~= m.content;
         return r;
     }
 
-    private size_t pinCount(Agent a)
+    private size_t pinCount(Agent a) pure
     {
         import std.algorithm : count;
         size_t n;

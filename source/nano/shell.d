@@ -12,6 +12,7 @@
 module nano.shell;
 
 @safe:
+pure:
 
 import std.algorithm : canFind, startsWith, any;
 import std.array : split;
@@ -300,7 +301,7 @@ enum maxDepth = 16;
 
 /// Whether an expanding here-document body contains an expansion that assigns
 /// a shell variable. Fails closed: a malformed expansion returns true.
-bool heredocBodyAssigns(string body)
+bool heredocBodyAssigns(string body) pure
 {
     auto p = Parser(body.to!(dchar[]), 0, 0);
     Word word;
@@ -322,9 +323,9 @@ bool heredocBodyAssigns(string body)
 
 /// Parse a command line into its simple commands, including those inside
 /// command substitutions.
-Simple[] parse(string source) { return parseNested(source, 0); }
+Simple[] parse(string source) pure { return parseNested(source, 0); }
 
-Simple[] parseNested(string source, size_t depth)
+Simple[] parseNested(string source, size_t depth) pure
 {
     if (depth > maxDepth) throw new ShellParseError("command nests too deeply to inspect");
     dchar[] chars;
@@ -384,7 +385,7 @@ private struct Parser
     }
 
     /// Decode one ANSI-C (`$'...'`) backslash escape; pos just past the `\`.
-    void ansiCEscape(ref Word word)
+    void ansiCEscape(ref Word word) pure
     {
         if (atEnd) throw new ShellParseError("unterminated $'...' string");
         auto next = chars[pos++];
@@ -452,7 +453,7 @@ private struct Parser
 
     /// Parse commands until the end of input or, when `untilParen`, the `)`
     /// that closes a command substitution.
-    void script(bool untilParen)
+    void script(bool untilParen) pure
     {
         Simple current;
         size_t parens = 0;
@@ -607,7 +608,7 @@ private struct Parser
         foreach (ref s; out_[outStart .. $]) s.loopHeaderSub = true;
     }
 
-    void redirect(ref Simple current, ref PendingHeredoc[] pending)
+    void redirect(ref Simple current, ref PendingHeredoc[] pending) pure
     {
         auto start = pos;
         if (eat('&'))
@@ -639,7 +640,7 @@ private struct Parser
         current.redirects ~= Redirect(op, target);
     }
 
-    string heredocBody(string delimiter, bool stripTabs)
+    string heredocBody(string delimiter, bool stripTabs) pure
     {
         string body;
         while (pos < chars.length)
@@ -657,7 +658,7 @@ private struct Parser
     }
 
     /// Parse a `$(...)` body (the opening `$(` already consumed) as commands.
-    void substitution()
+    void substitution() pure
     {
         if (depth >= maxDepth) throw new ShellParseError("command nests too deeply to inspect");
         auto inner = Parser(chars, pos, depth + 1);
@@ -666,7 +667,7 @@ private struct Parser
         out_ ~= inner.out_;
     }
 
-    void backtick()
+    void backtick() pure
     {
         dchar[] inner;
         for (;;)
@@ -690,7 +691,7 @@ private struct Parser
 
     /// Skip a balanced `${...}` or `$((...))` body, returning its text, while
     /// still parsing command substitutions nested in it.
-    string balanced(dchar open, dchar close)
+    string balanced(dchar open, dchar close) pure
     {
         auto start = pos;
         int level = 1;
@@ -728,7 +729,7 @@ private struct Parser
     }
 
     /// `$...` at the current position (the `$` not yet consumed).
-    void dollar(ref Word word, bool quoted)
+    void dollar(ref Word word, bool quoted) pure
     {
         ++pos;
         auto c = peek();
@@ -783,7 +784,7 @@ private struct Parser
             word.text ~= '$';
     }
 
-    void singleQuote(ref Word word)
+    void singleQuote(ref Word word) pure
     {
         ++pos;
         word.quoted = true;
@@ -796,7 +797,7 @@ private struct Parser
         }
     }
 
-    void doubleQuote(ref Word word)
+    void doubleQuote(ref Word word) pure
     {
         ++pos;
         word.quoted = true;
@@ -828,7 +829,7 @@ private struct Parser
         }
     }
 
-    void ansiCString(ref Word word)
+    void ansiCString(ref Word word) pure
     {
         pos += 2;
         word.quoted = true;
@@ -857,7 +858,7 @@ private struct Parser
         else word.text ~= '\\';
     }
 
-    Word word()
+    Word word() pure
     {
         Word word;
         while (!atEnd)
@@ -904,7 +905,7 @@ private struct Parser
 
     /// Unquoted brace expansion (`{a,b}`, `{1..9}`), parsed with the normal
     /// lexer handlers so quotes and substitutions inside keep their metadata.
-    void braceWord(ref Word word)
+    void braceWord(ref Word word) pure
     {
         word.text ~= '{';
         ++pos;
@@ -984,7 +985,7 @@ private struct Parser
 
 version (unittest)
 {
-    private string[][] words(string source)
+    private string[][] words(string source) pure
     {
         string[][] r;
         foreach (s; parse(source))
@@ -996,9 +997,9 @@ version (unittest)
         return r;
     }
 
-    private Word wordAt(string source, size_t cmd, size_t idx) { return parse(source)[cmd].words[idx]; }
+    private Word wordAt(string source, size_t cmd, size_t idx) pure { return parse(source)[cmd].words[idx]; }
 
-    private bool fails(string source)
+    private bool fails(string source) pure
     {
         try { parse(source); return false; }
         catch (ShellParseError) return true;

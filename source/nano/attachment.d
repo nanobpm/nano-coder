@@ -32,7 +32,7 @@ enum size_t DEFAULT_MAX_BYTES = 3 * 1024 * 1024;
 enum ImageFormat { png, jpeg, gif, webp }
 
 /// The format these bytes start with, if we accept it.
-Nullable!ImageFormat sniff(const(ubyte)[] b)
+Nullable!ImageFormat sniff(const(ubyte)[] b) pure
 {
     Nullable!ImageFormat r;
     if (b.length >= 8 && b[0 .. 8] == cast(const(ubyte)[]) "\x89PNG\r\n\x1a\n") r = ImageFormat.png;
@@ -68,7 +68,7 @@ string extension(ImageFormat f) pure nothrow
 }
 
 /// Hex sha256 of `bytes` (lowercase); names the stored copy.
-string sha256Hex(const(ubyte)[] bytes)
+string sha256Hex(const(ubyte)[] bytes) pure
 {
     import std.digest.sha : sha256Of;
     import std.digest : toHexString, LetterCase;
@@ -102,7 +102,7 @@ uint[2] dimensions(const(ubyte)[] b)
     }
 }
 
-private uint[2] webpDimensions(const(ubyte)[] b)
+private uint[2] webpDimensions(const(ubyte)[] b) pure
 {
     if (b.length < 30) throw new Exception("truncated WebP header");
     auto chunk = (cast(const(char)[]) b[12 .. 16]).idup;
@@ -213,7 +213,7 @@ struct ImageLimits
     /// Media types the model accepts; empty means any of ours.
     string[] acceptedMediaTypes;
 
-    bool accepts(string mt) const
+    bool accepts(string mt) pure const
     {
         import std.algorithm : canFind;
         return !acceptedMediaTypes.length || acceptedMediaTypes.canFind(mt);
@@ -237,10 +237,10 @@ struct Attachment
     string extension;
 
     /// Stands in for the image where it is summarized away or not sent.
-    string placeholder() const { return format("[image: %s, %s×%s]", path, width, height); }
+    string placeholder() pure const { return format("[image: %s, %s×%s]", path, width, height); }
 
     import std.json : JSONValue, JSONType;
-    JSONValue toJSON() const
+    JSONValue toJSON() pure const
     {
         JSONValue j = ["media_type": mediaType, "path": path, "sha256": sha256, "extension": extension];
         j["width"] = width;
@@ -249,7 +249,7 @@ struct Attachment
         return j;
     }
 
-    static Attachment fromJSON(const JSONValue j)
+    static Attachment fromJSON(const JSONValue j) pure
     {
         Attachment a;
         string s(string k) { auto p = k in j.objectNoRef; return p && p.type == JSONType.string ? p.str : null; }
@@ -404,7 +404,7 @@ private uint scaledLongest(uint w, uint h, uint maxDim) pure
 /// `<sha256>.<ext>`, or null when either field isn't the shape the writer
 /// produces: the metadata comes from a session log, and a crafted `../`
 /// must not read or write outside the attachments directory.
-string storedFilename(const ref Attachment a)
+string storedFilename(const ref Attachment a) pure
 {
     import std.algorithm : all, canFind;
     import std.ascii : isDigit;
@@ -486,7 +486,7 @@ Nullable!ImageData readForLimits(string dir, const ref Attachment a, const ref I
 version (unittest)
 {
     /// A PNG header claiming `w`×`h`, padded to `size` bytes.
-    immutable(ubyte)[] fakePng(uint w, uint h, size_t size = 64)
+    immutable(ubyte)[] fakePng(uint w, uint h, size_t size = 64) pure
     {
         ubyte[] b = cast(ubyte[]) "\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".dup;
         foreach (v; [w, h]) b ~= [cast(ubyte)(v >> 24), cast(ubyte)(v >> 16), cast(ubyte)(v >> 8), cast(ubyte) v];
@@ -495,7 +495,7 @@ version (unittest)
     }
 
     /// A JPEG with an optional EXIF orientation and a SOF0 of `w`×`h`.
-    immutable(ubyte)[] fakeJpeg(uint w, uint h, uint orientation = 0)
+    immutable(ubyte)[] fakeJpeg(uint w, uint h, uint orientation = 0) pure
     {
         ubyte[] b = [0xff, 0xd8];
         if (orientation)

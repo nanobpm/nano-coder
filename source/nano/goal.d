@@ -7,6 +7,8 @@
 module nano.goal;
 
 @safe:
+pure:
+import nano.safeio : jsonText, jsonPretty;
 
 import std.json;
 import std.string : strip, toLower;
@@ -25,7 +27,7 @@ enum verifyReminder = "You changed files after your last check. Run the relevant
     ~ "or report again if no check applies.";
 
 /// Parse a status leniently (Rust `Status::parse`); false when unknown.
-bool parseStatus(string text, out OutcomeStatus s)
+bool parseStatus(string text, out OutcomeStatus s) pure
 {
     switch (text.strip.toLower.replace("-", "_").replace(" ", "_"))
     {
@@ -36,7 +38,7 @@ bool parseStatus(string text, out OutcomeStatus s)
     }
 }
 
-string statusName(OutcomeStatus s)
+string statusName(OutcomeStatus s) pure
 {
     final switch (s)
     {
@@ -48,7 +50,7 @@ string statusName(OutcomeStatus s)
 
 class OutcomeError : Exception
 {
-    this(string msg) { super(msg); }
+    this(string msg) pure { super(msg); }
 }
 
 struct Outcome
@@ -57,7 +59,7 @@ struct Outcome
     string summary;
 
     /// Parse the tool's arguments, tolerating arguments sent as a JSON string.
-    static Outcome fromArgs(JSONValue args)
+    static Outcome fromArgs(JSONValue args) pure
     {
         if (args.type == JSONType.string)
         {
@@ -70,7 +72,7 @@ struct Outcome
         Outcome o;
         if (!parseStatus(st.str, o.status))
             throw new OutcomeError(format!`report_outcome %sstatus%s must be "completed", "blocked" or "needs_input", got %s`(
-                "`", "`", JSONValue(st.str).toString));
+                "`", "`", JSONValue(st.str).jsonText));
         auto sm = "summary" in args.objectNoRef;
         o.summary = sm !is null && sm.type == JSONType.string ? sm.str.strip : "";
         if (!o.summary.length) throw new OutcomeError("report_outcome needs a `summary`");
@@ -78,7 +80,7 @@ struct Outcome
     }
 
     /// The turn's final answer.
-    string response() const
+    string response() pure const
     {
         final switch (status)
         {
@@ -88,13 +90,13 @@ struct Outcome
         }
     }
 
-    JSONValue toJSON() const
+    JSONValue toJSON() pure const
     {
         return JSONValue(["status": statusName(status), "summary": summary]);
     }
 
     /// The latest successful `report_outcome` call among one turn's messages.
-    static bool reportedIn(const Message[] messages, out Outcome found)
+    static bool reportedIn(const Message[] messages, out Outcome found) pure
     {
         bool succeeded(string id)
         {
@@ -120,7 +122,7 @@ struct Outcome
     }
 }
 
-ToolDefinition definition()
+ToolDefinition definition() pure
 {
     return ToolDefinition(toolName,
         "Report the outcome of the task you were given. This ends your turn: the summary becomes your final "

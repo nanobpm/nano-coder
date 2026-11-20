@@ -54,7 +54,7 @@ void deviceWriteAt(string target, string cwd)
 }
 
 /// Split arguments into flags and operands (everything after `--` is an operand).
-void splitFlags(const Word[] args, out string[] flags, out const(Word)[] operands) nothrow
+void splitFlags(const Word[] args, out string[] flags, out const(Word)[] operands) pure nothrow
 {
     bool onlyOperands = false;
     foreach (arg; args)
@@ -192,7 +192,7 @@ struct Guard
         return resolveSymlinks(joinPath(base, text));
     }
 
-    string expandHome(string text)
+    string expandHome(string text) pure
     {
         if (text == "~" || text.startsWith("~/"))
         {
@@ -402,7 +402,7 @@ struct Guard
     }
 
     /// Why deleting/moving/re-permissioning `p` would be catastrophic, or null.
-    string danger(string p, bool protectCwd)
+    string danger(string p, bool protectCwd) pure
     {
         if (samePath(p, "/")) return "the filesystem root";
         if (protectCwd && samePath(p, cwd)) return "the working directory";
@@ -428,7 +428,7 @@ struct Guard
     }
 
     /// Like `danger`, but only catastrophic roots outside the workspace.
-    string catastrophicRoot(string p)
+    string catastrophicRoot(string p) pure
     {
         if (components(p).canFind(".git")) return "a git repository's .git directory";
         if (!samePath(cwd, "/") && startsWithPath(p, cwd)) return null;

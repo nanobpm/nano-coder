@@ -71,7 +71,7 @@ struct Options
     /// Let imports in project files resolve outside the repository.
     bool importsOutsideProject;
 
-    static Options project(const string[] names) { Options o; o.names = names.dup; return o; }
+    static Options project(const string[] names) pure { Options o; o.names = names.dup; return o; }
 }
 
 private struct ScopedRule
@@ -142,7 +142,7 @@ string readCapped(string path)
 }
 
 /// Strip leading blockquote markers; returns the content and the depth.
-private string stripBlockquote(string line, out size_t depth)
+private string stripBlockquote(string line, out size_t depth) pure
 {
     auto rest = line;
     for (;;)
@@ -158,7 +158,7 @@ private string stripBlockquote(string line, out size_t depth)
 }
 
 /// 0–3 leading spaces before a fence marker, or -1 (a tab or 4+ spaces).
-private ptrdiff_t fenceIndent(string line)
+private ptrdiff_t fenceIndent(string line) pure
 {
     size_t spaces;
     while (spaces < line.length && line[spaces] == ' ') ++spaces;
@@ -173,7 +173,7 @@ private struct Fence
 }
 
 /// The opening fence on this line, if any.
-private bool fence(string line, out Fence f)
+private bool fence(string line, out Fence f) pure
 {
     size_t depth;
     line = stripBlockquote(line, depth);
@@ -191,7 +191,7 @@ private bool fence(string line, out Fence f)
 }
 
 /// Whether this line closes `open` (same container, a long-enough bare run).
-private bool closesFence(string line, Fence open)
+private bool closesFence(string line, Fence open) pure
 {
     size_t depth;
     line = stripBlockquote(line, depth);
@@ -205,7 +205,7 @@ private bool closesFence(string line, Fence open)
 }
 
 /// An indented code line (4+ spaces or a leading tab).
-private bool isIndentedCode(string line)
+private bool isIndentedCode(string line) pure
 {
     size_t depth;
     line = stripBlockquote(line, depth);
@@ -219,7 +219,7 @@ private bool isIndentedCode(string line)
 }
 
 /// Remove block-level `<!-- ... -->` comments outside code, as Claude Code does.
-string stripHtmlComments(string text)
+string stripHtmlComments(string text) pure
 {
     string out_;
     bool inFence, inComment;
@@ -272,7 +272,7 @@ string stripHtmlComments(string text)
 
 /// `@path` references outside code spans and fenced blocks, in order. A
 /// reference starts a line or follows whitespace or `(`; `\ ` continues a path.
-string[] importRefs(string text)
+string[] importRefs(string text) pure
 {
     import std.conv : to;
     string[] refs;
@@ -330,7 +330,7 @@ string[] importRefs(string text)
 
 /// `@path` imports expand in Claude-format files only: in `AGENTS.md` an
 /// `@name` is a mention.
-private bool expandsImports(string path, Kind kind) nothrow
+private bool expandsImports(string path, Kind kind) pure nothrow
 {
     auto n = path.baseName;
     return kind == Kind.rule || kind == Kind.imported || n == "CLAUDE.md" || n == "CLAUDE.local.md";
@@ -338,7 +338,7 @@ private bool expandsImports(string path, Kind kind) nothrow
 
 /// Split a rule's front matter into its `paths` (hasPaths false: applies
 /// everywhere) and the body. Accepts a YAML list, `[a, b]` or `a, b`.
-string ruleFrontMatter(string text, out bool hasPaths, out string[] paths) nothrow
+string ruleFrontMatter(string text, out bool hasPaths, out string[] paths) pure nothrow
 {
     auto lines = text.lineSplitter!(KeepTerminator.yes).array;
     if (!lines.length || lines[0].stripRight != "---") return text;
@@ -392,7 +392,7 @@ string ruleFrontMatter(string text, out bool hasPaths, out string[] paths) nothr
 }
 
 /// Split on top-level commas only (not inside `{a,b}` or quotes).
-private string[] splitTopLevel(string value) nothrow
+private string[] splitTopLevel(string value) pure nothrow
 {
     string[] out_;
     size_t depth, start;
@@ -409,7 +409,7 @@ private string[] splitTopLevel(string value) nothrow
 }
 
 /// Expand `{a,b}` groups; past `budget` patterns, keep the rest unexpanded.
-private string[] expandBraces(string pattern, ref size_t budget)
+private string[] expandBraces(string pattern, ref size_t budget) pure
 {
     auto open = pattern.indexOf('{');
     if (open < 0) return [pattern];
@@ -693,7 +693,7 @@ class ProjectInstructions
     }
 
     /// Record a diagnostic once.
-    private void warn(string message)
+    private void warn(string message) pure
     {
         if (!warnings.canFind(message)) warnings ~= message;
     }
@@ -839,7 +839,7 @@ class ProjectInstructions
 
     /// After compaction, nested instructions attached to old tool results may
     /// be gone: let them attach again.
-    void forgetNested()
+    void forgetNested() pure
     {
         searched = initial.dup;
         seen = initialSeen.dup;
@@ -851,7 +851,7 @@ class ProjectInstructions
     }
 
     /// Files in the prompt, for the banner, `/context` and ACP.
-    string[] loadedPaths()
+    string[] loadedPaths() pure
     {
         string[] out_;
         foreach (f; loaded) out_ ~= f.path;
@@ -861,7 +861,7 @@ class ProjectInstructions
     }
 
     /// Rules attached only when a matching file is touched.
-    string[] onDemandPaths()
+    string[] onDemandPaths() pure
     {
         string[] out_;
         foreach (r; scoped) if (!r.attached) out_ ~= r.path;
@@ -889,7 +889,7 @@ version (unittest)
 
     private ProjectInstructions find(string cwd) { return ProjectInstructions.discover(cwd, Options.project(defaultFiles)); }
 
-    private string[] texts(ProjectInstructions p)
+    private string[] texts(ProjectInstructions p) pure
     {
         string[] t;
         foreach (f; p.loaded) t ~= f.text;
@@ -996,7 +996,7 @@ unittest // import scanning: code spans, fences, blockquotes
     assert(strip_("    <!-- code -->\n").canFind("<!-- code -->"));
 }
 
-private string strip_(string s) { return stripHtmlComments(s); }
+private string strip_(string s) pure { return stripHtmlComments(s); }
 
 // rust: instructions.rs::front_matter_forms
 // rust: instructions.rs::inline_paths_keep_brace_groups

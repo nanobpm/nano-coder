@@ -36,13 +36,13 @@ template hasNullableMark(alias sym)
 }
 
 /// Names of the `@nullable` symbols in module `M` (fields and globals).
-string[] markedNullable(alias M)() { return walkModule!(M, true)(); }
+string[] markedNullable(alias M)() pure { return walkModule!(M, true)(); }
 
 /// Unmarked bare class references declared in module `M`, as
 /// "module.Type.field: Class" lines.
-string[] bareRefs(alias M)() { return walkModule!(M, false)(); }
+string[] bareRefs(alias M)() pure { return walkModule!(M, false)(); }
 
-private string[] walkModule(alias M, bool marked)()
+private string[] walkModule(alias M, bool marked)() pure
 {
     string[] found;
     static foreach (name; __traits(allMembers, M))
@@ -66,7 +66,7 @@ private string[] walkModule(alias M, bool marked)()
     return found;
 }
 
-private string[] walkAggregate(S, bool marked)(string path)
+private string[] walkAggregate(S, bool marked)(string path) pure
 {
     string[] found;
     static foreach (i, F; typeof(S.tupleof))

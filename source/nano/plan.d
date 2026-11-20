@@ -15,6 +15,8 @@ import std.uni : toUpper;
 import nano.llm : ToolDefinition;
 
 @safe:
+pure:
+import nano.safeio : jsonText, jsonPretty;
 
 enum maxItems = 200;
 enum maxTitleChars = 200;
@@ -27,12 +29,12 @@ enum contextChars = 8_000;
 
 immutable string[] toolNames = ["plan_add", "plan_update", "plan_show"];
 
-bool isPlanTool(string name) { return toolNames.canFind(name); }
+bool isPlanTool(string name) pure { return toolNames.canFind(name); }
 
 /// A rejected plan call (Rust `bail!`).
 class PlanError : Exception
 {
-    this(string msg) { super(msg); }
+    this(string msg) pure { super(msg); }
 }
 
 enum Status { pending, inProgress, done, blocked, dropped }
@@ -49,7 +51,7 @@ string statusName(Status s) pure nothrow
     }
 }
 
-Status parseStatus(string text)
+Status parseStatus(string text) pure
 {
     auto t = text.strip.toLower.replace("-", "_").replace(" ", "_");
     switch (t)
@@ -61,7 +63,7 @@ Status parseStatus(string text)
         case "dropped", "cancelled", "canceled", "skipped": return Status.dropped;
         default:
             throw new PlanError(format!"unknown status %s; use pending, in_progress, done, blocked or dropped"(
-                    JSONValue(t).toString));
+                    JSONValue(t).jsonText));
     }
 }
 
@@ -87,7 +89,7 @@ struct PlanItem
     string[] notes; /// findings and decisions, oldest first
     uint[] after; /// items that must be done (or dropped) first
 
-    PlanItem dup() const { return PlanItem(id, title, status, notes.dup, after.dup); }
+    PlanItem dup() pure const { return PlanItem(id, title, status, notes.dup, after.dup); }
 }
 
 /// What a plan tool call did.
@@ -102,7 +104,7 @@ struct Plan
     string goal;
     PlanItem[] items;
 
-    Plan dup() const
+    Plan dup() pure const
     {
         Plan p;
         p.goal = goal;
@@ -110,7 +112,7 @@ struct Plan
         return p;
     }
 
-    bool opEquals(const Plan o) const
+    bool opEquals(const Plan o) pure const
     {
         if (goal != o.goal || items.length != o.items.length) return false;
         foreach (k, ref i; items)
@@ -122,10 +124,10 @@ struct Plan
         return true;
     }
 
-    bool empty() const { return !goal.length && !items.length; }
+    bool empty() pure const { return !goal.length && !items.length; }
 
     /// (done, total), not counting dropped items.
-    size_t[2] progress() const
+    size_t[2] progress() pure const
     {
         size_t done, total;
         foreach (ref i; items)
@@ -137,14 +139,14 @@ struct Plan
         return [done, total];
     }
 
-    private size_t item(uint id)
+    private size_t item(uint id) pure
     {
         foreach (k, ref i; items) if (i.id == id) return k;
         if (!items.length) throw new PlanError(format!"no item %s: the plan is empty; add items with plan_add"(id));
         throw new PlanError(format!"no item %s; items are %s"(id, items.map!(i => i.id.to!string).join(", ")));
     }
 
-    private bool isReady(const ref PlanItem it) const
+    private bool isReady(const ref PlanItem it) pure const
     {
         if (it.status != Status.pending) return false;
         foreach (dep; it.after)
@@ -154,7 +156,7 @@ struct Plan
     }
 
     /// Items to work on next: those in progress, else the first ready one.
-    private const(PlanItem)[] next() const
+    private const(PlanItem)[] next() pure const
     {
         const(PlanItem)[] active;
         foreach (ref i; items) if (i.status == Status.inProgress) active ~= i;
@@ -164,7 +166,7 @@ struct Plan
     }
 
     /// Run a plan tool. Throws PlanError (the plan is left unchanged).
-    Outcome apply(string tool, JSONValue args)
+    Outcome apply(string tool, JSONValue args) pure
     {
         switch (tool)
         {
@@ -175,7 +177,7 @@ struct Plan
         }
     }
 
-    private Outcome add(JSONValue args)
+    private Outcome add(JSONValue args) pure
     {
         auto plan = dup();
         string[] summary;
@@ -216,7 +218,7 @@ struct Plan
             foreach (dep; after)
                 if (dep >= id || !plan.items.any!(i => i.id == dep))
                     throw new PlanError(format!"item %s: `after` must name earlier items, not %s"(
-                            JSONValue(title).toString, dep));
+                            JSONValue(title).jsonText, dep));
             PlanItem p = {id: id, title: clip(title, maxTitleChars), status: Status.pending, after: after};
             if (note.strip.length) p.notes = [clip(note.strip, maxNoteChars)];
             plan.items ~= p;
@@ -228,7 +230,7 @@ struct Plan
         return outcome(summary.join(", "));
     }
 
-    private Outcome update(JSONValue args)
+    private Outcome update(JSONValue args) pure
     {
         JSONValue[] updates;
         auto u = field(args, "updates");
@@ -274,14 +276,14 @@ struct Plan
         return outcome("updated " ~ summary.join(", "));
     }
 
-    private Outcome outcome(string summary) const
+    private Outcome outcome(string summary) pure const
     {
         return Outcome(capitalize(summary) ~ ".\n" ~ render(false, size_t.max), true);
     }
 
     /// The plan as a checklist. `notes` includes each item's notes; output
     /// over `budget` characters drops the notes of finished items, then all notes.
-    string render(bool notes, size_t budget) const
+    string render(bool notes, size_t budget) pure const
     {
         if (empty) return "The plan is empty.";
         bool[2][] modes = notes ? [[true, true], [true, false], [false, false]] : [[false, false]];
@@ -294,7 +296,7 @@ struct Plan
         return text;
     }
 
-    private string renderWith(bool openNotes, bool closedNotes) const
+    private string renderWith(bool openNotes, bool closedNotes) pure const
     {
         string out_;
         if (goal.length) out_ ~= "Goal: " ~ goal ~ "\n";
@@ -323,14 +325,14 @@ struct Plan
     }
 
     /// The plan restated for the model after its context was compacted.
-    string contextNote() const
+    string contextNote() pure const
     {
         return "[Your plan, kept by the harness. Earlier conversation may be summarized, but the plan and its notes are "
             ~ "complete. Continue from it and keep it current with plan_update.]\n" ~ render(true, contextChars);
     }
 
     /// The plan handed to a new session that continues an earlier run.
-    string carriedOverNote() const
+    string carriedOverNote() pure const
     {
         return "[A plan carried over from an earlier, interrupted run of this task, kept by the harness. Work already "
             ~ "marked done may be committed or pushed: check the current state before redoing it. Continue from the "
@@ -338,7 +340,7 @@ struct Plan
     }
 
     /// ACP `plan` entries (dropped items omitted).
-    JSONValue acpEntries() const
+    JSONValue acpEntries() pure const
     {
         JSONValue[] list;
         foreach (ref i; items)
@@ -351,7 +353,7 @@ struct Plan
     }
 
     /// Serialized like Rust's serde form: {goal?, items: [{id, title, status, notes?, after?}]}.
-    JSONValue toJSON() const
+    JSONValue toJSON() pure const
     {
         JSONValue[] list;
         foreach (ref i; items)
@@ -368,7 +370,7 @@ struct Plan
 
     /// Accept a plan from a client or a session log: this harness's own shape
     /// (`{goal, items}`) or bare ACP entries.
-    static Plan fromJSON(JSONValue v)
+    static Plan fromJSON(JSONValue v) pure
     {
         Plan plan;
         if (v.type == JSONType.object && "items" in v)
@@ -414,7 +416,7 @@ struct Plan
     }
 
     /// Check a plan from outside (ids unique and in range, dependencies known).
-    private void validate() const
+    private void validate() pure const
     {
         if (items.length > maxItems) throw new PlanError(format!"a plan holds at most %s items"(maxItems));
         bool[uint] seen;
@@ -434,7 +436,7 @@ import nano.safeio : jsonGet;
 private alias field = jsonGet;
 
 /// Models sometimes send a nested list as a JSON string; decode it.
-private JSONValue decoded(const JSONValue v)
+private JSONValue decoded(const JSONValue v) pure
 {
     if (v.type == JSONType.string)
     {
@@ -444,13 +446,13 @@ private JSONValue decoded(const JSONValue v)
             try return parseJSON(v.str);
             catch (Exception e)
                 throw new PlanError(format!"could not parse %s as JSON: %s; pass a list, not a string"(
-                        JSONValue(v.str).toString, e.msg));
+                        JSONValue(v.str).jsonText, e.msg));
         }
     }
     return cast(JSONValue) v;
 }
 
-private bool idOf(const JSONValue v, out uint id)
+private bool idOf(const JSONValue v, out uint id) pure
 {
     try
     {
@@ -468,7 +470,7 @@ private bool idOf(const JSONValue v, out uint id)
     return false;
 }
 
-private uint[] idsOf(const JSONValue v)
+private uint[] idsOf(const JSONValue v) pure
 {
     const(JSONValue)[] list;
     if (v.type == JSONType.array) list = v.arrayNoRef;
@@ -477,13 +479,13 @@ private uint[] idsOf(const JSONValue v)
     foreach (x; list)
     {
         uint id;
-        if (!idOf(x, id)) throw new PlanError("`after` must list item ids, got " ~ x.toString);
+        if (!idOf(x, id)) throw new PlanError("`after` must list item ids, got " ~ x.jsonText);
         out_ ~= id;
     }
     return out_;
 }
 
-private string clip(string text, size_t max)
+private string clip(string text, size_t max) pure
 {
     import std.utf : count;
     import std.range : take;
@@ -491,7 +493,7 @@ private string clip(string text, size_t max)
     return text.take(max - 1).to!string ~ "…";
 }
 
-private string capitalize(string text)
+private string capitalize(string text) pure
 {
     if (!text.length) return text;
     import std.utf : decode, stride;
@@ -499,7 +501,7 @@ private string capitalize(string text)
     return text[0 .. n].toUpper ~ text[n .. $];
 }
 
-ToolDefinition[] definitions()
+ToolDefinition[] definitions() pure
 {
     return [
         ToolDefinition("plan_add",
@@ -578,7 +580,8 @@ unittest // context_note_drops_finished_notes_first_and_round_trips_through_acp
     auto tight = plan.render(true, 300);
     assert(tight.canFind("- keep me") && tight.canFind("(1 note)"), tight);
 
-    assert(Plan.fromJSON(parseJSON(plan.toJSON.toString)) == plan);
+    import nano.safeio : jsonText;
+    assert(Plan.fromJSON(parseJSON(plan.toJSON.jsonText)) == plan);
     auto entries = plan.acpEntries;
     assert(entries[0]["status"].str == "completed");
     auto seeded = Plan.fromJSON(entries);
@@ -590,7 +593,7 @@ unittest // context_note_drops_finished_notes_first_and_round_trips_through_acp
 enum planLines = 12;
 
 /// The plan as the terminal shows it after a change (Rust `ui::plan_checklist`).
-string checklist(const ref Plan plan, size_t width, bool color)
+string checklist(const ref Plan plan, size_t width, bool color) pure
 {
     import nano.trajectory : terminalSafe;
     string c(string code) { return color ? code : ""; }
@@ -626,7 +629,7 @@ string checklist(const ref Plan plan, size_t width, bool color)
     return out_;
 }
 
-private string fitWidth(string s, size_t width)
+private string fitWidth(string s, size_t width) pure
 {
     import nano.lineedit : textWidth, charWidth;
     if (width < 2 || textWidth(s) <= width) return s;

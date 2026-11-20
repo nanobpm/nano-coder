@@ -3,6 +3,7 @@
 module nano.session;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 import nano.clock : wallNow;
 
 import nano.safeio : readBytes;
@@ -123,7 +124,7 @@ string newSessionId()
 }
 
 /// Session ids name files: 1-128 of [A-Za-z0-9._-], not starting with '.'.
-void validateId(string id)
+void validateId(string id) pure
 {
     import std.algorithm : all;
     import std.ascii : isAlphaNum;
@@ -131,11 +132,11 @@ void validateId(string id)
         && id.all!(c => c.isAlphaNum || c == '-' || c == '_' || c == '.');
     if (!ok)
         throw new Exception(format("invalid session id %s: use 1-128 of [A-Za-z0-9._-], not starting with '.'",
-            JSONValue(id).toString(JSONOptions.doNotEscapeSlashes)));
+            JSONValue(id).jsonText(JSONOptions.doNotEscapeSlashes)));
 }
 
 /// A message as a session-log record body (Rust's serde form of `Message`).
-JSONValue messageRecord(const ref Message m)
+JSONValue messageRecord(const ref Message m) pure
 {
     JSONValue j = ["role": roleName(m.role), "content": m.content];
     if (m.extra.type == JSONType.object)
@@ -147,7 +148,7 @@ JSONValue messageRecord(const ref Message m)
         {
             JSONValue cj = ["id": c.id, "name": c.name];
             // Rust's shape: malformed text is kept beside an empty object.
-            cj["arguments"] = c.invalidArguments.length ? parseJSON("{}") : parseJSON(c.arguments.toString);
+            cj["arguments"] = c.invalidArguments.length ? parseJSON("{}") : parseJSON(c.arguments.jsonText);
             if (c.invalidArguments.length) cj["malformed_arguments"] = c.invalidArguments;
             if (c.itemId.length) cj["item_id"] = c.itemId;
             calls ~= cj;
@@ -168,7 +169,7 @@ JSONValue messageRecord(const ref Message m)
     if (m.thinkingBlocks.length)
     {
         JSONValue[] blocks;
-        foreach (ref b; m.thinkingBlocks) blocks ~= parseJSON(b.toString);
+        foreach (ref b; m.thinkingBlocks) blocks ~= parseJSON(b.jsonText);
         j["thinking_blocks"] = blocks;
     }
     if (m.hasUsage)
@@ -189,7 +190,7 @@ JSONValue messageRecord(const ref Message m)
 }
 
 /// Parse a message record body.
-Message messageFromRecord(JSONValue j)
+Message messageFromRecord(JSONValue j) pure
 {
     import std.algorithm : countUntil;
     Message m;
@@ -211,7 +212,7 @@ Message messageFromRecord(JSONValue j)
                 auto mal = "malformed_arguments" in c;
                 // Legacy logs held malformed text as a string `arguments`.
                 auto raw = mal && mal.type == JSONType.string ? mal.str
-                    : args.type == JSONType.string ? args.str : args.toString;
+                    : args.type == JSONType.string ? args.str : args.jsonText;
                 auto call = ToolCall.fromRaw(c["id"].str, c["name"].str, raw);
                 if (auto iid = "item_id" in c) if (iid.type == JSONType.string) call.itemId = iid.str;
                 m.toolCalls ~= call;
@@ -260,9 +261,9 @@ Message messageFromRecord(JSONValue j)
 
 /// One log line. `type` comes first and `/` is not escaped, byte-for-byte
 /// like serde: Rust's session index finds records by the `{"type":"input"` prefix.
-private string record(string type, JSONValue data)
+private string record(string type, JSONValue data) pure
 {
-    return `{"type":` ~ JSONValue(type).toString ~ `,"data":` ~ data.toString(JSONOptions.doNotEscapeSlashes) ~ "}\n";
+    return `{"type":` ~ JSONValue(type).jsonText ~ `,"data":` ~ data.jsonText(JSONOptions.doNotEscapeSlashes) ~ "}\n";
 }
 
 /// An append-only session log in the Rust nano-coder's format (version 1):
@@ -437,7 +438,7 @@ class SessionLog
 /// legacy prompt with hook context appended (`<input>\n\n<system-reminder>…`)
 /// gets the logged input it starts with (the longest such) as its user-typed
 /// part. A message that already has one, or is exactly an input, is left alone.
-void backfillPinText(ref Message m, const string[] inputs)
+void backfillPinText(ref Message m, const string[] inputs) pure
 {
     import std.algorithm : canFind, startsWith;
     import std.string : stripLeft;
@@ -581,8 +582,8 @@ Restored restore(string path)
                 throw new Exception(format("unsupported session format version %s (this build supports %s)", v, formatVersion));
             r.id = data["id"].str;
             if (r.id != path.baseName.stripExtension)
-                throw new Exception(format("session log header id %s does not match %s", JSONValue(r.id).toString,
-                    JSONValue(path.baseName.stripExtension).toString));
+                throw new Exception(format("session log header id %s does not match %s", JSONValue(r.id).jsonText,
+                    JSONValue(path.baseName.stripExtension).jsonText));
             if (auto c = "cwd" in data) r.cwd = c.str;
             if (auto m = "model" in data) r.model = m.str;
             if (auto c = "created_at" in data) r.createdAt = c.str;
@@ -772,7 +773,7 @@ string ago(SysTime then, SysTime now)
 }
 
 /// One line of text: whitespace collapsed and control characters dropped.
-string oneLine(string text)
+string oneLine(string text) pure
 {
     import std.array : split, join;
     import std.uni : isControl;

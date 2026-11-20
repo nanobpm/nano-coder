@@ -20,7 +20,7 @@ private Regex!char re(string pattern)
     return regex(pattern, flags);
 }
 
-private string trimQuotes(string s, string set)
+private string trimQuotes(string s, string set) pure
 {
     while (s.length && set.canFind(s[0])) s = s[1 .. $];
     while (s.length && set.canFind(s[$ - 1])) s = s[0 .. $ - 1];
@@ -62,7 +62,7 @@ string looksLikeSecret(string text)
 /// After `<label> is`: a value stated outright is a secret; a location
 /// (`stored in the vault`) is not, unless a secret-shaped word or an `as <value>`
 /// connective follows it.
-private bool copularValueIsSecret(string rest)
+private bool copularValueIsSecret(string rest) pure
 {
     static immutable fillers = ["the", "a", "an", "your", "my", "our", "their", "his", "her", "its"];
     static immutable location = ["stored", "in", "at", "kept", "lives", "set", "saved", "located", "found", "defined",
@@ -83,18 +83,18 @@ private bool copularValueIsSecret(string rest)
     return false;
 }
 
-private bool isSecretShaped(string value)
+private bool isSecretShaped(string value) pure
 {
     auto v = trimQuotes(value, `"',.;:`);
     return v.length >= 6 && v.any!(c => c >= '0' && c <= '9');
 }
 
-private bool isSecretStoreNoun(string lower)
+private bool isSecretStoreNoun(string lower) pure
 {
     return ["1password", "onepassword", "route53", "keepassxc"].canFind(lower);
 }
 
-private bool endsWithCredentialLabel(string text)
+private bool endsWithCredentialLabel(string text) pure
 {
     auto normalised = text.toLower.map!(c => c == '_' || c == '-' ? ' ' : c).to!string;
     auto words = normalised.split;
@@ -119,7 +119,7 @@ bool evidenceStatesLabelValue(string text, string evidence)
     return looksLikeSecret(text ~ " is " ~ evidence) !is null;
 }
 
-private bool isPlaceholder(string value)
+private bool isPlaceholder(string value) pure
 {
     if (value.length >= 2 && value[0] == '<' && value[$ - 1] == '>')
     {
@@ -135,19 +135,19 @@ private bool isPlaceholder(string value)
     return isPlaceholderFiller(value);
 }
 
-private bool isShellVarName(string name)
+private bool isShellVarName(string name) pure
 {
     if (!name.length || !(isAlpha(name[0]) || name[0] == '_')) return false;
     return name.all!(c => c < 0x80 && (isAlphaNum(cast(char) c) || c == '_'));
 }
 
-private bool isMask(string s)
+private bool isMask(string s) pure
 {
     import std.utf : byDchar;
     return s.byDchar.all!(c => c == 'x' || c == 'X' || c == '*' || c == '•');
 }
 
-private bool isPlaceholderFiller(string value)
+private bool isPlaceholderFiller(string value) pure
 {
     size_t a = 0, b = value.length;
     while (a < b && !(value[a] < 0x80 && isAlphaNum(value[a]))) a++;
@@ -171,12 +171,12 @@ private bool isPlaceholderFiller(string value)
 
 // ---- remote normalisation ----
 
-private bool dosDrivePrefix(string s)
+private bool dosDrivePrefix(string s) pure
 {
     return s.length >= 2 && isAlpha(s[0]) && s[1] == ':';
 }
 
-private bool scpAuthority(string s)
+private bool scpAuthority(string s) pure
 {
     auto colon = s.indexOf(':');
     if (colon < 0) return false;
@@ -220,7 +220,7 @@ private string sanitizeUriQuery(string query)
     return kept.join("&");
 }
 
-private string percentDecodeLossy(string s)
+private string percentDecodeLossy(string s) pure
 {
     import nano.tools : lossyUtf8;
     ubyte[] out_;
@@ -237,7 +237,7 @@ private string percentDecodeLossy(string s)
     return lossyUtf8(out_);
 }
 
-private bool isCredentialQueryKey(string key)
+private bool isCredentialQueryKey(string key) pure
 {
     static immutable substr = ["password", "passwd", "pwd", "apikey", "accesskey", "privatekey", "credential", "signature", "oauth"];
     static immutable affix = ["token", "secret", "auth"];

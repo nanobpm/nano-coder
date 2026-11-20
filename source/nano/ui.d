@@ -37,7 +37,7 @@ string describe(Verbosity v) pure nothrow
 }
 
 /// Parse a level (trimmed, any case), with Rust's error wording.
-Verbosity parseVerbosity(string s)
+Verbosity parseVerbosity(string s) pure
 {
     import nano.trajectory : serdeString;
     auto t = s.strip.toLower;
@@ -47,7 +47,7 @@ Verbosity parseVerbosity(string s)
 }
 
 /// The bare `/verbosity` listing.
-string verbosityListing(Verbosity current)
+string verbosityListing(Verbosity current) pure
 {
     auto out_ = format("Verbosity: %s (%s)", current.name, current.describe);
     foreach (v; allVerbosities) out_ ~= format("\n  %-8s %s", v.name, v.describe);
@@ -99,7 +99,7 @@ string derivedEndpointSource(const ref ProviderConfig p)
 }
 
 /// Rust prints the kind with `{:?}` lowercased (`GithubCopilot` → `githubcopilot`).
-private string kindLabel(const ref ProviderConfig p)
+private string kindLabel(const ref ProviderConfig p) pure
 {
     if (!p.hasKind) return "?";
     final switch (p.kind)

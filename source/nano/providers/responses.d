@@ -5,6 +5,7 @@
 module nano.providers.responses;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 
 import std.json;
 import std.format : format;
@@ -14,14 +15,14 @@ import nano.llm;
 import nano.config : ResolvedProvider, reasonsOverResponses;
 import thinking = nano.thinking;
 
-private string strOf(const JSONValue v, string key)
+private string strOf(const JSONValue v, string key) pure
 {
     import nano.safeio : jsonGet;
     auto p = jsonGet(v, key);
     return p && p.type == JSONType.string ? p.str : "";
 }
 
-private string typeOf(const JSONValue v) { return strOf(v, "type"); }
+private string typeOf(const JSONValue v) pure { return strOf(v, "type"); }
 
 /// The Responses request body for `req`, with provider overrides applied.
 JSONValue responsesBody(const ref ChatRequest req, const ref ResolvedProvider p, bool stream)
@@ -45,7 +46,7 @@ JSONValue responsesBody(const ref ChatRequest req, const ref ResolvedProvider p,
                 // Reasoning items go right before the calls they led to.
                 if (replay)
                     foreach (ref b; m.thinkingBlocks)
-                        if (typeOf(b) == "reasoning") input ~= parseJSON(b.toString);
+                        if (typeOf(b) == "reasoning") input ~= parseJSON(b.jsonText);
                 foreach (ref c; m.toolCalls)
                 {
                     JSONValue fc = ["type": "function_call", "call_id": c.id, "name": c.name,
@@ -104,7 +105,7 @@ JSONValue responsesBody(const ref ChatRequest req, const ref ResolvedProvider p,
 }
 
 /// Text of a content-part list (refusals skipped).
-private string partsText(const JSONValue content)
+private string partsText(const JSONValue content) pure
 {
     string s;
     if (content.type == JSONType.array)
@@ -113,7 +114,7 @@ private string partsText(const JSONValue content)
     return s;
 }
 
-private string reasoningText(const JSONValue item)
+private string reasoningText(const JSONValue item) pure
 {
     string s;
     foreach (key; ["summary", "content"])
@@ -122,7 +123,7 @@ private string reasoningText(const JSONValue item)
 }
 
 /// `incomplete` surfaces its nested reason (e.g. `max_output_tokens`).
-private string stopReason(const JSONValue response)
+private string stopReason(const JSONValue response) pure
 {
     auto status = strOf(response, "status");
     if (status == "incomplete")
@@ -134,7 +135,7 @@ private string stopReason(const JSONValue response)
     return status;
 }
 
-private void readUsage(const JSONValue u, ref TokenUsage usage)
+private void readUsage(const JSONValue u, ref TokenUsage usage) pure
 {
     if (u.type != JSONType.object) return;
     if (auto v = "input_tokens" in u.objectNoRef) if (v.type == JSONType.integer) usage.inputTokens = v.integer;
@@ -144,7 +145,7 @@ private void readUsage(const JSONValue u, ref TokenUsage usage)
             if (auto v = "cached_tokens" in d.objectNoRef) if (v.type == JSONType.integer) usage.cachedInputTokens = v.integer;
 }
 
-private ToolCall callFrom(const JSONValue item, string raw)
+private ToolCall callFrom(const JSONValue item, string raw) pure
 {
     auto id = strOf(item, "call_id");
     if (!id.length) id = strOf(item, "id");
@@ -154,12 +155,12 @@ private ToolCall callFrom(const JSONValue item, string raw)
 }
 
 /// Parse a whole (non-streamed) Responses payload.
-LLMResponse parseResponses(JSONValue v, bool replay)
+LLMResponse parseResponses(JSONValue v, bool replay) pure
 {
     if (strOf(v, "status") == "failed")
-        throw new Exception("response failed: " ~ ("error" in v ? v["error"].toString : v.toString));
+        throw new Exception("response failed: " ~ ("error" in v ? v["error"].jsonText : v.jsonText));
     auto output = "output" in v;
-    if (output is null || output.type != JSONType.array) throw new Exception("response has no output: " ~ v.toString);
+    if (output is null || output.type != JSONType.array) throw new Exception("response has no output: " ~ v.jsonText);
     LLMResponse r;
     foreach (item; output.arrayNoRef)
         switch (typeOf(item))
@@ -236,15 +237,15 @@ struct ResponsesStream
                 break;
             case "response.failed":
                 auto resp = "response" in j;
-                throw new Exception("response failed: " ~ (resp && "error" in *resp ? (*resp)["error"].toString : j.toString));
+                throw new Exception("response failed: " ~ (resp && "error" in *resp ? (*resp)["error"].jsonText : j.jsonText));
             case "error", "response.error":
-                throw new Exception("stream error: " ~ ("error" in j ? j["error"].toString : j.toString));
+                throw new Exception("stream error: " ~ ("error" in j ? j["error"].jsonText : j.jsonText));
             default:
                 break;
         }
     }
 
-    LLMResponse finish()
+    LLMResponse finish() pure
     {
         import std.algorithm : sort;
         size_t position;

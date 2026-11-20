@@ -6,6 +6,7 @@ module nano.history;
 import std.string : strip;
 
 @safe:
+pure:
 
 struct InputHistory
 {
@@ -19,7 +20,7 @@ struct InputHistory
     private string draft;
 
     /// Record a submitted line; blanks and repeats of the previous line aren't kept.
-    void record(string line)
+    void record(string line) pure
     {
         if (!line.strip.length || (lines.length && lines[$ - 1] == line)) return;
         lines ~= line;
@@ -28,7 +29,7 @@ struct InputHistory
 
     /// The entry one older than shown, or null at the oldest. The first call
     /// saves `current` as the draft.
-    string up(string current)
+    string up(string current) pure
     {
         if (position < 0)
         {
@@ -45,7 +46,7 @@ struct InputHistory
     }
 
     /// The entry one newer; past the newest, the saved draft. null when not browsing.
-    string down()
+    string down() pure
     {
         if (position < 0) return null;
         if (position + 1 < lines.length) return lines[++position];
@@ -54,11 +55,11 @@ struct InputHistory
     }
 
     /// The line changed by other means: the next Up starts from the newest.
-    void edited() { position = -1; }
+    void edited() pure { position = -1; }
 
     /// Take the browsing state (position and saved draft), leaving history
     /// not browsing, for a parked editor line (`restoreBrowsing` puts it back).
-    HistoryBrowsing parkBrowsing()
+    HistoryBrowsing parkBrowsing() pure
     {
         auto b = HistoryBrowsing(position, draft);
         position = -1;
@@ -67,7 +68,7 @@ struct InputHistory
     }
 
     /// ditto
-    void restoreBrowsing(HistoryBrowsing b)
+    void restoreBrowsing(HistoryBrowsing b) pure
     {
         position = b.position;
         draft = b.draft;

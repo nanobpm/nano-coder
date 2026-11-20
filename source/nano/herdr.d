@@ -55,7 +55,7 @@ struct Session
 
 /// The resume argv for `sessionId`, or null when Herdr would reject it
 /// (apostrophes or control characters, too many arguments or bytes).
-immutable(string)[] resumeArgv(string sessionId, string model, const string[] extra)
+immutable(string)[] resumeArgv(string sessionId, string model, const string[] extra) pure
 {
     import std.algorithm : any, canFind;
     import std.uni : isControl;
@@ -72,7 +72,7 @@ immutable(string)[] resumeArgv(string sessionId, string model, const string[] ex
 }
 
 /// The arguments (after the Herdr binary) for one state report.
-string[] reportArgs(string pane, State state, ulong seq, string message)
+string[] reportArgs(string pane, State state, ulong seq, string message) pure
 {
     import std.uni : isControl;
     string[] args = ["pane", "report-agent", pane, "--source", source, "--agent", agent, "--state", state.to!string,
@@ -96,13 +96,13 @@ string[] reportArgs(string pane, State state, ulong seq, string message)
 /// The arguments for a session report. Sent separately from the state
 /// report because Herdr before 0.9.2 rejects the trailing resume argv: there
 /// only this call fails, and state reports keep working.
-string[] sessionArgs(string pane, ulong seq, const Session session)
+string[] sessionArgs(string pane, ulong seq, const Session session) pure
 {
     return ["pane", "report-agent-session", pane, "--source", source, "--agent", agent, "--seq", seq.to!string,
         "--agent-session-id", session.id, "--"] ~ session.resume.dup;
 }
 
-string[] releaseArgs(string pane, ulong seq)
+string[] releaseArgs(string pane, ulong seq) pure
 {
     return ["pane", "release-agent", pane, "--source", source, "--agent", agent, "--seq", seq.to!string];
 }

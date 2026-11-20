@@ -5,6 +5,7 @@
 module nano.reminders;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 
 import std.algorithm : canFind, startsWith, all;
 import std.array : join;
@@ -33,7 +34,7 @@ enum size_t repeatHardStopAfter = repeatWarnAfter + repeatMaxWarnings;
 immutable string[] repeatExemptTools = ["question"];
 
 /// Wrap reminder text in `<system-reminder>` tags.
-string wrap(string text)
+string wrap(string text) pure
 {
     return "<system-reminder>\n" ~ text ~ "\n</system-reminder>";
 }
@@ -45,9 +46,9 @@ struct RepeatVerdict
     Kind kind;
     string text; /// the warning, or the hard-stop reason
 
-    bool none() const { return kind == Kind.none; }
-    bool warning() const { return kind == Kind.warning; }
-    bool hardStop() const { return kind == Kind.hardStop; }
+    bool none() pure const { return kind == Kind.none; }
+    bool warning() pure const { return kind == Kind.warning; }
+    bool hardStop() pure const { return kind == Kind.hardStop; }
 }
 
 /// Tool-call counters behind the reminders.
@@ -62,25 +63,25 @@ struct Reminders
     /// Whether `report_outcome` is offered, so the warning only names it then.
     bool outcomeTool;
 
-    this(bool outcomeTool) { this.outcomeTool = outcomeTool; }
+    this(bool outcomeTool) pure { this.outcomeTool = outcomeTool; }
 
-    void startTurn()
+    void startTurn() pure
     {
         thisTurn = 0;
         resetRepeat();
         repeatWarnings = 0;
     }
 
-    void planChanged() { sincePlanChange = 0; }
+    void planChanged() pure { sincePlanChange = 0; }
 
-    void memorySaved()
+    void memorySaved() pure
     {
         sinceMemorySave = 0;
         suggestedMemory = true;
     }
 
     /// Break the current streak without counting a call (plan/outcome calls).
-    void resetRepeat()
+    void resetRepeat() pure
     {
         repeatCount = 0;
         repeatKey_ = null;
@@ -88,7 +89,7 @@ struct Reminders
     }
 
     /// Count a (non-plan) tool call and return any reminders for its result.
-    string[] afterToolCall(const ref Plan plan, bool memoryWritable)
+    string[] afterToolCall(const ref Plan plan, bool memoryWritable) pure
     {
         ++sincePlanChange;
         ++thisTurn;
@@ -207,7 +208,7 @@ immutable string[] diagnosticStages = ["wc", "head", "tail", "cat", "tac", "sort
 
 /// The argument text a repeat match is based on: for bash, the command with
 /// its trailing read-only diagnostic stages stripped plus the other arguments.
-string normalisedArgs(string tool, JSONValue args)
+string normalisedArgs(string tool, JSONValue args) pure
 {
     if (tool == "bash" && args.type == JSONType.object)
         if (auto c = "command" in args.objectNoRef)
@@ -215,13 +216,13 @@ string normalisedArgs(string tool, JSONValue args)
             {
                 JSONValue[string] rest;
                 foreach (k, v; args.objectNoRef) if (k != "command") rest[k] = v;
-                return pipelineKey(c.str) ~ "|" ~ JSONValue(rest).toString;
+                return pipelineKey(c.str) ~ "|" ~ JSONValue(rest).jsonText;
             }
-    return args.toString;
+    return args.jsonText;
 }
 
 /// Strip the trailing run of read-only diagnostic stages from a command.
-string pipelineKey(string command)
+string pipelineKey(string command) pure
 {
     auto stages = splitPipeline(command);
     if (stages is null || stages.length <= 1) return command.strip;
@@ -235,7 +236,7 @@ string pipelineKey(string command)
 
 /// Whether `b` is `a` with only read-only diagnostic stages appended (or the
 /// reverse): shared stages identical, every extra stage diagnostic.
-bool isDiagnosticExtension(string a, string b)
+bool isDiagnosticExtension(string a, string b) pure
 {
     auto sa = splitPipeline(a), sb = splitPipeline(b);
     if (sa is null || sb is null) return a.strip == b.strip;
@@ -247,7 +248,7 @@ bool isDiagnosticExtension(string a, string b)
 
 /// A stage that only reads stdin and writes stdout. Conservative: anything
 /// unrecognised or with shell control/redirection/substitution is not.
-bool isDiagnosticStage(string stage)
+bool isDiagnosticStage(string stage) pure
 {
     import std.array : split;
     stage = stage.strip;
@@ -273,7 +274,7 @@ private struct OptionSpec
     long maxReadPositionals = -1; // more positionals than this write (uniq OUT)
 }
 
-private bool optionSpec(string cmd, out OptionSpec spec)
+private bool optionSpec(string cmd, out OptionSpec spec) pure
 {
     switch (cmd)
     {
@@ -296,7 +297,7 @@ private bool optionSpec(string cmd, out OptionSpec spec)
 
 /// Whether a diagnostic command writes a file or runs a helper via an option
 /// or an extra positional. Long options match by unambiguous prefix (`--out`).
-private bool stageHasSideEffect(string cmd, string[] args)
+private bool stageHasSideEffect(string cmd, string[] args) pure
 {
     import std.algorithm.searching : startsWith, findSplit;
     import std.ascii : isDigit;
@@ -343,7 +344,7 @@ private bool stageHasSideEffect(string cmd, string[] args)
 
 /// Shell-style words of a stage: quotes stripped, escapes honoured. False for
 /// shapes not modelled (expansions, globs, redirections, unterminated quotes).
-private bool shellWords(string stage, out string[] words) nothrow
+private bool shellWords(string stage, out string[] words) pure nothrow
 {
     string cur;
     bool inWord;
@@ -403,7 +404,7 @@ private bool shellWords(string stage, out string[] words) nothrow
 /// Split into top-level pipeline stages, quote- and escape-aware. Returns null
 /// for shapes not modelled: `||`, `|&`, substitutions, here-docs, newlines and
 /// unterminated quotes.
-string[] splitPipeline(string command) nothrow
+string[] splitPipeline(string command) pure nothrow
 {
     string[] stages;
     size_t start, i;

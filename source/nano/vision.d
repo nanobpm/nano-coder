@@ -6,6 +6,7 @@
 module nano.vision;
 
 @safe:
+pure:
 
 import std.algorithm : canFind, any;
 import std.json;
@@ -22,15 +23,15 @@ struct Vision
     size_t maxImageBytes = DEFAULT_MAX_BYTES;
     string[] mediaTypes;
 
-    static Vision capable() { return Vision.init; }
+    static Vision capable() pure { return Vision.init; }
 
     /// The limits an image is prepared against for this model.
-    ImageLimits imageLimits() const
+    ImageLimits imageLimits() pure const
     {
         return ImageLimits(MAX_DIMENSION, maxImageBytes, mediaTypes.dup);
     }
 
-    static Nullable!Vision fromModelEntry(const JSONValue entry)
+    static Nullable!Vision fromModelEntry(const JSONValue entry) pure
     {
         Nullable!Vision none;
         auto caps = objGet(entry, "capabilities");
@@ -59,7 +60,7 @@ struct Vision
         return Nullable!Vision(out_);
     }
 
-    static Nullable!Vision fromOllamaShow(const JSONValue show)
+    static Nullable!Vision fromOllamaShow(const JSONValue show) pure
     {
         auto caps = objGet(show, "capabilities");
         if (caps !is null && caps.type == JSONType.array)
@@ -67,7 +68,7 @@ struct Vision
         return Nullable!Vision.init;
     }
 
-    static Nullable!Vision fromLlamacppProps(const JSONValue props)
+    static Nullable!Vision fromLlamacppProps(const JSONValue props) pure
     {
         auto m = objGet(props, "modalities");
         auto v = m is null ? null : objGet(*m, "vision");
@@ -77,10 +78,10 @@ struct Vision
 
 enum Source { model, provider, global, detected }
 
-private Vision copy(const Vision v) { return Vision(v.maxImages, v.maxImageBytes, v.mediaTypes.dup); }
+private Vision copy(const Vision v) pure { return Vision(v.maxImages, v.maxImageBytes, v.mediaTypes.dup); }
 
 /// The configured override (model, provider, global) and where it came from.
-Nullable!bool configuredOverride(Nullable!bool global, const ref ProviderConfig provider, string model, out Source source)
+Nullable!bool configuredOverride(Nullable!bool global, const ref ProviderConfig provider, string model, out Source source) pure
 {
     if (auto ms = model in provider.models)
         if (!ms.vision.isNull) { source = Source.model; return Nullable!bool(ms.vision.get); }
@@ -91,7 +92,7 @@ Nullable!bool configuredOverride(Nullable!bool global, const ref ProviderConfig 
 }
 
 Nullable!Vision resolve(Nullable!bool global, ProviderKind kind, const ref ProviderConfig provider, string model,
-    scope const(Vision)* reported = null)
+    scope const(Vision)* reported = null) pure
 {
     Source s;
     auto o = configuredOverride(global, provider, model, s);
@@ -109,7 +110,7 @@ Nullable!Vision resolve(Nullable!bool global, ProviderKind kind, const ref Provi
 }
 
 /// The lower-cased host of `url`.
-string baseUrlHost(string url)
+string baseUrlHost(string url) pure
 {
     auto at = url.indexOf("://");
     auto rest = at >= 0 ? url[at + 3 .. $] : url;
@@ -123,15 +124,15 @@ string baseUrlHost(string url)
     return auth.toLower;
 }
 
-private bool hostIs(string url, string domain)
+private bool hostIs(string url, string domain) pure
 {
     auto h = baseUrlHost(url);
     return h == domain || (h.length > domain.length && h.endsWith("." ~ domain));
 }
 
-private bool endsWith(string s, string t) { return s.length >= t.length && s[$ - t.length .. $] == t; }
+private bool endsWith(string s, string t) pure { return s.length >= t.length && s[$ - t.length .. $] == t; }
 
-private string baseModel(string model)
+private string baseModel(string model) pure
 {
     auto m = model.toLower;
     if (m.startsWith("ft:"))
@@ -143,20 +144,20 @@ private string baseModel(string model)
     return m;
 }
 
-private bool familyMatch(string base, string family)
+private bool familyMatch(string base, string family) pure
 {
     if (!base.startsWith(family)) return false;
     auto rest = base[family.length .. $];
     return rest.length == 0 || rest[0] == '-' || rest[0] == '.';
 }
 
-bool assumesAnthropicVision(string model)
+bool assumesAnthropicVision(string model) pure
 {
     auto b = baseModel(model);
     return !familyMatch(b, "claude-2") && !familyMatch(b, "claude-instant");
 }
 
-bool assumesOpenaiVision(string model)
+bool assumesOpenaiVision(string model) pure
 {
     auto b = baseModel(model);
     foreach (t; ["o3-mini", "o1-mini", "o1-preview"])

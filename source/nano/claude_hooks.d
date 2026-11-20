@@ -9,6 +9,7 @@
 module nano.claude_hooks;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 import nano.clock : monoNow, sleepFor;
 
 import nano.safeio : ignoreSigpipe, killGroup, pollFds, readFd, setNonBlocking, writeFd;
@@ -158,7 +159,7 @@ struct Outcome
     string stop; /// null = none
     string[] systemMessages;
 
-    private void absorb(HookResult r)
+    private void absorb(HookResult r) pure
     {
         if (r.blocked)
         {
@@ -174,13 +175,13 @@ struct Outcome
     }
 
     /// The combined additional context as one block, or null.
-    string contextBlock() const
+    string contextBlock() pure const
     {
         return context.length ? context.join("\n\n") : null;
     }
 
     /// Whether this (tool) outcome denies the call outright.
-    bool denies() const
+    bool denies() pure const
     {
         return blocked || decision == Decision.deny;
     }
@@ -246,7 +247,7 @@ class HookManager
     string permissionMode = "default";
     SandboxConfig sandbox;
 
-    this(Hook[] hooks, string projectDir)
+    this(Hook[] hooks, string projectDir) pure
     {
         this.hooks = hooks;
         this.projectDir = projectDir;
@@ -370,7 +371,7 @@ class HookManager
                     if (ifRule !is null)
                         if (auto err = validateRule(ifRule))
                         {
-                            skipped ~= Skipped(eventName, format("invalid `if` filter %s: %s", JSONValue(ifRule).toString, err), source);
+                            skipped ~= Skipped(eventName, format("invalid `if` filter %s: %s", JSONValue(ifRule).jsonText, err), source);
                             continue;
                         }
                     Hook h;
@@ -382,7 +383,7 @@ class HookManager
                         if (a.type == JSONType.array)
                         {
                             h.hasArgs = true;
-                            foreach (x; a.arrayNoRef) h.args ~= x.type == JSONType.string ? x.str : x.toString;
+                            foreach (x; a.arrayNoRef) h.args ~= x.type == JSONType.string ? x.str : x.jsonText;
                         }
                     if (auto t = "timeout" in entry)
                     {
@@ -399,14 +400,14 @@ class HookManager
     /// Drop duplicate handlers (same event, matcher, `if` rule and command and
     /// args), keeping the first. Shell form (no args) stays distinct from exec
     /// form with no args.
-    private void dedup()
+    private void dedup() pure
     {
         bool[string] seen;
         Hook[] kept;
         foreach (h; hooks)
         {
             auto key = JSONValue([JSONValue(claudeName(h.event)), JSONValue(h.matcher), JSONValue(h.ifRule),
-                JSONValue(h.command), h.hasArgs ? JSONValue(h.args) : JSONValue(null)]).toString;
+                JSONValue(h.command), h.hasArgs ? JSONValue(h.args) : JSONValue(null)]).jsonText;
             if (key in seen) continue;
             seen[key] = true;
             kept ~= h;
@@ -414,7 +415,7 @@ class HookManager
         hooks = kept;
     }
 
-    void setSession(string id, string transcript, string mode)
+    void setSession(string id, string transcript, string mode) pure
     {
         sessionId = id;
         transcriptPath = transcript;
@@ -422,7 +423,7 @@ class HookManager
     }
 
     /// One-line startup notice for project hooks, or null.
-    string startupNotice() const
+    string startupNotice() pure const
     {
         string[] events;
         size_t n;
@@ -442,7 +443,7 @@ class HookManager
     }
 
     /// The `/hooks` listing: loaded hooks, skipped hooks, files read.
-    string listing() const
+    string listing() pure const
     {
         string out_;
         if (!hooks.length) out_ ~= "No hooks loaded.\n";
@@ -542,7 +543,7 @@ class HookManager
     private Outcome runAll(const(Hook)[] selected, Event event, JSONValue input)
     {
         Outcome o;
-        auto json = input.toString;
+        auto json = input.jsonText;
         foreach (ref h; selected) o.absorb(interpret(event, h, execute(h, json, projectDir, h.source.isProject ? sandbox : SandboxConfig.init)));
         return o;
     }
@@ -555,7 +556,7 @@ private Duration timeoutOf(ulong secs) @safe pure nothrow
     return secs > long.max / 10_000_000 ? Duration.max : (cast(long) secs).seconds;
 }
 
-private string optString(JSONValue o, string key)
+private string optString(JSONValue o, string key) pure
 {
     if (auto v = key in o)
         if (v.type == JSONType.string) return v.str;
@@ -621,7 +622,7 @@ string claudeToolName(string nanoTool) @safe pure nothrow
 }
 
 /// nano's tool arguments presented as Claude's `tool_input`.
-JSONValue toolInputFor(string nanoTool, JSONValue args)
+JSONValue toolInputFor(string nanoTool, JSONValue args) pure
 {
     string[] keys;
     switch (nanoTool)
@@ -641,7 +642,7 @@ JSONValue toolInputFor(string nanoTool, JSONValue args)
 
 /// Translate a hook's `updatedInput` (Claude `tool_input` space) back into
 /// nano's argument space, merged onto the original arguments.
-JSONValue applyUpdatedInput(string nanoTool, JSONValue original, JSONValue updated)
+JSONValue applyUpdatedInput(string nanoTool, JSONValue original, JSONValue updated) pure
 {
     if (updated.type != JSONType.object) return original;
     JSONValue r = JSONValue(string[string].init);
@@ -902,7 +903,7 @@ private string expandProjectDir(string text, string dir) @safe pure
 
 /// Interpret a process run per the Claude protocol, with nano's fail-closed
 /// `PreToolUse` behaviour.
-private HookResult interpret(Event event, const ref Hook hook, ProcessRun run)
+private HookResult interpret(Event event, const ref Hook hook, ProcessRun run) pure
 {
     HookResult r;
     string failure = run.launchError;
@@ -947,7 +948,7 @@ private HookResult interpret(Event event, const ref Hook hook, ProcessRun run)
     return r;
 }
 
-private void applyJsonOutput(Event event, JSONValue json, ref HookResult r)
+private void applyJsonOutput(Event event, JSONValue json, ref HookResult r) pure
 {
     static string getStr(JSONValue v, string key)
     {
@@ -1001,7 +1002,7 @@ private void applyJsonOutput(Event event, JSONValue json, ref HookResult r)
 /// Single-line sanitiser for config-derived text in the `/hooks` listing:
 /// control characters become visible control pictures and U+2028/U+2029
 /// become ␤, so a crafted command cannot forge an extra listing row.
-string listingField(string text) nothrow
+string listingField(string text) pure nothrow
 {
     import std.utf : byDchar;
     string out_;
@@ -1017,7 +1018,7 @@ string listingField(string text) nothrow
 
 /// Cap a field at `fieldCap` characters (not bytes); over the cap keep
 /// `fieldCap - 1` characters plus an ellipsis.
-string cap(string text)
+string cap(string text) pure
 {
     import std.utf : byDchar;
     import std.range : take;
@@ -1097,7 +1098,7 @@ version (unittest)
     }
 
 
-    private Hook cmd(Event e, string command)
+    private Hook cmd(Event e, string command) pure
     {
         Hook h;
         h.event = e;
@@ -1106,14 +1107,14 @@ version (unittest)
         return h;
     }
 
-    private HookManager with_(Hook[] hooks, string dir)
+    private HookManager with_(Hook[] hooks, string dir) pure
     {
         auto m = new HookManager(hooks, dir);
         m.sessionId = "s1";
         return m;
     }
 
-    private JSONValue j(string s) { return parseJSON(s); }
+    private JSONValue j(string s) pure { return parseJSON(s); }
 
     private HookManager loadProject(string dir, string settings, bool disable = false, bool noProject = false)
     {

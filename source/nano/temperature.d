@@ -5,6 +5,7 @@
 module nano.temperature;
 
 @safe:
+pure:
 
 import std.algorithm : canFind;
 import std.format : format;
@@ -17,7 +18,7 @@ enum MAX = 2.0;
 
 enum Source { model, provider, global, extraBody, required }
 
-string label(Source s)
+string label(Source s) pure
 {
     final switch (s)
     {
@@ -30,7 +31,7 @@ string label(Source s)
 }
 
 /// Display a value: NaN is the model default; whole numbers print bare.
-string show(double v)
+string show(double v) pure
 {
     if (isNaN(v)) return "model default";
     return format("%g", v);
@@ -48,7 +49,7 @@ struct Resolved
     private string extraBodyWarning;
 
     /// This resolution with the temperature dropped for `reason`.
-    Resolved fixedBy(string reason) const
+    Resolved fixedBy(string reason) pure const
     {
         if (fixed.length) return this;
         Resolved r;
@@ -63,11 +64,11 @@ struct Resolved
         return r;
     }
 
-    string describe() const { return format("%s (%s)", show(effective), label(source)); }
+    string describe() pure const { return format("%s (%s)", show(effective), label(source)); }
 }
 
 /// Why `model` accepts no temperature, if it doesn't.
-string fixedReason(ProviderKind kind, const ref ProviderConfig provider, string model)
+string fixedReason(ProviderKind kind, const ref ProviderConfig provider, string model) pure
 {
     import nano.config : reasonsOverResponses;
     if (provider.dropParams.canFind("temperature")) return "the provider drops temperature (drop_params)";
@@ -78,7 +79,7 @@ string fixedReason(ProviderKind kind, const ref ProviderConfig provider, string 
 /// The temperature for `model` on `provider`: the model's, else the
 /// provider's, else `global` (NaN = default); then `extra_body`, the fixed
 /// rules, and Anthropic's 0..1 clamp.
-Resolved resolve(double global, ProviderKind kind, const ref ProviderConfig provider, string model)
+Resolved resolve(double global, ProviderKind kind, const ref ProviderConfig provider, string model) pure
 {
     double chosen;
     Source source;

@@ -5,6 +5,7 @@
 module nano.tools.files;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 import nano.arith : saturatingSub;
 
 import nano.safeio : ownText, readBytes, realPath, statMode, chmodPath;
@@ -55,7 +56,7 @@ string resolvePath(string p)
     return buildNormalizedPath(absolutePath(expandTilde(p)));
 }
 
-bool looksBinary(const(ubyte)[] data)
+bool looksBinary(const(ubyte)[] data) pure
 {
     import std.algorithm : canFind;
     return data[0 .. min(data.length, 8192)].canFind(cast(ubyte) 0);
@@ -63,7 +64,7 @@ bool looksBinary(const(ubyte)[] data)
 
 /// Lines as `read_file` numbers them: split on `\n`, a `\r` before it dropped,
 /// no trailing empty line (Rust `str::lines`).
-string[] textLines(string s)
+string[] textLines(string s) pure
 {
     string[] out_;
     size_t st;
@@ -105,7 +106,7 @@ string readFile(JSONValue args, ReadState state)
         img["width"] = dims[0];
         img["height"] = dims[1];
         img["bytes"] = data.length;
-        return JSONValue(["image": img]).toString;
+        return JSONValue(["image": img]).jsonText;
     }
     if (looksBinary(data)) throw new ToolError(format("read_file: %s looks like a binary file (%s bytes)", path, data.length));
     import std.utf : validate, UTFException;
@@ -138,7 +139,7 @@ string readFile(JSONValue args, ReadState state)
 }
 
 /// A byte index ≤ `at` that does not split a UTF-8 sequence.
-private size_t safeCut(string s, size_t at)
+private size_t safeCut(string s, size_t at) pure
 {
     if (at >= s.length) return s.length;
     while (at > 0 && (s[at] & 0xC0) == 0x80) at--;
@@ -150,8 +151,8 @@ struct Expect
 {
     bool absent;
     const(ubyte)[] bytes;
-    static Expect none() { return Expect(true, null); }
-    static Expect was(const(ubyte)[] b) { return Expect(false, b); }
+    static Expect none() pure { return Expect(true, null); }
+    static Expect was(const(ubyte)[] b) pure { return Expect(false, b); }
 }
 
 private bool linkPresent(string path)
@@ -241,7 +242,7 @@ struct Located
 }
 
 /// `s` with `\n` turned into `\r\n` when `text` uses CRLF anywhere.
-private string toFileEndings(string text, string s)
+private string toFileEndings(string text, string s) pure
 {
     return text.indexOf("\r\n") >= 0 && s.indexOf('\r') < 0 ? s.replace("\n", "\r\n") : s;
 }
@@ -249,7 +250,7 @@ private string toFileEndings(string text, string s)
 /// The line ending for a replacement over `text[start .. end]`: a multiline
 /// region keeps the ending of the line it starts on; a single-line region
 /// uses its own line's terminator, else the file's first line ending.
-string endingFor(string text, size_t start, size_t end)
+string endingFor(string text, size_t start, size_t end) pure
 {
     auto lo = min(start, text.length);
     auto hi = max(min(end, text.length), lo);
@@ -264,13 +265,13 @@ string endingFor(string text, size_t start, size_t end)
     return lineCrlf || fileCrlf ? "\r\n" : "\n";
 }
 
-private string toEndingsAt(string text, size_t start, size_t end, string s)
+private string toEndingsAt(string text, size_t start, size_t end, string s) pure
 {
     return endingFor(text, start, end) == "\r\n" && s.indexOf('\r') < 0 ? s.replace("\n", "\r\n") : s;
 }
 
 /// `read_file`'s `{:>6}\t` line-number prefix: the number and the rest.
-private bool prefixNum(string line, out ulong num, out string rest)
+private bool prefixNum(string line, out ulong num, out string rest) pure
 {
     import std.ascii : isDigit;
     import std.conv : to, ConvException;
@@ -296,7 +297,7 @@ struct Stripped
 /// When `old` is copied `read_file` output (every line prefixed, numbers
 /// consecutive), `old` with the prefixes removed and its first line number.
 /// A `new` line prefixed with a number in old's range is ambiguous: rejected.
-Stripped stripLineNumbers(string old, string new_)
+Stripped stripLineNumbers(string old, string new_) pure
 {
     ulong[] nums;
     foreach (l; textLines(old))
@@ -330,12 +331,12 @@ Stripped stripLineNumbers(string old, string new_)
 }
 
 /// The 1-based line number byte offset `at` falls on.
-private ulong lineAt(string text, size_t at) { return text[0 .. at].count('\n') + 1; }
+private ulong lineAt(string text, size_t at) pure { return text[0 .. at].count('\n') + 1; }
 
-private bool atLineStart(string text, size_t at) { return at == 0 || text[at - 1] == '\n'; }
+private bool atLineStart(string text, size_t at) pure { return at == 0 || text[at - 1] == '\n'; }
 
 /// The file's lines as [start, end of content, end including terminator].
-private size_t[3][] lineSpans(string text)
+private size_t[3][] lineSpans(string text) pure
 {
     size_t[3][] spans;
     size_t st;
@@ -354,7 +355,7 @@ private size_t[3][] lineSpans(string text)
 }
 
 /// `old`'s lines without a trailing empty line, and whether it ended in `\n`.
-private string[] oldLines(string old, out bool endsNl)
+private string[] oldLines(string old, out bool endsNl) pure
 {
     endsNl = old.endsWith("\n");
     auto body_ = endsNl ? old[0 .. $ - 1] : old;
@@ -368,10 +369,10 @@ private string[] oldLines(string old, out bool endsNl)
     return ls;
 }
 
-private string leadingWs(string s) { return s[0 .. s.length - s.stripLeft.length]; }
+private string leadingWs(string s) pure { return s[0 .. s.length - s.stripLeft.length]; }
 
 /// `s` without `prefix`, or null when it doesn't start with it.
-private bool chop(string s, string prefix, out string rest)
+private bool chop(string s, string prefix, out string rest) pure
 {
     if (!s.startsWith(prefix)) return false;
     rest = s[prefix.length .. $];
@@ -381,7 +382,7 @@ private bool chop(string s, string prefix, out string rest)
 /// Re-indent `text` from the replacement's base indentation `had` to the
 /// file's `want`, keeping tab/space structure; incompatible whitespace (neither
 /// a prefix of the other) is rejected.
-string reindent(string text, string had, string want)
+string reindent(string text, string had, string want) pure
 {
     import std.range : drop, walkLength;
     if (!want.startsWith(had) && !had.startsWith(want))
@@ -404,7 +405,7 @@ string reindent(string text, string had, string want)
 /// Match `old` line by line ignoring trailing whitespace (or, with
 /// `trimStart`, indentation too). Only a unique match counts; an
 /// indentation-relaxed one re-indents the replacement.
-private bool matchLines(string text, string old, string new_, bool trimStart, out Located found)
+private bool matchLines(string text, string old, string new_, bool trimStart, out Located found) pure
 {
     auto spans = lineSpans(text);
     bool endsNl;
@@ -462,7 +463,7 @@ private bool matchLines(string text, string old, string new_, bool trimStart, ou
 }
 
 /// Non-overlapping occurrences of `pat` in `text`.
-private size_t[2][] occurrences(string text, string pat)
+private size_t[2][] occurrences(string text, string pat) pure
 {
     size_t[2][] r;
     size_t from;
@@ -484,7 +485,7 @@ private struct Attempt
 }
 
 /// Exact match of one attempt, in its literal and file-ending forms.
-private bool exactMatch(string text, const Attempt a, bool replaceAll, out Located found)
+private bool exactMatch(string text, const Attempt a, bool replaceAll, out Located found) pure
 {
     auto normalized = toFileEndings(text, a.old);
     auto cands = normalized != a.old ? [a.old, normalized] : [a.old];
@@ -518,7 +519,7 @@ private bool exactMatch(string text, const Attempt a, bool replaceAll, out Locat
 /// Find `old` in `text`: exactly (as given, then without `read_file` line
 /// numbers), then line by line ignoring trailing whitespace, then ignoring
 /// indentation. Relaxed matches must be unique and agree across attempts.
-Located locate(string text, string old, string new_, bool replaceAll)
+Located locate(string text, string old, string new_, bool replaceAll) pure
 {
     Located found;
     auto literal = Attempt(old, new_, "", 0);
@@ -552,7 +553,7 @@ Located locate(string text, string old, string new_, bool replaceAll)
 
 /// Lines `lo .. hi` (0-based, inclusive) numbered as `read_file` shows them;
 /// long spans keep their first and last 20 lines.
-private string numbered(const string[] lines, size_t lo, size_t hi)
+private string numbered(const string[] lines, size_t lo, size_t hi) pure
 {
     string fmt(size_t i)
     {
@@ -574,7 +575,7 @@ private string numbered(const string[] lines, size_t lo, size_t hi)
 /// The edited regions with three lines of context either side. Nearby regions
 /// merge, distant ones are separated by `...`, and a global budget bounds the
 /// total (omitted regions are noted).
-string snippet(string text, const size_t[2][] ranges)
+string snippet(string text, const size_t[2][] ranges) pure
 {
     auto lines = textLines(text);
     if (lines.length == 0) return "(the file is now empty)\n";
@@ -616,7 +617,7 @@ string snippet(string text, const size_t[2][] ranges)
 
 /// For a failed match: the window sharing the most trimmed lines with `old`,
 /// else (a misspelled line) the window with the most shared characters.
-string nearMiss(string text, string old)
+string nearMiss(string text, string old) pure
 {
     auto lines = textLines(text);
     bool endsNl;
@@ -739,7 +740,7 @@ version (unittest)
         return p;
     }
 
-    private JSONValue j(T...)(T kv)
+    private JSONValue j(T...)(T kv) pure
     {
         JSONValue o = JSONValue(string[string].init);
         static foreach (i; 0 .. T.length / 2) o[kv[2 * i]] = kv[2 * i + 1];

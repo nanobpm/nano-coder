@@ -475,7 +475,7 @@ struct Shared(T)
     /// A new cell holding `v`.
     static Shared make(T v = T.init) { return Shared(new shared Locked!T(v)); }
     /// Whether this handle refers to a cell.
-    bool opCast(B : bool)() const { return atomicLoad(impl) !is null; }
+    bool opCast(B : bool)() pure const { return atomicLoad(impl) !is null; }
     /// See `Locked`.
     T get() { return atomicLoad(impl).get(); }
     /// ditto
@@ -521,7 +521,7 @@ struct Isolated(T)
     /// Claim that nothing else refers to `value` (e.g. it was just built).
     /// The compiler can't check this; check-safe.sh counts every call
     /// against scripts/isolation-budget, so each claim gets reviewed.
-    static Isolated assumeIsolated(T value)
+    static Isolated assumeIsolated(T value) pure
     {
         Isolated r;
         r.payload = value;
@@ -529,7 +529,7 @@ struct Isolated(T)
     }
 
     /// Take the value out (the holder is left empty).
-    T unwrap()
+    T unwrap() pure
     {
         auto v = payload;
         payload = T.init;
@@ -538,7 +538,7 @@ struct Isolated(T)
 
     /// Make it immutable: sound because nothing else can still change it.
     /// `@trusted`: the cast is what isolation licenses (`assumeUnique`).
-    immutable(T) freeze() @trusted
+    immutable(T) freeze() pure @trusted
     {
         auto v = unwrap();
         return cast(immutable) v;
@@ -570,7 +570,7 @@ private final class ResultBox(R) { Unqual!R value; }
 
 /// `@trusted`: the thread wrote `box.value` before it ended, and `join`
 /// waited for that (a happens-before edge), so nothing else touches it now.
-private R takeResult(R)(ResultBox!R box) @trusted
+private R takeResult(R)(ResultBox!R box) pure @trusted
 {
     import core.lifetime : move;
     return cast(R) move(box.value);
@@ -641,7 +641,7 @@ struct Chan(T)
     /// A new, open channel.
     static Chan make() { return Chan(new shared Channel!T); }
     /// Whether this handle refers to a channel.
-    bool opCast(B : bool)() const { return atomicLoad(impl) !is null; }
+    bool opCast(B : bool)() pure const { return atomicLoad(impl) !is null; }
     /// See `Channel`.
     void put(T v, bool front = false) { atomicLoad(impl).put(v, front); }
     /// ditto
@@ -768,20 +768,23 @@ size_t[2] terminalSize(int fd = 1) @trusted nothrow @nogc
 
 /// C `strtod` (correctly rounded, unlike `std.conv.to!double`) on `text`;
 /// `consumed` is how many characters it read. The string is copied to a
-/// NUL-terminated buffer, and `end` only points into that copy.
-double cStrtod(string text, out size_t consumed) @trusted
+/// NUL-terminated buffer, and `end` only points into that copy. Pure: strtod
+/// reads only its input and the C locale, which stays "C" (check-safe bans
+/// setlocale); the errno it may set on overflow is never read.
+double cStrtod(string text, out size_t consumed) pure @trusted
 {
     import core.stdc.stdlib : strtod;
     import std.string : toStringz;
+    alias Strtod = double function(scope const(char)*, scope char**) pure nothrow @nogc;
     auto z = text.toStringz;
-    immutable(char)* end;
-    auto v = strtod(z, &end);
+    char* end;
+    auto v = (cast(Strtod) &strtod)(z, &end);
     consumed = end - z;
     return v;
 }
 
 /// ditto
-double cStrtod(string text)
+double cStrtod(string text) pure
 {
     size_t n;
     return cStrtod(text, n);
@@ -791,7 +794,7 @@ import std.json : JSONValue, JSONType;
 /// `v[key]` when `v` is an object holding it, else null. Phobos marks
 /// `JSONValue.object` @system because it returns the AA by reference; this
 /// only looks a key up and returns a pointer into the GC-owned table.
-const(JSONValue)* jsonGet(return scope const ref JSONValue v, string key) @trusted
+const(JSONValue)* jsonGet(return scope const ref JSONValue v, string key) pure @trusted
 {
     if (v.type != JSONType.object) return null;
     return key in v.object;
@@ -800,7 +803,7 @@ const(JSONValue)* jsonGet(return scope const ref JSONValue v, string key) @trust
 /// A deep, mutable copy of `v`, so a `const` tree can be merged into a
 /// mutable one without casting `const` away (and without the two sharing
 /// subtrees). Numbers are copied as stored, never re-parsed.
-JSONValue jsonCopy(const JSONValue v)
+JSONValue jsonCopy(const JSONValue v) pure
 {
     final switch (v.type)
     {
@@ -826,7 +829,7 @@ JSONValue jsonCopy(const JSONValue v)
 /// JSON is copied with `jsonCopy`, structs field by field. Data that is
 /// already immutable (strings) is shared. This replaces `cast()` copies out
 /// of `const`, which would let the copy write into the original.
-U deepCopy(U)(const U v)
+U deepCopy(U)(const U v) pure
 {
     import std.traits : hasIndirections, isAssociativeArray, KeyType, ValueType;
     import std.typecons : Nullable;
@@ -896,4 +899,54 @@ U deepCopy(U)(const U v)
     assert(jsonGet(j, "a").integer == 1 && jsonGet(j, "b") is null);
     auto n1 = JSONValue(1);
     assert(jsonGet(n1, "a") is null);
+}
+
+// --- JSON text, pure -------------------------------------------------------
+
+import std.json : JSONOptions, JSONValue;
+
+private string jsonTextImpl(const JSONValue v, JSONOptions options, bool pretty)
+{
+    return pretty ? v.toPrettyString(options) : v.toString(options);
+}
+
+/// `v.toString(options)`, but `pure`, so code that serializes JSON can be.
+// why: std.json's toJSON recurses through a nested function, for which D
+// infers no attributes, so it isn't marked pure; it only writes to its own
+// appender (floats through std.format's pure formatter) and reads no globals.
+string jsonText(const JSONValue v, JSONOptions options = JSONOptions.none) pure @trusted
+{
+    alias Impure = string function(const JSONValue, JSONOptions, bool) @safe;
+    alias Pure = string function(const JSONValue, JSONOptions, bool) pure @safe;
+    return (cast(Pure) cast(Impure) &jsonTextImpl)(v, options, false);
+}
+
+/// `v.toPrettyString(options)`, pure; see `jsonText`.
+// why: as for jsonText.
+string jsonPretty(const JSONValue v, JSONOptions options = JSONOptions.none) pure @trusted
+{
+    alias Impure = string function(const JSONValue, JSONOptions, bool) @safe;
+    alias Pure = string function(const JSONValue, JSONOptions, bool) pure @safe;
+    return (cast(Pure) cast(Impure) &jsonTextImpl)(v, options, true);
+}
+
+/// Through a pointer, as `p.toString` reads (UFCS doesn't dereference).
+string jsonText(const(JSONValue)* v, JSONOptions options = JSONOptions.none) pure
+{
+    return jsonText(*v, options);
+}
+
+/// ditto
+string jsonPretty(const(JSONValue)* v, JSONOptions options = JSONOptions.none) pure
+{
+    return jsonPretty(*v, options);
+}
+
+unittest
+{
+    import std.json : parseJSON;
+    auto v = parseJSON(`{"a":[1,2.5,"x/y"],"b":null}`);
+    assert(jsonText(v) == v.toString);
+    assert(jsonText(v, JSONOptions.doNotEscapeSlashes) == v.toString(JSONOptions.doNotEscapeSlashes));
+    assert(jsonPretty(v) == v.toPrettyString);
 }

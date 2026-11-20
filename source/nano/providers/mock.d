@@ -15,7 +15,7 @@ class MockClient : LLMClient
     /// The `max_tokens` sent with each request.
     long[] maxTokensSeen;
 
-    this(LLMResponse[] script) { this.script = script; }
+    this(LLMResponse[] script) pure { this.script = script; }
 
     LLMResponse chat(const ref ChatRequest req, StreamSink sink)
     {
@@ -43,7 +43,7 @@ class MockClient : LLMClient
         return r;
     }
 
-    string[] listModels() { return ["mock"]; }
-    string modelName() const { return "mock"; }
-    string providerName() const { return "mock"; }
+    string[] listModels() pure { return ["mock"]; }
+    string modelName() pure const { return "mock"; }
+    string providerName() pure const { return "mock"; }
 }

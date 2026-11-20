@@ -293,7 +293,7 @@ private Key modifiedKey(uint key, uint modifier)
     return Key(K.ignored);
 }
 
-private uint[] splitNums(string s)
+private uint[] splitNums(string s) pure
 {
     uint[] out_;
     import std.algorithm : splitter;
@@ -412,27 +412,27 @@ struct EditState
     /// the idle-compaction quiet check reads it; staleness keeps `lastEdit`.
     MonoTime lastKey;
 
-    string text() const { return buf.to!string; }
+    string text() pure const { return buf.to!string; }
 
     /// When the prompt last saw user activity: the latest of `shown` (when
     /// the prompt was put up), the last edit and the last key of any kind.
-    MonoTime quietSince(MonoTime shown) const { return max(shown, lastEdit, lastKey); }
+    MonoTime quietSince(MonoTime shown) pure const { return max(shown, lastEdit, lastKey); }
 
     /// Record that the reader saw a key (see `lastKey`).
-    void keySeen(MonoTime at) { lastKey = at; }
+    void keySeen(MonoTime at) pure { lastKey = at; }
 
     /// A fresh half-typed line holds back a due timer; an empty or stale one doesn't.
-    bool holdsTimer(MonoTime now) const { return buf.length && !draftIsStale(now); }
+    bool holdsTimer(MonoTime now) pure const { return buf.length && !draftIsStale(now); }
 
     /// The draft has been idle for `draftHold` (or was never touched by a key).
-    bool draftIsStale(MonoTime now) const
+    bool draftIsStale(MonoTime now) pure const
     {
         return buf.length && (lastEdit == MonoTime.init || now - lastEdit >= draftHold);
     }
 
     /// Clear the line for a timer turn, returning it to put back afterwards;
     /// false (nothing parked) when the line is empty.
-    bool parkDraft(out ParkedDraft parked)
+    bool parkDraft(out ParkedDraft parked) pure
     {
         if (!buf.length) return false;
         parked = ParkedDraft(buf, cursor, lastEdit, generation, history.parkBrowsing());
@@ -446,7 +446,7 @@ struct EditState
     /// Put a parked draft back, unless the user typed, cleared or sent
     /// something since it was parked. Its age is kept, so a stale draft
     /// doesn't hold the next timer.
-    void restoreDraft(ParkedDraft parked)
+    void restoreDraft(ParkedDraft parked) pure
     {
         if (buf.length || generation != parked.generation) return;
         buf = parked.buf;
@@ -466,7 +466,7 @@ struct EditState
         if (cursor != before) active();
     }
 
-    void set(string s)
+    void set(string s) pure
     {
         buf = s.to!(dchar[]);
         cursor = buf.length;
@@ -475,7 +475,7 @@ struct EditState
     /// Take the line and reset (recording it in the history). A blank
     /// Enter changes nothing else, so a parked draft and history browsing
     /// survive it.
-    string take()
+    string take() pure
     {
         auto t = text;
         lastEdit = MonoTime.init;
@@ -528,7 +528,7 @@ struct EditState
     void home() { move({ while (cursor > 0 && buf[cursor - 1] != '\n') --cursor; }); }
     void end() { move({ while (cursor < buf.length && buf[cursor] != '\n') ++cursor; }); }
 
-    private static bool wordChar(dchar c) { return isAlphaNum(c) || c == '_'; }
+    private static bool wordChar(dchar c) pure { return isAlphaNum(c) || c == '_'; }
 
     void wordLeft()
     {
@@ -593,7 +593,7 @@ struct EditState
     }
 
     /// Move the cursor to the same column one line up/down within the input.
-    private bool moveLine(int dir)
+    private bool moveLine(int dir) pure
     {
         size_t lineStart = cursor;
         while (lineStart > 0 && buf[lineStart - 1] != '\n') --lineStart;
@@ -747,19 +747,19 @@ final class LineEditor
     private static dstring replicateD(dchar c, size_t n) pure { dstring r; foreach (_; 0 .. n) r ~= c; return r; }
 
     /// Text is typed but not yet sent.
-    bool hasDraft() const { return state.buf.length > 0; }
+    bool hasDraft() pure const { return state.buf.length > 0; }
 
     /// A fresh draft holds back a due timer (see `EditState.holdsTimer`).
-    bool holdsTimer(MonoTime now) const { return state.holdsTimer(now); }
+    bool holdsTimer(MonoTime now) pure const { return state.holdsTimer(now); }
 
     /// See `EditState.quietSince`.
-    MonoTime quietSince(MonoTime shown) const { return state.quietSince(shown); }
+    MonoTime quietSince(MonoTime shown) pure const { return state.quietSince(shown); }
 
     /// Park the draft for a timer turn (see `EditState.parkDraft`).
-    bool parkDraft(out ParkedDraft parked) { return state.parkDraft(parked); }
+    bool parkDraft(out ParkedDraft parked) pure { return state.parkDraft(parked); }
 
     /// Put a parked draft back after the turn (see `EditState.restoreDraft`).
-    void restoreDraft(ParkedDraft parked) { state.restoreDraft(parked); }
+    void restoreDraft(ParkedDraft parked) pure { state.restoreDraft(parked); }
 
     private Result read(string prompt, string styledPrompt, bool turn, bool delegate() @safe stop)
     {
@@ -931,7 +931,7 @@ final class LineEditor
         }
     }
 
-    private static string fitCols(string s, size_t w)
+    private static string fitCols(string s, size_t w) pure
     {
         if (textWidth(s) <= w) return s;
         string r;
@@ -1087,7 +1087,7 @@ version (Posix)
 version (unittest)
 {
     /// Scripted input: the bytes of `keys`, then end of input.
-    ByteSource script(string keys)
+    ByteSource script(string keys) pure
     {
         size_t i;
         // `\xff` stands for a pause: the read times out.

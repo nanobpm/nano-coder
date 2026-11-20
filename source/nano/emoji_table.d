@@ -3,6 +3,7 @@
 module nano.emoji_table;
 
 @safe:
+pure:
 
 immutable string[2][] emojiShortcodes = [
     ["+1", "👍"],

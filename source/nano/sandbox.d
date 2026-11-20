@@ -24,6 +24,7 @@ version (OSX) version = HasOsSandbox;
 version (linux) version = HasOsSandbox;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 
 enum SandboxMode { off, workspace, readOnly }
 
@@ -38,7 +39,7 @@ string modeName(SandboxMode m) pure nothrow
 }
 
 /// Parse a mode name; throws with the Rust message on anything else.
-SandboxMode parseMode(string s)
+SandboxMode parseMode(string s) pure
 {
     switch (s)
     {
@@ -46,7 +47,7 @@ SandboxMode parseMode(string s)
         case "workspace", "workspace-write": return SandboxMode.workspace;
         case "read-only", "readonly": return SandboxMode.readOnly;
         default:
-            throw new Exception(format("unknown sandbox mode %s (expected off, workspace or read-only)", JSONValue(s).toString));
+            throw new Exception(format("unknown sandbox mode %s (expected off, workspace or read-only)", JSONValue(s).jsonText));
     }
 }
 
@@ -78,7 +79,7 @@ struct SandboxConfig
     bool toolCaches = true;
 
     /// From the `[sandbox]` table; throws on a bad mode or type.
-    static SandboxConfig fromJSON(JSONValue v)
+    static SandboxConfig fromJSON(JSONValue v) pure
     {
         SandboxConfig c;
         if (v.type != JSONType.object) return c;

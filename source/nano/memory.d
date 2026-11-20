@@ -14,6 +14,7 @@
 module nano.memory;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 import nano.clock : monoNow, sleepFor, wallNow;
 import nano.arith : saturatingSub;
 
@@ -48,28 +49,28 @@ private enum defaultLimit = 20;
 /// `memory` in config.toml.
 enum MemoryMode { off, readOnly, on }
 
-MemoryMode parseMemoryMode(string s)
+MemoryMode parseMemoryMode(string s) pure
 {
     switch (s)
     {
     case "off": return MemoryMode.off;
     case "read_only": return MemoryMode.readOnly;
     case "on": return MemoryMode.on;
-    default: throw new Exception(format("memory must be \"on\", \"read_only\" or \"off\", not %s", JSONValue(s).toString));
+    default: throw new Exception(format("memory must be \"on\", \"read_only\" or \"off\", not %s", JSONValue(s).jsonText));
     }
 }
 
 enum Scope { user, project }
 
-string name(Scope s) { return s == Scope.user ? "user" : "project"; }
+string name(Scope s) pure { return s == Scope.user ? "user" : "project"; }
 
-Scope parseScope(string text)
+Scope parseScope(string text) pure
 {
     switch (text.strip.toLower)
     {
     case "user", "machine", "global": return Scope.user;
     case "project", "repo", "repository": return Scope.project;
-    default: throw new Exception(format("unknown scope %s; use \"user\" or \"project\"", JSONValue(text.strip.toLower).toString));
+    default: throw new Exception(format("unknown scope %s; use \"user\" or \"project\"", JSONValue(text.strip.toLower).jsonText));
     }
 }
 
@@ -89,13 +90,13 @@ struct Entry
     string[] anchors;
     bool hasAnchors;
 
-    bool isRule() const { return kind == "rule"; }
+    bool isRule() pure const { return kind == "rule"; }
 
-    string label() const { return format("[%s] (%s)", scrubControl(id), created.length >= 10 ? created[0 .. 10] : created); }
+    string label() pure const { return format("[%s] (%s)", scrubControl(id), created.length >= 10 ? created[0 .. 10] : created); }
 
-    string toJson() const
+    string toJson() pure const
     {
-        string q(string s) { return JSONValue(s).toString(JSONOptions.doNotEscapeSlashes); }
+        string q(string s) { return JSONValue(s).jsonText(JSONOptions.doNotEscapeSlashes); }
         auto s = format(`{"id":%s,"text":%s,"created":%s,"last_used":%s`, q(id), q(text), q(created), q(lastUsed));
         if (evidence !is null) s ~= `,"evidence":` ~ q(evidence);
         if (session !is null) s ~= `,"session":` ~ q(session);
@@ -185,21 +186,21 @@ final class Store
     /// Entries unused for this many days expire; 0 disables expiry.
     ulong expiryDays;
 
-    this(string root, string project, ulong expiryDays)
+    this(string root, string project, ulong expiryDays) pure
     {
         this.root = root;
         this.project = project;
         this.expiryDays = expiryDays;
     }
 
-    string path(Scope s) const
+    string path(Scope s) pure const
     {
         if (s == Scope.user) return buildPath(root, "user.jsonl");
         if (project is null) throw new Exception("no project scope here: not in a git repository");
         return buildPath(root, "projects", sanitizeKey(project) ~ ".jsonl");
     }
 
-    private bool hasPath(Scope s) const { return s == Scope.user || project !is null; }
+    private bool hasPath(Scope s) pure const { return s == Scope.user || project !is null; }
 
     private SysTime expiryCutoff() const
     {
@@ -329,7 +330,7 @@ final class Store
             }
             loaded ~= Loaded(s, p, f, lock);
         }
-        if (!hits.length) return format("No memories match %s.", JSONValue(pattern).toString);
+        if (!hits.length) return format("No memories match %s.", JSONValue(pattern).jsonText);
         import std.algorithm : SwapStrategy;
         hits.sort!((a, b) => a.e.lastUsedTime > b.e.lastUsedTime, SwapStrategy.stable);
         auto shown = hits[0 .. hits.length < defaultLimit ? $ : defaultLimit];
@@ -445,7 +446,7 @@ final class Store
     }
 }
 
-private string saveGuidance()
+private string saveGuidance() pure
 {
     return "Find more with " ~ searchTool ~ ".\n\nSave with " ~ saveTool ~ " when you learn something a future "
         ~ "session would otherwise have to rediscover or ask again:\n"
@@ -460,7 +461,7 @@ private string saveGuidance()
 }
 
 /// Tool definitions; `writable` adds save and forget.
-ToolDefinition[] definitions(bool writable)
+ToolDefinition[] definitions(bool writable) pure
 {
     auto tools = [ToolDefinition(searchTool,
         "Search facts you saved in earlier sessions (regex, case-insensitive; plain text works too). Memories are "
@@ -485,7 +486,7 @@ ToolDefinition[] definitions(bool writable)
     return tools;
 }
 
-bool isMemoryTool(string n) { return n == saveTool || n == searchTool || n == forgetTool; }
+bool isMemoryTool(string n) pure { return n == saveTool || n == searchTool || n == forgetTool; }
 
 /// A memory tool as a session offers it.
 struct SessionTool
@@ -636,7 +637,7 @@ private string canonicalizeExisting(string p)
 }
 
 /// A file name for a project key: a readable head plus an FNV-1a hash.
-string sanitizeKey(string key)
+string sanitizeKey(string key) pure
 {
     import std.ascii : isAlphaNum;
     string cleaned;
@@ -650,20 +651,20 @@ string sanitizeKey(string key)
     return head.length ? format("%s-%016x", head, h) : format("%016x", h);
 }
 
-bool isLineBreak(dchar c)
+bool isLineBreak(dchar c) pure
 {
     import std.uni : isControl;
     return isControl(c) || c == '\u2028' || c == '\u2029';
 }
 
-string scrubControl(string s)
+string scrubControl(string s) pure
 {
     string r;
     foreach (dchar c; s) { if (isLineBreak(c)) r ~= '?'; else r ~= c; }
     return r;
 }
 
-private string oneLine(string text)
+private string oneLine(string text) pure
 {
     dstring d = text.to!dstring;
     auto cut = d.countUntil!isLineBreak;
@@ -671,7 +672,7 @@ private string oneLine(string text)
     return first.length > 200 ? first[0 .. 200].to!string ~ "…" : first.to!string;
 }
 
-private string snippet(Regex!dchar rx, string text)
+private string snippet(Regex!dchar rx, string text) pure
 {
     dstring d = text.to!dstring;
     auto m = matchFirst(d, rx);
@@ -815,11 +816,11 @@ private immutable string[] stopAnchors = [
 ];
 
 /// "hint" or "rule" (case-insensitive), else an error.
-string parseKind(string text)
+string parseKind(string text) pure
 {
     auto k = text.strip.toLower;
     if (k == "hint" || k == "rule") return k;
-    throw new Exception(format("unknown kind %s; use \"hint\" or \"rule\"", JSONValue(k).toString));
+    throw new Exception(format("unknown kind %s; use \"hint\" or \"rule\"", JSONValue(k).jsonText));
 }
 
 private string[] validateAnchors(string[] list)
@@ -832,7 +833,7 @@ private string[] validateAnchors(string[] list)
         if (anchor.byDchar.any!isLineBreak) throw new Exception("anchors must be single-line");
         auto n = anchor.byDchar.count;
         if (n < minAnchorChars || n > maxAnchorChars)
-            throw new Exception(format("anchor %s must be %s-%s characters", JSONValue(anchor).toString, minAnchorChars, maxAnchorChars));
+            throw new Exception(format("anchor %s must be %s-%s characters", JSONValue(anchor).jsonText, minAnchorChars, maxAnchorChars));
         if (looksLikeSecret(anchor) !is null) throw new Exception("refusing to save: an anchor looks like a secret");
         if (!out_.any!(a => asciiEqualFold(a, anchor))) out_ ~= anchor;
     }
@@ -841,7 +842,7 @@ private string[] validateAnchors(string[] list)
 }
 
 /// Rust `eq_ignore_ascii_case`.
-private bool asciiEqualFold(string a, string b)
+private bool asciiEqualFold(string a, string b) pure
 {
     import std.ascii : toLower;
     if (a.length != b.length) return false;
@@ -893,7 +894,7 @@ string[] anchorsOf(const Entry entry)
     return out_;
 }
 
-private bool isPathLike(string token)
+private bool isPathLike(string token) pure
 {
     import std.uni : isAlphaNum;
     return token.byDchar.count >= 5 && token.canFind('/') && token.byDchar.any!(c => isAlphaNum(c))
@@ -909,7 +910,7 @@ private bool isHostLike(string token)
 }
 
 /// A tool call's string and number arguments, lowercased, one per line.
-string argumentText(const JSONValue args)
+string argumentText(const JSONValue args) pure
 {
     import std.uni : uniToLower = toLower;
     string out_;
@@ -929,7 +930,7 @@ string argumentText(const JSONValue args)
                 foreach (k; keys) walk(v.objectNoRef[k]);
             }
             break;
-        case JSONType.integer, JSONType.uinteger, JSONType.float_: out_ ~= v.toString ~ "\n"; break;
+        case JSONType.integer, JSONType.uinteger, JSONType.float_: out_ ~= v.jsonText ~ "\n"; break;
         case JSONType.null_, JSONType.true_, JSONType.false_: break;
         }
     }
@@ -939,7 +940,7 @@ string argumentText(const JSONValue args)
 
 /// Whether `anchor` occurs in `haystack` without running into a word
 /// character on a side where the anchor itself starts or ends with one.
-bool containsAnchor(string haystack, string anchor)
+bool containsAnchor(string haystack, string anchor) pure
 {
     import std.uni : isAlphaNum;
     import std.utf : decode, decodeFront, strideBack;
@@ -982,14 +983,14 @@ struct Recall
     /// Recalled by a note and not yet followed by a `memory_search` hit.
     bool[string] fired;
 
-    bool empty() const { return !seen.length && !fired.length; }
+    bool empty() pure const { return !seen.length && !fired.length; }
 
-    bool opEquals(const Recall o) const
+    bool opEquals(const Recall o) pure const
     {
         return sortedKeys(seen) == sortedKeys(o.seen) && sortedKeys(fired) == sortedKeys(o.fired);
     }
 
-    Recall dup() const
+    Recall dup() pure const
     {
         Recall r;
         foreach (k, _; seen) r.seen[k] = true;
@@ -1026,13 +1027,13 @@ struct Recall
     }
 
     /// `{"seen":[...],"fired":[...]}`, sorted (Rust `BTreeSet`).
-    JSONValue toJSON() const
+    JSONValue toJSON() pure const
     {
         JSONValue j = ["seen": JSONValue(sortedKeys(seen)), "fired": JSONValue(sortedKeys(fired))];
         return j;
     }
 
-    static Recall fromJSON(const JSONValue j)
+    static Recall fromJSON(const JSONValue j) pure
     {
         Recall r;
         if (j.type != JSONType.object) return r;
@@ -1042,7 +1043,7 @@ struct Recall
     }
 }
 
-private string[] sortedKeys(const bool[string] set)
+private string[] sortedKeys(const bool[string] set) pure
 {
     auto k = set.keys;
     sort(k);
@@ -1097,7 +1098,7 @@ void logRecall(Store store, string event, string id, string tool, string session
         // Keys sorted, as serde_json's `json!` map writes them.
         JSONValue j = ["at": JSONValue(stamp(wallNow)), "event": JSONValue(event), "id": JSONValue(id),
             "session": session !is null ? JSONValue(session) : JSONValue(null), "tool": JSONValue(tool)];
-        auto line = cast(const(ubyte)[]) (j.toString(JSONOptions.doNotEscapeSlashes) ~ "\n");
+        auto line = cast(const(ubyte)[]) (j.jsonText(JSONOptions.doNotEscapeSlashes) ~ "\n");
         auto fd = openPath(buildPath(store.root, recallLog), O_WRONLY | O_CREAT | O_APPEND, octal!600);
         if (fd < 0) return;
         scope (exit) close(fd);
@@ -1132,7 +1133,7 @@ size_t[2][string] recallStats(Store store)
 /// The complete text on one line: line breaks and control characters become
 /// spaces and whitespace collapses, but nothing is clipped (a note marks the
 /// entry seen, so it must show all of it).
-private string fullLine(string text)
+private string fullLine(string text) pure
 {
     import std.array : split;
     import std.uni : isControl;
@@ -1143,7 +1144,7 @@ private string fullLine(string text)
 
 /// The note: framed as an untrusted hint to verify, with its `check:` and a
 /// staleness signal.
-private string recallNoteText(Scope s, const Entry e, SysTime now)
+private string recallNoteText(Scope s, const Entry e, SysTime now) pure
 {
     auto d = (now - e.lastUsedTime).total!"days";
     if (d < 0) d = 0;
@@ -1156,7 +1157,7 @@ private string recallNoteText(Scope s, const Entry e, SysTime now)
 /// The id after `forget`, which must end at a token boundary (`forgetful`
 /// is not a forget); "" for a bare `forget`, `none` for anything else.
 import nano.option : Option, none;
-Option!string parseForgetId(string arg)
+Option!string parseForgetId(string arg) pure
 {
     import std.string : startsWith, strip;
     import std.uni : isWhite;
@@ -1195,7 +1196,7 @@ private string memoryCommandText(Store store, string arg, bool writable, bool pl
     }
     if (arg.length)
         return format("Unknown /memory argument %s; use /memory or /memory forget <id>.\n",
-            JSONValue(arg).toString(JSONOptions.doNotEscapeSlashes));
+            JSONValue(arg).jsonText(JSONOptions.doNotEscapeSlashes));
     // Effective writability: plan mode has no memory_save tool either.
     bool canWrite = writable && !plan;
     auto all_ = store.all();

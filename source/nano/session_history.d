@@ -4,6 +4,7 @@
 module nano.session_history;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 import nano.arith : saturatingSub;
 
 import std.algorithm : canFind, startsWith, min;
@@ -26,13 +27,13 @@ enum size_t defaultLimit = 20, maxLimit = 100, snippetChars = 240, snippetsPerMe
 
 class HistoryError : Exception
 {
-    this(string msg) @safe { super(msg); }
+    this(string msg) pure @safe { super(msg); }
 }
 
-bool isHistoryTool(string name) @safe { return name == searchTool || name == readTool; }
+bool isHistoryTool(string name) pure @safe { return name == searchTool || name == readTool; }
 
 /// A call that failed, including a bash command that ran but reported failure.
-bool looksFailed(string tool, bool ok, string result) @safe
+bool looksFailed(string tool, bool ok, string result) pure @safe
 {
     if (isHistoryTool(tool)) return false;
     if (!ok) return true;
@@ -43,7 +44,7 @@ bool looksFailed(string tool, bool ok, string result) @safe
 }
 
 /// Whether this message already consumed the one-time post-compaction hint.
-bool consumesHint(const ref Message m) @safe
+bool consumesHint(const ref Message m) pure @safe
 {
     if (m.role == Role.tool) return m.content.canFind(failedToolHint) || isHistoryTool(m.toolName);
     if (m.role == Role.assistant)
@@ -51,7 +52,7 @@ bool consumesHint(const ref Message m) @safe
     return false;
 }
 
-ToolDefinition[] definitions()
+ToolDefinition[] definitions() pure
 {
     return [
         ToolDefinition(searchTool,
@@ -96,7 +97,7 @@ Entry[] load(string path)
     return out_;
 }
 
-string roleName(Role r) @safe
+string roleName(Role r) pure @safe
 {
     final switch (r)
     {
@@ -108,7 +109,7 @@ string roleName(Role r) @safe
 }
 
 /// `#N role [name] (failed) (YYYY-MM-DD HH:MM:SS)`.
-private string label(ulong id, const ref Message m) @safe
+private string label(ulong id, const ref Message m) pure @safe
 {
     auto s = format("#%s %s", id, roleName(m.role));
     if (m.toolName.length) s ~= " " ~ m.toolName;
@@ -118,16 +119,16 @@ private string label(ulong id, const ref Message m) @safe
 }
 
 /// Text and tool calls, leaving out history lookups so a search can't find itself.
-private string searchable(const ref Message m)
+private string searchable(const ref Message m) pure
 {
     if (isHistoryTool(m.toolName)) return "";
     string text = m.content;
     foreach (ref c; m.toolCalls)
-        if (!isHistoryTool(c.name)) text ~= format("\n[called %s(%s)]", c.name, c.arguments.toString);
+        if (!isHistoryTool(c.name)) text ~= format("\n[called %s(%s)]", c.name, c.arguments.jsonText);
     return text;
 }
 
-private ulong idArg(JSONValue args, string key, bool required)
+private ulong idArg(JSONValue args, string key, bool required) pure
 {
     auto v = args.type == JSONType.object ? key in args.objectNoRef : null;
     if (v is null || v.type == JSONType.null_)
@@ -148,7 +149,7 @@ private ulong idArg(JSONValue args, string key, bool required)
 }
 
 /// ~240 characters around a match, whitespace collapsed, `…` where cut.
-private string snippet(string text, size_t start, size_t end)
+private string snippet(string text, size_t start, size_t end) pure
 {
     import std.utf : toUTF32, toUTF8, count;
     auto pre = text[0 .. start].toUTF32;
@@ -256,7 +257,7 @@ string search(string path, JSONValue args)
     }
     if (!hits.length)
     {
-        auto o = format("No %smessages match %s.", role.length ? role ~ " " : "", JSONValue(pattern).toString);
+        auto o = format("No %smessages match %s.", role.length ? role ~ " " : "", JSONValue(pattern).jsonText);
         return hiddenNote.length ? o ~ "\n" ~ hiddenNote : o;
     }
     auto out_ = hits.join("\n");
@@ -303,7 +304,7 @@ string read(string path, JSONValue args)
                 }
     if (!emitted && m.thinking.length) text ~= "[thinking] " ~ m.thinking ~ "\n";
     text ~= m.content;
-    foreach (ref c; m.toolCalls) text ~= format("\n[called %s id=%s %s]", c.name, c.id, c.arguments.toString);
+    foreach (ref c; m.toolCalls) text ~= format("\n[called %s id=%s %s]", c.name, c.id, c.arguments.jsonText);
     return truncateOutput(text, limit, format("history-%s", id));
 }
 

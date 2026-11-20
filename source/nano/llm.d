@@ -2,12 +2,13 @@
 module nano.llm;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 
 import std.json;
 
 enum Role { system, user, assistant, tool }
 
-string roleName(Role r)
+string roleName(Role r) pure
 {
     final switch (r)
     {
@@ -30,7 +31,7 @@ struct ToolCall
     /// can pair a preserved reasoning item with its call.
     string itemId;
 
-    static ToolCall fromRaw(string id, string name, string raw)
+    static ToolCall fromRaw(string id, string name, string raw) pure
     {
         ToolCall c = ToolCall(id, name);
         import std.string : strip;
@@ -55,14 +56,14 @@ struct ToolCall
         return c;
     }
 
-    string encodedArguments() const
+    string encodedArguments() pure const
     {
-        return invalidArguments.length ? invalidArguments : arguments.toString;
+        return invalidArguments.length ? invalidArguments : arguments.jsonText;
     }
 
     /// The tool result for a call whose arguments were not a JSON object
     /// (null when they were), with advice suited to why the reply ended.
-    string rawArgumentsError(string stopReason) const
+    string rawArgumentsError(string stopReason) pure const
     {
         import std.format : format;
         import std.range : take;
@@ -145,22 +146,22 @@ struct Message
     /// kept so a resumed Rust log round-trips them.
     JSONValue extra;
 
-    static Message system(string c) { return Message(Role.system, c); }
-    static Message user(string c) { return Message(Role.user, c); }
+    static Message system(string c) pure { return Message(Role.system, c); }
+    static Message user(string c) pure { return Message(Role.user, c); }
     /// A harness-initiated user-role message (a reminder, continuation or timer).
-    static Message auto_(string c)
+    static Message auto_(string c) pure
     {
         auto m = Message(Role.user, c);
         m.autoInitiated = true;
         return m;
     }
-    static Message assistant(string c, ToolCall[] calls = null)
+    static Message assistant(string c, ToolCall[] calls = null) pure
     {
         auto m = Message(Role.assistant, c);
         m.toolCalls = calls;
         return m;
     }
-    static Message toolResult(string id, string name, string content, bool error = false)
+    static Message toolResult(string id, string name, string content, bool error = false) pure
     {
         auto m = Message(Role.tool, content);
         m.toolCallId = id;
@@ -169,7 +170,7 @@ struct Message
         return m;
     }
 
-    JSONValue toJson() const
+    JSONValue toJson() pure const
     {
         JSONValue j = ["role": roleName(role), "content": content];
         if (toolCalls.length)
@@ -189,7 +190,7 @@ struct Message
         return j;
     }
 
-    static Message fromJson(JSONValue j)
+    static Message fromJson(JSONValue j) pure
     {
         import std.algorithm : countUntil;
         Message m;
@@ -223,7 +224,7 @@ struct TokenUsage
 /// or terminal stream event (the parent of `usage`, or of `response` for the
 /// Responses API) into `usage`, as AI Credits (1 credit = 1e9 nano).
 /// Leaves `usage` alone when the field is absent (other providers).
-void readCopilotAic(const JSONValue parent, ref TokenUsage usage) @safe
+void readCopilotAic(const JSONValue parent, ref TokenUsage usage) pure @safe
 {
     if (parent.type != JSONType.object) return;
     auto cu = "copilot_usage" in parent.objectNoRef;
@@ -359,7 +360,7 @@ struct AttachmentPlan
 {
     bool[size_t[2]] available, sendable;
     /// Whether the request carries at least one real image.
-    bool carriesImage() const { return sendable.length > 0; }
+    bool carriesImage() pure const { return sendable.length > 0; }
 }
 
 /// Receives streamed text: `reasoning` is true for thinking output.
@@ -394,8 +395,8 @@ interface LLMClient
 {
     LLMResponse chat(const ref ChatRequest req, StreamSink sink);
     string[] listModels();
-    string modelName() const;
-    string providerName() const;
+    string modelName() pure const;
+    string providerName() pure const;
 }
 
 /// Splits `<think>...</think>` out of streamed content, across chunk boundaries.

@@ -34,8 +34,8 @@ class Claude : MockClient, KindedClient
         sent ~= Sent(req.temperature, req.thinking, req.maxTokens);
         return super.chat(req, sink);
     }
-    override string modelName() const { return model; }
-    override string providerName() const { return "anthropic"; }
+    override string modelName() pure const { return model; }
+    override string providerName() pure const { return "anthropic"; }
     ProviderKind kind() const { return ProviderKind.anthropic; }
 }
 
@@ -168,7 +168,7 @@ unittest
 class Kindless : MockClient
 {
     this() { super([]); }
-    override string providerName() const { return "mock"; }
+    override string providerName() pure const { return "mock"; }
 }
 
 // The kind comes from the live client: a kindless one gets the provider's
@@ -246,7 +246,7 @@ string shown(Agent agent)
 class Gpt : MockClient, KindedClient
 {
     this() { super([]); }
-    override string modelName() const { return "gpt-5"; }
+    override string modelName() pure const { return "gpt-5"; }
     ProviderKind kind() const { return ProviderKind.openai; }
 }
 

@@ -16,6 +16,7 @@
 module nano.permissions;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 
 import std.json;
 import std.format : format;
@@ -61,7 +62,7 @@ struct Rule
     string patternSource;
     Regex!char pattern;
 
-    bool appliesTo(string tool) const { return tools.canFind(tool); }
+    bool appliesTo(string tool) pure const { return tools.canFind(tool); }
 
     bool matches(string text) const
     {
@@ -75,7 +76,7 @@ struct Rule
     }
 }
 
-private string quoted(string s) { return debugQuote(s); }
+private string quoted(string s) pure { return debugQuote(s); }
 
 /// Parse a rule like `Bash(git push *)`, `Read(**/.env)` or `write_file`.
 Rule parseRule(string src)
@@ -116,7 +117,7 @@ Rule parseRule(string src)
     return r;
 }
 
-private string escapeChar(dchar c)
+private string escapeChar(dchar c) pure
 {
     import std.conv : to;
     if (`\.+*?()|[]{}^$`.canFind(c)) return "\\" ~ c.to!string;
@@ -125,7 +126,7 @@ private string escapeChar(dchar c)
 
 /// `*` matches anything (including spaces and `/`); a trailing `:*` matches
 /// the prefix alone or followed by arguments (`npm run test:*`).
-string commandGlob(string pattern)
+string commandGlob(string pattern) pure
 {
     bool prefix = pattern.endsWith(":*");
     auto body = prefix ? pattern[0 .. $ - 2] : pattern;
@@ -203,7 +204,7 @@ bool ruleMatches(string ruleSrc, string tool, JSONValue args)
         auto joined = joinPath(cwd, expandTilde(path));
         return pathRuleMatches(rule, normalize(joined), cwd) || pathRuleMatches(rule, resolveSymlinks(joined), cwd);
     case Subject.arguments:
-        return rule.matches(args.toString);
+        return rule.matches(args.jsonText);
     }
 }
 
@@ -215,7 +216,7 @@ string validateRule(string ruleSrc)
     return null;
 }
 
-private string stringArg(JSONValue args, string key)
+private string stringArg(JSONValue args, string key) pure
 {
     if (args.type != JSONType.object) return null;
     auto v = key in args;
@@ -338,13 +339,13 @@ struct Policy
                 if (root is null) root = ".";
                 if (auto rule = readDenyRule(expandTilde(root), cwd))
                     return format("rule `%s` denies %s on %s", rule, tool, root);
-                auto text = args.toString;
+                auto text = args.jsonText;
                 foreach (rule; deny)
                     if (rule.subject == Subject.arguments && rule.appliesTo(tool) && rule.matches(text))
                         return format("rule `%s` denies %s", rule.source, tool);
                 return null;
             default:
-                auto text = args.toString;
+                auto text = args.jsonText;
                 foreach (rule; deny)
                     if (rule.appliesTo(tool) && rule.matches(text))
                         return format("rule `%s` denies %s", rule.source, tool);
@@ -469,7 +470,7 @@ struct Policy
 }
 
 /// The message a blocked call returns to the model.
-string blockedMessage(string reason)
+string blockedMessage(string reason) pure
 {
     return format("Blocked by nano-coder permissions: %s. %s", reason, blockAdvice);
 }

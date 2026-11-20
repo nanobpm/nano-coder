@@ -41,7 +41,7 @@ struct FrameUi
     private int tty = -1, writeEnd = -1, wake = -1;
 
     /// Whether this is a running frame.
-    bool opCast(B : bool)() const { return cast(bool) requests; }
+    bool opCast(B : bool)() pure const { return cast(bool) requests; }
 
     /// Takes over the terminal: fd 1 and 2 now feed the transcript. Returns
     /// `FrameUi.init` if it can't.
@@ -262,7 +262,7 @@ private final class FrameState
     size_t lastW, lastH;
     Debouncer debounce = Debouncer(150);
 
-    this(FrameRenderer renderer) { this.renderer = renderer; }
+    this(FrameRenderer renderer) pure { this.renderer = renderer; }
     StatusFn status;
     /// A turn is running: the prompt shows the spinner and `clock`.
     bool busy;

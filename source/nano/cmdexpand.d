@@ -215,7 +215,7 @@ struct ExpandCtx
     /// Variables of loops that were unrolled away.
     string[] bound;
 
-    void note(string verdict, const Simple command)
+    void note(string verdict, const Simple command) pure
     {
         if (verdict !is null) unverified ~= Unverified(withWords(command, command.words), verdict);
     }
@@ -244,7 +244,7 @@ void parseInner(string script, size_t depth, ref Simple[] out_)
 
 /// Text of a script argument (`bash -c SCRIPT`, `eval ...`); throws when it is
 /// computed at run time and so cannot be inspected.
-string scriptText(const Word[] words)
+string scriptText(const Word[] words) pure
 {
     auto text = words.map!(w => w.text).join(" ");
     bool opaque = words.any!(w => w.text.canFind("$(...)"))
@@ -585,7 +585,7 @@ bool unrollLiteralLoop(const Simple[] region, size_t offset, ref size_t budget, 
 
 /// Whether any command in `prior` runs a declaration builtin whose arguments
 /// name `name` or are computed (wrappers seen through by scanning every word).
-bool priorDeclares(const Simple[] prior, string name)
+bool priorDeclares(const Simple[] prior, string name) pure
 {
     foreach (cmd; prior)
     {
@@ -612,7 +612,7 @@ bool priorDeclares(const Simple[] prior, string name)
 /// (quoted/escaped) `$name` with real expansions, or when word splitting,
 /// pathname or brace expansion would turn `value` into something other than
 /// one literal argument. `ifs` null means the default IFS.
-bool substituteWord(const Word word, string name, string value, string ifs, out Word result)
+bool substituteWord(const Word word, string name, string value, string ifs, out Word result) pure
 {
     if (!word.dynamic)
     {
@@ -702,7 +702,7 @@ bool substituteWord(const Word word, string name, string value, string ifs, out 
 /// or single-letter ranges (with an optional step), with any prefix and
 /// suffix. False on nested or unbalanced braces; a non-expanding brace group
 /// (`{}`, `{x}`) is kept literally.
-bool braceExpand(string text, out string[] result)
+bool braceExpand(string text, out string[] result) pure
 {
     import core.checkedint : adds, subs;
     import std.conv : to, ConvException;
@@ -814,7 +814,7 @@ bool startsReadonlyLoopKeyword(const Simple s) pure
         "do", "then", "else", "elif", "fi", "done", "esac", "}"].canFind(s.words[0].text);
 }
 
-void validateLoopHeader(const Simple simple, size_t offset, string kind)
+void validateLoopHeader(const Simple simple, size_t offset, string kind) pure
 {
     auto bad = format("cannot inspect `%s` loop header `%s`; only `for NAME [in WORDS]` loops are supported "
         ~ "(arithmetic `for ((...))` loops are not)", kind, commandText(simple));
@@ -826,7 +826,7 @@ void validateLoopHeader(const Simple simple, size_t offset, string kind)
             ~ "commands run; rewrite it as explicit commands", kind, commandText(simple), variable.text));
 }
 
-void checkLoopSideEffects(const Simple cmd, string kind, string phase)
+void checkLoopSideEffects(const Simple cmd, string kind, string phase) pure
 {
     auto rendered = commandText(cmd);
     foreach (r; cmd.redirects)
@@ -1062,7 +1062,7 @@ string checkReadonlyLoopCommand(const Simple cmd, string kind, string phase)
     return null;
 }
 
-void rejectDangerousLoopDestination(const Word name, string kind, string phase, string rendered, string builtin)
+void rejectDangerousLoopDestination(const Word name, string kind, string phase, string rendered, string builtin) pure
 {
     if (name.dynamic || name.quoted || name.glob)
         throw new Blocked(format("cannot allow `%s` loop: %s command `%s` writes a shell variable with `%s` whose name "
@@ -1076,7 +1076,7 @@ void rejectDangerousLoopDestination(const Word name, string kind, string phase, 
 
 private bool readOptionTakesValue(dchar c) pure { return "adinNptu".canFind(c); }
 
-void checkLoopReadDestinations(const Word[] args, string kind, string phase, string rendered)
+void checkLoopReadDestinations(const Word[] args, string kind, string phase, string rendered) pure
 {
     auto uninspectable = format("cannot allow `%s` loop: %s command `%s` uses a `read` option that cannot be "
         ~ "inspected; rewrite it as explicit commands", kind, phase, rendered);
@@ -1128,7 +1128,7 @@ void checkLoopReadDestinations(const Word[] args, string kind, string phase, str
         rejectDangerousLoopDestination(name, kind, phase, rendered, "read");
 }
 
-void checkLoopPrintfDestination(const Word[] args, string kind, string phase, string rendered)
+void checkLoopPrintfDestination(const Word[] args, string kind, string phase, string rendered) pure
 {
     string fail(string what) { return format("cannot allow `%s` loop: %s command `%s` %s", kind, phase, rendered, what); }
     size_t i = 0;
@@ -1245,7 +1245,7 @@ const(Word)[] optionWords(const Word[] args, string shortWithValue, const string
     return optionPositionWords(args, shortWithValue, longWithValue).filter!(a => !a.dynamic && !a.glob).array;
 }
 
-void checkLoopDynamicOptionPosition(const Word[] args, const Simple cmd, string kind, string phase, string program)
+void checkLoopDynamicOptionPosition(const Word[] args, const Simple cmd, string kind, string phase, string program) pure
 {
     string short_ = program == "sort" ? sortShortWithValue : program == "file" ? fileShortWithValue : "";
     const string[] long_ = program == "sort" ? sortLongWithValue : program == "file" ? fileLongWithValue : [];
@@ -1653,7 +1653,7 @@ struct Known
 
 /// Script texts nested inside `simple` that the shell runs (deliberately
 /// permissive; used only to collect assignments).
-string[] nestedScripts(const Simple simple)
+string[] nestedScripts(const Simple simple) pure
 {
     auto words = simple.words;
     string[] scripts;
@@ -1965,7 +1965,7 @@ void collectLoopBodyWrites(const Word[] words, ref bool[string] out_)
     }
 }
 
-void collectReadDestinations(const Word[] args, ref bool[string] out_)
+void collectReadDestinations(const Word[] args, ref bool[string] out_) pure
 {
     import std.conv : to;
     size_t i = 0;
@@ -2005,7 +2005,7 @@ void collectReadDestinations(const Word[] args, ref bool[string] out_)
     if (!destinations.length && !sawArray) out_["REPLY"] = true;
 }
 
-void collectPrintfDestination(const Word[] args, ref bool[string] out_)
+void collectPrintfDestination(const Word[] args, ref bool[string] out_) pure
 {
     size_t i = 0;
     while (i < args.length)
@@ -2024,7 +2024,7 @@ void collectPrintfDestination(const Word[] args, ref bool[string] out_)
     }
 }
 
-void insertVarName(string text, ref bool[string] out_)
+void insertVarName(string text, ref bool[string] out_) pure
 {
     auto b = text.indexOf('[') >= 0 ? text[0 .. text.indexOf('[')] : text;
     if (isShellIdentifier(b)) out_[b] = true;

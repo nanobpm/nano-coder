@@ -4,6 +4,7 @@
 module nano.config;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 
 import nano.skills : SkillsConfig;
 import nano.memory : MemoryMode, parseMemoryMode, defaultExpiryDays;
@@ -40,7 +41,7 @@ struct ModelSettings
     /// unset), e.g. an OpenRouter workspace serving each model on one region.
     string baseUrl;
 
-    static ModelSettings fromJSON(JSONValue o)
+    static ModelSettings fromJSON(JSONValue o) pure
     {
         ModelSettings m;
         m.overlay(o);
@@ -48,7 +49,7 @@ struct ModelSettings
     }
 
     /// Set the fields present in `o`, keeping the rest (a later layer).
-    void overlay(JSONValue o)
+    void overlay(JSONValue o) pure
     {
         if (auto v = "temperature" in o) temperature = numberOrDefault(*v);
         if (auto v = "thinking" in o) thinking = Thinking.parse(v.str);
@@ -59,7 +60,7 @@ struct ModelSettings
     }
 }
 
-string[] strings(JSONValue v)
+string[] strings(JSONValue v) pure
 {
     string[] o;
     foreach (x; v.arrayNoRef) o ~= x.str;
@@ -76,7 +77,7 @@ interface KindedClient
     ProviderKind kind() const;
 }
 
-ProviderKind parseKind(string s)
+ProviderKind parseKind(string s) pure
 {
     switch (s)
     {
@@ -128,7 +129,7 @@ struct ProviderConfig
     bool hasRetryableStatuses;
 
     /// The retry policy these settings describe.
-    imported!"nano.retry".RetryPolicy retryPolicy() const
+    imported!"nano.retry".RetryPolicy retryPolicy() pure const
     {
         import core.time : msecs;
         imported!"nano.retry".RetryPolicy r;
@@ -139,7 +140,7 @@ struct ProviderConfig
     }
 
     /// HTTP statuses worth retrying.
-    const(ushort)[] statuses() const
+    const(ushort)[] statuses() pure const
     {
         import nano.retry : defaultRetryableStatuses;
         return hasRetryableStatuses ? retryableStatuses : defaultRetryableStatuses;
@@ -175,7 +176,7 @@ struct ProviderConfig
     }
 
     /// Overlay the fields set in `o` (a user table) onto this preset.
-    void merge(JSONValue o)
+    void merge(JSONValue o) pure
     {
         if (auto v = "kind" in o) { hasKind = true; kind = parseKind(v.str); }
         if (auto v = "base_url" in o) baseUrl = v.str;
@@ -222,7 +223,7 @@ struct ProviderConfig
 
     /// The configured models as (id, display name), sorted by id, when
     /// `list_models = "configured"`; null means list from the endpoint.
-    string[2][] configuredModels() const
+    string[2][] configuredModels() pure const
     {
         import std.algorithm : sort;
         if (!configuredList) return null;
@@ -289,7 +290,7 @@ long bashHeartbeatIntervalSecs(long configSecs)
 }
 
 /// The names of the providers to offer in listings: `disabled` and `hidden` ones dropped, sorted.
-string[] enabledProviderNames(const ProviderConfig[string] providers)
+string[] enabledProviderNames(const ProviderConfig[string] providers) pure
 {
     import std.algorithm : sort;
     string[] o;
@@ -304,7 +305,7 @@ bool isVisible(const ref ProviderConfig p) pure nothrow { return !p.disabled && 
 /// Whether a model spec (`provider/model`, or a bare model on the default
 /// provider) names a visible provider, so it may be offered as a suggestion.
 /// A spec on a hidden or removed provider stays usable but isn't offered.
-bool specVisible(string spec, const ProviderConfig[string] providers, string defaultProvider)
+bool specVisible(string spec, const ProviderConfig[string] providers, string defaultProvider) pure
 {
     import std.string : indexOf;
     auto slash = spec.indexOf('/');
@@ -314,14 +315,14 @@ bool specVisible(string spec, const ProviderConfig[string] providers, string def
 }
 
 /// Refuse a spec naming a disabled provider.
-void checkEnabled(string name, const ref ProviderConfig p)
+void checkEnabled(string name, const ref ProviderConfig p) pure
 {
     if (p.disabled)
         throw new Exception(format("provider \"%s\" is disabled (`disabled = true` in [providers.%s])", name, name));
 }
 
 /// A number, or NaN for `"default"` (send none).
-double numberOrDefault(JSONValue v)
+double numberOrDefault(JSONValue v) pure
 {
     if (v.type == JSONType.string)
     {
@@ -337,7 +338,7 @@ double numberOrDefault(JSONValue v)
     return v.floating;
 }
 
-ProviderConfig preset(ProviderKind kind, string url, string env, string model = null)
+ProviderConfig preset(ProviderKind kind, string url, string env, string model = null) pure
 {
     ProviderConfig p;
     p.hasKind = true;
@@ -348,7 +349,7 @@ ProviderConfig preset(ProviderKind kind, string url, string env, string model = 
     return p;
 }
 
-ProviderConfig[string] presets()
+ProviderConfig[string] presets() pure
 {
     alias O = ProviderKind.openai;
     ProviderConfig[string] m;
@@ -472,12 +473,12 @@ struct Config
 
     /// A notice for a config that still sets the retired `renderer` option
     /// to anything but `frame` (the only renderer left).
-    string retiredRendererNotice() const
+    string retiredRendererNotice() pure const
     {
         import std.string : strip;
         if (retiredRenderer is null || retiredRenderer.strip == "frame") return null;
         return format("Note: renderer = %s is no longer available; using the frame renderer (remove the setting)",
-            imported!"std.json".JSONValue(retiredRenderer).toString);
+            imported!"std.json".JSONValue(retiredRenderer).jsonText);
     }
 
     static Config load(string path)
@@ -574,7 +575,7 @@ struct ResolvedProvider
 
 /// Whether this provider and model reason over the Responses API: they
 /// need reasoning replayed and reject a non-default temperature.
-bool reasonsOverResponses(ProviderKind kind, string model) @safe
+bool reasonsOverResponses(ProviderKind kind, string model) pure @safe
 {
     import nano.copilot : isReasoningModel;
     // Muse always speaks Responses and always reasons.
@@ -583,7 +584,7 @@ bool reasonsOverResponses(ProviderKind kind, string model) @safe
 
 /// Split `provider/model` (or a bare provider, or a bare model).
 void parseModelSpec(string spec, const ProviderConfig[string] providers, string defaultProvider,
-        out string provider, out string model)
+        out string provider, out string model) pure
 {
     spec = spec.strip;
     auto slash = spec.indexOf('/');
@@ -604,7 +605,7 @@ void parseModelSpec(string spec, const ProviderConfig[string] providers, string 
 
 /// A base URL a request path can be appended to: http(s), no whitespace or
 /// control characters, no query or fragment.
-void validateHttpBaseUrl(string provider, string url)
+void validateHttpBaseUrl(string provider, string url) pure
 {
     import std.uni : isWhite;
     import std.ascii : isControl;
@@ -989,7 +990,7 @@ unittest
     assert(resolve(c, "anthropic/claude").config.baseUrl == "https://api.anthropic.com/v1", "presets remain");
 }
 
-version (unittest) private string tomlQuote(string s) { return `"` ~ s ~ `"`; }
+version (unittest) private string tomlQuote(string s) pure { return `"` ~ s ~ `"`; }
 
 // rust: config.rs::legacy_base_url_targets_an_openai_compatible_default
 // rust: config.rs::parses_partial_config_with_providers

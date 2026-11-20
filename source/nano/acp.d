@@ -15,6 +15,7 @@
 module nano.acp;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 import nano.clock : stdTimeNow;
 import nano.arith : saturatingSub;
 import nano.option : Option, some, none, match, ifSome, NotNull;
@@ -46,7 +47,7 @@ import std.array : join;
 /// of these means only its arguments were not accepted.
 immutable string[] acpCommandRoots = ["/compact", "/settings", "/tools", "/plan", "/providers", "/model"];
 
-JSONValue rpcResult(JSONValue id, JSONValue result)
+JSONValue rpcResult(JSONValue id, JSONValue result) pure
 {
     JSONValue m = ["jsonrpc": JSONValue("2.0")];
     m["id"] = id;
@@ -54,7 +55,7 @@ JSONValue rpcResult(JSONValue id, JSONValue result)
     return m;
 }
 
-JSONValue rpcError(JSONValue id, long code, string message)
+JSONValue rpcError(JSONValue id, long code, string message) pure
 {
     JSONValue m = ["jsonrpc": JSONValue("2.0")];
     m["id"] = id;
@@ -62,21 +63,21 @@ JSONValue rpcError(JSONValue id, long code, string message)
     return m;
 }
 
-private JSONValue get(JSONValue v, string key)
+private JSONValue get(JSONValue v, string key) pure
 {
     if (v.type != JSONType.object) return JSONValue(null);
     if (auto p = key in v) return *p;
     return JSONValue(null);
 }
 
-private string getStr(JSONValue v, string key)
+private string getStr(JSONValue v, string key) pure
 {
     auto x = get(v, key);
     return x.type == JSONType.string ? x.str : null;
 }
 
 /// The text of a `session/prompt`: its text content blocks, joined.
-string promptText(JSONValue params)
+string promptText(JSONValue params) pure
 {
     string out_;
     auto p = get(params, "prompt");
@@ -87,7 +88,7 @@ string promptText(JSONValue params)
 
 /// A `//…` line is a prompt that starts with `/`: the text with one `/`
 /// removed. null for other lines.
-string unescapePrompt(string line)
+string unescapePrompt(string line) pure
 {
     import std.string : stripLeft;
     auto t = line.stripLeft;
@@ -96,7 +97,7 @@ string unescapePrompt(string line)
 
 /// Reject a slash prompt no command handled (a non-null note), or return
 /// the turn text in `text`.
-string enforceSlashInvariant(ref string text)
+string enforceSlashInvariant(ref string text) pure
 {
     auto trimmed = text.strip;
     if (isCommand(trimmed))
@@ -118,7 +119,7 @@ string enforceSlashInvariant(ref string text)
 /// between the turn's start and end (input, output), summed over its model
 /// calls. A null JSON value when the provider reported nothing (the field is
 /// optional in ACP). Counters reset mid-turn by /clear never go negative.
-JSONValue turnUsage(const ulong[2] before, const ulong[2] after)
+JSONValue turnUsage(const ulong[2] before, const ulong[2] after) pure
 {
     auto input = saturatingSub(after[0], before[0]);
     auto output = saturatingSub(after[1], before[1]);
@@ -135,7 +136,7 @@ unittest
 }
 
 /// Whether `msg` is a JSON-RPC 2.0 request or notification.
-bool isJsonRpcRequest(JSONValue msg)
+bool isJsonRpcRequest(JSONValue msg) pure
 {
     return getStr(msg, "jsonrpc") == "2.0" && getStr(msg, "method") !is null;
 }
@@ -143,7 +144,7 @@ bool isJsonRpcRequest(JSONValue msg)
 enum DuringTurn { cancel, steer, defer }
 
 /// How a message arriving mid-turn is routed; `steerText` is set for steer.
-DuringTurn classifyDuringTurn(JSONValue msg, string active, out string steerText)
+DuringTurn classifyDuringTurn(JSONValue msg, string active, out string steerText) pure
 {
     auto params = get(msg, "params");
     auto requested = getStr(params, "sessionId");
@@ -164,7 +165,7 @@ DuringTurn classifyDuringTurn(JSONValue msg, string active, out string steerText
 }
 
 /// The ACP tool kind, for client display.
-string toolKind(string name)
+string toolKind(string name) pure
 {
     switch (name)
     {
@@ -177,7 +178,7 @@ string toolKind(string name)
     }
 }
 
-private JSONValue textBlock(string t) { return JSONValue(["type": JSONValue("text"), "text": JSONValue(t)]); }
+private JSONValue textBlock(string t) pure { return JSONValue(["type": JSONValue("text"), "text": JSONValue(t)]); }
 
 /// What the server needs from the host program.
 struct Host
@@ -201,7 +202,7 @@ struct Host
 }
 
 /// Input id for idempotent prompts: `messageId`, or `_meta.inputId`.
-string inputId(JSONValue params)
+string inputId(JSONValue params) pure
 {
     if (params.type != JSONType.object) return null;
     auto v = "messageId" in params.objectNoRef;
@@ -324,7 +325,7 @@ struct AcpRouter
             foreach (t; st.items) items ~= parseJSON(t);
             if (!finish(items, st.steerMarks, st.sessionId)) return;
             immutable(string)[] back;
-            foreach (m; items) back ~= m.toString;
+            foreach (m; items) back ~= m.jsonText;
             st.items = back;
         });
     }
@@ -376,7 +377,7 @@ final class AcpServer : AgentEvents
         };
     }
 
-    void send(JSONValue msg) { writeOut(msg.toString); }
+    void send(JSONValue msg) { writeOut(msg.jsonText); }
 
     /// A bash "still running" heartbeat: a `session/update` the supervising
     /// worker sees on the JSON-RPC stream. It is not part of the model's
@@ -409,8 +410,8 @@ final class AcpServer : AgentEvents
 
     // ---- AgentEvents: progress becomes session/update ----
 
-    void text(bool reasoning, string chunk) {}
-    void usage(TokenUsage u) {}
+    void text(bool reasoning, string chunk) pure {}
+    void usage(TokenUsage u) pure {}
 
     void userMessage(string t)
     {
@@ -418,8 +419,8 @@ final class AcpServer : AgentEvents
     }
 
     /// Nothing to retract over ACP: the client has the streamed chunks.
-    void responseRestarted() {}
-    void generationStart() {}
+    void responseRestarted() pure {}
+    void generationStart() pure {}
 
     void assistantMessage(string t, string reasoning)
     {
@@ -434,7 +435,7 @@ final class AcpServer : AgentEvents
     {
         JSONValue u = ["sessionUpdate": JSONValue("tool_call"), "toolCallId": JSONValue(call.id),
             "title": JSONValue(call.name), "kind": JSONValue(toolKind(call.name)), "status": JSONValue("in_progress")];
-        u["rawInput"] = parseJSON(call.arguments.toString);
+        u["rawInput"] = parseJSON(call.arguments.jsonText);
         update(u);
     }
 
@@ -476,7 +477,7 @@ final class AcpServer : AgentEvents
         return run();
     }
 
-    private string sessionId() { return sessionId_; }
+    private string sessionId() pure { return sessionId_; }
     private void sessionId(string id) { sessionId_ = id; router.sessionId(id); }
 
     // ---- handling ----
@@ -796,7 +797,7 @@ final class AcpServer : AgentEvents
 /// Insert steers that missed their turn into `deferred` as prompts, each at
 /// the position `deferred` had when it arrived. `leftover` are the last
 /// steers to arrive, so they match the tail of `marks`.
-JSONValue[] requeueSteers(JSONValue[] deferred, Steer[] leftover, const(size_t)[] marks, string active)
+JSONValue[] requeueSteers(JSONValue[] deferred, Steer[] leftover, const(size_t)[] marks, string active) pure
 {
     import std.algorithm : min;
     auto first = saturatingSub(marks.length, leftover.length);

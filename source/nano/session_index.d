@@ -125,7 +125,7 @@ struct Summary
 }
 
 /// Whether a prompt says too little to identify a session by itself.
-bool isTerse(string text)
+bool isTerse(string text) pure
 {
     auto t = text.strip;
     return t.startsWith("/") || (t.walkLength < 24 && t.split.length <= 4);
@@ -133,13 +133,13 @@ bool isTerse(string text)
 
 /// Prompts are kept only to name and describe the session: the title request
 /// uses at most 600 characters of one, so keep only that prefix.
-private string clipPrompt(string text)
+private string clipPrompt(string text) pure
 {
     return text.take(600).to!string;
 }
 
 /// Fold one input record into `s` (count, first/last and context prompts).
-private void foldInput(ref Summary s, string text)
+private void foldInput(ref Summary s, string text) pure
 {
     s.prompts++;
     if (s.firstPrompt is null) s.firstPrompt = clipPrompt(text);
@@ -153,7 +153,7 @@ private void foldInput(ref Summary s, string text)
 
 /// A pre-upgrade index line that predates `first_telling_prompt` yet holds a
 /// non-terse prompt: folding onto it would misname the session, so rebuild.
-private bool missingTellingPrompt(const ref Summary s)
+private bool missingTellingPrompt(const ref Summary s) pure
 {
     if (s.firstTellingPrompt !is null) return false;
     foreach (p; [s.firstPrompt, s.lastPrompt, s.contextPrompt])
@@ -162,7 +162,7 @@ private bool missingTellingPrompt(const ref Summary s)
 }
 
 /// Committed (newline-terminated) lines of `bytes`.
-private const(char)[][] committedLines(const(ubyte)[] bytes)
+private const(char)[][] committedLines(const(ubyte)[] bytes) pure
 {
     size_t committed = bytes.length;
     while (committed && bytes[committed - 1] != '\n') committed--;
@@ -170,7 +170,7 @@ private const(char)[][] committedLines(const(ubyte)[] bytes)
 }
 
 /// The input text of a committed log line, or null when it isn't an input record.
-private string inputText(const(char)[] line)
+private string inputText(const(char)[] line) pure
 {
     if (!line.canFind(`"input"`)) return null; // cheap pre-filter; any JSON spacing is valid
     try
@@ -230,7 +230,7 @@ Summary summarize(string path)
     return s;
 }
 
-private string indexPath(string dir)
+private string indexPath(string dir) pure
 {
     return buildPath(dir, indexFile);
 }
@@ -384,7 +384,7 @@ bool setTitle(string path, string title)
 
 /// The prompts a title is made from: the first telling prompt and, when
 /// different, the latest telling one. Null while every prompt is terse.
-string titleSource(const ref Summary s)
+string titleSource(const ref Summary s) pure
 {
     string last;
     foreach (p; [s.lastPrompt, s.contextPrompt])
@@ -402,7 +402,7 @@ string titleSource(const ref Summary s)
 /// Tidy a model's title reply: first line, no control characters, quotes,
 /// labels or trailing period, at most six words and 60 characters (ellipsis
 /// included). Null when nothing usable is left.
-string cleanTitle(string reply)
+string cleanTitle(string reply) pure
 {
     import std.uni : isWhite, isControl;
     import std.string : lineSplitter, chompPrefix;
@@ -630,7 +630,7 @@ unittest
     assert(list(dir)[0].prompts == 81);
 }
 
-version (unittest) private bool canFindSlashEscape(string s)
+version (unittest) private bool canFindSlashEscape(string s) pure
 {
     import std.algorithm : canFind;
     return s.canFind(`\/`);

@@ -14,7 +14,7 @@ import nano.llm : ToolDefinition;
 /// A tool failure the model should see as an error result.
 class ToolError : Exception
 {
-    this(string msg) { super(msg); }
+    this(string msg) pure { super(msg); }
 }
 
 /// Decodes bytes as UTF-8, replacing each invalid sequence with U+FFFD
@@ -50,16 +50,16 @@ class ToolRegistry
     private ToolDefinition[string] defs;
     private ToolHandler[string] handlers;
 
-    void register(ToolDefinition def, ToolHandler handler)
+    void register(ToolDefinition def, ToolHandler handler) pure
     {
         defs[def.name] = def;
         handlers[def.name] = handler;
     }
 
-    bool has(string name) const { return (name in defs) !is null; }
+    bool has(string name) pure const { return (name in defs) !is null; }
 
     /// Sorted by name so requests are stable across turns (prompt caching).
-    ToolDefinition[] definitions()
+    ToolDefinition[] definitions() pure
     {
         auto all = defs.values;
         all.sort!((a, b) => a.name < b.name);
@@ -78,7 +78,7 @@ class ToolRegistry
 // Argument helpers
 // ---------------------------------------------------------------------------
 
-string requireString(JSONValue args, string name, string tool)
+string requireString(JSONValue args, string name, string tool) pure
 {
     auto v = name in args;
     if (v is null) throw new ToolError(format(`%s: missing required argument "%s"`, tool, name));
@@ -102,7 +102,7 @@ string jsonTypeName(const JSONValue v) pure nothrow
     }
 }
 
-string optString(JSONValue args, string name, string def = null)
+string optString(JSONValue args, string name, string def = null) pure
 {
     auto v = name in args;
     if (v is null || v.type == JSONType.null_) return def;
@@ -110,7 +110,7 @@ string optString(JSONValue args, string name, string def = null)
     return v.str;
 }
 
-long optInt(JSONValue args, string name, long def)
+long optInt(JSONValue args, string name, long def) pure
 {
     auto v = name in args;
     if (v is null || v.type == JSONType.null_) return def;
@@ -126,7 +126,7 @@ long optInt(JSONValue args, string name, long def)
     throw new ToolError(format(`argument "%s" must be an integer`, name));
 }
 
-bool optBool(JSONValue args, string name, bool def)
+bool optBool(JSONValue args, string name, bool def) pure
 {
     auto v = name in args;
     if (v is null || v.type == JSONType.null_) return def;
@@ -160,7 +160,7 @@ string truncateOutput(string text, size_t limit, string label)
 
 /// The first 16 hex digits of the text's SHA-256: the spill marker's
 /// identity, which the repeat detector keys on instead of the per-call path.
-string contentDigest(scope const(char)[] text)
+string contentDigest(scope const(char)[] text) pure
 {
     import std.digest.sha : sha256Of, toHexString;
     import std.ascii : LetterCase;
@@ -202,7 +202,7 @@ void setSpillDir(string dir) { spillDir_ = dir; }
 
 /// The spill directory of the session logged at `logPath` (`<id>.spill`
 /// beside `<id>.jsonl`, as Rust's `session::spill_dir_for`).
-string spillDirFor(string logPath)
+string spillDirFor(string logPath) pure
 {
     import std.path : stripExtension;
     return logPath.stripExtension ~ ".spill";

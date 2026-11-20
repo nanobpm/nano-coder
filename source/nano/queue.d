@@ -14,6 +14,7 @@
 module nano.queue;
 
 @safe:
+import nano.safeio : jsonText, jsonPretty;
 
 import std.sumtype : SumType, match;
 import std.format : format;
@@ -142,10 +143,10 @@ enum usage = "usage: /queue [list] | /queue add text | /queue remove N... | /que
 
 class QueueUsage : Exception
 {
-    this(string msg) { super(msg); }
+    this(string msg) pure { super(msg); }
 }
 
-private size_t parseId(string word)
+private size_t parseId(string word) pure
 {
     import std.json : JSONValue;
     try
@@ -153,10 +154,10 @@ private size_t parseId(string word)
         if (word.length && word[0] != '+' && word[0] != '-') return word.to!size_t;
     }
     catch (ConvException) {}
-    throw new QueueUsage(format!"%s is not a queue id — %s"(JSONValue(word).toString, usage));
+    throw new QueueUsage(format!"%s is not a queue id — %s"(JSONValue(word).jsonText, usage));
 }
 
-private string[] words(string s)
+private string[] words(string s) pure
 {
     import std.array : array;
     import std.algorithm : splitter, filter;
@@ -165,7 +166,7 @@ private string[] words(string s)
 }
 
 /// Split at the first whitespace.
-private string[2] splitOnce(string s)
+private string[2] splitOnce(string s) pure
 {
     import std.ascii : isWhite;
     foreach (i, char c; s)
@@ -174,7 +175,7 @@ private string[2] splitOnce(string s)
 }
 
 /// Parse the arguments after `/queue` (empty means list); throws QueueUsage.
-QueueOp parse(string args)
+QueueOp parse(string args) pure
 {
     args = args.strip;
     if (!args.length || args == "list" || args == "ls") return QueueOp(ListOp());
@@ -265,9 +266,9 @@ private string summary(MessageQueue queue, shared TurnControl steers)
     return n == 0 ? format!"%s steer%s pending"(w, plural(w)) : format!"%s steer%s pending, %s queued"(w, plural(w), n);
 }
 
-private string plural(size_t n) { return n == 1 ? "" : "s"; }
+private string plural(size_t n) pure { return n == 1 ? "" : "s"; }
 
-private string idsText(const size_t[] ids)
+private string idsText(const size_t[] ids) pure
 {
     if (ids.length == 1) return format!"id %s"(ids[0]);
     string[] parts;
@@ -276,7 +277,7 @@ private string idsText(const size_t[] ids)
 }
 
 /// One line, at most `max` characters (an ellipsis marks a cut).
-string preview(string text, size_t max)
+string preview(string text, size_t max) pure
 {
     import std.utf : count;
     import std.range : take;

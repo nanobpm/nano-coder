@@ -53,7 +53,7 @@ struct Steer
     }
 
     /// The ACP request id, or JSON null.
-    JSONValue tag() const
+    JSONValue tag() pure const
     {
         import std.json : parseJSON;
         return tagJson is null ? JSONValue.init : parseJSON(tagJson);
@@ -81,10 +81,10 @@ final class TurnControl
     this() shared { state = new shared Locked!State; }
 
     /// The live agent mode; the running turn reads it at each iteration.
-    AgentMode mode() shared { return cast(AgentMode) atomicLoad(mode_); }
+    AgentMode mode() pure shared { return cast(AgentMode) atomicLoad(mode_); }
 
     /// Change the live mode (from the key reader or a command).
-    void mode(AgentMode m) shared { atomicStore(mode_, cast(int) m); }
+    void mode(AgentMode m) pure shared { atomicStore(mode_, cast(int) m); }
 
     /// Ask the running turn to switch model (`/model` mid-turn).
     void requestModel(string spec) shared { state.update((ref State s) { s.modelRequest = spec; }); }
