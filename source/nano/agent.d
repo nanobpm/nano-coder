@@ -885,8 +885,7 @@ class Agent
         if (v.warning) extra ~= "\n\n" ~ wrap(v.text);
         else if (v.hardStop)
         {
-            extra ~= "\n\n" ~ wrap("This call already ran, but it has repeated too many times: the turn is ending "
-                    ~ "as blocked and any further retries are being stopped. Do not retry it.");
+            extra ~= "\n\n" ~ wrap(loopHardStopNote);
             loopStop = v.text;
         }
         return extra;
@@ -2831,6 +2830,10 @@ StopReason stopReasonFrom(string value) @safe pure nothrow
         if (value == m) return m;
     return StopReason.endTurn;
 }
+
+/// The note appended to a tool result when the loop detector ends the turn.
+enum string loopHardStopNote = "This call already ran, but it has repeated too many times: the turn is ending "
+    ~ "as blocked and any further retries are being stopped. Do not retry it.";
 
 /// The reminder asking the model to continue a cut-off reply.
 Message continuationReminder(long completionTokens) pure

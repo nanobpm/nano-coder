@@ -110,6 +110,9 @@ Replay replay(const LoggedTurn turn)
         import std.algorithm.searching : all;
         return cancelling && ms[i .. $].all!(m => m.role == Role.user && m.timer);
     }
+    import nano.agent : loopHardStopNote;
+    import nano.reminders : wrap;
+    const hardStop = wrap(loopHardStopNote);
     auto state = TurnState.start(Limits(0, false));
     Event[] event = [Event(CallDue(AgentMode.normal, false))];
     size_t toolCalls;
@@ -156,6 +159,9 @@ Replay replay(const LoggedTurn turn)
                 (const ContinueCutOff _) {
                     skipTimers();
                     if (i < ms.length && ms[i].continuation) i++;
+                    // The log doesn't record the turn cap: a cut-off reply that
+                    // ended the turn had no room left for a continuation.
+                    else if (i >= ms.length) { go = Go.skip; why = "cut off at the turn cap"; }
                     else { go = Go.differ; why = format("expected a continuation reminder at message %s", i); }
                 },
                 (const RunTools _) {
@@ -170,7 +176,8 @@ Replay replay(const LoggedTurn turn)
                         }
                         const m = ms[i++];
                         if (m.toolName == "report_outcome" && !m.isError) reported = true;
-                        if (m.content.canFind("repeated too many times")) loop = true;
+                        // The whole wrapped note, which tool output (this file, say) doesn't contain.
+                        if (m.content.canFind(hardStop)) loop = true;
                     }
                     next ~= Event(ToolsRan(loop, reported, null, cancelled));
                 },
@@ -264,6 +271,22 @@ unittest
     // Without the reminder the log disagrees with the machine.
     log = input ~ msg("user", "go") ~ reply("a", "max_tokens") ~ reply("c") ~ end("ac");
     assert(only(log).kind == Replay.Kind.differed);
+}
+
+unittest
+{
+    // Tool output that only mentions the loop detector isn't a hard stop.
+    auto log = input ~ msg("user", "go") ~ reply("", "tool_use", call("c1", "read_file"))
+        ~ tool("c1", "read_file", "it has repeated too many times: the turn is ending") ~ reply("done") ~ end("done");
+    assert(only(log).kind == Replay.Kind.matched, only(log).why);
+    // The note itself is.
+    import nano.agent : loopHardStopNote;
+    import nano.reminders : wrap;
+    log = input ~ msg("user", "go") ~ reply("", "tool_use", call("c1", "bash"))
+        ~ tool("c1", "bash", "ok\n\n" ~ wrap(loopHardStopNote)) ~ msg("assistant", "Blocked: loop") ~ end("Blocked: loop");
+    assert(only(log).kind == Replay.Kind.matched, only(log).why);
+    // A cut-off last reply, with no reminder after it, ended at a turn cap the log doesn't record.
+    assert(only(input ~ msg("user", "go") ~ reply("a", "max_tokens") ~ end("a")).kind == Replay.Kind.skipped);
 }
 
 unittest
