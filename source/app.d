@@ -1776,6 +1776,10 @@ int runMain(string[] args)
     // before each turn (`reloadInstructions`).
     Option!ProjectInstructions instructions;
     string instructionsDir;
+    // The on-demand rules' fingerprint when `instructions` was read: computed
+    // again later it would read today's files, so it is kept.
+    string instructionRules;
+    static string rulesOf(Option!ProjectInstructions i) { return i.match!(pi => pi.scopedFingerprint, () => string.init); }
     // Every caller installs the prompt it builds at once, so the ids its
     // memory index renders in full go straight to the agent (recall skips them).
     bool[string] indexShown;
@@ -1789,6 +1793,7 @@ int runMain(string[] args)
         {
             instructionsDir = dir;
             instructions = discoverInstructions(cfg, dir);
+            instructionRules = rulesOf(instructions);
             if (agent !is null) agent.instructions = instructions;
         }
         return buildSystemPrompt(cfg, dir, wallNow.toISOExtString[0 .. 10], plan, skills, index,
@@ -2034,21 +2039,19 @@ int runMain(string[] args)
 
     // Re-read the instruction files (AGENTS.md, CLAUDE.md, rules, your own
     // files) so edits apply without a restart. A change to what they put in
-    // the system prompt rebuilds it (true); a change to on-demand rules only
-    // swaps the rules. Either way what already attached to tool results
-    // stays attached, unless its rule changed.
+    // the system prompt rebuilds it (true); a change to on-demand rules (or
+    // their imports) only swaps the rules. A change starts attachment over:
+    // a rule or nested file may attach once more, but never stays stale.
     bool reloadInstructions()
     {
         static string text(Option!ProjectInstructions i) { return i.match!(pi => pi.render, () => string.init); }
-        static string rules(Option!ProjectInstructions i) { return i.match!(pi => pi.scopedFingerprint, () => string.init); }
         auto fresh = discoverInstructions(cfg, cwd);
-        const sameDir = instructionsDir == cwd;
-        const sameText = sameDir && text(fresh) == text(instructions);
-        if (sameText && rules(fresh) == rules(instructions)) return false;
-        if (sameDir)
-            foreach (pi; fresh) foreach (old; instructions) pi.inheritAttachments(old);
+        const freshRules = rulesOf(fresh);
+        const sameText = instructionsDir == cwd && text(fresh) == text(instructions);
+        if (sameText && freshRules == instructionRules) return false;
         instructionsDir = cwd;
         instructions = fresh;
+        instructionRules = freshRules;
         agent.instructions = fresh;
         if (sameText) return false;
         agent.installSystem(systemFor(cwd, agent.promptPlan), indexShown);

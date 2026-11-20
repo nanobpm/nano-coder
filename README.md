@@ -1079,9 +1079,9 @@ they add to the system prompt has changed (a file was edited, added or removed),
 prompt is rebuilt and a dim `[instruction files changed: ...]` line says so, so there's no
 need to restart and lose the conversation. Resuming a session (`--resume`) also rebuilds it
 from the current files. The provider's prompt cache misses once, on the turn after a change.
-Edits to rules scoped with `paths:` are picked up too: a changed rule attaches again the next
-time a matching file is touched, while unchanged rules and nested files that already attached
-stay attached.
+Edits to rules scoped with `paths:`, and to files they import, are picked up too. After any
+change, rules and nested files attach afresh the next time a matching file is touched, so one
+already in the conversation may appear once more, but never in an old version.
 ACP sessions (`--acp`) still read the files once, when the session starts.
 
 **Imports.** `CLAUDE.md`, `CLAUDE.local.md`, rules and imported files can pull in other files
