@@ -81,6 +81,7 @@ static import nano.thinking;
 static import nano.timers;
 static import nano.toml;
 static import nano.toml_edit;
+static import nano.turn;
 static import nano.tools.bash;
 static import nano.tools.files;
 static import nano.tools;
@@ -166,6 +167,7 @@ private alias modules = imported!"std.meta".AliasSeq!(
     nano.thinking,
     nano.timers,
     nano.toml,
+    nano.turn,
     nano.toml_edit,
     nano.tools.bash,
     nano.tools.files,
