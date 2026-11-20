@@ -527,6 +527,17 @@ Results come back as values, and so do errors: a function that can fail returns
 point, which returns the error. Their exception classes are private, and check-safe caps those
 `throw`s (`scripts/pure-throw-budget`).
 
+The agent loop is part of that core too. `nano.turn` is a state machine: `step(state, event)`
+returns the next state and a list of effects. Events are what happened (a call is due, the model
+replied, a call failed, tools ran, a Stop hook ran, compaction finished); effects are what to do
+next (call the model, run the tools, continue a cut-off reply, run the Stop hook, finish). Every
+decision in a turn is made in `step`: the turn cap, stream restarts, the output cap, compacting on
+overflow, continuations, steers, Stop hook blocks and reported outcomes. `Agent.runTurn` only
+carries effects out and feeds the results back in. `source/nano/turn_replay_test.d` replays
+session logs through `step` and checks that each turn asks for what the log shows next and ends
+with the recorded answer. Point `NANO_REPLAY_DIR` at a sessions directory to replay all of its
+turns.
+
 ## Configuration
 
 Create `~/.config/nano-coder/config.toml` (every field is optional). Directories from before the rename (`agentic-harness`, for config and for data such as sessions) are moved to `nano-coder` at startup when the new ones don't exist yet. A symlink is left at the old path so an older nano-coder still finds them. If that compatibility symlink can't be created, a warning is printed and the link is retried on later starts; if the move itself fails, the old directory is used:
