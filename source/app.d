@@ -1772,7 +1772,8 @@ int runMain(string[] args)
         foreach (t; memorySessionTools(store, memoryWritable, () => agent.control.mode == AgentMode.plan,
                 () => agent.log.match!(l => l.id, () => string.init)))
             tools.register(t.definition, asToolError(t.handler));
-    // Instruction files, discovered once per working directory.
+    // Instruction files, discovered once per working directory and re-read
+    // before each turn (`reloadInstructions`).
     Option!ProjectInstructions instructions;
     string instructionsDir;
     // Every caller installs the prompt it builds at once, so the ids its
@@ -2031,6 +2032,21 @@ int runMain(string[] args)
     agent.promptPlan = o.plan;
     void syncMode() { agent.syncModePrompt((bool plan) => systemFor(cwd, plan)); }
 
+    // Re-read the instruction files (AGENTS.md, CLAUDE.md, rules, your own
+    // files): when what they put in the system prompt changed, rebuild it so
+    // the next call follows them, without a restart. True when it changed.
+    bool reloadInstructions()
+    {
+        static string text(Option!ProjectInstructions i) { return i.match!(pi => pi.render, () => string.init); }
+        auto fresh = discoverInstructions(cfg, cwd);
+        if (instructionsDir == cwd && text(fresh) == text(instructions)) return false;
+        instructionsDir = cwd;
+        instructions = fresh;
+        agent.instructions = fresh;
+        agent.installSystem(systemFor(cwd, agent.promptPlan), indexShown);
+        return true;
+    }
+
     // `h.cfg` points at runMain's `cfg`, which outlives every settings
     // dialog (they all run inside runMain).
     SettingsHost settingsHost()
@@ -2122,6 +2138,8 @@ int runMain(string[] args)
 
     bool turn(string input) @safe
     {
+        if (reloadInstructions())
+            stdErr.writeln(console.dim("[instruction files changed: the system prompt now follows them]"));
         syncMode();
         nano.herdr.report(nano.herdr.State.working);
         if (gFrame) gFrame.busy(true);
