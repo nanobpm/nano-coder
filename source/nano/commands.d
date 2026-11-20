@@ -569,21 +569,21 @@ unittest
     import std.algorithm : find, any, startsWith;
     import nano.config : Config;
     auto path = buildPath(tempDir, "nano-d-model-suggestions-2.toml");
-    write(path, `model = "openrouter-camunda/moonshotai/kimi-k3"
+    write(path, `model = "openrouter-regional/moonshotai/kimi-k3"
 [providers.openrouter]
 disabled = true
-[providers.openrouter-camunda]
+[providers.openrouter-regional]
 kind = "openai"
 base_url = "https://us.openrouter.ai/api/v1"
 list_models = "configured"
-[providers.openrouter-camunda.models."amazon/nova-lite-v1"]
+[providers.openrouter-regional.models."amazon/nova-lite-v1"]
 name = "Nova Lite 1.0"
 base_url = "https://eu.openrouter.ai/api/v1"
 `);
     scope (exit) remove(path);
     auto cfg = Config.load(path);
     auto found = modelSuggestions(cfg, null, null);
-    auto nova = found.find!(s => s.value == "openrouter-camunda/amazon/nova-lite-v1");
+    auto nova = found.find!(s => s.value == "openrouter-regional/amazon/nova-lite-v1");
     assert(nova.length, "configured model offered");
     assert(nova[0].note == "Nova Lite 1.0", nova[0].note);
     assert(!found.any!(s => s.value == "openrouter" || s.value.startsWith("openrouter/")), "disabled hidden");

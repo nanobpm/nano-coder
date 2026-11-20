@@ -725,15 +725,15 @@ version (unittest) Config regionalConfig(string extra = "")
     write(path, `default_provider = "mock"
 [providers.openrouter]
 disabled = true
-[providers.openrouter-camunda]
+[providers.openrouter-regional]
 kind = "openai"
 base_url = "https://us.openrouter.ai/api/v1/"
 api_key = "k"
 list_models = "configured"
 default_model = "moonshotai/kimi-k3"
-[providers.openrouter-camunda.models."moonshotai/kimi-k3"]
+[providers.openrouter-regional.models."moonshotai/kimi-k3"]
 name = "Kimi K3"
-[providers.openrouter-camunda.models."amazon/nova-lite-v1"]
+[providers.openrouter-regional.models."amazon/nova-lite-v1"]
 name = "Nova Lite 1.0"
 base_url = "https://eu.openrouter.ai/api/v1"
 ` ~ extra);
@@ -747,15 +747,15 @@ unittest
     import std.algorithm : canFind;
     import std.exception : collectExceptionMsg;
     auto c = regionalConfig();
-    auto eu = resolve(c, "openrouter-camunda/amazon/nova-lite-v1");
+    auto eu = resolve(c, "openrouter-regional/amazon/nova-lite-v1");
     assert(eu.config.baseUrl == "https://eu.openrouter.ai/api/v1" && eu.model == "amazon/nova-lite-v1");
-    auto us = resolve(c, "openrouter-camunda/moonshotai/kimi-k3");
+    auto us = resolve(c, "openrouter-regional/moonshotai/kimi-k3");
     assert(us.config.baseUrl == "https://us.openrouter.ai/api/v1", us.config.baseUrl);
-    assert(resolve(c, "openrouter-camunda/x-ai/grok-4.6").config.baseUrl == us.config.baseUrl);
-    assert(resolve(c, "openrouter-camunda").model == "moonshotai/kimi-k3");
+    assert(resolve(c, "openrouter-regional/x-ai/grok-4.6").config.baseUrl == us.config.baseUrl);
+    assert(resolve(c, "openrouter-regional").model == "moonshotai/kimi-k3");
     // A bad per-model host is refused like a bad provider host.
-    auto bad = regionalConfig("[providers.openrouter-camunda.models.\"m\"]\nbase_url = \"ftp://eu.openrouter.ai\"\n");
-    assert(collectExceptionMsg(resolve(bad, "openrouter-camunda/m")).canFind("must be http(s)"));
+    auto bad = regionalConfig("[providers.openrouter-regional.models.\"m\"]\nbase_url = \"ftp://eu.openrouter.ai\"\n");
+    assert(collectExceptionMsg(resolve(bad, "openrouter-regional/m")).canFind("must be http(s)"));
 }
 
 // rust: providers/mod.rs::a_hidden_provider_is_filtered_from_listings_but_still_usable
@@ -831,7 +831,7 @@ unittest
     assert(c.providers["openrouter"].disabled);
     assert(c.providers["openrouter"].baseUrl == "https://openrouter.ai/api/v1", "the preset merges");
     auto shown = enabledProviderNames(c.providers);
-    assert(!shown.canFind("openrouter") && shown.canFind("openrouter-camunda"));
+    assert(!shown.canFind("openrouter") && shown.canFind("openrouter-regional"));
     foreach (spec; ["openrouter/moonshotai/kimi-k3", "openrouter"])
         assert(collectExceptionMsg(resolve(c, spec)).canFind(`"openrouter" is disabled`), spec);
 }
@@ -843,7 +843,7 @@ unittest
     import std.exception : collectExceptionMsg;
     auto c = regionalConfig();
     string[2][] want = [["amazon/nova-lite-v1", "Nova Lite 1.0"], ["moonshotai/kimi-k3", "Kimi K3"]];
-    assert(c.providers["openrouter-camunda"].configuredModels == want);
+    assert(c.providers["openrouter-regional"].configuredModels == want);
     assert(c.providers["openai"].configuredModels is null, "presets list from the endpoint");
     // A later layer sets only some fields of a model: the rest survive.
     ProviderConfig p;
