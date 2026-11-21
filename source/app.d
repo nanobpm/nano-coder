@@ -988,8 +988,13 @@ void updateStatus(scope void delegate(ref Stats) @safe f)
 {
     if (!gFrame) return;
     gStats.update(f);
-    gFrame.redraw();
+    if (!gStatusBatched) gFrame.redraw();
 }
+
+/// Set while a transcript replays: status changes still land in `gStats`
+/// but skip the redraw (each copies the whole retained transcript), so a
+/// tool-heavy resume redraws once, at the final idle reset.
+bool gStatusBatched;
 
 /// The agent's side of the status line: model, context, plan, mode, tokens.
 
@@ -1588,6 +1593,10 @@ void replayTranscript(Agent agent, Console console)
     auto after = console.afterStep;
     console.afterStep = null;
     scope (exit) { console.afterStep = after; if (after !is null) after(); }
+    // Batch status redraws until the final idle reset below.
+    const wasBatched = gStatusBatched;
+    gStatusBatched = true;
+    scope (exit) gStatusBatched = wasBatched;
     // Tool calls whose header waits for its result, so each header shows
     // directly above its own output (several calls in one message would
     // otherwise stack every header above all the results).
@@ -1626,7 +1635,9 @@ void replayTranscript(Agent agent, Console console)
             // own soft-wrap / verbatim markers.
             // Quiet mode shows only final answers live (no tool calls);
             // an output-limit cut-off has no tool calls, so it stays.
-            if (m.content.strip.length && !(console.quiet && m.toolCalls.length)) writeln(stampBlock(console.stamp(), console.display(escapeMarks(sanitizeBlock(m.content))).stripRight));
+            // A Stop hook rejecting the answer supersedes it: live quiet
+            // mode keeps only the answer that finally stood.
+            if (m.content.strip.length && !(console.quiet && (m.toolCalls.length || stopRejected(msgs, i)))) writeln(stampBlock(console.stamp(), console.display(escapeMarks(sanitizeBlock(m.content))).stripRight));
             foreach (j, ref c; m.toolCalls) pending ~= [i, j];
             break;
         case Role.tool:
@@ -1646,10 +1657,32 @@ void replayTranscript(Agent agent, Console console)
     }
     flushPending();
     if (!agent.plan.empty && !console.quiet) writeln(escapeMarks(sanitizeBlock(planText(agent))));
-    // toolStart/toolEnd drive the live status; the replay leaves it idle.
+    // toolStart/toolEnd drive the live status; the replay leaves it idle
+    // (and this one redraw covers every batched change).
+    gStatusBatched = wasBatched;
     updateStatus((ref Stats s) { s.activity = Activity.idle; s.tool = null; s.tokensPerSec = 0;
         s.historySearches = s.historyReads = 0; });
     stdOut.flush();
+}
+
+/// Whether the message after `msgs[i]` is a Stop hook's rejection (an
+/// automatic message that is not a continuation, timer or hook context).
+bool stopRejected(const Message[] msgs, size_t i) pure nothrow @nogc @safe
+{
+    if (i + 1 >= msgs.length) return false;
+    const n = &msgs[i + 1];
+    return n.role == Role.user && n.autoInitiated && !n.continuation && !n.timer && !n.hookContext;
+}
+
+unittest
+{
+    auto hook = Message.auto_("keep going");
+    auto cont = Message.auto_("cut off");
+    cont.continuation = true;
+    auto msgs = [Message.assistant("first"), hook, Message.assistant("second"), cont, Message.assistant("tail")];
+    assert(stopRejected(msgs, 0));
+    assert(!stopRejected(msgs, 2));
+    assert(!stopRejected(msgs, 4));
 }
 
 string planText(Agent agent) pure
