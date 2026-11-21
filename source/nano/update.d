@@ -138,7 +138,6 @@ string[] installArgs(Channel c)
     }
 }
 
-/// The update command for a channel ("" for other).
 /// The tap that serves `brewFormula`.
 enum brewTap = "nanobpm/tap";
 
@@ -189,6 +188,7 @@ string brewTapRepo()
     return dir.length && exists(buildPath(dir, ".git")) ? dir : null;
 }
 
+/// The update command for a channel ("" for other).
 string installCommand(Channel c) { return c == Channel.other ? "" : installer(c) ~ " " ~ installArgs(c).joinWords; }
 
 /// Where the channel's latest version is read (null for other).
@@ -462,10 +462,19 @@ string[] runInstaller(Channel channel, string exe, string running,
     {
         if (channel == Channel.brew) tapRepo = tapRepoOf is null ? brewTapRepo() : tapRepoOf();
         steps = installSteps(channel, tapRepo);
-        foreach (step; steps)
+        foreach (i, step; steps)
         {
             shown = step.program ~ " " ~ step.args.joinWords;
             status = runner(step.program, step.args, step.env);
+            if (status != 0 && i == 0 && steps.length > 1)
+            {
+                // The tap refresh failed (offline, diverged tap, no git):
+                // fall back to plain `brew upgrade`, which refreshes taps itself.
+                auto plain = installSteps(channel, null)[0];
+                shown = plain.program ~ " " ~ plain.args.joinWords;
+                status = runner(plain.program, plain.args, plain.env);
+                break;
+            }
             if (status != 0) break;
         }
     }
@@ -790,10 +799,17 @@ unittest
     assert(installSteps(Channel.npm, "/tap").length == 1 && installSteps(Channel.other, "/tap") is null);
     if (which("brew") is null) return; // runInstaller needs brew on PATH
     string[] ran;
-    auto rec = (string p, string[] a, const string[string] e) @safe { ran ~= p; return p == "git" ? 1 : 0; };
+    const(string[string])[] envs;
+    auto rec = (string p, string[] a, const string[string] e) @safe { ran ~= p; envs ~= e; return p == "git" ? 1 : 0; };
     auto out_ = runInstaller(Channel.brew, "/x", "0.1.0", rec, (string e) @safe => "0.2.0", () @safe => "/tap");
-    assert(ran == ["git"], "a failed tap refresh stops before brew upgrade");
-    assert(out_[0].canFind("git -C /tap pull") && out_[0].canFind("unchanged"), out_[0]);
+    assert(ran == ["git", "brew"], "a failed tap refresh falls back to plain brew upgrade");
+    assert(envs[1] is null, "the fallback upgrade lets brew refresh taps itself");
+    assert(out_[0].canFind("Updated to 0.2.0"), out_[0]);
+    ran = null; envs = null;
+    auto failing = (string p, string[] a, const string[string] e) @safe { ran ~= p; return 1; };
+    out_ = runInstaller(Channel.brew, "/x", "0.1.0", failing, (string e) @safe => "0.2.0", () @safe => "/tap");
+    assert(ran == ["git", "brew"]);
+    assert(out_[0].canFind("`brew upgrade") && out_[0].canFind("unchanged"), out_[0]);
 }
 
 // rust: update.rs::the_formula_version_is_read_from_its_download_url
