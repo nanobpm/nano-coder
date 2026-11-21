@@ -1677,7 +1677,12 @@ class Agent
             if (!m.timestamp.length) m.timestamp = nowStamp();
             newLog.ifSome((SessionLog l) { m.logLine = l.append(m); });
         }
-        messages = messages.length && messages[0].role == Role.system ? messages[0 .. 1] : null;
+        // Keep only the system message of the replaced conversation — and
+        // copy it: `messages[0 .. 1]` would stay a slice of the old backing
+        // array, keeping the whole previous conversation reachable through
+        // its allocation, which the conservative GC then scans and the
+        // post-resume `releaseHeap` cannot reclaim.
+        messages = messages.length && messages[0].role == Role.system ? messages[0 .. 1].dup : null;
         foreach (ref m; r.conversation)
             if (m.role != Role.system) messages ~= m;
         replaceLog(newLog);
@@ -2888,6 +2893,27 @@ unittest
     assert(isClose(agent.sessionAic, 0.0432) && agent.sessionInputTokens == 30);
     agent.resetSessionCounters();
     assert(!agent.hasSessionAic && agent.sessionAic == 0 && agent.sessionInputTokens == 0);
+}
+
+// Resuming over a system-message-only session must not keep the replaced
+// conversation's backing array alive through a slice: `loadRestored` copies
+// the kept system message so the old allocation is collectable.
+unittest
+{
+    import nano.session : Restored;
+    import nano.providers.mock;
+    auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "sys");
+    agent.messages ~= [Message.user("u1"), Message.assistant("a1")];
+    // Mutating the old array must not reach the resumed conversation: the
+    // kept system message is a copy, not a slice of the old backing array.
+    auto old = agent.messages;
+    Restored r;
+    r.conversation = [Message.user("u2"), Message.assistant("a2")];
+    agent.loadRestored(r, Option!SessionLog.init);
+    assert(agent.messages.length == 3 && agent.messages[0].role == Role.system
+        && agent.messages[1].content == "u2" && agent.messages[2].content == "a2");
+    old[0].content = "overwritten";
+    assert(agent.messages[0].content == "sys", agent.messages[0].content);
 }
 
 /// The tool result a crash left unwritten (Rust's INTERRUPTED_TOOL_RESULT).
