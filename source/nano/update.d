@@ -243,15 +243,20 @@ private bool canFindChar(string set, dchar c) pure { foreach (d; set) if (d == c
 
 /// The step as a copy-pasteable shell command: its environment overrides
 /// (sorted, as `K=V` prefixes) then the program and arguments, so a manual
-/// retry reproduces what `/update` ran. Removals (null values) are not shown:
-/// they only undo a redirect the session inherited.
+/// retry reproduces what `/update` ran. Removals (null values) are rendered
+/// as an `env -u K ...` prefix, so a pasted retry is isolated from an inherited
+/// redirect (e.g. `GIT_DIR`) exactly like the step `/update` ran.
 string stepCommand(InstallStep step)
 {
     import std.algorithm : sort;
     import std.array : array;
-    string s;
-    foreach (k; step.env.keys.array.sort) if (step.env[k] !is null) s ~= k ~ "=" ~ shellWord(step.env[k]) ~ " ";
-    return s ~ shellWord(step.program) ~ " " ~ step.args.joinWords;
+    string unset, set;
+    foreach (k; step.env.keys.array.sort)
+    {
+        if (step.env[k] is null) unset ~= "-u " ~ shellWord(k) ~ " ";
+        else set ~= k ~ "=" ~ shellWord(step.env[k]) ~ " ";
+    }
+    return (unset.length ? "env " ~ unset : "") ~ set ~ shellWord(step.program) ~ " " ~ step.args.joinWords;
 }
 
 /// Checks are off by environment.
@@ -877,11 +882,18 @@ unittest
     auto plain = installSteps(Channel.brew, null);
     assert(plain.length == 1 && plain[0].args == ["upgrade", brewFormula] && plain[0].env is null);
     assert(stepCommand(plain[0]) == "brew upgrade " ~ brewFormula);
-    assert(stepCommand(steps[0]) == "git -C /tap pull --ff-only --quiet");
+    {
+        import std.algorithm : sort, map;
+        import std.array : array, join;
+        auto unsets = steps[0].env.keys.array.sort.map!(k => "-u " ~ k ~ " ").join;
+        assert(stepCommand(steps[0]) == "env " ~ unsets ~ "git -C /tap pull --ff-only --quiet", stepCommand(steps[0]));
+        assert(stepCommand(steps[0]).canFind("-u GIT_DIR ") && stepCommand(steps[0]).canFind("-u GIT_WORK_TREE "));
+    }
     assert(stepCommand(steps[1]) == "HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 "
         ~ "HOMEBREW_NO_INSTALL_CLEANUP=1 brew upgrade " ~ brewFormula);
     auto spaced = installSteps(Channel.brew, "/opt/home brew/tap");
-    assert(stepCommand(spaced[0]) == "git -C '/opt/home brew/tap' pull --ff-only --quiet");
+    assert(stepCommand(spaced[0]).canFind(" git -C '/opt/home brew/tap' pull --ff-only --quiet"));
+    assert(stepCommand(InstallStep("p", ["x"], ["A": null, "B": "1"])) == "env -u A B=1 p x");
     assert(shellWord("it's") == `'it'\''s'` && shellWord("") == "''" && shellWord("a b") == "'a b'");
     assert(stepCommand(InstallStep("my prog", ["x"], ["K": "a b"])) == "K='a b' 'my prog' x");
     assert(installSteps(Channel.npm, "/tap").length == 1 && installSteps(Channel.other, "/tap") is null);
@@ -902,7 +914,7 @@ unittest
         ran ~= p; if (p == "git") throw new Exception("git: not found"); return 0; };
     out_ = runInstaller(Channel.brew, "/x", "0.1.0", noGit, (string e) @safe => "0.2.0", () @safe => "/tap");
     assert(ran == ["git"], "git missing from PATH stops before brew upgrade too");
-    assert(out_[0].canFind("Could not run `git -C /tap pull") && out_[0].canFind("git: not found")
+    assert(out_[0].canFind("Could not run `env -u ") && out_[0].canFind(" git -C /tap pull") && out_[0].canFind("git: not found")
         && out_[0].canFind("unchanged") && !out_[0].canFind("status -1"), out_[0]);
     // Successful tap refresh: git then brew, with every override reaching brew's runner.
     ran = null;
