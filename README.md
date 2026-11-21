@@ -1322,6 +1322,19 @@ prompt. A saved session is reported with the command that resumes it
 can reopen it after a restart (Herdr 0.9.2 or later). The pane is released on exit.
 Reports run in the background and failures are ignored; outside Herdr nothing is sent.
 
+While the agent has a timer set, nano-coder also reports a `timer` token showing ⏰.
+Herdr's state icon is fixed per state, so put `$timer` next to it in your Herdr
+`config.toml`. Herdr only takes per-agent layouts for its built-in agents, so this is the
+layout for every agent; the token takes no space where no timer is reported:
+
+```toml
+[ui.sidebar.agents]
+rows = [
+  ["state_icon", "$timer", "workspace", "tab"],
+  ["agent"],
+]
+```
+
 ## Formal Verification
 
 `tla/` holds TLA+ specifications of ACP turn routing (steer, cancel, deferred

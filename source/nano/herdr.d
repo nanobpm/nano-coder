@@ -131,6 +131,18 @@ string[] metadataArgs(string pane, string model) pure
     return args ~ ["--display-agent", agent ~ " · " ~ clean, "--token", "model=" ~ clean];
 }
 
+/// The icon the `timer` token shows while a timer is set.
+enum timerIcon = "⏰";
+
+/// The arguments for the `timer` token: the icon while a timer is set,
+/// cleared otherwise. Herdr shows it where the user's sidebar layout puts
+/// `$timer`, for example next to `state_icon`; unset, it takes no space.
+string[] timerArgs(string pane, bool on) pure
+{
+    string[] args = ["pane", "report-metadata", pane, "--source", source, "--agent", agent];
+    return args ~ (on ? ["--token", "timer=" ~ timerIcon] : ["--clear-token", "timer"]);
+}
+
 /// A report waiting to be sent: sequence numbers for the state report and,
 /// when the session changed, the session report that follows it.
 private struct Queued
@@ -166,6 +178,11 @@ private struct Reporter
     /// Whether `lastModel` holds a reported name, so a first empty name
     /// (a clear) is still sent rather than mistaken for a repeat.
     bool hasLastModel;
+    /// Whether a timer is set, when that changed since the last report.
+    bool hasPendingTimer, pendingTimer, lastTimer;
+    /// Whether `lastTimer` holds a reported state, so a first `false` is
+    /// still sent (clearing an icon a previous process left behind).
+    bool hasLastTimer;
     /// Set by `release`; no metadata is sent afterwards.
     bool released;
     /// A metadata send is running in the worker; `release` waits for it so
@@ -182,27 +199,54 @@ private bool takeModel(ref Reporter r, out string model)
     return take;
 }
 
-/// Start the release: nothing more is sent. Returns whether a model is shown
-/// (so it must be cleared) and the release sequence number.
-private ulong beginRelease(ref Reporter r, out bool shown)
+/// The worker takes the pending timer flag to send, unless the pane was
+/// released.
+private bool takeTimer(ref Reporter r, out bool on)
+{
+    bool take = r.hasPendingTimer && !r.released;
+    r.hasPendingTimer = false;
+    if (take) { on = r.pendingTimer; r.modelInFlight = true; }
+    return take;
+}
+
+/// Start the release: nothing more is sent. Returns whether a model or the
+/// timer icon is shown (so they must be cleared) and the release sequence
+/// number.
+private ulong beginRelease(ref Reporter r, out bool shown, out bool timerShown)
 {
     r.released = true;
     // A pending model (even an empty one, i.e. a clear) may follow a shown
     // one, so it counts as shown: clearing an unshown model is harmless.
     shown = r.lastModel.length > 0 || r.modelInFlight || r.hasPendingModel;
-    r.hasPending = r.hasPendingModel = false;
+    // A pending clear not yet sent may follow a shown icon: clear it anyway.
+    timerShown = r.lastTimer || r.hasPendingTimer || r.modelInFlight;
+    r.hasPending = r.hasPendingModel = r.hasPendingTimer = false;
     r.lastModel = null;
-    r.hasLastModel = false;
+    r.hasLastModel = r.hasLastTimer = false;
+    r.lastTimer = false;
     return nextSeq(r);
 }
 
 /// Undo a release whose exit did not happen (a failed relaunch): reporting
-/// starts afresh, so the next state, session and model are all sent again.
+/// starts afresh, so the next state, session, model and timer are all sent
+/// again.
 private void endRelease(ref Reporter r)
 {
     r.released = false;
-    r.hasLast = r.hasLastSession = r.hasLastModel = false;
+    r.hasLast = r.hasLastSession = r.hasLastModel = r.hasLastTimer = false;
     r.lastModel = null;
+    r.lastTimer = false;
+}
+
+/// Queue the timer state `on` unless released or a repeat of the last one.
+/// The first state is always sent, even `false`.
+private void queueTimer(ref Reporter r, bool on)
+{
+    if (r.released || (r.hasLastTimer && on == r.lastTimer)) return;
+    r.hasLastTimer = true;
+    r.lastTimer = on;
+    r.pendingTimer = on;
+    r.hasPendingTimer = true;
 }
 
 /// Queue `name` for display unless released or a repeat of the last one.
@@ -295,28 +339,45 @@ void showModel(string model)
     atomicLoad(gReporter).update((ref Reporter r) { queueModel(r, name); });
 }
 
+/// ditto, for callers that only track the model.
+private ulong beginRelease(ref Reporter r, out bool shown)
+{
+    bool timerShown;
+    return beginRelease(r, shown, timerShown);
+}
+
+/// Show the timer icon in Herdr while `on` (a timer is set), in the
+/// background. Repeats are skipped.
+void showTimer(bool on)
+{
+    if (!active) return;
+    atomicLoad(gReporter).update((ref Reporter r) { queueTimer(r, on); });
+}
+
 /// Release the pane on exit. Runs in the foreground (bounded by a timeout)
 /// so it is sent before the process ends; drops any report still pending.
 void release()
 {
     if (!active) return;
     Pane pane;
-    bool shown;
+    bool shown, timerShown;
     auto rep = atomicLoad(gReporter);
     ulong seq = rep.update!ulong((ref Reporter r) {
         pane = r.pane;
-        return beginRelease(r, shown);
+        return beginRelease(r, shown, timerShown);
     });
     // Let an in-flight metadata send finish (each run is time-bounded) so
     // the clear below is the last metadata Herdr sees.
     rep.await!bool((ref const Reporter r) => !r.modelInFlight, (ref Reporter r) => true);
     // Metadata outlives the release, so clear the model first.
     if (shown) run(pane.bin, metadataArgs(pane.id, null));
+    if (timerShown) run(pane.bin, timerArgs(pane.id, false));
     run(pane.bin, releaseArgs(pane.id, seq));
 }
 
 /// Resume reporting after `release` when the process keeps running (a
-/// failed relaunch): the next state, session and model are reported again.
+/// failed relaunch): the next state, session, model and timer are reported
+/// again.
 void reacquire()
 {
     if (!active) return;
@@ -328,7 +389,8 @@ private void worker(string bin, string pane)
     for (;;)
     {
         bool hasState;
-        auto q = atomicLoad(gReporter).await!Queued((ref const Reporter r) => r.hasPending || r.hasPendingModel,
+        auto q = atomicLoad(gReporter).await!Queued(
+            (ref const Reporter r) => r.hasPending || r.hasPendingModel || r.hasPendingTimer,
             (ref Reporter r) {
                 hasState = r.hasPending;
                 r.hasPending = false;
@@ -339,16 +401,19 @@ private void worker(string bin, string pane)
             run(bin, reportArgs(pane, q.state, q.stateSeq, q.message));
             if (q.hasSession) run(bin, sessionArgs(pane, q.sessionSeq, q.session));
         }
-        // Take the model only after state/session reporting, so a release
-        // that starts meanwhile discards it instead of waiting on unrelated
-        // reports before its own clear and release calls.
+        // Take the model and timer only after state/session reporting, so a
+        // release that starts meanwhile discards them instead of waiting on
+        // unrelated reports before its own clear and release calls.
         string model;
-        bool hasModel = atomicLoad(gReporter).update!bool((ref Reporter r) => takeModel(r, model));
-        if (hasModel)
-        {
-            run(bin, metadataArgs(pane, model));
-            atomicLoad(gReporter).update((ref Reporter r) { r.modelInFlight = false; });
-        }
+        bool timerOn;
+        bool hasModel, hasTimer;
+        atomicLoad(gReporter).update((ref Reporter r) {
+            hasModel = takeModel(r, model);
+            hasTimer = takeTimer(r, timerOn);
+        });
+        if (hasModel) run(bin, metadataArgs(pane, model));
+        if (hasTimer) run(bin, timerArgs(pane, timerOn));
+        if (hasModel || hasTimer) atomicLoad(gReporter).update((ref Reporter r) { r.modelInFlight = false; });
     }
 }
 
@@ -539,4 +604,72 @@ unittest // after a failed relaunch, model, state and session report again
     r.hasPendingModel = true;
     string model;
     assert(takeModel(r, model) && model == "gpt-5");
+}
+
+unittest // the timer token shows the icon while a timer is set and is cleared otherwise
+{
+    assert(timerArgs("p1", true) == ["pane", "report-metadata", "p1", "--source", "nano-coder", "--agent", "nano-coder",
+        "--token", "timer=⏰"]);
+    assert(timerArgs("p1", false)[$ - 2 .. $] == ["--clear-token", "timer"]);
+}
+
+unittest // the first timer state is sent even when false; repeats are skipped
+{
+    Reporter r;
+    queueTimer(r, false);
+    assert(r.hasPendingTimer && !r.pendingTimer);
+    r.hasPendingTimer = false;
+    queueTimer(r, false);
+    assert(!r.hasPendingTimer);
+    queueTimer(r, true);
+    assert(r.hasPendingTimer && r.pendingTimer);
+}
+
+unittest // after release and reacquire, the first timer state is sent again
+{
+    Reporter r;
+    queueTimer(r, false);
+    bool shown, timerShown;
+    beginRelease(r, shown, timerShown);
+    queueTimer(r, false);
+    assert(!r.hasPendingTimer);           // released: nothing queued
+    endRelease(r);
+    queueTimer(r, false);
+    assert(r.hasPendingTimer && !r.pendingTimer);
+}
+
+unittest // release clears a shown timer, and nothing is taken after it
+{
+    Reporter r;
+    r.lastTimer = true;
+    r.hasPendingTimer = r.pendingTimer = true;
+    bool shown, timerShown, on;
+    beginRelease(r, shown, timerShown);
+    assert(timerShown && !shown && !r.lastTimer);
+    assert(!takeTimer(r, on));
+}
+
+unittest // release clears the icon when a pending clear was never sent
+{
+    Reporter r;
+    r.lastTimer = r.pendingTimer = true;
+    r.hasPendingTimer = true;
+    bool on;
+    assert(takeTimer(r, on) && on);
+    r.modelInFlight = false;            // the icon was sent
+    r.lastTimer = r.pendingTimer = false; // showTimer(false), not yet sent
+    r.hasPendingTimer = true;
+    bool shown, timerShown;
+    beginRelease(r, shown, timerShown);
+    assert(timerShown);
+}
+
+unittest // release clears a model whose pending clear was never sent
+{
+    Reporter r;
+    r.lastModel = null;
+    r.hasPendingModel = true;
+    bool shown;
+    beginRelease(r, shown);
+    assert(shown);
 }
