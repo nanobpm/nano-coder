@@ -1324,11 +1324,12 @@ Reports run in the background and failures are ignored; outside Herdr nothing is
 
 While the agent has a timer set, nano-coder also reports a `timer` token showing ⏰.
 Herdr's state icon is fixed per state, so put `$timer` next to it in your Herdr
-`config.toml` (it takes no space when no timer is set):
+`config.toml`. Herdr only takes per-agent layouts for its built-in agents, so this is the
+layout for every agent; the token takes no space where no timer is reported:
 
 ```toml
-[ui.sidebar.agents.rows_by_agent]
-nano-coder = [
+[ui.sidebar.agents]
+rows = [
   ["state_icon", "$timer", "workspace", "tab"],
   ["agent"],
 ]
