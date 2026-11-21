@@ -902,7 +902,8 @@ unittest
     import core.time : days;
     auto old = wallNow - days(400);
     setTimes(titled, old, old);
-    std.file.remove(buildPath(dir, ".tidy-stamp"));
+    auto stamp = buildPath(dir, ".tidy-stamp");
+    if (exists(stamp)) std.file.remove(stamp);
     auto t = tidySessions(dir, 0, 30);
     assert(t.deleted == 0 && exists(titled), "a titled log is never deleted");
 }

@@ -1921,8 +1921,15 @@ int runMain(string[] args)
         // that closes while this one waits on the lock leaves state a pre-lock
         // `restore` would adopt stale (re-executing a completed input).
         auto log = o.noSession ? null : new SessionLog(path);
+        // Until the agent adopts the incoming log (a failed restore or
+        // dangling-tool repair write throws first), release its descriptor
+        // and lock so other processes can resume the session.
+        bool adopted;
+        scope (failure) if (!adopted && log !is null) log.close();
         auto restored = log is null ? restore(path) : log.restoreLocked();
-        foreach (note; agent.loadRestored(restored, o.noSession ? Option!SessionLog(none) : some(log)))
+        auto notes = agent.loadRestored(restored, o.noSession ? Option!SessionLog(none) : some(log));
+        adopted = true;
+        foreach (note; notes)
             stdErr.writeln("nano-coder: ignoring ", note);
         updateStatus((ref Stats s) { s.historySearches = s.historyReads = 0; });
         if (!agent.timers.empty)
