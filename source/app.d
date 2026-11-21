@@ -1580,6 +1580,16 @@ string timersText(Agent agent)
         : agent.timers.list(agent.timerNow(), true).stripRight;
 }
 
+/// Transparent to an output-limit continuation: system messages
+/// (compaction), timer firings/nudges and hook-only context are not user
+/// input, so one between a reminder and the reply keeps the accumulated
+/// answer. Shared by replayAnswerQuiet (forward walk) and replayTranscript
+/// (backward walk) so the two cannot drift apart.
+bool replayTransparent(const ref Message x) pure nothrow @safe
+{
+    return x.role == Role.system || (x.role == Role.user && (x.hookContext || (x.timer && !x.continuation)));
+}
+
 /// What of an assistant message a quiet replay shows (Rust ui.rs quiet
 /// mode): live, an answer's deltas stream only while nothing supersedes
 /// them — a tool call or a Stop-hook rejection hides them, and an
@@ -1596,15 +1606,8 @@ string replayAnswerQuiet(const Message[] msgs, size_t i) pure nothrow @safe
     if (m.toolCalls.length || stopRejected(msgs, i)) return null;
     if (!isLengthStop(m.stopReason)) return m.content;
     // A cut-off chunk: the continuation reminder carries the answer on.
-    // System messages (compaction), timer firings/nudges and hook-only
-    // context are transparent — none is user input — so one between a
-    // reminder and the reply keeps the accumulated answer.
-    static bool transparent(const ref Message x) pure nothrow @safe
-    {
-        return x.role == Role.system || (x.role == Role.user && (x.hookContext || (x.timer && !x.continuation)));
-    }
     size_t k = i + 1;
-    while (k < msgs.length && transparent(msgs[k])) k++;
+    while (k < msgs.length && replayTransparent(msgs[k])) k++;
     // The log cut short on the chunk (a crash before the reminder): it was
     // the turn's visible tail, so it shows.
     if (k >= msgs.length) return m.content;
@@ -1624,7 +1627,7 @@ string replayAnswerQuiet(const Message[] msgs, size_t i) pure nothrow @safe
     for (size_t j = k + 1; j < msgs.length; j++)
     {
         const n = msgs[j];
-        if (transparent(n)) continue;
+        if (replayTransparent(n)) continue;
         final switch (n.role)
         {
         case Role.system: break;
@@ -1649,6 +1652,97 @@ string replayAnswerQuiet(const Message[] msgs, size_t i) pure nothrow @safe
     // The log ends on a capped chunk: the turn's visible tail.
     if (afterCut) return kept;
     return null; // the log ends mid-segment: no accepted answer to show
+}
+
+/// What quiet replay prints for assistant message `msgs[i]` — replayAnswerQuiet
+/// unless an earlier chunk of the same continuation segment already printed
+/// the accumulated whole. Live quiet prints an accepted answer once, at turn
+/// end; replay prints it whole at the segment's first cut-off chunk (which
+/// accumulates the later chunks), so every later chunk a reminder continues —
+/// including the segment's final, non-length-stop chunk — is suppressed. A
+/// chunk only suppresses when an earlier cut-off chunk of its segment is in
+/// the log to carry the whole: a log truncated to mid-segment (e.g. after a
+/// compaction) still shows the tail it has.
+string replayQuietShown(const Message[] msgs, size_t i) pure nothrow @safe
+{
+    import nano.llm : isLengthStop;
+    if (msgs[i].role != Role.assistant) return null;
+    // Walk the segment backward: over transparent messages, then a
+    // continuation reminder, to the chunk that reminder continues.
+    size_t back = i;
+    while (back > 0)
+    {
+        size_t k = back;
+        while (k > 0 && replayTransparent(msgs[k - 1])) k--;
+        if (k == 0 || msgs[k - 1].role != Role.user || !msgs[k - 1].continuation) break;
+        back = k - 1; // the reminder; the chunk it continues precedes it
+        while (back > 0 && replayTransparent(msgs[back - 1])) back--;
+        if (back > 0 && msgs[back - 1].role == Role.assistant && isLengthStop(msgs[back - 1].stopReason))
+            return null; // an earlier cut-off chunk prints the whole
+    }
+    return replayAnswerQuiet(msgs, i);
+}
+
+unittest
+{
+    import nano.agent : wrapReminder;
+    auto cont = Message.auto_(wrapReminder("cut off"));
+    cont.continuation = true;
+    Message cut(string text)
+    {
+        auto m = Message.assistant(text);
+        m.stopReason = "max_tokens";
+        return m;
+    }
+
+    // The accepted answer of a continued segment prints exactly once, at the
+    // segment's first cut-off chunk — the final chunk is not a length stop,
+    // yet its text is already in that whole.
+    auto ok = [cut("one "), cont, cut("two "), cont, Message.assistant("three")];
+    assert(replayQuietShown(ok, 0) == "one two three");
+    assert(replayQuietShown(ok, 2) is null, "a continued chunk is suppressed");
+    assert(replayQuietShown(ok, 4) is null, "the segment's final chunk is suppressed too");
+    size_t prints;
+    foreach (j; 0 .. ok.length) if (replayQuietShown(ok, j) !is null) prints++;
+    assert(prints == 1, "the accepted answer prints exactly once");
+
+    // A log truncated to mid-segment (a compaction boundary) has no earlier
+    // chunk to carry the whole: the tail it has still shows.
+    auto tail = [cont, Message.assistant("three")];
+    assert(replayQuietShown(tail, 1) == "three", "a truncated log shows the tail it has");
+    auto tail2 = [cont, cut("two "), cont, Message.assistant("three")];
+    assert(replayQuietShown(tail2, 1) == "two three", "the first in-log chunk carries the whole");
+    assert(replayQuietShown(tail2, 3) is null);
+
+    // Transparent messages between a chunk and its reminder keep the segment.
+    auto tick = Message.auto_(wrapReminder("timer"));
+    tick.timer = true;
+    auto timed = [cut("one "), cont, tick, cut("two "), cont, tick, Message.assistant("three")];
+    assert(replayQuietShown(timed, 0) == "one two three");
+    assert(replayQuietShown(timed, 3) is null);
+    assert(replayQuietShown(timed, 6) is null);
+
+    // A segment a tool call discarded prints nothing; the fresh answer shows.
+    auto call = Message.assistant("", [ToolCall.fromRaw("c1", "echo", `{}`)]);
+    auto discarded = [cut("lost "), cont, call, Message.toolResult("c1", "echo", "pong"), Message.assistant("fresh")];
+    assert(replayQuietShown(discarded, 0) is null);
+    assert(replayQuietShown(discarded, 2) is null);
+    assert(replayQuietShown(discarded, 4) == "fresh");
+
+    // A rejected segment prints nothing either.
+    auto rej = Message.auto_(wrapReminder("keep going"));
+    rej.stopBlocked = true;
+    auto blocked = [cut("lost "), cont, Message.assistant("draft"), rej, Message.assistant("final")];
+    assert(replayQuietShown(blocked, 0) is null);
+    assert(replayQuietShown(blocked, 2) is null, "a rejected draft stays hidden");
+    assert(replayQuietShown(blocked, 4) == "final");
+
+    // Plain turns and capped answers are unaffected.
+    auto plain = [Message.assistant("hi"), Message.assistant("bye")];
+    assert(replayQuietShown(plain, 0) == "hi" && replayQuietShown(plain, 1) == "bye");
+    auto capped = [cut("capped"), Message.user("next"), Message.assistant("ok")];
+    assert(replayQuietShown(capped, 0) == "capped");
+    assert(replayQuietShown(capped, 2) == "ok");
 }
 
 unittest
@@ -1814,19 +1908,9 @@ void replayTranscript(Agent agent, Console console)
             // mode keeps only the answer that finally stood.
             // Live quiet prints an accepted answer once, at turn end; replay
             // prints it whole at the segment's first cut-off chunk (which
-            // accumulates the later chunks), suppressing the chunks a
+            // accumulates the later chunks), suppressing every later chunk a
             // reminder continues — their text is already in that whole.
-            string shown;
-            if (console.quiet)
-            {
-                size_t back = i;
-                while (back > 0 && (msgs[back - 1].role == Role.system
-                    || (msgs[back - 1].role == Role.user && (msgs[back - 1].hookContext
-                        || (msgs[back - 1].timer && !msgs[back - 1].continuation))))) back--;
-                const continued = back > 0 && msgs[back - 1].role == Role.user && msgs[back - 1].continuation;
-                if (!(continued && isLengthStop(m.stopReason))) shown = replayAnswerQuiet(msgs, i);
-            }
-            else shown = m.content;
+            const shown = console.quiet ? replayQuietShown(msgs, i) : m.content;
             if (shown.strip.length) writeln(stampBlock(console.stamp(), console.display(escapeMarks(sanitizeBlock(shown))).stripRight));
             foreach (j, ref c; m.toolCalls) pending ~= [i, j];
             break;
