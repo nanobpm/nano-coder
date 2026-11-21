@@ -151,6 +151,20 @@ long toLong(size_t v) nothrow @nogc
     return long(v);
 }
 
+/// An external count (a provider's context window or output cap) as a
+/// `long`, saturating at `long.max`: oversized input is clamped, not fatal.
+long clampToLong(size_t v) pure nothrow @nogc @safe
+{
+    return v > long.max ? long.max : long(v);
+}
+
+unittest
+{
+    assert(clampToLong(size_t(9)) == 9);
+    assert(clampToLong(size_t.max) == long.max);
+    assert(clampToLong(size_t(long.max)) == long.max);
+}
+
 unittest
 {
     import std.conv : ConvException;
