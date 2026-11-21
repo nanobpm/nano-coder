@@ -163,6 +163,31 @@ private struct Reporter
     /// The model to show, when it changed since the last metadata report.
     bool hasPendingModel;
     string pendingModel, lastModel;
+    /// Set by `release`; no metadata is sent afterwards.
+    bool released;
+    /// A metadata send is running in the worker; `release` waits for it so
+    /// its final clear cannot be overtaken by a stale model.
+    bool modelInFlight;
+}
+
+/// The worker takes the pending model to send, unless the pane was released.
+private bool takeModel(ref Reporter r, out string model)
+{
+    bool take = r.hasPendingModel && !r.released;
+    r.hasPendingModel = false;
+    if (take) { model = r.pendingModel; r.modelInFlight = true; }
+    return take;
+}
+
+/// Start the release: nothing more is sent. Returns whether a model is shown
+/// (so it must be cleared) and the release sequence number.
+private ulong beginRelease(ref Reporter r, out bool shown)
+{
+    r.released = true;
+    r.hasPending = r.hasPendingModel = false;
+    shown = r.lastModel.length > 0 || r.modelInFlight;
+    r.lastModel = null;
+    return nextSeq(r);
 }
 
 private shared Locked!Reporter gReporter;
@@ -243,7 +268,7 @@ void showModel(string model)
     if (!active) return;
     auto name = shortModel(model);
     atomicLoad(gReporter).update((ref Reporter r) {
-        if (name == r.lastModel) return;
+        if (r.released || name == r.lastModel) return;
         r.lastModel = name;
         r.pendingModel = name;
         r.hasPendingModel = true;
@@ -257,13 +282,14 @@ void release()
     if (!active) return;
     Pane pane;
     bool shown;
-    ulong seq = atomicLoad(gReporter).update!ulong((ref Reporter r) {
-        r.hasPending = r.hasPendingModel = false;
-        shown = r.lastModel.length > 0;
-        r.lastModel = null;
+    auto rep = atomicLoad(gReporter);
+    ulong seq = rep.update!ulong((ref Reporter r) {
         pane = r.pane;
-        return nextSeq(r);
+        return beginRelease(r, shown);
     });
+    // Let an in-flight metadata send finish (each run is time-bounded) so
+    // the clear below is the last metadata Herdr sees.
+    rep.await!bool((ref const Reporter r) => !r.modelInFlight, (ref Reporter r) => true);
     // Metadata outlives the release, so clear the model first.
     if (shown) run(pane.bin, metadataArgs(pane.id, null));
     run(pane.bin, releaseArgs(pane.id, seq));
@@ -278,9 +304,8 @@ private void worker(string bin, string pane)
         auto q = atomicLoad(gReporter).await!Queued((ref const Reporter r) => r.hasPending || r.hasPendingModel,
             (ref Reporter r) {
                 hasState = r.hasPending;
-                hasModel = r.hasPendingModel;
-                model = r.pendingModel;
-                r.hasPending = r.hasPendingModel = false;
+                hasModel = takeModel(r, model);
+                r.hasPending = false;
                 return r.pending;
             });
         if (hasState)
@@ -288,7 +313,11 @@ private void worker(string bin, string pane)
             run(bin, reportArgs(pane, q.state, q.stateSeq, q.message));
             if (q.hasSession) run(bin, sessionArgs(pane, q.sessionSeq, q.session));
         }
-        if (hasModel) run(bin, metadataArgs(pane, model));
+        if (hasModel)
+        {
+            run(bin, metadataArgs(pane, model));
+            atomicLoad(gReporter).update((ref Reporter r) { r.modelInFlight = false; });
+        }
     }
 }
 
@@ -415,4 +444,29 @@ unittest // the model shows by its short name, and an empty one clears it
         "nano-coder", "--display-agent", "nano-coder · gpt-5", "--token", "model=gpt-5"]);
     assert(metadataArgs("p1", "gpt\x1b-5")[$ - 1] == "model=gpt-5");
     assert(metadataArgs("p1", null)[$ - 3 .. $] == ["--clear-display-agent", "--clear-token", "model"]);
+}
+
+unittest // a model taken before release is waited for and cleared; none is sent after
+{
+    Reporter r;
+    r.lastModel = r.pendingModel = "gpt-5";
+    r.hasPendingModel = true;
+    string model;
+    assert(takeModel(r, model) && model == "gpt-5" && r.modelInFlight);
+    bool shown;
+    beginRelease(r, shown);
+    assert(shown && r.released);
+    r.modelInFlight = false;
+    r.pendingModel = "late";
+    r.hasPendingModel = true;
+    assert(!takeModel(r, model));
+}
+
+unittest // an in-flight model counts as shown even before lastModel is set
+{
+    Reporter r;
+    r.modelInFlight = true;
+    bool shown;
+    beginRelease(r, shown);
+    assert(shown);
 }
