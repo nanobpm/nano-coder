@@ -424,6 +424,22 @@ final class FrameRenderer
         if (diff < top) return fullRedraw(frame, width, height);
         auto row = prev.length >= height ? diff - top + 1 : height - prev.length + diff + 1;
         auto buf = appender!string;
+        // A pure append lands one row past the bottom (diff == prev.length). A
+        // cursor move there is clamped by the terminal to the last row, so the
+        // first appended row would overwrite the current bottom row and leave
+        // the screen one row behind the stored frame. Position at the bottom
+        // row and scroll once per appended row first, so the previous bottom
+        // row moves up into scrollback and the new rows write below it.
+        if (row > height)
+        {
+            buf ~= syncStart ~ format("\x1b[%s;1H", height)
+                ~ "\r\n".replicate(frame.length - prev.length);
+            emitRows(buf, shown[diff .. $], width, true);
+            buf ~= syncEnd;
+            out_(buf[]);
+            prev = shown;
+            return;
+        }
         buf ~= syncStart ~ format("\x1b[%s;1H", row);
         emitRows(buf, shown[diff .. $], width, true);
         buf ~= syncEnd;
@@ -920,6 +936,40 @@ unittest
     screen = null;
     re.render(["cmd", M ~ sepWrapMark ~ "中x", "s"], 4, 6);
     assert(screen.canFind("cmd 中x"), screen);
+}
+
+// A pure append past a full screen must scroll, not overwrite the bottom row:
+// the previous bottom row moves into scrollback and the new rows land below it.
+unittest
+{
+    import std.algorithm : canFind;
+    string screen;
+    auto r = new FrameRenderer((string s) { screen ~= s; });
+    // Fill the screen exactly, then append one row.
+    r.render(["a", "b", "c", "d"], 20, 4);
+    screen = null;
+    r.render(["a", "b", "c", "d", "e"], 20, 4);
+    // Positions at the bottom row (4), scrolls once, then writes "e" — never a
+    // cursor move to a row past the bottom (which the terminal would clamp,
+    // overwriting "d").
+    assert(screen == syncStart ~ "\x1b[4;1H\r\n\x1b[2Ke" ~ syncEnd, screen);
+    // Another append scrolls again.
+    screen = null;
+    r.render(["a", "b", "c", "d", "e", "f"], 20, 4);
+    assert(screen == syncStart ~ "\x1b[4;1H\r\n\x1b[2Kf" ~ syncEnd, screen);
+    // A burst of appends scrolls once per new row, then writes them all.
+    screen = null;
+    r.render(["a", "b", "c", "d", "e", "f", "g", "h"], 20, 4);
+    assert(screen == syncStart ~ "\x1b[4;1H\r\n\r\n\x1b[2Kg\r\n\x1b[2Kh" ~ syncEnd, screen);
+
+    // The same append bug bit a frame shorter than the screen: the bottom row
+    // is occupied (the frame is bottom-anchored), so an append still scrolls.
+    screen = null;
+    auto s = new FrameRenderer((string t) { screen ~= t; });
+    s.render(["x", "y"], 20, 6);
+    screen = null;
+    s.render(["x", "y", "z"], 20, 6);
+    assert(screen == syncStart ~ "\x1b[6;1H\r\n\x1b[2Kz" ~ syncEnd, screen);
 }
 
 // Rows already in the scrollback are never cleared or rewritten; a shorter
