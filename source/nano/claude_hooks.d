@@ -9,6 +9,10 @@
 module nano.claude_hooks;
 
 @safe:
+
+import nano.arith : toLong;
+
+import std.string : representation;
 import nano.safeio : jsonText, jsonPretty;
 import nano.clock : monoNow, sleepFor;
 
@@ -228,7 +232,7 @@ bool isHerdrIntegration(string command)
             if (!path.isFile) continue;
             ubyte[1024] head;
             auto got = File(path, "rb").rawRead(head[]);
-            if ((cast(const(char)[]) got).canFind("HERDR_INTEGRATION_ID=")) return true;
+            if (got.canFind("HERDR_INTEGRATION_ID=".representation)) return true;
         }
         catch (Exception) continue; // an unreadable hook script isn't a Herdr integration; check the next
     }
@@ -553,7 +557,7 @@ private Duration timeoutOf(ulong secs) @safe pure nothrow
 {
     // Durations are hnsecs in a long; anything that does not fit fails closed
     // at run time rather than wrapping to a tiny or negative timeout.
-    return secs > long.max / 10_000_000 ? Duration.max : (cast(long) secs).seconds;
+    return secs > long.max / 10_000_000 ? Duration.max : toLong(secs).seconds;
 }
 
 private string optString(JSONValue o, string key) pure
@@ -725,7 +729,7 @@ unittest
         {
             switch (calls++)
             {
-                case 0: c[0 .. data.length] = cast(const(ubyte)[]) data; return data.length;
+                case 0: c[0 .. data.length] = data.representation; return data.length;
                 case 1: err = fail; return -1;
                 default: return 0;
             }
@@ -737,13 +741,13 @@ unittest
     string error;
     auto broken = Flaky("partial", EPIPE);
     drainReady(&broken.opCall, chunk, buf, open, overflow, error);
-    assert(buf == cast(const(ubyte)[]) "partial", "bytes read before the error are kept");
+    assert(buf == "partial".representation, "bytes read before the error are kept");
     assert(!overflow && !open && error !is null, "a read error is reported, not treated as EOF");
 
     buf = null; open = true; error = null;
     auto interrupted = Flaky("hello", EINTR);
     drainReady(&interrupted.opCall, chunk, buf, open, overflow, error);
-    assert(buf == cast(const(ubyte)[]) "hello" && !overflow && error is null, error);
+    assert(buf == "hello".representation && !overflow && error is null, error);
     assert(!open && interrupted.calls == 3, "EINTR is retried through to EOF");
 }
 
@@ -803,7 +807,7 @@ ProcessRun execute(const ref Hook hook, string input, string projectDir, const S
     int inFd = inP.writeEnd.fileno, outFd = outP.readEnd.fileno, errFd = errP.readEnd.fileno;
     foreach (fd; [inFd, outFd, errFd]) setNonBlocking(fd);
 
-    auto bytes = cast(const(ubyte)[]) input;
+    auto bytes = input.representation;
     size_t written;
     bool inOpen = true, outOpen = true, errOpen = true, overflow;
     string readError;
@@ -1009,7 +1013,7 @@ string listingField(string text) pure nothrow
     foreach (dchar c; text.byDchar)
     {
         if (c == '\u2028' || c == '\u2029') out_ ~= '\u2424';
-        else if (c <= 0x1f) out_ ~= cast(dchar)(0x2400 + c);
+        else if (c <= 0x1f) out_ ~= dchar(0x2400 + c);
         else if (c == 0x7f) out_ ~= '\u2421';
         else out_ ~= c;
     }
@@ -1034,7 +1038,7 @@ string cap(string text) pure
 /// ports log the same value.
 string contentHash(string text) @safe pure
 {
-    auto data = cast(const(ubyte)[]) text ~ cast(ubyte) 0xff;
+    auto data = text.representation ~ ubyte(0xff);
     return format!"%016x"(sipHash13(data));
 }
 
@@ -1054,13 +1058,13 @@ private ulong sipHash13(const(ubyte)[] data) @safe pure nothrow
     for (; i + 8 <= len; i += 8)
     {
         ulong m;
-        foreach (j; 0 .. 8) m |= cast(ulong) data[i + j] << (8 * j);
+        foreach (j; 0 .. 8) m |= ulong(data[i + j]) << (8 * j);
         v3 ^= m;
         round();
         v0 ^= m;
     }
-    ulong b = cast(ulong)(len & 0xff) << 56;
-    foreach (j; 0 .. len - i) b |= cast(ulong) data[i + j] << (8 * j);
+    ulong b = ulong(len & 0xff) << 56;
+    foreach (j; 0 .. len - i) b |= ulong(data[i + j]) << (8 * j);
     v3 ^= b;
     round();
     v0 ^= b;

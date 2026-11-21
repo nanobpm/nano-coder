@@ -496,7 +496,7 @@ version (unittest)
         foreach (r; denyRules) p.deny ~= parseRule(r);
         return (string root) @safe {
             ReadDenyScan scan;
-            if (!p.readDenyScan(cwd, scan)) return cast(Denied) null;
+            if (!p.readDenyScan(cwd, scan)) return Denied.init;
             auto f = scan.forRoot(root);
             return (string path) @safe => f.denied(path);
         };

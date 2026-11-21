@@ -2,6 +2,8 @@
 module nano.providers.anthropic;
 
 @safe:
+
+import nano.arith : toSize;
 import nano.safeio : jsonText, jsonPretty;
 
 import std.json;
@@ -231,7 +233,7 @@ struct AnthropicStream
                 if (auto u = "usage" in j["message"]) readUsage(*u, r.usage);
                 break;
             case "content_block_start":
-                auto idx = cast(size_t) j["index"].integer;
+                auto idx = toSize(j["index"].integer);
                 auto b = j["content_block"];
                 kinds[idx] = b["type"].str;
                 // Signed thinking and redacted blocks are kept verbatim for replay.
@@ -255,7 +257,7 @@ struct AnthropicStream
                 }
                 break;
             case "content_block_delta":
-                auto idx = cast(size_t) j["index"].integer;
+                auto idx = toSize(j["index"].integer);
                 auto d = j["delta"];
                 switch (d["type"].str)
                 {

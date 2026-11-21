@@ -379,7 +379,7 @@ version (unittest)
                 (const SyncContinuation _) => "Sync", (const Notice _) => "Notice", (const RunStopHook _) => "RunStopHook",
                 (const StopBlocked _) => "StopBlocked", (const RunTools _) => "RunTools",
                 (const FinishOutcome f) => f.loopStopped ? "FinishLoop" : "FinishOutcome",
-                (const Finish f) => "Finish:" ~ cast(string) f.stop);
+                (const Finish f) => "Finish:" ~ f.stop);
         return n;
     }
 

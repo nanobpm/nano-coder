@@ -10,6 +10,8 @@
 module nano.keycmd;
 
 @safe:
+
+import nano.safeio : readBytes;
 import nano.clock : monoNow, sleepFor;
 
 import core.time : Duration, MonoTime, msecs, seconds;
@@ -54,7 +56,7 @@ string runKeyCommand(string provider, string command, Duration timeout = keyComm
     setNonBlocking(outFd);
     auto group = -pid.processID;
     string what = format("provider %s: api_key_command", provider);
-    string stderrText() { return lossyUtf8(cast(const(ubyte)[]) read(errPath)).strip; }
+    string stderrText() { return lossyUtf8(readBytes(errPath)).strip; }
     bool exited;
     int status;
     void fail(string why)

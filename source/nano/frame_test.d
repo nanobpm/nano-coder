@@ -3,6 +3,8 @@
 module nano.frame_test;
 @safe:
 
+import std.string : representation;
+
 version (unittest):
 
 import std.algorithm : all, any, canFind, count, filter, startsWith;
@@ -115,7 +117,7 @@ struct Emu
 string[] transcript(string printed, size_t width)
 {
     Transcript t;
-    t.feed(cast(const(ubyte)[]) printed);
+    t.feed(printed.representation);
     return t.render(width);
 }
 

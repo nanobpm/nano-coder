@@ -3,6 +3,10 @@
 module nano.session;
 
 @safe:
+
+import std.conv : to;
+
+import nano.arith : toSize;
 import nano.safeio : jsonText, jsonPretty;
 import nano.clock : wallNow;
 
@@ -109,7 +113,7 @@ string stamp(SysTime when)
     auto mins = off.total!"minutes";
     char sign = mins < 0 ? '-' : '+';
     if (mins < 0) mins = -mins;
-    return format("%04d-%02d-%02dT%02d:%02d:%02d.%06d%s%02d:%02d", t.year, cast(int) t.month, t.day, t.hour,
+    return format("%04d-%02d-%02dT%02d:%02d:%02d.%06d%s%02d:%02d", t.year, int(t.month), t.day, t.hour,
         t.minute, t.second, t.fracSecs.total!"usecs", sign, mins / 60, mins % 60);
 }
 
@@ -119,7 +123,7 @@ string newSessionId()
     import std.random : uniform;
     import std.datetime.timezone : UTC;
     auto t = wallNow(UTC());
-    return format("sess-%04d%02d%02dT%02d%02d%02d-%08x", t.year, cast(int) t.month, t.day, t.hour, t.minute,
+    return format("sess-%04d%02d%02dT%02d%02d%02d-%08x", t.year, int(t.month), t.day, t.hour, t.minute,
         t.second, uniform!uint);
 }
 
@@ -197,7 +201,7 @@ Message messageFromRecord(JSONValue j) pure
     auto names = ["system", "user", "assistant", "tool"];
     auto r = names.countUntil(j["role"].str);
     if (r < 0) throw new Exception("unknown role " ~ j["role"].str);
-    m.role = cast(Role) r;
+    m.role = r.to!Role;
     JSONValue extra = string[string].init;
     foreach (k, v; j.objectNoRef)
     {
@@ -638,7 +642,7 @@ Restored restore(string path)
                 auto pos = "pending_position" in data;
                 if (r.hasPending && pos !is null && pos.type == JSONType.integer)
                 {
-                    r.pending.position = cast(size_t) pos.integer;
+                    r.pending.position = toSize(pos.integer);
                     r.pending.hasContinuation = false;
                     r.pending.answer = null;
                     r.pending.count = 0;
@@ -647,12 +651,12 @@ Restored restore(string path)
                     {
                         r.pending.hasContinuation = true;
                         r.pending.answer = c.arrayNoRef[0].str;
-                        r.pending.count = cast(size_t) c.arrayNoRef[1].integer;
+                        r.pending.count = toSize(c.arrayNoRef[1].integer);
                     }
                     r.pending.hasBase = true;
                     r.pending.base = r.conversation.length;
                     auto rn = "pending_recall_notes" in data;
-                    r.pending.recallNotes = rn !is null && rn.type == JSONType.integer ? cast(size_t) rn.integer : 0;
+                    r.pending.recallNotes = rn !is null && rn.type == JSONType.integer ? toSize(rn.integer) : 0;
                 }
                 else
                 {
@@ -678,7 +682,7 @@ Restored restore(string path)
                 bool active;
                 if (folded !is null && base !is null && base.type == JSONType.integer)
                 {
-                    auto b = cast(size_t) base.integer;
+                    auto b = toSize(base.integer);
                     auto delta = decode(*folded, inputs);
                     if ((b < rustStash.length ? b : rustStash.length) + delta.length > 0)
                     {
@@ -695,7 +699,7 @@ Restored restore(string path)
                 r.replayStash = rustStash.dup;
                 r.replayRestated = Option!size_t.init;
                 if (auto at = "restated" in data)
-                    if (active && at.type == JSONType.integer && at.integer >= 0) r.replayRestated = some(cast(size_t) at.integer);
+                    if (active && at.type == JSONType.integer && at.integer >= 0) r.replayRestated = some(toSize(at.integer));
                 auto pins = "pinned_requests" in data;
                 r.pinStash = pins !is null ? decode(*pins, inputs) : rustStash.dup;
             }

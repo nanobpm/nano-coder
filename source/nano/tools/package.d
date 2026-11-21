@@ -2,6 +2,10 @@
 module nano.tools;
 
 @safe:
+
+import std.math : trunc;
+
+import std.conv : to;
 import nano.clock : stdTimeNow;
 
 import nano.safeio : ownText;
@@ -22,19 +26,8 @@ class ToolError : Exception
 /// to an encoding error.
 string lossyUtf8(const(ubyte)[] data) @safe pure
 {
-    import std.utf : decode, UTFException;
-    import std.array : appender;
-    auto s = cast(const(char)[]) data;
-    auto o = appender!string;
-    size_t i = 0;
-    while (i < s.length)
-    {
-        if (s[i] < 0x80) { o.put(s[i]); ++i; continue; }
-        size_t j = i;
-        try { decode(s, j); o.put(s[i .. j]); i = j; }
-        catch (UTFException) { o.put("\uFFFD"); ++i; }
-    }
-    return o[];
+    import nano.safeio : lossyText;
+    return lossyText(data);
 }
 
 unittest
@@ -115,8 +108,8 @@ long optInt(JSONValue args, string name, long def) pure
     auto v = name in args;
     if (v is null || v.type == JSONType.null_) return def;
     if (v.type == JSONType.integer) return v.integer;
-    if (v.type == JSONType.uinteger) return cast(long) v.uinteger;
-    if (v.type == JSONType.float_ && v.floating == cast(long) v.floating) return cast(long) v.floating;
+    if (v.type == JSONType.uinteger) return v.uinteger.to!long;
+    if (v.type == JSONType.float_ && v.floating == trunc(v.floating)) return v.floating.to!long;
     if (v.type == JSONType.string)
     {
         import std.conv : to;
@@ -282,4 +275,16 @@ unittest
     truncateOutput("klmnopqrst", 4, "tool-x");
     auto texts = dirEntries(dir, SpanMode.shallow).array.map!(e => readText(e.name)).array.sort.array;
     assert(texts == ["abcdefghij", "klmnopqrst"]);
+}
+
+unittest
+{
+    // A number past `long.max` is reported where it is read, not wrapped
+    // to a negative value.
+    import std.conv : ConvException;
+    import std.exception : assertThrown;
+    import std.json : parseJSON;
+    assert(optInt(parseJSON(`{"n":7.0}`), "n", 0) == 7);
+    assertThrown!ConvException(optInt(parseJSON(`{"n":18446744073709551615}`), "n", 0));
+    assertThrown!ConvException(optInt(parseJSON(`{"n":1e300}`), "n", 0));
 }

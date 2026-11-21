@@ -104,6 +104,10 @@ struct ParkedDraft
 import commands = nano.commands;
 
 @safe:
+
+import nano.safeio : utf8Text, lossyText;
+
+import std.string : representation;
 import nano.clock : monoNow;
 
 // ---------------------------------------------------------------------------
@@ -159,19 +163,19 @@ Key decode(ByteSource next, int timeoutMs, ref ubyte[] utf8)
         case 0x1b: return decodeEscape(next);
         default:
             if (b < 0x20) return Key(K.ignored);
-            utf8 ~= cast(ubyte) b;
+            utf8 ~= b.to!ubyte;
             auto need = utf8Length(utf8[0]);
             if (need == 0) { utf8 = null; return Key(K.ignored); }
             while (utf8.length < need)
             {
                 auto c = next(escapeWaitMs);
                 if (c < 0 || (c & 0xC0) != 0x80) { utf8 = null; return Key(K.ignored); }
-                utf8 ~= cast(ubyte) c;
+                utf8 ~= c.to!ubyte;
             }
-            auto s = (() => cast(string) utf8.idup)();
+            auto bytes = utf8;
             utf8 = null;
-            import std.utf : validate;
-            try validate(s); catch (Exception) return Key(K.ignored); // invalid UTF-8 from the terminal is dropped, not inserted
+            string s;
+            try s = utf8Text(bytes); catch (Exception) return Key(K.ignored); // invalid UTF-8 from the terminal is dropped, not inserted
             return Key(K.insert, s);
     }
 }
@@ -191,15 +195,15 @@ private Key decodeEscape(ByteSource next)
     if (intro < 0) return Key(K.escape);
     if (intro == '[' || intro == 'O')
     {
-        ubyte[] seq = [0x1b, cast(ubyte) intro];
+        ubyte[] seq = [0x1b, intro.to!ubyte];
         for (;;)
         {
             auto c = next(escapeWaitMs);
             if (c < 0) break;
-            seq ~= cast(ubyte) c;
+            seq ~= c.to!ubyte;
             if (c >= 0x40 && c <= 0x7e) break;
         }
-        auto s = (() => cast(string) seq.idup)();
+        auto s = lossyText(seq);
         if (s == "\x1b[200~") return Key(K.paste, readPaste(next));
         if (s == "\x1b[Z") return Key(K.cycleMode); // Shift-Tab (backtab)
         if (s == "\x1b[M") // legacy mouse report: drop its three coordinate bytes
@@ -283,7 +287,7 @@ private Key modifiedKey(uint key, uint modifier)
     if (key == 27 && (bits & ~shift) == 0) return Key(K.escape);
     if (((key >= 0x41 && key <= 0x5a) || (key >= 0x61 && key <= 0x7a)) && (bits & ~shift) == ctrl)
     {
-        ubyte[] one = [cast(ubyte)(key & 0x1f)];
+        ubyte[] one = [(key & 0x1f).to!ubyte];
         ubyte[] none;
         auto i = 0;
         return decode((int) => i++ == 0 ? one[0] : -1, 0, none);
@@ -318,15 +322,15 @@ string readPaste(ByteSource next)
     {
         auto c = next(1000);
         if (c < 0) break;
-        buf ~= cast(ubyte) c;
-        if (buf.length >= end.length && buf[$ - end.length .. $] == cast(const(ubyte)[]) end)
+        buf ~= c.to!ubyte;
+        if (buf.length >= end.length && buf[$ - end.length .. $] == end.representation)
         {
             buf = buf[0 .. $ - end.length];
             break;
         }
     }
     import std.utf : byDchar;
-    auto raw = (() => cast(string) buf.idup)();
+    auto raw = lossyText(buf); // invalid bytes: U+FFFD, dropped below
     string out_;
     bool cr;
     foreach (dchar ch; raw.byDchar)
@@ -890,7 +894,7 @@ final class LineEditor
                 frameDraw(null);
                 import std.array : join;
                 auto answer = "\x1b[32m?\x1b[0m " ~ prompt ~ " \x1b[36m" ~ fitCols(labels[at], fw / 2) ~ "\x1b[0m";
-                frameCommit(body_.length ? (cast(const(string)[]) body_).join("\n") ~ "\n" ~ answer : answer);
+                frameCommit(body_.length ? body_[].join("\n") ~ "\n" ~ answer : answer);
                 return;
             }
             if (at < top) top = at;
@@ -1066,7 +1070,7 @@ version (Posix)
             {
                 auto b = pending[0];
                 pending = pending[1 .. $];
-                return cast(int) b;
+                return b;
             }
             pollfd[1] p = [pollfd(fd, POLLIN, 0)];
             auto r = pollFds(p[], timeoutMs);
@@ -1076,7 +1080,7 @@ version (Posix)
             auto n = readFd(fd, buf[]);
             if (n <= 0) return -2;
             pending = buf[1 .. n].dup;
-            return cast(int) buf[0];
+            return buf[0];
         };
     }
 }
@@ -1094,7 +1098,7 @@ version (unittest)
         return (int) {
             if (i >= keys.length) return -2;
             auto b = keys[i++];
-            return b == 0xff ? -1 : cast(int) b;
+            return b == 0xff ? -1 : b;
         };
     }
 

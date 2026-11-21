@@ -5,6 +5,8 @@ module nano.recents;
 
 @safe:
 
+import std.conv : to;
+
 import std.json;
 import std.string : strip;
 import nano.config : ProviderConfig, parseModelSpec;
@@ -94,7 +96,7 @@ Recents load(string path) nothrow
         if (auto v = "version" in j)
         {
             if (v.type != JSONType.integer && v.type != JSONType.uinteger) return Recents.init;
-            r.version_ = cast(uint) v.integer;
+            r.version_ = v.integer.to!uint;
         }
         if (auto ms = "models" in j)
         {
