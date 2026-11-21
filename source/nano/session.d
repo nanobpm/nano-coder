@@ -464,16 +464,29 @@ class SessionLog
             shareHandle(path, f);
         }
         scope (failure) close();
-        auto bytes = readBytes(path);
-        size_t committed = bytes.length;
-        while (committed && bytes[committed - 1] != '\n') committed--;
-        if (committed < bytes.length)
+        // Count the committed lines in fixed-size chunks: a long session's
+        // log can run to hundreds of MB, and reading it whole here (on top of
+        // `restore`'s own read) doubled a resume's peak heap.
+        ulong committed, size;
         {
-            // Drop a torn trailing record so later appends stay line-aligned.
-            import std.file : write_file = write;
-            write_file(path, bytes[0 .. committed]);
+            auto r = File(path, "rb");
+            auto buf = new ubyte[](64 * 1024);
+            for (;;)
+            {
+                auto chunk = r.rawRead(buf);
+                if (!chunk.length) break;
+                foreach (i, b; chunk)
+                    if (b == '\n') { ++lines; committed = size + i + 1; }
+                size += chunk.length;
+            }
         }
-        foreach (b; bytes[0 .. committed]) if (b == '\n') ++lines;
+        if (committed < size)
+        {
+            // Drop a torn trailing record so later appends stay line-aligned
+            // (rare: a crash mid-write), so the whole read is fine here.
+            import std.file : write_file = write;
+            write_file(path, readBytes(path)[0 .. cast(size_t) committed]);
+        }
     }
 
     /// Tests: the next write fails (Rust `fail_next_persist`).

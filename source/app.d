@@ -1542,6 +1542,16 @@ string timersText(Agent agent)
         : agent.timers.list(agent.timerNow(), true).stripRight;
 }
 
+/// Collect garbage and return the free GC pools to the OS: after a burst
+/// of short-lived allocation (loading a session) the heap otherwise stays
+/// at its peak.
+void releaseHeap() nothrow
+{
+    import core.memory : GC;
+    GC.collect();
+    GC.minimize();
+}
+
 string planText(Agent agent) pure
 {
     return agent.plan.empty ? "No plan yet. The agent makes one with the plan_add tool."
@@ -1965,6 +1975,13 @@ int runMain(string[] args)
         if (restored.pendingInput.length)
             stdErr.writefln("the last prompt never finished (the session was interrupted): %s",
                 oneLine(restored.pendingInput));
+        // Reading a long session's log parses every record of it (a log can
+        // run to hundreds of MB of superseded compaction snapshots); the
+        // agent keeps only the live state. Drop the parse and hand the freed
+        // heap back to the OS, or the GC keeps the load's peak for the
+        // life of the process.
+        restored = Restored.init;
+        releaseHeap();
     }
 
     try
