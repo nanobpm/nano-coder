@@ -1917,8 +1917,12 @@ int runMain(string[] args)
     /// Load a saved session into the agent: its conversation, plan and log.
     void loadSession(string path)
     {
-        auto restored = restore(path);
-        foreach (note; agent.loadRestored(restored, o.noSession ? Option!SessionLog(none) : some(new SessionLog(path))))
+        // Lock the log first, then restore from its current content: a writer
+        // that closes while this one waits on the lock leaves state a pre-lock
+        // `restore` would adopt stale (re-executing a completed input).
+        auto log = o.noSession ? null : new SessionLog(path);
+        auto restored = log is null ? restore(path) : log.restoreLocked();
+        foreach (note; agent.loadRestored(restored, o.noSession ? Option!SessionLog(none) : some(log)))
             stdErr.writeln("nano-coder: ignoring ", note);
         updateStatus((ref Stats s) { s.historySearches = s.historyReads = 0; });
         if (!agent.timers.empty)
