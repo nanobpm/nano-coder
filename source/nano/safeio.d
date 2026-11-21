@@ -1032,6 +1032,15 @@ bool jsonUnsigned(const JSONValue v, out ulong r) pure @safe
     return false;
 }
 
+/// Reads a whole JSON number of either tag as a `long`; false for
+/// non-integral types and for a `uinteger` above `long.max`.
+bool jsonSigned(const JSONValue v, out long r) pure @safe
+{
+    if (v.type == JSONType.integer) { r = v.integer; return true; }
+    if (v.type == JSONType.uinteger && v.uinteger <= long.max) { r = cast(long) v.uinteger; return true; }
+    return false;
+}
+
 /// A whole JSON number (either tag) as a double; NaN for other types.
 double jsonWholeAsDouble(const JSONValue v) pure @safe
 {
@@ -1048,6 +1057,11 @@ unittest
     assert(jsonUnsigned(JSONValue(7), r) && r == 7);
     assert(!jsonUnsigned(JSONValue(-1), r));
     assert(!jsonUnsigned(JSONValue("1"), r));
+    long l;
+    assert(jsonSigned(JSONValue(1u), l) && l == 1);
+    assert(jsonSigned(JSONValue(-4), l) && l == -4);
+    assert(!jsonSigned(JSONValue(ulong.max), l));
+    assert(!jsonSigned(JSONValue(1.5), l));
     assert(jsonWholeAsDouble(JSONValue(3u)) == 3.0);
     assert(jsonWholeAsDouble(JSONValue(-3)) == -3.0);
 }
