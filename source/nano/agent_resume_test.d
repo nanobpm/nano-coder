@@ -646,7 +646,7 @@ unittest
     CompactReport rep;
     import std.exception : assertThrown;
     assertThrown(agent.compact(rep), "the failed replace propagates");
-    assert(agent.pinStash is null, "the failed compaction stashes nothing");
+    assert(agent.pinStash.isEmpty, "the failed compaction stashes nothing");
     assert(agent.messages.length == 3, "the conversation is not compacted");
     agent.run("second request", new NullEvents);
     assert(agent.compact(rep), "the retry persists");
