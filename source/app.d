@@ -1981,6 +1981,13 @@ int runMain(string[] args)
         if (restored.pendingInput.length)
             stdErr.writefln("the last prompt never finished (the session was interrupted): %s",
                 oneLine(restored.pendingInput));
+        // Reading a long session's log parses every record of it (a log can
+        // run to hundreds of MB of superseded compaction snapshots); the
+        // agent keeps only the live state. Drop the parse and hand the freed
+        // heap back to the OS, or the GC keeps the load's peak for the
+        // life of the process.
+        restored = Restored.init;
+        releaseHeap();
     }
 
     try

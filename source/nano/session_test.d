@@ -115,6 +115,28 @@ unittest
     assert(restore(log.path).conversation.length == 2);
 }
 
+// Reopening counts committed lines in 64 KiB chunks: records straddling chunk
+// boundaries, and a torn tail after them, still leave the next append on the
+// right line (its `#N` ID) and the file line-aligned.
+unittest
+{
+    import std.algorithm : count;
+    import std.array : replicate;
+    import std.file : append, readText;
+    auto dir = fresh("chunks");
+    scope (exit) rmdirRecurse(dir);
+    auto log = create(dir, "s3c");
+    foreach (i; 0 .. 5) log.add(Message.user(replicate("x", 50_000 + i * 7_000)));
+    auto committed = readText(log.path).count('\n');
+    append(log.path, `{"type":"message","data":{"role":"us`);
+    auto reopened = new SessionLog(log.path);
+    auto next = Message.user("next");
+    assert(reopened.append(next) == committed + 1);
+    auto text = readText(log.path);
+    assert(text.count('\n') == committed + 1 && text[$ - 1] == '\n', "torn tail dropped, append line-aligned");
+    assert(restore(log.path).conversation.length == 6);
+}
+
 // D's JSON objects don't keep key order, so the golden check is on the parsed shape.
 // rust: session.rs::golden_format_is_stable
 unittest

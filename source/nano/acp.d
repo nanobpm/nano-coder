@@ -745,6 +745,12 @@ final class AcpServer : AgentEvents
         sessionId = log.id;
         if (host.loadHooks !is null) agent.useHooks(host.loadHooks(getcwd()), true);
         replayHistory();
+        // As on the CLI resume: drop the full-log parse and the replaced
+        // conversation, then hand the freed heap back to the OS so a
+        // long-lived ACP worker does not keep the load's peak.
+        restored = Restored.init;
+        prior = null;
+        releaseHeap();
     }
 
     /// Replay the conversation as session/update notifications.
