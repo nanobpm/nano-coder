@@ -423,6 +423,15 @@ final class FrameRenderer
         if (frame.length < prev.length)
         {
             auto at = gapAt <= frame.length ? gapAt : diff;
+            // A gap above the screen would move scrollback rows (a full
+            // redraw): when the transcript's end has scrolled off (a draft
+            // taller than the screen), open the gap at the top of the
+            // screen instead, past any continuation of a wrapped line.
+            if (at < top)
+            {
+                at = top;
+                while (at < diff && joins(frame, at)) at++;
+            }
             if (at < diff) diff = at;
             shown = frame[0 .. at] ~ new string[prev.length - frame.length] ~ frame[at .. $];
         }
@@ -1068,6 +1077,22 @@ unittest
     screen = null;
     r.render(["CHANGED"] ~ t[1 .. $] ~ ["line 8", "line 9", "> e", "status"], 20, 4, t.length + 2);
     assert(screen.canFind("\x1b[3J"));
+}
+
+// A draft taller than the screen shrinking: the transcript's end is in the
+// scrollback, so the gap opens on screen and nothing is cleared.
+unittest
+{
+    import std.algorithm : canFind;
+    string screen;
+    auto r = new FrameRenderer((string s) { screen ~= s; });
+    auto t = ["t0", "t1"];
+    auto d = ["d0", "d1", "d2", "d3", "d4", "d5"];
+    r.render(t ~ d ~ ["status"], 20, 4, t.length);
+    screen = null;
+    r.render(t ~ d[0 .. 5] ~ ["status"], 20, 4, t.length);
+    assert(!screen.canFind("\x1b[2J") && !screen.canFind("\x1b[3J"), screen);
+    assert(screen == syncStart ~ "\x1b[1;1H\x1b[2K\r\n\x1b[2Kd3\r\n\x1b[2Kd4\r\n\x1b[2Kstatus" ~ syncEnd, screen);
 }
 
 // ---- Whose turn it is: the prompt glyph and hint (ui.rs prompt_glyph/prompt_hint) ----
