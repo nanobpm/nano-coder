@@ -663,6 +663,9 @@ public string terminalSafe(string text, bool keepNewlines = false) pure
         }
         if (c == '\n' && keepNewlines) { o ~= '\n'; col = 0; continue; }
         if (c == '\u2028' || c == '\u2029' || isControl(c)) continue;
+        // The frame's private-use wrap marks (U+E002-U+E004) are metadata,
+        // never text: a literal one would be read as a wrap or verbatim mark.
+        if (c >= '\uE002' && c <= '\uE004') c = '\uFFFD';
         char[4] buf;
         auto len = encode(buf, c);
         o ~= buf[0 .. len].idup;
@@ -708,6 +711,7 @@ unittest
     assert(terminalSafe("mem-evil\u2028forged row", true) == "mem-evilforged row");
     assert(terminalSafe("head\u2029forged row", true) == "headforged row");
     assert(terminalSafe("café — label", true) == "café — label");
+    assert(terminalSafe("/tmp/a\uE003b\uE002c\uE004d") == "/tmp/a\uFFFDb\uFFFDc\uFFFDd");
 }
 
 /// Drop control characters (C0/C1, so no escape sequence survives) and expand

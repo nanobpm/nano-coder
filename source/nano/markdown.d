@@ -146,9 +146,19 @@ private struct Lines
         // never broken here: the row is marked verbatim so the frame breaks it
         // by character at the full terminal width, and no newline or alignment
         // padding lands inside a copied path, identifier or code argument.
-        if (curW + w > width) cur ~= verbatimMark;
+        // Inline code with a space is verbatim even when it fits: a later
+        // reflow (resize) must break it by character, never at its spaces,
+        // or the frame's alignment padding would land inside the argument.
+        if (curW + w > width || spacedCode(pieces)) cur ~= verbatimMark;
         foreach (p; pieces) cur ~= styled(p.text, p.style);
         curW += w;
+    }
+
+    /// Whether `pieces` holds inline code containing whitespace.
+    static bool spacedCode(const Piece[] pieces) pure
+    {
+        foreach (p; pieces) if (p.style & CODE) foreach (dchar c; p.text) if (isWhite(c)) return true;
+        return false;
     }
 
     string[] finish() pure
@@ -288,7 +298,8 @@ private string[] renderBlock(const Block block, size_t width, size_t depth) pure
 /// The lines of `text` drawn for a terminal `width` cells wide.
 string[] renderLines(string text, size_t width) pure
 {
-    return renderBlocks(parse(text), width < 10 ? 10 : width, 0, true);
+    import nano.frame : escapeMarks;
+    return renderBlocks(parse(escapeMarks(text)), width < 10 ? 10 : width, 0, true);
 }
 
 /// `text` rendered for a terminal `width` cells wide (no trailing newline).
@@ -597,6 +608,7 @@ unittest // code blocks are verbatim between dim fences
     assert(show("```\n" ~ "x".replicate(25) ~ "\n```", 10)[1] == "x".replicate(25));
     import nano.frame : wrapAnsi, dropSoftWraps;
     import std.algorithm : map;
+    import std.algorithm : map;
     import std.array : array;
     auto rows = wrapAnsi(renderLines("```\n" ~ "x".replicate(25) ~ "\n```", 10)[1], 10).map!(r => dropSoftWraps(plain(r))).array;
     assert(rows == ["xxxxxxxxxx", "xxxxxxxxxx", "xxxxx"], rows[0]);
@@ -721,6 +733,7 @@ unittest // indented code is verbatim: the frame breaks it, the indent stays on 
     import std.algorithm : map;
     import std.array : array;
     import nano.frame : wrapAnsi, dropSoftWraps;
+    import std.algorithm : map;
     auto rows = renderLines("    rm -r /a b", 6);
     assert(rows.length == 1 && rows[0].indexOf(verbatimMark) >= 0, rows[0]);
     assert(wrapAnsi(rows[0], 6).map!dropSoftWraps.array == ["    rm", " -r /a", " b"]);
@@ -758,4 +771,25 @@ unittest // a word with inline code is whole and verbatim whenever it would brea
     assert(e.canFind!(r => r.canFind("/klmnopqrs")), e.to!string);
     // A fitting code word is not marked.
     assert(renderLines("see `/ab`", 20)[0].indexOf(verbatimMark) < 0);
+    // Fitting code with a space is still verbatim, so a reflow after a
+    // resize breaks it by character and never pads inside the argument.
+    auto spaced = renderLines("run `echo 'a b'` now", 40);
+    assert(spaced.length == 1 && spaced[0].indexOf(verbatimMark) >= 0, spaced.to!string);
+    import nano.frame : wrapAnsi, dropSoftWraps;
+    import std.algorithm : map;
+    import std.array : join;
+    auto re = wrapAnsi(spaced[0], 13);
+    assert(plain(re.map!(r => dropSoftWraps(r)).join).canFind("echo 'a b'"), re.to!string);
+}
+
+unittest // literal reserved mark characters in the text are not read as marks
+{
+    import std.algorithm : canFind;
+    import nano.frame : softWrapMark, sepWrapMark;
+    foreach (m; [softWrapMark, verbatimMark, sepWrapMark])
+    {
+        auto rows = renderLines("cat /tmp/a" ~ m ~ "b", 40);
+        foreach (r; rows) assert(!r.canFind(m), r);
+        assert(plain(rows[0]).canFind("/tmp/a\uFFFDb"), rows[0]);
+    }
 }
