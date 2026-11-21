@@ -437,21 +437,57 @@ final class FrameRenderer
         // row moves up into scrollback and the new rows write below it. Only
         // one CRLF here: emitRows already emits a CRLF between rows, which
         // scrolls once for each further appended row.
+        // Rewriting from a continuation row skips the line's earlier rows, and
+        // with them the SGR state they set: replay it so the clipped rows keep
+        // the line's color and style.
+        auto lead = activeStyle(shown, diff);
         if (row > height)
         {
-            buf ~= syncStart ~ format("\x1b[%s;1H", height) ~ "\r\n";
+            buf ~= syncStart ~ format("\x1b[%s;1H", height) ~ "\r\n" ~ lead;
             emitRows(buf, shown[diff .. $], width, true);
             buf ~= syncEnd;
             out_(buf[]);
             prev = shown;
             return;
         }
-        buf ~= syncStart ~ format("\x1b[%s;1H", row);
+        buf ~= syncStart ~ format("\x1b[%s;1H", row) ~ lead;
         emitRows(buf, shown[diff .. $], width, true);
         buf ~= syncEnd;
         out_(buf[]);
         prev = shown;
     }
+}
+
+/// The SGR sequences that the rows of row `i`'s logical line above it set,
+/// in order: replaying them restores the style active where row `i` starts.
+/// Empty when row `i` starts its logical line.
+private string activeStyle(const string[] rows, size_t i) pure
+{
+    if (!joins(rows, i)) return "";
+    size_t start = i;
+    while (start > 0 && joins(rows, start)) start--;
+    auto acc = appender!string;
+    foreach (r; rows[start .. i])
+    {
+        size_t k;
+        while (k < r.length)
+        {
+            if (r[k] == '\x1b' && k + 1 < r.length && r[k + 1] == '[')
+            {
+                size_t e = k + 2;
+                while (e < r.length && !(r[e] >= 0x40 && r[e] <= 0x7e)) e++;
+                if (e < r.length)
+                {
+                    if (r[e] == 'm') acc ~= r[k .. e + 1];
+                    k = e + 1;
+                    continue;
+                }
+                break;
+            }
+            k++;
+        }
+    }
+    return acc[];
 }
 
 /// Whether row `i` continues the row above it through a soft wrap.
@@ -942,6 +978,28 @@ unittest
     screen = null;
     re.render(["cmd", M ~ sepWrapMark ~ "中x", "s"], 4, 6);
     assert(screen.canFind("cmd 中x"), screen);
+}
+
+// A styled logical line growing while its start sits in scrollback keeps its
+// style: the clipped rewrite replays the SGR set by the off-screen rows.
+unittest
+{
+    import std.algorithm : canFind;
+    string screen;
+    auto r = new FrameRenderer((string s) { screen ~= s; });
+    r.render(wrapAnsi("\x1b[36mabcdefghij\x1b[0m", 4) ~ "s", 4, 3);
+    screen = null;
+    r.render(wrapAnsi("\x1b[36mabcdefghijklmn\x1b[0m", 4) ~ "s", 4, 3);
+    assert(screen.canFind("\x1b[1;1H\x1b[36m"), screen);
+    // An unstyled continuation rewrite adds nothing.
+    screen = null;
+    auto p = new FrameRenderer((string s) { screen ~= s; });
+    p.render(wrapAnsi("abcdefghij", 4) ~ "s", 4, 3);
+    screen = null;
+    p.render(wrapAnsi("abcdefghijklmn", 4) ~ "s", 4, 3);
+    assert(!screen.canFind("\x1b[36m") && screen.canFind("\x1b[1;1H"), screen);
+    // A row that starts its own logical line replays nothing.
+    assert(activeStyle(["\x1b[31mx", "y"], 1) == "");
 }
 
 // A pure append past a full screen must scroll, not overwrite the bottom row:
