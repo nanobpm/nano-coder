@@ -6,7 +6,7 @@ module nano.agent;
 import nano.safeio : jsonText, jsonPretty;
 import nano.clock : monoNow, since, sleepFor, stdTimeNow, wallNow;
 import core.time : MonoTime;
-import nano.arith : checkedAdd, checkedMul, checkedSub, saturatingSub, toLong, toSize;
+import nano.arith : checkedMul, checkedSub, saturatingAdd, saturatingSub, toLong, toSize;
 import nano.option : Option, some, none, match, ifSome, orElse, unwrap, NotNull;
 import nano.result : orThrow, toOption, match, unwrap;
 
@@ -765,10 +765,12 @@ class Agent
         {
             // Anchored at the assistant message about to be pushed. Convert
             // the nonnegative operands separately and sum the sizes with
-            // checked arithmetic: a malformed pair such as long.max + 1
-            // would overflow the signed addition before `toSize` runs.
+            // saturating arithmetic: a malformed pair such as long.max + 1
+            // would overflow the signed addition before `toSize` runs, and a
+            // halt here would crash a completed turn over bookkeeping. The
+            // clamped anchor only makes later estimates read high.
             calibLen = messages.length + 1;
-            calibTokens = checkedAdd(toSize(max(0L, r.usage.inputTokens)), toSize(max(0L, r.usage.outputTokens)));
+            calibTokens = saturatingAdd(toSize(max(0L, r.usage.inputTokens)), toSize(max(0L, r.usage.outputTokens)));
         }
         ev.usage(r.usage);
         auto reply = Message.assistant(r.content, r.toolCalls);
@@ -930,7 +932,7 @@ class Agent
             auto prefix = ctx.availableCount(messages[0 .. calibLen], part(0, calibLen));
             auto suffix = ctx.availableCount(messages[calibLen .. $], part(calibLen, messages.length));
             calibrated = min(prefix, slots) == min(prefix, saturatingSub(slots, suffix));
-            if (calibrated) return calibTokens + ctx.messagesTokens(messages[calibLen .. $], slots, part(calibLen, messages.length));
+            if (calibrated) return saturatingAdd(calibTokens, ctx.messagesTokens(messages[calibLen .. $], slots, part(calibLen, messages.length)));
         }
         size_t tools_;
         foreach (d; offeredTools())
@@ -1072,7 +1074,7 @@ class Agent
         double limit = window * threshold;
         auto headroom = saturatingSub(window, reserved);
         if (headroom && headroom < limit) limit = headroom;
-        return tokens > limit && tokens > compactFloor + window / 10;
+        return tokens > limit && tokens > saturatingAdd(compactFloor, window / 10);
     }
 
     /// `max_tokens` for the next request: the configured value lowered so the
@@ -3161,6 +3163,30 @@ unittest // a new system text drops the usage anchor, so estimates count it
     agent.installSystem("long ".replicate(4000), null);
     auto estimate = agent.estimateContextTokens(calibrated);
     assert(!calibrated && estimate > 500, "the longer system text is counted");
+}
+
+unittest // extreme usage anchors clamp instead of halting the estimate
+{
+    import nano.providers.mock : MockClient;
+    LLMResponse[] none;
+    auto agent = new Agent(new MockClient(none), new ToolRegistry, Policy.init, "sys");
+    agent.push(Message.user("hi"));
+    agent.calibLen = agent.messages.length;
+    bool calibrated;
+    // A malformed provider report near 2^63 sums past size_t.max on 64-bit:
+    // the anchor clamps there and the estimate stays calibrated (and huge).
+    agent.calibTokens = size_t.max;
+    assert(agent.estimateContextTokens(calibrated) == size_t.max && calibrated);
+    // So does a saturated floor: the threshold check wraps to "due" on
+    // nothing, it must read "not due" instead of halting or wrapping low.
+    agent.compactFloor = size_t.max;
+    assert(!agent.overThresholdAt(size_t.max));
+    agent.compactFloor = 0;
+    // The report of a successful compaction formats clamped counts rather
+    // than throwing, so the run never reads as failed over bookkeeping.
+    auto rep = CompactReport(4, 2, size_t.max, size_t.max, 2, null, false, ctx.CompactionMode.standard);
+    import std.algorithm : canFind;
+    assert(rep.toString.canFind("compacted 2 messages"), rep.toString);
 }
 
 // rust: agent.rs::a_memory_evicted_from_the_installed_index_becomes_recallable
