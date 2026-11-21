@@ -461,6 +461,7 @@ string[] runInstaller(Channel channel, string exe, string running,
     string shown = installCommand(channel);
     InstallStep[] steps;
     int status;
+    bool refreshFailed;
     // One catch for every process this runs: brew --repository, git, the installer.
     try
     {
@@ -481,6 +482,7 @@ string[] runInstaller(Channel channel, string exe, string running,
                 // step at all).
                 try status = runner(step.program, step.args, step.env);
                 catch (Exception) status = -1; // spawn failure == refresh failed: report, don't crash
+                refreshFailed = status != 0;
             }
             else
                 status = runner(step.program, step.args, step.env);
@@ -490,7 +492,7 @@ string[] runInstaller(Channel channel, string exe, string running,
     catch (Exception e) return [format("Could not run `%s`: %s", shown, e.msg)];
     if (status != 0)
         return [format("`%s` exited with status %s; the running session is unchanged. Try it by hand to see the full error: %s",
-            shown, status, installCommand(channel))];
+            shown, status, refreshFailed ? shown : installCommand(channel))];
     auto v = versionOf is null ? installedVersion(exe) : versionOf(exe);
     if (v is null)
         return ["The installer finished but the installed `nano-coder --version` could not be read; the running session is unchanged."];
@@ -799,6 +801,7 @@ unittest
 unittest
 {
     import std.algorithm : canFind;
+    import std.string : indexOf;
     auto steps = installSteps(Channel.brew, "/tap");
     assert(steps.length == 2);
     assert(steps[0].program == "git" && steps[0].args == ["-C", "/tap", "pull", "--ff-only", "--quiet"] && steps[0].env is null);
@@ -814,6 +817,13 @@ unittest
     auto out_ = runInstaller(Channel.brew, "/x", "0.1.0", rec, (string e) @safe => "0.2.0", () @safe => "/tap");
     assert(ran == ["git"], "a failed tap refresh stops before brew upgrade");
     assert(out_[0].canFind("git -C /tap pull") && out_[0].canFind("unchanged"), out_[0]);
+    auto hint = out_[0][out_[0].indexOf("full error:") .. $];
+    assert(hint.canFind("git -C /tap pull") && !hint.canFind("brew upgrade"), "retry hint names the failed refresh: " ~ out_[0]);
+    ran = null;
+    auto brewFails = (string p, string[] a, const string[string] e) @safe { ran ~= p; return p == "brew" ? 1 : 0; };
+    out_ = runInstaller(Channel.brew, "/x", "0.1.0", brewFails, (string e) @safe => "0.2.0", () @safe => "/tap");
+    assert(ran == ["git", "brew"]);
+    assert(out_[0][out_[0].indexOf("full error:") .. $].canFind(installCommand(Channel.brew)), out_[0]);
     ran = null;
     auto failing = (string p, string[] a, const string[string] e) @safe { ran ~= p; return 1; };
     out_ = runInstaller(Channel.brew, "/x", "0.1.0", failing, (string e) @safe => "0.2.0", () @safe => "/tap");
