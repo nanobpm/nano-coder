@@ -12,8 +12,9 @@ module nano.frame;
 @safe:
 import nano.arith : saturatingSub;
 
-import std.array : Appender, appender, replicate;
+import std.array : Appender, appender, replace, replicate;
 import std.format : format;
+import std.string : indexOf;
 import std.utf : decode;
 import nano.lineedit : charWidth;
 
@@ -40,16 +41,27 @@ enum dchar verbatim = '\uE003';
 /// `verbatim` as a string.
 enum verbatimMark = "\uE003";
 
-/// `s` without soft-wrap or verbatim marks (output that bypasses the frame).
+/// A word separator consumed by a wrap one cell short of the edge before a
+/// double-width glyph. The row above can't hold it and the frame pads nothing
+/// there (a pad would copy into the joined text), so the wrappers move the
+/// separator into this zero-cell mark at the start of the continuation row;
+/// the frame emits it as a space and pads the row above to the edge, and a
+/// copy across the wrap keeps the words apart.
+enum dchar sepWrap = '\uE004';
+/// `sepWrap` as a string.
+enum sepWrapMark = "\uE004";
+
+/// `s` without soft-wrap, verbatim or separator marks (output that bypasses
+/// the frame).
 string dropSoftWraps(string s) pure
 {
     import std.array : replace;
-    return s.replace(softWrapMark, "").replace(verbatimMark, "");
+    return s.replace(softWrapMark, "").replace(verbatimMark, "").replace(sepWrapMark, "");
 }
 
 size_t cellWidth(dchar c) pure nothrow
 {
-    return c == cursorMark ? 1 : c == softWrap || c == verbatim ? 0 : charWidth(c);
+    return c == cursorMark ? 1 : c == softWrap || c == verbatim || c == sepWrap ? 0 : charWidth(c);
 }
 
 private bool isFinal(dchar c) pure nothrow { return c >= '@' && c <= '~'; }
@@ -171,11 +183,14 @@ string[] wrapAnsi(string line, size_t width) pure
         {
             auto rest = cur[brk .. $];
             auto row = cur[0 .. brk].stripRight(" ");
-            // A row one cell short of the edge keeps its separator: the frame
-            // pads nothing before a wide glyph there, so it would be lost.
-            if (wideNext && row.length < brk && visibleWidth(row) + 1 == width) row ~= ' ';
             out_ ~= row;
             cur = rest.stripLeft(" ");
+            // One cell short of the edge before a wide glyph, the separator
+            // fits nowhere: the frame pads nothing there, so it survives the
+            // wrap as a mark the frame emits as a space (keeping the copy's
+            // words apart).
+            if (wideNext && row.length < brk && visibleWidth(row) + 1 == width)
+                cur = sepWrapMark ~ cur;
             vis = visibleWidth(cur);
         }
         else
@@ -421,7 +436,8 @@ final class FrameRenderer
 private bool joins(const string[] rows, size_t i) pure
 {
     import std.string : indexOf;
-    return i > 0 && i < rows.length && rows[i].indexOf(softWrapMark) >= 0
+    return i > 0 && i < rows.length
+        && (rows[i].indexOf(softWrapMark) >= 0 || rows[i].indexOf(sepWrapMark) >= 0)
         && visibleWidth(dropSoftWraps(rows[i])) > 0;
 }
 
@@ -447,7 +463,9 @@ private void emitRows(ref Appender!string buf, const string[] rows, size_t width
 {
     foreach (i, l; rows)
     {
-        auto text = dropSoftWraps(l);
+        // A separator consumed by the wrap rides the continuation row as a
+        // zero-cell mark; emit it as the space it was.
+        auto text = dropSoftWraps(l).replace(sepWrapMark, " ");
         auto cont = joins(rows, i);
         if (i && !cont) buf ~= "\r\n";
         if (clear && !cont) buf ~= "\x1b[2K";
@@ -456,9 +474,12 @@ private void emitRows(ref Appender!string buf, const string[] rows, size_t width
         if (joins(rows, i + 1))
         {
             // A wide glyph one cell short of the edge wraps by itself; a pad
-            // space there would be copied into the joined text.
+            // space there would be copied into the joined text. But when the
+            // next row carries a wrapped-away separator, the space belongs to
+            // the text: pad to the edge so it is emitted.
             auto gap = vis < width ? width - vis : 0;
-            if (gap == 1 && firstGlyphWidth(dropSoftWraps(rows[i + 1])) == 2) gap = 0;
+            if (gap == 1 && rows[i + 1].indexOf(sepWrapMark) < 0
+                    && firstGlyphWidth(dropSoftWraps(rows[i + 1])) == 2) gap = 0;
             if (gap) buf ~= " ".replicate(gap);
         }
         else if (clear && cont && vis < width) buf ~= "\x1b[K";
@@ -739,7 +760,9 @@ unittest
     assert(wrapAnsi("the quick brown fox", 10) == ["the quick", M ~ "brown fox"]);
     assert(wrapAnsi("abcdefghij", 4) == ["abcd", M ~ "efgh", M ~ "ij"]);
     assert(wrapAnsi("ab中", 3) == ["ab", M ~ "中"]);
-    assert(wrapAnsi("cmd 中", 4) == ["cmd ", M ~ "中"]);
+    // A separator one cell short of the edge before a wide glyph rides the
+    // continuation as a zero-cell mark, so the copy keeps the words apart.
+    assert(wrapAnsi("cmd 中", 4) == ["cmd", M ~ sepWrapMark ~ "中"]);
     assert(wrapAnsi("cmd中", 4) == ["cmd", M ~ "中"]);
     assert(wrapAnsi("", 5) == [""]);
     assert(wrapBlock("a\nb", 5) == ["a", "b"]);
@@ -876,6 +899,27 @@ unittest
     t.render(tall[0 .. $ - 1] ~ (M ~ "zz") ~ "s", 2, 4);
     assert(!screen.canFind("\x1b[3J") && screen.canFind("\x1b[1;1H"), screen);
     assert(screen.canFind("zz\r\n\x1b[2Ks"), screen);
+
+    // A separator consumed by a wrap one cell short of the edge before a
+    // wide glyph is emitted as a space: "cmd 中" copies with its words
+    // apart, while "cmd中" stays joined.
+    screen = null;
+    auto sep = new FrameRenderer((string s) { screen ~= s; });
+    sep.render(wrapAnsi("cmd 中", 4) ~ "s", 4, 6);
+    assert(screen.canFind("cmd 中"), screen);
+    assert(!screen.canFind(sepWrapMark) && !screen.canFind(M), screen);
+    screen = null;
+    auto nosep = new FrameRenderer((string s) { screen ~= s; });
+    nosep.render(wrapAnsi("cmd中", 4) ~ "s", 4, 6);
+    assert(screen.canFind("cmd中"), screen);
+
+    // A differential rewrite of a separator-wrap row re-emits the space.
+    screen = null;
+    auto re = new FrameRenderer((string s) { screen ~= s; });
+    re.render(["cmd", M ~ sepWrapMark ~ "中", "s"], 4, 6);
+    screen = null;
+    re.render(["cmd", M ~ sepWrapMark ~ "中x", "s"], 4, 6);
+    assert(screen.canFind("cmd 中x"), screen);
 }
 
 // Rows already in the scrollback are never cleared or rewritten; a shorter
