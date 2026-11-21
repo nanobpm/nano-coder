@@ -43,9 +43,11 @@ sys.path.insert(0, str(HERE))
 import cases as synthetic  # noqa: E402
 
 # Denied unless --tools all: synthetic logs describe a project that doesn't
-# exist, so without history tools the agent would explore the real disk.
-WORK_TOOLS = ("bash", "read_file", "write_file", "edit_file")
-OVERRIDDEN = ("session_dir", "compaction_mode", "compaction_pin_requests", "auto_compact", "persist_sessions", "project_instructions", "model")
+# exist, so without history tools the agent would explore the real disk (and
+# a fork of a real log would find its answers there, not in the history).
+WORK_TOOLS = ("bash", "read_file", "write_file", "edit_file", "grep", "glob", "web_fetch", "load_skill")
+OVERRIDDEN = ("session_dir", "compaction_mode", "compaction_pin_requests", "auto_compact", "persist_sessions",
+              "project_instructions", "model", "memory", "disable_hooks", "user_instruction_files")
 
 
 def default_config():
@@ -213,17 +215,46 @@ def extra_body_arg(text):
     return value
 
 
+def bracket_depth(text):
+    """Net `[` minus `]` in a TOML fragment, outside strings and comments."""
+    depth, quote, i = 0, None, 0
+    while i < len(text):
+        c = text[i]
+        if quote:
+            if c == "\\" and quote == '"':
+                i += 1
+            elif c == quote:
+                quote = None
+        elif c in "\"'":
+            quote = c
+        elif c == "#":
+            break
+        elif c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+        i += 1
+    return depth
+
+
 def config_text(base, session_dir, mode, extra_body=None, providers=(), pin=True):
     """The user's config (for providers and keys) with eval overrides on top.
     Overridden top-level keys are removed from the base so TOML stays valid."""
     lines = []
     if base:
         in_table = False
+        depth = 0  # open brackets of a multiline array value being dropped
         for line in Path(base).read_text().splitlines():
+            if depth > 0:
+                depth += bracket_depth(line)
+                continue
             if line.strip().startswith("["):
                 in_table = True
             key = line.split("=", 1)[0].strip()
             if not in_table and key in OVERRIDDEN:
+                value = line.split("=", 1)[1].strip() if "=" in line else ""
+                # Only an array value can continue onto later lines.
+                depth = max(0, bracket_depth(value)) if value.startswith("[") else 0
                 continue
             lines.append(line)
     head = [
@@ -234,6 +265,12 @@ def config_text(base, session_dir, mode, extra_body=None, providers=(), pin=True
         "auto_compact = false",
         "persist_sessions = true",
         "project_instructions = false",
+        # Nothing from outside the session: saved memories, hook-injected
+        # context (SessionStart) and global instruction files can all hold
+        # the answer to a question about a real session.
+        'memory = "off"',
+        "disable_hooks = true",
+        "user_instruction_files = []",
     ]
     tail = []
     if extra_body:
@@ -469,8 +506,11 @@ class Acp:
 
     def __init__(self, argv, cwd, stderr_path, timeout):
         self.stderr = open(stderr_path, "w")
+        # No skills: their names and descriptions in the system prompt are
+        # operator context that real-session questions could lean on.
         self.proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=self.stderr, text=True, bufsize=1)
+                                     stderr=self.stderr, text=True, bufsize=1,
+                                     env={**os.environ, "NANO_CODER_NO_SKILLS": "1"})
         self.next_id = 0
         self.deadline = time.monotonic() + timeout
         self.updates = []
