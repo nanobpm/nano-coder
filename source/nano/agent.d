@@ -1647,7 +1647,7 @@ class Agent
         messages = messages.length && messages[0].role == Role.system ? messages[0 .. 1] : null;
         foreach (ref m; r.conversation)
             if (m.role != Role.system) messages ~= m;
-        log = newLog;
+        replaceLog(newLog);
         control.mode = AgentMode.normal;
         sessionThinking.nullify();
         completedInputs = r.completed;
@@ -1712,12 +1712,25 @@ class Agent
         restart(render(), newLog);
     }
 
+    /// Switch to `newLog`, closing the outgoing log (releasing its lock and
+    /// descriptor) unless it is the same object.
+    void replaceLog(Option!SessionLog newLog)
+    {
+        auto old = log;
+        log = newLog;
+        old.ifSome((SessionLog o) {
+            bool same;
+            newLog.ifSome((SessionLog n) { same = n is o; });
+            if (!same) o.close();
+        });
+    }
+
     void restart(string system, Option!SessionLog newLog)
     {
         import nano.mode : AgentMode;
         messages = [Message.system(system)];
         promptPlan = false; // the caller renders `system` for normal mode
-        log = newLog;
+        replaceLog(newLog);
         log.ifSome((SessionLog l) { l.append(messages[0]); });
         control.mode = AgentMode.normal;
         sessionThinking.nullify();

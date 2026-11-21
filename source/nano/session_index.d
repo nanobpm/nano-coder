@@ -456,6 +456,31 @@ string cleanTitle(string reply) pure
     return title;
 }
 
+/// Ids of every titled session: from the strictly loaded index (no picker
+/// filters, no cache rewrite) plus titles summarized from the logs
+/// themselves. Throws when the index is unreadable or corrupt.
+bool[string] titledIds(string dir)
+{
+    bool[string] named;
+    if (!dir.exists) return named;
+    size_t lines;
+    foreach (id, s; load(dir, lines, true)) if (s.title !is null) named[id] = true;
+    foreach (DirEntry e; dirEntries(dir, SpanMode.shallow, false))
+    {
+        auto name = e.name.baseName;
+        immutable compressed = name.endsWith(".jsonl.gz");
+        if (!compressed && (name.extension != ".jsonl" || name == indexFile)) continue;
+        auto id = compressed ? name[0 .. $ - ".jsonl.gz".length] : name.stripExtension;
+        if (id in named) continue;
+        try
+        {
+            if (summarize(e.name).title !is null) named[id] = true;
+        }
+        catch (Exception) {} // unsummarizable: the index is the only witness
+    }
+    return named;
+}
+
 /// Every resumable session with at least one prompt in `dir`, newest first.
 /// Sessions the index lacks, or whose log changed since it was indexed, are
 /// summarized from their logs, and the index is updated. A missing directory
