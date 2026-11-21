@@ -429,11 +429,12 @@ final class FrameRenderer
         // first appended row would overwrite the current bottom row and leave
         // the screen one row behind the stored frame. Position at the bottom
         // row and scroll once per appended row first, so the previous bottom
-        // row moves up into scrollback and the new rows write below it.
+        // row moves up into scrollback and the new rows write below it. Only
+        // one CRLF here: emitRows already emits a CRLF between rows, which
+        // scrolls once for each further appended row.
         if (row > height)
         {
-            buf ~= syncStart ~ format("\x1b[%s;1H", height)
-                ~ "\r\n".replicate(frame.length - prev.length);
+            buf ~= syncStart ~ format("\x1b[%s;1H", height) ~ "\r\n";
             emitRows(buf, shown[diff .. $], width, true);
             buf ~= syncEnd;
             out_(buf[]);
@@ -957,10 +958,13 @@ unittest
     screen = null;
     r.render(["a", "b", "c", "d", "e", "f"], 20, 4);
     assert(screen == syncStart ~ "\x1b[4;1H\r\n\x1b[2Kf" ~ syncEnd, screen);
-    // A burst of appends scrolls once per new row, then writes them all.
+    // A burst of appends scrolls exactly once per new row (one CRLF before
+    // each), never inserting a blank row between them.
     screen = null;
     r.render(["a", "b", "c", "d", "e", "f", "g", "h"], 20, 4);
-    assert(screen == syncStart ~ "\x1b[4;1H\r\n\r\n\x1b[2Kg\r\n\x1b[2Kh" ~ syncEnd, screen);
+    assert(screen == syncStart ~ "\x1b[4;1H\r\n\x1b[2Kg\r\n\x1b[2Kh" ~ syncEnd, screen);
+    import std.algorithm : count;
+    assert(screen.count("\r\n") == 2, screen);
 
     // The same append bug bit a frame shorter than the screen: the bottom row
     // is occupied (the frame is bottom-anchored), so an append still scrolls.
