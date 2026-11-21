@@ -1588,16 +1588,32 @@ void replayTranscript(Agent agent, Console console)
     auto after = console.afterStep;
     console.afterStep = null;
     scope (exit) { console.afterStep = after; if (after !is null) after(); }
-    size_t[2][string] calls; // call ID -> [message, call] index into msgs
+    // Tool calls whose header waits for its result, so each header shows
+    // directly above its own output (several calls in one message would
+    // otherwise stack every header above all the results).
+    size_t[2][] pending; // [message, call] index into msgs
+    void flushPending()
+    {
+        foreach (p; pending)
+        {
+            console.replayTime = msgs[p[0]].timestamp;
+            console.toolStart(msgs[p[0]].toolCalls[p[1]]);
+        }
+        pending = null;
+    }
     scope (exit) console.replayTime = null;
     foreach (i, ref m; msgs)
     {
+        if (m.role != Role.tool) flushPending();
         console.replayTime = m.timestamp;
         final switch (m.role)
         {
         case Role.system: break;
         case Role.user:
         {
+            // Model-only reminders (hook context, output-limit continuations,
+            // timer firings and nudges) were never typed by the user.
+            if (m.hookContext || m.continuation || m.timer) break;
             // Hook context appended to the prompt was never shown live.
             auto typed = m.pinText.length ? m.pinText : m.content;
             if (typed.strip.length)
@@ -1605,19 +1621,27 @@ void replayTranscript(Agent agent, Console console)
             break;
         }
         case Role.assistant:
-            if (m.content.strip.length) writeln(stampBlock(console.stamp(), escapeMarks(console.display(sanitizeBlock(m.content))).stripRight));
-            foreach (j, ref c; m.toolCalls)
-            {
-                calls[c.id] = [i, j];
-                console.toolStart(c);
-            }
+            // Escape literal markers before rendering, keeping the renderer's
+            // own soft-wrap / verbatim markers.
+            if (m.content.strip.length) writeln(stampBlock(console.stamp(), console.display(escapeMarks(sanitizeBlock(m.content))).stripRight));
+            foreach (j, ref c; m.toolCalls) pending ~= [i, j];
             break;
         case Role.tool:
-            if (auto at = m.toolCallId in calls)
-                console.toolEnd(msgs[(*at)[0]].toolCalls[(*at)[1]], toolResultDisplay(m.content, m.attachments), m.isError);
+            foreach (k, p; pending)
+            {
+                auto c = msgs[p[0]].toolCalls[p[1]];
+                if (c.id != m.toolCallId) continue;
+                console.replayTime = msgs[p[0]].timestamp;
+                console.toolStart(c);
+                console.replayTime = m.timestamp;
+                console.toolEnd(c, toolResultDisplay(m.content, m.attachments), m.isError);
+                pending = pending[0 .. k] ~ pending[k + 1 .. $];
+                break;
+            }
             break;
         }
     }
+    flushPending();
     if (!agent.plan.empty) writeln(escapeMarks(sanitizeBlock(planText(agent))));
     // toolStart/toolEnd drive the live status; the replay leaves it idle.
     updateStatus((ref Stats s) { s.activity = Activity.idle; s.tool = null; s.tokensPerSec = 0;
