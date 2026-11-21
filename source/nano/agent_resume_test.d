@@ -655,6 +655,53 @@ unittest
     assert(r.pinStash[0].content == "first request" && r.pinStash[1].content == "second request");
 }
 
+// Round-9 review fix for issue #205: the compaction rollback disarms once
+// the replace record is persisted, so a throwing `onCompacted` callback
+// leaves the live conversation matching the log instead of reverting it.
+unittest
+{
+    import std.exception : assertThrown;
+    auto dir = freshDir("compact-callback-throws");
+    auto mock = new MockClient([LLMResponse("work"), LLMResponse("SUMMARY")]);
+    auto agent = new Agent(mock, echoTools, Policy.init, "sys");
+    agent.log = some(new SessionLog(dir, "mock/m", "/w"));
+    agent.run("first request", new NullEvents);
+    auto log = agent.log.unwrap("set by the test");
+    agent.onCompacted = (ref const CompactReport) { throw new Exception("reporting failed"); };
+    CompactReport rep;
+    assertThrown(agent.compact(rep), "the callback's failure propagates");
+    agent.onCompacted = null;
+    assert(agent.pinStash.length == 1 && agent.pinStash[0].content == "first request",
+        "the persisted compaction keeps its stash");
+    assert(agent.messages[1].content != "first request", "the folded turn stays summarized");
+    auto r = restore(log.path);
+    assert(r.conversation.length == agent.messages.length,
+        "the live conversation stays the compacted one the log recorded");
+    assert(r.conversation[1].content == agent.messages[1].content,
+        "the recorded replacement is the live summary");
+}
+
+// Round-9 review fix for issue #205: a throwing `onPlanChanged` notification
+// after the change is persisted leaves the live plan matching the log — only
+// a persistence failure rolls the plan back.
+unittest
+{
+    import std.exception : assertThrown;
+    auto dir = freshDir("plan-callback-throws");
+    auto agent = new Agent(new MockClient([]), echoTools, Policy.init, "sys");
+    auto log = new SessionLog(dir, "mock/m", "/w");
+    log.append(agent.messages[0]);
+    agent.log = some(log);
+    agent.onPlanChanged = () { throw new Exception("notify failed"); };
+    assertThrown!Exception(agent.runPlanTool("plan_add", parseJSON(`{"goal":"Ship it","items":["One"]}`)));
+    agent.onPlanChanged = null;
+    assert(agent.plan.items.length == 1, "the persisted change is not rolled back");
+    auto r = restore(log.path);
+    auto resumed = new Agent(new MockClient([]), echoTools, Policy.init, "sys");
+    resumed.loadRestored(r, some(new SessionLog(log.path)));
+    assert(resumed.plan == agent.plan, "resume restores the plan the log recorded");
+}
+
 // Round-8 review fix for issue #205: a failed repair write on resume closes
 // the incoming log — its lock and registration do not outlive the failure —
 // while the live log stays.

@@ -816,12 +816,6 @@ Restored restore(string path)
             index++;
             continue;
         }
-        // Any other record sees the plan as of the records before it.
-        if (planDeltas.length > planFrom)
-        {
-            r.plan = planAt(planFrom);
-            planFrom = planDeltas.length;
-        }
         if (type == "session")
         {
             if (index) throw new Exception(format("session record must be first (found at record %s)", index + 1));
@@ -1207,15 +1201,24 @@ private File createPrivate(string path)
 }
 
 /// fsync `path`'s parent directory, so a created or removed directory entry
-/// survives a power loss. Best-effort on filesystems that refuse (EINVAL).
+/// survives a power loss. Tolerated only where the filesystem refuses
+/// directory handles or directory fsync outright (EINVAL): every other
+/// failure throws, so a caller that removes the source after publishing
+/// never retires it without a durable destination entry.
 private void syncDirOf(string path) @trusted
 {
+    import core.stdc.errno : errno, EINVAL;
     import core.sys.posix.fcntl : O_RDONLY, O_DIRECTORY;
     import nano.safeio : openPath, fsyncFd, closeFd;
     auto fd = openPath(path.dirName, O_RDONLY | O_DIRECTORY);
-    if (fd < 0) return;
+    if (fd < 0)
+    {
+        if (errno == EINVAL) return;
+        throw new Exception("cannot open the directory of " ~ path);
+    }
     scope (exit) closeFd(fd);
-    fsyncFd(fd);
+    if (fsyncFd(fd) != 0 && errno != EINVAL)
+        throw new Exception("cannot sync the directory of " ~ path);
 }
 
 /// Publish the fully written temp file `tmp` as `dest` durably: fsync the

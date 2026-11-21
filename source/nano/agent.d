@@ -1404,15 +1404,21 @@ class Agent
         auto savedReplayRestated = replayRestated;
         auto savedPending = pending;
         auto savedCalibLen = calibLen;
+        // The rollback covers only the mutation-and-persistence transaction:
+        // once `l.replace` has persisted the compacted conversation the log
+        // holds the replacement, so a later failure (reporting, notification)
+        // must not revert the live state away from what the log records.
+        bool persisted;
         scope (failure)
-        {
-            messages = savedMessages;
-            pinStash = savedPinStash;
-            replayStash = savedReplayStash;
-            replayRestated = savedReplayRestated;
-            pending = savedPending;
-            calibLen = savedCalibLen;
-        }
+            if (!persisted)
+            {
+                messages = savedMessages;
+                pinStash = savedPinStash;
+                replayStash = savedReplayStash;
+                replayRestated = savedReplayRestated;
+                pending = savedPending;
+                calibLen = savedCalibLen;
+            }
         size_t pinnedBase = pinStash.length;
         Message[] pinnedNew;
         foreach (ref x; summarized)
@@ -1475,6 +1481,9 @@ class Agent
                 hasPending ? &pending : null, folded, extendsStash ? some(stashBase) : Option!size_t.init, replayRestated,
                 some(pinnedBase));
         });
+        // The replace record is durable: the live state now matches the log,
+        // so nothing past this point may roll it back.
+        persisted = true;
         // The replacement drops recalled notes' full text from context, so
         // every memory may be recalled again (except those the retained
         // system message's index renders in full: `indexShown` is kept).
@@ -2049,8 +2058,9 @@ class Agent
         auto o = plan.apply(name, args).orThrow!(e => new ToolError(e));
         if (o.changed)
         {
-            // As for timers: an unrecorded change is rolled back.
-            scope (failure) plan = before;
+            // As for timers: a change that cannot be recorded is rolled back
+            // (the rollback itself lives in `planChanged`, which disarms it
+            // once the change is persisted).
             planChanged(before);
         }
         return o.text;
@@ -2066,6 +2076,11 @@ class Agent
     private void planChanged(Plan before)
     {
         import std.algorithm : canFind;
+        // Only persistence may roll the plan back: once the change is
+        // recorded the log holds it, so a throwing notification must leave
+        // the live plan matching what resume will restore.
+        bool persisted;
+        scope (failure) if (!persisted) plan = before;
         log.ifSome((SessionLog l) {
             if (++planDeltasSinceSnapshot >= planSnapshotEvery || (before.items.length == 0 && plan.items.length > 1))
             {
@@ -2086,6 +2101,7 @@ class Agent
                 l.planDelta(goal, upserts, drop, before.items.length);
             }
         });
+        persisted = true;
         reminders.planChanged();
         if (onPlanChanged !is null) onPlanChanged();
     }
