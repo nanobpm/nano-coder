@@ -789,7 +789,11 @@ struct Transcript
                 continue;
             }
             if (cr) { cur = null; cr = false; }
-            cur ~= s[at .. i];
+            // A literal wrap mark in the text is never metadata: replace it
+            // with U+FFFD so it can't be read as a generated wrap, verbatim
+            // or separator mark (which would alter the copied text or join
+            // genuine hard lines).
+            cur ~= c >= softWrap && c <= sepWrap ? "\uFFFD" : s[at .. i];
         }
     }
 
@@ -972,6 +976,12 @@ unittest
     small.cap = 10;
     foreach (n; 0 .. 11) small.feed(cast(const(ubyte)[]) "x\n");
     assert(small.lines.length == 9);
+    // A literal wrap mark in fed text is never metadata: it becomes U+FFFD,
+    // so it can't forge a wrap/verbatim mark or join genuine hard lines.
+    Transcript lit;
+    lit.feed(cast(const(ubyte)[]) "/tmp/a\uE003b\uE002c\uE004d\n");
+    assert(lit.lines == ["/tmp/a\uFFFDb\uFFFDc\uFFFDd"]);
+    assert(lit.render(20) == ["/tmp/a\uFFFDb\uFFFDc\uFFFDd"]);
 }
 
 // Wrapped rows reach the terminal through autowrap, so a copy has no newline.
