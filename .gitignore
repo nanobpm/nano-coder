@@ -10,3 +10,4 @@ tla/*_TTrace_*
 tla/*.bin
 states/
 /node_modules
+.qjs-build/

@@ -1575,7 +1575,8 @@ class Agent
         bool isOutcome = outcomeTool && call.name == outcomeToolName;
         bool isHistory = historyEnabled && hist.isHistoryTool(call.name);
         bool isTimer = timerTools && isTimerTool(call.name);
-        if (!isPlan && !isOutcome && !isHistory && !isTimer && !tools.has(call.name))
+        bool isScript = codemode && call.name == "run_script";
+        if (!isPlan && !isOutcome && !isHistory && !isTimer && !isScript && !tools.has(call.name))
             return format("Tool '%s' not found. Available: %s", call.name, toolNames());
         // Backstop for a call already in flight when plan mode was switched on.
         if (control.mode == AgentMode.plan && !planAllows(call.name))
@@ -1636,6 +1637,12 @@ class Agent
                 out_ = call.name == hist.searchTool ? hist.search(logPath, args) : hist.read(logPath, args);
             }
             else if (isTimer) out_ = runTimerTool(call.name, args);
+            else if (isScript)
+            {
+                auto r = runScriptTool(call.id, args);
+                if (r.isError) throw new ToolError(r.output);
+                out_ = r.output;
+            }
             else out_ = isPlan ? runPlanTool(call.name, args) : tools.execute(call.name, args);
             isError = false;
         }
@@ -1652,6 +1659,30 @@ class Agent
             if (o.blocked && o.blockReason.strip.length) context ~= o.blockReason;
         }
         return withContext(out_, context);
+    }
+
+    /// Codemode spike: offer `run_script` (NANO_CODEMODE=1).
+    bool codemode;
+
+    /// Run a `run_script` call: each tool the script calls goes through
+    /// `runTool` (permission policy, plan mode, hooks), like a direct call.
+    private auto runScriptTool(string id, JSONValue args)
+    {
+        import nano.codemode : runScript, ScriptResult;
+        auto code = "code" in args;
+        if (code is null || code.type != JSONType.string) throw new ToolError("run_script needs a `code` string");
+        size_t n;
+        auto host = delegate string(string name, JSONValue a) {
+            if (name == "run_script" || name == outcomeToolName || name == "question" || isPlanTool(name)
+                || isTimerTool(name))
+                throw new Exception(name ~ " cannot be called from run_script");
+            auto sub = ToolCall(format("%s-s%s", id, ++n), name, a);
+            bool err;
+            auto out_ = runTool(sub, null, err);
+            if (err) throw new Exception(out_);
+            return out_;
+        };
+        return runScript(code.str, host, 120_000, 256 << 20, null);
     }
 
     /// Instruction files: nested ones attach to file-tool results.
@@ -1925,6 +1956,11 @@ class Agent
         auto all = tools.definitions ~ (planTools ? planDefinitions() : null)
             ~ (outcomeTool ? [outcomeDefinition()] : null) ~ (historyEnabled ? hist.definitions() : null)
             ~ (timerTools ? timerDefinitions() : null);
+        if (codemode)
+        {
+            import nano.codemode : scriptDefinition;
+            all ~= scriptDefinition();
+        }
         if (control.mode != AgentMode.plan) return all;
         ToolDefinition[] kept;
         foreach (t; all) if (planAllows(t.name)) kept ~= t;

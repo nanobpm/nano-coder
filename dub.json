@@ -9,7 +9,8 @@
     "curl"
   ],
   "libs-linux": [
-    "z"
+    "z",
+    "m"
   ],
   "lflags-osx": [
     "-exported_symbol",
@@ -42,6 +43,10 @@
     "-fno-delete-null-pointer-checks"
   ],
   "preBuildCommands": [
-    "\"$PACKAGE_DIR/scripts/check-safe.sh\""
+    "\"$PACKAGE_DIR/scripts/check-safe.sh\"",
+    "\"$PACKAGE_DIR/scripts/build-quickjs.sh\""
+  ],
+  "lflags": [
+    "$PACKAGE_DIR/.qjs-build/libquickjs.a"
   ]
 }

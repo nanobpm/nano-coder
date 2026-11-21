@@ -1853,6 +1853,10 @@ int runMain(string[] args)
     agent.titleClient = (string spec) => makeClient(resolve(cfg, spec));
     agent.planTools = cfg.planTools;
     agent.timerTools = !o.acp; // ACP has no idle loop to fire them
+    {
+        import std.process : environment;
+        agent.codemode = environment.get("NANO_CODEMODE", "") == "1"; // codemode spike
+    }
     agent.outcomeTool = cfg.outcomeTool;
     agent.remindersEnabled = cfg.reminders;
     agent.questions = questions;

@@ -10,6 +10,7 @@ import nano.nullaudit;
 static import nano.acp;
 static import nano.agent;
 static import nano.clock;
+static import nano.codemode;
 static import nano.agent_status;
 static import nano.system_prompt;
 static import nano.testserver;
@@ -99,6 +100,7 @@ private alias modules = imported!"std.meta".AliasSeq!(
     nano.agent,
     nano.agent_status,
     nano.clock,
+    nano.codemode,
     nano.system_prompt,
     nano.testserver,
     nano.testenv_test,
