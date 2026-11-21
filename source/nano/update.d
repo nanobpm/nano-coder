@@ -148,7 +148,25 @@ struct InstallStep
 {
     string program;
     string[] args;
-    string[string] env; /// added to the inherited environment
+    string[string] env; /// added to the inherited environment; a null value removes the variable
+}
+
+/// `git rev-parse --local-env-vars`: inherited, these redirect a `git -C dir`
+/// to another repository (`-C` does not override them).
+immutable string[] gitLocalEnvVars = [
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE", "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX",
+    "GIT_SHALLOW_FILE", "GIT_COMMON_DIR",
+];
+
+/// An env override that removes every `gitLocalEnvVars` entry, so a git step
+/// acts on the directory it names, not on a repository the session inherited.
+string[string] cleanGitEnv()
+{
+    string[string] e;
+    foreach (n; gitLocalEnvVars) e[n] = null;
+    return e;
 }
 
 /// Homebrew settings for the upgrade: no `brew update` of every tap, no
@@ -176,7 +194,7 @@ InstallStep[] installSteps(Channel c, string tapRepo)
 {
     if (c == Channel.other) return null;
     if (c == Channel.brew && tapRepo.length)
-        return [InstallStep("git", ["-C", tapRepo, "pull", "--ff-only", "--quiet"]),
+        return [InstallStep("git", ["-C", tapRepo, "pull", "--ff-only", "--quiet"], cleanGitEnv()),
             InstallStep(installer(c), installArgs(c), quietBrewEnv.dup)];
     return [InstallStep(installer(c), installArgs(c))];
 }
@@ -225,13 +243,14 @@ private bool canFindChar(string set, dchar c) pure { foreach (d; set) if (d == c
 
 /// The step as a copy-pasteable shell command: its environment overrides
 /// (sorted, as `K=V` prefixes) then the program and arguments, so a manual
-/// retry reproduces exactly what `/update` ran.
+/// retry reproduces what `/update` ran. Removals (null values) are not shown:
+/// they only undo a redirect the session inherited.
 string stepCommand(InstallStep step)
 {
     import std.algorithm : sort;
     import std.array : array;
     string s;
-    foreach (k; step.env.keys.array.sort) s ~= k ~ "=" ~ shellWord(step.env[k]) ~ " ";
+    foreach (k; step.env.keys.array.sort) if (step.env[k] !is null) s ~= k ~ "=" ~ shellWord(step.env[k]) ~ " ";
     return s ~ shellWord(step.program) ~ " " ~ step.args.joinWords;
 }
 
@@ -529,8 +548,14 @@ string[] runInstaller(Channel channel, string exe, string running,
 /// Runs the installer attached to the terminal; its exit status.
 int spawnInstaller(string program, string[] args, const string[string] env)
 {
-    import std.process : spawnProcess, wait;
-    return wait(spawnProcess([program] ~ args, env));
+    import std.process : spawnProcess, wait, environment, Config;
+    bool removes;
+    foreach (k, v; env) if (v is null) removes = true;
+    if (!removes) return wait(spawnProcess([program] ~ args, env));
+    // Removing needs the whole environment: spawnProcess only adds to it.
+    auto full = environment.toAA;
+    foreach (k, v; env) { if (v is null) full.remove(k); else full[k] = v; }
+    return wait(spawnProcess([program] ~ args, full, Config.newEnv));
 }
 
 /// `exe --version`'s version, or null.
@@ -809,6 +834,22 @@ unittest
     assert(channelFor(buildPath(dir, "opt/nano-coder/bin/nano-coder")) == Channel.brew);
 }
 
+// spawnInstaller removes null-valued variables from the child and passes
+// the rest, without touching this process's environment.
+unittest
+{
+    import std.process : environment;
+    if (which("sh") is null) return;
+    // A private variable, not GIT_DIR itself: tests run concurrently with git ones.
+    enum v = "NANO_UPDATE_TEST_INHERITED";
+    environment[v] = "/elsewhere/.git";
+    scope (exit) environment.remove(v);
+    string[string] e = [v: null, "NANO_T": "y"];
+    assert(spawnInstaller("sh", ["-c", `test -z "${` ~ v ~ `+x}" && test "$NANO_T" = y`], e) == 0);
+    assert(spawnInstaller("sh", ["-c", `test "$` ~ v ~ `" = /elsewhere/.git`], null) == 0);
+    assert(environment.get(v) == "/elsewhere/.git", "the session environment is unchanged");
+}
+
 // rust: update.rs::the_brew_channel_upgrades_the_tap_formula
 unittest
 {
@@ -826,7 +867,10 @@ unittest
     import std.algorithm : canFind;
     auto steps = installSteps(Channel.brew, "/tap");
     assert(steps.length == 2);
-    assert(steps[0].program == "git" && steps[0].args == ["-C", "/tap", "pull", "--ff-only", "--quiet"] && steps[0].env is null);
+    assert(steps[0].program == "git" && steps[0].args == ["-C", "/tap", "pull", "--ff-only", "--quiet"]);
+    foreach (n; ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY"])
+        assert(n in steps[0].env && steps[0].env[n] is null, n ~ " must be removed from the tap pull's environment");
+    foreach (v; steps[0].env.byValue) assert(v is null, "the tap pull only removes variables");
     assert(steps[1].program == "brew" && steps[1].args == ["upgrade", brewFormula]);
     assert(steps[1].env["HOMEBREW_NO_AUTO_UPDATE"] == "1" && steps[1].env["HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK"] == "1");
     assert(steps[1].env["HOMEBREW_NO_INSTALL_CLEANUP"] == "1" && steps[1].env["HOMEBREW_NO_ENV_HINTS"] == "1");
