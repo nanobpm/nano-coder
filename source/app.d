@@ -1667,22 +1667,34 @@ void replayTranscript(Agent agent, Console console)
 
 /// Whether the message after `msgs[i]` is a Stop hook's rejection (an
 /// automatic message that is not a continuation, timer or hook context).
+/// Stop-hook rejections are always a wrapped system reminder; an idle timer
+/// turn's message is automatic but unflagged and starts with the raw notice.
 bool stopRejected(const Message[] msgs, size_t i) pure nothrow @nogc @safe
 {
+    import std.algorithm.searching : startsWith;
     if (i + 1 >= msgs.length) return false;
     const n = &msgs[i + 1];
-    return n.role == Role.user && n.autoInitiated && !n.continuation && !n.timer && !n.hookContext;
+    return n.role == Role.user && n.autoInitiated && !n.continuation && !n.timer && !n.hookContext
+        && n.content.startsWith("<system-reminder>");
 }
 
 unittest
 {
-    auto hook = Message.auto_("keep going");
-    auto cont = Message.auto_("cut off");
+    import nano.agent : wrapReminder;
+    auto hook = Message.auto_(wrapReminder("keep going"));
+    auto cont = Message.auto_(wrapReminder("cut off"));
     cont.continuation = true;
-    auto msgs = [Message.assistant("first"), hook, Message.assistant("second"), cont, Message.assistant("tail")];
+    // Mid-turn timers are flagged `timer`; an idle timer turn's input isn't.
+    auto timerNew = Message.auto_(wrapReminder("Timer 1, set at 10:00, fired: check"));
+    timerNew.timer = true;
+    auto timerOld = Message.auto_("Timer 2, set at 10:00, fired: check");
+    auto msgs = [Message.assistant("first"), hook, Message.assistant("second"), cont, Message.assistant("third"),
+        timerNew, Message.assistant("fourth"), timerOld, Message.assistant("tail")];
     assert(stopRejected(msgs, 0));
     assert(!stopRejected(msgs, 2));
     assert(!stopRejected(msgs, 4));
+    assert(!stopRejected(msgs, 6));
+    assert(!stopRejected(msgs, 8));
 }
 
 string planText(Agent agent) pure
