@@ -250,7 +250,7 @@ private ulong sizeOr0(string path)
 
 /// Index lines parsed into `map` (latest wins, titles monotonic). Unreadable
 /// lines are skipped: the index is only a cache.
-private void mergeLines(const(ubyte)[] bytes, ref Summary[string] map, ref size_t lines)
+private void mergeLines(const(ubyte)[] bytes, ref Summary[string] map, ref size_t lines, bool strict = false)
 {
     foreach (raw; (cast(const(char)[]) bytes).split('\n'))
     {
@@ -259,7 +259,12 @@ private void mergeLines(const(ubyte)[] bytes, ref Summary[string] map, ref size_
         lines++;
         Summary s;
         try s = Summary.fromJson(line);
-        catch (Exception) continue; // skip a corrupt index line; the log rebuilds it
+        catch (Exception)
+        {
+            // Strict callers (retention) must not guess at titles a corrupt line hid.
+            if (strict) throw new Exception("session index has a corrupt line");
+            continue; // skip a corrupt index line; the log rebuilds it
+        }
         // A later line without a title must not hide one an earlier line recorded.
         if (s.title is null)
             if (auto prev = s.id in map) s.title = prev.title;
@@ -268,14 +273,21 @@ private void mergeLines(const(ubyte)[] bytes, ref Summary[string] map, ref size_
 }
 
 /// The index's summaries by id and its line count.
-private Summary[string] load(string dir, out size_t lines)
+/// `strict` (retention's title check): only a missing index reads as empty;
+/// an unreadable index or a corrupt line throws instead of hiding titles.
+private Summary[string] load(string dir, out size_t lines, bool strict = false)
 {
     import nano.safeio : readBytes;
     Summary[string] map;
     ubyte[] bytes;
-    try bytes = readBytes(indexPath(dir));
-    catch (Exception) return map; // no index yet: start empty and rebuild
-    mergeLines(bytes, map, lines);
+    if (strict && !indexPath(dir).exists) return map;
+    if (strict) bytes = readBytes(indexPath(dir));
+    else
+    {
+        try bytes = readBytes(indexPath(dir));
+        catch (Exception) return map; // no index yet: start empty and rebuild
+    }
+    mergeLines(bytes, map, lines, strict);
     return map;
 }
 
@@ -447,13 +459,14 @@ string cleanTitle(string reply) pure
 /// Every resumable session with at least one prompt in `dir`, newest first.
 /// Sessions the index lacks, or whose log changed since it was indexed, are
 /// summarized from their logs, and the index is updated. A missing directory
-/// is no sessions; other filesystem errors propagate.
-Summary[] list(string dir)
+/// is no sessions; other filesystem errors propagate. `strictIndex` also
+/// fails on an unreadable or corrupt index (see `load`).
+Summary[] list(string dir, bool strictIndex = false)
 {
     if (!dir.exists) return null;
     auto indexLen = sizeOr0(indexPath(dir));
     size_t lines;
-    auto index = load(dir, lines);
+    auto index = load(dir, lines, strictIndex);
     Summary[string] current;
     Summary[] updates;
     foreach (DirEntry e; dirEntries(dir, SpanMode.shallow, false))

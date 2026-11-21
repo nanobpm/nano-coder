@@ -54,7 +54,7 @@ string logText(string path)
 // avail_in/avail_out); the stream struct is plain C data.
 private string gunzipLog(const(ubyte)[] bytes, string path) @trusted
 {
-    import etc.c.zlib : z_stream, inflateInit2, inflate, inflateEnd, Z_FINISH, Z_STREAM_END, Z_OK, Z_BUF_ERROR;
+    import etc.c.zlib : z_stream, inflateInit2, inflate, inflateEnd, Z_FINISH, Z_NO_FLUSH, Z_STREAM_END, Z_OK, Z_BUF_ERROR;
     import core.stdc.string : strlen;
     // A gzip wrapper needs raw inflate with windowBits 31 (15 + the 16 that
     // asks for the gzip header); std.zlib's uncompress expects a zlib stream.
@@ -63,24 +63,39 @@ private string gunzipLog(const(ubyte)[] bytes, string path) @trusted
         throw new Exception("inflate init failed for " ~ path);
     scope (exit) inflateEnd(&zs);
     auto out_ = new ubyte[](bytes.length ? bytes.length * 4 : 64);
-    zs.next_in = cast(ubyte*) bytes.ptr;
-    zs.avail_in = cast(uint) bytes.length;
-    size_t used;
+    // zlib counts in 32-bit uints: feed the input and expose the output in
+    // windows of at most uint.max, advancing by what zlib actually consumed
+    // and wrote, so >4 GiB buffers never wrap.
+    size_t fed, used;
     for (;;)
     {
+        if (zs.avail_in == 0 && fed < bytes.length)
+        {
+            immutable n = zlibWindow(bytes.length - fed);
+            zs.next_in = cast(ubyte*) bytes.ptr + fed;
+            zs.avail_in = n;
+            fed += n;
+        }
         if (used == out_.length) out_.length = out_.length * 2;
+        immutable window = zlibWindow(out_.length - used);
         zs.next_out = out_.ptr + used;
-        zs.avail_out = cast(uint) (out_.length - used);
-        auto rc = inflate(&zs, Z_FINISH);
-        used = out_.length - zs.avail_out;
+        zs.avail_out = window;
+        auto rc = inflate(&zs, fed < bytes.length ? Z_NO_FLUSH : Z_FINISH);
+        used += window - zs.avail_out;
         if (rc == Z_STREAM_END) break;
         if (rc != Z_OK && rc != Z_BUF_ERROR)
             throw new Exception(format("gunzip %s: %s", path,
                 zs.msg !is null ? zs.msg[0 .. strlen(zs.msg)] : "corrupt stream"));
-        if (rc == Z_BUF_ERROR && zs.avail_in == 0 && zs.avail_out != 0)
+        if (rc == Z_BUF_ERROR && zs.avail_in == 0 && fed == bytes.length && zs.avail_out != 0)
             throw new Exception("gunzip " ~ path ~ ": truncated stream");
     }
     return cast(string) out_[0 .. used];
+}
+
+/// One zlib buffer window over `remaining` bytes: zlib's sizes are 32-bit.
+package uint zlibWindow(size_t remaining) pure nothrow @nogc @safe
+{
+    return remaining > uint.max ? uint.max : cast(uint) remaining;
 }
 
 // zlib's C API writes only within the caller's buffers (sizes tracked in
@@ -88,24 +103,32 @@ private string gunzipLog(const(ubyte)[] bytes, string path) @trusted
 /// The gzip-compressed bytes of `text` (a session log's whole content).
 ubyte[] gzipLog(const(char)[] text) @trusted
 {
-    import etc.c.zlib : z_stream, deflateInit2, deflate, deflateEnd, Z_FINISH, Z_STREAM_END;
+    import etc.c.zlib : z_stream, deflateInit2, deflate, deflateEnd, Z_FINISH, Z_NO_FLUSH, Z_STREAM_END, Z_BUF_ERROR;
     z_stream zs;
     if (deflateInit2(&zs, 6, 8 /* Z_DEFLATED */, 15 + 16 /* gzip wrapper */, 8, 0) != 0)
         throw new Exception("deflate init failed");
     scope (exit) deflateEnd(&zs);
     auto out_ = new ubyte[](text.length / 4 + 256);
-    zs.next_in = cast(ubyte*) text.ptr;
-    zs.avail_in = cast(uint) text.length;
-    size_t used;
+    // Chunked like gunzipLog: a >4 GiB log must compress whole, never as
+    // its wrapped-length prefix (tidy-up deletes the original afterwards).
+    size_t fed, used;
     for (;;)
     {
+        if (zs.avail_in == 0 && fed < text.length)
+        {
+            immutable n = zlibWindow(text.length - fed);
+            zs.next_in = cast(ubyte*) text.ptr + fed;
+            zs.avail_in = n;
+            fed += n;
+        }
         if (used == out_.length) out_.length = out_.length * 2;
+        immutable window = zlibWindow(out_.length - used);
         zs.next_out = out_.ptr + used;
-        zs.avail_out = cast(uint) (out_.length - used);
-        auto rc = deflate(&zs, Z_FINISH);
-        used = out_.length - zs.avail_out;
+        zs.avail_out = window;
+        auto rc = deflate(&zs, fed < text.length ? Z_NO_FLUSH : Z_FINISH);
+        used += window - zs.avail_out;
         if (rc == Z_STREAM_END) break;
-        if (rc != 0) throw new Exception("deflate failed compressing a session log");
+        if (rc != 0 && rc != Z_BUF_ERROR) throw new Exception("deflate failed compressing a session log");
     }
     return out_[0 .. used].dup;
 }
@@ -375,8 +398,9 @@ class SessionLog
         path = buildPath(dir, this.id ~ ".jsonl");
         if (path.exists) throw new Exception("session log " ~ path ~ " already exists");
         f = File(path, "a");
-        tryLock(f); // a brand-new file: no one else can hold it yet
-        openHere[path] = true;
+        // A brand-new file: only an unsupported filesystem can refuse.
+        if (tryLock(f) == LockResult.contended) throw new Exception("session log " ~ path ~ " is locked");
+        shareHandle(path, f);
         JSONValue h = ["id": this.id, "created_at": nowStamp(), "cwd": cwd, "model": model];
         h["version"] = formatVersion;
         write_(record("session", h));
@@ -396,8 +420,8 @@ class SessionLog
             // never leaves a truncated `.jsonl` that would shadow it.
             import std.file : write_file = write, rename;
             auto archive = File(path, "r");
-            awaitLock(archive);
-            if (!path.exists) throw new Exception("session log " ~ path ~ " was removed");
+            awaitLock(archive, path);
+            if (!sameFile(archive, path)) throw new Exception("session log " ~ path ~ " was removed");
             auto plain = path[0 .. $ - ".gz".length];
             auto tmp = format("%s.tmp-%s", plain, thisProcessID);
             scope (failure) if (tmp.exists) remove(tmp);
@@ -411,14 +435,23 @@ class SessionLog
         validateId(id);
         // Lock before reading or truncating, so tidy-up cannot compress or
         // delete the log underneath this writer.
-        // "a" would recreate a missing log: check first, then again under the
-        // lock (a tidy-up that removed it meanwhile unlinked our inode).
-        if (!path.exists) throw new Exception("session log " ~ path ~ " does not exist");
-        f = File(path, "a");
-        if (path in openHere) tryLock(f); // this thread already holds it open
-        else awaitLock(f);
-        openHere[path] = true;
-        if (!path.exists) { f.close(); throw new Exception("session log " ~ path ~ " was removed"); }
+        if (auto held = path in openHere)
+        {
+            // This process already holds the log open and locked: share that
+            // locked handle (a second open would be a separate, unlocked
+            // file description once the first closes).
+            f = held.file;
+            held.refs++;
+        }
+        else
+        {
+            // Open without creating (never recreate a log tidy-up removed),
+            // lock, then verify the path still names the inode we locked.
+            f = openExistingForAppend(path);
+            awaitLock(f, path);
+            if (!sameFile(f, path)) { f.close(); throw new Exception("session log " ~ path ~ " was removed"); }
+            shareHandle(path, f);
+        }
         auto bytes = readBytes(path);
         size_t committed = bytes.length;
         while (committed && bytes[committed - 1] != '\n') committed--;
@@ -437,8 +470,16 @@ class SessionLog
     /// Close the log (releasing its lock); a closed log must not be written.
     void close()
     {
-        if (f.isOpen) f.close();
-        openHere.remove(path);
+        if (!f.isOpen) return;
+        // AA removal does not run destructors: close the shared handle
+        // explicitly when the last writer goes, releasing the lock.
+        if (auto held = path in openHere)
+            if (--held.refs == 0)
+            {
+                held.file.close();
+                openHere.remove(path);
+            }
+        f.detach();
     }
 
     private void write_(string line)
@@ -1012,35 +1053,69 @@ struct TidyResult
 /// The stamp file whose mtime rate-limits the tidy-up to once a day.
 private enum string tidyStampFile = ".tidy-stamp";
 
-/// Take an exclusive advisory lock on `f` without waiting: false when
-/// another open file description holds it. A filesystem without flock
-/// (ENOLCK/EOPNOTSUPP) counts as locked, best-effort. The lock lives until
-/// `f` is closed. flock only marks the open file description.
-private bool tryLock(ref File f) @trusted
+/// How a non-blocking lock attempt ended.
+package enum LockResult { acquired, contended, unsupported }
+
+/// Take an exclusive advisory lock on `f` without waiting. `unsupported`
+/// is any other flock failure (ENOLCK, EOPNOTSUPP, ...): writers carry on
+/// best-effort, but destructive maintenance must treat it as not held.
+/// The lock lives until `f` is closed; flock marks the open file description.
+private LockResult tryLock(ref File f) @trusted
 {
-    import core.stdc.errno : errno, EWOULDBLOCK;
-    if (flock(fileno(f.getFP), LOCK_EX | LOCK_NB) == 0) return true;
-    return errno != EWOULDBLOCK;
+    import core.stdc.errno : errno, EWOULDBLOCK, EAGAIN;
+    if (flock(fileno(f.getFP), LOCK_EX | LOCK_NB) == 0) return LockResult.acquired;
+    return errno == EWOULDBLOCK || errno == EAGAIN ? LockResult.contended : LockResult.unsupported;
 }
 
-/// Logs this thread holds open, so reopening one (an in-process resume)
-/// does not wait on its own lock.
-private bool[string] openHere;
+/// A locked log handle shared by this thread's writers of one path.
+private struct Held { File file; size_t refs; }
+
+/// Logs this thread holds open and locked, so an in-process reopen shares
+/// the locked handle instead of opening an unlocked second description.
+private Held[string] openHere;
+
+private void shareHandle(string path, File f)
+{
+    openHere[path] = Held(f, 1);
+}
 
 /// Lock `f` for a writer, waiting briefly while a tidy-up holds it (a
-/// compression or expiry takes milliseconds); the caller re-checks that the
-/// path still exists afterwards, so a log tidied away meanwhile is reported
-/// rather than silently recreated. Still contended after the wait, the writer
-/// carries on unlocked (best-effort, as on a filesystem without flock).
-private void awaitLock(ref File f)
+/// compression or expiry takes milliseconds). Still contended after the
+/// wait, throw: an unlocked writer could append to a log tidy-up is
+/// compressing or deleting. An unsupported filesystem proceeds best-effort.
+private void awaitLock(ref File f, string path)
 {
     import nano.clock : sleepFor;
     import core.time : msecs;
-    foreach (attempt; 0 .. 10)
+    foreach (attempt; 0 .. 40)
     {
-        if (tryLock(f)) return;
+        if (tryLock(f) != LockResult.contended) return;
         sleepFor(25.msecs);
     }
+    throw new Exception("session log " ~ path ~ " is locked by another process (tidy-up?); try again");
+}
+
+/// `path` opened for appending without ever creating it.
+private File openExistingForAppend(string path) @trusted
+{
+    import core.sys.posix.fcntl : open, O_WRONLY, O_APPEND;
+    import std.string : toStringz;
+    auto fd = open(path.toStringz, O_WRONLY | O_APPEND);
+    if (fd < 0) throw new Exception("session log " ~ path ~ " does not exist");
+    File f;
+    f.fdopen(fd, "a");
+    return f;
+}
+
+/// Whether `path` still names the inode `f` has open (tidy-up may have
+/// removed or replaced it while we waited for the lock).
+private bool sameFile(ref File f, string path) @trusted
+{
+    import core.sys.posix.sys.stat : fstat, stat, stat_t;
+    import std.string : toStringz;
+    stat_t a, b;
+    if (fstat(fileno(f.getFP), &a) != 0 || stat(path.toStringz, &b) != 0) return false;
+    return a.st_dev == b.st_dev && a.st_ino == b.st_ino;
 }
 
 private extern (C) int flock(int, int) nothrow @nogc;
@@ -1065,7 +1140,7 @@ TidyResult tidySessions(string dir, long compressAfterDays, long retentionDays)
     // Without the titles, any deletion could hit a named session: fail
     // closed and only compress this pass.
     bool mayDelete = retentionDays > 0;
-    try foreach (s; list(dir)) if (s.title !is null) named[s.id] = true;
+    try foreach (s; list(dir, true)) if (s.title !is null) named[s.id] = true;
     catch (Exception) mayDelete = false; // unknown titles: compress only, delete nothing
     foreach (DirEntry e; dirEntries(dir, SpanMode.shallow, false))
     {
@@ -1086,10 +1161,14 @@ TidyResult tidySessions(string dir, long compressAfterDays, long retentionDays)
             // and append to a log this pass then removes.
             auto held = File(e.name, "r");
             scope (exit) held.close();
-            if (!tryLock(held) || !e.name.exists) continue;
+            // Only a lock actually acquired proves no writer has the log.
+            if (tryLock(held) != LockResult.acquired || !sameFile(held, e.name)) continue;
+            // Re-sample the age under the lock: a session may have
+            // appended and closed since the directory scan.
+            age = now - timeLastModified(e.name);
             if (mayDelete && age >= dur!"days"(retentionDays) && id !in named)
             {
-                result.freedBytes += e.size;
+                result.freedBytes += getSize(e.name);
                 remove(e.name);
                 ++result.deleted;
             }
@@ -1097,13 +1176,13 @@ TidyResult tidySessions(string dir, long compressAfterDays, long retentionDays)
             {
                 import std.file : rename, setTimes;
                 auto gz = e.name ~ ".gz";
-                auto before = e.size;
+                auto before = getSize(e.name);
                 auto tmp = format("%s.tmp-%s", gz, thisProcessID);
                 scope (failure) if (tmp.exists) remove(tmp);
                 std.file.write(tmp, gzipLog(cast(const(char)[]) readBytes(e.name)));
                 // Keep the last activity time: retention and the picker
                 // measure age from it, not from compression.
-                auto mtime = e.timeLastModified;
+                auto mtime = timeLastModified(e.name);
                 setTimes(tmp, mtime, mtime);
                 rename(tmp, gz);
                 remove(e.name);
@@ -1431,12 +1510,12 @@ unittest
     auto old = makeLog("old-log", "an old session that should be compressed");
     auto kept = makeLog("kept-log", "a named session that must survive retention");
     auto fresh = makeLog("fresh-log", "a session too new to touch");
-    foreach (p; [old, kept]) setTimes(p, wallNow - 20.days, wallNow - 20.days);
-    // Name `kept` via the index.
+    // Name `kept` via the index (before ageing: naming may touch the log).
     import nano.session_index : setTitle;
     setTitle(kept, "Keep me");
+    foreach (p; [old, kept]) setTimes(p, wallNow - 20.days, wallNow - 20.days);
     auto r = tidySessions(dir, 14, 0);
-    assert(r.compressed == 2 && r.deleted == 0);
+    assert(r.compressed == 2 && r.deleted == 0, format("%s", r));
     assert(!old.exists && (old ~ ".gz").exists && !kept.exists && (kept ~ ".gz").exists);
     assert(fresh.exists, "a fresh log is not compressed");
     assert(restore(old ~ ".gz").completed.length == 1, "a compressed log restores");
@@ -1538,4 +1617,76 @@ unittest
     assert(p.items.length == 2 && p.items[1].after == [1u]);
     import nano.plan : Status;
     assert(p.items[1].status == Status.done, "the dependent upsert applied");
+}
+
+// Round-3 review fixes for issue #205: zlib windows never exceed 32 bits; a
+// resume never recreates a removed log; an in-process reopen shares the
+// locked handle; a contended writer fails instead of running unlocked;
+// tidy-up re-reads the age under the lock and keeps named sessions when the
+// index is unreadable.
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse;
+    import std.path : buildPath;
+    import std.exception : assertThrown;
+    import core.time : days;
+    assert(zlibWindow(10) == 10);
+    assert(zlibWindow(cast(size_t) uint.max) == uint.max);
+    static if (size_t.sizeof > 4)
+    {
+        assert(zlibWindow(cast(size_t) uint.max + 1) == uint.max, "output window capped");
+        assert(zlibWindow(4UL << 30) == uint.max, "a 4 GiB input is never fed as 0 bytes");
+    }
+    auto dir = buildPath(tempDir, "nano-d-tidy3-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+
+    // A removed log is reported, not recreated as a headerless file.
+    auto gone = new SessionLog(dir, "mock/m", "/w", "gone");
+    gone.close();
+    remove(gone.path);
+    assertThrown(new SessionLog(gone.path));
+    assert(!gone.path.exists, "resume must not recreate a removed log");
+
+    // An in-process reopen shares the locked handle: after the first writer
+    // closes, the log is still locked against tidy-up.
+    auto a = new SessionLog(dir, "mock/m", "/w", "shared");
+    a.input("in-1", "shared session");
+    auto b = new SessionLog(a.path);
+    a.close();
+    auto probe = File(b.path, "r");
+    assert(tryLock(probe) == LockResult.contended, "the reopened writer still holds the lock");
+    probe.close();
+    b.close();
+    auto probe2 = File(b.path, "r");
+    assert(tryLock(probe2) == LockResult.acquired, "the last close releases the lock");
+
+    // While another description holds the lock, a writer fails rather than
+    // appending unlocked.
+    {
+        import nano.clock : FakeClock;
+        auto clock = FakeClock.install(wallNow); // the bounded wait is instant
+        assertThrown(new SessionLog(b.path));
+    }
+    probe2.close();
+
+    // Retention re-reads the age under the lock: a log touched after the scan
+    // sampled it is kept. (Simulated: fresh mtime means nothing is deleted.)
+    auto fresh = new SessionLog(dir, "mock/m", "/w", "fresh2");
+    fresh.close();
+    assert(tidySessions(dir, 0, 30).deleted == 0);
+
+    // An unreadable/corrupt index disables deletion (titles unknown).
+    import nano.session_index : list, indexFile;
+    auto old = new SessionLog(dir, "mock/m", "/w", "old3");
+    old.input("in-1", "old session");
+    old.close();
+    list(dir); // build the index
+    auto idx = buildPath(dir, indexFile);
+    std.file.append(idx, "{not json\n");
+    setTimes(old.path, wallNow - 200.days, wallNow - 200.days);
+    std.file.write(buildPath(dir, tidyStampFile), "");
+    setTimes(buildPath(dir, tidyStampFile), wallNow - 2.days, wallNow - 2.days);
+    auto r = tidySessions(dir, 0, 180);
+    assert(r.deleted == 0 && old.path.exists, "a corrupt index must not let retention delete");
 }
