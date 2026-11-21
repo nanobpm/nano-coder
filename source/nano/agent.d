@@ -1394,6 +1394,25 @@ class Agent
         // The requests this compaction adds to the pinned block (the stash so
         // far is their base): the log records only these, so a session holds
         // each request once instead of restating the whole stash (issue #205).
+        // The compaction's in-memory changes commit only when the replace
+        // record is persisted: a failed `l.replace` rolls them all back, so
+        // a later successful compaction never writes a delta whose base
+        // counts requests no log record holds (resume would lose them).
+        auto savedMessages = messages;
+        auto savedPinStash = pinStash;
+        auto savedReplayStash = replayStash;
+        auto savedReplayRestated = replayRestated;
+        auto savedPending = pending;
+        auto savedCalibLen = calibLen;
+        scope (failure)
+        {
+            messages = savedMessages;
+            pinStash = savedPinStash;
+            replayStash = savedReplayStash;
+            replayRestated = savedReplayRestated;
+            pending = savedPending;
+            calibLen = savedCalibLen;
+        }
         size_t pinnedBase = pinStash.length;
         Message[] pinnedNew;
         foreach (ref x; summarized)
@@ -1636,8 +1655,11 @@ class Agent
     {
         import nano.mode : AgentMode;
         string[] dropped;
-        // Repairs are logged first: a failed write leaves the live session as it was.
+        // Repairs are logged first: a failed write leaves the live session as
+        // it was — and closes the incoming log, which the agent never
+        // adopted, so its descriptor and lock do not leak into `openHere`.
         auto repairs = danglingRepairs(r.conversation);
+        scope (failure) newLog.ifSome((SessionLog l) { l.close(); });
         foreach (ref m; repairs)
         {
             import nano.session : nowStamp;
