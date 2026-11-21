@@ -467,11 +467,19 @@ string[] runInstaller(Channel channel, string exe, string running,
         foreach (i, step; steps)
         {
             shown = step.program ~ " " ~ step.args.joinWords;
-            status = runner(step.program, step.args, step.env);
-            if (status != 0 && i == 0 && steps.length > 1)
+            bool refreshStep = i == 0 && steps.length > 1;
+            if (refreshStep)
             {
-                // The tap refresh failed (offline, diverged tap, no git):
-                // fall back to plain `brew upgrade`, which refreshes taps itself.
+                // The tap refresh failing (offline, diverged tap, git missing
+                // so the spawn throws) must not block the upgrade: fall back to
+                // plain `brew upgrade`, which refreshes taps itself.
+                try status = runner(step.program, step.args, step.env);
+                catch (Exception) status = -1; // reported via the fallback: spawn failure == refresh failed
+            }
+            else
+                status = runner(step.program, step.args, step.env);
+            if (status != 0 && refreshStep)
+            {
                 auto plain = installSteps(channel, null)[0];
                 shown = plain.program ~ " " ~ plain.args.joinWords;
                 status = runner(plain.program, plain.args, plain.env);
@@ -813,6 +821,12 @@ unittest
     out_ = runInstaller(Channel.brew, "/x", "0.1.0", failing, (string e) @safe => "0.2.0", () @safe => "/tap");
     assert(ran == ["git", "brew"]);
     assert(out_[0].canFind("`brew upgrade") && out_[0].canFind("unchanged"), out_[0]);
+    ran = null;
+    auto noGit = (string p, string[] a, const string[string] e) @safe {
+        ran ~= p; if (p == "git") throw new Exception("git: not found"); return 0; };
+    out_ = runInstaller(Channel.brew, "/x", "0.1.0", noGit, (string e) @safe => "0.2.0", () @safe => "/tap");
+    assert(ran == ["git", "brew"], "git missing from PATH still falls back to brew upgrade");
+    assert(out_[0].canFind("Updated to 0.2.0"), out_[0]);
 }
 
 // rust: update.rs::the_formula_version_is_read_from_its_download_url
