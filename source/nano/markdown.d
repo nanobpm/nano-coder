@@ -31,6 +31,7 @@ import std.format : format;
 import std.string : indexOf, lastIndexOf, strip, stripLeft;
 import std.uni : isWhite;
 import nano.lineedit : charWidth;
+import nano.frame : softWrapMark, verbatimMark, sepWrapMark;
 import nano.mdblock;
 import nano.mdinline;
 import nano.mdtable : layout, textWidth = width;
@@ -105,35 +106,59 @@ private struct Lines
     string cur;
     size_t curW;
 
-    void newline() pure { lines ~= cur; cur = null; curW = 0; }
+    /// Ends the line; `soft` marks the next one as its continuation (a wrap,
+    /// not a break in the text), so the frame joins them for copying.
+    void newline(bool soft = false) pure { lines ~= cur; cur = soft ? softWrapMark : null; curW = 0; }
+
+    /// Whether the first visible glyph of `pieces` is double-width.
+    static bool firstWide(const Piece[] pieces) pure
+    {
+        foreach (p; pieces) foreach (dchar c; p.text) if (charWidth(c)) return charWidth(c) > 1;
+        return false;
+    }
 
     /// Place one word (styled pieces, no whitespace), preceded by a space
-    /// unless it starts a line. A word wider than the line is broken.
+    /// unless it starts a line. A word wider than the line is broken,
+    /// except inline code: it starts its own row and is left whole, so the
+    /// frame breaks it at the full terminal width as one soft-wrapped row and
+    /// no alignment padding lands inside a copied path or identifier.
     void word(const Piece[] pieces, bool space) pure
     {
         size_t w;
         foreach (p; pieces) foreach (dchar c; p.text) w += charWidth(c);
         if (!w) return;
         size_t gap = space && curW > 0 ? 1 : 0;
-        if (curW > 0 && curW + gap + w > width) newline();
-        else if (gap) { cur ~= ' '; curW++; }
-        foreach (p; pieces)
+        if (curW > 0 && curW + gap + w > width)
         {
-            string run;
-            foreach (dchar c; p.text)
-            {
-                auto cw = charWidth(c);
-                if (curW + cw > width && curW > 0)
-                {
-                    cur ~= styled(run, p.style);
-                    run = null;
-                    newline();
-                }
-                run ~= c;
-                curW += cw;
-            }
-            cur ~= styled(run, p.style);
+            // A separator on the edge starts the next row, so a copy across
+            // the wrap keeps it (a shorter row is padded with spaces anyway).
+            auto full = curW >= width;
+            // One cell short of the edge before a wide glyph, the separator
+            // fits nowhere (the frame pads nothing there): it rides the next
+            // row as a zero-cell mark the frame emits as a space.
+            auto sep = gap && curW + 1 == width && firstWide(pieces);
+            newline(true);
+            if (sep) cur ~= sepWrapMark;
+            else if (gap && full) { cur ~= ' '; curW = 1; }
         }
+        else if (gap) { cur ~= ' '; curW++; }
+        // A word that doesn't fit the rest of its row (which it starts) is
+        // never broken here: the row is marked verbatim so the frame breaks it
+        // by character at the full terminal width, and no newline or alignment
+        // padding lands inside a copied path, identifier or code argument.
+        // Inline code with a space is verbatim even when it fits: a later
+        // reflow (resize) must break it by character, never at its spaces,
+        // or the frame's alignment padding would land inside the argument.
+        if (curW + w > width || spacedCode(pieces)) cur ~= verbatimMark;
+        foreach (p; pieces) cur ~= styled(p.text, p.style);
+        curW += w;
+    }
+
+    /// Whether `pieces` holds inline code containing whitespace.
+    static bool spacedCode(const Piece[] pieces) pure
+    {
+        foreach (p; pieces) if (p.style & CODE) foreach (dchar c; p.text) if (isWhite(c)) return true;
+        return false;
     }
 
     string[] finish() pure
@@ -171,7 +196,7 @@ private string[] wrapSpans(const Span[] spans, size_t width, ubyte extra) pure
                 lines.newline();
                 space = false;
             }
-            else if (isWhite(c))
+            else if (isWhite(c) && !(style & CODE))
             {
                 if (piece.length) { word ~= Piece(piece, style); piece = null; }
                 flush();
@@ -185,26 +210,12 @@ private string[] wrapSpans(const Span[] spans, size_t width, ubyte extra) pure
     return lines.finish();
 }
 
-/// A verbatim line (code, HTML), broken at `width` cells rather than wrapped.
+/// A verbatim line (code, HTML). It isn't broken here: the frame breaks it
+/// by character at the terminal's full width (`verbatimMark`), so the rows
+/// after the first carry no indent or quote prefix and a copy is exact.
 string[] hardLines(string line, size_t width, ubyte style) pure
 {
-    string[] out_;
-    string cur;
-    size_t w;
-    foreach (dchar c; line)
-    {
-        auto cw = charWidth(c);
-        if (w + cw > width && w > 0)
-        {
-            out_ ~= styled(cur, style);
-            cur = null;
-            w = 0;
-        }
-        cur ~= c;
-        w += cw;
-    }
-    out_ ~= styled(cur, style);
-    return out_;
+    return [verbatimMark ~ styled(line, style)];
 }
 
 string fenceOpen(string info) pure nothrow { return DIM ~ "```" ~ info ~ RESET; }
@@ -248,7 +259,11 @@ private string[] renderBlock(const Block block, size_t width, size_t depth) pure
         case BK.code:
             if (block.fenced) return [fenceOpen(block.info)] ~ codeLines(block.text, width) ~ fenceClose();
             string[] out_;
-            foreach (l; codeLines(block.text, width > 5 ? width - 4 : 1)) out_ ~= "    " ~ l;
+            // Verbatim like fenced code: the frame breaks each line by
+            // character at the full width, so the indent stays on the first
+            // row only and a copy is exact (wrapping at width-4 repeated the
+            // indent on every continuation row).
+            foreach (l; codeLines(block.text, width)) out_ ~= "    " ~ l;
             return out_;
         case BK.quote:
             string[] out_;
@@ -283,7 +298,8 @@ private string[] renderBlock(const Block block, size_t width, size_t depth) pure
 /// The lines of `text` drawn for a terminal `width` cells wide.
 string[] renderLines(string text, size_t width) pure
 {
-    return renderBlocks(parse(text), width < 10 ? 10 : width, 0, true);
+    import nano.frame : escapeMarks;
+    return renderBlocks(parse(escapeMarks(text)), width < 10 ? 10 : width, 0, true);
 }
 
 /// `text` rendered for a terminal `width` cells wide (no trailing newline).
@@ -491,11 +507,16 @@ version (unittest)
     private string[] show(string text, size_t width) pure
     {
         string[] out_;
-        foreach (l; renderLines(text, width)) out_ ~= plain(l);
+        import nano.frame : dropSoftWraps;
+        foreach (l; renderLines(text, width)) out_ ~= dropSoftWraps(plain(l));
         return out_;
     }
 
-    private size_t w(string s) pure { return textWidth(plain(s)); }
+    private size_t w(string s) pure
+    {
+        import nano.frame : dropSoftWraps;
+        return textWidth(dropSoftWraps(plain(s)));
+    }
 
     private string stream(string[] chunks, size_t width) pure
     {
@@ -544,7 +565,17 @@ unittest // paragraphs wrap and soft breaks reflow
     assert(show("one two three\nfour five six seven", 12) == ["one two", "three four", "five six", "seven"]);
     assert(show("a  \nb", 80) == ["a", "b"]);
     assert(show("x<br>y", 80) == ["x", "y"]);
-    foreach (l; show("supercalifragilisticexpialidocious ".replicate(3), 10)) assert(w(l) <= 10, l);
+    // An oversized word is never broken here (the frame wraps it at the
+    // terminal width), so no alignment padding can land inside it.
+    import nano.frame : verbatimMark;
+    import std.algorithm : canFind;
+    foreach (l; renderLines("supercalifragilisticexpialidocious ".replicate(3), 10))
+        assert(l.canFind(verbatimMark) && plain(l).canFind("supercalifragilisticexpialidocious"), l);
+    foreach (l; renderLines("/abcdefghijklmnopqrstuv", 20))
+        assert(plain(l).canFind("/abcdefghijklmnopqrstuv"), l);
+    // Inline code keeps its spaces: an oversized span is one verbatim row.
+    auto code = renderLines("`echo 'ab cde'`", 10);
+    assert(code.length == 1 && code[0].canFind(verbatimMark) && plain(code[0]).canFind("echo 'ab cde'"), code.join("|"));
 }
 
 // rust: markdown.rs::links_show_their_url_unless_it_is_the_text
@@ -572,7 +603,15 @@ unittest // code blocks are verbatim between dim fences
 {
     assert(show("```rust\nfn main() {\n    **not bold**\n}\n```\nafter", 80) == ["```rust", "fn main() {", "    **not bold**", "}", "```", "", "after"]);
     assert(show("    indented\n    code", 80) == ["    indented", "    code"]);
-    assert(show("```\n" ~ "x".replicate(25) ~ "\n```", 10)[1 .. 4] == ["xxxxxxxxxx", "xxxxxxxxxx", "xxxxx"]);
+    // A long code line stays whole here; the frame breaks it by character
+    // at the terminal's width, so copying it back gives exactly the line.
+    assert(show("```\n" ~ "x".replicate(25) ~ "\n```", 10)[1] == "x".replicate(25));
+    import nano.frame : wrapAnsi, dropSoftWraps;
+    import std.algorithm : map;
+    import std.algorithm : map;
+    import std.array : array;
+    auto rows = wrapAnsi(renderLines("```\n" ~ "x".replicate(25) ~ "\n```", 10)[1], 10).map!(r => dropSoftWraps(plain(r))).array;
+    assert(rows == ["xxxxxxxxxx", "xxxxxxxxxx", "xxxxx"], rows[0]);
 }
 
 // rust: markdown.rs::block_quotes_get_a_bar
@@ -618,7 +657,12 @@ unittest // every line fits the width
     auto text = format("# A heading that is fairly long\n\n> quote with words %s\n\n- list %s\n  1. nested %s\n\n%s\n\n```\n%s\n```",
         "w ".replicate(40), "x ".replicate(40), "y ".replicate(40), TABLE, "z".replicate(90));
     foreach (width; [10, 17, 30, 80])
-        foreach (l; renderLines(text, width)) assert(w(l) <= width, l);
+        foreach (l; renderLines(text, width))
+        {
+            // Code is left whole for the frame to break by character.
+            import std.string : indexOf;
+            if (l.indexOf(verbatimMark) < 0) assert(w(l) <= width, l);
+        }
 }
 
 unittest // stream matches whole-text rendering at any split
@@ -630,6 +674,7 @@ unittest // stream matches whole-text rendering at any split
 
 unittest // stream emits blocks as soon as they complete
 {
+    import nano.frame : dropSoftWraps;
     MarkdownStream s;
     assert(plain(s.push("# Title\n", 80)) == "Title\n");
     assert(s.push("Para", 80) == "");
@@ -637,8 +682,8 @@ unittest // stream emits blocks as soon as they complete
     assert(plain(s.push("\n- a\n", 80)) == "\nParagraph text\n");
     assert(plain(s.push("- b\n", 80)) == "\n• a\n");
     assert(plain(s.push("- c\n", 80)) == "• b\n");
-    assert(plain(s.push("```py\nx = 1\n", 80)) == "• c\n\n```py\nx = 1\n");
-    assert(plain(s.push("y = 2\n```\n", 80)) == "y = 2\n```\n");
+    assert(dropSoftWraps(plain(s.push("```py\nx = 1\n", 80))) == "• c\n\n```py\nx = 1\n");
+    assert(dropSoftWraps(plain(s.push("y = 2\n```\n", 80))) == "y = 2\n```\n");
     assert(plain(s.push("bye", 80)) == "");
     assert(plain(s.finish(80)) == "\nbye\n");
     assert(!s.holding);
@@ -647,7 +692,8 @@ unittest // stream emits blocks as soon as they complete
 unittest // finish closes an unterminated code block; plain text is unchanged
 {
     auto all = stream(["text\n\n```\ncode", " more"], 80);
-    assert(plain(all) == "text\n\n```\ncode more\n```\n", all);
+    import nano.frame : dropSoftWraps;
+    assert(dropSoftWraps(plain(all)) == "text\n\n```\ncode more\n```\n", all);
     assert(plain(all) == plain(render("text\n\n```\ncode more", 80) ~ "\n"));
     assert(stream(["just ", "some words\n", "on lines"], 80) == "just some words on lines\n");
 }
@@ -666,4 +712,84 @@ unittest // GitHub-style emoji shortcodes in prose; code stays verbatim
     assert(r("v1:zz:seedling:").canFind("v1:zz🌱"));
     assert(r("`:seedling:`").canFind(":seedling:"));
     assert(r("```\n:seedling:\n```").canFind(":seedling:"));
+}
+
+unittest // a separator one cell short of the edge survives a wide-glyph wrap
+{
+    import std.conv : to;
+    import std.string : indexOf;
+    // The consumed separator rides the continuation as a zero-cell mark the
+    // frame emits as a space, so a copy keeps the words apart (a plain view
+    // drops the mark; the emit half is covered in nano.frame).
+    auto rows = renderLines("cmd abcdef 中", 11);
+    assert(rows.length == 2 && rows[1].indexOf(sepWrapMark) >= 0, rows[1]);
+    assert(show("cmd abcdef 中", 11) == ["cmd abcdef", "中"], show("cmd abcdef 中", 11).to!string);
+    assert(show("cmd abcdefg中", 11) == ["cmd", "abcdefg中"], show("cmd abcdefg中", 11).to!string);
+}
+
+unittest // indented code is verbatim: the frame breaks it, the indent stays on the first row
+{
+    import std.conv : to;
+    import std.algorithm : map;
+    import std.array : array;
+    import nano.frame : wrapAnsi, dropSoftWraps;
+    import std.algorithm : map;
+    auto rows = renderLines("    rm -r /a b", 6);
+    assert(rows.length == 1 && rows[0].indexOf(verbatimMark) >= 0, rows[0]);
+    assert(wrapAnsi(rows[0], 6).map!dropSoftWraps.array == ["    rm", " -r /a", " b"]);
+    assert(show("    short", 20) == ["    short"]);
+}
+
+unittest // inline code wider than the line stays whole for the frame to wrap
+{
+    import std.conv : to;
+    import std.algorithm : canFind;
+    // Breaking it here would put a newline (and the caller's alignment pad)
+    // inside the token, corrupting a copied path. Plain words do the same.
+    foreach (c; [["`/abcdefghijklmnopqrstuv`", "/abcdefghijklmnopqrstuv"],
+                 ["see `/abcdefghijklmnopqrstuv`", "/abcdefghijklmnopqrstuv"],
+                 ["x `/abcd` `/klmnopqrstuvwx`", "/klmnopqrstuvwx"]])
+    {
+        auto rows = show(c[0], 10);
+        assert(rows.canFind!(r => r.canFind(c[1])), rows.to!string);
+    }
+    assert(show("/abcdefghijklmnopqrstuv", 10) == ["/abcdefghijklmnopqrstuv"]);
+}
+
+unittest // a word with inline code is whole and verbatim whenever it would break
+{
+    import std.conv : to;
+    import std.algorithm : canFind, count;
+    // Oversized: the row is verbatim, so the frame wraps by character.
+    auto rows = renderLines("see `/abcdefghijklmnopqrstuv`", 20);
+    assert(rows.count!(r => r.indexOf(verbatimMark) >= 0) == 1, rows.to!string);
+    // Adjacent punctuation: the code word stays whole.
+    auto p = show("see `/abcdefghijklmnopqrstuv`,", 10);
+    assert(p.canFind!(r => r.canFind("/abcdefghijklmnopqrstuv,")), p.to!string);
+    // Exactly the width after an edge separator: kept whole, not split.
+    auto e = show("abcdefghij `/klmnopqrs`", 10);
+    assert(e.canFind!(r => r.canFind("/klmnopqrs")), e.to!string);
+    // A fitting code word is not marked.
+    assert(renderLines("see `/ab`", 20)[0].indexOf(verbatimMark) < 0);
+    // Fitting code with a space is still verbatim, so a reflow after a
+    // resize breaks it by character and never pads inside the argument.
+    auto spaced = renderLines("run `echo 'a b'` now", 40);
+    assert(spaced.length == 1 && spaced[0].indexOf(verbatimMark) >= 0, spaced.to!string);
+    import nano.frame : wrapAnsi, dropSoftWraps;
+    import std.algorithm : map;
+    import std.array : join;
+    auto re = wrapAnsi(spaced[0], 13);
+    assert(plain(re.map!(r => dropSoftWraps(r)).join).canFind("echo 'a b'"), re.to!string);
+}
+
+unittest // literal reserved mark characters in the text are not read as marks
+{
+    import std.algorithm : canFind;
+    import nano.frame : softWrapMark, sepWrapMark;
+    foreach (m; [softWrapMark, verbatimMark, sepWrapMark])
+    {
+        auto rows = renderLines("cat /tmp/a" ~ m ~ "b", 40);
+        foreach (r; rows) assert(!r.canFind(m), r);
+        assert(plain(rows[0]).canFind("/tmp/a\uFFFDb"), rows[0]);
+    }
 }

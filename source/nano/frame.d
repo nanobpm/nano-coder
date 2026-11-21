@@ -12,8 +12,9 @@ module nano.frame;
 @safe:
 import nano.arith : saturatingSub;
 
-import std.array : appender, replicate;
+import std.array : Appender, appender, replace, replicate;
 import std.format : format;
+import std.string : indexOf;
 import std.utf : decode;
 import nano.lineedit : charWidth;
 
@@ -25,9 +26,50 @@ private enum DIM = "\x1b[2m", BOLD = "\x1b[1m", RESET = "\x1b[0m";
 /// blank after layout.
 enum dchar cursorMark = '\0';
 
+/// Starts a row that continues the logical line above it (a wrap the
+/// renderer made, not a newline in the text). It takes no cell: the renderer
+/// drops it and joins the rows through the terminal's own autowrap, so the
+/// terminal records a soft wrap and a copy across the rows has no newline.
+enum dchar softWrap = '\uE002';
+/// `softWrap` as a string.
+enum softWrapMark = "\uE002";
+
+/// Marks a line as verbatim (code): `wrapAnsi` breaks it by character at
+/// the full width, never at spaces, so a copy across its rows is exact. Takes
+/// no cell.
+enum dchar verbatim = '\uE003';
+/// `verbatim` as a string.
+enum verbatimMark = "\uE003";
+
+/// A word separator consumed by a wrap one cell short of the edge before a
+/// double-width glyph. The row above can't hold it and the frame pads nothing
+/// there (a pad would copy into the joined text), so the wrappers move the
+/// separator into this zero-cell mark at the start of the continuation row;
+/// the frame emits it as a space and pads the row above to the edge, and a
+/// copy across the wrap keeps the words apart.
+enum dchar sepWrap = '\uE004';
+/// `sepWrap` as a string.
+enum sepWrapMark = "\uE004";
+
+/// `s` without soft-wrap, verbatim or separator marks (output that bypasses
+/// the frame).
+string dropSoftWraps(string s) pure
+{
+    import std.array : replace;
+    return s.replace(softWrapMark, "").replace(verbatimMark, "").replace(sepWrapMark, "");
+}
+
+/// `s` with any literal mark character (`softWrap`, `verbatim`, `sepWrap`)
+/// replaced by U+FFFD, so untrusted text can never forge wrap metadata.
+string escapeMarks(string s) pure
+{
+    import std.array : replace;
+    return s.replace(softWrapMark, "\uFFFD").replace(verbatimMark, "\uFFFD").replace(sepWrapMark, "\uFFFD");
+}
+
 size_t cellWidth(dchar c) pure nothrow
 {
-    return c == cursorMark ? 1 : charWidth(c);
+    return c == cursorMark ? 1 : c == softWrap || c == verbatim || c == sepWrap ? 0 : charWidth(c);
 }
 
 private bool isFinal(dchar c) pure nothrow { return c >= '@' && c <= '~'; }
@@ -133,20 +175,30 @@ string fit(string text, size_t width) pure
 /// breaking at spaces where it can.
 string[] wrapAnsi(string line, size_t width) pure
 {
-    import std.string : stripRight, stripLeft;
+    import std.string : stripRight, stripLeft, indexOf;
     if (width < 1) width = 1;
     line = sanitize(line);
+    // Code breaks by character: a space is content, and the row above a break
+    // is always full, so the copy joins the rows with nothing added.
+    immutable code = line.indexOf(verbatimMark) >= 0;
     string[] out_;
     string cur;
     size_t vis;
     ptrdiff_t brk = -1;
-    void breakLine()
+    void breakLine(bool wideNext = false)
     {
         if (brk >= 0)
         {
             auto rest = cur[brk .. $];
-            out_ ~= cur[0 .. brk].stripRight(" ");
+            auto row = cur[0 .. brk].stripRight(" ");
+            out_ ~= row;
             cur = rest.stripLeft(" ");
+            // One cell short of the edge before a wide glyph, the separator
+            // fits nowhere: the frame pads nothing there, so it survives the
+            // wrap as a mark the frame emits as a space (keeping the copy's
+            // words apart).
+            if (wideNext && row.length < brk && visibleWidth(row) + 1 == width)
+                cur = sepWrapMark ~ cur;
             vis = visibleWidth(cur);
         }
         else
@@ -172,13 +224,16 @@ string[] wrapAnsi(string line, size_t width) pure
             cur ~= line[at .. i];
             continue;
         }
-        if (c == ' ')
+        if (c == ' ' && !code)
         {
             if (vis >= width)
             {
+                // The separator falls on the edge: it starts the next row, so
+                // a copy across the wrap still has it (a row that ends short
+                // is padded with spaces instead).
                 out_ ~= cur.stripRight(" ");
-                cur = null;
-                vis = 0;
+                cur = " ";
+                vis = 1;
                 brk = -1;
                 continue;
             }
@@ -187,13 +242,14 @@ string[] wrapAnsi(string line, size_t width) pure
             brk = cur.length;
             continue;
         }
-        if (vis >= width) breakLine();
         auto w = cellWidth(c);
-        if (w > 1 && vis + w > width && cur.length) breakLine();
+        if (vis >= width) { if (code) brk = -1; breakLine(w > 1); }
+        if (w > 1 && vis + w > width && cur.length) { if (code) brk = -1; breakLine(true); }
         cur ~= line[at .. i];
         vis += w;
     }
     out_ ~= cur;
+    foreach (ref r; out_[1 .. $]) r = softWrapMark ~ r;
     return out_;
 }
 
@@ -231,14 +287,22 @@ string[] editorLines(string prompt, dstring text, size_t cursor, size_t width) p
             ~ text[cursor + 1 .. $].to!string;
     else
         marked = (text[0 .. cursor] ~ cursorMark ~ text[cursor .. $]).to!string;
+    marked = escapeMarks(marked);
+    // The first logical line wraps together with the prompt at the full
+    // width (a placeholder of the prompt's cells stands in for it), so a
+    // character-broken continuation row is full and a copy across it has
+    // no padding inside a long token.
     auto pw = visibleWidth(prompt);
-    auto inner = width > pw ? width - pw : 1;
+    if (pw >= width) pw = 0;
+    auto hold = "\uE005".replicate(pw);
     string[] lines;
     size_t n;
     foreach (logical; marked.splitter('\n'))
-        lines ~= wrapAnsi(logical, n++ == 0 ? inner : width);
+        lines ~= wrapAnsi(n++ == 0 ? hold ~ logical : logical, width);
     if (!lines.length) lines = [""];
-    lines[0] = BOLD ~ prompt ~ RESET ~ lines[0];
+    import std.algorithm : startsWith;
+    assert(lines[0].startsWith(hold));
+    lines[0] = BOLD ~ prompt ~ RESET ~ lines[0][hold.length .. $];
     foreach (ref l; lines) l = fit(l, width).replace("\0", "\x1b[7m \x1b[27m");
     return lines;
 }
@@ -311,19 +375,34 @@ final class FrameRenderer
     private string[] prev;
     private size_t width, height;
     private bool started;
+    // After an editor shrink with rows in scrollback, `prev[0 .. frozen]` is
+    // physical history standing for the frame's first `frozenLogical` rows
+    // (the transcript) plus stale editor rows that can't be taken back.
+    private size_t frozen, frozenLogical;
+    // The logical transcript the frozen rows stand for: checked against the
+    // incoming frame directly, since `prev[0 .. frozen]` may hold old editor
+    // rows (after repeated shrinks) that no longer match the logical prefix.
+    private string[] frozenText;
+    // A row of `prev` whose predecessor still carries a terminal wrap flag
+    // (it was a continuation, now blank at the top of the screen): the
+    // physical join survives until the row is redrawn from scratch.
+    private size_t staleJoin = size_t.max;
 
     this(void delegate(string) @safe out_) pure { this.out_ = out_; }
 
     /// The next render is a full redraw (something else drew on the screen).
     void invalidate() pure { started = false; }
 
-    void render(const string[] frame, size_t width, size_t height)
+    /// Draws `frame` (one terminal row per entry). `gapAt` is where blank
+    /// rows go when the frame gets shorter (the transcript's end): rows that
+    /// scrolled into the terminal's scrollback can't move back down, so the
+    /// frame keeps its height and the space fills as output arrives.
+    void render(const string[] frame, size_t width, size_t height, size_t gapAt = size_t.max)
     {
         if (width < 1) width = 1;
         if (height < 1) height = 1;
         if (!started || width != this.width || height != this.height) fullRedraw(frame, width, height);
-        else differential(frame, width, height);
-        prev = frame.dup;
+        else differential(frame, width, height, gapAt);
         this.width = width;
         this.height = height;
         started = true;
@@ -336,34 +415,210 @@ final class FrameRenderer
         buf ~= syncStart ~ "\x1b[r\x1b[H\x1b[2J\x1b[3J";
         auto physical = physicalRows(frame, width);
         buf ~= format("\x1b[%s;1H", physical < height ? height - physical + 1 : 1);
-        foreach (i, l; frame)
-        {
-            if (i) buf ~= "\r\n";
-            buf ~= l;
-        }
+        emitRows(buf, frame, width, false);
         buf ~= syncEnd;
         out_(buf[]);
+        prev = frame.dup;
+        frozen = frozenLogical = 0;
+        frozenText = null;
+        staleJoin = size_t.max;
     }
 
-    private void differential(const string[] frame, size_t width, size_t height)
+    /// Rewrites from the first changed row. Rows that went into the
+    /// terminal's scrollback are never touched: new rows scroll in at the
+    /// bottom, so a user reading scrollback keeps their place. Only a change
+    /// above the screen (a fold toggled far back, the transcript cap) or a
+    /// row wider than the terminal redraws everything.
+    private void differential(const string[] inFrame, size_t width, size_t height, size_t gapAt)
     {
-        auto diff = firstDiff(prev, frame);
-        if (diff < 0) return;
-        auto prevPhysical = physicalRows(prev, width), newPhysical = physicalRows(frame, width);
-        auto prevTop = saturatingSub(prev.length, height);
-        if (prevPhysical != newPhysical || diff < prevTop) return fullRedraw(frame, width, height);
-        size_t before;
-        foreach (l; frame[0 .. diff]) before += linePhysicalRows(l, width);
-        auto row = newPhysical <= height ? height - newPhysical + before + 1 : before - (newPhysical - height) + 1;
-        auto buf = appender!string;
-        buf ~= syncStart ~ format("\x1b[%s;1H", row);
-        foreach (i, l; frame[diff .. $])
+        // Map the logical frame onto the retained physical history: the
+        // transcript prefix is replaced by the frozen rows standing for it,
+        // so new output after it fills the gap instead of looking like a
+        // change to scrollback.
+        const(string)[] frame = inFrame;
+        const logicalGap = gapAt;
+        if (frozen)
         {
-            if (i) buf ~= "\r\n";
-            buf ~= "\x1b[2K" ~ l;
+            if (frame.length < frozenLogical || prev.length < frozen
+                || frame[0 .. frozenLogical] != frozenText
+                || (gapAt != size_t.max && gapAt < frozenLogical))
+                return fullRedraw(inFrame, width, height);
+            frame = prev[0 .. frozen] ~ frame[frozenLogical .. $];
+            if (gapAt != size_t.max) gapAt = gapAt - frozenLogical + frozen;
         }
+        auto d = firstDiff(prev, frame);
+        if (d < 0) return;
+        // Screen rows are computed from entry indices: both frames must be one row per entry.
+        if (physicalRows(frame, width) != frame.length || physicalRows(prev, width) != prev.length)
+            return fullRedraw(inFrame, width, height);
+        auto top = saturatingSub(prev.length, height);
+        // A shorter frame keeps its height: blank rows open at the gap (the
+        // transcript's end). Compose that first and diff against it, so a
+        // shrink that leaves the scrolled-off rows alone never redraws.
+        auto shown = frame.dup;
+        if (frame.length < prev.length)
+        {
+            size_t at = gapAt <= frame.length ? gapAt : d;
+            // A gap above the screen would move scrollback rows: open it at
+            // the top of the screen instead, past any continuation of a
+            // wrapped line (independently of where the change starts).
+            if (at < top)
+            {
+                at = top < frame.length ? top : frame.length;
+                while (at < frame.length && joins(frame, at)) at++;
+            }
+            shown = frame[0 .. at] ~ new string[prev.length - frame.length] ~ frame[at .. $];
+            auto sd = firstDiff(prev, shown);
+            if (sd < 0) { prev = shown; return; }
+            d = sd;
+            // Only the rows after the transcript's end (the editor) changed,
+            // but some of them scrolled off: leave the scrollback as it is and
+            // redraw the screen with the shrunken tail at its bottom.
+            if (d < top && gapAt <= frame.length && d >= gapAt
+                && frame.length - gapAt <= height && prev.length >= height)
+            {
+                shown = prev[0 .. top].dup ~ new string[height - (frame.length - gapAt)] ~ frame[gapAt .. $];
+                frozen = top;
+                frozenLogical = logicalGap;
+                frozenText = inFrame[0 .. logicalGap].dup;
+                d = firstDiff(prev, shown);
+                if (d < 0) { prev = shown; return; }
+            }
+        }
+        if (d < top) return fullRedraw(inFrame, width, height);
+        size_t diff = d;
+        // A soft-wrapped line is rewritten from its start, so the terminal
+        // keeps its wrap; but not past the top of the screen, as the rows
+        // above are scrollback (the wrap flag of a row up there stays).
+        // Rewind through continuations in either frame: a soft wrap that
+        // became a hard newline must also clear the old row's wrap flag.
+        while (diff > top && (joins(shown, diff) || joins(prev, diff))) diff--;
+        // The row above the screen keeps its wrap flag, so a join at `top`
+        // that changed (soft became hard or the reverse) can't be rewritten
+        // in place: the copy would still join (or split) the old way. A blank
+        // row there is harmless: the old line just ends in spaces.
+        // A blank row keeps the old flag recorded (`staleJoin`), so filling it
+        // later compares against the physical flag, not the blank.
+        const prevJoinsTop = joins(prev, top) || staleJoin == top;
+        if (diff == top && top > 0 && shown[top].length && joins(shown, top) != prevJoinsTop)
+            return fullRedraw(inFrame, width, height);
+        if (diff == top && top > 0 && !shown[top].length && prevJoinsTop) staleJoin = top;
+        else if (staleJoin != size_t.max && diff <= staleJoin && staleJoin < shown.length && shown[staleJoin].length)
+            staleJoin = size_t.max;
+        auto row = prev.length >= height ? diff - top + 1 : height - prev.length + diff + 1;
+        auto buf = appender!string;
+        // A pure append lands one row past the bottom (diff == prev.length). A
+        // cursor move there is clamped by the terminal to the last row, so the
+        // first appended row would overwrite the current bottom row and leave
+        // the screen one row behind the stored frame. Position at the bottom
+        // row and scroll once per appended row first, so the previous bottom
+        // row moves up into scrollback and the new rows write below it. Only
+        // one CRLF here: emitRows already emits a CRLF between rows, which
+        // scrolls once for each further appended row.
+        // Rewriting from a continuation row skips the line's earlier rows, and
+        // with them the SGR state they set: replay it so the clipped rows keep
+        // the line's color and style.
+        auto lead = activeStyle(shown, diff);
+        if (row > height)
+        {
+            buf ~= syncStart ~ format("\x1b[%s;1H", height) ~ "\r\n" ~ lead;
+            emitRows(buf, shown[diff .. $], width, true);
+            buf ~= syncEnd;
+            out_(buf[]);
+            prev = shown;
+            return;
+        }
+        buf ~= syncStart ~ format("\x1b[%s;1H", row) ~ lead;
+        emitRows(buf, shown[diff .. $], width, true);
         buf ~= syncEnd;
         out_(buf[]);
+        prev = shown;
+    }
+}
+
+/// The SGR sequences that the rows of row `i`'s logical line above it set,
+/// in order: replaying them restores the style active where row `i` starts.
+/// Empty when row `i` starts its logical line.
+private string activeStyle(const string[] rows, size_t i) pure
+{
+    if (!joins(rows, i)) return "";
+    size_t start = i;
+    while (start > 0 && joins(rows, start)) start--;
+    auto acc = appender!string;
+    foreach (r; rows[start .. i])
+    {
+        size_t k;
+        while (k < r.length)
+        {
+            if (r[k] == '\x1b' && k + 1 < r.length && r[k + 1] == '[')
+            {
+                size_t e = k + 2;
+                while (e < r.length && !(r[e] >= 0x40 && r[e] <= 0x7e)) e++;
+                if (e < r.length)
+                {
+                    if (r[e] == 'm') acc ~= r[k .. e + 1];
+                    k = e + 1;
+                    continue;
+                }
+                break;
+            }
+            k++;
+        }
+    }
+    return acc[];
+}
+
+/// Whether row `i` continues the row above it through a soft wrap.
+private bool joins(const string[] rows, size_t i) pure
+{
+    import std.string : indexOf;
+    return i > 0 && i < rows.length
+        && (rows[i].indexOf(softWrapMark) >= 0 || rows[i].indexOf(sepWrapMark) >= 0)
+        && visibleWidth(dropSoftWraps(rows[i])) > 0;
+}
+
+/// Cell width of the first visible glyph of `text` (0 if none).
+private size_t firstGlyphWidth(string text) pure
+{
+    size_t i;
+    while (i < text.length)
+    {
+        import std.utf : stride;
+        i += stride(text, i);
+        auto w = visibleWidth(text[0 .. i]);
+        if (w) return w;
+    }
+    return 0;
+}
+
+/// Writes `rows` from the cursor. A row that continues the one above is
+/// reached through autowrap (the row above padded to the edge) rather than a
+/// newline, so the terminal joins them when text is copied. With `clear`,
+/// each row also erases what was there before.
+private void emitRows(ref Appender!string buf, const string[] rows, size_t width, bool clear)
+{
+    foreach (i, l; rows)
+    {
+        // A separator consumed by the wrap rides the continuation row as a
+        // zero-cell mark; emit it as the space it was.
+        auto text = dropSoftWraps(l).replace(sepWrapMark, " ");
+        auto cont = joins(rows, i);
+        if (i && !cont) buf ~= "\r\n";
+        if (clear && !cont) buf ~= "\x1b[2K";
+        buf ~= text;
+        auto vis = visibleWidth(text);
+        if (joins(rows, i + 1))
+        {
+            // A wide glyph one cell short of the edge wraps by itself; a pad
+            // space there would be copied into the joined text. But when the
+            // next row carries a wrapped-away separator, the space belongs to
+            // the text: pad to the edge so it is emitted.
+            auto gap = vis < width ? width - vis : 0;
+            if (gap == 1 && rows[i + 1].indexOf(sepWrapMark) < 0
+                    && firstGlyphWidth(dropSoftWraps(rows[i + 1])) == 2) gap = 0;
+            if (gap) buf ~= " ".replicate(gap);
+        }
+        else if (clear && cont && vis < width) buf ~= "\x1b[K";
     }
 }
 
@@ -634,9 +889,17 @@ unittest
     assert(sanitize("\x1b[\r31mx") == "x");
     assert(fit("hello world", 6) == "hello…\x1b[0m");
     assert(fit("short", 10) == "short");
-    assert(wrapAnsi("the quick brown fox", 9) == ["the quick", "brown fox"]);
-    assert(wrapAnsi("abcdefghij", 4) == ["abcd", "efgh", "ij"]);
-    assert(wrapAnsi("ab中", 3) == ["ab", "中"]);
+    // Rows after the first carry the soft-wrap mark (they continue the line).
+    enum M = softWrapMark;
+    // A separator on the edge starts the next row, so a copy keeps it.
+    assert(wrapAnsi("the quick brown fox", 9) == ["the quick", M ~ " brown", M ~ "fox"]);
+    assert(wrapAnsi("the quick brown fox", 10) == ["the quick", M ~ "brown fox"]);
+    assert(wrapAnsi("abcdefghij", 4) == ["abcd", M ~ "efgh", M ~ "ij"]);
+    assert(wrapAnsi("ab中", 3) == ["ab", M ~ "中"]);
+    // A separator one cell short of the edge before a wide glyph rides the
+    // continuation as a zero-cell mark, so the copy keeps the words apart.
+    assert(wrapAnsi("cmd 中", 4) == ["cmd", M ~ sepWrapMark ~ "中"]);
+    assert(wrapAnsi("cmd中", 4) == ["cmd", M ~ "中"]);
     assert(wrapAnsi("", 5) == [""]);
     assert(wrapBlock("a\nb", 5) == ["a", "b"]);
     auto ed = editorLines("› ", "hi"d, 2, 20);
@@ -649,6 +912,15 @@ unittest
     // On a newline the blank sits at the end of that row.
     ed = editorLines("› ", "ab\ncd"d, 2, 20);
     assert(ed.length == 2 && ed[0].canFind("ab\x1b[7m \x1b[27m"));
+    {
+        // A long token wraps with the prompt at the full width: no padding
+        // lands inside it, so a copy keeps it intact.
+        auto rows = editorLines("› ", "/abcdefghijklmnopqrstuv"d, 0, 10);
+        import std.algorithm : all;
+        foreach (r; rows[0 .. $ - 1]) assert(visibleWidth(dropSoftWraps(r)) == 10, r);
+        auto lit = editorLines("› ", "a\uE003b"d, 0, 20);
+        assert(lit[0].indexOf(verbatimMark) < 0, lit[0]);
+    }
     ed = editorLines("› ", "abcdef"d, 0, 5);
     assert(ed.length == 2 && ed[0].canFind("\x1b[7ma\x1b[27m"));
     assert(compose(["t"], ["e"], "s") == ["t", "e", "s"]);
@@ -667,8 +939,10 @@ unittest
     screen = null;
     r.render(["one", "TWO", "bar"], 10, 5);
     assert(!screen.length);
+    // Growing appends from the change and lets the terminal scroll: the
+    // screen and scrollback are not cleared, so a reader keeps their place.
     r.render(["one", "TWO", "x", "bar"], 10, 5);
-    assert(screen.canFind("\x1b[2J"));
+    assert(screen == syncStart ~ "\x1b[5;1H\x1b[2Kx\r\n\x1b[2Kbar" ~ syncEnd, screen);
     screen = null;
     r.render(["one", "TWO", "x", "bar"], 12, 5);
     assert(screen.canFind("\x1b[2J"));
@@ -691,13 +965,212 @@ unittest
     t.feed(bytes[0 .. 1]);
     t.feed(bytes[1 .. $]);
     assert(t.lines[$ - 1] == "é");
-    assert(t.render(3)[0 .. 2] == ["hel", "lo"]);
+    assert(t.render(3)[0 .. 2] == ["hel", softWrapMark ~ "lo"]);
     t.feed(cast(const(ubyte)[]) "\x1b[H\x1b[2J\x1b[3Jfresh");
     assert(!t.lines.length && t.render(10) == ["fresh"]);
     Transcript small;
     small.cap = 10;
     foreach (n; 0 .. 11) small.feed(cast(const(ubyte)[]) "x\n");
     assert(small.lines.length == 9);
+}
+
+// Wrapped rows reach the terminal through autowrap, so a copy has no newline.
+unittest
+{
+    import std.algorithm : canFind;
+    enum M = softWrapMark;
+    string screen;
+    auto r = new FrameRenderer((string s) { screen ~= s; });
+    // A 14-character command on a 6-column terminal: rows are joined by
+    // writing them back to back (full rows wrap on their own), never \r\n.
+    auto rows = wrapAnsi("rm -r /a/b/cde", 6);
+    assert(rows == ["rm -r", M ~ "/a/b/c", M ~ "de"], rows[1]);
+    r.render(rows ~ "status", 6, 10);
+    // "rm -r" is padded to the edge so the terminal wraps into "/a/b/c".
+    assert(screen.canFind("rm -r /a/b/cde\r\nstatus"), screen);
+    assert(!screen.canFind(M));
+
+    // A differential rewrite of a continuation row starts from its line.
+    screen = null;
+    r.render(["rm -r", M ~ "/a/b/c", M ~ "dX", "status"], 6, 10);
+    assert(screen.canFind("\x1b[2Krm -r /a/b/cdX\x1b[K\r\n\x1b[2Kstatus"), screen);
+
+    // An empty continuation (trailing spaces at the edge) can't autowrap: newline.
+    screen = null;
+    auto q = new FrameRenderer((string s) { screen ~= s; });
+    q.render(["abc", M, "s"], 3, 10);
+    assert(screen.canFind("abc\r\n\r\ns"), screen);
+}
+
+// Copilot review cases: separators at the edge, code by character, frames
+// that weren't one row per entry, and a long line reaching into scrollback.
+unittest
+{
+    import std.algorithm : canFind;
+    enum M = softWrapMark;
+    // `git status --short` at width 10: the space after "status" falls on the edge.
+    auto rows = wrapAnsi("git status --short", 10);
+    assert(rows == ["git status", M ~ " --short"], rows[1]);
+    string screen;
+    auto r = new FrameRenderer((string s) { screen ~= s; });
+    r.render(rows ~ "s", 10, 6);
+    assert(screen.canFind("git status --short\r\ns"), screen);
+
+    // Code (verbatim) breaks by character with nothing dropped, even with an
+    // indent or prefix on the first row; later rows have none.
+    auto code = wrapAnsi("    " ~ verbatimMark ~ "rm -r /a b", 6);
+    assert(code == ["    " ~ verbatimMark ~ "rm", M ~ " -r /a", M ~ " b"], code[0]);
+    screen = null;
+    auto c = new FrameRenderer((string s) { screen ~= s; });
+    c.render(code ~ "s", 6, 6);
+    assert(screen.canFind("    rm -r /a b\r\ns"), screen);
+
+    // The previous frame had a row wider than the terminal: full redraw.
+    screen = null;
+    auto w = new FrameRenderer((string s) { screen ~= s; });
+    w.render(["abcdef", "bar"], 3, 5);
+    screen = null;
+    w.render(["abc", "bar"], 3, 5);
+    assert(screen.canFind("\x1b[2J"), screen);
+
+    // A logical line taller than the screen updates its last rows without
+    // touching the scrollback (no rewind past the top, no 3J).
+    string[] tall = ["a1"];
+    foreach (n; 0 .. 6) tall ~= M ~ "a2";
+    screen = null;
+    auto t = new FrameRenderer((string s) { screen ~= s; });
+    t.render(tall ~ "s", 2, 4);
+    screen = null;
+    t.render(tall[0 .. $ - 1] ~ (M ~ "zz") ~ "s", 2, 4);
+    assert(!screen.canFind("\x1b[3J") && screen.canFind("\x1b[1;1H"), screen);
+    assert(screen.canFind("zz\r\n\x1b[2Ks"), screen);
+
+    // A separator consumed by a wrap one cell short of the edge before a
+    // wide glyph is emitted as a space: "cmd 中" copies with its words
+    // apart, while "cmd中" stays joined.
+    screen = null;
+    auto sep = new FrameRenderer((string s) { screen ~= s; });
+    sep.render(wrapAnsi("cmd 中", 4) ~ "s", 4, 6);
+    assert(screen.canFind("cmd 中"), screen);
+    assert(!screen.canFind(sepWrapMark) && !screen.canFind(M), screen);
+    screen = null;
+    auto nosep = new FrameRenderer((string s) { screen ~= s; });
+    nosep.render(wrapAnsi("cmd中", 4) ~ "s", 4, 6);
+    assert(screen.canFind("cmd中"), screen);
+
+    // A differential rewrite of a separator-wrap row re-emits the space.
+    screen = null;
+    auto re = new FrameRenderer((string s) { screen ~= s; });
+    re.render(["cmd", M ~ sepWrapMark ~ "中", "s"], 4, 6);
+    screen = null;
+    re.render(["cmd", M ~ sepWrapMark ~ "中x", "s"], 4, 6);
+    assert(screen.canFind("cmd 中x"), screen);
+}
+
+// A styled logical line growing while its start sits in scrollback keeps its
+// style: the clipped rewrite replays the SGR set by the off-screen rows.
+unittest
+{
+    import std.algorithm : canFind;
+    string screen;
+    auto r = new FrameRenderer((string s) { screen ~= s; });
+    r.render(wrapAnsi("\x1b[36mabcdefghij\x1b[0m", 4) ~ "s", 4, 3);
+    screen = null;
+    r.render(wrapAnsi("\x1b[36mabcdefghijklmn\x1b[0m", 4) ~ "s", 4, 3);
+    assert(screen.canFind("\x1b[1;1H\x1b[36m"), screen);
+    // An unstyled continuation rewrite adds nothing.
+    screen = null;
+    auto p = new FrameRenderer((string s) { screen ~= s; });
+    p.render(wrapAnsi("abcdefghij", 4) ~ "s", 4, 3);
+    screen = null;
+    p.render(wrapAnsi("abcdefghijklmn", 4) ~ "s", 4, 3);
+    assert(!screen.canFind("\x1b[36m") && screen.canFind("\x1b[1;1H"), screen);
+    // A row that starts its own logical line replays nothing.
+    assert(activeStyle(["\x1b[31mx", "y"], 1) == "");
+}
+
+// A pure append past a full screen must scroll, not overwrite the bottom row:
+// the previous bottom row moves into scrollback and the new rows land below it.
+unittest
+{
+    import std.algorithm : canFind;
+    string screen;
+    auto r = new FrameRenderer((string s) { screen ~= s; });
+    // Fill the screen exactly, then append one row.
+    r.render(["a", "b", "c", "d"], 20, 4);
+    screen = null;
+    r.render(["a", "b", "c", "d", "e"], 20, 4);
+    // Positions at the bottom row (4), scrolls once, then writes "e" — never a
+    // cursor move to a row past the bottom (which the terminal would clamp,
+    // overwriting "d").
+    assert(screen == syncStart ~ "\x1b[4;1H\r\n\x1b[2Ke" ~ syncEnd, screen);
+    // Another append scrolls again.
+    screen = null;
+    r.render(["a", "b", "c", "d", "e", "f"], 20, 4);
+    assert(screen == syncStart ~ "\x1b[4;1H\r\n\x1b[2Kf" ~ syncEnd, screen);
+    // A burst of appends scrolls exactly once per new row (one CRLF before
+    // each), never inserting a blank row between them.
+    screen = null;
+    r.render(["a", "b", "c", "d", "e", "f", "g", "h"], 20, 4);
+    assert(screen == syncStart ~ "\x1b[4;1H\r\n\x1b[2Kg\r\n\x1b[2Kh" ~ syncEnd, screen);
+    import std.algorithm : count;
+    assert(screen.count("\r\n") == 2, screen);
+
+    // The same append bug bit a frame shorter than the screen: the bottom row
+    // is occupied (the frame is bottom-anchored), so an append still scrolls.
+    screen = null;
+    auto s = new FrameRenderer((string t) { screen ~= t; });
+    s.render(["x", "y"], 20, 6);
+    screen = null;
+    s.render(["x", "y", "z"], 20, 6);
+    assert(screen == syncStart ~ "\x1b[6;1H\r\n\x1b[2Kz" ~ syncEnd, screen);
+}
+
+// Rows already in the scrollback are never cleared or rewritten; a shorter
+// frame leaves a gap above the editor instead of pulling rows back down.
+unittest
+{
+    import std.algorithm : canFind;
+    import std.format : format;
+    string screen;
+    auto r = new FrameRenderer((string s) { screen ~= s; });
+    string[] t;
+    foreach (n; 0 .. 8) t ~= format("line %s", n);
+    r.render(t ~ ["> edit", "more", "status"], 20, 4, t.length);
+    // Transcript grows by a row: only the bottom of the screen is written.
+    screen = null;
+    r.render(t ~ ["line 8", "> edit", "more", "status"], 20, 4, t.length + 1);
+    assert(!screen.canFind("\x1b[2J") && !screen.canFind("\x1b[3J"), screen);
+    assert(screen.canFind("line 8\r\n"), screen);
+    // The editor shrinks by a row: a blank row goes where the transcript ends.
+    screen = null;
+    r.render(t ~ ["line 8", "> e", "status"], 20, 4, t.length + 1);
+    assert(!screen.canFind("\x1b[3J"), screen);
+    assert(screen == syncStart ~ "\x1b[2;1H\x1b[2K\r\n\x1b[2K> e\r\n\x1b[2Kstatus" ~ syncEnd, screen);
+    // Output fills the gap without scrolling.
+    screen = null;
+    r.render(t ~ ["line 8", "line 9", "> e", "status"], 20, 4, t.length + 2);
+    assert(screen == syncStart ~ "\x1b[2;1H\x1b[2Kline 9\r\n\x1b[2K> e\r\n\x1b[2Kstatus" ~ syncEnd, screen);
+    // A change to a row in the scrollback (a fold far back) redraws everything.
+    screen = null;
+    r.render(["CHANGED"] ~ t[1 .. $] ~ ["line 8", "line 9", "> e", "status"], 20, 4, t.length + 2);
+    assert(screen.canFind("\x1b[3J"));
+}
+
+// A draft taller than the screen shrinking: the transcript's end is in the
+// scrollback, so the gap opens on screen and nothing is cleared.
+unittest
+{
+    import std.algorithm : canFind;
+    string screen;
+    auto r = new FrameRenderer((string s) { screen ~= s; });
+    auto t = ["t0", "t1"];
+    auto d = ["d0", "d1", "d2", "d3", "d4", "d5"];
+    r.render(t ~ d ~ ["status"], 20, 4, t.length);
+    screen = null;
+    r.render(t ~ d[0 .. 5] ~ ["status"], 20, 4, t.length);
+    assert(!screen.canFind("\x1b[2J") && !screen.canFind("\x1b[3J"), screen);
+    assert(screen == syncStart ~ "\x1b[1;1H\x1b[2K\r\n\x1b[2Kd3\r\n\x1b[2Kd4\r\n\x1b[2Kstatus" ~ syncEnd, screen);
 }
 
 // ---- Whose turn it is: the prompt glyph and hint (ui.rs prompt_glyph/prompt_hint) ----
@@ -947,4 +1420,49 @@ unittest
     t.cap = 4;
     t.feed(cast(const(ubyte)[]) "a\nb\nc\n");
     assert(!t.toggleLatest());
+}
+
+// Repeated tall-editor shrinks with output between them: the second freeze
+// must keep its logical prefix, so an unchanged render clears nothing.
+unittest
+{
+    import std.algorithm : canFind;
+    string screen;
+    auto r = new FrameRenderer((string s) { screen ~= s; });
+    auto d = ["d0", "d1", "d2", "d3", "d4", "d5"];
+    string[] t = ["t0", "t1"];
+    r.render(t ~ d ~ ["status"], 20, 4, t.length);
+    r.render(t ~ d[0 .. 2] ~ ["status"], 20, 4, t.length);
+    t ~= "t2";
+    r.render(t ~ d[0 .. 2] ~ ["status"], 20, 4, t.length);
+    r.render(t ~ d ~ ["status"], 20, 4, t.length);
+    r.render(t ~ d[0 .. 2] ~ ["status"], 20, 4, t.length);
+    screen = null;
+    r.render(t ~ d[0 .. 2] ~ ["status"], 20, 4, t.length);
+    assert(!screen.canFind("\x1b[2J") && !screen.canFind("\x1b[3J"), screen);
+    screen = null;
+    t ~= "t3";
+    r.render(t ~ d[0 .. 2] ~ ["status"], 20, 4, t.length);
+    assert(!screen.canFind("\x1b[3J"), screen);
+    assert(screen.canFind("t3"), screen);
+}
+
+// A soft-wrapped draft row at the top of the screen goes blank on a shrink:
+// the row above keeps its terminal wrap flag, so a hard transcript line that
+// later fills that row must redraw rather than join the old draft on copy.
+unittest
+{
+    import std.algorithm : canFind;
+    enum M = softWrapMark;
+    string screen;
+    auto r = new FrameRenderer((string s) { screen ~= s; });
+    auto t = ["t0", "t1"];
+    // top == 4: the continuation "c" is the top screen row.
+    r.render(t ~ ["a", "b", M ~ "c", "e", "f", "status"], 20, 4, t.length);
+    screen = null;
+    r.render(t ~ ["a", "status"], 20, 4, t.length);
+    assert(!screen.canFind("\x1b[3J"), screen);
+    screen = null;
+    r.render(t ~ ["new", "a", "status"], 20, 4, t.length + 1);
+    assert(screen.canFind("\x1b[3J"), screen);
 }
