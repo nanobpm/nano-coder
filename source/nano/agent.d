@@ -6,7 +6,7 @@ module nano.agent;
 import nano.safeio : jsonText, jsonPretty;
 import nano.clock : monoNow, since, sleepFor, stdTimeNow, wallNow;
 import core.time : MonoTime;
-import nano.arith : checkedMul, checkedSub, saturatingSub, toLong, toSize;
+import nano.arith : checkedAdd, checkedMul, checkedSub, saturatingSub, toLong, toSize;
 import nano.option : Option, some, none, match, ifSome, orElse, unwrap, NotNull;
 import nano.result : orThrow, toOption, match, unwrap;
 
@@ -763,9 +763,12 @@ class Agent
         recordUsage(r.usage);
         if (r.usage.inputTokens > 0)
         {
-            // Anchored at the assistant message about to be pushed.
+            // Anchored at the assistant message about to be pushed. Convert
+            // the nonnegative operands separately and sum the sizes with
+            // checked arithmetic: a malformed pair such as long.max + 1
+            // would overflow the signed addition before `toSize` runs.
             calibLen = messages.length + 1;
-            calibTokens = toSize(max(0L, r.usage.inputTokens + max(0L, r.usage.outputTokens)));
+            calibTokens = checkedAdd(toSize(max(0L, r.usage.inputTokens)), toSize(max(0L, r.usage.outputTokens)));
         }
         ev.usage(r.usage);
         auto reply = Message.assistant(r.content, r.toolCalls);

@@ -183,7 +183,11 @@ string search(string path, JSONValue args)
     size_t limit = defaultLimit;
     if (auto l = "limit" in args.objectNoRef)
     {
-        long n = l.type == JSONType.integer ? l.integer : l.type == JSONType.uinteger ? long.max : 0; // uinteger: above long.max
+        // Phobos tags any unsigned value `uinteger` (even `JSONValue(1u)`),
+        // so clamp the actual value to the signed range rather than reading
+        // every unsigned limit as "unbounded".
+        long n = l.type == JSONType.integer ? l.integer
+            : l.type == JSONType.uinteger ? (l.uinteger > ulong(long.max) ? long.max : long(l.uinteger)) : 0;
         if (n > 0) limit = min(toSize(n), maxLimit);
     }
     bool oldestFirst;
@@ -277,7 +281,10 @@ string read(string path, JSONValue args)
     size_t limit = defaultMaxOutput;
     if (auto l = "max_output_length" in args.objectNoRef)
     {
-        long n = l.type == JSONType.integer ? l.integer : l.type == JSONType.uinteger ? long.max : -1; // uinteger: above long.max
+        // Clamp the actual unsigned value (see `search` above): an unsigned
+        // 100 must stay 100, and an unsigned 0 must still be rejected.
+        long n = l.type == JSONType.integer ? l.integer
+            : l.type == JSONType.uinteger ? (l.uinteger > ulong(long.max) ? long.max : long(l.uinteger)) : -1;
         if (n <= 0) throw new HistoryError("max_output_length must be a positive integer");
         limit = min(toSize(n), maxOutputLimit);
     }
