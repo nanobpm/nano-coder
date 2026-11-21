@@ -343,7 +343,7 @@ unittest // preserves unknown, malformed UTF-8 and extra-field records
     auto keep = s.save(Scope.user, "a real fact", null, null);
     auto path = s.path(Scope.user);
     auto now = stamp(wallNow);
-    auto torn = cast(immutable(ubyte)[]) "{\"id\":\"torn\",\"text\":\"bad \xF0\x9F bytes\"}";
+    auto torn = "{\"id\":\"torn\",\"text\":\"bad \xF0\x9F bytes\"}".representation;
     auto raw = readBytes(path) ~ "not even json\n{\"unknown_future_field\":true}\n".representation ~ torn ~ cast(ubyte) '\n'
         ~ ("{\"id\":\"fut1\",\"text\":\"future fact\",\"created\":\"" ~ now ~ "\",\"last_used\":\"" ~ now ~ "\",\"future_field\":42}\n").representation;
     std.file.write(path, raw);

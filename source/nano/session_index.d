@@ -11,6 +11,14 @@
 module nano.session_index;
 
 @safe:
+
+import std.utf : UTFException;
+
+import nano.safeio : lossyText, utf8View;
+
+import nano.arith : toSize, toLong;
+
+import std.string : representation;
 import nano.clock : wallNow;
 
 import std.json;
@@ -20,7 +28,7 @@ import std.format : format;
 import std.string : strip, startsWith;
 static import std.string;
 import std.datetime.systime : SysTime, Clock;
-import std.algorithm : sort, any, filter, canFind;
+import std.algorithm : sort, any, filter, canFind, splitter, map;
 import std.array : array, join, split;
 import std.range : walkLength, take;
 import std.conv : to;
@@ -113,13 +121,13 @@ struct Summary
         s.model = opt("model");
         s.createdAt = opt("created_at");
         s.lastUsed = SysTime.fromISOExtString(j["last_used"].str);
-        s.prompts = cast(size_t) j["prompts"].integer;
+        s.prompts = toSize(j["prompts"].integer);
         s.firstPrompt = opt("first_prompt");
         s.firstTellingPrompt = opt("first_telling_prompt");
         s.lastPrompt = opt("last_prompt");
         s.contextPrompt = opt("context_prompt");
         s.title = opt("title");
-        s.logBytes = cast(ulong) j["log_bytes"].integer;
+        s.logBytes = j["log_bytes"].integer.to!ulong;
         return s;
     }
 }
@@ -161,12 +169,13 @@ private bool missingTellingPrompt(const ref Summary s) pure
     return false;
 }
 
-/// Committed (newline-terminated) lines of `bytes`.
-private const(char)[][] committedLines(const(ubyte)[] bytes) pure
+/// Committed (newline-terminated) lines of `bytes`, invalid UTF-8 replaced
+/// with U+FFFD (such a line then fails to parse where it is decoded).
+private string[] committedLines(const(ubyte)[] bytes) pure
 {
     size_t committed = bytes.length;
     while (committed && bytes[committed - 1] != '\n') committed--;
-    return (cast(const(char)[]) bytes[0 .. committed]).split('\n').filter!(l => l.length > 0).array;
+    return bytes[0 .. committed].splitter(ubyte('\n')).filter!(l => l.length > 0).map!lossyText.array;
 }
 
 /// The input text of a committed log line, or null when it isn't an input record.
@@ -245,8 +254,11 @@ private ulong sizeOr0(string path)
 /// lines are skipped: the index is only a cache.
 private void mergeLines(const(ubyte)[] bytes, ref Summary[string] map, ref size_t lines)
 {
-    foreach (raw; (cast(const(char)[]) bytes).split('\n'))
+    foreach (rawBytes; bytes.splitter(ubyte('\n')))
     {
+        const(char)[] raw;
+        try raw = utf8View(rawBytes);
+        catch (UTFException) { if (rawBytes.length) lines++; continue; } // invalid UTF-8: unreadable
         auto line = raw.strip;
         if (!line.length) continue;
         lines++;
@@ -285,7 +297,7 @@ private void append(string dir, const Summary[] summaries)
     foreach (ref s; summaries)
     {
         auto line = s.toJson ~ "\n";
-        if (writeFd(fd, cast(const(ubyte)[]) line) != cast(long) line.length) throw new Exception("short write to session index");
+        if (writeFd(fd, line.representation) != toLong(line.length)) throw new Exception("short write to session index");
     }
 }
 
@@ -298,7 +310,7 @@ private void rewrite(string dir, const Summary[string] summaries, ulong since)
     import nano.safeio : readFrom;
     import std.process : thisProcessID;
     Summary[string] merged;
-    foreach (k, v; summaries) merged[k] = cast(Summary) v;
+    foreach (k, v; summaries) merged[k] = v;
     try
     {
         import std.stdio : File;
@@ -722,7 +734,7 @@ unittest
     scope (exit) rmdirRecurse(dir);
     size_t lines;
     assert(load(dir, lines).length == 2);
-    std.file.append(indexPath(dir), cast(const(ubyte)[]) "\xff\xfe not utf8\n");
+    std.file.append(indexPath(dir), "\xff\xfe not utf8\n".representation);
     auto after = load(dir, lines);
     assert(after.length == 2, "the two good lines survive the corrupt one");
     assert(lines == 3, "the corrupt line still counts toward compaction");
@@ -738,7 +750,7 @@ version (unittest) private void rewriteAfter(string dir, const(ubyte)[] prefix)
     auto since = getSize(indexPath(dir));
     auto newer = summarize(buildPath(dir, "b.jsonl"));
     newer.model = "anthropic/claude";
-    std.file.append(indexPath(dir), prefix ~ cast(const(ubyte)[]) (newer.toJson ~ "\n"));
+    std.file.append(indexPath(dir), prefix ~ (newer.toJson ~ "\n").representation);
     rewrite(dir, current, since);
     auto sessions = list(dir);
     assert(sessions.length == 2);
@@ -750,7 +762,7 @@ unittest
 {
     auto dir = twoSessions("corrupt-tail");
     scope (exit) rmdirRecurse(dir);
-    rewriteAfter(dir, cast(const(ubyte)[]) "\xff\xfe not utf8\n");
+    rewriteAfter(dir, "\xff\xfe not utf8\n".representation);
 }
 
 // rust: session_index.rs::rewrite_merges_lines_appended_since_the_read

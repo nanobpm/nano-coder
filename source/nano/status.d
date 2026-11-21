@@ -4,7 +4,9 @@ module nano.status;
 
 @safe:
 pure:
-import nano.arith : saturatingSub;
+
+import std.algorithm : max;
+import nano.arith : saturatingSub, toSize;
 
 import std.format : format;
 import std.conv : to;
@@ -164,7 +166,7 @@ string render(const ref Stats stats, size_t cols) pure
     else if (percent >= 90.0) barColor = "\x1b[38;5;203m";
     else if (percent >= 60.0) barColor = "\x1b[38;5;221m";
     else barColor = "\x1b[38;5;114m";
-    auto filled = cast(size_t) round(percent / 10.0);
+    auto filled = round(percent / 10.0).to!size_t;
     if (filled > 10) filled = 10;
     auto bar = repeatStr("█", filled) ~ repeatStr("░", 10 - filled);
     auto approx = stats.calibrated ? "" : "~";
@@ -187,8 +189,8 @@ string render(const ref Stats stats, size_t cols) pure
     else if (stats.mode == AgentMode.auto_) segments ~= Segment(" auto ", "\x1b[1;38;5;114m", 10);
     if (stats.thinking.length) segments ~= Segment(" think " ~ stats.thinking ~ " ", "\x1b[38;5;147m", 4);
     if (stats.sessionInputTokens + stats.sessionOutputTokens > 0)
-        segments ~= Segment(format(" ↑%s ↓%s ", formatTokens(cast(size_t) stats.sessionInputTokens),
-            formatTokens(cast(size_t) stats.sessionOutputTokens)), null, 2);
+        segments ~= Segment(format(" ↑%s ↓%s ", formatTokens(toSize(max(0L, stats.sessionInputTokens))),
+            formatTokens(toSize(max(0L, stats.sessionOutputTokens)))), null, 2);
     if (stats.hasAic) segments ~= Segment(format(" %.1f AIC ", stats.aic), "\x1b[38;5;222m", 2);
     if (stats.historySearches + stats.historyReads > 0)
         segments ~= Segment(format(" hist %ss %sr ", stats.historySearches, stats.historyReads), null, 1);

@@ -4,6 +4,8 @@
 module nano.config;
 
 @safe:
+
+import std.conv : to;
 import nano.safeio : jsonText, jsonPretty;
 
 import nano.skills : SkillsConfig;
@@ -217,7 +219,7 @@ struct ProviderConfig
         {
             hasRetryableStatuses = true;
             retryableStatuses = null;
-            foreach (st; v.arrayNoRef) retryableStatuses ~= cast(ushort) st.integer;
+            foreach (st; v.arrayNoRef) retryableStatuses ~= st.integer.to!ushort;
         }
         if (auto v = "replay_reasoning" in o) replayReasoning = v.boolean;
     }
@@ -330,8 +332,8 @@ double numberOrDefault(JSONValue v) pure
         if (v.str == "default") return double.nan;
         throw new Exception("temperature must be a number or \"default\"");
     }
-    if (v.type == JSONType.integer) return cast(double) v.integer;
-    if (v.type == JSONType.uinteger) return cast(double) v.uinteger;
+    if (v.type == JSONType.integer) return double(v.integer);
+    if (v.type == JSONType.uinteger) return double(v.uinteger);
     if (v.type != JSONType.float_) throw new Exception("temperature must be a number or \"default\"");
     // TOML reads nan/inf as floats; NaN here would silently mean "default".
     import std.math : isFinite;
@@ -613,7 +615,7 @@ void validateHttpBaseUrl(string provider, string url) pure
     import std.string : toLower, startsWith;
     if (url.strip.length == 0) throw new Exception(format("provider \"%s\" has an empty base_url", provider));
     foreach (dchar ch; url)
-        if (isWhite(ch) || (ch < 0x80 && isControl(cast(char) ch)) || (ch >= 0x80 && ch < 0xa0))
+        if (isWhite(ch) || (ch < 0x80 && isControl(ch)) || (ch >= 0x80 && ch < 0xa0))
             throw new Exception(format("provider \"%s\" base_url \"%s\" must not contain whitespace or control characters", provider, url));
     auto colon = url.indexOf("://");
     if (colon <= 0) throw new Exception(format("provider \"%s\" has a malformed base_url \"%s\"", provider, url));

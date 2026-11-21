@@ -224,7 +224,7 @@ string debugQuote(string s) pure @safe
         case '\t': out_ ~= `\t`; break;
         case '\r': out_ ~= `\r`; break;
         default:
-            if (c < 0x20) out_ ~= format(`\u{%x}`, cast(uint) c);
+            if (c < 0x20) out_ ~= format(`\u{%x}`, uint(c));
             else out_ ~= c;
         }
     }

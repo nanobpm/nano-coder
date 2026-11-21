@@ -174,7 +174,7 @@ private ulong nextSeq(ref Reporter r)
     import std.datetime.systime : Clock;
     import std.datetime : SysTime, UTC;
     import std.algorithm : max;
-    auto now = cast(ulong)((wallNow(UTC()) - SysTime.fromUnixTime(0, UTC())).total!"usecs");
+    auto now = (wallNow(UTC()) - SysTime.fromUnixTime(0, UTC())).total!"usecs".to!ulong;
     r.seq = max(now, r.seq + 1);
     return r.seq;
 }

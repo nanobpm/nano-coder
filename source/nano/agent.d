@@ -6,7 +6,7 @@ module nano.agent;
 import nano.safeio : jsonText, jsonPretty;
 import nano.clock : monoNow, since, sleepFor, stdTimeNow, wallNow;
 import core.time : MonoTime;
-import nano.arith : checkedMul, checkedSub, saturatingSub;
+import nano.arith : checkedMul, checkedSub, saturatingSub, toLong, toSize;
 import nano.option : Option, some, none, match, ifSome, orElse, unwrap, NotNull;
 import nano.result : orThrow, toOption, match, unwrap;
 
@@ -111,7 +111,7 @@ struct IdleCompactReport
     this(CompactReport r, size_t window) pure
     {
         import std.math : round;
-        size_t pct(size_t t) { return cast(size_t) round(t * 100.0 / (window ? window : 1)); }
+        size_t pct(size_t t) { import std.conv : to; return round(t * 100.0 / (window ? window : 1)).to!size_t; }
         report = r;
         percentBefore = pct(r.tokensBefore);
         percentAfter = pct(r.tokensAfter);
@@ -378,13 +378,13 @@ class Agent
             throw e;
         }
         log.ifSome((SessionLog l) {
-            l.turnEnd(inputId, response, cast(string) lastStop, hasOutcome ? lastOutcome.toJSON : JSONValue.init,
+            l.turnEnd(inputId, response, lastStop, hasOutcome ? lastOutcome.toJSON : JSONValue.init,
                 turnHistoryCalls);
             indexTurn(l, from);
         });
         hasPending = false;
         completedInputs[inputId] = response;
-        if (lastStop != StopReason.endTurn) completedStops[inputId] = cast(string) lastStop;
+        if (lastStop != StopReason.endTurn) completedStops[inputId] = lastStop;
         else completedStops.remove(inputId);
         if (hasOutcome) completedOutcomes[inputId] = lastOutcome.toJSON;
         else completedOutcomes.remove(inputId);
@@ -765,7 +765,7 @@ class Agent
         {
             // Anchored at the assistant message about to be pushed.
             calibLen = messages.length + 1;
-            calibTokens = cast(size_t)(r.usage.inputTokens + (r.usage.outputTokens > 0 ? r.usage.outputTokens : 0));
+            calibTokens = toSize(max(0L, r.usage.inputTokens + max(0L, r.usage.outputTokens)));
         }
         ev.usage(r.usage);
         auto reply = Message.assistant(r.content, r.toolCalls);
@@ -954,7 +954,7 @@ class Agent
 
     size_t estimateContextTokens() { bool _; return estimateContextTokens(_); }
 
-    private size_t outputBase() pure const { return cast(size_t) effectiveMaxTokens(); }
+    private size_t outputBase() pure const { return toSize(effectiveMaxTokens()); }
 
     /// The output budget before the context-window clamp: `max_tokens` when
     /// configured, else the model's published cap, a known cap for the model
@@ -962,8 +962,8 @@ class Agent
     long effectiveMaxTokens() pure const
     {
         long base = maxTokens > 0 ? maxTokens
-            : capabilities.maxOutput ? cast(long) capabilities.maxOutput
-            : ctx.outputLimitForModel(client.modelName) ? cast(long) ctx.outputLimitForModel(client.modelName)
+            : capabilities.maxOutput ? toLong(capabilities.maxOutput)
+            : ctx.outputLimitForModel(client.modelName) ? toLong(ctx.outputLimitForModel(client.modelName))
             : ctx.defaultMaxOutputTokens;
         return learnedMaxOutput > 0 && learnedMaxOutput < base ? learnedMaxOutput : base;
     }
@@ -1249,13 +1249,13 @@ class Agent
             auto combined = combinedWindow();
             if (!combined) return maxTokens;
             auto usedC = estimateContextTokens() + ctx.outputMargin(combined);
-            long roomC = cast(long) saturatingSub(combined, usedC);
+            long roomC = toLong(saturatingSub(combined, usedC));
             auto c = maxTokens < roomC ? maxTokens : roomC;
             return c < 1 ? 1 : c;
         }
         auto window = contextWindow();
         auto used = estimateContextTokens() + ctx.outputMargin(window);
-        long room = cast(long) saturatingSub(window, used);
+        long room = toLong(saturatingSub(window, used));
         auto n = maxTokens < room ? maxTokens : room;
         return n < 1 ? 1 : n;
     }
@@ -1300,7 +1300,7 @@ class Agent
                 if (x.logLine > last) last = x.logLine;
             }
 
-        auto budget = ctx.summaryOutputBudget(window, cast(long) outputBase);
+        auto budget = ctx.summaryOutputBudget(window, toLong(outputBase));
         string summary, fallback;
         bool truncated, retried;
         size_t drops;
@@ -1525,7 +1525,7 @@ class Agent
         // An unverifiable shell loop never prompts: the policy allows it
         // under the OS sandbox and blocks it without one (Rust #171).
         auto permissionDeny = policy.decide(call.name, call.arguments).match!(
-            (PermAllow _) => cast(string) null,
+            (PermAllow _) => string.init,
             (PermDeny d) => d.message,
         );
         if (permissionDeny !is null) return permissionDeny;

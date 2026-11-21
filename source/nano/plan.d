@@ -206,7 +206,7 @@ struct Plan
         uint[] added;
         foreach (offset, it; list)
         {
-            uint id = firstId + cast(uint) offset;
+            uint id = firstId + offset.to!uint;
             string title, note;
             uint[] after;
             if (it.type == JSONType.string) title = it.str;
@@ -404,9 +404,9 @@ struct Plan
                 if (idv is null || idv.type != JSONType.integer && idv.type != JSONType.uinteger || t is null
                         || t.type != JSONType.string || s is null || s.type != JSONType.string)
                     return R.err(shape);
-                auto raw = idv.type == JSONType.integer ? idv.integer : cast(long) idv.uinteger;
+                auto raw = idv.type == JSONType.integer ? idv.integer : long.max; // uinteger: above long.max
                 if (raw <= 0 || raw > maxId) return R.err(format!"plan item id %s is out of range 1-%s"(raw, maxId));
-                p.id = cast(uint) raw;
+                p.id = raw.to!uint; // in range: checked above
                 p.title = t.str;
                 auto st = parseStatus(s.str);
                 if (st.isErr) return R.err(st.unwrapErr("isErr"));
@@ -446,7 +446,7 @@ struct Plan
                     if (parsed.isErr) return R.err(parsed.unwrapErr("isErr"));
                     st = parsed.unwrap("isOk");
                 }
-            plan.items ~= PlanItem(cast(uint) index + 1, clip(title, maxTitleChars), st);
+            plan.items ~= PlanItem((index + 1).to!uint, clip(title, maxTitleChars), st);
         }
         return R.ok(plan);
     }
@@ -490,15 +490,15 @@ private PlanResult!JSONValue decoded(const JSONValue v) pure
                         JSONValue(v.str).jsonText, e.msg));
         }
     }
-    return R.ok(cast(JSONValue) v);
+    return R.ok(JSONValue(v));
 }
 
 private bool idOf(const JSONValue v, out uint id) pure
 {
     try
     {
-        if (v.type == JSONType.integer && v.integer >= 0 && v.integer <= uint.max) { id = cast(uint) v.integer; return true; }
-        if (v.type == JSONType.uinteger && v.uinteger <= uint.max) { id = cast(uint) v.uinteger; return true; }
+        if (v.type == JSONType.integer && v.integer >= 0 && v.integer <= uint.max) { id = v.integer.to!uint; return true; }
+        if (v.type == JSONType.uinteger && v.uinteger <= uint.max) { id = v.uinteger.to!uint; return true; }
         if (v.type == JSONType.string)
         {
             auto s = v.str.strip;

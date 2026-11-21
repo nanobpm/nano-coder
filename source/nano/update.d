@@ -582,7 +582,7 @@ unittest
     assert(runInstaller(Channel.npm, "/x", "0.1.0", (string p, string[] a) @safe => 1)[0].canFind("unchanged"));
     assert(runInstaller(Channel.npm, "/x", "0.1.0", ok, (string e) @safe => "0.2.0")[0].canFind("Updated to 0.2.0 — /relaunch"));
     assert(runInstaller(Channel.npm, "/x", "0.1.0", ok, (string e) @safe => "0.1.0")[0].canFind("still reports 0.1.0"));
-    assert(runInstaller(Channel.npm, "/x", "0.1.0", ok, (string e) @safe => cast(string) null)[0].canFind("could not be read"));
+    assert(runInstaller(Channel.npm, "/x", "0.1.0", ok, (string e) @safe => string.init)[0].canFind("could not be read"));
 }
 
 // rust: update.rs::relaunch_argv_replaces_resume_and_continue

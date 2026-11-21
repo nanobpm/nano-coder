@@ -197,12 +197,12 @@ struct Timers
     {
         Timers r;
         if (v.type != JSONType.object) return r;
-        if (auto l = "last_id" in v.objectNoRef) r.lastId = cast(uint) l.integer;
+        if (auto l = "last_id" in v.objectNoRef) r.lastId = l.integer.to!uint;
         foreach (key; ["items", "pending"])
             if (auto list = key in v.objectNoRef)
                 foreach (j; list.arrayNoRef)
                 {
-                    auto t = Timer(cast(uint) j["id"].integer, j["set_at"].integer, j["due_at"].integer, j["note"].str);
+                    auto t = Timer(j["id"].integer.to!uint, j["set_at"].integer, j["due_at"].integer, j["note"].str);
                     if (t.id > r.lastId) r.lastId = t.id;
                     if (key == "items") r.items ~= t;
                     else r.pending ~= t;
@@ -269,7 +269,8 @@ long parseDelay(string s) pure
             case "h", "hr", "hrs", "hour", "hours": mult = 3600; break;
             default: throw new TimerError(format("unknown unit %s in %s; use s, m or h", unit, s));
         }
-        total += cast(long)(n * mult);
+        if (n * mult >= long.max / 2) throw new TimerError(format("the delay %s is too long", s));
+        total += (n * mult).to!long;
         i = k;
         while (i < t.length && t[i] == ' ') i++;
     }

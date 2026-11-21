@@ -10,6 +10,8 @@
 module nano.frame;
 
 @safe:
+
+import std.string : representation;
 import nano.arith : saturatingSub;
 
 import std.array : appender, replicate;
@@ -440,8 +442,8 @@ string foldMark(string id, size_t lines, string expanded) pure
 {
     import std.base64 : Base64;
     import std.conv : to;
-    return "\x1b]" ~ foldOsc ~ ";" ~ Base64.encode(cast(const(ubyte)[]) id).idup ~ ";" ~ lines.to!string ~ ";"
-        ~ Base64.encode(cast(const(ubyte)[]) expanded).idup ~ "\x07";
+    return "\x1b]" ~ foldOsc ~ ";" ~ Base64.encode(id.representation).idup ~ ";" ~ lines.to!string ~ ";"
+        ~ Base64.encode(expanded.representation).idup ~ "\x07";
 }
 
 /// A block of transcript lines with an alternate (expanded or collapsed) form.
@@ -681,22 +683,22 @@ unittest
     assert(!d.pending);
 
     Transcript t;
-    t.feed(cast(const(ubyte)[]) "hello\nwor");
+    t.feed("hello\nwor".representation);
     assert(t.lines == ["hello"] && t.cur == "wor");
-    t.feed(cast(const(ubyte)[]) "ld\n\x1b[2mdim\x1b[0m\n");
+    t.feed("ld\n\x1b[2mdim\x1b[0m\n".representation);
     assert(t.lines == ["hello", "world", "\x1b[2mdim\x1b[0m"]);
-    t.feed(cast(const(ubyte)[]) "∴ Thinking: a\r\x1b[2K∴ Thinking: ab\r\x1b[2K∴ Thought\n");
+    t.feed("∴ Thinking: a\r\x1b[2K∴ Thinking: ab\r\x1b[2K∴ Thought\n".representation);
     assert(t.lines[$ - 1] == "∴ Thought");
-    auto bytes = cast(const(ubyte)[]) "é\n";
+    auto bytes = "é\n".representation;
     t.feed(bytes[0 .. 1]);
     t.feed(bytes[1 .. $]);
     assert(t.lines[$ - 1] == "é");
     assert(t.render(3)[0 .. 2] == ["hel", "lo"]);
-    t.feed(cast(const(ubyte)[]) "\x1b[H\x1b[2J\x1b[3Jfresh");
+    t.feed("\x1b[H\x1b[2J\x1b[3Jfresh".representation);
     assert(!t.lines.length && t.render(10) == ["fresh"]);
     Transcript small;
     small.cap = 10;
-    foreach (n; 0 .. 11) small.feed(cast(const(ubyte)[]) "x\n");
+    foreach (n; 0 .. 11) small.feed("x\n".representation);
     assert(small.lines.length == 9);
 }
 
@@ -901,7 +903,7 @@ unittest
 // rust: ui.rs::tool_result_inherits_expansion_from_its_call
 unittest
 {
-    void put(ref Transcript t, string s) { t.feed(cast(const(ubyte)[]) s); }
+    void put(ref Transcript t, string s) { t.feed(s.representation); }
     Transcript t;
     string rows;
     foreach (i; 1 .. 16) rows ~= format("row %s\n", i);
@@ -935,16 +937,16 @@ unittest
     assert(!t.toggleLatest());
     auto mark = foldMark("", 1, "∴ Thought for 1.5s\n    first idea\n    second\n");
     // A mark split across reads still applies.
-    t.feed(cast(const(ubyte)[]) ("∴ Thought for 1.5s\n" ~ mark[0 .. 9]));
-    t.feed(cast(const(ubyte)[]) mark[9 .. $]);
-    t.feed(cast(const(ubyte)[]) "after\n");
+    t.feed(("∴ Thought for 1.5s\n" ~ mark[0 .. 9]).representation);
+    t.feed(mark[9 .. $].representation);
+    t.feed("after\n".representation);
     assert(t.lines == ["∴ Thought for 1.5s", "after"]);
     assert(t.toggleLatest());
     assert(t.lines == ["∴ Thought for 1.5s", "    first idea", "    second", "after"]);
     // Other OSC sequences are dropped; a fold scrolled past the cap goes.
-    t.feed(cast(const(ubyte)[]) "\x1b]0;title\x07x\n");
+    t.feed("\x1b]0;title\x07x\n".representation);
     assert(t.lines[$ - 1] == "x");
     t.cap = 4;
-    t.feed(cast(const(ubyte)[]) "a\nb\nc\n");
+    t.feed("a\nb\nc\n".representation);
     assert(!t.toggleLatest());
 }

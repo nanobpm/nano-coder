@@ -4,6 +4,8 @@
 module nano.providers.openai;
 
 @safe:
+
+import nano.arith : toSize;
 import nano.safeio : jsonText, jsonPretty;
 import nano.clock : wallNow;
 
@@ -377,7 +379,7 @@ struct StreamState
             if (calls.type == JSONType.array)
                 foreach (tc; calls.arrayNoRef)
                 {
-                    size_t idx = "index" in tc ? cast(size_t) tc["index"].integer : order.length;
+                    size_t idx = "index" in tc ? toSize(tc["index"].integer) : order.length;
                     if (idx !in args) { order ~= idx; args[idx] = ""; names[idx] = ""; ids[idx] = ""; }
                     if (auto id = "id" in tc) if (id.type == JSONType.string) ids[idx] = id.str;
                     if (auto fn = "function" in tc)
@@ -639,8 +641,8 @@ size_t tokensAt(JSONValue v, string[] path) pure
         if (n is null) return 0;
         v = *n;
     }
-    if (v.type == JSONType.integer && v.integer > 0) return cast(size_t) v.integer;
-    if (v.type == JSONType.uinteger && v.uinteger > 0) return cast(size_t) v.uinteger;
+    if (v.type == JSONType.integer && v.integer > 0) return toSize(v.integer);
+    if (v.type == JSONType.uinteger && v.uinteger > 0) return toSize(v.uinteger);
     return 0;
 }
 

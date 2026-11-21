@@ -24,7 +24,7 @@ version (OSX) version = HasOsSandbox;
 version (linux) version = HasOsSandbox;
 
 @safe:
-import nano.safeio : jsonText, jsonPretty;
+import nano.safeio : jsonText, jsonPretty, lossyText;
 
 enum SandboxMode { off, workspace, readOnly }
 
@@ -309,7 +309,7 @@ string[] gitDirs(string cwd) nothrow
     {
         auto p = pipeProcess(["git", "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
             Redirect.stdout | Redirect.stderr, null, Config.none, cwd);
-        auto output = cast(const(char)[]) readToEnd(p.stdout);
+        auto output = lossyText(readToEnd(p.stdout));
         if (wait(p.pid) != 0) return null;
         string[] dirs;
         foreach (l; output.idup.splitLines)
