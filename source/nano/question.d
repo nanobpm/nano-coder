@@ -95,9 +95,12 @@ string questionPrompt(string question, size_t width, out string[] body_) pure
     // Room for the `? ` prefix and the `› ` after the prompt.
     import nano.arith : saturatingSub;
     auto room = saturatingSub(width, 4);
-    import nano.frame : dropSoftWraps;
-    // The picker draws its own rows; soft-wrap marks are only for the frame.
-    auto rendered = dropSoftWraps(render(text, room > 20 ? room : 20));
+    import nano.frame : dropSoftWraps, wrapBlock;
+    import std.array : join;
+    // The picker draws its own rows and counts one per body line: wrap to the
+    // width here (code lines come whole from markdown), then drop the marks.
+    auto w = room > 20 ? room : 20;
+    auto rendered = dropSoftWraps(wrapBlock(render(text, w), w).join("\n"));
     // Inline only if it fits the prompt row, in cells (wide glyphs count 2).
     if (rendered == text && !text.canFind('\n') && cells(text) <= room) return text;
     body_ = rendered.split('\n');
@@ -330,7 +333,7 @@ unittest // wording, and control sequences/newlines stripped
 // rust: main.rs::a_long_question_wraps_and_escapes_are_dropped
 unittest // questionPrompt: inline, markdown body, wrapping and escapes
 {
-    import std.algorithm : any, canFind;
+    import std.algorithm : all, any, canFind;
     import std.array : replicate;
     string[] body_;
     assert(questionPrompt("Which database should I use?", 80, body_) == "Which database should I use?");
@@ -344,6 +347,11 @@ unittest // questionPrompt: inline, markdown body, wrapping and escapes
 
     string[] wrapped;
     assert(questionPrompt("\x1b[2J" ~ "word ".replicate(40), 40, wrapped) == "Your answer");
+    // A long code line comes back as rows no wider than the room.
+    string[] code;
+    questionPrompt("```\n" ~ "x".replicate(100) ~ "\n```", 40, code);
+    import nano.resume : cells;
+    assert(code.length >= 4 && code.all!(l => cells(l) <= 36), code[1]);
     assert(wrapped.length > 1);
     foreach (l; wrapped) assert(!l.canFind("\x1b[2J"), "escapes dropped");
 }
