@@ -59,6 +59,14 @@ string dropSoftWraps(string s) pure
     return s.replace(softWrapMark, "").replace(verbatimMark, "").replace(sepWrapMark, "");
 }
 
+/// `s` with any literal mark character (`softWrap`, `verbatim`, `sepWrap`)
+/// replaced by U+FFFD, so untrusted text can never forge wrap metadata.
+string escapeMarks(string s) pure
+{
+    import std.array : replace;
+    return s.replace(softWrapMark, "\uFFFD").replace(verbatimMark, "\uFFFD").replace(sepWrapMark, "\uFFFD");
+}
+
 size_t cellWidth(dchar c) pure nothrow
 {
     return c == cursorMark ? 1 : c == softWrap || c == verbatim || c == sepWrap ? 0 : charWidth(c);
@@ -279,14 +287,22 @@ string[] editorLines(string prompt, dstring text, size_t cursor, size_t width) p
             ~ text[cursor + 1 .. $].to!string;
     else
         marked = (text[0 .. cursor] ~ cursorMark ~ text[cursor .. $]).to!string;
+    marked = escapeMarks(marked);
+    // The first logical line wraps together with the prompt at the full
+    // width (a placeholder of the prompt's cells stands in for it), so a
+    // character-broken continuation row is full and a copy across it has
+    // no padding inside a long token.
     auto pw = visibleWidth(prompt);
-    auto inner = width > pw ? width - pw : 1;
+    if (pw >= width) pw = 0;
+    auto hold = "\uE005".replicate(pw);
     string[] lines;
     size_t n;
     foreach (logical; marked.splitter('\n'))
-        lines ~= wrapAnsi(logical, n++ == 0 ? inner : width);
+        lines ~= wrapAnsi(n++ == 0 ? hold ~ logical : logical, width);
     if (!lines.length) lines = [""];
-    lines[0] = BOLD ~ prompt ~ RESET ~ lines[0];
+    import std.algorithm : startsWith;
+    assert(lines[0].startsWith(hold));
+    lines[0] = BOLD ~ prompt ~ RESET ~ lines[0][hold.length .. $];
     foreach (ref l; lines) l = fit(l, width).replace("\0", "\x1b[7m \x1b[27m");
     return lines;
 }
@@ -896,6 +912,15 @@ unittest
     // On a newline the blank sits at the end of that row.
     ed = editorLines("› ", "ab\ncd"d, 2, 20);
     assert(ed.length == 2 && ed[0].canFind("ab\x1b[7m \x1b[27m"));
+    {
+        // A long token wraps with the prompt at the full width: no padding
+        // lands inside it, so a copy keeps it intact.
+        auto rows = editorLines("› ", "/abcdefghijklmnopqrstuv"d, 0, 10);
+        import std.algorithm : all;
+        foreach (r; rows[0 .. $ - 1]) assert(visibleWidth(dropSoftWraps(r)) == 10, r);
+        auto lit = editorLines("› ", "a\uE003b"d, 0, 20);
+        assert(lit[0].indexOf(verbatimMark) < 0, lit[0]);
+    }
     ed = editorLines("› ", "abcdef"d, 0, 5);
     assert(ed.length == 2 && ed[0].canFind("\x1b[7ma\x1b[27m"));
     assert(compose(["t"], ["e"], "s") == ["t", "e", "s"]);
