@@ -769,7 +769,8 @@ Restored restore(string path)
     string[] inputs;
     // The cumulative decoded `folded` stash across the log's `replace`
     // records (Rust's cumulative stash of folded turns). Both stash helpers
-    // read it read-only; only `restoreReplayStash` advances it. The pin
+    // read it; only `restoreReplayStash` advances it, and it runs after
+    // `restorePinStash` so the pin fallback sees the pre-record stash. The pin
     // helper's Rust-era fallback decodes `folded` itself rather than reading
     // the replay helper's output, so the two stay independently editable.
     Message[] foldedStash;
@@ -926,8 +927,12 @@ Restored restore(string path)
                 // its own running sequence and never reads the other's
                 // decoded array, so either representation can change without
                 // touching the other (epic #221).
-                restoreReplayStash!decode(data, inputs, foldedStash, r);
+                // Pin runs FIRST: its Rust-era fallback applies this record's
+                // `folded` delta onto the PRE-record `foldedStash`; running it
+                // after the replay helper advanced the stash would apply the
+                // delta twice (duplicated pins when folded_base > length).
                 restorePinStash!decode(data, inputs, foldedStash, r);
+                restoreReplayStash!decode(data, inputs, foldedStash, r);
             }
             {
                 auto mode = "mode" in data;
@@ -1625,6 +1630,23 @@ unittest
         ~ line("replace", rep([rec(Message.user("two"))], 1)));
     auto rr = restore(path);
     assert(rr.pinStash.length == 2 && rr.pinStash[0].content == "one" && rr.pinStash[1].content == "two");
+
+    // A folded_base past the prior stash (torn/hand-edited log, or a first
+    // replace with base > 0) must apply the delta once, not twice.
+    auto path2 = buildPath(dir, "rust2.jsonl");
+    write(path2, `{"type":"session","data":{"version":1,"id":"rust2","created_at":"x"}}` ~ "\n"
+        ~ line("replace", rep([rec(Message.user("d1")), rec(Message.user("d2"))], 2)));
+    auto r2 = restore(path2);
+    assert(r2.pinStash.length == 2 && r2.pinStash[0].content == "d1" && r2.pinStash[1].content == "d2",
+        "the Rust-era pin fallback must not re-apply the delta onto the advanced stash");
+    assert(r2.replayStash.length == 2);
+    // The same with a non-empty prior stash shorter than the base.
+    auto path3 = buildPath(dir, "rust3.jsonl");
+    write(path3, `{"type":"session","data":{"version":1,"id":"rust3","created_at":"x"}}` ~ "\n"
+        ~ line("replace", rep([rec(Message.user("one"))]))
+        ~ line("replace", rep([rec(Message.user("d1")), rec(Message.user("d2"))], 3)));
+    auto r3 = restore(path3);
+    assert(r3.pinStash.length == 3 && r3.pinStash[2].content == "d2", "delta applied once over a short prior stash");
 }
 
 // A compaction's pinned block is logged as a delta: `pinned_requests` holds
