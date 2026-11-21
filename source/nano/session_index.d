@@ -53,6 +53,10 @@ struct Summary
     string title;
     /// Size of the log this summary was made from.
     ulong logBytes;
+    /// On-disk size of a compressed log (`<id>.jsonl.gz`) this summary was
+    /// made from, 0 for a plain log: the archive's cache fingerprint, kept
+    /// apart from the uncompressed `logBytes` append offset.
+    ulong archiveBytes;
     /// The log file (not serialized).
     string path;
 
@@ -76,6 +80,7 @@ struct Summary
         opt("context_prompt", contextPrompt);
         opt("title", title);
         f ~= ["log_bytes", logBytes.to!string];
+        if (archiveBytes) f ~= ["archive_bytes", archiveBytes.to!string];
         return f;
     }
 
@@ -120,6 +125,8 @@ struct Summary
         s.contextPrompt = opt("context_prompt");
         s.title = opt("title");
         s.logBytes = cast(ulong) j["log_bytes"].integer;
+        if (auto a = "archive_bytes" in j)
+            if (a.type == JSONType.integer && a.integer > 0) s.archiveBytes = cast(ulong) a.integer;
         return s;
     }
 }
@@ -462,7 +469,10 @@ Summary[] list(string dir)
         auto size = e.size;
         Summary s;
         auto cached = id in index;
-        if (cached !is null && cached.logBytes == size && !compressed) s = *cached;
+        immutable hit = cached !is null && (compressed
+            ? cached.archiveBytes == size
+            : cached.archiveBytes == 0 && cached.logBytes == size);
+        if (hit) s = *cached;
         else
         {
             try s = summarize(e.name);
@@ -474,6 +484,7 @@ Summary[] list(string dir)
                 if (cached.model !is null) s.model = cached.model;
                 if (s.title is null) s.title = cached.title;
             }
+            s.archiveBytes = compressed ? size : 0;
             updates ~= s;
         }
         if (cached !is null) index.remove(id);
