@@ -5,7 +5,7 @@ module nano.status;
 @safe:
 pure:
 
-import std.algorithm : max;
+import std.algorithm : max, min;
 import nano.arith : saturatingSub, toSize;
 
 import std.format : format;
@@ -166,8 +166,10 @@ string render(const ref Stats stats, size_t cols) pure
     else if (percent >= 90.0) barColor = "\x1b[38;5;203m";
     else if (percent >= 60.0) barColor = "\x1b[38;5;221m";
     else barColor = "\x1b[38;5;114m";
-    auto filled = round(percent / 10.0).to!size_t;
-    if (filled > 10) filled = 10;
+    // Clamp in the real domain first: an anomalous provider count (e.g.
+    // tokens = long.max, window = 1) rounds past size_t.max, and the checked
+    // conversion would throw before the 10-cell clamp could run.
+    auto filled = min(round(percent / 10.0), 10.0).to!size_t;
     auto bar = repeatStr("█", filled) ~ repeatStr("░", 10 - filled);
     auto approx = stats.calibrated ? "" : "~";
     auto model = stats.model.length ? stats.provider ~ "/" ~ stats.model : stats.provider;
@@ -398,6 +400,11 @@ unittest
     assert(tildePath("/home/joshua", "/home/joshua", null) == "~");
     assert(tildePath("/home/joshua2", "/home/joshua", null) == "/home/joshua2");
     assert(tildePath("/x", "/", null) == "/x");
+
+    // An anomalous provider count must not throw before the bar clamp:
+    // percent rounds past size_t.max here, and render still caps at 10 cells.
+    Stats extreme = {tokens: size_t.max, window: 1};
+    assert(visible(render(extreme, 200)).canFind("██████████"));
 
     RateMeter m;
     assert(m.record(400, 0) == 0 && m.record(400, 100) == 0);
