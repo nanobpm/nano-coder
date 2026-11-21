@@ -449,6 +449,11 @@ struct Config
     bool persistSessions = true;
     /// Session log directory (empty: the platform data folder).
     string sessionDir;
+    /// Gzip session logs idle this many days at startup (0: never; issue #205).
+    long sessionCompressAfterDays = 14;
+    /// Delete session logs untouched this many days (0: keep forever), except
+    /// named sessions (issue #205).
+    long sessionRetentionDays;
     /// Ask once per turn for a check's evidence before accepting a completed
     /// outcome when files were edited after the last bash call. ACP turns it off.
     bool verifyBeforeComplete = true;
@@ -523,6 +528,8 @@ struct Config
         if (auto v = "idle_compact" in doc) c.idleCompact = v.boolean;
         if (auto v = "persist_sessions" in doc) c.persistSessions = v.boolean;
         if (auto v = "session_dir" in doc) c.sessionDir = v.str;
+        if (auto v = "session_compress_after_days" in doc) c.sessionCompressAfterDays = v.integer;
+        if (auto v = "session_retention_days" in doc) c.sessionRetentionDays = v.integer;
         if (auto v = "verify_before_complete" in doc) c.verifyBeforeComplete = v.boolean;
         if (auto v = "idle_compact_hold_secs" in doc) c.idleCompactHoldSecs = v.integer;
         if (auto v = "disable_hooks" in doc) c.disableHooks = v.boolean;

@@ -1391,8 +1391,13 @@ class Agent
         if (compactionPinRequests)
             if (auto pinned = ctx.pinnedUserRequests(pinStash, summarized, smart, window))
                 summary ~= "\n\n" ~ pinned;
+        // The requests this compaction adds to the pinned block (the stash so
+        // far is their base): the log records only these, so a session holds
+        // each request once instead of restating the whole stash (issue #205).
+        size_t pinnedBase = pinStash.length;
+        Message[] pinnedNew;
         foreach (ref x; summarized)
-            if (ctx.isUserRequest(x)) pinStash ~= x;
+            if (ctx.isUserRequest(x)) { pinStash ~= x; pinnedNew ~= x; }
 
         // The newly folded real turns for the replay stash. On a repeated
         // compaction the first folded message is the previous summary, whose
@@ -1447,8 +1452,9 @@ class Agent
             pending.base = messages.length;
         }
         log.ifSome((SessionLog l) {
-            l.replace(messages, first, last, ctx.modeName(m), client.providerName ~ "/" ~ client.modelName, pinStash,
-                hasPending ? &pending : null, folded, extendsStash ? some(stashBase) : Option!size_t.init, replayRestated);
+            l.replace(messages, first, last, ctx.modeName(m), client.providerName ~ "/" ~ client.modelName, pinnedNew,
+                hasPending ? &pending : null, folded, extendsStash ? some(stashBase) : Option!size_t.init, replayRestated,
+                pinnedNew.length ? some(pinnedBase) : Option!size_t.init);
         });
         // The replacement drops recalled notes' full text from context, so
         // every memory may be recalled again (except those the retained
@@ -1659,6 +1665,7 @@ class Agent
             // A malformed plan is dropped; the session resumes.
             Plan.fromJSON(r.plan).match!((p) { plan = p; }, (e) { dropped ~= "the saved plan: " ~ e; });
         }
+        planDeltasSinceSnapshot = 0;
         Timers t;
         try t = Timers.fromJSON(r.timers);
         catch (Exception e) dropped ~= "the saved timers: " ~ e.msg; // malformed timers are dropped, the session resumes
@@ -1713,6 +1720,7 @@ class Agent
         control.mode = AgentMode.normal;
         sessionThinking.nullify();
         plan = Plan.init;
+        planDeltasSinceSnapshot = 0;
         setTimers(Timers.init);
         reminders = Reminders.init;
         sessionStarted = false;
@@ -2006,14 +2014,41 @@ class Agent
         {
             // As for timers: an unrecorded change is rolled back.
             scope (failure) plan = before;
-            planChanged();
+            planChanged(before);
         }
         return o.text;
     }
 
-    private void planChanged()
+    /// Log a plan change as a delta against `before` (issue #205: a full
+    /// snapshot per change rewrites every note, and `plan` records were 8% of
+    /// the largest logs), with a full snapshot every `planSnapshotEvery`
+    /// changes so a resume never replays an unbounded delta chain.
+    private enum size_t planSnapshotEvery = 20;
+    private size_t planDeltasSinceSnapshot;
+
+    private void planChanged(Plan before)
     {
-        log.ifSome((SessionLog l) { l.plan(plan.toJSON); });
+        import std.algorithm : canFind;
+        log.ifSome((SessionLog l) {
+            if (++planDeltasSinceSnapshot >= planSnapshotEvery || (before.items.length == 0 && plan.items.length > 1))
+            {
+                l.plan(plan.toJSON);
+                planDeltasSinceSnapshot = 0;
+            }
+            else
+            {
+                JSONValue goal = JSONValue(null);
+                if (before.goal != plan.goal) goal = JSONValue(plan.goal);
+                JSONValue[] upserts;
+                foreach (i, ref it; plan.items)
+                    if (i >= before.items.length || it != before.items[i])
+                        upserts ~= it.toJSON;
+                uint[] drop;
+                foreach (ref b; before.items[0 .. min(before.items.length, plan.items.length)])
+                    if (!plan.items.canFind!(i => i.id == b.id)) drop ~= b.id;
+                l.planDelta(goal, upserts, drop, before.items.length);
+            }
+        });
         reminders.planChanged();
         if (onPlanChanged !is null) onPlanChanged();
     }
@@ -2025,6 +2060,7 @@ class Agent
         plan = p;
         if (announce && planTools && !plan.empty) push(Message.user(plan.carriedOverNote));
         log.ifSome((SessionLog l) { l.plan(plan.toJSON); });
+        planDeltasSinceSnapshot = 0;
     }
 
     private static string withContext(string text, string[] context) pure
