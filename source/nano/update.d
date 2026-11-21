@@ -860,6 +860,20 @@ unittest
     assert(ran == ["git"], "git missing from PATH stops before brew upgrade too");
     assert(out_[0].canFind("Could not run `git -C /tap pull") && out_[0].canFind("git: not found")
         && out_[0].canFind("unchanged") && !out_[0].canFind("status -1"), out_[0]);
+    // Successful tap refresh: git then brew, with every override reaching brew's runner.
+    ran = null;
+    string[string] brewEnv;
+    auto okRun = (string p, string[] a, const string[string] e) @safe {
+        ran ~= p;
+        if (p == "brew") foreach (k; ["HOMEBREW_NO_AUTO_UPDATE", "HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK",
+                "HOMEBREW_NO_INSTALL_CLEANUP", "HOMEBREW_NO_ENV_HINTS"]) if (auto v = k in e) brewEnv[k] = *v;
+        return 0; };
+    out_ = runInstaller(Channel.brew, "/x", "0.1.0", okRun, (string e) @safe => "0.2.0", () @safe => "/tap");
+    assert(ran == ["git", "brew"], "a successful tap refresh is followed by brew upgrade");
+    assert(out_[0].canFind("Updated to 0.2.0"), out_[0]);
+    foreach (k; ["HOMEBREW_NO_AUTO_UPDATE", "HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK",
+            "HOMEBREW_NO_INSTALL_CLEANUP", "HOMEBREW_NO_ENV_HINTS"])
+        assert(k in brewEnv && brewEnv[k] == "1", k);
     // No tap checkout (tapRepo null): plain `brew upgrade` is the only step.
     ran = null;
     auto plainRun = (string p, string[] a, const string[string] e) @safe { ran ~= p; return 0; };
