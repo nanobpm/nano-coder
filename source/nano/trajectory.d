@@ -7,7 +7,7 @@
 module nano.trajectory;
 
 @safe:
-import nano.safeio : jsonText, jsonPretty;
+import nano.safeio : jsonText, jsonPretty, jsonWholeAsDouble;
 import nano.arith : saturatingSub;
 
 import std.algorithm : canFind, map, max, sum, filter;
@@ -379,7 +379,7 @@ void appendMessageRows(ref Turn turn, const JSONValue m, ulong line, ref string 
                         // logged digits with the correctly-rounded strtod.
                         auto lit = rawNumber(rawLine, "aic");
                         r.aic = serdeFloat(lit !is null ? strtodOf(lit)
-                            : a.type == JSONType.float_ ? a.floating : double(a.integer));
+                            : a.type == JSONType.float_ ? a.floating : jsonWholeAsDouble(*a));
                     }
             }
         if (auto d = "duration_ms" in m) if (d.type == JSONType.integer) r.durationMs = d.integer;
@@ -1073,4 +1073,17 @@ unittest
     assert(rawNumber(`{"usage":{"aic":1.3876,"x":1}}`, "aic") == "1.3876" && rawNumber("{}", "aic") is null);
     assert(serdeFloat(strtodOf("1.3876")) == "1.3876");
     assert(serdeFloat(123456789.0) == "123456789.0" && serdeFloat(0.00012) == "0.00012");
+}
+
+unittest
+{
+    // A uinteger-tagged aic (JSONValue(2u)) with no raw line must be read, not throw.
+    Turn t;
+    string prev;
+    auto m = parseJSON(`{"role":"assistant","content":"x","usage":{}}`);
+    m["usage"]["aic"] = JSONValue(2u);
+    appendMessageRows(t, m, 1, prev);
+    bool seen;
+    foreach (r; t.rows) if (r.aic !is null) { seen = true; assert(r.aic == "2" || r.aic == "2.0", r.aic); }
+    assert(seen);
 }

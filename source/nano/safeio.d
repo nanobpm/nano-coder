@@ -1019,3 +1019,35 @@ unittest
     assert(v == "hi");
     assert(bytesOf("hi") == [0x68, 0x69]);
 }
+
+/// Reads a whole JSON number that may be tagged either `integer` or
+/// `uinteger` (std.json uses the latter for values > long.max and for
+/// `JSONValue(1u)`). Reading `.integer` on a `uinteger` throws, so every
+/// site that accepts both tags must go through here. Returns false for
+/// non-integral types and for negative values.
+bool jsonUnsigned(const JSONValue v, out ulong r) pure @safe
+{
+    if (v.type == JSONType.uinteger) { r = v.uinteger; return true; }
+    if (v.type == JSONType.integer && v.integer >= 0) { r = cast(ulong) v.integer; return true; }
+    return false;
+}
+
+/// A whole JSON number (either tag) as a double; NaN for other types.
+double jsonWholeAsDouble(const JSONValue v) pure @safe
+{
+    if (v.type == JSONType.uinteger) return double(v.uinteger);
+    if (v.type == JSONType.integer) return double(v.integer);
+    return double.nan;
+}
+
+unittest
+{
+    ulong r;
+    assert(jsonUnsigned(JSONValue(1u), r) && r == 1);
+    assert(jsonUnsigned(JSONValue(ulong.max), r) && r == ulong.max);
+    assert(jsonUnsigned(JSONValue(7), r) && r == 7);
+    assert(!jsonUnsigned(JSONValue(-1), r));
+    assert(!jsonUnsigned(JSONValue("1"), r));
+    assert(jsonWholeAsDouble(JSONValue(3u)) == 3.0);
+    assert(jsonWholeAsDouble(JSONValue(-3)) == -3.0);
+}
