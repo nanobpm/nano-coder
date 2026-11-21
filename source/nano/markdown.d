@@ -31,7 +31,7 @@ import std.format : format;
 import std.string : indexOf, lastIndexOf, strip, stripLeft;
 import std.uni : isWhite;
 import nano.lineedit : charWidth;
-import nano.frame : softWrapMark, verbatimMark;
+import nano.frame : softWrapMark, verbatimMark, sepWrapMark;
 import nano.mdblock;
 import nano.mdinline;
 import nano.mdtable : layout, textWidth = width;
@@ -130,11 +130,13 @@ private struct Lines
             // A separator on the edge starts the next row, so a copy across
             // the wrap keeps it (a shorter row is padded with spaces anyway).
             auto full = curW >= width;
-            // One cell short of the edge, the separator stays on this row:
-            // the frame pads nothing before a wide glyph there.
-            if (gap && curW + 1 == width && firstWide(pieces)) { cur ~= ' '; gap = 0; }
+            // One cell short of the edge before a wide glyph, the separator
+            // fits nowhere (the frame pads nothing there): it rides the next
+            // row as a zero-cell mark the frame emits as a space.
+            auto sep = gap && curW + 1 == width && firstWide(pieces);
             newline(true);
-            if (gap && full) { cur ~= ' '; curW = 1; }
+            if (sep) cur ~= sepWrapMark;
+            else if (gap && full) { cur ~= ' '; curW = 1; }
         }
         else if (gap) { cur ~= ' '; curW++; }
         foreach (p; pieces)
@@ -254,7 +256,11 @@ private string[] renderBlock(const Block block, size_t width, size_t depth) pure
         case BK.code:
             if (block.fenced) return [fenceOpen(block.info)] ~ codeLines(block.text, width) ~ fenceClose();
             string[] out_;
-            foreach (l; codeLines(block.text, width > 5 ? width - 4 : 1)) out_ ~= "    " ~ l;
+            // Verbatim like fenced code: the frame breaks each line by
+            // character at the full width, so the indent stays on the first
+            // row only and a copy is exact (wrapping at width-4 repeated the
+            // indent on every continuation row).
+            foreach (l; codeLines(block.text, width)) out_ ~= "    " ~ l;
             return out_;
         case BK.quote:
             string[] out_;
@@ -696,6 +702,24 @@ unittest // GitHub-style emoji shortcodes in prose; code stays verbatim
 unittest // a separator one cell short of the edge survives a wide-glyph wrap
 {
     import std.conv : to;
-    assert(show("cmd abcdef 中", 11) == ["cmd abcdef ", "中"], show("cmd abcdef 中", 11).to!string);
+    import std.string : indexOf;
+    // The consumed separator rides the continuation as a zero-cell mark the
+    // frame emits as a space, so a copy keeps the words apart (a plain view
+    // drops the mark; the emit half is covered in nano.frame).
+    auto rows = renderLines("cmd abcdef 中", 11);
+    assert(rows.length == 2 && rows[1].indexOf(sepWrapMark) >= 0, rows[1]);
+    assert(show("cmd abcdef 中", 11) == ["cmd abcdef", "中"], show("cmd abcdef 中", 11).to!string);
     assert(show("cmd abcdefg中", 11) == ["cmd", "abcdefg中"], show("cmd abcdefg中", 11).to!string);
+}
+
+unittest // indented code is verbatim: the frame breaks it, the indent stays on the first row
+{
+    import std.conv : to;
+    import std.algorithm : map;
+    import std.array : array;
+    import nano.frame : wrapAnsi, dropSoftWraps;
+    auto rows = renderLines("    rm -r /a b", 6);
+    assert(rows.length == 1 && rows[0].indexOf(verbatimMark) >= 0, rows[0]);
+    assert(wrapAnsi(rows[0], 6).map!dropSoftWraps.array == ["    rm", " -r /a", " b"]);
+    assert(show("    short", 20) == ["    short"]);
 }

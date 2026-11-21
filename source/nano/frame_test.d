@@ -282,7 +282,9 @@ unittest
 }
 
 /// A wide glyph one cell short of the edge wraps natively; no pad space is
-/// emitted into the copied text.
+/// emitted into the copied text. A separator the wrap consumed rides the
+/// continuation row as a zero-cell mark and is emitted as a space, so copied
+/// words stay apart.
 unittest
 {
     string outp;
@@ -293,6 +295,14 @@ unittest
     auto emu = Emu(5, 10);
     emu.render(["rm -r /ab", softWrapMark ~ "中/x"]);
     assert(emu.screen()[$ - 2 .. $] == ["rm -r /ab", "中/x"], (){ import std.conv : to; return emu.screen().to!string; }());
+
+    outp = null;
+    auto s = new FrameRenderer((string s) { outp ~= s; });
+    s.render(["cmd", softWrapMark ~ sepWrapMark ~ "中"], 4, 5);
+    assert(outp.canFind("cmd 中"), outp);
+    auto emu2 = Emu(5, 5);
+    emu2.render(["cmdx", softWrapMark ~ sepWrapMark ~ "中"]);
+    assert(emu2.screen()[$ - 2 .. $] == ["cmdx", "中"], (){ import std.conv : to; return emu2.screen().to!string; }());
 }
 
 /// A soft wrap that becomes a hard newline rewrites the row above, so its
