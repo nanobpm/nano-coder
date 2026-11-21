@@ -297,10 +297,9 @@ struct Trajectory
 /// log is refused). A torn trailing line is dropped, as on resume.
 Trajectory load(string path, string expectedId = null)
 {
-    import nano.safeio : readRawText;
-    import nano.session : formatVersion;
+    import nano.session : formatVersion, logText;
     string text;
-    try text = readRawText(path);
+    try text = logText(path);
     catch (Exception e)
     {
         // FileException prefixes the path; keep just the OS reason.
