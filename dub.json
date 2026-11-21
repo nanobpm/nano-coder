@@ -42,6 +42,6 @@
     "-fno-delete-null-pointer-checks"
   ],
   "preBuildCommands": [
-    "$PACKAGE_DIR/scripts/check-safe.sh"
+    "\"$PACKAGE_DIR/scripts/check-safe.sh\""
   ]
 }

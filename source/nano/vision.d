@@ -9,7 +9,7 @@ module nano.vision;
 pure:
 
 import nano.arith : toSize;
-import nano.safeio : jsonUnsigned;
+import nano.safeio : jsonUnsigned, jsonSigned;
 
 import std.algorithm : canFind, any;
 import std.json;
@@ -93,7 +93,10 @@ private bool isWhole(const JSONValue v) pure
 /// ConvException where it is read (reading `.integer` on a uinteger throws).
 private size_t wholeToSize(const JSONValue v) pure
 {
-    return v.type == JSONType.uinteger ? toSize(v.uinteger) : toSize(v.integer);
+    ulong u;
+    long l;
+    // Shared signed/unsigned reader; a negative value still throws via toSize.
+    return jsonUnsigned(v, u) ? toSize(u) : jsonSigned(v, l) ? toSize(l) : toSize(-1L);
 }
 
 private Vision copy(const Vision v) pure { return Vision(v.maxImages, v.maxImageBytes, v.mediaTypes.dup); }
