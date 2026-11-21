@@ -363,6 +363,14 @@ final class FrameRenderer
     // physical history standing for the frame's first `frozenLogical` rows
     // (the transcript) plus stale editor rows that can't be taken back.
     private size_t frozen, frozenLogical;
+    // The logical transcript the frozen rows stand for: checked against the
+    // incoming frame directly, since `prev[0 .. frozen]` may hold old editor
+    // rows (after repeated shrinks) that no longer match the logical prefix.
+    private string[] frozenText;
+    // A row of `prev` whose predecessor still carries a terminal wrap flag
+    // (it was a continuation, now blank at the top of the screen): the
+    // physical join survives until the row is redrawn from scratch.
+    private size_t staleJoin = size_t.max;
 
     this(void delegate(string) @safe out_) pure { this.out_ = out_; }
 
@@ -396,6 +404,8 @@ final class FrameRenderer
         out_(buf[]);
         prev = frame.dup;
         frozen = frozenLogical = 0;
+        frozenText = null;
+        staleJoin = size_t.max;
     }
 
     /// Rewrites from the first changed row. Rows that went into the
@@ -414,7 +424,7 @@ final class FrameRenderer
         if (frozen)
         {
             if (frame.length < frozenLogical || prev.length < frozen
-                || frame[0 .. frozenLogical] != prev[0 .. frozenLogical]
+                || frame[0 .. frozenLogical] != frozenText
                 || (gapAt != size_t.max && gapAt < frozenLogical))
                 return fullRedraw(inFrame, width, height);
             frame = prev[0 .. frozen] ~ frame[frozenLogical .. $];
@@ -454,6 +464,7 @@ final class FrameRenderer
                 shown = prev[0 .. top].dup ~ new string[height - (frame.length - gapAt)] ~ frame[gapAt .. $];
                 frozen = top;
                 frozenLogical = logicalGap;
+                frozenText = inFrame[0 .. logicalGap].dup;
                 d = firstDiff(prev, shown);
                 if (d < 0) { prev = shown; return; }
             }
@@ -470,8 +481,14 @@ final class FrameRenderer
         // that changed (soft became hard or the reverse) can't be rewritten
         // in place: the copy would still join (or split) the old way. A blank
         // row there is harmless: the old line just ends in spaces.
-        if (diff == top && top > 0 && shown[top].length && joins(shown, top) != joins(prev, top))
+        // A blank row keeps the old flag recorded (`staleJoin`), so filling it
+        // later compares against the physical flag, not the blank.
+        const prevJoinsTop = joins(prev, top) || staleJoin == top;
+        if (diff == top && top > 0 && shown[top].length && joins(shown, top) != prevJoinsTop)
             return fullRedraw(inFrame, width, height);
+        if (diff == top && top > 0 && !shown[top].length && prevJoinsTop) staleJoin = top;
+        else if (staleJoin != size_t.max && diff <= staleJoin && staleJoin < shown.length && shown[staleJoin].length)
+            staleJoin = size_t.max;
         auto row = prev.length >= height ? diff - top + 1 : height - prev.length + diff + 1;
         auto buf = appender!string;
         // A pure append lands one row past the bottom (diff == prev.length). A
@@ -1378,4 +1395,49 @@ unittest
     t.cap = 4;
     t.feed(cast(const(ubyte)[]) "a\nb\nc\n");
     assert(!t.toggleLatest());
+}
+
+// Repeated tall-editor shrinks with output between them: the second freeze
+// must keep its logical prefix, so an unchanged render clears nothing.
+unittest
+{
+    import std.algorithm : canFind;
+    string screen;
+    auto r = new FrameRenderer((string s) { screen ~= s; });
+    auto d = ["d0", "d1", "d2", "d3", "d4", "d5"];
+    string[] t = ["t0", "t1"];
+    r.render(t ~ d ~ ["status"], 20, 4, t.length);
+    r.render(t ~ d[0 .. 2] ~ ["status"], 20, 4, t.length);
+    t ~= "t2";
+    r.render(t ~ d[0 .. 2] ~ ["status"], 20, 4, t.length);
+    r.render(t ~ d ~ ["status"], 20, 4, t.length);
+    r.render(t ~ d[0 .. 2] ~ ["status"], 20, 4, t.length);
+    screen = null;
+    r.render(t ~ d[0 .. 2] ~ ["status"], 20, 4, t.length);
+    assert(!screen.canFind("\x1b[2J") && !screen.canFind("\x1b[3J"), screen);
+    screen = null;
+    t ~= "t3";
+    r.render(t ~ d[0 .. 2] ~ ["status"], 20, 4, t.length);
+    assert(!screen.canFind("\x1b[3J"), screen);
+    assert(screen.canFind("t3"), screen);
+}
+
+// A soft-wrapped draft row at the top of the screen goes blank on a shrink:
+// the row above keeps its terminal wrap flag, so a hard transcript line that
+// later fills that row must redraw rather than join the old draft on copy.
+unittest
+{
+    import std.algorithm : canFind;
+    enum M = softWrapMark;
+    string screen;
+    auto r = new FrameRenderer((string s) { screen ~= s; });
+    auto t = ["t0", "t1"];
+    // top == 4: the continuation "c" is the top screen row.
+    r.render(t ~ ["a", "b", M ~ "c", "e", "f", "status"], 20, 4, t.length);
+    screen = null;
+    r.render(t ~ ["a", "status"], 20, 4, t.length);
+    assert(!screen.canFind("\x1b[3J"), screen);
+    screen = null;
+    r.render(t ~ ["new", "a", "status"], 20, 4, t.length + 1);
+    assert(screen.canFind("\x1b[3J"), screen);
 }
