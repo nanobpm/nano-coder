@@ -414,6 +414,11 @@ final class FrameRenderer
         // Rewind through continuations in either frame: a soft wrap that
         // became a hard newline must also clear the old row's wrap flag.
         while (diff > top && (joins(frame, diff) || joins(prev, diff))) diff--;
+        // The row above the screen keeps its wrap flag, so a join at `top`
+        // that changed (soft became hard or the reverse) can't be rewritten
+        // in place: the copy would still join (or split) the old way.
+        if (diff == top && top > 0 && joins(frame, top) != joins(prev, top))
+            return fullRedraw(frame, width, height);
         auto shown = frame.dup;
         if (frame.length < prev.length)
         {
