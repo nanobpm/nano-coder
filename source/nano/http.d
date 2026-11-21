@@ -496,7 +496,12 @@ struct SseParser
     private void dispatch(scope void delegate(string) @safe emit)
     {
         if (!hasData) return;
-        auto d = data;
+        // Chunks arrive unchecked (a network chunk may end inside a
+        // character), so validate once here: a completed event holds every
+        // byte of any multi-byte character, and invalid bytes become U+FFFD
+        // instead of reaching the consumer as broken UTF-8.
+        import std.string : representation;
+        auto d = lossyText(data.representation);
         data = null;
         hasData = false;
         emit(d);
@@ -513,6 +518,27 @@ unittest
     p.feed(":1}\r\n\r\ndata: one\ndata: two\n\ndata: [DONE]", &emit);
     p.finish(&emit);
     assert(got == [`{"a":1}`, "one\ntwo", "[DONE]"]);
+}
+
+// Completed events are sanitized before delivery: invalid bytes in a stream
+// become U+FFFD instead of reaching the consumer as broken UTF-8, and a
+// multi-byte character split across network chunks survives whole.
+unittest
+{
+    string[] got;
+    SseParser p;
+    void emit(string s) { got ~= s; }
+    // "hé" split inside the é (0xC3 0xA9) across two chunks, plus a bad byte.
+    p.feed("data: h\xc3", &emit);
+    p.feed("\xa9llo \xff!\n\n", &emit);
+    p.finish(&emit);
+    assert(got == ["héllo \uFFFD!"], got[0]);
+    // An event that ends without a trailing blank line is still sanitized.
+    got = null;
+    SseParser q;
+    q.feed("data: a\xffb", &emit);
+    q.finish(&emit);
+    assert(got == ["a\uFFFDb"], got[0]);
 }
 
 // Unreachable network: transport failures keep retrying past maxRetries until
