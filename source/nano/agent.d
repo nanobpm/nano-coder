@@ -1668,7 +1668,9 @@ class Agent
         // it was — and closes the incoming log, which the agent never
         // adopted, so its descriptor and lock do not leak into `openHere`.
         auto repairs = danglingRepairs(r.conversation);
-        scope (failure) newLog.ifSome((SessionLog l) { l.close(); });
+        // Once `replaceLog` adopts it the log is the live writer: a later
+        // failure (e.g. a throwing timers callback) must not close it.
+        scope (failure) if (!ownsLog(newLog)) newLog.ifSome((SessionLog l) { l.close(); });
         foreach (ref m; repairs)
         {
             import nano.session : nowStamp;
@@ -1745,6 +1747,17 @@ class Agent
 
     /// Switch to `newLog`, closing the outgoing log (releasing its lock and
     /// descriptor) unless it is the same object.
+    /// Whether `l` is the agent's live writer (ownership has transferred).
+    bool ownsLog(Option!SessionLog l)
+    {
+        bool same;
+        log.ifSome((SessionLog cur) { l.ifSome((SessionLog n) { same = n is cur; }); });
+        return same;
+    }
+
+    /// ditto
+    bool ownsLog(SessionLog l) { return ownsLog(some(l)); }
+
     void replaceLog(Option!SessionLog newLog)
     {
         auto old = log;

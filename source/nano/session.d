@@ -804,8 +804,10 @@ Restored restore(string path)
             throw new Exception("session log " ~ path ~ " does not start with a session header");
         if (type == "plan")
         {
-            // A snapshot supersedes every earlier delta: replay restarts here.
-            planFrom = planDeltas.length;
+            // A snapshot supersedes every earlier delta: drop them (bounding
+            // memory as well as replay) and restart the suffix here.
+            planDeltas = null;
+            planFrom = 0;
             r.plan = data["plan"];
             index++;
             continue;
@@ -1208,9 +1210,11 @@ private File createPrivate(string path)
 private void syncDirOf(string path) @trusted
 {
     import core.stdc.errno : errno, EINVAL;
-    import core.sys.posix.fcntl : O_RDONLY, O_DIRECTORY;
+    // Plain O_RDONLY: druntime lacks O_DIRECTORY on macOS, and the parent
+    // of a path is a directory by construction.
+    import core.sys.posix.fcntl : O_RDONLY;
     import nano.safeio : openPath, fsyncFd, closeFd;
-    auto fd = openPath(path.dirName, O_RDONLY | O_DIRECTORY);
+    auto fd = openPath(path.dirName, O_RDONLY);
     if (fd < 0)
     {
         if (errno == EINVAL) return;

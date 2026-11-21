@@ -728,19 +728,20 @@ final class AcpServer : AgentEvents
         import std.file : getcwd;
         auto path = findSession(host.sessionDir, want);
         auto sys = host.systemPrompt !is null ? host.systemPrompt(getcwd()) : null;
-        agent.messages = sys.length ? [Message.system(sys)] : null;
         // Lock the log first, then read the state the lock covers: a writer
         // finishing a turn while the lock wait blocks would otherwise be
-        // adopted from a pre-turn snapshot and the turn re-run.
+        // adopted from a pre-turn snapshot and the turn re-run. The live
+        // conversation is kept until the lock and restore succeed.
         auto log = new SessionLog(path);
         // Close on failure only until the agent adopts the log: after
-        // `loadRestored` it is the agent's live writer, and a hook or replay
-        // failure must not close it from under the session.
-        bool adopted;
-        scope (failure) if (!adopted) log.close();
+        // `loadRestored` takes it (even if it throws later) it is the agent's
+        // live writer, and a hook or replay failure must not close it.
+        scope (failure) if (!agent.ownsLog(log)) log.close();
         auto restored = restore(log.path);
+        auto prior = agent.messages;
+        scope (failure) if (!agent.ownsLog(log)) agent.messages = prior;
+        agent.messages = sys.length ? [Message.system(sys)] : null;
         agent.loadRestored(restored, some(log)); // ACP has no channel for the dropped-state notes
-        adopted = true;
         sessionId = log.id;
         if (host.loadHooks !is null) agent.useHooks(host.loadHooks(getcwd()), true);
         replayHistory();

@@ -1942,14 +1942,14 @@ int runMain(string[] args)
         {
             auto incoming = new SessionLog(path);
             // Close on failure only until the agent adopts the log: after
-            // `loadRestored` it is the agent's live writer.
-            bool adopted;
-            scope (failure) if (!adopted) incoming.close();
+            // `loadRestored` adopts it (even if it throws afterwards) it is
+            // the agent's live writer.
+            scope (failure) if (!agent.ownsLog(incoming)) incoming.close();
             newLog = some(incoming);
             restored = restore(incoming.path);
-            foreach (note; agent.loadRestored(restored, newLog))
+            auto notes = agent.loadRestored(restored, newLog);
+            foreach (note; notes)
                 stdErr.writeln("nano-coder: ignoring ", note);
-            adopted = true;
         }
         else
         {

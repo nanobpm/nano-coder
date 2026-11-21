@@ -484,6 +484,7 @@ Summary[] list(string dir, bool strictIndex = false)
     auto index = load(dir, lines, strictIndex);
     Summary[string] current;
     Summary[] updates;
+    Summary[string] skippedTitled;
     foreach (DirEntry e; dirEntries(dir, SpanMode.shallow, false))
     {
         auto name = e.name.baseName;
@@ -493,7 +494,14 @@ Summary[] list(string dir, bool strictIndex = false)
         try validateId(id);
         catch (Exception) continue; // not a session log name: skip
         if (!e.isFile) continue;
-        if (compressed && buildPath(dir, id ~ ".jsonl").exists) continue; // the plain twin wins
+        if (compressed && buildPath(dir, id ~ ".jsonl").exists)
+        {
+            // The plain twin wins. An archive resume may publish it after the
+            // iterator passed it: remember the title so the rewrite keeps it.
+            if (auto cached_ = id in index)
+                if (cached_.title !is null) skippedTitled[id] = *cached_;
+            continue;
+        }
         auto size = e.size;
         Summary s;
         auto cached = id in index;
@@ -533,6 +541,18 @@ Summary[] list(string dir, bool strictIndex = false)
         if (cached !is null) index.remove(id);
         s.path = e.name;
         current[id] = s;
+    }
+    // A titled archive skipped for a plain twin the listing never yielded:
+    // keep its title (zero prompts hides it) and a zero log size, which no
+    // real log has, so the next listing summarizes the plain log afresh.
+    foreach (id, k; skippedTitled)
+    {
+        if (id in current) continue;
+        k.prompts = 0;
+        k.logBytes = 0;
+        k.archiveBytes = 0;
+        current[id] = k;
+        index.remove(id);
     }
     try
     {
