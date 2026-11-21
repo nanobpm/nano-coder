@@ -2343,6 +2343,7 @@ int runMain(string[] args)
                 else nano.herdr.report(nano.herdr.State.idle);
             }
             else nano.herdr.report(nano.herdr.State.idle);
+            nano.herdr.showModel(agent.client.modelName);
             // The prompt's stamp is redrawn with the submission time (Rust's restamp).
             ed.restyle = () => console.stamp() ~ console.bold("› ");
             // While the Ctrl-C exit hint is armed, end the read when the window

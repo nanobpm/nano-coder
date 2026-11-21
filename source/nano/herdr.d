@@ -107,6 +107,30 @@ string[] releaseArgs(string pane, ulong seq) pure
     return ["pane", "release-agent", pane, "--source", source, "--agent", agent, "--seq", seq.to!string];
 }
 
+/// The model's short name: the part after the last `/`, so
+/// `anthropic/claude-sonnet-4.5` shows as `claude-sonnet-4.5`.
+string shortModel(string model) pure
+{
+    import std.string : lastIndexOf;
+    auto slash = model.lastIndexOf('/');
+    return slash < 0 ? model : model[slash + 1 .. $];
+}
+
+/// The arguments for a display-only metadata report: the agent shown as
+/// `nano-coder · <model>`, plus a `model` token. An empty model clears both.
+/// Metadata changes only what Herdr shows; state and session restore are
+/// unaffected, and a Herdr without `report-metadata` just fails the call.
+string[] metadataArgs(string pane, string model) pure
+{
+    import std.uni : isControl;
+    import std.algorithm : filter;
+    import std.conv : text;
+    string[] args = ["pane", "report-metadata", pane, "--source", source, "--agent", agent];
+    string clean = model.filter!(c => !isControl(c)).text;
+    if (!clean.length) return args ~ ["--clear-display-agent", "--clear-token", "model"];
+    return args ~ ["--display-agent", agent ~ " · " ~ clean, "--token", "model=" ~ clean];
+}
+
 /// A report waiting to be sent: sequence numbers for the state report and,
 /// when the session changed, the session report that follows it.
 private struct Queued
@@ -136,6 +160,9 @@ private struct Reporter
     Session lastSession;
     /// The last sequence number used; strictly increasing.
     ulong seq;
+    /// The model to show, when it changed since the last metadata report.
+    bool hasPendingModel;
+    string pendingModel, lastModel;
 }
 
 private shared Locked!Reporter gReporter;
@@ -209,17 +236,36 @@ void report(State state, string message = null, Session session = Session.init, 
     });
 }
 
+/// Show `model` (its short name) next to the agent's name in Herdr, in the
+/// background. Repeats are skipped.
+void showModel(string model)
+{
+    if (!active) return;
+    auto name = shortModel(model);
+    atomicLoad(gReporter).update((ref Reporter r) {
+        if (name == r.lastModel) return;
+        r.lastModel = name;
+        r.pendingModel = name;
+        r.hasPendingModel = true;
+    });
+}
+
 /// Release the pane on exit. Runs in the foreground (bounded by a timeout)
 /// so it is sent before the process ends; drops any report still pending.
 void release()
 {
     if (!active) return;
     Pane pane;
+    bool shown;
     ulong seq = atomicLoad(gReporter).update!ulong((ref Reporter r) {
-        r.hasPending = false;
+        r.hasPending = r.hasPendingModel = false;
+        shown = r.lastModel.length > 0;
+        r.lastModel = null;
         pane = r.pane;
         return nextSeq(r);
     });
+    // Metadata outlives the release, so clear the model first.
+    if (shown) run(pane.bin, metadataArgs(pane.id, null));
     run(pane.bin, releaseArgs(pane.id, seq));
 }
 
@@ -227,12 +273,22 @@ private void worker(string bin, string pane)
 {
     for (;;)
     {
-        auto q = atomicLoad(gReporter).await!Queued((ref const Reporter r) => r.hasPending, (ref Reporter r) {
-            r.hasPending = false;
-            return r.pending;
-        });
-        run(bin, reportArgs(pane, q.state, q.stateSeq, q.message));
-        if (q.hasSession) run(bin, sessionArgs(pane, q.sessionSeq, q.session));
+        bool hasState, hasModel;
+        string model;
+        auto q = atomicLoad(gReporter).await!Queued((ref const Reporter r) => r.hasPending || r.hasPendingModel,
+            (ref Reporter r) {
+                hasState = r.hasPending;
+                hasModel = r.hasPendingModel;
+                model = r.pendingModel;
+                r.hasPending = r.hasPendingModel = false;
+                return r.pending;
+            });
+        if (hasState)
+        {
+            run(bin, reportArgs(pane, q.state, q.stateSeq, q.message));
+            if (q.hasSession) run(bin, sessionArgs(pane, q.sessionSeq, q.session));
+        }
+        if (hasModel) run(bin, metadataArgs(pane, model));
     }
 }
 
@@ -348,4 +404,15 @@ unittest // outside Herdr nothing starts and reports are no-ops
         report(State.working);
         release();
     }
+}
+
+unittest // the model shows by its short name, and an empty one clears it
+{
+    assert(shortModel("anthropic/claude-sonnet-4.5") == "claude-sonnet-4.5");
+    assert(shortModel("openrouter/moonshotai/kimi-k2") == "kimi-k2");
+    assert(shortModel("gpt-5") == "gpt-5");
+    assert(metadataArgs("p1", "gpt-5") == ["pane", "report-metadata", "p1", "--source", "nano-coder", "--agent",
+        "nano-coder", "--display-agent", "nano-coder · gpt-5", "--token", "model=gpt-5"]);
+    assert(metadataArgs("p1", "gpt\x1b-5")[$ - 1] == "model=gpt-5");
+    assert(metadataArgs("p1", null)[$ - 3 .. $] == ["--clear-display-agent", "--clear-token", "model"]);
 }
