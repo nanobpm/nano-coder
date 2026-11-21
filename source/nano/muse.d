@@ -8,7 +8,7 @@
 module nano.muse;
 
 @safe:
-import nano.safeio : jsonText, jsonPretty;
+import nano.safeio : jsonText, jsonPretty, jsonUnsigned;
 import nano.clock : wallNow;
 
 import std.json;
@@ -112,7 +112,12 @@ struct StoredCredentials
         c.oauthToken = j["oauth_token"].str;
         c.refreshToken = str("refresh_token");
         if (auto v = "expires_at" in j)
-            if (v.type == JSONType.integer || v.type == JSONType.uinteger) c.expiresAt = v.integer;
+        {
+            // Reading `.integer` on a uinteger tag throws, so clamp the way
+            // plan.d/session_history.d do.
+            ulong n;
+            if (jsonUnsigned(*v, n)) c.expiresAt = n > ulong(long.max) ? long.max : long(n);
+        }
         c.apiKey = str("api_key");
         c.apiBase = str("api_base");
         c.createdAt = str("created_at");
@@ -233,7 +238,10 @@ private Nullable!long intField(const JSONValue j, string k) pure
 {
     if (j.type != JSONType.object) return Nullable!long.init;
     auto v = k in j;
-    if (v && (v.type == JSONType.integer || v.type == JSONType.uinteger)) return Nullable!long(v.integer);
+    // Reading `.integer` on a uinteger tag throws, so clamp the way
+    // plan.d/session_history.d do.
+    ulong n;
+    if (v && jsonUnsigned(*v, n)) return Nullable!long(n > ulong(long.max) ? long.max : long(n));
     return Nullable!long.init;
 }
 
@@ -451,7 +459,12 @@ private long positive(const JSONValue row, string[] keys) pure
     if (row.type != JSONType.object) return 0;
     foreach (k; keys)
         if (auto v = k in row)
-            if (v.type == JSONType.integer || v.type == JSONType.uinteger) return v.integer > 0 ? v.integer : 0;
+        {
+            // Reading `.integer` on a uinteger tag throws, so clamp the way
+            // plan.d/session_history.d do.
+            ulong n;
+            if (jsonUnsigned(*v, n)) return n > ulong(long.max) ? long.max : long(n);
+        }
     return 0;
 }
 
@@ -592,4 +605,26 @@ unittest
     assert(museVision(rows[0]) && !museVision(rows[1]) && !museVision(rows[2]) && !museVision(rows[4]));
     assert(listableModels(cat) == ["muse-spark-1.3"]);
     assert(catalogRows(parseJSON(`[{"id":"x"}]`)).length == 1);
+}
+
+// A uinteger-tagged number (JSONValue(1u), or any value > long.max such as
+// ulong.max) must be read, not throw: reading `.integer` on a uinteger tag
+// raises JSONException. Oversized values clamp to long.max.
+unittest
+{
+    // StoredCredentials.fromJSON: expires_at
+    auto c = StoredCredentials.fromJSON(JSONValue(["oauth_token": JSONValue("t"), "expires_at": JSONValue(1u)]));
+    assert(!c.expiresAt.isNull && c.expiresAt.get == 1);
+    c = StoredCredentials.fromJSON(JSONValue(["oauth_token": JSONValue("t"), "expires_at": JSONValue(ulong.max)]));
+    assert(!c.expiresAt.isNull && c.expiresAt.get == long.max);
+
+    // intField: device/poll payloads
+    assert(intField(JSONValue(["interval": JSONValue(5u)]), "interval").get == 5);
+    assert(intField(JSONValue(["interval": JSONValue(ulong.max)]), "interval").get == long.max);
+    assert(intField(JSONValue(["interval": JSONValue(-3)]), "interval").isNull);
+
+    // positive: catalog context/output limits
+    assert(contextLimit(JSONValue(["context_limit": JSONValue(200_000u)])) == 200_000);
+    assert(contextLimit(JSONValue(["context_limit": JSONValue(ulong.max)])) == long.max);
+    assert(outputLimit(JSONValue(["output_limit": JSONValue(-1)])) == 0);
 }
