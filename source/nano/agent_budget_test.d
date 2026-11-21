@@ -267,6 +267,20 @@ unittest
     assert(agent.sessionInputTokens == 1_000);
 }
 
+// A malformed provider pair such as long.max + 1 must not wrap the signed
+// sum into a zero calibration: the operands convert separately and the sizes
+// sum with checked arithmetic (which halts rather than wrapping).
+unittest
+{
+    LLMResponse hi = LLMResponse("hi");
+    hi.usage.inputTokens = 1_000;
+    hi.usage.outputTokens = long.max - 500; // representable per operand
+    auto agent = new Agent(new MockClient([hi]), new ToolRegistry, Policy.init, "system");
+    bool calibrated;
+    agent.run("go", new NullEvents);
+    assert(agent.estimateContextTokens(calibrated) == size_t(1_000) + (long.max - 500) && calibrated);
+}
+
 // A newer image after the usage anchor displaces the anchored one into a
 // placeholder (one image slot), so the anchor's full-image charge is stale and
 // the estimate recomputes the conversation as the wire plan sends it.
