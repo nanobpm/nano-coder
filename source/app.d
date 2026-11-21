@@ -1583,6 +1583,11 @@ string timersText(Agent agent)
 void replayTranscript(Agent agent, Console console)
 {
     auto msgs = agent.replayMessages;
+    // Each toolEnd would refresh the view (a token estimate over the whole
+    // conversation): quadratic on long sessions, so refresh once at the end.
+    auto after = console.afterStep;
+    console.afterStep = null;
+    scope (exit) { console.afterStep = after; if (after !is null) after(); }
     size_t[2][string] calls; // call ID -> [message, call] index into msgs
     scope (exit) console.replayTime = null;
     foreach (i, ref m; msgs)
@@ -1592,11 +1597,15 @@ void replayTranscript(Agent agent, Console console)
         {
         case Role.system: break;
         case Role.user:
-            if (m.content.strip.length)
-                writeln(stampBlock(console.stamp(), console.bold("› ") ~ escapeMarks(sanitizeBlock(m.content))));
+        {
+            // Hook context appended to the prompt was never shown live.
+            auto typed = m.pinText.length ? m.pinText : m.content;
+            if (typed.strip.length)
+                writeln(stampBlock(console.stamp(), console.bold("› ") ~ escapeMarks(sanitizeBlock(typed))));
             break;
+        }
         case Role.assistant:
-            if (m.content.strip.length) writeln(stampBlock(console.stamp(), console.display(m.content).stripRight));
+            if (m.content.strip.length) writeln(stampBlock(console.stamp(), escapeMarks(console.display(sanitizeBlock(m.content))).stripRight));
             foreach (j, ref c; m.toolCalls)
             {
                 calls[c.id] = [i, j];
@@ -1609,7 +1618,7 @@ void replayTranscript(Agent agent, Console console)
             break;
         }
     }
-    if (!agent.plan.empty) writeln(planText(agent));
+    if (!agent.plan.empty) writeln(escapeMarks(sanitizeBlock(planText(agent))));
     // toolStart/toolEnd drive the live status; the replay leaves it idle.
     updateStatus((ref Stats s) { s.activity = Activity.idle; s.tool = null; s.tokensPerSec = 0;
         s.historySearches = s.historyReads = 0; });
@@ -2019,8 +2028,11 @@ int runMain(string[] args)
     }
 
     /// Load a saved session into the agent: its conversation, plan and log.
-    void loadSession(string path)
+    /// Load a saved session; returns its diagnostics so a frame caller can
+    /// print them after clearing and replaying the transcript.
+    string[] loadSession(string path)
     {
+        string[] notes;
         // Lock the log first, then read the state the lock covers: a writer
         // finishing a turn while the lock wait blocks would otherwise be
         // adopted from a pre-turn snapshot and the turn re-run. A failure
@@ -2037,23 +2049,22 @@ int runMain(string[] args)
             scope (failure) if (!agent.ownsLog(incoming)) incoming.close();
             newLog = some(incoming);
             restored = restore(incoming.path);
-            auto notes = agent.loadRestored(restored, newLog);
-            foreach (note; notes)
-                stdErr.writeln("nano-coder: ignoring ", note);
+            foreach (note; agent.loadRestored(restored, newLog))
+                notes ~= "nano-coder: ignoring " ~ note;
         }
         else
         {
             restored = restore(path);
             foreach (note; agent.loadRestored(restored, newLog))
-                stdErr.writeln("nano-coder: ignoring ", note);
+                notes ~= "nano-coder: ignoring " ~ note;
         }
         updateStatus((ref Stats s) { s.historySearches = s.historyReads = 0; });
         if (!agent.timers.empty)
-            stdErr.writefln("%s timer%s still set (/timers lists them)", agent.timers.items.length,
+            notes ~= format("%s timer%s still set (/timers lists them)", agent.timers.items.length,
                 agent.timers.items.length == 1 ? "" : "s");
-        stdErr.writefln("resumed %s (%s messages)", restored.id, agent.messages.length - 1);
+        notes ~= format("resumed %s (%s messages)", restored.id, agent.messages.length - 1);
         if (restored.pendingInput.length)
-            stdErr.writefln("the last prompt never finished (the session was interrupted): %s",
+            notes ~= format("the last prompt never finished (the session was interrupted): %s",
                 oneLine(restored.pendingInput));
         // Reading a long session's log parses every record of it (a log can
         // run to hundreds of MB of superseded compaction snapshots); the
@@ -2062,11 +2073,12 @@ int runMain(string[] args)
         // life of the process.
         restored = Restored.init;
         releaseHeap();
+        return notes;
     }
 
     try
     {
-        if (o.hasResume) loadSession(findSession(sessionDir, o.resume, cwd));
+        if (o.hasResume) foreach (n; loadSession(findSession(sessionDir, o.resume, cwd))) stdErr.writeln(n);
         else if (!o.noSession)
         {
             auto log = new SessionLog(sessionDir, spec, cwd);
@@ -2810,9 +2822,12 @@ int runMain(string[] args)
                     try { validateId(id); path = nano.session.findSession(sessionDir, id); ok = path.isFile; }
                     catch (Exception) {} // an invalid ID or unreadable path is reported as "no saved session" just below
                     if (!ok) { writefln("No saved session %s: /resume without an ID lists them", JSONValue(id).jsonText); continue; }
-                    try loadSession(path);
+                    string[] loadNotes;
+                    try loadNotes = loadSession(path);
                     catch (Exception e) { writeln(e.msg); continue; }
                     if (gFrame) { gFrame.clear(); replayTranscript(agent, console); }
+                    foreach (n; loadNotes) stdErr.writeln(n);
+                    stdErr.flush();
                     writefln("Resumed session %s (resume later with --resume %s)", id, id);
                     continue;
                 }
