@@ -270,7 +270,7 @@ private bool editContext(SettingsUi ui, ref SettingsHost h)
         }
     }
     auto m = ui.select("Compaction mode", ["standard: summary only",
-        "smart (experimental): summary cites the session log; history tools recover originals"],
+        "smart: summary cites the session log; history tools recover originals"],
         cfg.compactionMode == "smart" ? 1 : 0);
     if (m < 0) return false;
     auto w = ui.input("Context window in tokens (0 = from provider/model)", format("%s", cfg.contextWindow));
