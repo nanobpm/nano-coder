@@ -184,7 +184,7 @@ def pinned_request(seed, filler_turns):
     filler(log, rng, filler_turns)
     return log.records, (
         "Before we begin: what exact flag, how many passes, and what label did I ask for at the very start?"
-    ), [flag, f"{count} passes", phrase], []
+    ), [flag, rf"\b{count}\W+passes|passes\W+(?:exactly\W+)?{count}\b", phrase], []
 
 
 CASES = {

@@ -43,9 +43,11 @@ sys.path.insert(0, str(HERE))
 import cases as synthetic  # noqa: E402
 
 # Denied unless --tools all: synthetic logs describe a project that doesn't
-# exist, so without history tools the agent would explore the real disk.
-WORK_TOOLS = ("bash", "read_file", "write_file", "edit_file")
-OVERRIDDEN = ("session_dir", "compaction_mode", "compaction_pin_requests", "auto_compact", "persist_sessions", "project_instructions", "model")
+# exist, so without history tools the agent would explore the real disk (and
+# a fork of a real log would find its answers there, not in the history).
+WORK_TOOLS = ("bash", "read_file", "write_file", "edit_file", "grep", "glob", "web_fetch", "load_skill")
+OVERRIDDEN = ("session_dir", "compaction_mode", "compaction_pin_requests", "auto_compact", "persist_sessions",
+              "project_instructions", "model", "memory", "disable_hooks", "user_instruction_files")
 
 
 def default_config():
@@ -234,6 +236,12 @@ def config_text(base, session_dir, mode, extra_body=None, providers=(), pin=True
         "auto_compact = false",
         "persist_sessions = true",
         "project_instructions = false",
+        # Nothing from outside the session: saved memories, hook-injected
+        # context (SessionStart) and global instruction files can all hold
+        # the answer to a question about a real session.
+        'memory = "off"',
+        "disable_hooks = true",
+        "user_instruction_files = []",
     ]
     tail = []
     if extra_body:
