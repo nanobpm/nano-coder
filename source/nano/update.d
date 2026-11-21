@@ -210,6 +210,18 @@ string latestUrl(Channel c) pure
 
 private string joinWords(string[] a) pure { import std.array : join; return a.join(" "); }
 
+/// The step as a copy-pasteable shell command: its environment overrides
+/// (sorted, as `K=V` prefixes) then the program and arguments, so a manual
+/// retry reproduces exactly what `/update` ran.
+string stepCommand(InstallStep step)
+{
+    import std.algorithm : sort;
+    import std.array : array;
+    string s;
+    foreach (k; step.env.keys.array.sort) s ~= k ~ "=" ~ step.env[k] ~ " ";
+    return s ~ step.program ~ " " ~ step.args.joinWords;
+}
+
 /// Checks are off by environment.
 bool disabledByEnv()
 {
@@ -470,7 +482,7 @@ string[] runInstaller(Channel channel, string exe, string running,
         steps = installSteps(channel, tapRepo);
         foreach (i, step; steps)
         {
-            shown = step.program ~ " " ~ step.args.joinWords;
+            shown = stepCommand(step);
             // A failed tap refresh (offline, diverged tap, or git missing so
             // the spawn throws) stops the update before any brew run: plain
             // `brew upgrade` would re-enable the all-tap auto-update and
@@ -801,6 +813,10 @@ unittest
     assert(steps[1].env["HOMEBREW_NO_INSTALL_CLEANUP"] == "1" && steps[1].env["HOMEBREW_NO_ENV_HINTS"] == "1");
     auto plain = installSteps(Channel.brew, null);
     assert(plain.length == 1 && plain[0].args == ["upgrade", brewFormula] && plain[0].env is null);
+    assert(stepCommand(plain[0]) == "brew upgrade " ~ brewFormula);
+    assert(stepCommand(steps[0]) == "git -C /tap pull --ff-only --quiet");
+    assert(stepCommand(steps[1]) == "HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 "
+        ~ "HOMEBREW_NO_INSTALL_CLEANUP=1 brew upgrade " ~ brewFormula);
     assert(installSteps(Channel.npm, "/tap").length == 1 && installSteps(Channel.other, "/tap") is null);
     if (which("brew") is null) return; // runInstaller needs brew on PATH
     string[] ran;
