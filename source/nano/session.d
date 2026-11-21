@@ -1010,8 +1010,11 @@ private void applyPlanDelta(ref Plan p, JSONValue data)
     import nano.result : unwrap;
     import std.algorithm : countUntil;
     auto base = "base" in data;
-    auto b = base !is null && base.type == JSONType.integer && base.integer >= 0
-        ? toSize(base.integer) : size_t.max;
+    // `planDelta` writes `base` from a size_t, which toJSON tags uinteger —
+    // an integer-only check reads a self-written log as a torn one and
+    // restarts the plan from the delta's items.
+    ulong bu = ulong.max;
+    auto b = base is null || !jsonUnsigned(*base, bu) ? size_t.max : toSize(bu);
     if (b > p.items.length) p = Plan.init;
     else if (b < p.items.length) p.items = p.items[0 .. b];
     if (auto g = "goal" in data)
@@ -1650,6 +1653,26 @@ unittest
     log.plan(parseJSON(`{"items":[{"id":1,"title":"x","status":"pending"}]}`));
     auto p3 = Plan.fromJSON(restore(log.path).plan).unwrap("a valid plan");
     assert(p3.goal.length == 0 && p3.items.length == 1 && p3.items[0].title == "x");
+    // A uinteger-tagged base — what `planDelta` itself writes from a size_t —
+    // applies as a base, not as a torn log restarting the plan.
+    {
+        auto p4 = Plan.fromJSON(parseJSON(
+            `{"goal":"g","items":[{"id":1,"title":"a","status":"pending"},{"id":2,"title":"b","status":"pending"}]}`)).unwrap("a valid plan");
+        JSONValue d;
+        d["base"] = JSONValue(2u);
+        d["drop"] = JSONValue([JSONValue(1u)]);
+        d["upserts"] = JSONValue([parseJSON(`{"id":2,"title":"b","status":"done"}`)]);
+        applyPlanDelta(p4, d);
+        assert(p4.goal == "g" && p4.items.length == 1 && p4.items[0].id == 2
+            && p4.items[0].status == Status.done, "a uinteger base keeps the first items");
+        // An out-of-shape base still restarts the plan from the delta's items.
+        auto p5 = p4;
+        JSONValue d5;
+        d5["base"] = JSONValue("two");
+        d5["upserts"] = JSONValue([parseJSON(`{"id":9,"title":"z","status":"pending"}`)]);
+        applyPlanDelta(p5, d5);
+        assert(p5.items.length == 1 && p5.items[0].id == 9, "a malformed base restarts the plan");
+    }
 }
 
 // gzip round-trip: a compressed log reads back byte-for-byte, and the tidy-up
