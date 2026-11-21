@@ -469,6 +469,9 @@ class SessionLog
     /// Tests: the next write fails (Rust `fail_next_persist`).
     bool failNextWrite;
 
+    /// Tests: whether `close` has released this writer's handle.
+    bool isOpenForWrite() const @safe { return f.isOpen; }
+
     /// Close the log (releasing its lock); a closed log must not be written.
     void close()
     {

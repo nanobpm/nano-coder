@@ -2582,6 +2582,32 @@ unittest
     assert(agent.pinStash is null);
 }
 
+// Round-5 review fix for issue #205: replacing the agent's log closes the
+// outgoing one (releasing its lock and descriptor); a no-op replace keeps it.
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse;
+    import std.path : buildPath;
+    import nano.providers.mock;
+    import nano.session : SessionLog, newSessionId;
+    auto dir = buildPath(tempDir, "nano-d-replacelog-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto agent = new Agent(new MockClient([LLMResponse("ok")]), new ToolRegistry, Policy.init, "sys");
+    auto first = new SessionLog(dir, "mock/m", "/w");
+    agent.replaceLog(some(first));
+    assert(first.isOpenForWrite, "the live log stays open");
+    auto second = new SessionLog(dir, "mock/m", "/w");
+    agent.replaceLog(some(second));
+    assert(!first.isOpenForWrite, "a replaced log is closed (lock and descriptor released)");
+    assert(second.isOpenForWrite, "the incoming log stays open");
+    // Re-setting the same log is a no-op, and dropping the log closes it.
+    agent.replaceLog(some(second));
+    assert(second.isOpenForWrite, "replacing a log with itself closes nothing");
+    agent.replaceLog(Option!SessionLog.init);
+    assert(!second.isOpenForWrite, "teardown (no new log) closes the outgoing log");
+}
+
 // Compaction: manual, past the threshold, and after a context overflow.
 unittest
 {
