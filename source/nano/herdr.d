@@ -163,6 +163,9 @@ private struct Reporter
     /// The model to show, when it changed since the last metadata report.
     bool hasPendingModel;
     string pendingModel, lastModel;
+    /// Whether `lastModel` holds a reported name, so a first empty name
+    /// (a clear) is still sent rather than mistaken for a repeat.
+    bool hasLastModel;
     /// Set by `release`; no metadata is sent afterwards.
     bool released;
     /// A metadata send is running in the worker; `release` waits for it so
@@ -189,6 +192,7 @@ private ulong beginRelease(ref Reporter r, out bool shown)
     shown = r.lastModel.length > 0 || r.modelInFlight || r.hasPendingModel;
     r.hasPending = r.hasPendingModel = false;
     r.lastModel = null;
+    r.hasLastModel = false;
     return nextSeq(r);
 }
 
@@ -197,8 +201,18 @@ private ulong beginRelease(ref Reporter r, out bool shown)
 private void endRelease(ref Reporter r)
 {
     r.released = false;
-    r.hasLast = r.hasLastSession = false;
+    r.hasLast = r.hasLastSession = r.hasLastModel = false;
     r.lastModel = null;
+}
+
+/// Queue `name` for display unless released or a repeat of the last one.
+private void queueModel(ref Reporter r, string name)
+{
+    if (r.released || (r.hasLastModel && name == r.lastModel)) return;
+    r.hasLastModel = true;
+    r.lastModel = name;
+    r.pendingModel = name;
+    r.hasPendingModel = true;
 }
 
 private shared Locked!Reporter gReporter;
@@ -278,12 +292,7 @@ void showModel(string model)
 {
     if (!active) return;
     auto name = shortModel(model);
-    atomicLoad(gReporter).update((ref Reporter r) {
-        if (r.released || name == r.lastModel) return;
-        r.lastModel = name;
-        r.pendingModel = name;
-        r.hasPendingModel = true;
-    });
+    atomicLoad(gReporter).update((ref Reporter r) { queueModel(r, name); });
 }
 
 /// Release the pane on exit. Runs in the foreground (bounded by a timeout)
@@ -500,6 +509,21 @@ unittest // a pending clear after a shown model still clears on release
     bool shown;
     beginRelease(r, shown);
     assert(shown && !r.hasPendingModel);
+}
+
+unittest // a first empty name still clears a predecessor's model; repeats are skipped
+{
+    Reporter r;
+    queueModel(r, "");
+    assert(r.hasPendingModel && r.pendingModel == "");
+    r.hasPendingModel = false;
+    queueModel(r, "");
+    assert(!r.hasPendingModel);
+    bool shown;
+    beginRelease(r, shown);
+    endRelease(r);
+    queueModel(r, "");
+    assert(r.hasPendingModel, "reacquiring reports an empty name afresh");
 }
 
 unittest // after a failed relaunch, model, state and session report again
