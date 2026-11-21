@@ -318,12 +318,10 @@ private void worker(string bin, string pane)
 {
     for (;;)
     {
-        bool hasState, hasModel;
-        string model;
+        bool hasState;
         auto q = atomicLoad(gReporter).await!Queued((ref const Reporter r) => r.hasPending || r.hasPendingModel,
             (ref Reporter r) {
                 hasState = r.hasPending;
-                hasModel = takeModel(r, model);
                 r.hasPending = false;
                 return r.pending;
             });
@@ -332,6 +330,11 @@ private void worker(string bin, string pane)
             run(bin, reportArgs(pane, q.state, q.stateSeq, q.message));
             if (q.hasSession) run(bin, sessionArgs(pane, q.sessionSeq, q.session));
         }
+        // Take the model only after state/session reporting, so a release
+        // that starts meanwhile discards it instead of waiting on unrelated
+        // reports before its own clear and release calls.
+        string model;
+        bool hasModel = atomicLoad(gReporter).update!bool((ref Reporter r) => takeModel(r, model));
         if (hasModel)
         {
             run(bin, metadataArgs(pane, model));
