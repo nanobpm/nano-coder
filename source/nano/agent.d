@@ -1665,7 +1665,9 @@ class Agent
             // A malformed plan is dropped; the session resumes.
             Plan.fromJSON(r.plan).match!((p) { plan = p; }, (e) { dropped ~= "the saved plan: " ~ e; });
         }
-        planDeltasSinceSnapshot = 0;
+        // The log's delta chain length is unknown here: snapshot on the next
+        // change so repeated short runs cannot grow the chain without bound.
+        planDeltasSinceSnapshot = planSnapshotEvery;
         Timers t;
         try t = Timers.fromJSON(r.timers);
         catch (Exception e) dropped ~= "the saved timers: " ~ e.msg; // malformed timers are dropped, the session resumes
