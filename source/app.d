@@ -1665,15 +1665,16 @@ void replayTranscript(Agent agent, Console console)
     stdOut.flush();
 }
 
-/// Whether the message after `msgs[i]` is a Stop hook's rejection (an
-/// automatic message that is not a continuation, timer or hook context).
-/// Stop-hook rejections are always a wrapped system reminder; an idle timer
-/// turn's message is automatic but unflagged and starts with the raw notice.
+/// Whether the message after `msgs[i]` is a Stop hook's rejection. New logs
+/// flag it explicitly (`stop_blocked`); for older logs, fall back to an
+/// unflagged automatic wrapped reminder (an idle timer turn's message is
+/// automatic but starts with the raw notice; a user steer is never automatic).
 bool stopRejected(const Message[] msgs, size_t i) pure nothrow @nogc @safe
 {
     import std.algorithm.searching : startsWith;
     if (i + 1 >= msgs.length) return false;
     const n = &msgs[i + 1];
+    if (n.stopBlocked) return n.role == Role.user;
     return n.role == Role.user && n.autoInitiated && !n.continuation && !n.timer && !n.hookContext
         && n.content.startsWith("<system-reminder>");
 }
@@ -1695,6 +1696,15 @@ unittest
     assert(!stopRejected(msgs, 4));
     assert(!stopRejected(msgs, 6));
     assert(!stopRejected(msgs, 8));
+    // Answer -> mid-turn steer (with reminder-like text) -> answer: the
+    // first answer stays visible; an explicit flag wins over the content.
+    auto flagged = Message.auto_("reason");
+    flagged.stopBlocked = true;
+    auto steered = [Message.assistant("a1"), Message.user("<system-reminder>steer"), Message.assistant("a2"),
+        flagged, Message.assistant("a3")];
+    assert(!stopRejected(steered, 0));
+    assert(stopRejected(steered, 2));
+    assert(!stopRejected(steered, 4));
 }
 
 string planText(Agent agent) pure

@@ -689,7 +689,9 @@ class Agent
                     },
                     (StopBlocked b) {
                         hasReported = false;
-                        push(Message.auto_(wrapReminder(b.reason)));
+                        auto rej = Message.auto_(wrapReminder(b.reason));
+                        rej.stopBlocked = true;
+                        push(rej);
                         ev.userMessage(b.reason);
                     },
                     (RunTools _) { next ~= runToolCalls(r, ev, loopStop); },
