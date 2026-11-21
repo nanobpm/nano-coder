@@ -368,3 +368,24 @@ unittest // a shrinking soft-wrapped draft opens its gap past the wrap, stably
     r.render(["t0", "a1", softWrapMark ~ "a2", softWrapMark ~ "a3", softWrapMark ~ "a4", "st"], 10, 4);
     assert(!screen.canFind("\x1b[3J"), strip(screen));
 }
+
+unittest // output after a scrolled-off editor shrank fills the gap, keeping scrollback
+{
+    string screen;
+    auto r = new FrameRenderer((string s) { screen ~= s; });
+    r.render(["t0", "t1", "e0", "e1", "e2", "e3", "e4", "e5", "st"], 10, 4, 2);
+    r.render(["t0", "t1", "e0", "st"], 10, 4, 2);
+    screen = null;
+    r.render(["t0", "t1", "new output", "e0", "st"], 10, 4, 3);
+    assert(!screen.canFind("\x1b[3J") && !screen.canFind("\x1b[2J"), strip(screen));
+    assert(screen.canFind("new output"), strip(screen));
+    screen = null;
+    r.render(["t0", "t1", "new output", "more", "e0", "st"], 10, 4, 4);
+    assert(!screen.canFind("\x1b[3J"), strip(screen));
+    assert(screen.canFind("more"), strip(screen));
+    // A change inside the frozen transcript still redraws everything.
+    screen = null;
+    r.render(["t0", "T1", "new output", "more", "e0", "st"], 10, 4, 4);
+    assert(screen.canFind("\x1b[3J"), strip(screen));
+    assert(!screen.canFind("e5"), strip(screen));
+}

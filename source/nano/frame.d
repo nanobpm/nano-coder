@@ -359,6 +359,10 @@ final class FrameRenderer
     private string[] prev;
     private size_t width, height;
     private bool started;
+    // After an editor shrink with rows in scrollback, `prev[0 .. frozen]` is
+    // physical history standing for the frame's first `frozenLogical` rows
+    // (the transcript) plus stale editor rows that can't be taken back.
+    private size_t frozen, frozenLogical;
 
     this(void delegate(string) @safe out_) pure { this.out_ = out_; }
 
@@ -391,6 +395,7 @@ final class FrameRenderer
         buf ~= syncEnd;
         out_(buf[]);
         prev = frame.dup;
+        frozen = frozenLogical = 0;
     }
 
     /// Rewrites from the first changed row. Rows that went into the
@@ -398,13 +403,28 @@ final class FrameRenderer
     /// bottom, so a user reading scrollback keeps their place. Only a change
     /// above the screen (a fold toggled far back, the transcript cap) or a
     /// row wider than the terminal redraws everything.
-    private void differential(const string[] frame, size_t width, size_t height, size_t gapAt)
+    private void differential(const string[] inFrame, size_t width, size_t height, size_t gapAt)
     {
+        // Map the logical frame onto the retained physical history: the
+        // transcript prefix is replaced by the frozen rows standing for it,
+        // so new output after it fills the gap instead of looking like a
+        // change to scrollback.
+        const(string)[] frame = inFrame;
+        const logicalGap = gapAt;
+        if (frozen)
+        {
+            if (frame.length < frozenLogical || prev.length < frozen
+                || frame[0 .. frozenLogical] != prev[0 .. frozenLogical]
+                || (gapAt != size_t.max && gapAt < frozenLogical))
+                return fullRedraw(inFrame, width, height);
+            frame = prev[0 .. frozen] ~ frame[frozenLogical .. $];
+            if (gapAt != size_t.max) gapAt = gapAt - frozenLogical + frozen;
+        }
         auto d = firstDiff(prev, frame);
         if (d < 0) return;
         // Screen rows are computed from entry indices: both frames must be one row per entry.
         if (physicalRows(frame, width) != frame.length || physicalRows(prev, width) != prev.length)
-            return fullRedraw(frame, width, height);
+            return fullRedraw(inFrame, width, height);
         auto top = saturatingSub(prev.length, height);
         // A shorter frame keeps its height: blank rows open at the gap (the
         // transcript's end). Compose that first and diff against it, so a
@@ -432,11 +452,13 @@ final class FrameRenderer
                 && frame.length - gapAt <= height && prev.length >= height)
             {
                 shown = prev[0 .. top].dup ~ new string[height - (frame.length - gapAt)] ~ frame[gapAt .. $];
+                frozen = top;
+                frozenLogical = logicalGap;
                 d = firstDiff(prev, shown);
                 if (d < 0) { prev = shown; return; }
             }
         }
-        if (d < top) return fullRedraw(frame, width, height);
+        if (d < top) return fullRedraw(inFrame, width, height);
         size_t diff = d;
         // A soft-wrapped line is rewritten from its start, so the terminal
         // keeps its wrap; but not past the top of the screen, as the rows
@@ -449,7 +471,7 @@ final class FrameRenderer
         // in place: the copy would still join (or split) the old way. A blank
         // row there is harmless: the old line just ends in spaces.
         if (diff == top && top > 0 && shown[top].length && joins(shown, top) != joins(prev, top))
-            return fullRedraw(frame, width, height);
+            return fullRedraw(inFrame, width, height);
         auto row = prev.length >= height ? diff - top + 1 : height - prev.length + diff + 1;
         auto buf = appender!string;
         // A pure append lands one row past the bottom (diff == prev.length). A
