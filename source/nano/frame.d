@@ -12,7 +12,7 @@ module nano.frame;
 @safe:
 import nano.arith : saturatingSub;
 
-import std.array : appender, replicate;
+import std.array : Appender, appender, replicate;
 import std.format : format;
 import std.utf : decode;
 import nano.lineedit : charWidth;
@@ -25,9 +25,24 @@ private enum DIM = "\x1b[2m", BOLD = "\x1b[1m", RESET = "\x1b[0m";
 /// blank after layout.
 enum dchar cursorMark = '\0';
 
+/// Starts a row that continues the logical line above it (a wrap the
+/// renderer made, not a newline in the text). It takes no cell: the renderer
+/// drops it and joins the rows through the terminal's own autowrap, so the
+/// terminal records a soft wrap and a copy across the rows has no newline.
+enum dchar softWrap = '\uE002';
+/// `softWrap` as a string.
+enum softWrapMark = "\uE002";
+
+/// `s` without soft-wrap marks (for output that bypasses the frame).
+string dropSoftWraps(string s) pure
+{
+    import std.array : replace;
+    return s.replace(softWrapMark, "");
+}
+
 size_t cellWidth(dchar c) pure nothrow
 {
-    return c == cursorMark ? 1 : charWidth(c);
+    return c == cursorMark ? 1 : c == softWrap ? 0 : charWidth(c);
 }
 
 private bool isFinal(dchar c) pure nothrow { return c >= '@' && c <= '~'; }
@@ -194,6 +209,7 @@ string[] wrapAnsi(string line, size_t width) pure
         vis += w;
     }
     out_ ~= cur;
+    foreach (ref r; out_[1 .. $]) r = softWrapMark ~ r;
     return out_;
 }
 
@@ -317,13 +333,16 @@ final class FrameRenderer
     /// The next render is a full redraw (something else drew on the screen).
     void invalidate() pure { started = false; }
 
-    void render(const string[] frame, size_t width, size_t height)
+    /// Draws `frame` (one terminal row per entry). `gapAt` is where blank
+    /// rows go when the frame gets shorter (the transcript's end): rows that
+    /// scrolled into the terminal's scrollback can't move back down, so the
+    /// frame keeps its height and the space fills as output arrives.
+    void render(const string[] frame, size_t width, size_t height, size_t gapAt = size_t.max)
     {
         if (width < 1) width = 1;
         if (height < 1) height = 1;
         if (!started || width != this.width || height != this.height) fullRedraw(frame, width, height);
-        else differential(frame, width, height);
-        prev = frame.dup;
+        else differential(frame, width, height, gapAt);
         this.width = width;
         this.height = height;
         started = true;
@@ -336,34 +355,68 @@ final class FrameRenderer
         buf ~= syncStart ~ "\x1b[r\x1b[H\x1b[2J\x1b[3J";
         auto physical = physicalRows(frame, width);
         buf ~= format("\x1b[%s;1H", physical < height ? height - physical + 1 : 1);
-        foreach (i, l; frame)
-        {
-            if (i) buf ~= "\r\n";
-            buf ~= l;
-        }
+        emitRows(buf, frame, width, false);
         buf ~= syncEnd;
         out_(buf[]);
+        prev = frame.dup;
     }
 
-    private void differential(const string[] frame, size_t width, size_t height)
+    /// Rewrites from the first changed row. Rows that went into the
+    /// terminal's scrollback are never touched: new rows scroll in at the
+    /// bottom, so a user reading scrollback keeps their place. Only a change
+    /// above the screen (a fold toggled far back, the transcript cap) or a
+    /// row wider than the terminal redraws everything.
+    private void differential(const string[] frame, size_t width, size_t height, size_t gapAt)
     {
-        auto diff = firstDiff(prev, frame);
-        if (diff < 0) return;
-        auto prevPhysical = physicalRows(prev, width), newPhysical = physicalRows(frame, width);
-        auto prevTop = saturatingSub(prev.length, height);
-        if (prevPhysical != newPhysical || diff < prevTop) return fullRedraw(frame, width, height);
-        size_t before;
-        foreach (l; frame[0 .. diff]) before += linePhysicalRows(l, width);
-        auto row = newPhysical <= height ? height - newPhysical + before + 1 : before - (newPhysical - height) + 1;
+        auto d = firstDiff(prev, frame);
+        if (d < 0) return;
+        if (physicalRows(frame, width) != frame.length) return fullRedraw(frame, width, height);
+        size_t diff = d;
+        // A soft-wrapped line is rewritten whole, so the terminal keeps its wrap.
+        while (diff > 0 && joins(frame, diff)) diff--;
+        auto shown = frame.dup;
+        if (frame.length < prev.length)
+        {
+            auto at = gapAt <= frame.length ? gapAt : diff;
+            if (at < diff) diff = at;
+            shown = frame[0 .. at] ~ new string[prev.length - frame.length] ~ frame[at .. $];
+        }
+        auto top = saturatingSub(prev.length, height);
+        if (diff < top) return fullRedraw(frame, width, height);
+        auto row = prev.length >= height ? diff - top + 1 : height - prev.length + diff + 1;
         auto buf = appender!string;
         buf ~= syncStart ~ format("\x1b[%s;1H", row);
-        foreach (i, l; frame[diff .. $])
-        {
-            if (i) buf ~= "\r\n";
-            buf ~= "\x1b[2K" ~ l;
-        }
+        emitRows(buf, shown[diff .. $], width, true);
         buf ~= syncEnd;
         out_(buf[]);
+        prev = shown;
+    }
+}
+
+/// Whether row `i` continues the row above it through a soft wrap.
+private bool joins(const string[] rows, size_t i) pure
+{
+    import std.string : indexOf;
+    return i > 0 && i < rows.length && rows[i].indexOf(softWrapMark) >= 0
+        && visibleWidth(dropSoftWraps(rows[i])) > 0;
+}
+
+/// Writes `rows` from the cursor. A row that continues the one above is
+/// reached through autowrap (the row above padded to the edge) rather than a
+/// newline, so the terminal joins them when text is copied. With `clear`,
+/// each row also erases what was there before.
+private void emitRows(ref Appender!string buf, const string[] rows, size_t width, bool clear)
+{
+    foreach (i, l; rows)
+    {
+        auto text = dropSoftWraps(l);
+        auto cont = joins(rows, i);
+        if (i && !cont) buf ~= "\r\n";
+        if (clear && !cont) buf ~= "\x1b[2K";
+        buf ~= text;
+        auto vis = visibleWidth(text);
+        if (joins(rows, i + 1)) { if (vis < width) buf ~= " ".replicate(width - vis); }
+        else if (clear && cont && vis < width) buf ~= "\x1b[K";
     }
 }
 
@@ -634,9 +687,11 @@ unittest
     assert(sanitize("\x1b[\r31mx") == "x");
     assert(fit("hello world", 6) == "hello…\x1b[0m");
     assert(fit("short", 10) == "short");
-    assert(wrapAnsi("the quick brown fox", 9) == ["the quick", "brown fox"]);
-    assert(wrapAnsi("abcdefghij", 4) == ["abcd", "efgh", "ij"]);
-    assert(wrapAnsi("ab中", 3) == ["ab", "中"]);
+    // Rows after the first carry the soft-wrap mark (they continue the line).
+    enum M = softWrapMark;
+    assert(wrapAnsi("the quick brown fox", 9) == ["the quick", M ~ "brown fox"]);
+    assert(wrapAnsi("abcdefghij", 4) == ["abcd", M ~ "efgh", M ~ "ij"]);
+    assert(wrapAnsi("ab中", 3) == ["ab", M ~ "中"]);
     assert(wrapAnsi("", 5) == [""]);
     assert(wrapBlock("a\nb", 5) == ["a", "b"]);
     auto ed = editorLines("› ", "hi"d, 2, 20);
@@ -667,8 +722,10 @@ unittest
     screen = null;
     r.render(["one", "TWO", "bar"], 10, 5);
     assert(!screen.length);
+    // Growing appends from the change and lets the terminal scroll: the
+    // screen and scrollback are not cleared, so a reader keeps their place.
     r.render(["one", "TWO", "x", "bar"], 10, 5);
-    assert(screen.canFind("\x1b[2J"));
+    assert(screen == syncStart ~ "\x1b[5;1H\x1b[2Kx\r\n\x1b[2Kbar" ~ syncEnd, screen);
     screen = null;
     r.render(["one", "TWO", "x", "bar"], 12, 5);
     assert(screen.canFind("\x1b[2J"));
@@ -691,13 +748,72 @@ unittest
     t.feed(bytes[0 .. 1]);
     t.feed(bytes[1 .. $]);
     assert(t.lines[$ - 1] == "é");
-    assert(t.render(3)[0 .. 2] == ["hel", "lo"]);
+    assert(t.render(3)[0 .. 2] == ["hel", softWrapMark ~ "lo"]);
     t.feed(cast(const(ubyte)[]) "\x1b[H\x1b[2J\x1b[3Jfresh");
     assert(!t.lines.length && t.render(10) == ["fresh"]);
     Transcript small;
     small.cap = 10;
     foreach (n; 0 .. 11) small.feed(cast(const(ubyte)[]) "x\n");
     assert(small.lines.length == 9);
+}
+
+// Wrapped rows reach the terminal through autowrap, so a copy has no newline.
+unittest
+{
+    import std.algorithm : canFind;
+    enum M = softWrapMark;
+    string screen;
+    auto r = new FrameRenderer((string s) { screen ~= s; });
+    // A 14-character command on a 6-column terminal: rows are joined by
+    // writing them back to back (full rows wrap on their own), never \r\n.
+    auto rows = wrapAnsi("rm -r /a/b/cde", 6);
+    assert(rows == ["rm -r", M ~ "/a/b/c", M ~ "de"], rows[1]);
+    r.render(rows ~ "status", 6, 10);
+    // "rm -r" is padded to the edge so the terminal wraps into "/a/b/c".
+    assert(screen.canFind("rm -r /a/b/cde\r\nstatus"), screen);
+    assert(!screen.canFind(M));
+
+    // A differential rewrite of a continuation row starts from its line.
+    screen = null;
+    r.render(["rm -r", M ~ "/a/b/c", M ~ "dX", "status"], 6, 10);
+    assert(screen.canFind("\x1b[2Krm -r /a/b/cdX\x1b[K\r\n\x1b[2Kstatus"), screen);
+
+    // An empty continuation (trailing spaces at the edge) can't autowrap: newline.
+    screen = null;
+    auto q = new FrameRenderer((string s) { screen ~= s; });
+    q.render(["abc", M, "s"], 3, 10);
+    assert(screen.canFind("abc\r\n\r\ns"), screen);
+}
+
+// Rows already in the scrollback are never cleared or rewritten; a shorter
+// frame leaves a gap above the editor instead of pulling rows back down.
+unittest
+{
+    import std.algorithm : canFind;
+    import std.format : format;
+    string screen;
+    auto r = new FrameRenderer((string s) { screen ~= s; });
+    string[] t;
+    foreach (n; 0 .. 8) t ~= format("line %s", n);
+    r.render(t ~ ["> edit", "more", "status"], 20, 4, t.length);
+    // Transcript grows by a row: only the bottom of the screen is written.
+    screen = null;
+    r.render(t ~ ["line 8", "> edit", "more", "status"], 20, 4, t.length + 1);
+    assert(!screen.canFind("\x1b[2J") && !screen.canFind("\x1b[3J"), screen);
+    assert(screen.canFind("line 8\r\n"), screen);
+    // The editor shrinks by a row: a blank row goes where the transcript ends.
+    screen = null;
+    r.render(t ~ ["line 8", "> e", "status"], 20, 4, t.length + 1);
+    assert(!screen.canFind("\x1b[3J"), screen);
+    assert(screen == syncStart ~ "\x1b[2;1H\x1b[2K\r\n\x1b[2K> e\r\n\x1b[2Kstatus" ~ syncEnd, screen);
+    // Output fills the gap without scrolling.
+    screen = null;
+    r.render(t ~ ["line 8", "line 9", "> e", "status"], 20, 4, t.length + 2);
+    assert(screen == syncStart ~ "\x1b[2;1H\x1b[2Kline 9\r\n\x1b[2K> e\r\n\x1b[2Kstatus" ~ syncEnd, screen);
+    // A change to a row in the scrollback (a fold far back) redraws everything.
+    screen = null;
+    r.render(["CHANGED"] ~ t[1 .. $] ~ ["line 8", "line 9", "> e", "status"], 20, 4, t.length + 2);
+    assert(screen.canFind("\x1b[3J"));
 }
 
 // ---- Whose turn it is: the prompt glyph and hint (ui.rs prompt_glyph/prompt_hint) ----
