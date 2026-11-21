@@ -1596,11 +1596,12 @@ string replayAnswerQuiet(const Message[] msgs, size_t i) pure nothrow @safe
     if (m.toolCalls.length || stopRejected(msgs, i)) return null;
     if (!isLengthStop(m.stopReason)) return m.content;
     // A cut-off chunk: the continuation reminder carries the answer on.
-    // System messages (compaction) and timer firings/nudges are transparent:
-    // a timer between a reminder and the reply keeps the accumulated answer.
+    // System messages (compaction), timer firings/nudges and hook-only
+    // context are transparent — none is user input — so one between a
+    // reminder and the reply keeps the accumulated answer.
     static bool transparent(const ref Message x) pure nothrow @safe
     {
-        return x.role == Role.system || (x.role == Role.user && x.timer && !x.continuation);
+        return x.role == Role.system || (x.role == Role.user && (x.hookContext || (x.timer && !x.continuation)));
     }
     size_t k = i + 1;
     while (k < msgs.length && transparent(msgs[k])) k++;
@@ -1612,17 +1613,14 @@ string replayAnswerQuiet(const Message[] msgs, size_t i) pure nothrow @safe
     // rejection superseded it (stopRejected above already covers those).
     if (msgs[k].role == Role.user && !msgs[k].continuation) return m.content;
     if (msgs[k].role != Role.user) return null;
-    // A chunk continuing an in-flight segment shows only the text its own
-    // continuation added when the answer stands (the prefix already showed
-    // with the segment's first chunk, which shows the accumulated whole).
-    size_t back = i;
-    while (back > 0 && transparent(msgs[back - 1])) back--;
-    const continued = back > 0 && msgs[back - 1].role == Role.user && msgs[back - 1].continuation;
+    // A chunk resolves to the accepted answer from itself on: itself plus
+    // the later chunks of its segment (the segment's final chunk is its own
+    // text). replayTranscript prints that once, at the segment's first
+    // chunk, suppressing the chunks a reminder continues.
     // The segment runs from the reminder on; the first message that closes
     // it decides whether the accumulated chunks stood.
     string kept = m.content;
-    string last = m.content; // the latest chunk, for a segment the budget capped
-    bool afterCut = false;   // the previous segment message was a cut-off chunk
+    bool afterCut = false; // the previous segment message was a cut-off chunk
     for (size_t j = k + 1; j < msgs.length; j++)
     {
         const n = msgs[j];
@@ -1638,18 +1636,18 @@ string replayAnswerQuiet(const Message[] msgs, size_t i) pure nothrow @safe
             if (n.stopBlocked || n.steered || !afterCut) return null;
             // A new turn after a capped chunk: the budget ended the turn on
             // the accumulated answer, which stood.
-            return continued ? last : kept;
+            return kept;
         case Role.assistant:
             // Discarded with the tool call that replaced the answer.
             if (n.toolCalls.length) return null;
             if (stopRejected(msgs, j)) return null;
-            if (isLengthStop(n.stopReason)) { kept ~= n.content; last = n.content; afterCut = true; break; }
-            return continued ? n.content : kept ~ n.content;
+            if (isLengthStop(n.stopReason)) { kept ~= n.content; afterCut = true; break; }
+            return kept ~ n.content;
         case Role.tool: return null;
         }
     }
     // The log ends on a capped chunk: the turn's visible tail.
-    if (afterCut) return continued ? last : kept;
+    if (afterCut) return kept;
     return null; // the log ends mid-segment: no accepted answer to show
 }
 
@@ -1676,14 +1674,14 @@ unittest
     assert(replayAnswerQuiet(msgs, 2) is null, "an answer carrying tool calls stays hidden in quiet");
     assert(replayAnswerQuiet(msgs, 4) == "fresh");
 
-    // A continuation that stood: the segment's first chunk shows the
-    // accepted answer whole (live, the turn's end reprints the accumulated
-    // answer); a chunk continuing the segment shows only the text its own
-    // continuation added (the prefix already showed with the first chunk).
+    // A continuation that stood: a cut-off chunk resolves to the accepted
+    // answer from itself on (itself plus the later chunks of its segment);
+    // the segment's final chunk is its own text. replayTranscript prints the
+    // whole once, at the segment's first chunk, suppressing the rest.
     auto ok = [cut("one "), cont, cut("two "), cont, Message.assistant("three")];
-    assert(replayAnswerQuiet(ok, 0) == "one two three");
-    assert(replayAnswerQuiet(ok, 2) == "three", "a continued chunk's prefix already showed with the first");
-    assert(replayAnswerQuiet(ok, 4) == "three");
+    assert(replayAnswerQuiet(ok, 0) == "one two three", "ok0=" ~ replayAnswerQuiet(ok, 0));
+    assert(replayAnswerQuiet(ok, 2) == "two three", "ok2=" ~ replayAnswerQuiet(ok, 2));
+    assert(replayAnswerQuiet(ok, 4) == "three", "ok4=" ~ replayAnswerQuiet(ok, 4));
 
     // A chunk the log cuts short on (crash before the reminder) shows: it
     // was the turn's visible tail.
@@ -1724,7 +1722,7 @@ unittest
     assert(replayAnswerQuiet(capped2, 2) == "two");
     // A new prompt while a reminder awaits its reply still discards.
     auto aborted = [cut("lost"), cont, Message.user("next"), Message.assistant("ok")];
-    assert(replayAnswerQuiet(aborted, 0) is null);
+    assert(replayAnswerQuiet(aborted, 0) is null, "aborted0=[" ~ replayAnswerQuiet(aborted, 0) ~ "]");
 
     // A timer firing during a continued answer keeps the retained prefix.
     auto tick = Message.auto_(wrapReminder("timer"));
@@ -1734,7 +1732,21 @@ unittest
     auto timed2 = [cut("one "), tick, cont, Message.assistant("two")];
     assert(replayAnswerQuiet(timed2, 0) == "one two", "a timer before the reminder is transparent");
     auto timed3 = [cut("one "), cont, tick, cut("two "), cont, Message.assistant("three")];
-    assert(replayAnswerQuiet(timed3, 3) == "three", "a timer before a continued chunk keeps it continued");
+    assert(replayAnswerQuiet(timed3, 3) == "two three", "a timer before a continued chunk keeps it continued");
+
+    // Hook-only context (a resumed turn's SessionStart block) is model-only
+    // like a timer: it never printed live, so it is transparent — a resumed
+    // interrupted turn (`cut → reminder → hookContext → answer`) keeps the
+    // cutoff prefix its continuation stood on.
+    auto hook = Message.user(wrapReminder("session context"));
+    hook.hookContext = true;
+    auto hooked = [cut("one "), cont, hook, Message.assistant("two")];
+    assert(replayAnswerQuiet(hooked, 0) == "one two", "hook context between reminder and reply keeps the prefix");
+    assert(replayAnswerQuiet(hooked, 3) == "two");
+    auto hooked2 = [cut("one "), cont, hook, cut("two "), cont, Message.assistant("three")];
+    assert(replayAnswerQuiet(hooked2, 0) == "one two three", "hook context mid-segment keeps the segment");
+    assert(replayAnswerQuiet(hooked2, 3) == "two three");
+    assert(replayAnswerQuiet(hooked2, 5) == "three");
 }
 
 /// Rebuild the transcript of a loaded session on the frame (Rust
@@ -1800,7 +1812,21 @@ void replayTranscript(Agent agent, Console console)
             // or rejection discarded never printed live.
             // A Stop hook rejecting the answer supersedes it: live quiet
             // mode keeps only the answer that finally stood.
-            auto shown = console.quiet ? replayAnswerQuiet(msgs, i) : m.content;
+            // Live quiet prints an accepted answer once, at turn end; replay
+            // prints it whole at the segment's first cut-off chunk (which
+            // accumulates the later chunks), suppressing the chunks a
+            // reminder continues — their text is already in that whole.
+            string shown;
+            if (console.quiet)
+            {
+                size_t back = i;
+                while (back > 0 && (msgs[back - 1].role == Role.system
+                    || (msgs[back - 1].role == Role.user && (msgs[back - 1].hookContext
+                        || (msgs[back - 1].timer && !msgs[back - 1].continuation))))) back--;
+                const continued = back > 0 && msgs[back - 1].role == Role.user && msgs[back - 1].continuation;
+                if (!(continued && isLengthStop(m.stopReason))) shown = replayAnswerQuiet(msgs, i);
+            }
+            else shown = m.content;
             if (shown.strip.length) writeln(stampBlock(console.stamp(), console.display(escapeMarks(sanitizeBlock(shown))).stripRight));
             foreach (j, ref c; m.toolCalls) pending ~= [i, j];
             break;
