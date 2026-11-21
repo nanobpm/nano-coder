@@ -309,8 +309,10 @@ unittest
     string[] beats;
     heartbeatSink = (string line) { beats ~= line; };
     heartbeatInterval = 30.msecs;
-    auto text = execute(parseJSON(`{"command":"sleep 0.1; printf done"}`));
-    assert(beats.length >= 1);
+    // ~300 ms at a 30 ms interval: nominally 9 beats, so a loaded CI runner
+    // (macOS) still yields at least one.
+    auto text = execute(parseJSON(`{"command":"sleep 0.3; printf done"}`));
+    assert(beats.length >= 1, "expected ≥1 heartbeat");
     assert(text.canFind("done") && !text.canFind("still running"), text);
 }
 
