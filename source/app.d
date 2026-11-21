@@ -222,13 +222,13 @@ int printSessions(string sessionDir, bool all, bool json)
 /// `--trajectory ID [--json|--markdown]`: a saved session's turn-by-turn ledger.
 int printTrajectory(string sessionDir, string id, bool json, bool markdown)
 {
-    import nano.session : validateId;
+    import nano.session : validateId, findSession;
     import std.path : buildPath;
     static import nano.trajectory;
     try
     {
         validateId(id);
-        auto t = nano.trajectory.load(buildPath(sessionDir, id ~ ".jsonl"), id);
+        auto t = nano.trajectory.load(findSession(sessionDir, id), id);
         if (json) writeln(t.toJson);
         else if (markdown) writeln(t.toMarkdown);
         else showTrajectory(t);
@@ -1617,6 +1617,15 @@ int runMain(string[] args)
     if (sessionDir == nano.session.sessionDir())
         if (auto n = nano.session.adoptPreviewSessions(nano.session.previewSessionDir(), sessionDir))
             stdErr.writefln("nano-coder: moved %s session(s) from the nano-coder-d preview into %s", n, sessionDir);
+    // Compress and expire old logs (issue #205), at most once a day.
+    try
+    {
+        auto tidy = nano.session.tidySessions(sessionDir, cfg.sessionCompressAfterDays, cfg.sessionRetentionDays);
+        if (tidy.compressed || tidy.deleted)
+            stdErr.writefln("nano-coder: tidied session logs in %s (%s compressed, %s expired, %.1f MB freed)",
+                sessionDir, tidy.compressed, tidy.deleted, tidy.freedBytes / 1_048_576.0);
+    }
+    catch (Exception) {} // tidy-up is best-effort; the session starts anyway
     if (!cfg.persistSessions) o.noSession = true;
     if (o.trajectory !is null) return printTrajectory(sessionDir, o.trajectory, o.json, o.markdown);
     if (o.listSessions) return printSessions(sessionDir, o.all, o.json);
@@ -2643,9 +2652,10 @@ int runMain(string[] args)
                     if (id == current) { writefln("Already in session %s", id); continue; }
                     import std.path : buildPath;
                     import std.file : isFile;
-                    auto path = buildPath(sessionDir, id ~ ".jsonl");
+                    // findSession also resolves a compressed (archived) log.
+                    string path;
                     bool ok;
-                    try { validateId(id); ok = path.exists && path.isFile; }
+                    try { validateId(id); path = nano.session.findSession(sessionDir, id); ok = path.isFile; }
                     catch (Exception) {} // an invalid ID or unreadable path is reported as "no saved session" just below
                     if (!ok) { writefln("No saved session %s: /resume without an ID lists them", JSONValue(id).jsonText); continue; }
                     try loadSession(path);
