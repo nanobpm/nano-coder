@@ -471,28 +471,19 @@ string[] runInstaller(Channel channel, string exe, string running,
         foreach (i, step; steps)
         {
             shown = step.program ~ " " ~ step.args.joinWords;
-            bool refreshStep = i == 0 && steps.length > 1;
-            if (refreshStep)
-            {
-                // The tap refresh failing (offline, diverged tap, git missing
-                // so the spawn throws) stops the update before any brew run:
-                // falling back to plain `brew upgrade` would re-enable the
-                // all-tap auto-update and dependents check, and could report
-                // success despite the refresh failure. The plain-brew fallback
-                // is only for a tap that is not a git checkout (no refresh
-                // step at all).
-                try status = runner(step.program, step.args, step.env);
-                catch (Exception) status = -1; // spawn failure == refresh failed: report, don't crash
-            }
-            else
-                status = runner(step.program, step.args, step.env);
+            // A failed tap refresh (offline, diverged tap, or git missing so
+            // the spawn throws) stops the update before any brew run: plain
+            // `brew upgrade` would re-enable the all-tap auto-update and
+            // dependents check. A spawn failure reaches the catch below with
+            // its message intact.
+            status = runner(step.program, step.args, step.env);
             if (status != 0) break;
         }
     }
-    catch (Exception e) return [format("Could not run `%s`: %s", shown, e.msg)];
+    catch (Exception e) return [format("Could not run `%s`: %s; the running session is unchanged.", shown, e.msg)];
     if (status != 0)
         return [format("`%s` exited with status %s; the running session is unchanged. Try it by hand to see the full error: %s",
-            shown, status, installCommand(channel))];
+            shown, status, shown)];
     auto v = versionOf is null ? installedVersion(exe) : versionOf(exe);
     if (v is null)
         return ["The installer finished but the installed `nano-coder --version` could not be read; the running session is unchanged."];
@@ -822,12 +813,14 @@ unittest
     out_ = runInstaller(Channel.brew, "/x", "0.1.0", failing, (string e) @safe => "0.2.0", () @safe => "/tap");
     assert(ran == ["git"], "brew never runs when the tap refresh failed");
     assert(out_[0].canFind("git -C /tap pull") && out_[0].canFind("unchanged"), out_[0]);
+    assert(!out_[0].canFind("full error: brew"), "the retry hint names the failed refresh, not brew upgrade");
     ran = null;
     auto noGit = (string p, string[] a, const string[string] e) @safe {
         ran ~= p; if (p == "git") throw new Exception("git: not found"); return 0; };
     out_ = runInstaller(Channel.brew, "/x", "0.1.0", noGit, (string e) @safe => "0.2.0", () @safe => "/tap");
     assert(ran == ["git"], "git missing from PATH stops before brew upgrade too");
-    assert(out_[0].canFind("git -C /tap pull") && out_[0].canFind("unchanged"), out_[0]);
+    assert(out_[0].canFind("Could not run `git -C /tap pull") && out_[0].canFind("git: not found")
+        && out_[0].canFind("unchanged") && !out_[0].canFind("status -1"), out_[0]);
     // No tap checkout (tapRepo null): plain `brew upgrade` is the only step.
     ran = null;
     auto plainRun = (string p, string[] a, const string[string] e) @safe { ran ~= p; return 0; };
