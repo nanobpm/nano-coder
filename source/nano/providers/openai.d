@@ -631,7 +631,7 @@ JSONValue modelEntry(JSONValue models, string model, bool onlyFallback = true) p
     return onlyFallback && items.arrayNoRef.length == 1 ? items.arrayNoRef[0] : JSONValue.init;
 }
 
-/// A positive integer at `path`, else 0.
+/// A positive integer at `path` that fits a signed token budget, else 0.
 size_t tokensAt(JSONValue v, string[] path) pure
 {
     foreach (k; path)
@@ -642,8 +642,17 @@ size_t tokensAt(JSONValue v, string[] path) pure
         v = *n;
     }
     if (v.type == JSONType.integer && v.integer > 0) return toSize(v.integer);
-    if (v.type == JSONType.uinteger && v.uinteger > 0) return toSize(v.uinteger);
+    if (v.type == JSONType.uinteger && v.uinteger > 0 && v.uinteger <= long.max) return toSize(v.uinteger);
     return 0;
+}
+
+unittest
+{
+    import std.json : parseJSON;
+    assert(tokensAt(parseJSON(`{"n": 9223372036854775808}`), ["n"]) == 0);
+    assert(tokensAt(parseJSON(`{"n": 18446744073709551615}`), ["n"]) == 0);
+    assert(tokensAt(parseJSON(`{"n": 9223372036854775807}`), ["n"]) == long.max);
+    assert(tokensAt(parseJSON(`{"n": 4096}`), ["n"]) == 4096);
 }
 
 /// The window listed on a `/models` entry (vLLM, OpenRouter, Groq, Mistral, ...).
