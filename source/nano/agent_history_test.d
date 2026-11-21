@@ -4,6 +4,8 @@
 module nano.agent_history_test;
 @safe:
 
+import std.string : representation;
+
 version (unittest):
 
 import std.algorithm : any, canFind, endsWith, filter, map, startsWith;
@@ -290,7 +292,7 @@ unittest
     agent.compactionPinRequests = false;
     auto dir = agent.attachmentsDir;
     scope (exit) if (exists(dir)) rmdirRecurse(dir);
-    immutable bytes = cast(immutable(ubyte)[]) "compaction-tail-image";
+    immutable bytes = "compaction-tail-image".representation;
     Attachment img;
     img.mediaType = "image/png";
     img.extension = "png";

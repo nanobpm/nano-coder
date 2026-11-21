@@ -5,6 +5,8 @@
 module nano.reminders;
 
 @safe:
+
+import std.string : representation;
 import nano.safeio : jsonText, jsonPretty;
 
 import std.algorithm : canFind, startsWith, all;
@@ -178,11 +180,11 @@ private string fingerprint(string tool, JSONValue args, string rawArgs, bool ok,
     auto a = rawArgs !is null ? rawArgs : normalisedArgs(tool, args);
     SHA256 h;
     h.start();
-    h.put(cast(const(ubyte)[]) normaliseSpillPaths(result));
+    h.put(normaliseSpillPaths(result).representation);
     foreach (sha; attachments)
     {
-        h.put(cast(const(ubyte)[]) "\x00img:");
-        h.put(cast(const(ubyte)[]) sha);
+        h.put("\x00img:".representation);
+        h.put(sha.representation);
     }
     auto digest = h.finish();
     return format("%s|%s|err=%s|out=%s", tool, a, ok, toHexString(digest[0 .. 8]).idup);

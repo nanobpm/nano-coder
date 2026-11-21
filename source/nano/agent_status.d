@@ -32,7 +32,7 @@ void statusFromAgent(ref Stats s, Agent agent, string cwdShown)
     s.hasAic = agent.hasSessionAic;
     s.aic = agent.sessionAic;
     s.autoCompact = agent.autoCompact;
-    s.threshold = agent.autoCompactThreshold;
+    s.threshold = agent.effectiveAutoCompactThreshold;
     s.smartCompact = agent.compactionMode == CompactionMode.smart;
     s.compactions = agent.compactions;
 }

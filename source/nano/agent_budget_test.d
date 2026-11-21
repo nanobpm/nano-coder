@@ -4,6 +4,8 @@
 module nano.agent_budget_test;
 @safe:
 
+import std.string : representation;
+
 version (unittest):
 
 import std.algorithm : startsWith;
@@ -265,6 +267,20 @@ unittest
     assert(agent.sessionInputTokens == 1_000);
 }
 
+// A malformed provider pair such as long.max + 1 must not wrap the signed
+// sum into a zero calibration: the operands convert separately and the sizes
+// sum with checked arithmetic (which halts rather than wrapping).
+unittest
+{
+    LLMResponse hi = LLMResponse("hi");
+    hi.usage.inputTokens = 1_000;
+    hi.usage.outputTokens = long.max - 500; // representable per operand
+    auto agent = new Agent(new MockClient([hi]), new ToolRegistry, Policy.init, "system");
+    bool calibrated;
+    agent.run("go", new NullEvents);
+    assert(agent.estimateContextTokens(calibrated) == size_t(1_000) + (long.max - 500) && calibrated);
+}
+
 // A newer image after the usage anchor displaces the anchored one into a
 // placeholder (one image slot), so the anchor's full-image charge is stale and
 // the estimate recomputes the conversation as the wire plan sends it.
@@ -277,7 +293,7 @@ unittest
     ok.usage.inputTokens = 5_000;
     auto agent = new Agent(new MockClient([ok]), new ToolRegistry, Policy.init, "system");
     agent.capabilities.vision = Vision(1);
-    auto bytes = cast(immutable(ubyte)[]) "calib-displace-image";
+    auto bytes = "calib-displace-image".representation;
     auto img = Attachment("image/png", "x.png", sha256Hex(bytes), 1000, 1000, bytes.length, "png");
     store(agent.attachmentsDir, img, bytes);
     auto look = Message.user("look");
@@ -340,4 +356,19 @@ unittest
     string source;
     assert(agent.contextWindow(source) == 200_000 && source == "context_window in config");
     assert(agent.effectiveMaxTokens == 16_000, "the endpoint's output limit stands beside a configured window");
+}
+
+// An out-of-range configured threshold (negative, above 1, NaN) is clamped
+// to the agent's effective 0.1–0.99 range for every reader, so reports never
+// convert a negative or overflowing token count.
+unittest
+{
+    auto agent = budgeted(new MockClient([]), 100_000, 1_000);
+    foreach (t, want; [-0.5: 0.1, 0.0: 0.1, 1.5: 0.99, 0.5: 0.5])
+    {
+        agent.autoCompactThreshold = t;
+        assert(agent.effectiveAutoCompactThreshold == want);
+    }
+    agent.autoCompactThreshold = double.nan;
+    assert(agent.effectiveAutoCompactThreshold == 0.8);
 }

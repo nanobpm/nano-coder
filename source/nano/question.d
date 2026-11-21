@@ -214,7 +214,7 @@ struct QuestionBroker
     /// A new broker.
     static QuestionBroker make() { return QuestionBroker(Shared!State.make); }
     /// Whether this handle refers to a broker.
-    bool opCast(B : bool)() pure const { return cast(bool) state; }
+    bool opCast(B : bool)() pure const { return !!state; }
 
     void interactive(bool on) { state.update((ref State s) { s.interactive = on; }); }
     bool interactive() { return state.get.interactive; }

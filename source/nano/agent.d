@@ -6,7 +6,7 @@ module nano.agent;
 import nano.safeio : jsonText, jsonPretty;
 import nano.clock : monoNow, since, sleepFor, stdTimeNow, wallNow;
 import core.time : MonoTime;
-import nano.arith : checkedMul, checkedSub, saturatingSub;
+import nano.arith : checkedMul, checkedSub, saturatingAdd, saturatingSub, clampToLong, toLong, toSize;
 import nano.option : Option, some, none, match, ifSome, orElse, unwrap, NotNull;
 import nano.result : orThrow, toOption, match, unwrap;
 
@@ -111,7 +111,15 @@ struct IdleCompactReport
     this(CompactReport r, size_t window) pure
     {
         import std.math : round;
-        size_t pct(size_t t) { return cast(size_t) round(t * 100.0 / (window ? window : 1)); }
+        // Saturate before converting: a huge anomalous count over a tiny
+        // window exceeds size_t (and size_t.max rounds up as a double).
+        size_t pct(size_t t)
+        {
+            import std.conv : to;
+            immutable p = round(t * 100.0 / (window ? window : 1));
+            // 2.0^^64 is the first double past size_t.max (which rounds up to it).
+            return p >= 2.0 ^^ (size_t.sizeof * 8) ? size_t.max : p.to!size_t;
+        }
         report = r;
         percentBefore = pct(r.tokensBefore);
         percentAfter = pct(r.tokensAfter);
@@ -207,6 +215,17 @@ class Agent
     /// Compact automatically past `autoCompactThreshold` of the window.
     bool autoCompact = true;
     double autoCompactThreshold = 0.8;
+
+    /// `autoCompactThreshold` clamped to the effective 0.1–0.99 range
+    /// (a NaN falls back to the 0.8 default). Every reader that reports or
+    /// acts on the threshold goes through this, so a configured out-of-range
+    /// value can never yield a negative or overflowing token count.
+    double effectiveAutoCompactThreshold() const pure nothrow @nogc @safe
+    {
+        auto t = autoCompactThreshold;
+        if (t != t) return 0.8;
+        return t < 0.1 ? 0.1 : t > 0.99 ? 0.99 : t;
+    }
     ctx.CompactionMode compactionMode = ctx.CompactionMode.standard;
     /// Pin the user's requests verbatim after each compaction summary
     /// (`compaction_pin_requests`, issue #66).
@@ -378,13 +397,13 @@ class Agent
             throw e;
         }
         log.ifSome((SessionLog l) {
-            l.turnEnd(inputId, response, cast(string) lastStop, hasOutcome ? lastOutcome.toJSON : JSONValue.init,
+            l.turnEnd(inputId, response, lastStop, hasOutcome ? lastOutcome.toJSON : JSONValue.init,
                 turnHistoryCalls);
             indexTurn(l, from);
         });
         hasPending = false;
         completedInputs[inputId] = response;
-        if (lastStop != StopReason.endTurn) completedStops[inputId] = cast(string) lastStop;
+        if (lastStop != StopReason.endTurn) completedStops[inputId] = lastStop;
         else completedStops.remove(inputId);
         if (hasOutcome) completedOutcomes[inputId] = lastOutcome.toJSON;
         else completedOutcomes.remove(inputId);
@@ -763,9 +782,14 @@ class Agent
         recordUsage(r.usage);
         if (r.usage.inputTokens > 0)
         {
-            // Anchored at the assistant message about to be pushed.
+            // Anchored at the assistant message about to be pushed. Convert
+            // the nonnegative operands separately and sum the sizes with
+            // saturating arithmetic: a malformed pair such as long.max + 1
+            // would overflow the signed addition before `toSize` runs, and a
+            // halt here would crash a completed turn over bookkeeping. The
+            // clamped anchor only makes later estimates read high.
             calibLen = messages.length + 1;
-            calibTokens = cast(size_t)(r.usage.inputTokens + (r.usage.outputTokens > 0 ? r.usage.outputTokens : 0));
+            calibTokens = saturatingAdd(toSize(max(0L, r.usage.inputTokens)), toSize(max(0L, r.usage.outputTokens)));
         }
         ev.usage(r.usage);
         auto reply = Message.assistant(r.content, r.toolCalls);
@@ -927,7 +951,7 @@ class Agent
             auto prefix = ctx.availableCount(messages[0 .. calibLen], part(0, calibLen));
             auto suffix = ctx.availableCount(messages[calibLen .. $], part(calibLen, messages.length));
             calibrated = min(prefix, slots) == min(prefix, saturatingSub(slots, suffix));
-            if (calibrated) return calibTokens + ctx.messagesTokens(messages[calibLen .. $], slots, part(calibLen, messages.length));
+            if (calibrated) return saturatingAdd(calibTokens, ctx.messagesTokens(messages[calibLen .. $], slots, part(calibLen, messages.length)));
         }
         size_t tools_;
         foreach (d; offeredTools())
@@ -954,7 +978,7 @@ class Agent
 
     size_t estimateContextTokens() { bool _; return estimateContextTokens(_); }
 
-    private size_t outputBase() pure const { return cast(size_t) effectiveMaxTokens(); }
+    private size_t outputBase() pure const { return toSize(effectiveMaxTokens()); }
 
     /// The output budget before the context-window clamp: `max_tokens` when
     /// configured, else the model's published cap, a known cap for the model
@@ -962,8 +986,8 @@ class Agent
     long effectiveMaxTokens() pure const
     {
         long base = maxTokens > 0 ? maxTokens
-            : capabilities.maxOutput ? cast(long) capabilities.maxOutput
-            : ctx.outputLimitForModel(client.modelName) ? cast(long) ctx.outputLimitForModel(client.modelName)
+            : capabilities.maxOutput ? clampToLong(capabilities.maxOutput)
+            : ctx.outputLimitForModel(client.modelName) ? clampToLong(ctx.outputLimitForModel(client.modelName))
             : ctx.defaultMaxOutputTokens;
         return learnedMaxOutput > 0 && learnedMaxOutput < base ? learnedMaxOutput : base;
     }
@@ -1028,7 +1052,7 @@ class Agent
     {
         if (!idleCompact || !overThresholdAt(tokens)) return false;
         auto window = contextWindow();
-        auto threshold = clamp(autoCompactThreshold, 0.1, 0.99);
+        auto threshold = effectiveAutoCompactThreshold;
         if (tokens < window * threshold) return false;
         return idleGate.armed(tokens, window);
     }
@@ -1063,13 +1087,13 @@ class Agent
     bool overThresholdAt(size_t tokens) pure
     {
         if (!autoCompact) return false;
-        auto threshold = autoCompactThreshold < 0.1 ? 0.1 : autoCompactThreshold > 0.99 ? 0.99 : autoCompactThreshold;
+        auto threshold = effectiveAutoCompactThreshold;
         auto window = contextWindow();
-        auto reserved = (outputBase < ctx.minOutputReserve ? outputBase : ctx.minOutputReserve) + ctx.outputMargin(window);
+        auto reserved = saturatingAdd(outputBase < ctx.minOutputReserve ? outputBase : ctx.minOutputReserve, ctx.outputMargin(window));
         double limit = window * threshold;
         auto headroom = saturatingSub(window, reserved);
         if (headroom && headroom < limit) limit = headroom;
-        return tokens > limit && tokens > compactFloor + window / 10;
+        return tokens > limit && tokens > saturatingAdd(compactFloor, window / 10);
     }
 
     /// `max_tokens` for the next request: the configured value lowered so the
@@ -1248,14 +1272,14 @@ class Agent
         {
             auto combined = combinedWindow();
             if (!combined) return maxTokens;
-            auto usedC = estimateContextTokens() + ctx.outputMargin(combined);
-            long roomC = cast(long) saturatingSub(combined, usedC);
+            auto usedC = saturatingAdd(estimateContextTokens(), ctx.outputMargin(combined));
+            long roomC = clampToLong(saturatingSub(combined, usedC));
             auto c = maxTokens < roomC ? maxTokens : roomC;
             return c < 1 ? 1 : c;
         }
         auto window = contextWindow();
-        auto used = estimateContextTokens() + ctx.outputMargin(window);
-        long room = cast(long) saturatingSub(window, used);
+        auto used = saturatingAdd(estimateContextTokens(), ctx.outputMargin(window));
+        long room = clampToLong(saturatingSub(window, used));
         auto n = maxTokens < room ? maxTokens : room;
         return n < 1 ? 1 : n;
     }
@@ -1300,7 +1324,7 @@ class Agent
                 if (x.logLine > last) last = x.logLine;
             }
 
-        auto budget = ctx.summaryOutputBudget(window, cast(long) outputBase);
+        auto budget = ctx.summaryOutputBudget(window, toLong(outputBase));
         string summary, fallback;
         bool truncated, retried;
         size_t drops;
@@ -1525,7 +1549,7 @@ class Agent
         // An unverifiable shell loop never prompts: the policy allows it
         // under the OS sandbox and blocks it without one (Rust #171).
         auto permissionDeny = policy.decide(call.name, call.arguments).match!(
-            (PermAllow _) => cast(string) null,
+            (PermAllow _) => string.init,
             (PermDeny d) => d.message,
         );
         if (permissionDeny !is null) return permissionDeny;
@@ -3158,6 +3182,42 @@ unittest // a new system text drops the usage anchor, so estimates count it
     agent.installSystem("long ".replicate(4000), null);
     auto estimate = agent.estimateContextTokens(calibrated);
     assert(!calibrated && estimate > 500, "the longer system text is counted");
+}
+
+unittest // extreme usage anchors clamp instead of halting the estimate
+{
+    import nano.providers.mock : MockClient;
+    LLMResponse[] none;
+    auto agent = new Agent(new MockClient(none), new ToolRegistry, Policy.init, "sys");
+    agent.push(Message.user("hi"));
+    agent.calibLen = agent.messages.length;
+    bool calibrated;
+    // A malformed provider report near 2^63 sums past size_t.max on 64-bit:
+    // the anchor clamps there and the estimate stays calibrated (and huge).
+    agent.calibTokens = size_t.max;
+    assert(agent.estimateContextTokens(calibrated) == size_t.max && calibrated);
+    // So does a saturated floor: the threshold check wraps to "due" on
+    // nothing, it must read "not due" instead of halting or wrapping low.
+    agent.compactFloor = size_t.max;
+    assert(!agent.overThresholdAt(size_t.max));
+    agent.compactFloor = 0;
+    // The report of a successful compaction formats clamped counts rather
+    // than throwing, so the run never reads as failed over bookkeeping.
+    auto rep = CompactReport(4, 2, size_t.max, size_t.max, 2, null, false, ctx.CompactionMode.standard);
+    import std.algorithm : canFind;
+    assert(rep.toString.canFind("compacted 2 messages"), rep.toString);
+    // The idle report saturates its percentages instead of throwing.
+    auto idle = IdleCompactReport(rep, 1);
+    assert(idle.percentBefore == size_t.max && idle.percentAfter == size_t.max);
+    // A saturated estimate plus the output margin must not wrap low and
+    // grant a large output budget: the exhausted context gets the minimum.
+    agent.configuredWindow = 12_000;
+    assert(agent.requestMaxTokens() == 1);
+    agent.configuredWindow = 0;
+    agent.capabilities.window = 12_000;
+    agent.capabilities.promptCap = true;
+    agent.capabilities.totalWindow = 12_000;
+    assert(agent.requestMaxTokens() == 1);
 }
 
 // rust: agent.rs::a_memory_evicted_from_the_installed_index_becomes_recallable
