@@ -1542,6 +1542,45 @@ string timersText(Agent agent)
         : agent.timers.list(agent.timerNow(), true).stripRight;
 }
 
+/// Rebuild the transcript of a loaded session on the frame (Rust
+/// `replay_history` in frame mode): the frame owns the screen, so without
+/// this a resumed or relaunched session opens with an empty transcript.
+/// Prompts, answers, tool calls and results show as they did live; after a
+/// compaction the pre-compaction turns replay instead of the summary.
+void replayTranscript(Agent agent, Console console)
+{
+    auto msgs = agent.replayMessages;
+    size_t[2][string] calls; // call ID -> [message, call] index into msgs
+    foreach (i, ref m; msgs)
+    {
+        final switch (m.role)
+        {
+        case Role.system: break;
+        case Role.user:
+            if (m.content.strip.length)
+                writeln(stampBlock(console.stamp(), console.bold("› ") ~ escapeMarks(sanitizeBlock(m.content))));
+            break;
+        case Role.assistant:
+            if (m.content.strip.length) writeln(stampBlock(console.stamp(), console.display(m.content).stripRight));
+            foreach (j, ref c; m.toolCalls)
+            {
+                calls[c.id] = [i, j];
+                console.toolStart(c);
+            }
+            break;
+        case Role.tool:
+            if (auto at = m.toolCallId in calls)
+                console.toolEnd(msgs[(*at)[0]].toolCalls[(*at)[1]], toolResultDisplay(m.content, m.attachments), m.isError);
+            break;
+        }
+    }
+    if (!agent.plan.empty) writeln(planText(agent));
+    // toolStart/toolEnd drive the live status; the replay leaves it idle.
+    updateStatus((ref Stats s) { s.activity = Activity.idle; s.tool = null; s.tokensPerSec = 0;
+        s.historySearches = s.historyReads = 0; });
+    stdOut.flush();
+}
+
 string planText(Agent agent) pure
 {
     return agent.plan.empty ? "No plan yet. The agent makes one with the plan_add tool."
@@ -2368,6 +2407,8 @@ int runMain(string[] args)
         banner ~= "Type /help for commands";
         writeln(stampBlock(console.stamp(), banner.join("\n")));
     }
+    // The frame owns the screen: rebuild a resumed session's transcript on it.
+    if (gFrame && o.hasResume) replayTranscript(agent, console);
     import core.time : MonoTime, msecs;
     import nano.lineedit : DoublePress, interruptWindowMs;
     auto exitPress = DoublePress(interruptWindowMs); // idle Ctrl-C twice exits
@@ -2736,6 +2777,7 @@ int runMain(string[] args)
                     if (!ok) { writefln("No saved session %s: /resume without an ID lists them", JSONValue(id).jsonText); continue; }
                     try loadSession(path);
                     catch (Exception e) { writeln(e.msg); continue; }
+                    if (gFrame) { gFrame.clear(); replayTranscript(agent, console); }
                     writefln("Resumed session %s (resume later with --resume %s)", id, id);
                     continue;
                 }
