@@ -1659,15 +1659,16 @@ int runMain(string[] args)
     }
 
     auto spec = o.model.length ? o.model : cfg.model;
-    LLMClient client;
     ConfiguredWindow configuredWindow;
-    try
-    {
-        auto rp = resolve(cfg, spec);
-        configuredWindow = windowFor(cfg, rp.config);
-        client = makeClient(rp);
-    }
-    catch (Exception e) die(e.msg);
+    LLMClient client = () {
+        try
+        {
+            auto rp = resolve(cfg, spec);
+            configuredWindow = windowFor(cfg, rp.config);
+            return makeClient(rp);
+        }
+        catch (Exception e) die(e.msg);
+    }();
 
     Policy policy;
     try policy = Policy.fromConfig("permissions" in rawConfig ? rawConfig["permissions"] : JSONValue(null));
@@ -1696,14 +1697,20 @@ int runMain(string[] args)
 
     auto tools = new ToolRegistry;
     auto readState = new ReadState;
-    Agent agent;
+    // The closures below are registered before the agent exists (it is built
+    // from their tools and prompt), so they reach it through `built`, which is
+    // set once it is.
+    Option!Agent built;
     // Read-deny rules hide paths from search results (Policy.readDenyScan).
     // The deny rules and working directory are resolved once per search, so
     // each walked entry is judged lexically (Rust #160).
     registerBuiltinTools(tools, cfg, readState, (string root) @safe {
         import nano.permissions : ReadDenyScan;
         ReadDenyScan scan;
-        if (!agent.policy.readDenyScan(getcwd(), scan)) return cast(bool delegate(string) @safe) null;
+        // Before the agent exists, the policy it will be built with.
+        immutable has = built.match!(a => a.policy.readDenyScan(getcwd(), scan),
+            () => policy.readDenyScan(getcwd(), scan));
+        if (!has) return cast(bool delegate(string) @safe) null;
         auto forRoot = scan.forRoot(root);
         return (string path) @safe => forRoot.denied(path);
     });
@@ -1739,7 +1746,6 @@ int runMain(string[] args)
     // Off is an empty set (as in Rust), not null.
     // NANO_CODER_NO_SKILLS turns skills off for one run (as in Rust).
     bool skillsOn = cfg.skills.enabled && environment.get("NANO_CODER_NO_SKILLS") is null;
-    Skills skills;
     Skills discoverSkills(string dir)
     {
         if (!skillsOn) return new Skills;
@@ -1749,7 +1755,7 @@ int runMain(string[] args)
         foreach (w; s.warnings) stdErr.writeln("nano-coder: skills: ", w);
         return s;
     }
-    skills = discoverSkills(cwd);
+    Skills skills = discoverSkills(cwd);
     if (skillsOn && (o.acp || !skills.empty))
         tools.register(skillsDefinition, (JSONValue a) => skills.load(a));
     // Memory: read-only when no human vets saves live (ACP, -p, piped stdio) and in plan mode.
@@ -1769,8 +1775,9 @@ int runMain(string[] args)
         };
     }
     foreach (store; memory)
-        foreach (t; memorySessionTools(store, memoryWritable, () => agent.control.mode == AgentMode.plan,
-                () => agent.log.match!(l => l.id, () => string.init)))
+        foreach (t; memorySessionTools(store, memoryWritable,
+                () => built.match!(a => a.control.mode == AgentMode.plan, () => o.plan),
+                () => built.match!(a => a.log.match!(l => l.id, () => string.init), () => string.init)))
             tools.register(t.definition, asToolError(t.handler));
     // Instruction files, discovered once per working directory and re-read
     // before each turn (`reloadInstructions`).
@@ -1782,21 +1789,22 @@ int runMain(string[] args)
     string systemFor(string dir, bool plan)
     {
         indexShown = null;
-        // `agent` is null only on the first call: the agent is built from this prompt.
+        // `built` is empty only on the first call: the agent is built from this prompt.
         auto index = memory.match!(m => m.indexWithRendered(memoryWritable && !plan, indexShown), () => string.init);
-        if (agent !is null) agent.indexShown = indexShown;
+        foreach (a; built) a.indexShown = indexShown;
         if (instructionsDir is null || instructionsDir != dir)
         {
             instructionsDir = dir;
             instructions = discoverInstructions(cfg, dir);
-            if (agent !is null) agent.instructions = instructions;
+            foreach (a; built) a.instructions = instructions;
         }
         return buildSystemPrompt(cfg, dir, wallNow.toISOExtString[0 .. 10], plan, skills, index,
             instructions.match!(pi => pi.render, () => string.init));
     }
     auto questions = QuestionBroker.make;
     tools.register(questionDefinition, (JSONValue a) => questions.run(a));
-    agent = new Agent(client, tools, policy, systemFor(cwd, o.plan));
+    Agent agent = new Agent(client, tools, policy, systemFor(cwd, o.plan));
+    built = some(agent);
     mainAgent = some(agent);
     agent.memory = memory;
     agent.indexShown = indexShown;
