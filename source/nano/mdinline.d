@@ -26,17 +26,21 @@ struct Span
 
 private bool isControl(dchar c) pure nothrow { return c < 0x20 || (c >= 0x7f && c < 0xa0); }
 
-/// Model text with control characters removed; tabs become spaces.
+/// Model text with control characters removed; tabs become spaces. The
+/// frame's private-use wrap marks (U+E002-U+E004) are metadata, never text:
+/// a literal one would be read as a wrap, verbatim or separator mark, so it
+/// is replaced by U+FFFD (as `terminalSafe` does).
 string clean(string text) pure
 {
     bool plain = true;
-    foreach (char c; text) if (c < 0x20 && c != '\n' || c == 0x7f || c == 0xc2) { plain = false; break; }
+    foreach (dchar c; text)
+        if ((c < 0x20 && c != '\n') || (c >= 0x7f && c < 0xa0) || (c >= 0xE002 && c <= 0xE004)) { plain = false; break; }
     if (plain) return text;
     auto o = appender!string;
     foreach (dchar c; text)
     {
         if (c == '\t') o ~= ' ';
-        else if (c == '\n' || !isControl(c)) o ~= c;
+        else if (c == '\n' || !isControl(c)) o ~= c >= 0xE002 && c <= 0xE004 ? '\uFFFD' : c;
     }
     return o[];
 }
@@ -513,4 +517,7 @@ unittest
     assert(inlinePlain("[unclosed and [x](y)") == "[unclosed and x (y)");
     assert(inlinePlain("<a@b.co>") == "a@b.co");
     assert(inlinePlain("x ~~y~~ ~z~") == "x y z");
+    // A literal wrap mark is text, never metadata: it becomes U+FFFD.
+    assert(clean("/tmp/a\uE003b\uE002c\uE004d") == "/tmp/a\uFFFDb\uFFFDc\uFFFDd");
+    assert(clean("plain") is "plain");
 }

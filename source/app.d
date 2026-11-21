@@ -38,7 +38,7 @@ import nano.plan : Plan, checklist;
 import nano.queue : MessageQueue, QueuedMessage, QueueUsage, queueParse = parse, queueApply = apply;
 import nano.mode : AgentMode, allModes, parseMode, planPromptNote, name, describe, nextMode = next;
 static import nano.herdr;
-import nano.frame : glyphMark, foldMark, expandedBody, expandedResult;
+import nano.frame : glyphMark, foldMark, expandedBody, expandedResult, dropSoftWraps, escapeMarks;
 import core.time : MonoTime, seconds;
 import std.sumtype : match;
 import nano.trajectory : terminalSafe;
@@ -55,7 +55,7 @@ import nano.control : TurnControl, FdLineReader;
 import nano.instructions : ProjectInstructions, InstructionOptions = Options, expandHome;
 import core.atomic : atomicLoad, atomicStore, cas;
 
-enum string packageVersion = "1.5.0";
+enum string packageVersion = "1.6.0";
 enum string versionString = "nano-coder " ~ packageVersion;
 
 enum string usage = `Usage: nano-coder [--model provider/model] [--config PATH] [-p PROMPT]
@@ -222,13 +222,13 @@ int printSessions(string sessionDir, bool all, bool json)
 /// `--trajectory ID [--json|--markdown]`: a saved session's turn-by-turn ledger.
 int printTrajectory(string sessionDir, string id, bool json, bool markdown)
 {
-    import nano.session : validateId;
+    import nano.session : validateId, findSession;
     import std.path : buildPath;
     static import nano.trajectory;
     try
     {
         validateId(id);
-        auto t = nano.trajectory.load(buildPath(sessionDir, id ~ ".jsonl"), id);
+        auto t = nano.trajectory.load(findSession(sessionDir, id), id);
         if (json) writeln(t.toJson);
         else if (markdown) writeln(t.toMarkdown);
         else showTrajectory(t);
@@ -765,7 +765,7 @@ void updateCommand(bool frameUi)
         if (gFrame) gFrame.suspend();
         leaveKeyMode();
         scope (exit) { enterKeyMode(0); if (gFrame) gFrame.resume(); }
-        lines = runInstaller(channel, launchExe(), packageVersion, (string p, string[] a) @safe => spawnInstaller(p, a));
+        lines = runInstaller(channel, launchExe(), packageVersion, (string p, string[] a, const string[string] e) @safe => spawnInstaller(p, a, e));
     }
     foreach (l; lines) writeln(l);
 }
@@ -1004,6 +1004,8 @@ struct Screen
     {
         import std.algorithm : splitter;
         import std.array : replicate;
+        // Soft-wrap marks are for the frame; anything else gets plain text.
+        if (!gFrame) t = dropSoftWraps(t);
         if (!pad) { write(t); if (t.length) midLine = t[$ - 1] != '\n'; return; }
         size_t i;
         while (i < t.length)
@@ -1045,7 +1047,7 @@ struct Screen
         if (blockExpanded)
         {
             auto t = first ? chunk.stripLeft : chunk;
-            if (t.length) writeAligned(thinkStyle(t), blockStamp.length ? stampWidth : 0);
+            if (t.length) writeAligned(thinkStyle(escapeMarks(t)), blockStamp.length ? stampWidth : 0);
         }
         stdOut.flush();
     }
@@ -1110,7 +1112,7 @@ struct Screen
         if (midLine) write("\n");
         midLine = false;
         answering = false;
-        writeln(stampBlock(stamp(), text));
+        writeln(stampBlock(stamp(), escapeMarks(text)));
         stdOut.flush();
     }
 
@@ -1205,7 +1207,12 @@ class Console : AgentEvents
 
     /// A whole answer as shown on this console: markdown rendered for a
     /// color terminal, verbatim otherwise.
-    string display(string text) { return renderMarkdown ? renderMarkdownText(text, answerWidth()) : text; }
+    string display(string text)
+    {
+        if (!renderMarkdown) return text;
+        auto shown = renderMarkdownText(text, answerWidth());
+        return gFrame ? shown : dropSoftWraps(shown);
+    }
 
     string stamp() { return .stamp(color); }
 
@@ -1266,7 +1273,7 @@ class Console : AgentEvents
         meter.reset(nowMs);
         if (quiet || quietTool(call)) return;
         endLine();
-        auto line = stamp() ~ (color ? "\x1b[38;5;114m●\x1b[0m " : "● ") ~ bold(call.name) ~ " " ~ dim(summary(call));
+        auto line = stamp() ~ (color ? "\x1b[38;5;114m●\x1b[0m " : "● ") ~ bold(escapeMarks(call.name)) ~ " " ~ dim(summary(call));
         writeln(line);
         // Ctrl-O shows the full arguments under the call.
         if (gFrame) write(foldMark(call.id, 1, line ~ "\n" ~ expandedBody(argsText(call), color ? "\x1b[2m" : "")));
@@ -1307,7 +1314,7 @@ class Console : AgentEvents
     {
         if (quiet) return;
         endLine();
-        writeln(stampBlock(stamp(), dim("↪ " ~ text)));
+        writeln(stampBlock(stamp(), dim("↪ " ~ escapeMarks(text))));
     }
     /// Close the abandoned partial so the resent reply starts a fresh segment
     /// instead of joining the stale prefix.
@@ -1344,7 +1351,14 @@ class Console : AgentEvents
         link.screen.update((ref Screen s) { s.reconcile(text); s.endReasoning(reasoning); });
     }
 
+    /// One-line call summary; literal wrap marks in model-supplied
+    /// arguments are escaped so they cannot forge transcript metadata.
     static string summary(const ref ToolCall c)
+    {
+        return escapeMarks(rawSummary(c));
+    }
+
+    private static string rawSummary(const ref ToolCall c)
     {
         if (c.invalidArguments.length) return "(invalid arguments)";
         foreach (k; ["command", "path", "pattern", "text", "name", "id"])
@@ -1633,6 +1647,15 @@ int runMain(string[] args)
     if (sessionDir == nano.session.sessionDir())
         if (auto n = nano.session.adoptPreviewSessions(nano.session.previewSessionDir(), sessionDir))
             stdErr.writefln("nano-coder: moved %s session(s) from the nano-coder-d preview into %s", n, sessionDir);
+    // Compress and expire old logs (issue #205), at most once a day.
+    try
+    {
+        auto tidy = nano.session.tidySessions(sessionDir, cfg.sessionCompressAfterDays, cfg.sessionRetentionDays);
+        if (tidy.compressed || tidy.deleted)
+            stdErr.writefln("nano-coder: tidied session logs in %s (%s compressed, %s expired, %.1f MB freed)",
+                sessionDir, tidy.compressed, tidy.deleted, tidy.freedBytes / 1_048_576.0);
+    }
+    catch (Exception) {} // tidy-up is best-effort; the session starts anyway
     if (!cfg.persistSessions) o.noSession = true;
     if (o.trajectory !is null) return printTrajectory(sessionDir, o.trajectory, o.json, o.markdown);
     if (o.listSessions) return printSessions(sessionDir, o.all, o.json);
@@ -1924,9 +1947,32 @@ int runMain(string[] args)
     /// Load a saved session into the agent: its conversation, plan and log.
     void loadSession(string path)
     {
-        auto restored = restore(path);
-        foreach (note; agent.loadRestored(restored, o.noSession ? Option!SessionLog(none) : some(new SessionLog(path))))
-            stdErr.writeln("nano-coder: ignoring ", note);
+        // Lock the log first, then read the state the lock covers: a writer
+        // finishing a turn while the lock wait blocks would otherwise be
+        // adopted from a pre-turn snapshot and the turn re-run. A failure
+        // before adoption closes the incoming log (loadRestored rolls the
+        // live session back itself once it takes the log).
+        Option!SessionLog newLog;
+        Restored restored;
+        if (!o.noSession)
+        {
+            auto incoming = new SessionLog(path);
+            // Close on failure only until the agent adopts the log: after
+            // `loadRestored` adopts it (even if it throws afterwards) it is
+            // the agent's live writer.
+            scope (failure) if (!agent.ownsLog(incoming)) incoming.close();
+            newLog = some(incoming);
+            restored = restore(incoming.path);
+            auto notes = agent.loadRestored(restored, newLog);
+            foreach (note; notes)
+                stdErr.writeln("nano-coder: ignoring ", note);
+        }
+        else
+        {
+            restored = restore(path);
+            foreach (note; agent.loadRestored(restored, newLog))
+                stdErr.writeln("nano-coder: ignoring ", note);
+        }
         updateStatus((ref Stats s) { s.historySearches = s.historyReads = 0; });
         if (!agent.timers.empty)
             stdErr.writefln("%s timer%s still set (/timers lists them)", agent.timers.items.length,
@@ -2675,9 +2721,10 @@ int runMain(string[] args)
                     if (id == current) { writefln("Already in session %s", id); continue; }
                     import std.path : buildPath;
                     import std.file : isFile;
-                    auto path = buildPath(sessionDir, id ~ ".jsonl");
+                    // findSession also resolves a compressed (archived) log.
+                    string path;
                     bool ok;
-                    try { validateId(id); ok = path.exists && path.isFile; }
+                    try { validateId(id); path = nano.session.findSession(sessionDir, id); ok = path.isFile; }
                     catch (Exception) {} // an invalid ID or unreadable path is reported as "no saved session" just below
                     if (!ok) { writefln("No saved session %s: /resume without an ID lists them", JSONValue(id).jsonText); continue; }
                     try loadSession(path);
@@ -2898,4 +2945,26 @@ unittest
     atomicLoad(ctx.control).mode = AgentMode.plan;
     assert(midTurnCommand("/mode", ctx).startsWith("Mode: plan"), midTurnCommand("/mode", ctx));
     assert(midTurnCommand("/compact", ctx) is null && midTurnCommand("/plan extra", ctx) is null);
+}
+
+// Model-supplied tool arguments with literal wrap marks reach the transcript
+// as U+FFFD, never as metadata that changes how the row wraps or is copied.
+unittest
+{
+    import std.algorithm : canFind;
+    import std.json : parseJSON;
+    import nano.frame : Transcript, softWrapMark, verbatimMark, sepWrapMark;
+    import nano.llm : ToolCall;
+    foreach (m; [softWrapMark, verbatimMark, sepWrapMark])
+    {
+        ToolCall c;
+        c.name = "bash";
+        c.arguments = parseJSON(`{"command":"cat /tmp/a` ~ m ~ `b"}`);
+        auto s = Console.summary(c);
+        assert(!s.canFind(m) && s.canFind("a\uFFFDb"), s);
+        Transcript t;
+        t.feed(cast(const(ubyte)[]) ("● bash " ~ s ~ "\n"));
+        assert(t.lines.length == 1 && !t.lines[0].canFind(m) && t.lines[0].canFind("\uFFFD"), t.lines[0]);
+        assert(escapeMarks("↪ x" ~ m) == "↪ x\uFFFD");
+    }
 }

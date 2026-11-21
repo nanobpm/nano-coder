@@ -10,7 +10,7 @@ version (unittest):
 import nano.option : match, some, unwrap;
 import nano.result : unwrap;
 import std.json;
-import std.file : tempDir, exists, rmdirRecurse;
+import std.file : tempDir, exists, rmdirRecurse, readText;
 import std.path : buildPath;
 import nano.agent;
 import nano.llm;
@@ -506,6 +506,31 @@ unittest
     assert(resumed.control.mode == AgentMode.normal, "a load resets the mode");
 }
 
+// Plan changes log as deltas (issue #205): the log holds one full snapshot
+// plus the changed items, and a resume rebuilds the same plan.
+unittest
+{
+    import std.algorithm : count;
+    auto dir = freshDir("plan-delta");
+    auto mock = new MockClient([
+        LLMResponse("", "", [ToolCall.fromRaw("p1", "plan_add", `{"goal":"Ship it","items":["One","Two"]}`)]),
+        LLMResponse("", "", [ToolCall.fromRaw("p2", "plan_update", `{"id":1,"status":"done","note":"found"}`)]),
+        LLMResponse("", "", [ToolCall.fromRaw("p3", "plan_update", `{"id":2,"status":"in_progress"}`)]),
+        LLMResponse("done")]);
+    auto agent = new Agent(mock, echoTools, Policy.init, "sys");
+    auto log = new SessionLog(dir, "mock/m", "/w");
+    log.append(agent.messages[0]);
+    agent.log = some(log);
+    agent.run("go", new NullEvents);
+    auto text = readText(log.path);
+    assert(text.count(`{"type":"plan"`) == 1 && text.count(`{"type":"plan_delta"`) == 2,
+        "the first change snapshots, the rest are deltas");
+    auto r = restore(log.path);
+    auto resumed = new Agent(new MockClient([]), echoTools, Policy.init, "sys");
+    resumed.loadRestored(r, some(new SessionLog(log.path)));
+    assert(resumed.plan == agent.plan, "the delta chain rebuilds the plan");
+}
+
 // A restart or a load drops the session's thinking override and its totals.
 // (A failed switch keeping the override has no D counterpart: D opens the
 // new log before calling restart, so a failure leaves the agent untouched.)
@@ -603,4 +628,143 @@ unittest
     assertThrown(agent.loadRestored(r, some(target)));
     assert(agent.messages.length == liveLen);
     assert(agent.log.match!(l => l is live, () => false), "the live log stays");
+}
+
+// Round-8 review fix for issue #205: a failed compaction write rolls the
+// in-memory compaction back, so the next compaction's delta base counts only
+// persisted requests.
+unittest
+{
+    auto dir = freshDir("compact-rollback");
+    auto mock = new MockClient([LLMResponse("work"), LLMResponse("SUMMARY ONE"), LLMResponse("more"),
+        LLMResponse("SUMMARY TWO")]);
+    auto agent = new Agent(mock, echoTools, Policy.init, "sys");
+    agent.log = some(new SessionLog(dir, "mock/m", "/w"));
+    agent.run("first request", new NullEvents);
+    auto log = agent.log.unwrap("set by the test");
+    log.failNextWrite = true;
+    CompactReport rep;
+    import std.exception : assertThrown;
+    assertThrown(agent.compact(rep), "the failed replace propagates");
+    assert(agent.pinStash is null, "the failed compaction stashes nothing");
+    assert(agent.messages.length == 3, "the conversation is not compacted");
+    agent.run("second request", new NullEvents);
+    assert(agent.compact(rep), "the retry persists");
+    auto r = restore(log.path);
+    assert(r.pinStash.length == 2, "both requests are pinned exactly once");
+    assert(r.pinStash[0].content == "first request" && r.pinStash[1].content == "second request");
+}
+
+// Round-9 review fix for issue #205: the compaction rollback disarms once
+// the replace record is persisted, so a throwing `onCompacted` callback
+// leaves the live conversation matching the log instead of reverting it.
+unittest
+{
+    import std.exception : assertThrown;
+    auto dir = freshDir("compact-callback-throws");
+    auto mock = new MockClient([LLMResponse("work"), LLMResponse("SUMMARY")]);
+    auto agent = new Agent(mock, echoTools, Policy.init, "sys");
+    agent.log = some(new SessionLog(dir, "mock/m", "/w"));
+    agent.run("first request", new NullEvents);
+    auto log = agent.log.unwrap("set by the test");
+    agent.onCompacted = (ref const CompactReport) { throw new Exception("reporting failed"); };
+    CompactReport rep;
+    assertThrown(agent.compact(rep), "the callback's failure propagates");
+    agent.onCompacted = null;
+    assert(agent.pinStash.length == 1 && agent.pinStash[0].content == "first request",
+        "the persisted compaction keeps its stash");
+    assert(agent.messages[1].content != "first request", "the folded turn stays summarized");
+    auto r = restore(log.path);
+    assert(r.conversation.length == agent.messages.length,
+        "the live conversation stays the compacted one the log recorded");
+    assert(r.conversation[1].content == agent.messages[1].content,
+        "the recorded replacement is the live summary");
+}
+
+// Round-9 review fix for issue #205: a throwing `onPlanChanged` notification
+// after the change is persisted leaves the live plan matching the log — only
+// a persistence failure rolls the plan back.
+unittest
+{
+    import std.exception : assertThrown;
+    auto dir = freshDir("plan-callback-throws");
+    auto agent = new Agent(new MockClient([]), echoTools, Policy.init, "sys");
+    auto log = new SessionLog(dir, "mock/m", "/w");
+    log.append(agent.messages[0]);
+    agent.log = some(log);
+    agent.onPlanChanged = () { throw new Exception("notify failed"); };
+    assertThrown!Exception(agent.runPlanTool("plan_add", parseJSON(`{"goal":"Ship it","items":["One"]}`)));
+    agent.onPlanChanged = null;
+    assert(agent.plan.items.length == 1, "the persisted change is not rolled back");
+    auto r = restore(log.path);
+    auto resumed = new Agent(new MockClient([]), echoTools, Policy.init, "sys");
+    resumed.loadRestored(r, some(new SessionLog(log.path)));
+    assert(resumed.plan == agent.plan, "resume restores the plan the log recorded");
+}
+
+// Round-15 review fix for issue #205: a failed snapshot write in `setPlan`
+// restores the previous plan, so a later delta never references an
+// unrecorded baseline (which would lose unchanged items and the goal on
+// resume).
+unittest
+{
+    import std.exception : assertThrown;
+    import nano.plan : Plan, PlanItem, Status;
+    auto dir = freshDir("setplan-rollback");
+    auto agent = new Agent(new MockClient([]), echoTools, Policy.init, "sys");
+    auto log = new SessionLog(dir, "mock/m", "/w");
+    log.append(agent.messages[0]);
+    agent.log = some(log);
+    agent.runPlanTool("plan_add", parseJSON(`{"goal":"Old goal","items":["One"]}`));
+    auto before = agent.plan;
+
+    Plan carried;
+    carried.goal = "New goal";
+    PlanItem item;
+    item.id = 1;
+    item.title = "Two";
+    carried.items = [item];
+    log.failNextWrite = true;
+    assertThrown!Exception(agent.setPlan(carried, false), "the failed snapshot propagates");
+    assert(agent.plan == before, "the previous plan is restored");
+    // The retry persists and a later delta replays against the recorded baseline.
+    agent.setPlan(carried, false);
+    assert(agent.plan.goal == "New goal");
+    agent.runPlanTool("plan_update", parseJSON(`{"id":1,"status":"done"}`));
+    auto r = restore(log.path);
+    auto resumed = new Agent(new MockClient([]), echoTools, Policy.init, "sys");
+    resumed.loadRestored(r, some(new SessionLog(log.path)));
+    assert(resumed.plan == agent.plan, "resume rebuilds the plan from snapshot plus delta");
+    assert(resumed.plan.goal == "New goal" && resumed.plan.items[0].status == Status.done);
+}
+
+// Round-8 review fix for issue #205: a failed repair write on resume closes
+// the incoming log — its lock and registration do not outlive the failure —
+// while the live log stays.
+unittest
+{
+    import std.exception : assertThrown;
+    auto dir = freshDir("failed-repair-release");
+    auto agent = new Agent(new MockClient([LLMResponse("one")]), echoTools, Policy.init, "sys");
+    auto live = new SessionLog(dir, "mock/m", "/w");
+    live.append(agent.messages[0]);
+    agent.log = some(live);
+    assert(agent.run("hello", new NullEvents) == "one");
+    auto liveLen = agent.messages.length;
+
+    auto call = Message.assistant("");
+    call.toolCalls = [echoCall("c9")];
+    auto path = crashedSession(dir, [Message.user("run it"), call]);
+    auto r = restore(path);
+    auto target = new SessionLog(path);
+    target.failNextWrite = true;
+    assertThrown(agent.loadRestored(r, some(target)));
+    assert(agent.messages.length == liveLen && agent.log.match!(l => l is live, () => false),
+        "the live session is untouched");
+    assert(!target.isOpenForWrite, "the incoming log is closed on failure");
+    // The lock went with it: another writer can adopt the session at once.
+    auto r2 = restore(path);
+    auto agent2 = new Agent(new MockClient(null), echoTools, Policy.init, "sys");
+    agent2.loadRestored(r2, some(new SessionLog(path)));
+    agent2.log.unwrap("adopted").close();
 }

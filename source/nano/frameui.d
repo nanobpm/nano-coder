@@ -282,7 +282,7 @@ private final class FrameState
         lastRenderMs = now;
         auto lines = transcript.render(w);
         auto rows = decorate(editorRows, busy, clock.elapsed(now), w);
-        renderer.render(compose(lines, rows, status is null ? "" : status(w)), w, h);
+        renderer.render(compose(lines, rows, status is null ? "" : status(w)), w, h, lines.length);
     }
 
     /// Reads what's waiting in the pipe into the transcript; false at EOF.

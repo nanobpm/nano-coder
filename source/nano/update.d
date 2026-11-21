@@ -140,6 +140,78 @@ string[] installArgs(Channel c) pure
     }
 }
 
+/// The tap that serves `brewFormula`.
+enum brewTap = "nanobpm/tap";
+
+/// One command `/update` runs.
+struct InstallStep
+{
+    string program;
+    string[] args;
+    string[string] env; /// added to the inherited environment; a null value removes the variable
+}
+
+/// `git rev-parse --local-env-vars`: inherited, these redirect a `git -C dir`
+/// to another repository (`-C` does not override them).
+immutable string[] gitLocalEnvVars = [
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE", "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX",
+    "GIT_SHALLOW_FILE", "GIT_COMMON_DIR",
+];
+
+/// An env override that removes every `gitLocalEnvVars` entry, so a git step
+/// acts on the directory it names, not on a repository the session inherited.
+string[string] cleanGitEnv()
+{
+    string[string] e;
+    foreach (n; gitLocalEnvVars) e[n] = null;
+    return e;
+}
+
+/// Homebrew settings for the upgrade: no `brew update` of every tap, no
+/// upgrading or reinstalling of other formulae that depend on upgraded ones,
+/// no periodic cleanup of unrelated formulae's old kegs and cache, no hints.
+/// Only used once our own tap has been refreshed.
+immutable string[string] quietBrewEnv;
+shared static this()
+{
+    quietBrewEnv = [
+        "HOMEBREW_NO_AUTO_UPDATE": "1",
+        "HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK": "1",
+        "HOMEBREW_NO_INSTALL_CLEANUP": "1",
+        "HOMEBREW_NO_ENV_HINTS": "1",
+    ];
+}
+
+/// What `/update` runs. A brew install whose tap checkout is known
+/// (`tapRepo`) refreshes just that tap, then upgrades with `quietBrewEnv`, so
+/// the update touches nano-coder and nothing else. Without it, plain
+/// `brew upgrade` (brew refreshes every tap itself). A failed refresh stops
+/// before the upgrade: running plain `brew upgrade` there would re-enable the
+/// all-tap auto-update and dependents check, and could mask the failure.
+InstallStep[] installSteps(Channel c, string tapRepo)
+{
+    if (c == Channel.other) return null;
+    if (c == Channel.brew && tapRepo.length)
+        return [InstallStep("git", ["-C", tapRepo, "pull", "--ff-only", "--quiet"], cleanGitEnv()),
+            InstallStep(installer(c), installArgs(c), quietBrewEnv.dup)];
+    return [InstallStep(installer(c), installArgs(c))];
+}
+
+/// The local checkout of `brewTap` (`brew --repository`), or null when it is
+/// missing or not a git checkout. Throws when brew cannot be run.
+string brewTapRepo()
+{
+    import std.process : execute;
+    import std.file : exists;
+    import std.path : buildPath;
+    auto r = execute(["brew", "--repository", brewTap]);
+    if (r.status != 0) return null;
+    auto dir = r.output.strip;
+    return dir.length && exists(buildPath(dir, ".git")) ? dir : null;
+}
+
 /// The update command for a channel ("" for other).
 string installCommand(Channel c) pure { return c == Channel.other ? "" : installer(c) ~ " " ~ installArgs(c).joinWords; }
 
@@ -154,7 +226,38 @@ string latestUrl(Channel c) pure
     }
 }
 
-private string joinWords(string[] a) pure { import std.array : join; return a.join(" "); }
+private string joinWords(string[] a) pure { import std.algorithm : map; import std.array : join; return a.map!shellWord.join(" "); }
+
+/// A word as a POSIX shell would need it to round-trip: bare when it holds
+/// only safe characters, otherwise single-quoted (embedded `'` as `'\''`).
+string shellWord(string w) pure
+{
+    import std.algorithm : all;
+    import std.array : replace;
+    import std.ascii : isAlphaNum;
+    if (w.length && w.all!(c => c.isAlphaNum || "-_./=:@%+,".canFindChar(c))) return w;
+    return "'" ~ w.replace("'", "'\\''") ~ "'";
+}
+
+private bool canFindChar(string set, dchar c) pure { foreach (d; set) if (d == c) return true; return false; }
+
+/// The step as a copy-pasteable shell command: its environment overrides
+/// (sorted, as `K=V` prefixes) then the program and arguments, so a manual
+/// retry reproduces what `/update` ran. Removals (null values) are rendered
+/// as an `env -u K ...` prefix, so a pasted retry is isolated from an inherited
+/// redirect (e.g. `GIT_DIR`) exactly like the step `/update` ran.
+string stepCommand(InstallStep step)
+{
+    import std.algorithm : sort;
+    import std.array : array;
+    string unset, set;
+    foreach (k; step.env.keys.array.sort)
+    {
+        if (step.env[k] is null) unset ~= "-u " ~ shellWord(k) ~ " ";
+        else set ~= k ~ "=" ~ shellWord(step.env[k]) ~ " ";
+    }
+    return (unset.length ? "env " ~ unset : "") ~ set ~ shellWord(step.program) ~ " " ~ step.args.joinWords;
+}
 
 /// Checks are off by environment.
 bool disabledByEnv()
@@ -395,7 +498,8 @@ Chan!string startChecker(Channel channel, string running)
 
 /// `/update`'s outcome: lines to print.
 string[] runInstaller(Channel channel, string exe, string running,
-    int delegate(string program, string[] args) @safe runner, string delegate(string exe) @safe versionOf = null)
+    int delegate(string program, string[] args, const string[string] env) @safe runner,
+    string delegate(string exe) @safe versionOf = null, string delegate() @safe tapRepoOf = null)
 {
     if (channel == Channel.other)
         return [format("This nano-coder was not installed with npm or Homebrew (install channel: other), so it cannot update itself. "
@@ -404,12 +508,37 @@ string[] runInstaller(Channel channel, string exe, string running,
     if (which(program) is null)
         return [format("`%s` is not on PATH, so nano-coder cannot run the update itself. Install it manually with: %s",
             program, installCommand(channel))];
+    string tapRepo;
+    string shown = installCommand(channel);
+    InstallStep[] steps;
     int status;
-    try status = runner(program, installArgs(channel));
-    catch (Exception e) return [format("Could not run `%s`: %s", installCommand(channel), e.msg)];
+    // One catch for every process this runs: brew --repository, git, the installer.
+    try
+    {
+        if (channel == Channel.brew)
+        {
+            // Name the lookup itself if it throws; the loop below then
+            // replaces `shown` with each step it actually runs.
+            shown = "brew --repository " ~ brewTap;
+            tapRepo = tapRepoOf is null ? brewTapRepo() : tapRepoOf();
+        }
+        steps = installSteps(channel, tapRepo);
+        foreach (i, step; steps)
+        {
+            shown = stepCommand(step);
+            // A failed tap refresh (offline, diverged tap, or git missing so
+            // the spawn throws) stops the update before any brew run: plain
+            // `brew upgrade` would re-enable the all-tap auto-update and
+            // dependents check. A spawn failure reaches the catch below with
+            // its message intact.
+            status = runner(step.program, step.args, step.env);
+            if (status != 0) break;
+        }
+    }
+    catch (Exception e) return [format("Could not run `%s`: %s; the running session is unchanged.", shown, e.msg)];
     if (status != 0)
         return [format("`%s` exited with status %s; the running session is unchanged. Try it by hand to see the full error: %s",
-            installCommand(channel), status, installCommand(channel))];
+            shown, status, shown)];
     auto v = versionOf is null ? installedVersion(exe) : versionOf(exe);
     if (v is null)
         return ["The installer finished but the installed `nano-coder --version` could not be read; the running session is unchanged."];
@@ -422,10 +551,16 @@ string[] runInstaller(Channel channel, string exe, string running,
 }
 
 /// Runs the installer attached to the terminal; its exit status.
-int spawnInstaller(string program, string[] args)
+int spawnInstaller(string program, string[] args, const string[string] env)
 {
-    import std.process : spawnProcess, wait;
-    return wait(spawnProcess([program] ~ args));
+    import std.process : spawnProcess, wait, environment, Config;
+    bool removes;
+    foreach (k, v; env) if (v is null) removes = true;
+    if (!removes) return wait(spawnProcess([program] ~ args, env));
+    // Removing needs the whole environment: spawnProcess only adds to it.
+    auto full = environment.toAA;
+    foreach (k, v; env) { if (v is null) full.remove(k); else full[k] = v; }
+    return wait(spawnProcess([program] ~ args, full, Config.newEnv));
 }
 
 /// `exe --version`'s version, or null.
@@ -575,11 +710,11 @@ unittest
 {
     import std.algorithm : canFind;
     int ran;
-    int delegate(string, string[]) @safe ok = (string p, string[] a) { ran++; assert(a == ["install", "-g", npmPackage ~ "@latest"]); return 0; };
+    int delegate(string, string[], const string[string]) @safe ok = (string p, string[] a, const string[string] e) { ran++; assert(e is null); assert(a == ["install", "-g", npmPackage ~ "@latest"]); return 0; };
     auto other = runInstaller(Channel.other, "/x", "0.1.0", ok);
     assert(other[0].canFind("install channel: other") && other[0].canFind(releasesUrl) && !ran);
     if (which("npm") is null) return; // the rest needs npm on PATH
-    assert(runInstaller(Channel.npm, "/x", "0.1.0", (string p, string[] a) @safe => 1)[0].canFind("unchanged"));
+    assert(runInstaller(Channel.npm, "/x", "0.1.0", (string p, string[] a, const string[string] e) @safe => 1)[0].canFind("unchanged"));
     assert(runInstaller(Channel.npm, "/x", "0.1.0", ok, (string e) @safe => "0.2.0")[0].canFind("Updated to 0.2.0 — /relaunch"));
     assert(runInstaller(Channel.npm, "/x", "0.1.0", ok, (string e) @safe => "0.1.0")[0].canFind("still reports 0.1.0"));
     assert(runInstaller(Channel.npm, "/x", "0.1.0", ok, (string e) @safe => string.init)[0].canFind("could not be read"));
@@ -704,6 +839,22 @@ unittest
     assert(channelFor(buildPath(dir, "opt/nano-coder/bin/nano-coder")) == Channel.brew);
 }
 
+// spawnInstaller removes null-valued variables from the child and passes
+// the rest, without touching this process's environment.
+unittest
+{
+    import std.process : environment;
+    if (which("sh") is null) return;
+    // A private variable, not GIT_DIR itself: tests run concurrently with git ones.
+    enum v = "NANO_UPDATE_TEST_INHERITED";
+    environment[v] = "/elsewhere/.git";
+    scope (exit) environment.remove(v);
+    string[string] e = [v: null, "NANO_T": "y"];
+    assert(spawnInstaller("sh", ["-c", `test -z "${` ~ v ~ `+x}" && test "$NANO_T" = y`], e) == 0);
+    assert(spawnInstaller("sh", ["-c", `test "$` ~ v ~ `" = /elsewhere/.git`], null) == 0);
+    assert(environment.get(v) == "/elsewhere/.git", "the session environment is unchanged");
+}
+
 // rust: update.rs::the_brew_channel_upgrades_the_tap_formula
 unittest
 {
@@ -711,6 +862,86 @@ unittest
     assert(latestUrl(Channel.brew) == brewFormulaUrl);
     assert(installCommand(Channel.npm) == "npm install -g @nanobpm/nano-coder@latest");
     assert(installCommand(Channel.other) == "");
+}
+
+// /update on brew refreshes only our tap, then upgrades without brew's
+// auto-update, dependents upgrades, or cleanup; a failed refresh stops
+// before the upgrade; unknown tap: plain `brew upgrade`.
+unittest
+{
+    import std.algorithm : canFind;
+    auto steps = installSteps(Channel.brew, "/tap");
+    assert(steps.length == 2);
+    assert(steps[0].program == "git" && steps[0].args == ["-C", "/tap", "pull", "--ff-only", "--quiet"]);
+    foreach (n; ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY"])
+        assert(n in steps[0].env && steps[0].env[n] is null, n ~ " must be removed from the tap pull's environment");
+    foreach (v; steps[0].env.byValue) assert(v is null, "the tap pull only removes variables");
+    assert(steps[1].program == "brew" && steps[1].args == ["upgrade", brewFormula]);
+    assert(steps[1].env["HOMEBREW_NO_AUTO_UPDATE"] == "1" && steps[1].env["HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK"] == "1");
+    assert(steps[1].env["HOMEBREW_NO_INSTALL_CLEANUP"] == "1" && steps[1].env["HOMEBREW_NO_ENV_HINTS"] == "1");
+    auto plain = installSteps(Channel.brew, null);
+    assert(plain.length == 1 && plain[0].args == ["upgrade", brewFormula] && plain[0].env is null);
+    assert(stepCommand(plain[0]) == "brew upgrade " ~ brewFormula);
+    {
+        import std.algorithm : sort, map;
+        import std.array : array, join;
+        auto unsets = steps[0].env.keys.array.sort.map!(k => "-u " ~ k ~ " ").join;
+        assert(stepCommand(steps[0]) == "env " ~ unsets ~ "git -C /tap pull --ff-only --quiet", stepCommand(steps[0]));
+        assert(stepCommand(steps[0]).canFind("-u GIT_DIR ") && stepCommand(steps[0]).canFind("-u GIT_WORK_TREE "));
+    }
+    assert(stepCommand(steps[1]) == "HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 "
+        ~ "HOMEBREW_NO_INSTALL_CLEANUP=1 brew upgrade " ~ brewFormula);
+    auto spaced = installSteps(Channel.brew, "/opt/home brew/tap");
+    assert(stepCommand(spaced[0]).canFind(" git -C '/opt/home brew/tap' pull --ff-only --quiet"));
+    assert(stepCommand(InstallStep("p", ["x"], ["A": null, "B": "1"])) == "env -u A B=1 p x");
+    assert(shellWord("it's") == `'it'\''s'` && shellWord("") == "''" && shellWord("a b") == "'a b'");
+    assert(stepCommand(InstallStep("my prog", ["x"], ["K": "a b"])) == "K='a b' 'my prog' x");
+    assert(installSteps(Channel.npm, "/tap").length == 1 && installSteps(Channel.other, "/tap") is null);
+    if (which("brew") is null) return; // runInstaller needs brew on PATH
+    string[] ran;
+    auto rec = (string p, string[] a, const string[string] e) @safe { ran ~= p; return p == "git" ? 1 : 0; };
+    auto out_ = runInstaller(Channel.brew, "/x", "0.1.0", rec, (string e) @safe => "0.2.0", () @safe => "/tap");
+    assert(ran == ["git"], "a failed tap refresh stops before brew upgrade");
+    assert(out_[0].canFind("git -C /tap pull") && out_[0].canFind("unchanged"), out_[0]);
+    ran = null;
+    auto failing = (string p, string[] a, const string[string] e) @safe { ran ~= p; return 1; };
+    out_ = runInstaller(Channel.brew, "/x", "0.1.0", failing, (string e) @safe => "0.2.0", () @safe => "/tap");
+    assert(ran == ["git"], "brew never runs when the tap refresh failed");
+    assert(out_[0].canFind("git -C /tap pull") && out_[0].canFind("unchanged"), out_[0]);
+    assert(!out_[0].canFind("full error: brew"), "the retry hint names the failed refresh, not brew upgrade");
+    ran = null;
+    auto noGit = (string p, string[] a, const string[string] e) @safe {
+        ran ~= p; if (p == "git") throw new Exception("git: not found"); return 0; };
+    out_ = runInstaller(Channel.brew, "/x", "0.1.0", noGit, (string e) @safe => "0.2.0", () @safe => "/tap");
+    assert(ran == ["git"], "git missing from PATH stops before brew upgrade too");
+    assert(out_[0].canFind("Could not run `env -u ") && out_[0].canFind(" git -C /tap pull") && out_[0].canFind("git: not found")
+        && out_[0].canFind("unchanged") && !out_[0].canFind("status -1"), out_[0]);
+    // Successful tap refresh: git then brew, with every override reaching brew's runner.
+    ran = null;
+    string[string] brewEnv;
+    auto okRun = (string p, string[] a, const string[string] e) @safe {
+        ran ~= p;
+        if (p == "brew") foreach (k; ["HOMEBREW_NO_AUTO_UPDATE", "HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK",
+                "HOMEBREW_NO_INSTALL_CLEANUP", "HOMEBREW_NO_ENV_HINTS"]) if (auto v = k in e) brewEnv[k] = *v;
+        return 0; };
+    out_ = runInstaller(Channel.brew, "/x", "0.1.0", okRun, (string e) @safe => "0.2.0", () @safe => "/tap");
+    assert(ran == ["git", "brew"], "a successful tap refresh is followed by brew upgrade");
+    assert(out_[0].canFind("Updated to 0.2.0"), out_[0]);
+    foreach (k; ["HOMEBREW_NO_AUTO_UPDATE", "HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK",
+            "HOMEBREW_NO_INSTALL_CLEANUP", "HOMEBREW_NO_ENV_HINTS"])
+        assert(k in brewEnv && brewEnv[k] == "1", k);
+    // No tap checkout (tapRepo null): plain `brew upgrade` is the only step.
+    ran = null;
+    auto plainRun = (string p, string[] a, const string[string] e) @safe { ran ~= p; return 0; };
+    out_ = runInstaller(Channel.brew, "/x", "0.1.0", plainRun, (string e) @safe => "0.2.0", () @safe => cast(string) null);
+    assert(ran == ["brew"], "no tap checkout: plain brew upgrade");
+    assert(out_[0].canFind("Updated to 0.2.0"), out_[0]);
+    // A throwing tap lookup is reported as the lookup, not the unattempted upgrade.
+    ran = null;
+    out_ = runInstaller(Channel.brew, "/x", "0.1.0", plainRun, (string e) @safe => "0.2.0",
+        delegate string() @safe { throw new Exception("lookup boom"); });
+    assert(ran is null, "nothing runs when the tap lookup throws");
+    assert(out_[0].canFind("Could not run `brew --repository " ~ brewTap ~ "`") && out_[0].canFind("lookup boom"), out_[0]);
 }
 
 // rust: update.rs::the_formula_version_is_read_from_its_download_url

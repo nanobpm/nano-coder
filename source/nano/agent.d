@@ -1415,8 +1415,38 @@ class Agent
         if (compactionPinRequests)
             if (auto pinned = ctx.pinnedUserRequests(pinStash, summarized, smart, window))
                 summary ~= "\n\n" ~ pinned;
+        // The requests this compaction adds to the pinned block (the stash so
+        // far is their base): the log records only these, so a session holds
+        // each request once instead of restating the whole stash (issue #205).
+        // The compaction's in-memory changes commit only when the replace
+        // record is persisted: a failed `l.replace` rolls them all back, so
+        // a later successful compaction never writes a delta whose base
+        // counts requests no log record holds (resume would lose them).
+        auto savedMessages = messages;
+        auto savedPinStash = pinStash;
+        auto savedReplayStash = replayStash;
+        auto savedReplayRestated = replayRestated;
+        auto savedPending = pending;
+        auto savedCalibLen = calibLen;
+        // The rollback covers only the mutation-and-persistence transaction:
+        // once `l.replace` has persisted the compacted conversation the log
+        // holds the replacement, so a later failure (reporting, notification)
+        // must not revert the live state away from what the log records.
+        bool persisted;
+        scope (failure)
+            if (!persisted)
+            {
+                messages = savedMessages;
+                pinStash = savedPinStash;
+                replayStash = savedReplayStash;
+                replayRestated = savedReplayRestated;
+                pending = savedPending;
+                calibLen = savedCalibLen;
+            }
+        size_t pinnedBase = pinStash.length;
+        Message[] pinnedNew;
         foreach (ref x; summarized)
-            if (ctx.isUserRequest(x)) pinStash ~= x;
+            if (ctx.isUserRequest(x)) { pinStash ~= x; pinnedNew ~= x; }
 
         // The newly folded real turns for the replay stash. On a repeated
         // compaction the first folded message is the previous summary, whose
@@ -1471,9 +1501,13 @@ class Agent
             pending.base = messages.length;
         }
         log.ifSome((SessionLog l) {
-            l.replace(messages, first, last, ctx.modeName(m), client.providerName ~ "/" ~ client.modelName, pinStash,
-                hasPending ? &pending : null, folded, extendsStash ? some(stashBase) : Option!size_t.init, replayRestated);
+            l.replace(messages, first, last, ctx.modeName(m), client.providerName ~ "/" ~ client.modelName, pinnedNew,
+                hasPending ? &pending : null, folded, extendsStash ? some(stashBase) : Option!size_t.init, replayRestated,
+                some(pinnedBase));
         });
+        // The replace record is durable: the live state now matches the log,
+        // so nothing past this point may roll it back.
+        persisted = true;
         // The replacement drops recalled notes' full text from context, so
         // every memory may be recalled again (except those the retained
         // system message's index renders in full: `indexShown` is kept).
@@ -1654,8 +1688,13 @@ class Agent
     {
         import nano.mode : AgentMode;
         string[] dropped;
-        // Repairs are logged first: a failed write leaves the live session as it was.
+        // Repairs are logged first: a failed write leaves the live session as
+        // it was — and closes the incoming log, which the agent never
+        // adopted, so its descriptor and lock do not leak into `openHere`.
         auto repairs = danglingRepairs(r.conversation);
+        // Once `replaceLog` adopts it the log is the live writer: a later
+        // failure (e.g. a throwing timers callback) must not close it.
+        scope (failure) if (!ownsLog(newLog)) newLog.ifSome((SessionLog l) { l.close(); });
         foreach (ref m; repairs)
         {
             import nano.session : nowStamp;
@@ -1665,7 +1704,7 @@ class Agent
         messages = messages.length && messages[0].role == Role.system ? messages[0 .. 1] : null;
         foreach (ref m; r.conversation)
             if (m.role != Role.system) messages ~= m;
-        log = newLog;
+        replaceLog(newLog);
         control.mode = AgentMode.normal;
         sessionThinking.nullify();
         completedInputs = r.completed;
@@ -1683,6 +1722,9 @@ class Agent
             // A malformed plan is dropped; the session resumes.
             Plan.fromJSON(r.plan).match!((p) { plan = p; }, (e) { dropped ~= "the saved plan: " ~ e; });
         }
+        // The log's delta chain length is unknown here: snapshot on the next
+        // change so repeated short runs cannot grow the chain without bound.
+        planDeltasSinceSnapshot = planSnapshotEvery;
         Timers t;
         try t = Timers.fromJSON(r.timers);
         catch (Exception e) dropped ~= "the saved timers: " ~ e.msg; // malformed timers are dropped, the session resumes
@@ -1727,16 +1769,41 @@ class Agent
         restart(render(), newLog);
     }
 
+    /// Switch to `newLog`, closing the outgoing log (releasing its lock and
+    /// descriptor) unless it is the same object.
+    /// Whether `l` is the agent's live writer (ownership has transferred).
+    bool ownsLog(Option!SessionLog l)
+    {
+        bool same;
+        log.ifSome((SessionLog cur) { l.ifSome((SessionLog n) { same = n is cur; }); });
+        return same;
+    }
+
+    /// ditto
+    bool ownsLog(SessionLog l) { return ownsLog(some(l)); }
+
+    void replaceLog(Option!SessionLog newLog)
+    {
+        auto old = log;
+        log = newLog;
+        old.ifSome((SessionLog o) {
+            bool same;
+            newLog.ifSome((SessionLog n) { same = n is o; });
+            if (!same) o.close();
+        });
+    }
+
     void restart(string system, Option!SessionLog newLog)
     {
         import nano.mode : AgentMode;
         messages = [Message.system(system)];
         promptPlan = false; // the caller renders `system` for normal mode
-        log = newLog;
+        replaceLog(newLog);
         log.ifSome((SessionLog l) { l.append(messages[0]); });
         control.mode = AgentMode.normal;
         sessionThinking.nullify();
         plan = Plan.init;
+        planDeltasSinceSnapshot = 0;
         setTimers(Timers.init);
         reminders = Reminders.init;
         sessionStarted = false;
@@ -2028,16 +2095,50 @@ class Agent
         auto o = plan.apply(name, args).orThrow!(e => new ToolError(e));
         if (o.changed)
         {
-            // As for timers: an unrecorded change is rolled back.
-            scope (failure) plan = before;
-            planChanged();
+            // As for timers: a change that cannot be recorded is rolled back
+            // (the rollback itself lives in `planChanged`, which disarms it
+            // once the change is persisted).
+            planChanged(before);
         }
         return o.text;
     }
 
-    private void planChanged()
+    /// Log a plan change as a delta against `before` (issue #205: a full
+    /// snapshot per change rewrites every note, and `plan` records were 8% of
+    /// the largest logs), with a full snapshot every `planSnapshotEvery`
+    /// changes so a resume never replays an unbounded delta chain.
+    private enum size_t planSnapshotEvery = 20;
+    private size_t planDeltasSinceSnapshot;
+
+    private void planChanged(Plan before)
     {
-        log.ifSome((SessionLog l) { l.plan(plan.toJSON); });
+        import std.algorithm : canFind;
+        // Only persistence may roll the plan back: once the change is
+        // recorded the log holds it, so a throwing notification must leave
+        // the live plan matching what resume will restore.
+        bool persisted;
+        scope (failure) if (!persisted) plan = before;
+        log.ifSome((SessionLog l) {
+            if (++planDeltasSinceSnapshot >= planSnapshotEvery || (before.items.length == 0 && plan.items.length > 1))
+            {
+                l.plan(plan.toJSON);
+                planDeltasSinceSnapshot = 0;
+            }
+            else
+            {
+                JSONValue goal = JSONValue(null);
+                if (before.goal != plan.goal) goal = JSONValue(plan.goal);
+                JSONValue[] upserts;
+                foreach (i, ref it; plan.items)
+                    if (i >= before.items.length || it != before.items[i])
+                        upserts ~= it.toJSON;
+                uint[] drop;
+                foreach (ref b; before.items[0 .. min(before.items.length, plan.items.length)])
+                    if (!plan.items.canFind!(i => i.id == b.id)) drop ~= b.id;
+                l.planDelta(goal, upserts, drop, before.items.length);
+            }
+        });
+        persisted = true;
         reminders.planChanged();
         if (onPlanChanged !is null) onPlanChanged();
     }
@@ -2046,9 +2147,17 @@ class Agent
     /// the model about it unless `announce` is false.
     void setPlan(Plan p, bool announce)
     {
+        // As in `planChanged`: only persistence may roll the plan back. A
+        // failure before the snapshot is recorded restores the previous plan,
+        // so a later delta never references an unrecorded baseline.
+        auto before = plan.dup;
+        bool persisted;
+        scope (failure) if (!persisted) plan = before;
         plan = p;
         if (announce && planTools && !plan.empty) push(Message.user(plan.carriedOverNote));
         log.ifSome((SessionLog l) { l.plan(plan.toJSON); });
+        persisted = true;
+        planDeltasSinceSnapshot = 0;
     }
 
     private static string withContext(string text, string[] context) pure
@@ -2553,6 +2662,32 @@ unittest
     agent.pinStash = [Message.user("old")];
     agent.restart("sys", Option!SessionLog.init);
     assert(agent.pinStash is null);
+}
+
+// Round-5 review fix for issue #205: replacing the agent's log closes the
+// outgoing one (releasing its lock and descriptor); a no-op replace keeps it.
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse;
+    import std.path : buildPath;
+    import nano.providers.mock;
+    import nano.session : SessionLog, newSessionId;
+    auto dir = buildPath(tempDir, "nano-d-replacelog-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto agent = new Agent(new MockClient([LLMResponse("ok")]), new ToolRegistry, Policy.init, "sys");
+    auto first = new SessionLog(dir, "mock/m", "/w");
+    agent.replaceLog(some(first));
+    assert(first.isOpenForWrite, "the live log stays open");
+    auto second = new SessionLog(dir, "mock/m", "/w");
+    agent.replaceLog(some(second));
+    assert(!first.isOpenForWrite, "a replaced log is closed (lock and descriptor released)");
+    assert(second.isOpenForWrite, "the incoming log stays open");
+    // Re-setting the same log is a no-op, and dropping the log closes it.
+    agent.replaceLog(some(second));
+    assert(second.isOpenForWrite, "replacing a log with itself closes nothing");
+    agent.replaceLog(Option!SessionLog.init);
+    assert(!second.isOpenForWrite, "teardown (no new log) closes the outgoing log");
 }
 
 // Compaction: manual, past the threshold, and after a context overflow.

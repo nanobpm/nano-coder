@@ -16,4 +16,5 @@ nano.cmdexpand environment variables
 nano.config environment variables
 nano.trust environment variables
 nano.testenv_test environment variables
+nano.update environment variables
 nano.herdr the Herdr reporter
