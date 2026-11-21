@@ -8,6 +8,8 @@ module nano.vision;
 @safe:
 pure:
 
+import nano.arith : toSize;
+
 import std.algorithm : canFind, any;
 import std.json;
 import std.string : toLower, startsWith, indexOf, lastIndexOf;
@@ -48,11 +50,11 @@ struct Vision
                 if (m.type == JSONType.integer || m.type == JSONType.uinteger)
                 {
                     if (m.integer == 0) return none;
-                    out_.maxImages = cast(size_t) m.integer;
+                    out_.maxImages = toSize(m.integer);
                 }
             if (auto m = objGet(*lv, "max_prompt_image_size"))
                 if ((m.type == JSONType.integer || m.type == JSONType.uinteger) && m.integer > 0)
-                    out_.maxImageBytes = cast(size_t) m.integer;
+                    out_.maxImageBytes = toSize(m.integer);
             if (auto m = objGet(*lv, "supported_media_types"))
                 if (m.type == JSONType.array)
                     foreach (t; m.arrayNoRef) if (t.type == JSONType.string) out_.mediaTypes ~= t.str;
@@ -181,6 +183,13 @@ unittest
     auto v = Vision.fromModelEntry(parseJSON(`{"capabilities":{"supports":{"vision":true},"limits":{"vision":{"max_prompt_images":5,"max_prompt_image_size":3145728,"supported_media_types":["image/png"]}}}}`));
     assert(!v.isNull && v.get.maxImages == 5 && v.get.maxImageBytes == 3145728 && v.get.mediaTypes == ["image/png"]);
     assert(Vision.fromModelEntry(parseJSON(`{"capabilities":{"supports":{"vision":true},"limits":{"vision":{"max_prompt_images":0}}}}`)).isNull);
+    {
+        // A negative count is reported where it is read, not wrapped to 2^64.
+        import std.exception : assertThrown;
+        import std.conv : ConvException;
+        assertThrown!ConvException(Vision.fromModelEntry(parseJSON(
+            `{"capabilities":{"supports":{"vision":true},"limits":{"vision":{"max_prompt_images":-1}}}}`)));
+    }
     assert(!Vision.fromOllamaShow(parseJSON(`{"capabilities":["vision"]}`)).isNull);
     assert(!Vision.fromLlamacppProps(parseJSON(`{"modalities":{"vision":true}}`)).isNull);
     ProviderConfig openai;

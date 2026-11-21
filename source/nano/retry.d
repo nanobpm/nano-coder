@@ -4,6 +4,8 @@
 module nano.retry;
 
 @safe:
+
+import std.conv : to;
 import nano.safeio : jsonText, jsonPretty;
 
 import core.time : Duration, seconds, msecs, usecs;
@@ -67,7 +69,7 @@ bool retryable(const ErrorInfo e, const(ushort)[] statuses) pure nothrow
     if (e.code.length && fatalCodes.canFind(e.code)) return false;
     if (e.status != 429 && ["authentication_error", "permission_error", "insufficient_quota", "invalid_request_error"].canFind(e.kind))
         return false;
-    if (e.status < 200 || e.status >= 300) return statuses.canFind(cast(ushort) e.status);
+    if (e.status < 200 || e.status >= 300) return statuses.canFind(e.status);
     // An error reported inside a 2xx body: fail open.
     return true;
 }
@@ -118,7 +120,7 @@ Duration retryDelay(RetryPolicy policy, long attempt, scope const(ErrorInfo)* er
     return delay - usecsOf((delay / 5).total!"usecs" * jitter);
 }
 
-private Duration usecsOf(double n) pure { return (cast(long) n).usecs; }
+private Duration usecsOf(double n) pure { return n.to!long.usecs; }
 
 /// `Retry-After`: seconds (integer or decimal) or an HTTP date.
 Duration parseRetryAfterHeader(string value, long nowUnix)

@@ -4,7 +4,7 @@ module nano.resume;
 
 @safe:
 import nano.clock : wallNow;
-import nano.arith : saturatingSub;
+import nano.arith : saturatingSub, toLong;
 
 import nano.safeio : stdErr, stdOut;
 
@@ -359,7 +359,7 @@ struct Picker
         {
             case K.escape, K.interrupt, K.eof, K.closed: return -2;
             case K.submit:
-                return filtered.length ? cast(long) filtered[sel] : -1;
+                return filtered.length ? toLong(filtered[sel]) : -1;
             case K.up:
                 if (filtered.length) sel = (sel + filtered.length - 1) % filtered.length;
                 return -1;

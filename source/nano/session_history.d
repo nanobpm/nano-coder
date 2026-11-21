@@ -5,7 +5,7 @@ module nano.session_history;
 
 @safe:
 import nano.safeio : jsonText, jsonPretty;
-import nano.arith : saturatingSub;
+import nano.arith : saturatingSub, toSize;
 
 import std.algorithm : canFind, startsWith, min;
 import std.array : join, split;
@@ -183,8 +183,8 @@ string search(string path, JSONValue args)
     size_t limit = defaultLimit;
     if (auto l = "limit" in args.objectNoRef)
     {
-        long n = l.type == JSONType.integer ? l.integer : l.type == JSONType.uinteger ? cast(long) l.uinteger : 0;
-        if (n > 0) limit = min(cast(size_t) n, maxLimit);
+        long n = l.type == JSONType.integer ? l.integer : l.type == JSONType.uinteger ? long.max : 0; // uinteger: above long.max
+        if (n > 0) limit = min(toSize(n), maxLimit);
     }
     bool oldestFirst;
     if (auto o = "order" in args.objectNoRef)
@@ -277,9 +277,9 @@ string read(string path, JSONValue args)
     size_t limit = defaultMaxOutput;
     if (auto l = "max_output_length" in args.objectNoRef)
     {
-        long n = l.type == JSONType.integer ? l.integer : l.type == JSONType.uinteger ? cast(long) l.uinteger : -1;
+        long n = l.type == JSONType.integer ? l.integer : l.type == JSONType.uinteger ? long.max : -1; // uinteger: above long.max
         if (n <= 0) throw new HistoryError("max_output_length must be a positive integer");
-        limit = min(cast(size_t) n, maxOutputLimit);
+        limit = min(toSize(n), maxOutputLimit);
     }
     auto messages = load(path);
     const(Entry)* found;

@@ -160,7 +160,7 @@ private string[] wrapSpans(const Span[] spans, size_t width, ubyte extra) pure
     }
     foreach (span; spans)
     {
-        auto style = cast(ubyte)(span.style | extra);
+        ubyte style = span.style | extra;
         string piece;
         foreach (dchar c; span.text)
         {

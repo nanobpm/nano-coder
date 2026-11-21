@@ -5,6 +5,8 @@
 module nano.frameui;
 
 @safe:
+
+import std.string : representation;
 import nano.clock : monoNow;
 
 import nano.option : NotNull;
@@ -41,7 +43,7 @@ struct FrameUi
     private int tty = -1, writeEnd = -1, wake = -1;
 
     /// Whether this is a running frame.
-    bool opCast(B : bool)() pure const { return cast(bool) requests; }
+    bool opCast(B : bool)() pure const { return !!requests; }
 
     /// Takes over the terminal: fd 1 and 2 now feed the transcript. Returns
     /// `FrameUi.init` if it can't.
@@ -187,7 +189,7 @@ private void frameThread(Isolated!FrameState state, Chan!Request requests)
                     import std.array : replace;
                     // A committed prompt keeps the ready glyph, not a spinner frame.
                     auto line = c.line.replace(glyphMark, promptGlyph(false, 0));
-                    f.transcript.feed(cast(const(ubyte)[]) (line ~ "\n"));
+                    f.transcript.feed((line ~ "\n").representation);
                     f.render();
                     c.done.put(true);
                     return false;

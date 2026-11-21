@@ -379,7 +379,7 @@ void appendMessageRows(ref Turn turn, const JSONValue m, ulong line, ref string 
                         // logged digits with the correctly-rounded strtod.
                         auto lit = rawNumber(rawLine, "aic");
                         r.aic = serdeFloat(lit !is null ? strtodOf(lit)
-                            : a.type == JSONType.float_ ? a.floating : cast(double) a.integer);
+                            : a.type == JSONType.float_ ? a.floating : double(a.integer));
                     }
             }
         if (auto d = "duration_ms" in m) if (d.type == JSONType.integer) r.durationMs = d.integer;

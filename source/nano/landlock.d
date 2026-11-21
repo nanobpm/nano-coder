@@ -15,6 +15,8 @@ import std.format : format;
 
 @safe:
 
+import std.conv : to;
+
 /// The internal flag that marks a helper invocation.
 enum execFlag = "--landlock-exec";
 
@@ -120,7 +122,7 @@ string restrict(bool network, const string[] roots) @trusted
     if (auto e = rights(network, v, fs, net)) return e;
     auto attr = RulesetAttr(fs, net);
     auto size = v >= 4 ? RulesetAttr.sizeof : ulong.sizeof;
-    auto fd = cast(int) syscall(sysCreateRuleset, &attr, size, 0u);
+    auto fd = syscall(sysCreateRuleset, &attr, size, 0u).to!int;
     if (fd < 0) return "sandbox unavailable: landlock_create_ruleset: " ~ lastError();
     scope (exit) close(fd);
     // Device-node creation is handled but granted nowhere, so mknod fails

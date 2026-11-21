@@ -294,7 +294,7 @@ struct Policy
     string check(string tool, JSONValue args)
     {
         return decide(tool, args).match!(
-            (PermAllow _) => cast(string) null,
+            (PermAllow _) => string.init,
             (PermDeny d) => d.message,
         );
     }
