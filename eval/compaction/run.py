@@ -215,6 +215,28 @@ def extra_body_arg(text):
     return value
 
 
+def bracket_depth(text):
+    """Net `[` minus `]` in a TOML fragment, outside strings and comments."""
+    depth, quote, i = 0, None, 0
+    while i < len(text):
+        c = text[i]
+        if quote:
+            if c == "\\" and quote == '"':
+                i += 1
+            elif c == quote:
+                quote = None
+        elif c in "\"'":
+            quote = c
+        elif c == "#":
+            break
+        elif c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+        i += 1
+    return depth
+
+
 def config_text(base, session_dir, mode, extra_body=None, providers=(), pin=True):
     """The user's config (for providers and keys) with eval overrides on top.
     Overridden top-level keys are removed from the base so TOML stays valid."""
@@ -224,14 +246,15 @@ def config_text(base, session_dir, mode, extra_body=None, providers=(), pin=True
         depth = 0  # open brackets of a multiline array value being dropped
         for line in Path(base).read_text().splitlines():
             if depth > 0:
-                depth += line.count("[") - line.count("]")
+                depth += bracket_depth(line)
                 continue
             if line.strip().startswith("["):
                 in_table = True
             key = line.split("=", 1)[0].strip()
             if not in_table and key in OVERRIDDEN:
-                value = line.split("=", 1)[1] if "=" in line else ""
-                depth = max(0, value.count("[") - value.count("]"))
+                value = line.split("=", 1)[1].strip() if "=" in line else ""
+                # Only an array value can continue onto later lines.
+                depth = max(0, bracket_depth(value)) if value.startswith("[") else 0
                 continue
             lines.append(line)
     head = [
