@@ -2662,9 +2662,10 @@ int runMain(string[] args)
                     if (id == current) { writefln("Already in session %s", id); continue; }
                     import std.path : buildPath;
                     import std.file : isFile;
-                    auto path = buildPath(sessionDir, id ~ ".jsonl");
+                    // findSession also resolves a compressed (archived) log.
+                    string path;
                     bool ok;
-                    try { validateId(id); ok = path.exists && path.isFile; }
+                    try { validateId(id); path = nano.session.findSession(sessionDir, id); ok = path.isFile; }
                     catch (Exception) {} // an invalid ID or unreadable path is reported as "no saved session" just below
                     if (!ok) { writefln("No saved session %s: /resume without an ID lists them", JSONValue(id).jsonText); continue; }
                     try loadSession(path);
