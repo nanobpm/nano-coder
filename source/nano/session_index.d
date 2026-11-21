@@ -505,7 +505,20 @@ Summary[] list(string dir, bool strictIndex = false)
         {
             try s = summarize(e.name);
             catch (FileException err) throw err;
-            catch (Exception) continue; // not resumable
+            catch (Exception)
+            {
+                // Not resumable — but a titled entry's title lives only in
+                // the index, and rewriting the index without it would expose
+                // the named log to retention. Keep the titled entry for a
+                // file that still exists; it stays out of the picker (the
+                // `prompts > 0` filter below) while its title survives.
+                if (cached !is null && cached.title !is null)
+                {
+                    current[id] = *cached;
+                    index.remove(id);
+                }
+                continue;
+            }
             if (cached !is null)
             {
                 // Keep a model and title the index learned after the session started.
@@ -861,4 +874,33 @@ unittest
     std.file.append(indexPath(dir), cast(const(ubyte)[]) "{not json\n");
     import std.exception : assertThrown;
     assertThrown(titledIds(dir), "a corrupt index must not read as 'nothing titled'");
+}
+
+// Round-7 review fix for issue #205: listing a titled log that can no longer
+// be summarized (a torn tail) must not drop its title from the index — the
+// next retention pass would delete the named log. The entry is kept for the
+// file that exists but stays out of the picker (no prompts).
+unittest
+{
+    import nano.session : SessionLog, tidySessions;
+    auto dir = testDir("titled-torn");
+    scope (exit) rmdirRecurse(dir);
+    auto titled = writeLog(dir, "named", ["A prompt worth keeping"]);
+    list(dir);
+    setTitle(titled, "Keep me");
+    // Corrupt the log's header so `summarize` fails on it (the size change
+    // also busts the index's cache hit).
+    std.file.write(titled, cast(const(ubyte)[]) "\xff\xfe not a log\n");
+    auto shown = list(dir);
+    assert(shown.length == 0, "an unresumable log is not offered");
+    auto named = titledIds(dir);
+    assert("named" in named, "the title survives a failed summarize");
+    // Retention with the title intact must not delete the named log.
+    import std.file : setTimes, exists;
+    import core.time : days;
+    auto old = wallNow - days(400);
+    setTimes(titled, old, old);
+    std.file.remove(buildPath(dir, ".tidy-stamp"));
+    auto t = tidySessions(dir, 0, 30);
+    assert(t.deleted == 0 && exists(titled), "a titled log is never deleted");
 }

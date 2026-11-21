@@ -729,10 +729,18 @@ final class AcpServer : AgentEvents
         auto path = findSession(host.sessionDir, want);
         auto sys = host.systemPrompt !is null ? host.systemPrompt(getcwd()) : null;
         agent.messages = sys.length ? [Message.system(sys)] : null;
-        auto restored = restore(path);
+        // Lock the log first, then restore from its current content: a writer
+        // that closes while this one waits on the lock leaves state a pre-lock
+        // `restore` would adopt stale (re-executing a completed input).
         auto log = new SessionLog(path);
-        scope (failure) log.close();
+        // Close on failure only until the agent adopts this log: after
+        // `loadRestored` the log is the agent's writer, and a later throw
+        // (hooks, replay) must not close it out from under the session.
+        bool adopted;
+        scope (failure) if (!adopted) log.close();
+        auto restored = log.restoreLocked();
         agent.loadRestored(restored, some(log)); // ACP has no channel for the dropped-state notes
+        adopted = true;
         sessionId = log.id;
         if (host.loadHooks !is null) agent.useHooks(host.loadHooks(getcwd()), true);
         replayHistory();

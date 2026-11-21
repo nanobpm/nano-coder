@@ -1394,10 +1394,13 @@ class Agent
         // The requests this compaction adds to the pinned block (the stash so
         // far is their base): the log records only these, so a session holds
         // each request once instead of restating the whole stash (issue #205).
+        // `pinStash` grows only after the replace record is written (below):
+        // a failed write must not let a later delta's base count requests
+        // that never reached the log.
         size_t pinnedBase = pinStash.length;
         Message[] pinnedNew;
         foreach (ref x; summarized)
-            if (ctx.isUserRequest(x)) { pinStash ~= x; pinnedNew ~= x; }
+            if (ctx.isUserRequest(x)) pinnedNew ~= x;
 
         // The newly folded real turns for the replay stash. On a repeated
         // compaction the first folded message is the previous summary, whose
@@ -1439,23 +1442,30 @@ class Agent
                         x.content = smart && x.logLine
                             ? c ~ format("\n[clipped at compaction; history_read #%s has it whole]", x.logLine) : c;
         }
+        // Persist first: a failed replace must leave the in-memory state as
+        // it was, or a later compaction would write a delta whose base
+        // includes requests that never reached the log — resume then loses
+        // them (issue #205).
+        size_t stashBase = replayStash.length;
+        auto nextStash = extendsStash ? replayStash ~ folded : folded;
+        auto nextRestated = nextStash.length && hasPending && pending.position < split
+            ? some(pendingPos) : Option!size_t.init;
+        log.ifSome((SessionLog l) {
+            l.replace(next, first, last, ctx.modeName(m), client.providerName ~ "/" ~ client.modelName, pinnedNew,
+                hasPending ? &pending : null, folded, extendsStash ? some(stashBase) : Option!size_t.init, nextRestated,
+                some(pinnedBase));
+        });
         messages = next;
         calibLen = 0;
-        size_t stashBase = replayStash.length;
-        replayStash = extendsStash ? replayStash ~ folded : folded;
-        replayRestated = replayStash.length && hasPending && pending.position < split
-            ? some(pendingPos) : Option!size_t.init;
+        pinStash ~= pinnedNew;
+        replayStash = nextStash;
+        replayRestated = nextRestated;
         if (hasPending)
         {
             pending.position = pendingPos;
             pending.hasBase = true;
             pending.base = messages.length;
         }
-        log.ifSome((SessionLog l) {
-            l.replace(messages, first, last, ctx.modeName(m), client.providerName ~ "/" ~ client.modelName, pinnedNew,
-                hasPending ? &pending : null, folded, extendsStash ? some(stashBase) : Option!size_t.init, replayRestated,
-                some(pinnedBase));
-        });
         // The replacement drops recalled notes' full text from context, so
         // every memory may be recalled again (except those the retained
         // system message's index renders in full: `indexShown` is kept).
