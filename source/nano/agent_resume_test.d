@@ -702,6 +702,42 @@ unittest
     assert(resumed.plan == agent.plan, "resume restores the plan the log recorded");
 }
 
+// Round-15 review fix for issue #205: a failed snapshot write in `setPlan`
+// restores the previous plan, so a later delta never references an
+// unrecorded baseline (which would lose unchanged items and the goal on
+// resume).
+unittest
+{
+    import std.exception : assertThrown;
+    import nano.plan : Plan, PlanItem, Status;
+    auto dir = freshDir("setplan-rollback");
+    auto agent = new Agent(new MockClient([]), echoTools, Policy.init, "sys");
+    auto log = new SessionLog(dir, "mock/m", "/w");
+    log.append(agent.messages[0]);
+    agent.log = some(log);
+    agent.runPlanTool("plan_add", parseJSON(`{"goal":"Old goal","items":["One"]}`));
+    auto before = agent.plan;
+
+    Plan carried;
+    carried.goal = "New goal";
+    PlanItem item;
+    item.id = 1;
+    item.title = "Two";
+    carried.items = [item];
+    log.failNextWrite = true;
+    assertThrown!Exception(agent.setPlan(carried, false), "the failed snapshot propagates");
+    assert(agent.plan == before, "the previous plan is restored");
+    // The retry persists and a later delta replays against the recorded baseline.
+    agent.setPlan(carried, false);
+    assert(agent.plan.goal == "New goal");
+    agent.runPlanTool("plan_update", parseJSON(`{"id":1,"status":"done"}`));
+    auto r = restore(log.path);
+    auto resumed = new Agent(new MockClient([]), echoTools, Policy.init, "sys");
+    resumed.loadRestored(r, some(new SessionLog(log.path)));
+    assert(resumed.plan == agent.plan, "resume rebuilds the plan from snapshot plus delta");
+    assert(resumed.plan.goal == "New goal" && resumed.plan.items[0].status == Status.done);
+}
+
 // Round-8 review fix for issue #205: a failed repair write on resume closes
 // the incoming log — its lock and registration do not outlive the failure —
 // while the live log stays.

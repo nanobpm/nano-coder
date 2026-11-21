@@ -2123,9 +2123,16 @@ class Agent
     /// the model about it unless `announce` is false.
     void setPlan(Plan p, bool announce)
     {
+        // As in `planChanged`: only persistence may roll the plan back. A
+        // failure before the snapshot is recorded restores the previous plan,
+        // so a later delta never references an unrecorded baseline.
+        auto before = plan.dup;
+        bool persisted;
+        scope (failure) if (!persisted) plan = before;
         plan = p;
         if (announce && planTools && !plan.empty) push(Message.user(plan.carriedOverNote));
         log.ifSome((SessionLog l) { l.plan(plan.toJSON); });
+        persisted = true;
         planDeltasSinceSnapshot = 0;
     }
 
