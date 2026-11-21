@@ -5,7 +5,7 @@ module nano.retry;
 
 @safe:
 
-import std.conv : to;
+import std.conv : to, ConvException;
 import nano.safeio : jsonText, jsonPretty;
 
 import core.time : Duration, seconds, msecs, usecs;
@@ -156,10 +156,16 @@ Duration parseRetryAfterMessage(string message)
     static re = regex(`\btry again in\s*(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|seconds?)\b`, "i");
     auto m = matchFirst(message, re);
     if (m.empty) return Duration.zero;
-    double amount;
-    try amount = m[1].to!double;
-    catch (Exception) return Duration.zero; // an unparsable amount gives no hint; use the normal backoff
-    return m[2].toLower[0] == 'm' ? usecsOf(amount * 1e3) : usecsOf(amount * 1e6);
+    // One try covers the amount parse and the usecs conversion: an
+    // unparsable amount or an unrepresentable hint ("try again in
+    // 100000000000000 seconds") is worthless, not fatal — no hint, use the
+    // normal backoff.
+    try
+    {
+        const amount = m[1].to!double;
+        return m[2].toLower[0] == 'm' ? usecsOf(amount * 1e3) : usecsOf(amount * 1e6);
+    }
+    catch (ConvException) return Duration.zero; // no usable hint: use the normal backoff
 }
 
 // rust: providers/retry.rs::classifies_retryable_errors
@@ -197,6 +203,10 @@ unittest
     assert(parseRetryAfterHeader("Thu, 01 Jan 2026 00:00:03 GMT", now) == 3.seconds);
     assert(parseRetryAfterMessage("try again in 250ms") == 250.msecs);
     assert(parseRetryAfterMessage("Please try again in 2 seconds") == 2.seconds);
+    // An unrepresentable hint falls back to the normal backoff instead of
+    // throwing out of the parser and aborting the request.
+    assert(parseRetryAfterMessage("try again in 100000000000000 seconds") == Duration.zero);
+    assert(parseRetryAfterMessage("try again in 10000000000000000000000 milliseconds") == Duration.zero);
     RetryPolicy p;
     auto rate = ErrorInfo(429, "rate_limit_exceeded", null, "try again in 2s");
     assert(retryDelay(p, 0, &rate, null, now, 0.5) == 2.seconds);
