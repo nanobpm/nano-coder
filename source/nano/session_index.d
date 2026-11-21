@@ -169,13 +169,33 @@ private bool missingTellingPrompt(const ref Summary s) pure
     return false;
 }
 
-/// Committed (newline-terminated) lines of `bytes`, invalid UTF-8 replaced
-/// with U+FFFD (such a line then fails to parse where it is decoded).
-private string[] committedLines(const(ubyte)[] bytes) pure
+/// Committed (newline-terminated) lines of `bytes`: valid UTF-8 lines are
+/// zero-copy views into `bytes`; only a malformed line is copied, with its
+/// invalid bytes replaced by U+FFFD (it then fails to parse where decoded).
+private const(char)[][] committedLines(const(ubyte)[] bytes) pure
 {
     size_t committed = bytes.length;
     while (committed && bytes[committed - 1] != '\n') committed--;
-    return bytes[0 .. committed].splitter(ubyte('\n')).filter!(l => l.length > 0).map!lossyText.array;
+    return bytes[0 .. committed].splitter(ubyte('\n')).filter!(l => l.length > 0).map!(viewOrLossy).array;
+}
+
+/// `l` as a view when valid UTF-8, else a sanitized copy.
+private const(char)[] viewOrLossy(const(ubyte)[] l) pure
+{
+    import std.utf : UTFException;
+    try return utf8View(l);
+    catch (UTFException) return lossyText(l);
+}
+
+unittest
+{
+    import std.string : representation;
+    auto bytes = "ab\ncd\nxy".representation;
+    auto ls = committedLines(bytes);
+    assert(ls == ["ab", "cd"]);
+    assert(&ls[0][0] == cast(const(char)*) &bytes[0], "valid lines are views, not copies");
+    const(ubyte)[] bad = [0x61, 0xff, 0x0a];
+    assert(committedLines(bad) == ["a\uFFFD"]);
 }
 
 /// The input text of a committed log line, or null when it isn't an input record.
