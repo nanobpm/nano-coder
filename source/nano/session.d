@@ -467,7 +467,7 @@ class SessionLog
         // Count the committed lines in fixed-size chunks: a long session's
         // log can run to hundreds of MB, and reading it whole here (on top of
         // `restore`'s own read) doubled a resume's peak heap.
-        ulong committed, size;
+        size_t committed, size;
         {
             auto r = File(path, "rb");
             auto buf = new ubyte[](64 * 1024);
@@ -485,7 +485,7 @@ class SessionLog
             // Drop a torn trailing record so later appends stay line-aligned
             // (rare: a crash mid-write), so the whole read is fine here.
             import std.file : write_file = write;
-            write_file(path, readBytes(path)[0 .. cast(size_t) committed]);
+            write_file(path, readBytes(path)[0 .. committed]);
         }
     }
 
