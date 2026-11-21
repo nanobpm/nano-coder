@@ -491,7 +491,13 @@ string[] runInstaller(Channel channel, string exe, string running,
     // One catch for every process this runs: brew --repository, git, the installer.
     try
     {
-        if (channel == Channel.brew) tapRepo = tapRepoOf is null ? brewTapRepo() : tapRepoOf();
+        if (channel == Channel.brew)
+        {
+            // Name the lookup itself if it throws; the loop below then
+            // replaces `shown` with each step it actually runs.
+            shown = "brew --repository " ~ brewTap;
+            tapRepo = tapRepoOf is null ? brewTapRepo() : tapRepoOf();
+        }
         steps = installSteps(channel, tapRepo);
         foreach (i, step; steps)
         {
@@ -860,6 +866,12 @@ unittest
     out_ = runInstaller(Channel.brew, "/x", "0.1.0", plainRun, (string e) @safe => "0.2.0", () @safe => cast(string) null);
     assert(ran == ["brew"], "no tap checkout: plain brew upgrade");
     assert(out_[0].canFind("Updated to 0.2.0"), out_[0]);
+    // A throwing tap lookup is reported as the lookup, not the unattempted upgrade.
+    ran = null;
+    out_ = runInstaller(Channel.brew, "/x", "0.1.0", plainRun, (string e) @safe => "0.2.0",
+        delegate string() @safe { throw new Exception("lookup boom"); });
+    assert(ran is null, "nothing runs when the tap lookup throws");
+    assert(out_[0].canFind("Could not run `brew --repository " ~ brewTap ~ "`") && out_[0].canFind("lookup boom"), out_[0]);
 }
 
 // rust: update.rs::the_formula_version_is_read_from_its_download_url
