@@ -406,6 +406,36 @@ final class FrameRenderer
         if (physicalRows(frame, width) != frame.length || physicalRows(prev, width) != prev.length)
             return fullRedraw(frame, width, height);
         auto top = saturatingSub(prev.length, height);
+        // A shorter frame keeps its height: blank rows open at the gap (the
+        // transcript's end). Compose that first and diff against it, so a
+        // shrink that leaves the scrolled-off rows alone never redraws.
+        auto shown = frame.dup;
+        if (frame.length < prev.length)
+        {
+            size_t at = gapAt <= frame.length ? gapAt : d;
+            // A gap above the screen would move scrollback rows: open it at
+            // the top of the screen instead, past any continuation of a
+            // wrapped line (independently of where the change starts).
+            if (at < top)
+            {
+                at = top < frame.length ? top : frame.length;
+                while (at < frame.length && joins(frame, at)) at++;
+            }
+            shown = frame[0 .. at] ~ new string[prev.length - frame.length] ~ frame[at .. $];
+            auto sd = firstDiff(prev, shown);
+            if (sd < 0) { prev = shown; return; }
+            d = sd;
+            // Only the rows after the transcript's end (the editor) changed,
+            // but some of them scrolled off: leave the scrollback as it is and
+            // redraw the screen with the shrunken tail at its bottom.
+            if (d < top && gapAt <= frame.length && d >= gapAt
+                && frame.length - gapAt <= height && prev.length >= height)
+            {
+                shown = prev[0 .. top].dup ~ new string[height - (frame.length - gapAt)] ~ frame[gapAt .. $];
+                d = firstDiff(prev, shown);
+                if (d < 0) { prev = shown; return; }
+            }
+        }
         if (d < top) return fullRedraw(frame, width, height);
         size_t diff = d;
         // A soft-wrapped line is rewritten from its start, so the terminal
@@ -413,29 +443,13 @@ final class FrameRenderer
         // above are scrollback (the wrap flag of a row up there stays).
         // Rewind through continuations in either frame: a soft wrap that
         // became a hard newline must also clear the old row's wrap flag.
-        while (diff > top && (joins(frame, diff) || joins(prev, diff))) diff--;
+        while (diff > top && (joins(shown, diff) || joins(prev, diff))) diff--;
         // The row above the screen keeps its wrap flag, so a join at `top`
         // that changed (soft became hard or the reverse) can't be rewritten
-        // in place: the copy would still join (or split) the old way.
-        if (diff == top && top > 0 && joins(frame, top) != joins(prev, top))
+        // in place: the copy would still join (or split) the old way. A blank
+        // row there is harmless: the old line just ends in spaces.
+        if (diff == top && top > 0 && shown[top].length && joins(shown, top) != joins(prev, top))
             return fullRedraw(frame, width, height);
-        auto shown = frame.dup;
-        if (frame.length < prev.length)
-        {
-            auto at = gapAt <= frame.length ? gapAt : diff;
-            // A gap above the screen would move scrollback rows (a full
-            // redraw): when the transcript's end has scrolled off (a draft
-            // taller than the screen), open the gap at the top of the
-            // screen instead, past any continuation of a wrapped line.
-            if (at < top)
-            {
-                at = top;
-                while (at < diff && joins(frame, at)) at++;
-            }
-            if (at < diff) diff = at;
-            shown = frame[0 .. at] ~ new string[prev.length - frame.length] ~ frame[at .. $];
-        }
-        if (diff < top) return fullRedraw(frame, width, height);
         auto row = prev.length >= height ? diff - top + 1 : height - prev.length + diff + 1;
         auto buf = appender!string;
         // A pure append lands one row past the bottom (diff == prev.length). A

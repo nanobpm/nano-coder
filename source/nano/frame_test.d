@@ -341,3 +341,30 @@ unittest
     r.render(["abcd", softWrapMark ~ "eg", "s"], 4, 2);
     assert(!outp.canFind("\x1b[3J"), outp);
 }
+
+unittest // an editor that shrinks while partly in scrollback keeps the scrollback
+{
+    string screen;
+    auto r = new FrameRenderer((string s) { screen ~= s; });
+    // Two transcript rows, a six-row editor and a status row on four rows.
+    r.render(["t0", "t1", "e0", "e1", "e2", "e3", "e4", "e5", "st"], 10, 4, 2);
+    screen = null;
+    r.render(["t0", "t1", "e0", "st"], 10, 4, 2);
+    assert(!screen.canFind("\x1b[3J") && !screen.canFind("\x1b[2J"), strip(screen));
+    screen = null;
+    r.render(["t0", "t1", "e0", "st"], 10, 4, 2);
+    assert(!screen.canFind("\x1b[3J"), strip(screen));
+}
+
+unittest // a shrinking soft-wrapped draft opens its gap past the wrap, stably
+{
+    string screen;
+    auto r = new FrameRenderer((string s) { screen ~= s; });
+    r.render(["t0", "a1", softWrapMark ~ "a2", softWrapMark ~ "a3", softWrapMark ~ "a4", "b", "c", "st"], 10, 4);
+    screen = null;
+    r.render(["t0", "a1", softWrapMark ~ "a2", softWrapMark ~ "a3", softWrapMark ~ "a4", "st"], 10, 4);
+    assert(!screen.canFind("\x1b[3J"), strip(screen));
+    screen = null;
+    r.render(["t0", "a1", softWrapMark ~ "a2", softWrapMark ~ "a3", softWrapMark ~ "a4", "st"], 10, 4);
+    assert(!screen.canFind("\x1b[3J"), strip(screen));
+}
