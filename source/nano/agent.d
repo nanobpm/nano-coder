@@ -2904,14 +2904,13 @@ unittest
     import nano.providers.mock;
     auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "sys");
     agent.messages ~= [Message.user("u1"), Message.assistant("a1")];
-    // Mutating the old array must not reach the resumed conversation: the
-    // kept system message is a copy, not a slice of the old backing array.
+    // Restore a system-only conversation so nothing is appended after the
+    // kept system message: an append could reallocate and mask a missing copy.
     auto old = agent.messages;
     Restored r;
-    r.conversation = [Message.user("u2"), Message.assistant("a2")];
     agent.loadRestored(r, Option!SessionLog.init);
-    assert(agent.messages.length == 3 && agent.messages[0].role == Role.system
-        && agent.messages[1].content == "u2" && agent.messages[2].content == "a2");
+    assert(agent.messages.length == 1 && agent.messages[0].role == Role.system);
+    assert(agent.messages.ptr !is old.ptr, "kept system message aliases the old array");
     old[0].content = "overwritten";
     assert(agent.messages[0].content == "sys", agent.messages[0].content);
 }
