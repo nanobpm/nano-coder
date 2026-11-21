@@ -1568,11 +1568,27 @@ string contextReport(Agent agent)
     out_ ~= format("Session:      %s input, %s output tokens", agent.sessionInputTokens, agent.sessionOutputTokens);
     if (agent.hasSessionAic) out_ ~= format("AI Credits:   %.2f used this session", agent.sessionAic);
     out_ ~= agent.autoCompact
-        ? format("Auto-compact: at %.0f%% (~%s tokens); compacted %s time(s)", agent.autoCompactThreshold * 100,
-            imported!"std.conv".to!size_t(window * agent.autoCompactThreshold), agent.compactions)
+        ? format("Auto-compact: at %.0f%% (~%s tokens); compacted %s time(s)", agent.effectiveAutoCompactThreshold * 100,
+            imported!"std.conv".to!size_t(window * agent.effectiveAutoCompactThreshold), agent.compactions)
         : "Auto-compact: off";
     out_ ~= format("Compaction:   %s mode (/compact --smart or --standard overrides once)", modeName(agent.compactionMode));
     return out_.join("\n");
+}
+
+// A negative configured threshold is clamped for the report too: building
+// it (as refreshView does before every turn) must not throw on the token count.
+unittest
+{
+    import std.algorithm : canFind;
+    import nano.providers.mock : MockClient;
+    import nano.tools : ToolRegistry;
+    import nano.permissions : Policy;
+    auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "system");
+    agent.configuredWindow = 100_000;
+    agent.autoCompact = true;
+    agent.autoCompactThreshold = -0.5;
+    auto report = contextReport(agent);
+    assert(report.canFind("Auto-compact: at 10% (~10000 tokens)"), report);
 }
 
 /// The agent, for `main`'s exit (title requests may still be in flight).

@@ -215,6 +215,17 @@ class Agent
     /// Compact automatically past `autoCompactThreshold` of the window.
     bool autoCompact = true;
     double autoCompactThreshold = 0.8;
+
+    /// `autoCompactThreshold` clamped to the effective 0.1–0.99 range
+    /// (a NaN falls back to the 0.8 default). Every reader that reports or
+    /// acts on the threshold goes through this, so a configured out-of-range
+    /// value can never yield a negative or overflowing token count.
+    double effectiveAutoCompactThreshold() const pure nothrow @nogc @safe
+    {
+        auto t = autoCompactThreshold;
+        if (t != t) return 0.8;
+        return t < 0.1 ? 0.1 : t > 0.99 ? 0.99 : t;
+    }
     ctx.CompactionMode compactionMode = ctx.CompactionMode.standard;
     /// Pin the user's requests verbatim after each compaction summary
     /// (`compaction_pin_requests`, issue #66).
@@ -1041,7 +1052,7 @@ class Agent
     {
         if (!idleCompact || !overThresholdAt(tokens)) return false;
         auto window = contextWindow();
-        auto threshold = clamp(autoCompactThreshold, 0.1, 0.99);
+        auto threshold = effectiveAutoCompactThreshold;
         if (tokens < window * threshold) return false;
         return idleGate.armed(tokens, window);
     }
@@ -1076,7 +1087,7 @@ class Agent
     bool overThresholdAt(size_t tokens) pure
     {
         if (!autoCompact) return false;
-        auto threshold = autoCompactThreshold < 0.1 ? 0.1 : autoCompactThreshold > 0.99 ? 0.99 : autoCompactThreshold;
+        auto threshold = effectiveAutoCompactThreshold;
         auto window = contextWindow();
         auto reserved = saturatingAdd(outputBase < ctx.minOutputReserve ? outputBase : ctx.minOutputReserve, ctx.outputMargin(window));
         double limit = window * threshold;
