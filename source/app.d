@@ -5,7 +5,7 @@ module app;
 @safe:
 import nano.safeio : jsonText, jsonPretty;
 import nano.clock : monoNow, sleepFor, wallNow;
-import nano.arith : saturatingSub;
+import nano.arith : saturatingSub, toSize;
 import nano.option : Option, some, none, match, ifSome, unwrap, notNull, NotNull, nullable;
 import nano.result : match, unwrap, unwrapErr, orThrow;
 
@@ -30,7 +30,7 @@ import nano.tools;
 import nano.tools.bash : bashDefinition = definition, bashExecute = execute,
     bashHeartbeatSink = heartbeatSink, bashHeartbeatInterval = heartbeatInterval;
 import nano.tools.files : ReadState, registerFiles = register;
-import nano.tools.search : DenyScan, registerSearch = register;
+import nano.tools.search : Denied, DenyScan, registerSearch = register;
 import nano.permissions;
 import nano.session;
 import nano.toml : parseToml;
@@ -919,7 +919,7 @@ unittest
     import std.array : array;
     Config c;
     auto reg = new ToolRegistry;
-    registerBuiltinTools(reg, c, new ReadState, (string root) @safe => cast(bool delegate(string) @safe) null);
+    registerBuiltinTools(reg, c, new ReadState, (string root) @safe => Denied.init);
     auto names = reg.definitions.map!(d => d.name).array;
     assert(names.canFind("grep") && names.canFind("glob") && names.canFind("bash") && names.canFind("edit_file"));
     assert(!names.canFind("echo"), "no vestigial echo tool");
@@ -1457,8 +1457,8 @@ unittest
 /// provider's (0: none), and which one it is.
 ConfiguredWindow windowFor(const ref Config c, const ref ProviderConfig p) pure
 {
-    if (c.contextWindow > 0) return ConfiguredWindow(cast(size_t) c.contextWindow, "context_window in config");
-    if (p.contextWindow > 0) return ConfiguredWindow(cast(size_t) p.contextWindow, "provider context_window");
+    if (c.contextWindow > 0) return ConfiguredWindow(toSize(c.contextWindow), "context_window in config");
+    if (p.contextWindow > 0) return ConfiguredWindow(toSize(p.contextWindow), "provider context_window");
     return ConfiguredWindow.init;
 }
 
@@ -1582,11 +1582,27 @@ string contextReport(Agent agent)
     out_ ~= format("Session:      %s input, %s output tokens", agent.sessionInputTokens, agent.sessionOutputTokens);
     if (agent.hasSessionAic) out_ ~= format("AI Credits:   %.2f used this session", agent.sessionAic);
     out_ ~= agent.autoCompact
-        ? format("Auto-compact: at %.0f%% (~%s tokens); compacted %s time(s)", agent.autoCompactThreshold * 100,
-            cast(size_t)(window * agent.autoCompactThreshold), agent.compactions)
+        ? format("Auto-compact: at %.0f%% (~%s tokens); compacted %s time(s)", agent.effectiveAutoCompactThreshold * 100,
+            imported!"std.conv".to!size_t(window * agent.effectiveAutoCompactThreshold), agent.compactions)
         : "Auto-compact: off";
     out_ ~= format("Compaction:   %s mode (/compact --smart or --standard overrides once)", modeName(agent.compactionMode));
     return out_.join("\n");
+}
+
+// A negative configured threshold is clamped for the report too: building
+// it (as refreshView does before every turn) must not throw on the token count.
+unittest
+{
+    import std.algorithm : canFind;
+    import nano.providers.mock : MockClient;
+    import nano.tools : ToolRegistry;
+    import nano.permissions : Policy;
+    auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "system");
+    agent.configuredWindow = 100_000;
+    agent.autoCompact = true;
+    agent.autoCompactThreshold = -0.5;
+    auto report = contextReport(agent);
+    assert(report.canFind("Auto-compact: at 10% (~10000 tokens)"), report);
 }
 
 /// The agent, for `main`'s exit (title requests may still be in flight).
@@ -1733,7 +1749,7 @@ int runMain(string[] args)
         // Before the agent exists, the policy it will be built with.
         immutable has = built.match!(a => a.policy.readDenyScan(getcwd(), scan),
             () => policy.readDenyScan(getcwd(), scan));
-        if (!has) return cast(bool delegate(string) @safe) null;
+        if (!has) return Denied.init;
         auto forRoot = scan.forRoot(root);
         return (string path) @safe => forRoot.denied(path);
     });
@@ -2118,14 +2134,14 @@ int runMain(string[] args)
         h.configPath = cfgPath;
         h.recents = () => recents.models;
         h.switchModel = (string spec) {
-            try { switchModel(spec); return cast(string) null; }
+            try { switchModel(spec); return string.init; }
             catch (Exception e) return e.msg;
         };
         h.listModels = (string name) => makeClient(resolve(cfg, name)).listModels();
         h.refreshSystem = () { agent.messages[0].content = systemFor(cwd, agent.promptPlan); };
         h.refreshClient = (string name) {
             import nano.settings : editRebuilds;
-            if (!editRebuilds(cfg, name, agent.client.providerName)) return cast(string) null;
+            if (!editRebuilds(cfg, name, agent.client.providerName)) return string.init;
             // The client's own provider was edited: keep its model. Otherwise the
             // configured model now resolves to the edited provider: build that.
             auto spec = agent.client.providerName == name ? name ~ "/" ~ agent.client.modelName : cfg.model;

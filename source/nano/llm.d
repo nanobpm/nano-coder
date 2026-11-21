@@ -2,6 +2,8 @@
 module nano.llm;
 
 @safe:
+
+import std.conv : to;
 import nano.safeio : jsonText, jsonPretty;
 
 import std.json;
@@ -197,7 +199,7 @@ struct Message
         auto names = ["system", "user", "assistant", "tool"];
         auto r = names.countUntil(j["role"].str);
         if (r < 0) throw new Exception("unknown role " ~ j["role"].str);
-        m.role = cast(Role) r;
+        m.role = r.to!Role;
         if (auto c = "content" in j) m.content = c.type == JSONType.string ? c.str : "";
         if (auto calls = "tool_calls" in j)
             foreach (c; calls.arrayNoRef)

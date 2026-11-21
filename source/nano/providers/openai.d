@@ -4,6 +4,8 @@
 module nano.providers.openai;
 
 @safe:
+
+import nano.arith : toSize;
 import nano.safeio : jsonText, jsonPretty;
 import nano.clock : wallNow;
 
@@ -377,7 +379,7 @@ struct StreamState
             if (calls.type == JSONType.array)
                 foreach (tc; calls.arrayNoRef)
                 {
-                    size_t idx = "index" in tc ? cast(size_t) tc["index"].integer : order.length;
+                    size_t idx = "index" in tc ? toSize(tc["index"].integer) : order.length;
                     if (idx !in args) { order ~= idx; args[idx] = ""; names[idx] = ""; ids[idx] = ""; }
                     if (auto id = "id" in tc) if (id.type == JSONType.string) ids[idx] = id.str;
                     if (auto fn = "function" in tc)
@@ -629,7 +631,7 @@ JSONValue modelEntry(JSONValue models, string model, bool onlyFallback = true) p
     return onlyFallback && items.arrayNoRef.length == 1 ? items.arrayNoRef[0] : JSONValue.init;
 }
 
-/// A positive integer at `path`, else 0.
+/// A positive integer at `path` that fits a signed token budget, else 0.
 size_t tokensAt(JSONValue v, string[] path) pure
 {
     foreach (k; path)
@@ -639,9 +641,18 @@ size_t tokensAt(JSONValue v, string[] path) pure
         if (n is null) return 0;
         v = *n;
     }
-    if (v.type == JSONType.integer && v.integer > 0) return cast(size_t) v.integer;
-    if (v.type == JSONType.uinteger && v.uinteger > 0) return cast(size_t) v.uinteger;
+    if (v.type == JSONType.integer && v.integer > 0) return toSize(v.integer);
+    if (v.type == JSONType.uinteger && v.uinteger > 0 && v.uinteger <= long.max) return toSize(v.uinteger);
     return 0;
+}
+
+unittest
+{
+    import std.json : parseJSON;
+    assert(tokensAt(parseJSON(`{"n": 9223372036854775808}`), ["n"]) == 0);
+    assert(tokensAt(parseJSON(`{"n": 18446744073709551615}`), ["n"]) == 0);
+    assert(tokensAt(parseJSON(`{"n": 9223372036854775807}`), ["n"]) == long.max);
+    assert(tokensAt(parseJSON(`{"n": 4096}`), ["n"]) == 4096);
 }
 
 /// The window listed on a `/models` entry (vLLM, OpenRouter, Groq, Mistral, ...).

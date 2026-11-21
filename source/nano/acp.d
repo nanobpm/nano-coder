@@ -779,7 +779,7 @@ final class AcpServer : AgentEvents
             agent.lastStop = StopReason.endTurn;
         }
         router.endTurn((ref JSONValue[] items, const(size_t)[] marks, string session) {
-            auto stop = cast(string) agent.lastStop;
+            string stop = agent.lastStop;
             if (id.type != JSONType.null_)
             {
                 auto reply = JSONValue(["stopReason": stop, "response": response]);

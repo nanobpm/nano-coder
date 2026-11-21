@@ -5,6 +5,8 @@ module nano.settings_dialog;
 
 @safe:
 
+import nano.arith : toSize;
+
 import nano.option : NotNull;
 import std.format : format;
 import std.math : isNaN;
@@ -282,8 +284,8 @@ private bool editContext(SettingsUi ui, ref SettingsHost h)
     a.compactionMode = m == 1 ? CompactionMode.smart : CompactionMode.standard;
     cfg.contextWindow = window;
     auto pc = a.client.providerName in cfg.providers;
-    a.setConfiguredWindow(window > 0 ? ConfiguredWindow(cast(size_t) window, "context_window in config")
-        : pc !is null && pc.contextWindow > 0 ? ConfiguredWindow(cast(size_t) pc.contextWindow, "provider context_window")
+    a.setConfiguredWindow(window > 0 ? ConfiguredWindow(toSize(window), "context_window in config")
+        : pc !is null && pc.contextWindow > 0 ? ConfiguredWindow(toSize(pc.contextWindow), "provider context_window")
         : ConfiguredWindow.init);
     return true;
 }

@@ -85,9 +85,9 @@ private immutable(Captured)[] run(immutable(Reply)[] replies, Chan!ushort port, 
             buf ~= chunk[0 .. n];
             if (head < 0)
             {
-                head = (cast(const(char)[]) buf).indexOf("\r\n\r\n");
+                head = buf.indexOf("\r\n\r\n");
                 if (head >= 0)
-                    foreach (line; (cast(const(char)[]) buf[0 .. head]).splitLines)
+                    foreach (line; buf[0 .. head].splitLines)
                         if (line.toLower.startsWith("content-length:")) want = line[15 .. $].strip.to!size_t;
             }
             if (head >= 0 && buf.length >= head + 4 + want) break;

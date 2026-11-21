@@ -129,7 +129,7 @@ uint cappedBudget(uint budget, long maxTokens) pure
     long room = maxTokens - 1;
     if (room < 0) room = 0;
     if (room > uint.max) room = uint.max;
-    uint b = budget < room ? budget : cast(uint) room;
+    uint b = budget < room ? budget : room.to!uint;
     return b >= MIN_BUDGET ? b : 0;
 }
 
@@ -725,7 +725,7 @@ AnthropicThinking anthropicFields(const Request req, long maxTokens) pure
             auto b = cappedBudget(req.budget, maxTokens);
             if (!b) return A.init;
             JSONValue t = ["type": "enabled"];
-            t["budget_tokens"] = cast(long) b;
+            t["budget_tokens"] = long(b);
             return A(["thinking": t], true);
         case K.off:
             return A(["thinking": JSONValue(["type": "disabled"])], false);
