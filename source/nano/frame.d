@@ -33,16 +33,23 @@ enum dchar softWrap = '\uE002';
 /// `softWrap` as a string.
 enum softWrapMark = "\uE002";
 
-/// `s` without soft-wrap marks (for output that bypasses the frame).
+/// Marks a line as verbatim (code): `wrapAnsi` breaks it by character at
+/// the full width, never at spaces, so a copy across its rows is exact. Takes
+/// no cell.
+enum dchar verbatim = '\uE003';
+/// `verbatim` as a string.
+enum verbatimMark = "\uE003";
+
+/// `s` without soft-wrap or verbatim marks (output that bypasses the frame).
 string dropSoftWraps(string s) pure
 {
     import std.array : replace;
-    return s.replace(softWrapMark, "");
+    return s.replace(softWrapMark, "").replace(verbatimMark, "");
 }
 
 size_t cellWidth(dchar c) pure nothrow
 {
-    return c == cursorMark ? 1 : c == softWrap ? 0 : charWidth(c);
+    return c == cursorMark ? 1 : c == softWrap || c == verbatim ? 0 : charWidth(c);
 }
 
 private bool isFinal(dchar c) pure nothrow { return c >= '@' && c <= '~'; }
@@ -148,9 +155,12 @@ string fit(string text, size_t width) pure
 /// breaking at spaces where it can.
 string[] wrapAnsi(string line, size_t width) pure
 {
-    import std.string : stripRight, stripLeft;
+    import std.string : stripRight, stripLeft, indexOf;
     if (width < 1) width = 1;
     line = sanitize(line);
+    // Code breaks by character: a space is content, and the row above a break
+    // is always full, so the copy joins the rows with nothing added.
+    immutable code = line.indexOf(verbatimMark) >= 0;
     string[] out_;
     string cur;
     size_t vis;
@@ -187,13 +197,16 @@ string[] wrapAnsi(string line, size_t width) pure
             cur ~= line[at .. i];
             continue;
         }
-        if (c == ' ')
+        if (c == ' ' && !code)
         {
             if (vis >= width)
             {
+                // The separator falls on the edge: it starts the next row, so
+                // a copy across the wrap still has it (a row that ends short
+                // is padded with spaces instead).
                 out_ ~= cur.stripRight(" ");
-                cur = null;
-                vis = 0;
+                cur = " ";
+                vis = 1;
                 brk = -1;
                 continue;
             }
@@ -202,9 +215,9 @@ string[] wrapAnsi(string line, size_t width) pure
             brk = cur.length;
             continue;
         }
-        if (vis >= width) breakLine();
+        if (vis >= width) { if (code) brk = -1; breakLine(); }
         auto w = cellWidth(c);
-        if (w > 1 && vis + w > width && cur.length) breakLine();
+        if (w > 1 && vis + w > width && cur.length) { if (code) brk = -1; breakLine(); }
         cur ~= line[at .. i];
         vis += w;
     }
@@ -370,10 +383,16 @@ final class FrameRenderer
     {
         auto d = firstDiff(prev, frame);
         if (d < 0) return;
-        if (physicalRows(frame, width) != frame.length) return fullRedraw(frame, width, height);
+        // Screen rows are computed from entry indices: both frames must be one row per entry.
+        if (physicalRows(frame, width) != frame.length || physicalRows(prev, width) != prev.length)
+            return fullRedraw(frame, width, height);
+        auto top = saturatingSub(prev.length, height);
+        if (d < top) return fullRedraw(frame, width, height);
         size_t diff = d;
-        // A soft-wrapped line is rewritten whole, so the terminal keeps its wrap.
-        while (diff > 0 && joins(frame, diff)) diff--;
+        // A soft-wrapped line is rewritten from its start, so the terminal
+        // keeps its wrap; but not past the top of the screen, as the rows
+        // above are scrollback (the wrap flag of a row up there stays).
+        while (diff > top && joins(frame, diff)) diff--;
         auto shown = frame.dup;
         if (frame.length < prev.length)
         {
@@ -381,7 +400,6 @@ final class FrameRenderer
             if (at < diff) diff = at;
             shown = frame[0 .. at] ~ new string[prev.length - frame.length] ~ frame[at .. $];
         }
-        auto top = saturatingSub(prev.length, height);
         if (diff < top) return fullRedraw(frame, width, height);
         auto row = prev.length >= height ? diff - top + 1 : height - prev.length + diff + 1;
         auto buf = appender!string;
@@ -689,7 +707,9 @@ unittest
     assert(fit("short", 10) == "short");
     // Rows after the first carry the soft-wrap mark (they continue the line).
     enum M = softWrapMark;
-    assert(wrapAnsi("the quick brown fox", 9) == ["the quick", M ~ "brown fox"]);
+    // A separator on the edge starts the next row, so a copy keeps it.
+    assert(wrapAnsi("the quick brown fox", 9) == ["the quick", M ~ " brown", M ~ "fox"]);
+    assert(wrapAnsi("the quick brown fox", 10) == ["the quick", M ~ "brown fox"]);
     assert(wrapAnsi("abcdefghij", 4) == ["abcd", M ~ "efgh", M ~ "ij"]);
     assert(wrapAnsi("ab中", 3) == ["ab", M ~ "中"]);
     assert(wrapAnsi("", 5) == [""]);
@@ -783,6 +803,50 @@ unittest
     auto q = new FrameRenderer((string s) { screen ~= s; });
     q.render(["abc", M, "s"], 3, 10);
     assert(screen.canFind("abc\r\n\r\ns"), screen);
+}
+
+// Copilot review cases: separators at the edge, code by character, frames
+// that weren't one row per entry, and a long line reaching into scrollback.
+unittest
+{
+    import std.algorithm : canFind;
+    enum M = softWrapMark;
+    // `git status --short` at width 10: the space after "status" falls on the edge.
+    auto rows = wrapAnsi("git status --short", 10);
+    assert(rows == ["git status", M ~ " --short"], rows[1]);
+    string screen;
+    auto r = new FrameRenderer((string s) { screen ~= s; });
+    r.render(rows ~ "s", 10, 6);
+    assert(screen.canFind("git status --short\r\ns"), screen);
+
+    // Code (verbatim) breaks by character with nothing dropped, even with an
+    // indent or prefix on the first row; later rows have none.
+    auto code = wrapAnsi("    " ~ verbatimMark ~ "rm -r /a b", 6);
+    assert(code == ["    " ~ verbatimMark ~ "rm", M ~ " -r /a", M ~ " b"], code[0]);
+    screen = null;
+    auto c = new FrameRenderer((string s) { screen ~= s; });
+    c.render(code ~ "s", 6, 6);
+    assert(screen.canFind("    rm -r /a b\r\ns"), screen);
+
+    // The previous frame had a row wider than the terminal: full redraw.
+    screen = null;
+    auto w = new FrameRenderer((string s) { screen ~= s; });
+    w.render(["abcdef", "bar"], 3, 5);
+    screen = null;
+    w.render(["abc", "bar"], 3, 5);
+    assert(screen.canFind("\x1b[2J"), screen);
+
+    // A logical line taller than the screen updates its last rows without
+    // touching the scrollback (no rewind past the top, no 3J).
+    string[] tall = ["a1"];
+    foreach (n; 0 .. 6) tall ~= M ~ "a2";
+    screen = null;
+    auto t = new FrameRenderer((string s) { screen ~= s; });
+    t.render(tall ~ "s", 2, 4);
+    screen = null;
+    t.render(tall[0 .. $ - 1] ~ (M ~ "zz") ~ "s", 2, 4);
+    assert(!screen.canFind("\x1b[3J") && screen.canFind("\x1b[1;1H"), screen);
+    assert(screen.canFind("zz\r\n\x1b[2Ks"), screen);
 }
 
 // Rows already in the scrollback are never cleared or rewritten; a shorter

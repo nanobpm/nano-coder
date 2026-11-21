@@ -31,7 +31,7 @@ import std.format : format;
 import std.string : indexOf, lastIndexOf, strip, stripLeft;
 import std.uni : isWhite;
 import nano.lineedit : charWidth;
-import nano.frame : softWrapMark;
+import nano.frame : softWrapMark, verbatimMark;
 import nano.mdblock;
 import nano.mdinline;
 import nano.mdtable : layout, textWidth = width;
@@ -118,7 +118,14 @@ private struct Lines
         foreach (p; pieces) foreach (dchar c; p.text) w += charWidth(c);
         if (!w) return;
         size_t gap = space && curW > 0 ? 1 : 0;
-        if (curW > 0 && curW + gap + w > width) newline(true);
+        if (curW > 0 && curW + gap + w > width)
+        {
+            // A separator on the edge starts the next row, so a copy across
+            // the wrap keeps it (a shorter row is padded with spaces anyway).
+            auto full = curW >= width;
+            newline(true);
+            if (gap && full) { cur ~= ' '; curW = 1; }
+        }
         else if (gap) { cur ~= ' '; curW++; }
         foreach (p; pieces)
         {
@@ -188,27 +195,12 @@ private string[] wrapSpans(const Span[] spans, size_t width, ubyte extra) pure
     return lines.finish();
 }
 
-/// A verbatim line (code, HTML), broken at `width` cells rather than wrapped.
+/// A verbatim line (code, HTML). It isn't broken here: the frame breaks it
+/// by character at the terminal's full width (`verbatimMark`), so the rows
+/// after the first carry no indent or quote prefix and a copy is exact.
 string[] hardLines(string line, size_t width, ubyte style) pure
 {
-    string[] out_;
-    string cur;
-    size_t w;
-    foreach (dchar c; line)
-    {
-        auto cw = charWidth(c);
-        if (w + cw > width && w > 0)
-        {
-            out_ ~= styled(cur, style);
-            cur = null;
-            w = 0;
-        }
-        cur ~= c;
-        w += cw;
-    }
-    out_ ~= styled(cur, style);
-    foreach (ref r; out_[1 .. $]) r = softWrapMark ~ r;
-    return out_;
+    return [verbatimMark ~ styled(line, style)];
 }
 
 string fenceOpen(string info) pure nothrow { return DIM ~ "```" ~ info ~ RESET; }
@@ -581,7 +573,14 @@ unittest // code blocks are verbatim between dim fences
 {
     assert(show("```rust\nfn main() {\n    **not bold**\n}\n```\nafter", 80) == ["```rust", "fn main() {", "    **not bold**", "}", "```", "", "after"]);
     assert(show("    indented\n    code", 80) == ["    indented", "    code"]);
-    assert(show("```\n" ~ "x".replicate(25) ~ "\n```", 10)[1 .. 4] == ["xxxxxxxxxx", "xxxxxxxxxx", "xxxxx"]);
+    // A long code line stays whole here; the frame breaks it by character
+    // at the terminal's width, so copying it back gives exactly the line.
+    assert(show("```\n" ~ "x".replicate(25) ~ "\n```", 10)[1] == "x".replicate(25));
+    import nano.frame : wrapAnsi, dropSoftWraps;
+    import std.algorithm : map;
+    import std.array : array;
+    auto rows = wrapAnsi(renderLines("```\n" ~ "x".replicate(25) ~ "\n```", 10)[1], 10).map!(r => dropSoftWraps(plain(r))).array;
+    assert(rows == ["xxxxxxxxxx", "xxxxxxxxxx", "xxxxx"], rows[0]);
 }
 
 // rust: markdown.rs::block_quotes_get_a_bar
@@ -627,7 +626,12 @@ unittest // every line fits the width
     auto text = format("# A heading that is fairly long\n\n> quote with words %s\n\n- list %s\n  1. nested %s\n\n%s\n\n```\n%s\n```",
         "w ".replicate(40), "x ".replicate(40), "y ".replicate(40), TABLE, "z".replicate(90));
     foreach (width; [10, 17, 30, 80])
-        foreach (l; renderLines(text, width)) assert(w(l) <= width, l);
+        foreach (l; renderLines(text, width))
+        {
+            // Code is left whole for the frame to break by character.
+            import std.string : indexOf;
+            if (l.indexOf(verbatimMark) < 0) assert(w(l) <= width, l);
+        }
 }
 
 unittest // stream matches whole-text rendering at any split
@@ -639,6 +643,7 @@ unittest // stream matches whole-text rendering at any split
 
 unittest // stream emits blocks as soon as they complete
 {
+    import nano.frame : dropSoftWraps;
     MarkdownStream s;
     assert(plain(s.push("# Title\n", 80)) == "Title\n");
     assert(s.push("Para", 80) == "");
@@ -646,8 +651,8 @@ unittest // stream emits blocks as soon as they complete
     assert(plain(s.push("\n- a\n", 80)) == "\nParagraph text\n");
     assert(plain(s.push("- b\n", 80)) == "\n• a\n");
     assert(plain(s.push("- c\n", 80)) == "• b\n");
-    assert(plain(s.push("```py\nx = 1\n", 80)) == "• c\n\n```py\nx = 1\n");
-    assert(plain(s.push("y = 2\n```\n", 80)) == "y = 2\n```\n");
+    assert(dropSoftWraps(plain(s.push("```py\nx = 1\n", 80))) == "• c\n\n```py\nx = 1\n");
+    assert(dropSoftWraps(plain(s.push("y = 2\n```\n", 80))) == "y = 2\n```\n");
     assert(plain(s.push("bye", 80)) == "");
     assert(plain(s.finish(80)) == "\nbye\n");
     assert(!s.holding);
@@ -656,7 +661,8 @@ unittest // stream emits blocks as soon as they complete
 unittest // finish closes an unterminated code block; plain text is unchanged
 {
     auto all = stream(["text\n\n```\ncode", " more"], 80);
-    assert(plain(all) == "text\n\n```\ncode more\n```\n", all);
+    import nano.frame : dropSoftWraps;
+    assert(dropSoftWraps(plain(all)) == "text\n\n```\ncode more\n```\n", all);
     assert(plain(all) == plain(render("text\n\n```\ncode more", 80) ~ "\n"));
     assert(stream(["just ", "some words\n", "on lines"], 80) == "just some words on lines\n");
 }
