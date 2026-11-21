@@ -78,12 +78,11 @@ struct Entry
 /// The log's message records with their IDs. Torn or unknown lines are skipped.
 Entry[] load(string path)
 {
-    import std.file : readText;
     import std.string : lineSplitter;
-    import nano.session : messageFromRecord;
+    import nano.session : messageFromRecord, logText;
     Entry[] out_;
     ulong n;
-    foreach (line; readText(path).lineSplitter)
+    foreach (line; logText(path).lineSplitter)
     {
         ++n;
         if (!line.canFind(`"message"`)) continue; // cheap pre-filter; any JSON spacing is valid

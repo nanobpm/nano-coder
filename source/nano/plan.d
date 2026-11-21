@@ -90,6 +90,15 @@ struct PlanItem
     uint[] after; /// items that must be done (or dropped) first
 
     PlanItem dup() pure const { return PlanItem(id, title, status, notes.dup, after.dup); }
+
+    /// Serialized like an entry of `Plan.toJSON`'s `items` list.
+    JSONValue toJSON() pure const
+    {
+        auto o = JSONValue(["id": JSONValue(id), "title": JSONValue(title), "status": JSONValue(statusName(status))]);
+        if (notes.length) o["notes"] = JSONValue(notes.dup);
+        if (after.length) o["after"] = JSONValue(after.map!(a => JSONValue(a)).array);
+        return o;
+    }
 }
 
 /// What a plan tool call did.
@@ -372,13 +381,7 @@ struct Plan
     JSONValue toJSON() pure const
     {
         JSONValue[] list;
-        foreach (ref i; items)
-        {
-            auto o = JSONValue(["id": JSONValue(i.id), "title": JSONValue(i.title), "status": JSONValue(statusName(i.status))]);
-            if (i.notes.length) o["notes"] = JSONValue(i.notes.dup);
-            if (i.after.length) o["after"] = JSONValue(i.after.map!(a => JSONValue(a)).array);
-            list ~= o;
-        }
+        foreach (ref i; items) list ~= i.toJSON;
         auto o = JSONValue(["items": JSONValue(list)]);
         if (goal.length) o["goal"] = JSONValue(goal);
         return o;
