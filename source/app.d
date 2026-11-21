@@ -2159,6 +2159,7 @@ int runMain(string[] args)
             stdErr.writeln(console.dim("[instruction files changed: the system prompt now follows them]"));
         syncMode();
         nano.herdr.report(nano.herdr.State.working);
+        nano.herdr.showTimer(!agent.timers.empty);
         if (gFrame) gFrame.busy(true);
         scope (exit) if (gFrame) gFrame.busy(false);
         atomicStore(gTurnRunning, true);
@@ -2352,6 +2353,7 @@ int runMain(string[] args)
             }
             else nano.herdr.report(nano.herdr.State.idle);
             nano.herdr.showModel(agent.client.modelName);
+            nano.herdr.showTimer(!agent.timers.empty);
             // The prompt's stamp is redrawn with the submission time (Rust's restamp).
             ed.restyle = () => console.stamp() ~ console.bold("› ");
             // While the Ctrl-C exit hint is armed, end the read when the window
