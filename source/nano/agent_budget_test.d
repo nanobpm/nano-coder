@@ -357,3 +357,18 @@ unittest
     assert(agent.contextWindow(source) == 200_000 && source == "context_window in config");
     assert(agent.effectiveMaxTokens == 16_000, "the endpoint's output limit stands beside a configured window");
 }
+
+// An out-of-range configured threshold (negative, above 1, NaN) is clamped
+// to the agent's effective 0.1–0.99 range for every reader, so reports never
+// convert a negative or overflowing token count.
+unittest
+{
+    auto agent = budgeted(new MockClient([]), 100_000, 1_000);
+    foreach (t, want; [-0.5: 0.1, 0.0: 0.1, 1.5: 0.99, 0.5: 0.5])
+    {
+        agent.autoCompactThreshold = t;
+        assert(agent.effectiveAutoCompactThreshold == want);
+    }
+    agent.autoCompactThreshold = double.nan;
+    assert(agent.effectiveAutoCompactThreshold == 0.8);
+}
