@@ -1299,6 +1299,7 @@ class Console : AgentEvents
 
     void toolStart(const ref ToolCall call)
     {
+        import nano.trajectory : terminalSafe;
         string name = call.name;
         updateStatus((ref Stats s) {
             s.activity = Activity.tool;
@@ -1310,10 +1311,10 @@ class Console : AgentEvents
         meter.reset(nowMs);
         if (quiet || quietTool(call)) return;
         endLine();
-        auto line = stamp() ~ (color ? "\x1b[38;5;114m●\x1b[0m " : "● ") ~ bold(escapeMarks(call.name)) ~ " " ~ dim(summary(call));
+        auto line = stamp() ~ (color ? "\x1b[38;5;114m●\x1b[0m " : "● ") ~ bold(escapeMarks(terminalSafe(call.name))) ~ " " ~ dim(terminalSafe(summary(call)));
         writeln(line);
         // Ctrl-O shows the full arguments under the call.
-        if (gFrame) write(foldMark(call.id, 1, line ~ "\n" ~ expandedBody(argsText(call), color ? "\x1b[2m" : "")));
+        if (gFrame) write(foldMark(call.id, 1, line ~ "\n" ~ expandedBody(sanitizeBlock(argsText(call)), color ? "\x1b[2m" : "")));
         stdOut.flush();
     }
 
@@ -1665,17 +1666,22 @@ void replayTranscript(Agent agent, Console console)
     stdOut.flush();
 }
 
-/// Whether the message after `msgs[i]` is a Stop hook's rejection. New logs
-/// flag it explicitly (`stop_blocked`); for older logs, fall back to an
-/// unflagged automatic wrapped reminder (an idle timer turn's message is
-/// automatic but starts with the raw notice; a user steer is never automatic).
+/// Whether the answer `msgs[i]` was superseded within its turn: the next
+/// non-system message is a Stop hook's rejection or a mid-turn steer. New
+/// logs flag both explicitly (`stop_blocked`, `steered`); for older logs, fall
+/// back to an unflagged automatic wrapped reminder (an idle timer turn's
+/// message is automatic but starts with the raw notice). System messages
+/// (e.g. a compaction summary between stash and conversation) are skipped.
 bool stopRejected(const Message[] msgs, size_t i) pure nothrow @nogc @safe
 {
     import std.algorithm.searching : startsWith;
-    if (i + 1 >= msgs.length) return false;
-    const n = &msgs[i + 1];
-    if (n.stopBlocked) return n.role == Role.user;
-    return n.role == Role.user && n.autoInitiated && !n.continuation && !n.timer && !n.hookContext
+    size_t k = i + 1;
+    while (k < msgs.length && msgs[k].role == Role.system) k++;
+    if (k >= msgs.length) return false;
+    const n = &msgs[k];
+    if (n.role != Role.user) return false;
+    if (n.stopBlocked || n.steered) return true;
+    return n.autoInitiated && !n.continuation && !n.timer && !n.hookContext
         && n.content.startsWith("<system-reminder>");
 }
 
@@ -1696,15 +1702,28 @@ unittest
     assert(!stopRejected(msgs, 4));
     assert(!stopRejected(msgs, 6));
     assert(!stopRejected(msgs, 8));
-    // Answer -> mid-turn steer (with reminder-like text) -> answer: the
-    // first answer stays visible; an explicit flag wins over the content.
+    // An unflagged user message (a new turn) never supersedes; a flagged
+    // Stop-hook rejection does regardless of its content.
     auto flagged = Message.auto_("reason");
     flagged.stopBlocked = true;
-    auto steered = [Message.assistant("a1"), Message.user("<system-reminder>steer"), Message.assistant("a2"),
+    auto turns = [Message.assistant("a1"), Message.user("<system-reminder>next"), Message.assistant("a2"),
         flagged, Message.assistant("a3")];
-    assert(!stopRejected(steered, 0));
-    assert(stopRejected(steered, 2));
-    assert(!stopRejected(steered, 4));
+    assert(!stopRejected(turns, 0));
+    assert(stopRejected(turns, 2));
+    assert(!stopRejected(turns, 4));
+    // Answer -> mid-turn steer -> answer: only the final answer stands.
+    auto steer = Message.user("shorter");
+    steer.steered = true;
+    auto steered = [Message.assistant("a1"), steer, Message.assistant("a2")];
+    assert(stopRejected(steered, 0));
+    assert(!stopRejected(steered, 2));
+    // A compaction boundary inserts a system message between an answer and
+    // its rejection (or a steer): it is skipped.
+    auto compacted = [Message.assistant("a1"), Message.system("summary"), flagged, Message.assistant("a2"),
+        Message.system("summary"), steer, Message.assistant("a3"), Message.system("summary")];
+    assert(stopRejected(compacted, 0));
+    assert(stopRejected(compacted, 3));
+    assert(!stopRejected(compacted, 6));
 }
 
 string planText(Agent agent) pure

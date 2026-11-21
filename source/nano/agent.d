@@ -727,7 +727,9 @@ class Agent
     {
         foreach (s; control.takePending)
         {
-            push(Message.user(s.text));
+            auto sm = Message.user(s.text);
+            sm.steered = true;
+            push(sm);
             ev.userMessage(s.text);
             control.absorbed(s);
         }
