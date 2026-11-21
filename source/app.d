@@ -877,9 +877,38 @@ string stamp(bool color)
 {
     import std.datetime.systime : Clock;
     if (!atomicLoad(gTimestamps)) return "";
-    auto t = wallNow;
+    return formatStamp(color, wallNow);
+}
+
+private string formatStamp(T)(bool color, T t)
+{
     auto s = format("%02d:%02d:%02d", t.hour, t.minute, t.second);
     return color ? "\x1b[2m" ~ s ~ "\x1b[0m " : s ~ " ";
+}
+
+/// The stamp for a saved message's RFC 3339 `timestamp`, in local time; the
+/// current time when it is missing or unreadable (sessions from before
+/// timestamps were logged).
+string stampAt(bool color, string timestamp)
+{
+    import std.datetime.systime : SysTime;
+    if (!atomicLoad(gTimestamps)) return "";
+    if (timestamp.length)
+        try return formatStamp(color, SysTime.fromISOExtString(timestamp).toLocalTime);
+        catch (Exception) {} // malformed: fall back to now
+    return stamp(color);
+}
+
+unittest
+{
+    import std.datetime.systime : SysTime;
+    auto was = atomicLoad(gTimestamps);
+    scope (exit) atomicStore(gTimestamps, was);
+    atomicStore(gTimestamps, true);
+    auto t = SysTime.fromISOExtString("2026-01-02T03:04:05.250+13:00").toLocalTime;
+    assert(stampAt(false, "2026-01-02T03:04:05.250+13:00") == format("%02d:%02d:%02d ", t.hour, t.minute, t.second));
+    assert(stampAt(false, "garbage").length == 9);
+    assert(stampAt(false, "").length == 9);
 }
 
 /// `text` with `stamp` before the first line and its width in spaces before the rest.
@@ -1214,7 +1243,10 @@ class Console : AgentEvents
         return gFrame ? shown : dropSoftWraps(shown);
     }
 
-    string stamp() { return .stamp(color); }
+    /// While replaying a saved session: the message's own timestamp, so
+    /// replayed lines carry their original time.
+    string replayTime;
+    string stamp() { return replayTime.length ? stampAt(color, replayTime) : .stamp(color); }
 
     this(bool color, bool tty = false)
     {
@@ -1545,14 +1577,17 @@ string timersText(Agent agent)
 /// Rebuild the transcript of a loaded session on the frame (Rust
 /// `replay_history` in frame mode): the frame owns the screen, so without
 /// this a resumed or relaunched session opens with an empty transcript.
-/// Prompts, answers, tool calls and results show as they did live; after a
+/// Prompts, answers, tool calls and results show as they did live, stamped
+/// with their saved times; after a
 /// compaction the pre-compaction turns replay instead of the summary.
 void replayTranscript(Agent agent, Console console)
 {
     auto msgs = agent.replayMessages;
     size_t[2][string] calls; // call ID -> [message, call] index into msgs
+    scope (exit) console.replayTime = null;
     foreach (i, ref m; msgs)
     {
+        console.replayTime = m.timestamp;
         final switch (m.role)
         {
         case Role.system: break;
