@@ -10,7 +10,7 @@ version (unittest):
 import nano.option : match, some, unwrap;
 import nano.result : unwrap;
 import std.json;
-import std.file : tempDir, exists, rmdirRecurse;
+import std.file : tempDir, exists, rmdirRecurse, readText;
 import std.path : buildPath;
 import nano.agent;
 import nano.llm;
@@ -504,6 +504,31 @@ unittest
     resumed.loadRestored(r, some(new SessionLog(log.path)));
     assert(resumed.plan == agent.plan);
     assert(resumed.control.mode == AgentMode.normal, "a load resets the mode");
+}
+
+// Plan changes log as deltas (issue #205): the log holds one full snapshot
+// plus the changed items, and a resume rebuilds the same plan.
+unittest
+{
+    import std.algorithm : count;
+    auto dir = freshDir("plan-delta");
+    auto mock = new MockClient([
+        LLMResponse("", "", [ToolCall.fromRaw("p1", "plan_add", `{"goal":"Ship it","items":["One","Two"]}`)]),
+        LLMResponse("", "", [ToolCall.fromRaw("p2", "plan_update", `{"id":1,"status":"done","note":"found"}`)]),
+        LLMResponse("", "", [ToolCall.fromRaw("p3", "plan_update", `{"id":2,"status":"in_progress"}`)]),
+        LLMResponse("done")]);
+    auto agent = new Agent(mock, echoTools, Policy.init, "sys");
+    auto log = new SessionLog(dir, "mock/m", "/w");
+    log.append(agent.messages[0]);
+    agent.log = some(log);
+    agent.run("go", new NullEvents);
+    auto text = readText(log.path);
+    assert(text.count(`{"type":"plan"`) == 1 && text.count(`{"type":"plan_delta"`) == 2,
+        "the first change snapshots, the rest are deltas");
+    auto r = restore(log.path);
+    auto resumed = new Agent(new MockClient([]), echoTools, Policy.init, "sys");
+    resumed.loadRestored(r, some(new SessionLog(log.path)));
+    assert(resumed.plan == agent.plan, "the delta chain rebuilds the plan");
 }
 
 // A restart or a load drops the session's thinking override and its totals.

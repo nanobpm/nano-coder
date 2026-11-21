@@ -17,7 +17,7 @@ import std.json;
 import std.file;
 import std.path;
 import std.format : format;
-import std.string : strip, startsWith;
+import std.string : strip, startsWith, endsWith;
 static import std.string;
 import std.datetime.systime : SysTime, Clock;
 import std.algorithm : sort, any, filter, canFind;
@@ -197,16 +197,16 @@ private void foldInputsSince(string path, ulong from, ref Summary s)
 /// record that isn't a matching header of this format version.
 Summary summarize(string path)
 {
-    import nano.safeio : readBytes;
-    auto bytes = readBytes(path);
+    import nano.session : logText, logIdOf;
+    auto text = logText(path);
     Summary s;
     s.path = path;
     s.lastUsed = timeLastModified(path);
-    s.id = path.baseName.stripExtension;
-    s.logBytes = bytes.length;
+    s.id = logIdOf(path);
+    s.logBytes = text.length;
     try validateId(s.id);
     catch (Exception e) throw new Exception(format("session log %s has an invalid id", path));
-    auto lines = committedLines(bytes);
+    auto lines = committedLines(cast(const(ubyte)[]) text);
     bool ok;
     if (lines.length)
     {
@@ -452,15 +452,17 @@ Summary[] list(string dir)
     foreach (DirEntry e; dirEntries(dir, SpanMode.shallow, false))
     {
         auto name = e.name.baseName;
-        if (name.extension != ".jsonl" || name == indexFile) continue;
-        auto id = name.stripExtension;
+        immutable compressed = name.endsWith(".jsonl.gz");
+        if (!compressed && (name.extension != ".jsonl" || name == indexFile)) continue;
+        auto id = compressed ? name[0 .. $ - ".jsonl.gz".length] : name.stripExtension;
         try validateId(id);
         catch (Exception) continue; // not a session log name: skip
         if (!e.isFile) continue;
+        if (compressed && buildPath(dir, id ~ ".jsonl").exists) continue; // the plain twin wins
         auto size = e.size;
         Summary s;
         auto cached = id in index;
-        if (cached !is null && cached.logBytes == size) s = *cached;
+        if (cached !is null && cached.logBytes == size && !compressed) s = *cached;
         else
         {
             try s = summarize(e.name);

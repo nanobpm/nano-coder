@@ -13,14 +13,102 @@ import std.format : format;
 import std.file;
 import std.path;
 import std.stdio : File;
-import std.string : strip, lineSplitter;
+import std.string : strip, lineSplitter, endsWith;
 import std.stdio : fileno;
 import std.datetime.systime : Clock;
+import core.time : dur;
 import std.process : environment;
 import std.algorithm : sort, filter, map;
 import std.array : array;
 import nano.llm;
 import nano.option : Option, some, ifSome;
+
+/// The extension tidy-up compresses a session log to (`<id>.jsonl.gz`).
+enum string compressedExtension = ".jsonl.gz";
+
+/// Whether `path` names a gzip-compressed session log.
+bool isCompressedLog(string path) pure
+{
+    return path.endsWith(compressedExtension);
+}
+
+/// The id a log file (plain or compressed) belongs to, extensions stripped.
+string logIdOf(string path) pure
+{
+    import std.string : endsWith;
+    auto name = path.baseName;
+    return name.endsWith(compressedExtension) ? name[0 .. $ - compressedExtension.length] : name.stripExtension;
+}
+
+/// The whole log at `path` as text, gunzipping a compressed log (issue #205:
+/// every reader — resume, the picker, history, the index, the trajectory —
+/// sees compressed logs transparently).
+string logText(string path)
+{
+    import nano.safeio : readRawText;
+    if (!isCompressedLog(path)) return readRawText(path);
+    return gunzipLog(readBytes(path), path);
+}
+
+// zlib's C API writes only within the caller's buffers (sizes tracked in
+// avail_in/avail_out); the stream struct is plain C data.
+private string gunzipLog(const(ubyte)[] bytes, string path) @trusted
+{
+    import etc.c.zlib : z_stream, inflateInit2, inflate, inflateEnd, Z_FINISH, Z_STREAM_END;
+    import core.stdc.string : strlen;
+    // A gzip wrapper needs raw inflate with windowBits 31 (15 + the 16 that
+    // asks for the gzip header); std.zlib's uncompress expects a zlib stream.
+    z_stream zs;
+    if (inflateInit2(&zs, 15 + 16) != 0 /* Z_OK */)
+        throw new Exception("inflate init failed for " ~ path);
+    scope (exit) inflateEnd(&zs);
+    auto out_ = new ubyte[](bytes.length ? bytes.length * 4 : 64);
+    zs.next_in = cast(ubyte*) bytes.ptr;
+    zs.avail_in = cast(uint) bytes.length;
+    size_t used;
+    for (;;)
+    {
+        if (used == out_.length) out_.length = out_.length * 2;
+        zs.next_out = out_.ptr + used;
+        zs.avail_out = cast(uint) (out_.length - used);
+        auto rc = inflate(&zs, Z_FINISH);
+        used = out_.length - zs.avail_out;
+        if (rc == Z_STREAM_END) break;
+        if (rc != 0 /* Z_OK */ && rc != 2 /* Z_BUF_ERROR */)
+            throw new Exception(format("gunzip %s: %s", path,
+                zs.msg !is null ? zs.msg[0 .. strlen(zs.msg)] : "corrupt stream"));
+        if (rc == 2 && zs.avail_in == 0 && zs.avail_out != 0)
+            throw new Exception("gunzip " ~ path ~ ": truncated stream");
+    }
+    return cast(string) out_[0 .. used];
+}
+
+// zlib's C API writes only within the caller's buffers (sizes tracked in
+// avail_in/avail_out); the stream struct is plain C data.
+/// The gzip-compressed bytes of `text` (a session log's whole content).
+ubyte[] gzipLog(const(char)[] text) @trusted
+{
+    import etc.c.zlib : z_stream, deflateInit2, deflate, deflateEnd, Z_FINISH, Z_STREAM_END;
+    z_stream zs;
+    if (deflateInit2(&zs, 6, 8 /* Z_DEFLATED */, 15 + 16 /* gzip wrapper */, 8, 0) != 0)
+        throw new Exception("deflate init failed");
+    scope (exit) deflateEnd(&zs);
+    auto out_ = new ubyte[](text.length / 4 + 256);
+    zs.next_in = cast(ubyte*) text.ptr;
+    zs.avail_in = cast(uint) text.length;
+    size_t used;
+    for (;;)
+    {
+        if (used == out_.length) out_.length = out_.length * 2;
+        zs.next_out = out_.ptr + used;
+        zs.avail_out = cast(uint) (out_.length - used);
+        auto rc = deflate(&zs, Z_FINISH);
+        used = out_.length - zs.avail_out;
+        if (rc == Z_STREAM_END) break;
+        if (rc != 0) throw new Exception("deflate failed compressing a session log");
+    }
+    return out_[0 .. used].dup;
+}
 
 /// The session log directory: `NANO_CODER_SESSIONS`, else the configured
 /// `session_dir` (`~` expanded), else the platform data folder.
@@ -287,16 +375,27 @@ class SessionLog
         path = buildPath(dir, this.id ~ ".jsonl");
         if (path.exists) throw new Exception("session log " ~ path ~ " already exists");
         f = File(path, "a");
+        lockHeld();
         JSONValue h = ["id": this.id, "created_at": nowStamp(), "cwd": cwd, "model": model];
         h["version"] = formatVersion;
         write_(record("session", h));
     }
 
-    /// Continue an existing log (after `restore` read it).
+    /// Continue an existing log (after `restore` read it). A compressed log
+    /// (`<id>.jsonl.gz`, written by the tidy-up) is decompressed back to its
+    /// plain name first, so appends stay line-aligned text (issue #205).
     this(string existingPath)
     {
         path = existingPath;
-        id = existingPath.baseName.stripExtension;
+        if (isCompressedLog(path))
+        {
+            import std.file : write_file = write;
+            auto plain = path[0 .. $ - ".gz".length];
+            write_file(plain, logText(path));
+            remove(path);
+            path = plain;
+        }
+        id = path.baseName.stripExtension;
         validateId(id);
         auto bytes = readBytes(path);
         size_t committed = bytes.length;
@@ -309,10 +408,26 @@ class SessionLog
         }
         foreach (b; bytes[0 .. committed]) if (b == '\n') ++lines;
         f = File(path, "a");
+        lockHeld();
+    }
+
+    /// Hold an advisory lock on the log for as long as it is open, so the
+    /// startup tidy-up (issue #205) never compresses or deletes a live
+    /// session's log. Best-effort: a filesystem without flock logs unlocked.
+    /// flock only marks the open file description; no memory is touched.
+    private void lockHeld() @trusted
+    {
+        flock(fileno(f.getFP), LOCK_EX | LOCK_NB);
     }
 
     /// Tests: the next write fails (Rust `fail_next_persist`).
     bool failNextWrite;
+
+    /// Close the log (releasing its lock); a closed log must not be written.
+    void close()
+    {
+        if (f.isOpen) f.close();
+    }
 
     private void write_(string line)
     {
@@ -358,6 +473,23 @@ class SessionLog
         write_(record("plan", d));
     }
 
+    /// A plan change as a delta against the plan the log so far restores to
+    /// (issue #205: a full snapshot per `plan_update` rewrites every note on
+    /// every change). `goal` when it changed, `upserts` the added/updated
+    /// items (each with its full notes), `drop` the removed item ids, `base`
+    /// how many items the plan so far holds (a resume applies the delta onto
+    /// the first `base` of them). A malformed base is no corruption: the
+    /// resume then takes the delta's items as the whole plan.
+    void planDelta(JSONValue goal, JSONValue[] upserts, uint[] drop, size_t base)
+    {
+        JSONValue d = ["recorded_at": nowStamp()];
+        if (goal.type != JSONType.null_) d["goal"] = goal;
+        if (upserts.length) d["upserts"] = upserts;
+        if (drop.length) d["drop"] = JSONValue(drop.map!(i => JSONValue(i)).array);
+        d["base"] = base;
+        write_(record("plan_delta", d));
+    }
+
     /// The timers after a change; the latest record wins.
     void timers(JSONValue timers)
     {
@@ -392,8 +524,13 @@ class SessionLog
 
     /// The conversation was replaced wholesale (e.g. `/clear` keeps only the system prompt).
     /// Compaction also records the folded log-line range, its mode and model.
-    /// `pinStash`: the user requests folded by compactions so far (resume
-    /// rebuilds the pinned block from them).
+    /// `pinStash`: the user requests this compaction adds to the pinned block
+    /// (resume rebuilds the block from them). `pinnedBase` is how many requests
+    /// earlier compactions already stashed: the new requests extend that prefix
+    /// rather than restating it, so a session's log holds each request once
+    /// (issue #205 — a full restatement per compaction is quadratic). A plain
+    /// replacement passes the whole stash with no base (the full form, which a
+    /// resume still reads).
     /// `pending`: an in-flight input that survives the replacement (a
     /// mid-turn compaction), with its continuation snapshot.
     /// `folded`: the real turns this compaction folded, extending the first
@@ -401,7 +538,8 @@ class SessionLog
     /// the index of the restated in-flight input in `messages`.
     void replace(const Message[] messages, ulong first = 0, ulong last = 0, string mode = null, string model = null,
         const Message[] pinStash = null, scope const(PendingInput)* pending = null, const Message[] folded = null,
-        Option!size_t foldedBase = Option!size_t.init, Option!size_t restated = Option!size_t.init)
+        Option!size_t foldedBase = Option!size_t.init, Option!size_t restated = Option!size_t.init,
+        Option!size_t pinnedBase = Option!size_t.init)
     {
         JSONValue[] ms;
         foreach (ref m; messages) ms ~= messageRecord(m);
@@ -412,6 +550,7 @@ class SessionLog
             JSONValue[] ps;
             foreach (ref m; pinStash) ps ~= messageRecord(m);
             d["pinned_requests"] = ps;
+            pinnedBase.ifSome((size_t b) { d["pinned_base"] = b; });
         }
         if (pending !is null)
         {
@@ -553,7 +692,7 @@ Restored restore(string path)
 {
     import std.algorithm : countUntil;
     Restored r;
-    auto text = readText(path);
+    auto text = logText(path);
     auto committed = text.length;
     while (committed && text[committed - 1] != '\n') committed--;
     if (!committed) throw new Exception("session log " ~ path ~ " has no committed records");
@@ -581,9 +720,9 @@ Restored restore(string path)
             if (v != formatVersion)
                 throw new Exception(format("unsupported session format version %s (this build supports %s)", v, formatVersion));
             r.id = data["id"].str;
-            if (r.id != path.baseName.stripExtension)
+            if (r.id != logIdOf(path))
                 throw new Exception(format("session log header id %s does not match %s", JSONValue(r.id).jsonText,
-                    JSONValue(path.baseName.stripExtension).jsonText));
+                    JSONValue(logIdOf(path)).jsonText));
             if (auto c = "cwd" in data) r.cwd = c.str;
             if (auto m = "model" in data) r.model = m.str;
             if (auto c = "created_at" in data) r.createdAt = c.str;
@@ -696,8 +835,17 @@ Restored restore(string path)
                 r.replayRestated = Option!size_t.init;
                 if (auto at = "restated" in data)
                     if (active && at.type == JSONType.integer && at.integer >= 0) r.replayRestated = some(cast(size_t) at.integer);
-                auto pins = "pinned_requests" in data;
-                r.pinStash = pins !is null ? decode(*pins, inputs) : rustStash.dup;
+                // The pinned block: a full `pinned_requests` restatement, or a
+                // delta extending the first `pinned_base` of the stash so far
+                // (issue #205). With neither, a Rust log's folded stash is it.
+                auto pins = "pinned_requests" in data, pinBase = "pinned_base" in data;
+                if (pins !is null && pinBase !is null && pinBase.type == JSONType.integer)
+                {
+                    auto b = cast(size_t) pinBase.integer;
+                    auto kept = b < r.pinStash.length ? r.pinStash[0 .. b] : r.pinStash;
+                    r.pinStash = kept ~ decode(*pins, inputs);
+                }
+                else r.pinStash = pins !is null ? decode(*pins, inputs) : rustStash.dup;
             }
             {
                 auto mode = "mode" in data;
@@ -717,6 +865,50 @@ Restored restore(string path)
             break;
         case "plan":
             r.plan = data["plan"];
+            break;
+        case "plan_delta":
+            // A plan change against the plan so far (issue #205): keep the
+            // first `base` items, apply the goal change, drop removed ids and
+            // upsert the rest. A base past the plan's length (a hand-edited
+            // or torn log) restarts the plan from the delta's items.
+            {
+                import nano.plan : Plan, PlanItem;
+                import nano.result : unwrap;
+                import std.algorithm : countUntil;
+                auto base = "base" in data;
+                auto b = base !is null && base.type == JSONType.integer && base.integer >= 0
+                    ? cast(size_t) base.integer : size_t.max;
+                Plan p;
+                if (r.plan.type == JSONType.object)
+                {
+                    auto restored = Plan.fromJSON(r.plan);
+                    if (!restored.isErr) p = restored.unwrap("checked");
+                }
+                if (b > p.items.length) p = Plan.init;
+                else if (b < p.items.length) p.items = p.items[0 .. b];
+                if (auto g = "goal" in data)
+                    if (g.type == JSONType.string) p.goal = g.str;
+                if (auto dr = "drop" in data)
+                    if (dr.type == JSONType.array)
+                    {
+                        bool[uint] gone;
+                        foreach (x; dr.arrayNoRef)
+                            if (x.type == JSONType.integer && x.integer >= 0) gone[cast(uint) x.integer] = true;
+                        p.items = p.items.filter!(i => i.id !in gone).array;
+                    }
+                if (auto up = "upserts" in data)
+                    if (up.type == JSONType.array)
+                        foreach (x; up.arrayNoRef)
+                        {
+                            auto parsed = Plan.fromJSON(JSONValue(["items": JSONValue([x])]));
+                            if (parsed.isErr) continue;
+                            auto item = parsed.unwrap("checked").items[0];
+                            auto at = p.items.countUntil!(i => i.id == item.id);
+                            if (at >= 0) p.items[at] = item;
+                            else p.items ~= item;
+                        }
+                r.plan = p.toJSON;
+            }
             break;
         case "timers":
             r.timers = data["timers"];
@@ -745,6 +937,7 @@ Summary[] listSessions(string dir)
 }
 
 /// Find a session log by id, or "last" for the newest one started in `cwd`.
+/// A compressed log (`<id>.jsonl.gz`) is found by the same id.
 string findSession(string dir, string which, string cwd = null)
 {
     if (which == "last" || !which.length)
@@ -755,8 +948,110 @@ string findSession(string dir, string which, string cwd = null)
     }
     validateId(which);
     auto p = buildPath(dir, which ~ ".jsonl");
-    if (!p.exists) throw new Exception("no session " ~ which ~ " in " ~ dir);
-    return p;
+    if (p.exists) return p;
+    auto z = p ~ ".gz";
+    if (z.exists) return z;
+    throw new Exception("no session " ~ which ~ " in " ~ dir);
+}
+
+// ---------------------------------------------------------------------------
+// Tidy-up (issue #205): compress idle logs, expire old ones.
+
+/// What `tidySessions` did.
+struct TidyResult
+{
+    size_t compressed, deleted;
+    ulong freedBytes;
+}
+
+/// The stamp file whose mtime rate-limits the tidy-up to once a day.
+private enum string tidyStampFile = ".tidy-stamp";
+
+/// Whether another process holds an advisory lock on `path`: such a log is
+/// never compressed or deleted under it. The probe itself takes and drops a
+/// lock, so a log this process holds open is also "in use" when it locked it.
+/// open/close/flock on a NUL-terminated copy of the path touch no memory.
+private bool logInUse(string path) @trusted
+{
+    import core.sys.posix.fcntl : open, O_RDWR;
+    import core.sys.posix.unistd : close;
+    import std.string : toStringz;
+    auto fd = open(path.toStringz, O_RDWR);
+    if (fd < 0) return false; // unreadable: nothing to tidy
+    scope (exit) close(fd);
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) return true;
+    flock(fd, LOCK_UN);
+    return false;
+}
+
+private extern (C) int flock(int, int) nothrow @nogc;
+private enum LOCK_EX = 2, LOCK_NB = 4, LOCK_UN = 8;
+
+/// Compress logs idle for `compressAfterDays` and delete logs untouched for
+/// `retentionDays` (0: keep forever), except named (titled) sessions. Runs at
+/// most once a day per directory (the `.tidy-stamp` mtime), never touches a
+/// log another process holds the lock on, and leaves a log whose plain and
+/// compressed names both exist alone. Best-effort: an unreadable or
+/// unwritable entry is skipped.
+TidyResult tidySessions(string dir, long compressAfterDays, long retentionDays)
+{
+    import nano.session_index : list, indexFile;
+    TidyResult result;
+    if (!dir.exists || (compressAfterDays <= 0 && retentionDays <= 0)) return result;
+    auto stampPath = buildPath(dir, tidyStampFile);
+    auto now = wallNow;
+    if (stampPath.exists && now - timeLastModified(stampPath) < dur!"days"(1)) return result;
+    // Titles name the sessions retention keeps.
+    bool[string] named;
+    try foreach (s; list(dir)) if (s.title !is null) named[s.id] = true;
+    catch (Exception) {} // a broken index is rebuilt on demand; tidy anyway
+    foreach (DirEntry e; dirEntries(dir, SpanMode.shallow, false))
+    {
+        auto name = e.name.baseName;
+        immutable compressed = name.endsWith(compressedExtension);
+        if (!compressed && (!name.endsWith(".jsonl") || name == indexFile)) continue;
+        auto id = logIdOf(e.name);
+        try validateId(id);
+        catch (Exception) continue; // not a session log name: skip
+        if (!e.isFile) continue;
+        auto age = now - e.timeLastModified;
+        try
+        {
+            if (compressed)
+            {
+                // Retire the twin of a log that was decompressed for a resume.
+                if (buildPath(dir, id ~ ".jsonl").exists) { remove(e.name); continue; }
+                if (retentionDays > 0 && age >= dur!"days"(retentionDays) && id !in named && !logInUse(e.name))
+                {
+                    result.freedBytes += e.size;
+                    remove(e.name);
+                    ++result.deleted;
+                }
+                continue;
+            }
+            if (logInUse(e.name)) continue;
+            if (retentionDays > 0 && age >= dur!"days"(retentionDays) && id !in named)
+            {
+                result.freedBytes += e.size;
+                remove(e.name);
+                ++result.deleted;
+            }
+            else if (compressAfterDays > 0 && age >= dur!"days"(compressAfterDays))
+            {
+                auto gz = e.name ~ ".gz";
+                if (gz.exists) continue; // both names: a human's doing; leave it
+                auto before = e.size;
+                std.file.write(gz, gzipLog(cast(const(char)[]) readBytes(e.name)));
+                remove(e.name);
+                result.freedBytes += before - getSize(gz);
+                ++result.compressed;
+            }
+        }
+        catch (Exception) {} // one unreadable log must not stop the pass
+    }
+    try std.file.write(stampPath, "");
+    catch (Exception) {} // a stamp that won't write just tidies again next start
+    return result;
 }
 
 /// How long ago `then` was, briefly.
@@ -969,4 +1264,139 @@ unittest
         ~ line("replace", rep([rec(Message.user("two"))], 1)));
     auto rr = restore(path);
     assert(rr.pinStash.length == 2 && rr.pinStash[0].content == "one" && rr.pinStash[1].content == "two");
+}
+
+// A compaction's pinned block is logged as a delta: `pinned_requests` holds
+// only the requests that compaction adds, extending the first `pinned_base`
+// of the stash so far (issue #205); a full restatement (no base) still reads.
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, write;
+    import std.path : buildPath;
+    auto dir = buildPath(tempDir, "nano-d-pindelta-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    static JSONValue rec(Message m) { return messageRecord(m); }
+    string line(string type, JSONValue data) { return JSONValue(["type": JSONValue(type), "data": data]).toString ~ "\n"; }
+    JSONValue rep(JSONValue[] pins, long base = -1)
+    {
+        JSONValue d = ["messages": JSONValue([rec(Message.user("summary"))])];
+        d["pinned_requests"] = pins;
+        if (base >= 0) d["pinned_base"] = base;
+        return d;
+    }
+    auto path = buildPath(dir, "pd.jsonl");
+    write(path, `{"type":"session","data":{"version":1,"id":"pd","created_at":"x"}}` ~ "\n"
+        ~ line("replace", rep([rec(Message.user("one")), rec(Message.user("two"))]))
+        ~ line("replace", rep([rec(Message.user("three"))], 2))
+        ~ line("replace", rep(cast(JSONValue[]) [], 3)));
+    auto r = restore(path);
+    assert(r.pinStash.length == 3 && r.pinStash[0].content == "one" && r.pinStash[1].content == "two"
+        && r.pinStash[2].content == "three", "the delta extends the kept prefix");
+    // A base past the stash keeps the whole stash rather than corrupting it.
+    auto path2 = buildPath(dir, "pd2.jsonl");
+    write(path2, `{"type":"session","data":{"version":1,"id":"pd2","created_at":"x"}}` ~ "\n"
+        ~ line("replace", rep([rec(Message.user("one"))]))
+        ~ line("replace", rep([rec(Message.user("two"))], 9)));
+    auto r2 = restore(path2);
+    assert(r2.pinStash.length == 2 && r2.pinStash[1].content == "two");
+}
+
+// Plan changes log as deltas applied onto the plan so far, with a full
+// `plan` snapshot resetting the chain (issue #205).
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse;
+    import std.path : buildPath;
+    import nano.plan : Plan, Status;
+    import nano.result : unwrap;
+    auto dir = buildPath(tempDir, "nano-d-plandelta-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/w");
+    log.plan(parseJSON(`{"goal":"g","items":[{"id":1,"title":"a","status":"pending"},{"id":2,"title":"b","status":"pending"}]}`));
+    log.planDelta(JSONValue("g2"), [parseJSON(`{"id":2,"title":"b","status":"done","notes":["n"]}`),
+        parseJSON(`{"id":3,"title":"c","status":"pending"}`)], [1], 2);
+    auto r = restore(log.path);
+    auto p = Plan.fromJSON(r.plan).unwrap("a valid plan");
+    assert(p.goal == "g2" && p.items.length == 2 && p.items[0].id == 2 && p.items[1].id == 3);
+    assert(p.items[0].status == Status.done && p.items[0].notes == ["n"]);
+    // A base past the plan's length restarts the plan from the delta's items.
+    log.planDelta(JSONValue(null), [parseJSON(`{"id":7,"title":"z","status":"pending"}`)], null, 99);
+    auto p2 = Plan.fromJSON(restore(log.path).plan).unwrap("a valid plan");
+    assert(p2.goal.length == 0 && p2.items.length == 1 && p2.items[0].id == 7);
+    // A full snapshot replaces the delta chain.
+    log.plan(parseJSON(`{"items":[{"id":1,"title":"x","status":"pending"}]}`));
+    auto p3 = Plan.fromJSON(restore(log.path).plan).unwrap("a valid plan");
+    assert(p3.goal.length == 0 && p3.items.length == 1 && p3.items[0].title == "x");
+}
+
+// gzip round-trip: a compressed log reads back byte-for-byte, and the tidy-up
+// compresses idle logs, expires old ones, keeps named sessions, skips logs in
+// use, and runs at most once a day (issue #205).
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse;
+    import std.path : buildPath;
+    import core.time : days, hours;
+    auto dir = buildPath(tempDir, "nano-d-tidy-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto text = `{"type":"session","data":{"version":1,"id":"x","created_at":"x"}}` ~ "\n"
+        ~ `{"type":"input","data":{"id":"in-1","text":"hello"}}` ~ "\n";
+    auto gzPath = buildPath(dir, "x.jsonl.gz");
+    std.file.write(gzPath, gzipLog(text));
+    assert(logText(gzPath) == text, "gzip round-trips");
+    remove(gzPath);
+
+    string makeLog(string id, string prompt)
+    {
+        auto log = new SessionLog(dir, "mock/m", "/w", id);
+        log.input("in-1", prompt);
+        log.turnEnd("in-1", "", "end_turn");
+        log.close();
+        return log.path;
+    }
+    auto old = makeLog("old-log", "an old session that should be compressed");
+    auto kept = makeLog("kept-log", "a named session that must survive retention");
+    auto fresh = makeLog("fresh-log", "a session too new to touch");
+    foreach (p; [old, kept]) setTimes(p, wallNow - 20.days, wallNow - 20.days);
+    // Name `kept` via the index.
+    import nano.session_index : setTitle;
+    setTitle(kept, "Keep me");
+    auto r = tidySessions(dir, 14, 0);
+    assert(r.compressed == 2 && r.deleted == 0);
+    assert(!old.exists && (old ~ ".gz").exists && !kept.exists && (kept ~ ".gz").exists);
+    assert(fresh.exists, "a fresh log is not compressed");
+    assert(restore(old ~ ".gz").completed.length == 1, "a compressed log restores");
+    assert(findSession(dir, "old-log") == old ~ ".gz", "a compressed log is found by id");
+    assert(listSessions(dir).length == 3, "compressed logs list");
+    // Rate-limited: a second pass the same day does nothing.
+    auto again = makeLog("second-old", "another old session");
+    setTimes(again, wallNow - 20.days, wallNow - 20.days);
+    assert(tidySessions(dir, 14, 0).compressed == 0, "the stamp rate-limits the pass");
+    // A log another process holds is left alone.
+    auto inUse = new SessionLog(dir, "mock/m", "/w", "in-use");
+    setTimes(inUse.path, wallNow - 20.days, wallNow - 20.days);
+    std.file.write(buildPath(dir, tidyStampFile), "");
+    setTimes(buildPath(dir, tidyStampFile), wallNow - 2.days, wallNow - 2.days);
+    auto r2 = tidySessions(dir, 14, 30);
+    assert(r2.compressed == 1, "the second old log compresses once the stamp ages");
+    assert(inUse.path.exists && !(inUse.path ~ ".gz").exists, "a locked log is skipped");
+    inUse.close();
+    // Retention: old unnamed logs go, named and fresh ones stay.
+    setTimes(kept ~ ".gz", wallNow - 200.days, wallNow - 200.days);
+    setTimes(old ~ ".gz", wallNow - 200.days, wallNow - 200.days);
+    setTimes(again ~ ".gz", wallNow - 200.days, wallNow - 200.days);
+    setTimes(buildPath(dir, tidyStampFile), wallNow - 2.days, wallNow - 2.days);
+    auto r3 = tidySessions(dir, 14, 180);
+    assert(r3.deleted == 2 && !(old ~ ".gz").exists && !(again ~ ".gz").exists);
+    assert((kept ~ ".gz").exists, "a named session survives retention");
+    assert(fresh.exists, "a fresh log survives retention");
+    // Resuming a compressed log decompresses it back to its plain name.
+    auto resumed = new SessionLog(kept ~ ".gz");
+    auto more = Message.user("more");
+    resumed.append(more);
+    assert(kept.exists && !(kept ~ ".gz").exists);
+    assert(restore(kept).conversation[$ - 1].content == "more");
 }
