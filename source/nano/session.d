@@ -545,7 +545,7 @@ class SessionLog
         foreach (ref m; messages) ms ~= messageRecord(m);
         JSONValue d = ["recorded_at": nowStamp()];
         d["messages"] = ms;
-        if (pinStash.length)
+        if (pinStash.length || !pinnedBase.isNone)
         {
             JSONValue[] ps;
             foreach (ref m; pinStash) ps ~= messageRecord(m);
@@ -1248,6 +1248,13 @@ unittest
     assert(r.conversation[0].autoInitiated && r.conversation[1].hookContext);
     log.replace([Message.user("x")]);
     assert(restore(log.path).pinStash.length == 0, "a plain replace clears the stash");
+    // A compaction that folds no new request still logs its base, so the
+    // stash built so far survives a resume (it must not fall back to `folded`).
+    log.replace([Message.auto_("s1")], 1, 2, "standard", "m", [p], null, [Message.user("f")]);
+    log.replace([Message.auto_("s2")], 3, 4, "standard", "m", null, null, [Message.assistant("a")],
+        Option!size_t.init, Option!size_t.init, some(size_t(1)));
+    auto rk = restore(log.path);
+    assert(rk.pinStash.length == 1 && rk.pinStash[0].pinText == "goal", "an empty delta keeps the stash");
 
     static JSONValue rec(Message m) { return messageRecord(m); }
     string line(string type, JSONValue data) { return JSONValue(["type": JSONValue(type), "data": data]).toString ~ "\n"; }
