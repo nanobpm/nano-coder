@@ -7,6 +7,8 @@ module nano.toml_edit;
 @safe:
 pure:
 
+import nano.arith : toSize;
+
 import nano.result : Result, unwrap;
 import std.array : join, split;
 import std.format : format;
@@ -26,7 +28,7 @@ string tomlString(string s) pure
             case '\r': out_ ~= `\r`; break;
             case '\t': out_ ~= `\t`; break;
             default:
-                if (c < 0x20 || c == 0x7f) out_ ~= format("\\u%04X", cast(uint) c);
+                if (c < 0x20 || c == 0x7f) out_ ~= format("\\u%04X", uint(c));
                 else
                 {
                     import std.conv : to;
@@ -226,7 +228,7 @@ Result!(string, string) tomlSet(string doc, const string[] path, string key, str
         tail ~= tomlKey(key) ~ " = " ~ value;
         return R.ok((lines ~ tail).join("\n") ~ "\n");
     }
-    foreach (i; cast(size_t) start .. end)
+    foreach (i; toSize(start) .. end)
     {
         auto k = lineKey(lines[i]);
         if (k == "\0" ~ key)
@@ -251,7 +253,7 @@ Result!(string, string) tomlSet(string doc, const string[] path, string key, str
     if (value is null) return R.ok(doc);
     // Insert after the table's last key line (before trailing blanks/comments).
     size_t at = start;
-    foreach (i; cast(size_t) start .. end)
+    foreach (i; toSize(start) .. end)
         if (lineKey(lines[i]) !is null) { size_t er; valueEnd(lines, i, lines[i].indexOf('=') + 1, er); at = er + 1; }
     auto res = lines[0 .. at] ~ [tomlKey(key) ~ " = " ~ value] ~ lines[at .. $];
     return R.ok(res.join("\n") ~ "\n");

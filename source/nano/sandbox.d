@@ -24,7 +24,7 @@ version (OSX) version = HasOsSandbox;
 version (linux) version = HasOsSandbox;
 
 @safe:
-import nano.safeio : jsonText, jsonPretty;
+import nano.safeio : jsonText, jsonPretty, utf8Text;
 
 enum SandboxMode { off, workspace, readOnly }
 
@@ -309,8 +309,11 @@ string[] gitDirs(string cwd) nothrow
     {
         auto p = pipeProcess(["git", "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
             Redirect.stdout | Redirect.stderr, null, Config.none, cwd);
-        auto output = cast(const(char)[]) readToEnd(p.stdout);
+        auto raw = readToEnd(p.stdout);
         if (wait(p.pid) != 0) return null;
+        // Strict decoding: a lossy one would rewrite a non-UTF-8 path into a
+        // different directory and grant it write access. Throws into the catch.
+        auto output = utf8Text(raw);
         string[] dirs;
         foreach (l; output.idup.splitLines)
             if (l.strip.length) dirs ~= joinPath(cwd, l.strip);

@@ -3,10 +3,15 @@
 module nano.session;
 
 @safe:
+
+import std.conv : to;
+
 import nano.safeio : jsonText, jsonPretty;
 import nano.clock : wallNow;
 
-import nano.safeio : readBytes;
+import nano.safeio : readBytes, jsonUnsigned;
+import nano.arith : toSize;
+import std.string : representation;
 
 import std.json;
 import std.format : format;
@@ -73,7 +78,7 @@ private string gunzipLog(const(ubyte)[] bytes, string path) @trusted
         if (zs.avail_in == 0 && fed < bytes.length)
         {
             immutable n = zlibWindow(bytes.length - fed);
-            zs.next_in = cast(ubyte*) bytes.ptr + fed;
+            zs.next_in = bytes.ptr + fed;
             zs.avail_in = n;
             fed += n;
         }
@@ -90,19 +95,25 @@ private string gunzipLog(const(ubyte)[] bytes, string path) @trusted
         if (rc == Z_BUF_ERROR && zs.avail_in == 0 && fed == bytes.length && zs.avail_out != 0)
             throw new Exception("gunzip " ~ path ~ ": truncated stream");
     }
-    return cast(string) out_[0 .. used];
+    import std.exception : assumeUnique;
+    import std.string : assumeUTF;
+    return out_[0 .. used].assumeUTF.assumeUnique;
 }
 
 /// One zlib buffer window over `remaining` bytes: zlib's sizes are 32-bit.
 package uint zlibWindow(size_t remaining) pure nothrow @nogc @safe
 {
-    return remaining > uint.max ? uint.max : cast(uint) remaining;
+    // The mask keeps the low 32 bits, which range propagation admits as a uint.
+    return remaining > uint.max ? uint.max : remaining & uint.max;
 }
 
 // zlib's C API writes only within the caller's buffers (sizes tracked in
 // avail_in/avail_out); the stream struct is plain C data.
 /// The gzip-compressed bytes of `text` (a session log's whole content).
-ubyte[] gzipLog(const(char)[] text) @trusted
+ubyte[] gzipLog(const(char)[] text) { return gzipLog(text.representation); }
+
+/// ditto, for raw bytes (a log read from disk, compressed unvalidated).
+ubyte[] gzipLog(const(ubyte)[] text) @trusted
 {
     import etc.c.zlib : z_stream, deflateInit2, deflate, deflateEnd, Z_FINISH, Z_NO_FLUSH, Z_STREAM_END, Z_BUF_ERROR;
     z_stream zs;
@@ -118,7 +129,7 @@ ubyte[] gzipLog(const(char)[] text) @trusted
         if (zs.avail_in == 0 && fed < text.length)
         {
             immutable n = zlibWindow(text.length - fed);
-            zs.next_in = cast(ubyte*) text.ptr + fed;
+            zs.next_in = text.ptr + fed;
             zs.avail_in = n;
             fed += n;
         }
@@ -221,7 +232,7 @@ string stamp(SysTime when)
     auto mins = off.total!"minutes";
     char sign = mins < 0 ? '-' : '+';
     if (mins < 0) mins = -mins;
-    return format("%04d-%02d-%02dT%02d:%02d:%02d.%06d%s%02d:%02d", t.year, cast(int) t.month, t.day, t.hour,
+    return format("%04d-%02d-%02dT%02d:%02d:%02d.%06d%s%02d:%02d", t.year, int(t.month), t.day, t.hour,
         t.minute, t.second, t.fracSecs.total!"usecs", sign, mins / 60, mins % 60);
 }
 
@@ -231,7 +242,7 @@ string newSessionId()
     import std.random : uniform;
     import std.datetime.timezone : UTC;
     auto t = wallNow(UTC());
-    return format("sess-%04d%02d%02dT%02d%02d%02d-%08x", t.year, cast(int) t.month, t.day, t.hour, t.minute,
+    return format("sess-%04d%02d%02dT%02d%02d%02d-%08x", t.year, int(t.month), t.day, t.hour, t.minute,
         t.second, uniform!uint);
 }
 
@@ -309,7 +320,7 @@ Message messageFromRecord(JSONValue j) pure
     auto names = ["system", "user", "assistant", "tool"];
     auto r = names.countUntil(j["role"].str);
     if (r < 0) throw new Exception("unknown role " ~ j["role"].str);
-    m.role = cast(Role) r;
+    m.role = r.to!Role;
     JSONValue extra = string[string].init;
     foreach (k, v; j.objectNoRef)
     {
@@ -436,7 +447,7 @@ class SessionLog
             }
             auto tmp = format("%s.tmp-%s", plain, thisProcessID);
             scope (failure) if (tmp.exists) remove(tmp);
-            writePrivate(tmp, cast(const(ubyte)[]) logText(path), modeOf(path));
+            writePrivate(tmp, logText(path).representation, modeOf(path));
             publishOver(tmp, plain); // fsync the copy, link, sync the entry, unlink
             remove(path);
             archive.close();
@@ -464,16 +475,29 @@ class SessionLog
             shareHandle(path, f);
         }
         scope (failure) close();
-        auto bytes = readBytes(path);
-        size_t committed = bytes.length;
-        while (committed && bytes[committed - 1] != '\n') committed--;
-        if (committed < bytes.length)
+        // Count the committed lines in fixed-size chunks: a long session's
+        // log can run to hundreds of MB, and reading it whole here (on top of
+        // `restore`'s own read) doubled a resume's peak heap.
+        size_t committed, size;
         {
-            // Drop a torn trailing record so later appends stay line-aligned.
-            import std.file : write_file = write;
-            write_file(path, bytes[0 .. committed]);
+            auto r = File(path, "rb");
+            auto buf = new ubyte[](64 * 1024);
+            for (;;)
+            {
+                auto chunk = r.rawRead(buf);
+                if (!chunk.length) break;
+                foreach (i, b; chunk)
+                    if (b == '\n') { ++lines; committed = size + i + 1; }
+                size += chunk.length;
+            }
         }
-        foreach (b; bytes[0 .. committed]) if (b == '\n') ++lines;
+        if (committed < size)
+        {
+            // Drop a torn trailing record so later appends stay line-aligned
+            // (rare: a crash mid-write), so the whole read is fine here.
+            import std.file : write_file = write;
+            write_file(path, readBytes(path)[0 .. committed]);
+        }
     }
 
     /// Tests: the next write fails (Rust `fail_next_persist`).
@@ -888,7 +912,7 @@ Restored restore(string path)
                 auto pos = "pending_position" in data;
                 if (r.hasPending && pos !is null && pos.type == JSONType.integer)
                 {
-                    r.pending.position = cast(size_t) pos.integer;
+                    r.pending.position = toSize(pos.integer);
                     r.pending.hasContinuation = false;
                     r.pending.answer = null;
                     r.pending.count = 0;
@@ -897,12 +921,12 @@ Restored restore(string path)
                     {
                         r.pending.hasContinuation = true;
                         r.pending.answer = c.arrayNoRef[0].str;
-                        r.pending.count = cast(size_t) c.arrayNoRef[1].integer;
+                        r.pending.count = toSize(c.arrayNoRef[1].integer);
                     }
                     r.pending.hasBase = true;
                     r.pending.base = r.conversation.length;
                     auto rn = "pending_recall_notes" in data;
-                    r.pending.recallNotes = rn !is null && rn.type == JSONType.integer ? cast(size_t) rn.integer : 0;
+                    r.pending.recallNotes = rn !is null && rn.type == JSONType.integer ? toSize(rn.integer) : 0;
                 }
                 else
                 {
@@ -1057,8 +1081,11 @@ private void applyPlanDelta(ref Plan p, JSONValue data)
     import nano.result : unwrap;
     import std.algorithm : countUntil;
     auto base = "base" in data;
-    auto b = base !is null && base.type == JSONType.integer && base.integer >= 0
-        ? cast(size_t) base.integer : size_t.max;
+    // `planDelta` writes `base` from a size_t, which toJSON tags uinteger —
+    // an integer-only check reads a self-written log as a torn one and
+    // restarts the plan from the delta's items.
+    ulong bu = ulong.max;
+    auto b = base is null || !jsonUnsigned(*base, bu) ? size_t.max : toSize(bu);
     if (b > p.items.length) p = Plan.init;
     else if (b < p.items.length) p.items = p.items[0 .. b];
     if (auto g = "goal" in data)
@@ -1068,7 +1095,10 @@ private void applyPlanDelta(ref Plan p, JSONValue data)
         {
             bool[uint] gone;
             foreach (x; dr.arrayNoRef)
-                if (x.type == JSONType.integer && x.integer >= 0) gone[cast(uint) x.integer] = true;
+            {
+                ulong id;
+                if (jsonUnsigned(x, id) && id <= uint.max) gone[id.to!uint] = true;
+            }
             p.items = p.items.filter!(i => i.id !in gone).array;
         }
     // Merge the upserts as raw items, then validate the whole
@@ -1079,9 +1109,8 @@ private void applyPlanDelta(ref Plan p, JSONValue data)
         if (i.type != JSONType.object) return -1;
         auto v = "id" in i;
         if (v is null) return -1;
-        if (v.type == JSONType.integer) return v.integer;
-        if (v.type == JSONType.uinteger) return cast(long) v.uinteger;
-        return -1;
+        ulong n; // ids above long.max can't name an item: treat as absent
+        return jsonUnsigned(*v, n) && n <= long.max ? n.to!long : -1;
     }
     if (auto up = "upserts" in data)
         if (up.type == JSONType.array)
@@ -1388,12 +1417,12 @@ TidyResult tidySessions(string dir, long compressAfterDays, long retentionDays)
                 import std.file : setTimes;
                 auto gz = e.name ~ ".gz";
                 auto before = getSize(e.name);
-                auto packed = gzipLog(cast(const(char)[]) readBytes(e.name));
+                auto packed = gzipLog(readBytes(e.name));
                 // Gzip can grow a short log: keep the original then.
                 if (packed.length >= before) continue;
                 auto tmp = format("%s.tmp-%s", gz, thisProcessID);
                 scope (failure) if (tmp.exists) remove(tmp);
-                writePrivate(tmp, cast(const(ubyte)[]) packed, modeOf(e.name));
+                writePrivate(tmp, packed, modeOf(e.name));
                 // Keep the last activity time: retention and the picker
                 // measure age from it, not from compression.
                 auto mtime = timeLastModified(e.name);
@@ -1712,6 +1741,26 @@ unittest
     log.plan(parseJSON(`{"items":[{"id":1,"title":"x","status":"pending"}]}`));
     auto p3 = Plan.fromJSON(restore(log.path).plan).unwrap("a valid plan");
     assert(p3.goal.length == 0 && p3.items.length == 1 && p3.items[0].title == "x");
+    // A uinteger-tagged base — what `planDelta` itself writes from a size_t —
+    // applies as a base, not as a torn log restarting the plan.
+    {
+        auto p4 = Plan.fromJSON(parseJSON(
+            `{"goal":"g","items":[{"id":1,"title":"a","status":"pending"},{"id":2,"title":"b","status":"pending"}]}`)).unwrap("a valid plan");
+        JSONValue d;
+        d["base"] = JSONValue(2u);
+        d["drop"] = JSONValue([JSONValue(1u)]);
+        d["upserts"] = JSONValue([parseJSON(`{"id":2,"title":"b","status":"done"}`)]);
+        applyPlanDelta(p4, d);
+        assert(p4.goal == "g" && p4.items.length == 1 && p4.items[0].id == 2
+            && p4.items[0].status == Status.done, "a uinteger base keeps the first items");
+        // An out-of-shape base still restarts the plan from the delta's items.
+        auto p5 = p4;
+        JSONValue d5;
+        d5["base"] = JSONValue("two");
+        d5["upserts"] = JSONValue([parseJSON(`{"id":9,"title":"z","status":"pending"}`)]);
+        applyPlanDelta(p5, d5);
+        assert(p5.items.length == 1 && p5.items[0].id == 9, "a malformed base restarts the plan");
+    }
 }
 
 // gzip round-trip: a compressed log reads back byte-for-byte, and the tidy-up
@@ -2025,4 +2074,14 @@ unittest
     import nano.plan : Status;
     assert(p.items.length == 2 && p.items[0].status == Status.done && p.items[1].status == Status.done,
         "the snapshot plus its later deltas restore the plan");
+}
+
+/// Collect garbage and return the free GC pools to the OS: after a burst
+/// of short-lived allocation (loading a session) the heap otherwise stays
+/// at its peak.
+void releaseHeap() nothrow
+{
+    import core.memory : GC;
+    GC.collect();
+    GC.minimize();
 }

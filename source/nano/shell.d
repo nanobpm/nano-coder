@@ -385,7 +385,7 @@ private struct Parser
     static void pushCode(ref Word w, uint val) pure
     {
         import std.utf : isValidDchar;
-        auto d = cast(dchar) val;
+        dchar d = val;
         if (isValidDchar(d)) w.text ~= d;
         else w.dynamic = true;
     }
@@ -448,7 +448,7 @@ private struct Parser
             {
                 auto c = chars[pos++];
                 auto up = (c >= 'a' && c <= 'z') ? c - 32 : c;
-                word.text ~= cast(char)((cast(ubyte) up) ^ 0x40);
+                word.text ~= ((up & 0xff) ^ 0x40).to!char;
             }
             break;
         default:
@@ -775,7 +775,8 @@ private struct Parser
         {
             word.text ~= '$';
             while (!atEnd && (isAlnum(peek()) || peek() == '_')) word.text ~= chars[pos++];
-            word.expansionSpans ~= cast(size_t[2]) [at, word.text.length];
+            size_t[2] span = [at, word.text.length];
+            word.expansionSpans ~= span;
             word.dynamic = true;
             if (!quoted) word.splits = true;
         }

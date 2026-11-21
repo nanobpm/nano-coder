@@ -2,6 +2,10 @@
 module nano.tools;
 
 @safe:
+
+import std.math : trunc;
+
+import std.conv : to;
 import nano.clock : stdTimeNow;
 
 import nano.safeio : ownText;
@@ -22,19 +26,8 @@ class ToolError : Exception
 /// to an encoding error.
 string lossyUtf8(const(ubyte)[] data) @safe pure
 {
-    import std.utf : decode, UTFException;
-    import std.array : appender;
-    auto s = cast(const(char)[]) data;
-    auto o = appender!string;
-    size_t i = 0;
-    while (i < s.length)
-    {
-        if (s[i] < 0x80) { o.put(s[i]); ++i; continue; }
-        size_t j = i;
-        try { decode(s, j); o.put(s[i .. j]); i = j; }
-        catch (UTFException) { o.put("\uFFFD"); ++i; }
-    }
-    return o[];
+    import nano.safeio : lossyText;
+    return lossyText(data);
 }
 
 unittest
@@ -115,8 +108,14 @@ long optInt(JSONValue args, string name, long def) pure
     auto v = name in args;
     if (v is null || v.type == JSONType.null_) return def;
     if (v.type == JSONType.integer) return v.integer;
-    if (v.type == JSONType.uinteger) return cast(long) v.uinteger;
-    if (v.type == JSONType.float_ && v.floating == cast(long) v.floating) return cast(long) v.floating;
+    if (v.type == JSONType.uinteger) return v.uinteger.to!long;
+    // An integral float converts only below 2^63: `long.max` rounds to 2^63
+    // as a double, so Phobos's `value > T.max` check misses
+    // 9223372036854775808.0 and the cast would be out of range instead of
+    // reporting invalid input. (Below -2^63 the cast itself throws, so only
+    // the upper boundary needs the explicit gate.)
+    if (v.type == JSONType.float_ && v.floating == trunc(v.floating) && v.floating < 0x1p63)
+        return v.floating.to!long;
     if (v.type == JSONType.string)
     {
         import std.conv : to;
@@ -282,4 +281,31 @@ unittest
     truncateOutput("klmnopqrst", 4, "tool-x");
     auto texts = dirEntries(dir, SpanMode.shallow).array.map!(e => readText(e.name)).array.sort.array;
     assert(texts == ["abcdefghij", "klmnopqrst"]);
+}
+
+unittest
+{
+    // A number past `long.max` is reported where it is read, not wrapped
+    // to a negative value.
+    import std.conv : ConvException;
+    import std.exception : assertThrown;
+    import std.json : parseJSON;
+    assert(optInt(parseJSON(`{"n":7.0}`), "n", 0) == 7);
+    assertThrown!ConvException(optInt(parseJSON(`{"n":18446744073709551615}`), "n", 0));
+    // 1e300 is past 2^63: invalid input, a tool error rather than a bad cast.
+    assertThrown!ToolError(optInt(parseJSON(`{"n":1e300}`), "n", 0));
+}
+
+unittest // optInt rejects integral floats at and above 2^63
+{
+    import std.exception : assertThrown;
+    // `long.max` rounds to 2^63 as a double, so 9223372036854775808.0 slips
+    // past Phobos's `value > T.max` check; the explicit 2^63 gate rejects it
+    // as invalid input instead of an out-of-range cast.
+    assertThrown!ToolError(optInt(parseJSON(`{"n": 9223372036854775808.0}`), "n", 0));
+    assertThrown!ToolError(optInt(parseJSON(`{"n": 1.5}`), "n", 0)); // non-integral
+    // The largest double below 2^63 and -2^63 itself still convert.
+    assert(optInt(parseJSON(`{"n": 9223372036854774784.0}`), "n", 0) == 9223372036854774784L);
+    assert(optInt(parseJSON(`{"n": -9223372036854775808.0}`), "n", 0) == long.min);
+    assert(optInt(parseJSON(`{"n": 4096.0}`), "n", 0) == 4096);
 }

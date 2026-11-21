@@ -950,3 +950,118 @@ unittest
     assert(jsonText(v, JSONOptions.doNotEscapeSlashes) == v.toString(JSONOptions.doNotEscapeSlashes));
     assert(jsonPretty(v) == v.toPrettyString);
 }
+
+// Bytes to text. Viewing bytes as `char` skips UTF-8 validation, so bad
+// input would become a `string` that throws wherever it is next decoded.
+// These are the casts between the two; the rest of the code goes through
+// them (text to bytes is `std.string.representation`, which needs no cast).
+
+/// `b` as text, checked: throws `UTFException` at the first invalid byte.
+/// The result aliases `b`.
+inout(char)[] utf8View(return scope inout(ubyte)[] b) pure
+{
+    import std.utf : validate;
+    auto s = cast(inout(char)[]) b;
+    validate(s);
+    return s;
+}
+
+/// `b` copied into a `string`, checked like `utf8View`.
+string utf8Text(scope const(ubyte)[] b) pure
+{
+    return utf8View(b).idup;
+}
+
+/// `b` copied into a `string`, each invalid byte replaced with U+FFFD.
+string lossyText(scope const(ubyte)[] b) pure
+{
+    import std.utf : decode, UTFException;
+    import std.array : appender;
+    auto s = cast(const(char)[]) b;
+    auto o = appender!string;
+    size_t i = 0;
+    while (i < s.length)
+    {
+        if (s[i] < 0x80) { o.put(s[i]); ++i; continue; }
+        size_t j = i;
+        try { decode(s, j); o.put(s[i .. j]); i = j; }
+        catch (UTFException) { o.put("\uFFFD"); ++i; }
+    }
+    return o[];
+}
+
+/// `b` as `char`s without validation, for byte-level scanning (searching
+/// for ASCII delimiters) whose pieces are validated or treated as bytes
+/// afterwards. Never let the result escape as a `string`.
+inout(char)[] asChars(return scope inout(ubyte)[] b) pure nothrow @nogc
+{
+    return cast(inout(char)[]) b;
+}
+
+/// `s` as bytes owned by the caller: a mutable copy.
+ubyte[] bytesOf(scope const(char)[] s) pure nothrow
+{
+    import std.string : representation;
+    return s.representation.dup;
+}
+
+unittest
+{
+    import std.exception : assertThrown;
+    import std.utf : UTFException;
+    import std.string : representation;
+    assert(utf8Text("héllo".representation) == "héllo");
+    assertThrown!UTFException(utf8Text([0x61, 0xff, 0x62]));
+    assert(lossyText([0x61, 0xff, 0x62]) == "a\uFFFDb");
+    assert(lossyText("€".representation) == "€");
+    ubyte[] m = [0x68, 0x69];
+    char[] v = utf8View(m);
+    assert(v == "hi");
+    assert(bytesOf("hi") == [0x68, 0x69]);
+}
+
+/// Reads a whole JSON number that may be tagged either `integer` or
+/// `uinteger` (std.json uses the latter for values > long.max and for
+/// `JSONValue(1u)`). Reading `.integer` on a `uinteger` throws, so every
+/// site that accepts both tags must go through here. Returns false for
+/// non-integral types and for negative values.
+bool jsonUnsigned(const JSONValue v, out ulong r) pure @safe
+{
+    if (v.type == JSONType.uinteger) { r = v.uinteger; return true; }
+    if (v.type == JSONType.integer && v.integer >= 0) { r = cast(ulong) v.integer; return true; }
+    return false;
+}
+
+/// Reads a whole JSON number of either tag as a `long`; false for
+/// non-integral types and for a `uinteger` above `long.max`.
+bool jsonSigned(const JSONValue v, out long r) pure @safe
+{
+    if (v.type == JSONType.integer) { r = v.integer; return true; }
+    if (v.type == JSONType.uinteger && v.uinteger <= long.max) { r = cast(long) v.uinteger; return true; }
+    return false;
+}
+
+/// A whole JSON number (either tag) as a double; NaN for other types.
+double jsonWholeAsDouble(const JSONValue v) pure @safe
+{
+    if (v.type == JSONType.uinteger) return double(v.uinteger);
+    if (v.type == JSONType.integer) return double(v.integer);
+    return double.nan;
+}
+
+unittest
+{
+    ulong r;
+    assert(jsonUnsigned(JSONValue(1u), r) && r == 1);
+    assert(jsonUnsigned(JSONValue(ulong.max), r) && r == ulong.max);
+    assert(jsonUnsigned(JSONValue(7), r) && r == 7);
+    assert(!jsonUnsigned(JSONValue(-1), r));
+    assert(!jsonUnsigned(JSONValue("1"), r));
+    long l;
+    assert(jsonSigned(JSONValue(1u), l) && l == 1);
+    assert(jsonSigned(JSONValue(-4), l) && l == -4);
+    assert(!jsonSigned(JSONValue(ulong.max), l));
+    assert(!jsonSigned(JSONValue(1.5), l));
+    assert(jsonWholeAsDouble(JSONValue(3u)) == 3.0);
+    assert(jsonWholeAsDouble(JSONValue(-3)) == -3.0);
+}
