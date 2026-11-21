@@ -95,7 +95,9 @@ string questionPrompt(string question, size_t width, out string[] body_) pure
     // Room for the `? ` prefix and the `› ` after the prompt.
     import nano.arith : saturatingSub;
     auto room = saturatingSub(width, 4);
-    auto rendered = render(text, room > 20 ? room : 20);
+    import nano.frame : dropSoftWraps;
+    // The picker draws its own rows; soft-wrap marks are only for the frame.
+    auto rendered = dropSoftWraps(render(text, room > 20 ? room : 20));
     // Inline only if it fits the prompt row, in cells (wide glyphs count 2).
     if (rendered == text && !text.canFind('\n') && cells(text) <= room) return text;
     body_ = rendered.split('\n');

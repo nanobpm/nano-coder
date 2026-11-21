@@ -31,6 +31,7 @@ import std.format : format;
 import std.string : indexOf, lastIndexOf, strip, stripLeft;
 import std.uni : isWhite;
 import nano.lineedit : charWidth;
+import nano.frame : softWrapMark;
 import nano.mdblock;
 import nano.mdinline;
 import nano.mdtable : layout, textWidth = width;
@@ -105,7 +106,9 @@ private struct Lines
     string cur;
     size_t curW;
 
-    void newline() pure { lines ~= cur; cur = null; curW = 0; }
+    /// Ends the line; `soft` marks the next one as its continuation (a wrap,
+    /// not a break in the text), so the frame joins them for copying.
+    void newline(bool soft = false) pure { lines ~= cur; cur = soft ? softWrapMark : null; curW = 0; }
 
     /// Place one word (styled pieces, no whitespace), preceded by a space
     /// unless it starts a line. A word wider than the line is broken.
@@ -115,7 +118,7 @@ private struct Lines
         foreach (p; pieces) foreach (dchar c; p.text) w += charWidth(c);
         if (!w) return;
         size_t gap = space && curW > 0 ? 1 : 0;
-        if (curW > 0 && curW + gap + w > width) newline();
+        if (curW > 0 && curW + gap + w > width) newline(true);
         else if (gap) { cur ~= ' '; curW++; }
         foreach (p; pieces)
         {
@@ -127,7 +130,7 @@ private struct Lines
                 {
                     cur ~= styled(run, p.style);
                     run = null;
-                    newline();
+                    newline(true);
                 }
                 run ~= c;
                 curW += cw;
@@ -204,6 +207,7 @@ string[] hardLines(string line, size_t width, ubyte style) pure
         w += cw;
     }
     out_ ~= styled(cur, style);
+    foreach (ref r; out_[1 .. $]) r = softWrapMark ~ r;
     return out_;
 }
 
@@ -491,11 +495,16 @@ version (unittest)
     private string[] show(string text, size_t width) pure
     {
         string[] out_;
-        foreach (l; renderLines(text, width)) out_ ~= plain(l);
+        import nano.frame : dropSoftWraps;
+        foreach (l; renderLines(text, width)) out_ ~= dropSoftWraps(plain(l));
         return out_;
     }
 
-    private size_t w(string s) pure { return textWidth(plain(s)); }
+    private size_t w(string s) pure
+    {
+        import nano.frame : dropSoftWraps;
+        return textWidth(dropSoftWraps(plain(s)));
+    }
 
     private string stream(string[] chunks, size_t width) pure
     {
