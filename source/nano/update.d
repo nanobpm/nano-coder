@@ -208,7 +208,20 @@ string latestUrl(Channel c) pure
     }
 }
 
-private string joinWords(string[] a) pure { import std.array : join; return a.join(" "); }
+private string joinWords(string[] a) pure { import std.algorithm : map; import std.array : join; return a.map!shellWord.join(" "); }
+
+/// A word as a POSIX shell would need it to round-trip: bare when it holds
+/// only safe characters, otherwise single-quoted (embedded `'` as `'\''`).
+string shellWord(string w) pure
+{
+    import std.algorithm : all;
+    import std.array : replace;
+    import std.ascii : isAlphaNum;
+    if (w.length && w.all!(c => c.isAlphaNum || "-_./=:@%+,".canFindChar(c))) return w;
+    return "'" ~ w.replace("'", "'\\''") ~ "'";
+}
+
+private bool canFindChar(string set, dchar c) pure { foreach (d; set) if (d == c) return true; return false; }
 
 /// The step as a copy-pasteable shell command: its environment overrides
 /// (sorted, as `K=V` prefixes) then the program and arguments, so a manual
@@ -218,8 +231,8 @@ string stepCommand(InstallStep step)
     import std.algorithm : sort;
     import std.array : array;
     string s;
-    foreach (k; step.env.keys.array.sort) s ~= k ~ "=" ~ step.env[k] ~ " ";
-    return s ~ step.program ~ " " ~ step.args.joinWords;
+    foreach (k; step.env.keys.array.sort) s ~= k ~ "=" ~ shellWord(step.env[k]) ~ " ";
+    return s ~ shellWord(step.program) ~ " " ~ step.args.joinWords;
 }
 
 /// Checks are off by environment.
@@ -817,6 +830,10 @@ unittest
     assert(stepCommand(steps[0]) == "git -C /tap pull --ff-only --quiet");
     assert(stepCommand(steps[1]) == "HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 "
         ~ "HOMEBREW_NO_INSTALL_CLEANUP=1 brew upgrade " ~ brewFormula);
+    auto spaced = installSteps(Channel.brew, "/opt/home brew/tap");
+    assert(stepCommand(spaced[0]) == "git -C '/opt/home brew/tap' pull --ff-only --quiet");
+    assert(shellWord("it's") == `'it'\''s'` && shellWord("") == "''" && shellWord("a b") == "'a b'");
+    assert(stepCommand(InstallStep("my prog", ["x"], ["K": "a b"])) == "K='a b' 'my prog' x");
     assert(installSteps(Channel.npm, "/tap").length == 1 && installSteps(Channel.other, "/tap") is null);
     if (which("brew") is null) return; // runInstaller needs brew on PATH
     string[] ran;
