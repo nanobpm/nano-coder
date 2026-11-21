@@ -163,6 +163,94 @@ struct ConfiguredWindow
     string source;
 }
 
+/// The genuine user requests folded by earlier compactions, so each
+/// compaction rebuilds the pinned block from originals (Rust's
+/// `pre_compaction_transcript`, trimmed to requests).
+///
+/// A thin named wrapper around the message sequence (epic #221 seam): the
+/// representation is a private `Message[]` for now, but callers reach it only
+/// through the named members below, so a later slice can bound or re-encode it
+/// without touching call sites. There is deliberately NO `alias this` and no
+/// implicit conversion to or from `Message[]` — a raw array enters only via
+/// `adopt`/`append`/`assign` and leaves only via the named read members.
+struct PinStash
+{
+    private Message[] store;
+
+    /// The count the on-disk delta base (`pinned_base`) is written from: the
+    /// logical number of requests the stash represents.
+    size_t base() const pure nothrow @safe @nogc { return store.length; }
+    /// The number of requests currently held.
+    size_t length() const pure nothrow @safe @nogc { return store.length; }
+    /// Whether the stash holds nothing.
+    bool isEmpty() const pure nothrow @safe @nogc { return store.length == 0; }
+
+    /// Read-only element access (for `pinnedUserRequests` and tests).
+    ref const(Message) opIndex(size_t i) const pure nothrow @safe @nogc { return store[i]; }
+    /// Read-only range access over the held requests.
+    const(Message)[] opSlice() const pure nothrow @safe @nogc { return store; }
+
+    /// Append one folded request (compaction).
+    void append(Message m) pure @safe { store ~= m; }
+    /// Take over a restored sequence (adoption from `Restored`).
+    void adopt(Message[] msgs) pure nothrow @safe @nogc { store = msgs; }
+    /// Test-only setter: replace the held sequence.
+    void assign(Message[] msgs) pure nothrow @safe @nogc { store = msgs; }
+    /// Drop every held request (session reset).
+    void clear() pure nothrow @safe @nogc { store = null; }
+
+    /// A snapshot for rollback: a copy of the slice (length + pointer), so a
+    /// later `~= x` (which may reallocate the live buffer) never disturbs it.
+    /// This matches the pre-seam rollback, which copied the dynamic array.
+    Message[] snapshot() pure nothrow @safe @nogc { return store; }
+    /// Restore from a `snapshot` copy (takes ownership of the copy).
+    void restoreFrom(Message[] snap) pure nothrow @safe @nogc { store = snap; }
+}
+
+/// The real turns folded by compactions since the last plain replacement:
+/// a replay (ACP session/load) shows them in place of the summary.
+///
+/// A thin named wrapper around the message sequence (epic #221 seam): the
+/// representation is a private `Message[]` for now, but callers reach it only
+/// through the named members below, so a later slice can turn it into line
+/// references without touching call sites. There is deliberately NO
+/// `alias this` and no implicit conversion to or from `Message[]` — a raw
+/// array enters only via `adopt`/`append`/`assign` and leaves only via the
+/// named read members.
+struct ReplayStash
+{
+    private Message[] store;
+
+    /// The count the on-disk delta base (`folded_base`) is written from: the
+    /// logical number of turns the stash represents.
+    size_t base() const pure nothrow @safe @nogc { return store.length; }
+    /// The number of turns currently held (the logical length).
+    size_t length() const pure nothrow @safe @nogc { return store.length; }
+    /// Whether the stash holds nothing.
+    bool isEmpty() const pure nothrow @safe @nogc { return store.length == 0; }
+
+    /// Read-only element access.
+    ref const(Message) opIndex(size_t i) const pure nothrow @safe @nogc { return store[i]; }
+    /// Read-only range access over the held turns (the replay fast path).
+    const(Message)[] opSlice() const pure nothrow @safe @nogc { return store; }
+
+    /// Append one folded turn (compaction).
+    void append(Message m) pure @safe { store ~= m; }
+    /// Take over a restored sequence (adoption from `Restored`).
+    void adopt(Message[] msgs) pure nothrow @safe @nogc { store = msgs; }
+    /// Test-only setter: replace the held sequence.
+    void assign(Message[] msgs) pure nothrow @safe @nogc { store = msgs; }
+    /// Drop every held turn (session reset).
+    void clear() pure nothrow @safe @nogc { store = null; }
+
+    /// A snapshot for rollback: a copy of the slice (length + pointer), so a
+    /// later `~= x` (which may reallocate the live buffer) never disturbs it.
+    /// This matches the pre-seam rollback, which copied the dynamic array.
+    Message[] snapshot() pure nothrow @safe @nogc { return store; }
+    /// Restore from a `snapshot` copy (takes ownership of the copy).
+    void restoreFrom(Message[] snap) pure nothrow @safe @nogc { store = snap; }
+}
+
 class Agent
 {
     NotNull!LLMClient client;
@@ -271,12 +359,12 @@ class Agent
     /// The genuine user requests folded by earlier compactions, so each
     /// compaction rebuilds the pinned block from originals (Rust's
     /// `pre_compaction_transcript`, trimmed to requests).
-    Message[] pinStash;
-    /// The real turns folded by compactions since the last plain replacement:
-    /// a replay (ACP session/load) shows them in place of the summary.
-    Message[] replayStash;
+    PinStash pinStash;
     /// history_search / history_read calls in the current turn (logged on its turn_end).
     uint turnHistoryCalls;
+    /// The real turns folded by compactions since the last plain replacement:
+    /// a replay (ACP session/load) shows them in place of the summary.
+    ReplayStash replayStash;
     /// The thinking level the turn's latest request sent (as the status line
     /// shows it; empty: none), so a setting changed while it runs is shown
     /// only once a request sends it. None between turns.
@@ -1389,7 +1477,7 @@ class Agent
         if (planTools && !plan.empty) summary ~= "\n\n" ~ plan.contextNote();
         // Pin the user's own words, rebuilt from the originals every time.
         if (compactionPinRequests)
-            if (auto pinned = ctx.pinnedUserRequests(pinStash, summarized, smart, window))
+            if (auto pinned = ctx.pinnedUserRequests(pinStash[], summarized, smart, window))
                 summary ~= "\n\n" ~ pinned;
         // The requests this compaction adds to the pinned block (the stash so
         // far is their base): the log records only these, so a session holds
@@ -1399,9 +1487,9 @@ class Agent
         // a later successful compaction never writes a delta whose base
         // counts requests no log record holds (resume would lose them).
         auto savedMessages = messages;
-        auto savedPinStash = pinStash;
-        auto savedReplayStash = replayStash;
+        auto pinSnap = pinStash.snapshot();
         auto savedReplayRestated = replayRestated;
+        auto replaySnap = replayStash.snapshot();
         auto savedPending = pending;
         auto savedCalibLen = calibLen;
         // The rollback covers only the mutation-and-persistence transaction:
@@ -1413,16 +1501,16 @@ class Agent
             if (!persisted)
             {
                 messages = savedMessages;
-                pinStash = savedPinStash;
-                replayStash = savedReplayStash;
+                pinStash.restoreFrom(pinSnap);
                 replayRestated = savedReplayRestated;
+                replayStash.restoreFrom(replaySnap);
                 pending = savedPending;
                 calibLen = savedCalibLen;
             }
-        size_t pinnedBase = pinStash.length;
+        size_t pinnedBase = pinStash.base;
         Message[] pinnedNew;
         foreach (ref x; summarized)
-            if (ctx.isUserRequest(x)) { pinStash ~= x; pinnedNew ~= x; }
+            if (ctx.isUserRequest(x)) { pinStash.append(x); pinnedNew ~= x; }
 
         // The newly folded real turns for the replay stash. On a repeated
         // compaction the first folded message is the previous summary, whose
@@ -1466,8 +1554,9 @@ class Agent
         }
         messages = next;
         calibLen = 0;
-        size_t stashBase = replayStash.length;
-        replayStash = extendsStash ? replayStash ~ folded : folded;
+        size_t stashBase = replayStash.base;
+        if (extendsStash) foreach (ref f; folded) replayStash.append(f);
+        else replayStash.adopt(folded);
         replayRestated = replayStash.length && hasPending && pending.position < split
             ? some(pendingPos) : Option!size_t.init;
         if (hasPending)
@@ -1644,7 +1733,7 @@ class Agent
     const(Message)[] replayMessages() pure const
     {
         if (!replayStash.length) return messages;
-        const(Message)[] o = replayStash;
+        const(Message)[] o = replayStash[];
         bool skipped;
         foreach (i, ref m; messages)
         {
@@ -1688,9 +1777,9 @@ class Agent
         completedOutcomes = r.completedOutcomes;
         historyAvailable = r.historyAvailable;
         historyHintPending = r.historyAvailable && !r.historyHintConsumed;
-        pinStash = r.pinStash;
-        replayStash = r.replayStash;
+        pinStash.adopt(r.pinStash);
         replayRestated = r.replayRestated;
+        replayStash.adopt(r.replayStash);
         adoptPending(r);
         plan = Plan.init;
         if (r.plan.type == JSONType.object)
@@ -1789,9 +1878,9 @@ class Agent
         calibLen = calibTokens = 0;
         compactFloor = 0;
         resetIdleCompaction();
-        pinStash = null;
-        replayStash = null;
+        pinStash.clear();
         replayRestated = Option!size_t.init;
+        replayStash.clear();
         hasPending = false;
         historyAvailable = historyHintPending = false;
         recallState = mem.Recall.init;
@@ -2635,9 +2724,9 @@ unittest
     assert(agent.messages[3].content == "timer fired" && agent.messages[3].autoInitiated && !agent.automaticInput);
     assert(Message.auto_("x").autoInitiated && !ctx.isUserRequest(Message.auto_("x")));
     // A reset (new session or /clear) drops the stash.
-    agent.pinStash = [Message.user("old")];
+    agent.pinStash.assign([Message.user("old")]);
     agent.restart("sys", Option!SessionLog.init);
-    assert(agent.pinStash is null);
+    assert(agent.pinStash.isEmpty);
 }
 
 // Round-5 review fix for issue #205: replacing the agent's log closes the

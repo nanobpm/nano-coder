@@ -767,7 +767,12 @@ Restored restore(string path)
     string pendingId;
     // Every logged input's text, to backfill `pinText` on legacy messages.
     string[] inputs;
-    Message[] rustStash;
+    // The cumulative decoded `folded` stash across the log's `replace`
+    // records (Rust's cumulative stash of folded turns). Both stash helpers
+    // read it read-only; only `restoreReplayStash` advances it. The pin
+    // helper's Rust-era fallback decodes `folded` itself rather than reading
+    // the replay helper's output, so the two stay independently editable.
+    Message[] foldedStash;
     // Every direct message record, with its line, for `backfillLogLines`.
     Message[] originals;
     // Plan replay is bounded by the latest full snapshot (issue #205): deltas
@@ -917,40 +922,12 @@ Restored restore(string path)
                         }
                     return o;
                 }
-                // Rust's cumulative stash of folded turns: full, or a delta on a base.
-                auto folded = "folded" in data, base = "folded_base" in data;
-                bool active;
-                if (folded !is null && base !is null && base.type == JSONType.integer)
-                {
-                    auto b = cast(size_t) base.integer;
-                    auto delta = decode(*folded, inputs);
-                    if ((b < rustStash.length ? b : rustStash.length) + delta.length > 0)
-                    {
-                        rustStash = rustStash[0 .. (b < rustStash.length ? b : rustStash.length)] ~ delta;
-                        active = true;
-                    }
-                }
-                else if (folded !is null)
-                {
-                    auto full = decode(*folded, inputs);
-                    if (full.length) { rustStash = full; active = true; }
-                }
-                if (!active) rustStash = null;
-                r.replayStash = rustStash.dup;
-                r.replayRestated = Option!size_t.init;
-                if (auto at = "restated" in data)
-                    if (active && at.type == JSONType.integer && at.integer >= 0) r.replayRestated = some(cast(size_t) at.integer);
-                // The pinned block: a full `pinned_requests` restatement, or a
-                // delta extending the first `pinned_base` of the stash so far
-                // (issue #205). With neither, a Rust log's folded stash is it.
-                auto pins = "pinned_requests" in data, pinBase = "pinned_base" in data;
-                if (pins !is null && pinBase !is null && pinBase.type == JSONType.integer)
-                {
-                    auto b = cast(size_t) pinBase.integer;
-                    auto kept = b < r.pinStash.length ? r.pinStash[0 .. b] : r.pinStash;
-                    r.pinStash = kept ~ decode(*pins, inputs);
-                }
-                else r.pinStash = pins !is null ? decode(*pins, inputs) : rustStash.dup;
+                // The two stashes restore independently: each helper keeps
+                // its own running sequence and never reads the other's
+                // decoded array, so either representation can change without
+                // touching the other (epic #221).
+                restoreReplayStash!decode(data, inputs, foldedStash, r);
+                restorePinStash!decode(data, inputs, foldedStash, r);
             }
             {
                 auto mode = "mode" in data;
@@ -987,6 +964,82 @@ Restored restore(string path)
     // Apply the deltas after the latest full snapshot, if any remain.
     if (planDeltas.length > planFrom) r.plan = planAt(planFrom);
     return r;
+}
+
+/// The REPLAY half of a `replace` record's stash restore (epic #221): decode
+/// `folded`/`folded_base` — a full restatement, or a delta on a base — into
+/// `r.replayStash`, and set `r.replayRestated` from `restated`. Advances the
+/// cumulative `foldedStash` (Rust's cumulative stash of folded turns) and
+/// mirrors it into `r.replayStash`; never reads the pin side's decoded array,
+/// so the replay representation can change without touching the pin path.
+private void restoreReplayStash(alias decode)(JSONValue data, const string[] inputs, ref Message[] foldedStash, ref Restored r)
+{
+    // Rust's cumulative stash of folded turns: full, or a delta on a base.
+    auto folded = "folded" in data, base = "folded_base" in data;
+    bool active;
+    if (folded !is null && base !is null && base.type == JSONType.integer)
+    {
+        auto b = cast(size_t) base.integer;
+        auto delta = decode(*folded, inputs);
+        if ((b < foldedStash.length ? b : foldedStash.length) + delta.length > 0)
+        {
+            foldedStash = foldedStash[0 .. (b < foldedStash.length ? b : foldedStash.length)] ~ delta;
+            active = true;
+        }
+    }
+    else if (folded !is null)
+    {
+        auto full = decode(*folded, inputs);
+        if (full.length) { foldedStash = full; active = true; }
+    }
+    if (!active) foldedStash = null;
+    r.replayStash = foldedStash.dup;
+    r.replayRestated = Option!size_t.init;
+    if (auto at = "restated" in data)
+        if (active && at.type == JSONType.integer && at.integer >= 0) r.replayRestated = some(cast(size_t) at.integer);
+}
+
+/// The PIN half of a `replace` record's stash restore (epic #221): decode
+/// `pinned_requests`/`pinned_base` — a full restatement, or a delta extending
+/// the first `pinned_base` of the stash so far (issue #205) — into
+/// `r.pinStash`. Keeps its own running sequence in `r.pinStash`. With neither
+/// field (a Rust-era log) the pin stash is the decoded `folded` stash, which
+/// this helper decodes ITSELF and applies onto the read-only cumulative
+/// `foldedStash` — it never reads the replay helper's decoded output, so the
+/// pin representation can change without touching the replay path.
+private void restorePinStash(alias decode)(JSONValue data, const string[] inputs, ref Message[] foldedStash, ref Restored r)
+{
+    auto pins = "pinned_requests" in data, pinBase = "pinned_base" in data;
+    if (pins !is null && pinBase !is null && pinBase.type == JSONType.integer)
+    {
+        auto b = cast(size_t) pinBase.integer;
+        auto kept = b < r.pinStash.length ? r.pinStash[0 .. b] : r.pinStash;
+        r.pinStash = kept ~ decode(*pins, inputs);
+    }
+    else if (pins !is null) r.pinStash = decode(*pins, inputs);
+    else
+    {
+        // Rust-era fallback: no `pinned_requests` field, so the pin stash is
+        // the decoded `folded` stash. This helper decodes THIS record's
+        // `folded` itself and applies it onto the cumulative `foldedStash`
+        // (read-only) — it never reads the replay helper's decoded output, so
+        // the two stay independently editable.
+        auto folded = "folded" in data, base = "folded_base" in data;
+        if (folded !is null && base !is null && base.type == JSONType.integer)
+        {
+            auto b = cast(size_t) base.integer;
+            auto delta = decode(*folded, inputs);
+            if ((b < foldedStash.length ? b : foldedStash.length) + delta.length > 0)
+                r.pinStash = foldedStash[0 .. (b < foldedStash.length ? b : foldedStash.length)] ~ delta;
+            else r.pinStash = null;
+        }
+        else if (folded !is null)
+        {
+            auto full = decode(*folded, inputs);
+            r.pinStash = full.length ? full : null;
+        }
+        else r.pinStash = null;
+    }
 }
 
 /// Apply one `plan_delta` record to `p` (issue #205): keep the first `base`
