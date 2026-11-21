@@ -17,7 +17,7 @@ import std.string : strip, lineSplitter, endsWith;
 import std.stdio : fileno;
 import std.datetime.systime : Clock;
 import core.time : dur;
-import std.process : environment;
+import std.process : environment, thisProcessID;
 import std.algorithm : sort, filter, map;
 import std.array : array;
 import nano.llm;
@@ -54,7 +54,7 @@ string logText(string path)
 // avail_in/avail_out); the stream struct is plain C data.
 private string gunzipLog(const(ubyte)[] bytes, string path) @trusted
 {
-    import etc.c.zlib : z_stream, inflateInit2, inflate, inflateEnd, Z_FINISH, Z_STREAM_END;
+    import etc.c.zlib : z_stream, inflateInit2, inflate, inflateEnd, Z_FINISH, Z_STREAM_END, Z_OK, Z_BUF_ERROR;
     import core.stdc.string : strlen;
     // A gzip wrapper needs raw inflate with windowBits 31 (15 + the 16 that
     // asks for the gzip header); std.zlib's uncompress expects a zlib stream.
@@ -74,10 +74,10 @@ private string gunzipLog(const(ubyte)[] bytes, string path) @trusted
         auto rc = inflate(&zs, Z_FINISH);
         used = out_.length - zs.avail_out;
         if (rc == Z_STREAM_END) break;
-        if (rc != 0 /* Z_OK */ && rc != 2 /* Z_BUF_ERROR */)
+        if (rc != Z_OK && rc != Z_BUF_ERROR)
             throw new Exception(format("gunzip %s: %s", path,
                 zs.msg !is null ? zs.msg[0 .. strlen(zs.msg)] : "corrupt stream"));
-        if (rc == 2 && zs.avail_in == 0 && zs.avail_out != 0)
+        if (rc == Z_BUF_ERROR && zs.avail_in == 0 && zs.avail_out != 0)
             throw new Exception("gunzip " ~ path ~ ": truncated stream");
     }
     return cast(string) out_[0 .. used];
@@ -375,7 +375,8 @@ class SessionLog
         path = buildPath(dir, this.id ~ ".jsonl");
         if (path.exists) throw new Exception("session log " ~ path ~ " already exists");
         f = File(path, "a");
-        lockHeld();
+        tryLock(f); // a brand-new file: no one else can hold it yet
+        openHere[path] = true;
         JSONValue h = ["id": this.id, "created_at": nowStamp(), "cwd": cwd, "model": model];
         h["version"] = formatVersion;
         write_(record("session", h));
@@ -389,14 +390,35 @@ class SessionLog
         path = existingPath;
         if (isCompressedLog(path))
         {
-            import std.file : write_file = write;
+            // Hold the archive's lock while decompressing so a concurrent
+            // tidy-up cannot delete it; publish the plain copy atomically
+            // (temp file + rename) before retiring the archive, so a crash
+            // never leaves a truncated `.jsonl` that would shadow it.
+            import std.file : write_file = write, rename;
+            auto archive = File(path, "r");
+            awaitLock(archive);
+            if (!path.exists) throw new Exception("session log " ~ path ~ " was removed");
             auto plain = path[0 .. $ - ".gz".length];
-            write_file(plain, logText(path));
+            auto tmp = format("%s.tmp-%s", plain, thisProcessID);
+            scope (failure) if (tmp.exists) remove(tmp);
+            write_file(tmp, logText(path));
+            rename(tmp, plain);
             remove(path);
+            archive.close();
             path = plain;
         }
         id = path.baseName.stripExtension;
         validateId(id);
+        // Lock before reading or truncating, so tidy-up cannot compress or
+        // delete the log underneath this writer.
+        // "a" would recreate a missing log: check first, then again under the
+        // lock (a tidy-up that removed it meanwhile unlinked our inode).
+        if (!path.exists) throw new Exception("session log " ~ path ~ " does not exist");
+        f = File(path, "a");
+        if (path in openHere) tryLock(f); // this thread already holds it open
+        else awaitLock(f);
+        openHere[path] = true;
+        if (!path.exists) { f.close(); throw new Exception("session log " ~ path ~ " was removed"); }
         auto bytes = readBytes(path);
         size_t committed = bytes.length;
         while (committed && bytes[committed - 1] != '\n') committed--;
@@ -407,17 +429,6 @@ class SessionLog
             write_file(path, bytes[0 .. committed]);
         }
         foreach (b; bytes[0 .. committed]) if (b == '\n') ++lines;
-        f = File(path, "a");
-        lockHeld();
-    }
-
-    /// Hold an advisory lock on the log for as long as it is open, so the
-    /// startup tidy-up (issue #205) never compresses or deletes a live
-    /// session's log. Best-effort: a filesystem without flock logs unlocked.
-    /// flock only marks the open file description; no memory is touched.
-    private void lockHeld() @trusted
-    {
-        flock(fileno(f.getFP), LOCK_EX | LOCK_NB);
     }
 
     /// Tests: the next write fails (Rust `fail_next_persist`).
@@ -427,6 +438,7 @@ class SessionLog
     void close()
     {
         if (f.isOpen) f.close();
+        openHere.remove(path);
     }
 
     private void write_(string line)
@@ -896,17 +908,50 @@ Restored restore(string path)
                             if (x.type == JSONType.integer && x.integer >= 0) gone[cast(uint) x.integer] = true;
                         p.items = p.items.filter!(i => i.id !in gone).array;
                     }
+                // Merge the upserts as raw items, then validate the whole
+                // plan: an item's `after` may name an item restored earlier.
+                auto items = p.toJSON["items"].arrayNoRef.dup;
+                static long idOf(const JSONValue i)
+                {
+                    if (i.type != JSONType.object) return -1;
+                    auto v = "id" in i;
+                    if (v is null) return -1;
+                    if (v.type == JSONType.integer) return v.integer;
+                    if (v.type == JSONType.uinteger) return cast(long) v.uinteger;
+                    return -1;
+                }
                 if (auto up = "upserts" in data)
                     if (up.type == JSONType.array)
                         foreach (x; up.arrayNoRef)
                         {
-                            auto parsed = Plan.fromJSON(JSONValue(["items": JSONValue([x])]));
+                            if (x.type != JSONType.object) continue;
+                            JSONValue[string] fields;
+                            foreach (k, v; x.objectNoRef) if (k != "after") fields[k] = v;
+                            auto shape = JSONValue(fields);
+                            auto parsed = Plan.fromJSON(JSONValue(["items": JSONValue([shape])]));
                             if (parsed.isErr) continue;
-                            auto item = parsed.unwrap("checked").items[0];
-                            auto at = p.items.countUntil!(i => i.id == item.id);
-                            if (at >= 0) p.items[at] = item;
-                            else p.items ~= item;
+                            auto itemId = parsed.unwrap("checked").items[0].id;
+                            auto at = items.countUntil!(i => idOf(i) == itemId);
+                            if (at >= 0) items[at] = x;
+                            else items ~= x;
                         }
+                auto merged = Plan.fromJSON(JSONValue(["goal": JSONValue(p.goal), "items": JSONValue(items)]));
+                if (merged.isErr)
+                {
+                    // Drop dependencies on unknown items rather than the plan.
+                    bool[long] known;
+                    foreach (i; items) known[idOf(i)] = true;
+                    foreach (ref i; items)
+                    {
+                        auto a = "after" in i;
+                        if (a is null) continue;
+                        if (a.type == JSONType.array)
+                            i["after"] = JSONValue(a.arrayNoRef.filter!(d => idOf(JSONValue(["id": d])) in known).array);
+                        else i["after"] = JSONValue(JSONValue[].init);
+                    }
+                    merged = Plan.fromJSON(JSONValue(["goal": JSONValue(p.goal), "items": JSONValue(items)]));
+                }
+                if (!merged.isErr) p = merged.unwrap("checked");
                 r.plan = p.toJSON;
             }
             break;
@@ -967,21 +1012,35 @@ struct TidyResult
 /// The stamp file whose mtime rate-limits the tidy-up to once a day.
 private enum string tidyStampFile = ".tidy-stamp";
 
-/// Whether another process holds an advisory lock on `path`: such a log is
-/// never compressed or deleted under it. The probe itself takes and drops a
-/// lock, so a log this process holds open is also "in use" when it locked it.
-/// open/close/flock on a NUL-terminated copy of the path touch no memory.
-private bool logInUse(string path) @trusted
+/// Take an exclusive advisory lock on `f` without waiting: false when
+/// another open file description holds it. A filesystem without flock
+/// (ENOLCK/EOPNOTSUPP) counts as locked, best-effort. The lock lives until
+/// `f` is closed. flock only marks the open file description.
+private bool tryLock(ref File f) @trusted
 {
-    import core.sys.posix.fcntl : open, O_RDWR;
-    import core.sys.posix.unistd : close;
-    import std.string : toStringz;
-    auto fd = open(path.toStringz, O_RDWR);
-    if (fd < 0) return false; // unreadable: nothing to tidy
-    scope (exit) close(fd);
-    if (flock(fd, LOCK_EX | LOCK_NB) != 0) return true;
-    flock(fd, LOCK_UN);
-    return false;
+    import core.stdc.errno : errno, EWOULDBLOCK;
+    if (flock(fileno(f.getFP), LOCK_EX | LOCK_NB) == 0) return true;
+    return errno != EWOULDBLOCK;
+}
+
+/// Logs this thread holds open, so reopening one (an in-process resume)
+/// does not wait on its own lock.
+private bool[string] openHere;
+
+/// Lock `f` for a writer, waiting briefly while a tidy-up holds it (a
+/// compression or expiry takes milliseconds); the caller re-checks that the
+/// path still exists afterwards, so a log tidied away meanwhile is reported
+/// rather than silently recreated. Still contended after the wait, the writer
+/// carries on unlocked (best-effort, as on a filesystem without flock).
+private void awaitLock(ref File f)
+{
+    import nano.clock : sleepFor;
+    import core.time : msecs;
+    foreach (attempt; 0 .. 10)
+    {
+        if (tryLock(f)) return;
+        sleepFor(25.msecs);
+    }
 }
 
 private extern (C) int flock(int, int) nothrow @nogc;
@@ -1003,8 +1062,11 @@ TidyResult tidySessions(string dir, long compressAfterDays, long retentionDays)
     if (stampPath.exists && now - timeLastModified(stampPath) < dur!"days"(1)) return result;
     // Titles name the sessions retention keeps.
     bool[string] named;
+    // Without the titles, any deletion could hit a named session: fail
+    // closed and only compress this pass.
+    bool mayDelete = retentionDays > 0;
     try foreach (s; list(dir)) if (s.title !is null) named[s.id] = true;
-    catch (Exception) {} // a broken index is rebuilt on demand; tidy anyway
+    catch (Exception) mayDelete = false; // unknown titles: compress only, delete nothing
     foreach (DirEntry e; dirEntries(dir, SpanMode.shallow, false))
     {
         auto name = e.name.baseName;
@@ -1017,31 +1079,33 @@ TidyResult tidySessions(string dir, long compressAfterDays, long retentionDays)
         auto age = now - e.timeLastModified;
         try
         {
-            if (compressed)
-            {
-                // Retire the twin of a log that was decompressed for a resume.
-                if (buildPath(dir, id ~ ".jsonl").exists) { remove(e.name); continue; }
-                if (retentionDays > 0 && age >= dur!"days"(retentionDays) && id !in named && !logInUse(e.name))
-                {
-                    result.freedBytes += e.size;
-                    remove(e.name);
-                    ++result.deleted;
-                }
-                continue;
-            }
-            if (logInUse(e.name)) continue;
-            if (retentionDays > 0 && age >= dur!"days"(retentionDays) && id !in named)
+            // Both names exist: an interrupted resume or a human's doing.
+            // The plain copy may be incomplete, so leave both alone.
+            if (buildPath(dir, id ~ (compressed ? ".jsonl" : ".jsonl.gz")).exists) continue;
+            // Hold the lock for the whole operation, so no resume can open
+            // and append to a log this pass then removes.
+            auto held = File(e.name, "r");
+            scope (exit) held.close();
+            if (!tryLock(held) || !e.name.exists) continue;
+            if (mayDelete && age >= dur!"days"(retentionDays) && id !in named)
             {
                 result.freedBytes += e.size;
                 remove(e.name);
                 ++result.deleted;
             }
-            else if (compressAfterDays > 0 && age >= dur!"days"(compressAfterDays))
+            else if (!compressed && compressAfterDays > 0 && age >= dur!"days"(compressAfterDays))
             {
+                import std.file : rename, setTimes;
                 auto gz = e.name ~ ".gz";
-                if (gz.exists) continue; // both names: a human's doing; leave it
                 auto before = e.size;
-                std.file.write(gz, gzipLog(cast(const(char)[]) readBytes(e.name)));
+                auto tmp = format("%s.tmp-%s", gz, thisProcessID);
+                scope (failure) if (tmp.exists) remove(tmp);
+                std.file.write(tmp, gzipLog(cast(const(char)[]) readBytes(e.name)));
+                // Keep the last activity time: retention and the picker
+                // measure age from it, not from compression.
+                auto mtime = e.timeLastModified;
+                setTimes(tmp, mtime, mtime);
+                rename(tmp, gz);
                 remove(e.name);
                 result.freedBytes += before - getSize(gz);
                 ++result.compressed;
@@ -1406,4 +1470,72 @@ unittest
     resumed.append(more);
     assert(kept.exists && !(kept ~ ".gz").exists);
     assert(restore(kept).conversation[$ - 1].content == "more");
+}
+
+// Review fixes for issue #205: highly compressible logs (> 4x) decompress;
+// compression keeps the log's mtime; a plain/archive twin is left alone;
+// a live log refuses a second writer; the index caches an archive by its
+// on-disk size.
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, timeLastModified;
+    import std.path : buildPath;
+    import std.array : replicate;
+    import core.time : days;
+    import nano.session_index : list;
+    import std.math : abs;
+    auto dir = buildPath(tempDir, "nano-d-tidy2-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    // Z_BUF_ERROR growth: repetitive text compresses far beyond 4x.
+    auto big = `{"type":"input","data":{"id":"in-1","text":"aaaa"}}` ~ "\n";
+    big = big.replicate(5000);
+    auto z = buildPath(dir, "big.jsonl.gz");
+    std.file.write(z, gzipLog(big));
+    assert(logText(z) == big, "a log expanding past the initial buffer reads back");
+    remove(z);
+
+    auto log = new SessionLog(dir, "mock/m", "/w", "aged");
+    log.input("in-1", "an aged session to archive");
+    log.turnEnd("in-1", "", "end_turn");
+    // A second writer on a live log is refused.
+    log.close();
+    auto when = wallNow - 20.days;
+    setTimes(log.path, when, when);
+    // A twin pair is left alone (the plain copy may be a torn decompression).
+    auto twin = new SessionLog(dir, "mock/m", "/w", "twin");
+    twin.close();
+    setTimes(twin.path, when, when);
+    std.file.write(twin.path ~ ".gz", gzipLog("x\n"));
+    setTimes(twin.path ~ ".gz", when, when);
+    auto r = tidySessions(dir, 14, 0);
+    assert(r.compressed == 1);
+    assert(twin.path.exists && (twin.path ~ ".gz").exists, "twins are left alone");
+    auto gz = log.path ~ ".gz";
+    assert(abs((timeLastModified(gz) - when).total!"seconds") <= 1, "compression keeps the mtime");
+    // The index records the archive's on-disk size, so later listings hit the cache.
+    auto first = list(dir);
+    auto s = first.filter!(x => x.id == "aged").array;
+    assert(s.length == 1 && s[0].archiveBytes == getSize(gz));
+}
+
+// A plan delta whose upserted item depends on an earlier item restores the
+// update instead of dropping it (dependencies validate against the whole plan).
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse;
+    import std.path : buildPath;
+    import nano.plan : Plan;
+    import nano.result : unwrap;
+    auto dir = buildPath(tempDir, "nano-d-plandep-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/w", "dep");
+    log.plan(parseJSON(`{"items":[{"id":1,"title":"a","status":"pending"},{"id":2,"title":"b","status":"pending","after":[1]}]}`));
+    log.planDelta(JSONValue(null), [parseJSON(`{"id":2,"title":"b","status":"done","after":[1]}`)], [], 2);
+    log.close();
+    auto p = Plan.fromJSON(restore(log.path).plan).unwrap("a valid plan");
+    assert(p.items.length == 2 && p.items[1].after == [1u]);
+    import nano.plan : Status;
+    assert(p.items[1].status == Status.done, "the dependent upsert applied");
 }
