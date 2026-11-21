@@ -456,28 +456,18 @@ string cleanTitle(string reply) pure
     return title;
 }
 
-/// Ids of every titled session: from the strictly loaded index (no picker
-/// filters, no cache rewrite) plus titles summarized from the logs
-/// themselves. Throws when the index is unreadable or corrupt.
+/// Ids of every titled session, from the strictly loaded index alone (no
+/// picker filters, no cache rewrite). Titles are only ever recorded in the
+/// index (`setTitle`) — `summarize` never populates `Summary.title` — so
+/// scanning the logs can only re-derive what the index holds, at a startup
+/// cost proportional to the whole (decompressed) history. Throws when the
+/// index is unreadable or corrupt.
 bool[string] titledIds(string dir)
 {
     bool[string] named;
     if (!dir.exists) return named;
     size_t lines;
     foreach (id, s; load(dir, lines, true)) if (s.title !is null) named[id] = true;
-    foreach (DirEntry e; dirEntries(dir, SpanMode.shallow, false))
-    {
-        auto name = e.name.baseName;
-        immutable compressed = name.endsWith(".jsonl.gz");
-        if (!compressed && (name.extension != ".jsonl" || name == indexFile)) continue;
-        auto id = compressed ? name[0 .. $ - ".jsonl.gz".length] : name.stripExtension;
-        if (id in named) continue;
-        try
-        {
-            if (summarize(e.name).title !is null) named[id] = true;
-        }
-        catch (Exception) {} // unsummarizable: the index is the only witness
-    }
     return named;
 }
 
@@ -847,4 +837,28 @@ unittest
     auto s = list(dir)[0];
     assert(s.firstTellingPrompt == "Investigate the flaky deploy test", s.firstTellingPrompt);
     assert(titleSource(s) == "Investigate the flaky deploy test\n\nNow fix the retry logic in the deployer", titleSource(s));
+}
+
+// Round-5 review fix for issue #205: `titledIds` reads the index alone —
+// titles are only ever recorded there, so a tidy-up pass must not scan or
+// decompress logs (startup cost proportional to the whole history).
+unittest
+{
+    import nano.session : SessionLog;
+    auto dir = testDir("titled-index-only");
+    scope (exit) rmdirRecurse(dir);
+    auto titled = writeLog(dir, "titled-one", ["A prompt worth naming"]);
+    auto plain = writeLog(dir, "plain-one", ["A prompt without a name"]);
+    assert(titledIds(dir).length == 0, "no index entries yet: nothing titled");
+    list(dir); // index both logs without titles
+    setTitle(titled, "Keep me");
+    auto named = titledIds(dir);
+    assert(named.length == 1 && "titled-one" in named, "the index title is reported");
+    // A log the index has no title for is not scanned into protection, even
+    // though it sits right there in the directory.
+    assert("plain-one" !in named, "an untitled log is not scanned");
+    // A corrupt index hides titles: strict load throws so retention fails closed.
+    std.file.append(indexPath(dir), cast(const(ubyte)[]) "{not json\n");
+    import std.exception : assertThrown;
+    assertThrown(titledIds(dir), "a corrupt index must not read as 'nothing titled'");
 }
