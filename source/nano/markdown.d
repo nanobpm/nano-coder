@@ -127,8 +127,6 @@ private struct Lines
         size_t w;
         foreach (p; pieces) foreach (dchar c; p.text) w += charWidth(c);
         if (!w) return;
-        bool hasCode;
-        foreach (p; pieces) if (p.style & CODE) hasCode = true;
         size_t gap = space && curW > 0 ? 1 : 0;
         if (curW > 0 && curW + gap + w > width)
         {
@@ -144,29 +142,13 @@ private struct Lines
             else if (gap && full) { cur ~= ' '; curW = 1; }
         }
         else if (gap) { cur ~= ' '; curW++; }
-        // A word with inline code that doesn't fit the rest of its row
-        // (which it starts) is never broken here: the row is marked verbatim
-        // so the frame breaks it by character at the full terminal width,
-        // and no newline or alignment padding lands inside the token.
-        immutable whole = hasCode && curW + w > width;
-        if (whole) cur ~= verbatimMark;
-        foreach (p; pieces)
-        {
-            string run;
-            foreach (dchar c; p.text)
-            {
-                auto cw = charWidth(c);
-                if (!whole && curW + cw > width && curW > 0)
-                {
-                    cur ~= styled(run, p.style);
-                    run = null;
-                    newline(true);
-                }
-                run ~= c;
-                curW += cw;
-            }
-            cur ~= styled(run, p.style);
-        }
+        // A word that doesn't fit the rest of its row (which it starts) is
+        // never broken here: the row is marked verbatim so the frame breaks it
+        // by character at the full terminal width, and no newline or alignment
+        // padding lands inside a copied path, identifier or code argument.
+        if (curW + w > width) cur ~= verbatimMark;
+        foreach (p; pieces) cur ~= styled(p.text, p.style);
+        curW += w;
     }
 
     string[] finish() pure
@@ -204,7 +186,7 @@ private string[] wrapSpans(const Span[] spans, size_t width, ubyte extra) pure
                 lines.newline();
                 space = false;
             }
-            else if (isWhite(c))
+            else if (isWhite(c) && !(style & CODE))
             {
                 if (piece.length) { word ~= Piece(piece, style); piece = null; }
                 flush();
@@ -572,7 +554,17 @@ unittest // paragraphs wrap and soft breaks reflow
     assert(show("one two three\nfour five six seven", 12) == ["one two", "three four", "five six", "seven"]);
     assert(show("a  \nb", 80) == ["a", "b"]);
     assert(show("x<br>y", 80) == ["x", "y"]);
-    foreach (l; show("supercalifragilisticexpialidocious ".replicate(3), 10)) assert(w(l) <= 10, l);
+    // An oversized word is never broken here (the frame wraps it at the
+    // terminal width), so no alignment padding can land inside it.
+    import nano.frame : verbatimMark;
+    import std.algorithm : canFind;
+    foreach (l; renderLines("supercalifragilisticexpialidocious ".replicate(3), 10))
+        assert(l.canFind(verbatimMark) && plain(l).canFind("supercalifragilisticexpialidocious"), l);
+    foreach (l; renderLines("/abcdefghijklmnopqrstuv", 20))
+        assert(plain(l).canFind("/abcdefghijklmnopqrstuv"), l);
+    // Inline code keeps its spaces: an oversized span is one verbatim row.
+    auto code = renderLines("`echo 'ab cde'`", 10);
+    assert(code.length == 1 && code[0].canFind(verbatimMark) && plain(code[0]).canFind("echo 'ab cde'"), code.join("|"));
 }
 
 // rust: markdown.rs::links_show_their_url_unless_it_is_the_text
@@ -740,7 +732,7 @@ unittest // inline code wider than the line stays whole for the frame to wrap
     import std.conv : to;
     import std.algorithm : canFind;
     // Breaking it here would put a newline (and the caller's alignment pad)
-    // inside the token, corrupting a copied path. Plain words still break.
+    // inside the token, corrupting a copied path. Plain words do the same.
     foreach (c; [["`/abcdefghijklmnopqrstuv`", "/abcdefghijklmnopqrstuv"],
                  ["see `/abcdefghijklmnopqrstuv`", "/abcdefghijklmnopqrstuv"],
                  ["x `/abcd` `/klmnopqrstuvwx`", "/klmnopqrstuvwx"]])
@@ -748,7 +740,7 @@ unittest // inline code wider than the line stays whole for the frame to wrap
         auto rows = show(c[0], 10);
         assert(rows.canFind!(r => r.canFind(c[1])), rows.to!string);
     }
-    foreach (l; show("/abcdefghijklmnopqrstuv", 10)) assert(w(l) <= 10, l);
+    assert(show("/abcdefghijklmnopqrstuv", 10) == ["/abcdefghijklmnopqrstuv"]);
 }
 
 unittest // a word with inline code is whole and verbatim whenever it would break
