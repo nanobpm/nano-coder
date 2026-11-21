@@ -110,6 +110,13 @@ private struct Lines
     /// not a break in the text), so the frame joins them for copying.
     void newline(bool soft = false) pure { lines ~= cur; cur = soft ? softWrapMark : null; curW = 0; }
 
+    /// Whether the first visible glyph of `pieces` is double-width.
+    static bool firstWide(const Piece[] pieces) pure
+    {
+        foreach (p; pieces) foreach (dchar c; p.text) if (charWidth(c)) return charWidth(c) > 1;
+        return false;
+    }
+
     /// Place one word (styled pieces, no whitespace), preceded by a space
     /// unless it starts a line. A word wider than the line is broken.
     void word(const Piece[] pieces, bool space) pure
@@ -123,6 +130,9 @@ private struct Lines
             // A separator on the edge starts the next row, so a copy across
             // the wrap keeps it (a shorter row is padded with spaces anyway).
             auto full = curW >= width;
+            // One cell short of the edge, the separator stays on this row:
+            // the frame pads nothing before a wide glyph there.
+            if (gap && curW + 1 == width && firstWide(pieces)) { cur ~= ' '; gap = 0; }
             newline(true);
             if (gap && full) { cur ~= ' '; curW = 1; }
         }
@@ -681,4 +691,11 @@ unittest // GitHub-style emoji shortcodes in prose; code stays verbatim
     assert(r("v1:zz:seedling:").canFind("v1:zz🌱"));
     assert(r("`:seedling:`").canFind(":seedling:"));
     assert(r("```\n:seedling:\n```").canFind(":seedling:"));
+}
+
+unittest // a separator one cell short of the edge survives a wide-glyph wrap
+{
+    import std.conv : to;
+    assert(show("cmd abcdef 中", 11) == ["cmd abcdef ", "中"], show("cmd abcdef 中", 11).to!string);
+    assert(show("cmd abcdefg中", 11) == ["cmd", "abcdefg中"], show("cmd abcdefg中", 11).to!string);
 }

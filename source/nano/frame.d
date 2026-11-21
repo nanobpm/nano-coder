@@ -165,12 +165,16 @@ string[] wrapAnsi(string line, size_t width) pure
     string cur;
     size_t vis;
     ptrdiff_t brk = -1;
-    void breakLine()
+    void breakLine(bool wideNext = false)
     {
         if (brk >= 0)
         {
             auto rest = cur[brk .. $];
-            out_ ~= cur[0 .. brk].stripRight(" ");
+            auto row = cur[0 .. brk].stripRight(" ");
+            // A row one cell short of the edge keeps its separator: the frame
+            // pads nothing before a wide glyph there, so it would be lost.
+            if (wideNext && row.length < brk && visibleWidth(row) + 1 == width) row ~= ' ';
+            out_ ~= row;
             cur = rest.stripLeft(" ");
             vis = visibleWidth(cur);
         }
@@ -215,9 +219,9 @@ string[] wrapAnsi(string line, size_t width) pure
             brk = cur.length;
             continue;
         }
-        if (vis >= width) { if (code) brk = -1; breakLine(); }
         auto w = cellWidth(c);
-        if (w > 1 && vis + w > width && cur.length) { if (code) brk = -1; breakLine(); }
+        if (vis >= width) { if (code) brk = -1; breakLine(w > 1); }
+        if (w > 1 && vis + w > width && cur.length) { if (code) brk = -1; breakLine(true); }
         cur ~= line[at .. i];
         vis += w;
     }
@@ -735,6 +739,8 @@ unittest
     assert(wrapAnsi("the quick brown fox", 10) == ["the quick", M ~ "brown fox"]);
     assert(wrapAnsi("abcdefghij", 4) == ["abcd", M ~ "efgh", M ~ "ij"]);
     assert(wrapAnsi("ab中", 3) == ["ab", M ~ "中"]);
+    assert(wrapAnsi("cmd 中", 4) == ["cmd ", M ~ "中"]);
+    assert(wrapAnsi("cmd中", 4) == ["cmd", M ~ "中"]);
     assert(wrapAnsi("", 5) == [""]);
     assert(wrapBlock("a\nb", 5) == ["a", "b"]);
     auto ed = editorLines("› ", "hi"d, 2, 20);
