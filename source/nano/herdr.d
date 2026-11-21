@@ -367,7 +367,8 @@ void release()
 }
 
 /// Resume reporting after `release` when the process keeps running (a
-/// failed relaunch): the next state, session and model are reported again.
+/// failed relaunch): the next state, session, model and timer are reported
+/// again.
 void reacquire()
 {
     if (!active) return;
@@ -612,4 +613,29 @@ unittest // release clears a shown timer, and nothing is taken after it
     beginRelease(r, shown, timerShown);
     assert(timerShown && !shown && !r.lastTimer);
     assert(!takeTimer(r, on));
+}
+
+unittest // release clears the icon when a pending clear was never sent
+{
+    Reporter r;
+    r.lastTimer = r.pendingTimer = true;
+    r.hasPendingTimer = true;
+    bool on;
+    assert(takeTimer(r, on) && on);
+    r.modelInFlight = false;            // the icon was sent
+    r.lastTimer = r.pendingTimer = false; // showTimer(false), not yet sent
+    r.hasPendingTimer = true;
+    bool shown, timerShown;
+    beginRelease(r, shown, timerShown);
+    assert(timerShown);
+}
+
+unittest // release clears a model whose pending clear was never sent
+{
+    Reporter r;
+    r.lastModel = null;
+    r.hasPendingModel = true;
+    bool shown;
+    beginRelease(r, shown);
+    assert(shown);
 }

@@ -2160,6 +2160,10 @@ int runMain(string[] args)
         syncMode();
         nano.herdr.report(nano.herdr.State.working);
         nano.herdr.showTimer(!agent.timers.empty);
+        // Follow timers set or cancelled during the turn too, not only the
+        // state sampled here and at the idle prompt.
+        if (nano.herdr.active && agent.onTimersChanged is null)
+            agent.onTimersChanged = () { nano.herdr.showTimer(!agent.timers.empty); };
         if (gFrame) gFrame.busy(true);
         scope (exit) if (gFrame) gFrame.busy(false);
         atomicStore(gTurnRunning, true);
