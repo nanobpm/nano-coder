@@ -184,10 +184,21 @@ private bool takeModel(ref Reporter r, out string model)
 private ulong beginRelease(ref Reporter r, out bool shown)
 {
     r.released = true;
+    // A pending model (even an empty one, i.e. a clear) may follow a shown
+    // one, so it counts as shown: clearing an unshown model is harmless.
+    shown = r.lastModel.length > 0 || r.modelInFlight || r.hasPendingModel;
     r.hasPending = r.hasPendingModel = false;
-    shown = r.lastModel.length > 0 || r.modelInFlight;
     r.lastModel = null;
     return nextSeq(r);
+}
+
+/// Undo a release whose exit did not happen (a failed relaunch): reporting
+/// starts afresh, so the next state, session and model are all sent again.
+private void endRelease(ref Reporter r)
+{
+    r.released = false;
+    r.hasLast = r.hasLastSession = false;
+    r.lastModel = null;
 }
 
 private shared Locked!Reporter gReporter;
@@ -293,6 +304,14 @@ void release()
     // Metadata outlives the release, so clear the model first.
     if (shown) run(pane.bin, metadataArgs(pane.id, null));
     run(pane.bin, releaseArgs(pane.id, seq));
+}
+
+/// Resume reporting after `release` when the process keeps running (a
+/// failed relaunch): the next state, session and model are reported again.
+void reacquire()
+{
+    if (!active) return;
+    atomicLoad(gReporter).update((ref Reporter r) { endRelease(r); });
 }
 
 private void worker(string bin, string pane)
@@ -469,4 +488,28 @@ unittest // an in-flight model counts as shown even before lastModel is set
     bool shown;
     beginRelease(r, shown);
     assert(shown);
+}
+
+unittest // a pending clear after a shown model still clears on release
+{
+    Reporter r;
+    r.hasPendingModel = true; // showModel queued "" over a shown model
+    bool shown;
+    beginRelease(r, shown);
+    assert(shown && !r.hasPendingModel);
+}
+
+unittest // after a failed relaunch, model, state and session report again
+{
+    Reporter r;
+    r.lastModel = "gpt-5";
+    r.hasLast = r.hasLastSession = true;
+    bool shown;
+    beginRelease(r, shown);
+    endRelease(r);
+    assert(!r.released && !r.hasLast && !r.hasLastSession && !r.lastModel.length);
+    r.pendingModel = "gpt-5";
+    r.hasPendingModel = true;
+    string model;
+    assert(takeModel(r, model) && model == "gpt-5");
 }
