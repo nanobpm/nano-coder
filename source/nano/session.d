@@ -1149,11 +1149,36 @@ private File openExistingForAppend(string path) @trusted
 {
     import core.sys.posix.fcntl : open, O_WRONLY, O_APPEND;
     import std.string : toStringz;
+    import core.stdc.errno : errno, ENOENT;
+    import std.exception : ErrnoException;
     auto fd = open(path.toStringz, O_WRONLY | O_APPEND);
-    if (fd < 0) throw new Exception("session log " ~ path ~ " does not exist");
+    if (fd < 0)
+    {
+        immutable err = errno;
+        if (err == ENOENT) throw new Exception("session log " ~ path ~ " does not exist");
+        throw new ErrnoException("cannot open session log " ~ path, err);
+    }
     File f;
     f.fdopen(fd, "a");
     return f;
+}
+
+@("openExistingForAppend distinguishes a missing log from an access failure")
+unittest
+{
+    import std.file : tempDir, write, remove, setAttributes;
+    import std.path : buildPath;
+    import std.exception : collectExceptionMsg;
+    import std.algorithm : canFind;
+    auto missing = buildPath(tempDir, "nano-oefa-missing-" ~ __LINE__.stringof);
+    assert(collectExceptionMsg(openExistingForAppend(missing)).canFind("does not exist"));
+    auto ro = buildPath(tempDir, "nano-oefa-ro-" ~ __LINE__.stringof);
+    write(ro, "");
+    scope (exit) remove(ro);
+    setAttributes(ro, octal!444);
+    auto msg = collectExceptionMsg(openExistingForAppend(ro));
+    if (msg is null) return; // root bypasses permission bits
+    assert(!msg.canFind("does not exist") && msg.canFind("cannot open"), msg);
 }
 
 /// Whether `path` still names the inode `f` has open (tidy-up may have
