@@ -127,8 +127,8 @@ private struct Lines
         size_t w;
         foreach (p; pieces) foreach (dchar c; p.text) w += charWidth(c);
         if (!w) return;
-        bool whole = w > width;
-        foreach (p; pieces) if (!(p.style & CODE)) whole = false;
+        bool hasCode;
+        foreach (p; pieces) if (p.style & CODE) hasCode = true;
         size_t gap = space && curW > 0 ? 1 : 0;
         if (curW > 0 && curW + gap + w > width)
         {
@@ -144,6 +144,12 @@ private struct Lines
             else if (gap && full) { cur ~= ' '; curW = 1; }
         }
         else if (gap) { cur ~= ' '; curW++; }
+        // A word with inline code that doesn't fit the rest of its row
+        // (which it starts) is never broken here: the row is marked verbatim
+        // so the frame breaks it by character at the full terminal width,
+        // and no newline or alignment padding lands inside the token.
+        immutable whole = hasCode && curW + w > width;
+        if (whole) cur ~= verbatimMark;
         foreach (p; pieces)
         {
             string run;
@@ -743,4 +749,21 @@ unittest // inline code wider than the line stays whole for the frame to wrap
         assert(rows.canFind!(r => r.canFind(c[1])), rows.to!string);
     }
     foreach (l; show("/abcdefghijklmnopqrstuv", 10)) assert(w(l) <= 10, l);
+}
+
+unittest // a word with inline code is whole and verbatim whenever it would break
+{
+    import std.conv : to;
+    import std.algorithm : canFind, count;
+    // Oversized: the row is verbatim, so the frame wraps by character.
+    auto rows = renderLines("see `/abcdefghijklmnopqrstuv`", 20);
+    assert(rows.count!(r => r.indexOf(verbatimMark) >= 0) == 1, rows.to!string);
+    // Adjacent punctuation: the code word stays whole.
+    auto p = show("see `/abcdefghijklmnopqrstuv`,", 10);
+    assert(p.canFind!(r => r.canFind("/abcdefghijklmnopqrstuv,")), p.to!string);
+    // Exactly the width after an edge separator: kept whole, not split.
+    auto e = show("abcdefghij `/klmnopqrs`", 10);
+    assert(e.canFind!(r => r.canFind("/klmnopqrs")), e.to!string);
+    // A fitting code word is not marked.
+    assert(renderLines("see `/ab`", 20)[0].indexOf(verbatimMark) < 0);
 }
