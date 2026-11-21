@@ -392,7 +392,9 @@ final class FrameRenderer
         // A soft-wrapped line is rewritten from its start, so the terminal
         // keeps its wrap; but not past the top of the screen, as the rows
         // above are scrollback (the wrap flag of a row up there stays).
-        while (diff > top && joins(frame, diff)) diff--;
+        // Rewind through continuations in either frame: a soft wrap that
+        // became a hard newline must also clear the old row's wrap flag.
+        while (diff > top && (joins(frame, diff) || joins(prev, diff))) diff--;
         auto shown = frame.dup;
         if (frame.length < prev.length)
         {
@@ -419,6 +421,20 @@ private bool joins(const string[] rows, size_t i) pure
         && visibleWidth(dropSoftWraps(rows[i])) > 0;
 }
 
+/// Cell width of the first visible glyph of `text` (0 if none).
+private size_t firstGlyphWidth(string text) pure
+{
+    size_t i;
+    while (i < text.length)
+    {
+        import std.utf : stride;
+        i += stride(text, i);
+        auto w = visibleWidth(text[0 .. i]);
+        if (w) return w;
+    }
+    return 0;
+}
+
 /// Writes `rows` from the cursor. A row that continues the one above is
 /// reached through autowrap (the row above padded to the edge) rather than a
 /// newline, so the terminal joins them when text is copied. With `clear`,
@@ -433,7 +449,14 @@ private void emitRows(ref Appender!string buf, const string[] rows, size_t width
         if (clear && !cont) buf ~= "\x1b[2K";
         buf ~= text;
         auto vis = visibleWidth(text);
-        if (joins(rows, i + 1)) { if (vis < width) buf ~= " ".replicate(width - vis); }
+        if (joins(rows, i + 1))
+        {
+            // A wide glyph one cell short of the edge wraps by itself; a pad
+            // space there would be copied into the joined text.
+            auto gap = vis < width ? width - vis : 0;
+            if (gap == 1 && firstGlyphWidth(dropSoftWraps(rows[i + 1])) == 2) gap = 0;
+            if (gap) buf ~= " ".replicate(gap);
+        }
         else if (clear && cont && vis < width) buf ~= "\x1b[K";
     }
 }
