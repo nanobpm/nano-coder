@@ -494,10 +494,8 @@ struct Transcript
             if (need > k + 1) end = buf.length - 1 - k;
         }
         pending = buf[end .. $].dup;
-        import std.utf : validate, UTFException;
-        auto s = cast(string) buf[0 .. end].idup;
-        try validate(s);
-        catch (UTFException) { import std.encoding : sanitize; s = sanitize(s); }
+        import nano.safeio : lossyText;
+        auto s = lossyText(buf[0 .. end]);
         size_t i;
         while (i < s.length)
         {
@@ -514,7 +512,7 @@ struct Transcript
                     auto bel = rest.indexOf('\x07'), st = rest.indexOf("\x1b\\");
                     if (bel < 0 && st < 0)
                     {
-                        pending = cast(ubyte[]) s[at .. $].dup ~ pending;
+                        pending = s[at .. $].representation.dup ~ pending;
                         return;
                     }
                     auto end_ = bel >= 0 && (st < 0 || bel < st) ? bel : st;
@@ -568,12 +566,10 @@ struct Transcript
         if (parts.length != 4 || parts[0] != foldOsc) return;
         try
         {
-            auto id = cast(string) Base64.decode(parts[1]).idup;
+            import nano.safeio : utf8Text;
+            auto id = utf8Text(Base64.decode(parts[1]));
             auto n = parts[2].to!size_t;
-            auto expanded = cast(string) Base64.decode(parts[3]).idup;
-            import std.utf : validate;
-            validate(id);
-            validate(expanded);
+            auto expanded = utf8Text(Base64.decode(parts[3]));
             if (!n || n > lines.length) return;
             import std.string : stripRight;
             folds ~= Fold(id, lines.length - n, n, expanded.stripRight("\n").split("\n"));
@@ -605,12 +601,12 @@ struct Transcript
             if (f.expanded == want) return;
             auto shown = lines[f.start .. f.start + f.length].dup;
             lines = lines[0 .. f.start] ~ f.other ~ lines[f.start + f.length .. $];
-            long delta = cast(long) f.other.length - cast(long) f.length;
+            immutable oldLength = f.length, newLength = f.other.length;
             f.length = f.other.length;
             f.other = shown;
             f.expanded = want;
             foreach (ref g; folds)
-                if (g.start > f.start) g.start = cast(size_t)(g.start + delta);
+                if (g.start > f.start) g.start = g.start - oldLength + newLength;
             if (cache.length > f.start) cache = cache[0 .. f.start];
         }
     }
@@ -761,7 +757,7 @@ string promptGlyph(bool busy, long elapsedMs) pure
 {
     import std.conv : to;
     if (!busy) return "\x1b[38;5;114m›\x1b[39m";
-    auto frame = spinnerFrames[cast(size_t)(elapsedMs / spinnerIntervalMs) % spinnerFrames.length];
+    auto frame = spinnerFrames[elapsedMs < 0 ? 0 : (elapsedMs / spinnerIntervalMs) % spinnerFrames.length];
     return "\x1b[38;5;117m" ~ frame.to!string ~ "\x1b[39m";
 }
 
