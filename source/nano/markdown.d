@@ -576,6 +576,12 @@ unittest // paragraphs wrap and soft breaks reflow
     // Inline code keeps its spaces: an oversized span is one verbatim row.
     auto code = renderLines("`echo 'ab cde'`", 10);
     assert(code.length == 1 && code[0].canFind(verbatimMark) && plain(code[0]).canFind("echo 'ab cde'"), code.join("|"));
+    // The rendered marks survive the stdout pipe into the transcript.
+    import nano.frame : Transcript;
+    Transcript t;
+    t.feed(cast(const(ubyte)[]) (render("```\nls -la /tmp\n```", 40) ~ "\n"));
+    assert(t.lines.canFind!(l => l.canFind(verbatimMark)), t.lines.join("|"));
+    foreach (l; t.render(40)) assert(!l.canFind("\uFFFD"), l);
 }
 
 // rust: markdown.rs::links_show_their_url_unless_it_is_the_text

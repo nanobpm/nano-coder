@@ -789,11 +789,11 @@ struct Transcript
                 continue;
             }
             if (cr) { cur = null; cr = false; }
-            // A literal wrap mark in the text is never metadata: replace it
-            // with U+FFFD so it can't be read as a generated wrap, verbatim
-            // or separator mark (which would alter the copied text or join
-            // genuine hard lines).
-            cur ~= c >= softWrap && c <= sepWrap ? "\uFFFD" : s[at .. i];
+            // Wrap marks pass through: the app's stdout carries the
+            // renderer's generated marks (verbatim code blocks, soft and
+            // separator wraps). Literal marks are escaped upstream, before
+            // rendering (escapeMarks / mdinline.clean).
+            cur ~= s[at .. i];
         }
     }
 
@@ -976,12 +976,13 @@ unittest
     small.cap = 10;
     foreach (n; 0 .. 11) small.feed(cast(const(ubyte)[]) "x\n");
     assert(small.lines.length == 9);
-    // A literal wrap mark in fed text is never metadata: it becomes U+FFFD,
-    // so it can't forge a wrap/verbatim mark or join genuine hard lines.
-    Transcript lit;
-    lit.feed(cast(const(ubyte)[]) "/tmp/a\uE003b\uE002c\uE004d\n");
-    assert(lit.lines == ["/tmp/a\uFFFDb\uFFFDc\uFFFDd"]);
-    assert(lit.render(20) == ["/tmp/a\uFFFDb\uFFFDc\uFFFDd"]);
+    // Generated marks fed through stdout (the renderer's own verbatim mark
+    // on a code-block line) survive intake and still drive render().
+    Transcript gen;
+    gen.feed(cast(const(ubyte)[]) (verbatimMark ~ "abcdef\n"));
+    assert(gen.lines == [verbatimMark ~ "abcdef"]);
+    assert(gen.render(20) != ["\uFFFDabcdef"]);
+    assert(!gen.render(20)[0].canFind("\uFFFD"));
 }
 
 // Wrapped rows reach the terminal through autowrap, so a copy has no newline.
