@@ -221,11 +221,17 @@ def config_text(base, session_dir, mode, extra_body=None, providers=(), pin=True
     lines = []
     if base:
         in_table = False
+        depth = 0  # open brackets of a multiline array value being dropped
         for line in Path(base).read_text().splitlines():
+            if depth > 0:
+                depth += line.count("[") - line.count("]")
+                continue
             if line.strip().startswith("["):
                 in_table = True
             key = line.split("=", 1)[0].strip()
             if not in_table and key in OVERRIDDEN:
+                value = line.split("=", 1)[1] if "=" in line else ""
+                depth = max(0, value.count("[") - value.count("]"))
                 continue
             lines.append(line)
     head = [
@@ -477,8 +483,11 @@ class Acp:
 
     def __init__(self, argv, cwd, stderr_path, timeout):
         self.stderr = open(stderr_path, "w")
+        # No skills: their names and descriptions in the system prompt are
+        # operator context that real-session questions could lean on.
         self.proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=self.stderr, text=True, bufsize=1)
+                                     stderr=self.stderr, text=True, bufsize=1,
+                                     env={**os.environ, "NANO_CODER_NO_SKILLS": "1"})
         self.next_id = 0
         self.deadline = time.monotonic() + timeout
         self.updates = []
