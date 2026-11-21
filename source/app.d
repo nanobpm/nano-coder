@@ -1580,6 +1580,123 @@ string timersText(Agent agent)
         : agent.timers.list(agent.timerNow(), true).stripRight;
 }
 
+/// What of an assistant message a quiet replay shows (Rust ui.rs quiet
+/// mode): live, an answer's deltas stream only while nothing supersedes
+/// them — a tool call or a Stop-hook rejection hides them, and an
+/// output-limit chunk a later tool call discarded never prints. A replay
+/// sees whole messages, so the same rule is: nothing with tool calls,
+/// nothing a rejection supersedes, and of an output-limit continuation
+/// only the chunks that stood — a chunk a continuation carried into the
+/// segment's accepted answer shows there, one a tool call or rejection
+/// discarded doesn't.
+string replayAnswerQuiet(const Message[] msgs, size_t i) pure nothrow @safe
+{
+    import nano.llm : isLengthStop;
+    const m = msgs[i];
+    if (m.toolCalls.length || stopRejected(msgs, i)) return null;
+    if (!isLengthStop(m.stopReason)) return m.content;
+    // A cut-off chunk: the continuation reminder carries the answer on.
+    size_t k = i + 1;
+    while (k < msgs.length && msgs[k].role == Role.system) k++;
+    // The log cut short on the chunk (a crash before the reminder): it was
+    // the turn's visible tail, so it shows.
+    if (k >= msgs.length) return m.content;
+    if (msgs[k].role != Role.user || !msgs[k].continuation) return null;
+    // A chunk continuing an in-flight segment shows only the text its own
+    // continuation added when the answer stands (the prefix already showed
+    // with the segment's first chunk, which shows the accumulated whole).
+    size_t back = i;
+    while (back > 0 && msgs[back - 1].role == Role.system) back--;
+    const continued = back > 0 && msgs[back - 1].role == Role.user && msgs[back - 1].continuation;
+    // The segment runs from the reminder on; the first message that closes
+    // it decides whether the accumulated chunks stood.
+    string kept = m.content;
+    for (size_t j = k + 1; j < msgs.length; j++)
+    {
+        const n = msgs[j];
+        final switch (n.role)
+        {
+        case Role.system: break;
+        case Role.user:
+            // A further reminder continues the segment; anything else
+            // (a rejection, a steer, a new turn) discarded it.
+            if (n.continuation) break;
+            return null;
+        case Role.assistant:
+            // Discarded with the tool call that replaced the answer.
+            if (n.toolCalls.length) return null;
+            if (stopRejected(msgs, j)) return null;
+            if (isLengthStop(n.stopReason)) { kept ~= n.content; break; }
+            return continued ? n.content : kept ~ n.content;
+        case Role.tool: return null;
+        }
+    }
+    return null; // the log ends mid-segment: no accepted answer to show
+}
+
+unittest
+{
+    import nano.agent : wrapReminder;
+    import std.json : JSONValue;
+    auto cont = Message.auto_(wrapReminder("cut off"));
+    cont.continuation = true;
+    Message cut(string text)
+    {
+        auto m = Message.assistant(text);
+        m.stopReason = "max_tokens";
+        return m;
+    }
+
+    // The cited sequence: a discarded chunk must not print; only the
+    // accepted answer shows.
+    auto call = Message.assistant("", [ToolCall.fromRaw("c1", "echo", `{}`)]);
+    assert(call.toolCalls.length == 1, "fromRaw builds the call");
+    auto msgs = [cut("lost "), cont, call, Message.toolResult("c1", "echo", "pong"), Message.assistant("fresh")];
+    assert(replayAnswerQuiet(msgs, 0) is null, "a chunk a tool call discarded is dropped");
+    assert(msgs.length == 5 && msgs[2].toolCalls.length == 1 && msgs[3].role == Role.tool, "the sequence's layout");
+    assert(replayAnswerQuiet(msgs, 2) is null, "an answer carrying tool calls stays hidden in quiet");
+    assert(replayAnswerQuiet(msgs, 4) == "fresh");
+
+    // A continuation that stood: the segment's first chunk shows the
+    // accepted answer whole (live, the turn's end reprints the accumulated
+    // answer); a chunk continuing the segment shows only the text its own
+    // continuation added (the prefix already showed with the first chunk).
+    auto ok = [cut("one "), cont, cut("two "), cont, Message.assistant("three")];
+    assert(replayAnswerQuiet(ok, 0) == "one two three");
+    assert(replayAnswerQuiet(ok, 2) == "three", "a continued chunk's prefix already showed with the first");
+    assert(replayAnswerQuiet(ok, 4) == "three");
+
+    // A chunk the log cuts short on (crash before the reminder) shows: it
+    // was the turn's visible tail.
+    auto torn = [cut("half a file")];
+    assert(replayAnswerQuiet(torn, 0) == "half a file");
+
+    // A chunk a Stop-hook rejection supersedes is dropped.
+    auto rej = Message.auto_(wrapReminder("keep going"));
+    rej.stopBlocked = true;
+    auto blocked = [cut("lost "), cont, Message.assistant("draft"), rej, Message.assistant("final")];
+    assert(replayAnswerQuiet(blocked, 0) is null, "a chunk whose segment ends rejected is dropped");
+    assert(replayAnswerQuiet(blocked, 2) is null);
+    assert(replayAnswerQuiet(blocked, 4) == "final");
+
+    // A chunk a mid-turn steer supersedes is dropped too.
+    auto steer = Message.user("shorter");
+    steer.steered = true;
+    auto steered = [cut("lost "), cont, steer, Message.assistant("short")];
+    assert(replayAnswerQuiet(steered, 0) is null, "a chunk whose segment a steer cut short is dropped");
+    assert(replayAnswerQuiet(steered, 3) == "short");
+
+    // A system message between a chunk and its reminder (a compaction
+    // boundary) is skipped, as stopRejected skips it.
+    auto compacted = [cut("lost "), Message.system("summary"), cont, call, Message.assistant("fresh")];
+    assert(replayAnswerQuiet(compacted, 0) is null);
+    assert(replayAnswerQuiet(compacted, 4) == "fresh");
+
+    // Plain answers are unaffected: shown unless tool calls or a rejection.
+    auto plain = [Message.assistant("hi"), Message.assistant("bye")];
+    assert(replayAnswerQuiet(plain, 0) == "hi" && replayAnswerQuiet(plain, 1) == "bye");
+}
+
 /// Rebuild the transcript of a loaded session on the frame (Rust
 /// `replay_history` in frame mode): the frame owns the screen, so without
 /// this a resumed or relaunched session opens with an empty transcript.
@@ -1635,10 +1752,13 @@ void replayTranscript(Agent agent, Console console)
             // Escape literal markers before rendering, keeping the renderer's
             // own soft-wrap / verbatim markers.
             // Quiet mode shows only final answers live (no tool calls);
-            // an output-limit cut-off has no tool calls, so it stays.
+            // an output-limit cut-off has no tool calls, so it stays — but
+            // only when its continuation stood: a chunk a later tool call
+            // or rejection discarded never printed live.
             // A Stop hook rejecting the answer supersedes it: live quiet
             // mode keeps only the answer that finally stood.
-            if (m.content.strip.length && !(console.quiet && (m.toolCalls.length || stopRejected(msgs, i)))) writeln(stampBlock(console.stamp(), console.display(escapeMarks(sanitizeBlock(m.content))).stripRight));
+            auto shown = console.quiet ? replayAnswerQuiet(msgs, i) : m.content;
+            if (shown.strip.length) writeln(stampBlock(console.stamp(), console.display(escapeMarks(sanitizeBlock(shown))).stripRight));
             foreach (j, ref c; m.toolCalls) pending ~= [i, j];
             break;
         case Role.tool:
