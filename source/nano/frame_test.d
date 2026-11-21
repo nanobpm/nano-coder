@@ -317,3 +317,27 @@ unittest
     assert(outp.canFind("abcd"), outp);
     assert(outp.canFind("abcd\r\n"), outp);
 }
+
+/// A join at the top of the screen that changes redraws everything: the row
+/// above is scrollback and its wrap flag can't be rewritten in place.
+unittest
+{
+    import std.algorithm : canFind;
+    foreach (pair; [[["abcd", softWrapMark ~ "ef", "s"], ["abcd", "ef", "s"]],
+                    [["abcd", "ef", "s"], ["abcd", softWrapMark ~ "ef", "s"]]])
+    {
+        string outp;
+        auto r = new FrameRenderer((string s) { outp ~= s; });
+        r.render(pair[0], 4, 2);
+        outp = null;
+        r.render(pair[1], 4, 2);
+        assert(outp.canFind("\x1b[3J"), outp);
+    }
+    // An unchanged join at the top stays a bounded rewrite.
+    string outp;
+    auto r = new FrameRenderer((string s) { outp ~= s; });
+    r.render(["abcd", softWrapMark ~ "ef", "s"], 4, 2);
+    outp = null;
+    r.render(["abcd", softWrapMark ~ "eg", "s"], 4, 2);
+    assert(!outp.canFind("\x1b[3J"), outp);
+}
