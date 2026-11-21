@@ -111,7 +111,15 @@ struct IdleCompactReport
     this(CompactReport r, size_t window) pure
     {
         import std.math : round;
-        size_t pct(size_t t) { import std.conv : to; return round(t * 100.0 / (window ? window : 1)).to!size_t; }
+        // Saturate before converting: a huge anomalous count over a tiny
+        // window exceeds size_t (and size_t.max rounds up as a double).
+        size_t pct(size_t t)
+        {
+            import std.conv : to;
+            immutable p = round(t * 100.0 / (window ? window : 1));
+            // 2.0^^64 is the first double past size_t.max (which rounds up to it).
+            return p >= 2.0 ^^ (size_t.sizeof * 8) ? size_t.max : p.to!size_t;
+        }
         report = r;
         percentBefore = pct(r.tokensBefore);
         percentAfter = pct(r.tokensAfter);
@@ -1070,7 +1078,7 @@ class Agent
         if (!autoCompact) return false;
         auto threshold = autoCompactThreshold < 0.1 ? 0.1 : autoCompactThreshold > 0.99 ? 0.99 : autoCompactThreshold;
         auto window = contextWindow();
-        auto reserved = (outputBase < ctx.minOutputReserve ? outputBase : ctx.minOutputReserve) + ctx.outputMargin(window);
+        auto reserved = saturatingAdd(outputBase < ctx.minOutputReserve ? outputBase : ctx.minOutputReserve, ctx.outputMargin(window));
         double limit = window * threshold;
         auto headroom = saturatingSub(window, reserved);
         if (headroom && headroom < limit) limit = headroom;
@@ -1253,13 +1261,13 @@ class Agent
         {
             auto combined = combinedWindow();
             if (!combined) return maxTokens;
-            auto usedC = estimateContextTokens() + ctx.outputMargin(combined);
+            auto usedC = saturatingAdd(estimateContextTokens(), ctx.outputMargin(combined));
             long roomC = toLong(saturatingSub(combined, usedC));
             auto c = maxTokens < roomC ? maxTokens : roomC;
             return c < 1 ? 1 : c;
         }
         auto window = contextWindow();
-        auto used = estimateContextTokens() + ctx.outputMargin(window);
+        auto used = saturatingAdd(estimateContextTokens(), ctx.outputMargin(window));
         long room = toLong(saturatingSub(window, used));
         auto n = maxTokens < room ? maxTokens : room;
         return n < 1 ? 1 : n;
@@ -3187,6 +3195,18 @@ unittest // extreme usage anchors clamp instead of halting the estimate
     auto rep = CompactReport(4, 2, size_t.max, size_t.max, 2, null, false, ctx.CompactionMode.standard);
     import std.algorithm : canFind;
     assert(rep.toString.canFind("compacted 2 messages"), rep.toString);
+    // The idle report saturates its percentages instead of throwing.
+    auto idle = IdleCompactReport(rep, 1);
+    assert(idle.percentBefore == size_t.max && idle.percentAfter == size_t.max);
+    // A saturated estimate plus the output margin must not wrap low and
+    // grant a large output budget: the exhausted context gets the minimum.
+    agent.configuredWindow = 12_000;
+    assert(agent.requestMaxTokens() == 1);
+    agent.configuredWindow = 0;
+    agent.capabilities.window = 12_000;
+    agent.capabilities.promptCap = true;
+    agent.capabilities.totalWindow = 12_000;
+    assert(agent.requestMaxTokens() == 1);
 }
 
 // rust: agent.rs::a_memory_evicted_from_the_installed_index_becomes_recallable
