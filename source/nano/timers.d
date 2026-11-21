@@ -269,8 +269,13 @@ long parseDelay(string s) pure
             case "h", "hr", "hrs", "hour", "hours": mult = 3600; break;
             default: throw new TimerError(format("unknown unit %s in %s; use s, m or h", unit, s));
         }
-        if (n * mult >= long.max / 2) throw new TimerError(format("the delay %s is too long", s));
-        total += (n * mult).to!long;
+        // Bound the running sum, not just each component, so several large components can't
+        // wrap `total` into a short delay; `!(x < cap)` also rejects NaN.
+        enum long cap = long.max / 2;
+        immutable secs = n * mult;
+        if (!(secs < double(cap - total))) throw new TimerError(format("the delay %s is too long", s));
+        total += secs.to!long;
+        if (total >= cap) throw new TimerError(format("the delay %s is too long", s));
         i = k;
         while (i < t.length && t[i] == ' ') i++;
     }
@@ -370,6 +375,10 @@ unittest
     import std.exception : assertThrown;
     assertThrown!TimerError(parseDelay("soon"));
     assertThrown!TimerError(parseDelay("5d"));
+    // the running sum is bounded, not just each component (four huge parts must not wrap to 90s)
+    assertThrown!TimerError(parseDelay("4611686018427386880s4611686018427386880s4611686018427386880s4611686018427386880s4186s"));
+    assertThrown!TimerError(parseDelay("4000000000000000000s4000000000000000000s"));
+    assertThrown!TimerError(parseDelay("nans"));
     assert(describe(45) == "45s" && describe(300) == "5m" && describe(5400) == "1h30m" && describe(7200) == "2h");
 }
 
