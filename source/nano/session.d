@@ -6,11 +6,12 @@ module nano.session;
 
 import std.conv : to;
 
-import nano.arith : toSize;
 import nano.safeio : jsonText, jsonPretty;
 import nano.clock : wallNow;
 
-import nano.safeio : readBytes;
+import nano.safeio : readBytes, jsonUnsigned;
+import nano.arith : toSize;
+import std.string : representation;
 
 import std.json;
 import std.format : format;
@@ -77,7 +78,7 @@ private string gunzipLog(const(ubyte)[] bytes, string path) @trusted
         if (zs.avail_in == 0 && fed < bytes.length)
         {
             immutable n = zlibWindow(bytes.length - fed);
-            zs.next_in = cast(ubyte*) bytes.ptr + fed;
+            zs.next_in = bytes.ptr + fed;
             zs.avail_in = n;
             fed += n;
         }
@@ -94,19 +95,25 @@ private string gunzipLog(const(ubyte)[] bytes, string path) @trusted
         if (rc == Z_BUF_ERROR && zs.avail_in == 0 && fed == bytes.length && zs.avail_out != 0)
             throw new Exception("gunzip " ~ path ~ ": truncated stream");
     }
-    return cast(string) out_[0 .. used];
+    import std.exception : assumeUnique;
+    import std.string : assumeUTF;
+    return out_[0 .. used].assumeUTF.assumeUnique;
 }
 
 /// One zlib buffer window over `remaining` bytes: zlib's sizes are 32-bit.
 package uint zlibWindow(size_t remaining) pure nothrow @nogc @safe
 {
-    return remaining > uint.max ? uint.max : cast(uint) remaining;
+    // The mask keeps the low 32 bits, which range propagation admits as a uint.
+    return remaining > uint.max ? uint.max : remaining & uint.max;
 }
 
 // zlib's C API writes only within the caller's buffers (sizes tracked in
 // avail_in/avail_out); the stream struct is plain C data.
 /// The gzip-compressed bytes of `text` (a session log's whole content).
-ubyte[] gzipLog(const(char)[] text) @trusted
+ubyte[] gzipLog(const(char)[] text) { return gzipLog(text.representation); }
+
+/// ditto, for raw bytes (a log read from disk, compressed unvalidated).
+ubyte[] gzipLog(const(ubyte)[] text) @trusted
 {
     import etc.c.zlib : z_stream, deflateInit2, deflate, deflateEnd, Z_FINISH, Z_NO_FLUSH, Z_STREAM_END, Z_BUF_ERROR;
     z_stream zs;
@@ -122,7 +129,7 @@ ubyte[] gzipLog(const(char)[] text) @trusted
         if (zs.avail_in == 0 && fed < text.length)
         {
             immutable n = zlibWindow(text.length - fed);
-            zs.next_in = cast(ubyte*) text.ptr + fed;
+            zs.next_in = text.ptr + fed;
             zs.avail_in = n;
             fed += n;
         }
@@ -440,7 +447,7 @@ class SessionLog
             }
             auto tmp = format("%s.tmp-%s", plain, thisProcessID);
             scope (failure) if (tmp.exists) remove(tmp);
-            writePrivate(tmp, cast(const(ubyte)[]) logText(path), modeOf(path));
+            writePrivate(tmp, logText(path).representation, modeOf(path));
             publishOver(tmp, plain); // fsync the copy, link, sync the entry, unlink
             remove(path);
             archive.close();
@@ -1004,7 +1011,7 @@ private void applyPlanDelta(ref Plan p, JSONValue data)
     import std.algorithm : countUntil;
     auto base = "base" in data;
     auto b = base !is null && base.type == JSONType.integer && base.integer >= 0
-        ? cast(size_t) base.integer : size_t.max;
+        ? toSize(base.integer) : size_t.max;
     if (b > p.items.length) p = Plan.init;
     else if (b < p.items.length) p.items = p.items[0 .. b];
     if (auto g = "goal" in data)
@@ -1014,7 +1021,10 @@ private void applyPlanDelta(ref Plan p, JSONValue data)
         {
             bool[uint] gone;
             foreach (x; dr.arrayNoRef)
-                if (x.type == JSONType.integer && x.integer >= 0) gone[cast(uint) x.integer] = true;
+            {
+                ulong id;
+                if (jsonUnsigned(x, id) && id <= uint.max) gone[id.to!uint] = true;
+            }
             p.items = p.items.filter!(i => i.id !in gone).array;
         }
     // Merge the upserts as raw items, then validate the whole
@@ -1025,9 +1035,8 @@ private void applyPlanDelta(ref Plan p, JSONValue data)
         if (i.type != JSONType.object) return -1;
         auto v = "id" in i;
         if (v is null) return -1;
-        if (v.type == JSONType.integer) return v.integer;
-        if (v.type == JSONType.uinteger) return cast(long) v.uinteger;
-        return -1;
+        ulong n; // ids above long.max can't name an item: treat as absent
+        return jsonUnsigned(*v, n) && n <= long.max ? n.to!long : -1;
     }
     if (auto up = "upserts" in data)
         if (up.type == JSONType.array)
@@ -1334,12 +1343,12 @@ TidyResult tidySessions(string dir, long compressAfterDays, long retentionDays)
                 import std.file : setTimes;
                 auto gz = e.name ~ ".gz";
                 auto before = getSize(e.name);
-                auto packed = gzipLog(cast(const(char)[]) readBytes(e.name));
+                auto packed = gzipLog(readBytes(e.name));
                 // Gzip can grow a short log: keep the original then.
                 if (packed.length >= before) continue;
                 auto tmp = format("%s.tmp-%s", gz, thisProcessID);
                 scope (failure) if (tmp.exists) remove(tmp);
-                writePrivate(tmp, cast(const(ubyte)[]) packed, modeOf(e.name));
+                writePrivate(tmp, packed, modeOf(e.name));
                 // Keep the last activity time: retention and the picker
                 // measure age from it, not from compression.
                 auto mtime = timeLastModified(e.name);

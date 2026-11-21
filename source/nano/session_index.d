@@ -242,7 +242,7 @@ Summary summarize(string path)
     s.logBytes = text.length;
     try validateId(s.id);
     catch (Exception e) throw new Exception(format("session log %s has an invalid id", path));
-    auto lines = committedLines(cast(const(ubyte)[]) text);
+    auto lines = committedLines(text.representation);
     bool ok;
     if (lines.length)
     {
