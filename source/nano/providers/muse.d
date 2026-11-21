@@ -3,6 +3,8 @@
 module nano.providers.muse;
 
 @safe:
+
+import nano.arith : toSize;
 import nano.safeio : jsonText, jsonPretty;
 import nano.clock : wallNow;
 
@@ -199,10 +201,10 @@ class MuseClient : LLMClient, CapabilityProbe, KindedClient
         if (museVision(row)) c.vision = Vision.capable();
         {
             import nano.muse : contextLimit, outputLimit;
-            c.maxOutput = cast(size_t) outputLimit(row);
+            c.maxOutput = toSize(outputLimit(row));
             if (auto w = contextLimit(row))
             {
-                c.window = cast(size_t) w;
+                c.window = toSize(w);
                 c.windowSource = "Muse /muse-code/models context_limit";
             }
         }

@@ -4,6 +4,8 @@
 module nano.agent_budget_test;
 @safe:
 
+import std.string : representation;
+
 version (unittest):
 
 import std.algorithm : startsWith;
@@ -277,7 +279,7 @@ unittest
     ok.usage.inputTokens = 5_000;
     auto agent = new Agent(new MockClient([ok]), new ToolRegistry, Policy.init, "system");
     agent.capabilities.vision = Vision(1);
-    auto bytes = cast(immutable(ubyte)[]) "calib-displace-image";
+    auto bytes = "calib-displace-image".representation;
     auto img = Attachment("image/png", "x.png", sha256Hex(bytes), 1000, 1000, bytes.length, "png");
     store(agent.attachmentsDir, img, bytes);
     auto look = Message.user("look");

@@ -950,3 +950,72 @@ unittest
     assert(jsonText(v, JSONOptions.doNotEscapeSlashes) == v.toString(JSONOptions.doNotEscapeSlashes));
     assert(jsonPretty(v) == v.toPrettyString);
 }
+
+// Bytes to text. Viewing bytes as `char` skips UTF-8 validation, so bad
+// input would become a `string` that throws wherever it is next decoded.
+// These are the casts between the two; the rest of the code goes through
+// them (text to bytes is `std.string.representation`, which needs no cast).
+
+/// `b` as text, checked: throws `UTFException` at the first invalid byte.
+/// The result aliases `b`.
+inout(char)[] utf8View(return scope inout(ubyte)[] b) pure
+{
+    import std.utf : validate;
+    auto s = cast(inout(char)[]) b;
+    validate(s);
+    return s;
+}
+
+/// `b` copied into a `string`, checked like `utf8View`.
+string utf8Text(scope const(ubyte)[] b) pure
+{
+    return utf8View(b).idup;
+}
+
+/// `b` copied into a `string`, each invalid byte replaced with U+FFFD.
+string lossyText(scope const(ubyte)[] b) pure
+{
+    import std.utf : decode, UTFException;
+    import std.array : appender;
+    auto s = cast(const(char)[]) b;
+    auto o = appender!string;
+    size_t i = 0;
+    while (i < s.length)
+    {
+        if (s[i] < 0x80) { o.put(s[i]); ++i; continue; }
+        size_t j = i;
+        try { decode(s, j); o.put(s[i .. j]); i = j; }
+        catch (UTFException) { o.put("\uFFFD"); ++i; }
+    }
+    return o[];
+}
+
+/// `b` as `char`s without validation, for byte-level scanning (searching
+/// for ASCII delimiters) whose pieces are validated or treated as bytes
+/// afterwards. Never let the result escape as a `string`.
+inout(char)[] asChars(return scope inout(ubyte)[] b) pure nothrow @nogc
+{
+    return cast(inout(char)[]) b;
+}
+
+/// `s` as bytes owned by the caller: a mutable copy.
+ubyte[] bytesOf(scope const(char)[] s) pure nothrow
+{
+    import std.string : representation;
+    return s.representation.dup;
+}
+
+unittest
+{
+    import std.exception : assertThrown;
+    import std.utf : UTFException;
+    import std.string : representation;
+    assert(utf8Text("héllo".representation) == "héllo");
+    assertThrown!UTFException(utf8Text([0x61, 0xff, 0x62]));
+    assert(lossyText([0x61, 0xff, 0x62]) == "a\uFFFDb");
+    assert(lossyText("€".representation) == "€");
+    ubyte[] m = [0x68, 0x69];
+    char[] v = utf8View(m);
+    assert(v == "hi");
+    assert(bytesOf("hi") == [0x68, 0x69]);
+}

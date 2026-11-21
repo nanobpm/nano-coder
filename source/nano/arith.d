@@ -103,3 +103,44 @@ unittest
     static assert(__traits(compiles, { enum x = checkedAdd(1, 2); }));
     static assert(__traits(compiles, { enum x = checkedMul(3, 2); }));
 }
+
+/// A count or index from outside (JSON, config, a file) as a `size_t`:
+/// throws `ConvException` when it is negative (or, for `ulong` on 32-bit,
+/// too large), so bad input fails where it enters instead of wrapping to an
+/// enormous size downstream.
+size_t toSize(T)(T v) if (isIntegral!T)
+{
+    import std.conv : to;
+    return v.to!size_t;
+}
+
+/// `toSize` without throwing: `none` when `v` doesn't fit.
+auto trySize(T)(T v) nothrow @nogc if (isIntegral!T)
+{
+    import nano.option : Option, some, none;
+    static if (isSigned!T) if (v < 0) return Option!size_t(none);
+    static if (T.max > size_t.max) if (v > size_t.max) return Option!size_t(none);
+    return some(size_t(v));
+}
+
+/// A length as a `long`, for arithmetic that may go negative. Halts if it
+/// doesn't fit (a length over 2^63 is a broken invariant, not input).
+long toLong(size_t v) nothrow @nogc
+{
+    if (v > long.max) assert(0, "length overflow");
+    return long(v);
+}
+
+unittest
+{
+    import std.conv : ConvException;
+    import nano.option : orElse;
+    import std.exception : assertThrown;
+    assert(toSize(5L) == 5);
+    assert(toSize(0) == 0);
+    assertThrown!ConvException(toSize(-1L));
+    assert(trySize(7L).orElse(size_t(0)) == 7);
+    assert(trySize(-7L).isNone);
+    assert(toLong(size_t(9)) == 9);
+    static assert(!__traits(compiles, { enum x = toLong(size_t.max); }));
+}

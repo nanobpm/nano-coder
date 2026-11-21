@@ -5,8 +5,11 @@
 module nano.tools.files;
 
 @safe:
+
+import std.string : representation;
+import nano.safeio : bytesOf, utf8Text;
 import nano.safeio : jsonText, jsonPretty;
-import nano.arith : saturatingSub;
+import nano.arith : saturatingSub, toSize;
 
 import nano.safeio : ownText, readBytes, realPath, statMode, chmodPath;
 
@@ -59,7 +62,7 @@ string resolvePath(string p)
 bool looksBinary(const(ubyte)[] data) pure
 {
     import std.algorithm : canFind;
-    return data[0 .. min(data.length, 8192)].canFind(cast(ubyte) 0);
+    return data[0 .. min(data.length, 8192)].canFind(ubyte(0));
 }
 
 /// Lines as `read_file` numbers them: split on `\n`, a `\r` before it dropped,
@@ -124,8 +127,8 @@ string readFile(JSONValue args, ReadState state)
     // Record only once the read has succeeded, so a failed out-of-range read
     // can't authorize a later edit the model never saw.
     state.record(path, data);
-    auto first = cast(size_t) offset - 1;
-    auto last = min(lines.length, first + cast(size_t) limit);
+    auto first = toSize(offset - 1);
+    auto last = min(lines.length, first + toSize(limit));
     string out_;
     foreach (n; first .. last)
     {
@@ -675,9 +678,9 @@ string editFile(JSONValue args, ReadState state)
     try bytes = readBytes(path);
     catch (Exception e) throw new ToolError(format("edit_file: read %s: %s", path, e.msg));
     state.checkFresh(path, bytes, "edit_file");
-    import std.utf : validate, UTFException;
-    auto text = cast(string) bytes.idup;
-    try validate(text);
+    import std.utf : UTFException;
+    string text;
+    try text = utf8Text(bytes);
     catch (UTFException) throw new ToolError(format("edit_file: %s is not valid UTF-8", path));
     Located found;
     try found = locate(text, oldS, newS, all);
@@ -1168,7 +1171,7 @@ unittest
     auto p = tmpFile("t.txt", "on disk\n");
     st.record(p, "on disk\n");
     bool threw;
-    try writeAtomically(p, "new\n", Expect.was(cast(const(ubyte)[]) "planned-against\n"), st, "write_file");
+    try writeAtomically(p, "new\n", Expect.was("planned-against\n".representation), st, "write_file");
     catch (ToolError e) threw = e.msg.indexOf("changed while") >= 0;
     assert(threw);
     assert(readText(p) == "on disk\n" && !tempPresent(p));
@@ -1245,8 +1248,8 @@ unittest
     auto dir = buildPath(tempDir, format("nano-files-img-%s", thisProcessID));
     mkdirRecurse(dir);
     scope (exit) rmdirRecurse(dir);
-    ubyte[] gif = cast(ubyte[]) "GIF89a".dup ~ cast(ubyte[]) [40, 0, 20, 0] ~ new ubyte[16];
-    ubyte[] webp = cast(ubyte[]) "RIFF\0\0\0\0WEBPVP8X".dup ~ new ubyte[8] ~ cast(ubyte[]) [39, 0, 0, 19, 0, 0];
+    ubyte[] gif = bytesOf("GIF89a") ~ cast(ubyte[]) [40, 0, 20, 0] ~ new ubyte[16];
+    ubyte[] webp = bytesOf("RIFF\0\0\0\0WEBPVP8X") ~ new ubyte[8] ~ cast(ubyte[]) [39, 0, 0, 19, 0, 0];
     foreach (c; [tuple("a.png", fakePng(40, 20), "image/png"), tuple("a.jpg", fakeJpeg(40, 20), "image/jpeg"),
             tuple("a.gif", gif.idup, "image/gif"), tuple("a.webp", webp.idup, "image/webp"),
             tuple("misleading.txt", fakePng(8, 8), "image/png")])
