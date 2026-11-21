@@ -17,7 +17,7 @@ import std.json;
 import std.file;
 import std.path;
 import std.format : format;
-import std.string : strip, startsWith;
+import std.string : strip, startsWith, endsWith;
 static import std.string;
 import std.datetime.systime : SysTime, Clock;
 import std.algorithm : sort, any, filter, canFind;
@@ -53,6 +53,10 @@ struct Summary
     string title;
     /// Size of the log this summary was made from.
     ulong logBytes;
+    /// On-disk size of a compressed log (`<id>.jsonl.gz`) this summary was
+    /// made from, 0 for a plain log: the archive's cache fingerprint, kept
+    /// apart from the uncompressed `logBytes` append offset.
+    ulong archiveBytes;
     /// The log file (not serialized).
     string path;
 
@@ -76,6 +80,7 @@ struct Summary
         opt("context_prompt", contextPrompt);
         opt("title", title);
         f ~= ["log_bytes", logBytes.to!string];
+        if (archiveBytes) f ~= ["archive_bytes", archiveBytes.to!string];
         return f;
     }
 
@@ -120,6 +125,8 @@ struct Summary
         s.contextPrompt = opt("context_prompt");
         s.title = opt("title");
         s.logBytes = cast(ulong) j["log_bytes"].integer;
+        if (auto a = "archive_bytes" in j)
+            if (a.type == JSONType.integer && a.integer > 0) s.archiveBytes = cast(ulong) a.integer;
         return s;
     }
 }
@@ -197,16 +204,16 @@ private void foldInputsSince(string path, ulong from, ref Summary s)
 /// record that isn't a matching header of this format version.
 Summary summarize(string path)
 {
-    import nano.safeio : readBytes;
-    auto bytes = readBytes(path);
+    import nano.session : logText, logIdOf;
+    auto text = logText(path);
     Summary s;
     s.path = path;
     s.lastUsed = timeLastModified(path);
-    s.id = path.baseName.stripExtension;
-    s.logBytes = bytes.length;
+    s.id = logIdOf(path);
+    s.logBytes = text.length;
     try validateId(s.id);
     catch (Exception e) throw new Exception(format("session log %s has an invalid id", path));
-    auto lines = committedLines(bytes);
+    auto lines = committedLines(cast(const(ubyte)[]) text);
     bool ok;
     if (lines.length)
     {
@@ -243,7 +250,7 @@ private ulong sizeOr0(string path)
 
 /// Index lines parsed into `map` (latest wins, titles monotonic). Unreadable
 /// lines are skipped: the index is only a cache.
-private void mergeLines(const(ubyte)[] bytes, ref Summary[string] map, ref size_t lines)
+private void mergeLines(const(ubyte)[] bytes, ref Summary[string] map, ref size_t lines, bool strict = false)
 {
     foreach (raw; (cast(const(char)[]) bytes).split('\n'))
     {
@@ -252,7 +259,12 @@ private void mergeLines(const(ubyte)[] bytes, ref Summary[string] map, ref size_
         lines++;
         Summary s;
         try s = Summary.fromJson(line);
-        catch (Exception) continue; // skip a corrupt index line; the log rebuilds it
+        catch (Exception)
+        {
+            // Strict callers (retention) must not guess at titles a corrupt line hid.
+            if (strict) throw new Exception("session index has a corrupt line");
+            continue; // skip a corrupt index line; the log rebuilds it
+        }
         // A later line without a title must not hide one an earlier line recorded.
         if (s.title is null)
             if (auto prev = s.id in map) s.title = prev.title;
@@ -261,14 +273,21 @@ private void mergeLines(const(ubyte)[] bytes, ref Summary[string] map, ref size_
 }
 
 /// The index's summaries by id and its line count.
-private Summary[string] load(string dir, out size_t lines)
+/// `strict` (retention's title check): only a missing index reads as empty;
+/// an unreadable index or a corrupt line throws instead of hiding titles.
+private Summary[string] load(string dir, out size_t lines, bool strict = false)
 {
     import nano.safeio : readBytes;
     Summary[string] map;
     ubyte[] bytes;
-    try bytes = readBytes(indexPath(dir));
-    catch (Exception) return map; // no index yet: start empty and rebuild
-    mergeLines(bytes, map, lines);
+    if (strict && !indexPath(dir).exists) return map;
+    if (strict) bytes = readBytes(indexPath(dir));
+    else
+    {
+        try bytes = readBytes(indexPath(dir));
+        catch (Exception) return map; // no index yet: start empty and rebuild
+    }
+    mergeLines(bytes, map, lines, strict);
     return map;
 }
 
@@ -437,46 +456,103 @@ string cleanTitle(string reply) pure
     return title;
 }
 
+/// Ids of every titled session, from the strictly loaded index alone (no
+/// picker filters, no cache rewrite). Titles are only ever recorded in the
+/// index (`setTitle`) — `summarize` never populates `Summary.title` — so
+/// scanning the logs can only re-derive what the index holds, at a startup
+/// cost proportional to the whole (decompressed) history. Throws when the
+/// index is unreadable or corrupt.
+bool[string] titledIds(string dir)
+{
+    bool[string] named;
+    if (!dir.exists) return named;
+    size_t lines;
+    foreach (id, s; load(dir, lines, true)) if (s.title !is null) named[id] = true;
+    return named;
+}
+
 /// Every resumable session with at least one prompt in `dir`, newest first.
 /// Sessions the index lacks, or whose log changed since it was indexed, are
 /// summarized from their logs, and the index is updated. A missing directory
-/// is no sessions; other filesystem errors propagate.
-Summary[] list(string dir)
+/// is no sessions; other filesystem errors propagate. `strictIndex` also
+/// fails on an unreadable or corrupt index (see `load`).
+Summary[] list(string dir, bool strictIndex = false)
 {
     if (!dir.exists) return null;
     auto indexLen = sizeOr0(indexPath(dir));
     size_t lines;
-    auto index = load(dir, lines);
+    auto index = load(dir, lines, strictIndex);
     Summary[string] current;
     Summary[] updates;
+    Summary[string] skippedTitled;
     foreach (DirEntry e; dirEntries(dir, SpanMode.shallow, false))
     {
         auto name = e.name.baseName;
-        if (name.extension != ".jsonl" || name == indexFile) continue;
-        auto id = name.stripExtension;
+        immutable compressed = name.endsWith(".jsonl.gz");
+        if (!compressed && (name.extension != ".jsonl" || name == indexFile)) continue;
+        auto id = compressed ? name[0 .. $ - ".jsonl.gz".length] : name.stripExtension;
         try validateId(id);
         catch (Exception) continue; // not a session log name: skip
         if (!e.isFile) continue;
+        if (compressed && buildPath(dir, id ~ ".jsonl").exists)
+        {
+            // The plain twin wins. An archive resume may publish it after the
+            // iterator passed it: remember the title so the rewrite keeps it.
+            if (auto cached_ = id in index)
+                if (cached_.title !is null) skippedTitled[id] = *cached_;
+            continue;
+        }
         auto size = e.size;
         Summary s;
         auto cached = id in index;
-        if (cached !is null && cached.logBytes == size) s = *cached;
+        immutable hit = cached !is null && (compressed
+            ? cached.archiveBytes == size
+            : cached.archiveBytes == 0 && cached.logBytes == size);
+        if (hit) s = *cached;
         else
         {
             try s = summarize(e.name);
             catch (FileException err) throw err;
-            catch (Exception) continue; // not resumable
+            catch (Exception)
+            {
+                // Not resumable (e.g. truncated): keep a titled entry whose
+                // file still exists, or the rewrite below would drop the
+                // title and a later tidy pass could delete a named session.
+                // Zero prompts keeps it out of picker results.
+                if (cached !is null && cached.title !is null)
+                {
+                    // Zero prompts keeps it out of picker results while the
+                    // rewrite below keeps its title.
+                    current[id] = *cached;
+                    current[id].prompts = 0;
+                    index.remove(id);
+                }
+                continue;
+            }
             if (cached !is null)
             {
                 // Keep a model and title the index learned after the session started.
                 if (cached.model !is null) s.model = cached.model;
                 if (s.title is null) s.title = cached.title;
             }
+            s.archiveBytes = compressed ? size : 0;
             updates ~= s;
         }
         if (cached !is null) index.remove(id);
         s.path = e.name;
         current[id] = s;
+    }
+    // A titled archive skipped for a plain twin the listing never yielded:
+    // keep its title (zero prompts hides it) and a zero log size, which no
+    // real log has, so the next listing summarizes the plain log afresh.
+    foreach (id, k; skippedTitled)
+    {
+        if (id in current) continue;
+        k.prompts = 0;
+        k.logBytes = 0;
+        k.archiveBytes = 0;
+        current[id] = k;
+        index.remove(id);
     }
     try
     {
@@ -796,4 +872,56 @@ unittest
     auto s = list(dir)[0];
     assert(s.firstTellingPrompt == "Investigate the flaky deploy test", s.firstTellingPrompt);
     assert(titleSource(s) == "Investigate the flaky deploy test\n\nNow fix the retry logic in the deployer", titleSource(s));
+}
+
+// Round-5 review fix for issue #205: `titledIds` reads the index alone —
+// titles are only ever recorded there, so a tidy-up pass must not scan or
+// decompress logs (startup cost proportional to the whole history).
+unittest
+{
+    import nano.session : SessionLog;
+    auto dir = testDir("titled-index-only");
+    scope (exit) rmdirRecurse(dir);
+    auto titled = writeLog(dir, "titled-one", ["A prompt worth naming"]);
+    auto plain = writeLog(dir, "plain-one", ["A prompt without a name"]);
+    assert(titledIds(dir).length == 0, "no index entries yet: nothing titled");
+    list(dir); // index both logs without titles
+    setTitle(titled, "Keep me");
+    auto named = titledIds(dir);
+    assert(named.length == 1 && "titled-one" in named, "the index title is reported");
+    // A log the index has no title for is not scanned into protection, even
+    // though it sits right there in the directory.
+    assert("plain-one" !in named, "an untitled log is not scanned");
+    // A corrupt index hides titles: strict load throws so retention fails closed.
+    std.file.append(indexPath(dir), cast(const(ubyte)[]) "{not json\n");
+    import std.exception : assertThrown;
+    assertThrown(titledIds(dir), "a corrupt index must not read as 'nothing titled'");
+}
+
+// Round-8 review fix for issue #205: a titled log that can no longer be
+// summarized keeps its title across a listing's index rewrite, so a later
+// tidy pass still treats it as named — and it stays out of picker results.
+unittest
+{
+    auto dir = testDir("titled-truncated");
+    scope (exit) rmdirRecurse(dir);
+    auto path = writeLog(dir, "titled-gone", ["A prompt worth naming"]);
+    list(dir);
+    setTitle(path, "Keep me");
+    std.file.write(path, ""); // truncated: no header, not resumable
+    // The listing between truncation and retention must not drop the title.
+    auto listed = list(dir);
+    assert(!listed.any!(s => s.id == "titled-gone"), "an unresumable log is not in picker results");
+    auto named = titledIds(dir);
+    assert("titled-gone" in named, "the title survives the index rewrite");
+    // And retention therefore keeps the named log.
+    import nano.session : tidySessions;
+    import std.file : setTimes, exists;
+    import nano.clock : wallNow;
+    import core.time : days;
+    setTimes(path, wallNow - 200.days, wallNow - 200.days);
+    std.file.write(buildPath(dir, ".tidy-stamp"), "");
+    setTimes(buildPath(dir, ".tidy-stamp"), wallNow - 2.days, wallNow - 2.days);
+    auto r = tidySessions(dir, 0, 180);
+    assert(r.deleted == 0 && path.exists, "a named log is never deleted");
 }

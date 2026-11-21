@@ -553,6 +553,8 @@ bash_timeout_secs = 600
 # bash_heartbeat_secs = 60               # supervisor-visible "still running" note interval (or NANO_CODER_BASH_HEARTBEAT_SECS)
 persist_sessions = true
 # session_dir = "/path/to/sessions"    # default: <platform data dir>/nano-coder/sessions
+session_compress_after_days = 14        # gzip logs idle this long at startup (0 = never)
+# session_retention_days = 0           # delete logs untouched this long (0 = keep; named sessions are kept)
 session_titles = false                  # ask the model for a few-word title per session (--resume picker)
 # title_model = "openai/gpt-4o-mini"    # model for titles (default: the session's model)
 auto_compact = true                     # summarize automatically when the context fills up
@@ -1311,6 +1313,15 @@ Record times and each message's `timestamp` are RFC 3339 with the local UTC offs
 - Input IDs are remembered. Redelivering a completed input returns its recorded response.
   Redelivering an input whose turn was interrupted resumes that turn without duplicating
   the user message.
+- To keep the log small, a compaction records only the user requests it adds to the
+  pinned block (a `pinned_base` delta, not the whole stash), and plan changes are logged
+  as deltas with a full snapshot every 20 changes.
+- At startup, logs idle for `session_compress_after_days` (default 14) are gzipped in
+  place (`<id>.jsonl.gz`); `--resume`, the picker, `--list-sessions`, `--trajectory` and
+  the history tools read them transparently, and resuming one decompresses it back.
+  `session_retention_days` (default 0 = keep forever) deletes logs untouched that long,
+  except named sessions. The tidy-up runs at most once a day and never touches a log a
+  running session holds open.
 
 ## Herdr
 
