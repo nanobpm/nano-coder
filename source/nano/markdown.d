@@ -118,12 +118,17 @@ private struct Lines
     }
 
     /// Place one word (styled pieces, no whitespace), preceded by a space
-    /// unless it starts a line. A word wider than the line is broken.
+    /// unless it starts a line. A word wider than the line is broken,
+    /// except inline code: it starts its own row and is left whole, so the
+    /// frame breaks it at the full terminal width as one soft-wrapped row and
+    /// no alignment padding lands inside a copied path or identifier.
     void word(const Piece[] pieces, bool space) pure
     {
         size_t w;
         foreach (p; pieces) foreach (dchar c; p.text) w += charWidth(c);
         if (!w) return;
+        bool whole = w > width;
+        foreach (p; pieces) if (!(p.style & CODE)) whole = false;
         size_t gap = space && curW > 0 ? 1 : 0;
         if (curW > 0 && curW + gap + w > width)
         {
@@ -145,7 +150,7 @@ private struct Lines
             foreach (dchar c; p.text)
             {
                 auto cw = charWidth(c);
-                if (curW + cw > width && curW > 0)
+                if (!whole && curW + cw > width && curW > 0)
                 {
                     cur ~= styled(run, p.style);
                     run = null;
@@ -722,4 +727,20 @@ unittest // indented code is verbatim: the frame breaks it, the indent stays on 
     assert(rows.length == 1 && rows[0].indexOf(verbatimMark) >= 0, rows[0]);
     assert(wrapAnsi(rows[0], 6).map!dropSoftWraps.array == ["    rm", " -r /a", " b"]);
     assert(show("    short", 20) == ["    short"]);
+}
+
+unittest // inline code wider than the line stays whole for the frame to wrap
+{
+    import std.conv : to;
+    import std.algorithm : canFind;
+    // Breaking it here would put a newline (and the caller's alignment pad)
+    // inside the token, corrupting a copied path. Plain words still break.
+    foreach (c; [["`/abcdefghijklmnopqrstuv`", "/abcdefghijklmnopqrstuv"],
+                 ["see `/abcdefghijklmnopqrstuv`", "/abcdefghijklmnopqrstuv"],
+                 ["x `/abcd` `/klmnopqrstuvwx`", "/klmnopqrstuvwx"]])
+    {
+        auto rows = show(c[0], 10);
+        assert(rows.canFind!(r => r.canFind(c[1])), rows.to!string);
+    }
+    foreach (l; show("/abcdefghijklmnopqrstuv", 10)) assert(w(l) <= 10, l);
 }
