@@ -1454,7 +1454,7 @@ class Agent
         log.ifSome((SessionLog l) {
             l.replace(messages, first, last, ctx.modeName(m), client.providerName ~ "/" ~ client.modelName, pinnedNew,
                 hasPending ? &pending : null, folded, extendsStash ? some(stashBase) : Option!size_t.init, replayRestated,
-                pinnedNew.length ? some(pinnedBase) : Option!size_t.init);
+                some(pinnedBase));
         });
         // The replacement drops recalled notes' full text from context, so
         // every memory may be recalled again (except those the retained
