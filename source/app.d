@@ -1542,16 +1542,6 @@ string timersText(Agent agent)
         : agent.timers.list(agent.timerNow(), true).stripRight;
 }
 
-/// Collect garbage and return the free GC pools to the OS: after a burst
-/// of short-lived allocation (loading a session) the heap otherwise stays
-/// at its peak.
-void releaseHeap() nothrow
-{
-    import core.memory : GC;
-    GC.collect();
-    GC.minimize();
-}
-
 string planText(Agent agent) pure
 {
     return agent.plan.empty ? "No plan yet. The agent makes one with the plan_add tool."

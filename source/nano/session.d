@@ -1964,3 +1964,13 @@ unittest
     assert(p.items.length == 2 && p.items[0].status == Status.done && p.items[1].status == Status.done,
         "the snapshot plus its later deltas restore the plan");
 }
+
+/// Collect garbage and return the free GC pools to the OS: after a burst
+/// of short-lived allocation (loading a session) the heap otherwise stays
+/// at its peak.
+void releaseHeap() nothrow
+{
+    import core.memory : GC;
+    GC.collect();
+    GC.minimize();
+}
