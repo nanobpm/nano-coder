@@ -397,10 +397,11 @@ class SessionLog
         mkdirRecurse(dir);
         path = buildPath(dir, this.id ~ ".jsonl");
         if (path.exists) throw new Exception("session log " ~ path ~ " already exists");
-        f = File(path, "a");
+        f = createPrivate(path);
         // A brand-new file: only an unsupported filesystem can refuse.
         if (tryLock(f) == LockResult.contended) throw new Exception("session log " ~ path ~ " is locked");
         shareHandle(path, f);
+        scope (failure) close();
         JSONValue h = ["id": this.id, "created_at": nowStamp(), "cwd": cwd, "model": model];
         h["version"] = formatVersion;
         write_(record("session", h));
@@ -425,7 +426,7 @@ class SessionLog
             auto plain = path[0 .. $ - ".gz".length];
             auto tmp = format("%s.tmp-%s", plain, thisProcessID);
             scope (failure) if (tmp.exists) remove(tmp);
-            write_file(tmp, logText(path));
+            writePrivate(tmp, cast(const(ubyte)[]) logText(path), modeOf(path));
             rename(tmp, plain);
             remove(path);
             archive.close();
@@ -452,6 +453,7 @@ class SessionLog
             if (!sameFile(f, path)) { f.close(); throw new Exception("session log " ~ path ~ " was removed"); }
             shareHandle(path, f);
         }
+        scope (failure) close();
         auto bytes = readBytes(path);
         size_t committed = bytes.length;
         while (committed && bytes[committed - 1] != '\n') committed--;
@@ -1118,6 +1120,41 @@ private bool sameFile(ref File f, string path) @trusted
     return a.st_dev == b.st_dev && a.st_ino == b.st_ino;
 }
 
+import std.conv : octal;
+
+/// `path`'s permission bits (0600 when it cannot be read).
+private uint modeOf(string path)
+{
+    import nano.safeio : statMode;
+    uint mode;
+    return statMode(path, mode) ? mode & octal!777 : octal!600;
+}
+
+/// Write `data` to a new file `path` created with mode `mode & 0600`
+/// (never wider than owner-only, whatever the umask), failing if it exists.
+private void writePrivate(string path, const(ubyte)[] data, uint mode)
+{
+    import core.sys.posix.fcntl : O_WRONLY, O_CREAT, O_EXCL;
+    import nano.safeio : openPath, fchmodFd, writeFd, closeFd;
+    auto fd = openPath(path, O_WRONLY | O_CREAT | O_EXCL, mode & octal!600);
+    if (fd < 0) throw new Exception("cannot create " ~ path);
+    scope (exit) closeFd(fd);
+    fchmodFd(fd, mode & octal!600);
+    while (data.length)
+    {
+        auto n = writeFd(fd, data);
+        if (n <= 0) throw new Exception("cannot write " ~ path);
+        data = data[n .. $];
+    }
+}
+
+/// A new session log opened for appending, created owner-only (0600).
+private File createPrivate(string path)
+{
+    writePrivate(path, null, octal!600);
+    return File(path, "a");
+}
+
 private extern (C) int flock(int, int) nothrow @nogc;
 private enum LOCK_EX = 2, LOCK_NB = 4, LOCK_UN = 8;
 
@@ -1129,7 +1166,7 @@ private enum LOCK_EX = 2, LOCK_NB = 4, LOCK_UN = 8;
 /// unwritable entry is skipped.
 TidyResult tidySessions(string dir, long compressAfterDays, long retentionDays)
 {
-    import nano.session_index : list, indexFile;
+    import nano.session_index : titledIds, indexFile;
     TidyResult result;
     if (!dir.exists || (compressAfterDays <= 0 && retentionDays <= 0)) return result;
     auto stampPath = buildPath(dir, tidyStampFile);
@@ -1140,7 +1177,7 @@ TidyResult tidySessions(string dir, long compressAfterDays, long retentionDays)
     // Without the titles, any deletion could hit a named session: fail
     // closed and only compress this pass.
     bool mayDelete = retentionDays > 0;
-    try foreach (s; list(dir, true)) if (s.title !is null) named[s.id] = true;
+    try named = titledIds(dir);
     catch (Exception) mayDelete = false; // unknown titles: compress only, delete nothing
     foreach (DirEntry e; dirEntries(dir, SpanMode.shallow, false))
     {
@@ -1177,9 +1214,12 @@ TidyResult tidySessions(string dir, long compressAfterDays, long retentionDays)
                 import std.file : rename, setTimes;
                 auto gz = e.name ~ ".gz";
                 auto before = getSize(e.name);
+                auto packed = gzipLog(cast(const(char)[]) readBytes(e.name));
+                // Gzip can grow a short log: keep the original then.
+                if (packed.length >= before) continue;
                 auto tmp = format("%s.tmp-%s", gz, thisProcessID);
                 scope (failure) if (tmp.exists) remove(tmp);
-                std.file.write(tmp, gzipLog(cast(const(char)[]) readBytes(e.name)));
+                writePrivate(tmp, cast(const(ubyte)[]) packed, modeOf(e.name));
                 // Keep the last activity time: retention and the picker
                 // measure age from it, not from compression.
                 auto mtime = timeLastModified(e.name);
@@ -1689,4 +1729,63 @@ unittest
     setTimes(buildPath(dir, tidyStampFile), wallNow - 2.days, wallNow - 2.days);
     auto r = tidySessions(dir, 0, 180);
     assert(r.deleted == 0 && old.path.exists, "a corrupt index must not let retention delete");
+}
+
+// Review fixes for issue #205 (round 4): a titled log whose summary fails
+// (truncated) keeps title protection via the strict index; archives and
+// decompressed logs stay owner-only; gzip that grows a log keeps the
+// original; a failed construction releases the log's registration.
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, setTimes, getAttributes;
+    import core.time : days;
+    import nano.session_index : list, setTitle;
+    auto dir = buildPath(tempDir, "nano-d-tidy-r4");
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+
+    // Title protection survives a log that no longer summarizes.
+    auto t = new SessionLog(dir, "mock/m", "/w", "titled");
+    t.input("in-1", "a titled session whose log is later truncated");
+    t.close();
+    list(dir);
+    setTitle(t.path, "Keep me");
+    std.file.write(t.path, ""); // truncated: no header, not resumable
+    setTimes(t.path, wallNow - 200.days, wallNow - 200.days);
+    auto r = tidySessions(dir, 0, 180);
+    assert(r.deleted == 0 && t.path.exists, "a titled archive in the index is protected");
+    remove(t.path);
+
+    // Permissions: logs, archives and decompressed copies are owner-only.
+    auto p = new SessionLog(dir, "mock/m", "/w", "private");
+    foreach (i; 0 .. 50) p.input(format("in-%s", i), "a repetitive prompt that compresses well");
+    p.close();
+    assert((getAttributes(p.path) & octal!777) == octal!600, "a new log is 0600");
+    setTimes(p.path, wallNow - 20.days, wallNow - 20.days);
+    setTimes(buildPath(dir, tidyStampFile), wallNow - 2.days, wallNow - 2.days);
+    auto r2 = tidySessions(dir, 14, 0);
+    assert(r2.compressed == 1 && r2.freedBytes > 0 && r2.freedBytes < 1_000_000, format("%s", r2));
+    assert((getAttributes(p.path ~ ".gz") & octal!777) == octal!600, "an archive is 0600");
+    auto back = new SessionLog(p.path ~ ".gz");
+    back.close();
+    assert((getAttributes(p.path) & octal!777) == octal!600, "a decompressed log is 0600");
+
+    // Gzip that does not shrink the log keeps the original.
+    auto tiny = buildPath(dir, "tiny.jsonl");
+    std.file.write(tiny, "x\n");
+    setTimes(tiny, wallNow - 20.days, wallNow - 20.days);
+    setTimes(buildPath(dir, tidyStampFile), wallNow - 2.days, wallNow - 2.days);
+    auto r3 = tidySessions(dir, 14, 0);
+    assert(r3.compressed == 0 && r3.freedBytes == 0 && tiny.exists && !(tiny ~ ".gz").exists, format("%s", r3));
+
+    // A construction that fails after registering releases the lock.
+    auto f = new SessionLog(dir, "mock/m", "/w", "fails");
+    f.close();
+    std.file.write(f.path, "\xff\xfe not a log\n");
+    {
+        import std.exception : collectException;
+        collectException(new SessionLog(f.path).close()); // either outcome: only the registration matters
+    }
+    assert(f.path !in openHere, "no stale registration after a failed open");
 }
