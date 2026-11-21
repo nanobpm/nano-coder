@@ -38,7 +38,7 @@ import nano.plan : Plan, checklist;
 import nano.queue : MessageQueue, QueuedMessage, QueueUsage, queueParse = parse, queueApply = apply;
 import nano.mode : AgentMode, allModes, parseMode, planPromptNote, name, describe, nextMode = next;
 static import nano.herdr;
-import nano.frame : glyphMark, foldMark, expandedBody, expandedResult;
+import nano.frame : glyphMark, foldMark, expandedBody, expandedResult, dropSoftWraps;
 import core.time : MonoTime, seconds;
 import std.sumtype : match;
 import nano.trajectory : terminalSafe;
@@ -1004,6 +1004,8 @@ struct Screen
     {
         import std.algorithm : splitter;
         import std.array : replicate;
+        // Soft-wrap marks are for the frame; anything else gets plain text.
+        if (!gFrame) t = dropSoftWraps(t);
         if (!pad) { write(t); if (t.length) midLine = t[$ - 1] != '\n'; return; }
         size_t i;
         while (i < t.length)
@@ -1205,7 +1207,12 @@ class Console : AgentEvents
 
     /// A whole answer as shown on this console: markdown rendered for a
     /// color terminal, verbatim otherwise.
-    string display(string text) { return renderMarkdown ? renderMarkdownText(text, answerWidth()) : text; }
+    string display(string text)
+    {
+        if (!renderMarkdown) return text;
+        auto shown = renderMarkdownText(text, answerWidth());
+        return gFrame ? shown : dropSoftWraps(shown);
+    }
 
     string stamp() { return .stamp(color); }
 
