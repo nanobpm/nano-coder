@@ -629,3 +629,59 @@ unittest
     assert(agent.messages.length == liveLen);
     assert(agent.log.match!(l => l is live, () => false), "the live log stays");
 }
+
+// Round-8 review fix for issue #205: a failed compaction write rolls the
+// in-memory compaction back, so the next compaction's delta base counts only
+// persisted requests.
+unittest
+{
+    auto dir = freshDir("compact-rollback");
+    auto mock = new MockClient([LLMResponse("work"), LLMResponse("SUMMARY ONE"), LLMResponse("more"),
+        LLMResponse("SUMMARY TWO")]);
+    auto agent = new Agent(mock, echoTools, Policy.init, "sys");
+    agent.log = some(new SessionLog(dir, "mock/m", "/w"));
+    agent.run("first request", new NullEvents);
+    auto log = agent.log.unwrap("set by the test");
+    log.failNextWrite = true;
+    CompactReport rep;
+    import std.exception : assertThrown;
+    assertThrown(agent.compact(rep), "the failed replace propagates");
+    assert(agent.pinStash is null, "the failed compaction stashes nothing");
+    assert(agent.messages.length == 3, "the conversation is not compacted");
+    agent.run("second request", new NullEvents);
+    assert(agent.compact(rep), "the retry persists");
+    auto r = restore(log.path);
+    assert(r.pinStash.length == 2, "both requests are pinned exactly once");
+    assert(r.pinStash[0].content == "first request" && r.pinStash[1].content == "second request");
+}
+
+// Round-8 review fix for issue #205: a failed repair write on resume closes
+// the incoming log — its lock and registration do not outlive the failure —
+// while the live log stays.
+unittest
+{
+    import std.exception : assertThrown;
+    auto dir = freshDir("failed-repair-release");
+    auto agent = new Agent(new MockClient([LLMResponse("one")]), echoTools, Policy.init, "sys");
+    auto live = new SessionLog(dir, "mock/m", "/w");
+    live.append(agent.messages[0]);
+    agent.log = some(live);
+    assert(agent.run("hello", new NullEvents) == "one");
+    auto liveLen = agent.messages.length;
+
+    auto call = Message.assistant("");
+    call.toolCalls = [echoCall("c9")];
+    auto path = crashedSession(dir, [Message.user("run it"), call]);
+    auto r = restore(path);
+    auto target = new SessionLog(path);
+    target.failNextWrite = true;
+    assertThrown(agent.loadRestored(r, some(target)));
+    assert(agent.messages.length == liveLen && agent.log.match!(l => l is live, () => false),
+        "the live session is untouched");
+    assert(!target.isOpenForWrite, "the incoming log is closed on failure");
+    // The lock went with it: another writer can adopt the session at once.
+    auto r2 = restore(path);
+    auto agent2 = new Agent(new MockClient(null), echoTools, Policy.init, "sys");
+    agent2.loadRestored(r2, some(new SessionLog(path)));
+    agent2.log.unwrap("adopted").close();
+}

@@ -505,7 +505,22 @@ Summary[] list(string dir, bool strictIndex = false)
         {
             try s = summarize(e.name);
             catch (FileException err) throw err;
-            catch (Exception) continue; // not resumable
+            catch (Exception)
+            {
+                // Not resumable (e.g. truncated): keep a titled entry whose
+                // file still exists, or the rewrite below would drop the
+                // title and a later tidy pass could delete a named session.
+                // Zero prompts keeps it out of picker results.
+                if (cached !is null && cached.title !is null)
+                {
+                    // Zero prompts keeps it out of picker results while the
+                    // rewrite below keeps its title.
+                    current[id] = *cached;
+                    current[id].prompts = 0;
+                    index.remove(id);
+                }
+                continue;
+            }
             if (cached !is null)
             {
                 // Keep a model and title the index learned after the session started.
@@ -861,4 +876,32 @@ unittest
     std.file.append(indexPath(dir), cast(const(ubyte)[]) "{not json\n");
     import std.exception : assertThrown;
     assertThrown(titledIds(dir), "a corrupt index must not read as 'nothing titled'");
+}
+
+// Round-8 review fix for issue #205: a titled log that can no longer be
+// summarized keeps its title across a listing's index rewrite, so a later
+// tidy pass still treats it as named — and it stays out of picker results.
+unittest
+{
+    auto dir = testDir("titled-truncated");
+    scope (exit) rmdirRecurse(dir);
+    auto path = writeLog(dir, "titled-gone", ["A prompt worth naming"]);
+    list(dir);
+    setTitle(path, "Keep me");
+    std.file.write(path, ""); // truncated: no header, not resumable
+    // The listing between truncation and retention must not drop the title.
+    auto listed = list(dir);
+    assert(!listed.any!(s => s.id == "titled-gone"), "an unresumable log is not in picker results");
+    auto named = titledIds(dir);
+    assert("titled-gone" in named, "the title survives the index rewrite");
+    // And retention therefore keeps the named log.
+    import nano.session : tidySessions;
+    import std.file : setTimes, exists;
+    import nano.clock : wallNow;
+    import core.time : days;
+    setTimes(path, wallNow - 200.days, wallNow - 200.days);
+    std.file.write(buildPath(dir, ".tidy-stamp"), "");
+    setTimes(buildPath(dir, ".tidy-stamp"), wallNow - 2.days, wallNow - 2.days);
+    auto r = tidySessions(dir, 0, 180);
+    assert(r.deleted == 0 && path.exists, "a named log is never deleted");
 }

@@ -1909,9 +1909,32 @@ int runMain(string[] args)
     /// Load a saved session into the agent: its conversation, plan and log.
     void loadSession(string path)
     {
-        auto restored = restore(path);
-        foreach (note; agent.loadRestored(restored, o.noSession ? Option!SessionLog(none) : some(new SessionLog(path))))
-            stdErr.writeln("nano-coder: ignoring ", note);
+        // Lock the log first, then read the state the lock covers: a writer
+        // finishing a turn while the lock wait blocks would otherwise be
+        // adopted from a pre-turn snapshot and the turn re-run. A failure
+        // before adoption closes the incoming log (loadRestored rolls the
+        // live session back itself once it takes the log).
+        Option!SessionLog newLog;
+        Restored restored;
+        if (!o.noSession)
+        {
+            auto incoming = new SessionLog(path);
+            // Close on failure only until the agent adopts the log: after
+            // `loadRestored` it is the agent's live writer.
+            bool adopted;
+            scope (failure) if (!adopted) incoming.close();
+            newLog = some(incoming);
+            restored = restore(incoming.path);
+            foreach (note; agent.loadRestored(restored, newLog))
+                stdErr.writeln("nano-coder: ignoring ", note);
+            adopted = true;
+        }
+        else
+        {
+            restored = restore(path);
+            foreach (note; agent.loadRestored(restored, newLog))
+                stdErr.writeln("nano-coder: ignoring ", note);
+        }
         updateStatus((ref Stats s) { s.historySearches = s.historyReads = 0; });
         if (!agent.timers.empty)
             stdErr.writefln("%s timer%s still set (/timers lists them)", agent.timers.items.length,

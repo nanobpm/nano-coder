@@ -22,6 +22,7 @@ import std.algorithm : sort, filter, map;
 import std.array : array;
 import nano.llm;
 import nano.option : Option, some, ifSome;
+import nano.plan : Plan;
 
 /// The extension tidy-up compresses a session log to (`<id>.jsonl.gz`).
 enum string compressedExtension = ".jsonl.gz";
@@ -419,15 +420,24 @@ class SessionLog
             // tidy-up cannot delete it; publish the plain copy atomically
             // (temp file + rename) before retiring the archive, so a crash
             // never leaves a truncated `.jsonl` that would shadow it.
-            import std.file : write_file = write, rename;
             auto archive = File(path, "r");
             awaitLock(archive, path);
             if (!sameFile(archive, path)) throw new Exception("session log " ~ path ~ " was removed");
             auto plain = path[0 .. $ - ".gz".length];
+            // Never replace an existing plain log: an interrupted earlier
+            // resume may have left one that has since been resumed and locked
+            // by another writer — the archive's lock does not cover that
+            // inode, and renaming over it would orphan its live appends.
+            if (plain.exists)
+            {
+                archive.close();
+                throw new Exception("cannot resume archive " ~ path ~ ": the plain log " ~ plain
+                    ~ " already exists; remove one of the two copies first");
+            }
             auto tmp = format("%s.tmp-%s", plain, thisProcessID);
             scope (failure) if (tmp.exists) remove(tmp);
             writePrivate(tmp, cast(const(ubyte)[]) logText(path), modeOf(path));
-            rename(tmp, plain);
+            publishOver(tmp, plain); // fsync the copy, link, sync the entry, unlink
             remove(path);
             archive.close();
             path = plain;
@@ -760,6 +770,23 @@ Restored restore(string path)
     Message[] rustStash;
     // Every direct message record, with its line, for `backfillLogLines`.
     Message[] originals;
+    // Plan replay is bounded by the latest full snapshot (issue #205): deltas
+    // before it are already folded in, so applying them would redo merges the
+    // snapshot supersedes. `planAt` replays only the suffix from `planFrom`.
+    JSONValue[] planDeltas;
+    size_t planFrom;
+    JSONValue planAt(size_t from)
+    {
+        import nano.result : unwrap;
+        Plan p;
+        if (r.plan.type == JSONType.object)
+        {
+            auto restored = Plan.fromJSON(r.plan);
+            if (!restored.isErr) p = restored.unwrap("checked");
+        }
+        foreach (d; planDeltas[from .. $]) applyPlanDelta(p, d);
+        return p.toJSON;
+    }
     size_t index;
     ulong lineNo;
     foreach (line; text[0 .. committed].lineSplitter)
@@ -771,6 +798,30 @@ Restored restore(string path)
         catch (Exception e) throw new Exception(format("decode record %s of %s: %s", index + 1, path, e.msg));
         auto type = rec["type"].str;
         auto data = "data" in rec ? rec["data"] : JSONValue(null);
+        // The session header must still be first: plan records are consumed
+        // below, but never before the header validates the log.
+        if (!index && type != "session")
+            throw new Exception("session log " ~ path ~ " does not start with a session header");
+        if (type == "plan")
+        {
+            // A snapshot supersedes every earlier delta: replay restarts here.
+            planFrom = planDeltas.length;
+            r.plan = data["plan"];
+            index++;
+            continue;
+        }
+        if (type == "plan_delta")
+        {
+            planDeltas ~= data;
+            index++;
+            continue;
+        }
+        // Any other record sees the plan as of the records before it.
+        if (planDeltas.length > planFrom)
+        {
+            r.plan = planAt(planFrom);
+            planFrom = planDeltas.length;
+        }
         if (type == "session")
         {
             if (index) throw new Exception(format("session record must be first (found at record %s)", index + 1));
@@ -925,81 +976,6 @@ Restored restore(string path)
             r.plan = data["plan"];
             break;
         case "plan_delta":
-            // A plan change against the plan so far (issue #205): keep the
-            // first `base` items, apply the goal change, drop removed ids and
-            // upsert the rest. A base past the plan's length (a hand-edited
-            // or torn log) restarts the plan from the delta's items.
-            {
-                import nano.plan : Plan, PlanItem;
-                import nano.result : unwrap;
-                import std.algorithm : countUntil;
-                auto base = "base" in data;
-                auto b = base !is null && base.type == JSONType.integer && base.integer >= 0
-                    ? cast(size_t) base.integer : size_t.max;
-                Plan p;
-                if (r.plan.type == JSONType.object)
-                {
-                    auto restored = Plan.fromJSON(r.plan);
-                    if (!restored.isErr) p = restored.unwrap("checked");
-                }
-                if (b > p.items.length) p = Plan.init;
-                else if (b < p.items.length) p.items = p.items[0 .. b];
-                if (auto g = "goal" in data)
-                    if (g.type == JSONType.string) p.goal = g.str;
-                if (auto dr = "drop" in data)
-                    if (dr.type == JSONType.array)
-                    {
-                        bool[uint] gone;
-                        foreach (x; dr.arrayNoRef)
-                            if (x.type == JSONType.integer && x.integer >= 0) gone[cast(uint) x.integer] = true;
-                        p.items = p.items.filter!(i => i.id !in gone).array;
-                    }
-                // Merge the upserts as raw items, then validate the whole
-                // plan: an item's `after` may name an item restored earlier.
-                auto items = p.toJSON["items"].arrayNoRef.dup;
-                static long idOf(const JSONValue i)
-                {
-                    if (i.type != JSONType.object) return -1;
-                    auto v = "id" in i;
-                    if (v is null) return -1;
-                    if (v.type == JSONType.integer) return v.integer;
-                    if (v.type == JSONType.uinteger) return cast(long) v.uinteger;
-                    return -1;
-                }
-                if (auto up = "upserts" in data)
-                    if (up.type == JSONType.array)
-                        foreach (x; up.arrayNoRef)
-                        {
-                            if (x.type != JSONType.object) continue;
-                            JSONValue[string] fields;
-                            foreach (k, v; x.objectNoRef) if (k != "after") fields[k] = v;
-                            auto shape = JSONValue(fields);
-                            auto parsed = Plan.fromJSON(JSONValue(["items": JSONValue([shape])]));
-                            if (parsed.isErr) continue;
-                            auto itemId = parsed.unwrap("checked").items[0].id;
-                            auto at = items.countUntil!(i => idOf(i) == itemId);
-                            if (at >= 0) items[at] = x;
-                            else items ~= x;
-                        }
-                auto merged = Plan.fromJSON(JSONValue(["goal": JSONValue(p.goal), "items": JSONValue(items)]));
-                if (merged.isErr)
-                {
-                    // Drop dependencies on unknown items rather than the plan.
-                    bool[long] known;
-                    foreach (i; items) known[idOf(i)] = true;
-                    foreach (ref i; items)
-                    {
-                        auto a = "after" in i;
-                        if (a is null) continue;
-                        if (a.type == JSONType.array)
-                            i["after"] = JSONValue(a.arrayNoRef.filter!(d => idOf(JSONValue(["id": d])) in known).array);
-                        else i["after"] = JSONValue(JSONValue[].init);
-                    }
-                    merged = Plan.fromJSON(JSONValue(["goal": JSONValue(p.goal), "items": JSONValue(items)]));
-                }
-                if (!merged.isErr) p = merged.unwrap("checked");
-                r.plan = p.toJSON;
-            }
             break;
         case "timers":
             r.timers = data["timers"];
@@ -1012,7 +988,79 @@ Restored restore(string path)
         }
         index++;
     }
+    // Apply the deltas after the latest full snapshot, if any remain.
+    if (planDeltas.length > planFrom) r.plan = planAt(planFrom);
     return r;
+}
+
+/// Apply one `plan_delta` record to `p` (issue #205): keep the first `base`
+/// items, apply the goal change, drop removed ids and upsert the rest. A base
+/// past the plan's length (a hand-edited or torn log) restarts the plan from
+/// the delta's items.
+private void applyPlanDelta(ref Plan p, JSONValue data)
+{
+    import nano.plan : PlanItem;
+    import nano.result : unwrap;
+    import std.algorithm : countUntil;
+    auto base = "base" in data;
+    auto b = base !is null && base.type == JSONType.integer && base.integer >= 0
+        ? cast(size_t) base.integer : size_t.max;
+    if (b > p.items.length) p = Plan.init;
+    else if (b < p.items.length) p.items = p.items[0 .. b];
+    if (auto g = "goal" in data)
+        if (g.type == JSONType.string) p.goal = g.str;
+    if (auto dr = "drop" in data)
+        if (dr.type == JSONType.array)
+        {
+            bool[uint] gone;
+            foreach (x; dr.arrayNoRef)
+                if (x.type == JSONType.integer && x.integer >= 0) gone[cast(uint) x.integer] = true;
+            p.items = p.items.filter!(i => i.id !in gone).array;
+        }
+    // Merge the upserts as raw items, then validate the whole
+    // plan: an item's `after` may name an item restored earlier.
+    auto items = p.toJSON["items"].arrayNoRef.dup;
+    static long idOf(const JSONValue i)
+    {
+        if (i.type != JSONType.object) return -1;
+        auto v = "id" in i;
+        if (v is null) return -1;
+        if (v.type == JSONType.integer) return v.integer;
+        if (v.type == JSONType.uinteger) return cast(long) v.uinteger;
+        return -1;
+    }
+    if (auto up = "upserts" in data)
+        if (up.type == JSONType.array)
+            foreach (x; up.arrayNoRef)
+            {
+                if (x.type != JSONType.object) continue;
+                JSONValue[string] fields;
+                foreach (k, v; x.objectNoRef) if (k != "after") fields[k] = v;
+                auto shape = JSONValue(fields);
+                auto parsed = Plan.fromJSON(JSONValue(["items": JSONValue([shape])]));
+                if (parsed.isErr) continue;
+                auto itemId = parsed.unwrap("checked").items[0].id;
+                auto at = items.countUntil!(i => idOf(i) == itemId);
+                if (at >= 0) items[at] = x;
+                else items ~= x;
+            }
+    auto merged = Plan.fromJSON(JSONValue(["goal": JSONValue(p.goal), "items": JSONValue(items)]));
+    if (merged.isErr)
+    {
+        // Drop dependencies on unknown items rather than the plan.
+        bool[long] known;
+        foreach (i; items) known[idOf(i)] = true;
+        foreach (ref i; items)
+        {
+            auto a = "after" in i;
+            if (a is null) continue;
+            if (a.type == JSONType.array)
+                i["after"] = JSONValue(a.arrayNoRef.filter!(d => idOf(JSONValue(["id": d])) in known).array);
+            else i["after"] = JSONValue(JSONValue[].init);
+        }
+        merged = Plan.fromJSON(JSONValue(["goal": JSONValue(p.goal), "items": JSONValue(items)]));
+    }
+    if (!merged.isErr) p = merged.unwrap("checked");
 }
 
 import std.datetime.systime : SysTime;
@@ -1158,6 +1206,39 @@ private File createPrivate(string path)
     return File(path, "a");
 }
 
+/// fsync `path`'s parent directory, so a created or removed directory entry
+/// survives a power loss. Best-effort on filesystems that refuse (EINVAL).
+private void syncDirOf(string path) @trusted
+{
+    import core.sys.posix.fcntl : O_RDONLY, O_DIRECTORY;
+    import nano.safeio : openPath, fsyncFd, closeFd;
+    auto fd = openPath(path.dirName, O_RDONLY | O_DIRECTORY);
+    if (fd < 0) return;
+    scope (exit) closeFd(fd);
+    fsyncFd(fd);
+}
+
+/// Publish the fully written temp file `tmp` as `dest` durably: fsync the
+/// data, link the name over any existing destination, sync the directory
+/// entry, then unlink the temp name. A crash anywhere leaves either the old
+/// or the new file whole at `dest` (never a truncated one), and a failure
+/// before the link leaves the original intact. The caller deletes the
+/// replaced original (when there is one) only after this returns.
+private void publishOver(string tmp, string dest) @trusted
+{
+    import core.sys.posix.fcntl : O_RDONLY;
+    import core.sys.posix.unistd : link, unlink;
+    import nano.safeio : openPath, fsyncFd, closeFd;
+    import std.string : toStringz;
+    auto fd = openPath(tmp, O_RDONLY);
+    if (fd < 0) throw new Exception("cannot open " ~ tmp);
+    scope (exit) closeFd(fd);
+    if (fsyncFd(fd) != 0) throw new Exception("cannot sync " ~ tmp);
+    if (link(tmp.toStringz, dest.toStringz) != 0) throw new Exception("cannot publish " ~ dest);
+    syncDirOf(dest);
+    unlink(tmp.toStringz);
+}
+
 private extern (C) int flock(int, int) nothrow @nogc;
 private enum LOCK_EX = 2, LOCK_NB = 4, LOCK_UN = 8;
 
@@ -1214,7 +1295,7 @@ TidyResult tidySessions(string dir, long compressAfterDays, long retentionDays)
             }
             else if (!compressed && compressAfterDays > 0 && age >= dur!"days"(compressAfterDays))
             {
-                import std.file : rename, setTimes;
+                import std.file : setTimes;
                 auto gz = e.name ~ ".gz";
                 auto before = getSize(e.name);
                 auto packed = gzipLog(cast(const(char)[]) readBytes(e.name));
@@ -1227,7 +1308,9 @@ TidyResult tidySessions(string dir, long compressAfterDays, long retentionDays)
                 // measure age from it, not from compression.
                 auto mtime = timeLastModified(e.name);
                 setTimes(tmp, mtime, mtime);
-                rename(tmp, gz);
+                // Sync the archive and its directory entry before unlinking
+                // the original: a power loss must not lose both.
+                publishOver(tmp, gz);
                 remove(e.name);
                 result.freedBytes += before - getSize(gz);
                 ++result.compressed;
@@ -1791,4 +1874,48 @@ unittest
         collectException(new SessionLog(f.path).close()); // either outcome: only the registration matters
     }
     assert(f.path !in openHere, "no stale registration after a failed open");
+}
+
+// Review fixes for issue #205 (round 8): an archive resume never replaces an
+// existing plain log, and a plan replay applies only the deltas after the
+// latest full snapshot.
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse;
+    import std.path : buildPath;
+    import std.exception : assertThrown;
+    import nano.plan : Plan;
+    import nano.result : unwrap;
+    auto dir = buildPath(tempDir, "nano-d-r8-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+
+    // Both names present: the archive resume refuses and leaves both intact.
+    auto a = new SessionLog(dir, "mock/m", "/w", "both");
+    a.input("in-1", "archived prompt");
+    a.close();
+    auto gz = a.path ~ ".gz";
+    std.file.write(gz, gzipLog(readText(a.path)));
+    std.file.write(a.path, "plain twin\n");
+    import std.exception : collectException;
+    auto ex = collectException!Exception(new SessionLog(gz));
+    assert(ex !is null && ex.msg.canFind("already exists"), ex !is null ? ex.msg : "no throw");
+    assert(readText(a.path) == "plain twin\n" && gz.exists, "both copies survive");
+    remove(a.path);
+    // Without the twin the archive resumes as before.
+    auto back = new SessionLog(gz);
+    back.close();
+    assert(back.path == a.path && a.path.exists && !gz.exists);
+
+    // Plan replay: deltas before the latest snapshot are already folded in.
+    auto log = new SessionLog(dir, "mock/m", "/w", "planreplay");
+    log.plan(parseJSON(`{"items":[{"id":1,"title":"first","status":"pending"}]}`));
+    log.planDelta(JSONValue(null), [parseJSON(`{"id":1,"title":"first","status":"done"}`)], [], 1);
+    log.plan(parseJSON(`{"items":[{"id":1,"title":"first","status":"done"},{"id":2,"title":"second","status":"pending"}]}`));
+    log.planDelta(JSONValue(null), [parseJSON(`{"id":2,"title":"second","status":"done"}`)], [], 2);
+    log.close();
+    auto p = Plan.fromJSON(restore(log.path).plan).unwrap("a valid plan");
+    import nano.plan : Status;
+    assert(p.items.length == 2 && p.items[0].status == Status.done && p.items[1].status == Status.done,
+        "the snapshot plus its later deltas restore the plan");
 }
