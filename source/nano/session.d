@@ -392,8 +392,13 @@ class SessionLog
 
     /// The conversation was replaced wholesale (e.g. `/clear` keeps only the system prompt).
     /// Compaction also records the folded log-line range, its mode and model.
-    /// `pinStash`: the user requests folded by compactions so far (resume
-    /// rebuilds the pinned block from them).
+    /// `pinStash`: the user requests this compaction adds to the pinned block
+    /// (resume rebuilds the block from them). `pinnedBase` is how many requests
+    /// earlier compactions already stashed: the new requests extend that prefix
+    /// rather than restating it, so a session's log holds each request once
+    /// (issue #205 — a full restatement per compaction is quadratic). A plain
+    /// replacement passes the whole stash with no base (the full form, which a
+    /// resume still reads).
     /// `pending`: an in-flight input that survives the replacement (a
     /// mid-turn compaction), with its continuation snapshot.
     /// `folded`: the real turns this compaction folded, extending the first
@@ -401,7 +406,8 @@ class SessionLog
     /// the index of the restated in-flight input in `messages`.
     void replace(const Message[] messages, ulong first = 0, ulong last = 0, string mode = null, string model = null,
         const Message[] pinStash = null, scope const(PendingInput)* pending = null, const Message[] folded = null,
-        Option!size_t foldedBase = Option!size_t.init, Option!size_t restated = Option!size_t.init)
+        Option!size_t foldedBase = Option!size_t.init, Option!size_t restated = Option!size_t.init,
+        Option!size_t pinnedBase = Option!size_t.init)
     {
         JSONValue[] ms;
         foreach (ref m; messages) ms ~= messageRecord(m);
@@ -412,6 +418,7 @@ class SessionLog
             JSONValue[] ps;
             foreach (ref m; pinStash) ps ~= messageRecord(m);
             d["pinned_requests"] = ps;
+            pinnedBase.ifSome((size_t b) { d["pinned_base"] = b; });
         }
         if (pending !is null)
         {
@@ -696,8 +703,17 @@ Restored restore(string path)
                 r.replayRestated = Option!size_t.init;
                 if (auto at = "restated" in data)
                     if (active && at.type == JSONType.integer && at.integer >= 0) r.replayRestated = some(cast(size_t) at.integer);
-                auto pins = "pinned_requests" in data;
-                r.pinStash = pins !is null ? decode(*pins, inputs) : rustStash.dup;
+                // The pinned block: a full `pinned_requests` restatement, or a
+                // delta extending the first `pinned_base` of the stash so far
+                // (issue #205). With neither, a Rust log's folded stash is it.
+                auto pins = "pinned_requests" in data, pinBase = "pinned_base" in data;
+                if (pins !is null && pinBase !is null && pinBase.type == JSONType.integer)
+                {
+                    auto b = cast(size_t) pinBase.integer;
+                    auto kept = b < r.pinStash.length ? r.pinStash[0 .. b] : r.pinStash;
+                    r.pinStash = kept ~ decode(*pins, inputs);
+                }
+                else r.pinStash = pins !is null ? decode(*pins, inputs) : rustStash.dup;
             }
             {
                 auto mode = "mode" in data;

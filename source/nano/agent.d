@@ -1391,8 +1391,13 @@ class Agent
         if (compactionPinRequests)
             if (auto pinned = ctx.pinnedUserRequests(pinStash, summarized, smart, window))
                 summary ~= "\n\n" ~ pinned;
+        // The requests this compaction adds to the pinned block (the stash so
+        // far is their base): the log records only these, so a session holds
+        // each request once instead of restating the whole stash (issue #205).
+        immutable pinnedBase = pinStash.length;
+        Message[] pinnedNew;
         foreach (ref x; summarized)
-            if (ctx.isUserRequest(x)) pinStash ~= x;
+            if (ctx.isUserRequest(x)) { pinStash ~= x; pinnedNew ~= x; }
 
         // The newly folded real turns for the replay stash. On a repeated
         // compaction the first folded message is the previous summary, whose
@@ -1447,8 +1452,9 @@ class Agent
             pending.base = messages.length;
         }
         log.ifSome((SessionLog l) {
-            l.replace(messages, first, last, ctx.modeName(m), client.providerName ~ "/" ~ client.modelName, pinStash,
-                hasPending ? &pending : null, folded, extendsStash ? some(stashBase) : Option!size_t.init, replayRestated);
+            l.replace(messages, first, last, ctx.modeName(m), client.providerName ~ "/" ~ client.modelName, pinnedNew,
+                hasPending ? &pending : null, folded, extendsStash ? some(stashBase) : Option!size_t.init, replayRestated,
+                pinnedNew.length ? some(pinnedBase) : Option!size_t.init);
         });
         // The replacement drops recalled notes' full text from context, so
         // every memory may be recalled again (except those the retained
