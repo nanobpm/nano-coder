@@ -180,6 +180,9 @@ private struct Reporter
     bool hasLastModel;
     /// Whether a timer is set, when that changed since the last report.
     bool hasPendingTimer, pendingTimer, lastTimer;
+    /// Whether `lastTimer` holds a reported state, so a first `false` is
+    /// still sent (clearing an icon a previous process left behind).
+    bool hasLastTimer;
     /// Set by `release`; no metadata is sent afterwards.
     bool released;
     /// A metadata send is running in the worker; `release` waits for it so
@@ -219,7 +222,7 @@ private ulong beginRelease(ref Reporter r, out bool shown, out bool timerShown)
     timerShown = r.lastTimer || r.hasPendingTimer || r.modelInFlight;
     r.hasPending = r.hasPendingModel = r.hasPendingTimer = false;
     r.lastModel = null;
-    r.hasLastModel = false;
+    r.hasLastModel = r.hasLastTimer = false;
     r.lastTimer = false;
     return nextSeq(r);
 }
@@ -230,9 +233,20 @@ private ulong beginRelease(ref Reporter r, out bool shown, out bool timerShown)
 private void endRelease(ref Reporter r)
 {
     r.released = false;
-    r.hasLast = r.hasLastSession = r.hasLastModel = false;
+    r.hasLast = r.hasLastSession = r.hasLastModel = r.hasLastTimer = false;
     r.lastModel = null;
     r.lastTimer = false;
+}
+
+/// Queue the timer state `on` unless released or a repeat of the last one.
+/// The first state is always sent, even `false`.
+private void queueTimer(ref Reporter r, bool on)
+{
+    if (r.released || (r.hasLastTimer && on == r.lastTimer)) return;
+    r.hasLastTimer = true;
+    r.lastTimer = on;
+    r.pendingTimer = on;
+    r.hasPendingTimer = true;
 }
 
 /// Queue `name` for display unless released or a repeat of the last one.
@@ -337,12 +351,7 @@ private ulong beginRelease(ref Reporter r, out bool shown)
 void showTimer(bool on)
 {
     if (!active) return;
-    atomicLoad(gReporter).update((ref Reporter r) {
-        if (r.released || on == r.lastTimer) return;
-        r.lastTimer = on;
-        r.pendingTimer = on;
-        r.hasPendingTimer = true;
-    });
+    atomicLoad(gReporter).update((ref Reporter r) { queueTimer(r, on); });
 }
 
 /// Release the pane on exit. Runs in the foreground (bounded by a timeout)
@@ -602,6 +611,31 @@ unittest // the timer token shows the icon while a timer is set and is cleared o
     assert(timerArgs("p1", true) == ["pane", "report-metadata", "p1", "--source", "nano-coder", "--agent", "nano-coder",
         "--token", "timer=⏰"]);
     assert(timerArgs("p1", false)[$ - 2 .. $] == ["--clear-token", "timer"]);
+}
+
+unittest // the first timer state is sent even when false; repeats are skipped
+{
+    Reporter r;
+    queueTimer(r, false);
+    assert(r.hasPendingTimer && !r.pendingTimer);
+    r.hasPendingTimer = false;
+    queueTimer(r, false);
+    assert(!r.hasPendingTimer);
+    queueTimer(r, true);
+    assert(r.hasPendingTimer && r.pendingTimer);
+}
+
+unittest // after release and reacquire, the first timer state is sent again
+{
+    Reporter r;
+    queueTimer(r, false);
+    bool shown, timerShown;
+    beginRelease(r, shown, timerShown);
+    queueTimer(r, false);
+    assert(!r.hasPendingTimer);           // released: nothing queued
+    endRelease(r);
+    queueTimer(r, false);
+    assert(r.hasPendingTimer && !r.pendingTimer);
 }
 
 unittest // release clears a shown timer, and nothing is taken after it
