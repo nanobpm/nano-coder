@@ -2351,6 +2351,7 @@ int runMain(string[] args)
                 else nano.herdr.report(nano.herdr.State.idle);
             }
             else nano.herdr.report(nano.herdr.State.idle);
+            nano.herdr.showModel(agent.client.modelName);
             // The prompt's stamp is redrawn with the submission time (Rust's restamp).
             ed.restyle = () => console.stamp() ~ console.bold("› ");
             // While the Ctrl-C exit hint is armed, end the read when the window
@@ -2531,6 +2532,7 @@ int runMain(string[] args)
                     leaveKeyMode();
                     nano.herdr.release();
                     auto err = execProgram(exe, [exe] ~ relaunchArgv(args[1 .. $], id));
+                    nano.herdr.reacquire();
                     enterKeyMode(0);
                     if (gFrame) gFrame.resume();
                     writefln("Relaunch failed: could not exec %s: %s", exe, err);
