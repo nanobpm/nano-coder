@@ -440,7 +440,7 @@ struct Config
     bool instructionImportsOutsideProject;
     double autoCompactThreshold = 0.8;
     /// `standard` or `smart` (summary cites the session log; history tools).
-    string compactionMode = "standard";
+    string compactionMode = "smart";
     /// Pin the user's requests verbatim after each compaction summary.
     bool compactionPinRequests = true;
     /// Compact at the idle prompt, once quiet for the hold (Rust #186).
@@ -697,6 +697,8 @@ unittest
     auto r = resolve(c, c.model);
     assert(r.name == "box" && r.model == "m1" && r.apiKey == "k" && r.config.baseUrl == "http://x/v1");
     assert(isNaN(c.temperature));
+    assert(c.compactionMode == "smart", "smart compaction is the default");
+    assert(Config.init.compactionMode == "smart");
     auto a = resolve(c, "anthropic");
     assert(a.model == "c9" && a.config.baseUrl == "https://api.anthropic.com/v1");
 }
