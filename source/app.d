@@ -1613,7 +1613,8 @@ void replayTranscript(Agent agent, Console console)
         {
             // Model-only reminders (hook context, output-limit continuations,
             // timer firings and nudges) were never typed by the user.
-            if (m.hookContext || m.continuation || m.timer) break;
+            // Stop-hook reminders and idle-timer turns are autoInitiated.
+            if (m.hookContext || m.continuation || m.timer || m.autoInitiated) break;
             // Hook context appended to the prompt was never shown live.
             auto typed = m.pinText.length ? m.pinText : m.content;
             if (typed.strip.length)
@@ -1623,7 +1624,9 @@ void replayTranscript(Agent agent, Console console)
         case Role.assistant:
             // Escape literal markers before rendering, keeping the renderer's
             // own soft-wrap / verbatim markers.
-            if (m.content.strip.length) writeln(stampBlock(console.stamp(), console.display(escapeMarks(sanitizeBlock(m.content))).stripRight));
+            // Quiet mode shows only final answers live (no tool calls);
+            // an output-limit cut-off has no tool calls, so it stays.
+            if (m.content.strip.length && !(console.quiet && m.toolCalls.length)) writeln(stampBlock(console.stamp(), console.display(escapeMarks(sanitizeBlock(m.content))).stripRight));
             foreach (j, ref c; m.toolCalls) pending ~= [i, j];
             break;
         case Role.tool:
@@ -1642,7 +1645,7 @@ void replayTranscript(Agent agent, Console console)
         }
     }
     flushPending();
-    if (!agent.plan.empty) writeln(escapeMarks(sanitizeBlock(planText(agent))));
+    if (!agent.plan.empty && !console.quiet) writeln(escapeMarks(sanitizeBlock(planText(agent))));
     // toolStart/toolEnd drive the live status; the replay leaves it idle.
     updateStatus((ref Stats s) { s.activity = Activity.idle; s.tool = null; s.tokensPerSec = 0;
         s.historySearches = s.historyReads = 0; });
