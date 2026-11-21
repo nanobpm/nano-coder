@@ -6,10 +6,12 @@ Releases are cut automatically from `main` by
 ## Commit messages
 
 The repository only allows squash merges, and the PR title becomes the commit subject on
-`main`. PR titles and every commit in a PR must follow
+`main`. PR titles must follow
 [Conventional Commits](https://www.conventionalcommits.org/): the `Commit messages` check runs
 [commitlint](https://commitlint.js.org/) (`commitlint.config.mjs`, the conventional preset) on
-both. Subjects start lowercase (`feat: add ...`, not `feat: Add ...`).
+the title. Intermediate commits in a
+PR never reach `main` and are not linted in CI (the optional local hook still checks them).
+Subjects start lowercase (`feat: add ...`, not `feat: Add ...`).
 
 To check messages as you commit (needs Node), and run `scripts/ci.sh quick` before each
 push, enable the hooks once per clone:
