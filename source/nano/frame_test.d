@@ -280,3 +280,112 @@ unittest
     auto lines = checklist(plan, 30, true).lineSplitter.array;
     assert(strip(lines[0]).canFind("1/2 done") && lines.length >= 3, lines[0]);
 }
+
+/// A wide glyph one cell short of the edge wraps natively; no pad space is
+/// emitted into the copied text. A separator the wrap consumed rides the
+/// continuation row as a zero-cell mark and is emitted as a space, so copied
+/// words stay apart.
+unittest
+{
+    string outp;
+    auto r = new FrameRenderer((string s) { outp ~= s; });
+    r.render(["rm -r /ab", softWrapMark ~ "中/x"], 10, 5);
+    assert(!outp.canFind("/ab 中"), outp);
+    assert(outp.canFind("/ab中"), outp);
+    auto emu = Emu(5, 10);
+    emu.render(["rm -r /ab", softWrapMark ~ "中/x"]);
+    assert(emu.screen()[$ - 2 .. $] == ["rm -r /ab", "中/x"], (){ import std.conv : to; return emu.screen().to!string; }());
+
+    outp = null;
+    auto s = new FrameRenderer((string s) { outp ~= s; });
+    s.render(["cmd", softWrapMark ~ sepWrapMark ~ "中"], 4, 5);
+    assert(outp.canFind("cmd 中"), outp);
+    auto emu2 = Emu(5, 5);
+    emu2.render(["cmdx", softWrapMark ~ sepWrapMark ~ "中"]);
+    assert(emu2.screen()[$ - 2 .. $] == ["cmdx", "中"], (){ import std.conv : to; return emu2.screen().to!string; }());
+}
+
+/// A soft wrap that becomes a hard newline rewrites the row above, so its
+/// terminal wrap flag is cleared.
+unittest
+{
+    string outp;
+    auto r = new FrameRenderer((string s) { outp ~= s; });
+    r.render(["abcd", softWrapMark ~ "ef", "s"], 4, 5);
+    outp = null;
+    r.render(["abcd", "ef", "s"], 4, 5);
+    assert(outp.canFind("abcd"), outp);
+    assert(outp.canFind("abcd\r\n"), outp);
+}
+
+/// A join at the top of the screen that changes redraws everything: the row
+/// above is scrollback and its wrap flag can't be rewritten in place.
+unittest
+{
+    import std.algorithm : canFind;
+    foreach (pair; [[["abcd", softWrapMark ~ "ef", "s"], ["abcd", "ef", "s"]],
+                    [["abcd", "ef", "s"], ["abcd", softWrapMark ~ "ef", "s"]]])
+    {
+        string outp;
+        auto r = new FrameRenderer((string s) { outp ~= s; });
+        r.render(pair[0], 4, 2);
+        outp = null;
+        r.render(pair[1], 4, 2);
+        assert(outp.canFind("\x1b[3J"), outp);
+    }
+    // An unchanged join at the top stays a bounded rewrite.
+    string outp;
+    auto r = new FrameRenderer((string s) { outp ~= s; });
+    r.render(["abcd", softWrapMark ~ "ef", "s"], 4, 2);
+    outp = null;
+    r.render(["abcd", softWrapMark ~ "eg", "s"], 4, 2);
+    assert(!outp.canFind("\x1b[3J"), outp);
+}
+
+unittest // an editor that shrinks while partly in scrollback keeps the scrollback
+{
+    string screen;
+    auto r = new FrameRenderer((string s) { screen ~= s; });
+    // Two transcript rows, a six-row editor and a status row on four rows.
+    r.render(["t0", "t1", "e0", "e1", "e2", "e3", "e4", "e5", "st"], 10, 4, 2);
+    screen = null;
+    r.render(["t0", "t1", "e0", "st"], 10, 4, 2);
+    assert(!screen.canFind("\x1b[3J") && !screen.canFind("\x1b[2J"), strip(screen));
+    screen = null;
+    r.render(["t0", "t1", "e0", "st"], 10, 4, 2);
+    assert(!screen.canFind("\x1b[3J"), strip(screen));
+}
+
+unittest // a shrinking soft-wrapped draft opens its gap past the wrap, stably
+{
+    string screen;
+    auto r = new FrameRenderer((string s) { screen ~= s; });
+    r.render(["t0", "a1", softWrapMark ~ "a2", softWrapMark ~ "a3", softWrapMark ~ "a4", "b", "c", "st"], 10, 4);
+    screen = null;
+    r.render(["t0", "a1", softWrapMark ~ "a2", softWrapMark ~ "a3", softWrapMark ~ "a4", "st"], 10, 4);
+    assert(!screen.canFind("\x1b[3J"), strip(screen));
+    screen = null;
+    r.render(["t0", "a1", softWrapMark ~ "a2", softWrapMark ~ "a3", softWrapMark ~ "a4", "st"], 10, 4);
+    assert(!screen.canFind("\x1b[3J"), strip(screen));
+}
+
+unittest // output after a scrolled-off editor shrank fills the gap, keeping scrollback
+{
+    string screen;
+    auto r = new FrameRenderer((string s) { screen ~= s; });
+    r.render(["t0", "t1", "e0", "e1", "e2", "e3", "e4", "e5", "st"], 10, 4, 2);
+    r.render(["t0", "t1", "e0", "st"], 10, 4, 2);
+    screen = null;
+    r.render(["t0", "t1", "new output", "e0", "st"], 10, 4, 3);
+    assert(!screen.canFind("\x1b[3J") && !screen.canFind("\x1b[2J"), strip(screen));
+    assert(screen.canFind("new output"), strip(screen));
+    screen = null;
+    r.render(["t0", "t1", "new output", "more", "e0", "st"], 10, 4, 4);
+    assert(!screen.canFind("\x1b[3J"), strip(screen));
+    assert(screen.canFind("more"), strip(screen));
+    // A change inside the frozen transcript still redraws everything.
+    screen = null;
+    r.render(["t0", "T1", "new output", "more", "e0", "st"], 10, 4, 4);
+    assert(screen.canFind("\x1b[3J"), strip(screen));
+    assert(!screen.canFind("e5"), strip(screen));
+}

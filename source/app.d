@@ -38,7 +38,7 @@ import nano.plan : Plan, checklist;
 import nano.queue : MessageQueue, QueuedMessage, QueueUsage, queueParse = parse, queueApply = apply;
 import nano.mode : AgentMode, allModes, parseMode, planPromptNote, name, describe, nextMode = next;
 static import nano.herdr;
-import nano.frame : glyphMark, foldMark, expandedBody, expandedResult;
+import nano.frame : glyphMark, foldMark, expandedBody, expandedResult, dropSoftWraps, escapeMarks;
 import core.time : MonoTime, seconds;
 import std.sumtype : match;
 import nano.trajectory : terminalSafe;
@@ -1004,6 +1004,8 @@ struct Screen
     {
         import std.algorithm : splitter;
         import std.array : replicate;
+        // Soft-wrap marks are for the frame; anything else gets plain text.
+        if (!gFrame) t = dropSoftWraps(t);
         if (!pad) { write(t); if (t.length) midLine = t[$ - 1] != '\n'; return; }
         size_t i;
         while (i < t.length)
@@ -1045,7 +1047,7 @@ struct Screen
         if (blockExpanded)
         {
             auto t = first ? chunk.stripLeft : chunk;
-            if (t.length) writeAligned(thinkStyle(t), blockStamp.length ? stampWidth : 0);
+            if (t.length) writeAligned(thinkStyle(escapeMarks(t)), blockStamp.length ? stampWidth : 0);
         }
         stdOut.flush();
     }
@@ -1110,7 +1112,7 @@ struct Screen
         if (midLine) write("\n");
         midLine = false;
         answering = false;
-        writeln(stampBlock(stamp(), text));
+        writeln(stampBlock(stamp(), escapeMarks(text)));
         stdOut.flush();
     }
 
@@ -1205,7 +1207,12 @@ class Console : AgentEvents
 
     /// A whole answer as shown on this console: markdown rendered for a
     /// color terminal, verbatim otherwise.
-    string display(string text) { return renderMarkdown ? renderMarkdownText(text, answerWidth()) : text; }
+    string display(string text)
+    {
+        if (!renderMarkdown) return text;
+        auto shown = renderMarkdownText(text, answerWidth());
+        return gFrame ? shown : dropSoftWraps(shown);
+    }
 
     string stamp() { return .stamp(color); }
 
@@ -1266,7 +1273,7 @@ class Console : AgentEvents
         meter.reset(nowMs);
         if (quiet || quietTool(call)) return;
         endLine();
-        auto line = stamp() ~ (color ? "\x1b[38;5;114m●\x1b[0m " : "● ") ~ bold(call.name) ~ " " ~ dim(summary(call));
+        auto line = stamp() ~ (color ? "\x1b[38;5;114m●\x1b[0m " : "● ") ~ bold(escapeMarks(call.name)) ~ " " ~ dim(summary(call));
         writeln(line);
         // Ctrl-O shows the full arguments under the call.
         if (gFrame) write(foldMark(call.id, 1, line ~ "\n" ~ expandedBody(argsText(call), color ? "\x1b[2m" : "")));
@@ -1307,7 +1314,7 @@ class Console : AgentEvents
     {
         if (quiet) return;
         endLine();
-        writeln(stampBlock(stamp(), dim("↪ " ~ text)));
+        writeln(stampBlock(stamp(), dim("↪ " ~ escapeMarks(text))));
     }
     /// Close the abandoned partial so the resent reply starts a fresh segment
     /// instead of joining the stale prefix.
@@ -1344,7 +1351,14 @@ class Console : AgentEvents
         link.screen.update((ref Screen s) { s.reconcile(text); s.endReasoning(reasoning); });
     }
 
+    /// One-line call summary; literal wrap marks in model-supplied
+    /// arguments are escaped so they cannot forge transcript metadata.
     static string summary(const ref ToolCall c)
+    {
+        return escapeMarks(rawSummary(c));
+    }
+
+    private static string rawSummary(const ref ToolCall c)
     {
         if (c.invalidArguments.length) return "(invalid arguments)";
         foreach (k; ["command", "path", "pattern", "text", "name", "id"])
@@ -2882,4 +2896,26 @@ unittest
     atomicLoad(ctx.control).mode = AgentMode.plan;
     assert(midTurnCommand("/mode", ctx).startsWith("Mode: plan"), midTurnCommand("/mode", ctx));
     assert(midTurnCommand("/compact", ctx) is null && midTurnCommand("/plan extra", ctx) is null);
+}
+
+// Model-supplied tool arguments with literal wrap marks reach the transcript
+// as U+FFFD, never as metadata that changes how the row wraps or is copied.
+unittest
+{
+    import std.algorithm : canFind;
+    import std.json : parseJSON;
+    import nano.frame : Transcript, softWrapMark, verbatimMark, sepWrapMark;
+    import nano.llm : ToolCall;
+    foreach (m; [softWrapMark, verbatimMark, sepWrapMark])
+    {
+        ToolCall c;
+        c.name = "bash";
+        c.arguments = parseJSON(`{"command":"cat /tmp/a` ~ m ~ `b"}`);
+        auto s = Console.summary(c);
+        assert(!s.canFind(m) && s.canFind("a\uFFFDb"), s);
+        Transcript t;
+        t.feed(cast(const(ubyte)[]) ("● bash " ~ s ~ "\n"));
+        assert(t.lines.length == 1 && !t.lines[0].canFind(m) && t.lines[0].canFind("\uFFFD"), t.lines[0]);
+        assert(escapeMarks("↪ x" ~ m) == "↪ x\uFFFD");
+    }
 }
