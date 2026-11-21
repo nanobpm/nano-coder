@@ -6,7 +6,7 @@ module nano.agent;
 import nano.safeio : jsonText, jsonPretty;
 import nano.clock : monoNow, since, sleepFor, stdTimeNow, wallNow;
 import core.time : MonoTime;
-import nano.arith : checkedMul, checkedSub, saturatingAdd, saturatingSub, toLong, toSize;
+import nano.arith : checkedMul, checkedSub, saturatingAdd, saturatingSub, clampToLong, toLong, toSize;
 import nano.option : Option, some, none, match, ifSome, orElse, unwrap, NotNull;
 import nano.result : orThrow, toOption, match, unwrap;
 
@@ -986,8 +986,8 @@ class Agent
     long effectiveMaxTokens() pure const
     {
         long base = maxTokens > 0 ? maxTokens
-            : capabilities.maxOutput ? toLong(capabilities.maxOutput)
-            : ctx.outputLimitForModel(client.modelName) ? toLong(ctx.outputLimitForModel(client.modelName))
+            : capabilities.maxOutput ? clampToLong(capabilities.maxOutput)
+            : ctx.outputLimitForModel(client.modelName) ? clampToLong(ctx.outputLimitForModel(client.modelName))
             : ctx.defaultMaxOutputTokens;
         return learnedMaxOutput > 0 && learnedMaxOutput < base ? learnedMaxOutput : base;
     }
@@ -1273,13 +1273,13 @@ class Agent
             auto combined = combinedWindow();
             if (!combined) return maxTokens;
             auto usedC = saturatingAdd(estimateContextTokens(), ctx.outputMargin(combined));
-            long roomC = toLong(saturatingSub(combined, usedC));
+            long roomC = clampToLong(saturatingSub(combined, usedC));
             auto c = maxTokens < roomC ? maxTokens : roomC;
             return c < 1 ? 1 : c;
         }
         auto window = contextWindow();
         auto used = saturatingAdd(estimateContextTokens(), ctx.outputMargin(window));
-        long room = toLong(saturatingSub(window, used));
+        long room = clampToLong(saturatingSub(window, used));
         auto n = maxTokens < room ? maxTokens : room;
         return n < 1 ? 1 : n;
     }
