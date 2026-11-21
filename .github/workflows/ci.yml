@@ -18,7 +18,11 @@ jobs:
       matrix:
         os: [ubuntu-24.04, macos-15]
     steps:
+      # Full history: check-safe compares the ratchets against the merge
+      # base with origin/main (scripts/ratchets.sh).
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - uses: dlang-community/setup-dlang@v2
         with:
           compiler: ldc-1.43.0
@@ -33,7 +37,11 @@ jobs:
     name: lint
     runs-on: ubuntu-24.04
     steps:
+      # Full history: check-safe compares the ratchets against the merge
+      # base with origin/main (scripts/ratchets.sh).
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - uses: dlang-community/setup-dlang@v2
         with:
           compiler: ldc-1.43.0
