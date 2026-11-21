@@ -280,3 +280,30 @@ unittest
     auto lines = checklist(plan, 30, true).lineSplitter.array;
     assert(strip(lines[0]).canFind("1/2 done") && lines.length >= 3, lines[0]);
 }
+
+/// A wide glyph one cell short of the edge wraps natively; no pad space is
+/// emitted into the copied text.
+unittest
+{
+    string outp;
+    auto r = new FrameRenderer((string s) { outp ~= s; });
+    r.render(["rm -r /ab", softWrapMark ~ "中/x"], 10, 5);
+    assert(!outp.canFind("/ab 中"), outp);
+    assert(outp.canFind("/ab中"), outp);
+    auto emu = Emu(5, 10);
+    emu.render(["rm -r /ab", softWrapMark ~ "中/x"]);
+    assert(emu.screen()[$ - 2 .. $] == ["rm -r /ab", "中/x"], (){ import std.conv : to; return emu.screen().to!string; }());
+}
+
+/// A soft wrap that becomes a hard newline rewrites the row above, so its
+/// terminal wrap flag is cleared.
+unittest
+{
+    string outp;
+    auto r = new FrameRenderer((string s) { outp ~= s; });
+    r.render(["abcd", softWrapMark ~ "ef", "s"], 4, 5);
+    outp = null;
+    r.render(["abcd", "ef", "s"], 4, 5);
+    assert(outp.canFind("abcd"), outp);
+    assert(outp.canFind("abcd\r\n"), outp);
+}
