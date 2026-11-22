@@ -515,6 +515,20 @@ class HookManager
         return runAll(selected(Event.userPromptSubmit, null, null, JSONValue.init, null), Event.userPromptSubmit, input);
     }
 
+    /// Whether any PreToolUse or PostToolUse hook could select a call to
+    /// `nanoTool` (whatever its arguments: an `if` rule is not consulted, so
+    /// this over-approximates). Such hooks may have side effects, so calls
+    /// they can see must keep sequential order (#222).
+    bool hasToolHooks(string nanoTool) const
+    {
+        auto claude = claudeToolName(nanoTool);
+        foreach (ref h; hooks)
+            if ((h.event == Event.preToolUse || h.event == Event.postToolUse)
+                && matcherSelects(h.matcher, claude, nanoTool))
+                return true;
+        return false;
+    }
+
     /// Called after the permission check allowed the call, before it runs.
     Outcome runPreToolUse(string nanoTool, JSONValue args, string toolUseId)
     {
