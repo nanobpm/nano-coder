@@ -38,18 +38,109 @@ unittest
 
 alias ToolHandler = string delegate(JSONValue args);
 
+/// What a worker thread hands back for one concurrent call. Sendable: plain
+/// strings and immutable bytes only.
+struct JobResult
+{
+    /// The result text, or the error message the model sees.
+    string text;
+    bool error;
+    /// Failed with an unexpected exception: `text` is its message, which the
+    /// agent prefixes with the tool name (as for a sequential call).
+    bool crashed;
+    /// Tool-specific facts for `Concurrency.settle` (e.g. a read's digest).
+    immutable(ubyte)[] receipt;
+}
+
+/// A read-only call packaged for a worker thread (issue #222): a
+/// context-free function and sendable inputs, so `nano.safeio.spawn` can
+/// run it. It must not touch the agent's (or any thread-local) state; it
+/// reads the filesystem and its own inputs only.
+struct Job
+{
+    JobResult function(string argsJson, immutable(string)[] context) @safe run;
+    /// The call's arguments, as JSON text (a `JSONValue` isn't sendable).
+    string argsJson;
+    /// Whatever else the tool needs, resolved on the agent's thread.
+    immutable(string)[] context;
+}
+
+/// Run a job's function, turning its exceptions into the error text the
+/// agent's sequential path produces for the same failure.
+JobResult runJob(Job j)
+{
+    try return j.run(j.argsJson, j.context);
+    catch (ToolError e) return JobResult(e.msg, true);
+    catch (Exception e) return JobResult(e.msg, true, true);
+}
+
+/// How a tool may run alongside the other calls of one reply (issue #222).
+/// The default (not read-only) makes each call a barrier that runs alone.
+struct Concurrency
+{
+    /// Read-only by construction and never prompts: a run of consecutive
+    /// read-only calls executes concurrently.
+    bool readOnly;
+    /// Packages a call for a worker thread; runs on the agent's thread.
+    /// Without it a read-only call runs on the agent's thread while the
+    /// workers run (cheap, in-memory tools).
+    Job delegate(JSONValue args) @safe offload;
+    /// Applies a worker's result to the tool's own state, on the agent's
+    /// thread, in call order (e.g. read_file records what was read).
+    void delegate(const ref JobResult) @safe settle;
+}
+
 class ToolRegistry
 {
     private ToolDefinition[string] defs;
     private ToolHandler[string] handlers;
+    private Object[string] richHandlers;
 
-    void register(ToolDefinition def, ToolHandler handler) pure
+    private static final class RichHandler(T)
+    {
+        T handler;
+        this(T h) pure { handler = h; }
+    }
+    private Concurrency[string] modes;
+
+    void register(ToolDefinition def, ToolHandler handler, Concurrency mode = Concurrency.init) pure
     {
         defs[def.name] = def;
         handlers[def.name] = handler;
+        if (mode.readOnly) modes[def.name] = mode;
+        else modes.remove(def.name);
+    }
+
+    /// Register an additional, richer-shaped handler for `name` (e.g.
+    /// apply_patch's PatchHandler), retrievable via `handlerAs`. It is kept
+    /// in its own map, so the plain ToolHandler used by `execute` is never
+    /// replaced or reinterpreted.
+    void registerHandler(T)(string name, T handler) pure
+    {
+        richHandlers[name] = new RichHandler!T(handler);
+    }
+
+    /// The richer handler registered for `name` with exactly the shape `T`,
+    /// or null when none was (a type-checked downcast, never a reinterpret).
+    T handlerAs(T)(string name)
+    {
+        auto h = name in richHandlers;
+        if (h is null) return null;
+        auto boxed = cast(RichHandler!T) *h;
+        return boxed is null ? null : boxed.handler;
     }
 
     bool has(string name) pure const { return (name in defs) !is null; }
+
+    /// Whether calls to `name` may run concurrently with other read-only calls.
+    bool readOnly(string name) pure const { return (name in modes) !is null; }
+
+    /// The tool's concurrency (the default for a sequential tool).
+    Concurrency concurrency(string name) pure
+    {
+        auto m = name in modes;
+        return m is null ? Concurrency.init : *m;
+    }
 
     /// Sorted by name so requests are stable across turns (prompt caching).
     ToolDefinition[] definitions() pure
@@ -65,6 +156,18 @@ class ToolRegistry
         if (h is null) throw new ToolError(format("Tool '%s' not found", name));
         return (*h)(args);
     }
+}
+
+unittest
+{
+    alias Rich = string delegate(JSONValue, int) @safe;
+    auto r = new ToolRegistry;
+    r.register(ToolDefinition("t", "d", JSONValue.init), (JSONValue a) => "plain");
+    assert(r.handlerAs!Rich("t") is null);
+    r.registerHandler!Rich("t", delegate(JSONValue a, int n) @safe => "rich");
+    assert(r.execute("t", JSONValue.init) == "plain"); // execute keeps the plain shape
+    assert(r.handlerAs!Rich("t")(JSONValue.init, 1) == "rich");
+    assert(r.handlerAs!(string delegate(JSONValue, string))("t") is null); // wrong shape
 }
 
 // ---------------------------------------------------------------------------

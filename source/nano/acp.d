@@ -173,7 +173,7 @@ string toolKind(string name) pure
     case "bash": return "execute";
     case "read_file": return "read";
     case "grep", "glob": return "search";
-    case "write_file", "edit_file": return "edit";
+    case "write_file", "edit_file", "apply_patch": return "edit";
     case "plan_add", "plan_update", "plan_show", "report_outcome": return "think";
     default: return "other";
     }

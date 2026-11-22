@@ -19,7 +19,9 @@ The check fails when
   * `todo` + `claimed` rows exceed parity/budget (a ratchet: lower it as
     rows are triaged or linked, never raise it).
 
-Usage: scripts/check-parity.py [--ref rust-final] [--update]
+Usage: scripts/check-parity.py [--ref REF] [--update]
+--ref is the Rust ref to check against (default rust-final, where the Rust
+code is frozen; main has been the D code since 1.0.0).
 --update adds new Rust tests as `todo` and drops removed ones, then rewrites
 the manifest sorted; it never changes an existing row's status.
 """
@@ -93,7 +95,7 @@ def write_manifest(rows):
 
 
 def main():
-    ref = 'origin/main'
+    ref = 'rust-final'
     if '--ref' in sys.argv:
         ref = sys.argv[sys.argv.index('--ref') + 1]
     rust = rust_tests(ref)

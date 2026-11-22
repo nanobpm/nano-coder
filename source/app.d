@@ -30,7 +30,7 @@ import nano.tools;
 import nano.tools.bash : bashDefinition = definition, bashExecute = execute,
     bashHeartbeatSink = heartbeatSink, bashHeartbeatInterval = heartbeatInterval;
 import nano.tools.files : ReadState, registerFiles = register;
-import nano.tools.search : Denied, DenyScan, registerSearch = register;
+import nano.tools.search : Denied, DenyRules, DenyScan, registerSearch = register;
 import nano.permissions;
 import nano.session;
 import nano.toml : parseToml;
@@ -55,7 +55,7 @@ import nano.control : TurnControl, FdLineReader;
 import nano.instructions : ProjectInstructions, InstructionOptions = Options, expandHome;
 import core.atomic : atomicLoad, atomicStore, cas;
 
-enum string packageVersion = "1.7.0";
+enum string packageVersion = "1.9.2";
 enum string versionString = "nano-coder " ~ packageVersion;
 
 enum string usage = `Usage: nano-coder [--model provider/model] [--config PATH] [-p PROMPT]
@@ -940,13 +940,14 @@ private string spaces(size_t n) pure { import std.array : replicate; return " ".
 Verbosity verbosity() { return atomicLoad(gVerbosity); }
 /// The built-in tools every session offers: bash, the file tools and
 /// search (`deny` hides read-denied paths from search results).
-void registerBuiltinTools(ToolRegistry tools, const ref Config cfg, ReadState readState, DenyScan deny)
+void registerBuiltinTools(ToolRegistry tools, const ref Config cfg, ReadState readState, DenyScan deny,
+    DenyRules denyRules = null)
 {
     auto bashTimeout = cfg.bashTimeoutSecs;
     auto sandbox = cfg.sandbox;
     tools.register(bashDefinition(bashTimeout), (JSONValue a) => bashExecute(a, bashTimeout, sandbox));
     registerFiles(tools, readState);
-    registerSearch(tools, deny);
+    registerSearch(tools, deny, denyRules);
 }
 
 // rust: main.rs::builtin_tools_include_search_and_no_echo
@@ -2352,6 +2353,10 @@ int runMain(string[] args)
         if (!has) return Denied.init;
         auto forRoot = scan.forRoot(root);
         return (string path) @safe => forRoot.denied(path);
+    }, () @safe {
+        // The same rules as text, for a search on a worker thread (#222).
+        auto sources = built.match!(a => a.policy.readDenySources, () => policy.readDenySources);
+        return sources.length ? getcwd() ~ sources : null;
     });
 
     auto cwd = getcwd();
@@ -2417,7 +2422,15 @@ int runMain(string[] args)
         foreach (t; memorySessionTools(store, memoryWritable,
                 () => built.match!(a => a.control.mode == AgentMode.plan, () => o.plan),
                 () => built.match!(a => a.log.match!(l => l.id, () => string.init), () => string.init)))
-            tools.register(t.definition, asToolError(t.handler));
+            // Search never prompts, and changes nothing another tool reads
+            // unless the session is writable: then it bumps `last_used` and
+            // rewrites the memory files (nano/memory.d `searchInner`), which
+            // would race a concurrent call's recall processing and any file
+            // worker reading the store. So it may run alongside other
+            // read-only calls only when it runs read-only itself — a writable
+            // session keeps it a barrier (#222).
+            tools.register(t.definition, asToolError(t.handler),
+                Concurrency(t.definition.name == imported!"nano.memory".searchTool && !memoryWritable));
     // Instruction files, discovered once per working directory and re-read
     // before each turn (`reloadInstructions`).
     Option!ProjectInstructions instructions;

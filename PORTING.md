@@ -33,7 +33,7 @@ which macOS and most Linux distributions already have.
 | `nano/providers/mock.d` | `providers/mock.rs` | A scripted client for tests. Unlike the Rust mock, it has no keyword triggers. |
 | `nano/tools/package.d` | `tools.rs`, `output.rs` | The registry, argument helpers, and head/tail truncation that spills the full output to a file. |
 | `nano/tools/bash.d` | `bash.rs` | `bash -c` runs in its own session. The timeout kills the whole process group, and stdout and stderr are captured to files. |
-| `nano/tools/files.d` | `files.rs` | `read_file`, `write_file` and `edit_file` with the same schemas. Writes and edits are refused if the file wasn't read first or has changed since. Fuzzy matching ignores trailing whitespace, then indentation. An image (PNG, JPEG, GIF or WebP, detected by magic bytes) returns its metadata, and the agent attaches it (see `nano/attachment.d`). |
+| `nano/tools/files.d` | `files.rs` | `read_file`, `write_file` and `edit_file` with the same schemas, plus `apply_patch` (nano-only: an atomic, content-anchored multi-file patch reusing `edit_file`'s matching). Writes and edits are refused if the file wasn't read first or has changed since. Fuzzy matching ignores trailing whitespace, then indentation. An image (PNG, JPEG, GIF or WebP, detected by magic bytes) returns its metadata, and the agent attaches it (see `nano/attachment.d`). |
 | `nano/attachment.d` | `attachment.rs`, attachment parts of `llm.rs`, `context.rs` and the providers | Images are prepared against the model's vision limits: longest side 1568, byte cap (3 MiB by default) and accepted types. They are stored as `<sha256>.<ext>` in `<session>.attachments/` (a temp dir when there's no session) and referenced from the tool result. The session log uses Rust's `attachments` field. Each request sends the newest `max_images` images that are still intact, checking the hash and re-fitting to the current model. Older ones become placeholders: "sent earlier", or "no longer available" when missing or tampered. Chat Completions gets one `user` message of `image_url` parts after the tool-result run. Anthropic gets `image` blocks inside the `tool_result`. Copilot gets `Copilot-Vision-Request`. Stored names are validated, so a crafted log can't escape the directory. Without vision, the result is Rust's "can't view images" error, and binary files get the vision hint. **Differences:** Rust decodes and re-encodes with the `image` crate. D reads dimensions and JPEG EXIF orientation from the headers. When an image must change, D shells out to `sips` (macOS) or ImageMagick, and fails with a clear error when neither is present. `sips` keeps EXIF orientation as a tag rather than rotating the pixels. WebP EXIF orientation isn't read. The context estimate assumes every stored image is still present. |
 | `nano/tools/search.d` | `search.rs` | `grep` and `glob` with the same schemas. They honour nested .gitignore files and skip `.git`, symlinks and binary files. Results are sorted and capped. |
 | `nano/shell.d` | `shell.rs` | The shell word/redirect/heredoc parser the guards inspect. |
@@ -144,8 +144,10 @@ The Rust test suite is the feature specification. `parity/manifest.tsv` lists ev
 test (`FILE::NAME`) with a status: `test` (a D unittest carries a `// rust: FILE::NAME`
 marker), `claimed` (ported per this file, no linked test yet), `gap` (not ported; the note
 says what's missing), `na` (doesn't apply; the note says why) or `todo` (not triaged).
-The Rust code is frozen at the `rust-final` tag, so CI no longer runs the check; the manifest
-is the record of the port. `scripts/check-parity.py --ref rust-final` still checks it, and fails when:
+The Rust code is frozen at the `rust-final` tag, and the manifest is the record of the port.
+`scripts/check-parity.py` checks it against `rust-final` (the default `--ref`); `scripts/ci.sh lint`
+runs it (skipping with a message when the tag isn't fetched), so a manifest edit can't silently
+break it. It fails when:
 
 - Rust gains a test the manifest doesn't list (`--update` adds it as `todo`);
 - a `test` row has no marker, or a marker isn't backed by a `test` row;

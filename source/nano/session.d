@@ -404,6 +404,10 @@ class SessionLog
     string id;
     string path;
     private File f;
+    /// The shared registration of `f` (its refcount), tied to the handle
+    /// rather than the path: a recovery that re-registers the path must not
+    /// let an old sharer's `close` release the replacement handle.
+    private Held* held;
     /// Lines written so far: the next record's physical line is `lines + 1`.
     private ulong lines;
 
@@ -418,7 +422,7 @@ class SessionLog
         f = createPrivate(path);
         // A brand-new file: only an unsupported filesystem can refuse.
         if (tryLock(f) == LockResult.contended) throw new Exception("session log " ~ path ~ " is locked");
-        shareHandle(path, f);
+        held = shareHandle(path, f);
         scope (failure) close();
         JSONValue h = ["id": this.id, "created_at": nowStamp(), "cwd": cwd, "model": model];
         h["version"] = formatVersion;
@@ -463,11 +467,12 @@ class SessionLog
         validateId(id);
         // Lock before reading or truncating, so tidy-up cannot compress or
         // delete the log underneath this writer.
-        if (auto held = path in openHere)
+        if (auto shared_ = path in openHere)
         {
             // This process already holds the log open and locked: share that
             // locked handle (a second open would be a separate, unlocked
             // file description once the first closes).
+            held = *shared_;
             f = held.file;
             held.refs++;
         }
@@ -478,7 +483,7 @@ class SessionLog
             f = openExistingForAppend(path);
             awaitLock(f, path);
             if (!sameFile(f, path)) { f.close(); throw new Exception("session log " ~ path ~ " was removed"); }
-            shareHandle(path, f);
+            held = shareHandle(path, f);
         }
         scope (failure) close();
         // Count the committed lines in fixed-size chunks: a long session's
@@ -509,6 +514,11 @@ class SessionLog
     /// Tests: the next write fails (Rust `fail_next_persist`).
     bool failNextWrite;
 
+    /// Tests: invoked with each recovery candidate's path right after its
+    /// exclusive create, so a test can swap the destination before the
+    /// post-sync identity re-check (simulating a concurrent replacement).
+    void delegate(string) swapAfterCreate;
+
     /// Tests: whether `close` has released this writer's handle.
     bool isOpenForWrite() const @safe { return f.isOpen; }
 
@@ -518,12 +528,14 @@ class SessionLog
         if (!f.isOpen) return;
         // AA removal does not run destructors: close the shared handle
         // explicitly when the last writer goes, releasing the lock.
-        if (auto held = path in openHere)
-            if (--held.refs == 0)
-            {
-                held.file.close();
-                openHere.remove(path);
-            }
+        if (held !is null && --held.refs == 0)
+        {
+            held.file.close();
+            // Only drop the path's registration if it is still this handle.
+            if (auto cur = path in openHere)
+                if (*cur is held) openHere.remove(path);
+        }
+        held = null;
         f.detach();
     }
 
@@ -534,9 +546,179 @@ class SessionLog
             failNextWrite = false;
             throw new Exception("session log write failed (injected)");
         }
+        if (!sameFile(f, path))
+        {
+            recoverReplaced();
+            // The header itself hit the replacement: name the recovery id.
+            { import std.string : assumeUTF; if (lines == 0) line = withHeaderId(line.representation, id).assumeUTF.idup; }
+        }
         f.write(line);
         f.flush();
         ++lines;
+    }
+
+    /// Where the warning about a replaced log goes (tests capture it).
+    void delegate(string) warn;
+
+    /// The path no longer names the file this writer holds open (something
+    /// moved, deleted or rewrote the live log). Appending on would write into
+    /// an orphan nobody can read again (issue #237), so move to a file that
+    /// holds every record: the path itself when it is gone or a prefix of
+    /// ours (append what it lacks), else a recovery file next to it. Always
+    /// tell the user.
+    private void recoverReplaced()
+    {
+        auto ours = readAll(f);
+        string target = path, how;
+        File next;
+        bool done;
+        import std.exception : collectException;
+        // A failed in-place repair falls through to the recovery log below.
+        collectException(() {
+            // Whatever path leaves the in-place repair undone (non-prefix
+            // rewrite, contention, a throw) must release `next`: the loop
+            // below reassigns it, which would leak the fd and keep a lock
+            // on the foreign file at the original path.
+            scope (exit) if (!done && next.isOpen) next.close();
+            if (!path.exists)
+            {
+                // Removed or moved away: put our records back at the path.
+                {
+                    auto tmp = format("%s.tmp-%s", path, thisProcessID);
+                    scope (failure) if (tmp.exists) remove(tmp);
+                    writePrivate(tmp, ours, octal!600);
+                    publishOver(tmp, path);
+                    next = openExistingForAppend(path);
+                    // Locked, still at the path, AND holding exactly our
+                    // records: a replacement that slipped in between the
+                    // publish and this reopen must not count as restored.
+                    if (tryLock(next) != LockResult.contended && sameFile(next, path)
+                        && readAll(next) == ours && sameFile(next, path))
+                    {
+                        syncLog(next, path);
+                        done = true;
+                        how = "it was removed; restored it from this session's records";
+                    }
+                    else next.close(); // contended or re-replaced: no fd leak into the loop below
+                }
+            }
+            else
+            {
+                // Lock first, then compare the whole locked file's bytes
+                // (not just its length) and re-check the path still names it.
+                // A contention or an inode change abandons the in-place
+                // repair for the recovery log below: close `next` first, or
+                // the loop's `next = createPrivate(...)` overwrites and
+                // leaks the fd.
+                next = openExistingForAppend(path);
+                if (tryLock(next) == LockResult.contended || !sameFile(next, path))
+                {
+                    next.close();
+                    return;
+                }
+                auto theirs = readAll(next);
+                if (theirs.length <= ours.length && ours[0 .. theirs.length] == theirs)
+                {
+                    // The replacement may be wider than our private log
+                    // (e.g. 0644): narrow it before appending private
+                    // records, or fall back to a private recovery log.
+                    import nano.safeio : fchmodFd;
+                    if (fchmodFd(fileno(next.getFP), octal!600) != 0) return;
+                    // Re-verify immediately before appending: a writer that
+                    // ignores flock (or rewrote the inode meanwhile) would
+                    // make the suffix land against a stale prefix, a gap or
+                    // overlap. Any change: fall back to the recovery log.
+                    if (!sameFile(next, path) || readAll(next) != theirs) return;
+                    next.rawWrite(ours[theirs.length .. $]);
+                    syncLog(next, path);
+                    // And confirm the result is exactly our records at the path.
+                    if (!sameFile(next, path) || readAll(next) != ours) return;
+                    done = true;
+                    how = "it was replaced; appended the records the new file was missing";
+                }
+            }
+        }());
+        if (!done)
+        {
+            // The path holds something else: keep the whole session in a
+            // recovery log beside it, a resumable session of its own: its
+            // header names the recovery id (same line count, so `#N` IDs hold).
+            auto dir = path.dirName;
+            auto stem = recoveryStem(id);
+            bool made;
+            foreach (n; 1 .. 1000)
+            {
+                auto rid = format("%s.recovered-%s", stem, n);
+                target = buildPath(dir, rid ~ ".jsonl");
+                // A name whose compressed archive exists belongs to an
+                // earlier recovered session tidy-up compressed: reusing it
+                // would shadow that archive (`findSession` prefers the plain
+                // log) and strand its history, so skip to the next name.
+                if (target.exists || (target ~ ".gz").exists) continue;
+                // Exclusive create, then lock before anything else can, and
+                // confirm the locked inode is still the one at the path.
+                import std.exception : collectException;
+                // Lost the race for this name (or cannot create it): try the next.
+                // The exclusive-create descriptor itself is kept (never a
+                // reopen of the name), so a swap of the path cannot hand us
+                // someone else's file.
+                if (collectException(next = createPrivate(target)) !is null) continue;
+                // A name whose lock another writer won, or whose path no
+                // longer names our inode: close our fd and try the next name.
+                // Never unlink it: the path may now hold another writer's
+                // records (or a replacement), and removing it could orphan them.
+                bool locked = collectException(awaitLock(next, target)) is null;
+                if (!locked || !sameFile(next, target)) { next.close(); continue; }
+                // Test seam: let a test swap the destination now, so the
+                // post-sync re-check below is exercised against a real race.
+                if (swapAfterCreate !is null) swapAfterCreate(target);
+                {
+                    // A failed write or sync closes the candidate: never leak it.
+                    scope (failure) next.close();
+                    next.rawWrite(withHeaderId(ours, rid));
+                    syncLog(next, target);
+                }
+                // An in-place rewrite of the same inode (a writer that
+                // ignores flock) is invisible to `sameFile`: adopt the
+                // candidate only if it holds exactly our records under the
+                // recovery header, else close it and try the next name.
+                if (readAll(next) != withHeaderId(ours, rid)) { next.close(); continue; }
+                // Revalidate after the write+sync, before adopting: if another
+                // process replaced `target` meanwhile, `next` is now an
+                // unlinked inode and adopting it would send this session's
+                // appends into a file nobody can read back. Close it and try
+                // the next name rather than report a successful recovery.
+                if (!sameFile(next, target)) { next.close(); continue; }
+                made = true;
+                break;
+            }
+            if (!made) throw new Exception("session log " ~ path ~ " was replaced and no recovery log could be created");
+            how = "it was replaced by a different file; this session continues in " ~ target
+                ~ " (resume it with --resume " ~ target.baseName.stripExtension ~ ")";
+        }
+        immutable old = path;
+        immutable oldId = id;
+        close();
+        f = next;
+        path = target;
+        id = path.baseName.stripExtension;
+        held = shareHandle(path, f);
+        // A new id moves the attachments dir (`<id>.attachments`): copy the
+        // stored images there so the recovered session still sees them,
+        // leaving the originals for the old log.
+        if (id != oldId) copyAttachments(buildPath(old.dirName, oldId ~ ".attachments"),
+            buildPath(path.dirName, id ~ ".attachments"));
+        auto msg = "WARNING: session log " ~ old ~ " no longer names the file this session was writing: "
+            ~ how ~ ". Nothing was lost.";
+        if (warn) warn(msg);
+        else
+        {
+            import nano.safeio : stdErr;
+            import std.exception : collectException;
+            // Best-effort diagnostic: a closed or unwritable stderr must not
+            // abort the caller's pending write after a successful recovery.
+            if (collectException(stdErr.writeln("\n", msg)) !is null) {}
+        }
     }
 
     /// Log a message; returns its physical line (its `#N` ID).
@@ -785,15 +967,326 @@ struct Restored
     bool historyHintConsumed;
 }
 
+/// The end of the JSON value starting at `s[i]` (a raw scan: strings are
+/// skipped escape-aware, containers by depth; nothing is decoded).
+private size_t skipJSONValue(const(char)[] s, size_t i) pure nothrow @nogc
+{
+    size_t depth;
+    while (i < s.length)
+    {
+        immutable c = s[i];
+        if (c == '"')
+        {
+            for (++i; i < s.length && s[i] != '"'; ++i)
+                if (s[i] == '\\') ++i;
+            ++i;
+            if (!depth) return i;
+            continue;
+        }
+        if (c == '{' || c == '[') depth++;
+        else if (c == '}' || c == ']')
+        {
+            if (!depth) return i;
+            if (!--depth) return i + 1;
+        }
+        else if (!depth && (c == ',' || c == ' ' || c == '\t' || c == '\r' || c == '\n')) return i;
+        ++i;
+    }
+    return i;
+}
+
+/// Decode the JSON escapes in the raw key text `key` in place of the slice
+/// (a fresh copy only when it has any); false for a malformed escape.
+private bool unescapeKey(ref const(char)[] key) pure @safe
+{
+    import std.ascii : isHexDigit;
+    import std.utf : encode;
+    size_t i;
+    while (i < key.length && key[i] != '\\') ++i;
+    if (i == key.length) return true;
+    char[] o = key[0 .. i].dup;
+    for (; i < key.length; ++i)
+    {
+        if (key[i] != '\\') { o ~= key[i]; continue; }
+        if (++i >= key.length) return false;
+        switch (key[i])
+        {
+            case '"': case '\\': case '/': o ~= key[i]; break;
+            case 'b': o ~= '\b'; break;
+            case 'f': o ~= '\f'; break;
+            case 'n': o ~= '\n'; break;
+            case 'r': o ~= '\r'; break;
+            case 't': o ~= '\t'; break;
+            case 'u':
+                if (i + 4 >= key.length) return false;
+                dchar c = 0;
+                foreach (h; key[i + 1 .. i + 5])
+                {
+                    if (!h.isHexDigit) return false;
+                    c = c * 16 + (h <= '9' ? h - '0' : (h | 0x20) - 'a' + 10);
+                }
+                i += 4;
+                // Surrogates never spell a key we compare against: keep them
+                // distinct but harmless.
+                if (c >= 0xD800 && c <= 0xDFFF) c = 0xFFFD;
+                char[4] buf;
+                o ~= buf[0 .. encode(buf, c)];
+                break;
+            default: return false;
+        }
+    }
+    key = o;
+    return true;
+}
+
+/// Call `dg` with each top-level key (JSON escapes decoded) and the raw text of its
+/// value in the JSON object `obj`, without parsing the values (issue #244: a
+/// superseded compaction snapshot is skimmed, not decoded). Stops when `dg`
+/// returns false; false for text that isn't an object.
+private bool skimObject(const(char)[] obj, scope bool delegate(const(char)[] key, const(char)[] raw) @safe dg)
+{
+    import std.ascii : isWhite;
+    size_t i;
+    void ws() { while (i < obj.length && obj[i].isWhite) ++i; }
+    ws();
+    if (i >= obj.length || obj[i] != '{') return false;
+    ++i;
+    for (;;)
+    {
+        ws();
+        if (i >= obj.length) return false;
+        if (obj[i] == '}') return true;
+        if (obj[i] != '"') return false;
+        auto ke = skipJSONValue(obj, i);
+        if (ke > obj.length || ke < i + 2) return false;
+        const(char)[] key = obj[i + 1 .. ke - 1];
+        // An escaped key (`"folded\u005fbase"`) must compare by its decoded
+        // value, or a delta could be misread as a full snapshot.
+        if (!unescapeKey(key)) return false;
+        i = ke;
+        ws();
+        if (i >= obj.length || obj[i] != ':') return false;
+        ++i;
+        ws();
+        auto ve = skipJSONValue(obj, i);
+        if (ve > obj.length) return false;
+        if (!dg(key, obj[i .. ve])) return true;
+        i = ve;
+        ws();
+        if (i < obj.length && obj[i] == ',') ++i;
+    }
+}
+
+unittest // escaped_keys_are_decoded_before_comparison
+{
+    assert(skimField(`{"folded\u005fbase":[1],"x":2}`, "folded_base") == "[1]");
+    assert(skimField(`{"a\"b":3}`, `a"b`) == "3");
+    assert(skimField(`{"bad\uZZZZ":1}`, "bad") is null);
+}
+
+/// The raw value of top-level `key` in the JSON object `obj`, or null.
+private const(char)[] skimField(const(char)[] obj, string key)
+{
+    const(char)[] found;
+    skimObject(obj, (k, v) { if (k == key) { found = v; return false; } return true; });
+    return found;
+}
+
+/// The decoded string of the record's top-level `type`, or null when it is
+/// not a readable string. The raw value keeps its escapes, so an escaped
+/// spelling (`"repla\u0063e"`) must decode to the type the full decoder sees,
+/// or the skim scan and `restore` disagree on the record.
+private const(char)[] skimType(const(char)[] line)
+{
+    auto raw = skimField(line, "type");
+    if (raw.length < 2 || raw[0] != '"' || raw[$ - 1] != '"') return null;
+    const(char)[] type = raw[1 .. $ - 1];
+    // A malformed escape fails closed: the record is not skimmed by type.
+    if (!unescapeKey(type)) return null;
+    return type;
+}
+
+unittest // escaped_type_decodes_before_comparison
+{
+    assert(skimType(`{"type":"replace","data":{}}`) == "replace");
+    assert(skimType(`{"type":"repla\u0063e","data":{}}`) == "replace");
+    assert(skimType(`{"type":"mes\u0073age"}`) == "message");
+    assert(skimType(`{"type":"bad\uZZZZ"}`) is null);
+    assert(skimType(`{"type":3}`) is null);
+}
+
+/// Whether `raw` is a JSON integer `jsonUnsigned` accepts (no leading `-`
+/// except the zero-valued `-0`, which std.json decodes to integer 0; fits a
+/// ulong), and its value. The skim scan must read numbers exactly as
+/// `restore`'s full decode does: a signed read would keep a `-1` floor or
+/// pending position the full decode drops, and drop a `uinteger` above
+/// `long.max` the full decode keeps (issue #240).
+private bool rawUnsigned(const(char)[] raw, out ulong v) pure nothrow @nogc
+{
+    import std.ascii : isDigit;
+    if (!raw.length) return false;
+    auto digits = raw;
+    // `-0` parses to integer 0, which `jsonUnsigned` accepts; any other
+    // negative is rejected there and here.
+    if (digits[0] == '-')
+    {
+        if (raw != "-0") return false;
+        digits = raw[1 .. $];
+    }
+    ulong acc;
+    foreach (c; digits)
+    {
+        if (!c.isDigit) return false;
+        immutable uint d = c - '0';
+        if (acc > (ulong.max - d) / 10) return false;
+        acc = acc * 10 + d;
+    }
+    v = acc;
+    return true;
+}
+
+unittest
+{
+    ulong v;
+    assert(rawUnsigned("0", v) && v == 0);
+    assert(rawUnsigned("-0", v) && v == 0); // std.json decodes -0 to integer 0
+    assert(rawUnsigned("42", v) && v == 42);
+    assert(rawUnsigned("18446744073709551615", v) && v == ulong.max);
+    assert(!rawUnsigned("-1", v));
+    assert(!rawUnsigned("-00", v));
+    assert(!rawUnsigned("-42", v));
+    assert(!rawUnsigned("18446744073709551616", v)); // above ulong.max
+    assert(!rawUnsigned("1.5", v));
+    assert(!rawUnsigned("", v));
+    assert(!rawUnsigned("-", v));
+}
+
+/// Call `dg` with the raw text of each element of the raw JSON array `arr`.
+private void skimArray(const(char)[] arr, scope void delegate(const(char)[] elem) @safe dg)
+{
+    import std.ascii : isWhite;
+    size_t i;
+    while (i < arr.length && arr[i].isWhite) ++i;
+    if (i >= arr.length || arr[i] != '[') return;
+    ++i;
+    for (;;)
+    {
+        while (i < arr.length && arr[i].isWhite) ++i;
+        if (i >= arr.length || arr[i] == ']') return;
+        auto e = skipJSONValue(arr, i);
+        if (e == i) return;
+        dg(arr[i .. e]);
+        i = e;
+        while (i < arr.length && arr[i].isWhite) ++i;
+        if (i < arr.length && arr[i] == ',') ++i;
+    }
+}
+
+/// The number of elements of the raw JSON array `arr` (0 if not an array).
+private size_t skimCount(const(char)[] arr) pure nothrow @nogc
+{
+    import std.ascii : isWhite;
+    size_t i, n;
+    while (i < arr.length && arr[i].isWhite) ++i;
+    if (i >= arr.length || arr[i] != '[') return 0;
+    ++i;
+    for (;;)
+    {
+        while (i < arr.length && arr[i].isWhite) ++i;
+        if (i >= arr.length || arr[i] == ']') return n;
+        auto e = skipJSONValue(arr, i);
+        if (e == i) return n;
+        n++;
+        i = e;
+        while (i < arr.length && arr[i].isWhite) ++i;
+        if (i < arr.length && arr[i] == ',') ++i;
+    }
+}
+
+/// Stream the committed lines of a session log (a torn last line is
+/// dropped) to `dg` with their 1-based line numbers. A plain log is read
+/// line by line rather than whole (issue #244); a compressed one is inflated.
+private void eachLogLine(string path, scope void delegate(const(char)[] line, ulong lineNo) @safe dg)
+{
+    ulong lineNo;
+    if (isCompressedLog(path))
+    {
+        auto text = logText(path);
+        auto committed = text.length;
+        while (committed && text[committed - 1] != '\n') committed--;
+        if (!committed) throw new Exception("session log " ~ path ~ " has no committed records");
+        foreach (line; text[0 .. committed].lineSplitter) dg(line, ++lineNo);
+        return;
+    }
+    import std.typecons : Yes;
+    auto f = File(path, "rb");
+    bool any;
+    foreach (line; f.byLine(Yes.keepTerminator))
+    {
+        if (!line.length || line[$ - 1] != '\n') break; // torn
+        any = true;
+        auto l = line[0 .. $ - 1];
+        if (l.length && l[$ - 1] == '\r') l = l[0 .. $ - 1];
+        dg(l, ++lineNo);
+    }
+    if (!any) throw new Exception("session log " ~ path ~ " has no committed records");
+}
+
+/// Pass 1 of `restore` (issue #244): the line of the latest `replace` that
+/// supersedes all earlier compaction state (a full restatement: no
+/// `folded_base` / `pinned_base` delta), and its `summarized` end, found by
+/// skimming record types without decoding any record. 0 when there is none.
+/// `floor` is the lowest `summarized` end of that replace and every later
+/// delta replace (an omitted range counts as 0), since `backfillLogLines`
+/// reads originals past each one's range.
+private ulong lastFullReplace(string path, out ulong floor)
+{
+    ulong at;
+    eachLogLine(path, (line, lineNo) {
+        auto type = skimType(line);
+        if (type != "replace") return;
+        auto data = skimField(line, "data");
+        bool delta;
+        ulong fl = 0;
+        // Fail closed: an unreadable `data` is never taken as a full snapshot.
+        immutable ok = skimObject(data, (k, v) {
+            if ((k == "folded_base" || k == "pinned_base") && v != "null") delta = true;
+            else if (k == "summarized")
+            {
+                // `[first, last]`: the second element, as `restore` reads it
+                // (unsigned: a `-1` or a `uinteger` above long.max must land
+                // exactly where the full decode lands).
+                const(char)[][] parts;
+                skimArray(v, (e) { parts ~= e; });
+                ulong last;
+                if (parts.length == 2 && rawUnsigned(parts[1], last)) fl = last;
+            }
+            return true;
+        });
+        if (!ok) delta = true;
+        if (!delta) { at = lineNo; floor = fl; }
+        else if (at && fl < floor) floor = fl;
+    });
+    return at;
+}
+
 /// Read a session log (Rust format), dropping a torn last line.
-Restored restore(string path)
+Restored restore(string path) => restoreLog(path, true);
+
+/// `restore`, optionally decoding every record (`skipSuperseded` false: the
+/// reference the two-pass restore is tested against).
+private Restored restoreLog(string path, bool skipSuperseded)
 {
     import std.algorithm : countUntil;
     Restored r;
-    auto text = logText(path);
-    auto committed = text.length;
-    while (committed && text[committed - 1] != '\n') committed--;
-    if (!committed) throw new Exception("session log " ~ path ~ " has no committed records");
+    // Records before the latest full `replace` only matter for what that
+    // replace doesn't restate (issue #244): inputs, turn ends, plan, timers,
+    // the pending input, and the originals `backfillLogLines` reads past its
+    // summarized range. Superseded snapshots and messages are skimmed.
+    ulong floorL;
+    immutable skipBefore = skipSuperseded ? lastFullReplace(path, floorL) : 0;
+    // The conversation length before `skipBefore`, without building it.
+    size_t skimmedLen;
     string pendingId;
     // Every logged input's text, to backfill `pinText` on legacy messages.
     string[] inputs;
@@ -818,11 +1311,53 @@ Restored restore(string path)
         return p.toJSON;
     }
     size_t index;
-    ulong lineNo;
-    foreach (line; text[0 .. committed].lineSplitter)
-    {
-        ++lineNo;
-        if (!line.length) continue;
+    eachLogLine(path, (line, lineNo) {
+        if (!line.length) return;
+        if (index && lineNo < skipBefore)
+        {
+            auto type = skimType(line);
+            if (type == "message")
+            {
+                skimmedLen++;
+                if (lineNo <= floorL) { index++; return; }
+                // An original past the latest summarized range: decoded
+                // below, for `backfillLogLines` only.
+            }
+            if (type == "replace")
+            {
+                // Superseded: only its effect on the pending input outlives
+                // the latest full replace. Mirror the full decode: a readable
+                // position refreshes the pending snapshot (base included, so a
+                // dropped input's stale fields match), anything else drops it.
+                auto data = skimField(line, "data");
+                skimmedLen = skimCount(skimField(data, "messages"));
+                auto posRaw = skimField(data, "pending_position");
+                ulong posVal;
+                if (r.hasPending && rawUnsigned(posRaw, posVal))
+                {
+                    r.pending.position = toSize(posVal);
+                    r.pending.hasContinuation = false;
+                    r.pending.answer = null;
+                    r.pending.count = 0;
+                    r.pending.hasBase = true;
+                    r.pending.base = skimmedLen;
+                    r.pending.recallNotes = 0;
+                }
+                else
+                {
+                    r.hasPending = false;
+                    r.pendingInput = null;
+                    pendingId = null;
+                }
+                if (!posRaw.length || posRaw == "null")
+                {
+                    pendingId = null;
+                    r.pendingInput = null;
+                }
+                index++;
+                return;
+            }
+        }
         JSONValue rec;
         try rec = parseJSON(line);
         catch (Exception e) throw new Exception(format("decode record %s of %s: %s", index + 1, path, e.msg));
@@ -840,13 +1375,13 @@ Restored restore(string path)
             planFrom = 0;
             r.plan = data["plan"];
             index++;
-            continue;
+            return;
         }
         if (type == "plan_delta")
         {
             planDeltas ~= data;
             index++;
-            continue;
+            return;
         }
         if (type == "session")
         {
@@ -870,9 +1405,16 @@ Restored restore(string path)
             r.pendingInput = data["text"].str;
             inputs ~= r.pendingInput;
             r.hasPending = true;
-            r.pending = PendingInput(pendingId, r.pendingInput, r.conversation.length);
+            r.pending = PendingInput(pendingId, r.pendingInput,
+                lineNo < skipBefore ? skimmedLen : r.conversation.length);
             break;
         case "message":
+            if (lineNo < skipBefore)
+            {
+                originals ~= messageFromRecord(data);
+                originals[$ - 1].logLine = lineNo;
+                break;
+            }
             r.conversation ~= messageFromRecord(data);
             r.conversation[$ - 1].logLine = lineNo;
             backfillPinText(r.conversation[$ - 1], inputs);
@@ -978,7 +1520,10 @@ Restored restore(string path)
                     if (full.length) { rustStash = full; active = true; }
                 }
                 if (!active) rustStash = null;
-                r.replayStash = rustStash.dup;
+                // Shared, not copied (issue #244): neither is mutated in place
+                // (a later delta builds a new array), and an append to one
+                // never shows through the other's length.
+                r.replayStash = rustStash;
                 r.replayRestated = Option!size_t.init;
                 if (auto at = "restated" in data)
                 {
@@ -996,7 +1541,7 @@ Restored restore(string path)
                     auto kept = b < r.pinStash.length ? r.pinStash[0 .. b] : r.pinStash;
                     r.pinStash = kept ~ decode(*pins, inputs);
                 }
-                else r.pinStash = pins !is null ? decode(*pins, inputs) : rustStash.dup;
+                else r.pinStash = pins !is null ? decode(*pins, inputs) : rustStash;
             }
             {
                 auto mode = "mode" in data;
@@ -1029,7 +1574,7 @@ Restored restore(string path)
             break;
         }
         index++;
-    }
+    });
     // Apply the deltas after the latest full snapshot, if any remain.
     if (planDeltas.length > planFrom) r.plan = planAt(planFrom);
     return r;
@@ -1172,11 +1717,73 @@ private struct Held { File file; size_t refs; }
 
 /// Logs this thread holds open and locked, so an in-process reopen shares
 /// the locked handle instead of opening an unlocked second description.
-private Held[string] openHere;
+private Held*[string] openHere;
 
-private void shareHandle(string path, File f)
+private Held* shareHandle(string path, File f)
 {
-    openHere[path] = Held(f, 1);
+    auto h = new Held(f, 1);
+    openHere[path] = h;
+    return h;
+}
+
+/// Every byte `f` holds, read from its start (the position is left at EOF).
+private ubyte[] readAll(ref File f)
+{
+    import std.stdio : SEEK_END;
+    f.flush();
+    f.seek(0);
+    ubyte[] all;
+    auto buf = new ubyte[](64 * 1024);
+    for (;;)
+    {
+        auto chunk = f.rawRead(buf);
+        if (!chunk.length) break;
+        all ~= chunk;
+    }
+    f.seek(0, SEEK_END);
+    return all;
+}
+
+/// The id stem for a recovery log of session `id`: any earlier
+/// `.recovered-N` suffix dropped (so repeats do not stack), and cut short
+/// enough that `<stem>.recovered-999` still passes `validateId`.
+string recoveryStem(string id) pure
+{
+    import std.ascii : isDigit;
+    import std.string : lastIndexOf;
+    auto stem = id;
+    auto at = stem.lastIndexOf(".recovered-");
+    if (at >= 0)
+    {
+        auto n = stem[at + ".recovered-".length .. $];
+        bool digits = n.length > 0;
+        foreach (c; n) digits = digits && c.isDigit;
+        if (digits) stem = stem[0 .. at];
+    }
+    enum room = 128 - ".recovered-999".length;
+    if (stem.length > room) stem = stem[0 .. room];
+    return stem;
+}
+
+/// `text` with its first line's `session` header renamed to `newId`; other
+/// lines and the line count are untouched. Text without a parseable header
+/// line comes back unchanged (an empty `newId` also leaves it unchanged).
+const(ubyte)[] withHeaderId(const(ubyte)[] text, string newId)
+{
+    import std.algorithm : countUntil;
+    import std.exception : collectException;
+    import std.string : assumeUTF;
+    if (!newId.length) return text;
+    auto nl = text.countUntil('\n');
+    if (nl < 0) return text;
+    JSONValue j;
+    // Not a JSON header line: nothing to rename, keep the bytes as they are.
+    if (collectException(j = parseJSON(text[0 .. nl].assumeUTF)) !is null) return text;
+    if (j.type != JSONType.object || "type" !in j || j["type"].type != JSONType.string
+        || j["type"].str != "session" || "data" !in j || j["data"].type != JSONType.object)
+        return text;
+    j["data"]["id"] = newId;
+    return record("session", j["data"]).representation ~ text[nl + 1 .. $];
 }
 
 /// Lock `f` for a writer, waiting briefly while a tidy-up holds it (a
@@ -1195,22 +1802,70 @@ private void awaitLock(ref File f, string path)
     throw new Exception("session log " ~ path ~ " is locked by another process (tidy-up?); try again");
 }
 
-/// `path` opened for appending without ever creating it.
-private File openExistingForAppend(string path) @trusted
+/// Copy every file of the attachments dir `from` into `to` (best-effort:
+/// a failed copy leaves that image unavailable, never aborts recovery).
+private void copyAttachments(string from, string to)
 {
-    import core.sys.posix.fcntl : open, O_WRONLY, O_APPEND;
+    import std.file : dirEntries, SpanMode, isDir, mkdirRecurse, copy;
+    import std.exception : collectException;
+    // The whole traversal is best-effort: an unreadable dir or a failing
+    // entry stat must not abort recovery (the warning and the pending
+    // record still have to be written).
+    collectException(() {
+        if (!from.exists || !from.isDir) return;
+        collectException(mkdirRecurse(to));
+        foreach (e; dirEntries(from, SpanMode.shallow))
+        {
+            bool file;
+            if (collectException(file = e.isFile) !is null || !file) continue;
+            auto dest = buildPath(to, e.name.baseName);
+            if (!dest.exists) collectException(copy(e.name, dest));
+        }
+    }());
+}
+
+/// Flush and fsync `f` (the log at `path`) and its parent directory, so
+/// recovered records survive a power loss before being reported. Throws.
+private void syncLog(ref File f, string path)
+{
+    import nano.safeio : fsyncFd;
+    f.flush();
+    if (fsyncFd(fileno(f.getFP)) != 0) throw new Exception("cannot sync " ~ path);
+    syncDirOf(path);
+}
+
+/// `path` opened for appending without ever creating it.
+private File openExistingForAppend(string path) { return openLog(path, false); }
+
+/// `path` opened read/write + append + close-on-exec; `create` makes it
+/// exclusively (0600), keeping that very descriptor.
+private File openLog(string path, bool create) @trusted
+{
+    import core.sys.posix.fcntl : open, fcntl, O_RDWR, O_APPEND, O_CREAT, O_EXCL, F_SETFD, FD_CLOEXEC;
+    import nano.safeio : fchmodFd;
     import std.string : toStringz;
     import core.stdc.errno : errno, ENOENT;
     import std.exception : ErrnoException;
-    auto fd = open(path.toStringz, O_WRONLY | O_APPEND);
+    // O_RDWR: a writer that finds its log replaced reads its own records
+    // back to recover them. Close-on-exec: a `/relaunch` exec must not
+    // inherit the fd and its flock, or the new image's resume is contended.
+    version (linux) enum int cloexec = 0x80000; // O_CLOEXEC
+    else version (OSX) enum int cloexec = 0x1000000;
+    else enum int cloexec = 0;
+    auto fd = create
+        ? open(path.toStringz, O_RDWR | O_APPEND | O_CREAT | O_EXCL | cloexec, octal!600)
+        : open(path.toStringz, O_RDWR | O_APPEND | cloexec);
     if (fd < 0)
     {
         immutable err = errno;
+        if (create) throw new ErrnoException("cannot create " ~ path, err);
         if (err == ENOENT) throw new Exception("session log " ~ path ~ " does not exist");
         throw new ErrnoException("cannot open session log " ~ path, err);
     }
+    fcntl(fd, F_SETFD, FD_CLOEXEC); // also where O_CLOEXEC is unknown
+    if (create) fchmodFd(fd, octal!600); // never wider, whatever the umask
     File f;
-    f.fdopen(fd, "a");
+    f.fdopen(fd, "a+");
     return f;
 }
 
@@ -1272,10 +1927,11 @@ private void writePrivate(string path, const(ubyte)[] data, uint mode)
 }
 
 /// A new session log opened for appending, created owner-only (0600).
+/// The descriptor from the exclusive create itself is returned (read/write,
+/// append, close-on-exec): reopening the name would race a replacement.
 private File createPrivate(string path)
 {
-    writePrivate(path, null, octal!600);
-    return File(path, "a");
+    return openLog(path, true);
 }
 
 /// fsync `path`'s parent directory, so a created or removed directory entry
@@ -2191,4 +2847,598 @@ void releaseHeap() nothrow
     import core.memory : GC;
     GC.collect();
     GC.minimize();
+}
+
+// A long log with many superseded full compaction snapshots (issue #244)
+// restores, skimming them, to exactly what decoding every record gives:
+// inputs, turn ends, the pending input across compactions, the retained
+// messages' backfilled log lines, and the Rust folded stash (held once).
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, write;
+    import std.path : buildPath;
+    import std.conv : text;
+    auto dir = buildPath(tempDir, "nano-d-skim-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    static JSONValue rec(Message m) { return messageRecord(m); }
+    string line(string type, JSONValue data) { return JSONValue(["type": JSONValue(type), "data": data]).toString ~ "\n"; }
+    auto log = `{"type":"session","data":{"version":1,"id":"skim","created_at":"x"}}` ~ "\n";
+    ulong lines = 1;
+    JSONValue[] folded;
+    Message[] live;
+    void add(string type, JSONValue data) { log ~= line(type, data); lines++; }
+    foreach (round; 0 .. 12)
+    {
+        auto first = lines + 1;
+        ulong lastIn;
+        foreach (t; 0 .. 5)
+        {
+            lastIn = lines + 1;
+            auto id = text("in-", round, "-", t);
+            auto q = text("question ", round, " ", t);
+            add("input", JSONValue(["id": id, "text": q]));
+            auto u = Message.user(q ~ "\n\n<system-reminder>ctx</system-reminder>");
+            add("message", rec(u));
+            add("message", rec(Message.assistant(text("answer ", round, " ", t))));
+            live ~= u;
+            if (t < 4 || round % 3) add("turn_end", JSONValue(["input_id": JSONValue(id), "response": JSONValue("ok")]));
+        }
+        if (round == 4) add("plan", JSONValue(["plan": parseJSON(`{"goal":"g","items":[]}`)]));
+        if (round == 6) add("timers", JSONValue(["timers": parseJSON(`{"last_id":1,"items":[]}`)]));
+        foreach (m; live[0 .. $ - 1]) folded ~= rec(m);
+        // Retained: the latest exchange, without log lines (backfilled).
+        JSONValue d = ["messages": JSONValue([rec(Message.user("summary")), rec(live[$ - 1]),
+            rec(Message.assistant(text("answer ", round, " 4")))])];
+        d["folded"] = folded;
+        d["summarized"] = JSONValue([JSONValue(first), JSONValue(lastIn - 1)]);
+        if (round % 3 == 0) d["pending_position"] = 1;
+        live = live[$ - 1 .. $];
+        add("replace", d);
+    }
+    add("input", JSONValue(["id": "tail", "text": "still going"]));
+    add("message", rec(Message.user("still going")));
+    auto path = buildPath(dir, "skim.jsonl");
+    write(path, log ~ `{"type":"mess`); // and a torn last line
+    auto skimmed = restoreLog(path, true), full = restoreLog(path, false);
+    assert(skimmed == full, "skimming superseded snapshots restores the same state");
+    assert(skimmed.conversation.length == 4 && skimmed.conversation[1].logLine && skimmed.conversation[2].logLine,
+        "retained messages get their log lines");
+    assert(skimmed.completed.length == full.completed.length && skimmed.hasPending);
+    assert(skimmed.replayStash.length == folded.length && skimmed.pinStash.ptr is skimmed.replayStash.ptr,
+        "the Rust folded stash is held once");
+}
+
+unittest // skim_floor_counts_later_delta_replaces (issue #244)
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, write;
+    import std.path : buildPath;
+    auto dir = buildPath(tempDir, "nano-d-skimdelta-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    static JSONValue rec(Message m) { return messageRecord(m); }
+    string line(string type, JSONValue data) { return JSONValue(["type": JSONValue(type), "data": data]).toString ~ "\n"; }
+    auto log = `{"type":"session","data":{"version":1,"id":"skimdelta","created_at":"x"}}` ~ "\n";
+    ulong lines = 1;
+    void add(string type, JSONValue data) { log ~= line(type, data); lines++; }
+    auto early = Message.user("early question");
+    add("input", JSONValue(["id": "in-0", "text": "early question"]));
+    add("message", rec(early));
+    add("message", rec(Message.assistant("early answer")));
+    JSONValue full = ["messages": JSONValue([rec(Message.user("summary"))])];
+    full["folded"] = JSONValue([rec(early)]);
+    full["summarized"] = JSONValue([JSONValue(2), JSONValue(lines)]);
+    add("replace", full);
+    // A later delta replace, with no `summarized`, retaining the early message
+    // without its log line: backfill must still find the original.
+    JSONValue delta = ["messages": JSONValue([rec(Message.user("summary 2")), rec(early)])];
+    delta["folded"] = JSONValue(cast(JSONValue[]) []);
+    delta["folded_base"] = 1;
+    add("replace", delta);
+    auto path = buildPath(dir, "skimdelta.jsonl");
+    write(path, log);
+    auto skimmed = restoreLog(path, true), fullR = restoreLog(path, false);
+    assert(skimmed == fullR, "a later delta lowers the skim floor");
+}
+
+unittest // escaped_delta_key_is_not_a_full_snapshot (issue #244)
+{
+    import std.array : replace;
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, write;
+    import std.path : buildPath;
+    auto dir = buildPath(tempDir, "nano-d-skimesc-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    static JSONValue rec(Message m) { return messageRecord(m); }
+    string line(string type, JSONValue data) { return JSONValue(["type": JSONValue(type), "data": data]).toString ~ "\n"; }
+    auto log = `{"type":"session","data":{"version":1,"id":"skimesc","created_at":"x"}}` ~ "\n";
+    auto one = Message.user("one"), two = Message.user("two");
+    log ~= line("message", rec(one));
+    JSONValue full = ["messages": JSONValue([rec(Message.user("summary"))])];
+    full["folded"] = JSONValue([rec(one)]);
+    log ~= line("replace", full);
+    JSONValue delta = ["messages": JSONValue([rec(Message.user("summary 2"))])];
+    delta["folded"] = JSONValue([rec(two)]);
+    delta["folded_base"] = 1;
+    log ~= line("replace", delta).replace(`"folded_base"`, `"folded\u005fbase"`);
+    auto path = buildPath(dir, "skimesc.jsonl");
+    write(path, log);
+    auto skimmed = restoreLog(path, true), fullR = restoreLog(path, false);
+    assert(skimmed == fullR, "an escaped delta key still marks a delta");
+    assert(skimmed.replayStash.length == 2, "the earlier folded stash survives");
+}
+
+unittest // escaped_type_delta_lowers_the_skim_floor (issue #244)
+{
+    import std.array : replace;
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, write;
+    import std.path : buildPath;
+    auto dir = buildPath(tempDir, "nano-d-skimesctype-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    static JSONValue rec(Message m) { return messageRecord(m); }
+    string line(string type, JSONValue data) { return JSONValue(["type": JSONValue(type), "data": data]).toString ~ "\n"; }
+    auto log = `{"type":"session","data":{"version":1,"id":"skimesctype","created_at":"x"}}` ~ "\n";
+    ulong lines = 1;
+    void add(string type, JSONValue data) { log ~= line(type, data); lines++; }
+    auto early = Message.user("early question");
+    add("input", JSONValue(["id": "in-0", "text": "early question"]));
+    add("message", rec(early));
+    add("message", rec(Message.assistant("early answer")));
+    JSONValue full = ["messages": JSONValue([rec(Message.user("summary"))])];
+    full["folded"] = JSONValue([rec(early)]);
+    full["summarized"] = JSONValue([JSONValue(2), JSONValue(lines)]);
+    add("replace", full);
+    // A later delta replace whose `type` is spelled with an escape and which
+    // omits `summarized`: the floor must still lower to 0 so backfill finds
+    // the retained original, exactly as full decoding restores it.
+    JSONValue delta = ["messages": JSONValue([rec(Message.user("summary 2")), rec(early)])];
+    delta["folded"] = JSONValue(cast(JSONValue[]) []);
+    delta["folded_base"] = 1;
+    log ~= line("replace", delta).replace(`"type":"replace"`, `"type":"repla\u0063e"`);
+    lines++;
+    auto path = buildPath(dir, "skimesctype.jsonl");
+    write(path, log);
+    auto skimmed = restoreLog(path, true), fullR = restoreLog(path, false);
+    assert(skimmed == fullR, "an escaped-type delta still lowers the skim floor");
+}
+
+unittest // skim_floor_reads_summarized_unsigned (issue #244)
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, write;
+    import std.path : buildPath;
+    auto dir = buildPath(tempDir, "nano-d-skimflooru-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    static JSONValue rec(Message m) { return messageRecord(m); }
+    string line(string type, JSONValue data) { return JSONValue(["type": JSONValue(type), "data": data]).toString ~ "\n"; }
+    // A full replace whose `summarized` end is signed-hostile: `-1` (which
+    // the full decode's jsonUnsigned rejects, leaving the floor at 0) and a
+    // uinteger above long.max (which a signed skim read rejects but the full
+    // decode accepts). The skimmed restore must land where the full one does.
+    foreach (i, end; [`-1`, `18446744073709551615`])
+    {
+        immutable id = "skimflooru" ~ i.to!string;
+        auto log = `{"type":"session","data":{"version":1,"id":"` ~ id ~ `","created_at":"x"}}` ~ "\n";
+        auto early = Message.user("early question");
+        log ~= line("input", JSONValue(["id": "in-0", "text": "early question"]));
+        log ~= line("message", rec(early));
+        log ~= line("message", rec(Message.assistant("early answer")));
+        // Retain the early message (without its log line) so a wrong skim
+        // floor changes its backfilled log line and fails the comparison.
+        JSONValue full = ["messages": JSONValue([rec(Message.user("summary")), rec(early)])];
+        full["folded"] = JSONValue([rec(early)]);
+        auto rl = line("replace", full);
+        // Splice the raw summarized end in unquoted through the existing
+        // `folded` field, past std.json's tagging.
+        import std.array : replace;
+        rl = rl.replace(`"folded":`, `"summarized":[2,` ~ end ~ `],"folded":`);
+        log ~= rl;
+        auto path = buildPath(dir, id ~ ".jsonl");
+        write(path, log);
+        auto skimmed = restoreLog(path, true), fullR = restoreLog(path, false);
+        assert(skimmed == fullR, "a signed-hostile summarized end (" ~ end ~ ") skims like the full decode");
+        // `-1` leaves the floor at 0, so backfill claims the early original;
+        // above-long.max keeps the floor past it, so it is never claimed.
+        assert(skimmed.conversation[1].logLine == (i == 0 ? 3 : 0),
+            "the hostile end (" ~ end ~ ") moves the retained message's log line");
+    }
+}
+
+unittest // skim_pending_position_reads_unsigned (issue #244)
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, write;
+    import std.path : buildPath;
+    auto dir = buildPath(tempDir, "nano-d-skimposu-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    static JSONValue rec(Message m) { return messageRecord(m); }
+    string line(string type, JSONValue data) { return JSONValue(["type": JSONValue(type), "data": data]).toString ~ "\n"; }
+    // An in-flight input preserved by the first full replace, then a
+    // superseded delta whose `pending_position` is signed-hostile: `-1` (full
+    // decode drops the pending input), `-0` (full decode keeps it: std.json
+    // parses -0 to integer 0, which jsonUnsigned accepts), and a uinteger
+    // above long.max (full decode keeps it). A final full replace re-reads
+    // whatever pending state survived the skimmed delta, so a skim that
+    // disagrees with the full decode loses (or keeps) the input.
+    foreach (i, pos; [`-1`, `-0`, `18446744073709551615`])
+    {
+        immutable id = "skimposu" ~ i.to!string;
+        auto log = `{"type":"session","data":{"version":1,"id":"` ~ id ~ `","created_at":"x"}}` ~ "\n";
+        log ~= line("input", JSONValue(["id": "in-0", "text": "crash here"]));
+        // The first snapshot preserves the in-flight input at position 0.
+        JSONValue full = ["messages": JSONValue([rec(Message.user("summary"))])];
+        full["folded"] = JSONValue(cast(JSONValue[]) []);
+        full["pending_position"] = 0;
+        log ~= line("replace", full);
+        JSONValue delta = ["messages": JSONValue([rec(Message.user("summary 2"))])];
+        delta["folded"] = JSONValue(cast(JSONValue[]) []);
+        delta["folded_base"] = 1;
+        auto dl = line("replace", delta);
+        import std.array : replace;
+        dl = dl.replace(`"folded_base":1`, `"folded_base":1,"pending_position":` ~ pos);
+        log ~= dl;
+        // A later full replace with position 0: it cannot restore a pending
+        // flag the skimmed delta wrongly cleared, and it keeps one the full
+        // decode kept. Continuation snapshots are compared only while the
+        // input is active, since inactive pending fields can retain stale
+        // values.
+        JSONValue last = ["messages": JSONValue([rec(Message.user("summary 3"))])];
+        last["folded"] = JSONValue(cast(JSONValue[]) []);
+        last["pending_position"] = 0;
+        log ~= line("replace", last);
+        auto path = buildPath(dir, id ~ ".jsonl");
+        write(path, log);
+        auto skimmed = restoreLog(path, true), fullR = restoreLog(path, false);
+        assert(skimmed == fullR, "a signed-hostile pending_position (" ~ pos ~ ") skims like the full decode");
+        immutable survives = pos != `-1`;
+        assert(skimmed.hasPending == survives,
+            "the pending input " ~ (survives ? "survives " : "is dropped by ") ~ pos ~ " exactly as the full decode");
+        if (survives) assert(skimmed.pendingInput == "crash here", "the input text survives " ~ pos);
+    }
+}
+
+@("a session log's fd is close-on-exec, so a relaunched image can lock it (#237)")
+unittest
+{
+    import std.process : spawnProcess, wait, Config;
+    auto dir = buildPath(tempDir, format("nano-coder-cloexec-%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/x");
+    scope (exit) log.close();
+    immutable fd = log.f.fileno;
+    auto resumed = new SessionLog(log.path); // shared in-process handle
+    resumed.close();
+    // Exec level: an exec'd image must not see the fd (and its flock).
+    auto script = format("test ! -e /dev/fd/%s", fd);
+    // inheritFDs: std.process closes nothing, so only FD_CLOEXEC can.
+    auto pid = spawnProcess(["/bin/sh", "-c", script], null, Config.inheritFDs);
+    assert(wait(pid) == 0, "the log fd survived exec");
+}
+
+@("a log replaced under a live writer loses nothing silently (#237)")
+unittest
+{
+    import std.algorithm : canFind, count;
+    auto dir = buildPath(tempDir, format("nano-coder-replaced-%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    string[] warned;
+
+    // 1. Replaced by a copy (a prefix of ours): the path gets the rest.
+    {
+        auto log = new SessionLog(dir, "mock/m", "/x");
+        log.warn = (string m) { warned ~= m; };
+        log.input("i1", "first");
+        auto p = log.path;
+        auto text = readText(p);
+        rename(p, p ~ ".moved");
+        std.file.write(p, text);
+        setAttributes(p, octal!644); // a world-readable replacement
+        log.input("i2", "second");
+        log.close();
+        assert((getAttributes(p) & octal!777) == octal!600, "the replacement is narrowed before appending");
+        auto now = readText(p);
+        assert(now.canFind("first") && now.canFind("second"), now);
+        assert(now.count('\n') == 3);
+        assert(warned.length == 1 && warned[0].canFind("missing"), warned[0]);
+    }
+    // 2. Removed: the path is restored with every record.
+    {
+        auto log = new SessionLog(dir, "mock/m", "/x");
+        log.warn = (string m) { warned ~= m; };
+        log.input("i1", "alpha");
+        auto p = log.path;
+        remove(p);
+        log.input("i2", "beta");
+        log.close();
+        auto now = readText(p);
+        assert(now.canFind("alpha") && now.canFind("beta"), now);
+        assert(warned.length == 2 && warned[1].canFind("removed"));
+    }
+    // 3. Rewritten with different content (e.g. compacted): a recovery log.
+    {
+        auto log = new SessionLog(dir, "mock/m", "/x");
+        log.warn = (string m) { warned ~= m; };
+        log.input("i1", "gamma");
+        auto p = log.path;
+        remove(p);
+        std.file.write(p, "{\"type\":\"session\",\"data\":{}}\n");
+        log.input("i2", "delta");
+        auto rec = log.path;
+        log.input("i3", "epsilon");
+        {
+            // The foreign file at the original path must not stay locked
+            // by a leaked in-place-repair fd while this writer lives on.
+            auto probe = File(p, "r+");
+            assert(tryLock(probe) == LockResult.acquired, "a leaked fd still locks the rewritten path");
+            probe.close();
+        }
+        log.close();
+        assert(rec != p && rec.exists);
+        auto now = readText(rec);
+        assert(now.canFind("gamma") && now.canFind("delta") && now.canFind("epsilon"), now);
+        assert(readText(p) == "{\"type\":\"session\",\"data\":{}}\n");
+        assert(warned.length == 3 && warned[2].canFind(rec));
+        validateId(log.id);
+        // The recovery is a resumable session: its header names its id.
+        restore(rec); // throws on a header id mismatch
+        assert(parseJSON(readText(rec).lineSplitter.front)["data"]["id"].str == log.id);
+        assert(findSession(dir, log.id) == rec);
+    }
+    // 4. Rewritten with different content of the same length: not a prefix.
+    {
+        auto log = new SessionLog(dir, "mock/m", "/x");
+        log.warn = (string m) { warned ~= m; };
+        log.input("i1", "zeta");
+        auto p = log.path;
+        auto text = readText(p);
+        remove(p);
+        { import std.array : replace; std.file.write(p, text.replace("zeta", "ZETA")); }
+        log.input("i2", "eta");
+        auto rec = log.path;
+        log.close();
+        assert(rec != p, "an equal-length rewrite must not be treated as a prefix");
+        assert(readText(rec).canFind("zeta") && readText(rec).canFind("eta"));
+        assert(readText(p).canFind("ZETA") && !readText(p).canFind("eta"));
+    }
+}
+
+@("recovery ids stay valid for long and repeatedly recovered ids (#237)")
+unittest
+{
+    auto longId = new char[](128);
+    longId[] = 'a';
+    auto stem = recoveryStem(longId.idup);
+    validateId(stem ~ ".recovered-999");
+    assert(recoveryStem("sess-x.recovered-3") == "sess-x");
+    assert(recoveryStem("sess-x.recovered-") == "sess-x.recovered-");
+    assert(withHeaderId("{\"type\":\"session\",\"data\":{\"id\":\"a\"}}\nrest\n".representation, "b")
+        == "{\"type\":\"session\",\"data\":{\"id\":\"b\"}}\nrest\n".representation);
+    assert(withHeaderId("not json\n".representation, "b") == "not json\n".representation);
+}
+
+@("closing an old sharer after an in-place recovery keeps the recovered handle (#237)")
+unittest
+{
+    import std.algorithm : canFind;
+    auto dir = buildPath(tempDir, format("nano-coder-sharers-%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto a = new SessionLog(dir, "mock/m", "/x");
+    a.warn = (string) {};
+    auto b = new SessionLog(a.path); // shares a's handle
+    auto p = a.path;
+    remove(p);
+    a.input("i1", "after-removal"); // recovers in place: a new handle at p
+    b.close(); // must not close a's recovered handle
+    assert(a.isOpenForWrite);
+    a.input("i2", "still-writing");
+    a.close();
+    assert(readText(p).canFind("still-writing"));
+    assert(p !in openHere);
+}
+
+@("a contended in-place repair falls through to a recovery log and leaks no fd (#237)")
+unittest
+{
+    import std.algorithm : canFind, count;
+    auto dir = buildPath(tempDir, format("nano-coder-contended-%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/x");
+    log.warn = (string) {};
+    log.input("i1", "kappa");
+    auto p = log.path;
+    // Replace the path with a foreign file whose lock another handle holds:
+    // the in-place repair is contended, so recovery must fall through to a
+    // recovery log — closing the contended fd it opened, not leaking it.
+    auto foreign = buildPath(dir, "foreign.jsonl");
+    std.file.write(foreign, "{\"type\":\"session\",\"data\":{}}\n");
+    auto holder = openExistingForAppend(foreign);
+    assert(tryLock(holder) == LockResult.acquired);
+    scope (exit) holder.close();
+    rename(foreign, p);
+    log.input("i2", "lambda");
+    auto rec = log.path;
+    log.close();
+    assert(rec != p && rec.exists, "a contended in-place repair recovers to a recovery log");
+    auto now = readText(rec);
+    assert(now.canFind("kappa") && now.canFind("lambda"), now);
+    assert(now.count('\n') == 3, now); // header + both records: nothing lost
+    assert(readText(p) == "{\"type\":\"session\",\"data\":{}}\n", "the foreign file is untouched");
+    // A leaked fd keeps its flock after close(): the recovered log's lock
+    // must be free again.
+    auto probe = openExistingForAppend(rec);
+    scope (exit) probe.close();
+    assert(tryLock(probe) == LockResult.acquired, "no leaked fd still locks the recovery log");
+    restore(rec); // a resumable session: its header names the recovery id
+}
+
+@("a contended recovery name is skipped, never unlinked, and the next name used (#237)")
+unittest
+{
+    import std.algorithm : canFind, count;
+    import std.file : dirEntries, SpanMode;
+    auto dir = buildPath(tempDir, format("nano-coder-racename-%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/x");
+    log.warn = (string) {};
+    log.input("i1", "mu");
+    auto p = log.path;
+    // Rewrite the path with foreign content so recovery needs a recovery log,
+    // then sit on the first recovery name's lock: recovery must skip the
+    // contended name (closing its fd and removing the empty, header-less file
+    // it published) and continue at N+1 — not abort the whole recovery.
+    remove(p);
+    std.file.write(p, "{\"type\":\"session\",\"data\":{}}\n");
+    auto stem = recoveryStem(log.id);
+    auto first = buildPath(dir, stem ~ ".recovered-1.jsonl");
+    auto squatter = createPrivate(first);
+    assert(tryLock(squatter) == LockResult.acquired);
+    scope (exit) squatter.close();
+    log.input("i2", "nu");
+    auto rec = log.path;
+    log.close();
+    assert(rec == buildPath(dir, stem ~ ".recovered-2.jsonl"), rec);
+    auto now = readText(rec);
+    assert(now.canFind("mu") && now.canFind("nu"), now);
+    assert(now.count('\n') == 3, now);
+    // The contended name is left exactly as the squatter had it: present,
+    // empty, and still exclusively the squatter's (no second writer, no
+    // leaked fd, no partial header).
+    assert(readText(first) == "", "the skipped name stays header-less for its lock holder");
+    auto probe = openExistingForAppend(rec);
+    scope (exit) probe.close();
+    assert(tryLock(probe) == LockResult.acquired, "the adopted recovery log is free after close");
+    assert(dirEntries(dir, "*.recovered-*.jsonl", SpanMode.shallow).array.length == 2,
+        "no extra empty recovery files left behind");
+    restore(rec);
+}
+
+@("a recovery log under a new id keeps the session's attachments (#237)")
+unittest
+{
+    auto dir = buildPath(tempDir, format("nano-coder-recatt-%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/x");
+    log.warn = (string) {};
+    log.input("i1", "img");
+    auto p = log.path, oldId = log.id;
+    auto oldAtt = buildPath(dir, oldId ~ ".attachments");
+    mkdirRecurse(oldAtt);
+    std.file.write(buildPath(oldAtt, "blob.png"), "PNG");
+    remove(p);
+    std.file.write(p, "{\"type\":\"session\",\"data\":{}}\n");
+    log.input("i2", "after");
+    log.close();
+    assert(log.id != oldId);
+    assert(readText(buildPath(dir, log.id ~ ".attachments", "blob.png")) == "PNG");
+    assert(buildPath(oldAtt, "blob.png").exists, "the originals stay for the old log");
+}
+
+@("recovery skips a name whose compressed archive already exists (#237)")
+unittest
+{
+    import std.algorithm : canFind, count;
+    auto dir = buildPath(tempDir, format("nano-coder-recgz-%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/x");
+    log.warn = (string) {};
+    log.input("i1", "pi");
+    auto p = log.path;
+    auto stem = recoveryStem(log.id);
+    // An earlier recovered session was tidied up to `<stem>.recovered-1.jsonl.gz`.
+    // A later recovery must not take the plain `recovered-1` name: that would
+    // shadow the archive (`findSession` prefers a plain log) and strand it.
+    auto gz = buildPath(dir, stem ~ ".recovered-1.jsonl.gz");
+    std.file.write(gz, "x");
+    remove(p);
+    std.file.write(p, "{\"type\":\"session\",\"data\":{}}\n");
+    log.input("i2", "rho");
+    auto rec = log.path;
+    log.close();
+    assert(rec == buildPath(dir, stem ~ ".recovered-2.jsonl"), rec);
+    auto now = readText(rec);
+    assert(now.canFind("pi") && now.canFind("rho"), now);
+    assert(gz.exists, "the earlier archive is left in place");
+    // And the archive stays resumable by its own id once the plain squat is gone.
+    assert(findSession(dir, stem ~ ".recovered-1") == gz);
+    restore(rec);
+}
+
+@("a destination replaced after the final sync is not adopted (#237)")
+unittest
+{
+    import std.algorithm : canFind;
+    auto dir = buildPath(tempDir, format("nano-coder-recswap-%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/x");
+    log.warn = (string) {};
+    log.input("i1", "sigma");
+    auto p = log.path;
+    auto stem = recoveryStem(log.id);
+    // Force the recovery-log path, and pre-create the first recovery name so
+    // the loop adopts the second. Then swap that second name between the
+    // recovery's create+lock and its post-sync identity re-check: the writer
+    // must detect the swap, close the unlinked candidate, and fall to the
+    // next name instead of adopting (and appending to) an unlinked inode.
+    remove(p);
+    std.file.write(p, "{\"type\":\"session\",\"data\":{}}\n");
+    auto first = buildPath(dir, stem ~ ".recovered-1.jsonl");
+    std.file.write(first, ""); // taken, so the loop moves to recovered-2
+    // A swap hook: when recovery creates recovered-2, replace the path with a
+    // foreign file before the post-sync sameFile re-check runs.
+    auto second = buildPath(dir, stem ~ ".recovered-2.jsonl");
+    log.swapAfterCreate = (string created) {
+        if (created == second)
+        {
+            remove(created);
+            std.file.write(created, "{\"type\":\"session\",\"data\":{}}\n");
+        }
+    };
+    log.input("i2", "tau");
+    auto rec = log.path;
+    log.close();
+    // The swapped candidate (recovered-2) was not adopted; recovery used the next.
+    assert(rec == buildPath(dir, stem ~ ".recovered-3.jsonl"), rec);
+    auto now = readText(rec);
+    assert(now.canFind("sigma") && now.canFind("tau"), now);
+    restore(rec);
+}
+
+// An in-place rewrite of the recovery candidate (same inode, so `sameFile`
+// still matches) must not be adopted: recovery verifies the bytes.
+unittest
+{
+    import std.algorithm : canFind;
+    import std.array : replicate;
+    auto dir = buildPath(tempDir, format("nano-coder-recinplace-%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/x");
+    log.warn = (string) {};
+    log.input("i1", "sigma");
+    auto p = log.path;
+    auto stem = recoveryStem(log.id);
+    remove(p);
+    std.file.write(p, "{\"type\":\"session\",\"data\":{}}\n");
+    auto first = buildPath(dir, stem ~ ".recovered-1.jsonl");
+    log.swapAfterCreate = (string created) {
+        // Same inode: truncate-and-write, longer than our records.
+        if (created == first)
+            std.file.write(created, "{\"type\":\"session\",\"data\":{\"id\":\"foreign\"}}\n" ~ "x".replicate(8192) ~ "\n");
+    };
+    log.input("i2", "tau");
+    auto rec = log.path;
+    log.close();
+    assert(rec == buildPath(dir, stem ~ ".recovered-2.jsonl"), rec);
+    auto now = readText(rec);
+    assert(now.canFind("sigma") && now.canFind("tau") && !now.canFind("foreign"), now);
+    restore(rec);
 }

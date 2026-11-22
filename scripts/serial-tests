@@ -19,3 +19,4 @@ nano.testenv_test environment variables
 nano.update environment variables
 nano.herdr the Herdr reporter
 nano.subagent_test the cancel flag
+nano.agent_parallel_test the cancel flag

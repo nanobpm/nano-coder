@@ -161,6 +161,21 @@ int fchmodFd(int fd, uint mode) @trusted
     return fchmod(fd, cast(mode_t) mode);
 }
 
+/// The mode `open(2)` gives a new file created with 0666: 0666 less the
+/// process umask, read once at startup (reading it means setting it, which
+/// is only safe before other threads exist).
+immutable uint newFileMode;
+
+// Safe: umask(2) takes and returns a plain mode, touching no memory.
+shared static this() @trusted
+{
+    import core.sys.posix.sys.stat : umask;
+    import std.conv : octal;
+    auto old = umask(0);
+    umask(old);
+    newFileMode = octal!666 & ~uint(old);
+}
+
 /// `stat(2)`'s `st_mode` for `path`; false when the path can't be stat'ed.
 bool statMode(string path, out uint mode) @trusted
 {
@@ -1072,4 +1087,69 @@ unittest
     assert(!jsonSigned(JSONValue(1.5), l));
     assert(jsonWholeAsDouble(JSONValue(3u)) == 3.0);
     assert(jsonWholeAsDouble(JSONValue(-3)) == -3.0);
+}
+
+/// Create a fresh temp file beside `base` in `dir` holding `content`, opened
+/// exclusively (`O_CREAT | O_EXCL`, which never follows a symlink) under an
+/// unpredictable name, retrying on a collision. Returns its path. The file is
+/// private (0600) while being written, then given `mode` (the replaced
+/// file's permissions, or `newFileMode` for a fresh one) in a single step, so
+/// it is never wider than that final mode. The name is bounded so a
+/// long `base` can't push it past the filesystem's component limit.
+string writeTemp(string dir, string base, const(ubyte)[] content, uint mode) @trusted
+{
+    import core.sys.posix.fcntl : open, O_WRONLY, O_CREAT, O_EXCL, O_NOFOLLOW;
+    import core.sys.posix.unistd : posixWrite = write, close;
+    import core.stdc.errno : errno, EEXIST, EINTR;
+    import std.process : thisProcessID;
+    import std.file : FileException, remove;
+    import std.format : format;
+    import std.path : buildPath;
+    import std.conv : octal;
+    import std.random : uniform;
+    import std.string : toStringz;
+    // A 255-byte component limit is common; the suffix needs a dot, the PID
+    // and 16 hex digits, so cap the basename to keep the whole name under it.
+    enum maxBase = 240 - 20 - 10;
+    if (base.length > maxBase) base = base[$ - maxBase .. $];
+    foreach (_; 0 .. 100)
+    {
+        auto tmp = buildPath(dir, format(".%s.tmp-%s-%016x", base, thisProcessID, uniform!ulong));
+        auto fd = open(tmp.toStringz, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, octal!600);
+        if (fd < 0)
+        {
+            if (errno == EEXIST) continue;
+            throw new FileException(tmp, errno);
+        }
+        scope (exit) close(fd);
+        scope (failure) { try remove(tmp); catch (FileException) {} } // best effort; the write error propagates
+        auto rest = content;
+        while (rest.length)
+        {
+            auto n = posixWrite(fd, rest.ptr, rest.length);
+            if (n < 0)
+            {
+                if (errno == EINTR) continue;
+                throw new FileException(tmp, errno);
+            }
+            rest = rest[n .. $];
+        }
+        // Apply the final mode once: never widen past it, even briefly.
+        if (fchmodFd(fd, mode & octal!7777) != 0) throw new FileException(tmp, errno);
+        return tmp;
+    }
+    throw new FileException(dir, "could not create a unique temporary file");
+}
+
+unittest // writeTemp applies the caller's final mode directly; a 0600 target's replacement is never widened
+{
+    import std.conv : octal;
+    import std.file : getAttributes, remove, tempDir, readText;
+    auto t = writeTemp(tempDir, "wt-mode-private", cast(const(ubyte)[]) "s\n", octal!600);
+    scope (exit) remove(t);
+    assert((getAttributes(t) & octal!7777) == octal!600);
+    assert(readText(t) == "s\n");
+    auto u = writeTemp(tempDir, "wt-mode-default", cast(const(ubyte)[]) "d\n", newFileMode);
+    scope (exit) remove(u);
+    assert((getAttributes(u) & octal!7777) == newFileMode);
 }
