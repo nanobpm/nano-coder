@@ -42,6 +42,13 @@ class ToolRegistry
 {
     private ToolDefinition[string] defs;
     private ToolHandler[string] handlers;
+    private Object[string] richHandlers;
+
+    private static final class RichHandler(T)
+    {
+        T handler;
+        this(T h) pure { handler = h; }
+    }
 
     void register(ToolDefinition def, ToolHandler handler) pure
     {
@@ -49,25 +56,23 @@ class ToolRegistry
         handlers[def.name] = handler;
     }
 
-    /// Replace a tool's handler with a richer delegate shape (e.g.
-    /// apply_patch's PatchHandler), retrievable via `handlerAs`.
-    /// `execute` must not be used for such a tool; its callers go through
-    /// `handlerAs`.
-    void registerHandler(T)(string name, T handler) pure @trusted
+    /// Register an additional, richer-shaped handler for `name` (e.g.
+    /// apply_patch's PatchHandler), retrievable via `handlerAs`. It is kept
+    /// in its own map, so the plain ToolHandler used by `execute` is never
+    /// replaced or reinterpreted.
+    void registerHandler(T)(string name, T handler) pure
     {
-        // Trusted: a delegate's bit-pattern is shape-independent; only the
-        // matching cast in handlerAs ever invokes it (see below).
-        handlers[name] = cast(ToolHandler) handler;
+        richHandlers[name] = new RichHandler!T(handler);
     }
 
-    /// The handler behind `name` as the richer shape `T` it was registered
-    /// with (e.g. apply_patch's PatchHandler), or null when it has the plain
-    /// ToolHandler shape. Trusted for the matching registerHandler above:
-    /// the cast is sound because the same name carried exactly a `T` there.
-    T handlerAs(T)(string name) @trusted
+    /// The richer handler registered for `name` with exactly the shape `T`,
+    /// or null when none was (a type-checked downcast, never a reinterpret).
+    T handlerAs(T)(string name)
     {
-        auto h = name in handlers;
-        return h is null ? null : cast(T) *h;
+        auto h = name in richHandlers;
+        if (h is null) return null;
+        auto boxed = cast(RichHandler!T) *h;
+        return boxed is null ? null : boxed.handler;
     }
 
     bool has(string name) pure const { return (name in defs) !is null; }
@@ -86,6 +91,18 @@ class ToolRegistry
         if (h is null) throw new ToolError(format("Tool '%s' not found", name));
         return (*h)(args);
     }
+}
+
+unittest
+{
+    alias Rich = string delegate(JSONValue, int) @safe;
+    auto r = new ToolRegistry;
+    r.register(ToolDefinition("t", "d", JSONValue.init), (JSONValue a) => "plain");
+    assert(r.handlerAs!Rich("t") is null);
+    r.registerHandler!Rich("t", delegate(JSONValue a, int n) @safe => "rich");
+    assert(r.execute("t", JSONValue.init) == "plain"); // execute keeps the plain shape
+    assert(r.handlerAs!Rich("t")(JSONValue.init, 1) == "rich");
+    assert(r.handlerAs!(string delegate(JSONValue, string))("t") is null); // wrong shape
 }
 
 // ---------------------------------------------------------------------------

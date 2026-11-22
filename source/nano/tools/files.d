@@ -1226,6 +1226,10 @@ private void rollBack(const ref Staged s)
     rename(tmp, target);
 }
 
+/// Test seam: runs just before a failed commit rolls back, so a test can
+/// make the restoration itself fail.
+version (unittest) private void delegate() beforeRollbackForTest;
+
 /// Write the staged changes. Every target is re-checked against what was
 /// staged before anything is written and again just before its own write or
 /// delete; a mutation that then fails rolls back the ones before it. The
@@ -1246,6 +1250,7 @@ private void commitStaged(Staged[] staged, ReadState state)
     // then restore deleted entries, whose paths those directories may hold.
     void rollback()
     {
+        version (unittest) if (beforeRollbackForTest !is null) beforeRollbackForTest();
         void undo(bool writes)
         {
             foreach_reverse (ref s; staged[0 .. done])
@@ -1590,7 +1595,7 @@ void register(ToolRegistry tools, ReadState state)
         (JSONValue a) => applyPatch(a, state));
     // The richer shape, for callers that carry the hook-approved staged
     // contents into the commit (see PatchHandler).
-    tools.registerHandler("apply_patch", (JSONValue a, PatchSnapshot[] prepared) => applyPatch(a, state, prepared));
+    tools.registerHandler!PatchHandler("apply_patch", (JSONValue a, PatchSnapshot[] prepared) => applyPatch(a, state, prepared));
 }
 
 version (unittest)
@@ -2550,4 +2555,33 @@ unittest // review round 8: symlink freshness by identity, pinned targets, prepa
     assert(e3.indexOf("rolled back") >= 0 && e3.indexOf("ROLLBACK FAILED") < 0, e3);
     assert(!b.exists, e3);
     remove(dst); remove(a); remove(blocker);
+    // The rollback itself failing (its directory went read-only) is reported
+    // as ROLLBACK FAILED. Root ignores directory permissions, so skip there.
+    import core.sys.posix.unistd : geteuid;
+    if (geteuid() != 0)
+    {
+        auto roDir = tmpFile("p8-ro", null);
+        if (roDir.exists) rmdirRecurse(roDir);
+        mkdirRecurse(roDir);
+        auto c = buildPath(roDir, "c.txt");
+        auto blocker2 = tmpFile("p8-blocker2", "file\n");
+        beforeRollbackForTest = () { setAttributes(roDir, octal!555); };
+        scope (exit)
+        {
+            beforeRollbackForTest = null;
+            setAttributes(roDir, octal!755);
+            rmdirRecurse(roDir);
+            remove(blocker2);
+        }
+        auto e4 = patchErr(st, pt("*** Add File: " ~ c, "+x", "*** Add File: " ~ buildPath(blocker2, "child"), "+y"));
+        assert(e4.indexOf("ROLLBACK FAILED") >= 0 && e4.indexOf("rolled back") < 0, e4);
+        assert(c.exists, e4);
+    }
+}
+
+unittest // the hook-approved commit path is reachable: apply_patch's PatchHandler is retrievable by its exact shape
+{
+    auto reg = new ToolRegistry;
+    register(reg, new ReadState);
+    assert(reg.handlerAs!PatchHandler("apply_patch") !is null);
 }
