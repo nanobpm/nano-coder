@@ -902,6 +902,10 @@ class Agent
         // logged results, and history_read's spill bookkeeping is the
         // agent thread's own.
         if (hist.isHistoryTool(name)) return false;
+        // Tool-use hooks are arbitrary commands that may change files, so a
+        // call a hook can see keeps its sequential place: a PostToolUse hook
+        // on one read must run before the next read observes the tree.
+        if (hooks.match!(m => m.hasToolHooks(name), () => false)) return false;
         return tools.readOnly(name);
     }
 
@@ -990,8 +994,19 @@ class Agent
                 // Packaging only copies text: the tool's own checks run in the job.
                 if (mode.offload !is null)
                 {
-                    jobs[k] = mode.offload(runs[k].effectiveArgs);
-                    offloaded[k] = true;
+                    // Packaging can fail (e.g. a deleted cwd while building
+                    // the Read-deny scan): that call fails like a sequential
+                    // one would, rather than unwinding the whole batch.
+                    try
+                    {
+                        jobs[k] = mode.offload(runs[k].effectiveArgs);
+                        offloaded[k] = true;
+                    }
+                    catch (Exception e)
+                    {
+                        results[k] = JobResult(e.msg, true, true);
+                        finished[k] = true;
+                    }
                 }
             }
         }

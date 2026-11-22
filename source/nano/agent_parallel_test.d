@@ -334,3 +334,61 @@ unittest
     assert(r[4].canFind("repeated too many times"), r[4]);
 }
 
+
+// A tool-use hook (which may change files) keeps the calls it can see in
+// sequential order: the rendezvous never meets, each call runs alone.
+unittest
+{
+    import nano.claude_hooks : Event, Hook, HookManager;
+    import nano.option : some;
+    import core.time : seconds;
+    foreach (event; [Event.preToolUse, Event.postToolUse])
+    {
+        atomicStore(arrived, 0);
+        auto reg = new ToolRegistry;
+        Concurrency c;
+        c.readOnly = true;
+        c.offload = (JSONValue a) => Job(&rendezvous, a.toString, ["2"]);
+        reg.register(def("meet"), (JSONValue a) => "sequential", c);
+        auto mock = new MockClient([
+            reply([call("a", "meet", `{"n":1}`), call("b", "meet", `{"n":2}`)]),
+            LLMResponse("done"),
+        ]);
+        auto agent = new Agent(mock, reg, Policy.init, "sys");
+        Hook h;
+        h.event = event;
+        h.command = "true";
+        h.matcher = "meet";
+        h.timeout = 10.seconds;
+        agent.hooks = some(new HookManager([h], tempDir));
+        assert(agent.run("go", new NullEvents) == "done");
+        assert(results(agent) == [
+            `["a", "meet", "sequential", "false"]`,
+            `["b", "meet", "sequential", "false"]`,
+        ], results(agent).to!string);
+    }
+}
+
+// A call whose job can't be packaged fails alone, like a sequential call
+// that throws; its batch neighbours still run.
+unittest
+{
+    auto reg = new ToolRegistry;
+    Concurrency bad;
+    bad.readOnly = true;
+    bad.offload = (JSONValue a) { throw new Exception("no cwd"); return Job.init; };
+    reg.register(def("bad"), (JSONValue a) => "unused", bad);
+    Concurrency ok;
+    ok.readOnly = true;
+    reg.register(def("ok"), (JSONValue a) => "fine", ok);
+    auto mock = new MockClient([
+        reply([call("a", "bad"), call("b", "ok")]),
+        LLMResponse("done"),
+    ]);
+    auto agent = new Agent(mock, reg, Policy.init, "sys");
+    assert(agent.run("go", new NullEvents) == "done");
+    assert(results(agent) == [
+        `["a", "bad", "bad failed: no cwd", "true"]`,
+        `["b", "ok", "fine", "false"]`,
+    ], results(agent).to!string);
+}
