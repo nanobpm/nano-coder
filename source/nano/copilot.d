@@ -3,6 +3,8 @@
 module nano.copilot;
 
 @safe:
+
+import std.string : representation;
 import nano.safeio : jsonText, jsonPretty;
 import nano.clock : wallNow;
 
@@ -173,7 +175,7 @@ void writePrivateAtomic(string path, string text)
         size_t done;
         while (done < text.length)
         {
-            auto n = writeFd(fd, cast(const(ubyte)[]) text[done .. $]);
+            auto n = writeFd(fd, text[done .. $].representation);
             if (n <= 0) throw new Exception("write " ~ tmp ~ " failed");
             done += n;
         }
@@ -237,6 +239,22 @@ struct SessionToken
     long refreshAt;
 }
 
+/// When to refresh a session token expiring at `expires` (unix seconds);
+/// saturates instead of wrapping for hostile `expires_at` values near long.min.
+long refreshAtFor(long expires) pure nothrow @safe @nogc
+{
+    return expires < long.min + refreshMarginSecs ? long.min : expires - refreshMarginSecs;
+}
+
+unittest
+{
+    assert(refreshAtFor(1000) == 1000 - refreshMarginSecs);
+    assert(refreshAtFor(long.min) == long.min);
+    assert(refreshAtFor(long.min + refreshMarginSecs - 1) == long.min);
+    assert(refreshAtFor(long.min + refreshMarginSecs) == long.min);
+    assert(refreshAtFor(long.max) == long.max - refreshMarginSecs);
+}
+
 /// Exchange a GitHub OAuth token for a Copilot session token.
 SessionToken exchange(const Endpoints e, string oauth)
 {
@@ -261,7 +279,7 @@ SessionToken exchange(const Endpoints e, string oauth)
     s.token = t.str;
     auto expires = "expires_at" in j && j["expires_at"].type == JSONType.integer ? j["expires_at"].integer
         : wallNow.toUnixTime + 1500;
-    s.refreshAt = expires - refreshMarginSecs;
+    s.refreshAt = refreshAtFor(expires);
     if (auto ep = "endpoints" in j)
         if (ep.type == JSONType.object)
             if (auto api = "api" in *ep) if (api.type == JSONType.string) s.baseUrl = api.str.stripRight("/");
@@ -312,7 +330,7 @@ string login(scope void delegate(string) @safe note, scope void delegate(long se
     }
     long interval = num(device, "interval", 5);
     if (interval < 1) interval = 1;
-    auto deadline = wallNow.toUnixTime + num(device, "expires_in", 900);
+    auto deadline = deviceDeadline(wallNow.toUnixTime, num(device, "expires_in", 900));
     note("UNOFFICIAL: this signs in as the VS Code Copilot extension; use at your own risk.");
     note(format("Open %s and enter code: %s", uri, userCode));
     note("Waiting for authorization...");
@@ -367,4 +385,19 @@ unittest
     auto path = saveCredentials(StoredCredentials("gho_x", "github.com", "2026-01-01T00:00:00Z"), dir);
     assert((getAttributes(path) & octal!777) == octal!600);
     assert(loadCredentials(c, dir) && c.oauthToken == "gho_x" && c.domain == "github.com");
+}
+
+/// Device-login deadline: saturates instead of wrapping on a huge expires_in.
+long deviceDeadline(long now, long secs) pure nothrow @safe @nogc
+{
+    if (secs < 0) secs = 0;
+    return secs > long.max - now ? long.max : now + secs;
+}
+
+unittest
+{
+    assert(deviceDeadline(100, 900) == 1000);
+    assert(deviceDeadline(100, long.max) == long.max);
+    assert(deviceDeadline(100, long.max - 100) == long.max);
+    assert(deviceDeadline(100, -5) == 100);
 }

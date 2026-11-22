@@ -215,7 +215,7 @@ struct Plan
         uint[] added;
         foreach (offset, it; list)
         {
-            uint id = firstId + cast(uint) offset;
+            uint id = firstId + offset.to!uint;
             string title, note;
             uint[] after;
             if (it.type == JSONType.string) title = it.str;
@@ -407,9 +407,14 @@ struct Plan
                 if (idv is null || idv.type != JSONType.integer && idv.type != JSONType.uinteger || t is null
                         || t.type != JSONType.string || s is null || s.type != JSONType.string)
                     return R.err(shape);
-                auto raw = idv.type == JSONType.integer ? idv.integer : cast(long) idv.uinteger;
+                // Phobos tags any unsigned value `uinteger` (even
+                // `JSONValue(1u)`, which `toJSON` produces for ids), so keep
+                // the actual value; only one above `long.max` can't be a
+                // valid id and takes the out-of-range path.
+                auto raw = idv.type == JSONType.integer ? idv.integer
+                    : idv.uinteger > ulong(long.max) ? long.max : long(idv.uinteger);
                 if (raw <= 0 || raw > maxId) return R.err(format!"plan item id %s is out of range 1-%s"(raw, maxId));
-                p.id = cast(uint) raw;
+                p.id = raw.to!uint; // in range: checked above
                 p.title = t.str;
                 auto st = parseStatus(s.str);
                 if (st.isErr) return R.err(st.unwrapErr("isErr"));
@@ -449,7 +454,7 @@ struct Plan
                     if (parsed.isErr) return R.err(parsed.unwrapErr("isErr"));
                     st = parsed.unwrap("isOk");
                 }
-            plan.items ~= PlanItem(cast(uint) index + 1, clip(title, maxTitleChars), st);
+            plan.items ~= PlanItem((index + 1).to!uint, clip(title, maxTitleChars), st);
         }
         return R.ok(plan);
     }
@@ -493,15 +498,15 @@ private PlanResult!JSONValue decoded(const JSONValue v) pure
                         JSONValue(v.str).jsonText, e.msg));
         }
     }
-    return R.ok(cast(JSONValue) v);
+    return R.ok(JSONValue(v));
 }
 
 private bool idOf(const JSONValue v, out uint id) pure
 {
     try
     {
-        if (v.type == JSONType.integer && v.integer >= 0 && v.integer <= uint.max) { id = cast(uint) v.integer; return true; }
-        if (v.type == JSONType.uinteger && v.uinteger <= uint.max) { id = cast(uint) v.uinteger; return true; }
+        if (v.type == JSONType.integer && v.integer >= 0 && v.integer <= uint.max) { id = v.integer.to!uint; return true; }
+        if (v.type == JSONType.uinteger && v.uinteger <= uint.max) { id = v.uinteger.to!uint; return true; }
         if (v.type == JSONType.string)
         {
             auto s = v.str.strip;
@@ -611,6 +616,16 @@ unittest // rejects_bad_calls_without_changing_the_plan
     assert(Plan.fromJSON(parseJSON(`{"items": [{"id": 4294967295, "title": "x", "status": "pending"}]}`)).isErr);
     assert(Plan.fromJSON(parseJSON(`{"items": [{"id": 1, "title": "x", "status": "pending"}, {"id": 1, "title": "y", "status": "done"}]}`)).isErr);
     assert(Plan.fromJSON(parseJSON(`{"items": [{"id": 1, "title": "x", "status": "pending", "after": [3]}]}`)).isErr);
+
+    // `toJSON` builds ids from `uint`, which Phobos tags `uinteger`: a
+    // nonempty plan must survive its own round-trip (the unsigned value is
+    // kept, not read as "above long.max").
+    Plan two;
+    two.apply("plan_add", parseJSON(`{"items": ["a", "b"]}`)).unwrap("valid");
+    auto back = Plan.fromJSON(two.toJSON).unwrap("a nonempty uinteger-id plan round-trips");
+    assert(back == two);
+    // An unsigned id above long.max is still out of range.
+    assert(Plan.fromJSON(parseJSON(`{"items": [{"id": 18446744073709551615, "title": "x", "status": "pending"}]}`)).isErr);
 }
 
 // rust: plan.rs::context_note_drops_finished_notes_first_and_round_trips_through_acp

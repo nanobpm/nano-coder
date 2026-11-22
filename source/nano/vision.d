@@ -8,6 +8,9 @@ module nano.vision;
 @safe:
 pure:
 
+import nano.arith : toSize;
+import nano.safeio : jsonUnsigned, jsonSigned;
+
 import std.algorithm : canFind, any;
 import std.json;
 import std.string : toLower, startsWith, indexOf, lastIndexOf;
@@ -45,14 +48,17 @@ struct Vision
         if (lv !is null)
         {
             if (auto m = objGet(*lv, "max_prompt_images"))
-                if (m.type == JSONType.integer || m.type == JSONType.uinteger)
+                if (isWhole(*m))
                 {
-                    if (m.integer == 0) return none;
-                    out_.maxImages = cast(size_t) m.integer;
+                    auto n = wholeToSize(*m);
+                    if (n == 0) return none;
+                    out_.maxImages = n;
                 }
             if (auto m = objGet(*lv, "max_prompt_image_size"))
-                if ((m.type == JSONType.integer || m.type == JSONType.uinteger) && m.integer > 0)
-                    out_.maxImageBytes = cast(size_t) m.integer;
+            {
+                ulong n; // negative/zero sizes are ignored, as before
+                if (jsonUnsigned(*m, n) && n > 0) out_.maxImageBytes = toSize(n);
+            }
             if (auto m = objGet(*lv, "supported_media_types"))
                 if (m.type == JSONType.array)
                     foreach (t; m.arrayNoRef) if (t.type == JSONType.string) out_.mediaTypes ~= t.str;
@@ -77,6 +83,21 @@ struct Vision
 }
 
 enum Source { model, provider, global, detected }
+
+private bool isWhole(const JSONValue v) pure
+{
+    return v.type == JSONType.integer || v.type == JSONType.uinteger;
+}
+
+/// Either integer tag as a size; a negative or oversized value throws
+/// ConvException where it is read (reading `.integer` on a uinteger throws).
+private size_t wholeToSize(const JSONValue v) pure
+{
+    ulong u;
+    long l;
+    // Shared signed/unsigned reader; a negative value still throws via toSize.
+    return jsonUnsigned(v, u) ? toSize(u) : jsonSigned(v, l) ? toSize(l) : toSize(-1L);
+}
 
 private Vision copy(const Vision v) pure { return Vision(v.maxImages, v.maxImageBytes, v.mediaTypes.dup); }
 
@@ -181,6 +202,13 @@ unittest
     auto v = Vision.fromModelEntry(parseJSON(`{"capabilities":{"supports":{"vision":true},"limits":{"vision":{"max_prompt_images":5,"max_prompt_image_size":3145728,"supported_media_types":["image/png"]}}}}`));
     assert(!v.isNull && v.get.maxImages == 5 && v.get.maxImageBytes == 3145728 && v.get.mediaTypes == ["image/png"]);
     assert(Vision.fromModelEntry(parseJSON(`{"capabilities":{"supports":{"vision":true},"limits":{"vision":{"max_prompt_images":0}}}}`)).isNull);
+    {
+        // A negative count is reported where it is read, not wrapped to 2^64.
+        import std.exception : assertThrown;
+        import std.conv : ConvException;
+        assertThrown!ConvException(Vision.fromModelEntry(parseJSON(
+            `{"capabilities":{"supports":{"vision":true},"limits":{"vision":{"max_prompt_images":-1}}}}`)));
+    }
     assert(!Vision.fromOllamaShow(parseJSON(`{"capabilities":["vision"]}`)).isNull);
     assert(!Vision.fromLlamacppProps(parseJSON(`{"modalities":{"vision":true}}`)).isNull);
     ProviderConfig openai;
@@ -198,4 +226,16 @@ unittest
     assert(!resolve(unset, ProviderKind.anthropic, anth, "claude-sonnet-4-5").isNull);
     assert(resolve(unset, ProviderKind.anthropic, anth, "claude-2.1").isNull);
     assert(baseUrlHost("http://user@Host.example:8080/x") == "host.example");
+}
+
+unittest
+{
+    // uinteger-tagged limits (JSONValue(1u)) must be read, not throw.
+    auto e = parseJSON(`{"capabilities":{"supports":{"vision":true},"limits":{"vision":{}}}}`);
+    e["capabilities"]["limits"]["vision"]["max_prompt_images"] = JSONValue(3u);
+    e["capabilities"]["limits"]["vision"]["max_prompt_image_size"] = JSONValue(1024u);
+    auto v = Vision.fromModelEntry(e);
+    assert(!v.isNull && v.get.maxImages == 3 && v.get.maxImageBytes == 1024);
+    e["capabilities"]["limits"]["vision"]["max_prompt_images"] = JSONValue(0u);
+    assert(Vision.fromModelEntry(e).isNull);
 }

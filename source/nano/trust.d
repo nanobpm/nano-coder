@@ -5,6 +5,10 @@
 module nano.trust;
 
 @safe:
+
+import nano.safeio : utf8Text;
+
+import std.string : representation;
 import nano.clock : monoNow;
 
 import std.algorithm : canFind, any, startsWith, endsWith;
@@ -13,7 +17,7 @@ import std.file : exists, isDir, isFile, readText, mkdirRecurse, dirEntries, Spa
 import std.path : buildPath, baseName, dirName, expandTilde, pathSplitter;
 import std.process : environment;
 import std.string : splitLines, strip, toLower, lineSplitter;
-import std.utf : validate;
+import std.utf : validate, UTFException;
 import nano.skills : canonical;
 
 /// How deep below a skills directory to look for a `SKILL.md`.
@@ -105,7 +109,7 @@ string escapeDebug(string s) pure
         else if (c == '\r') o ~= `\r`;
         else if (c == '\t') o ~= `\t`;
         else if (c == '\\') o ~= `\\`;
-        else if (c < 0x20 || c == 0x7f || (c >= 0x80 && c < 0xa0)) o ~= format(`\u{%x}`, cast(uint) c);
+        else if (c < 0x20 || c == 0x7f || (c >= 0x80 && c < 0xa0)) o ~= format(`\u{%x}`, uint(c));
         else o ~= c;
     }
     return o;
@@ -243,10 +247,12 @@ void remember(string root, string file)
         if (n == 0) break;
         existing ~= buf[0 .. n];
     }
-    auto text = cast(const(char)[]) existing;
+    string text;
+    try text = utf8Text(existing);
+    catch (UTFException) return; // not text: not ours to append to
     if (text.lineSplitter.canFind!(l => l == key)) return;
     if (text.length && !text.endsWith("\n")) return;
-    try writeFd(fd, cast(const(ubyte)[]) (key ~ "\n"));
+    try writeFd(fd, (key ~ "\n").representation);
     catch (Exception) {} // not remembered: the user is asked again next time (fail closed)
 }
 

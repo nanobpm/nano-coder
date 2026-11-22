@@ -172,6 +172,41 @@ unittest
     assertThrown(find(path, `{}`));
 }
 
+// Phobos tags any unsigned JSON value `uinteger` (even `JSONValue(1u)`), so a
+// programmatically supplied unsigned `limit` must keep its actual value, not
+// read as "unbounded"; only a value above long.max saturates.
+unittest
+{
+    import std.exception : assertThrown;
+    auto dir = fresh("unsigned-limit");
+    scope (exit) rmdirRecurse(dir);
+    auto path = fixture(dir);
+    JSONValue one = JSONValue(1u);
+    assert(one.type == JSONType.uinteger);
+    auto out_ = search(path, JSONValue(["pattern": JSONValue("auth"), "limit": one]));
+    assert(out_.canFind("[2 more older matching messages not shown"), out_);
+    JSONValue huge = JSONValue(ulong.max);
+    out_ = search(path, JSONValue(["pattern": JSONValue("auth"), "limit": huge]));
+    assert(out_.lineSplitter.array.length == 3, out_); // saturates to maxLimit: every hit shown
+}
+
+// Same for `max_output_length`: an unsigned 100 stays 100 and an unsigned 0
+// is still rejected as non-positive.
+unittest
+{
+    import std.exception : assertThrown;
+    auto dir = fresh("unsigned-output");
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "m", "/w", "t");
+    auto user = Message.user("x");
+    auto reply = Message.assistant("y".replicate(500));
+    log.append(user);
+    log.append(reply);
+    auto out_ = read(log.path, JSONValue(["id": JSONValue(2), "max_output_length": JSONValue(100u)]));
+    assert(out_.length < 500, out_);
+    assertThrown!HistoryError(read(log.path, JSONValue(["id": JSONValue(2), "max_output_length": JSONValue(0u)])));
+}
+
 // rust: history.rs::search_shows_later_matches_in_a_message
 unittest
 {

@@ -5,7 +5,7 @@ module nano.session_history;
 
 @safe:
 import nano.safeio : jsonText, jsonPretty;
-import nano.arith : saturatingSub;
+import nano.arith : saturatingSub, toSize;
 
 import std.algorithm : canFind, startsWith, min;
 import std.array : join, split;
@@ -182,8 +182,12 @@ string search(string path, JSONValue args)
     size_t limit = defaultLimit;
     if (auto l = "limit" in args.objectNoRef)
     {
-        long n = l.type == JSONType.integer ? l.integer : l.type == JSONType.uinteger ? cast(long) l.uinteger : 0;
-        if (n > 0) limit = min(cast(size_t) n, maxLimit);
+        // Phobos tags any unsigned value `uinteger` (even `JSONValue(1u)`),
+        // so clamp the actual value to the signed range rather than reading
+        // every unsigned limit as "unbounded".
+        long n = l.type == JSONType.integer ? l.integer
+            : l.type == JSONType.uinteger ? (l.uinteger > ulong(long.max) ? long.max : long(l.uinteger)) : 0;
+        if (n > 0) limit = min(toSize(n), maxLimit);
     }
     bool oldestFirst;
     if (auto o = "order" in args.objectNoRef)
@@ -276,9 +280,12 @@ string read(string path, JSONValue args)
     size_t limit = defaultMaxOutput;
     if (auto l = "max_output_length" in args.objectNoRef)
     {
-        long n = l.type == JSONType.integer ? l.integer : l.type == JSONType.uinteger ? cast(long) l.uinteger : -1;
+        // Clamp the actual unsigned value (see `search` above): an unsigned
+        // 100 must stay 100, and an unsigned 0 must still be rejected.
+        long n = l.type == JSONType.integer ? l.integer
+            : l.type == JSONType.uinteger ? (l.uinteger > ulong(long.max) ? long.max : long(l.uinteger)) : -1;
         if (n <= 0) throw new HistoryError("max_output_length must be a positive integer");
-        limit = min(cast(size_t) n, maxOutputLimit);
+        limit = min(toSize(n), maxOutputLimit);
     }
     auto messages = load(path);
     const(Entry)* found;

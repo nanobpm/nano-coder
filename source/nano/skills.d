@@ -18,6 +18,10 @@
 module nano.skills;
 
 @safe:
+
+import nano.arith : toLong;
+
+import std.string : representation;
 import nano.safeio : jsonText, jsonPretty;
 import nano.clock : monoNow, sleepFor;
 
@@ -267,12 +271,12 @@ final class Skills
         if (!skills.length) return "";
         string out_ = "\n\n# Skills\n\nSkills are instructions for specific kinds of task. When a task matches a skill below, "
             ~ "call `" ~ toolName ~ "` with its name and follow what it says before you start. Load only the skills that apply.\n";
-        long budget = cast(long) maxIndexBytes - cast(long) out_.length;
+        long budget = toLong(maxIndexBytes) - toLong(out_.length);
         string[] omitted;
         foreach (s; skills)
         {
             auto line = format("\n- `%s`: %s", s.name, s.description);
-            if (cast(long) line.length > budget) { omitted ~= "`" ~ s.name ~ "`"; continue; }
+            if (toLong(line.length) > budget) { omitted ~= "`" ~ s.name ~ "`"; continue; }
             budget -= line.length;
             out_ ~= line;
         }
@@ -517,7 +521,7 @@ private bool relativeInside(string path) pure
 string storeKey(string url, string sha) pure
 {
     ulong h = 0xcbf2_9ce4_8422_2325UL;
-    foreach (ubyte b; cast(const(ubyte)[]) url)
+    foreach (ubyte b; url.representation)
     {
         h ^= b;
         h *= 0x0000_0100_0000_01b3UL;
