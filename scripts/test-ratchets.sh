@@ -87,4 +87,19 @@ for c in "$(git rev-parse --git-common-dir)"/nano-ratchets/*; do head -n 2 "$c" 
 if check; then no "a truncated cached measurement fails"; elif grep -q 'corrupt ratchet cache' out; then ok "a truncated cached measurement fails"; else no "a truncated cached measurement fails (message)"; fi
 rm -rf "$(git rev-parse --git-common-dir)"/nano-ratchets
 
+# A cached measurement with the right row count but a duplicated name fails.
+check || true
+for c in "$(git rev-parse --git-common-dir)"/nano-ratchets/*; do
+    { sed -n 1p "$c"; sed 1d "$c" | sed '$d'; sed -n 1p "$c"; } > "$c.t" && mv "$c.t" "$c"
+done
+if check; then no "a cached measurement with a duplicate row fails"; elif grep -q 'corrupt ratchet cache' out; then ok "a cached measurement with a duplicate row fails"; else no "a cached measurement with a duplicate row fails (message)"; fi
+rm -rf "$(git rev-parse --git-common-dir)"/nano-ratchets
+
+# A missing helper script fails the measurement instead of counting 0.
+for h in cast class-null; do
+    mv "scripts/$h.awk" "scripts/$h.awk.off"
+    if ./scripts/ratchets.sh . >/dev/null 2>&1; then no "a missing $h.awk fails"; else ok "a missing $h.awk fails"; fi
+    mv "scripts/$h.awk.off" "scripts/$h.awk"
+done
+
 [ "$fails" = 0 ] || { echo "$fails ratchet test(s) failed" >&2; exit 1; }

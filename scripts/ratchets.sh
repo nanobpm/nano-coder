@@ -38,12 +38,16 @@ out subtraction-budget max "$subs" 'raw subtractions in context.d and agent.d'
 out catch-budget max "$(nontest | xargs grep -hE 'catch[[:space:]]*\([[:space:]]*Exception\b' | grep -vE '^[[:space:]]*//' | num)" '`catch (Exception)` outside *_test.d'
 nfiles=$(find source -name '*.d' | num)
 files=$(find source -name '*.d' | sort)
+# Helper output is captured first so a missing or failing helper fails the
+# measurement instead of reading as a count of 0.
 # shellcheck disable=SC2086 # the list is passed three times, one per pass
-out class-null-budget max "$(awk -v n="$nfiles" -f "$S/class-null.awk" $files $files $files | grep -c .)" 'null checks on class references outside *_test.d (use nano.option.Option!T)'
+classnull=$(awk -v n="$nfiles" -f "$S/class-null.awk" $files $files $files) || { echo "ratchets.sh: class-null.awk failed" >&2; exit 2; }
+out class-null-budget max "$(printf '%s' "$classnull" | grep -c .)" 'null checks on class references outside *_test.d (use nano.option.Option!T)'
 out nullable-budget max "$(nontest | xargs grep -hE 'Nullable!' | grep -vE '^[[:space:]]*//' | grep -oE 'Nullable!' | num)" '`Nullable!` uses outside *_test.d (use nano.option.Option!T)'
 out class-budget max "$(nontest | xargs grep -hE '^[[:space:]]*((final|abstract|private|public)[[:space:]]+)*class[[:space:]]+[A-Z]' | grep -vE 'class[[:space:]]+[A-Za-z0-9_]*(Error|Exception)\b|:[[:space:]]*Exception' | num)" 'class declarations (exceptions aside) outside *_test.d'
 out nullable-mark-budget max "$(nontest | xargs grep -hE '^[[:space:]]*@nullable\(' | num)" '`@nullable` marks outside *_test.d'
-out cast-budget max "$(find source -name '*.d' ! -name '*_test.d' ! -name safeio.d | sort | xargs awk -f "$S/cast.awk" | num)" '`cast(`s outside unittests, *_test.d and safeio.d'
+casts=$(find source -name '*.d' ! -name '*_test.d' ! -name safeio.d | sort | xargs awk -f "$S/cast.awk") || { echo "ratchets.sh: cast.awk failed" >&2; exit 2; }
+out cast-budget max "$(printf '%s' "$casts" | grep -c .)" '`cast(`s outside unittests, *_test.d and safeio.d'
 out pure-floor min "$(nontest | xargs grep -hE '\bpure\b' | grep -vE '^[[:space:]]*(//|\*|/\+)' | grep -vE '^pure:$' | grep -oE '\bpure\b' | num)" '`pure` attributes outside *_test.d'
 # shellcheck disable=SC2046 # one file per word
 pure_files=$(grep -lE '^pure:$' /dev/null $(nontest) | grep -v 'pureaudit.d$')

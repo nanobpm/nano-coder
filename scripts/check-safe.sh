@@ -179,11 +179,16 @@ done
 # A measurement must succeed and give one numeric line per ratchet: a failed
 # or truncated one would otherwise skip comparisons and let regressions in.
 nratchets=$(grep -c '^out ' scripts/ratchets.sh)
+# One validator for fresh and cached measurements: exactly $nratchets rows,
+# unique names, a max/min direction and a numeric count on each.
+valid_measurement() {
+    printf '%s\n' "$1" | awk -v n="$nratchets" '
+        NF < 4 || $3 !~ /^[0-9]+$/ || ($2 != "max" && $2 != "min") || seen[$1]++ { bad = 1 }
+        END { exit (bad || NR != n) }'
+}
 measure() {
     m=$(./scripts/ratchets.sh "$1") || { echo "Error: scripts/ratchets.sh failed on $2" >&2; return 1; }
-    if ! printf '%s\n' "$m" | awk -v n="$nratchets" '
-        NF < 4 || $3 !~ /^[0-9]+$/ || ($2 != "max" && $2 != "min") || seen[$1]++ { bad = 1 }
-        END { exit (bad || NR != n) }'; then
+    if ! valid_measurement "$m"; then
         echo "Error: scripts/ratchets.sh gave an incomplete or malformed measurement of $2:" >&2
         printf '%s\n' "$m" >&2
         return 1
@@ -208,7 +213,7 @@ else
     cache=$(git rev-parse --git-common-dir)/nano-ratchets
     measure_cached() {
         m=$(cat "$1") || return 1
-        if ! printf '%s\n' "$m" | awk -v n="$nratchets" 'NF < 4 || $3 !~ /^[0-9]+$/ { bad = 1 } END { exit (bad || NR != n) }'; then
+        if ! valid_measurement "$m"; then
             echo "Error: corrupt ratchet cache $1; delete it" >&2
             return 1
         fi

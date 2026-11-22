@@ -33,8 +33,13 @@ typecheck() {
 lint() {
     step "check-safe"
     # In CI the ratchets must be compared against the merge base (the
-    # workflow fetches full history so origin/main is there).
-    NANO_RATCHET_REQUIRE=${CI:+1} ./scripts/check-safe.sh
+    # workflow fetches full history so origin/main is there); outside CI the
+    # caller's NANO_RATCHET_REQUIRE is kept.
+    if [ -n "${CI:-}" ]; then
+        NANO_RATCHET_REQUIRE=1 ./scripts/check-safe.sh
+    else
+        ./scripts/check-safe.sh
+    fi
     step "ratchet tests"
     ./scripts/test-ratchets.sh
     step "dscanner"
