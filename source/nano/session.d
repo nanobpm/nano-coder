@@ -783,15 +783,216 @@ struct Restored
     bool historyHintConsumed;
 }
 
+/// The end of the JSON value starting at `s[i]` (a raw scan: strings are
+/// skipped escape-aware, containers by depth; nothing is decoded).
+private size_t skipJSONValue(const(char)[] s, size_t i) pure nothrow @nogc
+{
+    size_t depth;
+    while (i < s.length)
+    {
+        immutable c = s[i];
+        if (c == '"')
+        {
+            for (++i; i < s.length && s[i] != '"'; ++i)
+                if (s[i] == '\\') ++i;
+            ++i;
+            if (!depth) return i;
+            continue;
+        }
+        if (c == '{' || c == '[') depth++;
+        else if (c == '}' || c == ']')
+        {
+            if (!depth) return i;
+            if (!--depth) return i + 1;
+        }
+        else if (!depth && (c == ',' || c == ' ' || c == '\t' || c == '\r' || c == '\n')) return i;
+        ++i;
+    }
+    return i;
+}
+
+/// Call `dg` with each top-level key (raw, unescaped) and the raw text of its
+/// value in the JSON object `obj`, without parsing the values (issue #244: a
+/// superseded compaction snapshot is skimmed, not decoded). Stops when `dg`
+/// returns false; false for text that isn't an object.
+private bool skimObject(const(char)[] obj, scope bool delegate(const(char)[] key, const(char)[] raw) @safe dg)
+{
+    import std.ascii : isWhite;
+    size_t i;
+    void ws() { while (i < obj.length && obj[i].isWhite) ++i; }
+    ws();
+    if (i >= obj.length || obj[i] != '{') return false;
+    ++i;
+    for (;;)
+    {
+        ws();
+        if (i >= obj.length) return false;
+        if (obj[i] == '}') return true;
+        if (obj[i] != '"') return false;
+        auto ke = skipJSONValue(obj, i);
+        if (ke > obj.length || ke < i + 2) return false;
+        auto key = obj[i + 1 .. ke - 1];
+        i = ke;
+        ws();
+        if (i >= obj.length || obj[i] != ':') return false;
+        ++i;
+        ws();
+        auto ve = skipJSONValue(obj, i);
+        if (ve > obj.length) return false;
+        if (!dg(key, obj[i .. ve])) return true;
+        i = ve;
+        ws();
+        if (i < obj.length && obj[i] == ',') ++i;
+    }
+}
+
+/// The raw value of top-level `key` in the JSON object `obj`, or null.
+private const(char)[] skimField(const(char)[] obj, string key)
+{
+    const(char)[] found;
+    skimObject(obj, (k, v) { if (k == key) { found = v; return false; } return true; });
+    return found;
+}
+
+/// Whether `raw` is a JSON integer that `std.json` reads as `JSONType.integer`
+/// (fits a long), and its value.
+private bool rawLong(const(char)[] raw, out long v) pure nothrow @nogc
+{
+    import std.ascii : isDigit;
+    size_t i;
+    bool neg = raw.length && raw[0] == '-';
+    if (neg) i = 1;
+    if (i >= raw.length) return false;
+    long acc;
+    for (; i < raw.length; ++i)
+    {
+        if (!raw[i].isDigit) return false;
+        immutable int d = raw[i] - '0';
+        if (neg ? acc < (long.min + d) / 10 : acc > (long.max - d) / 10) return false;
+        acc = neg ? acc * 10 - d : acc * 10 + d;
+    }
+    v = acc;
+    return true;
+}
+
+/// Call `dg` with the raw text of each element of the raw JSON array `arr`.
+private void skimArray(const(char)[] arr, scope void delegate(const(char)[] elem) @safe dg)
+{
+    import std.ascii : isWhite;
+    size_t i;
+    while (i < arr.length && arr[i].isWhite) ++i;
+    if (i >= arr.length || arr[i] != '[') return;
+    ++i;
+    for (;;)
+    {
+        while (i < arr.length && arr[i].isWhite) ++i;
+        if (i >= arr.length || arr[i] == ']') return;
+        auto e = skipJSONValue(arr, i);
+        if (e == i) return;
+        dg(arr[i .. e]);
+        i = e;
+        while (i < arr.length && arr[i].isWhite) ++i;
+        if (i < arr.length && arr[i] == ',') ++i;
+    }
+}
+
+/// The number of elements of the raw JSON array `arr` (0 if not an array).
+private size_t skimCount(const(char)[] arr) pure nothrow @nogc
+{
+    import std.ascii : isWhite;
+    size_t i, n;
+    while (i < arr.length && arr[i].isWhite) ++i;
+    if (i >= arr.length || arr[i] != '[') return 0;
+    ++i;
+    for (;;)
+    {
+        while (i < arr.length && arr[i].isWhite) ++i;
+        if (i >= arr.length || arr[i] == ']') return n;
+        auto e = skipJSONValue(arr, i);
+        if (e == i) return n;
+        n++;
+        i = e;
+        while (i < arr.length && arr[i].isWhite) ++i;
+        if (i < arr.length && arr[i] == ',') ++i;
+    }
+}
+
+/// Stream the committed lines of a session log (a torn last line is
+/// dropped) to `dg` with their 1-based line numbers. A plain log is read
+/// line by line rather than whole (issue #244); a compressed one is inflated.
+private void eachLogLine(string path, scope void delegate(const(char)[] line, ulong lineNo) @safe dg)
+{
+    ulong lineNo;
+    if (isCompressedLog(path))
+    {
+        auto text = logText(path);
+        auto committed = text.length;
+        while (committed && text[committed - 1] != '\n') committed--;
+        if (!committed) throw new Exception("session log " ~ path ~ " has no committed records");
+        foreach (line; text[0 .. committed].lineSplitter) dg(line, ++lineNo);
+        return;
+    }
+    import std.typecons : Yes;
+    auto f = File(path, "rb");
+    bool any;
+    foreach (line; f.byLine(Yes.keepTerminator))
+    {
+        if (!line.length || line[$ - 1] != '\n') break; // torn
+        any = true;
+        auto l = line[0 .. $ - 1];
+        if (l.length && l[$ - 1] == '\r') l = l[0 .. $ - 1];
+        dg(l, ++lineNo);
+    }
+    if (!any) throw new Exception("session log " ~ path ~ " has no committed records");
+}
+
+/// Pass 1 of `restore` (issue #244): the line of the latest `replace` that
+/// supersedes all earlier compaction state (a full restatement: no
+/// `folded_base` / `pinned_base` delta), and its `summarized` end, found by
+/// skimming record types without decoding any record. 0 when there is none.
+private ulong lastFullReplace(string path, out ulong floor)
+{
+    ulong at;
+    eachLogLine(path, (line, lineNo) {
+        auto type = skimField(line, "type");
+        if (type != `"replace"`) return;
+        auto data = skimField(line, "data");
+        bool delta;
+        ulong fl;
+        skimObject(data, (k, v) {
+            if ((k == "folded_base" || k == "pinned_base") && v != "null") delta = true;
+            else if (k == "summarized")
+            {
+                // `[first, last]`: the second element, as `restore` reads it.
+                const(char)[][] parts;
+                skimArray(v, (e) { parts ~= e; });
+                long last;
+                if (parts.length == 2 && rawLong(parts[1], last)) fl = last;
+            }
+            return true;
+        });
+        if (!delta) { at = lineNo; floor = fl; }
+    });
+    return at;
+}
+
 /// Read a session log (Rust format), dropping a torn last line.
-Restored restore(string path)
+Restored restore(string path) => restoreLog(path, true);
+
+/// `restore`, optionally decoding every record (`skipSuperseded` false: the
+/// reference the two-pass restore is tested against).
+private Restored restoreLog(string path, bool skipSuperseded)
 {
     import std.algorithm : countUntil;
     Restored r;
-    auto text = logText(path);
-    auto committed = text.length;
-    while (committed && text[committed - 1] != '\n') committed--;
-    if (!committed) throw new Exception("session log " ~ path ~ " has no committed records");
+    // Records before the latest full `replace` only matter for what that
+    // replace doesn't restate (issue #244): inputs, turn ends, plan, timers,
+    // the pending input, and the originals `backfillLogLines` reads past its
+    // summarized range. Superseded snapshots and messages are skimmed.
+    ulong floorL;
+    immutable skipBefore = skipSuperseded ? lastFullReplace(path, floorL) : 0;
+    // The conversation length before `skipBefore`, without building it.
+    size_t skimmedLen;
     string pendingId;
     // Every logged input's text, to backfill `pinText` on legacy messages.
     string[] inputs;
@@ -816,11 +1017,42 @@ Restored restore(string path)
         return p.toJSON;
     }
     size_t index;
-    ulong lineNo;
-    foreach (line; text[0 .. committed].lineSplitter)
-    {
-        ++lineNo;
-        if (!line.length) continue;
+    eachLogLine(path, (line, lineNo) {
+        if (!line.length) return;
+        if (index && lineNo < skipBefore)
+        {
+            auto type = skimField(line, "type");
+            if (type == `"message"`)
+            {
+                skimmedLen++;
+                if (lineNo <= floorL) { index++; return; }
+                // An original past the latest summarized range: decoded
+                // below, for `backfillLogLines` only.
+            }
+            if (type == `"replace"`)
+            {
+                // Superseded: only its effect on the pending input outlives
+                // the latest full replace.
+                auto data = skimField(line, "data");
+                skimmedLen = skimCount(skimField(data, "messages"));
+                auto posRaw = skimField(data, "pending_position");
+                long posVal;
+                immutable posInt = rawLong(posRaw, posVal);
+                if (!(r.hasPending && posInt))
+                {
+                    r.hasPending = false;
+                    r.pendingInput = null;
+                    pendingId = null;
+                }
+                if (!posRaw.length || posRaw == "null")
+                {
+                    pendingId = null;
+                    r.pendingInput = null;
+                }
+                index++;
+                return;
+            }
+        }
         JSONValue rec;
         try rec = parseJSON(line);
         catch (Exception e) throw new Exception(format("decode record %s of %s: %s", index + 1, path, e.msg));
@@ -838,13 +1070,13 @@ Restored restore(string path)
             planFrom = 0;
             r.plan = data["plan"];
             index++;
-            continue;
+            return;
         }
         if (type == "plan_delta")
         {
             planDeltas ~= data;
             index++;
-            continue;
+            return;
         }
         if (type == "session")
         {
@@ -868,9 +1100,16 @@ Restored restore(string path)
             r.pendingInput = data["text"].str;
             inputs ~= r.pendingInput;
             r.hasPending = true;
-            r.pending = PendingInput(pendingId, r.pendingInput, r.conversation.length);
+            r.pending = PendingInput(pendingId, r.pendingInput,
+                lineNo < skipBefore ? skimmedLen : r.conversation.length);
             break;
         case "message":
+            if (lineNo < skipBefore)
+            {
+                originals ~= messageFromRecord(data);
+                originals[$ - 1].logLine = lineNo;
+                break;
+            }
             r.conversation ~= messageFromRecord(data);
             r.conversation[$ - 1].logLine = lineNo;
             backfillPinText(r.conversation[$ - 1], inputs);
@@ -976,7 +1215,10 @@ Restored restore(string path)
                     if (full.length) { rustStash = full; active = true; }
                 }
                 if (!active) rustStash = null;
-                r.replayStash = rustStash.dup;
+                // Shared, not copied (issue #244): neither is mutated in place
+                // (a later delta builds a new array), and an append to one
+                // never shows through the other's length.
+                r.replayStash = rustStash;
                 r.replayRestated = Option!size_t.init;
                 if (auto at = "restated" in data)
                 {
@@ -994,7 +1236,7 @@ Restored restore(string path)
                     auto kept = b < r.pinStash.length ? r.pinStash[0 .. b] : r.pinStash;
                     r.pinStash = kept ~ decode(*pins, inputs);
                 }
-                else r.pinStash = pins !is null ? decode(*pins, inputs) : rustStash.dup;
+                else r.pinStash = pins !is null ? decode(*pins, inputs) : rustStash;
             }
             {
                 auto mode = "mode" in data;
@@ -1027,7 +1269,7 @@ Restored restore(string path)
             break;
         }
         index++;
-    }
+    });
     // Apply the deltas after the latest full snapshot, if any remain.
     if (planDeltas.length > planFrom) r.plan = planAt(planFrom);
     return r;
@@ -2142,4 +2384,64 @@ void releaseHeap() nothrow
     import core.memory : GC;
     GC.collect();
     GC.minimize();
+}
+
+// A long log with many superseded full compaction snapshots (issue #244)
+// restores, skimming them, to exactly what decoding every record gives:
+// inputs, turn ends, the pending input across compactions, the retained
+// messages' backfilled log lines, and the Rust folded stash (held once).
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, write;
+    import std.path : buildPath;
+    import std.conv : text;
+    auto dir = buildPath(tempDir, "nano-d-skim-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    static JSONValue rec(Message m) { return messageRecord(m); }
+    string line(string type, JSONValue data) { return JSONValue(["type": JSONValue(type), "data": data]).toString ~ "\n"; }
+    auto log = `{"type":"session","data":{"version":1,"id":"skim","created_at":"x"}}` ~ "\n";
+    ulong lines = 1;
+    JSONValue[] folded;
+    Message[] live;
+    void add(string type, JSONValue data) { log ~= line(type, data); lines++; }
+    foreach (round; 0 .. 12)
+    {
+        auto first = lines + 1;
+        ulong lastIn;
+        foreach (t; 0 .. 5)
+        {
+            lastIn = lines + 1;
+            auto id = text("in-", round, "-", t);
+            auto q = text("question ", round, " ", t);
+            add("input", JSONValue(["id": id, "text": q]));
+            auto u = Message.user(q ~ "\n\n<system-reminder>ctx</system-reminder>");
+            add("message", rec(u));
+            add("message", rec(Message.assistant(text("answer ", round, " ", t))));
+            live ~= u;
+            if (t < 4 || round % 3) add("turn_end", JSONValue(["input_id": JSONValue(id), "response": JSONValue("ok")]));
+        }
+        if (round == 4) add("plan", JSONValue(["plan": parseJSON(`{"goal":"g","items":[]}`)]));
+        if (round == 6) add("timers", JSONValue(["timers": parseJSON(`{"last_id":1,"items":[]}`)]));
+        foreach (m; live[0 .. $ - 1]) folded ~= rec(m);
+        // Retained: the latest exchange, without log lines (backfilled).
+        JSONValue d = ["messages": JSONValue([rec(Message.user("summary")), rec(live[$ - 1]),
+            rec(Message.assistant(text("answer ", round, " 4")))])];
+        d["folded"] = folded;
+        d["summarized"] = JSONValue([JSONValue(first), JSONValue(lastIn - 1)]);
+        if (round % 3 == 0) d["pending_position"] = 1;
+        live = live[$ - 1 .. $];
+        add("replace", d);
+    }
+    add("input", JSONValue(["id": "tail", "text": "still going"]));
+    add("message", rec(Message.user("still going")));
+    auto path = buildPath(dir, "skim.jsonl");
+    write(path, log ~ `{"type":"mess`); // and a torn last line
+    auto skimmed = restoreLog(path, true), full = restoreLog(path, false);
+    assert(skimmed == full, "skimming superseded snapshots restores the same state");
+    assert(skimmed.conversation.length == 4 && skimmed.conversation[1].logLine && skimmed.conversation[2].logLine,
+        "retained messages get their log lines");
+    assert(skimmed.completed.length == full.completed.length && skimmed.hasPending);
+    assert(skimmed.replayStash.length == folded.length && skimmed.pinStash.ptr is skimmed.replayStash.ptr,
+        "the Rust folded stash is held once");
 }
