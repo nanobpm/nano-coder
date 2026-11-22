@@ -954,7 +954,12 @@ unittest
     assert(!names.canFind("echo"), "no vestigial echo tool");
 }
 
-void setVerbosity(Verbosity v) { atomicStore(gVerbosity, v); }
+void setVerbosity(Verbosity v)
+{
+    atomicStore(gVerbosity, v);
+    // Existing tool results and thoughts follow the switch, not just new ones.
+    if (auto f = gFrame) f.setVerbose(v >= Verbosity.verbose);
+}
 
 // What the frame's status bar shows (status.rs).
 import nano.status : Stats, Activity, RateMeter;
@@ -2868,6 +2873,7 @@ int runMain(string[] args)
         // The app owns the screen and re-renders it (`nano.frameui`); the
         // editor draws only through it.
         gFrame = FrameUi.install(&frameStatus);
+        if (auto f = gFrame) f.setVerbose(verbosity >= Verbosity.verbose);
         if (!gFrame)
         {
             leaveKeyMode();

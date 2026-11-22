@@ -701,13 +701,116 @@ string foldMark(string id, size_t lines, string expanded) pure
         ~ Base64.encode(expanded.representation).idup ~ "\x07";
 }
 
-/// A block of transcript lines with an alternate (expanded or collapsed) form.
+/// Where a fold's expanded text lives: in an anonymous temporary file
+/// (deleted by the system when the process exits), so a long session holds
+/// none of it in memory. Without a file (no writable temporary directory, or
+/// `memoryOnly`), only the latest texts are kept, within `budget` bytes.
+struct FoldStore
+{
+    import std.stdio : File;
+    private File spill;
+    private bool onDisk;
+    private ulong end;
+    // The in-memory fallback, oldest first.
+    private string[ulong] mem;
+    private ulong[] order;
+    private size_t memBytes, head;
+    /// The fallback's byte budget.
+    size_t budget = 4 << 20;
+
+    private bool opened;
+    /// Never use a file (tests; and once a file failed).
+    bool memoryOnly;
+
+    private void open()
+    {
+        if (opened) return;
+        opened = true;
+        if (memoryOnly) return;
+        onDisk = io(() { spill = File.tmpfile(); }); // no temporary file: keep the latest texts in memory
+    }
+
+    /// Runs a file operation; false when it threw.
+    private static bool io(scope void delegate() @safe op)
+    {
+        try { op(); return true; }
+        catch (Exception) { return false; } // the callers fall back (memory, a collapsed fold)
+    }
+
+    /// Whether texts go to the temporary file.
+    bool backedByFile() { open(); return onDisk; }
+
+    /// Stores `text`; the returned reference reads it back.
+    FoldRef put(string text)
+    {
+        open();
+        if (onDisk)
+        {
+            immutable at = end;
+            if (io(() { spill.seek(at); spill.rawWrite(text.representation); }))
+            {
+                end += text.length;
+                return FoldRef(at, text.length);
+            }
+            onDisk = false; // a full disk: memory from here on
+        }
+        return putMemory(text);
+    }
+
+    /// `put` without a file: the latest texts within `budget`.
+    private FoldRef putMemory(string text) pure
+    {
+        auto key = end++ | (1UL << 63);
+        mem[key] = text;
+        order ~= key;
+        memBytes += text.length;
+        while (memBytes > budget && head < order.length)
+        {
+            auto k = order[head++];
+            if (auto t = k in mem) { memBytes -= t.length; mem.remove(k); }
+        }
+        if (head > 1024 && head * 2 > order.length) { order = order[head .. $].dup; head = 0; }
+        return FoldRef(key, text.length);
+    }
+
+    /// The text `r` refers to; false when it is gone (evicted from memory).
+    bool get(FoldRef r, out string text)
+    {
+        if (r.at & (1UL << 63))
+        {
+            auto t = r.at in mem;
+            if (t is null) return false;
+            text = *t;
+            return true;
+        }
+        auto buf = new ubyte[r.length];
+        const(ubyte)[] got;
+        // An unreadable spill file: the fold stays collapsed.
+        if (!io(() { spill.seek(r.at); got = spill.rawRead(buf); }) || got.length != r.length) return false;
+        import nano.safeio : utf8Text;
+        text = utf8Text(got);
+        return true;
+    }
+}
+
+/// A stored fold text (`FoldStore.put`).
+struct FoldRef
+{
+    ulong at;
+    size_t length;
+}
+
+/// A block of transcript lines that can show its expanded text instead.
+/// Only the reference is kept; while expanded, `collapsed` holds the short form.
 private struct Fold
 {
     string id;
     size_t start, length;
-    string[] other;
-    bool expanded;
+    FoldRef text;
+    string[] collapsed;
+    /// The text until `Transcript.settle` stores it.
+    string fresh;
+    bool expanded, lost, stored;
 }
 
 /// The transcript as the logical lines the console printed. `feed` takes
@@ -720,8 +823,14 @@ struct Transcript
     string cur;
     /// Bounded: the oldest lines go once there are more than this.
     size_t cap = 20_000;
+    /// Folds one Ctrl-O expands (about two screens' worth).
+    size_t batch = 20;
+    /// Folds switching to verbose expands.
+    size_t verboseCap = 200;
+    /// Where fold texts go (`settle`).
+    FoldStore store;
     private ubyte[] pending;
-    private bool cr;
+    private bool cr, verbose;
     private string[][] cache;
     private size_t cacheWidth;
     private Fold[] folds;
@@ -817,8 +926,7 @@ struct Transcript
     /// A fold mark (`foldMark`); anything else is dropped.
     private void osc(string body) pure
     {
-        import std.algorithm : splitter;
-        import std.array : array, split;
+        import std.array : split;
         import std.base64 : Base64;
         import std.conv : to;
         auto parts = body.split(";");
@@ -830,44 +938,120 @@ struct Transcript
             auto n = parts[2].to!size_t;
             auto expanded = utf8Text(Base64.decode(parts[3]));
             if (!n || n > lines.length) return;
-            import std.string : stripRight;
-            folds ~= Fold(id, lines.length - n, n, expanded.stripRight("\n").split("\n"));
-            // A result arrives expanded when its call already is.
-            if (id.length)
-                foreach (f; folds[0 .. $ - 1])
-                    if (f.id == id && f.expanded) { swap(folds.length - 1, true); break; }
+            folds ~= Fold(id, lines.length - n, n);
+            folds[$ - 1].fresh = expanded;
+            // A result arrives expanded when its call already is, and every
+            // fold does in verbose.
+            bool want = verbose;
+            if (id.length && !want)
+                foreach_reverse (ref f; folds[0 .. $ - 1])
+                    if (f.id == id) { want = f.expanded; break; }
+            if (want) swapIn(folds.length - 1, expanded);
         }
         catch (Exception) {} // a malformed OSC from the terminal is ignored, like any unknown escape
     }
 
-    /// Ctrl-O: swap the latest fold (with the others sharing its id) between
-    /// collapsed and expanded. False when there is none.
-    bool toggleLatest() pure
+    /// Ctrl-O: expands the next batch of collapsed folds, going up from the
+    /// bottom (with the others sharing their ids); once every fold is
+    /// expanded, collapses them all. False when nothing changed.
+    bool toggle()
     {
-        if (!folds.length) return false;
-        auto latest = folds[$ - 1];
-        bool want = !latest.expanded;
+        settle();
+        size_t todo = batch, changed;
         foreach_reverse (k; 0 .. folds.length)
-            if (k == folds.length - 1 || (latest.id.length && folds[k].id == latest.id)) swap(k, want);
-        return true;
+        {
+            if (!todo) break;
+            if (folds[k].expanded || folds[k].lost) continue;
+            if (swap(k, true)) changed++;
+            todo--;
+            if (folds[k].id.length)
+                foreach_reverse (j; 0 .. folds.length)
+                    if (j != k && folds[j].id == folds[k].id) swap(j, true);
+        }
+        if (changed) return true;
+        return collapseAll();
     }
 
-    /// Shows fold `k` expanded (`want`) or collapsed.
-    private void swap(size_t k, bool want) pure
+    /// Collapses every expanded fold. False when none was.
+    bool collapseAll() pure
     {
+        bool any;
+        foreach_reverse (k; 0 .. folds.length)
+            if (folds[k].expanded) any |= swapIn(k, null);
+        return any;
+    }
+
+    /// Verbose: expands the latest `verboseCap` folds, and every new one;
+    /// leaving it collapses them all. True when the transcript changed.
+    bool setVerbose(bool on)
+    {
+        settle();
+        if (on == verbose) return false;
+        verbose = on;
+        if (!on) return collapseAll();
+        bool any;
+        size_t n;
+        foreach_reverse (k; 0 .. folds.length)
         {
-            auto f = &folds[k];
-            if (f.expanded == want) return;
-            auto shown = lines[f.start .. f.start + f.length].dup;
-            lines = lines[0 .. f.start] ~ f.other ~ lines[f.start + f.length .. $];
-            immutable oldLength = f.length, newLength = f.other.length;
-            f.length = f.other.length;
-            f.other = shown;
-            f.expanded = want;
-            foreach (ref g; folds)
-                if (g.start > f.start) g.start = g.start - oldLength + newLength;
-            if (cache.length > f.start) cache = cache[0 .. f.start];
+            if (n++ >= verboseCap) break;
+            any |= swap(k, true);
         }
+        return any;
+    }
+
+    /// Moves the texts of new folds into `store`, so the transcript holds
+    /// none (the frame calls it after each read).
+    void settle()
+    {
+        size_t from = folds.length;
+        while (from && !folds[from - 1].stored) from--;
+        foreach (ref f; folds[from .. $])
+        {
+            f.text = store.put(f.fresh);
+            f.fresh = null;
+            f.stored = true;
+        }
+    }
+
+    /// Shows fold `k` expanded (`want`) or collapsed. False when it can't
+    /// (already so, or its text is gone).
+    private bool swap(size_t k, bool want)
+    {
+        auto f = &folds[k];
+        if (f.expanded == want || f.lost) return false;
+        if (!want) return swapIn(k, null);
+        string text = f.fresh;
+        if (f.stored && !store.get(f.text, text)) { f.lost = true; return false; }
+        return swapIn(k, text);
+    }
+
+    /// Shows fold `k` as `text` (expanded), or collapsed when null.
+    private bool swapIn(size_t k, string text) pure
+    {
+        auto f = &folds[k];
+        immutable want = text !is null;
+        if (f.expanded == want) return false;
+        string[] next;
+        if (want)
+        {
+            import std.string : stripRight;
+            import std.array : split;
+            next = text.stripRight("\n").split("\n");
+            f.collapsed = lines[f.start .. f.start + f.length].dup;
+        }
+        else
+        {
+            next = f.collapsed;
+            f.collapsed = null;
+        }
+        lines = lines[0 .. f.start] ~ next ~ lines[f.start + f.length .. $];
+        immutable oldLength = f.length, newLength = next.length, at = f.start;
+        f.length = newLength;
+        f.expanded = want;
+        foreach (ref g; folds)
+            if (g.start > at) g.start = g.start - oldLength + newLength;
+        if (cache.length > at) cache = cache[0 .. at];
+        return true;
     }
 
     /// Every line wrapped to `width` (the unfinished line last, if any).
@@ -1385,28 +1569,31 @@ unittest
 {
     void put(ref Transcript t, string s) { t.feed(s.representation); }
     Transcript t;
-    string rows;
-    foreach (i; 1 .. 16) rows ~= format("row %s\n", i);
+    t.batch = 1;
     put(t, "● bash ls\n" ~ foldMark("call_1", 1, "● bash ls\n    {\n      \"command\": \"ls\"\n    }\n"));
     put(t, "● read a.rs\n" ~ foldMark("call_2", 1, "● read a.rs\n    {\"path\": \"a.rs\"}\n"));
     put(t, "interleaved command output\n");
     put(t, "  ⎿ file-a (+1 lines)\n" ~ foldMark("call_1", 1, expandedResult(true, "file-a\nfile-b", false)));
     auto collapsed = t.lines.dup;
     assert(collapsed.length == 4, format("%s", collapsed));
-    assert(t.toggleLatest());
+    assert(t.toggle());
     // call_1 and its result expand; call_2 and the output between are untouched.
     assert(t.lines == ["● bash ls", "    {", "      \"command\": \"ls\"", "    }", "● read a.rs",
         "interleaved command output", "  ⎿ file-a", "    file-b"], format("%s", t.lines));
     foreach (w; [12, 20, 80])
         foreach (l; t.render(w)) assert(visibleWidth(l) <= w);
-    assert(t.toggleLatest());
+    // The next press reaches further up: call_2.
+    assert(t.toggle());
+    assert(t.lines[4 .. 6] == ["● read a.rs", "    {\"path\": \"a.rs\"}"], format("%s", t.lines));
+    // Everything is expanded: the next press collapses it all.
+    assert(t.toggle());
     assert(t.lines == collapsed);
     // A result that arrives later expands with its already-expanded call.
     put(t, "● bash pwd\n" ~ foldMark("call_3", 1, "● bash pwd\n    {}\n"));
-    assert(t.toggleLatest());
+    assert(t.toggle());
     put(t, "  ⎿ /x (+1 lines)\n" ~ foldMark("call_3", 1, "  ⎿ /x\n    /y\n"));
     assert(t.lines[$ - 4 .. $] == ["● bash pwd", "    {}", "  ⎿ /x", "    /y"], format("%s", t.lines));
-    assert(t.toggleLatest()); // collapses the pair
+    assert(t.collapseAll());
     assert(t.lines[$ - 2 .. $] == ["● bash pwd", "  ⎿ /x (+1 lines)"]);
 }
 
@@ -1414,21 +1601,93 @@ unittest
 unittest
 {
     Transcript t;
-    assert(!t.toggleLatest());
+    assert(!t.toggle());
     auto mark = foldMark("", 1, "∴ Thought for 1.5s\n    first idea\n    second\n");
     // A mark split across reads still applies.
     t.feed(("∴ Thought for 1.5s\n" ~ mark[0 .. 9]).representation);
     t.feed(mark[9 .. $].representation);
     t.feed("after\n".representation);
     assert(t.lines == ["∴ Thought for 1.5s", "after"]);
-    assert(t.toggleLatest());
+    assert(t.toggle());
     assert(t.lines == ["∴ Thought for 1.5s", "    first idea", "    second", "after"]);
     // Other OSC sequences are dropped; a fold scrolled past the cap goes.
     t.feed("\x1b]0;title\x07x\n".representation);
     assert(t.lines[$ - 1] == "x");
     t.cap = 4;
     t.feed("a\nb\nc\n".representation);
-    assert(!t.toggleLatest());
+    assert(!t.toggle());
+}
+
+// Ctrl-O expands in batches going up from the bottom, so folds scrolled off
+// the screen expand too; once all are expanded it collapses them all.
+unittest
+{
+    import std.algorithm : startsWith;
+    Transcript t;
+    t.batch = 3;
+    foreach (i; 0 .. 7)
+        t.feed((format("r%s\n", i) ~ foldMark(format("c%s", i), 1, format("r%s\n  full %s\n", i, i))).representation);
+    t.feed("answer\n".representation);
+    size_t expanded() { size_t n; foreach (l; t.lines) n += l.startsWith("  full"); return n; }
+    assert(t.toggle() && expanded == 3 && t.lines[$ - 3 .. $] == ["r6", "  full 6", "answer"]);
+    assert(t.lines[0] == "r0", "the oldest stay collapsed");
+    assert(t.toggle() && expanded == 6);
+    assert(t.toggle() && expanded == 7 && t.lines[0 .. 2] == ["r0", "  full 0"]);
+    assert(t.toggle() && expanded == 0 && t.lines.length == 8);
+}
+
+// The rendered markdown marks survive the stdout pipe into the transcript.
+unittest
+{
+    import std.algorithm : canFind;
+    import std.array : join;
+    import nano.markdown : render;
+    Transcript t;
+    t.feed(cast(const(ubyte)[]) (render("```\nls -la /tmp\n```", 40) ~ "\n"));
+    assert(t.lines.canFind!(l => l.canFind(verbatimMark)), t.lines.join("|"));
+    foreach (l; t.render(40)) assert(!l.canFind("\uFFFD"), l);
+}
+
+// Fold texts live in the store, not in the transcript: a file by default,
+// and in memory within a byte budget without one (the oldest are lost).
+unittest
+{
+    FoldStore disk;
+    if (disk.backedByFile)
+    {
+        auto a = disk.put("alpha"), b = disk.put("beta é");
+        string s;
+        assert(disk.get(b, s) && s == "beta é");
+        assert(disk.get(a, s) && s == "alpha");
+    }
+    Transcript t;
+    t.store.memoryOnly = true;
+    t.store.budget = 20;
+    t.batch = 10;
+    foreach (i; 0 .. 4)
+        t.feed((format("r%s\n", i) ~ foldMark("", 1, format("r%s\n  0123456\n", i))).representation);
+    // Each text is 13 bytes: only the latest fits the budget.
+    assert(t.toggle());
+    assert(t.lines == ["r0", "r1", "r2", "r3", "  0123456"], format("%s", t.lines));
+    assert(t.toggle(), "all that can expand is expanded: collapse");
+    assert(t.lines == ["r0", "r1", "r2", "r3"]);
+}
+
+// Verbose expands the existing folds (the latest `verboseCap`) and every
+// new one; leaving it collapses them.
+unittest
+{
+    Transcript t;
+    t.verboseCap = 2;
+    foreach (i; 0 .. 3)
+        t.feed((format("r%s\n", i) ~ foldMark("", 1, format("r%s\n  full\n", i))).representation);
+    assert(t.setVerbose(true));
+    assert(t.lines == ["r0", "r1", "  full", "r2", "  full"], format("%s", t.lines));
+    t.feed(("r3\n" ~ foldMark("", 1, "r3\n  full\n")).representation);
+    assert(t.lines[$ - 2 .. $] == ["r3", "  full"]);
+    assert(!t.setVerbose(true));
+    assert(t.setVerbose(false));
+    assert(t.lines == ["r0", "r1", "r2", "r3"]);
 }
 
 // Repeated tall-editor shrinks with output between them: the second freeze

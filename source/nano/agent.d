@@ -187,6 +187,44 @@ struct ConfiguredWindow
     string source;
 }
 
+/// Folded tool outputs longer than this keep only their log reference in
+/// the replay stash.
+enum size_t stashSlimBytes = 512;
+
+/// The replay stash with the content dropped for entries with a log
+/// (`Agent.replayStashLog`) read back from their log lines. An entry whose
+/// line can't be read keeps its empty content.
+const(Message)[] rehydrateStash(const(Message)[] stash, const(string)[] logs)
+{
+    import nano.session_history : load;
+    bool any;
+    foreach (l; logs) any |= l.length > 0;
+    if (!any) return stash;
+    Message[ulong][string] byLog;
+    import nano.safeio : deepCopy;
+    const(Message)[] o;
+    o.reserve(stash.length);
+    foreach (i, ref m; stash)
+    {
+        if (i >= logs.length || !logs[i].length) { o ~= m; continue; }
+        Message x = deepCopy(m);
+        auto path = logs[i];
+        if (path !in byLog)
+        {
+            Message[ulong] at;
+            try
+                foreach (e; load(path))
+                    if (e.message.role == Role.tool) at[e.id] = e.message;
+            catch (Exception) {} // an unreadable log: the entries replay empty
+            byLog[path] = at;
+        }
+        if (auto r = x.logLine in byLog[path])
+            if (r.toolCallId == x.toolCallId) x.content = r.content;
+        o ~= x;
+    }
+    return o;
+}
+
 class Agent
 {
     NotNull!LLMClient client;
@@ -310,6 +348,14 @@ class Agent
     /// The real turns folded by compactions since the last plain replacement:
     /// a replay (ACP session/load) shows them in place of the summary.
     Message[] replayStash;
+    /// Per `replayStash` entry: the session log its content was dropped for
+    /// (it is read back from its `logLine` there on replay), or null when the
+    /// entry keeps its content (or, with no log, dropped it). Long sessions would otherwise hold every
+    /// folded tool output in memory (issue #248).
+    string[] replayStashLog;
+    /// Log lines whose in-memory content a compaction clipped: their content
+    /// differs from the log record, so the stash keeps it.
+    bool[ulong] clippedLines;
     /// history_search / history_read calls in the current turn (logged on its turn_end).
     uint turnHistoryCalls;
     /// The thinking level the turn's latest request sent (as the status line
@@ -1445,6 +1491,7 @@ class Agent
         auto savedMessages = messages;
         auto savedPinStash = pinStash;
         auto savedReplayStash = replayStash;
+        auto savedReplayStashLog = replayStashLog;
         auto savedReplayRestated = replayRestated;
         auto savedPending = pending;
         auto savedCalibLen = calibLen;
@@ -1459,6 +1506,7 @@ class Agent
                 messages = savedMessages;
                 pinStash = savedPinStash;
                 replayStash = savedReplayStash;
+                replayStashLog = savedReplayStashLog;
                 replayRestated = savedReplayRestated;
                 pending = savedPending;
                 calibLen = savedCalibLen;
@@ -1505,13 +1553,35 @@ class Agent
             foreach (ref x; next[bodyStart + 1 .. $])
                 if (x.role == Role.tool)
                     foreach (c; ctx.clippedContent(x, clipTo))
+                    {
+                        if (x.logLine && c != x.content) clippedLines[x.logLine] = true;
                         x.content = smart && x.logLine
                             ? c ~ format("\n[clipped at compaction; history_read #%s has it whole]", x.logLine) : c;
+                    }
         }
         messages = next;
         calibLen = 0;
         size_t stashBase = replayStash.length;
-        replayStash = extendsStash ? replayStash ~ folded : folded;
+        // A copy: `folded` is persisted whole below.
+        replayStash = extendsStash ? replayStash ~ folded : folded.dup;
+        {
+            // The live log holds the folded turns: keep only references to
+            // large tool outputs (`replayMessages` reads them back). Without
+            // a log nothing can replay them (a replay needs a resumed or
+            // loaded session), so they are dropped.
+            string logPath;
+            log.ifSome((SessionLog l) { logPath = l.path; });
+            auto srcs = extendsStash ? replayStashLog.dup : null;
+            srcs.length = stashBase;
+            foreach (ref x; replayStash[stashBase .. $])
+            {
+                bool slim = x.role == Role.tool && x.content.length > stashSlimBytes && !x.attachments.length
+                    && (!logPath.length || (x.logLine && x.logLine !in clippedLines));
+                srcs ~= slim ? logPath : null;
+                if (slim) x.content = null;
+            }
+            replayStashLog = srcs;
+        }
         replayRestated = replayStash.length && hasPending && pending.position < split
             ? some(pendingPos) : Option!size_t.init;
         if (hasPending)
@@ -1685,10 +1755,10 @@ class Agent
     /// The messages a replay shows (Rust `replay_history`): the stashed
     /// pre-compaction turns, then the conversation without its synthetic
     /// summary (the first non-system message) or the restated input.
-    const(Message)[] replayMessages() pure const
+    const(Message)[] replayMessages() const
     {
         if (!replayStash.length) return messages;
-        const(Message)[] o = replayStash;
+        const(Message)[] o = rehydrateStash(replayStash, replayStashLog);
         bool skipped;
         foreach (i, ref m; messages)
         {
@@ -1739,6 +1809,8 @@ class Agent
         historyHintPending = r.historyAvailable && !r.historyHintConsumed;
         pinStash = r.pinStash;
         replayStash = r.replayStash;
+        replayStashLog = null;
+        clippedLines = null;
         replayRestated = r.replayRestated;
         adoptPending(r);
         plan = Plan.init;
@@ -1840,6 +1912,8 @@ class Agent
         resetIdleCompaction();
         pinStash = null;
         replayStash = null;
+        replayStashLog = null;
+        clippedLines = null;
         replayRestated = Option!size_t.init;
         hasPending = false;
         historyAvailable = historyHintPending = false;

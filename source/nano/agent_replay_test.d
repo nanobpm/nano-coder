@@ -111,3 +111,35 @@ unittest
     assert(r.replayStash.length == agent.replayStash.length, "the stash is rebuilt from the log");
     assert(users(r.replayStash) == ["ping", "pong"]);
 }
+
+// The stash keeps only log references for large folded tool outputs (a long
+// session would otherwise hold every one); the replay reads them back, and
+// the log's replace record still holds them whole (issue #248).
+unittest
+{
+    auto dir = buildPath(tempDir, "nano-d-agent-replay-slim");
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto agent = agentWith([LLMResponse("", "", [ToolCall.fromRaw("b1", "big", `{}`)]), LLMResponse("done"),
+        LLMResponse("SUMMARY: one")]);
+    auto log = new SessionLog(dir, "mock/m", "/w");
+    agent.log = some(log);
+    log.append(agent.messages[0]);
+    agent.run("go", new NullEvents);
+    assert(compactNow(agent));
+    auto stashed = agent.replayStash.filter!(m => m.role == Role.tool).array;
+    assert(stashed.length == 1 && !stashed[0].content.length, "the output is not held in memory");
+    auto shown = agent.replayMessages.filter!(m => m.role == Role.tool).array;
+    assert(shown.length == 1 && shown[0].content == "x".replicate(8_000), "the replay reads it from the log");
+    auto r = restore(log.path);
+    auto restored = r.replayStash.filter!(m => m.role == Role.tool).array;
+    assert(restored.length == 1 && restored[0].content == "x".replicate(8_000), "the log keeps it whole");
+    // Without a log nothing replays it: the stash drops it.
+    auto plain = agentWith([LLMResponse("", "", [ToolCall.fromRaw("b1", "big", `{}`)]), LLMResponse("done"),
+        LLMResponse("SUMMARY: one")]);
+    plain.run("go", new NullEvents);
+    assert(compactNow(plain));
+    assert(!plain.replayStash.filter!(m => m.role == Role.tool).front.content.length);
+    assert(users(plain.replayMessages).canFind("go"), "the turn itself still replays");
+}

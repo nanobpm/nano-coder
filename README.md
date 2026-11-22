@@ -89,6 +89,15 @@ can be discarded without deleting it character by character.
 With piped (non-terminal) stdin, lines read during a turn are queued as later prompts
 (never steer).
 
+**Ctrl-O** (at the prompt or mid-turn) expands collapsed tool calls, tool results and
+thinking blocks, a batch (about two screens' worth) at a time going up from the bottom,
+and re-draws the transcript so they are expanded in the scrollback too. If what you
+scrolled back to is still collapsed, press Ctrl-O again to reach further back; once
+everything is expanded, the next Ctrl-O collapses it all. Switching to `verbose` (or
+`debug`) expands the existing results as well as later ones, and switching back
+collapses them. The expanded text is not kept in memory: it lives in a temporary file
+that is removed when nano-coder exits (without one, only the latest 4 MB of it).
+
 ### ACP Headless Mode (--acp flag)
 
 ```bash

@@ -127,8 +127,10 @@ on the first start that uses the default folder; a log whose name already exists
   shell stages (#159); markdown renders `:emoji:` shortcodes (#181).
 - **Ctrl-O (#156).** Expands or collapses the latest tool call/result or thought in
   the frame UI. D's transcript is printed bytes, so folds are in-band OSC 8770 marks
-  the frame swaps in place; only the latest block toggles, and a thought still
-  streaming can't be expanded.
+  the frame swaps in place. Since #248 a press expands the next batch of 20 folds
+  going up from the bottom (all expanded: collapse all), verbose expands existing
+  folds, and the expanded text lives in an anonymous temporary file rather than in
+  memory; a thought still streaming can't be expanded.
 - **Updates (#154, #172).** Interactive npm installs (`@nanobpm/nano-coder`, found
   through the global bin symlink too) check the registry at startup and hourly in the
   background, keep `update-check.json` in the D data dir, and hint once per version

@@ -32,7 +32,8 @@ private struct Close { Chan!(immutable(string)[]) lines; }
 private struct Busy { bool on; }
 private struct WorkPause { bool paused; }
 private struct Toggle {}
-private alias Request = SumType!(Draw, Commit, Redraw, Clear, Suspend, Resume, Close, Busy, WorkPause, Toggle);
+private struct Verbose { bool on; }
+private alias Request = SumType!(Draw, Commit, Redraw, Clear, Suspend, Resume, Close, Busy, WorkPause, Toggle, Verbose);
 
 /// The frame renderer, as seen from other threads: a sendable handle to the
 /// thread that owns the transcript and the renderer (an actor). Copies
@@ -151,8 +152,13 @@ struct FrameUi
     /// Re-renders (the status changed).
     void redraw() { send(Request(Redraw())); }
 
-    /// Ctrl-O: expands or collapses the latest fold (`foldMark`).
+    /// Ctrl-O: expands the next batch of folds (`foldMark`) going up from
+    /// the bottom, or collapses them all once every one is expanded.
     void toggleExpand() { send(Request(Toggle())); }
+
+    /// Verbose on: expands the existing folds and every new one; off
+    /// collapses them.
+    void setVerbose(bool on) { send(Request(Verbose(on))); }
 
     /// Empties the transcript (`/restart`).
     void clear()
@@ -197,7 +203,12 @@ private void frameThread(Isolated!FrameState state, Chan!Request requests)
                 (Redraw _) { f.render(); return false; },
                 (Toggle _) {
                     f.drain();
-                    if (f.transcript.toggleLatest()) f.render();
+                    if (f.transcript.toggle()) f.render();
+                    return false;
+                },
+                (Verbose v) {
+                    f.drain();
+                    if (f.transcript.setVerbose(v.on)) f.render();
                     return false;
                 },
                 (Clear c) {
@@ -264,7 +275,7 @@ private final class FrameState
     size_t lastW, lastH;
     Debouncer debounce = Debouncer(150);
 
-    this(FrameRenderer renderer) pure { this.renderer = renderer; }
+    this(FrameRenderer renderer) pure nothrow { this.renderer = renderer; }
     StatusFn status;
     /// A turn is running: the prompt shows the spinner and `clock`.
     bool busy;
@@ -293,6 +304,8 @@ private final class FrameState
         {
             auto n = readFd_(readFd, buf[]);
             if (n > 0) { transcript.feed(buf[0 .. n]); continue; }
+            // Fold texts go to the store, out of memory.
+            transcript.settle();
             return n != 0;
         }
     }
