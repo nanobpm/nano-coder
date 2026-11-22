@@ -239,6 +239,22 @@ struct SessionToken
     long refreshAt;
 }
 
+/// When to refresh a session token expiring at `expires` (unix seconds);
+/// saturates instead of wrapping for hostile `expires_at` values near long.min.
+long refreshAtFor(long expires) pure nothrow @safe @nogc
+{
+    return expires < long.min + refreshMarginSecs ? long.min : expires - refreshMarginSecs;
+}
+
+unittest
+{
+    assert(refreshAtFor(1000) == 1000 - refreshMarginSecs);
+    assert(refreshAtFor(long.min) == long.min);
+    assert(refreshAtFor(long.min + refreshMarginSecs - 1) == long.min);
+    assert(refreshAtFor(long.min + refreshMarginSecs) == long.min);
+    assert(refreshAtFor(long.max) == long.max - refreshMarginSecs);
+}
+
 /// Exchange a GitHub OAuth token for a Copilot session token.
 SessionToken exchange(const Endpoints e, string oauth)
 {
@@ -263,7 +279,7 @@ SessionToken exchange(const Endpoints e, string oauth)
     s.token = t.str;
     auto expires = "expires_at" in j && j["expires_at"].type == JSONType.integer ? j["expires_at"].integer
         : wallNow.toUnixTime + 1500;
-    s.refreshAt = expires - refreshMarginSecs;
+    s.refreshAt = refreshAtFor(expires);
     if (auto ep = "endpoints" in j)
         if (ep.type == JSONType.object)
             if (auto api = "api" in *ep) if (api.type == JSONType.string) s.baseUrl = api.str.stripRight("/");
