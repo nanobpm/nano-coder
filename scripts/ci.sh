@@ -5,7 +5,7 @@
 #
 #   scripts/ci.sh [all|lint|test|quick]   (default: all)
 #
-#   lint   check-safe, ratchet tests, dscanner                    (CI job `lint`)
+#   lint   check-safe, parity manifest, ratchet tests, dscanner                    (CI job `lint`)
 #   test   unit tests, release build and smoke checks  (CI jobs `test (<os>)`)
 #   quick  check-safe, both builds typechecked, unit tests (pre-push)
 #   all    lint + test
@@ -39,6 +39,14 @@ lint() {
         NANO_RATCHET_REQUIRE=1 ./scripts/check-safe.sh
     else
         ./scripts/check-safe.sh
+    fi
+    step "parity manifest"
+    # Needs the rust-final tag (CI checks out with fetch-depth 0, which
+    # fetches tags); a shallow or tagless clone skips it.
+    if git rev-parse -q --verify 'refs/tags/rust-final^{commit}' >/dev/null; then
+        python3 scripts/check-parity.py
+    else
+        echo "skipped: tag rust-final missing (git fetch origin tag rust-final)"
     fi
     step "ratchet tests"
     ./scripts/test-ratchets.sh
