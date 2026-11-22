@@ -1852,6 +1852,13 @@ unittest
 void replayTranscript(Agent agent, Console console)
 {
     auto msgs = agent.replayMessages;
+    // Hold the frame while the history is written: each line would otherwise
+    // render its own synchronized frame, and a real terminal shows the whole
+    // conversation scrolling past. Released last (scope exits run in
+    // reverse), so the replay and the status bar appear in one frame.
+    auto frame = gFrame;
+    if (frame) frame.hold(true);
+    scope (exit) if (frame) frame.hold(false);
     // Each toolEnd would refresh the view (a token estimate over the whole
     // conversation): quadratic on long sessions, so refresh once at the end.
     auto after = console.afterStep;
