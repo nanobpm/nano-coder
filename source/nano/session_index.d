@@ -287,10 +287,10 @@ private void mergeLines(const(ubyte)[] bytes, ref Summary[string] map, ref size_
         try raw = utf8View(rawBytes);
         catch (UTFException)
         {
+            // Strict callers (retention) must not guess at titles a corrupt
+            // line hid, exactly like the `Summary.fromJson` catch below.
+            if (strict) throw new Exception("session index has a corrupt line");
             if (rawBytes.length) lines++;
-            // Strict callers (retention) must not guess at titles an
-            // unreadable line hid; a cache load just skips the line.
-            if (strict && rawBytes.length) throw new Exception("session index has a corrupt line");
             continue; // invalid UTF-8: unreadable
         }
         auto line = raw.strip;
@@ -935,10 +935,17 @@ unittest
     std.file.append(indexPath(dir), cast(const(ubyte)[]) "{not json\n");
     import std.exception : assertThrown;
     assertThrown(titledIds(dir), "a corrupt index must not read as 'nothing titled'");
-    // An invalid-UTF-8 line is just as unreadable: strict load must throw too.
-    import std.file : write;
-    write(indexPath(dir), cast(const(ubyte)[]) [0x7b, 0xff, 0x7d, 0x0a]);
-    assertThrown(titledIds(dir), "an unreadable index line must not read as 'nothing titled'");
+    // Invalid UTF-8 hides titles the same way: strict load must throw on it
+    // too, while a non-strict listing still skips the unreadable line.
+    // Fresh index with only valid lines plus the bad-UTF-8 line, so the
+    // assertion cannot pass merely because of the bad-JSON line above.
+    std.file.remove(indexPath(dir));
+    list(dir);
+    setTitle(titled, "Keep me");
+    assert(titledIds(dir).length == 1, "the rebuilt index loads cleanly");
+    std.file.append(indexPath(dir), cast(const(ubyte)[]) [0xFF, 0xFE, '\n']);
+    assertThrown(titledIds(dir), "invalid UTF-8 must not read as 'nothing titled' either");
+    assert(list(dir).length >= 1, "a non-strict load still skips the bad line");
 }
 
 // Round-8 review fix for issue #205: a titled log that can no longer be
