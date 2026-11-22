@@ -328,7 +328,7 @@ unittest
     assert(readText(target) == "one\n", "the write was refused");
 }
 
-private string toolResultText(Agent agent, string id)
+string toolResultText(Agent agent, string id)
 {
     foreach (m; agent.messages) if (m.role == Role.tool && m.toolCallId == id) return m.content;
     assert(0, "no result for " ~ id);
