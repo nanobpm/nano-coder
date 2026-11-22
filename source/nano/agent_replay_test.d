@@ -176,3 +176,38 @@ unittest
     assert(stashed.length == 1 && !stashed[0].content.length,
         "a leftover floor would keep the new session's output in memory");
 }
+
+// A slimmed stash entry references its log, not the log's path at slimming
+// time: when a later write finds the log replaced and moves the writer to a
+// recovery file (`SessionLog.recoverReplaced`), the replay must follow it —
+// the stale path names a foreign file, whose lines replay empty or unrelated
+// output (issue #248 review).
+unittest
+{
+    import std.file : remove, rename, write_file = write;
+    auto dir = buildPath(tempDir, "nano-d-agent-replay-recovery");
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto agent = agentWith([LLMResponse("", "", [ToolCall.fromRaw("b1", "big", `{}`)]), LLMResponse("done"),
+        LLMResponse("SUMMARY: one"), LLMResponse("after")]);
+    auto log = new SessionLog(dir, "mock/m", "/w");
+    agent.log = some(log);
+    log.append(agent.messages[0]);
+    agent.run("go", new NullEvents);
+    assert(compactNow(agent));
+    auto stashed = agent.replayStash.filter!(m => m.role == Role.tool).array;
+    assert(stashed.length == 1 && !stashed[0].content.length, "the output is not held in memory");
+    // The log is replaced by a foreign file (not a prefix of ours): the next
+    // write moves this session to a recovery log beside it.
+    auto original = log.path;
+    remove(original);
+    write_file(original, "{\"type\":\"session\",\"data\":{}}\n");
+    agent.run("after", new NullEvents);
+    assert(log.path != original, "the writer moved to a recovery log");
+    // The replay reads the slimmed output from the recovery log, not the
+    // foreign file at the stale path.
+    auto shown = agent.replayMessages.filter!(m => m.role == Role.tool).array;
+    assert(shown.length == 1 && shown[0].content == "x".replicate(8_000),
+        shown.length ? shown[0].content[0 .. 40] : "no tool message");
+}

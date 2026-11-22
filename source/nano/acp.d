@@ -707,7 +707,11 @@ final class AcpServer : AgentEvents
         if (host.sessionDir !is null)
         {
             auto log = new SessionLog(host.sessionDir, agent.client.providerName ~ "/" ~ agent.client.modelName, cwd);
-            scope (failure) log.close();
+            // Close on failure only until the agent adopts the log: after
+            // `restart` takes it (even if it throws later) it is the agent's
+            // live writer, and a later failure must not close it — the same
+            // guard `loadSession_` uses.
+            scope (failure) if (!agent.ownsLog(log)) log.close();
             agent.restart(sys, some(log));
             sessionId = log.id;
         }
@@ -1012,6 +1016,43 @@ unittest
     foreach (x; updates(shown.lines)) if (x["sessionUpdate"].str == "tool_call_update") upd = x;
     auto raw = upd["rawOutput"].str;
     assert(raw.canFind("[image: x.png, 12×34]") && raw.canFind("saw it"), raw);
+}
+
+// A failed `session/new` after `restart` adopted the log must not close the
+// adopted writer: the failure cleanup guards on ownership, as `loadSession_`
+// does, so a later prompt still logs (issue #248 review).
+unittest
+{
+    import std.file : exists, readText, rmdirRecurse, tempDir;
+    import std.path : buildPath;
+    import nano.permissions : Policy;
+    import nano.providers.mock;
+    import nano.session : SessionLog;
+    import nano.tools;
+    auto dir = buildPath(tempDir, "nano-acp-newsession-fail");
+    if (exists(dir)) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto reg = new ToolRegistry;
+    auto agent = new Agent(new MockClient([LLMResponse("ok")]), reg, Policy.init, null);
+    string[] lines;
+    auto srv = new AcpServer(agent, Host((string cwd) => "sys", null, dir, "test",
+        // The hook load throws after `restart` adopted the new log: the
+        // failure cleanup runs while the agent owns the writer.
+        (string cwd) { if (false) return new HookManager(null, null); throw new Exception("hooks boom"); }),
+        (string l) { lines ~= l; });
+    srv.receive(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}`);
+    srv.close();
+    assert(srv.run());
+    // The request failed, but the adopted log is still the agent's live
+    // writer: its records (the system prompt) are on disk, and a later
+    // prompt appends to it rather than writing to a closed file.
+    auto r1 = parseJSON(lines[0]);
+    assert(r1["error"]["message"].str.canFind("hooks boom"), r1.toString);
+    string path;
+    agent.log.ifSome((SessionLog l) { path = l.path; });
+    assert(path.length && exists(path));
+    assert(readText(path).canFind(`"sys"`), "the adopted log kept its records");
+    agent.log.ifSome((SessionLog l) { assert(l.isOpenForWrite, "the adopted log was not closed"); });
 }
 
 // rust: acp.rs::escaped_prompts_steer_mid_turn_while_commands_defer

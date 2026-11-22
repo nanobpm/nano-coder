@@ -194,31 +194,34 @@ enum size_t stashSlimBytes = 512;
 /// The replay stash with the content dropped for entries with a log
 /// (`Agent.replayStashLog`) read back from their log lines. An entry whose
 /// line can't be read keeps its empty content.
-const(Message)[] rehydrateStash(const(Message)[] stash, const(string)[] logs)
+const(Message)[] rehydrateStash(const(Message)[] stash, Option!SessionLog[] logs)
 {
     import nano.session_history : load;
     bool any;
-    foreach (l; logs) any |= l.length > 0;
+    foreach (l; logs) any |= l.isSome;
     if (!any) return stash;
-    Message[ulong][string] byLog;
+    Message[ulong][SessionLog] byLog;
     import nano.safeio : deepCopy;
     const(Message)[] o;
     o.reserve(stash.length);
     foreach (i, ref m; stash)
     {
-        if (i >= logs.length || !logs[i].length) { o ~= m; continue; }
+        if (i >= logs.length || logs[i].isNone) { o ~= m; continue; }
         Message x = deepCopy(m);
-        auto path = logs[i];
-        if (path !in byLog)
+        auto src = logs[i].unwrap("isSome");
+        if (src !in byLog)
         {
             Message[ulong] at;
+            // The path is read at replay time, not at slimming time: a
+            // recovery (`SessionLog.recoverReplaced`) may have moved the
+            // writer since, and the stale path would name a foreign file.
             try
-                foreach (e; load(path))
+                foreach (e; load(src.path))
                     if (e.message.role == Role.tool) at[e.id] = e.message;
             catch (Exception) {} // an unreadable log: the entries replay empty
-            byLog[path] = at;
+            byLog[src] = at;
         }
-        if (auto r = x.logLine in byLog[path])
+        if (auto r = x.logLine in byLog[src])
             if (r.toolCallId == x.toolCallId) x.content = r.content;
         o ~= x;
     }
@@ -352,7 +355,12 @@ class Agent
     /// (it is read back from its `logLine` there on replay), or null when the
     /// entry keeps its content (or, with no log, dropped it). Long sessions would otherwise hold every
     /// folded tool output in memory (issue #248).
-    string[] replayStashLog;
+    /// The live `SessionLog`, not its path at slimming time:
+    /// `SessionLog.recoverReplaced` can move the writer to a recovery file
+    /// (changing `l.path`) after the reference was taken, and a saved path
+    /// would then name a foreign file the replay reads empty or unrelated
+    /// output from.
+    Option!SessionLog[] replayStashLog;
     /// Log lines whose in-memory content a compaction clipped: their content
     /// differs from the log record, so the stash keeps it.
     bool[ulong] clippedLines;
@@ -360,6 +368,10 @@ class Agent
     /// is unknown (`clippedLines` is not persisted): their content is never
     /// dropped from the stash.
     ulong restoredLineFloor;
+    /// The session logs `replayStashLog` has handed out, so a slimmed entry's
+    /// reference stays valid for the session's life even across a `restart`
+    /// (which closes the outgoing log: a replay still reads it back).
+    private SessionLog[] stashRefLogs;
     /// history_search / history_read calls in the current turn (logged on its turn_end).
     uint turnHistoryCalls;
     /// The thinking level the turn's latest request sent (as the status line
@@ -1820,18 +1832,24 @@ class Agent
             // large tool outputs (`replayMessages` reads them back). Without
             // a log nothing can replay them (a replay needs a resumed or
             // loaded session), so they are dropped.
-            string logPath;
-            log.ifSome((SessionLog l) { logPath = l.path; });
+            // The reference is the log itself, not its path: a recovery can
+            // move the writer to a new path after this, and the replay must
+            // follow it rather than read a foreign file at the stale path.
             auto srcs = extendsStash ? replayStashLog.dup : null;
             srcs.length = stashBase;
             foreach (ref x; replayStash[stashBase .. $])
             {
                 bool slim = x.role == Role.tool && x.content.length > stashSlimBytes && !x.attachments.length
-                    && (!logPath.length || (x.logLine > restoredLineFloor && x.logLine !in clippedLines));
-                srcs ~= slim ? logPath : null;
+                    && (log.isNone || (x.logLine > restoredLineFloor && x.logLine !in clippedLines));
+                srcs ~= slim ? log : Option!SessionLog.init;
                 if (slim) x.content = null;
             }
             replayStashLog = srcs;
+            log.ifSome((SessionLog l) @safe {
+                bool held;
+                foreach (s; stashRefLogs) held |= s is l;
+                if (!held) stashRefLogs ~= l;
+            });
         }
         replayRestated = replayStash.length && hasPending && pending.position < split
             ? some(pendingPos) : Option!size_t.init;
@@ -2040,7 +2058,7 @@ class Agent
     /// The messages a replay shows (Rust `replay_history`): the stashed
     /// pre-compaction turns, then the conversation without its synthetic
     /// summary (the first non-system message) or the restated input.
-    const(Message)[] replayMessages() const
+    const(Message)[] replayMessages()
     {
         if (!replayStash.length) return messages;
         const(Message)[] o = rehydrateStash(replayStash, replayStashLog);
@@ -2095,6 +2113,7 @@ class Agent
         pinStash = r.pinStash;
         replayStash = r.replayStash;
         replayStashLog = null;
+        stashRefLogs = null;
         clippedLines = null;
         restoredLineFloor = 0;
         foreach (ref m; messages)
@@ -2208,6 +2227,7 @@ class Agent
         pinStash = null;
         replayStash = null;
         replayStashLog = null;
+        stashRefLogs = null;
         clippedLines = null;
         restoredLineFloor = 0;
         replayRestated = Option!size_t.init;

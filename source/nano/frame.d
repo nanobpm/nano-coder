@@ -927,6 +927,9 @@ struct Transcript
                 if (f.start >= drop) { f.start -= drop; kept ~= f; }
             folds = kept;
         }
+        // Long lines (and folds streaming in expanded) grow the transcript
+        // without ever crossing the line cap: bound the bytes too.
+        enforceByteCap();
     }
 
     /// A fold mark (`foldMark`); anything else is dropped.
@@ -976,7 +979,11 @@ struct Transcript
                     if (j != k && folds[j].id == folds[k].id) any |= swap(j, true);
             if (any) { changed++; todo--; }
         }
-        if (changed) return true;
+        if (changed)
+        {
+            enforceByteCap();
+            return true;
+        }
         return collapseAll();
     }
 
@@ -1019,6 +1026,38 @@ struct Transcript
         return true;
     }
 
+    /// The transcript's byte size: every line, plus the unfinished one and
+    /// the collapsed forms held for expanded folds. Expansion inserts a
+    /// fold's full text into `lines`, so this is also what Ctrl-O retains.
+    private size_t bytesHeld() pure
+    {
+        size_t n = cur.length;
+        foreach (l; lines) n += l.length;
+        foreach (ref f; folds)
+            if (f.expanded)
+                foreach (c; f.collapsed) n += c.length;
+        return n;
+    }
+
+    /// `cap` bounds lines, not bytes: a single line can be megabytes, and
+    /// Ctrl-O or verbose expansion inserts whole fold texts without a
+    /// completed line ever checking the cap, so an idle transcript could
+    /// grow without bound (issue #248 review). Once past `byteCap`, collapse
+    /// the oldest expanded folds (newest first would fight the user reading
+    /// the bottom); their texts stay in `store`, so nothing is lost.
+    size_t byteCap = 16 << 20;
+
+    private void enforceByteCap() pure
+    {
+        if (bytesHeld() <= byteCap) return;
+        foreach (k; 0 .. folds.length)
+        {
+            if (!folds[k].expanded) continue;
+            swapIn(k, null);
+            if (bytesHeld() <= byteCap) return;
+        }
+    }
+
     /// Verbose: expands the latest `verboseCap` folds, and every new one;
     /// leaving it collapses them all. True when the transcript changed.
     bool setVerbose(bool on)
@@ -1034,6 +1073,7 @@ struct Transcript
             if (n++ >= verboseCap) break;
             any |= swap(k, true);
         }
+        if (any) enforceByteCap();
         return any;
     }
 
@@ -1825,4 +1865,53 @@ unittest
     u.folds[1].lost = true;
     assert(u.toggle());
     assert(u.lines.canFind("  full 0"), format("%s", u.lines));
+}
+
+// The line cap does not bound expansion: Ctrl-O and verbose insert whole
+// fold texts into `lines` without a completed line ever checking it, so an
+// idle transcript could grow without bound. The byte cap collapses the
+// oldest expanded folds once it is exceeded; their texts stay in the store,
+// so a later Ctrl-O reads them back (issue #248 review).
+unittest
+{
+    import std.algorithm : canFind;
+    import std.array : replicate;
+    Transcript t;
+    t.byteCap = 1_024;
+    t.store.memoryOnly = true;
+    foreach (i; 0 .. 4)
+        t.feed((format("r%s\n", i) ~ foldMark(format("c%s", i), 1,
+            format("r%s\n%s\n", i, "x".replicate(400)))).representation);
+    t.settle();
+    // Ctrl-O expands the newest batch first; the byte cap then collapses the
+    // oldest ones, keeping the transcript under it.
+    assert(t.toggle());
+    assert(t.bytesHeld() <= t.byteCap, format!"%s held"(t.bytesHeld()));
+    assert(t.lines.canFind("x".replicate(400)), "the newest fold stays expanded");
+    assert(!t.folds[0].expanded && !t.folds[1].expanded,
+        "the oldest folds collapse first");
+    // Nothing is lost: the collapsed folds expand again from the store.
+    t.batch = 20;
+    assert(t.toggle());
+    assert(t.lines.canFind("x".replicate(400)));
+    // Verbose expansion is bounded the same way.
+    Transcript v;
+    v.byteCap = 1_024;
+    v.store.memoryOnly = true;
+    foreach (i; 0 .. 4)
+        v.feed((format("r%s\n", i) ~ foldMark(format("c%s", i), 1,
+            format("r%s\n%s\n", i, "y".replicate(400)))).representation);
+    v.settle();
+    assert(v.setVerbose(true));
+    assert(v.bytesHeld() <= v.byteCap, format!"%s held"(v.bytesHeld()));
+    // And a fold streaming in already expanded is bounded as it completes.
+    Transcript w;
+    w.byteCap = 1_024;
+    w.store.memoryOnly = true;
+    w.setVerbose(true);
+    foreach (i; 0 .. 4)
+        w.feed((format("r%s\n", i) ~ foldMark(format("c%s", i), 1,
+            format("r%s\n%s\n", i, "z".replicate(400)))).representation);
+    w.feed("tail\n".representation);
+    assert(w.bytesHeld() <= w.byteCap, format!"%s held"(w.bytesHeld()));
 }
