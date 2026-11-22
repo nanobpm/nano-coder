@@ -831,6 +831,12 @@ struct Transcript
     FoldStore store;
     private ubyte[] pending;
     private bool cr, verbose;
+    /// Inside an unfinished OSC longer than `oscCap`: its bytes are dropped
+    /// until the BEL/ST that ends it, so `pending` stays bounded.
+    private bool skippingOsc;
+    /// Longest unfinished OSC buffered in `pending` (bytes) before the rest
+    /// of it is discarded; an endless escape must not grow memory.
+    size_t oscCap = 4_096;
     private string[][] cache;
     private size_t cacheWidth;
     private Fold[] folds;
@@ -842,6 +848,7 @@ struct Transcript
         cur = null;
         cache = null;
         cr = false;
+        skippingOsc = false;
         heldBytes = 0;
         sweepFloor = size_t.max;
     }
@@ -849,6 +856,18 @@ struct Transcript
     void feed(scope const(ubyte)[] bytes) pure
     {
         import std.string : indexOf;
+        if (skippingOsc)
+        {
+            // Discard an over-long OSC up to its terminator (BEL or ST; an
+            // ST split across calls leaves a stray `\\`, which is harmless).
+            size_t j;
+            while (j < bytes.length && bytes[j] != 0x07
+                && !(bytes[j] == 0x1b && j + 1 < bytes.length && bytes[j + 1] == '\\'))
+                j++;
+            if (j == bytes.length) return;
+            skippingOsc = false;
+            bytes = bytes[j + (bytes[j] == 0x07 ? 1 : 2) .. $];
+        }
         auto buf = pending ~ bytes;
         // Hold back an incomplete UTF-8 sequence for the next call.
         size_t end = buf.length, k = 0;
@@ -878,6 +897,13 @@ struct Transcript
                     auto bel = rest.indexOf('\x07'), st = rest.indexOf("\x1b\\");
                     if (bel < 0 && st < 0)
                     {
+                        if (s.length - at + pending.length > oscCap)
+                        {
+                            pending = null;
+                            skippingOsc = true;
+                            enforceByteCap();
+                            return;
+                        }
                         pending = s[at .. $].representation.dup ~ pending;
                         enforceByteCap();
                         return;
@@ -2074,6 +2100,23 @@ unittest
     // And the cycle restarts from the bottom rather than wedging.
     assert(t.toggle() && expanded == 2, "the cycle restarts");
     assert(t.toggle() && expanded == 0, "and collapses again");
+}
+
+// An unfinished OSC must not grow `pending` without bound; text after its
+// terminator still lands.
+unittest
+{
+    Transcript t;
+    t.oscCap = 64;
+    t.feed(cast(const(ubyte)[]) "\x1b]0;");
+    foreach (_; 0 .. 1_000) t.feed(cast(const(ubyte)[]) "xxxxxxxxxxxxxxxx");
+    assert(t.pending.length <= t.oscCap);
+    t.feed(cast(const(ubyte)[]) "yy\x07after\n");
+    assert(t.lines == ["after"], format!"%s"(t.lines));
+    t.feed(cast(const(ubyte)[]) "\x1b]0;");
+    foreach (_; 0 .. 100) t.feed(cast(const(ubyte)[]) "xxxxxxxxxxxxxxxx");
+    t.feed(cast(const(ubyte)[]) "\x1b\\next\n");
+    assert(t.lines == ["after", "next"], format!"%s"(t.lines));
 }
 
 // `bytesHeld` is a running total, not a walk: it must match a from-scratch
