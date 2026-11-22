@@ -392,3 +392,46 @@ unittest
         `["b", "ok", "fine", "false"]`,
     ], results(agent).to!string);
 }
+
+/// Reads the file at `context[0]`.
+JobResult readPath(string argsJson, immutable(string)[] context)
+{
+    return JobResult(readText(context[0]));
+}
+
+// A hooked plan_show / timer_list is a barrier too: a PostToolUse hook on the
+// listing that rewrites a file runs before the next read observes it.
+unittest
+{
+    import nano.claude_hooks : Event, Hook, HookManager;
+    import nano.option : some;
+    import core.time : seconds;
+    foreach (listing; ["plan_show", "timer_list"])
+    {
+        auto dir = buildPath(tempDir, "nano-par-hook-" ~ listing);
+        mkdirRecurse(dir);
+        scope (exit) rmdirRecurse(dir);
+        auto p = buildPath(dir, "f.txt");
+        write(p, "old");
+        auto reg = new ToolRegistry;
+        Concurrency c;
+        c.readOnly = true;
+        immutable ip = p;
+        c.offload = (JSONValue a) => Job(&readPath, a.toString, [ip]);
+        reg.register(def("peek"), (JSONValue a) => readText(ip), c);
+        auto mock = new MockClient([
+            reply([call("a", listing), call("b", "peek")]),
+            LLMResponse("done"),
+        ]);
+        auto agent = new Agent(mock, reg, Policy.init, "sys");
+        Hook h;
+        h.event = Event.postToolUse;
+        h.command = "printf new > '" ~ p ~ "'";
+        h.matcher = listing;
+        h.timeout = 10.seconds;
+        agent.hooks = some(new HookManager([h], dir));
+        assert(agent.run("go", new NullEvents) == "done");
+        auto r = results(agent);
+        assert(r[1] == `["b", "peek", "new", "false"]`, r.to!string);
+    }
+}

@@ -896,16 +896,17 @@ class Agent
     private bool concurrentEligible(string name)
     {
         if (outcomeTool && name == outcomeToolName) return false;
+        // Tool-use hooks are arbitrary commands that may change files, so a
+        // call a hook can see keeps its sequential place: a PostToolUse hook
+        // on one read must run before the next read observes the tree.
+        // Checked before the plan/timer listings so hooked ones are barriers.
+        if (hooks.match!(m => m.hasToolHooks(name), () => false)) return false;
         if (planTools && isPlanTool(name)) return name == "plan_show";
         if (timerTools && isTimerTool(name)) return name == "timer_list";
         // History tools are barriers: they must see the preceding calls'
         // logged results, and history_read's spill bookkeeping is the
         // agent thread's own.
         if (hist.isHistoryTool(name)) return false;
-        // Tool-use hooks are arbitrary commands that may change files, so a
-        // call a hook can see keeps its sequential place: a PostToolUse hook
-        // on one read must run before the next read observes the tree.
-        if (hooks.match!(m => m.hasToolHooks(name), () => false)) return false;
         return tools.readOnly(name);
     }
 
