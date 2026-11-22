@@ -1002,6 +1002,14 @@ bool gStatusBatched;
 /// block, held-back markdown). It lives in a `Shared` cell, so the main
 /// thread and the turn's key reader print through the same state, one at a
 /// time.
+/// Raw model text is neutralised only when it lands in the frame
+/// transcript, where its control bytes could forge marks; piped
+/// (non-frame) output keeps the model's bytes verbatim.
+string rawShownIn(string text, bool framed)
+{
+    return framed ? rawModelText(text) : text;
+}
+
 struct Screen
 {
     bool color, tty;
@@ -1024,10 +1032,17 @@ struct Screen
     // The answer text streamed since the model call began (for `reconcile`).
     private string streamedAnswer;
     // Answers on a color terminal have their markdown rendered a block at a
-    // time (markdown.rs MarkdownStream); piped and NO_COLOR output keep it raw.
+    // time (markdown.rs MarkdownStream); piped and NO_COLOR output keep it raw
+    // (sanitised by `rawShown` only inside the frame).
     private MarkdownStream markdown;
     bool verbose() const { return verbosity >= Verbosity.verbose; }
     bool renderMarkdown() pure const { return tty && color; }
+    string rawShown(string text)
+    {
+        bool framed = (gFrame ? true : false);
+        version (unittest) framed = framed || testFrame;
+        return rawShownIn(text, framed);
+    }
 
     // Tests capture the output here, as the frame transcript would see it.
     version (unittest) private string captured;
@@ -1216,7 +1231,7 @@ struct Screen
             midLine = st.length > 0;
             answering = true;
         }
-        auto shown = renderMarkdown ? markdown.push(chunk, answerWidth()) : rawModelText(chunk);
+        auto shown = renderMarkdown ? markdown.push(chunk, answerWidth()) : rawShown(chunk);
         if (shown.length) writeAligned(shown, answerPad());
         stdOut.flush();
     }
@@ -1438,7 +1453,7 @@ class Console : AgentEvents
     /// color terminal, verbatim otherwise.
     string display(string text)
     {
-        if (!renderMarkdown) return rawModelText(text);
+        if (!renderMarkdown) return rawShownIn(text, (gFrame ? true : false));
         auto shown = renderMarkdownText(text, answerWidth());
         return gFrame ? shown : dropSoftWraps(shown);
     }
@@ -3726,4 +3741,18 @@ unittest
         assert(t.lines.length == 1 && !t.lines[0].canFind(m) && t.lines[0].canFind("\uFFFD"), t.lines[0]);
         assert(escapeMarks("↪ x" ~ m) == "↪ x\uFFFD");
     }
+}
+
+// Piped (non-frame) answers keep the model's bytes verbatim; only the
+// frame transcript neutralises control bytes.
+unittest
+{
+    Screen s;
+    s.capturing = true;
+    assert(rawShownIn("a\x1b[1mb\rc\x07", false) == "a\x1b[1mb\rc\x07");
+    s.text(false, "x\x1by\r");
+    import std.algorithm : canFind;
+    assert(s.captured.canFind("x\x1by\r"), s.captured);
+    s.testFrame = true;
+    assert(rawShownIn("a\x1bb", true) != "a\x1bb");
 }
