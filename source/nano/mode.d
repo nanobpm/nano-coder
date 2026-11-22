@@ -77,6 +77,8 @@ immutable string[] planAllowedTools = [
     "timer_set", "timer_list", "timer_cancel", "timer_done",
     "load_skill",
     "report_outcome", "question", "history_search", "history_read", "memory_search",
+    // Read-only sub-agents: their own calls are checked against plan mode.
+    "agent",
 ];
 
 /// Whether `tool` may run in plan mode.

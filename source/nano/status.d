@@ -40,6 +40,8 @@ struct Stats
     uint compactions;
     Activity activity;
     string tool; /// the running tool (activity == tool)
+    /// One live line per running sub-agent (shown above the status bar).
+    immutable(string)[] subagents;
     double tokensPerSec = 0; /// live output rate (0: none)
 
     double percent() pure const { return window == 0 ? 0.0 : tokens * 100.0 / window; }

@@ -350,7 +350,7 @@ private void writeStdoutLine(string l)
     stdOut.flush();
 }
 
-final class AcpServer : AgentEvents
+final class AcpServer : AgentEvents, imported!"nano.subagent".SubAgentEvents
 {
     private NotNull!Agent agent;
     private Host host;
@@ -443,6 +443,17 @@ final class AcpServer : AgentEvents
     void toolEnd(const ref ToolCall call, string result, bool isError)
     {
         toolUpdate(call.id, result, isError);
+    }
+
+    /// Sub-agent progress: an in-progress update on each `agent` call
+    /// (a `tool_call` upsert, as later calls haven't started on the client).
+    void subagents(const imported!"nano.subagent".SubProgress[] all)
+    {
+        import nano.subagent : progressLine;
+        foreach (ref p; all)
+            update(JSONValue(["sessionUpdate": JSONValue("tool_call"), "toolCallId": JSONValue(p.callId),
+                "title": JSONValue("agent"), "kind": JSONValue(toolKind("agent")), "status": JSONValue("in_progress"),
+                "content": JSONValue([JSONValue(["type": JSONValue("content"), "content": textBlock(progressLine(p))])])]));
     }
 
     private void toolUpdate(string id, string output, bool isError)

@@ -311,6 +311,7 @@ JSONValue messageRecord(const ref Message m) pure
     if (m.steered) j["steered"] = true;
     if (m.hookContext) j["hook_context"] = true;
     if (m.pinText.length) j["pin_text"] = m.pinText;
+    if (m.subLog.length) j["sub_log"] = m.subLog;
     return j;
 }
 
@@ -376,6 +377,7 @@ Message messageFromRecord(JSONValue j) pure
         case "steered": m.steered = v.type == JSONType.true_; break;
         case "hook_context": m.hookContext = v.type == JSONType.true_; break;
         case "pin_text": if (v.type == JSONType.string) m.pinText = v.str; break;
+        case "sub_log": if (v.type == JSONType.string) m.subLog = v.str; break;
         // Sub-kinds of an automatic turn.
         case "continuation": m.continuation = v.type == JSONType.true_; break;
         case "timer": m.timer = v.type == JSONType.true_; break;

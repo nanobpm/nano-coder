@@ -792,6 +792,14 @@ LineEditor makeEditor(ConsoleLink console, shared TurnControl control)
     return editor;
 }
 
+/// Builds sub-agents' clients (on their threads) from a frozen config.
+final class ConfigClients : imported!"nano.subagent".SubClientFactory
+{
+    private Config cfg;
+    this(immutable Config cfg) immutable { this.cfg = cfg; }
+    LLMClient make(string spec) const { return makeClient(resolve(cfg, spec)); }
+}
+
 /// A frozen copy of `cfg`, for another thread.
 immutable(Config) frozenConfig(const ref Config cfg) pure
 {
@@ -975,7 +983,10 @@ string frameStatus(size_t width)
     import nano.status : renderStatus = render;
     if (environment.get("AGENTIC_NO_STATUS") !is null) return "";
     auto stats = gStats.get;
-    return renderStatus(stats, width);
+    import nano.frame : fit;
+    string rows;
+    foreach (l; stats.subagents) rows ~= fit("\x1b[2m  " ~ l ~ "\x1b[0m", width ? width : 1) ~ "\n";
+    return rows ~ renderStatus(stats, width);
 }
 
 /// The status bar's figures, read and changed under their lock by the turn
@@ -1213,7 +1224,7 @@ struct ConsoleLink
     void endLine() { screen.update((ref Screen s) { s.endLine(); }); }
 }
 
-class Console : AgentEvents
+class Console : AgentEvents, imported!"nano.subagent".SubAgentEvents
 {
     immutable bool color, tty;
     /// The shared line state; hand `link` to other threads.
@@ -1315,6 +1326,36 @@ class Console : AgentEvents
         writeln(line);
         // Ctrl-O shows the full arguments under the call.
         if (gFrame) write(foldMark(call.id, 1, line ~ "\n" ~ expandedBody(sanitizeBlock(argsText(call)), color ? "\x1b[2m" : "")));
+        stdOut.flush();
+    }
+
+    private string[string] subRows;
+    /// Sub-agents: a live row per running one (above the status bar); each prints a
+    /// line when it finishes (the `agent` result follows in call order).
+    void subagents(const imported!"nano.subagent".SubProgress[] all)
+    {
+        import nano.subagent : progressLine;
+        import nano.trajectory : terminalSafe;
+        // Rows for the running ones (frame renderer), kept by call id; a
+        // finished one collapses to its line in the transcript.
+        foreach (ref p; all)
+        {
+            string id = p.callId;
+            if (p.done) subRows.remove(id);
+            else subRows[id] = progressLine(p);
+        }
+        import std.algorithm : sort;
+        string[] rows;
+        foreach (id; subRows.keys.sort) rows ~= terminalSafe(subRows[id]);
+        auto label = rows.length ? format("agent ×%s", rows.length) : "agent";
+        updateStatus((ref Stats s) { s.tool = label; s.subagents = rows.idup; });
+        if (quiet) return;
+        foreach (ref p; all)
+            if (p.done)
+            {
+                endLine();
+                writeln(stamp() ~ "  " ~ dim(terminalSafe(progressLine(p))));
+            }
         stdOut.flush();
     }
 
@@ -2409,6 +2450,19 @@ int runMain(string[] args)
     agent.sessionTitles = cfg.sessionTitles;
     agent.titleModel = cfg.titleModel;
     agent.titleClient = (string spec) => makeClient(resolve(cfg, spec));
+    if (cfg.subagents)
+    {
+        import nano.subagent : SubLimits;
+        import nano.arith : toSize;
+        agent.subagentClients = new immutable ConfigClients(frozenConfig(cfg));
+        agent.subagentModel = cfg.subagentModel;
+        agent.subagentMaxConcurrency = cfg.subagentMaxConcurrency > 0 ? toSize(cfg.subagentMaxConcurrency) : 1;
+        SubLimits lim;
+        if (cfg.subagentTimeoutSecs > 0) lim.timeoutSecs = cfg.subagentTimeoutSecs;
+        if (cfg.subagentMaxTurns > 0) lim.turns = toSize(cfg.subagentMaxTurns);
+        if (cfg.subagentMaxTokens > 0) lim.tokens = cfg.subagentMaxTokens;
+        agent.subagentLimits = lim;
+    }
     agent.planTools = cfg.planTools;
     agent.timerTools = !o.acp; // ACP has no idle loop to fire them
     agent.outcomeTool = cfg.outcomeTool;
