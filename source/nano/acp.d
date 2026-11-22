@@ -699,24 +699,22 @@ final class AcpServer : AgentEvents
         import std.file : getcwd;
         auto cwd = getcwd();
         auto sys = host.systemPrompt !is null ? host.systemPrompt(cwd) : null;
-        agent.messages = sys.length ? [Message.system(sys)] : null;
-        agent.replaceLog(Option!SessionLog.init);
-        agent.completedInputs = null;
-        agent.completedStops = null;
-        agent.completedOutcomes = null;
-        agent.plan = Plan.init;
-        agent.restoreRecall(JSONValue.init);
+        // `restart` (not a bare messages/log swap) so every piece of
+        // session-local state is reset: replay/clipping provenance
+        // (`restoredLineFloor`, `clippedLines`) left from a `session/load`
+        // would otherwise let a later compaction keep large tool outputs of
+        // this new session in memory (issue #248).
         if (host.sessionDir !is null)
         {
             auto log = new SessionLog(host.sessionDir, agent.client.providerName ~ "/" ~ agent.client.modelName, cwd);
             scope (failure) log.close();
-            foreach (m; agent.messages) log.append(m);
-            agent.replaceLog(some(log));
+            agent.restart(sys, some(log));
             sessionId = log.id;
         }
         else
         {
             import std.datetime.systime : Clock;
+            agent.restart(sys, Option!SessionLog.init);
             sessionId = format("session-%x", stdTimeNow);
         }
         if (host.loadHooks !is null) agent.useHooks(host.loadHooks(cwd), false);

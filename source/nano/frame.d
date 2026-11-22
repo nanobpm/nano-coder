@@ -981,12 +981,37 @@ struct Transcript
     }
 
     /// Collapses every expanded fold. False when none was.
+    /// Rebuilds the transcript in one pass: per-fold `swapIn` would rebuild
+    /// the whole line array and rescan every fold each time, so collapsing
+    /// thousands of folds (Ctrl-O cycling back, leaving verbose) would be
+    /// quadratic, blocking the frame thread (issue #248).
     bool collapseAll() pure
     {
         bool any;
-        foreach_reverse (k; 0 .. folds.length)
-            if (folds[k].expanded) any |= swapIn(k, null);
-        return any;
+        foreach (ref f; folds) any |= f.expanded;
+        if (!any) return false;
+        string[] nextLines;
+        nextLines.reserve(lines.length);
+        size_t at; // old index the next segment starts at
+        foreach (ref f; folds)
+        {
+            nextLines ~= lines[at .. f.start];
+            immutable oldLength = f.length;
+            if (f.expanded)
+            {
+                nextLines ~= f.collapsed;
+                f.length = f.collapsed.length;
+                f.collapsed = null;
+                f.expanded = false;
+            }
+            else nextLines ~= lines[f.start .. f.start + f.length];
+            at = f.start + oldLength; // old end of this fold
+            f.start = nextLines.length - f.length;
+        }
+        nextLines ~= lines[at .. $];
+        lines = nextLines;
+        cache = null;
+        return true;
     }
 
     /// Verbose: expands the latest `verboseCap` folds, and every new one;
@@ -1642,6 +1667,33 @@ unittest
     assert(t.toggle() && expanded == 6);
     assert(t.toggle() && expanded == 7 && t.lines[0 .. 2] == ["r0", "  full 0"]);
     assert(t.toggle() && expanded == 0 && t.lines.length == 8);
+}
+
+// Collapsing a mix of expanded and collapsed folds rebuilds the transcript
+// in one pass: every fold's collapsed form returns at its own place, the
+// lines between folds are untouched, and later folds still expand at their
+// updated offsets (issue #248 review).
+unittest
+{
+    import std.algorithm : startsWith;
+    Transcript t;
+    t.batch = 2;
+    foreach (i; 0 .. 5)
+        t.feed((format("r%s\n", i) ~ foldMark(format("c%s", i), 1, format("r%s\n  full %s\n", i, i))).representation);
+    t.feed("tail\n".representation);
+    auto collapsed = t.lines.dup;
+    // Expand the bottom two folds, then the next two: a mix of expanded
+    // (c3, c4) and collapsed (c0..c2) folds with gaps.
+    assert(t.toggle());
+    assert(t.toggle());
+    size_t expanded() { size_t n; foreach (l; t.lines) n += l.startsWith("  full"); return n; }
+    assert(expanded == 4);
+    assert(t.collapseAll());
+    assert(t.lines == collapsed, format("%s", t.lines));
+    assert(!t.collapseAll(), "already collapsed: nothing to do");
+    // The folds still work afterwards: expansion lands at the right offsets.
+    assert(t.toggle());
+    assert(t.lines == ["r0", "r1", "r2", "r3", "  full 3", "r4", "  full 4", "tail"], format("%s", t.lines));
 }
 
 // The rendered markdown marks survive the stdout pipe into the transcript.

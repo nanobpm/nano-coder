@@ -143,3 +143,36 @@ unittest
     assert(!plain.replayStash.filter!(m => m.role == Role.tool).front.content.length);
     assert(users(plain.replayMessages).canFind("go"), "the turn itself still replays");
 }
+
+// A new session after a resume (ACP `session/new`, `/restart`) resets the
+// restored-session provenance: a `restoredLineFloor` left over from the
+// loaded session would stop every later compaction from slimming this
+// session's large tool outputs, keeping them in memory for good (issue #248
+// review).
+unittest
+{
+    auto dir = buildPath(tempDir, "nano-d-agent-restart-slim");
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto agent = agentWith([LLMResponse("", "", [ToolCall.fromRaw("b1", "big", `{}`)]), LLMResponse("done"),
+        LLMResponse("SUMMARY: one")]);
+    // Simulate a resumed session: a restored conversation whose log lines
+    // are all at or below the floor `loadRestored` computes.
+    import nano.session : Restored;
+    Restored r;
+    auto restoredMsg = Message.user("old turn");
+    restoredMsg.logLine = 7;
+    r.conversation = [restoredMsg];
+    agent.loadRestored(r, Option!SessionLog.init);
+    assert(agent.restoredLineFloor == 7);
+    // The new session (what ACP `session/new` now does through `restart`).
+    auto log = new SessionLog(dir, "mock/m", "/w");
+    agent.restart("sys", some(log));
+    assert(!agent.restoredLineFloor, "the new session has no restored provenance");
+    agent.run("go", new NullEvents);
+    assert(compactNow(agent));
+    auto stashed = agent.replayStash.filter!(m => m.role == Role.tool).array;
+    assert(stashed.length == 1 && !stashed[0].content.length,
+        "a leftover floor would keep the new session's output in memory");
+}
