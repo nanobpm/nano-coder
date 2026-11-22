@@ -577,7 +577,11 @@ class SessionLog
                     writePrivate(tmp, ours, octal!600);
                     publishOver(tmp, path);
                     next = openExistingForAppend(path);
-                    if (tryLock(next) != LockResult.contended && sameFile(next, path))
+                    // Locked, still at the path, AND holding exactly our
+                    // records: a replacement that slipped in between the
+                    // publish and this reopen must not count as restored.
+                    if (tryLock(next) != LockResult.contended && sameFile(next, path)
+                        && readAll(next) == ours && sameFile(next, path))
                     {
                         done = true;
                         how = "it was removed; restored it from this session's records";
@@ -626,23 +630,16 @@ class SessionLog
                 // confirm the locked inode is still the one at the path.
                 import std.exception : collectException;
                 // Lost the race for this name (or cannot create it): try the next.
+                // The exclusive-create descriptor itself is kept (never a
+                // reopen of the name), so a swap of the path cannot hand us
+                // someone else's file.
                 if (collectException(next = createPrivate(target)) !is null) continue;
-                // Same for a name whose lock another process won first: close
-                // the fd and remove the empty file we just published, then try
-                // the next name — never abort the whole recovery over one
-                // contended name (and never leak the fd or the header-less
-                // file). Any other lock failure still throws.
-                try
-                {
-                    awaitLock(next, target);
-                }
-                catch (Exception) // contended name: skip it, try the next
-                {
-                    next.close();
-                    if (target.exists) remove(target);
-                    continue;
-                }
-                if (!sameFile(next, target)) { next.close(); remove(target); continue; }
+                // A name whose lock another writer won, or whose path no
+                // longer names our inode: close our fd and try the next name.
+                // Never unlink it: the path may now hold another writer's
+                // records (or a replacement), and removing it could orphan them.
+                bool locked = collectException(awaitLock(next, target)) is null;
+                if (!locked || !sameFile(next, target)) { next.close(); continue; }
                 next.rawWrite(withHeaderId(ours, rid));
                 next.flush();
                 made = true;
@@ -653,11 +650,17 @@ class SessionLog
                 ~ " (resume it with --resume " ~ target.baseName.stripExtension ~ ")";
         }
         immutable old = path;
+        immutable oldId = id;
         close();
         f = next;
         path = target;
         id = path.baseName.stripExtension;
         held = shareHandle(path, f);
+        // A new id moves the attachments dir (`<id>.attachments`): copy the
+        // stored images there so the recovered session still sees them,
+        // leaving the originals for the old log.
+        if (id != oldId) copyAttachments(buildPath(old.dirName, oldId ~ ".attachments"),
+            buildPath(path.dirName, id ~ ".attachments"));
         auto msg = "WARNING: session log " ~ old ~ " no longer names the file this session was writing: "
             ~ how ~ ". Nothing was lost.";
         if (warn) warn(msg);
@@ -1370,10 +1373,31 @@ private void awaitLock(ref File f, string path)
     throw new Exception("session log " ~ path ~ " is locked by another process (tidy-up?); try again");
 }
 
-/// `path` opened for appending without ever creating it.
-private File openExistingForAppend(string path) @trusted
+/// Copy every file of the attachments dir `from` into `to` (best-effort:
+/// a failed copy leaves that image unavailable, never aborts recovery).
+private void copyAttachments(string from, string to)
 {
-    import core.sys.posix.fcntl : open, fcntl, O_RDWR, O_APPEND, F_SETFD, FD_CLOEXEC;
+    import std.file : dirEntries, SpanMode, isDir, mkdirRecurse, copy;
+    import std.exception : collectException;
+    if (!from.exists || !from.isDir) return;
+    collectException(mkdirRecurse(to));
+    foreach (e; dirEntries(from, SpanMode.shallow))
+    {
+        if (!e.isFile) continue;
+        auto dest = buildPath(to, e.name.baseName);
+        if (!dest.exists) collectException(copy(e.name, dest));
+    }
+}
+
+/// `path` opened for appending without ever creating it.
+private File openExistingForAppend(string path) { return openLog(path, false); }
+
+/// `path` opened read/write + append + close-on-exec; `create` makes it
+/// exclusively (0600), keeping that very descriptor.
+private File openLog(string path, bool create) @trusted
+{
+    import core.sys.posix.fcntl : open, fcntl, O_RDWR, O_APPEND, O_CREAT, O_EXCL, F_SETFD, FD_CLOEXEC;
+    import nano.safeio : fchmodFd;
     import std.string : toStringz;
     import core.stdc.errno : errno, ENOENT;
     import std.exception : ErrnoException;
@@ -1383,14 +1407,18 @@ private File openExistingForAppend(string path) @trusted
     version (linux) enum int cloexec = 0x80000; // O_CLOEXEC
     else version (OSX) enum int cloexec = 0x1000000;
     else enum int cloexec = 0;
-    auto fd = open(path.toStringz, O_RDWR | O_APPEND | cloexec);
+    auto fd = create
+        ? open(path.toStringz, O_RDWR | O_APPEND | O_CREAT | O_EXCL | cloexec, octal!600)
+        : open(path.toStringz, O_RDWR | O_APPEND | cloexec);
     if (fd < 0)
     {
         immutable err = errno;
+        if (create) throw new ErrnoException("cannot create " ~ path, err);
         if (err == ENOENT) throw new Exception("session log " ~ path ~ " does not exist");
         throw new ErrnoException("cannot open session log " ~ path, err);
     }
     fcntl(fd, F_SETFD, FD_CLOEXEC); // also where O_CLOEXEC is unknown
+    if (create) fchmodFd(fd, octal!600); // never wider, whatever the umask
     File f;
     f.fdopen(fd, "a+");
     return f;
@@ -1454,10 +1482,11 @@ private void writePrivate(string path, const(ubyte)[] data, uint mode)
 }
 
 /// A new session log opened for appending, created owner-only (0600).
+/// The descriptor from the exclusive create itself is returned (read/write,
+/// append, close-on-exec): reopening the name would race a replacement.
 private File createPrivate(string path)
 {
-    writePrivate(path, null, octal!600);
-    return openExistingForAppend(path);
+    return openLog(path, true);
 }
 
 /// fsync `path`'s parent directory, so a created or removed directory entry
@@ -2390,7 +2419,7 @@ unittest
     restore(rec); // a resumable session: its header names the recovery id
 }
 
-@("a contended recovery name is skipped, its empty file removed, and the next name used (#237)")
+@("a contended recovery name is skipped, never unlinked, and the next name used (#237)")
 unittest
 {
     import std.algorithm : canFind, count;
@@ -2430,4 +2459,26 @@ unittest
     assert(dirEntries(dir, "*.recovered-*.jsonl", SpanMode.shallow).array.length == 2,
         "no extra empty recovery files left behind");
     restore(rec);
+}
+
+@("a recovery log under a new id keeps the session's attachments (#237)")
+unittest
+{
+    auto dir = buildPath(tempDir, format("nano-coder-recatt-%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/x");
+    log.warn = (string) {};
+    log.input("i1", "img");
+    auto p = log.path, oldId = log.id;
+    auto oldAtt = buildPath(dir, oldId ~ ".attachments");
+    mkdirRecurse(oldAtt);
+    std.file.write(buildPath(oldAtt, "blob.png"), "PNG");
+    remove(p);
+    std.file.write(p, "{\"type\":\"session\",\"data\":{}}\n");
+    log.input("i2", "after");
+    log.close();
+    assert(log.id != oldId);
+    assert(readText(buildPath(dir, log.id ~ ".attachments", "blob.png")) == "PNG");
+    assert(buildPath(oldAtt, "blob.png").exists, "the originals stay for the old log");
 }
