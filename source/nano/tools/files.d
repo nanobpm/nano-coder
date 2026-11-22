@@ -40,6 +40,8 @@ class ReadState
     }
 
     void record(string path, const(void)[] content) { seen[key(path)] = sha256Of(content); }
+    /// `record` for content hashed elsewhere (a concurrent read_file).
+    void recordDigest(string path, ubyte[32] digest) { seen[key(path)] = digest; }
     void forget(string path) { seen.remove(key(path)); }
 
     /// Whether the model read `path` and its bytes on disk (`current`) have
@@ -93,6 +95,13 @@ string[] textLines(string s) pure
 
 string readFile(JSONValue args, ReadState state)
 {
+    return readFile(args, (string path, const(ubyte)[] data) => state.record(path, data));
+}
+
+/// `read_file` reporting what it showed to `seen` instead of a `ReadState`,
+/// so it can run on a worker thread (issue #222): it touches nothing else.
+string readFile(JSONValue args, scope void delegate(string path, const(ubyte)[] data) @safe seen)
+{
     auto path = resolvePath(requireString(args, "path", "read_file"));
     auto offset = optInt(args, "offset", 1);
     auto limit = optInt(args, "limit", defaultReadLimit);
@@ -127,14 +136,14 @@ string readFile(JSONValue args, ReadState state)
     auto lines = textLines(text);
     if (lines.length == 0)
     {
-        state.record(path, data);
+        seen(path, data);
         return "(empty file)";
     }
     if (offset > lines.length)
         throw new ToolError(format("read_file: offset %s is past the end of %s (%s lines)", offset, path, lines.length));
     // Record only once the read has succeeded, so a failed out-of-range read
     // can't authorize a later edit the model never saw.
-    state.record(path, data);
+    seen(path, data);
     auto first = toSize(offset - 1);
     auto last = min(lines.length, first + toSize(limit));
     string out_;
@@ -1551,6 +1560,31 @@ string applyPatch(JSONValue args, ReadState state, PatchSnapshot[] prepared = nu
     return head ~ summary ~ noteText ~ "\n" ~ diff;
 }
 
+/// read_file runs on a worker thread; what it read is recorded on the
+/// agent's thread afterwards. The receipt is the content's SHA-256, then the
+/// path. A failed read records nothing (its receipt is empty).
+Concurrency readConcurrency(ReadState state)
+{
+    static JobResult work(string argsJson, immutable(string)[] context)
+    {
+        import std.string : representation;
+        immutable(ubyte)[] receipt;
+        auto text = readFile(parseJSON(argsJson), (string path, const(ubyte)[] data) {
+            receipt = sha256Of(data).idup ~ path.representation;
+        });
+        return JobResult(text, false, false, receipt);
+    }
+    Concurrency c;
+    c.readOnly = true;
+    c.offload = (JSONValue a) => Job(&work, a.jsonText, null);
+    c.settle = (const ref JobResult r) {
+        if (r.receipt.length < 32) return;
+        ubyte[32] d = r.receipt[0 .. 32];
+        state.recordDigest(utf8Text(r.receipt[32 .. $]), d);
+    };
+    return c;
+}
+
 void register(ToolRegistry tools, ReadState state)
 {
     tools.register(ToolDefinition("read_file",
@@ -1561,7 +1595,7 @@ void register(ToolRegistry tools, ReadState state)
             "offset":{"type":"integer","description":"1-based first line to return (text files only, default 1)"},
             "limit":{"type":"integer","description":"Maximum number of lines (text files only, default 2000)"}},
             "required":["path"]}`)),
-        (JSONValue a) => readFile(a, state));
+        (JSONValue a) => readFile(a, state), readConcurrency(state));
     tools.register(ToolDefinition("write_file",
         "Create a file, or overwrite one you have read, creating parent directories. Prefer edit_file (one change) or apply_patch (several) for changes to existing files.",
         parseJSON(`{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}`)),

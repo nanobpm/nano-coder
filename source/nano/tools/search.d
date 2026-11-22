@@ -5,7 +5,7 @@ module nano.tools.search;
 
 @safe:
 
-import nano.safeio : listDir, ownText, readCapped;
+import nano.safeio : jsonText, listDir, ownText, readCapped;
 
 import std.json;
 import std.format : format;
@@ -347,9 +347,49 @@ string glob(JSONValue args, Denied denied = null)
     return n ? out_.data : "(no matches)";
 }
 
+/// The Read-deny rules as sendable text for a worker thread: the working
+/// directory, then each rule's source (empty: nothing is denied).
+alias DenyRules = immutable(string)[] delegate() @safe;
+
+/// The deny check a worker rebuilds from `DenyRules` text for `root`.
+private Denied denyFrom(immutable(string)[] context, string root)
+{
+    import nano.permissions : Policy, parseRule, ReadDenyScan;
+    if (!context.length) return null;
+    Policy p;
+    foreach (src; context[1 .. $]) p.deny ~= parseRule(src);
+    ReadDenyScan scan;
+    if (!p.readDenyScan(context[0], scan)) return null;
+    auto forRoot = scan.forRoot(root);
+    return (string path) @safe => forRoot.denied(path);
+}
+
+/// grep or glob on a worker thread (issue #222): only its arguments and the
+/// deny rules' text, both sendable; a walk keeps its state on its stack.
+private JobResult searchJob(string tool)(string argsJson, immutable(string)[] context)
+{
+    auto args = parseJSON(argsJson);
+    auto root = resolvePath(optString(args, "path", "."));
+    auto denied = denyFrom(context, root);
+    static if (tool == "grep") return JobResult(grep(args, denied));
+    else return JobResult(glob(args, denied));
+}
+
+private Concurrency searchConcurrency(string tool)(DenyScan denied, DenyRules rules)
+{
+    Concurrency c;
+    c.readOnly = true;
+    // A deny check only the agent's thread can run keeps the call there.
+    if (denied is null || rules !is null)
+        c.offload = (JSONValue a) => Job(&searchJob!tool, a.jsonText, rules is null ? null : rules());
+    return c;
+}
+
 /// `scan` prepares, per search root, the check for paths Read-deny rules
-/// hide from search results.
-void register(ToolRegistry tools, DenyScan denied = null)
+/// hide from search results; `rules` is the same as text, so a search can
+/// run on a worker thread (without it, a search with a `scan` runs on the
+/// agent's thread).
+void register(ToolRegistry tools, DenyScan denied = null, DenyRules rules = null)
 {
     tools.register(ToolDefinition("grep",
         "Search file contents under a path for a regular expression. Read-only. Respects .gitignore, skips .git, symlinks and binary files. "
@@ -362,7 +402,7 @@ void register(ToolRegistry tools, DenyScan denied = null)
             "output_mode":{"type":"string","enum":["content","files","count"],"description":"Default content"},
             "limit":{"type":"integer","description":"Max results to return (default 250, max 5000)"}},
             "required":["pattern"]}`)),
-        (JSONValue a) => grep(a, denied));
+        (JSONValue a) => grep(a, denied), searchConcurrency!"grep"(denied, rules));
     tools.register(ToolDefinition("glob",
         "List files under a path whose name matches a glob pattern. Read-only. A pattern without `/` matches the file name at any depth (\"*.rs\"); "
         ~ "a pattern with `/` matches the path relative to the search root, where `*` stays within one directory and `**` crosses directories (\"src/**/*.rs\"). "
@@ -372,7 +412,7 @@ void register(ToolRegistry tools, DenyScan denied = null)
             "path":{"type":"string","description":"Directory to list from (default: working directory)"},
             "limit":{"type":"integer","description":"Max paths to return (default 250, max 5000)"}},
             "required":["pattern"]}`)),
-        (JSONValue a) => glob(a, denied));
+        (JSONValue a) => glob(a, denied), searchConcurrency!"glob"(denied, rules));
 }
 
 unittest

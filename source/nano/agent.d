@@ -10,7 +10,7 @@ import nano.arith : checkedMul, checkedSub, saturatingAdd, saturatingSub, clampT
 import nano.option : Option, some, none, match, ifSome, orElse, unwrap, NotNull;
 import nano.result : orThrow, toOption, match, unwrap;
 
-import nano.safeio : Isolated, JoinHandle, spawnDaemon, stdErr, stdOut;
+import nano.safeio : Chan, Isolated, Join, JoinHandle, spawn, spawnDaemon, stdErr, stdOut;
 
 import std.json;
 import std.format : format;
@@ -840,90 +840,335 @@ class Agent
             control.isCancelled));
     }
 
-    /// Run a reply's tool calls in order, each result pushed as it lands.
-    /// The loop detector's hard stop sets `loopStop` and skips the rest.
+    /// Run a reply's tool calls, each result pushed in call order. A run of
+    /// two or more consecutive read-only calls executes concurrently
+    /// (`runConcurrently`); every other call is a barrier that runs alone,
+    /// so "read, edit, read" still reads the edit (issue #222). The loop
+    /// detector's hard stop sets `loopStop` and skips the rest.
     private Event runToolCalls(const ref LLMResponse r, AgentEvents ev, ref string loopStop)
     {
         loopStop = null;
-        foreach (call; r.toolCalls)
+        auto calls = r.toolCalls;
+        for (size_t i = 0; i < calls.length;)
         {
+            size_t j = i;
+            while (j < calls.length && concurrentEligible(calls[j].name)) j++;
+            if (j > i + 1 && !control.isCancelled && loopStop is null)
+            {
+                runConcurrently(r.stopReason, calls[i .. j], ev, loopStop);
+                i = j;
+                continue;
+            }
+            auto call = calls[i++];
             ev.toolStart(call);
-            bool isError = true;
-            string result;
-            Attachment[] attachments;
-            bool dispatched;
-            JSONValue effectiveArgs;
-            auto recallBefore = recallState.dup;
-            auto notesBefore = recallTurnNotes;
-            if (control.isCancelled) result = cancelledToolResult;
-            else if (loopStop !is null) result = loopStoppedToolResult;
+            CallRun c;
+            c.recallBefore = recallState.dup;
+            c.notesBefore = recallTurnNotes;
+            if (control.isCancelled) c.result = cancelledToolResult;
+            else if (loopStop !is null) c.result = loopStoppedToolResult;
             else
             {
-                {
-                    import nano.tools : setSpillDir, spillDirFor, truncateOutput;
-                    // Cut outputs are kept beside a persisted session's log.
-                    setSpillDir(log.match!(l => spillDirFor(l.path), () => string.init));
-                    result = runTool(call, r.stopReason, isError, dispatched, effectiveArgs);
-                    // bash, read_file and history_read bound their own output.
-                    if (call.name != "bash" && call.name != "read_file" && call.name != hist.readTool
-                        && call.name != "load_skill")
-                        result = truncateOutput(result, toolOutputLimit,
-                            format("tool-%s-%s", safeName(call.id), safeName(call.name)));
-                }
-                // A successful edit marks the tree unchecked; a bash call
-                // that started (even one exiting non-zero) is the check.
-                auto patched = call.name == "apply_patch" && dispatched ? patchTouches(effectiveArgs, isError) : null;
-                if (!isError && (call.name == "write_file" || call.name == "edit_file" || patched.length)) editsSinceCheck = true;
-                else if (dispatched && !isError && call.name == "bash") editsSinceCheck = false;
-                if (call.name == "read_file") result = imageResult(result, isError, attachments);
-                // Deeper instruction files and scoped rules attach to the first
-                // file-tool result that touches a matching path.
-                if (!isError && (call.name == "read_file" || call.name == "write_file" || call.name == "edit_file"))
-                    if (auto p = "path" in call.arguments)
-                        if (p.type == JSONType.string)
-                        {
-                            import std.file : getcwd;
-                            instructions.ifSome((ProjectInstructions pi) {
-                                if (auto nested = pi.nestedFor(p.str, getcwd())) result ~= nested;
-                            });
-                        }
-                foreach (p; patched)
-                {
-                    import std.file : getcwd;
-                    instructions.ifSome((ProjectInstructions pi) {
-                        if (auto nested = pi.nestedFor(p, getcwd())) result ~= nested;
-                    });
-                }
-                // Memory recall (Rust #167): a note for each memory whose
-                // anchors appear in this call's arguments and whose full
-                // text is not already in context. Only calls that ran.
-                if (dispatched)
-                    foreach (note; recallMemories(call.name, withPaths(effectiveArgs, patched), !isError, result))
-                        result ~= "\n\n" ~ wrap(note);
-                if (hist.isHistoryTool(call.name)) historyHintPending = false;
-                else if (historyHintPending && historyEnabled && hist.looksFailed(call.name, !isError, result))
-                {
-                    historyHintPending = false;
-                    result ~= "\n\n" ~ hist.failedToolHint;
-                }
-                if (remindersEnabled) result ~= remind(call, !isError, result, loopStop);
+                import nano.tools : setSpillDir, spillDirFor;
+                // Cut outputs are kept beside a persisted session's log.
+                setSpillDir(log.match!(l => spillDirFor(l.path), () => string.init));
+                c.result = runTool(call, r.stopReason, c.isError, c.dispatched, c.effectiveArgs);
+                c.ran = true;
             }
-            ev.toolEnd(call, toolResultDisplay(result, attachments), isError);
-            auto msg = Message.toolResult(call.id, call.name, result, isError);
-            msg.attachments = attachments;
-            // Commit this call's recall changes only once the result
-            // carrying their notes is durable: a failed append rolls them
-            // back, so a resume never treats unseen notes as seen.
-            try push(msg);
-            catch (Exception e)
-            {
-                recallState = recallBefore;
-                recallTurnNotes = notesBefore;
-                throw e;
-            }
-            if (recallState != recallBefore) recallChanged();
+            finishCall(call, c, ev, loopStop);
         }
         return Event(ToolsRan(loopStop !is null, hasReported, reported.response, control.isCancelled));
+    }
+
+    /// Most worker threads one run of read-only calls uses at a time.
+    enum maxConcurrentTools = 8;
+
+    /// Whether calls to `name` may run concurrently with their read-only
+    /// neighbours: read-only by construction, never prompting. Tools say so
+    /// themselves (`Concurrency.readOnly`); of the agent's own, the history
+    /// tools and the plan and timer listings qualify. Everything else (bash,
+    /// edits, question, report_outcome, plan/timer/memory mutations, unknown
+    /// names) is a barrier.
+    ///
+    /// Thread-safety audit (#222). Worker threads get only a `Job`: a plain
+    /// function and immutable text, so the type system rules out shared
+    /// agent state. What each job touches: read_file reads the file and
+    /// hashes it; the agent records the digest in its `ReadState` afterwards
+    /// (`settle`, on this thread). grep/glob walk the tree with per-call
+    /// `Ignores`/regexes and rebuild the Read-deny scan from rule text
+    /// (`Rule.matches` keeps its compiled copy per thread). The history
+    /// tools are barriers (they read results logged by earlier calls). The
+    /// spill directory, spill set and truncation are thread-local and used
+    /// on this thread only (truncation happens after the run). Stats, the
+    /// loop detector, memory recall and the frame UI are touched only here,
+    /// in call order. memory_search, plan_show and timer_list run on this
+    /// thread while the workers run, so they share nothing with them.
+    private bool concurrentEligible(string name)
+    {
+        if (outcomeTool && name == outcomeToolName) return false;
+        // Tool-use hooks are arbitrary commands that may change files, so a
+        // call a hook can see keeps its sequential place: a PostToolUse hook
+        // on one read must run before the next read observes the tree.
+        // Checked before the plan/timer listings so hooked ones are barriers.
+        if (hooks.match!(m => m.hasToolHooks(name), () => false)) return false;
+        if (planTools && isPlanTool(name)) return name == "plan_show";
+        if (timerTools && isTimerTool(name)) return name == "timer_list";
+        // History tools are barriers: they must see the preceding calls'
+        // logged results, and history_read's spill bookkeeping is the
+        // agent thread's own.
+        if (hist.isHistoryTool(name)) return false;
+        return tools.readOnly(name);
+    }
+
+    /// One call's way through `runToolCalls`.
+    private static struct CallRun
+    {
+        string result;
+        bool isError = true;
+        /// Reached its handler (see `runTool`).
+        bool dispatched;
+        JSONValue effectiveArgs;
+        /// Admitted and run (or refused) rather than cancelled or loop-stopped.
+        bool ran;
+        /// Recall state before the call, restored if its result can't be logged.
+        typeof(recallState) recallBefore;
+        typeof(recallTurnNotes) notesBefore;
+    }
+
+    version (unittest)
+    {
+        /// Test hook: called by a worker right after it reads `afterCancel`.
+        static shared void function() @safe workerRecordedHook;
+    }
+
+    /// What a worker hands back: the job's result, and whether the turn was
+    /// already cancelled when the job finished (decided on the worker, so a
+    /// result completed before a cancel keeps its result however late the
+    /// agent collects it).
+    private static struct WorkerDone
+    {
+        JobResult result;
+        bool afterCancel;
+    }
+
+    /// A worker: run the job, then say which call finished.
+    private static WorkerDone worker(Job job, size_t index, Chan!size_t finished)
+    {
+        scope (exit) finished.put(index);
+        auto res = runJob(job);
+        auto afterCancel = cancelRequested();
+        import core.atomic : atomicLoad;
+        version (unittest)
+            if (auto hook = atomicLoad(workerRecordedHook)) hook();
+        return WorkerDone(res, afterCancel);
+    }
+
+    /// Run consecutive read-only calls concurrently (issue #222). In call
+    /// order, first: each call starts (`toolStart`) and is admitted (plan
+    /// mode, permissions, PreToolUse hooks, so a veto never races). Then the
+    /// admitted calls run: those a tool can package as a `Job` on worker
+    /// threads (at most `maxConcurrentTools` at once, through safeio's
+    /// `spawn`), the rest on this thread meanwhile. Last, in call order
+    /// again: the tool's `settle`, the PostToolUse hooks, the loop detector,
+    /// memory recall, `toolEnd` and the logged result, exactly as one call
+    /// at a time would produce them. A cancellation stops launching: a call
+    /// that hadn't finished reports the usual interrupted result, and every
+    /// worker is joined before this returns, so nothing outlives the turn.
+    private void runConcurrently(string stopReason, const(ToolCall)[] calls, AgentEvents ev, ref string loopStop)
+    {
+        import nano.tools : setSpillDir, spillDirFor;
+        setSpillDir(log.match!(l => spillDirFor(l.path), () => string.init));
+        auto n = calls.length;
+        auto runs = new CallRun[n];
+        auto contexts = new string[][n];
+        auto admitted = new bool[n];
+        auto jobs = new Job[n];
+        auto offloaded = new bool[n];
+        auto finished = new bool[n];
+        auto results = new JobResult[n];
+        // Calls never admitted because a cancel arrived first: no hooks,
+        // reported as interrupted.
+        auto skipped = new bool[n];
+        foreach (k, ref call; calls)
+        {
+            ev.toolStart(call);
+            if (control.isCancelled)
+            {
+                skipped[k] = true;
+                continue;
+            }
+            admitted[k] = admit(call, stopReason, runs[k].result, runs[k].effectiveArgs, contexts[k]);
+            if (!admitted[k]) continue;
+            if (tools.has(call.name))
+            {
+                auto mode = tools.concurrency(call.name);
+                // Packaging only copies text: the tool's own checks run in the job.
+                if (mode.offload !is null)
+                {
+                    // Packaging can fail (e.g. a deleted cwd while building
+                    // the Read-deny scan): that call fails like a sequential
+                    // one would, rather than unwinding the whole batch.
+                    try
+                    {
+                        jobs[k] = mode.offload(runs[k].effectiveArgs);
+                        offloaded[k] = true;
+                    }
+                    catch (Exception e)
+                    {
+                        results[k] = JobResult(e.msg, true, true);
+                        finished[k] = true;
+                    }
+                }
+            }
+        }
+        // The workers, launched in call order while not cancelled.
+        auto done = Chan!size_t.make;
+        auto handles = new Join!WorkerDone[n];
+        size_t next, running;
+        // Every started worker is joined on every exit path (a failed spawn
+        // or a throwing in-memory tool included), so none outlives the turn.
+        scope (failure)
+            while (running)
+            {
+                size_t k;
+                done.take(k);
+                // Counted off before the join: a join that rethrows has still
+                // consumed this worker's notification.
+                running--;
+                // `runJob` turns a job's exception into a result, so this
+                // only waits.
+                handles[k].join();
+            }
+        void launch()
+        {
+            for (; running < maxConcurrentTools && next < n && !control.isCancelled; next++)
+                if (offloaded[next] && !finished[next])
+                {
+                    handles[next] = spawn(&worker, jobs[next], next, done);
+                    running++;
+                }
+        }
+        launch();
+        // In-memory read-only tools run here while the workers run.
+        foreach (k, ref call; calls)
+            if (admitted[k] && !offloaded[k] && !finished[k] && !control.isCancelled)
+            {
+                bool isError;
+                results[k].text = execute(call, runs[k].effectiveArgs, isError);
+                results[k].error = isError;
+                // Finished after a cancellation (the worker rule): interrupted.
+                finished[k] = !control.isCancelled;
+            }
+        while (running)
+        {
+            size_t k;
+            done.take(k);
+            // Before the join, so a rethrowing join leaves the failure guard
+            // waiting only for notifications still to come.
+            running--;
+            auto w = handles[k].join();
+            results[k] = w.result;
+            // Finished after a cancellation: reported as interrupted.
+            finished[k] = !w.afterCancel;
+            launch();
+        }
+        foreach (k, ref call; calls)
+        {
+            auto c = &runs[k];
+            c.recallBefore = recallState.dup;
+            c.notesBefore = recallTurnNotes;
+            // Cancellation outranks a loop stop for a call that never ran:
+            // an interrupted call reports the interrupted result even when an
+            // earlier finished call tripped the loop detector.
+            // A loop stop outranks a refusal, as in the sequential path.
+            if (skipped[k] || (admitted[k] && !finished[k])) c.result = cancelledToolResult;
+            else if (loopStop !is null) c.result = loopStoppedToolResult;
+            else if (!admitted[k]) c.ran = true;
+            else
+            {
+                auto res = results[k];
+                if (offloaded[k] && !res.error)
+                    if (auto settle = tools.concurrency(call.name).settle) settle(res);
+                c.ran = c.dispatched = true;
+                c.isError = res.error;
+                auto text = res.crashed ? format("%s failed: %s", call.name, res.text) : res.text;
+                c.result = afterTool(call, c.effectiveArgs, text, contexts[k]);
+            }
+            finishCall(call, *c, ev, loopStop);
+        }
+    }
+
+    /// A call's result after it ran (truncated, annotated, the loop detector
+    /// consulted), shown (`toolEnd`) and logged. `c.ran` false: cancelled or
+    /// loop-stopped, logged as it is.
+    private void finishCall(const ref ToolCall call, ref CallRun c, AgentEvents ev, ref string loopStop)
+    {
+        string result = c.result;
+        bool isError = c.isError;
+        bool dispatched = c.dispatched;
+        auto effectiveArgs = c.effectiveArgs;
+        Attachment[] attachments;
+        if (c.ran)
+        {
+            {
+                import nano.tools : truncateOutput;
+                // bash, read_file and history_read bound their own output.
+                if (call.name != "bash" && call.name != "read_file" && call.name != hist.readTool
+                    && call.name != "load_skill")
+                    result = truncateOutput(result, toolOutputLimit,
+                        format("tool-%s-%s", safeName(call.id), safeName(call.name)));
+            }
+            // A successful edit marks the tree unchecked; a bash call
+            // that started (even one exiting non-zero) is the check.
+            auto patched = call.name == "apply_patch" && dispatched ? patchTouches(effectiveArgs, isError) : null;
+            if (!isError && (call.name == "write_file" || call.name == "edit_file" || patched.length)) editsSinceCheck = true;
+            else if (dispatched && !isError && call.name == "bash") editsSinceCheck = false;
+            if (call.name == "read_file") result = imageResult(result, isError, attachments);
+            // Deeper instruction files and scoped rules attach to the first
+            // file-tool result that touches a matching path.
+            if (!isError && (call.name == "read_file" || call.name == "write_file" || call.name == "edit_file"))
+                if (auto p = "path" in call.arguments)
+                    if (p.type == JSONType.string)
+                    {
+                        import std.file : getcwd;
+                        instructions.ifSome((ProjectInstructions pi) {
+                            if (auto nested = pi.nestedFor(p.str, getcwd())) result ~= nested;
+                        });
+                    }
+            foreach (p; patched)
+            {
+                import std.file : getcwd;
+                instructions.ifSome((ProjectInstructions pi) {
+                    if (auto nested = pi.nestedFor(p, getcwd())) result ~= nested;
+                });
+            }
+            // Memory recall (Rust #167): a note for each memory whose
+            // anchors appear in this call's arguments and whose full
+            // text is not already in context. Only calls that ran.
+            if (dispatched)
+                foreach (note; recallMemories(call.name, withPaths(effectiveArgs, patched), !isError, result))
+                    result ~= "\n\n" ~ wrap(note);
+            if (hist.isHistoryTool(call.name)) historyHintPending = false;
+            else if (historyHintPending && historyEnabled && hist.looksFailed(call.name, !isError, result))
+            {
+                historyHintPending = false;
+                result ~= "\n\n" ~ hist.failedToolHint;
+            }
+            if (remindersEnabled) result ~= remind(call, !isError, result, loopStop);
+        }
+        ev.toolEnd(call, toolResultDisplay(result, attachments), isError);
+        auto msg = Message.toolResult(call.id, call.name, result, isError);
+        msg.attachments = attachments;
+        // Commit this call's recall changes only once the result
+        // carrying their notes is durable: a failed append rolls them
+        // back, so a resume never treats unseen notes as seen.
+        try push(msg);
+        catch (Exception e)
+        {
+            recallState = c.recallBefore;
+            recallTurnNotes = c.notesBefore;
+            throw e;
+        }
+        if (recallState != c.recallBefore) recallChanged();
     }
 
     /// System reminders for one finished call: plan/memory nudges and the
@@ -1607,45 +1852,10 @@ class Agent
         out JSONValue effectiveArgs)
     {
         isError = true;
-        if (auto e = call.rawArgumentsError(stopReason)) return e;
-        bool isPlan = planTools && isPlanTool(call.name);
-        bool isOutcome = outcomeTool && call.name == outcomeToolName;
-        bool isHistory = historyEnabled && hist.isHistoryTool(call.name);
-        bool isTimer = timerTools && isTimerTool(call.name);
-        if (!isPlan && !isOutcome && !isHistory && !isTimer && !tools.has(call.name))
-            return format("Tool '%s' not found. Available: %s", call.name, toolNames());
-        // Backstop for a call already in flight when plan mode was switched on.
-        if (control.mode == AgentMode.plan && !planAllows(call.name))
-            return format("%s is disabled in plan mode (read-only)", call.name);
-        // An unverifiable shell loop never prompts: the policy allows it
-        // under the OS sandbox and blocks it without one (Rust #171).
-        auto permissionDeny = policy.decide(call.name, call.arguments).match!(
-            (PermAllow _) => string.init,
-            (PermDeny d) => d.message,
-        );
-        if (permissionDeny !is null) return permissionDeny;
-        // PreToolUse hooks run after the permission check, before the tool:
-        // they can deny the call, rewrite its input, or add context.
-        JSONValue args = call.arguments;
         string[] context;
-        foreach (h; hooks)
-        {
-            auto o = h.runPreToolUse(call.name, call.arguments, call.id);
-            if (auto ctx = o.contextBlock) context ~= ctx;
-            string deny;
-            if (o.denies) deny = o.blockReason.length ? o.blockReason : "blocked by a PreToolUse hook";
-            else if (o.decision == Decision.ask)
-                deny = o.blockReason.strip.length ? o.blockReason
-                    : "a PreToolUse hook requested confirmation (ask), which nano cannot prompt for yet; blocking the call";
-            else if (o.updatedInput.type != JSONType.null_)
-            {
-                args = applyUpdatedInput(call.name, call.arguments, o.updatedInput);
-                // The rewritten input must pass the policy too, or a hook could
-                // rewrite a command or path past the user's rules.
-                if (auto blocked = policy.check(call.name, args)) deny = blocked;
-            }
-            if (deny !is null) return withContext(deny, context);
-        }
+        string refused;
+        if (!admit(call, stopReason, refused, effectiveArgs, context)) return refused;
+        auto args = effectiveArgs;
         // apply_patch: each touched path also passes the hooks as a direct
         // edit of it would (the policy already checked every path).
         // The per-path hook inputs are built once, before the patch runs: a
@@ -1668,7 +1878,73 @@ class Agent
             else prepared = patchSnapshot(patchInputs);
         }
         dispatched = true;
-        effectiveArgs = args;
+        auto out_ = execute(call, args, isError, prepared);
+        return afterTool(call, args, out_, context, isError, patchInputs);
+    }
+
+    /// Before a call runs: its arguments, the tool, plan mode, the permission
+    /// policy and the PreToolUse hooks. False with the refusal in `refused`;
+    /// true with the arguments to run with (after any hook rewrite) and the
+    /// hooks' context.
+    private bool admit(const ref ToolCall call, string stopReason, out string refused, out JSONValue args,
+        ref string[] context)
+    {
+        if (auto e = call.rawArgumentsError(stopReason)) { refused = e; return false; }
+        bool isPlan = planTools && isPlanTool(call.name);
+        bool isOutcome = outcomeTool && call.name == outcomeToolName;
+        bool isHistory = historyEnabled && hist.isHistoryTool(call.name);
+        bool isTimer = timerTools && isTimerTool(call.name);
+        if (!isPlan && !isOutcome && !isHistory && !isTimer && !tools.has(call.name))
+        {
+            refused = format("Tool '%s' not found. Available: %s", call.name, toolNames());
+            return false;
+        }
+        // Backstop for a call already in flight when plan mode was switched on.
+        if (control.mode == AgentMode.plan && !planAllows(call.name))
+        {
+            refused = format("%s is disabled in plan mode (read-only)", call.name);
+            return false;
+        }
+        // An unverifiable shell loop never prompts: the policy allows it
+        // under the OS sandbox and blocks it without one (Rust #171).
+        auto permissionDeny = policy.decide(call.name, call.arguments).match!(
+            (PermAllow _) => string.init,
+            (PermDeny d) => d.message,
+        );
+        if (permissionDeny !is null) { refused = permissionDeny; return false; }
+        // PreToolUse hooks run after the permission check, before the tool:
+        // they can deny the call, rewrite its input, or add context.
+        args = call.arguments;
+        foreach (h; hooks)
+        {
+            auto o = h.runPreToolUse(call.name, call.arguments, call.id);
+            if (auto ctx = o.contextBlock) context ~= ctx;
+            string deny;
+            if (o.denies) deny = o.blockReason.length ? o.blockReason : "blocked by a PreToolUse hook";
+            else if (o.decision == Decision.ask)
+                deny = o.blockReason.strip.length ? o.blockReason
+                    : "a PreToolUse hook requested confirmation (ask), which nano cannot prompt for yet; blocking the call";
+            else if (o.updatedInput.type != JSONType.null_)
+            {
+                args = applyUpdatedInput(call.name, call.arguments, o.updatedInput);
+                // The rewritten input must pass the policy too, or a hook could
+                // rewrite a command or path past the user's rules.
+                if (auto blocked = policy.check(call.name, args)) deny = blocked;
+            }
+            if (deny !is null) { refused = withContext(deny, context); return false; }
+        }
+        return true;
+    }
+
+    /// Run an admitted call's handler on this thread.
+    private string execute(const ref ToolCall call, JSONValue args, out bool isError,
+        PatchSnapshot[] prepared = null)
+    {
+        isError = true;
+        bool isPlan = planTools && isPlanTool(call.name);
+        bool isOutcome = outcomeTool && call.name == outcomeToolName;
+        bool isHistory = historyEnabled && hist.isHistoryTool(call.name);
+        bool isTimer = timerTools && isTimerTool(call.name);
         string out_;
         try
         {
@@ -1704,6 +1980,13 @@ class Agent
         catch (OutcomeError e) out_ = e.msg;
         catch (QuestionError e) out_ = e.msg;
         catch (Exception e) out_ = format("%s failed: %s", call.name, e.msg);
+        return out_;
+    }
+
+    /// After a call ran: the PostToolUse hooks, and the hooks' context added.
+    private string afterTool(const ref ToolCall call, JSONValue args, string out_, string[] context,
+        bool isError = true, PatchEdit[] patchInputs = null)
+    {
         foreach (h; hooks)
         {
             auto o = h.runPostToolUse(call.name, args, out_, call.id);

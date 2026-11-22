@@ -81,6 +81,50 @@ private string mark(Status s) pure nothrow
 
 private bool closed(Status s) pure nothrow { return s == Status.done || s == Status.dropped; }
 
+/// A rendered plan (`Plan.render`, or a plan tool's result) for the
+/// terminal: each item's ASCII mark becomes a symbol, matching the ☐/☑ of
+/// rendered markdown task lists. The model keeps seeing the ASCII form;
+/// only item lines change (notes and other text are left alone).
+string planSymbols(string text) pure
+{
+    import std.array : split;
+    static immutable string[2][5] marks = [["[ ] ", "☐ "], ["[>] ", "◐ "], ["[x] ", "☑ "], ["[!] ", "⊘ "], ["[-] ", "☒ "]];
+    auto lines = text.split("\n");
+    foreach (ref l; lines)
+        foreach (m; marks)
+            if (l.startsWith(m[0]) && isItemId(l[4 .. $]))
+            {
+                l = m[1] ~ l[4 .. $];
+                break;
+            }
+    return lines.join("\n");
+}
+
+/// `s` starts with an item id: one or more digits followed by `. `.
+private bool isItemId(string s) pure nothrow @nogc
+{
+    import std.ascii : isDigit;
+    size_t i;
+    while (i < s.length && s[i].isDigit) i++;
+    return i > 0 && i + 1 < s.length && s[i] == '.' && s[i + 1] == ' ';
+}
+
+unittest
+{
+    // Goal/title continuation lines that merely look like items stay as typed.
+    assert(planSymbols("[x] 2026 release") == "[x] 2026 release");
+    assert(planSymbols("[ ] 3.5 kg") == "[ ] 3.5 kg");
+    assert(planSymbols("[ ] 12") == "[ ] 12");
+    assert(planSymbols("[>] 12. x") == "◐ 12. x");
+}
+
+unittest
+{
+    auto text = "Plan (1/5 done):\n[ ] 1. a\n[>] 2. b\n[x] 3. c\n      - [x] note text\n[!] 4. d\n[-] 5. e\n[x] not an item";
+    assert(planSymbols(text) == "Plan (1/5 done):\n☐ 1. a\n◐ 2. b\n☑ 3. c\n      - [x] note text\n⊘ 4. d\n☒ 5. e\n[x] not an item",
+        planSymbols(text));
+}
+
 struct PlanItem
 {
     uint id;
@@ -324,13 +368,13 @@ struct Plan
     private string renderWith(bool openNotes, bool closedNotes) pure const
     {
         string out_;
-        if (goal.length) out_ ~= "Goal: " ~ goal ~ "\n";
+        if (goal.length) out_ ~= "Goal: " ~ goal.replace("\n", "\n      ") ~ "\n";
         auto pr = progress();
         out_ ~= format!"Plan (%s/%s done):\n"(pr[0], pr[1]);
         foreach (ref it; items)
         {
             auto after = it.after.length ? " (after " ~ it.after.map!(a => a.to!string).join(", ") ~ ")" : "";
-            out_ ~= format!"%s %s. %s%s\n"(it.status.mark, it.id, it.title, after);
+            out_ ~= format!"%s %s. %s%s\n"(it.status.mark, it.id, it.title.replace("\n", "\n      "), after);
             auto show = it.status.closed ? closedNotes : openNotes;
             if (show)
                 foreach (n; it.notes) out_ ~= "      - " ~ n.replace("\n", "\n        ") ~ "\n";
@@ -344,7 +388,7 @@ struct Plan
         else
         {
             auto label = nx[0].status == Status.inProgress ? "In progress" : "Next";
-            out_ ~= label ~ ": " ~ nx.map!(i => format!"%s. %s"(i.id, i.title)).join("; ") ~ "\n";
+            out_ ~= label ~ ": " ~ nx.map!(i => format!"%s. %s"(i.id, i.title.replace("\n", "\n      "))).join("; ") ~ "\n";
         }
         return out_;
     }
@@ -702,6 +746,17 @@ private string fitWidth(string s, size_t width) pure
         w += cw;
     }
     return out_ ~ "…";
+}
+
+unittest // multiline goal/title continuation lines are indented, so planSymbols leaves them alone
+{
+    Plan p;
+    p.goal = "G\n[x] 9. fake";
+    p.items ~= PlanItem(1, "Ship\n[x] 2. done already");
+    auto t = planSymbols(p.render(true, size_t.max));
+    assert(t.canFind("      [x] 2. done already"), t);
+    assert(t.canFind("      [x] 9. fake"), t);
+    assert(!t.canFind("\u2611"), t);
 }
 
 unittest // checklist
