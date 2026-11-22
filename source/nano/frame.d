@@ -867,6 +867,19 @@ struct Transcript
     /// Longest unfinished OSC buffered in `pending` (bytes) before the rest
     /// of it is discarded; an endless escape must not grow memory.
     size_t oscCap = 4_096;
+    /// Longest fold or refold mark (`foldMark`, `refoldMark`) collected in
+    /// `foldOscBuf`: their Base64 payload is a whole tool result or thought,
+    /// far past `oscCap` and the frame's 8 KiB reads. Past it the mark is
+    /// dropped like any over-long OSC. The buffer is released as soon as the
+    /// mark ends, so nothing outlives one mark.
+    size_t foldOscCap = 8 << 20;
+    /// The body of an unfinished fold or refold mark, appended per read (no
+    /// rescan of what came before, so a big mark costs linear time).
+    private ubyte[] foldOscBuf;
+    private bool inFoldOsc;
+    /// The last read ended on the ESC of a possible ST (`ESC \\`) while
+    /// collecting or discarding an OSC; a `\\` first in the next read ends it.
+    private bool oscEsc;
     private string[][] cache;
     private size_t cacheWidth;
     private Fold[] folds;
@@ -899,6 +912,8 @@ struct Transcript
         cache = null;
         cr = false;
         skippingOsc = false;
+        inFoldOsc = oscEsc = false;
+        foldOscBuf = null;
         heldBytes = 0;
         sweepFloor = size_t.max;
         prunedIds = null;
@@ -911,17 +926,52 @@ struct Transcript
     void feed(scope const(ubyte)[] bytes) pure
     {
         import std.string : indexOf;
-        if (skippingOsc)
+        if ((skippingOsc || inFoldOsc) && !bytes.length) return;
+        if (skippingOsc || inFoldOsc)
         {
-            // Discard an over-long OSC up to its terminator (BEL or ST; an
-            // ST split across calls leaves a stray `\\`, which is harmless).
-            size_t j;
-            while (j < bytes.length && bytes[j] != 0x07
-                && !(bytes[j] == 0x1b && j + 1 < bytes.length && bytes[j + 1] == '\\'))
-                j++;
-            if (j == bytes.length) return;
-            skippingOsc = false;
-            bytes = bytes[j + (bytes[j] == 0x07 ? 1 : 2) .. $];
+            // Collect a fold mark, or discard an over-long OSC, up to its
+            // terminator: BEL, or ST, whose ESC may have ended the last read.
+            size_t j, term;
+            if (oscEsc && bytes.length && bytes[0] == '\\') term = 1;
+            else
+            {
+                if (oscEsc && inFoldOsc && bytes.length) foldOscBuf ~= 0x1b; // a lone ESC was payload
+                oscEsc = false;
+                while (j < bytes.length)
+                {
+                    if (bytes[j] == 0x07) { term = 1; break; }
+                    if (bytes[j] == 0x1b && j + 1 < bytes.length && bytes[j + 1] == '\\') { term = 2; break; }
+                    j++;
+                }
+            }
+            if (!term)
+            {
+                auto body = bytes;
+                if (body.length && body[$ - 1] == 0x1b) { oscEsc = true; body = body[0 .. $ - 1]; }
+                if (inFoldOsc)
+                {
+                    if (foldOscBuf.length + body.length > foldOscCap) dropFoldOsc();
+                    else foldOscBuf ~= body;
+                }
+                return;
+            }
+            oscEsc = false;
+            if (inFoldOsc)
+            {
+                if (foldOscBuf.length + j <= foldOscCap)
+                {
+                    foldOscBuf ~= bytes[0 .. j];
+                    import nano.safeio : lossyText;
+                    auto mark = lossyText(foldOscBuf);
+                    foldOscBuf = null;
+                    inFoldOsc = false;
+                    osc(mark);
+                }
+                else dropFoldOsc();
+            }
+            inFoldOsc = skippingOsc = false;
+            foldOscBuf = null;
+            bytes = bytes[j + term .. $];
         }
         auto buf = pending ~ bytes;
         // Hold back an incomplete UTF-8 sequence for the next call.
@@ -952,8 +1002,23 @@ struct Transcript
                     auto bel = rest.indexOf('\x07'), st = rest.indexOf("\x1b\\");
                     if (bel < 0 && st < 0)
                     {
+                        import std.algorithm : startsWith;
+                        if (rest.startsWith(foldOsc ~ ";") || rest.startsWith(refoldOsc ~ ";"))
+                        {
+                            // A fold mark: collect it apart from `pending`.
+                            auto body = rest.representation ~ pending;
+                            pending = null;
+                            if (body.length && body[$ - 1] == 0x1b) { oscEsc = true; body = body[0 .. $ - 1]; }
+                            inFoldOsc = true;
+                            if (body.length > foldOscCap) dropFoldOsc();
+                            else foldOscBuf = body.dup;
+                            enforceByteCap();
+                            return;
+                        }
                         if (s.length - at + pending.length > oscCap)
                         {
+                            // Keep a trailing ESC: it may start the ST.
+                            oscEsc = s[$ - 1] == '\x1b' && !pending.length;
                             pending = null;
                             skippingOsc = true;
                             enforceByteCap();
@@ -993,6 +1058,14 @@ struct Transcript
         // megabyte unfinished line is bounded and a split read is charged
         // exactly once (issue #248 review).
         enforceByteCap();
+    }
+
+    /// Gives up on an over-long fold mark: the rest of it is discarded.
+    private void dropFoldOsc() pure
+    {
+        foldOscBuf = null;
+        inFoldOsc = false;
+        skippingOsc = true;
     }
 
     private void endLine() pure
@@ -2462,6 +2535,55 @@ unittest
     foreach (_; 0 .. 100) t.feed(cast(const(ubyte)[]) "xxxxxxxxxxxxxxxx");
     t.feed(cast(const(ubyte)[]) "\x1b\\next\n");
     assert(t.lines == ["after", "next"], format!"%s"(t.lines));
+}
+
+// An ST split across reads (ESC last in one, `\\` first in the next) ends a
+// discarded OSC and a fold mark alike; nothing after it is swallowed.
+unittest
+{
+    // Discarded (over `oscCap`), split right after entering the discard.
+    Transcript t;
+    t.oscCap = 8;
+    t.feed(cast(const(ubyte)[]) "\x1b]0;xxxxxxxxxxxx\x1b");
+    t.feed(cast(const(ubyte)[]) "\\a\n");
+    assert(t.lines == ["a"], format!"%s"(t.lines));
+    // Split while already discarding.
+    t.feed(cast(const(ubyte)[]) "\x1b]0;xxxxxxxxxxxx");
+    t.feed(cast(const(ubyte)[]) "yyyy\x1b");
+    t.feed(cast(const(ubyte)[]) "\\b\n");
+    assert(t.lines == ["a", "b"], format!"%s"(t.lines));
+    // A fold mark ended by a split ST still registers its fold.
+    auto mark = foldMark("id", 1, "b\n    out\n");
+    mark = mark[0 .. $ - 1] ~ "\x1b";
+    t.feed(cast(const(ubyte)[]) mark);
+    t.feed(cast(const(ubyte)[]) "\\c\n");
+    assert(t.lines == ["a", "b", "c"], format!"%s"(t.lines));
+    assert(t.toggle());
+    assert(t.lines == ["a", "b", "    out", "c"], format!"%s"(t.lines));
+}
+
+// A fold mark far past `oscCap` (a large result), fed in the frame's
+// 8 KiB reads, still registers its fold; one past `foldOscCap` is dropped
+// without swallowing what follows it.
+unittest
+{
+    import std.array : replicate;
+    import std.algorithm : min;
+    Transcript t;
+    auto big = "r\n" ~ ("    " ~ "y".replicate(70) ~ "\n").replicate(500);
+    auto stream = "r\n" ~ foldMark("tool-1", 1, big) ~ "after\n";
+    for (size_t at = 0; at < stream.length; at += 8192)
+        t.feed(cast(const(ubyte)[]) stream[at .. min(at + 8192, stream.length)]);
+    assert(t.lines == ["r", "after"], format!"%s"(t.lines));
+    assert(!t.foldOscBuf.length && !t.inFoldOsc);
+    assert(t.toggle());
+    assert(t.lines.length == 502, format!"%s"(t.lines.length));
+    Transcript u;
+    u.foldOscCap = 1024;
+    for (size_t at = 0; at < stream.length; at += 8192)
+        u.feed(cast(const(ubyte)[]) stream[at .. min(at + 8192, stream.length)]);
+    assert(u.lines == ["r", "after"], format!"%s"(u.lines));
+    assert(!u.foldOscBuf.length && !u.toggle());
 }
 
 // `bytesHeld` is a running total, not a walk: it must match a from-scratch
