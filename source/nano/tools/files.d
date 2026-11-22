@@ -1549,7 +1549,8 @@ string applyPatch(JSONValue args, ReadState state, PatchSnapshot[] originals = n
         if (!s.changed || (!s.existed && !s.present)) continue;
         if (!s.present && movedAway[k]) continue;
         // Unchanged in place. A move destination never is: its source goes.
-        if (s.present && s.existed && s.movedFrom == size_t.max && s.after.representation == s.before) continue;
+        // Nor is a symlink replaced by a regular file with the same bytes.
+        if (s.present && s.existed && s.movedFrom == size_t.max && !(s.recreated && s.wasLink) && s.after.representation == s.before) continue;
         changedFiles++;
         if (s.present && s.movedFrom != size_t.max)
         {
@@ -2509,6 +2510,11 @@ unittest // review round 6: private bounded temp files, EOF newline state, CRLF 
     symlink(tgt, lk);
     out_ = applyPatch(j("patch", pt("*** Delete File: " ~ lk, "*** Add File: " ~ lk, "+new")), st);
     assert(!isLink(lk) && readText(lk) == "new\n" && readText(tgt) == "real\n", out_);
+    // Same bytes still count: the link becomes a regular file (review round 10).
+    remove(lk);
+    symlink(tgt, lk);
+    out_ = applyPatch(j("patch", pt("*** Delete File: " ~ lk, "*** Add File: " ~ lk, "+real")), st);
+    assert(!isLink(lk) && readText(lk) == "real\n" && out_.indexOf("to 1 file(s)") >= 0, out_);
     // A plain Update File through a symlink writes through it and keeps the link.
     remove(lk);
     symlink(tgt, lk);
