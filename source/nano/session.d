@@ -1190,6 +1190,13 @@ private void pinTruncate(ref Restored r, size_t b, Message[ulong] pinsByLine)
             if (m is null) break;
             reloaded ~= *m;
         }
+        // A PARTIAL reload would leave a gap AFTER the reloaded head, but
+        // the stash's layout (and every later truncation, bound and render)
+        // places the dropped middle right after the first request. Keep the
+        // invariant: when the reload stops short of what the base needs,
+        // leave the whole needed range dropped — a later, smaller base can
+        // still reload it by position.
+        if (reloaded.length < want) reloaded = null;
         budgetLeft -= reloaded.length;
         oldLines = oldLines[reloaded.length .. $];
         oldDrop.count -= reloaded.length;
@@ -2589,12 +2596,23 @@ unittest
     pinTruncate(r, 3, byLine);
     assert(r.pinStash.length == 3 && r.pinStash[1].content == "r5" && r.pinStash[2].content == "r6");
     assert(r.pinDrop.count == 0 && !r.pinDrop.lo && !r.pinDrop.hi && !r.pinDropLines.length);
-    // [#5, ID-less, #7], base 4: #5 reloads, the rest stays dropped with a valid span.
+    // [#5, ID-less, #7], base 4: the reload stops at the ID-less slot, so
+    // the whole needed range stays dropped (the gap stays right after the
+    // first request) with a valid span.
     setup([5, 0, 7]);
     pinTruncate(r, 4, byLine);
-    assert(r.pinStash.length == 2 && r.pinStash[1].content == "r5");
-    assert(r.pinDrop.count == 2 && r.pinDropLines == [0, 7] && r.pinDrop.lo == 7 && r.pinDrop.hi == 7);
-    assert(r.pinDrop.lo <= r.pinDrop.hi);
+    assert(r.pinStash.length == 1);
+    assert(r.pinDrop.count == 3 && r.pinDropLines == [5, 0, 7] && r.pinDrop.lo == 5 && r.pinDrop.hi == 7);
+    assert(r.pinLogical == r.pinStash.length + r.pinDrop.count);
+    // Two successive truncating deltas: base 4 then base 2 still recovers #5.
+    pinTruncate(r, 2, byLine);
+    assert(r.pinStash.length == 2 && r.pinStash[1].content == "r5", "a later base reloads #5");
+    assert(r.pinDrop.count == 0 && !r.pinDropLines.length && r.pinLogical == 2);
+    // And base 4 then base 3 keeps [#5, ID-less] dropped in order.
+    setup([5, 0, 7]);
+    pinTruncate(r, 4, byLine);
+    pinTruncate(r, 3, byLine);
+    assert(r.pinStash.length == 1 && r.pinDropLines == [5, 0] && r.pinLogical == 3);
     // pinBound records one line per dropped position.
     r = Restored.init;
     import std.array : replicate;
