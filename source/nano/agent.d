@@ -1750,7 +1750,12 @@ class Agent
                 if (x.logLine > last) last = x.logLine;
             }
 
-        auto budget = ctx.summaryOutputBudget(window, toLong(outputBase));
+        long budget;
+        // The output cap an output-cap rejection taught us (0: none yet).
+        // Every request clamps to it, so a window or maxOutput change
+        // published between the rejection and the retry cannot raise the
+        // retry above what the server just refused.
+        long learnedCap;
         string summary, fallback;
         bool truncated, retried;
         size_t drops;
@@ -1766,12 +1771,11 @@ class Agent
             if (control.isCancelled) return false;
             // The switch, or a probe it collected, can change the window:
             // size the summary for the model that will run it.
-            if (auto now = contextWindow())
-                if (now != window)
-                {
-                    window = now;
-                    budget = ctx.summaryOutputBudget(window, toLong(outputBase));
-                }
+            // Recompute before every request (a probe can change the
+            // window or the max output alone), then apply the learned cap.
+            if (auto now = contextWindow()) window = now;
+            budget = ctx.summaryOutputBudget(window, toLong(outputBase));
+            if (learnedCap && learnedCap < budget) budget = learnedCap;
             auto inputWindow = saturatingSub(window, budget);
             auto chars = checkedMul(max(saturatingSub(inputWindow, 2_000), 2_000), 3);
             auto request = "Conversation to summarize:\n\n" ~ ctx.renderTranscript(summarized, chars, smart);
@@ -1837,7 +1841,7 @@ class Agent
                     long learned = ctx.outputCapFromError(e.msg);
                     if (!learned) learned = budget / 2 > 1_024 ? budget / 2 : 1_024;
                     if (learned < 256) learned = 256;
-                    if (learned < budget) { budget = learned; continue; }
+                    if (learned < budget) { learnedCap = learned; continue; }
                 }
                 fallback = e.msg;
                 break;

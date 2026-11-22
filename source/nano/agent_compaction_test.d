@@ -113,6 +113,29 @@ unittest
     assert(c.seen[$ - 1] <= 8_000, "the retry is within the learned cap");
 }
 
+// A probe publishing a larger window (or max output) between the summary's
+// output-cap rejection and its retry must not raise the retry above the
+// learned cap: the retry would be rejected again and history dropped.
+unittest
+{
+    foreach (bumpWindow; [true, false])
+    {
+        auto c = new CapClient(8_000, "pong");
+        c.summaryOnly = c.recordSummaryOnly = true;
+        auto agent = agentFor(c);
+        agent.run("ping", new NullEvents);
+        c.onReject = () {
+            if (bumpWindow) agent.configuredWindow = 1_000_000;
+            else agent.capabilities.maxOutput = 64_000;
+        };
+        CompactReport report;
+        assert(agent.compact(report));
+        assert(report.fallback is null, "retried within the learned cap, not dropped");
+        assert(c.seen.length == 2);
+        assert(c.seen[1] <= 8_000, "the probe did not raise the retry");
+    }
+}
+
 // The cap is learned (here: published) between sending and handling the
 // rejection; the retry still compares against what was sent.
 // rust: agent.rs::an_output_limit_rejection_is_retried_against_the_sent_budget
