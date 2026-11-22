@@ -189,7 +189,9 @@ struct PinStash
     private ctx.PinDrop drop_;
     /// The logical count of requests ever stashed (what `pinned_base` sees).
     private size_t logical_;
-    /// The retained requests' text bytes (what the budget bounds).
+    /// The retained requests' RENDERED text bytes (what the budget bounds):
+    /// index 0 is charged the first-request render budget, the rest the
+    /// later-request one — never the full `content` a hook context may bloat.
     private size_t bytes_;
 
     /// The count the on-disk delta base (`pinned_base`) is written from: the
@@ -209,19 +211,23 @@ struct PinStash
     const(Message)[] opSlice() const pure nothrow @safe @nogc { return store; }
     /// The number of requests retained in memory.
     size_t retained() const pure nothrow @safe @nogc { return store.length; }
-    /// The retained requests' text bytes (≤ `ctx.pinStashBudgetBytes` unless
-    /// one request is oversized).
+    /// The retained requests' rendered text bytes (≤ `ctx.pinStashBudgetBytes`
+    /// unless one request is oversized).
     size_t retainedBytes() const pure nothrow @safe @nogc { return bytes_; }
     /// The bound's bookkeeping: how many requests were dropped between the
     /// first and the retained tail, and their log-line span.
     ctx.PinDrop drop() const pure nothrow @safe @nogc { return drop_; }
 
     /// Append one folded request (compaction), then re-apply the bound: O(1)
-    /// per append — the byte tally moves one request at a time.
+    /// per append — the byte tally moves one request at a time, and an
+    /// eviction swaps the evicted slot with the tail instead of copying the
+    /// retained array (the stash is an unordered set of the newest requests:
+    /// the renderer sorts them back into log order, so order within the
+    /// retained tail is not observable).
     void append(Message m) pure @safe
     {
         store ~= m;
-        bytes_ += ctx.pinStashBytes(m);
+        bytes_ += ctx.pinStashBytes(m, false);
         logical_++;
         bound();
     }
@@ -234,7 +240,7 @@ struct PinStash
         drop_ = d;
         logical_ = logical;
         bytes_ = 0;
-        foreach (ref m; store) bytes_ += ctx.pinStashBytes(m);
+        foreach (i, ref m; store) bytes_ += ctx.pinStashBytes(m, i == 0);
     }
     /// Test-only setter: replace the held sequence (unbounded).
     void assign(Message[] msgs) pure nothrow @safe @nogc
@@ -268,24 +274,32 @@ struct PinStash
         bytes_ = snap.bytes;
     }
 
-    /// Keep the first request and the newest requests whose text fits
-    /// `ctx.pinStashBudgetBytes`, folding the evicted middle into `drop_`
+    /// Keep the first request and the newest requests whose rendered text
+    /// fits `ctx.pinStashBudgetBytes`, folding the evicted middle into `drop_`
     /// (its count grows, its log-line span widens). No-op while everything
     /// fits; a single oversized request is retained whole (the render clips
-    /// it — dropping it would only lose text the renderer never shows).
+    /// it — dropping it would only lose text the renderer never shows). Each
+    /// eviction is O(1): the evicted slot takes the tail element and the array
+    /// shortens by one — no per-eviction copy of the retained requests.
     private void bound() pure @safe
     {
         while (store.length > 1 && bytes_ > ctx.pinStashBudgetBytes)
         {
             auto m = store[1];
-            bytes_ -= ctx.pinStashBytes(m);
+            bytes_ -= ctx.pinStashBytes(m, false);
             drop_.count++;
             if (auto id = m.logLine)
             {
                 drop_.lo = drop_.lo ? min(drop_.lo, id) : id;
                 drop_.hi = max(drop_.hi, id);
             }
-            store = store[0 .. 1] ~ store[2 .. $];
+            // O(1) eviction: move the tail into the freed slot, drop the
+            // tail. The renderer re-sorts by log line, so the swap's reorder
+            // is not observable; the evicted payload's last reference dies.
+            bytes_ -= ctx.pinStashBytes(store[$ - 1], false);
+            store[1] = store[$ - 1];
+            store = store[0 .. $ - 1];
+            bytes_ += ctx.pinStashBytes(store[1], false);
         }
     }
 }

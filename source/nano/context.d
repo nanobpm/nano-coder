@@ -947,23 +947,41 @@ struct PinDrop
     ulong lo, hi;
 }
 
-/// The byte budget bounding a pin stash's retained request text (issue
+/// The byte budget bounding a pin stash's retained RENDERED text (issue
 /// #221): an unbounded stash cost ~12 MB on a real 6,946-request session, so
-/// the stash keeps the first request plus the newest requests whose retained
+/// the stash keeps the first request plus the newest requests whose rendered
 /// text fits this budget and folds the evicted middle into a `PinDrop`. The
 /// budget is generous — the 1M-token window's pinned-block allowance is
 /// 500 KB and a render clips every later request to `pinnedLaterChars` — so
-/// only a stash far past anything a window can render is ever bounded. A
-/// single oversized request is retained whole: the render clips it, and
-/// dropping it would only save the stash a copy the renderer never shows.
+/// only a stash far past anything a window can render is ever bounded, and
+/// charging rendered text (never the full `content` a hook context may bloat)
+/// keeps every request a real window would show. A single oversized request
+/// is retained whole: the render clips it, and dropping it would only save
+/// the stash a copy the renderer never shows.
 enum size_t pinStashBudgetBytes = 512 * 1_024;
 
-/// The bytes a stashed request costs the bounded stash (issue #221): the
-/// text the pinned block renders from (`pinText` when set, else `content`).
-/// Cheap — string lengths only — so appending stays O(1).
-size_t pinStashBytes(const ref Message m) pure nothrow @safe @nogc
+/// The bytes a stashed request costs the bounded stash (issue #221): what the
+/// pinned block actually renders from it — `pinText` when set, else
+/// `content`, clipped to the per-request render budget (`pinnedFirstChars`
+/// for the first request, `pinnedLaterChars` for the rest, plus a smart
+/// label's room) — plus the newline. Charging rendered text, not the whole
+/// retained `Message`, means a large appended hook-context block never
+/// triggers an eviction, and the budget never drops a request the renderer
+/// would have shown whole. Cheap — string lengths only — so appending stays
+/// O(1).
+size_t pinStashBytes(const ref Message m, bool first) pure nothrow @safe @nogc
 {
-    return (m.pinText.length ? m.pinText.length : m.content.length) + 1;
+    auto text = m.pinText.length ? m.pinText : m.content;
+    auto budget = first ? pinnedFirstChars : pinnedLaterChars;
+    // The smart `#N: ` label is carved out of the per-request budget.
+    if (!first && m.logLine)
+    {
+        auto digits = cast(ulong) m.logLine;
+        size_t label = 3; // "#" ~ digits ~ ": "
+        do { label++; digits /= 10; } while (digits);
+        budget = saturatingSub(budget, label);
+    }
+    return min(text.length, budget) + 1;
 }
 
 /// `clip` bounded by UTF-8 bytes rather than characters, cut on a character
@@ -1019,7 +1037,10 @@ string pinnedUserRequests(const Message[] prior, const Message[] new_, bool smar
 /// ditto, for a bounded stash (issue #221): `prior` holds only the first and
 /// the most recent requests, and `drop` describes the requests the bound
 /// dropped between them, so the omission note covers exactly the requests the
-/// unbounded form would have named.
+/// unbounded form would have named. The retained tail is an unordered set
+/// (the bound evicts by swap), so the requests are sorted back into log order
+/// before rendering; `prior[0]` stays first — it is the logical first request
+/// even when it carries no log line.
 string pinnedUserRequests(const Message[] prior, const Message[] new_, bool smart, size_t windowTokens,
     PinDrop drop) pure
 {
@@ -1027,6 +1048,29 @@ string pinnedUserRequests(const Message[] prior, const Message[] new_, bool smar
     foreach (ref m; prior) if (isUserRequest(m)) requests ~= m;
     foreach (ref m; new_) if (isUserRequest(m)) requests ~= m;
     if (!requests.length) return null;
+    if (requests.length > 2)
+    {
+        import std.algorithm : isSorted;
+        // The tail is append-ordered already — only the bound's swap-eviction
+        // disturbs it — so sort lazily and by index (the elements are const).
+        if (!isSorted!((a, b) => a.logLine < b.logLine)(requests[1 .. $]))
+        {
+            import std.algorithm : makeIndex;
+            import std.array : appender;
+            // The elements are const, so sort an index over the tail and
+            // gather through it. Requests without a log line (appended this
+            // session, before the log assigns one) are the NEWEST: sort them
+            // as past every logged line, in append order.
+            auto order = new size_t[saturatingSub(requests.length, 1)];
+            makeIndex!((a, b) => (a.logLine ? a.logLine : ulong.max) < (b.logLine ? b.logLine : ulong.max))(
+                requests[1 .. $], order);
+            auto gathered = appender!(const(Message)[]);
+            gathered.reserve(requests.length);
+            gathered ~= requests[0];
+            foreach (o; order) gathered ~= requests[o + 1];
+            requests = gathered[];
+        }
+    }
     auto allowance = max(windowTokens / pinnedWindowShare, pinnedMinAllowanceTokens) * 4;
     auto prefixCost = pinnedRequestsPrefix.length + 1;
     size_t remaining = saturatingSub(allowance, prefixCost);
@@ -1195,21 +1239,22 @@ unittest
 unittest
 {
     // The bounded stash the byte budget produces, computed independently:
-    // the first request plus the newest ones whose text fits the budget.
+    // the first request plus the newest ones whose rendered text fits the
+    // budget.
     static void check(const Message[] all)
     {
         size_t bytes;
-        foreach (ref m; all) bytes += pinStashBytes(m);
+        foreach (i, ref m; all) bytes += pinStashBytes(m, i == 0);
         const(Message)[] kept;
         PinDrop drop;
         if (bytes <= pinStashBudgetBytes) kept = all;
         else
         {
             kept ~= all[0];
-            size_t tail = pinStashBytes(all[0]);
+            size_t tail = pinStashBytes(all[0], true);
             size_t start = all.length;
-            while (start > 1 && tail + pinStashBytes(all[start - 1]) <= pinStashBudgetBytes)
-                tail += pinStashBytes(all[--start]);
+            while (start > 1 && tail + pinStashBytes(all[start - 1], false) <= pinStashBudgetBytes)
+                tail += pinStashBytes(all[--start], false);
             foreach (ref m; all[1 .. start])
             {
                 drop.count++;
@@ -1278,12 +1323,35 @@ unittest
     check(requests(6_946, 40)); // the real session that motivated the bound
     check(requests(3_000, 200)); // ~600 KB of text: the budget binds
     check(requests(600, 1_000)); // long requests: fewer retained
+    // The budget charges RENDERED text, so 600 requests of ~1 KB — 600 KB of
+    // raw content but ≤ 200 rendered bytes each — are ALL retained: the
+    // renderer shows each of them whole, so the bound must not drop one
+    // (#221's byte-identical rendering requirement).
+    check(requests(600, 1_000));
+    {
+        size_t rendered;
+        auto rs = requests(600, 1_000);
+        foreach (i, ref m; rs) rendered += pinStashBytes(m, i == 0);
+        assert(rendered <= pinStashBudgetBytes, "600 renderable requests fit the budget");
+    }
+    // A short prompt with a huge appended hook-context block costs only its
+    // `pinText` — the bloat the renderer never shows never triggers eviction.
+    {
+        import std.array : replicate;
+        auto hooked = requests(3, 40);
+        foreach (ref m; hooked)
+        {
+            m.pinText = m.content;
+            m.content = m.content ~ " " ~ replicate("h", pinStashBudgetBytes);
+        }
+        check(hooked);
+    }
     // A single request larger than the whole budget is still retained (the
-    // render clips it; dropping it would lose the goal).
+    // render clips it; dropping it would lose the goal). With rendered-text
+    // charging the first request's cost is capped at `pinnedFirstChars`, so
+    // an over-budget stash now only ever comes from MANY requests — but the
+    // first-is-always-kept guarantee still holds by construction.
     auto huge = requests(1, pinStashBudgetBytes * 2) ~ requests(2, 40);
-    size_t hugeBytes;
-    foreach (ref m; huge) hugeBytes += pinStashBytes(m);
-    assert(hugeBytes > pinStashBudgetBytes);
     auto pinned = pinnedUserRequests(null, huge[0 .. 1], true, 128_000,
         PinDrop(2, huge[1].logLine, huge[2].logLine));
     assert(pinned.canFind("request number 0: ") && pinned.canFind("omitted from this pin"), pinned);

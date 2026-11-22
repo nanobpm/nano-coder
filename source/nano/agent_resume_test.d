@@ -783,13 +783,18 @@ unittest
     auto agent = new Agent(new MockClient([LLMResponse("SUM")]), echoTools, Policy.init, "sys");
     agent.log = some(new SessionLog(dir, "mock/m", "/w"));
     // A stash already past the bound, as a long session's restore leaves it:
-    // the first request plus a newest tail whose text fills the budget, and a
-    // dropped middle of 100 requests.
-    enum tail = 500;
+    // the first request plus a newest tail whose RENDERED text fills the
+    // budget (each later request renders up to `pinnedLaterChars` bytes), and
+    // a dropped middle of 100 requests.
+    enum tail = 5_000;
     Message[] retained;
     retained ~= Message.user("the original goal");
     foreach (i; 0 .. tail - 1)
-        retained ~= Message.user("request " ~ i.to!string ~ " " ~ "x".replicate(ctx.pinStashBudgetBytes / tail));
+    {
+        auto m = Message.user("request " ~ i.to!string ~ " " ~ "x".replicate(ctx.pinStashBudgetBytes / tail));
+        m.logLine = 20 + 2 * i;
+        retained ~= m;
+    }
     agent.pinStash.adopt(retained, ctx.PinDrop(100, 20, 238), retained.length + 100);
     assert(agent.pinStash.retainedBytes > ctx.pinStashBudgetBytes / 2, "the tail fills the budget");
     auto before = agent.pinStash.snapshot();
@@ -834,10 +839,10 @@ unittest
     }
     agent.log.unwrap("set").replace([Message.user("seed")], 0, 0, null, null, all);
     // The retained tail the byte budget keeps, computed independently.
-    size_t tailBytes = ctx.pinStashBytes(all[0]);
+    size_t tailBytes = ctx.pinStashBytes(all[0], true);
     size_t tailStart = n;
-    while (tailStart > 1 && tailBytes + ctx.pinStashBytes(all[tailStart - 1]) <= ctx.pinStashBudgetBytes)
-        tailBytes += ctx.pinStashBytes(all[--tailStart]);
+    while (tailStart > 1 && tailBytes + ctx.pinStashBytes(all[tailStart - 1], false) <= ctx.pinStashBudgetBytes)
+        tailBytes += ctx.pinStashBytes(all[--tailStart], false);
     auto retained = all[0 .. 1] ~ all[tailStart .. $];
     ctx.PinDrop drop;
     foreach (ref m; all[1 .. tailStart])

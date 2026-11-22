@@ -803,10 +803,13 @@ Restored restore(string path)
     }
     size_t index;
     ulong lineNo;
-    // Every `pinned_requests` array ever logged, by its request's log line:
-    // `pinTruncate` reloads a dropped middle the truncation base reaches back
-    // into from these records (the bound evicted it from memory, not disk).
-    Message[][ulong] pinsByLine;
+    // The newest record of each pinned request by its log line: `pinTruncate`
+    // reloads a dropped middle the truncation base reaches back into from
+    // these records (the bound evicted it from memory, not disk). One message
+    // per line — a full restatement re-logs the same lines, and the newest
+    // record wins — so the index stays one entry per distinct request and a
+    // reload never sees a superseded restatement's duplicate copy.
+    Message[ulong] pinsByLine;
     foreach (line; text[0 .. committed].lineSplitter)
     {
         ++lineNo;
@@ -1032,7 +1035,7 @@ private void restoreReplayStash(alias decode)(JSONValue data, const string[] inp
 /// is mapped onto the retained copy plus the dropped range (`pinTruncate`); the
 /// session log records and the on-disk format are unchanged.
 private void restorePinStash(alias decode)(JSONValue data, const string[] inputs, ref Message[] foldedStash,
-    ref Message[][ulong] pinsByLine, ref Restored r)
+    ref Message[ulong] pinsByLine, ref Restored r)
 {
     auto pins = "pinned_requests" in data, pinBase = "pinned_base" in data;
     if (pins !is null && pinBase !is null && pinBase.type == JSONType.integer)
@@ -1045,7 +1048,10 @@ private void restorePinStash(alias decode)(JSONValue data, const string[] inputs
     else
     {
         // Rust-era fallback: no `pinned_requests` field, so the pin stash is
-        // the decoded `folded` stash. This helper decodes THIS record's
+        // the decoded `folded` stash — filtered to genuine user requests
+        // first: the folded conversation also holds assistant and tool
+        // messages, and they must neither consume the pin budget nor count
+        // as omitted user requests. This helper decodes THIS record's
         // `folded` itself and applies it onto the cumulative `foldedStash`
         // (read-only) — it never reads the replay helper's decoded output, so
         // the two stay independently editable.
@@ -1054,17 +1060,32 @@ private void restorePinStash(alias decode)(JSONValue data, const string[] inputs
         {
             auto b = cast(size_t) base.integer;
             auto delta = decode(*folded, inputs);
-            if ((b < foldedStash.length ? b : foldedStash.length) + delta.length > 0)
-                pinAdoptFull(r, foldedStash[0 .. (b < foldedStash.length ? b : foldedStash.length)] ~ delta);
+            auto kept = b < foldedStash.length ? b : foldedStash.length;
+            if (kept + delta.length > 0)
+                // The base counts the folded CONVERSATION's turns, but only
+                // its user requests pin — filter prefix and delta separately,
+                // or the prefix's assistant/tool turns would shadow requests
+                // the base still covers.
+                pinAdoptFull(r, userRequests(foldedStash[0 .. kept]) ~ userRequests(delta));
             else pinAdoptFull(r, null);
         }
         else if (folded !is null)
         {
             auto full = decode(*folded, inputs);
-            pinAdoptFull(r, full.length ? full : null);
+            pinAdoptFull(r, full.length ? userRequests(full) : null);
         }
         else pinAdoptFull(r, null);
     }
+}
+
+/// The genuine user requests of a decoded legacy `folded` sequence, in order
+/// (the Rust-era pin fallback pins requests only — assistant/tool turns are
+/// never pinned, never budgeted, never counted as omitted).
+private Message[] userRequests(Message[] msgs)
+{
+    Message[] o;
+    foreach (m; msgs) if (ctx.isUserRequest(m)) o ~= m;
+    return o;
 }
 
 /// A full restatement replaces the pin stash (restore): the sequence is
@@ -1086,7 +1107,7 @@ private void pinAdoptFull(ref Restored r, Message[] full)
 /// pinLogical == pinStash.length + pinDrop.count holds for the truncated
 /// stash too. A base smaller than the next delta's true base means a torn or
 /// hand-edited log — well-formed logs never do this.
-private void pinTruncate(ref Restored r, size_t b, Message[][ulong] pinsByLine)
+private void pinTruncate(ref Restored r, size_t b, Message[ulong] pinsByLine)
 {
     if (b >= r.pinLogical) return;
     if (b == 0)
@@ -1099,10 +1120,11 @@ private void pinTruncate(ref Restored r, size_t b, Message[][ulong] pinsByLine)
     // The first request is always retained, so it always survives a base ≥ 1.
     auto oldRetained = r.pinStash;
     auto oldDrop = r.pinDrop;
-    r.pinStash = oldRetained[0 .. 1];
     auto budgetLeft = b - 1;
     // The base reaches into the dropped middle first: reload its oldest
-    // requests from the log (the span's lines are the middle's, oldest first).
+    // requests from the log (the span's lines are the middle's, oldest first)
+    // — one message per line, the newest record the restatement left.
+    Message[] reloaded;
     if (oldDrop.count && oldDrop.lo && budgetLeft)
     {
         auto want = budgetLeft < oldDrop.count ? budgetLeft : oldDrop.count;
@@ -1110,24 +1132,26 @@ private void pinTruncate(ref Restored r, size_t b, Message[][ulong] pinsByLine)
         auto line = oldDrop.lo;
         while (got && line <= oldDrop.hi)
         {
-            if (auto ms = line in pinsByLine)
-                foreach (m; *ms)
-                {
-                    if (!got) break;
-                    r.pinStash ~= m;
-                    got--;
-                }
+            if (auto m = line in pinsByLine)
+            {
+                reloaded ~= *m;
+                got--;
+            }
             line++;
         }
-        auto reloaded = want - got;
-        budgetLeft -= reloaded;
+        budgetLeft -= want - got;
         oldDrop.lo = line;
-        oldDrop.count -= reloaded;
+        oldDrop.count -= want - got;
         if (!oldDrop.count) oldDrop = ctx.PinDrop.init;
     }
     // Then the retained tail, oldest first, for what the base still covers.
     auto tailKept = budgetLeft < oldRetained.length - 1 ? budgetLeft : oldRetained.length - 1;
-    r.pinStash ~= oldRetained[1 .. 1 + tailKept];
+    // Build the first-plus-tail copy ONCE: first request, reloaded middle
+    // head, retained-tail head — no per-request reallocation.
+    r.pinStash = new Message[1 + reloaded.length + tailKept];
+    r.pinStash[0] = oldRetained[0];
+    r.pinStash[1 .. 1 + reloaded.length] = reloaded;
+    r.pinStash[1 + reloaded.length .. $] = oldRetained[1 .. 1 + tailKept];
     // What the base no longer covers — the middle's unreloaded rest plus the
     // un-dropped tail, gone from memory — is the new dropped middle. The old
     // span reached into the tail's unknown log lines, so it survives only
@@ -1138,13 +1162,15 @@ private void pinTruncate(ref Restored r, size_t b, Message[][ulong] pinsByLine)
     r.pinLogical = b;
 }
 
-/// Decode a `pinned_requests` array and index each request by its log line,
-/// so a later `pinTruncate` can reload a dropped middle from these records.
-private Message[] decodeAndIndex(alias decode)(const JSONValue v, const string[] inputs, ref Message[][ulong] pinsByLine)
+/// Decode a `pinned_requests` array and index each request by its log line —
+/// one message per line, the NEWEST record winning: a full restatement
+/// re-logs the same requests, and a later `pinTruncate` must reload each
+/// dropped line exactly once, from its latest record.
+private Message[] decodeAndIndex(alias decode)(const JSONValue v, const string[] inputs, ref Message[ulong] pinsByLine)
 {
     auto o = decode(v, inputs);
     foreach (m; o)
-        if (m.logLine) pinsByLine[m.logLine] ~= m;
+        if (m.logLine) pinsByLine[m.logLine] = m;
     return o;
 }
 
@@ -1157,25 +1183,38 @@ private void pinExtend(ref Restored r, Message[] delta)
     pinBound(r);
 }
 
-/// Keep the first request and the newest requests whose text fits
+/// Keep the first request and the newest requests whose rendered text fits
 /// `ctx.pinStashBudgetBytes`, folding the evicted middle into `r.pinDrop`. A
-/// single oversized request is retained whole (the render clips it).
+/// single oversized request is retained whole (the render clips it). The
+/// retained boundary is found in one pass, then the first-plus-tail array is
+/// built ONCE — no per-eviction copy of the remaining requests.
 private void pinBound(ref Restored r)
 {
-    size_t bytes;
-    foreach (ref m; r.pinStash) bytes += ctx.pinStashBytes(m);
-    while (r.pinStash.length > 1 && bytes > ctx.pinStashBudgetBytes)
+    if (!r.pinStash.length) return;
+    size_t bytes = ctx.pinStashBytes(r.pinStash[0], true);
+    // The retained tail boundary: walk from the newest request backwards
+    // while the budget holds. `tailStart` ends as the first index of the
+    // retained tail — 1 when the whole stash fits (nothing is dropped).
+    auto tailStart = r.pinStash.length;
+    while (tailStart > 1)
     {
-        auto m = r.pinStash[1];
-        bytes -= ctx.pinStashBytes(m);
+        auto b = ctx.pinStashBytes(r.pinStash[tailStart - 1], false);
+        if (bytes + b > ctx.pinStashBudgetBytes) break;
+        bytes += b;
+        tailStart--;
+    }
+    if (tailStart == 1) return; // everything fits: keep the whole stash
+    // Drop the middle [1 .. tailStart] — one metadata sweep, one array build.
+    foreach (ref m; r.pinStash[1 .. tailStart])
+    {
         r.pinDrop.count++;
         if (auto id = m.logLine)
         {
             r.pinDrop.lo = r.pinDrop.lo ? min(r.pinDrop.lo, id) : id;
             r.pinDrop.hi = max(r.pinDrop.hi, id);
         }
-        r.pinStash = r.pinStash[0 .. 1] ~ r.pinStash[2 .. $];
     }
+    r.pinStash = r.pinStash[0 .. 1] ~ r.pinStash[tailStart .. $];
 }
 
 /// Apply one `plan_delta` record to `p` (issue #205): keep the first `base`
@@ -1816,6 +1855,40 @@ unittest
     assert(r2.pinStash.length == 2 && r2.pinStash[1].content == "two");
 }
 
+// The Rust-era fallback (no `pinned_requests` field) pins the folded
+// conversation's genuine USER REQUESTS only: assistant and tool messages
+// neither consume the pin budget nor count as omitted user requests.
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, write;
+    import std.path : buildPath;
+    import std.array : replicate;
+    auto dir = buildPath(tempDir, "nano-d-legacyfold-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    static JSONValue rec(Message m) { return messageRecord(m); }
+    string line(string type, JSONValue data) { return JSONValue(["type": JSONValue(type), "data": data]).toString ~ "\n"; }
+    // [user goal, 600 KiB assistant reply, user follow-up]: neither user
+    // request is omitted, and the reply's bulk never touches the pin budget.
+    auto goal = Message.user("the goal");
+    goal.logLine = 2;
+    auto reply = Message.assistant("x".replicate(600 * 1_024));
+    reply.logLine = 3;
+    auto followUp = Message.user("a follow-up");
+    followUp.logLine = 4;
+    JSONValue d = ["messages": JSONValue([rec(Message.user("summary"))])];
+    d["folded"] = JSONValue([rec(goal), rec(reply), rec(followUp)]);
+    auto path = buildPath(dir, "legacy.jsonl");
+    write(path, `{"type":"session","data":{"version":1,"id":"legacy","created_at":"x"}}` ~ "\n" ~ line("replace", d));
+    auto r = restore(path);
+    assert(r.pinLogical == 2 && r.pinStash.length == 2 && r.pinDrop.count == 0,
+        "only the two user requests are pinned — the assistant reply is not");
+    assert(r.pinStash[0].content == "the goal" && r.pinStash[1].content == "a follow-up");
+    auto pinned = ctx.pinnedUserRequests(r.pinStash, null, true, 128_000, r.pinDrop);
+    assert(!pinned.canFind("omitted"), "no user request was omitted: " ~ pinned);
+    assert(pinned.canFind("the goal") && pinned.canFind("a follow-up"), pinned);
+}
+
 // The pin stash is bounded in memory (issue #221): a restored session with
 // thousands of stashed requests keeps only the first plus the newest that fit
 // the byte budget, while `pinLogical` reports the full count and `pinDrop`
@@ -1878,7 +1951,7 @@ unittest
     assert(r2.pinStash.length < big.length, "the in-memory stash is bounded");
     assert(r2.pinDrop.count == big.length - r2.pinStash.length, "the rest is the dropped middle");
     size_t retainedBytes;
-    foreach (ref m; r2.pinStash) retainedBytes += ctx.pinStashBytes(m);
+    foreach (i, ref m; r2.pinStash) retainedBytes += ctx.pinStashBytes(m, i == 0);
     assert(retainedBytes <= ctx.pinStashBudgetBytes, "the retained text fits the budget");
     assert(r2.pinStash[0].content == big[0].content, "the first request is retained");
     assert(r2.pinStash[$ - 1].content == big[$ - 1].content, "the newest request is retained");
@@ -1997,6 +2070,29 @@ unittest
     assert(ctx.pinnedUserRequests(r4.pinStash, null, true, 128_000, r4.pinDrop)
         == ctx.pinnedUserRequests(fat[0 .. 100] ~ fat[0 .. 5], null, true, 128_000),
         "the truncated bounded stash renders the unbounded block");
+    // The same truncation, but the full restatement is logged TWICE before
+    // the delta (a superseded restatement re-logs every request): the reload
+    // index keeps one message per log line — the newest record — so the
+    // dropped middle reloads each request EXACTLY once, never a duplicate
+    // copy from the superseded restatement.
+    auto path5 = buildPath(dir, "chain5.jsonl");
+    write(path5, `{"type":"session","data":{"version":1,"id":"chain5","created_at":"x"}}` ~ "\n"
+        ~ line("replace", rep(fatPins))
+        ~ line("replace", rep(fatPins))
+        ~ line("replace", rep(fatDelta, 100)));
+    auto r5 = restore(path5);
+    assert(r5.pinLogical == 105 && r5.pinStash.length == 105 && r5.pinDrop.count == 0,
+        "a double restatement truncates exactly like a single one");
+    assert(r5.pinStash[0].content.canFind("fat request 0:")
+        && r5.pinStash[1].content.canFind("fat request 1:")
+        && r5.pinStash[2].content.canFind("fat request 2:")
+        && r5.pinStash[99].content.canFind("fat request 99:")
+        && r5.pinStash[100].content.canFind("fat request 0:")
+        && r5.pinStash[$ - 1].content.canFind("fat request 4:"),
+        "the reloaded middle is each request once, not a restatement's duplicates");
+    assert(ctx.pinnedUserRequests(r5.pinStash, null, true, 128_000, r5.pinDrop)
+        == ctx.pinnedUserRequests(fat[0 .. 100] ~ fat[0 .. 5], null, true, 128_000),
+        "the double-restatement stash renders the unbounded block");
 }
 
 // Plan changes log as deltas applied onto the plan so far, with a full
