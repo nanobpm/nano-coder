@@ -558,3 +558,27 @@ LLMResponse reportWhole(LLMResponse r, StreamSink sink)
     }
     return r;
 }
+
+/// Mark the last assistant message of `msgs` as the reply a request cap
+/// stopped the turn on (`stop_reason` "max_turn_requests"), when it is a
+/// tool-calling reply the cap left unanswered.
+void markCapped(Message[] msgs) @safe pure nothrow
+{
+    foreach_reverse (ref m; msgs)
+    {
+        if (m.role == Role.user) return;
+        if (m.role != Role.assistant) continue;
+        if (m.toolCalls.length) m.stopReason = "max_turn_requests";
+        return;
+    }
+}
+
+unittest
+{
+    auto msgs = [Message.user("g"), Message.assistant("w", [ToolCall("c", "bash", JSONValue.init)]), Message.toolResult("c", "bash", "ok")];
+    markCapped(msgs);
+    assert(msgs[1].stopReason == "max_turn_requests");
+    auto plain = [Message.user("g"), Message.assistant("done")];
+    markCapped(plain);
+    assert(plain[1].stopReason != "max_turn_requests");
+}

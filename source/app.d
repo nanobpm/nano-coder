@@ -1753,6 +1753,7 @@ string replayQuietShownTurn(const Message[] msgs, size_t i, const size_t[] lasts
 {
     if (msgs[i].role != Role.assistant) return null;
     if (msgs[i].toolCalls.length && msgs[i].content.strip.length
+        && msgs[i].stopReason == "max_turn_requests"
         && (lasts.length ? lasts[i] : quietTurnLast(msgs, i)) == i)
         return msgs[i].content;
     return replayQuietShown(msgs, i);
@@ -1768,6 +1769,10 @@ unittest
     msgs ~= Message.toolResult("c2", "bash", "ok");
     msgs ~= Message.user("next goal");
     msgs ~= Message.assistant("done");
+    // Without the logged request-cap completion the turn was interrupted,
+    // not capped: its tool-calling reply stays hidden as it was live.
+    assert(replayQuietShownTurn(msgs, 3) is null);
+    msgs[3].stopReason = "max_turn_requests";
     // A turn that closed on a tool-calling message (the request cap) shows
     // the response live quiet dropped; an earlier tool-calling reply of the
     // same turn stays hidden (its turn went on).
@@ -1957,6 +1962,7 @@ unittest
     auto idled = [cut("one "), idleTick, Message.assistant("two")];
     assert(replayAnswerQuiet(idled, 0) == "one ", "a turn-starting timer does not continue the prior answer");
     auto capTool = Message.assistant("partial", [ToolCall("c1", "bash", parseJSON("{}"))]);
+    capTool.stopReason = "max_turn_requests";
     auto capped3 = [Message.user("go"), capTool, idleTick, Message.assistant("later")];
     assert(replayQuietShownTurn(capped3, 1) == "partial", "a capped tool reply before an idle timer turn shows");
     assert(replayQuietShownTurn(capped3, 1, quietTurnLasts(capped3)) == "partial");
@@ -2047,6 +2053,9 @@ void replayTranscript(Agent agent, Console console)
                 break;
             }
             if (m.hookContext || m.continuation || m.timer || m.autoInitiated) break;
+            // Model-only harness messages (a carried-over plan, synthetic
+            // summaries) are unflagged user-role turns: never shown live.
+            if (!isUserRequest(m)) break;
             // Hook context appended to the prompt was never shown live.
             auto typed = m.pinText.length ? m.pinText : m.content;
             // A steer rendered live through the shared user-message renderer

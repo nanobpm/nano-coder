@@ -779,6 +779,11 @@ struct Restored
     Message[] pinStash;
     /// The requests the bound dropped between `pinStash[0]` and `pinStash[1]`.
     ctx.PinDrop pinDrop;
+    /// The dropped middle's log line per LOGICAL position, oldest first
+    /// (0 for an ID-less request the log cannot re-decode): one integer per
+    /// dropped request, so a truncating `pinned_base` reloads exactly the
+    /// base's logical prefix. Always `pinDrop.count` long.
+    ulong[] pinDropLines;
     /// The logical count of requests ever stashed (dropped ones included).
     size_t pinLogical;
     /// The real turns folded by the compactions since the last plain
@@ -913,6 +918,11 @@ Restored restore(string path)
                 auto st = "stop_reason" in data;
                 if (st !is null && st.type == JSONType.string && st.str != "end_turn") r.completedStops[iid] = st.str;
                 else r.completedStops.remove(iid);
+                if (st !is null && st.type == JSONType.string && st.str == "max_turn_requests")
+                {
+                    import nano.llm : markCapped;
+                    markCapped(r.conversation);
+                }
                 auto oc = "outcome" in data;
                 if (oc !is null && oc.type == JSONType.object) r.completedOutcomes[iid] = *oc;
                 else r.completedOutcomes.remove(iid);
@@ -1090,7 +1100,7 @@ private void restorePinStash(alias decode)(JSONValue data, const string[] inputs
         if (folded !is null && base !is null && base.type == JSONType.integer)
         {
             auto b = toSize(base.integer);
-            auto delta = decode(*folded, inputs);
+            auto delta = indexRequests(decode(*folded, inputs), pinsByLine);
             auto kept = b < foldedStash.length ? b : foldedStash.length;
             if (kept + delta.length > 0)
                 // The base counts the folded CONVERSATION's turns, but only
@@ -1102,11 +1112,21 @@ private void restorePinStash(alias decode)(JSONValue data, const string[] inputs
         }
         else if (folded !is null)
         {
-            auto full = decode(*folded, inputs);
+            auto full = indexRequests(decode(*folded, inputs), pinsByLine);
             pinAdoptFull(r, full.length ? userRequests(full) : null);
         }
         else pinAdoptFull(r, null);
     }
+}
+
+/// Index a decoded legacy `folded` sequence's user requests by log line (as
+/// `decodeAndIndex` does for `pinned_requests`), so a later `pinned_base`
+/// truncating into a middle the bound dropped can reload them; returns `msgs`.
+private Message[] indexRequests(Message[] msgs, ref Message[ulong] pinsByLine)
+{
+    foreach (m; msgs)
+        if (m.logLine && ctx.isUserRequest(m)) pinsByLine[m.logLine] = m;
+    return msgs;
 }
 
 /// The genuine user requests of a decoded legacy `folded` sequence, in order
@@ -1125,6 +1145,7 @@ private void pinAdoptFull(ref Restored r, Message[] full)
 {
     r.pinStash = full;
     r.pinDrop = ctx.PinDrop.init;
+    r.pinDropLines = null;
     r.pinLogical = full.length;
     pinBound(r);
 }
@@ -1145,6 +1166,7 @@ private void pinTruncate(ref Restored r, size_t b, Message[ulong] pinsByLine)
     {
         r.pinStash = null;
         r.pinDrop = ctx.PinDrop.init;
+        r.pinDropLines = null;
         r.pinLogical = 0;
         return;
     }
@@ -1153,27 +1175,24 @@ private void pinTruncate(ref Restored r, size_t b, Message[ulong] pinsByLine)
     auto oldDrop = r.pinDrop;
     auto budgetLeft = b - 1;
     // The base reaches into the dropped middle first: reload its oldest
-    // requests from the log (the span's lines are the middle's, oldest first)
-    // — one message per line, the newest record the restatement left.
+    // requests from the log BY LOGICAL POSITION (`pinDropLines`), stopping at
+    // the first one the log cannot re-decode (an ID-less request, or a line
+    // with no indexed record) — the retained prefix must stay contiguous, so
+    // nothing past an unrecoverable position is promoted into it.
+    auto oldLines = r.pinDropLines.length == oldDrop.count ? r.pinDropLines : null;
     Message[] reloaded;
-    if (oldDrop.count && oldDrop.lo && budgetLeft)
+    if (oldLines.length && budgetLeft)
     {
-        auto want = budgetLeft < oldDrop.count ? budgetLeft : oldDrop.count;
-        auto got = want;
-        auto line = oldDrop.lo;
-        while (got && line <= oldDrop.hi)
+        auto want = budgetLeft < oldLines.length ? budgetLeft : oldLines.length;
+        foreach (line; oldLines[0 .. want])
         {
-            if (auto m = line in pinsByLine)
-            {
-                reloaded ~= *m;
-                got--;
-            }
-            line++;
+            auto m = line ? line in pinsByLine : null;
+            if (m is null) break;
+            reloaded ~= *m;
         }
-        budgetLeft -= want - got;
-        oldDrop.lo = line;
-        oldDrop.count -= want - got;
-        if (!oldDrop.count) oldDrop = ctx.PinDrop.init;
+        budgetLeft -= reloaded.length;
+        oldLines = oldLines[reloaded.length .. $];
+        oldDrop.count -= reloaded.length;
     }
     // Then the retained tail, oldest first, for what the base still covers.
     // The unreloaded middle (e.g. ID-less requests the log cannot re-decode)
@@ -1191,9 +1210,25 @@ private void pinTruncate(ref Restored r, size_t b, Message[ulong] pinsByLine)
     // un-dropped tail, gone from memory — is the new dropped middle. The old
     // span reached into the tail's unknown log lines, so it survives only
     // while the middle still has unreloaded requests.
-    r.pinDrop.count = b - r.pinStash.length;
-    if (!r.pinDrop.count || !oldDrop.count) r.pinDrop = ctx.PinDrop.init;
-    else { r.pinDrop.lo = oldDrop.lo; r.pinDrop.hi = oldDrop.hi; }
+    auto newCount = b - r.pinStash.length;
+    r.pinDrop = ctx.PinDrop.init;
+    r.pinDropLines = null;
+    if (newCount && oldDrop.count)
+    {
+        // The new middle is the unreloaded rest's logical prefix; its span
+        // is recomputed from exactly those positions (never inverted).
+        r.pinDrop.count = newCount;
+        if (oldLines.length >= newCount)
+        {
+            r.pinDropLines = oldLines[0 .. newCount].dup;
+            foreach (id; r.pinDropLines)
+                if (id)
+                {
+                    r.pinDrop.lo = r.pinDrop.lo ? min(r.pinDrop.lo, id) : id;
+                    r.pinDrop.hi = max(r.pinDrop.hi, id);
+                }
+        }
+    }
     r.pinLogical = b;
 }
 
@@ -1243,6 +1278,7 @@ private void pinBound(ref Restored r)
     foreach (ref m; r.pinStash[1 .. tailStart])
     {
         r.pinDrop.count++;
+        r.pinDropLines ~= m.logLine;
         if (auto id = m.logLine)
         {
             r.pinDrop.lo = r.pinDrop.lo ? min(r.pinDrop.lo, id) : id;
@@ -2521,6 +2557,52 @@ unittest
     r.pinLogical = 6;
     pinTruncate(r, 5, none);
     assert(r.pinStash.length == 3 && r.pinStash[1].content == "t1" && r.pinDrop.count == 2, "tail only past the middle");
+}
+
+/// A truncating base reloads the dropped middle by LOGICAL position: an
+/// ID-less request holds its slot (it is never skipped over to promote a
+/// later logged one), and the surviving omission span is recomputed from
+/// exactly the positions still dropped — never inverted.
+unittest
+{
+    Restored r;
+    Message u(string c, ulong line = 0) { Message m; m.role = Role.user; m.content = c; m.logLine = line; return m; }
+    Message[ulong] byLine;
+    foreach (m; indexRequests([u("r5", 5), u("r6", 6), u("r7", 7), Message.assistant("x")], byLine)) {}
+    assert(byLine.length == 3, "legacy folded requests are indexed for recovery");
+    void setup(ulong[] lines)
+    {
+        r = Restored.init;
+        r.pinStash = [u("goal"), u("t1")];
+        r.pinDrop.count = lines.length;
+        r.pinDropLines = lines.dup;
+        foreach (l; lines) if (l) { r.pinDrop.lo = r.pinDrop.lo ? min(r.pinDrop.lo, l) : l; r.pinDrop.hi = max(r.pinDrop.hi, l); }
+        r.pinLogical = 2 + lines.length;
+    }
+    // Middle [ID-less, #5, #6, #7], base 3: the ID-less head blocks reload.
+    setup([0, 5, 6, 7]);
+    pinTruncate(r, 3, byLine);
+    assert(r.pinStash.length == 1 && r.pinDrop.count == 2 && r.pinDropLines == [0, 5]);
+    assert(r.pinDrop.lo == 5 && r.pinDrop.hi == 5 && r.pinLogical == 3);
+    // All-logged middle: the prefix reloads in order, nothing stays dropped.
+    setup([5, 6, 7]);
+    pinTruncate(r, 3, byLine);
+    assert(r.pinStash.length == 3 && r.pinStash[1].content == "r5" && r.pinStash[2].content == "r6");
+    assert(r.pinDrop.count == 0 && !r.pinDrop.lo && !r.pinDrop.hi && !r.pinDropLines.length);
+    // [#5, ID-less, #7], base 4: #5 reloads, the rest stays dropped with a valid span.
+    setup([5, 0, 7]);
+    pinTruncate(r, 4, byLine);
+    assert(r.pinStash.length == 2 && r.pinStash[1].content == "r5");
+    assert(r.pinDrop.count == 2 && r.pinDropLines == [0, 7] && r.pinDrop.lo == 7 && r.pinDrop.hi == 7);
+    assert(r.pinDrop.lo <= r.pinDrop.hi);
+    // pinBound records one line per dropped position.
+    r = Restored.init;
+    import std.array : replicate;
+    auto big = "x".replicate(ctx.pinStashBudgetBytes);
+    r.pinStash = [u("goal"), u(big, 9), u("y", 0), u(big, 11)];
+    r.pinLogical = 4;
+    pinBound(r);
+    assert(r.pinDropLines.length == r.pinDrop.count);
 }
 
 /// Collect garbage and return the free GC pools to the OS: after a burst

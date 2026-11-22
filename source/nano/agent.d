@@ -670,6 +670,10 @@ class Agent
             });
             throw e;
         }
+        // A turn the request cap stopped closes on a tool-calling reply: mark
+        // it (in memory; a later replace record carries it) so quiet replay
+        // can tell a capped turn from one a crash interrupted.
+        if (lastStop == StopReason.maxTurnRequests) markCapped(messages);
         log.ifSome((SessionLog l) {
             l.turnEnd(inputId, response, lastStop, hasOutcome ? lastOutcome.toJSON : JSONValue.init,
                 turnHistoryCalls);
