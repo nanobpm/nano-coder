@@ -2363,11 +2363,15 @@ int runMain(string[] args)
         foreach (t; memorySessionTools(store, memoryWritable,
                 () => built.match!(a => a.control.mode == AgentMode.plan, () => o.plan),
                 () => built.match!(a => a.log.match!(l => l.id, () => string.init), () => string.init)))
-            // Search never prompts and changes nothing another tool reads
-            // (at most the store's own bookkeeping): it may run alongside
-            // other read-only calls, on the agent's thread (#222).
+            // Search never prompts, and changes nothing another tool reads
+            // unless the session is writable: then it bumps `last_used` and
+            // rewrites the memory files (nano/memory.d `searchInner`), which
+            // would race a concurrent call's recall processing and any file
+            // worker reading the store. So it may run alongside other
+            // read-only calls only when it runs read-only itself — a writable
+            // session keeps it a barrier (#222).
             tools.register(t.definition, asToolError(t.handler),
-                Concurrency(t.definition.name == imported!"nano.memory".searchTool));
+                Concurrency(t.definition.name == imported!"nano.memory".searchTool && !memoryWritable));
     // Instruction files, discovered once per working directory and re-read
     // before each turn (`reloadInstructions`).
     Option!ProjectInstructions instructions;

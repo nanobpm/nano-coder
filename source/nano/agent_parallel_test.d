@@ -231,6 +231,44 @@ JobResult quick(string argsJson, immutable(string)[] context)
     return JobResult("quick");
 }
 
+/// Set by the worker running `quick` once its result is in and it is about to
+/// read the cancel flag for its `afterCancel` metadata. `stop` waits for this
+/// acknowledgment instead of a fixed delay, so the cancel is ordered after the
+/// worker's bookkeeping rather than racing it (issue #222 review).
+shared bool workerRecorded;
+
+/// Wraps `quick`: reads the cancel flag the way the worker will for
+/// `afterCancel`, then signals that the metadata point is reached. Because
+/// `stop` waits for the signal before cancelling, both this read and the
+/// worker's own read observe "not cancelled", so the finished call keeps its
+/// result.
+JobResult quickAck(string argsJson, immutable(string)[] context)
+{
+    import nano.control : cancelRequested;
+    auto res = quick(argsJson, context);
+    // Read (and discard) the flag the worker reads next; the signal below
+    // orders `stop`'s cancel after it.
+    cast(void) cancelRequested();
+    atomicStore(workerRecorded, true);
+    return res;
+}
+
+/// How many `fast` workers have read their `afterCancel` metadata.
+shared int fastDone;
+
+/// `quick`, then count this worker as past its `afterCancel` read, so a test
+/// can cancel only once every `fast` call is recorded as finished (not
+/// interrupted). Reads the flag first so the count means "finished before any
+/// later cancel".
+JobResult quickCounted(string argsJson, immutable(string)[] context)
+{
+    import nano.control : cancelRequested;
+    auto res = quick(argsJson, context);
+    cast(void) cancelRequested();
+    atomicOp!"+="(fastDone, 1);
+    return res;
+}
+
 // A worker that finished before a cancel keeps its result, even though the
 // agent collects it only after the cancel.
 unittest
@@ -238,17 +276,18 @@ unittest
     import nano.clock : monoNow, since, sleepFor;
     import core.time : msecs, seconds;
     atomicStore(arrived, 0);
+    atomicStore(workerRecorded, false);
     auto reg = new ToolRegistry;
     Agent agent;
     Concurrency fast;
     fast.readOnly = true;
-    fast.offload = (JSONValue a) => Job(&quick, a.toString, null);
+    fast.offload = (JSONValue a) => Job(&quickAck, a.toString, null);
     reg.register(def("fast"), (JSONValue a) => "sequential", fast);
-    // On the agent's thread: waits for the worker to finish, then cancels.
+    // On the agent's thread: waits for the worker to record its completion
+    // metadata, then cancels.
     reg.register(def("stop"), (JSONValue a) {
         auto start = monoNow;
-        while (atomicLoad(arrived) < 1 && since(start) < 10.seconds) sleepFor(1.msecs);
-        sleepFor(20.msecs);
+        while (!atomicLoad(workerRecorded) && since(start) < 10.seconds) sleepFor(1.msecs);
         agent.control.cancel();
         return "stopped";
     }, Concurrency(true));
@@ -259,5 +298,57 @@ unittest
         `["a", "fast", "quick", "false"]`,
         `["b", "stop", "stopped", "false"]`,
     ], results(agent).to!string);
+}
+
+// A call still running when a cancel arrives reports the interrupted result,
+// not the loop-stop result, even when an earlier finished call tripped the
+// loop detector: cancellation outranks the loop stop for an unfinished call.
+unittest
+{
+    import nano.agent : loopStoppedToolResult;
+    import std.algorithm : canFind;
+    import nano.clock : monoNow, since, sleepFor;
+    import core.time : msecs, seconds;
+    atomicStore(arrived, 0);
+    atomicStore(fastDone, 0);
+    atomicStore(released, false);
+    auto reg = new ToolRegistry;
+    Agent agent;
+    // The five identical calls run `quick`, counting each past its metadata
+    // read so the cancel lands only once all five are recorded finished.
+    Concurrency fast;
+    fast.readOnly = true;
+    fast.offload = (JSONValue a) => Job(&quickCounted, a.toString, null);
+    reg.register(def("fast"), (JSONValue a) => "sequential", fast);
+    Concurrency slow;
+    slow.readOnly = true;
+    slow.offload = (JSONValue a) => Job(&held, a.toString, null);
+    reg.register(def("slow"), (JSONValue a) => "sequential", slow);
+    // Runs on the agent's thread while the workers run: waits for the five
+    // `fast` workers to be recorded finished (so the fifth trips the loop
+    // detector), then cancels while `slow` is still blocked, then releases it.
+    reg.register(def("stop"), (JSONValue a) {
+        auto start = monoNow;
+        while (atomicLoad(fastDone) < 5 && since(start) < 10.seconds) sleepFor(1.msecs);
+        agent.control.cancel();
+        atomicStore(released, true);
+        return "stopped";
+    }, Concurrency(true));
+    auto mock = new MockClient([
+        reply([
+            call("a", "fast", `{"n":1}`), call("b", "fast", `{"n":1}`),
+            call("c", "fast", `{"n":1}`), call("d", "fast", `{"n":1}`),
+            call("e", "fast", `{"n":1}`), call("f", "slow"), call("g", "stop"),
+        ]),
+        LLMResponse("never"),
+    ]);
+    agent = new Agent(mock, reg, Policy.init, "sys");
+    agent.run("go", new NullEvents);
+    auto r = results(agent);
+    // The five finished `fast` calls tripped the loop detector, so the turn
+    // is ending; but the interrupted `slow` call keeps the cancelled result,
+    // not the loop-stop one.
+    assert(r[5] == `["f", "slow", "` ~ cancelledToolResult ~ `", "true"]`, r.to!string);
+    assert(!r[5].canFind(loopStoppedToolResult), r[5]);
 }
 

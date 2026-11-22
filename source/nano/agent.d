@@ -1036,10 +1036,13 @@ class Agent
             auto c = &runs[k];
             c.recallBefore = recallState.dup;
             c.notesBefore = recallTurnNotes;
-            if (loopStop !is null) c.result = loopStoppedToolResult;
-            else if (skipped[k]) c.result = cancelledToolResult;
+            // Cancellation outranks a loop stop for a call that never ran:
+            // an interrupted call reports the interrupted result even when an
+            // earlier finished call tripped the loop detector.
+            if (skipped[k]) c.result = cancelledToolResult;
             else if (!admitted[k]) c.ran = true;
             else if (!finished[k]) c.result = cancelledToolResult;
+            else if (loopStop !is null) c.result = loopStoppedToolResult;
             else
             {
                 auto res = results[k];
