@@ -370,7 +370,7 @@ Message messageFromRecord(JSONValue j) pure
         case "stop_reason": m.stopReason = v.str; break;
         case "temperature": if (v.type == JSONType.string) m.temperature = v.str; break;
         case "thinking_level": if (v.type == JSONType.string) m.thinkingLevel = v.str; break;
-        case "log_line": if (v.type == JSONType.integer) m.logLine = v.integer; break; // direct records: the physical line wins
+        case "log_line": { ulong n; if (jsonUnsigned(v, n)) m.logLine = n; } break; // direct records: the physical line wins
         case "auto_initiated": m.autoInitiated = v.type == JSONType.true_; break;
         case "stop_blocked": m.stopBlocked = v.type == JSONType.true_; break;
         case "steered": m.steered = v.type == JSONType.true_; break;
@@ -1739,7 +1739,7 @@ unittest
 // `.type == JSONType.integer` comparison creeps back into `restore`.
 unittest
 {
-    import std.algorithm : canFind, findSplit;
+    import std.algorithm : canFind, findSplit, splitter;
     import std.file : readText;
     import std.string : indexOf;
     const src = readText(__FILE__);
@@ -1751,6 +1751,25 @@ unittest
     assert(body.canFind("jsonUnsigned"), "restore reads numbers through jsonUnsigned");
     assert(!body.canFind("JSONType.integer"),
         "restore compares no .type against JSONType.integer directly: a size_t logs as uinteger");
+    // messageFromRecord decodes embedded records too: `log_line` is a ulong.
+    const mstart = src.indexOf("Message messageFromRecord(JSONValue j)");
+    assert(mstart >= 0, "messageFromRecord's definition is found in this file");
+    const mrest = src[mstart .. $];
+    const mbody = mrest[0 .. $ - mrest.findSplit("\n}\n")[2].length];
+    foreach (line; mbody.splitter('\n'))
+        if (line.canFind(`"log_line"`))
+            assert(line.canFind("jsonUnsigned") && !line.canFind("JSONType.integer"),
+                "messageFromRecord reads log_line through jsonUnsigned: a ulong logs as uinteger");
+}
+
+// An embedded record's `log_line` (a ulong, tagged uinteger) round-trips.
+unittest
+{
+    auto m = Message.user("x");
+    m.logLine = 42;
+    auto j = messageRecord(m);
+    assert(j["log_line"].type == JSONType.uinteger);
+    assert(messageFromRecord(j).logLine == 42);
 }
 
 // Plan changes log as deltas applied onto the plan so far, with a full
