@@ -32,14 +32,69 @@ enum string cancelledResponse = "[turn cancelled]";
 
 private shared bool gCancel;
 
+/// A narrower cancellation scope than the process-wide flag: a sub-agent's
+/// per-child abort. Blocking work (the HTTP client, retry waits) polls the
+/// innermost scope on its thread first, so a parent stopping one child
+/// interrupts that child's in-flight request without cancelling its own
+/// turn. A scope is a `shared(bool)*` the child publishes and the parent's
+/// `SubAbort.abort` sets; `pushCancelScope`/`popCancelScope` install it on
+/// the child's thread (its whole run sits inside).
+private shared(bool)*[256] cancelScopes;
+private shared size_t cancelScopeDepth;
+
 /// Whether the running turn has been cancelled. Safe from any thread or a
 /// signal handler. Blocking tools and the HTTP client poll this.
-bool cancelRequested() @safe nothrow @nogc { return atomicLoad(gCancel); }
+bool cancelRequested() @safe nothrow @nogc
+{
+    const depth = atomicLoad(cancelScopeDepth);
+    if (depth > 0)
+    {
+        auto scope_ = atomicLoad(cancelScopes[depth - 1]);
+        if (scope_ !is null && atomicLoad(*scope_)) return true;
+    }
+    return atomicLoad(gCancel);
+}
+
+/// Poll `scope_` first on this thread until `popCancelScope`. The pointee
+/// must outlive the pop (the child's abort cell does).
+void pushCancelScope(scope shared(bool)* scope_) @safe nothrow @nogc
+{
+    const depth = atomicLoad(cancelScopeDepth);
+    if (depth >= cancelScopes.length) return; // deeper than ever nested: fall back to the global flag
+    atomicStore(cancelScopes[depth], scope_);
+    atomicStore(cancelScopeDepth, depth + 1);
+}
+
+/// Remove the scope `pushCancelScope` installed (LIFO).
+void popCancelScope() @safe nothrow @nogc
+{
+    const depth = atomicLoad(cancelScopeDepth);
+    if (depth == 0) return;
+    atomicStore(cancelScopes[depth - 1], null);
+    atomicStore(cancelScopeDepth, depth - 1);
+}
 
 /// Raised inside the agent when a cancel interrupts a model call.
 class Cancelled : Exception
 {
     this() pure nothrow @safe { super(cancelledResponse); }
+}
+
+unittest
+{
+    import core.atomic : atomicLoad, atomicStore;
+    assert(!cancelRequested);
+    shared bool hit;
+    pushCancelScope(&hit);
+    assert(!cancelRequested);
+    atomicStore(hit, true);
+    assert(cancelRequested);
+    popCancelScope();
+    assert(!cancelRequested);
+    // A null slot falls back to the flag.
+    pushCancelScope(null);
+    assert(!cancelRequested);
+    popCancelScope();
 }
 
 /// A steering message. `tag` is the ACP request id that sent it, if any. It is

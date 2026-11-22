@@ -1224,8 +1224,9 @@ struct ConsoleLink
     void endLine() { screen.update((ref Screen s) { s.endLine(); }); }
 }
 
-class Console : AgentEvents, imported!"nano.subagent".SubAgentEvents
+class Console : AgentEvents
 {
+    mixin imported!"nano.subagent".SubAgentEvents;
     immutable bool color, tty;
     /// The shared line state; hand `link` to other threads.
     ConsoleLink link;
@@ -2763,6 +2764,11 @@ int runMain(string[] args)
         h.refreshSystem = () { agent.messages[0].content = systemFor(cwd, agent.promptPlan); };
         h.refreshClient = (string name) {
             import nano.settings : editRebuilds;
+            // Sub-agents build clients from a config frozen at startup;
+            // re-freeze after every provider edit so children see the new
+            // credentials/endpoints (and a newly added provider).
+            if (cfg.subagents)
+                agent.subagentClients = new immutable ConfigClients(frozenConfig(cfg));
             if (!editRebuilds(cfg, name, agent.client.providerName)) return string.init;
             // The client's own provider was edited: keep its model. Otherwise the
             // configured model now resolves to the edited provider: build that.

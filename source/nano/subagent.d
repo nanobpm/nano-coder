@@ -132,20 +132,19 @@ struct ToolReply
 }
 
 /// Set by the parent to stop a sub-agent at its next step: a copyable,
-/// sendable handle (like `Chan`).
+/// sendable handle (like `Chan`). The cell is `shared` so the child's
+/// cancellation scope (nano.control) can publish its address on its thread.
 struct SubAbort
 {
-    /// Holds one value once aborted (nothing takes it).
-    private Chan!bool flag;
+    import core.atomic : atomicLoad, atomicStore;
+    /// Set once by `abort`; polled by `aborted`.
+    private shared bool flag;
 
-    static SubAbort make() { return SubAbort(Chan!bool.make); }
-    void abort() { flag.put(true); }
-    bool aborted()
-    {
-        bool set;
-        flag.edit((ref bool[] q) { set = q.length > 0; });
-        return set;
-    }
+    static SubAbort make() { return SubAbort.init; }
+    void abort() { atomicStore(flag, true); }
+    bool aborted() nothrow @nogc { return atomicLoad(flag); }
+    /// The cell the child's cancellation scope points at.
+    shared(bool)* ptr() return { return &flag; }
 }
 
 /// What a sub-agent did. Sendable: it crosses back through `join`.
@@ -257,19 +256,34 @@ private final class ChildEvents : imported!"nano.agent".AgentEvents
 
     long timeout() const { return spec.limits.timeoutSecs; }
 
+    /// The wall-clock moment the deadline passes (monoNow scale).
+    MonoTime deadline() const { return start + timeout.seconds; }
+
+    /// The first limit breach's reason, or null.
+    private string limitWhy()
+    {
+        if (generations >= spec.limits.turns) return format("turn limit (%s model calls)", spec.limits.turns);
+        if (tokens >= spec.limits.tokens) return format("token limit (%s tokens)", spec.limits.tokens);
+        if (since(start) >= timeout.seconds) return format("time limit (%ss)", timeout);
+        return null;
+    }
+
     /// Check the limits; on the first breach, tell the child to report now.
     void checkLimits()
     {
         if (limitHit !is null) return;
-        string why;
-        if (generations >= spec.limits.turns) why = format("turn limit (%s model calls)", spec.limits.turns);
-        else if (tokens >= spec.limits.tokens) why = format("token limit (%s tokens)", spec.limits.tokens);
-        else if (since(start) >= timeout.seconds) why = format("time limit (%ss)", timeout);
+        auto why = limitWhy();
         if (why is null) return;
         limitHit = why;
+        steerReportReminder();
+    }
+
+    /// Tell the child to stop investigating and report now (idempotent).
+    private void steerReportReminder()
+    {
         import nano.agent : wrapReminder;
         foreach (a; agent) a.control.steer(wrapReminder(format("You reached your %s. Stop investigating and call "
-            ~ "report_outcome now with what you found so far.", why)));
+            ~ "report_outcome now with what you found so far.", limitHit)));
     }
 
     void progress()
@@ -333,6 +347,16 @@ private final class ChildEvents : imported!"nano.agent".AgentEvents
         if (limitHit !is null && gensSinceLimit++ >= 1) throw new SubStop(limitHit);
         generations++;
     }
+
+    /// Before a fresh call's steers drain and its request is built (the
+    /// agent calls this from its CallModel step): a limit first seen now
+    /// still gets its reminder into the grace request.
+    void beforeFreshCall()
+    {
+        if (abort.aborted) throw new SubStop("stopped by the parent");
+        checkLimits();
+        if (limitHit !is null && gensSinceLimit == 0) steerReportReminder();
+    }
 }
 
 /// The text of the child's latest assistant reply, for a partial report.
@@ -361,11 +385,17 @@ SubResult runChild(immutable SubSpec spec, immutable(SubClientFactory) factory, 
     import nano.permissions : Policy;
     import nano.session : SessionLog;
     import nano.option : some;
-    import nano.control : cancelRequested, cancelledResponse;
+    import nano.control : cancelRequested, cancelledResponse, pushCancelScope, popCancelScope;
     import nano.goal : OutcomeStatus;
     SubResult res;
     res.model = spec.model;
     auto st = new ChildEvents(spec, up, down, abort);
+    // Blocking work on this thread (the model's HTTP requests, its retry
+    // waits) polls this child's abort before the process-wide cancel flag,
+    // so the parent stopping this child interrupts an in-flight request
+    // without cancelling its own turn.
+    pushCancelScope(abort.ptr);
+    scope (exit) popCancelScope();
     scope (exit)
     {
         res.durationMs = since(st.start).total!"msecs";
@@ -421,7 +451,7 @@ SubResult runChild(immutable SubSpec spec, immutable(SubClientFactory) factory, 
             if (answer == cancelledResponse || cancelRequested)
             {
                 res.cancelled = res.truncated = true;
-                res.truncatedReason = "cancelled";
+                res.truncatedReason = abort.aborted ? "stopped by the parent" : "cancelled";
                 auto partial = lastAssistantText(agent.messages);
                 answer = partial.length ? partial : "(cancelled before the sub-agent reported)";
             }
@@ -429,6 +459,22 @@ SubResult runChild(immutable SubSpec spec, immutable(SubClientFactory) factory, 
             {
                 res.truncated = true;
                 res.truncatedReason = st.limitHit;
+            }
+            else
+            {
+                // A final report_outcome bypasses `forward`, so its usage and
+                // the time it took never hit a limit check: a report that
+                // crossed the token or time cap is still marked truncated.
+                if (st.tokens >= spec.limits.tokens)
+                {
+                    res.truncated = true;
+                    res.truncatedReason = format("token limit (%s tokens)", spec.limits.tokens);
+                }
+                else if (since(st.start) >= st.timeout.seconds)
+                {
+                    res.truncated = true;
+                    res.truncatedReason = format("time limit (%ss)", st.timeout);
+                }
             }
         }
         catch (SubStop e)
@@ -479,6 +525,9 @@ struct SubSlot
     size_t toolCalls;
     ulong tokens;
     bool reportedDone;
+    /// The child's own read state: its read_file calls never authorize a
+    /// later parent write (the parent model sees only the report).
+    imported!"nano.option".Option!(imported!"nano.tools.files".ReadState) readState;
 }
 
 /// An `agent` call's checks, made before its reply's sub-agents start.
@@ -506,13 +555,15 @@ struct SubProgress
     bool truncated;
 }
 
-/// Renderers that show sub-agent progress implement this alongside
-/// `AgentEvents` (the loop checks with a cast).
-interface SubAgentEvents
+/// Renderers that show sub-agent progress mix this in alongside
+/// `AgentEvents` and override `subagents` (the loop checks with
+/// `__traits(hasMember, …, "subagents")`, so an events class without the
+/// mixin simply never gets the calls).
+mixin template SubAgentEvents()
 {
     /// Every running sub-agent's state after a change; `done` ones are listed
-    /// once, as they finish.
-    void subagents(const SubProgress[] all);
+    /// once, as they finish. The mixed-in default ignores them.
+    void subagents(const imported!"nano.subagent".SubProgress[] all) {}
 }
 
 /// One line of progress for a sub-agent (task, tool calls, tokens, elapsed).

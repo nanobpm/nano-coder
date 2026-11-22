@@ -286,3 +286,72 @@ unittest
     auto a = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "sys");
     assert(!a.offeredTools.canFind!(t => t.name == "agent"));
 }
+
+// A child's read_file never authorizes a parent write: it runs on the
+// child's own ReadState, so the parent's registry records nothing.
+unittest
+{
+    import nano.tools.files : registerFiles = register, ReadState;
+    import std.conv : to;
+    import std.file : mkdirRecurse, write, readText;
+    auto dir = buildPath(tempDir, "nano-sub-readstate-" ~ monoNow.ticks.to!string);
+    mkdirRecurse(dir);
+    scope (exit) if (dir.exists) rmdirRecurse(dir);
+    auto target = buildPath(dir, "f.txt");
+    write(target, "one\n");
+    auto parentState = new ReadState;
+    auto reg = new ToolRegistry;
+    registerFiles(reg, parentState);
+    auto parent = new MockClient([
+        LLMResponse("", "", [ToolCall.fromRaw("c", "agent",
+            `{"task":"read it","model":"mock/read"}`)]),
+        LLMResponse("", "", [ToolCall.fromRaw("w", "write_file",
+            JSONValue(["path": target, "content": "two\n"]).toString)]),
+        LLMResponse("done")]);
+    final class ReadScript : SubClientFactory
+    {
+        LLMClient make(string spec) const
+        {
+            return new MockClient([LLMResponse("", "", [ToolCall.fromRaw("r", "read_file",
+                JSONValue(["path": target]).toString)]), report("saw one")]);
+        }
+        void configure(Agent a, string spec) const {}
+    }
+    auto agent = new Agent(parent, reg, Policy.init, "sys");
+    agent.subagentClients = new immutable ReadScript;
+    auto answer = agent.run("go", new NullEvents);
+    // The child read the file (its report says so)...
+    assert(toolResultText(agent, "c").canFind("saw one"));
+    // ...but the parent's write_file must still demand the parent read it.
+    auto w = toolResultText(agent, "w");
+    assert(w.canFind("read") && w.canFind("before"), w);
+    assert(readText(target) == "one\n", "the write was refused");
+}
+
+private string toolResultText(Agent agent, string id)
+{
+    foreach (m; agent.messages) if (m.role == Role.tool && m.toolCallId == id) return m.content;
+    assert(0, "no result for " ~ id);
+}
+
+// A report that crosses the token cap on its final call is still marked
+// truncated (report_outcome bypasses the forwarded-call limit check).
+unittest
+{
+    final class BigTokens : SubClientFactory
+    {
+        LLMClient make(string spec) const
+        {
+            return new MockClient([used(report("done but over budget"), 500, 50)]);
+        }
+        void configure(Agent a, string spec) const {}
+    }
+    auto f = new Fixture([LLMResponse("", "", [ToolCall.fromRaw("t", "agent", agentCall("x", "mock/big"))]),
+        LLMResponse("ok")]);
+    f.agent.subagentClients = new immutable BigTokens;
+    SubLimits lim;
+    lim.tokens = 100;
+    f.agent.subagentLimits = lim;
+    assert(f.agent.run("go", new NullEvents) == "ok");
+    assert(f.toolResult("t").canFind("[truncated: token limit (100 tokens)"), f.toolResult("t"));
+}

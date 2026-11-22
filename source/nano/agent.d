@@ -53,7 +53,7 @@ import nano.session;
 import nano.control;
 import nano.claude_hooks : HookManager, Decision, HookOutcome = Outcome, applyUpdatedInput, maxStopBlocks;
 import nano.subagent : SubClientFactory, SubLimits, SubSlot, SubGate, SubMsg, SubKind, SubResult, SubProgress,
-    SubAgentEvents, ToolReply, SubAbort, SubSpec, subToolName = toolName, subDefinition = definition;
+    ToolReply, SubAbort, SubSpec, subToolName = toolName, subDefinition = definition;
 import nano.safeio : Chan;
 import std.typecons : Rebindable;
 
@@ -675,6 +675,10 @@ class Agent
                     (CallModel c) {
                         if (c.fresh)
                         {
+                            // A sub-agent's limit check runs before its
+                            // steers drain, so the report reminder reaches
+                            // the grace request (nano.subagent.ChildEvents).
+                            static if (__traits(hasMember, AgentEvents, "beforeFreshCall")) ev.beforeFreshCall();
                             if (!prepareCall(ev)) { done = true; answer = cancelled(ev); return; }
                             swStart = monoNow;
                         }
@@ -695,7 +699,7 @@ class Agent
                         auto learned = c.learned ? c.learned : estimateContextTokens() * 9 / 10;
                         learnedWindow = learned > 1_000 ? learned : 1_000;
                         CompactReport rep;
-                        const ok = compact(rep, CompactTrigger.overflow);
+                        const ok = compact(rep, CompactTrigger.overflow, null, null, some(ev));
                         next ~= Event(Compacted(ok, control.isCancelled));
                     },
                     (Rethrow _) { throw failure; },
@@ -757,7 +761,7 @@ class Agent
         if (overThreshold())
         {
             CompactReport rep;
-            compact(rep, CompactTrigger.threshold);
+            compact(rep, CompactTrigger.threshold, null, null, some(ev));
             if (control.isCancelled) return false;
         }
         applyModelRequest();
@@ -1318,7 +1322,7 @@ class Agent
     /// `mode` overrides `compactionMode` (null: the configured one); `focus`
     /// steers the summary. Returns false when there is nothing to compact.
     bool compact(out CompactReport report, CompactTrigger trigger = CompactTrigger.manual,
-            scope const(ctx.CompactionMode)* mode = null, string focus = null)
+            scope const(ctx.CompactionMode)* mode = null, string focus = null, Option!AgentEvents ev = none)
     {
         import std.algorithm : canFind;
         ctx.CompactionMode m = mode is null ? compactionMode : *mode;
@@ -1385,10 +1389,15 @@ class Agent
             try
             {
                 const swStart = monoNow;
+                // A compaction is a model call too: a sub-agent's budget
+                // counts it (its turn cap and token cap), so emit the same
+                // events a turn's call does.
+                foreach (e; ev) e.generationStart();
                 auto r = client.chat(req, (bool, string) {});
                 summaryMs = since(swStart).total!"msecs";
                 summaryUsage = r.usage;
                 recordUsage(r.usage);
+                foreach (e; ev) e.usage(r.usage);
                 truncated = r.stopReason == "length" || r.stopReason == "max_tokens";
                 auto body_ = r.content.strip;
                 if (body_.length)
@@ -1787,8 +1796,38 @@ class Agent
                 else
                 {
                     auto call = ToolCall.fromRaw(format("%s.%s", subSlots[i].callId, ++subCallSeq), m.name, m.args);
-                    rep.text = runTool(call, "tool_use", rep.isError);
+                    // A child's read_file runs on a fresh ReadState: the
+                    // parent's registry would record the read, letting a
+                    // later parent write pass the read-before-write check on
+                    // a file the parent model never saw.
+                    if (m.name == "read_file")
+                    {
+                        import nano.tools.files : readFile, ReadState;
+                        import nano.option : some;
+                        if (subSlots[i].readState.isNone) subSlots[i].readState = some(new ReadState);
+                        try
+                        {
+                            rep.text = readFile(call.arguments, subSlots[i].readState.unwrap("set above"));
+                            rep.isError = false;
+                        }
+                        catch (ToolError e) rep.text = e.msg;
+                    }
+                    else
+                    {
+                        // A dispatch failure (a hook cannot start, the
+                        // registry throws) must still wake the child: close
+                        // its reply channel so its `down.take` ends instead
+                        // of blocking cleanup forever.
+                        try rep.text = runTool(call, "tool_use", rep.isError);
+                        catch (Exception e)
+                        {
+                            subSlots[i].down.close();
+                            rep.text = format("%s failed: %s", m.name, e.msg);
+                        }
+                    }
                 }
+                // After a dispatch failure the channel is closed and the
+                // child already woke; the put is a harmless no-op then.
                 subSlots[i].down.put(rep);
                 break;
             case SubKind.progress:
@@ -1859,7 +1898,10 @@ class Agent
         }
         if (all.length)
             foreach (e; subEvents)
-                if (auto se = cast(SubAgentEvents) e) se.subagents(all);
+            {
+                // Renderers that show progress mix in SubAgentEvents.
+                static if (__traits(hasMember, AgentEvents, "subagents")) e.subagents(all);
+            }
     }
 
     /// The checks before a tool runs: known tool, plan mode, the permission

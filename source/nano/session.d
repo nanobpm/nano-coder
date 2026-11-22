@@ -1346,6 +1346,23 @@ TidyResult tidySessions(string dir, long compressAfterDays, long retentionDays)
     bool mayDelete = retentionDays > 0;
     try named = titledIds(dir);
     catch (Exception) mayDelete = false; // unknown titles: compress only, delete nothing
+    tidyDir(dir, now, compressAfterDays, retentionDays, mayDelete, named, result);
+    // Sub-agent logs sit one level down (<session>/sub-<call>.jsonl): the
+    // same retention and compression rules apply to them.
+    foreach (DirEntry e; dirEntries(dir, SpanMode.shallow, false))
+        if (e.isDir && !e.name.baseName.endsWith(".attachments"))
+            tidyDir(e.name, now, compressAfterDays, retentionDays, mayDelete, named, result);
+    try std.file.write(stampPath, "");
+    catch (Exception) {} // a stamp that won't write just tidies again next start
+    return result;
+}
+
+/// One directory's pass of `tidySessions` (also used for the child-log
+/// directories one level down).
+private void tidyDir(string dir, SysTime now, long compressAfterDays, long retentionDays,
+        bool mayDelete, const bool[string] named, ref TidyResult result)
+{
+    import nano.session_index : indexFile;
     foreach (DirEntry e; dirEntries(dir, SpanMode.shallow, false))
     {
         auto name = e.name.baseName;
@@ -1401,9 +1418,6 @@ TidyResult tidySessions(string dir, long compressAfterDays, long retentionDays)
         }
         catch (Exception) {} // one unreadable log must not stop the pass
     }
-    try std.file.write(stampPath, "");
-    catch (Exception) {} // a stamp that won't write just tidies again next start
-    return result;
 }
 
 /// How long ago `then` was, briefly.
