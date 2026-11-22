@@ -49,6 +49,27 @@ class ToolRegistry
         handlers[def.name] = handler;
     }
 
+    /// Replace a tool's handler with a richer delegate shape (e.g.
+    /// apply_patch's PatchHandler), retrievable via `handlerAs`.
+    /// `execute` must not be used for such a tool; its callers go through
+    /// `handlerAs`.
+    void registerHandler(T)(string name, T handler) pure @trusted
+    {
+        // Trusted: a delegate's bit-pattern is shape-independent; only the
+        // matching cast in handlerAs ever invokes it (see below).
+        handlers[name] = cast(ToolHandler) handler;
+    }
+
+    /// The handler behind `name` as the richer shape `T` it was registered
+    /// with (e.g. apply_patch's PatchHandler), or null when it has the plain
+    /// ToolHandler shape. Trusted for the matching registerHandler above:
+    /// the cast is sound because the same name carried exactly a `T` there.
+    T handlerAs(T)(string name) @trusted
+    {
+        auto h = name in handlers;
+        return h is null ? null : cast(T) *h;
+    }
+
     bool has(string name) pure const { return (name in defs) !is null; }
 
     /// Sorted by name so requests are stable across turns (prompt caching).

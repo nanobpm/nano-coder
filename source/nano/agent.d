@@ -36,6 +36,7 @@ import nano.thinking : Thinking, ThinkingResolved = Resolved, resolveThinking = 
 import temp = nano.temperature;
 import nano.vision : Vision, resolveVision = resolve;
 import nano.llm : Attachment;
+import nano.tools.files : PatchSnapshot, PatchHandler;
 
 /// A tool result as displayed: the text plus each attached image's placeholder.
 string toolResultDisplay(string text, const(Attachment)[] attachments) pure
@@ -1649,13 +1650,22 @@ class Agent
         // edit of it would (the policy already checked every path).
         // The per-path hook inputs are built once, before the patch runs: a
         // move deletes its source, so rebuilding them afterwards would lose
-        // the content the post-hooks should see.
+        // the content the post-hooks should see. The same snapshot then
+        // drives the commit itself (applyPatch's `prepared`): the tool
+        // writes the content the destination hooks approved, never a
+        // post-hook re-read of the source.
         PatchEdit[] patchInputs;
+        PatchSnapshot[] prepared;
         if (call.name == "apply_patch")
         {
             patchInputs = patchEdits(args, true);
             if (auto deny = patchPathHooks(call, patchInputs, context)) return withContext(deny, context);
-            if (auto d = "dry_run" in args) if (d.type == JSONType.true_) patchInputs = null;
+            if (auto d = "dry_run" in args)
+            {
+                if (d.type == JSONType.true_) patchInputs = null;
+                else prepared = patchSnapshot(patchInputs);
+            }
+            else prepared = patchSnapshot(patchInputs);
         }
         dispatched = true;
         effectiveArgs = args;
@@ -1684,6 +1694,7 @@ class Agent
                 out_ = call.name == hist.searchTool ? hist.search(logPath, args) : hist.read(logPath, args);
             }
             else if (isTimer) out_ = runTimerTool(call.name, args);
+            else if (call.name == "apply_patch") out_ = applyPatchPrepared(args, tools, prepared);
             else out_ = isPlan ? runPlanTool(call.name, args) : tools.execute(call.name, args);
             isError = false;
         }
@@ -1826,13 +1837,58 @@ class Agent
         return null;
     }
 
-    /// The paths a successful, non-dry-run apply_patch call changed.
+    /// The paths a successful, non-dry-run apply_patch call changed. Parsed
+    /// from the patch text only: the files have already been rewritten, so
+    /// re-reading them to re-apply the hunks (as patchEdits would) repeats
+    /// the matching work against the new content and computes near-miss
+    /// diagnostics that are discarded. Error and dry-run exclusions match
+    /// patchEdits.
     private static string[] patchTouches(JSONValue args, bool isError)
     {
+        import nano.tools : ToolError;
+        import nano.tools.files : patchPaths;
         if (isError) return null;
-        string[] out_;
-        foreach (e; patchEdits(args)) out_ ~= e.args["path"].str;
-        return out_;
+        auto p = "patch" in args;
+        if (p is null || p.type != JSONType.string) return null;
+        if (auto d = "dry_run" in args) if (d.type == JSONType.true_) return null;
+        try return patchPaths(p.str);
+        catch (ToolError) return null; // unparseable: the tool reported it and touched nothing
+    }
+
+    /// The staged contents an apply_patch call commits, captured from the
+    /// per-path hook inputs so the tool writes exactly what the destination
+    /// hooks approved (never a post-hook re-read of a move's source). Null
+    /// when the snapshot is incomplete (a path's content was unknown, or a
+    /// path appears without content and later with it): the tool then stages
+    /// from disk as usual, with its own freshness checks.
+    private static PatchSnapshot[] patchSnapshot(PatchEdit[] edits)
+    {
+        if (!edits.length) return null;
+        PatchSnapshot[] out_;
+        bool[string] seen;
+        foreach (e; edits)
+        {
+            auto path = e.args["path"].str;
+            if (auto c = "content" in e.args)
+            {
+                if (path in seen) return null; // content must follow the patch's order
+                seen[path] = true;
+                out_ ~= PatchSnapshot(path, c.str);
+                continue;
+            }
+            if (path in seen) return null; // a later write's content must win
+            seen[path] = true;
+        }
+        return out_.length ? out_ : null;
+    }
+
+    /// Run apply_patch with the staged contents the hooks approved, when the
+    /// registry's handler accepts them; otherwise (an unexpected handler
+    /// shape) fall back to the plain call, which stages from disk.
+    private static string applyPatchPrepared(JSONValue args, ToolRegistry tools, PatchSnapshot[] prepared)
+    {
+        if (auto h = tools.handlerAs!PatchHandler("apply_patch")) return h(args, prepared);
+        return tools.execute("apply_patch", args);
     }
 
     /// The call's arguments with the patch's paths listed, so memory recall

@@ -1117,7 +1117,21 @@ private struct Staged
     bool wasLink; /// the path was a symlink before the patch
     string linkTarget; /// its target then, to restore it on rollback
     bool recreated; /// deleted and re-added in this patch: write the entry itself, not through a link
+    string pinned; /// the write target resolved at staging (through a symlink); null: resolve at commit
+    bool pinnedLink; /// `pinned` came from the path's own symlink (not a symlinked parent)
 }
+
+/// The content an apply_patch call commits for one path, captured before its
+/// hooks run so the write carries exactly what the destination hook approved.
+struct PatchSnapshot
+{
+    string path; /// as written in the patch (resolved at staging)
+    string content; /// the staged content the hooks saw
+}
+
+/// The apply_patch handler's shape: the tool's arguments plus the staged
+/// contents its hooks approved (null: stage from disk, with freshness checks).
+alias PatchHandler = string delegate(JSONValue args, PatchSnapshot[] prepared);
 
 /// `path` relative to the working directory when inside it.
 private string displayPath(string path)
@@ -1133,11 +1147,14 @@ private string writeTarget(string path)
     return r !is null ? r : path;
 }
 
-/// The file a staged entry's write lands on: through a symlink, and through
-/// symlinked parent directories of a new file. Deletes act on the entry itself.
+/// The file a staged entry's write lands on: the target resolved (and
+/// permission-checked) at staging when there is one; otherwise through a
+/// symlink, and through symlinked parent directories of a new file. Deletes
+/// act on the entry itself.
 private string effectiveTarget(const ref Staged s)
 {
     if (!s.present || s.recreated) return s.path;
+    if (s.pinned !is null) return s.pinned;
     auto t = writeTarget(s.path);
     if (t != s.path) return t;
     auto r = realPath(s.path);
@@ -1148,12 +1165,26 @@ private string effectiveTarget(const ref Staged s)
 
 /// Fail unless `s`'s path still holds what was staged from it: absent, or
 /// the same bytes. Run before any write and again just before each mutation.
+/// A symlink staged as one is compared by entry identity and target, not by
+/// its referent's bytes: the referent may have been deleted by this patch's
+/// own earlier commit (a dangling link is still the unchanged entry), and a
+/// retargeted link must fail even when its new target holds identical bytes.
 private void checkUnchanged(const ref Staged s)
 {
     if (!s.existed)
     {
         if (linkPresent(s.path))
             throw new ToolError(format("apply_patch: %s was created while the patch was being prepared", s.display));
+        return;
+    }
+    if (s.wasLink)
+    {
+        string current;
+        try current = readLink(s.path);
+        catch (FileException e)
+            throw new ToolError(format("apply_patch: re-read %s: %s", s.display, e.msg));
+        if (current != s.linkTarget)
+            throw new ToolError(format("apply_patch: %s changed while the patch was being prepared", s.display));
         return;
     }
     ubyte[] current;
@@ -1171,7 +1202,9 @@ private void dropTemp(string tmp)
     catch (FileException) {} // best effort: the caller reports the original error
 }
 
-/// Undo one committed entry, unless something else changed it since.
+/// Undo one committed entry, unless something else changed it since. A write
+/// that went through a symlink is restored to the same pinned target it
+/// landed on, never to a freshly re-resolved one.
 private void rollBack(const ref Staged s)
 {
     if (!s.present)
@@ -1182,7 +1215,7 @@ private void rollBack(const ref Staged s)
         rename(tmp, s.path);
         return;
     }
-    auto target = s.recreated ? s.path : writeTarget(s.path);
+    auto target = s.recreated ? s.path : (s.pinned !is null ? s.pinned : writeTarget(s.path));
     ubyte[] current;
     try current = readBytes(target);
     catch (FileException) return;
@@ -1195,7 +1228,9 @@ private void rollBack(const ref Staged s)
 
 /// Write the staged changes. Every target is re-checked against what was
 /// staged before anything is written and again just before its own write or
-/// delete; a mutation that then fails rolls back the ones before it.
+/// delete; a mutation that then fails rolls back the ones before it. The
+/// rollback runs in the `catch` that formats the failure, so the message
+/// already knows whether restoration worked.
 private void commitStaged(Staged[] staged, ReadState state)
 {
     foreach (ref s; staged)
@@ -1207,10 +1242,10 @@ private void commitStaged(Staged[] staged, ReadState state)
     size_t done;
     string[] madeDirs; /// directories this commit created, to remove on rollback
     string[] unrolled; /// paths whose rollback failed, reported with the error
-    scope (failure)
+    // Undo writes first, then remove the directories they needed, and only
+    // then restore deleted entries, whose paths those directories may hold.
+    void rollback()
     {
-        // Undo writes first, then remove the directories they needed, and only
-        // then restore deleted entries, whose paths those directories may hold.
         void undo(bool writes)
         {
             foreach_reverse (ref s; staged[0 .. done])
@@ -1236,48 +1271,62 @@ private void commitStaged(Staged[] staged, ReadState state)
             ? format("; ROLLBACK FAILED for %s; the tree is partially modified", unrolled.join(", "))
             : " (earlier changes were rolled back)";
     }
+    ToolError failed;
     foreach (i, ref s; staged)
     {
         scope (success) done = i + 1;
         if (!s.changed) continue;
         if (!s.present && !s.existed) continue;
-        try checkUnchanged(s);
-        catch (ToolError e) throw new ToolError(e.msg ~ undone());
-        if (!s.present)
-        {
-            try remove(s.path);
-            catch (FileException e) throw new ToolError(format("apply_patch: delete %s: %s%s", s.display, e.msg, undone()));
-            continue;
-        }
-        // A deleted-then-recreated symlink is replaced, not followed: the
-        // entry the patch deleted is gone, so the rename lands on its path.
-        // A plain update writes through the link, like edit/write_file.
-        auto path = s.recreated ? s.path : writeTarget(s.path);
-        for (auto d = path.dirName; !linkPresent(d) && d != d.dirName; d = d.dirName) madeDirs ~= d;
-        try mkdirRecurse(path.dirName);
-        catch (FileException e) throw new ToolError(format("apply_patch: create %s: %s%s", path.dirName, e.msg, undone()));
-        string tmp;
         try
         {
-            uint mode = newFileMode;
-            if (s.hasMode) mode = s.mode;
-            else if (statMode(path, mode)) mode &= octal!7777;
-            else mode = newFileMode;
-            tmp = writeTemp(path.dirName, path.baseName, s.after.representation, mode);
-            // The last moment to notice a concurrent edit before replacing it.
             checkUnchanged(s);
-            rename(tmp, path);
+            if (!s.present)
+            {
+                try remove(s.path);
+                catch (FileException e) throw new ToolError(format("apply_patch: delete %s: %s", s.display, e.msg));
+                continue;
+            }
+            // A deleted-then-recreated symlink is replaced, not followed: the
+            // entry the patch deleted is gone, so the rename lands on its path.
+            // A plain update writes to the target resolved (and permission-
+            // checked) at staging, never to a freshly re-resolved link.
+            auto path = s.recreated ? s.path : (s.pinned !is null ? s.pinned : writeTarget(s.path));
+            for (auto d = path.dirName; !linkPresent(d) && d != d.dirName; d = d.dirName) madeDirs ~= d;
+            try mkdirRecurse(path.dirName);
+            catch (FileException e) throw new ToolError(format("apply_patch: create %s: %s", path.dirName, e.msg));
+            string tmp;
+            try
+            {
+                uint mode = newFileMode;
+                if (s.hasMode) mode = s.mode;
+                else if (statMode(path, mode)) mode &= octal!7777;
+                else mode = newFileMode;
+                tmp = writeTemp(path.dirName, path.baseName, s.after.representation, mode);
+                // The last moment to notice a concurrent edit before replacing it.
+                checkUnchanged(s);
+                rename(tmp, path);
+            }
+            catch (ToolError e)
+            {
+                dropTemp(tmp);
+                throw e;
+            }
+            catch (FileException e)
+            {
+                dropTemp(tmp);
+                throw new ToolError(format("apply_patch: write %s: %s", s.display, e.msg));
+            }
         }
         catch (ToolError e)
         {
-            dropTemp(tmp);
-            throw new ToolError(e.msg ~ undone());
+            failed = e;
+            break;
         }
-        catch (FileException e)
-        {
-            dropTemp(tmp);
-            throw new ToolError(format("apply_patch: write %s: %s%s", s.display, e.msg, undone()));
-        }
+    }
+    if (failed !is null)
+    {
+        rollback();
+        throw new ToolError(failed.msg ~ undone());
     }
     foreach (ref s; staged)
         if (s.changed)
@@ -1287,7 +1336,7 @@ private void commitStaged(Staged[] staged, ReadState state)
         }
 }
 
-string applyPatch(JSONValue args, ReadState state)
+string applyPatch(JSONValue args, ReadState state, PatchSnapshot[] prepared = null)
 {
     auto patch = requireString(args, "patch", "apply_patch");
     auto dry = optBool(args, "dry_run", false);
@@ -1317,6 +1366,12 @@ string applyPatch(JSONValue args, ReadState state)
                 s.wasLink = true;
                 try s.linkTarget = readLink(path);
                 catch (FileException e) throw new ToolError(format("apply_patch: read link %s: %s", s.display, e.msg));
+                // Pin the write target the path's permissions were checked
+                // against: a link retargeted after staging must fail the
+                // freshness check, not redirect the write (or its rollback)
+                // to a file nobody approved.
+                s.pinned = writeTarget(path);
+                s.pinnedLink = s.pinned != path;
             }
             uint mode;
             if (statMode(path, mode))
@@ -1401,6 +1456,20 @@ string applyPatch(JSONValue args, ReadState state)
             break;
         }
     }
+    // The caller's hook-approved staged contents (its per-path hook inputs)
+    // override what staging computed: the commit then writes exactly what the
+    // destination hooks approved, even if a source changed after they ran.
+    // The freshness checks in commitStaged still catch the drift itself. A
+    // path the patch deletes keeps that deletion (the snapshot never
+    // resurrects it).
+    if (prepared.length && !dry)
+        foreach (ps; prepared)
+        {
+            auto k = at(ps.path);
+            if (!staged[k].present && staged[k].changed) continue; // deleted by the patch
+            staged[k].present = staged[k].changed = true;
+            staged[k].after = ps.content;
+        }
     // Two entries that write the same file (a path and a symlink to it) would
     // each be staged from the original bytes, and the second write would
     // silently drop the first one's edit.
@@ -1519,6 +1588,9 @@ void register(ToolRegistry tools, ReadState state)
             "dry_run":{"type":"boolean","description":"Check the patch and return its diff without writing anything (default false)"}},
             "required":["patch"]}`)),
         (JSONValue a) => applyPatch(a, state));
+    // The richer shape, for callers that carry the hook-approved staged
+    // contents into the commit (see PatchHandler).
+    tools.registerHandler("apply_patch", (JSONValue a, PatchSnapshot[] prepared) => applyPatch(a, state, prepared));
 }
 
 version (unittest)
@@ -2420,4 +2492,62 @@ unittest // adversarial: replacing a 0600 file keeps it 0600 (write_file and app
     assert((getAttributes(p) & octal!7777) == octal!600);
     assert(readText(p) == "b\n");
     remove(w); remove(p);
+}
+
+unittest // review round 8: symlink freshness by identity, pinned targets, prepared snapshot, rollback message
+{
+    import std.file : symlink, remove;
+    auto st = new ReadState;
+    // Deleting a file and then a symlink to it: the link's own freshness is
+    // its identity/target, not its (now dangling) referent's bytes.
+    auto realF = tmpFile("p8-real.txt", "x\n");
+    auto lk = tmpFile("p8-lk.txt", null);
+    if (isLink(lk) || lk.exists) remove(lk);
+    symlink(realF, lk);
+    auto out_ = applyPatch(j("patch", pt("*** Delete File: " ~ realF, "*** Delete File: " ~ lk)), st);
+    assert(out_.indexOf("2 file(s)") >= 0, out_);
+    assert(!realF.exists && !isLink(lk) && !lk.exists);
+    // checkUnchanged compares a staged symlink by entry identity and target:
+    // a retarget to identical bytes fails, an untouched (even dangling) link passes.
+    auto t1 = tmpFile("p8-t1.txt", "same\n");
+    auto t2 = tmpFile("p8-t2.txt", "same\n");
+    auto lk2 = tmpFile("p8-lk2.txt", null);
+    if (isLink(lk2) || lk2.exists) remove(lk2);
+    symlink(t1, lk2);
+    Staged se;
+    se.path = lk2;
+    se.display = lk2;
+    se.existed = se.present = true;
+    se.before = readBytes(lk2);
+    se.wasLink = true;
+    se.linkTarget = readLink(lk2);
+    checkUnchanged(se); // untouched: passes even though it is a link
+    remove(lk2);
+    symlink(t2, lk2); // retargeted to a file with identical bytes
+    bool threw;
+    try checkUnchanged(se);
+    catch (ToolError e) threw = e.msg.indexOf("changed while the patch was being prepared") >= 0;
+    assert(threw, "a retargeted link must fail the freshness check");
+    remove(lk2);
+    symlink(t1, lk2);
+    checkUnchanged(se); // restored target: passes again
+    remove(t1); remove(t2); remove(lk2);
+    // A prepared snapshot's content is what the commit writes, not a re-read.
+    auto src = tmpFile("p8-src.txt", "approved\n");
+    auto dst = tmpFile("p8-dst.txt", null);
+    if (dst.exists) remove(dst);
+    PatchSnapshot[] prep = [PatchSnapshot(dst, "approved\n")];
+    applyPatch(j("patch", pt("*** Move File: " ~ src ~ " -> " ~ dst)), st, prep);
+    assert(readText(dst) == "approved\n", readText(dst));
+    assert(!src.exists);
+    // A failure after a committed write rolls it back and says so; a rollback
+    // failure is reported as ROLLBACK FAILED, never as a clean rollback.
+    auto a = tmpFile("p8-a.txt", "one\n");
+    auto b = tmpFile("p8-b.txt", null);
+    if (b.exists) remove(b);
+    auto blocker = tmpFile("p8-blocker", "file\n");
+    auto e3 = patchErr(st, pt("*** Add File: " ~ b, "+x", "*** Add File: " ~ buildPath(blocker, "child"), "+y"));
+    assert(e3.indexOf("rolled back") >= 0 && e3.indexOf("ROLLBACK FAILED") < 0, e3);
+    assert(!b.exists, e3);
+    remove(dst); remove(a); remove(blocker);
 }
