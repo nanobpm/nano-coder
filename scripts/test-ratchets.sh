@@ -41,10 +41,11 @@ D
     git add source/nano/ratchet_fixture_test.d
 }
 
+was=$(./scripts/ratchets.sh . | awk '$1 == "trusted-budget" { print $3 }')
 git checkout -q -b add base
 add_trusted
 git commit -q -m 'add a @trusted site'
-if check; then no "adding a @trusted site fails"; elif grep -q 'Error: trusted-budget: 17' out; then ok "adding a @trusted site fails"; else no "adding a @trusted site fails (message)"; fi
+if check; then no "adding a @trusted site fails"; elif grep -q "Error: trusted-budget: $((was + 1)) " out; then ok "adding a @trusted site fails"; else no "adding a @trusted site fails (message)"; fi
 
 git commit -q --allow-empty -m 'justify it' -m 'Ratchet-Override: trusted-budget the fixture needs it'
 if check && grep -q 'Ratchet-Override: the fixture needs it' out; then ok "a Ratchet-Override trailer allows it and is printed"; else no "a Ratchet-Override trailer allows it and is printed"; fi
@@ -78,5 +79,12 @@ sed "${line}s/ *@trusted//" "$f" > "$f.new" && mv "$f.new" "$f"
 git add "$f" && git commit -q -m 'pr2 improves trusted-budget'
 git checkout -q -b main2 base
 if git merge -q --no-edit pr1 && git merge -q --no-edit pr2 && check; then ok "two PRs improving one ratchet both merge cleanly"; else no "two PRs improving one ratchet both merge cleanly"; fi
+
+# A corrupt (truncated) cached base measurement fails instead of skipping.
+git checkout -q add
+check || true
+for c in "$(git rev-parse --git-common-dir)"/nano-ratchets/*; do head -n 2 "$c" > "$c.t" && mv "$c.t" "$c"; done
+if check; then no "a truncated cached measurement fails"; elif grep -q 'corrupt ratchet cache' out; then ok "a truncated cached measurement fails"; else no "a truncated cached measurement fails (message)"; fi
+rm -rf "$(git rev-parse --git-common-dir)"/nano-ratchets
 
 [ "$fails" = 0 ] || { echo "$fails ratchet test(s) failed" >&2; exit 1; }

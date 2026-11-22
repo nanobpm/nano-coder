@@ -176,7 +176,21 @@ for f in scripts/*-budget scripts/*-budget-* scripts/*-floor; do
     echo "Error: $f: ratchets are measured against the merge base (scripts/ratchets.sh), not committed; delete the file" >&2
     status=1
 done
-here=$(./scripts/ratchets.sh .)
+# A measurement must succeed and give one numeric line per ratchet: a failed
+# or truncated one would otherwise skip comparisons and let regressions in.
+nratchets=$(grep -c '^out ' scripts/ratchets.sh)
+measure() {
+    m=$(./scripts/ratchets.sh "$1") || { echo "Error: scripts/ratchets.sh failed on $2" >&2; return 1; }
+    if ! printf '%s\n' "$m" | awk -v n="$nratchets" '
+        NF < 4 || $3 !~ /^[0-9]+$/ || ($2 != "max" && $2 != "min") || seen[$1]++ { bad = 1 }
+        END { exit (bad || NR != n) }'; then
+        echo "Error: scripts/ratchets.sh gave an incomplete or malformed measurement of $2:" >&2
+        printf '%s\n' "$m" >&2
+        return 1
+    fi
+    printf '%s\n' "$m"
+}
+here=$(measure . "the working tree") || exit 1
 base_ref=${NANO_RATCHET_BASE:-origin/main}
 base=""
 if git rev-parse --git-dir >/dev/null 2>&1; then
@@ -192,21 +206,31 @@ if [ -z "$base" ]; then
 else
     key=$base-$(cat scripts/ratchets.sh scripts/*.awk | git hash-object --stdin)
     cache=$(git rev-parse --git-common-dir)/nano-ratchets
+    measure_cached() {
+        m=$(cat "$1") || return 1
+        if ! printf '%s\n' "$m" | awk -v n="$nratchets" 'NF < 4 || $3 !~ /^[0-9]+$/ { bad = 1 } END { exit (bad || NR != n) }'; then
+            echo "Error: corrupt ratchet cache $1; delete it" >&2
+            return 1
+        fi
+        printf '%s\n' "$m"
+    }
     if [ -s "$cache/$key" ]; then
-        then_=$(cat "$cache/$key")
+        then_=$(measure_cached "$cache/$key") || exit 1
     else
         tree=$(mktemp -d)
         rmdir "$tree"
         git worktree add -q --detach "$tree" "$base" >/dev/null 2>&1 || { echo "Error: git worktree add $base failed" >&2; exit 1; }
-        then_=$(./scripts/ratchets.sh "$tree")
+        then_=$(measure "$tree" "the merge base $base") || { git worktree remove --force "$tree"; exit 1; }
         git worktree remove --force "$tree"
-        mkdir -p "$cache" && printf '%s\n' "$then_" > "$cache/$key"
+        # Publish atomically: concurrent checks in other worktrees share it.
+        mkdir -p "$cache" && part=$(mktemp "$cache/.$key.XXXXXX") &&
+            printf '%s\n' "$then_" > "$part" && mv -f "$part" "$cache/$key"
     fi
     overrides=$(git log --format='%(trailers:key=Ratchet-Override,valueonly)' "$base..HEAD" 2>/dev/null | grep .)
     short=$(git rev-parse --short "$base")
     bad=$(printf '%s\n' "$here" | while read -r name dir now what; do
         was=$(printf '%s\n' "$then_" | awk -v n="$name" '$1 == n { print $3 }')
-        [ -n "$was" ] || continue
+        [ -n "$was" ] || { echo "Error: $name: no count at the merge base" >&2; echo "$name"; continue; }
         if [ "$dir" = max ]; then worse=$((now > was)); else worse=$((now < was)); fi
         [ "$worse" = 1 ] || continue
         why=$(printf '%s\n' "$overrides" | awk -v n="$name" '$1 == n { $1 = ""; sub(/^ +/, ""); print; exit }')
