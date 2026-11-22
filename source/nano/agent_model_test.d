@@ -364,8 +364,6 @@ unittest
 // unconditionally, so an oversized prompt is never sent (PR #260 review).
 unittest
 {
-    import core.time : msecs;
-    import nano.clock : sleepFor;
     import nano.safeio : Shared;
     auto p = Probes.make(false);
     auto agent = agentFor(new Interfering("first", [LLMResponse("unused")]));
@@ -383,14 +381,18 @@ unittest
     auto big = bigText();
     agent.messages ~= [Message.user(big), Message.assistant(big), Message.user("q"), Message.assistant("a")];
     assert(!agent.overThreshold(), "under the default window's threshold until the probe lands");
-    // The probe's result lands after prepareCall's first threshold check but
-    // before its apply: only the unconditional recheck can catch it. A hook
-    // holds the publish back until the first check has read the state.
-    auto hold = Shared!bool.make(true);
-    agent.onProbePublished = { while (hold.get) sleepFor(1.msecs); };
-    agent.onThresholdChecked = { hold.update((ref bool h) { h = false; }); };
+    // The probe's result must land after prepareCall's first threshold check
+    // but before its apply: only the unconditional recheck can catch it.
+    // Keep the probe gated until the first check has read the state (the
+    // hook at agent.d:813), then wait for the worker to finish there — never
+    // block inside the publish hook: a probe that completes before the first
+    // collection publishes on the agent thread, and blocking there deadlocks
+    // the test against the very check hook that would release it.
+    agent.onThresholdChecked = {
+        p.gate.update((ref bool open) { open = true; });
+        p.probes.await((ref const int n) => n == 1, (ref int _) {});
+    };
     auto ev = new CountingEvents;
-    p.gate.update((ref bool open) { open = true; }); // the probe answers during the apply
     assert(agent.run("go", ev) == "done");
     assert(probed !is null && probed.seen.length == 2 && probed.seen[0][0].content == ctx.summarySystemPrompt,
         "the probe-shrunk window triggered a compaction before the prompt went out");

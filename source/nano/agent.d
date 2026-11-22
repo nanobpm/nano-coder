@@ -252,12 +252,11 @@ class Agent
     ref inout(Capabilities) capabilities() inout pure return { return probe.caps; }
     version (unittest)
     {
-        /// Test hook: runs right after a background probe's result is
-        /// published, so a test can hold the publish back from a threshold
-        /// check that already read the state.
-        void delegate() onProbePublished;
         /// Test hook: runs in `prepareCall` after the first probe
-        /// collection, just before the first threshold check.
+        /// collection, just before the first threshold check. A test that
+        /// needs a probe to land after the first check gates the probe and
+        /// opens the gate here — blocking inside a publication instead
+        /// deadlocks the agent thread against this hook.
         void delegate() onThresholdChecked;
     }
     private ProviderConfig noProvider;
@@ -1543,7 +1542,6 @@ class Agent
             if (p.thread.running) { if (probe.isCurrent(p.generation)) still ~= p; continue; }
             auto result = p.thread.join();
             published |= probe.publishIfCurrent(p.generation, result.unwrap, configuredWindow == 0);
-            version (unittest) if (published && onProbePublished !is null) onProbePublished();
         }
         pendingProbes = still;
         return published;
