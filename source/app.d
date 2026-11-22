@@ -55,7 +55,7 @@ import nano.control : TurnControl, FdLineReader;
 import nano.instructions : ProjectInstructions, InstructionOptions = Options, expandHome;
 import core.atomic : atomicLoad, atomicStore, cas;
 
-enum string packageVersion = "1.6.5";
+enum string packageVersion = "1.7.0";
 enum string versionString = "nano-coder " ~ packageVersion;
 
 enum string usage = `Usage: nano-coder [--model provider/model] [--config PATH] [-p PROMPT]
@@ -1329,6 +1329,12 @@ class Console : AgentEvents
         auto st = stamp();
         auto w = (isTerminal(1) ? terminalWidth() : 80);
         auto clean = sanitizeBlock(result);
+        {
+            // A plan tool's result is the rendered plan: show its marks as symbols.
+            import std.algorithm.searching : startsWith;
+            import nano.plan : planSymbols;
+            if (renderMarkdown && call.name.startsWith("plan_")) clean = planSymbols(clean);
+        }
         auto shown = stampBlock(st, toolResult(!isError, clean, verbose, w > 8 + st.length ? w - 8 - (st.length ? stampWidth : 0) : 1));
         write(shown);
         // Ctrl-O shows every line, together with the call's arguments.
@@ -1852,6 +1858,13 @@ unittest
 void replayTranscript(Agent agent, Console console)
 {
     auto msgs = agent.replayMessages;
+    // Hold the frame while the history is written: each line would otherwise
+    // render its own synchronized frame, and a real terminal shows the whole
+    // conversation scrolling past. Released last (scope exits run in
+    // reverse), so the replay and the status bar appear in one frame.
+    auto frame = gFrame;
+    if (frame) frame.hold(true);
+    scope (exit) if (frame) frame.hold(false);
     // Each toolEnd would refresh the view (a token estimate over the whole
     // conversation): quadratic on long sessions, so refresh once at the end.
     auto after = console.afterStep;
@@ -1941,7 +1954,7 @@ void replayTranscript(Agent agent, Console console)
         }
     }
     flushPending();
-    if (!agent.plan.empty && !console.quiet) writeln(escapeMarks(sanitizeBlock(planText(agent))));
+    if (!agent.plan.empty && !console.quiet) writeln(escapeMarks(sanitizeBlock(planText(agent, console.renderMarkdown))));
     // toolStart/toolEnd drive the live status; the replay leaves it idle
     // (and this one redraw covers every batched change).
     gStatusBatched = wasBatched;
@@ -2083,10 +2096,14 @@ unittest
     assert(unwrapReminder("<system-reminder>\n\n</system-reminder>") == "");
 }
 
-string planText(Agent agent) pure
+/// The plan for `/plan` and replay; `symbols` (a rendering terminal) shows
+/// item marks as ☐/◐/☑/⊘/☒ like rendered markdown task lists.
+string planText(Agent agent, bool symbols = false) pure
 {
-    return agent.plan.empty ? "No plan yet. The agent makes one with the plan_add tool."
-        : agent.plan.render(true, size_t.max).stripRight;
+    import nano.plan : planSymbols;
+    if (agent.plan.empty) return "No plan yet. The agent makes one with the plan_add tool.";
+    auto text = agent.plan.render(true, size_t.max).stripRight;
+    return symbols ? planSymbols(text) : text;
 }
 
 string modeListing(AgentMode current) pure
@@ -2640,7 +2657,7 @@ int runMain(string[] args)
         view.set("/tools", toolsListing(agent));
         view.set("/skills", skillsListing(skills));
         view.set("/session", sessionText(agent));
-        view.set("/plan", planText(agent));
+        view.set("/plan", planText(agent, console.renderMarkdown));
         view.set("/timers", timersText(agent));
         view.set("/context", contextReport(agent));
         view.set("log", agent.log.match!(l => l.path, () => string.init));
@@ -2900,7 +2917,7 @@ int runMain(string[] args)
             "nano-coder v" ~ packageVersion,
             format("Model: %s (provider: %s)", client.modelName, client.providerName),
         ];
-        agent.log.ifSome((SessionLog l) { banner ~= format("Session: %s (resume with --resume %s)", l.id, l.id); });
+        agent.log.ifSome((SessionLog l) { banner ~= format("Session: %s (resume with nano-coder --resume %s)", l.id, l.id); });
         foreach (pi; instructions)
         {
             foreach (f; pi.loadedPaths) banner ~= "Instructions: " ~ f;
@@ -2936,7 +2953,7 @@ int runMain(string[] args)
     void goodbye()
     {
         writeln("\nGoodbye!");
-        agent.log.ifSome((SessionLog l) { writefln("Session: %s (resume with --resume %s)", l.id, l.id); });
+        agent.log.ifSome((SessionLog l) { writefln("Session: %s (resume with nano-coder --resume %s)", l.id, l.id); });
         stdOut.flush();
     }
     for (;;)
@@ -3124,7 +3141,7 @@ int runMain(string[] args)
                     agent.useHooks(loadHooks(cwd), false);
                     if (gFrame) gFrame.clear();
                     refreshStatus();
-                    log.match!(l => writefln("Session: %s (resume with --resume %s)", l.id, l.id),
+                    log.match!(l => writefln("Session: %s (resume with nano-coder --resume %s)", l.id, l.id),
                         () => writefln("Session: %s", newSessionId()));
                     continue;
                 }
@@ -3148,7 +3165,7 @@ int runMain(string[] args)
                     auto exe = launchExe();
                     // Printed after the frame hands the terminal back, so it stays on screen.
                     if (gFrame) gFrame.suspend();
-                    writefln("\nRelaunching into session %s (resume later with --resume %s)", id, id);
+                    writefln("\nRelaunching into session %s (resume later with nano-coder --resume %s)", id, id);
                     stdOut.flush();
                     leaveKeyMode();
                     nano.herdr.release();
@@ -3217,7 +3234,7 @@ int runMain(string[] args)
                     writeln(runQueueCommand(queue, agent.control.nonNull, arg));
                     continue;
                 case "/plan":
-                    writeln(planText(agent));
+                    writeln(planText(agent, console.renderMarkdown));
                     continue;
                 case "/timers":
                     writeln(timersText(agent));
@@ -3286,7 +3303,7 @@ int runMain(string[] args)
                     if (gFrame) { gFrame.clear(); replayTranscript(agent, console); }
                     foreach (n; loadNotes) stdErr.writeln(n);
                     stdErr.flush();
-                    writefln("Resumed session %s (resume later with --resume %s)", id, id);
+                    writefln("Resumed session %s (resume later with nano-coder --resume %s)", id, id);
                     continue;
                 }
                 case "/trajectory":

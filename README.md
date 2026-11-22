@@ -497,7 +497,17 @@ code could use them and pass `dub test` but fail the release build. All code is 
 compiler can't check are wrapped in small, commented `@trusted` functions (shared ones in
 `source/nano/safeio.d`). `check-safe.sh` fails the build on a module without `@safe:`, an
 uncommented `@trusted`, raw threads or `__gshared` outside `safeio.d`, or more `@trusted` than
-the budgets in `scripts/` allow. The build uses `-preview=dip1000` and `-preview=nosharedaccess`.
+the merge base had. These counts are ratchets (`scripts/ratchets.sh`): check-safe measures each
+one on the working tree and on the merge base with `origin/main` (`NANO_RATCHET_BASE` overrides),
+in a temporary worktree, and fails when one gets worse. Nothing is committed, so improving a count
+needs no edit and parallel PRs can't conflict; a deliberate loosening is a commit trailer
+`Ratchet-Override: <ratchet> <reason>`, which check-safe prints. Because this repository allows
+only squash merges (RELEASING.md), the trailer must survive the squash: check-safe reads the
+trailers of the squashed commit on `main`, so an override that is dropped from the squash commit
+message leaves the post-merge CI run comparing a loosened count against the pre-push commit with
+no approval in `base..HEAD`, and the build fails. When merging such a PR, copy every approved
+`Ratchet-Override:` trailer into the squash commit message's footer (GitHub's default squash
+message lists the PR's commits; keep the trailer lines). The build uses `-preview=dip1000` and `-preview=nosharedaccess`.
 
 Time goes through `nano.clock`: `wallNow`, `monoNow`, `since` and `sleepFor` instead of
 `Clock.currTime`, `MonoTime.currTime`, `StopWatch` and `Thread.sleep`, which check-safe bans
@@ -519,7 +529,7 @@ plans, context arithmetic, the status line and others) make up a pure core, and 
 in their callers. `pure:` doesn't reach member functions, so `source/nano/pure_core_test.d`
 runs a compile-time audit (`nano.pureaudit`) over those modules. check-safe keeps that list in
 step with the `pure:` modules, and the `pure` count and the number of pure modules can only
-grow (`scripts/pure-floor`, `scripts/pure-module-floor`).
+grow (ratchets `pure-floor` and `pure-module-floor`).
 
 The pure core is also strongly pure: no public function takes a `ref`, `out` or other mutable
 argument (the audit fails the build on one), so a call can't change what its caller passed.
@@ -528,7 +538,7 @@ Results come back as values, and so do errors: a function that can fail returns
 `orThrow!(e => new X(e))` for the code that still reports errors by throwing). A missing value is
 `Option!T`. Inside the core, only the shell and TOML parsers throw, to unwind to their own entry
 point, which returns the error. Their exception classes are private, and check-safe caps those
-`throw`s (`scripts/pure-throw-budget`).
+`throw`s (ratchet `pure-throw-budget`).
 
 The agent loop is part of that core too. `nano.turn` is a state machine: `step(state, event)`
 returns the next state and a list of effects. Events are what happened (a call is due, the model
