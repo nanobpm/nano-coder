@@ -38,7 +38,7 @@ import nano.plan : Plan, checklist;
 import nano.queue : MessageQueue, QueuedMessage, QueueUsage, queueParse = parse, queueApply = apply;
 import nano.mode : AgentMode, allModes, parseMode, planPromptNote, name, describe, nextMode = next;
 static import nano.herdr;
-import nano.frame : glyphMark, foldMark, refoldMark, expandedBody, expandedResult, dropSoftWraps, escapeMarks;
+import nano.frame : glyphMark, foldMark, refoldMark, expandedBody, expandedResult, dropSoftWraps, escapeMarks, rawModelText;
 import core.time : MonoTime, seconds;
 import std.sumtype : match;
 import nano.trajectory : terminalSafe;
@@ -1216,7 +1216,7 @@ struct Screen
             midLine = st.length > 0;
             answering = true;
         }
-        auto shown = renderMarkdown ? markdown.push(chunk, answerWidth()) : chunk;
+        auto shown = renderMarkdown ? markdown.push(chunk, answerWidth()) : rawModelText(chunk);
         if (shown.length) writeAligned(shown, answerPad());
         stdOut.flush();
     }
@@ -1438,7 +1438,7 @@ class Console : AgentEvents
     /// color terminal, verbatim otherwise.
     string display(string text)
     {
-        if (!renderMarkdown) return text;
+        if (!renderMarkdown) return rawModelText(text);
         auto shown = renderMarkdownText(text, answerWidth());
         return gFrame ? shown : dropSoftWraps(shown);
     }

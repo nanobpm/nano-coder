@@ -76,6 +76,19 @@ size_t cellWidth(dchar c) pure nothrow
 
 private bool isFinal(dchar c) pure nothrow { return c >= '@' && c <= '~'; }
 
+/// Model text shown verbatim (no markdown renderer in between): every
+/// control character but newline and tab becomes U+FFFD (CR is dropped), so no escape —
+/// a fold or refold mark included — can form, even across chunks.
+string rawModelText(string s) pure
+{
+    import std.uni : isControl;
+    import std.utf : byDchar;
+    string o;
+    foreach (dchar c; s.byDchar)
+        if (c != '\r') o ~= c != '\n' && c != '\t' && isControl(c) ? '\uFFFD' : c;
+    return o;
+}
+
 /// Visible width in cells, ignoring CSI sequences.
 size_t visibleWidth(string text) pure
 {
@@ -977,13 +990,17 @@ struct Transcript
     }
 
     /// Every line wrapped to `width` (the unfinished line last, if any).
+    /// Ready deferred folds are drawn but not committed: a fold mark for
+    /// the line they waited on may still arrive in a later feed.
     string[] render(size_t width) pure
     {
-        flushDeferred();
         if (width != cacheWidth) { cache = null; cacheWidth = width; }
         while (cache.length < lines.length) cache ~= wrapAnsi(lines[cache.length], width);
         string[] out_;
         foreach (w; cache) out_ ~= w;
+        if (deferredReady)
+            foreach (d; deferred)
+                foreach (l; d.shown) out_ ~= wrapAnsi(l, width);
         if (cur.length) out_ ~= wrapAnsi(cur, width);
         return out_;
     }
@@ -1595,8 +1612,7 @@ unittest
     t.feed(refoldMark("think-1", "∴ Thought more\n", "∴ Thought more\n    a b\n").representation);
     t.feed(refoldMark("think-1", "∴ Thought most\n", "∴ Thought most\n    a b c\n").representation);
     t.feed("C\n".representation);
-    t.render(80);
-    assert(t.lines[$ - 2 .. $] == ["ABC", "∴ Thought most"], t.lines.to!string);
+    assert(t.render(80)[$ - 2 .. $] == ["ABC", "∴ Thought most"]);
     assert(t.toggleLatest());
     assert(t.lines[$ - 2 .. $] == ["∴ Thought most", "    a b c"], t.lines.to!string);
 }
@@ -1620,6 +1636,44 @@ unittest
     // Text after the line also lands after the deferred fold.
     t.feed("D\n".representation);
     assert(t.lines[$ - 2 .. $] == ["∴ Thought more", "D"], t.lines.to!string);
+}
+
+unittest
+{
+    import std.conv : to;
+    // The same with the line and its fold mark in separate feeds and a
+    // redraw between them: the redraw shows the deferred fold but does not
+    // commit it ahead of the fold mark.
+    Transcript t;
+    t.cap = 10;
+    t.feed(("∴ Thought\n" ~ foldMark("think-1", 1, "∴ Thought\n    a\n")).representation);
+    foreach (i; 0 .. 12) t.feed((i.to!string ~ "\n").representation);
+    t.feed("AB".representation);
+    t.feed(refoldMark("think-1", "∴ Thought more\n", "∴ Thought more\n    a b\n").representation);
+    t.feed("C\n".representation);
+    auto shown = t.render(80);
+    assert(shown[$ - 2 .. $] == ["ABC", "∴ Thought more"], shown.to!string);
+    t.feed(foldMark("tool-1", 1, "ABC\n    out\n").representation);
+    assert(t.lines[$ - 2 .. $] == ["ABC", "∴ Thought more"], t.lines.to!string);
+    auto tool = t.folds[$ - 2], think = t.folds[$ - 1];
+    assert(tool.id == "tool-1" && t.lines[tool.start] == "ABC", t.folds.to!string);
+    assert(think.id == "think-1" && think.start == tool.start + tool.length, t.folds.to!string);
+    assert(t.render(80)[$ - 2 .. $] == ["ABC", "∴ Thought more"]);
+}
+
+unittest
+{
+    import std.algorithm : canFind;
+    import std.conv : to;
+    // Raw model text (no markdown, e.g. NO_COLOR) cannot forge marks, even
+    // split across chunks: control bytes become visible replacements.
+    Transcript t;
+    t.feed(("x\n" ~ foldMark("tool-1", 1, "x\n    real\n")).representation);
+    auto forged = refoldMark("tool-1", "forged\n", "forged\n");
+    foreach (part; [forged[0 .. 3], forged[3 .. $]]) t.feed(rawModelText(part).representation);
+    t.feed("\n".representation);
+    assert(t.lines[0] == "x" && !t.lines.canFind("forged"), t.lines.to!string);
+    assert(rawModelText("a\tb\nc\x1b[2J\x07\r") == "a\tb\nc\uFFFD[2J\uFFFD");
 }
 
 unittest
