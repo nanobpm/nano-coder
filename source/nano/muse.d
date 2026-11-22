@@ -8,7 +8,7 @@
 module nano.muse;
 
 @safe:
-import nano.safeio : jsonText, jsonPretty;
+import nano.safeio : jsonText, jsonPretty, jsonUnsigned;
 import nano.clock : wallNow;
 
 import std.json;
@@ -112,7 +112,12 @@ struct StoredCredentials
         c.oauthToken = j["oauth_token"].str;
         c.refreshToken = str("refresh_token");
         if (auto v = "expires_at" in j)
-            if (v.type == JSONType.integer || v.type == JSONType.uinteger) c.expiresAt = v.integer;
+        {
+            // Reading `.integer` on a uinteger tag throws, so clamp the way
+            // plan.d/session_history.d do.
+            ulong n;
+            if (jsonUnsigned(*v, n)) c.expiresAt = n > ulong(long.max) ? long.max : long(n);
+        }
         c.apiKey = str("api_key");
         c.apiBase = str("api_base");
         c.createdAt = str("created_at");
@@ -233,7 +238,10 @@ private Nullable!long intField(const JSONValue j, string k) pure
 {
     if (j.type != JSONType.object) return Nullable!long.init;
     auto v = k in j;
-    if (v && (v.type == JSONType.integer || v.type == JSONType.uinteger)) return Nullable!long(v.integer);
+    // Reading `.integer` on a uinteger tag throws, so clamp the way
+    // plan.d/session_history.d do.
+    ulong n;
+    if (v && jsonUnsigned(*v, n)) return Nullable!long(n > ulong(long.max) ? long.max : long(n));
     return Nullable!long.init;
 }
 
@@ -241,6 +249,15 @@ private long now()
 {
     import std.datetime.systime : Clock;
     return wallNow.toUnixTime;
+}
+
+/// An absolute expiry from a relative `expires_in`: `now + secs`, saturated
+/// at `long.max` so an oversized duration can never wrap the sum negative
+/// (which would read as "already expired").
+private long expiryAt(long secs)
+{
+    const t = now;
+    return secs > long.max - t ? long.max : t + secs;
 }
 
 /// A minted Meta API key and the endpoint it is valid for.
@@ -329,7 +346,7 @@ Nullable!OauthGrant refreshGrant(const Endpoints e, const OauthGrant grant)
     auto rt = strField(v, "refresh_token");
     g.refreshToken = rt !is null ? rt : grant.refreshToken;
     auto expiresIn = intField(v, "expires_in");
-    g.expiresAt = expiresIn.isNull ? grant.expiresAt : Nullable!long(now + expiresIn.get);
+    g.expiresAt = expiresIn.isNull ? grant.expiresAt : Nullable!long(expiryAt(expiresIn.get));
     return Nullable!OauthGrant(g);
 }
 
@@ -352,7 +369,7 @@ string login(scope void delegate(string) @safe note, scope void delegate(long se
     long interval = iv.isNull ? 5 : iv.get;
     if (interval < 1) interval = 1;
     auto ex = intField(device, "expires_in");
-    auto deadline = now + (ex.isNull ? 900 : ex.get);
+    auto deadline = ex.isNull ? now + 900 : expiryAt(ex.get);
     note("UNOFFICIAL: this signs in as the Muse Code CLI; use at your own risk.");
     note(format("Open %s and enter code: %s", uri, userCode));
     note("Waiting for authorization...");
@@ -370,7 +387,7 @@ string login(scope void delegate(string) @safe note, scope void delegate(long se
             StoredCredentials c;
             c.oauthToken = token;
             c.refreshToken = strField(poll, "refresh_token");
-            if (!expiresIn.isNull) c.expiresAt = now + expiresIn.get;
+            if (!expiresIn.isNull) c.expiresAt = expiryAt(expiresIn.get);
             c.apiKey = minted.apiKey;
             c.apiBase = minted.baseUrl;
             c.createdAt = wallNow(UTC()).toISOExtString;
@@ -451,7 +468,12 @@ private long positive(const JSONValue row, string[] keys) pure
     if (row.type != JSONType.object) return 0;
     foreach (k; keys)
         if (auto v = k in row)
-            if (v.type == JSONType.integer || v.type == JSONType.uinteger) return v.integer > 0 ? v.integer : 0;
+        {
+            // Reading `.integer` on a uinteger tag throws, so clamp the way
+            // plan.d/session_history.d do.
+            ulong n;
+            if (jsonUnsigned(*v, n)) return n > ulong(long.max) ? long.max : long(n);
+        }
     return 0;
 }
 
@@ -592,4 +614,42 @@ unittest
     assert(museVision(rows[0]) && !museVision(rows[1]) && !museVision(rows[2]) && !museVision(rows[4]));
     assert(listableModels(cat) == ["muse-spark-1.3"]);
     assert(catalogRows(parseJSON(`[{"id":"x"}]`)).length == 1);
+}
+
+// A uinteger-tagged number (JSONValue(1u), or any value > long.max such as
+// ulong.max) must be read, not throw: reading `.integer` on a uinteger tag
+// raises JSONException. Oversized values clamp to long.max.
+unittest
+{
+    // StoredCredentials.fromJSON: expires_at
+    auto c = StoredCredentials.fromJSON(JSONValue(["oauth_token": JSONValue("t"), "expires_at": JSONValue(1u)]));
+    assert(!c.expiresAt.isNull && c.expiresAt.get == 1);
+    c = StoredCredentials.fromJSON(JSONValue(["oauth_token": JSONValue("t"), "expires_at": JSONValue(ulong.max)]));
+    assert(!c.expiresAt.isNull && c.expiresAt.get == long.max);
+
+    // intField: device/poll payloads
+    assert(intField(JSONValue(["interval": JSONValue(5u)]), "interval").get == 5);
+    assert(intField(JSONValue(["interval": JSONValue(ulong.max)]), "interval").get == long.max);
+    assert(intField(JSONValue(["interval": JSONValue(-3)]), "interval").isNull);
+
+    // positive: catalog context/output limits
+    assert(contextLimit(JSONValue(["context_limit": JSONValue(200_000u)])) == 200_000);
+    assert(contextLimit(JSONValue(["context_limit": JSONValue(ulong.max)])) == long.max);
+    assert(outputLimit(JSONValue(["output_limit": JSONValue(-1)])) == 0);
+}
+
+// `expiryAt` adds a relative `expires_in` to the current time; an oversized
+// duration must saturate at long.max, never wrap the sum negative (which
+// would read as "already expired" to `needsRefresh` and the login deadline).
+unittest
+{
+    import nano.clock : FakeClock, wallNow;
+    auto clock = FakeClock.install(wallNow); // freeze: every `now` read agrees
+    const t = now;
+    assert(expiryAt(60) == t + 60);
+    assert(expiryAt(long.max) == long.max);
+    assert(expiryAt(long.max - t) == long.max);
+    assert(expiryAt(long.max - t - 1) == long.max - 1);
+    // A saturated expiry is never in the past.
+    assert(expiryAt(long.max) >= t);
 }

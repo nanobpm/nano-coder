@@ -399,10 +399,10 @@ private struct Parser
                 // Bytes, not decoded characters: the slice may end inside a multibyte one.
                 if (!s[i .. i + n].representation.all!(b => isHexDigit(b))) fail("bad unicode escape");
                 const code = s[i .. i + n].to!uint(16);
-                if (!isValidDchar(cast(dchar) code)) fail("bad unicode escape: not a Unicode scalar value");
+                if (!isValidDchar(code)) fail("bad unicode escape: not a Unicode scalar value");
                 i += n;
                 char[4] buf;
-                auto len = encode(buf, cast(dchar) code);
+                auto len = encode(buf, dchar(code));
                 out_.put(buf[0 .. len]);
                 break;
             default:

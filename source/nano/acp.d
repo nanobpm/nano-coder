@@ -745,6 +745,12 @@ final class AcpServer : AgentEvents
         sessionId = log.id;
         if (host.loadHooks !is null) agent.useHooks(host.loadHooks(getcwd()), true);
         replayHistory();
+        // As on the CLI resume: drop the full-log parse and the replaced
+        // conversation, then hand the freed heap back to the OS so a
+        // long-lived ACP worker does not keep the load's peak.
+        restored = Restored.init;
+        prior = null;
+        releaseHeap();
     }
 
     /// Replay the conversation as session/update notifications.
@@ -779,7 +785,7 @@ final class AcpServer : AgentEvents
             agent.lastStop = StopReason.endTurn;
         }
         router.endTurn((ref JSONValue[] items, const(size_t)[] marks, string session) {
-            auto stop = cast(string) agent.lastStop;
+            string stop = agent.lastStop;
             if (id.type != JSONType.null_)
             {
                 auto reply = JSONValue(["stopReason": stop, "response": response]);

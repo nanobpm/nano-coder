@@ -7,7 +7,7 @@
 module nano.trajectory;
 
 @safe:
-import nano.safeio : jsonText, jsonPretty;
+import nano.safeio : jsonText, jsonPretty, jsonWholeAsDouble, jsonSigned;
 import nano.arith : saturatingSub;
 
 import std.algorithm : canFind, map, max, sum, filter;
@@ -367,7 +367,7 @@ void appendMessageRows(ref Turn turn, const JSONValue m, ulong line, ref string 
             if (u.type == JSONType.object)
             {
                 r.hasUsage = true;
-                long n(string k) { if (auto p = k in *u) if (p.type == JSONType.integer) return p.integer; return 0; }
+                long n(string k) { long x; if (auto p = k in *u) if (jsonSigned(*p, x)) return x; return 0; }
                 r.promptTokens = n("prompt_tokens");
                 r.completionTokens = n("completion_tokens");
                 r.totalTokens = n("total_tokens");
@@ -378,10 +378,10 @@ void appendMessageRows(ref Turn turn, const JSONValue m, ulong line, ref string 
                         // logged digits with the correctly-rounded strtod.
                         auto lit = rawNumber(rawLine, "aic");
                         r.aic = serdeFloat(lit !is null ? strtodOf(lit)
-                            : a.type == JSONType.float_ ? a.floating : cast(double) a.integer);
+                            : a.type == JSONType.float_ ? a.floating : jsonWholeAsDouble(*a));
                     }
             }
-        if (auto d = "duration_ms" in m) if (d.type == JSONType.integer) r.durationMs = d.integer;
+        if (auto d = "duration_ms" in m) { long x; if (jsonSigned(*d, x)) r.durationMs = x; }
         r.temperature = scalarText(m, "temperature");
         r.thinkingLevel = scalarText(m, "thinking_level");
     }
@@ -1076,4 +1076,38 @@ unittest
     assert(rawNumber(`{"usage":{"aic":1.3876,"x":1}}`, "aic") == "1.3876" && rawNumber("{}", "aic") is null);
     assert(serdeFloat(strtodOf("1.3876")) == "1.3876");
     assert(serdeFloat(123456789.0) == "123456789.0" && serdeFloat(0.00012) == "0.00012");
+}
+
+unittest
+{
+    // A uinteger-tagged aic (JSONValue(2u)) with no raw line must be read, not throw.
+    Turn t;
+    string prev;
+    auto m = parseJSON(`{"role":"assistant","content":"x","usage":{}}`);
+    m["usage"]["aic"] = JSONValue(2u);
+    appendMessageRows(t, m, 1, prev);
+    bool seen;
+    foreach (r; t.rows) if (r.aic !is null) { seen = true; assert(r.aic == "2" || r.aic == "2.0", r.aic); }
+    assert(seen);
+}
+
+unittest
+{
+    // uinteger-tagged usage counts and duration_ms are read, not dropped to 0.
+    Turn t;
+    string prev;
+    auto m = parseJSON(`{"role":"assistant","content":"x","usage":{}}`);
+    m["usage"]["prompt_tokens"] = JSONValue(5u);
+    m["usage"]["completion_tokens"] = JSONValue(6u);
+    m["usage"]["total_tokens"] = JSONValue(11u);
+    m["duration_ms"] = JSONValue(42u);
+    appendMessageRows(t, m, 1, prev);
+    bool seen;
+    foreach (r; t.rows) if (r.hasUsage)
+    {
+        seen = true;
+        assert(r.promptTokens == 5 && r.completionTokens == 6 && r.totalTokens == 11);
+        assert(r.durationMs == 42);
+    }
+    assert(seen);
 }

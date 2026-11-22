@@ -14,9 +14,11 @@
 module nano.memory;
 
 @safe:
-import nano.safeio : jsonText, jsonPretty;
+
+import std.string : representation;
+import nano.safeio : jsonText, jsonPretty, utf8Text, readBytes;
 import nano.clock : monoNow, sleepFor, wallNow;
-import nano.arith : saturatingSub;
+import nano.arith : saturatingSub, toSize;
 
 import nano.safeio : chmodPath, fchmodFd, openPath, statMode, writeFd;
 
@@ -113,8 +115,8 @@ struct Entry
     /// Parse one line; false for anything serde (`deny_unknown_fields`) would reject.
     static bool parse(const(ubyte)[] line, out Entry e)
     {
-        auto text = cast(string) line.idup;
-        try validate(text);
+        string text;
+        try text = utf8Text(line);
         catch (Exception) return false; // an invalid UTF-8 line is skipped (kept verbatim by the caller)
         JSONValue j;
         try j = parseJSON(text);
@@ -174,7 +176,7 @@ string stamp(SysTime t)
     auto mins = t.utcOffset.total!"minutes";
     char sign = mins < 0 ? '-' : '+';
     if (mins < 0) mins = -mins;
-    return format("%04d-%02d-%02dT%02d:%02d:%02d.%06d%s%02d:%02d", t.year, cast(int) t.month, t.day, t.hour,
+    return format("%04d-%02d-%02dT%02d:%02d:%02d.%06d%s%02d:%02d", t.year, int(t.month), t.day, t.hour,
         t.minute, t.second, t.fracSecs.total!"usecs", sign, mins / 60, mins % 60);
 }
 
@@ -207,7 +209,7 @@ final class Store
         // SysTime covers about ±29k years; refuse rather than wrap.
         if (expiryDays > 365UL * 10_000)
             throw new Exception(format("memory expiry_days (%s) is out of range", expiryDays));
-        return wallNow - days(cast(long) expiryDays);
+        return wallNow - days(expiryDays.to!long);
     }
 
     private ScopeFile readScopeFile(Scope s, bool prune)
@@ -216,7 +218,7 @@ final class Store
         ScopeFile f;
         if (!p.exists) return f;
         const(ubyte)[] bytes;
-        try bytes = cast(const(ubyte)[]) read(p);
+        try bytes = readBytes(p);
         catch (Exception e) throw new Exception(format("reading memory scope %s: %s", p, e.msg));
         size_t start = 0;
         foreach (i; 0 .. bytes.length + 1)
@@ -642,11 +644,11 @@ string sanitizeKey(string key) pure
     import std.ascii : isAlphaNum;
     string cleaned;
     foreach (dchar c; key)
-        cleaned ~= (c < 0x80 && (isAlphaNum(cast(char) c) || c == '.' || c == '-' || c == '_')) ? cast(char) c : '-';
+        cleaned ~= (c < 0x80 && (isAlphaNum(c) || c == '.' || c == '-' || c == '_')) ? c : '-';
     while (cleaned.startsWith("-")) cleaned = cleaned[1 .. $];
     while (cleaned.endsWith("-")) cleaned = cleaned[0 .. $ - 1];
     ulong h = 14695981039346656037UL;
-    foreach (ubyte b; cast(const(ubyte)[]) key) { h ^= b; h *= 1099511628211UL; }
+    foreach (ubyte b; key.representation) { h ^= b; h *= 1099511628211UL; }
     auto head = cleaned.length > 80 ? cleaned[0 .. 80] : cleaned;
     return head.length ? format("%s-%016x", head, h) : format("%016x", h);
 }
@@ -720,8 +722,8 @@ void writeAll(string p, const Entry[] entries, const(ubyte[])[] unknown)
     import std.random : uniform;
     createDirAllPrivate(p.dirName);
     auto body_ = appender!(ubyte[]);
-    foreach (e; entries) { body_ ~= cast(const(ubyte)[]) e.toJson; body_ ~= cast(ubyte) '\n'; }
-    foreach (l; unknown) { body_ ~= l; body_ ~= cast(ubyte) '\n'; }
+    foreach (e; entries) { body_ ~= e.toJson.representation; body_ ~= ubyte('\n'); }
+    foreach (l; unknown) { body_ ~= l; body_ ~= ubyte('\n'); }
     auto tmp = format("%s.tmp.%s.%08x", p.setExtension("jsonl"), getpid(), uniform!uint);
     auto fd = openPath(tmp, O_WRONLY | O_CREAT | O_EXCL, octal!600);
     if (fd < 0) throw new Exception("creating " ~ tmp);
@@ -955,7 +957,7 @@ bool containsAnchor(string haystack, string anchor) pure
     {
         auto at = haystack[from .. $].indexOf(anchor);
         if (at < 0) return false;
-        auto i = from + cast(size_t) at;
+        auto i = from + toSize(at);
         auto end = i + anchor.length;
         bool beforeWord, afterWord;
         if (i > 0)
@@ -1098,7 +1100,7 @@ void logRecall(Store store, string event, string id, string tool, string session
         // Keys sorted, as serde_json's `json!` map writes them.
         JSONValue j = ["at": JSONValue(stamp(wallNow)), "event": JSONValue(event), "id": JSONValue(id),
             "session": session !is null ? JSONValue(session) : JSONValue(null), "tool": JSONValue(tool)];
-        auto line = cast(const(ubyte)[]) (j.jsonText(JSONOptions.doNotEscapeSlashes) ~ "\n");
+        auto line = (j.jsonText(JSONOptions.doNotEscapeSlashes) ~ "\n").representation;
         auto fd = openPath(buildPath(store.root, recallLog), O_WRONLY | O_CREAT | O_APPEND, octal!600);
         if (fd < 0) return;
         scope (exit) close(fd);

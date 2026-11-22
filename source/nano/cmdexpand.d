@@ -11,6 +11,10 @@ module nano.cmdexpand;
 
 @safe:
 
+import std.conv : to;
+
+import nano.arith : toLong;
+
 import std.algorithm : canFind, any, all, startsWith, endsWith, map, filter;
 import std.array : join, split, array;
 import std.format : format;
@@ -451,7 +455,7 @@ ptrdiff_t matchingDone(const Simple[] parsed, size_t start) pure
         else if (head == "done" && depth > 0)
         {
             --depth;
-            if (depth == 0) return cast(ptrdiff_t) index;
+            if (depth == 0) return toLong(index);
         }
     }
     return -1;
@@ -748,14 +752,14 @@ bool braceExpand(string text, out string[] result) pure
         long a, b;
         if (parseLong(from, a) && parseLong(to_, b))
         {
-            immutable ulong diff = a <= b ? cast(ulong) b - cast(ulong) a : cast(ulong) a - cast(ulong) b;
+            immutable ulong diff = a <= b ? ulong(b) - ulong(a) : ulong(a) - ulong(b); // two's complement: exact
             if (diff >= maxLoopUnroll) return false;
             // Bash pads only when an endpoint has an explicit leading zero.
             bool padded = (from.length > 1 && from.startsWith("0")) || from.startsWith("-0")
                 || (to_.length > 1 && to_.startsWith("0")) || to_.startsWith("-0");
             auto width = from.length > to_.length ? from.length : to_.length;
             if (step > long.max) step = long.max;
-            immutable long st = cast(long) step;
+            immutable long st = step.to!long;
             long n = a;
             for (;;)
             {
@@ -773,11 +777,11 @@ bool braceExpand(string text, out string[] result) pure
         {
             long ca = from[0], cb = to_[0];
             if ((ca <= cb ? cb - ca : ca - cb) >= maxLoopUnroll) return false;
-            immutable long st = step > long.max ? long.max : cast(long) step;
+            immutable long st = step > long.max ? long.max : step.to!long;
             long c = ca;
             for (;;)
             {
-                items ~= [cast(char) c].idup;
+                items ~= [c.to!char].idup;
                 if (c == cb) break;
                 bool overflow = false;
                 auto next = ca <= cb ? adds(c, st, overflow) : subs(c, st, overflow);

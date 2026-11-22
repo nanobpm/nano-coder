@@ -12,6 +12,16 @@ module nano.control;
 
 @safe:
 
+import std.algorithm : countUntil;
+
+import nano.safeio : lossyText;
+
+import std.conv : to;
+
+import nano.arith : toSize;
+
+import std.string : representation;
+
 import nano.option : NotNull;
 import core.atomic : atomicLoad, atomicStore;
 
@@ -81,10 +91,10 @@ final class TurnControl
     this() shared { state = new shared Locked!State; }
 
     /// The live agent mode; the running turn reads it at each iteration.
-    AgentMode mode() pure shared { return cast(AgentMode) atomicLoad(mode_); }
+    AgentMode mode() pure shared { return atomicLoad(mode_).to!AgentMode; }
 
     /// Change the live mode (from the key reader or a command).
-    void mode(AgentMode m) pure shared { atomicStore(mode_, cast(int) m); }
+    void mode(AgentMode m) pure shared { atomicStore(mode_, int(m)); }
 
     /// Ask the running turn to switch model (`/model` mid-turn).
     void requestModel(string spec) shared { state.update((ref State s) { s.modelRequest = spec; }); }
@@ -140,7 +150,7 @@ final class TurnControl
         import std.array : array;
         return state.update!size_t((ref State s) {
             auto before = s.steers.length;
-            s.steers = s.steers.filter!(m => m.id < 0 || !ids.canFind(cast(size_t) m.id)).array;
+            s.steers = s.steers.filter!(m => m.id < 0 || !ids.canFind(toSize(m.id))).array;
             return before - s.steers.length;
         });
     }
@@ -232,7 +242,7 @@ unittest
 struct FdLineReader
 {
     int fd;
-    private string pending;
+    private ubyte[] pending;
     private bool eof;
 
     /// The next line without its newline; null at end of input.
@@ -242,23 +252,23 @@ struct FdLineReader
         import std.string : indexOf;
         for (;;)
         {
-            auto nl = pending.indexOf('\n');
+            auto nl = pending.countUntil(ubyte('\n'));
             if (nl >= 0)
             {
-                auto line = pending[0 .. nl];
+                auto line = lossyText(pending[0 .. nl]);
                 pending = pending[nl + 1 .. $];
-                return line;
+                return line.length ? line : "";
             }
             if (eof)
             {
                 auto rest = pending;
                 pending = null;
-                return rest.length ? rest : null;
+                return rest.length ? lossyText(rest) : null;
             }
             ubyte[65536] buf;
             auto n = readFd(fd, buf[]);
             if (n <= 0) eof = true;
-            else pending ~= cast(string) buf[0 .. n].idup;
+            else pending ~= buf[0 .. n];
         }
     }
 }
@@ -270,9 +280,28 @@ unittest
     int[2] fds;
     assert(pipeFds(fds) == 0);
     auto data = "a\n\nbc\nlast";
-    writeFd(fds[1], cast(const(ubyte)[]) data);
+    writeFd(fds[1], data.representation);
     close(fds[1]);
     auto r = FdLineReader(fds[0]);
     assert(r.next == "a" && r.next == "" && r.next == "bc" && r.next == "last" && r.next is null);
     close(fds[0]);
+}
+
+unittest
+{
+    // Invalid UTF-8 becomes U+FFFD as the line is read, so the `string`
+    // handed on always decodes.
+    import nano.safeio : closeFd, pipeFds, writeFd;
+    import std.utf : validate;
+    int[2] fds;
+    assert(pipeFds(fds) == 0);
+    ubyte[] data = [0x61, 0xff, 0x0a, 0xe2, 0x82];
+    writeFd(fds[1], data);
+    closeFd(fds[1]);
+    auto r = FdLineReader(fds[0]);
+    assert(r.next == "a\uFFFD");
+    auto last = r.next;
+    validate(last);
+    assert(last == "\uFFFD\uFFFD" && r.next is null);
+    closeFd(fds[0]);
 }

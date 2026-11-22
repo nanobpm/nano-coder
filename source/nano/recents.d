@@ -5,7 +5,10 @@ module nano.recents;
 
 @safe:
 
+import std.conv : to;
+
 import std.json;
+import nano.safeio : jsonUnsigned;
 import std.string : strip;
 import nano.config : ProviderConfig, parseModelSpec;
 
@@ -85,28 +88,31 @@ string defaultPath()
 Recents load(string path) nothrow
 {
     import std.file : readText;
+    try return fromJSON(parseJSON(readText(path)));
+    catch (Exception) return Recents.init; // no recents file, or a corrupt one: start empty
+}
+
+/// Parse a recents document; any malformed shape yields `Recents.init`.
+Recents fromJSON(const JSONValue j)
+{
     Recents r;
-    try
+    if (j.type != JSONType.object) return Recents.init;
+    r.version_ = 0;
+    if (auto v = "version" in j)
     {
-        auto j = parseJSON(readText(path));
-        if (j.type != JSONType.object) return Recents.init;
-        r.version_ = 0;
-        if (auto v = "version" in j)
+        ulong n;
+        if (!jsonUnsigned(*v, n) || n > uint.max) return Recents.init;
+        r.version_ = n.to!uint; // bounded above
+    }
+    if (auto ms = "models" in j)
+    {
+        if (ms.type != JSONType.array) return Recents.init;
+        foreach (m; ms.arrayNoRef)
         {
-            if (v.type != JSONType.integer && v.type != JSONType.uinteger) return Recents.init;
-            r.version_ = cast(uint) v.integer;
-        }
-        if (auto ms = "models" in j)
-        {
-            if (ms.type != JSONType.array) return Recents.init;
-            foreach (m; ms.arrayNoRef)
-            {
-                if (m.type != JSONType.string) return Recents.init;
-                r.models ~= m.str;
-            }
+            if (m.type != JSONType.string) return Recents.init;
+            r.models ~= m.str;
         }
     }
-    catch (Exception) return Recents.init; // no recents file, or a corrupt one: start empty
     if (r.models.length > maxRecents) r.models = r.models[0 .. maxRecents];
     return r;
 }
@@ -249,4 +255,15 @@ unittest
     rmdirRecurse(dir);
     save(path, r);
     assert(load(path) == r);
+}
+
+unittest
+{
+    // A uinteger-tagged version (e.g. JSONValue(1u)) must be read, not throw.
+    JSONValue j = ["models": JSONValue(["a/b"])];
+    j["version"] = JSONValue(1u);
+    auto r = fromJSON(j);
+    assert(r.version_ == 1 && r.models == ["a/b"]);
+    j["version"] = JSONValue(-1);
+    assert(fromJSON(j) == Recents.init);
 }

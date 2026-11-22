@@ -3,9 +3,11 @@
 module nano.tools.bash;
 
 @safe:
+
+import nano.arith : toSize;
 import nano.clock : monoNow, sleepFor, stdTimeNow;
 
-import nano.safeio : killPid;
+import nano.safeio : killPid, readBytes;
 
 import std.json;
 import std.format : format;
@@ -152,9 +154,8 @@ BashResult run(string command, Duration timeout, string cwd = null, const Sandbo
         }
         sleepFor(20.msecs);
     }
-    import std.file : read;
-    r.stdout_ = lossyUtf8(cast(const(ubyte)[]) read(outPath));
-    r.stderr_ = lossyUtf8(cast(const(ubyte)[]) read(errPath));
+    r.stdout_ = lossyUtf8(readBytes(outPath));
+    r.stderr_ = lossyUtf8(readBytes(errPath));
     return r;
 }
 
@@ -174,8 +175,8 @@ string execute(JSONValue args, long defaultTimeout = defaultTimeoutSecs, const S
         throw new ToolError(format(`bash argument "max_output_length" must be between 1 and %s`, maxOutputLimit));
     auto r = run(command, secs.seconds, null, sandbox);
     string text;
-    auto o = truncateOutput(r.stdout_, cast(size_t) limit, "bash-stdout");
-    auto e = truncateOutput(r.stderr_, cast(size_t) limit, "bash-stderr");
+    auto o = truncateOutput(r.stdout_, toSize(limit), "bash-stdout");
+    auto e = truncateOutput(r.stderr_, toSize(limit), "bash-stderr");
     if (o.length) text ~= o;
     if (e.length) text ~= (text.length && text[$ - 1] != '\n' ? "\n" : "") ~ "\nStderr:\n" ~ e;
     if (r.cancelled) text ~= "\n\nError: the turn was cancelled; the command was killed";
@@ -308,8 +309,10 @@ unittest
     string[] beats;
     heartbeatSink = (string line) { beats ~= line; };
     heartbeatInterval = 30.msecs;
-    auto text = execute(parseJSON(`{"command":"sleep 0.1; printf done"}`));
-    assert(beats.length >= 1);
+    // ~300 ms at a 30 ms interval: nominally 9 beats, so a loaded CI runner
+    // (macOS) still yields at least one.
+    auto text = execute(parseJSON(`{"command":"sleep 0.3; printf done"}`));
+    assert(beats.length >= 1, "expected ≥1 heartbeat");
     assert(text.canFind("done") && !text.canFind("still running"), text);
 }
 

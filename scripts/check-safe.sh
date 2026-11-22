@@ -153,6 +153,11 @@ if [ -n "$missing" ]; then
     status=1
 fi
 ratchet "outside *_test.d" "$(find source -name '*.d' ! -name '*_test.d' | xargs grep -hE '^[[:space:]]*@nullable\(' | wc -l | tr -d ' ')" scripts/nullable-mark-budget "\`@nullable\` marks"
+# `cast(` outside unittest blocks, *_test.d and safeio.d (scripts/cast.awk).
+# Text to bytes is `representation`; bytes to text goes through safeio's
+# utf8Text/utf8View/lossyText; JSON numbers through nano.arith's toSize or
+# std.conv's `to`. What's left are class downcasts and arith's own checks.
+ratchet "outside unittests, *_test.d and safeio.d" "$(find source -name '*.d' ! -name '*_test.d' ! -name safeio.d | xargs awk -f scripts/cast.awk | wc -l | tr -d ' ')" scripts/cast-budget "\`cast(\`s"
 # Purity. Functions marked `pure` (outside tests) and pure-core modules (ones
 # starting with `pure:`) may only grow in number: removing `pure` makes a
 # function depend on hidden state, a reviewed choice (lower the floor). Each

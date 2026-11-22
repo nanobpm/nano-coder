@@ -11,6 +11,14 @@
 module nano.session_index;
 
 @safe:
+
+import std.utf : UTFException;
+
+import nano.safeio : lossyText, utf8View;
+
+import nano.arith : toSize, toLong;
+
+import std.string : representation;
 import nano.clock : wallNow;
 
 import std.json;
@@ -20,7 +28,7 @@ import std.format : format;
 import std.string : strip, startsWith, endsWith;
 static import std.string;
 import std.datetime.systime : SysTime, Clock;
-import std.algorithm : sort, any, filter, canFind;
+import std.algorithm : sort, any, filter, canFind, splitter, map;
 import std.array : array, join, split;
 import std.range : walkLength, take;
 import std.conv : to;
@@ -118,15 +126,15 @@ struct Summary
         s.model = opt("model");
         s.createdAt = opt("created_at");
         s.lastUsed = SysTime.fromISOExtString(j["last_used"].str);
-        s.prompts = cast(size_t) j["prompts"].integer;
+        s.prompts = toSize(j["prompts"].integer);
         s.firstPrompt = opt("first_prompt");
         s.firstTellingPrompt = opt("first_telling_prompt");
         s.lastPrompt = opt("last_prompt");
         s.contextPrompt = opt("context_prompt");
         s.title = opt("title");
-        s.logBytes = cast(ulong) j["log_bytes"].integer;
+        s.logBytes = j["log_bytes"].integer.to!ulong;
         if (auto a = "archive_bytes" in j)
-            if (a.type == JSONType.integer && a.integer > 0) s.archiveBytes = cast(ulong) a.integer;
+            if (a.type == JSONType.integer && a.integer > 0) s.archiveBytes = a.integer.to!ulong;
         return s;
     }
 }
@@ -168,12 +176,33 @@ private bool missingTellingPrompt(const ref Summary s) pure
     return false;
 }
 
-/// Committed (newline-terminated) lines of `bytes`.
+/// Committed (newline-terminated) lines of `bytes`: valid UTF-8 lines are
+/// zero-copy views into `bytes`; only a malformed line is copied, with its
+/// invalid bytes replaced by U+FFFD (it then fails to parse where decoded).
 private const(char)[][] committedLines(const(ubyte)[] bytes) pure
 {
     size_t committed = bytes.length;
     while (committed && bytes[committed - 1] != '\n') committed--;
-    return (cast(const(char)[]) bytes[0 .. committed]).split('\n').filter!(l => l.length > 0).array;
+    return bytes[0 .. committed].splitter(ubyte('\n')).filter!(l => l.length > 0).map!(viewOrLossy).array;
+}
+
+/// `l` as a view when valid UTF-8, else a sanitized copy.
+private const(char)[] viewOrLossy(const(ubyte)[] l) pure
+{
+    import std.utf : UTFException;
+    try return utf8View(l);
+    catch (UTFException) return lossyText(l);
+}
+
+unittest
+{
+    import std.string : representation;
+    auto bytes = "ab\ncd\nxy".representation;
+    auto ls = committedLines(bytes);
+    assert(ls == ["ab", "cd"]);
+    assert(&ls[0][0] == cast(const(char)*) &bytes[0], "valid lines are views, not copies");
+    const(ubyte)[] bad = [0x61, 0xff, 0x0a];
+    assert(committedLines(bad) == ["a\uFFFD"]);
 }
 
 /// The input text of a committed log line, or null when it isn't an input record.
@@ -213,7 +242,7 @@ Summary summarize(string path)
     s.logBytes = text.length;
     try validateId(s.id);
     catch (Exception e) throw new Exception(format("session log %s has an invalid id", path));
-    auto lines = committedLines(cast(const(ubyte)[]) text);
+    auto lines = committedLines(text.representation);
     bool ok;
     if (lines.length)
     {
@@ -252,8 +281,18 @@ private ulong sizeOr0(string path)
 /// lines are skipped: the index is only a cache.
 private void mergeLines(const(ubyte)[] bytes, ref Summary[string] map, ref size_t lines, bool strict = false)
 {
-    foreach (raw; (cast(const(char)[]) bytes).split('\n'))
+    foreach (rawBytes; bytes.splitter(ubyte('\n')))
     {
+        const(char)[] raw;
+        try raw = utf8View(rawBytes);
+        catch (UTFException)
+        {
+            // Strict callers (retention) must not guess at titles a corrupt
+            // line hid, exactly like the `Summary.fromJson` catch below.
+            if (strict) throw new Exception("session index has a corrupt line");
+            if (rawBytes.length) lines++;
+            continue; // invalid UTF-8: unreadable
+        }
         auto line = raw.strip;
         if (!line.length) continue;
         lines++;
@@ -304,7 +343,7 @@ private void append(string dir, const Summary[] summaries)
     foreach (ref s; summaries)
     {
         auto line = s.toJson ~ "\n";
-        if (writeFd(fd, cast(const(ubyte)[]) line) != cast(long) line.length) throw new Exception("short write to session index");
+        if (writeFd(fd, line.representation) != toLong(line.length)) throw new Exception("short write to session index");
     }
 }
 
@@ -317,7 +356,7 @@ private void rewrite(string dir, const Summary[string] summaries, ulong since)
     import nano.safeio : readFrom;
     import std.process : thisProcessID;
     Summary[string] merged;
-    foreach (k, v; summaries) merged[k] = cast(Summary) v;
+    foreach (k, v; summaries) merged[k] = v;
     try
     {
         import std.stdio : File;
@@ -798,7 +837,7 @@ unittest
     scope (exit) rmdirRecurse(dir);
     size_t lines;
     assert(load(dir, lines).length == 2);
-    std.file.append(indexPath(dir), cast(const(ubyte)[]) "\xff\xfe not utf8\n");
+    std.file.append(indexPath(dir), "\xff\xfe not utf8\n".representation);
     auto after = load(dir, lines);
     assert(after.length == 2, "the two good lines survive the corrupt one");
     assert(lines == 3, "the corrupt line still counts toward compaction");
@@ -814,7 +853,7 @@ version (unittest) private void rewriteAfter(string dir, const(ubyte)[] prefix)
     auto since = getSize(indexPath(dir));
     auto newer = summarize(buildPath(dir, "b.jsonl"));
     newer.model = "anthropic/claude";
-    std.file.append(indexPath(dir), prefix ~ cast(const(ubyte)[]) (newer.toJson ~ "\n"));
+    std.file.append(indexPath(dir), prefix ~ (newer.toJson ~ "\n").representation);
     rewrite(dir, current, since);
     auto sessions = list(dir);
     assert(sessions.length == 2);
@@ -826,7 +865,7 @@ unittest
 {
     auto dir = twoSessions("corrupt-tail");
     scope (exit) rmdirRecurse(dir);
-    rewriteAfter(dir, cast(const(ubyte)[]) "\xff\xfe not utf8\n");
+    rewriteAfter(dir, "\xff\xfe not utf8\n".representation);
 }
 
 // rust: session_index.rs::rewrite_merges_lines_appended_since_the_read
@@ -896,6 +935,17 @@ unittest
     std.file.append(indexPath(dir), cast(const(ubyte)[]) "{not json\n");
     import std.exception : assertThrown;
     assertThrown(titledIds(dir), "a corrupt index must not read as 'nothing titled'");
+    // Invalid UTF-8 hides titles the same way: strict load must throw on it
+    // too, while a non-strict listing still skips the unreadable line.
+    // Fresh index with only valid lines plus the bad-UTF-8 line, so the
+    // assertion cannot pass merely because of the bad-JSON line above.
+    std.file.remove(indexPath(dir));
+    list(dir);
+    setTitle(titled, "Keep me");
+    assert(titledIds(dir).length == 1, "the rebuilt index loads cleanly");
+    std.file.append(indexPath(dir), cast(const(ubyte)[]) [0xFF, 0xFE, '\n']);
+    assertThrown(titledIds(dir), "invalid UTF-8 must not read as 'nothing titled' either");
+    assert(list(dir).length >= 1, "a non-strict load still skips the bad line");
 }
 
 // Round-8 review fix for issue #205: a titled log that can no longer be

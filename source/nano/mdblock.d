@@ -8,6 +8,8 @@ module nano.mdblock;
 @safe:
 pure:
 
+import std.conv : to;
+
 import nano.option : NotNull, notNull;
 import std.array : appender, join;
 import std.string : strip, stripLeft, stripRight, indexOf;
@@ -81,7 +83,7 @@ private bool atx(string t, out int level, out string content) pure
     size_t n;
     while (n < t.length && t[n] == '#') n++;
     if (n < 1 || n > 6 || (n < t.length && t[n] != ' ' && t[n] != '\t')) return false;
-    level = cast(int) n;
+    level = n.to!int; // at most 6: checked above
     auto c = t[n .. $].strip;
     // An optional closing run of #s, preceded by a space.
     size_t k = c.length;

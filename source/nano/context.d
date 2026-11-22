@@ -4,7 +4,7 @@ module nano.context;
 @safe:
 pure:
 import nano.safeio : jsonText, jsonPretty;
-import nano.arith : checkedSub, saturatingSub;
+import nano.arith : checkedSub, saturatingSub, toLong, toSize;
 
 import std.algorithm : canFind, min, max;
 import std.array : join;
@@ -35,7 +35,7 @@ long summaryOutputBudget(size_t window, long configured) pure
 {
     configured = max(configured, 1L);
     auto floor = min(summaryMaxTokens, configured);
-    return max(min(configured, summaryMaxTokens + summaryReasoningAllowance, cast(long)(window / 4)), floor);
+    return max(min(configured, summaryMaxTokens + summaryReasoningAllowance, toLong(window / 4)), floor);
 }
 
 enum string summaryTruncatedNote = "\n\n[This summary was cut off at the output limit, so its end is missing. "
@@ -131,8 +131,8 @@ size_t messageTokens(const ref Message m) pure
 size_t imageTokens(const ref imported!"nano.attachment".Attachment a) pure
 {
     import nano.attachment : MAX_DIMENSION;
-    enum size_t max = (cast(size_t) MAX_DIMENSION * MAX_DIMENSION + 749) / 750;
-    auto e = (cast(size_t) a.width * a.height + 749) / 750;
+    enum size_t max = (size_t(MAX_DIMENSION) * MAX_DIMENSION + 749) / 750;
+    auto e = (size_t(a.width) * a.height + 749) / 750;
     return e < 1 ? 1 : e > max ? max : e;
 }
 
@@ -392,23 +392,24 @@ string clipToolResult(string text, size_t maxChars) pure
     enum long gap = 2; // "…\n" for every gap after the first
     auto n = lines.length;
     auto lens = new size_t[n];
+    immutable long cap = toLong(maxChars);
     foreach (i, l; lines) lens[i] = l.length;
     auto kept = new bool[n];
     auto clipped = new string[n];
     auto hasClip = new bool[n];
-    size_t used = markerLen; // nothing kept: one gap, rendered as the full marker
+    long used = toLong(markerLen); // nothing kept: one gap, rendered as the full marker
     long cost(size_t i, size_t len)
     {
         bool left = i > 0 && !kept[i - 1];
         bool right = i + 1 < n && !kept[i + 1];
-        return cast(long) len + (cast(long) left + cast(long) right - 1) * gap;
+        return toLong(len) + (long(left) + right - 1) * gap;
     }
     bool tryKeep(size_t i)
     {
         if (kept[i]) return true;
         auto c = cost(i, lens[i]);
-        if (cast(long) used + c > cast(long) maxChars) return false;
-        used = cast(size_t)(cast(long) used + c);
+        if (used + c > cap) return false;
+        used += c;
         kept[i] = true;
         return true;
     }
@@ -429,10 +430,10 @@ string clipToolResult(string text, size_t maxChars) pure
     size_t endsNl(size_t i) { return lines[i].length && lines[i][$ - 1] == '\n' ? 1 : 0; }
     void admitClipped(size_t i, string s, long base)
     {
-        auto l = cast(long) s.toUTF32.length;
-        if (cast(long) used + base + l <= cast(long) maxChars)
+        auto l = toLong(s.toUTF32.length);
+        if (used + base + l <= cap)
         {
-            used = cast(size_t)(cast(long) used + base + l);
+            used += base + l;
             kept[i] = true;
             clipped[i] = s;
             hasClip[i] = true;
@@ -441,7 +442,7 @@ string clipToolResult(string text, size_t maxChars) pure
     if (headEnd == 0 && n > 1 && floor > 8 && !isErrorLine(bare(0)))
     {
         auto base = cost(0, 0);
-        auto room = min(floor, cast(size_t) max(0L, cast(long) maxChars - cast(long) used - base));
+        auto room = min(floor, toSize(max(0L, cap - used - base)));
         if (room > 8)
         {
             admitClipped(0, excerpt(bareD(0), checkedSub(room, 2), false) ~ (endsNl(0) ? "\n" : ""), base);
@@ -452,7 +453,7 @@ string clipToolResult(string text, size_t maxChars) pure
     {
         auto i = n - 1;
         auto base = cost(i, 0);
-        auto room = min(floor, cast(size_t) max(0L, cast(long) maxChars - cast(long) used - base));
+        auto room = min(floor, toSize(max(0L, cap - used - base)));
         if (room > 8)
         {
             auto nl = endsNl(i);
@@ -471,7 +472,7 @@ string clipToolResult(string text, size_t maxChars) pure
         if (!pinned.length)
         {
             auto base = cost(i, 0);
-            auto room = cast(size_t) max(0L, cast(long) maxChars - cast(long) used - base - 1);
+            auto room = toSize(max(0L, cap - used - base - 1));
             admitClipped(i, clip(bare(i), room) ~ "\n", base);
             if (kept[i]) pinned ~= i;
         }
@@ -487,11 +488,11 @@ string clipToolResult(string text, size_t maxChars) pure
             if (!kept[j] && !isErrorLine(bare(j))) tryKeep(j);
     }
     // 4. Grow the head (2/3 of what is left) then the tail, then the head again.
-    auto spare = checkedSub(maxChars, used);
-    auto headTarget = used + spare * 2 / 3;
+    auto spare = checkedSub(maxChars, toSize(used));
+    auto headTarget = used + toLong(spare * 2 / 3);
     while (headEnd < n && !kept[headEnd])
     {
-        if (cast(long) used + cost(headEnd, lens[headEnd]) > cast(long) headTarget) break;
+        if (used + cost(headEnd, lens[headEnd]) > headTarget) break;
         tryKeep(headEnd);
         ++headEnd;
     }
