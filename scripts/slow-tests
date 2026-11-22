@@ -3,7 +3,8 @@
 # limit is 1000 ms). A module is listed only when its tests must wait on real
 # processes, sockets or timeouts; say why. Shorten the waits before raising a
 # limit: make the timeout or grace period a parameter, or use nano.clock's
-# FakeClock. NANO_TEST_BUDGET_SCALE multiplies every limit (slow machines).
+# FakeClock. NANO_TEST_BUDGET_SCALE multiplies every limit (slow machines); a
+# loaded host scales them too, up to 3x (calibrate in testenv_test.d).
 nano.claude_hooks 4000 real hook processes run into their timeouts
 nano.providers.openai_test 3000 a stream must outlast the 1 s idle timeout
 nano.http 3000 real sockets: refused, stalled and redirected connections
