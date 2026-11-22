@@ -18,7 +18,44 @@ shared static this()
 {
     import std.process : environment;
     foreach (name; gitLocalEnvVars) environment.remove(name);
+    privateTempDir();
     installRunner();
+}
+
+/// Point TMPDIR (and so `std.file.tempDir`, and every child process) at a
+/// directory of this process's own: tests name their scratch directories by
+/// purpose (`nano-d-mem-index`), so two test runs at once (two worktrees, or
+/// ci.sh while a pre-push hook runs) would otherwise delete and overwrite
+/// each other's files (issue #253).
+private void privateTempDir()
+{
+    import std.file : mkdirRecurse;
+    import std.path : buildPath;
+    import std.process : environment;
+    auto base = environment.get("TMPDIR", "/tmp");
+    const ownTemp = buildPath(base, ownTempName);
+    mkdirRecurse(ownTemp);
+    environment["TMPDIR"] = ownTemp;
+}
+
+/// The name of this process's temp directory.
+private string ownTempName()
+{
+    import std.conv : to;
+    import std.process : thisProcessID;
+    return "nano-test-" ~ thisProcessID.to!string;
+}
+
+/// Remove the directory `privateTempDir` made (TMPDIR still names it).
+private void removeTempDir()
+{
+    import std.file : exists, rmdirRecurse;
+    import std.path : baseName;
+    import std.process : environment;
+    const ownTemp = environment.get("TMPDIR");
+    if (ownTemp is null || ownTemp.baseName != ownTempName || !ownTemp.exists) return;
+    try rmdirRecurse(ownTemp);
+    catch (Exception) {} // best effort: a leftover temp dir fails nothing
 }
 
 // @trusted: Runtime's unittest hook is a plain (@system) global setter, set
@@ -35,6 +72,8 @@ struct ModuleRun
     string name;
     long msecs;
     bool passed;
+    /// Why it failed (the thrown error, or the time limit); null when it passed.
+    string reason;
 }
 
 /// A module's unittest function, as druntime lists it.
@@ -42,6 +81,13 @@ struct TestEntry
 {
     string name;
     void function() run;
+}
+
+/// The last dotted component: `core.exception.AssertError` -> `AssertError`.
+private string findLastDot(string s) pure nothrow @nogc
+{
+    foreach_reverse (i, c; s) if (c == '.') return s[i + 1 .. $];
+    return s;
 }
 
 /// Runs every module's unittests, like druntime's default runner, timing each
@@ -88,8 +134,6 @@ UnitTestResult runModuleTests() @trusted
     while (results.take(r)) runs ~= r;
     const scaleText = environment.get("NANO_TEST_BUDGET_SCALE");
     checkBudgets(runs, scaleText.length ? scaleText.to!double : 1.0, true, startLoad);
-    size_t passed;
-    foreach (x; runs) if (x.passed) passed++;
     auto top = environment.get("NANO_TEST_TIMES");
     if (top.length)
     {
@@ -100,7 +144,35 @@ UnitTestResult runModuleTests() @trusted
         foreach (x; runs[0 .. $ < top.to!size_t ? $ : top.to!size_t])
             stdErr.writefln("%7s ms  %s", x.msecs, x.name);
     }
-    return UnitTestResult(runs.length, passed, false, true);
+    // Our own summary, last: druntime's names no module, and the reasons are
+    // otherwise far above in the output.
+    stdErr.writeln(summary(runs));
+    removeTempDir();
+    size_t passed;
+    foreach (x; runs) if (x.passed) passed++;
+    return UnitTestResult(runs.length, passed, false, false);
+}
+
+/// The final line: how many modules passed, or which failed and why, e.g.
+/// `1/107 modules FAILED unittests: nano.memory_test (time limit 2330/2250 ms)`.
+string summary(const ModuleRun[] runs)
+{
+    import std.algorithm : filter, map, sort;
+    import std.array : array, join;
+    import std.format : format;
+    ModuleRun[] failed = runs.filter!(r => !r.passed).map!(r => ModuleRun(r.name, r.msecs, r.passed, r.reason)).array;
+    if (!failed.length) return format("%s modules passed unittests", runs.length);
+    failed.sort!((a, b) => a.name < b.name);
+    return format("%s/%s modules FAILED unittests: %s", failed.length, runs.length,
+        failed.map!(r => r.reason.length ? format("%s (%s)", r.name, r.reason) : r.name).join(", "));
+}
+
+unittest
+{
+    assert(summary([ModuleRun("a", 1, true)]) == "1 modules passed unittests");
+    assert(summary([ModuleRun("b", 2330, false, "time limit 2330/2250 ms"), ModuleRun("a", 1, true),
+            ModuleRun("a2", 1, false, "AssertError at x.d(3)")])
+        == "2/3 modules FAILED unittests: a2 (AssertError at x.d(3)), b (time limit 2330/2250 ms)");
 }
 
 /// Run modules from `queue` until it is empty, reporting each to `results`.
@@ -120,13 +192,16 @@ void runQueue(immutable(TestEntry)[] all, imported!"nano.safeio".Chan!size_t que
         scope (exit) if (trace) stdErr.writefln("test end %s", all[i].name);
         const start = monoNow;
         bool ok = true;
+        string reason;
         try all[i].run();
         catch (Throwable t) // a failed assert is an Error: report it like druntime and run the rest
         {
+            import std.format : format;
             ok = false;
             stdErr.writeln(t.toString);
+            reason = format("%s at %s(%s)", typeid(t).name.findLastDot, t.file, t.line);
         }
-        results.put(ModuleRun(all[i].name, since(start).total!"msecs", ok));
+        results.put(ModuleRun(all[i].name, since(start).total!"msecs", ok, reason));
     }
 }
 
@@ -171,6 +246,9 @@ void checkBudgets(ModuleRun[] runs, double scale, bool report = true, long start
         const limit = cast(long)(base * load);
         if (r.msecs <= limit) continue;
         r.passed = false;
+        import std.format : format;
+        const why = format("time limit %s/%s ms", r.msecs, limit);
+        r.reason = r.reason.length ? r.reason ~ "; " ~ why : why;
         if (report) stdErr.writefln("%s: unit tests took %s ms, over the %s ms limit (%s); shorten the waits "
             ~ "(timeout/grace parameters, nano.clock.FakeClock) or raise the limit with a reason",
             r.name, r.msecs, limit, file);
@@ -185,6 +263,7 @@ unittest // a module over its limit fails; listed modules get theirs
     if (!"scripts/slow-tests".exists) return;
     checkBudgets(runs, 1.0, false, 0, () => 0L);
     assert(!runs[0].passed && runs[1].passed);
+    assert(runs[0].reason == "time limit 1001/1000 ms", runs[0].reason);
 }
 
 /// What `calibrate` takes on an idle development machine (M-series Mac), in

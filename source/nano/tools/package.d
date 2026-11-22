@@ -94,6 +94,13 @@ class ToolRegistry
 {
     private ToolDefinition[string] defs;
     private ToolHandler[string] handlers;
+    private Object[string] richHandlers;
+
+    private static final class RichHandler(T)
+    {
+        T handler;
+        this(T h) pure { handler = h; }
+    }
     private Concurrency[string] modes;
 
     void register(ToolDefinition def, ToolHandler handler, Concurrency mode = Concurrency.init) pure
@@ -102,6 +109,25 @@ class ToolRegistry
         handlers[def.name] = handler;
         if (mode.readOnly) modes[def.name] = mode;
         else modes.remove(def.name);
+    }
+
+    /// Register an additional, richer-shaped handler for `name` (e.g.
+    /// apply_patch's PatchHandler), retrievable via `handlerAs`. It is kept
+    /// in its own map, so the plain ToolHandler used by `execute` is never
+    /// replaced or reinterpreted.
+    void registerHandler(T)(string name, T handler) pure
+    {
+        richHandlers[name] = new RichHandler!T(handler);
+    }
+
+    /// The richer handler registered for `name` with exactly the shape `T`,
+    /// or null when none was (a type-checked downcast, never a reinterpret).
+    T handlerAs(T)(string name)
+    {
+        auto h = name in richHandlers;
+        if (h is null) return null;
+        auto boxed = cast(RichHandler!T) *h;
+        return boxed is null ? null : boxed.handler;
     }
 
     bool has(string name) pure const { return (name in defs) !is null; }
@@ -130,6 +156,18 @@ class ToolRegistry
         if (h is null) throw new ToolError(format("Tool '%s' not found", name));
         return (*h)(args);
     }
+}
+
+unittest
+{
+    alias Rich = string delegate(JSONValue, int) @safe;
+    auto r = new ToolRegistry;
+    r.register(ToolDefinition("t", "d", JSONValue.init), (JSONValue a) => "plain");
+    assert(r.handlerAs!Rich("t") is null);
+    r.registerHandler!Rich("t", delegate(JSONValue a, int n) @safe => "rich");
+    assert(r.execute("t", JSONValue.init) == "plain"); // execute keeps the plain shape
+    assert(r.handlerAs!Rich("t")(JSONValue.init, 1) == "rich");
+    assert(r.handlerAs!(string delegate(JSONValue, string))("t") is null); // wrong shape
 }
 
 // ---------------------------------------------------------------------------
