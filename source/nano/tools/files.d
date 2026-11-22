@@ -1043,6 +1043,9 @@ private struct Staged
     bool changed;
     string after; /// the content after the patch, when present and changed
     size_t movedFrom = size_t.max; /// index of the move's source (max: none)
+    uint mode; /// permission bits to write with (from disk, or the move's source)
+    bool hasMode; /// whether `mode` is known
+    bool binary; /// `after` holds raw bytes carried through a pure rename
 }
 
 /// `path` relative to the working directory when inside it.
@@ -1085,7 +1088,11 @@ private void commitStaged(Staged[] staged, ReadState state)
             if (!s.changed) continue;
             try
             {
-                if (s.existed) write(writeTarget(s.path), s.before);
+                if (s.existed)
+            {
+                write(writeTarget(s.path), s.before);
+                if (s.hasMode) chmodPath(writeTarget(s.path), s.mode);
+            }
                 else if (linkPresent(s.path)) remove(s.path);
             }
             catch (FileException) {} // rollback is best effort: the error that triggered it is reported
@@ -1110,7 +1117,8 @@ private void commitStaged(Staged[] staged, ReadState state)
         {
             write(tmp, s.after);
             uint mode;
-            if (statMode(path, mode)) chmodPath(tmp, mode & octal!7777);
+            if (s.hasMode) chmodPath(tmp, s.mode);
+            else if (statMode(path, mode)) chmodPath(tmp, mode & octal!7777);
             rename(tmp, path);
         }
         catch (FileException e)
@@ -1152,6 +1160,8 @@ string applyPatch(JSONValue args, ReadState state)
                         ~ "read it again before patching it", s.display));
             s.existed = s.present = true;
             s.before = bytes;
+            uint mode;
+            if (statMode(path, mode)) { s.mode = mode & octal!7777; s.hasMode = true; }
         }
         index[path] = staged.length;
         staged ~= s;
@@ -1184,7 +1194,10 @@ string applyPatch(JSONValue args, ReadState state)
         case PatchKind.update:
             if (!staged[k].present)
                 throw new ToolError(format("apply_patch: Update File %s: it does not exist; use Add File to create it", staged[k].display));
-            auto updated = applyHunks(staged[k].changed ? staged[k].after : original(k), fp.hunks, notes, staged[k].display);
+            // A pure rename carries the bytes through untouched, so a binary file moves too.
+            immutable rawMove = fp.moveTo !is null && fp.hunks.length == 0 && !staged[k].changed;
+            auto updated = rawMove ? ownText(staged[k].before.dup)
+                : applyHunks(staged[k].changed ? staged[k].after : original(k), fp.hunks, notes, staged[k].display);
             if (fp.moveTo is null)
             {
                 staged[k].after = updated;
@@ -1201,6 +1214,14 @@ string applyPatch(JSONValue args, ReadState state)
             staged[d].present = staged[d].changed = true;
             staged[d].after = updated;
             staged[d].movedFrom = k;
+            staged[d].mode = staged[k].mode;
+            staged[d].hasMode = staged[k].hasMode;
+            if (rawMove)
+            {
+                import std.utf : validate, UTFException;
+                try validate(updated);
+                catch (UTFException) staged[d].binary = true;
+            }
             break;
         }
     }
@@ -1218,8 +1239,13 @@ string applyPatch(JSONValue args, ReadState state)
         if (s.present && s.movedFrom != size_t.max)
         {
             auto src = staged[s.movedFrom].display;
-            auto before = staged[s.movedFrom].existed ? original(s.movedFrom) : "";
             summary ~= format("  R %s -> %s\n", src, s.display);
+            if (s.binary)
+            {
+                diff ~= format("--- a/%s\n+++ b/%s\n(binary; renamed)\n", src, s.display);
+                continue;
+            }
+            auto before = staged[s.movedFrom].existed ? original(s.movedFrom) : "";
             auto d = unifiedDiff("a/" ~ src, "b/" ~ s.display, before, s.after);
             diff ~= d.count('\n') > 2 ? d : d ~ "(renamed; content unchanged)\n";
         }
@@ -1960,6 +1986,25 @@ unittest // atomic: one failing hunk or file writes nothing; dry run writes noth
     write(a, "changed\n");
     assert(patchErr(st, pt("*** Update File: " ~ a, "@@", "-changed", "+x")).indexOf("changed since it was last read") >= 0);
     assert(readText(a) == "changed\n");
+}
+
+unittest // a move keeps the source's permission bits and carries binary bytes through
+{
+    import std.file : getAttributes, setAttributes;
+    auto st = new ReadState;
+    auto src = tmpFile("p-mv-exec.sh", "#!/bin/sh\n");
+    auto dst = tmpFile("p-mv-exec2.sh", null);
+    setAttributes(src, octal!755);
+    applyPatch(j("patch", pt("*** Move File: " ~ src ~ " -> " ~ dst)), st);
+    assert(!src.exists && (getAttributes(dst) & octal!777) == octal!755);
+    auto bin = tmpFile("p-mv-bin.dat", null);
+    auto bin2 = tmpFile("p-mv-bin2.dat", null);
+    std.file.write(bin, cast(const(ubyte)[])[0xff, 0xfe, 0x00, 0x80]);
+    auto out_ = applyPatch(j("patch", pt("*** Move File: " ~ bin ~ " -> " ~ bin2)), st);
+    assert(!bin.exists && readBytes(bin2) == cast(const(ubyte)[])[0xff, 0xfe, 0x00, 0x80]);
+    assert(out_.indexOf("(binary; renamed)") >= 0);
+    remove(dst);
+    remove(bin2);
 }
 
 unittest // the unified diff
