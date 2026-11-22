@@ -1536,7 +1536,7 @@ version (OSX) unittest
     {
         Hook h;
         h.event = Event.userPromptSubmit;
-        h.command = format("echo x > %s/%s; echo x > inside-%s; exit 0", outside, file, file);
+        h.command = format("echo x > '%s/%s'; echo x > inside-%s; exit 0", outside, file, file); // quoted: the checkout path may hold spaces
         h.timeout = 10.seconds;
         h.source = src;
         return h;
