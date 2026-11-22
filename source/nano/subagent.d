@@ -357,6 +357,9 @@ private final class ChildEvents : imported!"nano.agent".AgentEvents
         checkLimits();
         if (limitHit !is null && gensSinceLimit == 0) steerReportReminder();
     }
+
+    /// A child's own progress is reported through its channel, not rendered.
+    void subagents(const(SubProgress)[] all) {}
 }
 
 /// The text of the child's latest assistant reply, for a partial report.
@@ -553,17 +556,6 @@ struct SubProgress
     bool done;
     /// When done: the result.
     bool truncated;
-}
-
-/// Renderers that show sub-agent progress mix this in alongside
-/// `AgentEvents` and override `subagents` (the loop checks with
-/// `__traits(hasMember, …, "subagents")`, so an events class without the
-/// mixin simply never gets the calls).
-mixin template SubAgentEvents()
-{
-    /// Every running sub-agent's state after a change; `done` ones are listed
-    /// once, as they finish. The mixed-in default ignores them.
-    void subagents(const imported!"nano.subagent".SubProgress[] all) {}
 }
 
 /// One line of progress for a sub-agent (task, tool calls, tokens, elapsed).

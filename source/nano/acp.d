@@ -352,7 +352,7 @@ private void writeStdoutLine(string l)
 
 final class AcpServer : AgentEvents
 {
-    mixin imported!"nano.subagent".SubAgentEvents;
+    mixin AgentEventDefaults;
     private NotNull!Agent agent;
     private Host host;
     private void delegate(string line) writeLine_;

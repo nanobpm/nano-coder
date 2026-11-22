@@ -74,6 +74,25 @@ interface AgentEvents
     /// A model call (one generation) is about to start: a rate shown for
     /// the previous one is stale from here on.
     void generationStart();
+    /// A fresh model call is about to be prepared, before its steers drain
+    /// and its request is built. A sub-agent's limit check runs here, so a
+    /// limit first seen now still gets its report reminder into the grace
+    /// request (nano.subagent.ChildEvents). Events classes that don't
+    /// care mix in `AgentEventDefaults` for a no-op.
+    void beforeFreshCall();
+    /// Every running sub-agent's state after a change; `done` ones are
+    /// listed once, as they finish. Renderers that show progress override
+    /// this; events classes that don't care mix in `AgentEventDefaults`.
+    void subagents(const(SubProgress)[] all);
+}
+
+/// No-op defaults for the `AgentEvents` members an events class need not
+/// care about (a D interface can't give a virtual method a body). Mix in
+/// and override what you render.
+mixin template AgentEventDefaults()
+{
+    void beforeFreshCall() {}
+    void subagents(const imported!"nano.subagent".SubProgress[] all) {}
 }
 
 /// Wrap text the model should read as a system note, not user words.
@@ -678,7 +697,7 @@ class Agent
                             // A sub-agent's limit check runs before its
                             // steers drain, so the report reminder reaches
                             // the grace request (nano.subagent.ChildEvents).
-                            static if (__traits(hasMember, AgentEvents, "beforeFreshCall")) ev.beforeFreshCall();
+                            ev.beforeFreshCall();
                             if (!prepareCall(ev)) { done = true; answer = cancelled(ev); return; }
                             swStart = monoNow;
                         }
@@ -1898,10 +1917,7 @@ class Agent
         }
         if (all.length)
             foreach (e; subEvents)
-            {
-                // Renderers that show progress mix in SubAgentEvents.
-                static if (__traits(hasMember, AgentEvents, "subagents")) e.subagents(all);
-            }
+                e.subagents(all);
     }
 
     /// The checks before a tool runs: known tool, plan mode, the permission
@@ -2497,6 +2513,7 @@ version (unittest)
 
     class NullEvents : AgentEvents
     {
+        mixin AgentEventDefaults;
         string shown;
         string[] tools;
         void text(bool r, string s) pure { if (!r) shown ~= s; }
@@ -2510,6 +2527,18 @@ version (unittest)
         void responseRestarted() pure { restarts++; }
         size_t generations;
         void generationStart() pure { generations++; }
+    }
+
+    // The interface defaults cover the events a renderer need not care
+    // about: NullEvents never mentions `subagents` or `beforeFreshCall`,
+    // yet compiles and runs a turn (the agent calls both unconditionally).
+    unittest
+    {
+        import nano.providers.mock;
+        auto reg = new ToolRegistry;
+        auto mock = new MockClient([LLMResponse("ok")]);
+        auto agent = new Agent(mock, reg, Policy.init, "sys");
+        assert(agent.run("go", new NullEvents) == "ok");
     }
 }
 

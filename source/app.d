@@ -1226,7 +1226,7 @@ struct ConsoleLink
 
 class Console : AgentEvents
 {
-    mixin imported!"nano.subagent".SubAgentEvents;
+    mixin AgentEventDefaults;
     immutable bool color, tty;
     /// The shared line state; hand `link` to other threads.
     ConsoleLink link;
