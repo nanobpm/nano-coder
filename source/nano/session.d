@@ -676,6 +676,11 @@ class SessionLog
                     next.rawWrite(withHeaderId(ours, rid));
                     syncLog(next, target);
                 }
+                // An in-place rewrite of the same inode (a writer that
+                // ignores flock) is invisible to `sameFile`: adopt the
+                // candidate only if it holds exactly our records under the
+                // recovery header, else close it and try the next name.
+                if (readAll(next) != withHeaderId(ours, rid)) { next.close(); continue; }
                 // Revalidate after the write+sync, before adopting: if another
                 // process replaced `target` meanwhile, `next` is now an
                 // unlinked inode and adopting it would send this session's
@@ -707,7 +712,10 @@ class SessionLog
         else
         {
             import nano.safeio : stdErr;
-            stdErr.writeln("\n", msg);
+            import std.exception : collectException;
+            // Best-effort diagnostic: a closed or unwritable stderr must not
+            // abort the caller's pending write after a successful recovery.
+            if (collectException(stdErr.writeln("\n", msg)) !is null) {}
         }
     }
 
@@ -2740,5 +2748,36 @@ unittest
     assert(rec == buildPath(dir, stem ~ ".recovered-3.jsonl"), rec);
     auto now = readText(rec);
     assert(now.canFind("sigma") && now.canFind("tau"), now);
+    restore(rec);
+}
+
+// An in-place rewrite of the recovery candidate (same inode, so `sameFile`
+// still matches) must not be adopted: recovery verifies the bytes.
+unittest
+{
+    import std.algorithm : canFind;
+    import std.array : replicate;
+    auto dir = buildPath(tempDir, format("nano-coder-recinplace-%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/x");
+    log.warn = (string) {};
+    log.input("i1", "sigma");
+    auto p = log.path;
+    auto stem = recoveryStem(log.id);
+    remove(p);
+    std.file.write(p, "{\"type\":\"session\",\"data\":{}}\n");
+    auto first = buildPath(dir, stem ~ ".recovered-1.jsonl");
+    log.swapAfterCreate = (string created) {
+        // Same inode: truncate-and-write, longer than our records.
+        if (created == first)
+            std.file.write(created, "{\"type\":\"session\",\"data\":{\"id\":\"foreign\"}}\n" ~ "x".replicate(8192) ~ "\n");
+    };
+    log.input("i2", "tau");
+    auto rec = log.path;
+    log.close();
+    assert(rec == buildPath(dir, stem ~ ".recovered-2.jsonl"), rec);
+    auto now = readText(rec);
+    assert(now.canFind("sigma") && now.canFind("tau") && !now.canFind("foreign"), now);
     restore(rec);
 }
