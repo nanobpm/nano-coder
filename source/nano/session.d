@@ -307,6 +307,8 @@ JSONValue messageRecord(const ref Message m) pure
     if (m.autoInitiated) j["auto_initiated"] = true;
     if (m.continuation) j["continuation"] = true;
     if (m.timer) j["timer"] = true;
+    if (m.stopBlocked) j["stop_blocked"] = true;
+    if (m.steered) j["steered"] = true;
     if (m.hookContext) j["hook_context"] = true;
     if (m.pinText.length) j["pin_text"] = m.pinText;
     return j;
@@ -370,6 +372,8 @@ Message messageFromRecord(JSONValue j) pure
         case "thinking_level": if (v.type == JSONType.string) m.thinkingLevel = v.str; break;
         case "log_line": if (v.type == JSONType.integer) m.logLine = v.integer; break; // direct records: the physical line wins
         case "auto_initiated": m.autoInitiated = v.type == JSONType.true_; break;
+        case "stop_blocked": m.stopBlocked = v.type == JSONType.true_; break;
+        case "steered": m.steered = v.type == JSONType.true_; break;
         case "hook_context": m.hookContext = v.type == JSONType.true_; break;
         case "pin_text": if (v.type == JSONType.string) m.pinText = v.str; break;
         // Sub-kinds of an automatic turn.
@@ -1572,10 +1576,16 @@ unittest
     hook.hookContext = true;
     auto p = Message.user("goal\n\n<system-reminder>x</system-reminder>");
     p.pinText = "goal";
-    log.replace([Message.auto_("note"), hook], 1, 2, "standard", "m", [p]);
+    auto sb = Message.auto_("<system-reminder>no</system-reminder>");
+    sb.stopBlocked = true;
+    auto st = Message.user("steer");
+    st.steered = true;
+    log.replace([Message.auto_("note"), hook, sb, st], 1, 2, "standard", "m", [p]);
     auto r = restore(log.path);
     assert(r.pinStash.length == 1 && r.pinStash[0].pinText == "goal");
-    assert(r.conversation[0].autoInitiated && r.conversation[1].hookContext);
+    assert(r.conversation[0].autoInitiated && r.conversation[1].hookContext
+        && r.conversation[2].stopBlocked && !r.conversation[0].stopBlocked
+        && r.conversation[3].steered && !r.conversation[2].steered);
     log.replace([Message.user("x")]);
     assert(restore(log.path).pinStash.length == 0, "a plain replace clears the stash");
     // A compaction that folds no new request still logs its base, so the

@@ -78,6 +78,22 @@ string wrapReminder(string text) pure nothrow
     return "<system-reminder>\n" ~ text ~ "\n</system-reminder>";
 }
 
+/// The text a `wrapReminder` note wraps, or null when `content` is not one.
+/// Replay shows a Stop hook's rejection reason as the user message it
+/// printed live, so it needs the reason back out of the wrapper.
+string unwrapReminder(string content) pure nothrow
+{
+    import std.string : startsWith, endsWith;
+    enum pre = "<system-reminder>\n", post = "\n</system-reminder>";
+    if (!content.startsWith(pre) || !content.endsWith(post)) return null;
+    // Both delimiters must fit without overlapping: a malformed wrapper like
+    // "<system-reminder>\n</system-reminder>" passes both checks yet shares
+    // the newline, and slicing [pre.length .. $ - post.length] would invert
+    // the bounds. Not a wrapper: fall back to the raw content.
+    if (content.length < pre.length + post.length) return null;
+    return content[pre.length .. $ - post.length];
+}
+
 
 /// A `report_outcome` call the agent rejects: `Outcome.fromArgs`'s error, or
 /// the verify reminder. Its message is the tool result for the model.
@@ -689,7 +705,9 @@ class Agent
                     },
                     (StopBlocked b) {
                         hasReported = false;
-                        push(Message.auto_(wrapReminder(b.reason)));
+                        auto rej = Message.auto_(wrapReminder(b.reason));
+                        rej.stopBlocked = true;
+                        push(rej);
                         ev.userMessage(b.reason);
                     },
                     (RunTools _) { next ~= runToolCalls(r, ev, loopStop); },
@@ -725,7 +743,9 @@ class Agent
     {
         foreach (s; control.takePending)
         {
-            push(Message.user(s.text));
+            auto sm = Message.user(s.text);
+            sm.steered = true;
+            push(sm);
             ev.userMessage(s.text);
             control.absorbed(s);
         }
