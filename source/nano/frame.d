@@ -1117,12 +1117,16 @@ struct Transcript
             if (bytesHeld() <= byteCap) return;
         }
         // Ordinary output: no fold is left to collapse, so the oldest lines
-        // go. A fold the cut runs through goes whole, with its metadata, so
+        // go, down to the low-water mark. A fold the cut runs through goes whole, with its metadata, so
         // no collapsed remnant is left that can't be expanded.
         if (lines.length)
         {
+            // Prune to a low-water mark (3/4 of the cap), as the line cap
+            // does, so the copy below is amortised over many lines instead
+            // of repeating for every new line once full (issue #248 review).
+            immutable lowWater = byteCap - byteCap / 4;
             size_t drop;
-            while (drop < lines.length && bytesHeld() > byteCap)
+            while (drop < lines.length && bytesHeld() > lowWater)
                 heldBytes = saturatingSub(heldBytes, lineCost(lines[drop++]));
             if (drop)
             {
@@ -2296,4 +2300,26 @@ unittest
     foreach (i; 0 .. 1_000) t.feed("x\n".representation);
     assert(t.bytesHeld() <= t.byteCap, format!"%s held"(t.bytesHeld()));
     assert(t.lines.length * (1 + string.sizeof) <= t.byteCap);
+}
+
+// Byte-cap eviction of ordinary lines prunes down to a low-water mark, so
+// once full, the transcript is not copied again on every new line: many
+// lines pass before the next prune (issue #248 review).
+unittest
+{
+    import std.array : replicate;
+    Transcript t;
+    t.byteCap = 64 * 1_024;
+    t.store.memoryOnly = true;
+    immutable row = "y".replicate(1_000) ~ "\n";
+    size_t prunes, last = size_t.max;
+    foreach (i; 0 .. 1_000)
+    {
+        t.feed(row.representation);
+        assert(t.bytesHeld() <= t.byteCap);
+        // A prune shows up as the line count going down.
+        if (last != size_t.max && t.lines.length < last) prunes++;
+        last = t.lines.length;
+    }
+    assert(prunes > 0 && prunes < 100, format!"%s prunes"(prunes));
 }
