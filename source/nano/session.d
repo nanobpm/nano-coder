@@ -908,6 +908,29 @@ private const(char)[] skimField(const(char)[] obj, string key)
     return found;
 }
 
+/// The decoded string of the record's top-level `type`, or null when it is
+/// not a readable string. The raw value keeps its escapes, so an escaped
+/// spelling (`"repla\u0063e"`) must decode to the type the full decoder sees,
+/// or the skim scan and `restore` disagree on the record.
+private const(char)[] skimType(const(char)[] line)
+{
+    auto raw = skimField(line, "type");
+    if (raw.length < 2 || raw[0] != '"' || raw[$ - 1] != '"') return null;
+    const(char)[] type = raw[1 .. $ - 1];
+    // A malformed escape fails closed: the record is not skimmed by type.
+    if (!unescapeKey(type)) return null;
+    return type;
+}
+
+unittest // escaped_type_decodes_before_comparison
+{
+    assert(skimType(`{"type":"replace","data":{}}`) == "replace");
+    assert(skimType(`{"type":"repla\u0063e","data":{}}`) == "replace");
+    assert(skimType(`{"type":"mes\u0073age"}`) == "message");
+    assert(skimType(`{"type":"bad\uZZZZ"}`) is null);
+    assert(skimType(`{"type":3}`) is null);
+}
+
 /// Whether `raw` is a JSON integer that `std.json` reads as `JSONType.integer`
 /// (fits a long), and its value.
 private bool rawLong(const(char)[] raw, out long v) pure nothrow @nogc
@@ -1011,8 +1034,8 @@ private ulong lastFullReplace(string path, out ulong floor)
 {
     ulong at;
     eachLogLine(path, (line, lineNo) {
-        auto type = skimField(line, "type");
-        if (type != `"replace"`) return;
+        auto type = skimType(line);
+        if (type != "replace") return;
         auto data = skimField(line, "data");
         bool delta;
         ulong fl = 0;
@@ -1081,15 +1104,15 @@ private Restored restoreLog(string path, bool skipSuperseded)
         if (!line.length) return;
         if (index && lineNo < skipBefore)
         {
-            auto type = skimField(line, "type");
-            if (type == `"message"`)
+            auto type = skimType(line);
+            if (type == "message")
             {
                 skimmedLen++;
                 if (lineNo <= floorL) { index++; return; }
                 // An original past the latest summarized range: decoded
                 // below, for `backfillLogLines` only.
             }
-            if (type == `"replace"`)
+            if (type == "replace")
             {
                 // Superseded: only its effect on the pending input outlives
                 // the latest full replace.
@@ -2563,4 +2586,39 @@ unittest // escaped_delta_key_is_not_a_full_snapshot (issue #244)
     auto skimmed = restoreLog(path, true), fullR = restoreLog(path, false);
     assert(skimmed == fullR, "an escaped delta key still marks a delta");
     assert(skimmed.replayStash.length == 2, "the earlier folded stash survives");
+}
+
+unittest // escaped_type_delta_lowers_the_skim_floor (issue #244)
+{
+    import std.array : replace;
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, write;
+    import std.path : buildPath;
+    auto dir = buildPath(tempDir, "nano-d-skimesctype-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    static JSONValue rec(Message m) { return messageRecord(m); }
+    string line(string type, JSONValue data) { return JSONValue(["type": JSONValue(type), "data": data]).toString ~ "\n"; }
+    auto log = `{"type":"session","data":{"version":1,"id":"skimesctype","created_at":"x"}}` ~ "\n";
+    ulong lines = 1;
+    void add(string type, JSONValue data) { log ~= line(type, data); lines++; }
+    auto early = Message.user("early question");
+    add("input", JSONValue(["id": "in-0", "text": "early question"]));
+    add("message", rec(early));
+    add("message", rec(Message.assistant("early answer")));
+    JSONValue full = ["messages": JSONValue([rec(Message.user("summary"))])];
+    full["folded"] = JSONValue([rec(early)]);
+    full["summarized"] = JSONValue([JSONValue(2), JSONValue(lines)]);
+    add("replace", full);
+    // A later delta replace whose `type` is spelled with an escape and which
+    // omits `summarized`: the floor must still lower to 0 so backfill finds
+    // the retained original, exactly as full decoding restores it.
+    JSONValue delta = ["messages": JSONValue([rec(Message.user("summary 2")), rec(early)])];
+    delta["folded"] = JSONValue(cast(JSONValue[]) []);
+    delta["folded_base"] = 1;
+    log ~= line("replace", delta).replace(`"type":"replace"`, `"type":"repla\u0063e"`);
+    lines++;
+    auto path = buildPath(dir, "skimesctype.jsonl");
+    write(path, log);
+    auto skimmed = restoreLog(path, true), fullR = restoreLog(path, false);
+    assert(skimmed == fullR, "an escaped-type delta still lowers the skim floor");
 }
