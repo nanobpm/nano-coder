@@ -950,6 +950,9 @@ private void eachLogLine(string path, scope void delegate(const(char)[] line, ul
 /// supersedes all earlier compaction state (a full restatement: no
 /// `folded_base` / `pinned_base` delta), and its `summarized` end, found by
 /// skimming record types without decoding any record. 0 when there is none.
+/// `floor` is the lowest `summarized` end of that replace and every later
+/// delta replace (an omitted range counts as 0), since `backfillLogLines`
+/// reads originals past each one's range.
 private ulong lastFullReplace(string path, out ulong floor)
 {
     ulong at;
@@ -958,7 +961,7 @@ private ulong lastFullReplace(string path, out ulong floor)
         if (type != `"replace"`) return;
         auto data = skimField(line, "data");
         bool delta;
-        ulong fl;
+        ulong fl = 0;
         skimObject(data, (k, v) {
             if ((k == "folded_base" || k == "pinned_base") && v != "null") delta = true;
             else if (k == "summarized")
@@ -972,6 +975,7 @@ private ulong lastFullReplace(string path, out ulong floor)
             return true;
         });
         if (!delta) { at = lineNo; floor = fl; }
+        else if (at && fl < floor) floor = fl;
     });
     return at;
 }
@@ -2444,4 +2448,36 @@ unittest
     assert(skimmed.completed.length == full.completed.length && skimmed.hasPending);
     assert(skimmed.replayStash.length == folded.length && skimmed.pinStash.ptr is skimmed.replayStash.ptr,
         "the Rust folded stash is held once");
+}
+
+unittest // skim_floor_counts_later_delta_replaces (issue #244)
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, write;
+    import std.path : buildPath;
+    auto dir = buildPath(tempDir, "nano-d-skimdelta-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    static JSONValue rec(Message m) { return messageRecord(m); }
+    string line(string type, JSONValue data) { return JSONValue(["type": JSONValue(type), "data": data]).toString ~ "\n"; }
+    auto log = `{"type":"session","data":{"version":1,"id":"skimdelta","created_at":"x"}}` ~ "\n";
+    ulong lines = 1;
+    void add(string type, JSONValue data) { log ~= line(type, data); lines++; }
+    auto early = Message.user("early question");
+    add("input", JSONValue(["id": "in-0", "text": "early question"]));
+    add("message", rec(early));
+    add("message", rec(Message.assistant("early answer")));
+    JSONValue full = ["messages": JSONValue([rec(Message.user("summary"))])];
+    full["folded"] = JSONValue([rec(early)]);
+    full["summarized"] = JSONValue([JSONValue(2), JSONValue(lines)]);
+    add("replace", full);
+    // A later delta replace, with no `summarized`, retaining the early message
+    // without its log line: backfill must still find the original.
+    JSONValue delta = ["messages": JSONValue([rec(Message.user("summary 2")), rec(early)])];
+    delta["folded"] = JSONValue(cast(JSONValue[]) []);
+    delta["folded_base"] = 1;
+    add("replace", delta);
+    auto path = buildPath(dir, "skimdelta.jsonl");
+    write(path, log);
+    auto skimmed = restoreLog(path, true), fullR = restoreLog(path, false);
+    assert(skimmed == fullR, "a later delta lowers the skim floor");
 }

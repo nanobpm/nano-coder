@@ -31,7 +31,7 @@ with open(os.path.join(out, sid + ".jsonl"), "w") as f:
         w("message", u); w("message", a)
         w("turn_end", {"input_id": iid, "response": a["content"]})
         live += [u, a]
-        if (i + 2) % every == 0:
+        if (i + 2) // every != i // every:  # crossed an interval boundary
             folded += live
             live = []
             w("replace", {"messages": [{"role": "user", "content": "summary up to %d" % i}], "folded": folded,
