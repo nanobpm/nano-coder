@@ -8,6 +8,16 @@ CWD = "/Users/joshua.wulf/workspace/nano-coder-codemode"
 SESS = os.path.expanduser("~/Library/Application Support/nano-coder/sessions")
 
 TASKS = {
+    "safeio-usage": "For each public function or template declared at module level in source/nano/safeio.d, count how many "
+                    "OTHER .d files under source/ reference it by name. List the ones referenced by zero or one other file, "
+                    "with the count and (for one) the file.",
+    "budget-history": "For each file named scripts/*-budget, report its current value and the date and short sha of the "
+                      "last commit that changed it (git log). Answer as a table sorted by date.",
+    "tools-imports": "For each .d file in source/nano/tools/, list the nano.* modules it imports. Then say which of those "
+                     "imported modules import nano.tools (or a nano.tools.* module) back, i.e. any import cycles.",
+    "test-gaps": "For each .d file in source/nano that is not a *_test.d file, check whether a matching <name>_test.d "
+                 "exists and how many unittest blocks the module itself contains. List the 5 largest modules (by line "
+                 "count) that have neither a _test.d file nor any unittest block of their own.",
     "tools-funcs": "For every .d file directly in source/nano/tools, list each top-level function it defines "
                    "(name only) and the file's total line count. Answer as a compact table.",
     "catch-top": "Which 5 modules under source/nano (excluding *_test.d) contain the most `catch (Exception` "
@@ -53,8 +63,9 @@ def stats(path):
 
 
 def run(task, arm):
+    """arm: plain | steered (NANO_CODEMODE=1 with system guidance, prompt unchanged)."""
     env = dict(os.environ)
-    if arm == "codemode":
+    if arm in ("codemode", "steered"):
         env["NANO_CODEMODE"] = "1"
     else:
         env.pop("NANO_CODEMODE", None)
@@ -70,9 +81,13 @@ def run(task, arm):
 
 if __name__ == "__main__":
     tasks = sys.argv[1:] or list(TASKS)
-    os.makedirs("/tmp/cmbench", exist_ok=True)
-    for t in tasks:
-        for arm in ("plain", "codemode"):
-            st, ans = run(t, arm)
-            open(f"/tmp/cmbench/{t}-{arm}.txt", "w").write(ans)
-            print(json.dumps(st), flush=True)
+    out = os.environ.get("CMBENCH_OUT", "/tmp/cmbench2")
+    reps = int(os.environ.get("CMBENCH_REPS", "2"))
+    os.makedirs(out, exist_ok=True)
+    for rep in range(reps):
+        for t in tasks:
+            for arm in ("plain", "steered"):
+                st, ans = run(t, arm)
+                st["rep"] = rep
+                open(f"{out}/{t}-{arm}-{rep}.txt", "w").write(ans)
+                print(json.dumps(st), flush=True)

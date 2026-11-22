@@ -1,0 +1,6 @@
+{"turns": 3, "aic": 6.36, "calls": 2, "input": 21304, "output": 926, "cached": 0, "tools": {"bash": 2}, "task": "tools-funcs", "arm": "plain", "wall": 14.4, "session": "sess-20261121T203057-ce482f08.jsonl", "rc": 0}
+{"turns": 4, "aic": 4.73, "calls": 3, "input": 30836, "output": 1310, "cached": 0, "tools": {"bash": 3}, "task": "tools-funcs", "arm": "codemode", "wall": 19.3, "session": "sess-20261121T203111-564e4c95.jsonl", "rc": 0}
+{"turns": 3, "aic": 1.59, "calls": 2, "input": 19386, "output": 491, "cached": 0, "tools": {"bash": 2}, "task": "catch-top", "arm": "plain", "wall": 10.5, "session": "sess-20261121T203130-31667c71.jsonl", "rc": 0}
+{"turns": 3, "aic": 1.51, "calls": 2, "input": 20465, "output": 445, "cached": 0, "tools": {"bash": 2}, "task": "catch-top", "arm": "codemode", "wall": 10.3, "session": "sess-20261121T203141-cae003ad.jsonl", "rc": 0}
+{"turns": 4, "aic": 3.61, "calls": 3, "input": 28735, "output": 1046, "cached": 0, "tools": {"bash": 3}, "task": "todo-blame", "arm": "plain", "wall": 16.5, "session": "sess-20261121T203151-1c8ee184.jsonl", "rc": 0}
+{"turns": 5, "aic": 3.63, "calls": 4, "input": 36767, "output": 1135, "cached": 0, "tools": {"bash": 3, "grep": 1}, "task": "todo-blame", "arm": "codemode", "wall": 18.1, "session": "sess-20261121T203208-0277814e.jsonl", "rc": 0}

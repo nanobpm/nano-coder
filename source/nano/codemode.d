@@ -27,13 +27,35 @@ const console = { log: print };
 var __out = [];
 };
 
+/// System-prompt guidance appended when codemode is on: when to reach
+/// for `run_script` instead of separate tool calls or ad-hoc shell/Python.
+enum string codemodeGuidance = q"EOS
+
+# Scripting tool calls (run_script)
+
+You have a `run_script` tool: a JavaScript sandbox in which read_file, grep, glob, bash and history_search are plain synchronous functions. Only what the script prints or returns enters the conversation.
+
+Prefer one `run_script` call over several separate tool calls whenever a task needs:
+- more than about three tool calls whose inputs depend on earlier outputs (read a list, then read or grep each item);
+- loops over files, matches, commits or records, with filtering, counting, joining or sorting;
+- cross-checking two sources (for example: every name declared in A, is it used in B?);
+- large intermediate output you only need to summarise.
+
+Prefer `run_script` over writing Python or chained shell pipelines through bash for this kind of work: run_script calls go through the same permission checks as direct tool calls and fail as catchable errors, and you can still call bash(...) inside the script for git or other commands.
+
+Use a direct tool call instead for a single lookup, for reading one file you need to see in full, and for any edit.
+
+Write the script to return a compact, structured result (counts, the matching lines with file:line, a small table). Do not return whole files. If a script fails, read the error, fix the script and rerun it once, rather than falling back to many separate calls.
+EOS";
+
 /// The `run_script` tool offered to the model.
 ToolDefinition scriptDefinition() pure
 {
     return ToolDefinition("run_script",
         "Run a JavaScript program (QuickJS, ES2023, synchronous) that calls tools as functions, "
-        ~ "and get back only what it prints or returns. Use it when a task needs many tool calls, loops, "
-        ~ "filtering or aggregation over tool output, so intermediate results stay out of the conversation. "
+        ~ "and get back only what it prints or returns. Prefer it over several separate calls, and over Python or "
+        ~ "shell pipelines via bash, when a task needs more than ~3 dependent tool calls, loops, filtering, "
+        ~ "joining or aggregation: intermediate results stay out of the conversation. "
         ~ "In scope: read_file(path, {offset, limit}), grep(pattern, {path, glob, output_mode, limit}), "
         ~ "glob(pattern, {path, limit}), bash(command, {timeout_seconds}), history_search(pattern, opts), "
         ~ "and tool(name, args) for any other tool; each returns that tool's text output, exactly as a "
@@ -117,10 +139,10 @@ ScriptResult runScript(string code, Host host, long timeoutMs = 120_000, size_t 
     if (b is null) return ScriptResult("run_script: could not start the interpreter", true);
     scope (exit) qjs_free(b);
     auto src = prelude ~ "\n(() => {\nconst __r = (() => {\n" ~ code
-        ~ "\n})();\nreturn {out: __out, value: __r};\n})()";
+        ~ "\n})();\nreturn {out: __out, value: __r};\n})()\0"; // JS_Eval reads input[len]: must be NUL-terminated
     char* out_;
     size_t outLen;
-    auto rc = qjs_eval(b, src.ptr, src.length, timeoutMs, cancel, &out_, &outLen);
+    auto rc = qjs_eval(b, src.ptr, src.length - 1, timeoutMs, cancel, &out_, &outLen);
     scope (exit) qjs_free_str(out_);
     auto text = out_ is null ? "" : out_[0 .. outLen].idup;
     final switch (rc)

@@ -1837,8 +1837,14 @@ int runMain(string[] args)
             instructions = discoverInstructions(cfg, dir);
             foreach (a; built) a.instructions = instructions;
         }
-        return buildSystemPrompt(cfg, dir, wallNow.toISOExtString[0 .. 10], plan, skills, index,
+        auto prompt = buildSystemPrompt(cfg, dir, wallNow.toISOExtString[0 .. 10], plan, skills, index,
             instructions.match!(pi => pi.render, () => string.init));
+        {
+            import std.process : environment;
+            import nano.codemode : codemodeGuidance;
+            if (environment.get("NANO_CODEMODE", "") == "1") prompt ~= codemodeGuidance; // codemode spike
+        }
+        return prompt;
     }
     auto questions = QuestionBroker.make;
     tools.register(questionDefinition, (JSONValue a) => questions.run(a));
