@@ -206,12 +206,17 @@ class Probing : Interfering, CapabilityProbe
     import nano.safeio : Shared;
     size_t window;
     Shared!bool gate;
+    /// Set once `probeCapabilities` has returned its answer: the probe worker
+    /// is about to exit, so awaiting it (not `probes`, which turns mid-work)
+    /// synchronises a test with the worker's termination.
+    Shared!bool done;
     Shared!int probes, windowProbes;
-    this(string model, LLMResponse[] script, size_t window, Shared!bool gate, Shared!int probes, Shared!int windowProbes)
+    this(string model, LLMResponse[] script, size_t window, Shared!bool gate, Shared!bool done, Shared!int probes, Shared!int windowProbes)
     {
         super(model, script);
         this.window = window;
         this.gate = gate;
+        this.done = done;
         this.probes = probes;
         this.windowProbes = windowProbes;
     }
@@ -223,6 +228,7 @@ class Probing : Interfering, CapabilityProbe
         Capabilities c;
         c.maxOutput = 1_234;
         if (withWindow) { c.window = window; c.windowSource = model; }
+        done.update((ref bool d) { d = true; });
         return c;
     }
 }
@@ -232,15 +238,15 @@ class Probing : Interfering, CapabilityProbe
 struct Probes
 {
     import nano.safeio : Shared;
-    Shared!bool gate;
+    Shared!bool gate, done;
     Shared!int probes, windowProbes;
     static Probes make(bool open)
     {
-        return Probes(Shared!bool.make(open), Shared!int.make(0), Shared!int.make(0));
+        return Probes(Shared!bool.make(open), Shared!bool.make(false), Shared!int.make(0), Shared!int.make(0));
     }
     Probing client(string model, LLMResponse[] script, size_t window)
     {
-        return new Probing(model, script, window, gate, probes, windowProbes);
+        return new Probing(model, script, window, gate, done, probes, windowProbes);
     }
 }
 
@@ -316,7 +322,7 @@ unittest
     assert(agent.settleProbes(5.seconds), "the stale probe is not waited for");
     assert(agent.capabilities.window == 4_096);
     slow.gate.update((ref bool open) { open = true; });
-    slow.probes.await((ref const int n) => n == 1, (ref int _) {}); // the stale probe finished
+    slow.done.await((ref const bool d) => d, (ref bool _) {}); // the stale probe finished
     agent.collectProbes();
     assert(agent.capabilities.window == 4_096 && agent.capabilities.windowSource == "fast",
         "the stale probe did not overwrite the live model's window");
@@ -387,10 +393,13 @@ unittest
     // hook at agent.d:813), then wait for the worker to finish there — never
     // block inside the publish hook: a probe that completes before the first
     // collection publishes on the agent thread, and blocking there deadlocks
-    // the test against the very check hook that would release it.
+    // the test against the very check hook that would release it. Await
+    // `done`, not `probes`: the counter turns mid-work, so it can pass while
+    // the worker still runs, leaving the fallback window in place for both
+    // collections and the normal request consuming SUM instead of compacting.
     agent.onThresholdChecked = {
         p.gate.update((ref bool open) { open = true; });
-        p.probes.await((ref const int n) => n == 1, (ref int _) {});
+        p.done.await((ref const bool d) => d, (ref bool _) {});
     };
     auto ev = new CountingEvents;
     assert(agent.run("go", ev) == "done");
