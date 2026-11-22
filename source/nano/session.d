@@ -532,9 +532,106 @@ class SessionLog
             failNextWrite = false;
             throw new Exception("session log write failed (injected)");
         }
+        if (!sameFile(f, path)) recoverReplaced();
         f.write(line);
         f.flush();
         ++lines;
+    }
+
+    /// Where the warning about a replaced log goes (tests capture it).
+    void delegate(string) warn;
+
+    /// The path no longer names the file this writer holds open (something
+    /// moved, deleted or rewrote the live log). Appending on would write into
+    /// an orphan nobody can read again (issue #237), so move to a file that
+    /// holds every record: the path itself when it is gone or a prefix of
+    /// ours (append what it lacks), else a recovery file next to it. Always
+    /// tell the user.
+    private void recoverReplaced()
+    {
+        import std.stdio : SEEK_END;
+        f.flush();
+        f.seek(0);
+        ubyte[] ours;
+        auto buf = new ubyte[](64 * 1024);
+        for (;;)
+        {
+            auto chunk = f.rawRead(buf);
+            if (!chunk.length) break;
+            ours ~= chunk;
+        }
+        f.seek(0, SEEK_END);
+        string target = path, how;
+        File next;
+        bool done;
+        import std.exception : collectException;
+        // A failed in-place repair falls through to the recovery log below.
+        collectException(() {
+            if (!path.exists)
+            {
+                // Removed or moved away: put our records back at the path.
+                {
+                    auto tmp = format("%s.tmp-%s", path, thisProcessID);
+                    scope (failure) if (tmp.exists) remove(tmp);
+                    writePrivate(tmp, ours, octal!600);
+                    publishOver(tmp, path);
+                    next = openExistingForAppend(path);
+                    if (tryLock(next) != LockResult.contended && sameFile(next, path))
+                    {
+                        done = true;
+                        how = "it was removed; restored it from this session's records";
+                    }
+                }
+            }
+            else
+            {
+                {
+                    auto theirs = readBytes(path);
+                    if (theirs.length <= ours.length && ours[0 .. theirs.length] == theirs)
+                    {
+                        next = openExistingForAppend(path);
+                        if (tryLock(next) != LockResult.contended && sameFile(next, path)
+                            && readBytes(path).length == theirs.length)
+                        {
+                            next.rawWrite(ours[theirs.length .. $]);
+                            next.flush();
+                            done = true;
+                            how = "it was replaced; appended the records the new file was missing";
+                        }
+                    }
+                }
+            }
+        }());
+        if (!done)
+        {
+            // The path holds something else: keep the whole session in a
+            // recovery log beside it (a resumable session id of its own).
+            auto base = path.stripExtension;
+            foreach (n; 1 .. 1000)
+            {
+                target = format("%s.recovered-%s.jsonl", base, n);
+                if (!target.exists) break;
+            }
+            writePrivate(target, ours, octal!600);
+            next = openExistingForAppend(target);
+            tryLock(next);
+            how = "it was replaced by a different file; this session continues in " ~ target
+                ~ " (resume it with --resume " ~ target.baseName.stripExtension ~ ")";
+        }
+        immutable old = path;
+        close();
+        f = next;
+        path = target;
+        id = path.baseName.stripExtension;
+        shareHandle(path, f);
+        auto msg = "WARNING: session log " ~ old ~ " no longer names the file this session was writing: "
+            ~ how ~ ". Nothing was lost.";
+        if (warn) warn(msg);
+        else
+        {
+            import nano.safeio : stdErr;
+            stdErr.writeln("\n", msg);
+        }
     }
 
     /// Log a message; returns its physical line (its `#N` ID).
@@ -1180,19 +1277,26 @@ private void awaitLock(ref File f, string path)
 /// `path` opened for appending without ever creating it.
 private File openExistingForAppend(string path) @trusted
 {
-    import core.sys.posix.fcntl : open, O_WRONLY, O_APPEND;
+    import core.sys.posix.fcntl : open, fcntl, O_RDWR, O_APPEND, F_SETFD, FD_CLOEXEC;
     import std.string : toStringz;
     import core.stdc.errno : errno, ENOENT;
     import std.exception : ErrnoException;
-    auto fd = open(path.toStringz, O_WRONLY | O_APPEND);
+    // O_RDWR: a writer that finds its log replaced reads its own records
+    // back to recover them. Close-on-exec: a `/relaunch` exec must not
+    // inherit the fd and its flock, or the new image's resume is contended.
+    version (linux) enum int cloexec = 0x80000; // O_CLOEXEC
+    else version (OSX) enum int cloexec = 0x1000000;
+    else enum int cloexec = 0;
+    auto fd = open(path.toStringz, O_RDWR | O_APPEND | cloexec);
     if (fd < 0)
     {
         immutable err = errno;
         if (err == ENOENT) throw new Exception("session log " ~ path ~ " does not exist");
         throw new ErrnoException("cannot open session log " ~ path, err);
     }
+    fcntl(fd, F_SETFD, FD_CLOEXEC); // also where O_CLOEXEC is unknown
     File f;
-    f.fdopen(fd, "a");
+    f.fdopen(fd, "a+");
     return f;
 }
 
@@ -1257,7 +1361,7 @@ private void writePrivate(string path, const(ubyte)[] data, uint mode)
 private File createPrivate(string path)
 {
     writePrivate(path, null, octal!600);
-    return File(path, "a");
+    return openExistingForAppend(path);
 }
 
 /// fsync `path`'s parent directory, so a created or removed directory entry
@@ -2019,4 +2123,82 @@ void releaseHeap() nothrow
     import core.memory : GC;
     GC.collect();
     GC.minimize();
+}
+
+@("a session log's fd is close-on-exec, so a relaunched image can lock it (#237)")
+unittest
+{
+    import std.process : spawnProcess, wait, Config;
+    auto dir = buildPath(tempDir, format("nano-coder-cloexec-%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/x");
+    scope (exit) log.close();
+    immutable fd = log.f.fileno;
+    auto resumed = new SessionLog(log.path); // shared in-process handle
+    resumed.close();
+    // Exec level: an exec'd image must not see the fd (and its flock).
+    auto script = format("test ! -e /dev/fd/%s", fd);
+    // inheritFDs: std.process closes nothing, so only FD_CLOEXEC can.
+    auto pid = spawnProcess(["/bin/sh", "-c", script], null, Config.inheritFDs);
+    assert(wait(pid) == 0, "the log fd survived exec");
+}
+
+@("a log replaced under a live writer loses nothing silently (#237)")
+unittest
+{
+    import std.algorithm : canFind, count;
+    auto dir = buildPath(tempDir, format("nano-coder-replaced-%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    string[] warned;
+
+    // 1. Replaced by a copy (a prefix of ours): the path gets the rest.
+    {
+        auto log = new SessionLog(dir, "mock/m", "/x");
+        log.warn = (string m) { warned ~= m; };
+        log.input("i1", "first");
+        auto p = log.path;
+        auto text = readText(p);
+        rename(p, p ~ ".moved");
+        std.file.write(p, text);
+        log.input("i2", "second");
+        log.close();
+        auto now = readText(p);
+        assert(now.canFind("first") && now.canFind("second"), now);
+        assert(now.count('\n') == 3);
+        assert(warned.length == 1 && warned[0].canFind("missing"), warned[0]);
+    }
+    // 2. Removed: the path is restored with every record.
+    {
+        auto log = new SessionLog(dir, "mock/m", "/x");
+        log.warn = (string m) { warned ~= m; };
+        log.input("i1", "alpha");
+        auto p = log.path;
+        remove(p);
+        log.input("i2", "beta");
+        log.close();
+        auto now = readText(p);
+        assert(now.canFind("alpha") && now.canFind("beta"), now);
+        assert(warned.length == 2 && warned[1].canFind("removed"));
+    }
+    // 3. Rewritten with different content (e.g. compacted): a recovery log.
+    {
+        auto log = new SessionLog(dir, "mock/m", "/x");
+        log.warn = (string m) { warned ~= m; };
+        log.input("i1", "gamma");
+        auto p = log.path;
+        remove(p);
+        std.file.write(p, "{\"type\":\"session\",\"data\":{}}\n");
+        log.input("i2", "delta");
+        auto rec = log.path;
+        log.input("i3", "epsilon");
+        log.close();
+        assert(rec != p && rec.exists);
+        auto now = readText(rec);
+        assert(now.canFind("gamma") && now.canFind("delta") && now.canFind("epsilon"), now);
+        assert(readText(p) == "{\"type\":\"session\",\"data\":{}}\n");
+        assert(warned.length == 3 && warned[2].canFind(rec));
+        validateId(log.id);
+    }
 }
