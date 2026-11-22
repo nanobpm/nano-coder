@@ -501,7 +501,13 @@ the merge base had. These counts are ratchets (`scripts/ratchets.sh`): check-saf
 one on the working tree and on the merge base with `origin/main` (`NANO_RATCHET_BASE` overrides),
 in a temporary worktree, and fails when one gets worse. Nothing is committed, so improving a count
 needs no edit and parallel PRs can't conflict; a deliberate loosening is a commit trailer
-`Ratchet-Override: <ratchet> <reason>`, which check-safe prints. The build uses `-preview=dip1000` and `-preview=nosharedaccess`.
+`Ratchet-Override: <ratchet> <reason>`, which check-safe prints. Because this repository allows
+only squash merges (RELEASING.md), the trailer must survive the squash: check-safe reads the
+trailers of the squashed commit on `main`, so an override that is dropped from the squash commit
+message leaves the post-merge CI run comparing a loosened count against the pre-push commit with
+no approval in `base..HEAD`, and the build fails. When merging such a PR, copy every approved
+`Ratchet-Override:` trailer into the squash commit message's footer (GitHub's default squash
+message lists the PR's commits; keep the trailer lines). The build uses `-preview=dip1000` and `-preview=nosharedaccess`.
 
 Time goes through `nano.clock`: `wallNow`, `monoNow`, `since` and `sleepFor` instead of
 `Clock.currTime`, `MonoTime.currTime`, `StopWatch` and `Thread.sleep`, which check-safe bans
