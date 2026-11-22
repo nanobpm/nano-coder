@@ -701,6 +701,21 @@ string foldMark(string id, size_t lines, string expanded) pure
         ~ Base64.encode(expanded.representation).idup ~ "\x07";
 }
 
+/// The OSC number of a refold mark (`refoldMark`).
+enum refoldOsc = "8771";
+
+/// An in-band mark that rewrites the latest fold with `id` in place: its
+/// collapsed form becomes `collapsed` and its expanded form `expanded`
+/// (whichever is shown is redrawn). A thinking block that reasoning
+/// streamed after the answer joins is updated this way, so the answer
+/// below it stays contiguous. Only for the frame transcript.
+string refoldMark(string id, string collapsed, string expanded) pure
+{
+    import std.base64 : Base64;
+    return "\x1b]" ~ refoldOsc ~ ";" ~ Base64.encode(id.representation).idup ~ ";"
+        ~ Base64.encode(collapsed.representation).idup ~ ";" ~ Base64.encode(expanded.representation).idup ~ "\x07";
+}
+
 /// A block of transcript lines with an alternate (expanded or collapsed) form.
 private struct Fold
 {
@@ -822,9 +837,10 @@ struct Transcript
         import std.base64 : Base64;
         import std.conv : to;
         auto parts = body.split(";");
-        if (parts.length != 4 || parts[0] != foldOsc) return;
+        if (parts.length != 4 || (parts[0] != foldOsc && parts[0] != refoldOsc)) return;
         try
         {
+            if (parts[0] == refoldOsc) { refold(parts); return; }
             import nano.safeio : utf8Text;
             auto id = utf8Text(Base64.decode(parts[1]));
             auto n = parts[2].to!size_t;
@@ -838,6 +854,35 @@ struct Transcript
                     if (f.id == id && f.expanded) { swap(folds.length - 1, true); break; }
         }
         catch (Exception) {} // a malformed OSC from the terminal is ignored, like any unknown escape
+    }
+
+    /// A refold mark (`refoldMark`): rewrites the latest fold with its id.
+    private void refold(string[] parts) pure
+    {
+        import std.array : split;
+        import std.base64 : Base64;
+        import std.string : stripRight;
+        {
+            import nano.safeio : utf8Text;
+            auto id = utf8Text(Base64.decode(parts[1]));
+            auto collapsed = utf8Text(Base64.decode(parts[2])).stripRight("\n").split("\n");
+            auto expanded = utf8Text(Base64.decode(parts[3])).stripRight("\n").split("\n");
+            if (!id.length) return;
+            foreach_reverse (k; 0 .. folds.length)
+            {
+                if (folds[k].id != id) continue;
+                auto f = &folds[k];
+                auto shownNow = f.expanded ? expanded : collapsed;
+                f.other = f.expanded ? collapsed : expanded;
+                immutable oldLength = f.length;
+                lines = lines[0 .. f.start] ~ shownNow ~ lines[f.start + oldLength .. $];
+                f.length = shownNow.length;
+                foreach (ref g; folds)
+                    if (g.start > f.start) g.start = g.start - oldLength + shownNow.length;
+                if (cache.length > f.start) cache = cache[0 .. f.start];
+                return;
+            }
+        }
     }
 
     /// Ctrl-O: swap the latest fold (with the others sharing its id) between
@@ -1429,6 +1474,31 @@ unittest
     t.cap = 4;
     t.feed("a\nb\nc\n".representation);
     assert(!t.toggleLatest());
+}
+
+// Refold marks (the frame side of ui.rs::trailing_thinking_merges_interleaved_reasoning_fragments).
+unittest
+{
+    import std.conv : to;
+    // Reasoning streamed after the answer started rewrites the reply's one
+    // thinking block in place; the answer lines below it stay contiguous.
+    Transcript t;
+    t.feed(("∴ Thought for 1.0s · 6 chars\n" ~ foldMark("think-1", 1, "∴ Thought for 1.0s · 6 chars\n    first\n")).representation);
+    t.feed("AB".representation);
+    t.feed(refoldMark("think-1", "∴ Thought for 2.0s · 12 chars\n", "∴ Thought for 2.0s · 12 chars\n    first second\n").representation);
+    t.feed("C\n".representation);
+    assert(t.lines == ["∴ Thought for 2.0s · 12 chars", "ABC"], t.lines.to!string);
+    assert(t.toggleLatest());
+    assert(t.lines == ["∴ Thought for 2.0s · 12 chars", "    first second", "ABC"], t.lines.to!string);
+    // Refolding while expanded redraws the expanded form; collapsing again
+    // shows the latest summary.
+    t.feed(refoldMark("think-1", "∴ Thought for 3.0s\n", "∴ Thought for 3.0s\n    x\n    y\n").representation);
+    assert(t.lines == ["∴ Thought for 3.0s", "    x", "    y", "ABC"], t.lines.to!string);
+    assert(t.toggleLatest());
+    assert(t.lines == ["∴ Thought for 3.0s", "ABC"], t.lines.to!string);
+    // An unknown id changes nothing.
+    t.feed(refoldMark("nope", "z\n", "z\n").representation);
+    assert(t.lines == ["∴ Thought for 3.0s", "ABC"]);
 }
 
 // Repeated tall-editor shrinks with output between them: the second freeze

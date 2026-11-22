@@ -38,7 +38,7 @@ import nano.plan : Plan, checklist;
 import nano.queue : MessageQueue, QueuedMessage, QueueUsage, queueParse = parse, queueApply = apply;
 import nano.mode : AgentMode, allModes, parseMode, planPromptNote, name, describe, nextMode = next;
 static import nano.herdr;
-import nano.frame : glyphMark, foldMark, expandedBody, expandedResult, dropSoftWraps, escapeMarks;
+import nano.frame : glyphMark, foldMark, refoldMark, expandedBody, expandedResult, dropSoftWraps, escapeMarks;
 import core.time : MonoTime, seconds;
 import std.sumtype : match;
 import nano.trajectory : terminalSafe;
@@ -1013,6 +1013,14 @@ struct Screen
     // (its first line got a stamp, so later lines are padded under it).
     private string blockStamp;
     private bool answering;
+    // The model call's finished thinking block (its fold id and how long it
+    // thought), and reasoning streamed after its answer started: that joins
+    // the block instead of opening a second one that splits the answer.
+    private string thinkId;
+    private long thinkMs, lateStart;
+    private bool late, thoughtThisCall;
+    private string lateText;
+    private static size_t thinkSeq;
     // The answer text streamed since the model call began (for `reconcile`).
     private string streamedAnswer;
     // Answers on a color terminal have their markdown rendered a block at a
@@ -1020,6 +1028,18 @@ struct Screen
     private MarkdownStream markdown;
     bool verbose() const { return verbosity >= Verbosity.verbose; }
     bool renderMarkdown() pure const { return tty && color; }
+
+    // Tests capture the output here, as the frame transcript would see it.
+    version (unittest) private string captured;
+    version (unittest) private bool capturing;
+    version (unittest) private bool testFrame;
+    private bool framed() { version (unittest) if (testFrame) return true; return !!gFrame; }
+    private void write(Args...)(Args args)
+    {
+        version (unittest) if (capturing) { import std.conv : text; captured ~= text(args); return; }
+        .write(args);
+    }
+    private void writeln(Args...)(Args args) { write(args, "\n"); }
 
     /// Prints any streamed markdown still held back (the answer segment
     /// ended, or the turn stopped mid-block).
@@ -1039,7 +1059,7 @@ struct Screen
         import std.algorithm : splitter;
         import std.array : replicate;
         // Soft-wrap marks are for the frame; anything else gets plain text.
-        if (!gFrame) t = dropSoftWraps(t);
+        if (!framed) t = dropSoftWraps(t);
         if (!pad) { write(t); if (t.length) midLine = t[$ - 1] != '\n'; return; }
         size_t i;
         while (i < t.length)
@@ -1086,28 +1106,80 @@ struct Screen
         stdOut.flush();
     }
 
-    private void finishThinking()
+    private string thoughtLine(long ms, string text)
     {
         import std.string : strip;
         import std.range : walkLength;
+        return blockStamp ~ thinkStyle(format("∴ Thought for %.1fs", ms / 1000.0))
+            ~ dim(format(" · %s chars", text.strip.walkLength));
+    }
+
+    private void finishThinking()
+    {
+        import std.conv : to;
         if (!thinking) return;
         thinking = false;
+        thinkMs = nowMs() - thinkStart;
+        thinkId = null;
+        thoughtThisCall = true;
         if (blockExpanded)
         {
             if (midLine) write("\n");
         }
         else
         {
-            auto secs = (nowMs() - thinkStart) / 1000.0;
-            auto chars = thinkText.strip.walkLength;
-            auto line = blockStamp ~ thinkStyle(format("∴ Thought for %.1fs", secs)) ~ dim(format(" · %s chars", chars));
+            auto line = thoughtLine(thinkMs, thinkText);
             write(line ~ "\n");
             // Ctrl-O shows the reasoning under the summary.
-            if (gFrame && chars)
-                write(foldMark("", 1, line ~ "\n" ~ expandedBody(thinkText, color ? "\x1b[38;5;245m" : "")));
+            if (framed)
+            {
+                // Its own id, so reasoning that streams after the answer can rewrite it.
+                thinkId = "think-" ~ (++thinkSeq).to!string;
+                write(foldMark(thinkId, 1, line ~ "\n" ~ expandedBody(thinkText, color ? "\x1b[38;5;245m" : "")));
+            }
         }
         midLine = false;
         stdOut.flush();
+    }
+
+    /// Reasoning that arrives after this call's thinking block closed and
+    /// its answer began: held back, so the answer is not split.
+    private bool lateReasoning(string chunk)
+    {
+        import std.string : strip;
+        if (thinking || !answering || !thoughtThisCall) return false;
+        if (!late && !chunk.strip.length) return true;
+        late = true;
+        if (!lateStart) lateStart = nowMs();
+        lateText ~= chunk;
+        return true;
+    }
+
+    /// Joins held-back reasoning to the call's thinking block. The frame
+    /// rewrites the block in place; an append-only console (or an expanded
+    /// block already printed) shows it after the answer instead.
+    private void mergeLate()
+    {
+        if (!late) return;
+        if (lateStart) thinkMs += nowMs() - lateStart;
+        late = false;
+        lateStart = 0;
+        auto rest = lateText;
+        lateText = null;
+        if (framed && thinkId.length)
+        {
+            thinkText ~= rest;
+            auto line = thoughtLine(thinkMs, thinkText);
+            write(refoldMark(thinkId, line ~ "\n", line ~ "\n" ~ expandedBody(thinkText, color ? "\x1b[38;5;245m" : "")));
+            stdOut.flush();
+            return;
+        }
+        flushMarkdown();
+        if (midLine) write("\n");
+        midLine = false;
+        answering = false;
+        thinkingDelta(rest);
+        finishThinking();
     }
 
     /// A streamed chunk of reasoning or answer.
@@ -1118,6 +1190,7 @@ struct Screen
             import std.string : strip;
             // Blank reasoning opens no block and doesn't count as streamed:
             // the call's full reasoning still shows at its end.
+            if (lateReasoning(chunk)) { if (late) streamedThinking = true; return; }
             if (!thinking && !chunk.strip.length) return;
             streamedThinking = true;
             thinkingDelta(chunk);
@@ -1125,6 +1198,7 @@ struct Screen
         }
         if (!chunk.length) return;
         streamedAnswer ~= chunk;
+        if (late && lateStart) { thinkMs += nowMs() - lateStart; lateStart = 0; }
         finishThinking();
         if (!answering)
         {
@@ -1154,6 +1228,7 @@ struct Screen
     {
         finishThinking();
         flushMarkdown();
+        mergeLate();
         if (midLine) writeln();
         midLine = false;
         answering = false;
@@ -1181,9 +1256,12 @@ struct Screen
     void endReasoning(string reasoning)
     {
         flushMarkdown();
+        mergeLate();
         if (!streamedThinking && reasoning.length && !thinking) thinkingDelta(reasoning);
         finishThinking();
         streamedThinking = false;
+        thinkId = null;
+        thoughtThisCall = false;
     }
 }
 
@@ -1193,6 +1271,52 @@ unittest
     Screen s;
     s.text(true, "  ");
     assert(!s.thinking && !s.streamedThinking, "blank reasoning must not hide the call's full reasoning");
+}
+
+// rust: ui.rs::trailing_thinking_merges_interleaved_reasoning_fragments
+unittest
+{
+    import std.algorithm : canFind, count, endsWith, filter;
+    import std.array : array;
+    import std.string : representation;
+    import nano.frame : Transcript;
+    import std.conv : to;
+    import std.string : lastIndexOf;
+    // The frame: reasoning after the answer started rewrites the reply's one
+    // thinking block, and the answer stays contiguous.
+    Screen s;
+    s.capturing = true;
+    s.testFrame = true;
+    s.text(true, "first ");
+    s.text(false, "A");
+    s.text(true, "second");
+    s.text(false, "B");
+    s.endReasoning("first second");
+    Transcript t;
+    t.feed(s.captured.representation);
+    auto thoughts = t.lines.filter!(l => l.canFind("Thought for")).array;
+    assert(thoughts.length == 1 && thoughts[0].canFind("12 chars"), t.lines.to!string);
+    assert(t.cur.endsWith(" AB") || t.cur == "AB", t.cur);
+    assert(t.toggleLatest());
+    assert(t.lines.canFind("    first second"), t.lines.to!string);
+    // A later answer chunk carries on the same line.
+    s.captured = null;
+    s.text(false, "C");
+    t.feed(s.captured.representation);
+    assert(t.cur.endsWith(" ABC") || t.cur == "ABC", t.cur);
+
+    // An append-only console: the answer is not split either; the late
+    // reasoning shows after it.
+    Screen p;
+    p.capturing = true;
+    p.text(true, "first ");
+    p.text(false, "A");
+    p.text(true, "second");
+    p.text(false, "B");
+    p.endReasoning("first second");
+    auto out_ = p.captured;
+    assert(out_.canFind("AB\n") && out_.count("Thought for") == 2, out_);
+    assert(out_.indexOf("AB") < out_.lastIndexOf("Thought for"), out_);
 }
 
 private size_t answerPad() { return atomicLoad(gTimestamps) ? stampWidth : 0; }
