@@ -30,7 +30,7 @@ import nano.tools;
 import nano.tools.bash : bashDefinition = definition, bashExecute = execute,
     bashHeartbeatSink = heartbeatSink, bashHeartbeatInterval = heartbeatInterval;
 import nano.tools.files : ReadState, registerFiles = register;
-import nano.tools.search : Denied, DenyScan, registerSearch = register;
+import nano.tools.search : Denied, DenyRules, DenyScan, registerSearch = register;
 import nano.permissions;
 import nano.session;
 import nano.toml : parseToml;
@@ -55,7 +55,7 @@ import nano.control : TurnControl, FdLineReader;
 import nano.instructions : ProjectInstructions, InstructionOptions = Options, expandHome;
 import core.atomic : atomicLoad, atomicStore, cas;
 
-enum string packageVersion = "1.6.5";
+enum string packageVersion = "1.8.0";
 enum string versionString = "nano-coder " ~ packageVersion;
 
 enum string usage = `Usage: nano-coder [--model provider/model] [--config PATH] [-p PROMPT]
@@ -932,13 +932,14 @@ private string spaces(size_t n) pure { import std.array : replicate; return " ".
 Verbosity verbosity() { return atomicLoad(gVerbosity); }
 /// The built-in tools every session offers: bash, the file tools and
 /// search (`deny` hides read-denied paths from search results).
-void registerBuiltinTools(ToolRegistry tools, const ref Config cfg, ReadState readState, DenyScan deny)
+void registerBuiltinTools(ToolRegistry tools, const ref Config cfg, ReadState readState, DenyScan deny,
+    DenyRules denyRules = null)
 {
     auto bashTimeout = cfg.bashTimeoutSecs;
     auto sandbox = cfg.sandbox;
     tools.register(bashDefinition(bashTimeout), (JSONValue a) => bashExecute(a, bashTimeout, sandbox));
     registerFiles(tools, readState);
-    registerSearch(tools, deny);
+    registerSearch(tools, deny, denyRules);
 }
 
 // rust: main.rs::builtin_tools_include_search_and_no_echo
@@ -1336,6 +1337,12 @@ class Console : AgentEvents
         auto st = stamp();
         auto w = (isTerminal(1) ? terminalWidth() : 80);
         auto clean = sanitizeBlock(result);
+        {
+            // A plan tool's result is the rendered plan: show its marks as symbols.
+            import std.algorithm.searching : startsWith;
+            import nano.plan : planSymbols;
+            if (renderMarkdown && call.name.startsWith("plan_")) clean = planSymbols(clean);
+        }
         auto shown = stampBlock(st, toolResult(!isError, clean, verbose && !gFrame, w > 8 + st.length ? w - 8 - (st.length ? stampWidth : 0) : 1));
         write(shown);
         // Ctrl-O shows every line, together with the call's arguments.
@@ -1859,6 +1866,13 @@ unittest
 void replayTranscript(Agent agent, Console console)
 {
     auto msgs = agent.replayMessages;
+    // Hold the frame while the history is written: each line would otherwise
+    // render its own synchronized frame, and a real terminal shows the whole
+    // conversation scrolling past. Released last (scope exits run in
+    // reverse), so the replay and the status bar appear in one frame.
+    auto frame = gFrame;
+    if (frame) frame.hold(true);
+    scope (exit) if (frame) frame.hold(false);
     // Each toolEnd would refresh the view (a token estimate over the whole
     // conversation): quadratic on long sessions, so refresh once at the end.
     auto after = console.afterStep;
@@ -1948,7 +1962,7 @@ void replayTranscript(Agent agent, Console console)
         }
     }
     flushPending();
-    if (!agent.plan.empty && !console.quiet) writeln(escapeMarks(sanitizeBlock(planText(agent))));
+    if (!agent.plan.empty && !console.quiet) writeln(escapeMarks(sanitizeBlock(planText(agent, console.renderMarkdown))));
     // toolStart/toolEnd drive the live status; the replay leaves it idle
     // (and this one redraw covers every batched change).
     gStatusBatched = wasBatched;
@@ -2090,10 +2104,14 @@ unittest
     assert(unwrapReminder("<system-reminder>\n\n</system-reminder>") == "");
 }
 
-string planText(Agent agent) pure
+/// The plan for `/plan` and replay; `symbols` (a rendering terminal) shows
+/// item marks as ☐/◐/☑/⊘/☒ like rendered markdown task lists.
+string planText(Agent agent, bool symbols = false) pure
 {
-    return agent.plan.empty ? "No plan yet. The agent makes one with the plan_add tool."
-        : agent.plan.render(true, size_t.max).stripRight;
+    import nano.plan : planSymbols;
+    if (agent.plan.empty) return "No plan yet. The agent makes one with the plan_add tool.";
+    auto text = agent.plan.render(true, size_t.max).stripRight;
+    return symbols ? planSymbols(text) : text;
 }
 
 string modeListing(AgentMode current) pure
@@ -2300,6 +2318,10 @@ int runMain(string[] args)
         if (!has) return Denied.init;
         auto forRoot = scan.forRoot(root);
         return (string path) @safe => forRoot.denied(path);
+    }, () @safe {
+        // The same rules as text, for a search on a worker thread (#222).
+        auto sources = built.match!(a => a.policy.readDenySources, () => policy.readDenySources);
+        return sources.length ? getcwd() ~ sources : null;
     });
 
     auto cwd = getcwd();
@@ -2365,7 +2387,15 @@ int runMain(string[] args)
         foreach (t; memorySessionTools(store, memoryWritable,
                 () => built.match!(a => a.control.mode == AgentMode.plan, () => o.plan),
                 () => built.match!(a => a.log.match!(l => l.id, () => string.init), () => string.init)))
-            tools.register(t.definition, asToolError(t.handler));
+            // Search never prompts, and changes nothing another tool reads
+            // unless the session is writable: then it bumps `last_used` and
+            // rewrites the memory files (nano/memory.d `searchInner`), which
+            // would race a concurrent call's recall processing and any file
+            // worker reading the store. So it may run alongside other
+            // read-only calls only when it runs read-only itself — a writable
+            // session keeps it a barrier (#222).
+            tools.register(t.definition, asToolError(t.handler),
+                Concurrency(t.definition.name == imported!"nano.memory".searchTool && !memoryWritable));
     // Instruction files, discovered once per working directory and re-read
     // before each turn (`reloadInstructions`).
     Option!ProjectInstructions instructions;
@@ -2647,7 +2677,7 @@ int runMain(string[] args)
         view.set("/tools", toolsListing(agent));
         view.set("/skills", skillsListing(skills));
         view.set("/session", sessionText(agent));
-        view.set("/plan", planText(agent));
+        view.set("/plan", planText(agent, console.renderMarkdown));
         view.set("/timers", timersText(agent));
         view.set("/context", contextReport(agent));
         view.set("log", agent.log.match!(l => l.path, () => string.init));
@@ -2908,7 +2938,7 @@ int runMain(string[] args)
             "nano-coder v" ~ packageVersion,
             format("Model: %s (provider: %s)", client.modelName, client.providerName),
         ];
-        agent.log.ifSome((SessionLog l) { banner ~= format("Session: %s (resume with --resume %s)", l.id, l.id); });
+        agent.log.ifSome((SessionLog l) { banner ~= format("Session: %s (resume with nano-coder --resume %s)", l.id, l.id); });
         foreach (pi; instructions)
         {
             foreach (f; pi.loadedPaths) banner ~= "Instructions: " ~ f;
@@ -2944,7 +2974,7 @@ int runMain(string[] args)
     void goodbye()
     {
         writeln("\nGoodbye!");
-        agent.log.ifSome((SessionLog l) { writefln("Session: %s (resume with --resume %s)", l.id, l.id); });
+        agent.log.ifSome((SessionLog l) { writefln("Session: %s (resume with nano-coder --resume %s)", l.id, l.id); });
         stdOut.flush();
     }
     for (;;)
@@ -3132,7 +3162,7 @@ int runMain(string[] args)
                     agent.useHooks(loadHooks(cwd), false);
                     if (gFrame) gFrame.clear();
                     refreshStatus();
-                    log.match!(l => writefln("Session: %s (resume with --resume %s)", l.id, l.id),
+                    log.match!(l => writefln("Session: %s (resume with nano-coder --resume %s)", l.id, l.id),
                         () => writefln("Session: %s", newSessionId()));
                     continue;
                 }
@@ -3156,7 +3186,7 @@ int runMain(string[] args)
                     auto exe = launchExe();
                     // Printed after the frame hands the terminal back, so it stays on screen.
                     if (gFrame) gFrame.suspend();
-                    writefln("\nRelaunching into session %s (resume later with --resume %s)", id, id);
+                    writefln("\nRelaunching into session %s (resume later with nano-coder --resume %s)", id, id);
                     stdOut.flush();
                     leaveKeyMode();
                     nano.herdr.release();
@@ -3225,7 +3255,7 @@ int runMain(string[] args)
                     writeln(runQueueCommand(queue, agent.control.nonNull, arg));
                     continue;
                 case "/plan":
-                    writeln(planText(agent));
+                    writeln(planText(agent, console.renderMarkdown));
                     continue;
                 case "/timers":
                     writeln(timersText(agent));
@@ -3294,7 +3324,7 @@ int runMain(string[] args)
                     if (gFrame) { gFrame.clear(); replayTranscript(agent, console); }
                     foreach (n; loadNotes) stdErr.writeln(n);
                     stdErr.flush();
-                    writefln("Resumed session %s (resume later with --resume %s)", id, id);
+                    writefln("Resumed session %s (resume later with nano-coder --resume %s)", id, id);
                     continue;
                 }
                 case "/trajectory":
