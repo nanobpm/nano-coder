@@ -128,6 +128,9 @@ BashResult run(string command, Duration timeout, string cwd = null, const Sandbo
     // The next heartbeat is due one interval in; it stops the moment the loop
     // below breaks (the command finished, timed out or was cancelled).
     auto nextBeat = started + heartbeatInterval;
+    // Poll fast at first (most commands finish in milliseconds), backing off
+    // to 20 ms for long ones.
+    auto poll = 1.msecs;
     for (;;)
     {
         auto st = tryWait(pid);
@@ -152,7 +155,8 @@ BashResult run(string command, Duration timeout, string cwd = null, const Sandbo
             heartbeatSink(heartbeatText(command, now - started));
             nextBeat = now + heartbeatInterval;
         }
-        sleepFor(20.msecs);
+        sleepFor(poll);
+        if (poll < 20.msecs) poll = poll * 2 > 20.msecs ? 20.msecs : poll * 2;
     }
     r.stdout_ = lossyUtf8(readBytes(outPath));
     r.stderr_ = lossyUtf8(readBytes(errPath));
@@ -200,7 +204,7 @@ unittest
 {
     auto r = run("echo out; echo err >&2; exit 3", 5.seconds);
     assert(r.stdout_ == "out\n" && r.stderr_ == "err\n" && r.exitCode == 3 && !r.timedOut);
-    auto t = run("sleep 5 & sleep 5", 100.msecs);
+    auto t = run("sleep 5 & sleep 5", 50.msecs);
     assert(t.timedOut);
     import std.string : indexOf;
     auto text = execute(parseJSON(`{"command":"printf hi; false"}`));
@@ -336,7 +340,7 @@ unittest
     auto savedInterval = heartbeatInterval;
     scope (exit) { heartbeatSink = savedSink; heartbeatInterval = savedInterval; }
     heartbeatSink = null;
-    heartbeatInterval = 20.msecs;
-    auto r = run("sleep 0.05", 5.seconds);
+    heartbeatInterval = 10.msecs;
+    auto r = run("sleep 0.03", 5.seconds);
     assert(r.exitCode == 0); // no crash, no output, no heartbeat
 }
