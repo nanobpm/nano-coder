@@ -237,7 +237,7 @@ struct PinStash
     /// Take over a restored sequence (adoption from `Restored`), which
     /// restore already bounded: `msgs` is its retained copy, `d` its dropped
     /// middle, `logical` the full logical count.
-    void adopt(Message[] msgs, ctx.PinDrop d, size_t logical) pure nothrow @safe @nogc
+    void adopt(Message[] msgs, ctx.PinDrop d, size_t logical) pure @safe
     {
         store = msgs;
         dead_ = 0;
@@ -247,7 +247,7 @@ struct PinStash
         foreach (i, ref m; store) bytes_ += ctx.pinStashBytes(m, i == 0);
     }
     /// Test-only setter: replace the held sequence (unbounded).
-    void assign(Message[] msgs) pure nothrow @safe @nogc
+    void assign(Message[] msgs) pure @safe
     {
         adopt(msgs, ctx.PinDrop.init, msgs.length);
     }
@@ -396,7 +396,7 @@ struct ReplayStash
     /// Take over a restored sequence (adoption from `Restored`).
     void adopt(Message[] msgs) pure nothrow @safe @nogc { store = msgs; }
     /// Test-only setter: replace the held sequence.
-    void assign(Message[] msgs) pure nothrow @safe @nogc { store = msgs; }
+    void assign(Message[] msgs) pure @safe { store = msgs; }
     /// Drop every held turn (session reset).
     void clear() pure nothrow @safe @nogc { store = null; }
 

@@ -969,7 +969,7 @@ enum size_t pinStashBudgetBytes = 512 * 1_024;
 /// triggers an eviction, and the budget never drops a request the renderer
 /// would have shown whole. Cheap — string lengths only — so appending stays
 /// O(1).
-size_t pinStashBytes(const ref Message m, bool first) pure nothrow @safe @nogc
+size_t pinStashBytes(const ref Message m, bool first) pure @safe
 {
     auto text = m.pinText.length ? m.pinText : m.content;
     auto budget = first ? pinnedFirstChars : pinnedLaterChars;
@@ -985,7 +985,14 @@ size_t pinStashBytes(const ref Message m, bool first) pure nothrow @safe @nogc
         do { label++; digits /= 10; } while (digits);
         budget = saturatingSub(budget, label);
     }
-    return min(len, budget) + 1;
+    if (len <= budget) return len + 1;
+    // Clipped: `clipBytes` scales its char budget for multi-byte text and can
+    // return well under `budget`, so charge what it actually emits — never
+    // more than the renderer shows (only over-budget requests pay this).
+    import std.array : join, split;
+    import std.string : strip;
+    string norm = first ? text.strip.idup : text.split.join(" ").idup;
+    return clipBytes(norm, budget).length + 1;
 }
 
 /// The byte length of `text` once leading/trailing whitespace is stripped.
@@ -1103,29 +1110,10 @@ string pinnedUserRequests(const Message[] prior, const Message[] new_, bool smar
     foreach (ref m; prior) if (isUserRequest(m)) requests ~= m;
     foreach (ref m; new_) if (isUserRequest(m)) requests ~= m;
     if (!requests.length) return null;
-    if (requests.length > 2)
-    {
-        import std.algorithm : isSorted;
-        // The tail is append-ordered already (the bound evicts oldest-first);
-        // sort defensively, lazily and by index (the elements are const).
-        if (!isSorted!((a, b) => a.logLine < b.logLine)(requests[1 .. $]))
-        {
-            import std.algorithm : makeIndex;
-            import std.array : appender;
-            // The elements are const, so sort an index over the tail and
-            // gather through it. Requests without a log line (appended this
-            // session, before the log assigns one) are the NEWEST: sort them
-            // as past every logged line, in append order.
-            auto order = new size_t[saturatingSub(requests.length, 1)];
-            makeIndex!((a, b) => (a.logLine ? a.logLine : ulong.max) < (b.logLine ? b.logLine : ulong.max))(
-                requests[1 .. $], order);
-            auto gathered = appender!(const(Message)[]);
-            gathered.reserve(requests.length);
-            gathered ~= requests[0];
-            foreach (o; order) gathered ~= requests[o + 1];
-            requests = gathered[];
-        }
-    }
+    // Keep append order: the stash is append-ordered already (the bound
+    // evicts oldest-first), and ID-less requests (legacy pins, restated
+    // pending inputs) can precede logged ones, so sorting by log line would
+    // reorder chronology and let a tight window keep older requests.
     auto allowance = max(windowTokens / pinnedWindowShare, pinnedMinAllowanceTokens) * 4;
     auto prefixCost = pinnedRequestsPrefix.length + 1;
     size_t remaining = saturatingSub(allowance, prefixCost);
@@ -1553,4 +1541,20 @@ unittest
     auto bracketed = Message.user("[constraint] use port 8080");
     assert(!renderTranscript([bracketed], 10_000, true).canFind("[earlier summary]"));
     assert(smartSummaryNote(2, 40).canFind("#2–#40"));
+}
+
+/// Charges never exceed what the renderer emits for clipped multi-byte text,
+/// and ID-less requests keep append order (no sort to the end).
+unittest
+{
+    import std.array : replicate;
+    Message m; m.role = Role.user; m.content = "😀".replicate(400);
+    auto rendered = clipBytes(m.content, pinnedLaterChars);
+    assert(pinStashBytes(m, false) == rendered.length + 1);
+    Message a; a.role = Role.user; a.content = "goal";
+    Message b; b.role = Role.user; b.content = "idless-old";
+    Message c; c.role = Role.user; c.content = "logged-new"; c.logLine = 7;
+    import std.string : indexOf;
+    auto out_ = pinnedUserRequests([a, b, c], null, false, 1_000_000);
+    assert(out_.indexOf("idless-old") < out_.indexOf("logged-new"), "append order kept");
 }

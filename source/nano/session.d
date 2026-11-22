@@ -19,6 +19,7 @@ import std.datetime.systime : Clock;
 import core.time : dur;
 import std.process : environment, thisProcessID;
 import std.algorithm : sort, filter, map, min, max;
+import nano.arith : saturatingSub;
 import std.array : array;
 import nano.llm;
 import nano.option : Option, some, ifSome;
@@ -1145,7 +1146,11 @@ private void pinTruncate(ref Restored r, size_t b, Message[ulong] pinsByLine)
         if (!oldDrop.count) oldDrop = ctx.PinDrop.init;
     }
     // Then the retained tail, oldest first, for what the base still covers.
-    auto tailKept = budgetLeft < oldRetained.length - 1 ? budgetLeft : oldRetained.length - 1;
+    // The unreloaded middle (e.g. ID-less requests the log cannot re-decode)
+    // still occupies the logical positions before the tail, so the tail only
+    // covers what the base reaches PAST the whole middle.
+    auto pastMiddle = saturatingSub(budgetLeft, oldDrop.count);
+    auto tailKept = pastMiddle < oldRetained.length - 1 ? pastMiddle : oldRetained.length - 1;
     // Build the first-plus-tail copy ONCE: first request, reloaded middle
     // head, retained-tail head — no per-request reallocation.
     r.pinStash = new Message[1 + reloaded.length + tailKept];
@@ -2435,4 +2440,24 @@ unittest
     import nano.plan : Status;
     assert(p.items.length == 2 && p.items[0].status == Status.done && p.items[1].status == Status.done,
         "the snapshot plus its later deltas restore the plan");
+}
+
+/// Truncating into an ID-less dropped middle keeps it dropped rather than
+/// promoting later retained-tail requests into the base's prefix.
+unittest
+{
+    Restored r;
+    Message u(string c) { Message m; m.role = Role.user; m.content = c; return m; }
+    r.pinStash = [u("goal"), u("t1"), u("t2"), u("t3")];
+    r.pinDrop.count = 10; // ID-less: lo/hi unknown
+    r.pinLogical = 14;
+    Message[ulong] none;
+    pinTruncate(r, 5, none);
+    assert(r.pinStash.length == 1 && r.pinStash[0].content == "goal", "no tail promoted into the middle's slots");
+    assert(r.pinDrop.count == 4 && r.pinLogical == 5, "omission metadata survives");
+    r.pinStash = [u("goal"), u("t1"), u("t2"), u("t3")];
+    r.pinDrop = ctx.PinDrop(2, 0, 0);
+    r.pinLogical = 6;
+    pinTruncate(r, 5, none);
+    assert(r.pinStash.length == 3 && r.pinStash[1].content == "t1" && r.pinDrop.count == 2, "tail only past the middle");
 }
