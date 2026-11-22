@@ -803,6 +803,10 @@ Restored restore(string path)
     }
     size_t index;
     ulong lineNo;
+    // Every `pinned_requests` array ever logged, by its request's log line:
+    // `pinTruncate` reloads a dropped middle the truncation base reaches back
+    // into from these records (the bound evicted it from memory, not disk).
+    Message[][ulong] pinsByLine;
     foreach (line; text[0 .. committed].lineSplitter)
     {
         ++lineNo;
@@ -939,7 +943,7 @@ Restored restore(string path)
                 // `folded` delta onto the PRE-record `foldedStash`; running it
                 // after the replay helper advanced the stash would apply the
                 // delta twice (duplicated pins when folded_base > length).
-                restorePinStash!decode(data, inputs, foldedStash, r);
+                restorePinStash!decode(data, inputs, foldedStash, pinsByLine, r);
                 restoreReplayStash!decode(data, inputs, foldedStash, r);
             }
             {
@@ -1027,16 +1031,17 @@ private void restoreReplayStash(alias decode)(JSONValue data, const string[] inp
 /// the logical count `pinned_base` refers to. A delta's base is LOGICAL, so it
 /// is mapped onto the retained copy plus the dropped range (`pinTruncate`); the
 /// session log records and the on-disk format are unchanged.
-private void restorePinStash(alias decode)(JSONValue data, const string[] inputs, ref Message[] foldedStash, ref Restored r)
+private void restorePinStash(alias decode)(JSONValue data, const string[] inputs, ref Message[] foldedStash,
+    ref Message[][ulong] pinsByLine, ref Restored r)
 {
     auto pins = "pinned_requests" in data, pinBase = "pinned_base" in data;
     if (pins !is null && pinBase !is null && pinBase.type == JSONType.integer)
     {
         auto b = cast(size_t) pinBase.integer;
-        pinTruncate(r, b);
-        pinExtend(r, decode(*pins, inputs));
+        pinTruncate(r, b, pinsByLine);
+        pinExtend(r, decodeAndIndex!decode(*pins, inputs, pinsByLine));
     }
-    else if (pins !is null) pinAdoptFull(r, decode(*pins, inputs));
+    else if (pins !is null) pinAdoptFull(r, decodeAndIndex!decode(*pins, inputs, pinsByLine));
     else
     {
         // Rust-era fallback: no `pinned_requests` field, so the pin stash is
@@ -1072,11 +1077,16 @@ private void pinAdoptFull(ref Restored r, Message[] full)
     pinBound(r);
 }
 
-/// Truncate the pin stash to a LOGICAL base of `b` requests (restore): a base
-/// that reaches into the dropped middle un-drops its tail — those requests
-/// are gone from memory, so the retained copy keeps only what the base still
-/// covers and the dropped range shrinks to its uncovered head.
-private void pinTruncate(ref Restored r, size_t b)
+/// Truncate the pin stash to a LOGICAL base of `b` requests (restore): the
+/// retained copy keeps the base's logical PREFIX — the first request, then
+/// the oldest requests of the dropped middle (re-decoded from the log's
+/// `pinned_requests` records by their line span: the bound evicted them from
+/// memory, not from disk), then as much of the retained tail as the base
+/// still covers. The rest of the middle stays dropped, so the invariant
+/// pinLogical == pinStash.length + pinDrop.count holds for the truncated
+/// stash too. A base smaller than the next delta's true base means a torn or
+/// hand-edited log — well-formed logs never do this.
+private void pinTruncate(ref Restored r, size_t b, Message[][ulong] pinsByLine)
 {
     if (b >= r.pinLogical) return;
     if (b == 0)
@@ -1087,19 +1097,55 @@ private void pinTruncate(ref Restored r, size_t b)
         return;
     }
     // The first request is always retained, so it always survives a base ≥ 1.
-    auto tailKept = b - 1 < r.pinStash.length - 1 ? b - 1 : r.pinStash.length - 1;
-    auto tailDropped = r.pinStash.length - 1 - tailKept;
-    r.pinStash = r.pinStash[0 .. 1 + tailKept];
-    // The uncovered head of the old middle stays dropped; its span no longer
-    // covers the un-dropped tail's log lines (unknown — they were dropped),
-    // which only a base smaller than the next delta's true base can produce
-    // (a torn or hand-edited log).
-    if (tailDropped < r.pinDrop.count)
+    auto oldRetained = r.pinStash;
+    auto oldDrop = r.pinDrop;
+    r.pinStash = oldRetained[0 .. 1];
+    auto budgetLeft = b - 1;
+    // The base reaches into the dropped middle first: reload its oldest
+    // requests from the log (the span's lines are the middle's, oldest first).
+    if (oldDrop.count && oldDrop.lo && budgetLeft)
     {
-        r.pinDrop.count -= tailDropped;
-        if (r.pinDrop.count == 0) r.pinDrop = ctx.PinDrop.init;
+        auto want = budgetLeft < oldDrop.count ? budgetLeft : oldDrop.count;
+        auto got = want;
+        auto line = oldDrop.lo;
+        while (got && line <= oldDrop.hi)
+        {
+            if (auto ms = line in pinsByLine)
+                foreach (m; *ms)
+                {
+                    if (!got) break;
+                    r.pinStash ~= m;
+                    got--;
+                }
+            line++;
+        }
+        auto reloaded = want - got;
+        budgetLeft -= reloaded;
+        oldDrop.lo = line;
+        oldDrop.count -= reloaded;
+        if (!oldDrop.count) oldDrop = ctx.PinDrop.init;
     }
+    // Then the retained tail, oldest first, for what the base still covers.
+    auto tailKept = budgetLeft < oldRetained.length - 1 ? budgetLeft : oldRetained.length - 1;
+    r.pinStash ~= oldRetained[1 .. 1 + tailKept];
+    // What the base no longer covers — the middle's unreloaded rest plus the
+    // un-dropped tail, gone from memory — is the new dropped middle. The old
+    // span reached into the tail's unknown log lines, so it survives only
+    // while the middle still has unreloaded requests.
+    r.pinDrop.count = b - r.pinStash.length;
+    if (!r.pinDrop.count || !oldDrop.count) r.pinDrop = ctx.PinDrop.init;
+    else { r.pinDrop.lo = oldDrop.lo; r.pinDrop.hi = oldDrop.hi; }
     r.pinLogical = b;
+}
+
+/// Decode a `pinned_requests` array and index each request by its log line,
+/// so a later `pinTruncate` can reload a dropped middle from these records.
+private Message[] decodeAndIndex(alias decode)(const JSONValue v, const string[] inputs, ref Message[][ulong] pinsByLine)
+{
+    auto o = decode(v, inputs);
+    foreach (m; o)
+        if (m.logLine) pinsByLine[m.logLine] ~= m;
+    return o;
 }
 
 /// Extend the pin stash with a delta's requests (restore), then re-apply the
@@ -1913,6 +1959,44 @@ unittest
         ~ line("replace", rep(second, 99_000)));
     auto r3 = restore(path3);
     assert(r3.pinLogical == 4_500 && r3.pinStash[$ - 1].content == "request 4499");
+    // A base truncating an ALREADY-BOUNDED stash (drop.count > 0 — the torn
+    // log above, but with requests fat enough to bind the budget): the
+    // un-dropped tail is gone from memory, so it rejoins the dropped middle
+    // and the invariant pinLogical == pinStash.length + pinDrop.count holds
+    // for the truncated stash too.
+    import std.array : replicate;
+    Message[] fat;
+    foreach (i; 0 .. 3_000)
+    {
+        auto m = Message.user(format("fat request %s: ", i) ~ "x".replicate(200));
+        m.logLine = 10 + 2 * i;
+        fat ~= m;
+    }
+    JSONValue[] fatPins, fatDelta;
+    foreach (m; fat) fatPins ~= rec(m);
+    foreach (m; fat[0 .. 5]) fatDelta ~= rec(m);
+    auto path4 = buildPath(dir, "chain4.jsonl");
+    write(path4, `{"type":"session","data":{"version":1,"id":"chain4","created_at":"x"}}` ~ "\n"
+        ~ line("replace", rep(fatPins))
+        ~ line("replace", rep(fatDelta, 100)));
+    auto r4 = restore(path4);
+    assert(r4.pinLogical == 105, "the base truncates the bounded stash logically");
+    assert(r4.pinStash.length == 105, "the retained copy keeps what the base still covers");
+    assert(r4.pinDrop.count == 0,
+        "the un-dropped tail rejoins the dropped middle — no stale dropped count");
+    assert(r4.pinLogical == r4.pinStash.length + r4.pinDrop.count, "the logical count is retained + dropped");
+    // The retained copy is the base's logical PREFIX: the first request, the
+    // reloaded middle head, then the retained tail head — the delta's five
+    // requests extend it, so the truncated bounded stash renders the
+    // unbounded block.
+    assert(r4.pinStash[0].content.canFind("fat request 0:")
+        && r4.pinStash[99].content.canFind("fat request 99:")
+        && r4.pinStash[100].content.canFind("fat request 0:")
+        && r4.pinStash[$ - 1].content.canFind("fat request 4:"),
+        "the retained copy is the logical prefix plus the delta");
+    assert(ctx.pinnedUserRequests(r4.pinStash, null, true, 128_000, r4.pinDrop)
+        == ctx.pinnedUserRequests(fat[0 .. 100] ~ fat[0 .. 5], null, true, 128_000),
+        "the truncated bounded stash renders the unbounded block");
 }
 
 // Plan changes log as deltas applied onto the plan so far, with a full
