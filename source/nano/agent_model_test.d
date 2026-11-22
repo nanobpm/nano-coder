@@ -321,3 +321,78 @@ unittest
     assert(agent.capabilities.window == 4_096 && agent.capabilities.windowSource == "fast",
         "the stale probe did not overwrite the live model's window");
 }
+
+/// Events that count summary starts and usage reports, to assert a
+/// threshold compaction in `prepareCall` notifies its consumers.
+class CountingEvents : NullEvents
+{
+    size_t summaries, usages;
+    override void summaryStart() { summaries++; }
+    override void usage(TokenUsage u) { usages++; }
+}
+
+string bigText()
+{
+    string big;
+    foreach (_; 0 .. 1_000) big ~= "0123456789";
+    return big;
+}
+
+// A threshold compaction triggered by the recheck after applying a queued
+// `/model` forwards the turn's events: the summary's generation and usage
+// reach the renderer (PR #260 review).
+unittest
+{
+    auto first = new Interfering("first", [toolCall("c1")]);
+    auto agent = agentFor(first);
+    auto small = new Interfering("small", [LLMResponse("SUM"), LLMResponse("done")]);
+    agent.onModelRequest = (string spec) { agent.useClient(small, ConfiguredWindow(4_000, "test")); };
+    first.hook = (size_t call) { if (call == 1) agent.control.requestModel("mock/small"); };
+    agent.compactionPinRequests = false;
+    auto big = bigText();
+    agent.messages ~= [Message.user(big), Message.assistant(big), Message.user("q"), Message.assistant("a")];
+    auto ev = new CountingEvents;
+    assert(agent.run("go", ev) == "done");
+    assert(small.seen.length == 2 && small.seen[0][0].content == ctx.summarySystemPrompt,
+        "the recheck compacted on the switched model");
+    assert(ev.summaries == 1, "summaryStart fired for the recheck compaction");
+    assert(ev.usages >= 2, "the summary's usage and the reply's usage both reported");
+}
+
+// A background probe that lands during `applyModelRequest` can shrink the
+// window even when no model request is queued: the threshold is rechecked
+// unconditionally, so an oversized prompt is never sent (PR #260 review).
+unittest
+{
+    import core.time : msecs;
+    import nano.clock : sleepFor;
+    import nano.safeio : Shared;
+    auto p = Probes.make(false);
+    auto agent = agentFor(new Interfering("first", [LLMResponse("unused")]));
+    Interfering probed;
+    agent.probeClient = (string spec) => cast(LLMClient) p.client("probed", null, 4_096);
+    agent.onModelRequest = (string spec) {
+        probed = p.client("probed", [LLMResponse("SUM"), LLMResponse("done")], 4_096);
+        agent.useClient(probed, ConfiguredWindow.init);
+    };
+    // The switch happens before the turn (e.g. typed at the prompt while the
+    // previous turn ran), so its probe is already in flight at prepareCall.
+    agent.control.requestModel("mock/probed");
+    assert(agent.applyModelRequest());
+    agent.compactionPinRequests = false;
+    auto big = bigText();
+    agent.messages ~= [Message.user(big), Message.assistant(big), Message.user("q"), Message.assistant("a")];
+    assert(!agent.overThreshold(), "under the default window's threshold until the probe lands");
+    // The probe's result lands after prepareCall's first threshold check but
+    // before its apply: only the unconditional recheck can catch it. A hook
+    // holds the publish back until the first check has read the state.
+    auto hold = Shared!bool.make(true);
+    agent.onProbePublished = { while (hold.get) sleepFor(1.msecs); };
+    agent.onThresholdChecked = { hold.update((ref bool h) { h = false; }); };
+    auto ev = new CountingEvents;
+    p.gate.update((ref bool open) { open = true; }); // the probe answers during the apply
+    assert(agent.run("go", ev) == "done");
+    assert(probed !is null && probed.seen.length == 2 && probed.seen[0][0].content == ctx.summarySystemPrompt,
+        "the probe-shrunk window triggered a compaction before the prompt went out");
+    assert(ev.summaries == 1 && ev.usages >= 2, "the compaction notified its consumers");
+}

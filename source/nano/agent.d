@@ -250,6 +250,16 @@ class Agent
     ProbeState probe;
     /// The reports themselves.
     ref inout(Capabilities) capabilities() inout pure return { return probe.caps; }
+    version (unittest)
+    {
+        /// Test hook: runs right after a background probe's result is
+        /// published, so a test can hold the publish back from a threshold
+        /// check that already read the state.
+        void delegate() onProbePublished;
+        /// Test hook: runs in `prepareCall` after the first probe
+        /// collection, just before the first threshold check.
+        void delegate() onThresholdChecked;
+    }
     private ProviderConfig noProvider;
     Option!SessionLog log;
     TokenUsage lastUsage;
@@ -800,6 +810,7 @@ class Agent
         // Publish finished probes first: one can lower the window, which
         // the threshold check below must see.
         collectProbes();
+        version (unittest) if (onThresholdChecked !is null) onThresholdChecked();
         if (overThreshold())
         {
             CompactReport rep;
@@ -807,14 +818,18 @@ class Agent
             if (control.isCancelled) return false;
         }
         // A switch (or a probe collected with it) can lower the window
-        // again: recheck before the request goes out.
-        if (applyModelRequest() || collectProbes())
-            if (overThreshold())
-            {
-                CompactReport rep;
-                compact(rep, CompactTrigger.threshold);
-                if (control.isCancelled) return false;
-            }
+        // again: recheck before the request goes out. Apply and collect
+        // unconditionally first — a probe `applyModelRequest` publishes can
+        // shrink the window even when no model request is queued — and
+        // forward the events so this compaction notifies like the one above.
+        applyModelRequest();
+        collectProbes();
+        if (overThreshold())
+        {
+            CompactReport rep;
+            compact(rep, CompactTrigger.threshold, null, null, some(ev));
+            if (control.isCancelled) return false;
+        }
         if (auto level = control.takeThinkingRequest())
         {
             import nano.thinking : sessionSetting;
@@ -1528,6 +1543,7 @@ class Agent
             if (p.thread.running) { if (probe.isCurrent(p.generation)) still ~= p; continue; }
             auto result = p.thread.join();
             published |= probe.publishIfCurrent(p.generation, result.unwrap, configuredWindow == 0);
+            version (unittest) if (published && onProbePublished !is null) onProbePublished();
         }
         pendingProbes = still;
         return published;
