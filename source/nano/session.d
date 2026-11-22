@@ -622,8 +622,15 @@ class SessionLog
                     // records, or fall back to a private recovery log.
                     import nano.safeio : fchmodFd;
                     if (fchmodFd(fileno(next.getFP), octal!600) != 0) return;
+                    // Re-verify immediately before appending: a writer that
+                    // ignores flock (or rewrote the inode meanwhile) would
+                    // make the suffix land against a stale prefix, a gap or
+                    // overlap. Any change: fall back to the recovery log.
+                    if (!sameFile(next, path) || readAll(next) != theirs) return;
                     next.rawWrite(ours[theirs.length .. $]);
                     syncLog(next, path);
+                    // And confirm the result is exactly our records at the path.
+                    if (!sameFile(next, path) || readAll(next) != ours) return;
                     done = true;
                     how = "it was replaced; appended the records the new file was missing";
                 }
