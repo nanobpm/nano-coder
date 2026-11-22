@@ -53,6 +53,10 @@ import nano.permissions;
 import nano.session;
 import nano.control;
 import nano.claude_hooks : HookManager, Decision, HookOutcome = Outcome, applyUpdatedInput, maxStopBlocks;
+import nano.subagent : SubClientFactory, SubLimits, SubSlot, SubGate, SubMsg, SubKind, SubResult, SubProgress,
+    ToolReply, SubAbort, SubSpec, subToolName = toolName, subDefinition = definition;
+import nano.safeio : Chan;
+import std.typecons : Rebindable;
 
 /// What the loop reports as it works (the CLI renders these).
 interface AgentEvents
@@ -71,6 +75,32 @@ interface AgentEvents
     /// A model call (one generation) is about to start: a rate shown for
     /// the previous one is stale from here on.
     void generationStart();
+    /// A fresh model call is about to be prepared, before its steers drain
+    /// and its request is built. A sub-agent's limit check runs here, so a
+    /// limit first seen now still gets its report reminder into the grace
+    /// request (nano.subagent.ChildEvents). Events classes that don't
+    /// care mix in `AgentEventDefaults` for a no-op.
+    void beforeFreshCall();
+    /// Every running sub-agent's state after a change; `done` ones are
+    /// listed once, as they finish. Renderers that show progress override
+    /// this; events classes that don't care mix in `AgentEventDefaults`.
+    void subagents(const(SubProgress)[] all);
+    /// A compaction's summary request (a model call that is not a turn's
+    /// generation) is about to start. A sub-agent counts it toward its
+    /// budget without spending its one reporting-grace call on it
+    /// (nano.subagent.ChildEvents); everyone else treats it as a
+    /// generation (`AgentEventDefaults`).
+    void summaryStart();
+}
+
+/// No-op defaults for the `AgentEvents` members an events class need not
+/// care about (a D interface can't give a virtual method a body). Mix in
+/// and override what you render.
+mixin template AgentEventDefaults()
+{
+    void beforeFreshCall() {}
+    void subagents(const imported!"nano.subagent".SubProgress[] all) {}
+    void summaryStart() { generationStart(); }
 }
 
 /// Wrap text the model should read as a system note, not user words.
@@ -742,6 +772,10 @@ class Agent
                     (CallModel c) {
                         if (c.fresh)
                         {
+                            // A sub-agent's limit check runs before its
+                            // steers drain, so the report reminder reaches
+                            // the grace request (nano.subagent.ChildEvents).
+                            ev.beforeFreshCall();
                             if (!prepareCall(ev)) { done = true; answer = cancelled(ev); return; }
                             swStart = monoNow;
                         }
@@ -762,7 +796,7 @@ class Agent
                         auto learned = c.learned ? c.learned : estimateContextTokens() * 9 / 10;
                         learnedWindow = learned > 1_000 ? learned : 1_000;
                         CompactReport rep;
-                        const ok = compact(rep, CompactTrigger.overflow);
+                        const ok = compact(rep, CompactTrigger.overflow, null, null, some(ev));
                         next ~= Event(Compacted(ok, control.isCancelled));
                     },
                     (Rethrow _) { throw failure; },
@@ -824,7 +858,7 @@ class Agent
         if (overThreshold())
         {
             CompactReport rep;
-            compact(rep, CompactTrigger.threshold);
+            compact(rep, CompactTrigger.threshold, null, null, some(ev));
             if (control.isCancelled) return false;
         }
         applyModelRequest();
@@ -910,9 +944,20 @@ class Agent
     private Event runToolCalls(const ref LLMResponse r, AgentEvents ev, ref string loopStop)
     {
         loopStop = null;
+        // The `agent` calls of each barrier-free stretch of the reply start
+        // together (up to the concurrency cap) when the loop reaches the
+        // stretch; each result is taken in order below. A child never
+        // starts before an earlier mutation, so "agent, edit, agent" has
+        // the second child read the edit.
+        // Guard first: a failed launch still stops children already started.
+        scope (exit) finishSubagents();
+        resetSubagents(ev);
         auto calls = r.toolCalls;
         for (size_t i = 0; i < calls.length;)
         {
+            if (subagentsEnabled && calls[i].name == subToolName && (calls[i].id in subGates) is null
+                && loopStop is null)
+                launchSubagents(r, i);
             size_t j = i;
             while (j < calls.length && concurrentEligible(calls[j].name)) j++;
             if (j > i + 1 && !control.isCancelled && loopStop is null)
@@ -1220,6 +1265,7 @@ class Agent
         ev.toolEnd(call, toolResultDisplay(result, attachments), isError);
         auto msg = Message.toolResult(call.id, call.name, result, isError);
         msg.attachments = attachments;
+        if (auto sub = call.id in subLogs) msg.subLog = *sub;
         // Commit this call's recall changes only once the result
         // carrying their notes is durable: a failed append rolls them
         // back, so a resume never treats unseen notes as seen.
@@ -1632,7 +1678,7 @@ class Agent
     /// `mode` overrides `compactionMode` (null: the configured one); `focus`
     /// steers the summary. Returns false when there is nothing to compact.
     bool compact(out CompactReport report, CompactTrigger trigger = CompactTrigger.manual,
-            scope const(ctx.CompactionMode)* mode = null, string focus = null)
+            scope const(ctx.CompactionMode)* mode = null, string focus = null, Option!AgentEvents ev = none)
     {
         import std.algorithm : canFind;
         ctx.CompactionMode m = mode is null ? compactionMode : *mode;
@@ -1699,10 +1745,15 @@ class Agent
             try
             {
                 const swStart = monoNow;
+                // A compaction is a model call too: a sub-agent's budget
+                // counts it (its turn cap and token cap), so emit the same
+                // events a turn's call does.
+                foreach (e; ev) e.summaryStart();
                 auto r = client.chat(req, (bool, string) {});
                 summaryMs = since(swStart).total!"msecs";
                 summaryUsage = r.usage;
                 recordUsage(r.usage);
+                foreach (e; ev) e.usage(r.usage);
                 truncated = r.stopReason == "length" || r.stopReason == "max_tokens";
                 auto body_ = r.content.strip;
                 if (body_.length)
@@ -1985,7 +2036,17 @@ class Agent
         bool isOutcome = outcomeTool && call.name == outcomeToolName;
         bool isHistory = historyEnabled && hist.isHistoryTool(call.name);
         bool isTimer = timerTools && isTimerTool(call.name);
-        if (!isPlan && !isOutcome && !isHistory && !isTimer && !tools.has(call.name))
+        bool isAgent = subagentsEnabled && call.name == subToolName;
+        // An `agent` call was checked when its reply's sub-agents launched.
+        if (isAgent)
+            if (auto gate = call.id in subGates)
+            {
+                if (gate.deny !is null) { refused = gate.deny; return false; }
+                args = gate.args;
+                context ~= gate.context;
+                return true;
+            }
+        if (!isPlan && !isOutcome && !isHistory && !isTimer && !isAgent && !tools.has(call.name))
         {
             refused = format("Tool '%s' not found. Available: %s", call.name, toolNames());
             return false;
@@ -2036,10 +2097,12 @@ class Agent
         bool isOutcome = outcomeTool && call.name == outcomeToolName;
         bool isHistory = historyEnabled && hist.isHistoryTool(call.name);
         bool isTimer = timerTools && isTimerTool(call.name);
+        bool isAgent = subagentsEnabled && call.name == subToolName;
         string out_;
         try
         {
-            if (isOutcome)
+            if (isAgent) out_ = runSubagent(call, call.id in subGates);
+            else if (isOutcome)
             {
                 auto o = Outcome.fromArgs(args).orThrow!(e => new OutcomeError(e));
                 // Verify-before-complete (Rust #158): `completed` after an
@@ -2061,6 +2124,11 @@ class Agent
                 out_ = call.name == hist.searchTool ? hist.search(logPath, args) : hist.read(logPath, args);
             }
             else if (isTimer) out_ = runTimerTool(call.name, args);
+            else if (call.name == "read_file" && childReadState.isSome)
+            {
+                import nano.tools.files : readFile;
+                out_ = readFile(args, childReadState.unwrap("checked isSome"));
+            }
             else if (call.name == "apply_patch") out_ = applyPatchPrepared(args, tools, originals);
             else out_ = isPlan ? runPlanTool(call.name, args) : tools.execute(call.name, args);
             isError = false;
@@ -2093,6 +2161,267 @@ class Agent
                     if (o.blocked && o.blockReason.strip.length) context ~= o.blockReason;
                 }
         return withContext(out_, context);
+    }
+
+    // ---- sub-agents (the `agent` tool, issue #231) ----
+    /// Builds sub-agents' clients; null: no `agent` tool (as in a sub-agent).
+    Rebindable!(immutable SubClientFactory) subagentClients;
+    /// The model sub-agents run on (`subagent_model`; empty: this agent's).
+    string subagentModel;
+    /// How many sub-agents run at once (`subagent_max_concurrency`).
+    size_t subagentMaxConcurrency = 4;
+    SubLimits subagentLimits;
+    /// The current reply's sub-agents, the gate result of its `agent` calls
+    /// by call id, and the child logs to reference.
+    private SubSlot[] subSlots;
+    private SubGate[string] subGates;
+    private string[string] subLogs;
+    private Chan!SubMsg subUp;
+    private size_t subRunning, subCallSeq;
+    private Option!AgentEvents subEvents;
+    /// Set only while runTool runs a sub-agent's read_file: the child's own
+    /// read registry, kept apart from the parent's.
+    private Option!(imported!"nano.tools.files".ReadState) childReadState;
+
+    bool subagentsEnabled() pure const { return subagentClients.get !is null; }
+
+    /// Clear the previous reply's sub-agent state before a reply's tools run.
+    private void resetSubagents(AgentEvents ev)
+    {
+        subSlots = null;
+        subGates = null;
+        subLogs = null;
+        subRunning = 0;
+        subUp = Chan!SubMsg.init;
+        subEvents = some(ev);
+    }
+
+    /// Where the barrier-free stretch of `calls` starting at `from` ends:
+    /// the first call that is neither an `agent` call nor eligible to run
+    /// beside reads (an edit, bash, a hooked call ...).
+    private size_t subSegmentEnd(const(ToolCall)[] calls, size_t from)
+    {
+        auto j = from;
+        while (j < calls.length && (calls[j].name == subToolName || concurrentEligible(calls[j].name))) j++;
+        return j;
+    }
+
+    /// Check and start the `agent` calls in the barrier-free stretch of `r`
+    /// that begins at call `from` (the rest wait for a slot). Later
+    /// stretches launch when the loop reaches them, after the mutations
+    /// between.
+    private void launchSubagents(const ref LLMResponse r, size_t from)
+    {
+        import nano.subagent : parseArgs, systemPrompt, encodeDefinition, forwardable;
+        import std.file : getcwd;
+        import std.path : stripExtension;
+        if (!subagentsEnabled) return;
+        string cwd;
+        immutable(string)[] defs;
+        foreach (call; r.toolCalls[from .. subSegmentEnd(r.toolCalls, from)])
+        {
+            if (call.name != subToolName || control.isCancelled || (call.id in subGates) !is null) continue;
+            // An invalid call is reported by runTool, as for any tool.
+            if (call.rawArgumentsError(r.stopReason)) continue;
+            SubGate g;
+            if (admit(call, r.stopReason, g.deny, g.args, g.context))
+            {
+                try
+                {
+                    auto a = parseArgs(g.args, subagentLimits.timeoutSecs);
+                    if (!cwd.length)
+                    {
+                        cwd = getcwd();
+                        foreach (d; tools.definitions)
+                            if (forwardable(d.name) && (control.mode != AgentMode.plan || planAllows(d.name)))
+                                defs ~= encodeDefinition(d);
+                    }
+                    auto limits = subagentLimits;
+                    limits.timeoutSecs = a.timeoutSecs;
+                    auto model = a.model.length ? a.model : subagentModel.length ? subagentModel
+                        : client.providerName ~ "/" ~ client.modelName;
+                    immutable spec = SubSpec(subSlots.length, call.id, a.task, model,
+                        systemPrompt(cwd, wallNow.toISOExtString[0 .. 10]), defs, limits,
+                        log.match!(l => l.path.stripExtension, () => string.init), "sub-" ~ safeName(call.id), cwd);
+                    g.slot = subSlots.length;
+                    g.launched = true;
+                    subSlots ~= SubSlot(call.id, a.task, spec);
+                }
+                catch (ToolError e) g.argError = e.msg;
+            }
+            subGates[call.id] = g;
+        }
+        if (!subSlots.length) return;
+        if (!subUp) subUp = Chan!SubMsg.make;
+        if (startSubagents()) reportSubagents();
+    }
+
+    /// Start waiting sub-agents while there is room (none once cancelled).
+    /// True when one started (the caller reports it).
+    private bool startSubagents()
+    {
+        bool any;
+        import nano.safeio : spawn;
+        import nano.subagent : runChild;
+        auto cap = subagentMaxConcurrency ? subagentMaxConcurrency : 1;
+        foreach (i; 0 .. subSlots.length)
+        {
+            if (subSlots[i].started || subSlots[i].finished) continue;
+            if (control.isCancelled)
+            {
+                subSlots[i].finished = true;
+                subSlots[i].result.report = "(cancelled before the sub-agent started)";
+                subSlots[i].result.truncated = subSlots[i].result.cancelled = true;
+                subSlots[i].result.truncatedReason = "cancelled";
+                continue;
+            }
+            if (subRunning >= cap) break;
+            subSlots[i].down = Chan!ToolReply.make;
+            subSlots[i].abort = SubAbort.make;
+            immutable spec = subSlots[i].spec;
+            subSlots[i].handle = spawn(&runChild, spec, subagentClients.get, subUp, subSlots[i].down, subSlots[i].abort);
+            subSlots[i].started = true;
+            subSlots[i].start = monoNow;
+            subRunning++;
+            any = true;
+        }
+        return any;
+    }
+
+    /// Handle one message from a running sub-agent: run its tool call
+    /// (through this agent's policy and hooks), note its progress, or collect
+    /// its result.
+    private void pumpSubagents()
+    {
+        import nano.subagent : forwardable;
+        SubMsg m;
+        // Every child sends `done` (even on failure) and nothing closes the
+        // channel, so a take ends only with a message.
+        if (!subUp.take(m)) assert(0, "the sub-agent channel closed");
+        auto i = m.slot;
+        final switch (m.kind)
+        {
+            case SubKind.tool:
+                ToolReply rep;
+                rep.isError = true;
+                if (control.isCancelled) rep.text = cancelledToolResult;
+                else if (subSlots[i].abort.aborted) rep.text = loopStoppedToolResult;
+                else if (!forwardable(m.name)) rep.text = format("%s is not available to a read-only sub-agent", m.name);
+                else
+                {
+                    auto call = ToolCall.fromRaw(format("%s.%s", subSlots[i].callId, ++subCallSeq), m.name, m.args);
+                    // A child's read_file runs on its own ReadState: the
+                    // parent's registry would record the read, letting a
+                    // later parent write pass the read-before-write check on
+                    // a file the parent model never saw. It still goes
+                    // through runTool, so the parent's permission rules and
+                    // hooks apply as for every forwarded tool.
+                    if (m.name == "read_file" && subSlots[i].readState.isNone)
+                    {
+                        import nano.tools.files : ReadState;
+                        import nano.option : some;
+                        subSlots[i].readState = some(new ReadState);
+                    }
+                    childReadState = m.name == "read_file" ? subSlots[i].readState : typeof(childReadState).init;
+                    scope (exit) childReadState = typeof(childReadState).init;
+                    // A dispatch failure (a hook cannot start, the
+                    // registry throws) must still wake the child: close
+                    // its reply channel so its `down.take` ends instead
+                    // of blocking cleanup forever.
+                    try
+                    {
+                        bool dispatched;
+                        JSONValue effectiveArgs;
+                        rep.text = runTool(call, "tool_use", rep.isError, dispatched, effectiveArgs);
+                        // Tell the child which path it actually read (after
+                        // any hook rewrite); only a dispatched, successful
+                        // read counts as one.
+                        if (!rep.isError && dispatched && m.name == "read_file")
+                            if (auto p = "path" in effectiveArgs)
+                                if (p.type == JSONType.string) rep.effectivePath = p.str;
+                    }
+                    catch (Exception e)
+                    {
+                        subSlots[i].down.close();
+                        rep.text = format("%s failed: %s", m.name, e.msg);
+                    }
+                }
+                // After a dispatch failure the channel is closed and the
+                // child already woke; the put is a harmless no-op then.
+                subSlots[i].down.put(rep);
+                break;
+            case SubKind.progress:
+                subSlots[i].toolCalls = m.toolCalls;
+                subSlots[i].tokens = m.tokens;
+                reportSubagents();
+                break;
+            case SubKind.done:
+                subSlots[i].result = subSlots[i].handle.join();
+                subSlots[i].finished = true;
+                subSlots[i].toolCalls = subSlots[i].result.toolCalls;
+                subRunning--;
+                // Usage rolls up into this session's totals (status line, /cost).
+                recordUsage(subSlots[i].result.usage);
+                // Start the replacements first, so the one report shows
+                // them running (a child sends no progress during its first
+                // model request).
+                startSubagents();
+                reportSubagents();
+                break;
+        }
+    }
+
+    /// The `agent` call's result: wait for its sub-agent, serving the others.
+    private string runSubagent(const ref ToolCall call, const(SubGate)* gate)
+    {
+        if (gate is null || !gate.launched)
+            throw new ToolError(gate !is null && gate.argError.length ? gate.argError : "agent: the sub-agent did not start");
+        auto i = gate.slot;
+        while (!subSlots[i].finished)
+        {
+            if (!subSlots[i].started && startSubagents()) reportSubagents();
+            if (!subSlots[i].finished && subRunning) pumpSubagents();
+        }
+        auto res = subSlots[i].result;
+        if (res.logPath.length) subLogs[call.id] = res.logPath;
+        return res.toolText;
+    }
+
+    /// After a reply's tools ran: stop and collect sub-agents still running
+    /// (a cancel or a loop stop skipped their calls).
+    private void finishSubagents()
+    {
+        foreach (ref s; subSlots)
+            if (s.started && !s.finished) s.abort.abort();
+        foreach (ref s; subSlots) if (!s.started) s.finished = true;
+        while (subRunning) pumpSubagents();
+        subSlots = null;
+        subGates = null;
+        subEvents = none;
+    }
+
+    /// Show every started sub-agent's progress (renderers that support it).
+    private void reportSubagents()
+    {
+        SubProgress[] all;
+        foreach (i, ref s; subSlots)
+        {
+            if (!s.started || s.reportedDone) continue;
+            SubProgress p;
+            p.callId = s.callId;
+            p.task = s.task;
+            p.index = i;
+            p.toolCalls = s.toolCalls;
+            p.tokens = s.finished ? s.result.inputTokens + s.result.outputTokens : s.tokens;
+            p.elapsed = since(s.start);
+            p.done = s.finished;
+            p.truncated = s.result.truncated;
+            if (s.finished) s.reportedDone = true;
+            all ~= p;
+        }
+        if (all.length)
+            foreach (e; subEvents)
+                e.subagents(all);
     }
 
     /// An apply_patch call's touched paths as the file-tool calls a direct
@@ -2568,7 +2897,7 @@ class Agent
     {
         auto all = tools.definitions ~ (planTools ? planDefinitions() : null)
             ~ (outcomeTool ? [outcomeDefinition()] : null) ~ (historyEnabled ? hist.definitions() : null)
-            ~ (timerTools ? timerDefinitions() : null);
+            ~ (timerTools ? timerDefinitions() : null) ~ (subagentsEnabled ? [subDefinition()] : null);
         if (control.mode != AgentMode.plan) return all;
         ToolDefinition[] kept;
         foreach (t; all) if (planAllows(t.name)) kept ~= t;
@@ -2845,6 +3174,7 @@ version (unittest)
 
     class NullEvents : AgentEvents
     {
+        mixin AgentEventDefaults;
         string shown;
         string[] tools;
         void text(bool r, string s) pure { if (!r) shown ~= s; }
@@ -2858,6 +3188,18 @@ version (unittest)
         void responseRestarted() pure { restarts++; }
         size_t generations;
         void generationStart() pure { generations++; }
+    }
+
+    // The interface defaults cover the events a renderer need not care
+    // about: NullEvents never mentions `subagents` or `beforeFreshCall`,
+    // yet compiles and runs a turn (the agent calls both unconditionally).
+    unittest
+    {
+        import nano.providers.mock;
+        auto reg = new ToolRegistry;
+        auto mock = new MockClient([LLMResponse("ok")]);
+        auto agent = new Agent(mock, reg, Policy.init, "sys");
+        assert(agent.run("go", new NullEvents) == "ok");
     }
 }
 

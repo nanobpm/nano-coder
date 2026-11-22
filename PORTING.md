@@ -146,8 +146,10 @@ The Rust test suite is the feature specification. `parity/manifest.tsv` lists ev
 test (`FILE::NAME`) with a status: `test` (a D unittest carries a `// rust: FILE::NAME`
 marker), `claimed` (ported per this file, no linked test yet), `gap` (not ported; the note
 says what's missing), `na` (doesn't apply; the note says why) or `todo` (not triaged).
-The Rust code is frozen at the `rust-final` tag, so CI no longer runs the check; the manifest
-is the record of the port. `scripts/check-parity.py --ref rust-final` still checks it, and fails when:
+The Rust code is frozen at the `rust-final` tag, and the manifest is the record of the port.
+`scripts/check-parity.py` checks it against `rust-final` (the default `--ref`); `scripts/ci.sh lint`
+runs it (skipping with a message when the tag isn't fetched), so a manifest edit can't silently
+break it. It fails when:
 
 - Rust gains a test the manifest doesn't list (`--update` adds it as `todo`);
 - a `test` row has no marker, or a marker isn't backed by a `test` row;

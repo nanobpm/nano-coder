@@ -10,6 +10,8 @@
 /// so dimensions and EXIF orientation are read from the file headers here.
 /// Any image that must change (too large, or a type the model won't take) is
 /// re-encoded by the platform tool: `sips` on macOS, ImageMagick elsewhere.
+/// Both turn EXIF-oriented pixels upright (`-auto-orient`; sips by an
+/// explicit rotate/flip, since it would otherwise keep them sideways).
 /// Without one, such an image fails with a clear error. Images already within
 /// the limits are sent unchanged, as in Rust.
 module nano.attachment;
@@ -134,6 +136,12 @@ private uint[2] webpDimensions(const(ubyte)[] b) pure
 /// before the scan; stops when `each` returns true.
 private void jpegSegments(const(ubyte)[] b, scope bool delegate(ubyte, const(ubyte)[]) @safe each)
 {
+    jpegSegments(b, (ubyte m, const(ubyte)[] seg, size_t _) => each(m, seg));
+}
+
+/// As above, also passing the offset of `segment` within `b`.
+private void jpegSegments(const(ubyte)[] b, scope bool delegate(ubyte, const(ubyte)[], size_t) @safe each)
+{
     size_t i = 2;
     while (i + 4 <= b.length)
     {
@@ -146,7 +154,7 @@ private void jpegSegments(const(ubyte)[] b, scope bool delegate(ubyte, const(uby
         if (i + 2 > b.length) break;
         auto len = be16(b, i);
         if (len < 2 || i + len > b.length) throw new Exception("truncated JPEG segment");
-        if (each(m, b[i + 2 .. i + len])) return;
+        if (each(m, b[i + 2 .. i + len], i + 2)) return;
         i += len;
     }
 }
@@ -173,9 +181,17 @@ private uint[2] jpegDimensions(const(ubyte)[] b)
 /// formats report 1. (Rust also reads WebP EXIF; D treats WebP as upright.)
 uint exifOrientation(const(ubyte)[] b, ImageFormat f)
 {
-    if (f != ImageFormat.jpeg) return 1;
+    return f == ImageFormat.jpeg ? exifOrientationAt(b)[0] : 1;
+}
+
+/// A JPEG's EXIF orientation (1 when absent) and the offset of its value
+/// within `b` (`size_t.max` when there is no orientation tag).
+private auto exifOrientationAt(const(ubyte)[] b)
+{
+    import std.typecons : tuple;
     uint result = 1;
-    try jpegSegments(b, (ubyte m, const(ubyte)[] seg) {
+    size_t at = size_t.max;
+    try jpegSegments(b, (ubyte m, const(ubyte)[] seg, size_t start) {
         if (m != 0xe1 || seg.length < 14 || seg[0 .. 6] != "Exif\0\0".representation) return false;
         auto t = seg[6 .. $];
         bool le = t[0] == 'I';
@@ -190,14 +206,65 @@ uint exifOrientation(const(ubyte)[] b, ImageFormat f)
             if (u16(e) == 0x0112)
             {
                 auto v = u16(e + 8);
-                if (v >= 1 && v <= 8) result = v;
+                if (v >= 1 && v <= 8) { result = v; at = start + 6 + e + 8; }
                 break;
             }
         }
         return true;
     });
     catch (Exception) {} // a truncated or malformed JPEG: keep whatever was read so far
-    return result;
+    return tuple(result, at);
+}
+
+/// `b` with its orientation marked upright: a JPEG's EXIF orientation set to
+/// 1, a PNG's `eXIf` chunks dropped, and XMP packets (which repeat the
+/// orientation as `tiff:Orientation`) dropped from both. For pixels an
+/// encoder already rotated but whose source metadata it copied (sips does),
+/// so nothing turns them a second time.
+immutable(ubyte)[] clearOrientation(immutable(ubyte)[] b, ImageFormat f)
+{
+    enum jpegXmp = "http://ns.adobe.com/xap/1.0/\0", pngXmp = "XML:com.adobe.xmp\0";
+    if (f == ImageFormat.jpeg)
+    {
+        auto r = exifOrientationAt(b);
+        ubyte[] o = b.dup;
+        if (r[1] != size_t.max && r[0] != 1)
+        {
+            bool le = false;
+            jpegSegments(b, (ubyte m, const(ubyte)[] seg) {
+                if (m != 0xe1 || seg.length < 14 || seg[0 .. 6] != "Exif\0\0".representation) return false;
+                le = seg[6] == 'I';
+                return true;
+            });
+            // The upright value 1 in the TIFF header's byte order.
+            o[r[1]] = le ? 1 : 0;
+            o[r[1] + 1] = le ? 0 : 1;
+        }
+        // Drop XMP segments, back to front so earlier offsets hold.
+        size_t[2][] cut;
+        jpegSegments(b, (ubyte m, const(ubyte)[] seg, size_t start) {
+            if (m == 0xe1 && seg.length >= jpegXmp.length && seg[0 .. jpegXmp.length] == jpegXmp.representation)
+                cut ~= [start - 4, start + seg.length];
+            return false;
+        });
+        foreach_reverse (c; cut) o = o[0 .. c[0]] ~ o[c[1] .. $];
+        return o.idup;
+    }
+    if (f != ImageFormat.png || b.length < 8) return b;
+    ubyte[] o = b[0 .. 8].dup;
+    size_t i = 8;
+    while (i + 12 <= b.length)
+    {
+        auto end = i + 12 + be32(b, i);
+        if (end > b.length || end < i) return b; // malformed: leave it alone
+        auto type = b[i + 4 .. i + 8], data = b[i + 8 .. end - 4];
+        bool xmp = type == "iTXt".representation && data.length >= pngXmp.length
+            && data[0 .. pngXmp.length] == pngXmp.representation;
+        if (type != "eXIf".representation && !xmp) o ~= b[i .. end];
+        i = end;
+    }
+    o ~= b[i .. $];
+    return o.idup;
 }
 
 /// Orientations 5..8 are quarter turns: display width and height swap.
@@ -318,6 +385,14 @@ Encoder platformEncoder()
 private immutable(ubyte)[] runEncoder(const(ubyte)[] src, ImageFormat codec,
         string[] delegate(string input, string output) @safe argv)
 {
+    return runEncoder(src, codec, (string i, string m, string o) => [argv(i, o)]);
+}
+
+/// Runs each command of `steps(input, intermediate, output)` in turn; a
+/// multi-step pipeline passes images through `intermediate` (a PNG path).
+private immutable(ubyte)[] runEncoder(const(ubyte)[] src, ImageFormat codec,
+        string[][] delegate(string input, string intermediate, string output) @safe steps)
+{
     import std.file : write, read, remove, exists, tempDir;
     import std.path : buildPath;
     import std.process : execute, thisProcessID;
@@ -326,26 +401,67 @@ private immutable(ubyte)[] runEncoder(const(ubyte)[] src, ImageFormat codec,
     static shared ulong counter;
     auto stem = buildPath(tempDir, format("nano-coder-img-%s-%s-%s", thisProcessID,
             stdTimeNow, atomicOp!"+="(counter, 1)));
-    auto input = stem ~ ".in", output = stem ~ "." ~ codec.extension;
+    auto input = stem ~ ".in", mid = stem ~ ".mid.png", output = stem ~ "." ~ codec.extension;
     scope (exit)
     {
-        if (exists(input)) remove(input);
-        if (exists(output)) remove(output);
+        foreach (f; [input, mid, output])
+            if (exists(f)) remove(f);
     }
     write(input, src);
-    auto r = execute(argv(input, output));
-    if (r.status != 0 || !exists(output))
-        throw new Exception(format("image re-encode failed: %s", r.output.length > 200 ? r.output[0 .. 200] : r.output));
+    foreach (cmd; steps(input, mid, output))
+    {
+        auto r = execute(cmd);
+        if (r.status != 0)
+            throw new Exception(format("image re-encode failed: %s", r.output.length > 200 ? r.output[0 .. 200] : r.output));
+    }
+    if (!exists(output)) throw new Exception("image re-encode failed: the encoder wrote no output");
     return readImmutableBytes(output);
+}
+
+/// The sips steps that turn pixels stored with EXIF `orientation` upright:
+/// a clockwise rotation in degrees (0 for none), then an optional flip.
+private auto sipsOrientation(uint orientation) pure nothrow
+{
+    import std.typecons : tuple;
+    switch (orientation)
+    {
+        case 2: return tuple(0, "horizontal");
+        case 3: return tuple(180, "");
+        case 4: return tuple(0, "vertical");
+        case 5: return tuple(90, "horizontal");
+        case 6: return tuple(90, "");
+        case 7: return tuple(270, "horizontal");
+        case 8: return tuple(270, "");
+        default: return tuple(0, "");
+    }
+}
+
+/// The sips command lines that re-encode an image with EXIF `orientation` to
+/// `codec` at most `maxSide` long, upright.
+string[][] sipsCommands(uint orientation, ImageFormat codec, uint maxSide, string input, string mid, string output) pure
+{
+    auto op = sipsOrientation(orientation);
+    auto encode = ["-s", "format", codec == ImageFormat.jpeg ? "jpeg" : "png"]
+        ~ (codec == ImageFormat.jpeg ? ["-s", "formatOptions", "85"] : []) ~ ["-Z", format("%s", maxSide)];
+    auto rotate = op[0] ? ["-r", format("%s", op[0])] : [];
+    auto flip = op[1].length ? ["-f", op[1]] : [];
+    // sips doesn't promise the order of -r and -f within one call, and the
+    // mirrored orientations need the rotation first: give each its own call.
+    if (rotate.length && flip.length)
+        return [["/usr/bin/sips"] ~ rotate ~ ["-s", "format", "png", "-Z", format("%s", maxSide), input, "--out", mid],
+            ["/usr/bin/sips"] ~ flip ~ encode ~ [mid, "--out", output]];
+    return [["/usr/bin/sips"] ~ rotate ~ flip ~ encode ~ [input, "--out", output]];
 }
 
 private immutable(ubyte)[] sipsEncode(const(ubyte)[] src, ImageFormat codec, uint maxSide) @safe
 {
-    // sips keeps EXIF orientation as metadata rather than rotating, so a
-    // quarter-turned photo keeps its tag (viewers still display it upright).
-    return runEncoder(src, codec, (string i, string o) => ["/usr/bin/sips", "-s", "format",
-        codec == ImageFormat.jpeg ? "jpeg" : "png"] ~ (codec == ImageFormat.jpeg ? ["-s", "formatOptions", "85"] : [])
-        ~ ["-Z", format("%s", maxSide), i, "--out", o]);
+    // sips neither applies EXIF orientation nor drops it: it re-encodes the
+    // stored pixels and copies the tag. So rotate/flip explicitly from the
+    // tag, then mark the result upright so nothing turns it a second time.
+    auto fmt = sniff(src);
+    uint orientation = fmt.isNull ? 1 : exifOrientation(src, fmt.get);
+    auto out_ = runEncoder(src, codec, (string i, string m, string o) => sipsCommands(orientation, codec, maxSide, i, m, o));
+    return orientation == 1 ? out_ : clearOrientation(out_, codec);
 }
 
 private immutable(ubyte)[] magickEncode(string tool, const(ubyte)[] src, ImageFormat codec, uint maxSide) @safe
@@ -715,4 +831,99 @@ unittest
     // A swapped stored copy reads as unavailable, not as the new bytes.
     write(buildPath(dir, storedFilename(small)), "tampered");
     assert(readForLimits(dir, small, lim, enc).isNull);
+}
+
+// sips gets an explicit rotation/flip per orientation, in two calls when a
+// mirrored orientation needs both, so the rotation always comes first.
+unittest
+{
+    auto c = sipsCommands(6, ImageFormat.png, 16, "i", "m", "o");
+    assert(c == [["/usr/bin/sips", "-r", "90", "-s", "format", "png", "-Z", "16", "i", "--out", "o"]]);
+    assert(sipsCommands(1, ImageFormat.jpeg, 8, "i", "m", "o")
+        == [["/usr/bin/sips", "-s", "format", "jpeg", "-s", "formatOptions", "85", "-Z", "8", "i", "--out", "o"]]);
+    assert(sipsCommands(2, ImageFormat.png, 8, "i", "m", "o")[0][1 .. 3] == ["-f", "horizontal"]);
+    auto t = sipsCommands(7, ImageFormat.png, 8, "i", "m", "o");
+    assert(t.length == 2 && t[0][1 .. 3] == ["-r", "270"] && t[0][$ - 1] == "m"
+        && t[1][1 .. 3] == ["-f", "horizontal"] && t[1][$ - 3] == "m");
+    // The intermediate is already bounded, so a big photo isn't flipped at full size.
+    assert(t[0][3 .. 9] == ["-s", "format", "png", "-Z", "8", "i"]);
+}
+
+// An encoder's copied orientation is cleared once its pixels are upright.
+unittest
+{
+    auto j = clearOrientation(fakeJpeg(30, 20, 6), ImageFormat.jpeg);
+    assert(exifOrientation(j, ImageFormat.jpeg) == 1 && dimensions(j) == [30, 20]);
+    auto plain = fakeJpeg(30, 20);
+    assert(clearOrientation(plain, ImageFormat.jpeg) == plain);
+    // A JPEG's XMP segment (which repeats the orientation) is dropped.
+    ubyte[] xmpSeg = bytesOf("http://ns.adobe.com/xap/1.0/\0<x/>");
+    auto withXmp = (plain[0 .. 2] ~ [ubyte(0xff), ubyte(0xe1)] ~ nativeToBigEndian((xmpSeg.length + 2).to!ushort)[]
+        ~ xmpSeg ~ plain[2 .. $]).idup;
+    assert(clearOrientation(withXmp, ImageFormat.jpeg) == plain);
+    // A PNG loses its eXIf chunk and keeps the rest.
+    ubyte[] chunk(string type, const(ubyte)[] data)
+    {
+        ubyte[] c = nativeToBigEndian(data.length.to!uint)[].dup ~ bytesOf(type) ~ data;
+        return c ~ new ubyte[4];
+    }
+    auto head = bytesOf("\x89PNG\r\n\x1a\n") ~ chunk("IHDR", new ubyte[13]);
+    auto png = (head ~ chunk("eXIf", bytesOf("MM\0\x2a")) ~ chunk("iTXt", bytesOf("XML:com.adobe.xmp\0\0\0\0\0<x/>"))
+        ~ chunk("tEXt", bytesOf("a\0b")) ~ chunk("IEND", [])).idup;
+    assert(clearOrientation(png, ImageFormat.png) == head ~ chunk("tEXt", bytesOf("a\0b")) ~ chunk("IEND", []));
+}
+
+// rust: attachment.rs::prepare_applies_exif_orientation_before_reencoding
+// The fixtures are 64×32 JPEGs with red/blue/green/white quadrants
+// (top-left, top-right, bottom-left, bottom-right) tagged with EXIF
+// orientation 5, 6 or 8. Re-encoded by the platform tool (sips on macOS), the
+// pixels themselves must come out upright. Pixels are read back by converting
+// the result to BMP with sips, so this runs on macOS only.
+version (OSX) unittest
+{
+    import std.file : exists_ = exists, read, write, remove, tempDir;
+    import std.path : buildPath, dirName;
+    import std.process : execute, thisProcessID;
+    if (!exists_("/usr/bin/sips")) return;
+    auto root = __FILE_FULL_PATH__.dirName.dirName.dirName;
+    ImageLimits pngLim = {acceptedMediaTypes: ["image/png"], maxDimension: 16};
+    ImageLimits jpegLim = {acceptedMediaTypes: ["image/jpeg"], maxDimension: 16};
+    // The colour at (x, y) of a 24/32-bit BMP: rows of BGR(A), bottom-up
+    // unless the height is negative.
+    string colour(const(ubyte)[] bmp, uint x, uint y)
+    {
+        uint off = le32(bmp, 10), w = le32(bmp, 18), bpp = le16(bmp, 28) / 8;
+        uint h = le32(bmp, 22);
+        auto stride = (w * bpp + 3) / 4 * 4;
+        auto row = h & 0x8000_0000 ? y : h - 1 - y;
+        auto p = off + row * stride + x * bpp;
+        auto b = bmp[p] > 128, g = bmp[p + 1] > 128, r = bmp[p + 2] > 128;
+        return r && g && b ? "white" : r ? "red" : g ? "green" : b ? "blue" : "black";
+    }
+    foreach (lim; [pngLim, jpegLim])
+    {
+    auto codec = lim.acceptedMediaTypes[0] == "image/png" ? ImageFormat.png : ImageFormat.jpeg;
+    auto ext = codec == ImageFormat.png ? ".png" : ".jpg";
+    foreach (o, want; [5: ["red", "green", "blue", "white"], 6: ["green", "red", "white", "blue"],
+            8: ["blue", "white", "red", "green"]])
+    {
+        auto src = readBytes(buildPath(root, "testdata", format("exif-orientation-%s.jpg", o)));
+        assert(exifOrientation(src, ImageFormat.jpeg) == o);
+        auto p = prepare(src, ImageFormat.jpeg, lim);
+        // Upright: 8×16, and the stored pixels, not just a tag, are turned.
+        assert(p.mediaType == lim.acceptedMediaTypes[0] && p.width == 8 && p.height == 16, format("%s: %s", o, p));
+        assert(dimensions(p.bytes) == [8, 16]);
+        // EXIF orientation is 1 and no XMP (or PNG eXIf) remains to re-rotate it.
+        assert(exifOrientation(p.bytes, codec) == 1);
+        assert(clearOrientation(p.bytes, codec) == p.bytes, "the result still carries orientation metadata");
+        auto stem = buildPath(tempDir, format("nano-att-orient-%s-%s", thisProcessID, o));
+        scope (exit) foreach (f; [stem ~ ext, stem ~ ".bmp"]) if (exists_(f)) remove(f);
+        write(stem ~ ext, p.bytes);
+        auto r = execute(["/usr/bin/sips", "-s", "format", "bmp", stem ~ ext, "--out", stem ~ ".bmp"]);
+        assert(r.status == 0, r.output);
+        auto bmp = readBytes(stem ~ ".bmp");
+        assert([colour(bmp, 1, 1), colour(bmp, 6, 1), colour(bmp, 1, 14), colour(bmp, 6, 14)] == want,
+            format("%s orientation %s: %s", ext, o, [colour(bmp, 1, 1), colour(bmp, 6, 1), colour(bmp, 1, 14), colour(bmp, 6, 14)]));
+    }
+    }
 }

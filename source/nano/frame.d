@@ -76,6 +76,19 @@ size_t cellWidth(dchar c) pure nothrow
 
 private bool isFinal(dchar c) pure nothrow { return c >= '@' && c <= '~'; }
 
+/// Model text shown verbatim (no markdown renderer in between): every
+/// control character but newline and tab becomes U+FFFD (CR is dropped), so no escape —
+/// a fold or refold mark included — can form, even across chunks.
+string rawModelText(string s) pure
+{
+    import std.uni : isControl;
+    import std.utf : byDchar;
+    string o;
+    foreach (dchar c; s.byDchar)
+        if (c != '\r') o ~= c != '\n' && c != '\t' && isControl(c) ? '\uFFFD' : c;
+    return o;
+}
+
 /// Visible width in cells, ignoring CSI sequences.
 size_t visibleWidth(string text) pure
 {
@@ -309,10 +322,12 @@ string[] editorLines(string prompt, dstring text, size_t cursor, size_t width) p
     return lines;
 }
 
-/// The whole frame: transcript, editor, then the status bar as the last line.
+/// The whole frame: transcript, editor, then the status bar as the last
+/// line (a multi-line status, such as live sub-agent rows, ends the frame).
 string[] compose(const string[] transcript, const string[] editor, string status) pure
 {
-    return transcript.dup ~ editor.dup ~ status;
+    import std.array : split;
+    return transcript.dup ~ editor.dup ~ status.split("\n");
 }
 
 /// The dim `⏸N queued` row under the editor (null when nothing is queued).
@@ -701,6 +716,21 @@ string foldMark(string id, size_t lines, string expanded) pure
         ~ Base64.encode(expanded.representation).idup ~ "\x07";
 }
 
+/// The OSC number of a refold mark (`refoldMark`).
+enum refoldOsc = "8771";
+
+/// An in-band mark that rewrites the latest fold with `id` in place: its
+/// collapsed form becomes `collapsed` and its expanded form `expanded`
+/// (whichever is shown is redrawn). A thinking block that reasoning
+/// streamed after the answer joins is updated this way, so the answer
+/// below it stays contiguous. Only for the frame transcript.
+string refoldMark(string id, string collapsed, string expanded) pure
+{
+    import std.base64 : Base64;
+    return "\x1b]" ~ refoldOsc ~ ";" ~ Base64.encode(id.representation).idup ~ ";"
+        ~ Base64.encode(collapsed.representation).idup ~ ";" ~ Base64.encode(expanded.representation).idup ~ "\x07";
+}
+
 /// Where a fold's expanded text lives: in an anonymous temporary file
 /// (deleted by the system when the process exits), so a long session holds
 /// none of it in memory. Without a file (no writable temporary directory, or
@@ -840,6 +870,26 @@ struct Transcript
     private string[][] cache;
     private size_t cacheWidth;
     private Fold[] folds;
+    /// Ids of folds pruned by the line cap: a refold for one re-adds it.
+    private bool[string] prunedIds;
+    /// `prunedIds` in pruning order, so the oldest are forgotten past `maxPruned`.
+    private string[] prunedOrder;
+    private enum maxPruned = 256;
+    /// Re-added folds waiting for the unfinished line in `cur` to end.
+    private Deferred[] deferred;
+    private static struct Deferred { Fold fold; string[] shown; }
+    /// The line `deferred` waited on has ended; they land before the next
+    /// output, after any fold mark for that line (which counts back from it).
+    private bool deferredReady;
+
+    /// Appends ready deferred folds at the end.
+    private void flushDeferred() pure
+    {
+        if (!deferredReady) return;
+        foreach (d; deferred) appendFold(d.fold, d.shown);
+        deferred = null;
+        deferredReady = false;
+    }
 
     void clear() pure
     {
@@ -851,6 +901,11 @@ struct Transcript
         skippingOsc = false;
         heldBytes = 0;
         sweepFloor = size_t.max;
+        prunedIds = null;
+        prunedOrder = null;
+        deferred = null;
+        deferredReady = false;
+        unsettled = false;
     }
 
     void feed(scope const(ubyte)[] bytes) pure
@@ -920,13 +975,14 @@ struct Transcript
                     dchar fin = 0;
                     while (i < s.length) { auto n = decode(s, i); if (isFinal(n)) { fin = n; break; } }
                     auto params = s[ps .. i > ps ? i - 1 : ps];
-                    if (fin == 'm') cur ~= s[at .. i];
+                    if (fin == 'm') { flushDeferred(); cur ~= s[at .. i]; }
                     else if (fin == 'K') { cur = null; cr = false; }
                     else if (fin == 'J' && (params == "2" || params == "3")) clear();
                 }
                 continue;
             }
             if (cr) { cur = null; cr = false; }
+            flushDeferred();
             // Wrap marks pass through: the app's stdout carries the
             // renderer's generated marks (verbatim code blocks, soft and
             // separator wraps). Literal marks are escaped upstream, before
@@ -941,10 +997,12 @@ struct Transcript
 
     private void endLine() pure
     {
+        flushDeferred();
         lines ~= cur;
         heldBytes += lineCost(cur);
         cur = null;
         cr = false;
+        if (deferred.length) deferredReady = true;
         if (lines.length > cap)
         {
             auto drop = lines.length - cap * 9 / 10;
@@ -968,6 +1026,19 @@ struct Transcript
         enforceByteCap();
     }
 
+    /// Remembers a pruned fold's id, forgetting the oldest past `maxPruned`.
+    private void notePruned(string id) pure
+    {
+        if (id in prunedIds) return;
+        prunedIds[id] = true;
+        prunedOrder ~= id;
+        if (prunedOrder.length > maxPruned)
+        {
+            prunedIds.remove(prunedOrder[0]);
+            prunedOrder = prunedOrder[1 .. $].dup;
+        }
+    }
+
     /// A fold mark (`foldMark`); anything else is dropped.
     private void osc(string body) pure
     {
@@ -975,9 +1046,11 @@ struct Transcript
         import std.base64 : Base64;
         import std.conv : to;
         auto parts = body.split(";");
-        if (parts.length != 4 || parts[0] != foldOsc) return;
+        if (parts.length != 4 || (parts[0] != foldOsc && parts[0] != refoldOsc)) return;
         try
         {
+            if (parts[0] == refoldOsc) { refold(parts); return; }
+            scope (exit) flushDeferred();
             import nano.safeio : utf8Text;
             auto id = utf8Text(Base64.decode(parts[1]));
             auto n = parts[2].to!size_t;
@@ -1004,6 +1077,84 @@ struct Transcript
         catch (Exception) {} // a malformed OSC from the terminal is ignored, like any unknown escape
     }
 
+    /// A refold mark (`refoldMark`): rewrites the latest fold with its id.
+    /// The new expanded text is held in `fresh` until the next `settle`
+    /// moves it into `store` (this runs inside the pure `feed`); only an
+    /// expanded fold keeps lines in memory, its shown text plus the
+    /// collapsed stash, both counted in `heldBytes`.
+    private void refold(string[] parts) pure
+    {
+        import std.array : split;
+        import std.base64 : Base64;
+        import std.string : stripRight;
+        import nano.safeio : utf8Text;
+        auto id = utf8Text(Base64.decode(parts[1]));
+        auto collapsed = utf8Text(Base64.decode(parts[2])).stripRight("\n").split("\n");
+        auto expandedText = utf8Text(Base64.decode(parts[3]));
+        if (!id.length) return;
+        foreach_reverse (k; 0 .. folds.length)
+        {
+            if (folds[k].id != id) continue;
+            auto f = &folds[k];
+            string[] shownNow;
+            if (f.expanded)
+            {
+                shownNow = expandedText.stripRight("\n").split("\n");
+                foreach (c; f.collapsed) heldBytes = saturatingSub(heldBytes, lineCost(c));
+                f.collapsed = collapsed;
+                foreach (c; collapsed) heldBytes += lineCost(c);
+            }
+            else shownNow = collapsed;
+            f.fresh = expandedText;
+            f.text = FoldRef.init;
+            f.stored = false;
+            f.lost = false;
+            unsettled = true;
+            immutable oldLength = f.length;
+            foreach (l; lines[f.start .. f.start + oldLength])
+                heldBytes = saturatingSub(heldBytes, lineCost(l));
+            foreach (l; shownNow) heldBytes += lineCost(l);
+            lines = lines[0 .. f.start] ~ shownNow ~ lines[f.start + oldLength .. $];
+            f.length = shownNow.length;
+            foreach (ref g; folds)
+                if (g.start > f.start) g.start = g.start - oldLength + shownNow.length;
+            if (cache.length > f.start) cache = cache[0 .. f.start];
+            enforceByteCap();
+            return;
+        }
+        // Its fold was pruned: show the update as a fresh fold at the end,
+        // so late reasoning is not lost. While an unfinished line is in
+        // `cur` it waits for that line to end, so the line stays whole.
+        Fold f;
+        f.id = id;
+        f.length = collapsed.length;
+        f.fresh = expandedText;
+        foreach (ref d; deferred)
+            if (d.fold.id == id) { d = Deferred(f, collapsed); return; }
+        if (id !in prunedIds) return;
+        prunedIds.remove(id);
+        import std.algorithm : countUntil, remove;
+        auto at = prunedOrder.countUntil(id);
+        if (at >= 0) prunedOrder = prunedOrder.remove(at);
+        if (cur.length || deferred.length) { deferred ~= Deferred(f, collapsed); return; }
+        appendFold(f, collapsed);
+        enforceByteCap();
+    }
+
+    /// Appends re-added fold `f`, collapsed as `shown`, at the end; its
+    /// text waits in `fresh` for `settle`.
+    private void appendFold(Fold f, string[] shown) pure
+    {
+        f.start = lines.length;
+        lines ~= shown;
+        foreach (l; shown) heldBytes += lineCost(l);
+        folds ~= f;
+        unsettled = true;
+    }
+
+    /// A refold or re-add left an unstored fold that is not at the end.
+    private bool unsettled;
+
     /// Ctrl-O: expands the next batch of collapsed folds, going up from the
     /// bottom (with the others sharing their ids); once every fold has been
     /// expanded, collapses them all. False when nothing changed.
@@ -1021,6 +1172,7 @@ struct Transcript
     /// press starts from the bottom again).
     bool toggle()
     {
+        flushDeferred();
         settle();
         size_t floor = sweepFloor > folds.length ? folds.length : sweepFloor;
         size_t todo = batch, changed, reached = floor;
@@ -1196,6 +1348,7 @@ struct Transcript
         {
             if (f.start >= cut) { f.start -= cut; kept ~= f; continue; }
             gone++;
+            if (f.id.length) notePruned(f.id);
             foreach (c; f.collapsed) heldBytes = saturatingSub(heldBytes, lineCost(c));
         }
         folds = kept;
@@ -1206,6 +1359,7 @@ struct Transcript
     /// leaving it collapses them all. True when the transcript changed.
     bool setVerbose(bool on)
     {
+        flushDeferred();
         settle();
         if (on == verbose) return false;
         verbose = on;
@@ -1226,9 +1380,12 @@ struct Transcript
     void settle()
     {
         size_t from = folds.length;
-        while (from && !folds[from - 1].stored) from--;
+        if (unsettled) from = 0;
+        else while (from && !folds[from - 1].stored) from--;
+        unsettled = false;
         foreach (ref f; folds[from .. $])
         {
+            if (f.stored) continue;
             f.text = store.put(f.fresh);
             f.fresh = null;
             f.stored = true;
@@ -1282,12 +1439,17 @@ struct Transcript
     }
 
     /// Every line wrapped to `width` (the unfinished line last, if any).
+    /// Ready deferred folds are drawn but not committed: a fold mark for
+    /// the line they waited on may still arrive in a later feed.
     string[] render(size_t width) pure
     {
         if (width != cacheWidth) { cache = null; cacheWidth = width; }
         while (cache.length < lines.length) cache ~= wrapAnsi(lines[cache.length], width);
         string[] out_;
         foreach (w; cache) out_ ~= w;
+        if (deferredReady)
+            foreach (d; deferred)
+                foreach (l; d.shown) out_ ~= wrapAnsi(l, width);
         if (cur.length) out_ ~= wrapAnsi(cur, width);
         return out_;
     }
@@ -1337,6 +1499,7 @@ unittest
     ed = editorLines("› ", "abcdef"d, 0, 5);
     assert(ed.length == 2 && ed[0].canFind("\x1b[7ma\x1b[27m"));
     assert(compose(["t"], ["e"], "s") == ["t", "e", "s"]);
+    assert(compose(["t"], ["e"], "a\ns") == ["t", "e", "a", "s"]);
     assert(queueIndicator(0, 40) is null && queueIndicator(2, 40).canFind("⏸2 queued"));
     assert(firstDiff(["a", "b"], ["a", "b"]) == -1 && firstDiff(["a", "b"], ["a", "c"]) == 1 && firstDiff(["a"], ["a", "b"]) == 1);
     assert(linePhysicalRows("abcdef", 3) == 2 && linePhysicalRows("", 3) == 1 && linePhysicalRows("ab中", 3) == 2);
@@ -1942,6 +2105,188 @@ unittest
     assert(!t.setVerbose(true));
     assert(t.setVerbose(false));
     assert(t.lines == ["r0", "r1", "r2", "r3"]);
+}
+
+// Refold marks (the frame side of ui.rs::trailing_thinking_merges_interleaved_reasoning_fragments).
+unittest
+{
+    import std.conv : to;
+    // Reasoning streamed after the answer started rewrites the reply's one
+    // thinking block in place; the answer lines below it stay contiguous.
+    Transcript t;
+    t.feed(("∴ Thought for 1.0s · 6 chars\n" ~ foldMark("think-1", 1, "∴ Thought for 1.0s · 6 chars\n    first\n")).representation);
+    t.feed("AB".representation);
+    t.feed(refoldMark("think-1", "∴ Thought for 2.0s · 12 chars\n", "∴ Thought for 2.0s · 12 chars\n    first second\n").representation);
+    t.feed("C\n".representation);
+    assert(t.lines == ["∴ Thought for 2.0s · 12 chars", "ABC"], t.lines.to!string);
+    assert(t.toggle());
+    assert(t.lines == ["∴ Thought for 2.0s · 12 chars", "    first second", "ABC"], t.lines.to!string);
+    // Refolding while expanded redraws the expanded form; collapsing again
+    // shows the latest summary.
+    t.feed(refoldMark("think-1", "∴ Thought for 3.0s\n", "∴ Thought for 3.0s\n    x\n    y\n").representation);
+    assert(t.lines == ["∴ Thought for 3.0s", "    x", "    y", "ABC"], t.lines.to!string);
+    assert(t.toggle());
+    assert(t.lines == ["∴ Thought for 3.0s", "ABC"], t.lines.to!string);
+    // An unknown id changes nothing.
+    t.feed(refoldMark("nope", "z\n", "z\n").representation);
+    assert(t.lines == ["∴ Thought for 3.0s", "ABC"]);
+}
+
+unittest
+{
+    import std.conv : to;
+    // A refold whose fold was pruned by the line cap re-adds it at the end.
+    Transcript t;
+    t.cap = 10;
+    t.feed(("∴ Thought\n" ~ foldMark("think-1", 1, "∴ Thought\n    a\n")).representation);
+    foreach (i; 0 .. 12) t.feed((i.to!string ~ "\n").representation);
+    t.feed(refoldMark("think-1", "∴ Thought more\n", "∴ Thought more\n    a b\n").representation);
+    assert(t.lines[$ - 1] == "∴ Thought more", t.lines.to!string);
+    assert(t.toggle());
+    assert(t.lines[$ - 2 .. $] == ["∴ Thought more", "    a b"], t.lines.to!string);
+    // clear() forgets pruned ids: a later refold for one changes nothing.
+    t.feed(("∴ T2\n" ~ foldMark("think-2", 1, "∴ T2\n    b\n")).representation);
+    foreach (i; 0 .. 12) t.feed((i.to!string ~ "\n").representation);
+    t.clear();
+    t.feed(refoldMark("think-2", "∴ T2 more\n", "∴ T2 more\n").representation);
+    assert(t.lines.length == 0, t.lines.to!string);
+}
+
+unittest
+{
+    import std.conv : to;
+    // A pruned refold arriving mid-line waits for the line to end.
+    Transcript t;
+    t.cap = 10;
+    t.feed(("∴ Thought\n" ~ foldMark("think-1", 1, "∴ Thought\n    a\n")).representation);
+    foreach (i; 0 .. 12) t.feed((i.to!string ~ "\n").representation);
+    t.feed("AB".representation);
+    t.feed(refoldMark("think-1", "∴ Thought more\n", "∴ Thought more\n    a b\n").representation);
+    t.feed(refoldMark("think-1", "∴ Thought most\n", "∴ Thought most\n    a b c\n").representation);
+    t.feed("C\n".representation);
+    assert(t.render(80)[$ - 2 .. $] == ["ABC", "∴ Thought most"]);
+    assert(t.toggle());
+    assert(t.lines[$ - 2 .. $] == ["∴ Thought most", "    a b c"], t.lines.to!string);
+}
+
+unittest
+{
+    import std.conv : to;
+    // A fold mark for the line that releases a deferred refold folds that
+    // line, not the deferred one, and the two folds do not overlap.
+    Transcript t;
+    t.cap = 10;
+    t.feed(("∴ Thought\n" ~ foldMark("think-1", 1, "∴ Thought\n    a\n")).representation);
+    foreach (i; 0 .. 12) t.feed((i.to!string ~ "\n").representation);
+    t.feed("AB".representation);
+    t.feed(refoldMark("think-1", "∴ Thought more\n", "∴ Thought more\n    a b\n").representation);
+    t.feed(("C\n" ~ foldMark("tool-1", 1, "ABC\n    out\n")).representation);
+    assert(t.lines[$ - 2 .. $] == ["ABC", "∴ Thought more"], t.lines.to!string);
+    auto tool = t.folds[$ - 2], think = t.folds[$ - 1];
+    assert(tool.id == "tool-1" && t.lines[tool.start] == "ABC", t.folds.to!string);
+    assert(think.id == "think-1" && think.start == tool.start + tool.length, t.folds.to!string);
+    // Text after the line also lands after the deferred fold.
+    t.feed("D\n".representation);
+    assert(t.lines[$ - 2 .. $] == ["∴ Thought more", "D"], t.lines.to!string);
+}
+
+unittest
+{
+    import std.conv : to;
+    // The same with the line and its fold mark in separate feeds and a
+    // redraw between them: the redraw shows the deferred fold but does not
+    // commit it ahead of the fold mark.
+    Transcript t;
+    t.cap = 10;
+    t.feed(("∴ Thought\n" ~ foldMark("think-1", 1, "∴ Thought\n    a\n")).representation);
+    foreach (i; 0 .. 12) t.feed((i.to!string ~ "\n").representation);
+    t.feed("AB".representation);
+    t.feed(refoldMark("think-1", "∴ Thought more\n", "∴ Thought more\n    a b\n").representation);
+    t.feed("C\n".representation);
+    auto shown = t.render(80);
+    assert(shown[$ - 2 .. $] == ["ABC", "∴ Thought more"], shown.to!string);
+    t.feed(foldMark("tool-1", 1, "ABC\n    out\n").representation);
+    assert(t.lines[$ - 2 .. $] == ["ABC", "∴ Thought more"], t.lines.to!string);
+    auto tool = t.folds[$ - 2], think = t.folds[$ - 1];
+    assert(tool.id == "tool-1" && t.lines[tool.start] == "ABC", t.folds.to!string);
+    assert(think.id == "think-1" && think.start == tool.start + tool.length, t.folds.to!string);
+    assert(t.render(80)[$ - 2 .. $] == ["ABC", "∴ Thought more"]);
+}
+
+unittest
+{
+    import std.algorithm : canFind;
+    import std.conv : to;
+    // Raw model text (no markdown, e.g. NO_COLOR) cannot forge marks, even
+    // split across chunks: control bytes become visible replacements.
+    Transcript t;
+    t.feed(("x\n" ~ foldMark("tool-1", 1, "x\n    real\n")).representation);
+    auto forged = refoldMark("tool-1", "forged\n", "forged\n");
+    foreach (part; [forged[0 .. 3], forged[3 .. $]]) t.feed(rawModelText(part).representation);
+    t.feed("\n".representation);
+    assert(t.lines[0] == "x" && !t.lines.canFind("forged"), t.lines.to!string);
+    assert(rawModelText("a\tb\nc\x1b[2J\x07\r") == "a\tb\nc\uFFFD[2J\uFFFD");
+}
+
+unittest
+{
+    import std.conv : to;
+    // A refold of a fold whose text is already in the store (settled):
+    // the new expanded text replaces the stored one, collapsed and expanded,
+    // and nothing of it stays in the transcript once settled again.
+    foreach (memoryOnly; [false, true])
+    {
+        Transcript t;
+        t.store.memoryOnly = memoryOnly;
+        t.feed(("∴ T1\n" ~ foldMark("think-1", 1, "∴ T1\n    old\n") ~ "tail\n").representation);
+        t.settle();
+        assert(t.folds[0].stored && t.folds[0].fresh is null);
+        // Collapsed: the summary is redrawn, the new text is stored on settle.
+        t.feed(refoldMark("think-1", "∴ T2\n", "∴ T2\n    new\n").representation);
+        assert(t.lines == ["∴ T2", "tail"], t.lines.to!string);
+        t.settle();
+        assert(t.folds[0].stored && t.folds[0].fresh is null);
+        assert(t.toggle());
+        assert(t.lines == ["∴ T2", "    new", "tail"], t.lines.to!string);
+        // Expanded: the expanded text is redrawn and the collapsed stash updated.
+        t.feed(refoldMark("think-1", "∴ T3\n", "∴ T3\n    newer\n    more\n").representation);
+        assert(t.lines == ["∴ T3", "    newer", "    more", "tail"], t.lines.to!string);
+        t.settle();
+        assert(t.folds[0].stored && t.folds[0].fresh is null);
+        assert(t.toggle());
+        assert(t.lines == ["∴ T3", "tail"], t.lines.to!string);
+        assert(t.toggle());
+        assert(t.lines == ["∴ T3", "    newer", "    more", "tail"], t.lines.to!string);
+        // The held total matches a recount after the refolds.
+        size_t want;
+        foreach (l; t.lines) want += t.lineCost(l);
+        foreach (f; t.folds) foreach (c; f.collapsed) want += t.lineCost(c);
+        assert(t.heldBytes == want);
+    }
+    {
+        // A pruned stored fold re-added by a refold is stored on settle.
+        Transcript t;
+        t.cap = 10;
+        t.feed(("∴ T\n" ~ foldMark("think-1", 1, "∴ T\n    a\n")).representation);
+        t.settle();
+        foreach (i; 0 .. 12) t.feed((i.to!string ~ "\n").representation);
+        t.feed(refoldMark("think-1", "∴ T more\n", "∴ T more\n    a b\n").representation);
+        t.settle();
+        assert(t.folds[$ - 1].stored && t.folds[$ - 1].fresh is null);
+        assert(t.toggle());
+        assert(t.lines[$ - 2 .. $] == ["∴ T more", "    a b"], t.lines.to!string);
+    }
+}
+
+unittest
+{
+    import std.conv : to;
+    // Pruned-id bookkeeping is bounded.
+    Transcript t;
+    t.cap = 10;
+    foreach (i; 0 .. 400)
+        t.feed(("x\n" ~ foldMark("id-" ~ i.to!string, 1, "x\n    y\n")).representation);
+    assert(t.prunedOrder.length <= t.maxPruned && t.prunedIds.length == t.prunedOrder.length);
 }
 
 // Repeated tall-editor shrinks with output between them: the second freeze

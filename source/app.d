@@ -38,7 +38,7 @@ import nano.plan : Plan, checklist;
 import nano.queue : MessageQueue, QueuedMessage, QueueUsage, queueParse = parse, queueApply = apply;
 import nano.mode : AgentMode, allModes, parseMode, planPromptNote, name, describe, nextMode = next;
 static import nano.herdr;
-import nano.frame : glyphMark, foldMark, expandedBody, expandedResult, dropSoftWraps, escapeMarks;
+import nano.frame : glyphMark, foldMark, refoldMark, expandedBody, expandedResult, dropSoftWraps, escapeMarks, rawModelText;
 import core.time : MonoTime, seconds;
 import std.sumtype : match;
 import nano.trajectory : terminalSafe;
@@ -55,7 +55,7 @@ import nano.control : TurnControl, FdLineReader;
 import nano.instructions : ProjectInstructions, InstructionOptions = Options, expandHome;
 import core.atomic : atomicLoad, atomicStore, cas;
 
-enum string packageVersion = "1.9.0";
+enum string packageVersion = "1.10.0";
 enum string versionString = "nano-coder " ~ packageVersion;
 
 enum string usage = `Usage: nano-coder [--model provider/model] [--config PATH] [-p PROMPT]
@@ -792,6 +792,14 @@ LineEditor makeEditor(ConsoleLink console, shared TurnControl control)
     return editor;
 }
 
+/// Builds sub-agents' clients (on their threads) from a frozen config.
+final class ConfigClients : imported!"nano.subagent".SubClientFactory
+{
+    private Config cfg;
+    this(immutable Config cfg) immutable { this.cfg = cfg; }
+    LLMClient make(string spec) const { return makeClient(resolve(cfg, spec)); }
+}
+
 /// A frozen copy of `cfg`, for another thread.
 immutable(Config) frozenConfig(const ref Config cfg) pure
 {
@@ -981,7 +989,22 @@ string frameStatus(size_t width)
     import nano.status : renderStatus = render;
     if (environment.get("AGENTIC_NO_STATUS") !is null) return "";
     auto stats = gStats.get;
-    return renderStatus(stats, width);
+    import nano.frame : fit;
+    string rows;
+    if (stats.subagents.length)
+    {
+        import nano.subagent : progressLine;
+        import nano.trajectory : terminalSafe;
+        // Formatted now, not when the child last reported: the elapsed time
+        // moves during a long model request that sends no progress.
+        auto now = monoNow;
+        foreach (ref l; stats.subagents)
+        {
+            auto p = l.at(now);
+            rows ~= fit("\x1b[2m  " ~ terminalSafe(progressLine(p)) ~ "\x1b[0m", width ? width : 1) ~ "\n";
+        }
+    }
+    return rows ~ renderStatus(stats, width);
 }
 
 /// The status bar's figures, read and changed under their lock by the turn
@@ -1008,6 +1031,14 @@ bool gStatusBatched;
 /// block, held-back markdown). It lives in a `Shared` cell, so the main
 /// thread and the turn's key reader print through the same state, one at a
 /// time.
+/// Raw model text is neutralised only when it lands in the frame
+/// transcript, where its control bytes could forge marks; piped
+/// (non-frame) output keeps the model's bytes verbatim.
+string rawShownIn(string text, bool framed)
+{
+    return framed ? rawModelText(text) : text;
+}
+
 struct Screen
 {
     bool color, tty;
@@ -1019,13 +1050,40 @@ struct Screen
     // (its first line got a stamp, so later lines are padded under it).
     private string blockStamp;
     private bool answering;
+    // The model call's finished thinking block (its fold id and how long it
+    // thought), and reasoning streamed after its answer started: that joins
+    // the block instead of opening a second one that splits the answer.
+    private string thinkId;
+    private long thinkMs, lateStart, lateMs;
+    private bool late, thoughtThisCall;
+    private string lateText;
+    private static size_t thinkSeq;
     // The answer text streamed since the model call began (for `reconcile`).
     private string streamedAnswer;
     // Answers on a color terminal have their markdown rendered a block at a
-    // time (markdown.rs MarkdownStream); piped and NO_COLOR output keep it raw.
+    // time (markdown.rs MarkdownStream); piped and NO_COLOR output keep it raw
+    // (sanitised by `rawShown` only inside the frame).
     private MarkdownStream markdown;
     bool verbose() const { return verbosity >= Verbosity.verbose; }
     bool renderMarkdown() pure const { return tty && color; }
+    string rawShown(string text)
+    {
+        bool framed = (gFrame ? true : false);
+        version (unittest) framed = framed || testFrame;
+        return rawShownIn(text, framed);
+    }
+
+    // Tests capture the output here, as the frame transcript would see it.
+    version (unittest) private string captured;
+    version (unittest) private bool capturing;
+    version (unittest) private bool testFrame;
+    private bool framed() { version (unittest) if (testFrame) return true; return !!gFrame; }
+    private void write(Args...)(Args args)
+    {
+        version (unittest) if (capturing) { import std.conv : text; captured ~= text(args); return; }
+        .write(args);
+    }
+    private void writeln(Args...)(Args args) { write(args, "\n"); }
 
     /// Prints any streamed markdown still held back (the answer segment
     /// ended, or the turn stopped mid-block).
@@ -1045,7 +1103,7 @@ struct Screen
         import std.algorithm : splitter;
         import std.array : replicate;
         // Soft-wrap marks are for the frame; anything else gets plain text.
-        if (!gFrame) t = dropSoftWraps(t);
+        if (!framed) t = dropSoftWraps(t);
         if (!pad) { write(t); if (t.length) midLine = t[$ - 1] != '\n'; return; }
         size_t i;
         while (i < t.length)
@@ -1089,33 +1147,92 @@ struct Screen
         if (blockExpanded)
         {
             auto t = first ? chunk.stripLeft : chunk;
-            if (t.length) writeAligned(thinkStyle(escapeMarks(t)), blockStamp.length ? stampWidth : 0);
+            if (t.length) writeAligned(thinkStyle(escapeMarks(rawShown(t))), blockStamp.length ? stampWidth : 0);
         }
         stdOut.flush();
     }
 
-    private void finishThinking()
+    private string thoughtLine(long ms, string text)
     {
         import std.string : strip;
         import std.range : walkLength;
+        return blockStamp ~ thinkStyle(format("∴ Thought for %.1fs", ms / 1000.0))
+            ~ dim(format(" · %s chars", text.strip.walkLength));
+    }
+
+    private void finishThinking()
+    {
+        import std.conv : to;
         if (!thinking) return;
         thinking = false;
+        thinkMs = nowMs() - thinkStart;
+        thinkId = null;
+        thoughtThisCall = true;
         if (blockExpanded)
         {
             if (midLine) write("\n");
         }
         else
         {
-            auto secs = (nowMs() - thinkStart) / 1000.0;
-            auto chars = thinkText.strip.walkLength;
-            auto line = blockStamp ~ thinkStyle(format("∴ Thought for %.1fs", secs)) ~ dim(format(" · %s chars", chars));
+            auto line = thoughtLine(thinkMs, thinkText);
             write(line ~ "\n");
             // Ctrl-O shows the reasoning under the summary.
-            if (gFrame && chars)
-                write(foldMark("", 1, line ~ "\n" ~ expandedBody(thinkText, color ? "\x1b[38;5;245m" : "")));
+            if (framed)
+            {
+                // Its own id, so reasoning that streams after the answer can rewrite it.
+                thinkId = "think-" ~ (++thinkSeq).to!string;
+                write(foldMark(thinkId, 1, line ~ "\n" ~ expandedBody(thinkText, color ? "\x1b[38;5;245m" : "")));
+            }
         }
         midLine = false;
         stdOut.flush();
+    }
+
+    /// Reasoning that arrives after this call's thinking block closed and
+    /// its answer began: held back, so the answer is not split.
+    private bool lateReasoning(string chunk)
+    {
+        import std.string : strip;
+        // The call-lifetime flag, not `answering`: a mid-turn note clears
+        // `answering` without ending the call.
+        if (thinking || !thoughtThisCall) return false;
+        // Whitespace is kept as a separator, but alone opens nothing.
+        lateText ~= chunk;
+        if (!late && !chunk.strip.length) return true;
+        late = true;
+        if (!lateStart) lateStart = nowMs();
+        return true;
+    }
+
+    /// Joins held-back reasoning to the call's thinking block. The frame
+    /// rewrites the block in place; an append-only console (or an expanded
+    /// block already printed) shows it after the answer instead.
+    private void mergeLate()
+    {
+        if (!late) { lateText = null; return; }
+        if (lateStart) { thinkMs += nowMs() - lateStart; lateMs += nowMs() - lateStart; }
+        immutable lateFor = lateMs;
+        late = false;
+        lateStart = 0;
+        lateMs = 0;
+        auto rest = lateText;
+        lateText = null;
+        if (framed && thinkId.length)
+        {
+            thinkText ~= rest;
+            auto line = thoughtLine(thinkMs, thinkText);
+            write(refoldMark(thinkId, line ~ "\n", line ~ "\n" ~ expandedBody(thinkText, color ? "\x1b[38;5;245m" : "")));
+            stdOut.flush();
+            return;
+        }
+        flushMarkdown();
+        if (midLine) write("\n");
+        midLine = false;
+        answering = false;
+        thinkingDelta(rest);
+        // Time the late reasoning as it streamed, not this replay.
+        thinkStart = nowMs() - lateFor;
+        finishThinking();
     }
 
     /// A streamed chunk of reasoning or answer.
@@ -1126,6 +1243,7 @@ struct Screen
             import std.string : strip;
             // Blank reasoning opens no block and doesn't count as streamed:
             // the call's full reasoning still shows at its end.
+            if (lateReasoning(chunk)) { if (late) streamedThinking = true; return; }
             if (!thinking && !chunk.strip.length) return;
             streamedThinking = true;
             thinkingDelta(chunk);
@@ -1133,6 +1251,7 @@ struct Screen
         }
         if (!chunk.length) return;
         streamedAnswer ~= chunk;
+        if (late && lateStart) { thinkMs += nowMs() - lateStart; lateMs += nowMs() - lateStart; lateStart = 0; }
         finishThinking();
         if (!answering)
         {
@@ -1143,7 +1262,7 @@ struct Screen
             midLine = st.length > 0;
             answering = true;
         }
-        auto shown = renderMarkdown ? markdown.push(chunk, answerWidth()) : chunk;
+        auto shown = renderMarkdown ? markdown.push(chunk, answerWidth()) : rawShown(chunk);
         if (shown.length) writeAligned(shown, answerPad());
         stdOut.flush();
     }
@@ -1162,6 +1281,11 @@ struct Screen
     {
         finishThinking();
         flushMarkdown();
+        mergeLate();
+        // The call is over: its thinking block is closed, so reasoning from a
+        // later call never refolds it.
+        thinkId = null;
+        thoughtThisCall = false;
         if (midLine) writeln();
         midLine = false;
         answering = false;
@@ -1182,16 +1306,28 @@ struct Screen
     }
 
     /// A resent reply follows: what streamed before is abandoned.
-    void restart() pure { streamedAnswer = null; }
+    void restart() pure
+    {
+        streamedAnswer = null;
+        late = false;
+        lateText = null;
+        lateStart = 0;
+        lateMs = 0;
+        thinkId = null;
+        thoughtThisCall = false;
+    }
 
     /// The model call ended: reasoning that didn't stream shows now, like a
     /// block that just ended.
     void endReasoning(string reasoning)
     {
         flushMarkdown();
+        mergeLate();
         if (!streamedThinking && reasoning.length && !thinking) thinkingDelta(reasoning);
         finishThinking();
         streamedThinking = false;
+        thinkId = null;
+        thoughtThisCall = false;
     }
 }
 
@@ -1201,6 +1337,103 @@ unittest
     Screen s;
     s.text(true, "  ");
     assert(!s.thinking && !s.streamedThinking, "blank reasoning must not hide the call's full reasoning");
+}
+
+// A call ended by endLine (restart, quiet reply, interrupted call) closes
+// its thinking block: the next call's late reasoning gets its own block.
+unittest
+{
+    import std.algorithm : canFind, filter;
+    import std.array : array;
+    import std.string : representation;
+    import std.conv : to;
+    import nano.frame : Transcript;
+    Screen s;
+    s.capturing = true;
+    s.testFrame = true;
+    s.text(true, "x");
+    s.text(false, "A");
+    s.endLine();
+    s.text(false, "B");
+    s.text(true, "y");
+    s.endReasoning("y");
+    Transcript t;
+    t.feed(s.captured.representation);
+    auto thoughts = t.lines.filter!(l => l.canFind("Thought for")).array;
+    assert(thoughts.length == 2, t.lines.to!string);
+    assert(thoughts[0].canFind("1 chars") && thoughts[1].canFind("1 chars"), t.lines.to!string);
+}
+
+// A mid-turn note doesn't end the call: late reasoning still joins its
+// block, and whitespace-only deltas survive as separators.
+unittest
+{
+    import std.algorithm : canFind, filter;
+    import std.array : array;
+    import std.string : representation;
+    import std.conv : to;
+    import nano.frame : Transcript;
+    Screen s;
+    s.capturing = true;
+    s.testFrame = true;
+    s.text(true, "first");
+    s.text(false, "A");
+    s.note("mode changed");
+    s.text(true, " ");
+    s.text(true, "\n");
+    s.text(true, "second");
+    s.text(false, "B");
+    s.endReasoning("first \nsecond");
+    Transcript t;
+    t.feed(s.captured.representation);
+    auto thoughts = t.lines.filter!(l => l.canFind("Thought for")).array;
+    assert(thoughts.length == 1 && thoughts[0].canFind("13 chars"), t.lines.to!string);
+}
+
+// rust: ui.rs::trailing_thinking_merges_interleaved_reasoning_fragments
+unittest
+{
+    import std.algorithm : canFind, count, endsWith, filter;
+    import std.array : array;
+    import std.string : representation;
+    import nano.frame : Transcript;
+    import std.conv : to;
+    import std.string : lastIndexOf;
+    // The frame: reasoning after the answer started rewrites the reply's one
+    // thinking block, and the answer stays contiguous.
+    Screen s;
+    s.capturing = true;
+    s.testFrame = true;
+    s.text(true, "first ");
+    s.text(false, "A");
+    s.text(true, "second");
+    s.text(false, "B");
+    s.endReasoning("first second");
+    Transcript t;
+    t.feed(s.captured.representation);
+    auto thoughts = t.lines.filter!(l => l.canFind("Thought for")).array;
+    assert(thoughts.length == 1 && thoughts[0].canFind("12 chars"), t.lines.to!string);
+    assert(t.cur.endsWith(" AB") || t.cur == "AB", t.cur);
+    assert(t.toggle());
+    assert(t.lines.canFind("    first second"), t.lines.to!string);
+    // A later answer chunk carries on the same line.
+    s.captured = null;
+    s.text(false, "C");
+    t.feed(s.captured.representation);
+    assert(t.cur.endsWith(" ABC") || t.cur == "ABC", t.cur);
+
+    // An append-only console: the answer is not split either; the late
+    // reasoning shows after it.
+    Screen p;
+    p.capturing = true;
+    p.text(true, "first ");
+    p.text(false, "A");
+    p.text(true, "second");
+    p.text(false, "B");
+    p.endReasoning("first second");
+    auto out_ = p.captured;
+    assert(out_.canFind("AB\n") && out_.count("Thought for") == 2, out_);
+    assert(out_.indexOf("AB") < out_.lastIndexOf("Thought for"), out_);
 }
 
 private size_t answerPad() { return atomicLoad(gTimestamps) ? stampWidth : 0; }
@@ -1223,6 +1456,7 @@ struct ConsoleLink
 
 class Console : AgentEvents
 {
+    mixin AgentEventDefaults;
     immutable bool color, tty;
     /// The shared line state; hand `link` to other threads.
     ConsoleLink link;
@@ -1251,7 +1485,7 @@ class Console : AgentEvents
     /// color terminal, verbatim otherwise.
     string display(string text)
     {
-        if (!renderMarkdown) return text;
+        if (!renderMarkdown) return rawShownIn(text, (gFrame ? true : false));
         auto shown = renderMarkdownText(text, answerWidth());
         return gFrame ? shown : dropSoftWraps(shown);
     }
@@ -1323,6 +1557,37 @@ class Console : AgentEvents
         writeln(line);
         // Ctrl-O shows the full arguments under the call.
         if (gFrame) write(foldMark(call.id, 1, line ~ "\n" ~ expandedBody(sanitizeBlock(argsText(call)), color ? "\x1b[2m" : "")));
+        stdOut.flush();
+    }
+
+    private imported!"nano.status".LiveSubagent[string] subRows;
+    /// Sub-agents: a live row per running one (above the status bar); each prints a
+    /// line when it finishes (the `agent` result follows in call order).
+    void subagents(const imported!"nano.subagent".SubProgress[] all)
+    {
+        import nano.subagent : progressLine;
+        import nano.trajectory : terminalSafe;
+        import nano.status : LiveSubagent;
+        // Rows for the running ones (frame renderer), kept by call id; a
+        // finished one collapses to its line in the transcript.
+        foreach (ref p; all)
+        {
+            string id = p.callId;
+            if (p.done) subRows.remove(id);
+            else subRows[id] = LiveSubagent(p, monoNow);
+        }
+        import std.algorithm : sort;
+        immutable(LiveSubagent)[] rows;
+        foreach (id; subRows.keys.sort) rows ~= subRows[id];
+        auto label = rows.length ? format("agent ×%s", rows.length) : "agent";
+        updateStatus((ref Stats s) { s.tool = label; s.subagents = rows; });
+        if (quiet) return;
+        foreach (ref p; all)
+            if (p.done)
+            {
+                endLine();
+                writeln(stamp() ~ "  " ~ dim(terminalSafe(progressLine(p))));
+            }
         stdOut.flush();
     }
 
@@ -2429,6 +2694,19 @@ int runMain(string[] args)
     agent.sessionTitles = cfg.sessionTitles;
     agent.titleModel = cfg.titleModel;
     agent.titleClient = (string spec) => makeClient(resolve(cfg, spec));
+    if (cfg.subagents)
+    {
+        import nano.subagent : SubLimits;
+        import nano.arith : toSize;
+        agent.subagentClients = new immutable ConfigClients(frozenConfig(cfg));
+        agent.subagentModel = cfg.subagentModel;
+        agent.subagentMaxConcurrency = cfg.subagentMaxConcurrency > 0 ? toSize(cfg.subagentMaxConcurrency) : 1;
+        SubLimits lim;
+        if (cfg.subagentTimeoutSecs > 0) lim.timeoutSecs = cfg.subagentTimeoutSecs;
+        if (cfg.subagentMaxTurns > 0) lim.turns = toSize(cfg.subagentMaxTurns);
+        if (cfg.subagentMaxTokens > 0) lim.tokens = cfg.subagentMaxTokens;
+        agent.subagentLimits = lim;
+    }
     agent.planTools = cfg.planTools;
     agent.timerTools = !o.acp; // ACP has no idle loop to fire them
     agent.outcomeTool = cfg.outcomeTool;
@@ -2729,6 +3007,11 @@ int runMain(string[] args)
         h.refreshSystem = () { agent.messages[0].content = systemFor(cwd, agent.promptPlan); };
         h.refreshClient = (string name) {
             import nano.settings : editRebuilds;
+            // Sub-agents build clients from a config frozen at startup;
+            // re-freeze after every provider edit so children see the new
+            // credentials/endpoints (and a newly added provider).
+            if (cfg.subagents)
+                agent.subagentClients = new immutable ConfigClients(frozenConfig(cfg));
             if (!editRebuilds(cfg, name, agent.client.providerName)) return string.init;
             // The client's own provider was edited: keep its model. Otherwise the
             // configured model now resolves to the edited provider: build that.
@@ -3562,4 +3845,35 @@ unittest
         assert(t.lines.length == 1 && !t.lines[0].canFind(m) && t.lines[0].canFind("\uFFFD"), t.lines[0]);
         assert(escapeMarks("↪ x" ~ m) == "↪ x\uFFFD");
     }
+}
+
+// Piped (non-frame) answers keep the model's bytes verbatim; only the
+// frame transcript neutralises control bytes.
+unittest
+{
+    Screen s;
+    s.capturing = true;
+    assert(rawShownIn("a\x1b[1mb\rc\x07", false) == "a\x1b[1mb\rc\x07");
+    s.text(false, "x\x1by\r");
+    import std.algorithm : canFind;
+    assert(s.captured.canFind("x\x1by\r"), s.captured);
+    s.testFrame = true;
+    assert(rawShownIn("a\x1bb", true) != "a\x1bb");
+}
+
+// Expanded (verbose) reasoning in the frame can't forge a refold mark
+// with raw ESC/BEL bytes, nor a wrap mark with private-use chars.
+unittest
+{
+    import std.algorithm : canFind;
+    Screen s;
+    s.capturing = true;
+    s.testFrame = true;
+    auto prev = verbosity();
+    setVerbosity(Verbosity.verbose);
+    scope (exit) setVerbosity(prev);
+    s.text(true, "x\x1b]8771;Zm9v;bar\x07y\uE002z");
+    assert(!s.captured.canFind("\x1b]8771;Zm9v"), s.captured);
+    assert(!s.captured.canFind("\x07y"), s.captured);
+    assert(!s.captured.canFind("\uE002"), s.captured);
 }

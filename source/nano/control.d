@@ -32,14 +32,124 @@ enum string cancelledResponse = "[turn cancelled]";
 
 private shared bool gCancel;
 
+/// A narrower cancellation scope than the process-wide flag: a sub-agent's
+/// per-child abort. Blocking work (the HTTP client, retry waits) polls the
+/// innermost scope on its thread first, so a parent stopping one child
+/// interrupts that child's in-flight request without cancelling its own
+/// turn. A scope is a `shared(bool)*` the child publishes and the parent's
+/// `SubAbort.abort` sets; `pushCancelScope`/`popCancelScope` install it on
+/// the child's thread (its whole run sits inside).
+///
+/// The stack is thread-local: several children run at once, and a shared
+/// stack would let one child's pop remove a sibling's scope and make every
+/// thread's `cancelRequested` poll the top child's abort cell — stopping
+/// one child would cancel the parent's turn and its siblings. Thread-local,
+/// only the pushing thread's blocking work sees the scope.
+private shared(bool)*[256] cancelScopes;
+private size_t cancelScopeDepth;
+
 /// Whether the running turn has been cancelled. Safe from any thread or a
 /// signal handler. Blocking tools and the HTTP client poll this.
-bool cancelRequested() @safe nothrow @nogc { return atomicLoad(gCancel); }
+bool cancelRequested() @safe nothrow @nogc
+{
+    if (cancelScopeDepth > 0)
+    {
+        auto scope_ = cancelScopes[cancelScopeDepth - 1];
+        if (scope_ !is null && atomicLoad(*scope_)) return true;
+    }
+    return atomicLoad(gCancel);
+}
+
+/// Poll `scope_` first on this thread until `popCancelScope`. The
+/// parameter is escaping (not `scope`), so DIP1000 rejects a pointer to a
+/// stack local from a `@safe` caller: only a GC-owned flag (the child's
+/// abort cell) can be installed, and it lives as long as the slot does.
+void pushCancelScope(shared(bool)* scope_) @safe nothrow @nogc
+{
+    if (cancelScopeDepth >= cancelScopes.length) return; // deeper than ever nested: fall back to the global flag
+    cancelScopes[cancelScopeDepth] = scope_;
+    cancelScopeDepth++;
+}
+
+/// Remove the scope `pushCancelScope` installed (LIFO, on this thread).
+void popCancelScope() @safe nothrow @nogc
+{
+    if (cancelScopeDepth == 0) return;
+    cancelScopeDepth--;
+    cancelScopes[cancelScopeDepth] = null;
+}
 
 /// Raised inside the agent when a cancel interrupts a model call.
 class Cancelled : Exception
 {
     this() pure nothrow @safe { super(cancelledResponse); }
+}
+
+unittest
+{
+    import core.atomic : atomicLoad, atomicStore;
+    assert(!cancelRequested);
+    auto hit = new shared bool;
+    pushCancelScope(hit);
+    assert(!cancelRequested);
+    atomicStore(*hit, true);
+    assert(cancelRequested);
+    popCancelScope();
+    // A stack flag cannot be installed: the parameter escapes.
+    static assert(!__traits(compiles, () @safe { shared bool local; pushCancelScope(&local); }));
+    assert(!cancelRequested);
+    // A null slot falls back to the flag.
+    pushCancelScope(null);
+    assert(!cancelRequested);
+    popCancelScope();
+}
+
+unittest
+{
+    // The scope stack is thread-local: a child's scope neither leaks onto
+    // the parent thread nor is popped by a sibling. Two "children" run at
+    // once; aborting one must not cancel the other or the parent.
+    import core.atomic : atomicStore;
+    import nano.safeio : Chan, spawn;
+    static struct Go
+    {
+        shared(bool)* abortCell;
+        Chan!bool entered, leave;
+        Chan!bool seenCancelled;
+    }
+    static void child(Go g)
+    {
+        pushCancelScope(g.abortCell);
+        g.entered.put(true);
+        bool stop;
+        g.leave.take(stop);
+        g.seenCancelled.put(cancelRequested);
+        popCancelScope();
+    }
+    // Heap-allocated so the `Chan` members are not `scope` on the copy
+    // `spawn` makes.
+    auto abortA = new shared bool;
+    auto abortB = new shared bool;
+    auto a = new Go(abortA, Chan!bool.make, Chan!bool.make, Chan!bool.make);
+    auto b = new Go(abortB, Chan!bool.make, Chan!bool.make, Chan!bool.make);
+    auto ha = spawn(&child, *a);
+    auto hb = spawn(&child, *b);
+    bool got;
+    a.entered.take(got);
+    b.entered.take(got);
+    // Both scopes are live on their own threads; the parent sees neither.
+    assert(!cancelRequested);
+    atomicStore(*abortA, true);
+    a.leave.put(true);
+    b.leave.put(true);
+    bool seenA, seenB;
+    a.seenCancelled.take(seenA);
+    b.seenCancelled.take(seenB);
+    ha.join();
+    hb.join();
+    assert(seenA, "the aborted child sees its own scope");
+    assert(!seenB, "a sibling's abort does not reach this child");
+    assert(!cancelRequested, "no scope leaks onto the parent thread");
 }
 
 /// A steering message. `tag` is the ACP request id that sent it, if any. It is
