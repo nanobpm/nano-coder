@@ -748,6 +748,18 @@ struct Transcript
     /// Re-added folds waiting for the unfinished line in `cur` to end.
     private Deferred[] deferred;
     private static struct Deferred { Fold fold; string[] shown; }
+    /// The line `deferred` waited on has ended; they land before the next
+    /// output, after any fold mark for that line (which counts back from it).
+    private bool deferredReady;
+
+    /// Appends ready deferred folds at the end.
+    private void flushDeferred() pure
+    {
+        if (!deferredReady) return;
+        foreach (d; deferred) { auto f = d.fold; f.start = lines.length; lines ~= d.shown; folds ~= f; }
+        deferred = null;
+        deferredReady = false;
+    }
 
     void clear() pure
     {
@@ -759,6 +771,7 @@ struct Transcript
         prunedIds = null;
         prunedOrder = null;
         deferred = null;
+        deferredReady = false;
     }
 
     void feed(scope const(ubyte)[] bytes) pure
@@ -808,13 +821,14 @@ struct Transcript
                     dchar fin = 0;
                     while (i < s.length) { auto n = decode(s, i); if (isFinal(n)) { fin = n; break; } }
                     auto params = s[ps .. i > ps ? i - 1 : ps];
-                    if (fin == 'm') cur ~= s[at .. i];
+                    if (fin == 'm') { flushDeferred(); cur ~= s[at .. i]; }
                     else if (fin == 'K') { cur = null; cr = false; }
                     else if (fin == 'J' && (params == "2" || params == "3")) clear();
                 }
                 continue;
             }
             if (cr) { cur = null; cr = false; }
+            flushDeferred();
             // Wrap marks pass through: the app's stdout carries the
             // renderer's generated marks (verbatim code blocks, soft and
             // separator wraps). Literal marks are escaped upstream, before
@@ -825,11 +839,11 @@ struct Transcript
 
     private void endLine() pure
     {
+        flushDeferred();
         lines ~= cur;
         cur = null;
         cr = false;
-        foreach (d; deferred) { auto f = d.fold; f.start = lines.length; lines ~= d.shown; folds ~= f; }
-        deferred = null;
+        if (deferred.length) deferredReady = true;
         if (lines.length > cap)
         {
             auto drop = lines.length - cap * 9 / 10;
@@ -868,6 +882,7 @@ struct Transcript
         try
         {
             if (parts[0] == refoldOsc) { refold(parts); return; }
+            scope (exit) flushDeferred();
             import nano.safeio : utf8Text;
             auto id = utf8Text(Base64.decode(parts[1]));
             auto n = parts[2].to!size_t;
@@ -923,7 +938,7 @@ struct Transcript
             import std.algorithm : countUntil, remove;
             auto at = prunedOrder.countUntil(id);
             if (at >= 0) prunedOrder = prunedOrder.remove(at);
-            if (cur.length) { deferred ~= Deferred(f, collapsed); return; }
+            if (cur.length || deferred.length) { deferred ~= Deferred(f, collapsed); return; }
             f.start = lines.length;
             lines ~= collapsed;
             folds ~= f;
@@ -934,6 +949,7 @@ struct Transcript
     /// collapsed and expanded. False when there is none.
     bool toggleLatest() pure
     {
+        flushDeferred();
         if (!folds.length) return false;
         auto latest = folds[$ - 1];
         bool want = !latest.expanded;
@@ -963,6 +979,7 @@ struct Transcript
     /// Every line wrapped to `width` (the unfinished line last, if any).
     string[] render(size_t width) pure
     {
+        flushDeferred();
         if (width != cacheWidth) { cache = null; cacheWidth = width; }
         while (cache.length < lines.length) cache ~= wrapAnsi(lines[cache.length], width);
         string[] out_;
@@ -1578,9 +1595,31 @@ unittest
     t.feed(refoldMark("think-1", "∴ Thought more\n", "∴ Thought more\n    a b\n").representation);
     t.feed(refoldMark("think-1", "∴ Thought most\n", "∴ Thought most\n    a b c\n").representation);
     t.feed("C\n".representation);
+    t.render(80);
     assert(t.lines[$ - 2 .. $] == ["ABC", "∴ Thought most"], t.lines.to!string);
     assert(t.toggleLatest());
     assert(t.lines[$ - 2 .. $] == ["∴ Thought most", "    a b c"], t.lines.to!string);
+}
+
+unittest
+{
+    import std.conv : to;
+    // A fold mark for the line that releases a deferred refold folds that
+    // line, not the deferred one, and the two folds do not overlap.
+    Transcript t;
+    t.cap = 10;
+    t.feed(("∴ Thought\n" ~ foldMark("think-1", 1, "∴ Thought\n    a\n")).representation);
+    foreach (i; 0 .. 12) t.feed((i.to!string ~ "\n").representation);
+    t.feed("AB".representation);
+    t.feed(refoldMark("think-1", "∴ Thought more\n", "∴ Thought more\n    a b\n").representation);
+    t.feed(("C\n" ~ foldMark("tool-1", 1, "ABC\n    out\n")).representation);
+    assert(t.lines[$ - 2 .. $] == ["ABC", "∴ Thought more"], t.lines.to!string);
+    auto tool = t.folds[$ - 2], think = t.folds[$ - 1];
+    assert(tool.id == "tool-1" && t.lines[tool.start] == "ABC", t.folds.to!string);
+    assert(think.id == "think-1" && think.start == tool.start + tool.length, t.folds.to!string);
+    // Text after the line also lands after the deferred fold.
+    t.feed("D\n".representation);
+    assert(t.lines[$ - 2 .. $] == ["∴ Thought more", "D"], t.lines.to!string);
 }
 
 unittest
