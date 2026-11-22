@@ -1208,7 +1208,7 @@ class Agent
         {
             if (p.thread.running) { if (probe.isCurrent(p.generation)) still ~= p; continue; }
             auto result = p.thread.join();
-            published |= probe.publishIfCurrent(p.generation, result.unwrap);
+            published |= probe.publishIfCurrent(p.generation, result.unwrap, configuredWindow == 0);
         }
         pendingProbes = still;
         return published;

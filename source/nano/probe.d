@@ -54,12 +54,13 @@ struct ProbeState
     /// Publish a background probe's result if `g` is still current: thinking,
     /// vision and output limit land together, and the window slot is written
     /// only when the probe found a window. False when the result was stale
-    /// and discarded.
-    bool publishIfCurrent(ulong g, Capabilities c) pure
+    /// and discarded. `window = false` (a configured context window) never
+    /// publishes window metadata, even if a shared response carried some.
+    bool publishIfCurrent(ulong g, Capabilities c, bool window = true) pure
     {
         if (!isCurrent(g)) return false;
         storeWithoutWindow(c);
-        if (c.window)
+        if (window && c.window)
         {
             caps.window = c.window;
             caps.windowSource = c.windowSource;
@@ -115,4 +116,16 @@ unittest
     assert(probe.publishIfCurrent(g, c));
     assert(probe.caps.window == 5 && probe.caps.windowSource == "earlier");
     assert(probe.caps.maxOutput == 9);
+}
+
+// A configured context window: a background result's window metadata is ignored.
+unittest
+{
+    ProbeState probe;
+    auto g = probe.beginDetect();
+    auto c = windowOnly(4, "props");
+    c.maxOutput = 11;
+    assert(probe.publishIfCurrent(g, c, false));
+    assert(probe.caps.window == 0 && probe.caps.windowSource == "");
+    assert(probe.caps.maxOutput == 11);
 }
