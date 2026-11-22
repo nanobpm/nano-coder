@@ -515,6 +515,20 @@ class HookManager
         return runAll(selected(Event.userPromptSubmit, null, null, JSONValue.init, null), Event.userPromptSubmit, input);
     }
 
+    /// Whether any PreToolUse or PostToolUse hook could select a call to
+    /// `nanoTool` (whatever its arguments: an `if` rule is not consulted, so
+    /// this over-approximates). Such hooks may have side effects, so calls
+    /// they can see must keep sequential order (#222).
+    bool hasToolHooks(string nanoTool) const
+    {
+        auto claude = claudeToolName(nanoTool);
+        foreach (ref h; hooks)
+            if ((h.event == Event.preToolUse || h.event == Event.postToolUse)
+                && matcherSelects(h.matcher, claude, nanoTool))
+                return true;
+        return false;
+    }
+
     /// Called after the permission check allowed the call, before it runs.
     Outcome runPreToolUse(string nanoTool, JSONValue args, string toolUseId)
     {
@@ -1262,12 +1276,12 @@ unittest // if_rule_narrows_tool_hooks; stop_block_keeps_going; timeout_blocks_p
     auto s = with_([cmd(Event.stop, `echo '{"decision":"block","reason":"keep going"}'`)], dir).runStop(false);
     assert(s.blocked && s.blockReason == "keep going");
     auto t = cmd(Event.preToolUse, "sleep 5");
-    t.timeout = 200.msecs;
+    t.timeout = 100.msecs;
     auto start = monoNow;
     assert(with_([t], dir).runPreToolUse("bash", j(`{"command": "ls"}`), "t1").denies);
     assert(monoNow - start < 3.seconds);
     auto tp = cmd(Event.postToolUse, "sleep 5");
-    tp.timeout = 200.msecs;
+    tp.timeout = 100.msecs;
     assert(!with_([tp], dir).runPostToolUse("bash", j(`{"command": "ls"}`), "ok", "t1").blocked);
 }
 
@@ -1387,15 +1401,15 @@ unittest // detached descendant / unfinished I/O cannot hang the runner and fail
     auto dir = tdir("detached");
     // macOS has no setsid(1); perl's POSIX::setsid leaves the hook's group too.
     auto h = cmd(Event.preToolUse, `printf '%s' '{"hookSpecificOutput":{"permissionDecision":"deny"}}'; perl -MPOSIX -e 'setsid; sleep 3' & exit 0`);
-    h.timeout = 300.msecs;
-    h.grace = 100.msecs;
+    h.timeout = 100.msecs; // short waits: the hook denies either way (issue #253)
+    h.grace = 50.msecs;
     auto start = monoNow;
     auto o = with_([h], dir).runPreToolUse("bash", j(`{"command": "ls"}`), "t1");
     assert(monoNow - start < 3.seconds);
     assert(o.denies);
     auto ok = cmd(Event.preToolUse, `perl -MPOSIX -e 'setsid; sleep 3' & exit 0`);
-    ok.timeout = 300.msecs;
-    ok.grace = 100.msecs;
+    ok.timeout = 100.msecs;
+    ok.grace = 50.msecs;
     assert(with_([ok], dir).runPreToolUse("bash", j(`{"command": "ls"}`), "t1").denies, "unfinished I/O fails closed");
 }
 

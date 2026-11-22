@@ -10,7 +10,7 @@ import nano.arith : checkedMul, checkedSub, saturatingAdd, saturatingSub, clampT
 import nano.option : Option, some, none, match, ifSome, orElse, unwrap, NotNull;
 import nano.result : orThrow, toOption, match, unwrap;
 
-import nano.safeio : Isolated, Join, JoinHandle, spawnDaemon, stdErr, stdOut;
+import nano.safeio : Chan, Isolated, Join, JoinHandle, spawn, spawnDaemon, stdErr, stdOut;
 import nano.probe : ProbeState;
 
 import std.json;
@@ -37,6 +37,7 @@ import nano.thinking : Thinking, ThinkingResolved = Resolved, resolveThinking = 
 import temp = nano.temperature;
 import nano.vision : Vision, resolveVision = resolve;
 import nano.llm : Attachment;
+import nano.tools.files : PatchSnapshot, PatchHandler;
 
 /// A tool result as displayed: the text plus each attached image's placeholder.
 string toolResultDisplay(string text, const(Attachment)[] attachments) pure
@@ -186,6 +187,14 @@ struct ConfiguredWindow
 {
     size_t tokens;
     string source;
+}
+
+/// One path an apply_patch call touches, as the file-tool call that would
+/// change it directly (for the per-path hooks).
+private struct PatchEdit
+{
+    string name;
+    JSONValue args;
 }
 
 class Agent
@@ -846,82 +855,335 @@ class Agent
             control.isCancelled));
     }
 
-    /// Run a reply's tool calls in order, each result pushed as it lands.
-    /// The loop detector's hard stop sets `loopStop` and skips the rest.
+    /// Run a reply's tool calls, each result pushed in call order. A run of
+    /// two or more consecutive read-only calls executes concurrently
+    /// (`runConcurrently`); every other call is a barrier that runs alone,
+    /// so "read, edit, read" still reads the edit (issue #222). The loop
+    /// detector's hard stop sets `loopStop` and skips the rest.
     private Event runToolCalls(const ref LLMResponse r, AgentEvents ev, ref string loopStop)
     {
         loopStop = null;
-        foreach (call; r.toolCalls)
+        auto calls = r.toolCalls;
+        for (size_t i = 0; i < calls.length;)
         {
+            size_t j = i;
+            while (j < calls.length && concurrentEligible(calls[j].name)) j++;
+            if (j > i + 1 && !control.isCancelled && loopStop is null)
+            {
+                runConcurrently(r.stopReason, calls[i .. j], ev, loopStop);
+                i = j;
+                continue;
+            }
+            auto call = calls[i++];
             ev.toolStart(call);
-            bool isError = true;
-            string result;
-            Attachment[] attachments;
-            bool dispatched;
-            JSONValue effectiveArgs;
-            auto recallBefore = recallState.dup;
-            auto notesBefore = recallTurnNotes;
-            if (control.isCancelled) result = cancelledToolResult;
-            else if (loopStop !is null) result = loopStoppedToolResult;
+            CallRun c;
+            c.recallBefore = recallState.dup;
+            c.notesBefore = recallTurnNotes;
+            if (control.isCancelled) c.result = cancelledToolResult;
+            else if (loopStop !is null) c.result = loopStoppedToolResult;
             else
             {
-                {
-                    import nano.tools : setSpillDir, spillDirFor, truncateOutput;
-                    // Cut outputs are kept beside a persisted session's log.
-                    setSpillDir(log.match!(l => spillDirFor(l.path), () => string.init));
-                    result = runTool(call, r.stopReason, isError, dispatched, effectiveArgs);
-                    // bash, read_file and history_read bound their own output.
-                    if (call.name != "bash" && call.name != "read_file" && call.name != hist.readTool
-                        && call.name != "load_skill")
-                        result = truncateOutput(result, toolOutputLimit,
-                            format("tool-%s-%s", safeName(call.id), safeName(call.name)));
-                }
-                // A successful edit marks the tree unchecked; a bash call
-                // that started (even one exiting non-zero) is the check.
-                if (!isError && (call.name == "write_file" || call.name == "edit_file")) editsSinceCheck = true;
-                else if (dispatched && !isError && call.name == "bash") editsSinceCheck = false;
-                if (call.name == "read_file") result = imageResult(result, isError, attachments);
-                // Deeper instruction files and scoped rules attach to the first
-                // file-tool result that touches a matching path.
-                if (!isError && (call.name == "read_file" || call.name == "write_file" || call.name == "edit_file"))
-                    if (auto p = "path" in call.arguments)
-                        if (p.type == JSONType.string)
-                        {
-                            import std.file : getcwd;
-                            instructions.ifSome((ProjectInstructions pi) {
-                                if (auto nested = pi.nestedFor(p.str, getcwd())) result ~= nested;
-                            });
-                        }
-                // Memory recall (Rust #167): a note for each memory whose
-                // anchors appear in this call's arguments and whose full
-                // text is not already in context. Only calls that ran.
-                if (dispatched)
-                    foreach (note; recallMemories(call.name, effectiveArgs, !isError, result))
-                        result ~= "\n\n" ~ wrap(note);
-                if (hist.isHistoryTool(call.name)) historyHintPending = false;
-                else if (historyHintPending && historyEnabled && hist.looksFailed(call.name, !isError, result))
-                {
-                    historyHintPending = false;
-                    result ~= "\n\n" ~ hist.failedToolHint;
-                }
-                if (remindersEnabled) result ~= remind(call, !isError, result, loopStop);
+                import nano.tools : setSpillDir, spillDirFor;
+                // Cut outputs are kept beside a persisted session's log.
+                setSpillDir(log.match!(l => spillDirFor(l.path), () => string.init));
+                c.result = runTool(call, r.stopReason, c.isError, c.dispatched, c.effectiveArgs);
+                c.ran = true;
             }
-            ev.toolEnd(call, toolResultDisplay(result, attachments), isError);
-            auto msg = Message.toolResult(call.id, call.name, result, isError);
-            msg.attachments = attachments;
-            // Commit this call's recall changes only once the result
-            // carrying their notes is durable: a failed append rolls them
-            // back, so a resume never treats unseen notes as seen.
-            try push(msg);
-            catch (Exception e)
-            {
-                recallState = recallBefore;
-                recallTurnNotes = notesBefore;
-                throw e;
-            }
-            if (recallState != recallBefore) recallChanged();
+            finishCall(call, c, ev, loopStop);
         }
         return Event(ToolsRan(loopStop !is null, hasReported, reported.response, control.isCancelled));
+    }
+
+    /// Most worker threads one run of read-only calls uses at a time.
+    enum maxConcurrentTools = 8;
+
+    /// Whether calls to `name` may run concurrently with their read-only
+    /// neighbours: read-only by construction, never prompting. Tools say so
+    /// themselves (`Concurrency.readOnly`); of the agent's own, the history
+    /// tools and the plan and timer listings qualify. Everything else (bash,
+    /// edits, question, report_outcome, plan/timer/memory mutations, unknown
+    /// names) is a barrier.
+    ///
+    /// Thread-safety audit (#222). Worker threads get only a `Job`: a plain
+    /// function and immutable text, so the type system rules out shared
+    /// agent state. What each job touches: read_file reads the file and
+    /// hashes it; the agent records the digest in its `ReadState` afterwards
+    /// (`settle`, on this thread). grep/glob walk the tree with per-call
+    /// `Ignores`/regexes and rebuild the Read-deny scan from rule text
+    /// (`Rule.matches` keeps its compiled copy per thread). The history
+    /// tools are barriers (they read results logged by earlier calls). The
+    /// spill directory, spill set and truncation are thread-local and used
+    /// on this thread only (truncation happens after the run). Stats, the
+    /// loop detector, memory recall and the frame UI are touched only here,
+    /// in call order. memory_search, plan_show and timer_list run on this
+    /// thread while the workers run, so they share nothing with them.
+    private bool concurrentEligible(string name)
+    {
+        if (outcomeTool && name == outcomeToolName) return false;
+        // Tool-use hooks are arbitrary commands that may change files, so a
+        // call a hook can see keeps its sequential place: a PostToolUse hook
+        // on one read must run before the next read observes the tree.
+        // Checked before the plan/timer listings so hooked ones are barriers.
+        if (hooks.match!(m => m.hasToolHooks(name), () => false)) return false;
+        if (planTools && isPlanTool(name)) return name == "plan_show";
+        if (timerTools && isTimerTool(name)) return name == "timer_list";
+        // History tools are barriers: they must see the preceding calls'
+        // logged results, and history_read's spill bookkeeping is the
+        // agent thread's own.
+        if (hist.isHistoryTool(name)) return false;
+        return tools.readOnly(name);
+    }
+
+    /// One call's way through `runToolCalls`.
+    private static struct CallRun
+    {
+        string result;
+        bool isError = true;
+        /// Reached its handler (see `runTool`).
+        bool dispatched;
+        JSONValue effectiveArgs;
+        /// Admitted and run (or refused) rather than cancelled or loop-stopped.
+        bool ran;
+        /// Recall state before the call, restored if its result can't be logged.
+        typeof(recallState) recallBefore;
+        typeof(recallTurnNotes) notesBefore;
+    }
+
+    version (unittest)
+    {
+        /// Test hook: called by a worker right after it reads `afterCancel`.
+        static shared void function() @safe workerRecordedHook;
+    }
+
+    /// What a worker hands back: the job's result, and whether the turn was
+    /// already cancelled when the job finished (decided on the worker, so a
+    /// result completed before a cancel keeps its result however late the
+    /// agent collects it).
+    private static struct WorkerDone
+    {
+        JobResult result;
+        bool afterCancel;
+    }
+
+    /// A worker: run the job, then say which call finished.
+    private static WorkerDone worker(Job job, size_t index, Chan!size_t finished)
+    {
+        scope (exit) finished.put(index);
+        auto res = runJob(job);
+        auto afterCancel = cancelRequested();
+        import core.atomic : atomicLoad;
+        version (unittest)
+            if (auto hook = atomicLoad(workerRecordedHook)) hook();
+        return WorkerDone(res, afterCancel);
+    }
+
+    /// Run consecutive read-only calls concurrently (issue #222). In call
+    /// order, first: each call starts (`toolStart`) and is admitted (plan
+    /// mode, permissions, PreToolUse hooks, so a veto never races). Then the
+    /// admitted calls run: those a tool can package as a `Job` on worker
+    /// threads (at most `maxConcurrentTools` at once, through safeio's
+    /// `spawn`), the rest on this thread meanwhile. Last, in call order
+    /// again: the tool's `settle`, the PostToolUse hooks, the loop detector,
+    /// memory recall, `toolEnd` and the logged result, exactly as one call
+    /// at a time would produce them. A cancellation stops launching: a call
+    /// that hadn't finished reports the usual interrupted result, and every
+    /// worker is joined before this returns, so nothing outlives the turn.
+    private void runConcurrently(string stopReason, const(ToolCall)[] calls, AgentEvents ev, ref string loopStop)
+    {
+        import nano.tools : setSpillDir, spillDirFor;
+        setSpillDir(log.match!(l => spillDirFor(l.path), () => string.init));
+        auto n = calls.length;
+        auto runs = new CallRun[n];
+        auto contexts = new string[][n];
+        auto admitted = new bool[n];
+        auto jobs = new Job[n];
+        auto offloaded = new bool[n];
+        auto finished = new bool[n];
+        auto results = new JobResult[n];
+        // Calls never admitted because a cancel arrived first: no hooks,
+        // reported as interrupted.
+        auto skipped = new bool[n];
+        foreach (k, ref call; calls)
+        {
+            ev.toolStart(call);
+            if (control.isCancelled)
+            {
+                skipped[k] = true;
+                continue;
+            }
+            admitted[k] = admit(call, stopReason, runs[k].result, runs[k].effectiveArgs, contexts[k]);
+            if (!admitted[k]) continue;
+            if (tools.has(call.name))
+            {
+                auto mode = tools.concurrency(call.name);
+                // Packaging only copies text: the tool's own checks run in the job.
+                if (mode.offload !is null)
+                {
+                    // Packaging can fail (e.g. a deleted cwd while building
+                    // the Read-deny scan): that call fails like a sequential
+                    // one would, rather than unwinding the whole batch.
+                    try
+                    {
+                        jobs[k] = mode.offload(runs[k].effectiveArgs);
+                        offloaded[k] = true;
+                    }
+                    catch (Exception e)
+                    {
+                        results[k] = JobResult(e.msg, true, true);
+                        finished[k] = true;
+                    }
+                }
+            }
+        }
+        // The workers, launched in call order while not cancelled.
+        auto done = Chan!size_t.make;
+        auto handles = new Join!WorkerDone[n];
+        size_t next, running;
+        // Every started worker is joined on every exit path (a failed spawn
+        // or a throwing in-memory tool included), so none outlives the turn.
+        scope (failure)
+            while (running)
+            {
+                size_t k;
+                done.take(k);
+                // Counted off before the join: a join that rethrows has still
+                // consumed this worker's notification.
+                running--;
+                // `runJob` turns a job's exception into a result, so this
+                // only waits.
+                handles[k].join();
+            }
+        void launch()
+        {
+            for (; running < maxConcurrentTools && next < n && !control.isCancelled; next++)
+                if (offloaded[next] && !finished[next])
+                {
+                    handles[next] = spawn(&worker, jobs[next], next, done);
+                    running++;
+                }
+        }
+        launch();
+        // In-memory read-only tools run here while the workers run.
+        foreach (k, ref call; calls)
+            if (admitted[k] && !offloaded[k] && !finished[k] && !control.isCancelled)
+            {
+                bool isError;
+                results[k].text = execute(call, runs[k].effectiveArgs, isError);
+                results[k].error = isError;
+                // Finished after a cancellation (the worker rule): interrupted.
+                finished[k] = !control.isCancelled;
+            }
+        while (running)
+        {
+            size_t k;
+            done.take(k);
+            // Before the join, so a rethrowing join leaves the failure guard
+            // waiting only for notifications still to come.
+            running--;
+            auto w = handles[k].join();
+            results[k] = w.result;
+            // Finished after a cancellation: reported as interrupted.
+            finished[k] = !w.afterCancel;
+            launch();
+        }
+        foreach (k, ref call; calls)
+        {
+            auto c = &runs[k];
+            c.recallBefore = recallState.dup;
+            c.notesBefore = recallTurnNotes;
+            // Cancellation outranks a loop stop for a call that never ran:
+            // an interrupted call reports the interrupted result even when an
+            // earlier finished call tripped the loop detector.
+            // A loop stop outranks a refusal, as in the sequential path.
+            if (skipped[k] || (admitted[k] && !finished[k])) c.result = cancelledToolResult;
+            else if (loopStop !is null) c.result = loopStoppedToolResult;
+            else if (!admitted[k]) c.ran = true;
+            else
+            {
+                auto res = results[k];
+                if (offloaded[k] && !res.error)
+                    if (auto settle = tools.concurrency(call.name).settle) settle(res);
+                c.ran = c.dispatched = true;
+                c.isError = res.error;
+                auto text = res.crashed ? format("%s failed: %s", call.name, res.text) : res.text;
+                c.result = afterTool(call, c.effectiveArgs, text, contexts[k]);
+            }
+            finishCall(call, *c, ev, loopStop);
+        }
+    }
+
+    /// A call's result after it ran (truncated, annotated, the loop detector
+    /// consulted), shown (`toolEnd`) and logged. `c.ran` false: cancelled or
+    /// loop-stopped, logged as it is.
+    private void finishCall(const ref ToolCall call, ref CallRun c, AgentEvents ev, ref string loopStop)
+    {
+        string result = c.result;
+        bool isError = c.isError;
+        bool dispatched = c.dispatched;
+        auto effectiveArgs = c.effectiveArgs;
+        Attachment[] attachments;
+        if (c.ran)
+        {
+            {
+                import nano.tools : truncateOutput;
+                // bash, read_file and history_read bound their own output.
+                if (call.name != "bash" && call.name != "read_file" && call.name != hist.readTool
+                    && call.name != "load_skill")
+                    result = truncateOutput(result, toolOutputLimit,
+                        format("tool-%s-%s", safeName(call.id), safeName(call.name)));
+            }
+            // A successful edit marks the tree unchecked; a bash call
+            // that started (even one exiting non-zero) is the check.
+            auto patched = call.name == "apply_patch" && dispatched ? patchTouches(effectiveArgs, isError) : null;
+            if (!isError && (call.name == "write_file" || call.name == "edit_file" || patched.length)) editsSinceCheck = true;
+            else if (dispatched && !isError && call.name == "bash") editsSinceCheck = false;
+            if (call.name == "read_file") result = imageResult(result, isError, attachments);
+            // Deeper instruction files and scoped rules attach to the first
+            // file-tool result that touches a matching path.
+            if (!isError && (call.name == "read_file" || call.name == "write_file" || call.name == "edit_file"))
+                if (auto p = "path" in call.arguments)
+                    if (p.type == JSONType.string)
+                    {
+                        import std.file : getcwd;
+                        instructions.ifSome((ProjectInstructions pi) {
+                            if (auto nested = pi.nestedFor(p.str, getcwd())) result ~= nested;
+                        });
+                    }
+            foreach (p; patched)
+            {
+                import std.file : getcwd;
+                instructions.ifSome((ProjectInstructions pi) {
+                    if (auto nested = pi.nestedFor(p, getcwd())) result ~= nested;
+                });
+            }
+            // Memory recall (Rust #167): a note for each memory whose
+            // anchors appear in this call's arguments and whose full
+            // text is not already in context. Only calls that ran.
+            if (dispatched)
+                foreach (note; recallMemories(call.name, withPaths(effectiveArgs, patched), !isError, result))
+                    result ~= "\n\n" ~ wrap(note);
+            if (hist.isHistoryTool(call.name)) historyHintPending = false;
+            else if (historyHintPending && historyEnabled && hist.looksFailed(call.name, !isError, result))
+            {
+                historyHintPending = false;
+                result ~= "\n\n" ~ hist.failedToolHint;
+            }
+            if (remindersEnabled) result ~= remind(call, !isError, result, loopStop);
+        }
+        ev.toolEnd(call, toolResultDisplay(result, attachments), isError);
+        auto msg = Message.toolResult(call.id, call.name, result, isError);
+        msg.attachments = attachments;
+        // Commit this call's recall changes only once the result
+        // carrying their notes is durable: a failed append rolls them
+        // back, so a resume never treats unseen notes as seen.
+        try push(msg);
+        catch (Exception e)
+        {
+            recallState = c.recallBefore;
+            recallTurnNotes = c.notesBefore;
+            throw e;
+        }
+        if (recallState != c.recallBefore) recallChanged();
     }
 
     /// System reminders for one finished call: plan/memory nudges and the
@@ -1696,27 +1958,66 @@ class Agent
         out JSONValue effectiveArgs)
     {
         isError = true;
-        if (auto e = call.rawArgumentsError(stopReason)) return e;
+        string[] context;
+        string refused;
+        if (!admit(call, stopReason, refused, effectiveArgs, context)) return refused;
+        auto args = effectiveArgs;
+        // apply_patch: each touched path also passes the hooks as a direct
+        // edit of it would (the policy already checked every path).
+        // The per-path hook inputs are built once, before the patch runs, from
+        // a snapshot of every touched path taken first: a move deletes its
+        // source, so rebuilding them afterwards would lose the content the
+        // post-hooks should see. The tool then commits only if it stages from
+        // exactly that snapshot, so it writes the content the hooks approved
+        // and an edit made while they ran fails the call.
+        PatchEdit[] patchInputs;
+        PatchSnapshot[] originals;
+        if (call.name == "apply_patch")
+        {
+            originals = patchOriginalsOf(args);
+            patchInputs = patchEdits(args, true, originals);
+            if (auto deny = patchPathHooks(call, patchInputs, context)) return withContext(deny, context);
+            if (auto d = "dry_run" in args)
+                if (d.type == JSONType.true_) { patchInputs = null; originals = null; }
+        }
+        dispatched = true;
+        auto out_ = execute(call, args, isError, originals);
+        return afterTool(call, args, out_, context, isError, patchInputs);
+    }
+
+    /// Before a call runs: its arguments, the tool, plan mode, the permission
+    /// policy and the PreToolUse hooks. False with the refusal in `refused`;
+    /// true with the arguments to run with (after any hook rewrite) and the
+    /// hooks' context.
+    private bool admit(const ref ToolCall call, string stopReason, out string refused, out JSONValue args,
+        ref string[] context)
+    {
+        if (auto e = call.rawArgumentsError(stopReason)) { refused = e; return false; }
         bool isPlan = planTools && isPlanTool(call.name);
         bool isOutcome = outcomeTool && call.name == outcomeToolName;
         bool isHistory = historyEnabled && hist.isHistoryTool(call.name);
         bool isTimer = timerTools && isTimerTool(call.name);
         if (!isPlan && !isOutcome && !isHistory && !isTimer && !tools.has(call.name))
-            return format("Tool '%s' not found. Available: %s", call.name, toolNames());
+        {
+            refused = format("Tool '%s' not found. Available: %s", call.name, toolNames());
+            return false;
+        }
         // Backstop for a call already in flight when plan mode was switched on.
         if (control.mode == AgentMode.plan && !planAllows(call.name))
-            return format("%s is disabled in plan mode (read-only)", call.name);
+        {
+            refused = format("%s is disabled in plan mode (read-only)", call.name);
+            return false;
+        }
         // An unverifiable shell loop never prompts: the policy allows it
         // under the OS sandbox and blocks it without one (Rust #171).
         auto permissionDeny = policy.decide(call.name, call.arguments).match!(
             (PermAllow _) => string.init,
             (PermDeny d) => d.message,
         );
-        if (permissionDeny !is null) return permissionDeny;
+        if (permissionDeny !is null) { refused = permissionDeny; return false; }
         // PreToolUse hooks run after the permission check, before the tool:
         // they can deny the call, rewrite its input, or add context.
-        JSONValue args = call.arguments;
-        string[] context;
+        args = call.arguments;
         foreach (h; hooks)
         {
             auto o = h.runPreToolUse(call.name, call.arguments, call.id);
@@ -1733,10 +2034,20 @@ class Agent
                 // rewrite a command or path past the user's rules.
                 if (auto blocked = policy.check(call.name, args)) deny = blocked;
             }
-            if (deny !is null) return withContext(deny, context);
+            if (deny !is null) { refused = withContext(deny, context); return false; }
         }
-        dispatched = true;
-        effectiveArgs = args;
+        return true;
+    }
+
+    /// Run an admitted call's handler on this thread.
+    private string execute(const ref ToolCall call, JSONValue args, out bool isError,
+        PatchSnapshot[] originals = null)
+    {
+        isError = true;
+        bool isPlan = planTools && isPlanTool(call.name);
+        bool isOutcome = outcomeTool && call.name == outcomeToolName;
+        bool isHistory = historyEnabled && hist.isHistoryTool(call.name);
+        bool isTimer = timerTools && isTimerTool(call.name);
         string out_;
         try
         {
@@ -1762,6 +2073,7 @@ class Agent
                 out_ = call.name == hist.searchTool ? hist.search(logPath, args) : hist.read(logPath, args);
             }
             else if (isTimer) out_ = runTimerTool(call.name, args);
+            else if (call.name == "apply_patch") out_ = applyPatchPrepared(args, tools, originals);
             else out_ = isPlan ? runPlanTool(call.name, args) : tools.execute(call.name, args);
             isError = false;
         }
@@ -1771,13 +2083,209 @@ class Agent
         catch (OutcomeError e) out_ = e.msg;
         catch (QuestionError e) out_ = e.msg;
         catch (Exception e) out_ = format("%s failed: %s", call.name, e.msg);
+        return out_;
+    }
+
+    /// After a call ran: the PostToolUse hooks, and the hooks' context added.
+    private string afterTool(const ref ToolCall call, JSONValue args, string out_, string[] context,
+        bool isError = true, PatchEdit[] patchInputs = null)
+    {
         foreach (h; hooks)
         {
             auto o = h.runPostToolUse(call.name, args, out_, call.id);
             if (auto ctx = o.contextBlock) context ~= ctx;
             if (o.blocked && o.blockReason.strip.length) context ~= o.blockReason;
         }
+        if (call.name == "apply_patch" && !isError)
+            foreach (edit; patchInputs)
+                foreach (h; hooks)
+                {
+                    auto o = h.runPostToolUse(edit.name, edit.args, out_, call.id);
+                    if (auto ctx = o.contextBlock) context ~= ctx;
+                    if (o.blocked && o.blockReason.strip.length) context ~= o.blockReason;
+                }
         return withContext(out_, context);
+    }
+
+    /// An apply_patch call's touched paths as the file-tool calls a direct
+    /// change would make: `write_file` for an added file or a move's
+    /// destination, `edit_file` otherwise (with the path only). None when the
+    /// patch doesn't parse, or is a dry run (which writes nothing) unless
+    /// `withDryRun`: a dry run still reads every path, so pre-hooks see it.
+    private static PatchEdit[] patchEdits(JSONValue args, bool withDryRun = false, PatchSnapshot[] originals = null)
+    {
+        import nano.tools : ToolError;
+        import nano.tools.files : parsePatch, PatchKind, FilePatch;
+        auto p = "patch" in args;
+        if (p is null || p.type != JSONType.string) return null;
+        if (!withDryRun) if (auto d = "dry_run" in args) if (d.type == JSONType.true_) return null;
+        FilePatch[] files;
+        try files = parsePatch(p.str);
+        catch (ToolError) return null; // unparseable: the tool reports it and touches nothing
+        PatchEdit[] out_;
+        // Hooks that inspect content (`content`, `old_string`, `new_string`)
+        // see the same fields a direct write_file/edit_file would carry. A
+        // move's destination content comes from the patch's own sequential
+        // state (an earlier section's Add/Update), as the tool stages it,
+        // never from stale disk.
+        import nano.tools.files : applyHunks, resolvePath;
+        import std.file : readText, FileException;
+        import std.utf : UTFException;
+        string[string] staged; // path -> text after the sections so far
+        bool[string] absent, unknown;
+        bool textOf(string path, out string c)
+        {
+            auto key = resolvePath(path);
+            if (key in absent || key in unknown) return false;
+            if (auto t = key in staged) { c = *t; return true; }
+            // From the snapshot the tool will verify, never a second disk read.
+            if (originals.length)
+            {
+                import nano.safeio : utf8Text;
+                foreach (ref o; originals)
+                    if (o.path == key)
+                    {
+                        if (!o.existed || !o.readable) return false;
+                        try c = utf8Text(o.before);
+                        catch (UTFException) return false;
+                        return true;
+                    }
+                return false;
+            }
+            try { c = readText(key); return true; }
+            catch (FileException) return false;
+            catch (UTFException) return false;
+        }
+        void set(string path, bool known, string c)
+        {
+            auto key = resolvePath(path);
+            absent.remove(key); unknown.remove(key); staged.remove(key);
+            if (known) staged[key] = c; else unknown[key] = true;
+        }
+        void drop(string path)
+        {
+            auto key = resolvePath(path);
+            staged.remove(key); unknown.remove(key);
+            absent[key] = true;
+        }
+        foreach (fp; files)
+        {
+            if (fp.kind == PatchKind.add)
+            {
+                out_ ~= PatchEdit("write_file", JSONValue(["path": fp.path, "content": fp.content]));
+                set(fp.path, true, fp.content);
+                continue;
+            }
+            if (fp.kind == PatchKind.delete_)
+            {
+                out_ ~= PatchEdit("edit_file", JSONValue(["path": fp.path]));
+                drop(fp.path);
+                continue;
+            }
+            if (fp.hunks.length == 0)
+                out_ ~= PatchEdit("edit_file", JSONValue(["path": fp.path]));
+            else
+                foreach (h; fp.hunks)
+                    out_ ~= PatchEdit("edit_file", JSONValue(["path": fp.path,
+                        "old_string": h.old_.length ? h.old_.join("\n") ~ "\n" : "",
+                        "new_string": h.new_.length ? h.new_.join("\n") ~ "\n" : ""]));
+            string updated;
+            bool known = textOf(fp.path, updated);
+            if (known && fp.hunks.length)
+            {
+                try
+                {
+                    string[] notes;
+                    updated = applyHunks(updated, fp.hunks, notes, fp.path);
+                }
+                catch (ToolError) known = false; // the tool fails the same way and writes nothing
+            }
+            if (fp.moveTo is null)
+            {
+                set(fp.path, known, updated);
+                continue;
+            }
+            JSONValue w = JSONValue(["path": fp.moveTo]);
+            if (known) w["content"] = updated;
+            out_ ~= PatchEdit("write_file", w);
+            drop(fp.path);
+            set(fp.moveTo, known, updated);
+        }
+        return out_;
+    }
+
+    /// Run the PreToolUse hooks for each path an apply_patch call touches.
+    /// A hook can deny or add context; it can't rewrite one path of a patch,
+    /// so an input rewrite blocks the call. Null when every path may proceed.
+    private string patchPathHooks(const ToolCall call, PatchEdit[] edits, ref string[] context)
+    {
+        foreach (edit; edits)
+            foreach (h; hooks)
+            {
+                auto o = h.runPreToolUse(edit.name, edit.args, call.id);
+                if (auto ctx = o.contextBlock) context ~= ctx;
+                auto path = edit.args["path"].str;
+                if (o.denies)
+                    return o.blockReason.length ? o.blockReason : format("blocked by a PreToolUse hook (on %s)", path);
+                if (o.decision == Decision.ask)
+                    return o.blockReason.strip.length ? o.blockReason
+                        : format("a PreToolUse hook requested confirmation (ask) for %s, which nano cannot prompt for yet; blocking the call", path);
+                if (o.updatedInput.type != JSONType.null_)
+                    return format("a PreToolUse hook rewrote the input for %s, which apply_patch cannot apply to one path of a patch; "
+                            ~ "use edit_file or write_file for that file", path);
+            }
+        return null;
+    }
+
+    /// The paths a successful, non-dry-run apply_patch call changed. Parsed
+    /// from the patch text only: the files have already been rewritten, so
+    /// re-reading them to re-apply the hunks (as patchEdits would) repeats
+    /// the matching work against the new content and computes near-miss
+    /// diagnostics that are discarded. Error and dry-run exclusions match
+    /// patchEdits.
+    private static string[] patchTouches(JSONValue args, bool isError)
+    {
+        import nano.tools : ToolError;
+        import nano.tools.files : patchPaths;
+        if (isError) return null;
+        auto p = "patch" in args;
+        if (p is null || p.type != JSONType.string) return null;
+        if (auto d = "dry_run" in args) if (d.type == JSONType.true_) return null;
+        try return patchPaths(p.str);
+        catch (ToolError) return null; // unparseable: the tool reported it and touched nothing
+    }
+
+    /// Every path an apply_patch call touches, as on disk now (before any
+    /// hook runs). None when the patch is missing or doesn't parse: the tool
+    /// rejects it before touching any path.
+    private static PatchSnapshot[] patchOriginalsOf(JSONValue args)
+    {
+        import nano.tools : ToolError;
+        import nano.tools.files : patchOriginals;
+        auto p = "patch" in args;
+        if (p is null || p.type != JSONType.string) return null;
+        try return patchOriginals(p.str);
+        catch (ToolError) return null; // unparseable: the tool reports it and touches nothing
+    }
+
+    /// Run apply_patch against the snapshot its hook inputs were built from,
+    /// when the registry's handler accepts one; otherwise (an unexpected
+    /// handler shape) fall back to the plain call, which stages from disk.
+    private static string applyPatchPrepared(JSONValue args, ToolRegistry tools, PatchSnapshot[] originals)
+    {
+        if (auto h = tools.handlerAs!PatchHandler("apply_patch")) return h(args, originals);
+        return tools.execute("apply_patch", args);
+    }
+
+    /// The call's arguments with the patch's paths listed, so memory recall
+    /// sees them as it sees a file tool's `path`.
+    private static JSONValue withPaths(JSONValue args, string[] paths)
+    {
+        if (!paths.length || args.type != JSONType.object) return args;
+        JSONValue r = JSONValue(string[string].init);
+        foreach (k, v; args.objectNoRef) r[k] = v;
+        r["paths"] = JSONValue(paths);
+        return r;
     }
 
     /// Instruction files: nested ones attach to file-tool results.
@@ -3572,3 +4080,110 @@ unittest // at most two notes per input; refused calls never recall
     assert(pinCount(b) == 0);
 }
 
+
+// apply_patch passes the same gate as the file tools for every touched path:
+// a policy-denied path in a multi-file patch writes nothing and is named,
+// plan mode blocks it, an `Edit` hook sees each path, and a successful patch
+// counts as an edit for verify-before-complete.
+unittest
+{
+    import nano.providers.mock;
+    import nano.claude_hooks : Hook, Event;
+    import nano.tools.files : ReadState, registerFiles = register;
+    import std.algorithm : canFind;
+    import std.file : tempDir, write, readText, mkdirRecurse, rmdirRecurse, exists;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    import core.time : seconds;
+    auto dir = buildPath(tempDir, format("nano-agent-patch-%s", thisProcessID));
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto ok = buildPath(dir, "ok.txt"), secret = buildPath(dir, ".env");
+    write(ok, "one\n");
+    write(secret, "KEY=1\n");
+    string patchFor(string target)
+    {
+        return "*** Begin Patch\n*** Update File: " ~ ok ~ "\n@@\n-one\n+two\n*** Update File: " ~ target
+            ~ "\n@@\n-KEY=1\n+KEY=2\n*** End Patch\n";
+    }
+    auto call = (string id, string patch) => ToolCall.fromRaw(id, "apply_patch", JSONValue(["patch": patch]).toString);
+    string toolText(Agent a, string id)
+    {
+        foreach (m; a.messages) if (m.role == Role.tool && m.toolCallId == id) return m.content;
+        assert(0, "no tool result for " ~ id);
+    }
+    auto reg = new ToolRegistry;
+    registerFiles(reg, new ReadState);
+    auto ev = new NullEvents;
+
+    // A deny rule on one path blocks the whole patch: nothing is written.
+    auto mock = new MockClient([LLMResponse("", "", [call("p1", patchFor(secret))]), LLMResponse("done")]);
+    auto agent = new Agent(mock, reg, Policy.fromConfig(parseJSON(`{"deny":["Edit(**/.env)"]}`)), "sys");
+    agent.run("patch", ev);
+    auto t = toolText(agent, "p1");
+    assert(t.canFind("denies apply_patch on " ~ secret), t);
+    assert(readText(ok) == "one\n" && readText(secret) == "KEY=1\n");
+
+    // Plan mode blocks it like edit_file.
+    mock = new MockClient([LLMResponse("", "", [call("p2", patchFor(secret))]), LLMResponse("done")]);
+    agent = new Agent(mock, reg, Policy.init, "sys");
+    agent.control.mode = AgentMode.plan;
+    agent.run("patch", ev);
+    assert(toolText(agent, "p2").canFind("disabled in plan mode"), toolText(agent, "p2"));
+    assert(readText(ok) == "one\n");
+    agent.control.mode = AgentMode.normal;
+
+    // A PreToolUse hook matching `Edit` sees each path and can deny one.
+    Hook h;
+    h.event = Event.preToolUse;
+    h.matcher = "Edit";
+    h.command = `grep -q '\.env' && { echo "no env edits" >&2; exit 2; }; exit 0`;
+    h.timeout = 10.seconds;
+    mock = new MockClient([LLMResponse("", "", [call("p3", patchFor(secret))]), LLMResponse("done")]);
+    agent = new Agent(mock, reg, Policy.init, "sys");
+    agent.hooks = some(new HookManager([h], tempDir));
+    agent.run("patch", ev);
+    assert(toolText(agent, "p3").canFind("no env edits"), toolText(agent, "p3"));
+    assert(readText(ok) == "one\n" && readText(secret) == "KEY=1\n");
+
+    // Applied: both files change, and completing needs a check first.
+    auto done = ToolCall.fromRaw("o1", "report_outcome", `{"status":"completed","summary":"done"}`);
+    mock = new MockClient([LLMResponse("", "", [call("p4", patchFor(secret)), done]),
+        LLMResponse("", "", [ToolCall.fromRaw("o2", "report_outcome", `{"status":"completed","summary":"done"}`)])]);
+    agent = new Agent(mock, reg, Policy.init, "sys");
+    agent.run("patch", ev);
+    assert(toolText(agent, "p4").canFind("Applied patch to 2 file(s)"), toolText(agent, "p4"));
+    assert(readText(ok) == "two\n" && readText(secret) == "KEY=2\n");
+    assert(toolText(agent, "o1").canFind(verifyReminder));
+}
+
+unittest // apply_patch hooks see the content a direct write_file/edit_file would carry
+{
+    auto args = JSONValue(["patch": "*** Begin Patch\n*** Add File: n.txt\n+hello\n*** Update File: u.txt\n@@\n-old\n+new\n*** End Patch\n"]);
+    auto edits = Agent.patchEdits(args);
+    assert(edits.length == 2);
+    assert(edits[0].name == "write_file" && edits[0].args["content"].str == "hello\n");
+    assert(edits[1].name == "edit_file" && edits[1].args["old_string"].str == "old\n" && edits[1].args["new_string"].str == "new\n");
+}
+
+unittest // a move's destination hook input comes from the patch's own sequential state
+{
+    // An earlier Add supplies the moved content (nothing is on disk).
+    auto added = JSONValue(["patch": "*** Begin Patch\n*** Add File: nano-test-none/a.txt\n+SECRET\n"
+        ~ "*** Move File: nano-test-none/a.txt -> nano-test-none/b.txt\n*** End Patch\n"]);
+    auto edits = Agent.patchEdits(added);
+    assert(edits.length == 3 && edits[2].name == "write_file");
+    assert(edits[2].args["content"].str == "SECRET\n", edits[2].args.toString);
+    // An earlier Update is carried into the move, and the move's own hunks apply on top.
+    auto updated = JSONValue(["patch": "*** Begin Patch\n*** Add File: nano-test-none/c.txt\n+one\n"
+        ~ "*** Update File: nano-test-none/c.txt\n@@\n-one\n+two\n"
+        ~ "*** Update File: nano-test-none/c.txt\n*** Move to: nano-test-none/d.txt\n@@\n-two\n+three\n*** End Patch\n"]);
+    edits = Agent.patchEdits(updated);
+    assert(edits[$ - 1].args["path"].str == "nano-test-none/d.txt" && edits[$ - 1].args["content"].str == "three\n",
+        edits[$ - 1].args.toString);
+    // A source deleted earlier in the patch yields no content rather than stale disk text.
+    auto deleted = JSONValue(["patch": "*** Begin Patch\n*** Delete File: nano-test-none/e.txt\n"
+        ~ "*** Move File: nano-test-none/e.txt -> nano-test-none/f.txt\n*** End Patch\n"]);
+    edits = Agent.patchEdits(deleted);
+    assert("content" !in edits[$ - 1].args.objectNoRef);
+}

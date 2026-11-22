@@ -23,7 +23,7 @@ import std.format : format;
 import std.regex : regex, matchFirst, Regex;
 import std.string : strip, indexOf, toLower;
 import std.algorithm : canFind, any, all, startsWith, endsWith, filter;
-import std.array : array, join;
+import std.array : array, join, replace;
 import std.algorithm : map;
 import std.sumtype : SumType, match;
 import nano.shell : parse, Simple;
@@ -339,6 +339,33 @@ struct Policy
                         if (!sandbox.allowsWrite(p, cwd))
                             return format("%s is outside the %s sandbox's writable directories", p, sandbox.mode.modeName);
                 return null;
+            case "apply_patch":
+                // Every path the patch touches (both ends of a move) passes
+                // the same checks as a direct edit of it. A patch that doesn't
+                // parse touches nothing; the tool reports the parse error.
+                // A tool-level rule (`deny = ["apply_patch"]`) applies first.
+                foreach (rule; deny)
+                    if (rule.appliesTo(tool) && rule.matches(args.jsonText))
+                        return format("rule `%s` denies %s", rule.source, tool);
+                auto patch = stringArg(args, "patch");
+                if (patch is null) return null;
+                import nano.tools : ToolError;
+                import nano.tools.files : parsePatch, PatchKind, FilePatch;
+                FilePatch[] files;
+                try files = parsePatch(patch);
+                catch (ToolError) return null; // unparseable: the tool rejects it before touching any path
+                foreach (fp; files)
+                {
+                    // Delete/Update read the existing file (its text lands in
+                    // the diff, even on a dry run), so it must be readable too.
+                    if (fp.kind != PatchKind.add)
+                        if (auto r = reasonIn("read_file", JSONValue(["path": fp.path]), cwd, ask))
+                            return r.replace("denies read_file on", "denies apply_patch on");
+                    foreach (p; fp.moveTo is null ? [fp.path] : [fp.path, fp.moveTo])
+                        if (auto r = reasonIn("edit_file", JSONValue(["path": p]), cwd, ask))
+                            return r.replace("denies edit_file on", "denies apply_patch on");
+                }
+                return null;
             case "grep", "glob":
                 auto root = stringArg(args, "path");
                 if (root is null) root = ".";
@@ -376,6 +403,16 @@ struct Policy
         scan.cwdNormalized = scan.rootNormalized = normalize(cwd);
         scan.cwdResolved = scan.rootResolved = resolveSymlinks(cwd);
         return true;
+    }
+
+    /// The sources of the rules `readDenyScan` uses, so another thread can
+    /// rebuild the scan with `parseRule` (a `Policy` isn't sendable).
+    immutable(string)[] readDenySources() const
+    {
+        immutable(string)[] r;
+        foreach (ref r_; deny)
+            if (r_.subject == Subject.path && r_.appliesTo("read_file")) r ~= r_.source;
+        return r;
     }
 
     /// The source of the `Read(...)` deny rule covering `path`, or null.
@@ -504,6 +541,26 @@ unittest
     assert(p.check("bash", cmd("echo hi; git push origin main")) !is null);
     assert(p.check("edit_file", JSONValue(["path": "/x/y/.env"])) !is null);
     assert(p.check("edit_file", JSONValue(["path": "/x/y/env.d"])) is null);
+    // A tool-level deny of apply_patch blocks it outright, not only per path.
+    auto patch = JSONValue(["patch": "*** Begin Patch\n*** Add File: /x/ok.txt\n+a\n*** End Patch\n"]);
+    assert(p.check("apply_patch", patch) is null);
+    p.deny ~= parseRule("apply_patch");
+    assert(p.check("apply_patch", patch) !is null);
+}
+
+unittest
+{
+    // A path read_file may not show can't be read through apply_patch either
+    // (a dry-run Delete/Update would put its text in the diff), but a
+    // read-denied path may still be created by Add File.
+    Policy p;
+    p.deny = [parseRule("Read(**/.env)")];
+    JSONValue pt(string body_) { return JSONValue(["patch": "*** Begin Patch\n" ~ body_ ~ "*** End Patch\n"]); }
+    assert(p.check("apply_patch", pt("*** Delete File: /x/.env\n")) !is null);
+    assert(p.check("apply_patch", pt("*** Update File: /x/.env\n@@\n-a\n+b\n")) !is null);
+    assert(p.check("apply_patch", pt("*** Move File: /x/.env -> /x/b\n")) !is null);
+    assert(p.check("apply_patch", pt("*** Add File: /x/.env\n+a\n")) is null);
+    assert(p.check("apply_patch", pt("*** Delete File: /x/ok\n")) is null);
 }
 
 /// Read-deny rules prepared for judging many walked paths (`Policy.readDenyScan`).
