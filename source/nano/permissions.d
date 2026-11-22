@@ -343,6 +343,10 @@ struct Policy
                 // Every path the patch touches (both ends of a move) passes
                 // the same checks as a direct edit of it. A patch that doesn't
                 // parse touches nothing; the tool reports the parse error.
+                // A tool-level rule (`deny = ["apply_patch"]`) applies first.
+                foreach (rule; deny)
+                    if (rule.appliesTo(tool) && rule.matches(args.jsonText))
+                        return format("rule `%s` denies %s", rule.source, tool);
                 auto patch = stringArg(args, "patch");
                 if (patch is null) return null;
                 import nano.tools : ToolError;
@@ -519,6 +523,11 @@ unittest
     assert(p.check("bash", cmd("echo hi; git push origin main")) !is null);
     assert(p.check("edit_file", JSONValue(["path": "/x/y/.env"])) !is null);
     assert(p.check("edit_file", JSONValue(["path": "/x/y/env.d"])) is null);
+    // A tool-level deny of apply_patch blocks it outright, not only per path.
+    auto patch = JSONValue(["patch": "*** Begin Patch\n*** Add File: /x/ok.txt\n+a\n*** End Patch\n"]);
+    assert(p.check("apply_patch", patch) is null);
+    p.deny ~= parseRule("apply_patch");
+    assert(p.check("apply_patch", patch) !is null);
 }
 
 /// Read-deny rules prepared for judging many walked paths (`Policy.readDenyScan`).

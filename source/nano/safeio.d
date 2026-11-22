@@ -1065,3 +1065,45 @@ unittest
     assert(jsonWholeAsDouble(JSONValue(3u)) == 3.0);
     assert(jsonWholeAsDouble(JSONValue(-3)) == -3.0);
 }
+
+/// Create a fresh temp file beside `base` in `dir` holding `content`, opened
+/// exclusively (`O_CREAT | O_EXCL`, which never follows a symlink) under an
+/// unpredictable name, retrying on a collision. Returns its path.
+string writeTemp(string dir, string base, const(ubyte)[] content) @trusted
+{
+    import core.sys.posix.fcntl : open, O_WRONLY, O_CREAT, O_EXCL, O_NOFOLLOW;
+    import core.sys.posix.unistd : posixWrite = write, close;
+    import core.stdc.errno : errno, EEXIST, EINTR;
+    import std.process : thisProcessID;
+    import std.file : FileException, remove;
+    import std.format : format;
+    import std.path : buildPath;
+    import std.conv : octal;
+    import std.random : uniform;
+    import std.string : toStringz;
+    foreach (_; 0 .. 100)
+    {
+        auto tmp = buildPath(dir, format(".%s.tmp-%s-%016x", base, thisProcessID, uniform!ulong));
+        auto fd = open(tmp.toStringz, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, octal!666);
+        if (fd < 0)
+        {
+            if (errno == EEXIST) continue;
+            throw new FileException(tmp, errno);
+        }
+        scope (exit) close(fd);
+        scope (failure) { try remove(tmp); catch (FileException) {} } // best effort; the write error propagates
+        auto rest = content;
+        while (rest.length)
+        {
+            auto n = posixWrite(fd, rest.ptr, rest.length);
+            if (n < 0)
+            {
+                if (errno == EINTR) continue;
+                throw new FileException(tmp, errno);
+            }
+            rest = rest[n .. $];
+        }
+        return tmp;
+    }
+    throw new FileException(dir, "could not create a unique temporary file");
+}

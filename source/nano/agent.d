@@ -1685,14 +1685,15 @@ class Agent
     /// An apply_patch call's touched paths as the file-tool calls a direct
     /// change would make: `write_file` for an added file or a move's
     /// destination, `edit_file` otherwise (with the path only). None when the
-    /// patch doesn't parse or is a dry run, which writes nothing.
-    private static PatchEdit[] patchEdits(JSONValue args)
+    /// patch doesn't parse, or is a dry run (which writes nothing) unless
+    /// `withDryRun`: a dry run still reads every path, so pre-hooks see it.
+    private static PatchEdit[] patchEdits(JSONValue args, bool withDryRun = false)
     {
         import nano.tools : ToolError;
         import nano.tools.files : parsePatch, PatchKind, FilePatch;
         auto p = "patch" in args;
         if (p is null || p.type != JSONType.string) return null;
-        if (auto d = "dry_run" in args) if (d.type == JSONType.true_) return null;
+        if (!withDryRun) if (auto d = "dry_run" in args) if (d.type == JSONType.true_) return null;
         FilePatch[] files;
         try files = parsePatch(p.str);
         catch (ToolError) return null; // unparseable: the tool reports it and touches nothing
@@ -1710,7 +1711,7 @@ class Agent
     /// so an input rewrite blocks the call. Null when every path may proceed.
     private string patchPathHooks(const ToolCall call, JSONValue args, ref string[] context)
     {
-        foreach (edit; patchEdits(args))
+        foreach (edit; patchEdits(args, true))
             foreach (h; hooks)
             {
                 auto o = h.runPreToolUse(edit.name, edit.args, call.id);
