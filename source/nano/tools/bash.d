@@ -288,17 +288,24 @@ unittest
     auto savedSink = heartbeatSink;
     auto savedInterval = heartbeatInterval;
     scope (exit) { heartbeatSink = savedSink; heartbeatInterval = savedInterval; }
+    import std.file : tempDir, write, exists, remove;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    // Gate the command on the sink having seen 2 beats (flag file), with a
+    // 5 s shell-side deadline, so a loaded runner cannot starve the poller.
+    auto flag = buildPath(tempDir, "nano-hb-" ~ thisProcessID.to!string ~ "-a");
+    scope (exit) if (exists(flag)) remove(flag);
     string[] beats;
-    heartbeatSink = (string line) { beats ~= line; };
-    heartbeatInterval = 10.msecs;
-    // ~100 ms of silence at a 10 ms interval: nominally 9 beats; at least 2
-    // even on a loaded CI runner.
-    auto r = run("sleep 0.1", 5.seconds);
+    heartbeatSink = (string line) { beats ~= line; if (beats.length == 2) write(flag, ""); };
+    heartbeatInterval = 40.msecs;
+    import std.array : replace;
+    auto cmd = "i=0; while [ ! -e '" ~ flag.replace("'", "'\\''") ~ "' ] && [ $i -lt 500 ]; do sleep 0.01; i=$((i+1)); done";
+    auto r = run(cmd, 10.seconds);
     assert(!r.timedOut && r.exitCode == 0);
     assert(beats.length >= 2, "expected ≥2 heartbeats, got " ~ beats.length.to!string);
     foreach (b; beats) assert(b.canFind("still running"), b);
     // The beat names the command head so the supervisor can tell calls apart.
-    assert(beats[0].canFind("sleep 0.1"), beats[0]);
+    assert(beats[0].canFind("i=0"), beats[0]);
     // Beats come only from run's polling loop, on this thread, so none can
     // follow its return: nothing to wait for here.
 }
@@ -310,12 +317,20 @@ unittest
     auto savedSink = heartbeatSink;
     auto savedInterval = heartbeatInterval;
     scope (exit) { heartbeatSink = savedSink; heartbeatInterval = savedInterval; }
+    import std.conv : to;
+    import std.file : tempDir, write, exists, remove;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    // Gate the command on a beat having arrived (flag file), 5 s deadline.
+    auto flag = buildPath(tempDir, "nano-hb-" ~ thisProcessID.to!string ~ "-b");
+    scope (exit) if (exists(flag)) remove(flag);
     string[] beats;
-    heartbeatSink = (string line) { beats ~= line; };
-    heartbeatInterval = 10.msecs;
-    // ~100 ms at a 10 ms interval: nominally 9 beats, so a loaded CI runner
-    // (macOS) still yields at least one.
-    auto text = execute(parseJSON(`{"command":"sleep 0.1; printf done"}`));
+    heartbeatSink = (string line) { beats ~= line; write(flag, ""); };
+    heartbeatInterval = 30.msecs;
+    import std.array : replace;
+    auto cmd = "i=0; while [ ! -e '" ~ flag.replace("'", "'\\''") ~ "' ] && [ $i -lt 500 ]; do sleep 0.01; i=$((i+1)); done; printf done";
+    JSONValue args; args["command"] = cmd;
+    auto text = execute(args);
     assert(beats.length >= 1, "expected ≥1 heartbeat");
     assert(text.canFind("done") && !text.canFind("still running"), text);
 }
