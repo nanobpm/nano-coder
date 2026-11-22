@@ -931,17 +931,26 @@ unittest // escaped_type_decodes_before_comparison
     assert(skimType(`{"type":3}`) is null);
 }
 
-/// Whether `raw` is a JSON integer `jsonUnsigned` accepts (no leading `-`,
-/// fits a ulong), and its value. The skim scan must read numbers exactly as
+/// Whether `raw` is a JSON integer `jsonUnsigned` accepts (no leading `-`
+/// except the zero-valued `-0`, which std.json decodes to integer 0; fits a
+/// ulong), and its value. The skim scan must read numbers exactly as
 /// `restore`'s full decode does: a signed read would keep a `-1` floor or
 /// pending position the full decode drops, and drop a `uinteger` above
 /// `long.max` the full decode keeps (issue #240).
 private bool rawUnsigned(const(char)[] raw, out ulong v) pure nothrow @nogc
 {
     import std.ascii : isDigit;
-    if (!raw.length || raw[0] == '-') return false;
+    if (!raw.length) return false;
+    auto digits = raw;
+    // `-0` parses to integer 0, which `jsonUnsigned` accepts; any other
+    // negative is rejected there and here.
+    if (digits[0] == '-')
+    {
+        if (raw != "-0") return false;
+        digits = raw[1 .. $];
+    }
     ulong acc;
-    foreach (c; raw)
+    foreach (c; digits)
     {
         if (!c.isDigit) return false;
         immutable uint d = c - '0';
@@ -956,9 +965,12 @@ unittest
 {
     ulong v;
     assert(rawUnsigned("0", v) && v == 0);
+    assert(rawUnsigned("-0", v) && v == 0); // std.json decodes -0 to integer 0
     assert(rawUnsigned("42", v) && v == 42);
     assert(rawUnsigned("18446744073709551615", v) && v == ulong.max);
     assert(!rawUnsigned("-1", v));
+    assert(!rawUnsigned("-00", v));
+    assert(!rawUnsigned("-42", v));
     assert(!rawUnsigned("18446744073709551616", v)); // above ulong.max
     assert(!rawUnsigned("1.5", v));
     assert(!rawUnsigned("", v));
@@ -1130,13 +1142,24 @@ private Restored restoreLog(string path, bool skipSuperseded)
             if (type == "replace")
             {
                 // Superseded: only its effect on the pending input outlives
-                // the latest full replace.
+                // the latest full replace. Mirror the full decode: a readable
+                // position refreshes the pending snapshot (base included, so a
+                // dropped input's stale fields match), anything else drops it.
                 auto data = skimField(line, "data");
                 skimmedLen = skimCount(skimField(data, "messages"));
                 auto posRaw = skimField(data, "pending_position");
                 ulong posVal;
-                immutable posInt = rawUnsigned(posRaw, posVal);
-                if (!(r.hasPending && posInt))
+                if (r.hasPending && rawUnsigned(posRaw, posVal))
+                {
+                    r.pending.position = toSize(posVal);
+                    r.pending.hasContinuation = false;
+                    r.pending.answer = null;
+                    r.pending.count = 0;
+                    r.pending.hasBase = true;
+                    r.pending.base = skimmedLen;
+                    r.pending.recallNotes = 0;
+                }
+                else
                 {
                     r.hasPending = false;
                     r.pendingInput = null;
@@ -2659,17 +2682,24 @@ unittest // skim_floor_reads_summarized_unsigned (issue #244)
         log ~= line("input", JSONValue(["id": "in-0", "text": "early question"]));
         log ~= line("message", rec(early));
         log ~= line("message", rec(Message.assistant("early answer")));
-        JSONValue full = ["messages": JSONValue([rec(Message.user("summary"))])];
+        // Retain the early message (without its log line) so a wrong skim
+        // floor changes its backfilled log line and fails the comparison.
+        JSONValue full = ["messages": JSONValue([rec(Message.user("summary")), rec(early)])];
         full["folded"] = JSONValue([rec(early)]);
         auto rl = line("replace", full);
-        // Splice the raw summarized end in unquoted, past std.json's tagging.
+        // Splice the raw summarized end in unquoted through the existing
+        // `folded` field, past std.json's tagging.
         import std.array : replace;
-        rl = rl.replace(`"summarized":`, `"summarized":[2,` ~ end ~ `],"x":`);
+        rl = rl.replace(`"folded":`, `"summarized":[2,` ~ end ~ `],"folded":`);
         log ~= rl;
         auto path = buildPath(dir, id ~ ".jsonl");
         write(path, log);
         auto skimmed = restoreLog(path, true), fullR = restoreLog(path, false);
         assert(skimmed == fullR, "a signed-hostile summarized end (" ~ end ~ ") skims like the full decode");
+        // `-1` leaves the floor at 0, so backfill claims the early original;
+        // above-long.max keeps the floor past it, so it is never claimed.
+        assert(skimmed.conversation[1].logLine == (i == 0 ? 3 : 0),
+            "the hostile end (" ~ end ~ ") moves the retained message's log line");
     }
 }
 
@@ -2682,16 +2712,22 @@ unittest // skim_pending_position_reads_unsigned (issue #244)
     scope (exit) rmdirRecurse(dir);
     static JSONValue rec(Message m) { return messageRecord(m); }
     string line(string type, JSONValue data) { return JSONValue(["type": JSONValue(type), "data": data]).toString ~ "\n"; }
-    // An in-flight input, then a full replace, then a superseded delta whose
-    // `pending_position` is signed-hostile: `-1` (full decode drops the
-    // pending input) and a uinteger above long.max (full decode keeps it).
-    foreach (i, pos; [`-1`, `18446744073709551615`])
+    // An in-flight input preserved by the first full replace, then a
+    // superseded delta whose `pending_position` is signed-hostile: `-1` (full
+    // decode drops the pending input), `-0` (full decode keeps it: std.json
+    // parses -0 to integer 0, which jsonUnsigned accepts), and a uinteger
+    // above long.max (full decode keeps it). A final full replace re-reads
+    // whatever pending state survived the skimmed delta, so a skim that
+    // disagrees with the full decode loses (or keeps) the input.
+    foreach (i, pos; [`-1`, `-0`, `18446744073709551615`])
     {
         immutable id = "skimposu" ~ i.to!string;
         auto log = `{"type":"session","data":{"version":1,"id":"` ~ id ~ `","created_at":"x"}}` ~ "\n";
         log ~= line("input", JSONValue(["id": "in-0", "text": "crash here"]));
+        // The first snapshot preserves the in-flight input at position 0.
         JSONValue full = ["messages": JSONValue([rec(Message.user("summary"))])];
         full["folded"] = JSONValue(cast(JSONValue[]) []);
+        full["pending_position"] = 0;
         log ~= line("replace", full);
         JSONValue delta = ["messages": JSONValue([rec(Message.user("summary 2"))])];
         delta["folded"] = JSONValue(cast(JSONValue[]) []);
@@ -2700,9 +2736,22 @@ unittest // skim_pending_position_reads_unsigned (issue #244)
         import std.array : replace;
         dl = dl.replace(`"folded_base":1`, `"folded_base":1,"pending_position":` ~ pos);
         log ~= dl;
+        // A later full replace with position 0: it cannot restore a pending
+        // flag the skimmed delta wrongly cleared, and it keeps one the full
+        // decode kept. Continuation snapshots are compared only while the
+        // input is active, since inactive pending fields can retain stale
+        // values.
+        JSONValue last = ["messages": JSONValue([rec(Message.user("summary 3"))])];
+        last["folded"] = JSONValue(cast(JSONValue[]) []);
+        last["pending_position"] = 0;
+        log ~= line("replace", last);
         auto path = buildPath(dir, id ~ ".jsonl");
         write(path, log);
         auto skimmed = restoreLog(path, true), fullR = restoreLog(path, false);
         assert(skimmed == fullR, "a signed-hostile pending_position (" ~ pos ~ ") skims like the full decode");
+        immutable survives = pos != `-1`;
+        assert(skimmed.hasPending == survives,
+            "the pending input " ~ (survives ? "survives " : "is dropped by ") ~ pos ~ " exactly as the full decode");
+        if (survives) assert(skimmed.pendingInput == "crash here", "the input text survives " ~ pos);
     }
 }
