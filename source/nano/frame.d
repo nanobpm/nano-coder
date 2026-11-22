@@ -862,7 +862,6 @@ struct Transcript
         pending = buf[end .. $].dup;
         import nano.safeio : lossyText;
         auto s = lossyText(buf[0 .. end]);
-        immutable curBefore = cur.length;
         size_t i;
         while (i < s.length)
         {
@@ -880,6 +879,7 @@ struct Transcript
                     if (bel < 0 && st < 0)
                     {
                         pending = s[at .. $].representation.dup ~ pending;
+                        enforceByteCap();
                         return;
                     }
                     auto end_ = bel >= 0 && (st < 0 || bel < st) ? bel : st;
@@ -907,19 +907,16 @@ struct Transcript
             // rendering (escapeMarks / mdinline.clean).
             cur ~= s[at .. i];
         }
-        // `cur` is counted in `heldBytes` too: an unfinished line can be
-        // megabytes, and excluding it would let it grow past the byte cap
-        // unchecked (issue #248 review). `endLine` moves `cur` into `lines`
-        // without touching the total, so the delta here is exact.
-        heldBytes = saturatingSub(heldBytes, curBefore);
-        heldBytes += cur.length;
+        // `cur` counts toward the cap live (`bytesHeld` adds it), so a
+        // megabyte unfinished line is bounded and a split read is charged
+        // exactly once (issue #248 review).
         enforceByteCap();
     }
 
     private void endLine() pure
     {
         lines ~= cur;
-        heldBytes += cur.length;
+        heldBytes += lineCost(cur);
         cur = null;
         cr = false;
         if (lines.length > cap)
@@ -931,9 +928,11 @@ struct Transcript
                 if (f.start < drop && f.start + f.length > drop)
                     drop = f.start + f.length;
             if (drop > lines.length) drop = lines.length;
-            foreach (l; lines[0 .. drop]) heldBytes = saturatingSub(heldBytes, l.length);
-            lines = lines[drop .. $];
-            cache = cache.length > drop ? cache[drop .. $] : null;
+            foreach (l; lines[0 .. drop]) heldBytes = saturatingSub(heldBytes, lineCost(l));
+            // Copy, not slice: a suffix slice pins the dropped rows'
+            // backing array (and their text) under a conservative GC.
+            lines = lines[drop .. $].dup;
+            cache = cache.length > drop ? cache[drop .. $].dup : null;
             // A discarded expanded fold's collapsed stash is dropped too:
             // it was counted in `heldBytes` (issue #248 review).
             pruneFolds(drop);
@@ -1059,7 +1058,7 @@ struct Transcript
                 // same array, so it is not freed, just relocated). The held
                 // total therefore drops by exactly the expanded lines.
                 foreach (l; lines[f.start .. f.start + oldLength])
-                    heldBytes = saturatingSub(heldBytes, l.length);
+                    heldBytes = saturatingSub(heldBytes, lineCost(l));
                 f.length = f.collapsed.length;
                 f.collapsed = null;
                 f.expanded = false;
@@ -1077,13 +1076,21 @@ struct Transcript
     /// The transcript's byte size: every line, plus the unfinished one and
     /// the collapsed forms held for expanded folds. Expansion inserts a
     /// fold's full text into `lines`, so this is also what Ctrl-O retains.
-    /// O(1): `heldBytes` tracks it incrementally (feed's `cur` delta,
+    /// O(1): `heldBytes` tracks the rows incrementally (`cur` is added live,
     /// endLine's drop, swapIn, collapseAll, clear), so the per-line cap
     /// check stays off the O(lines) walk that made streaming output
     /// quadratic (issue #248 review).
-    private size_t bytesHeld() pure
+    private size_t bytesHeld() const pure nothrow @nogc
     {
-        return heldBytes;
+        return heldBytes + cur.length;
+    }
+
+    /// What one held row costs: its text plus its `string[]` slot, so
+    /// millions of tiny expanded rows can't hide behind a small text
+    /// total (issue #248 review).
+    private static size_t lineCost(scope const(char)[] l) pure nothrow @nogc
+    {
+        return l.length + string.sizeof;
     }
 
     /// `cap` bounds lines, not bytes: a single line can be megabytes, and
@@ -1102,12 +1109,12 @@ struct Transcript
 
     private void enforceByteCap() pure
     {
-        if (heldBytes <= byteCap) return;
+        if (bytesHeld() <= byteCap) return;
         foreach (k; 0 .. folds.length)
         {
             if (!folds[k].expanded) continue;
             swapIn(k, null); // updates heldBytes by the shrink
-            if (heldBytes <= byteCap) return;
+            if (bytesHeld() <= byteCap) return;
         }
         // Ordinary output: no fold is left to collapse, so the oldest lines
         // go. A fold the cut runs through goes whole, with its metadata, so
@@ -1115,8 +1122,8 @@ struct Transcript
         if (lines.length)
         {
             size_t drop;
-            while (drop < lines.length && heldBytes > byteCap)
-                heldBytes -= lines[drop++].length;
+            while (drop < lines.length && bytesHeld() > byteCap)
+                heldBytes = saturatingSub(heldBytes, lineCost(lines[drop++]));
             if (drop)
             {
                 size_t whole = drop;
@@ -1126,11 +1133,12 @@ struct Transcript
                 if (whole > lines.length) whole = lines.length;
                 // The fold-aligned extension's lines are not subtracted yet.
                 foreach (l; lines[drop .. whole])
-                    heldBytes = saturatingSub(heldBytes, l.length);
-                lines = lines[whole .. $];
-                cache = cache.length > whole ? cache[whole .. $] : null;
+                    heldBytes = saturatingSub(heldBytes, lineCost(l));
+                // Copy so the pruned rows' backing array is released.
+                lines = lines[whole .. $].dup;
+                cache = cache.length > whole ? cache[whole .. $].dup : null;
                 pruneFolds(whole);
-                if (heldBytes <= byteCap) return;
+                if (bytesHeld() <= byteCap) return;
             }
         }
         // Only the unfinished line can still be over: keep its tail, where
@@ -1142,7 +1150,6 @@ struct Transcript
             // the original oversized block.
             size_t from = cur.length - byteCap;
             while (from < cur.length && (cur[from] & 0xC0) == 0x80) from++;
-            heldBytes = saturatingSub(heldBytes, from);
             cur = cur[from .. $].idup;
         }
     }
@@ -1159,7 +1166,7 @@ struct Transcript
         {
             if (f.start >= cut) { f.start -= cut; kept ~= f; continue; }
             gone++;
-            foreach (c; f.collapsed) heldBytes = saturatingSub(heldBytes, c.length);
+            foreach (c; f.collapsed) heldBytes = saturatingSub(heldBytes, lineCost(c));
         }
         folds = kept;
         if (sweepFloor != size_t.max) sweepFloor = saturatingSub(sweepFloor, gone);
@@ -1223,17 +1230,17 @@ struct Transcript
             import std.array : split;
             next = text.stripRight("\n").split("\n");
             f.collapsed = lines[f.start .. f.start + f.length].dup;
-            foreach (c; f.collapsed) heldBytes += c.length;
+            foreach (c; f.collapsed) heldBytes += lineCost(c);
         }
         else
         {
             next = f.collapsed;
-            foreach (c; f.collapsed) heldBytes = saturatingSub(heldBytes, c.length);
+            foreach (c; f.collapsed) heldBytes = saturatingSub(heldBytes, lineCost(c));
             f.collapsed = null;
         }
         foreach (l; lines[f.start .. f.start + f.length])
-            heldBytes = saturatingSub(heldBytes, l.length);
-        foreach (l; next) heldBytes += l.length;
+            heldBytes = saturatingSub(heldBytes, lineCost(l));
+        foreach (l; next) heldBytes += lineCost(l);
         lines = lines[0 .. f.start] ~ next ~ lines[f.start + f.length .. $];
         immutable oldLength = f.length, newLength = next.length, at = f.start;
         f.length = newLength;
@@ -2076,10 +2083,10 @@ unittest
     size_t recount(ref Transcript t)
     {
         size_t n = t.cur.length;
-        foreach (l; t.lines) n += l.length;
+        foreach (l; t.lines) n += Transcript.lineCost(l);
         foreach (ref f; t.folds)
             if (f.expanded)
-                foreach (c; f.collapsed) n += c.length;
+                foreach (c; f.collapsed) n += Transcript.lineCost(c);
         return n;
     }
 
@@ -2122,10 +2129,10 @@ unittest
     size_t recount(ref Transcript t)
     {
         size_t n = t.cur.length;
-        foreach (l; t.lines) n += l.length;
+        foreach (l; t.lines) n += Transcript.lineCost(l);
         foreach (ref f; t.folds)
             if (f.expanded)
-                foreach (c; f.collapsed) n += c.length;
+                foreach (c; f.collapsed) n += Transcript.lineCost(c);
         return n;
     }
 
@@ -2256,4 +2263,37 @@ unittest
     t.sweepFloor = size_t.max;
     t.pruneFolds(t.folds[1].start);
     assert(t.sweepFloor == size_t.max);
+}
+
+// A line split across reads is charged once: 600 bytes then a newline
+// keeps the row under a 1 KiB cap, exactly as one read would (issue #248
+// review). An incomplete OSC still leaves the count exact and capped.
+unittest
+{
+    import std.array : replicate;
+    Transcript split, whole;
+    split.byteCap = whole.byteCap = 1_024;
+    split.feed("a".replicate(600).representation);
+    split.feed("\n".representation);
+    whole.feed(("a".replicate(600) ~ "\n").representation);
+    assert(split.lines == whole.lines && split.lines.length == 1);
+    assert(split.bytesHeld() == whole.bytesHeld());
+
+    Transcript o;
+    o.byteCap = 1_024;
+    o.feed(("b".replicate(2_000) ~ "\x1b]9;unterminated").representation);
+    assert(o.cur.length <= o.byteCap);
+    assert(o.bytesHeld() <= o.byteCap, format!"%s held"(o.bytesHeld()));
+}
+
+// Row storage counts: many tiny rows are charged their slots, so they
+// can't exceed the cap on text size alone (issue #248 review).
+unittest
+{
+    Transcript t;
+    t.byteCap = 1_024;
+    t.cap = size_t.max;
+    foreach (i; 0 .. 1_000) t.feed("x\n".representation);
+    assert(t.bytesHeld() <= t.byteCap, format!"%s held"(t.bytesHeld()));
+    assert(t.lines.length * (1 + string.sizeof) <= t.byteCap);
 }
