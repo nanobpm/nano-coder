@@ -1147,11 +1147,14 @@ struct Screen
     private bool lateReasoning(string chunk)
     {
         import std.string : strip;
-        if (thinking || !answering || !thoughtThisCall) return false;
+        // The call-lifetime flag, not `answering`: a mid-turn note clears
+        // `answering` without ending the call.
+        if (thinking || !thoughtThisCall) return false;
+        // Whitespace is kept as a separator, but alone opens nothing.
+        lateText ~= chunk;
         if (!late && !chunk.strip.length) return true;
         late = true;
         if (!lateStart) lateStart = nowMs();
-        lateText ~= chunk;
         return true;
     }
 
@@ -1160,7 +1163,7 @@ struct Screen
     /// block already printed) shows it after the answer instead.
     private void mergeLate()
     {
-        if (!late) return;
+        if (!late) { lateText = null; return; }
         if (lateStart) thinkMs += nowMs() - lateStart;
         late = false;
         lateStart = 0;
@@ -1308,6 +1311,32 @@ unittest
     auto thoughts = t.lines.filter!(l => l.canFind("Thought for")).array;
     assert(thoughts.length == 2, t.lines.to!string);
     assert(thoughts[0].canFind("1 chars") && thoughts[1].canFind("1 chars"), t.lines.to!string);
+}
+
+// A mid-turn note doesn't end the call: late reasoning still joins its
+// block, and whitespace-only deltas survive as separators.
+unittest
+{
+    import std.algorithm : canFind, filter;
+    import std.array : array;
+    import std.string : representation;
+    import std.conv : to;
+    import nano.frame : Transcript;
+    Screen s;
+    s.capturing = true;
+    s.testFrame = true;
+    s.text(true, "first");
+    s.text(false, "A");
+    s.note("mode changed");
+    s.text(true, " ");
+    s.text(true, "\n");
+    s.text(true, "second");
+    s.text(false, "B");
+    s.endReasoning("first \nsecond");
+    Transcript t;
+    t.feed(s.captured.representation);
+    auto thoughts = t.lines.filter!(l => l.canFind("Thought for")).array;
+    assert(thoughts.length == 1 && thoughts[0].canFind("13 chars"), t.lines.to!string);
 }
 
 // rust: ui.rs::trailing_thinking_merges_interleaved_reasoning_fragments
