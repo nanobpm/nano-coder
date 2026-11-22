@@ -1092,11 +1092,11 @@ unittest
 /// Create a fresh temp file beside `base` in `dir` holding `content`, opened
 /// exclusively (`O_CREAT | O_EXCL`, which never follows a symlink) under an
 /// unpredictable name, retrying on a collision. Returns its path. The file is
-/// private (0600) while being written, then given `newFileMode`; a caller
-/// replacing an existing file restores that file's permissions before
-/// publishing it with a rename. The name is bounded so a
+/// private (0600) while being written, then given `mode` (the replaced
+/// file's permissions, or `newFileMode` for a fresh one) in a single step, so
+/// it is never wider than that final mode. The name is bounded so a
 /// long `base` can't push it past the filesystem's component limit.
-string writeTemp(string dir, string base, const(ubyte)[] content) @trusted
+string writeTemp(string dir, string base, const(ubyte)[] content, uint mode) @trusted
 {
     import core.sys.posix.fcntl : open, O_WRONLY, O_CREAT, O_EXCL, O_NOFOLLOW;
     import core.sys.posix.unistd : posixWrite = write, close;
@@ -1134,11 +1134,22 @@ string writeTemp(string dir, string base, const(ubyte)[] content) @trusted
             }
             rest = rest[n .. $];
         }
-        // Leave the default creation mode (0666 less the umask) on it, as
-        // `open(2)` would for a fresh file; callers replacing an existing
-        // target then copy that target's mode over this.
-        if (fchmodFd(fd, newFileMode) != 0) throw new FileException(tmp, errno);
+        // Apply the final mode once: never widen past it, even briefly.
+        if (fchmodFd(fd, mode & octal!7777) != 0) throw new FileException(tmp, errno);
         return tmp;
     }
     throw new FileException(dir, "could not create a unique temporary file");
+}
+
+unittest // writeTemp applies the caller's final mode directly; a 0600 target's replacement is never widened
+{
+    import std.conv : octal;
+    import std.file : getAttributes, remove, tempDir, readText;
+    auto t = writeTemp(tempDir, "wt-mode-private", cast(const(ubyte)[]) "s\n", octal!600);
+    scope (exit) remove(t);
+    assert((getAttributes(t) & octal!7777) == octal!600);
+    assert(readText(t) == "s\n");
+    auto u = writeTemp(tempDir, "wt-mode-default", cast(const(ubyte)[]) "d\n", newFileMode);
+    scope (exit) remove(u);
+    assert((getAttributes(u) & octal!7777) == newFileMode);
 }

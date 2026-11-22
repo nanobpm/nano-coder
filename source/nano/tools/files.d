@@ -11,7 +11,7 @@ import nano.safeio : bytesOf, utf8Text;
 import nano.safeio : jsonText, jsonPretty;
 import nano.arith : saturatingSub, toSize;
 
-import nano.safeio : ownText, readBytes, realPath, statMode, chmodPath, writeTemp;
+import nano.safeio : ownText, readBytes, realPath, statMode, writeTemp, newFileMode;
 
 import std.json;
 import std.format : format;
@@ -193,13 +193,14 @@ void writeAtomically(string path, const(char)[] content, Expect expect, ReadStat
     }
     try mkdirRecurse(path.dirName);
     catch (FileException e) throw new ToolError(format("%s: create %s: %s", tool, path.dirName, e.msg));
+    uint mode = newFileMode;
+    if (statMode(path, mode)) mode &= octal!7777;
+    else mode = newFileMode;
     string tmp;
-    try tmp = writeTemp(path.dirName, path.baseName, content.representation);
+    try tmp = writeTemp(path.dirName, path.baseName, content.representation, mode);
     catch (FileException e) throw new ToolError(format("%s: write %s: %s", tool, path, e.msg));
     // best-effort cleanup of the temp file; the original error propagates
     scope (failure) { try remove(tmp); catch (Exception) {} }
-    uint mode;
-    if (statMode(path, mode)) chmodPath(tmp, mode & octal!7777);
     if (expect.absent)
     {
         if (linkPresent(path))
@@ -1177,8 +1178,7 @@ private void rollBack(const ref Staged s)
     {
         if (!s.existed || linkPresent(s.path)) return; // recreated meanwhile: leave it
         if (s.wasLink) { symlink(s.linkTarget, s.path); return; }
-        auto tmp = writeTemp(s.path.dirName, s.path.baseName, s.before);
-        if (s.hasOrigMode) chmodPath(tmp, s.origMode);
+        auto tmp = writeTemp(s.path.dirName, s.path.baseName, s.before, s.hasOrigMode ? s.origMode : newFileMode);
         rename(tmp, s.path);
         return;
     }
@@ -1189,8 +1189,7 @@ private void rollBack(const ref Staged s)
     if (current != s.after.representation) return; // edited since we wrote it: keep that edit
     if (!s.existed) { remove(s.path); return; }
     if (s.recreated && s.wasLink) { remove(s.path); symlink(s.linkTarget, s.path); return; }
-    auto tmp = writeTemp(target.dirName, target.baseName, s.before);
-    if (s.hasOrigMode) chmodPath(tmp, s.origMode);
+    auto tmp = writeTemp(target.dirName, target.baseName, s.before, s.hasOrigMode ? s.origMode : newFileMode);
     rename(tmp, target);
 }
 
@@ -1260,10 +1259,11 @@ private void commitStaged(Staged[] staged, ReadState state)
         string tmp;
         try
         {
-            tmp = writeTemp(path.dirName, path.baseName, s.after.representation);
-            uint mode;
-            if (s.hasMode) chmodPath(tmp, s.mode);
-            else if (statMode(path, mode)) chmodPath(tmp, mode & octal!7777);
+            uint mode = newFileMode;
+            if (s.hasMode) mode = s.mode;
+            else if (statMode(path, mode)) mode &= octal!7777;
+            else mode = newFileMode;
+            tmp = writeTemp(path.dirName, path.baseName, s.after.representation, mode);
             // The last moment to notice a concurrent edit before replacing it.
             checkUnchanged(s);
             rename(tmp, path);
@@ -2402,4 +2402,22 @@ unittest // review round 7: new files get the umask-filtered default mode; EOF s
     applyPatch(j("patch", pt("*** Update File: " ~ t3, "@@", " a", "-b", "+B")), st);
     assert(readText(t3) == "a\nB", readText(t3));
     remove(w); remove(ad); remove(t1); remove(t2); remove(t3);
+}
+
+unittest // adversarial: replacing a 0600 file keeps it 0600 (write_file and apply_patch)
+{
+    import std.file : getAttributes, setAttributes;
+    auto st = new ReadState;
+    auto w = tmpFile("p-mode-secret-w.txt", "a\n");
+    setAttributes(w, octal!600);
+    st.record(w, "a\n");
+    writeFile(JSONValue(["path": w, "content": "b\n"]), st);
+    assert((getAttributes(w) & octal!7777) == octal!600);
+    auto p = tmpFile("p-mode-secret-p.txt", "a\n");
+    setAttributes(p, octal!600);
+    st.record(p, "a\n");
+    applyPatch(j("patch", pt("*** Update File: " ~ p, "@@", "-a", "+b")), st);
+    assert((getAttributes(p) & octal!7777) == octal!600);
+    assert(readText(p) == "b\n");
+    remove(w); remove(p);
 }
