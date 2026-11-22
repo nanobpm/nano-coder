@@ -1698,12 +1698,49 @@ class Agent
         try files = parsePatch(p.str);
         catch (ToolError) return null; // unparseable: the tool reports it and touches nothing
         PatchEdit[] out_;
+        // Hooks that inspect content (`content`, `old_string`, `new_string`)
+        // see the same fields a direct write_file/edit_file would carry.
         foreach (fp; files)
         {
-            out_ ~= PatchEdit(fp.kind == PatchKind.add ? "write_file" : "edit_file", JSONValue(["path": fp.path]));
-            if (fp.moveTo !is null) out_ ~= PatchEdit("write_file", JSONValue(["path": fp.moveTo]));
+            if (fp.kind == PatchKind.add)
+                out_ ~= PatchEdit("write_file", JSONValue(["path": fp.path, "content": fp.content]));
+            else if (fp.hunks.length == 0)
+                out_ ~= PatchEdit("edit_file", JSONValue(["path": fp.path]));
+            else
+                foreach (h; fp.hunks)
+                    out_ ~= PatchEdit("edit_file", JSONValue(["path": fp.path,
+                        "old_string": h.old_.length ? h.old_.join("\n") ~ "\n" : "",
+                        "new_string": h.new_.length ? h.new_.join("\n") ~ "\n" : ""]));
+            if (fp.moveTo !is null)
+            {
+                JSONValue w = JSONValue(["path": fp.moveTo]);
+                string c;
+                if (movedContent(fp, c)) w["content"] = c;
+                out_ ~= PatchEdit("write_file", w);
+            }
         }
         return out_;
+    }
+
+    /// The text a move's destination would receive: the source with the
+    /// section's hunks applied. False when that can't be computed (the tool
+    /// then fails the same way and writes nothing).
+    private static bool movedContent(const imported!"nano.tools.files".FilePatch fp, out string content)
+    {
+        import nano.tools : ToolError;
+        import nano.tools.files : applyHunks, resolvePath;
+        import std.file : readText, FileException;
+        import std.utf : UTFException;
+        try
+        {
+            string[] notes;
+            auto t = applyHunks(readText(resolvePath(fp.path)), fp.hunks, notes, fp.path);
+            content = t;
+            return true;
+        }
+        catch (ToolError) return false;
+        catch (FileException) return false;
+        catch (UTFException) return false;
     }
 
     /// Run the PreToolUse hooks for each path an apply_patch call touches.
@@ -3608,4 +3645,13 @@ unittest
     assert(toolText(agent, "p4").canFind("Applied patch to 2 file(s)"), toolText(agent, "p4"));
     assert(readText(ok) == "two\n" && readText(secret) == "KEY=2\n");
     assert(toolText(agent, "o1").canFind(verifyReminder));
+}
+
+unittest // apply_patch hooks see the content a direct write_file/edit_file would carry
+{
+    auto args = JSONValue(["patch": "*** Begin Patch\n*** Add File: n.txt\n+hello\n*** Update File: u.txt\n@@\n-old\n+new\n*** End Patch\n"]);
+    auto edits = Agent.patchEdits(args);
+    assert(edits.length == 2);
+    assert(edits[0].name == "write_file" && edits[0].args["content"].str == "hello\n");
+    assert(edits[1].name == "edit_file" && edits[1].args["old_string"].str == "old\n" && edits[1].args["new_string"].str == "new\n");
 }

@@ -472,8 +472,10 @@ private bool matchLines(string text, string old, string new_, bool trimStart, ou
     return true;
 }
 
-/// Non-overlapping occurrences of `pat` in `text`.
-private size_t[2][] occurrences(string text, string pat) pure
+/// Occurrences of `pat` in `text`: non-overlapping, or every start when
+/// `overlapping` (so a patch hunk that matches at two overlapping places is
+/// seen as ambiguous rather than unique).
+private size_t[2][] occurrences(string text, string pat, bool overlapping = false) pure
 {
     size_t[2][] r;
     size_t from;
@@ -483,7 +485,7 @@ private size_t[2][] occurrences(string text, string pat) pure
         if (i < 0) break;
         auto at = from + i;
         r ~= [at, at + pat.length];
-        from = at + pat.length;
+        from = overlapping ? at + 1 : at + pat.length;
     }
     return r;
 }
@@ -502,7 +504,7 @@ private bool exactMatch(string text, const Attempt a, bool replaceAll, out Locat
     auto cands = normalized != a.old ? [a.old, normalized] : [a.old];
     size_t[2][] ranges;
     foreach (c; cands)
-        foreach (r; occurrences(text, c))
+        foreach (r; occurrences(text, c, a.lineStart))
             if ((a.atLine == 0 || (lineAt(text, r[0]) == a.atLine && atLineStart(text, r[0])))
                 && (!a.lineStart || atLineStart(text, r[0])))
                 ranges ~= r;
@@ -901,7 +903,12 @@ private string expectedLines(const PatchHunk h) pure
 }
 
 /// Apply one hunk to `text` (the file after the earlier hunks).
-private string applyHunk(string text, const PatchHunk h, size_t n, ref string[] notes, string display) pure
+/// `endAt` is where the replaced region ended in `text`, and `newTail`
+/// whether the region's last line is still followed by a line of the hunk
+/// (context or added), rather than removed, so the caller can track the
+/// final terminator.
+private string applyHunk(string text, const PatchHunk h, size_t n, ref string[] notes, string display,
+        out size_t endAt, out bool newTail) pure
 {
     auto where = format("hunk %s (patch line %s)%s", n, h.line, h.anchor.length ? format(" at `@@ %s`", h.anchor) : "");
     ToolError fail(string m) { return new ToolError(format("apply_patch: %s: %s: %s", display, where, m)); }
@@ -932,7 +939,10 @@ private string applyHunk(string text, const PatchHunk h, size_t n, ref string[] 
             throw fail(format("the anchor matches %s lines (%s, %s, ...) and the hunk has no context lines to tell them apart",
                     bases.length, lineAt(text, bases[0]) - 1, lineAt(text, bases[1]) - 1));
         auto at = h.anchor.length && !h.eof ? bases[0] : text.length;
-        return text[0 .. at] ~ toEndingsAt(text, at, at, newT) ~ text[at .. $];
+        auto ins = toEndingsAt(text, at, at, newT);
+        endAt = at;
+        newTail = ins.length > 0;
+        return text[0 .. at] ~ ins ~ text[at .. $];
     }
     Located found;
     bool have;
@@ -966,6 +976,13 @@ private string applyHunk(string text, const PatchHunk h, size_t n, ref string[] 
     if (h.eof && r[1] != text.length)
         throw fail(format("marked `*** End of File` but matches at line %s, not at the end of the file", lineAt(text, r[0])));
     if (found.how.length) notes ~= format("%s: %s matched %s", display, where, found.how);
+    endAt = r[1];
+    // The tail was deleted when the hunk ends in removed lines and adds
+    // nothing after its leading context.
+    size_t pre;
+    while (pre < h.old_.length && pre < h.new_.length && h.old_[pre] == h.new_[pre]) pre++;
+    bool tailKept = h.old_.length && h.new_.length && h.old_[$ - 1] == h.new_[$ - 1];
+    newTail = tailKept || h.new_.length > pre;
     return text[0 .. r[0]] ~ found.news[0] ~ text[r[1] .. $];
 }
 
@@ -973,10 +990,23 @@ private string applyHunk(string text, const PatchHunk h, size_t n, ref string[] 
 string applyHunks(string text, const PatchHunk[] hunks, ref string[] notes, string display) pure
 {
     // Work on text with a final newline so the last line matches like any other.
+    // The synthetic terminator follows the file's convention, and is tracked
+    // through the hunks: a hunk that deletes the last lines takes it along and
+    // exposes an original terminator, which must then stay.
     bool hadNl = text.length == 0 || text.endsWith("\n");
-    auto work = hadNl ? text : text ~ "\n";
-    foreach (n, h; hunks) work = applyHunk(work, h, n + 1, notes, display);
-    if (!hadNl && work.endsWith("\n")) work = work[0 .. $ - 1];
+    auto f = text.indexOf('\n');
+    auto term = f > 0 && text[f - 1] == '\r' ? "\r\n" : "\n";
+    auto work = hadNl ? text : text ~ term;
+    bool synthetic = !hadNl;
+    foreach (n, h; hunks)
+    {
+        auto len = work.length;
+        size_t endAt;
+        bool newTail;
+        work = applyHunk(work, h, n + 1, notes, display, endAt, newTail);
+        if (synthetic && endAt == len) synthetic = newTail;
+    }
+    if (synthetic && work.endsWith(term)) work = work[0 .. $ - term.length];
     return work;
 }
 
@@ -1060,6 +1090,8 @@ private struct Staged
     size_t movedFrom = size_t.max; /// index of the move's source (max: none)
     uint mode; /// permission bits to write with (from disk, or the move's source)
     bool hasMode; /// whether `mode` is known
+    uint origMode; /// the path's own permission bits before the patch, for rollback
+    bool hasOrigMode; /// whether `origMode` is known
     bool binary; /// `after` holds raw bytes carried through a pure rename
     bool wasLink; /// the path was a symlink before the patch
     string linkTarget; /// its target then, to restore it on rollback
@@ -1125,7 +1157,7 @@ private void rollBack(const ref Staged s)
         if (!s.existed || linkPresent(s.path)) return; // recreated meanwhile: leave it
         if (s.wasLink) { symlink(s.linkTarget, s.path); return; }
         auto tmp = writeTemp(s.path.dirName, s.path.baseName, s.before);
-        if (s.hasMode) chmodPath(tmp, s.mode);
+        if (s.hasOrigMode) chmodPath(tmp, s.origMode);
         rename(tmp, s.path);
         return;
     }
@@ -1136,7 +1168,7 @@ private void rollBack(const ref Staged s)
     if (current != s.after.representation) return; // edited since we wrote it: keep that edit
     if (!s.existed) { remove(s.path); return; }
     auto tmp = writeTemp(target.dirName, target.baseName, s.before);
-    if (s.hasMode) chmodPath(tmp, s.mode);
+    if (s.hasOrigMode) chmodPath(tmp, s.origMode);
     rename(tmp, target);
 }
 
@@ -1152,13 +1184,28 @@ private void commitStaged(Staged[] staged, ReadState state)
             catch (ToolError e) throw new ToolError(e.msg ~ "; nothing was written");
         }
     size_t done;
+    string[] madeDirs; /// directories this commit created, to remove on rollback
     scope (failure)
-        foreach_reverse (ref s; staged[0 .. done])
+    {
+        // Undo writes first, then remove the directories they needed, and only
+        // then restore deleted entries, whose paths those directories may hold.
+        void undo(bool writes)
         {
-            if (!s.changed) continue;
-            try rollBack(s);
-            catch (FileException) {} // rollback is best effort: the error that triggered it is reported
+            foreach_reverse (ref s; staged[0 .. done])
+            {
+                if (!s.changed || s.present != writes) continue;
+                try rollBack(s);
+                catch (FileException) {} // rollback is best effort: the error that triggered it is reported
+            }
         }
+        undo(true);
+        foreach (d; madeDirs.sort!((a, b) => a.length > b.length))
+        {
+            try rmdir(d);
+            catch (FileException) {} // not empty (someone else's file) or gone: leave it
+        }
+        undo(false);
+    }
     enum undone = " (earlier changes were rolled back)";
     foreach (i, ref s; staged)
     {
@@ -1174,6 +1221,7 @@ private void commitStaged(Staged[] staged, ReadState state)
             continue;
         }
         auto path = writeTarget(s.path);
+        for (auto d = path.dirName; !linkPresent(d) && d != d.dirName; d = d.dirName) madeDirs ~= d;
         try mkdirRecurse(path.dirName);
         catch (FileException e) throw new ToolError(format("apply_patch: create %s: %s%s", path.dirName, e.msg, undone));
         string tmp;
@@ -1238,7 +1286,11 @@ string applyPatch(JSONValue args, ReadState state)
                 catch (FileException e) throw new ToolError(format("apply_patch: read link %s: %s", s.display, e.msg));
             }
             uint mode;
-            if (statMode(path, mode)) { s.mode = mode & octal!7777; s.hasMode = true; }
+            if (statMode(path, mode))
+            {
+                s.mode = s.origMode = mode & octal!7777;
+                s.hasMode = s.hasOrigMode = true;
+            }
         }
         index[path] = staged.length;
         staged ~= s;
@@ -2150,4 +2202,48 @@ unittest // the unified diff
     auto changed = lines.replace("\n2\n", "\ntwo\n").replace("\n19\n", "\nnineteen\n");
     auto d = unifiedDiff("a", "b", lines, changed);
     assert(d == "--- a\n+++ b\n@@ -1,5 +1,5 @@\n 1\n-2\n+two\n 3\n 4\n 5\n@@ -16,5 +16,5 @@\n 16\n 17\n 18\n-19\n+nineteen\n 20\n", d);
+}
+
+unittest // review round 3: overlapping hunks, CRLF without a final newline, rollback of directories and modes
+{
+    import std.file : getAttributes, setAttributes;
+    import std.path : buildPath;
+    auto st = new ReadState;
+    // A hunk that matches at two overlapping places is ambiguous, not unique.
+    auto o = tmpFile("p-ovl.txt", "a\na\na\n");
+    assert(patchErr(st, pt("*** Update File: " ~ o, "@@", " a", "-a", "+b")).indexOf("ambiguous") >= 0);
+    assert(readText(o) == "a\na\na\n");
+    // CRLF file without a final newline: deleting the last line keeps the
+    // previous line's terminator whole; appending uses CRLF throughout.
+    auto c = tmpFile("p-crlf-del.txt", "a\r\nb");
+    applyPatch(j("patch", pt("*** Update File: " ~ c, "@@", " a", "-b")), st);
+    assert(readText(c) == "a\r\n", readText(c));
+    auto c2 = tmpFile("p-crlf-add.txt", "a\r\nb");
+    applyPatch(j("patch", pt("*** Update File: " ~ c2, "@@", "+c")), st);
+    assert(readText(c2) == "a\r\nb\r\nc", readText(c2));
+    auto c3 = tmpFile("p-crlf-mod.txt", "a\r\nb");
+    applyPatch(j("patch", pt("*** Update File: " ~ c3, "@@", "-b", "+B")), st);
+    assert(readText(c3) == "a\r\nB", readText(c3));
+    // A failed commit removes the directories it created before restoring
+    // a deleted file at the same path.
+    auto a = tmpFile("p-dirrb", "original\n");
+    auto blocker = tmpFile("p-dirrb-blocker", "file\n");
+    auto e = patchErr(st, pt("*** Delete File: " ~ a, "*** Add File: " ~ buildPath(a, "child"), "+x",
+            "*** Add File: " ~ buildPath(blocker, "child"), "+y"));
+    assert(e.indexOf("rolled back") >= 0, e);
+    assert(a.isFile && readText(a) == "original\n", e);
+    auto nd = buildPath(tempDir, "nano-coder-files-test", "p-newdir");
+    if (nd.exists) rmdirRecurse(nd);
+    patchErr(st, pt("*** Add File: " ~ buildPath(nd, "sub", "f"), "+x", "*** Add File: " ~ buildPath(blocker, "c"), "+y"));
+    assert(!nd.exists);
+    // Rollback restores a replaced destination with its own permission bits.
+    auto dst = tmpFile("p-mode-dst", "dst\n");
+    auto src = tmpFile("p-mode-src", "src\n");
+    setAttributes(dst, octal!755);
+    setAttributes(src, octal!644);
+    patchErr(st, pt("*** Delete File: " ~ dst, "*** Move File: " ~ src ~ " -> " ~ dst,
+            "*** Add File: " ~ buildPath(blocker, "c"), "+y"));
+    assert(readText(dst) == "dst\n" && (getAttributes(dst) & octal!777) == octal!755);
+    assert(readText(src) == "src\n" && (getAttributes(src) & octal!777) == octal!644);
+    remove(dst); remove(src); remove(a); remove(blocker);
 }
