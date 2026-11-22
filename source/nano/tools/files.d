@@ -1130,17 +1130,47 @@ private struct Staged
     bool pinnedLink; /// `pinned` came from the path's own symlink (not a symlinked parent)
 }
 
-/// The content an apply_patch call commits for one path, captured before its
-/// hooks run so the write carries exactly what the destination hook approved.
+/// One path an apply_patch call touches, as it was on disk when the
+/// caller built its hook inputs from it. The tool refuses to commit unless
+/// staging reads the same entry: the content it then computes is the
+/// content the hooks were shown (staging is deterministic), and an edit that
+/// landed while the hooks ran fails the call instead of being overwritten.
 struct PatchSnapshot
 {
-    string path; /// as written in the patch (resolved at staging)
-    string content; /// the staged content the hooks saw
+    string path; /// resolved
+    bool existed; /// an entry was there (a dangling link counts)
+    bool readable; /// its bytes could be read
+    const(ubyte)[] before; /// those bytes (through a symlink)
+}
+
+/// Capture every path `patch` touches (sources and move destinations), once
+/// each by resolved path, before any hook runs. Throws ToolError when the
+/// patch doesn't parse.
+PatchSnapshot[] patchOriginals(string patch)
+{
+    PatchSnapshot[] out_;
+    bool[string] seen;
+    foreach (raw; patchPaths(patch))
+    {
+        auto path = resolvePath(raw);
+        if (path in seen) continue;
+        seen[path] = true;
+        PatchSnapshot ps;
+        ps.path = path;
+        ps.existed = linkPresent(path);
+        if (ps.existed && !(path.exists && path.isDir))
+        {
+            try { ps.before = readBytes(path); ps.readable = true; }
+            catch (FileException) {} // staging fails the same way and writes nothing
+        }
+        out_ ~= ps;
+    }
+    return out_;
 }
 
 /// The apply_patch handler's shape: the tool's arguments plus the staged
 /// contents its hooks approved (null: stage from disk, with freshness checks).
-alias PatchHandler = string delegate(JSONValue args, PatchSnapshot[] prepared);
+alias PatchHandler = string delegate(JSONValue args, PatchSnapshot[] originals);
 
 /// `path` relative to the working directory when inside it.
 private string displayPath(string path)
@@ -1194,7 +1224,10 @@ private void checkUnchanged(const ref Staged s)
             throw new ToolError(format("apply_patch: re-read %s: %s", s.display, e.msg));
         if (current != s.linkTarget)
             throw new ToolError(format("apply_patch: %s changed while the patch was being prepared", s.display));
-        return;
+        // Deleting or recreating the entry needs only its identity (the
+        // referent may be gone, deleted by this patch). An update writes
+        // through the link, so the referent's bytes must be unchanged too.
+        if (!s.present || s.recreated) return;
     }
     ubyte[] current;
     try current = readBytes(s.path);
@@ -1238,6 +1271,8 @@ private void rollBack(const ref Staged s)
 /// Test seam: runs just before a failed commit rolls back, so a test can
 /// make the restoration itself fail.
 version (unittest) private void delegate() beforeRollbackForTest;
+/// Test seam: runs before commit entry `i` is re-checked and written.
+version (unittest) private void delegate(size_t i) beforeEntryForTest;
 
 /// Write the staged changes. Every target is re-checked against what was
 /// staged before anything is written and again just before its own write or
@@ -1288,9 +1323,11 @@ private void commitStaged(Staged[] staged, ReadState state)
     ToolError failed;
     foreach (i, ref s; staged)
     {
-        scope (success) done = i + 1;
+        // A failed entry is not committed: never roll it back as if it were.
+        scope (success) if (failed is null) done = i + 1;
         if (!s.changed) continue;
         if (!s.present && !s.existed) continue;
+        version (unittest) if (beforeEntryForTest !is null) beforeEntryForTest(i);
         try
         {
             checkUnchanged(s);
@@ -1350,7 +1387,7 @@ private void commitStaged(Staged[] staged, ReadState state)
         }
 }
 
-string applyPatch(JSONValue args, ReadState state, PatchSnapshot[] prepared = null)
+string applyPatch(JSONValue args, ReadState state, PatchSnapshot[] originals = null)
 {
     auto patch = requireString(args, "patch", "apply_patch");
     auto dry = optBool(args, "dry_run", false);
@@ -1470,19 +1507,20 @@ string applyPatch(JSONValue args, ReadState state, PatchSnapshot[] prepared = nu
             break;
         }
     }
-    // The caller's hook-approved staged contents (its per-path hook inputs)
-    // override what staging computed: the commit then writes exactly what the
-    // destination hooks approved, even if a source changed after they ran.
-    // The freshness checks in commitStaged still catch the drift itself. A
-    // path the patch deletes keeps that deletion (the snapshot never
-    // resurrects it).
-    if (prepared.length && !dry)
-        foreach (ps; prepared)
+    // The caller built its hook inputs from `originals`: commit only if
+    // staging read exactly those entries, so the content written is the
+    // content the hooks approved, and an edit made while they ran is never
+    // overwritten. Every path is checked, repeated or not.
+    if (!dry)
+        foreach (ps; originals)
         {
-            auto k = at(ps.path);
-            if (!staged[k].present && staged[k].changed) continue; // deleted by the patch
-            staged[k].present = staged[k].changed = true;
-            staged[k].after = ps.content;
+            auto k = resolvePath(ps.path) in index;
+            if (k is null)
+                throw new ToolError(format("apply_patch: %s is not part of the patch; nothing was written", displayPath(ps.path)));
+            auto st = &staged[*k];
+            if (st.existed != ps.existed || (st.existed && (!ps.readable || st.before != ps.before)))
+                throw new ToolError(format("apply_patch: %s changed while the patch's hooks ran; nothing was written. "
+                        ~ "Read it again before patching it", st.display));
         }
     // Two entries that write the same file (a path and a symlink to it) would
     // each be staged from the original bytes, and the second write would
@@ -1629,7 +1667,7 @@ void register(ToolRegistry tools, ReadState state)
         (JSONValue a) => applyPatch(a, state));
     // The richer shape, for callers that carry the hook-approved staged
     // contents into the commit (see PatchHandler).
-    tools.registerHandler!PatchHandler("apply_patch", (JSONValue a, PatchSnapshot[] prepared) => applyPatch(a, state, prepared));
+    tools.registerHandler!PatchHandler("apply_patch", (JSONValue a, PatchSnapshot[] originals) => applyPatch(a, state, originals));
 }
 
 version (unittest)
@@ -2571,12 +2609,12 @@ unittest // review round 8: symlink freshness by identity, pinned targets, prepa
     symlink(t1, lk2);
     checkUnchanged(se); // restored target: passes again
     remove(t1); remove(t2); remove(lk2);
-    // A prepared snapshot's content is what the commit writes, not a re-read.
+    // The caller's snapshot gates the commit: an unchanged one commits.
     auto src = tmpFile("p8-src.txt", "approved\n");
     auto dst = tmpFile("p8-dst.txt", null);
     if (dst.exists) remove(dst);
-    PatchSnapshot[] prep = [PatchSnapshot(dst, "approved\n")];
-    applyPatch(j("patch", pt("*** Move File: " ~ src ~ " -> " ~ dst)), st, prep);
+    auto mv = pt("*** Move File: " ~ src ~ " -> " ~ dst);
+    applyPatch(j("patch", mv), st, patchOriginals(mv));
     assert(readText(dst) == "approved\n", readText(dst));
     assert(!src.exists);
     // A failure after a committed write rolls it back and says so; a rollback
@@ -2618,4 +2656,74 @@ unittest // the hook-approved commit path is reachable: apply_patch's PatchHandl
     auto reg = new ToolRegistry;
     register(reg, new ReadState);
     assert(reg.handlerAs!PatchHandler("apply_patch") !is null);
+}
+
+unittest // review round 9: snapshot-gated commit, normalized repeats, symlink referents, rollback boundary
+{
+    import std.file : symlink, remove;
+    auto st = new ReadState;
+    // A source edited after the hooks' snapshot fails the call: nothing is
+    // written and the intervening edit survives.
+    auto src = tmpFile("p9-src.txt", "one\n");
+    auto dst = tmpFile("p9-dst.txt", null);
+    if (dst.exists) remove(dst);
+    auto mv = pt("*** Move File: " ~ src ~ " -> " ~ dst);
+    auto snap = patchOriginals(mv);
+    std.file.write(src, "two\n");
+    st.record(src, "two\n");
+    bool threw;
+    try applyPatch(j("patch", mv), st, snap);
+    catch (ToolError e) threw = e.msg.indexOf("changed while the patch's hooks ran") >= 0;
+    assert(threw && readText(src) == "two\n" && !dst.exists);
+    // A destination created after the snapshot fails it too.
+    snap = patchOriginals(mv);
+    std.file.write(dst, "theirs\n");
+    threw = false;
+    try applyPatch(j("patch", mv), st, snap);
+    catch (ToolError e) threw = true;
+    assert(threw && readText(dst) == "theirs\n" && readText(src) == "two\n");
+    remove(dst); remove(src);
+    // Repeated paths spelled differently resolve to one entry: the update wins.
+    auto d = tmpFile("p9-dir", null);
+    if (d.exists) rmdirRecurse(d);
+    mkdirRecurse(d);
+    scope (exit) rmdirRecurse(d);
+    auto rp = pt("*** Add File: " ~ d ~ "/a.txt", "+one", "*** Update File: " ~ d ~ "/./a.txt", "@@", "-one", "+two");
+    snap = patchOriginals(rp);
+    assert(snap.length == 1, "one snapshot entry per resolved path");
+    applyPatch(j("patch", rp), st, snap);
+    assert(readText(buildPath(d, "a.txt")) == "two\n");
+    // An update through a symlink re-checks the referent's bytes, not just the link.
+    auto t = tmpFile("p9-t.txt", "x\n");
+    auto lk = tmpFile("p9-lk.txt", null);
+    if (isLink(lk) || lk.exists) remove(lk);
+    symlink(t, lk);
+    Staged se;
+    se.path = lk;
+    se.display = lk;
+    se.existed = se.present = se.changed = true;
+    se.before = readBytes(lk);
+    se.wasLink = true;
+    se.linkTarget = readLink(lk);
+    checkUnchanged(se);
+    std.file.write(t, "edited\n");
+    threw = false;
+    try checkUnchanged(se);
+    catch (ToolError e) threw = true;
+    assert(threw, "an edited referent must fail an update's freshness check");
+    se.present = false; // a delete still needs only the entry's identity
+    checkUnchanged(se);
+    remove(lk); remove(t);
+    // A failed entry is outside the rollback boundary: a file another process
+    // created with the intended bytes is not removed as if this patch wrote it.
+    auto b = tmpFile("p9-b.txt", null);
+    auto c = tmpFile("p9-c.txt", null);
+    foreach (f; [b, c]) if (f.exists) remove(f);
+    beforeEntryForTest = (size_t i) { if (i == 1) std.file.write(c, "y\n"); };
+    scope (exit) beforeEntryForTest = null;
+    auto e = patchErr(st, pt("*** Add File: " ~ b, "+x", "*** Add File: " ~ c, "+y"));
+    assert(e.indexOf("was created while the patch was being prepared") >= 0, e);
+    assert(!b.exists, e);
+    assert(c.exists && readText(c) == "y\n", e);
+    remove(c);
 }

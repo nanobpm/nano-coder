@@ -1858,27 +1858,24 @@ class Agent
         auto args = effectiveArgs;
         // apply_patch: each touched path also passes the hooks as a direct
         // edit of it would (the policy already checked every path).
-        // The per-path hook inputs are built once, before the patch runs: a
-        // move deletes its source, so rebuilding them afterwards would lose
-        // the content the post-hooks should see. The same snapshot then
-        // drives the commit itself (applyPatch's `prepared`): the tool
-        // writes the content the destination hooks approved, never a
-        // post-hook re-read of the source.
+        // The per-path hook inputs are built once, before the patch runs, from
+        // a snapshot of every touched path taken first: a move deletes its
+        // source, so rebuilding them afterwards would lose the content the
+        // post-hooks should see. The tool then commits only if it stages from
+        // exactly that snapshot, so it writes the content the hooks approved
+        // and an edit made while they ran fails the call.
         PatchEdit[] patchInputs;
-        PatchSnapshot[] prepared;
+        PatchSnapshot[] originals;
         if (call.name == "apply_patch")
         {
-            patchInputs = patchEdits(args, true);
+            originals = patchOriginalsOf(args);
+            patchInputs = patchEdits(args, true, originals);
             if (auto deny = patchPathHooks(call, patchInputs, context)) return withContext(deny, context);
             if (auto d = "dry_run" in args)
-            {
-                if (d.type == JSONType.true_) patchInputs = null;
-                else prepared = patchSnapshot(patchInputs);
-            }
-            else prepared = patchSnapshot(patchInputs);
+                if (d.type == JSONType.true_) { patchInputs = null; originals = null; }
         }
         dispatched = true;
-        auto out_ = execute(call, args, isError, prepared);
+        auto out_ = execute(call, args, isError, originals);
         return afterTool(call, args, out_, context, isError, patchInputs);
     }
 
@@ -1938,7 +1935,7 @@ class Agent
 
     /// Run an admitted call's handler on this thread.
     private string execute(const ref ToolCall call, JSONValue args, out bool isError,
-        PatchSnapshot[] prepared = null)
+        PatchSnapshot[] originals = null)
     {
         isError = true;
         bool isPlan = planTools && isPlanTool(call.name);
@@ -1970,7 +1967,7 @@ class Agent
                 out_ = call.name == hist.searchTool ? hist.search(logPath, args) : hist.read(logPath, args);
             }
             else if (isTimer) out_ = runTimerTool(call.name, args);
-            else if (call.name == "apply_patch") out_ = applyPatchPrepared(args, tools, prepared);
+            else if (call.name == "apply_patch") out_ = applyPatchPrepared(args, tools, originals);
             else out_ = isPlan ? runPlanTool(call.name, args) : tools.execute(call.name, args);
             isError = false;
         }
@@ -2009,7 +2006,7 @@ class Agent
     /// destination, `edit_file` otherwise (with the path only). None when the
     /// patch doesn't parse, or is a dry run (which writes nothing) unless
     /// `withDryRun`: a dry run still reads every path, so pre-hooks see it.
-    private static PatchEdit[] patchEdits(JSONValue args, bool withDryRun = false)
+    private static PatchEdit[] patchEdits(JSONValue args, bool withDryRun = false, PatchSnapshot[] originals = null)
     {
         import nano.tools : ToolError;
         import nano.tools.files : parsePatch, PatchKind, FilePatch;
@@ -2035,6 +2032,20 @@ class Agent
             auto key = resolvePath(path);
             if (key in absent || key in unknown) return false;
             if (auto t = key in staged) { c = *t; return true; }
+            // From the snapshot the tool will verify, never a second disk read.
+            if (originals.length)
+            {
+                import nano.safeio : utf8Text;
+                foreach (ref o; originals)
+                    if (o.path == key)
+                    {
+                        if (!o.existed || !o.readable) return false;
+                        try c = utf8Text(o.before);
+                        catch (UTFException) return false;
+                        return true;
+                    }
+                return false;
+            }
             try { c = readText(key); return true; }
             catch (FileException) return false;
             catch (UTFException) return false;
@@ -2138,39 +2149,25 @@ class Agent
         catch (ToolError) return null; // unparseable: the tool reported it and touched nothing
     }
 
-    /// The staged contents an apply_patch call commits, captured from the
-    /// per-path hook inputs so the tool writes exactly what the destination
-    /// hooks approved (never a post-hook re-read of a move's source). Null
-    /// when the snapshot is incomplete (a path's content was unknown, or a
-    /// path appears without content and later with it): the tool then stages
-    /// from disk as usual, with its own freshness checks.
-    private static PatchSnapshot[] patchSnapshot(PatchEdit[] edits)
+    /// Every path an apply_patch call touches, as on disk now (before any
+    /// hook runs). None when the patch is missing or doesn't parse: the tool
+    /// rejects it before touching any path.
+    private static PatchSnapshot[] patchOriginalsOf(JSONValue args)
     {
-        if (!edits.length) return null;
-        PatchSnapshot[] out_;
-        bool[string] seen;
-        foreach (e; edits)
-        {
-            auto path = e.args["path"].str;
-            if (auto c = "content" in e.args)
-            {
-                if (path in seen) return null; // content must follow the patch's order
-                seen[path] = true;
-                out_ ~= PatchSnapshot(path, c.str);
-                continue;
-            }
-            if (path in seen) return null; // a later write's content must win
-            seen[path] = true;
-        }
-        return out_.length ? out_ : null;
+        import nano.tools : ToolError;
+        import nano.tools.files : patchOriginals;
+        auto p = "patch" in args;
+        if (p is null || p.type != JSONType.string) return null;
+        try return patchOriginals(p.str);
+        catch (ToolError) return null; // unparseable: the tool reports it and touches nothing
     }
 
-    /// Run apply_patch with the staged contents the hooks approved, when the
-    /// registry's handler accepts them; otherwise (an unexpected handler
-    /// shape) fall back to the plain call, which stages from disk.
-    private static string applyPatchPrepared(JSONValue args, ToolRegistry tools, PatchSnapshot[] prepared)
+    /// Run apply_patch against the snapshot its hook inputs were built from,
+    /// when the registry's handler accepts one; otherwise (an unexpected
+    /// handler shape) fall back to the plain call, which stages from disk.
+    private static string applyPatchPrepared(JSONValue args, ToolRegistry tools, PatchSnapshot[] originals)
     {
-        if (auto h = tools.handlerAs!PatchHandler("apply_patch")) return h(args, prepared);
+        if (auto h = tools.handlerAs!PatchHandler("apply_patch")) return h(args, originals);
         return tools.execute("apply_patch", args);
     }
 
