@@ -87,18 +87,35 @@ private bool closed(Status s) pure nothrow { return s == Status.done || s == Sta
 /// only item lines change (notes and other text are left alone).
 string planSymbols(string text) pure
 {
-    import std.ascii : isDigit;
     import std.array : split;
     static immutable string[2][5] marks = [["[ ] ", "☐ "], ["[>] ", "◐ "], ["[x] ", "☑ "], ["[!] ", "⊘ "], ["[-] ", "☒ "]];
     auto lines = text.split("\n");
     foreach (ref l; lines)
         foreach (m; marks)
-            if (l.startsWith(m[0]) && l.length > 4 && l[4].isDigit)
+            if (l.startsWith(m[0]) && isItemId(l[4 .. $]))
             {
                 l = m[1] ~ l[4 .. $];
                 break;
             }
     return lines.join("\n");
+}
+
+/// `s` starts with an item id: one or more digits followed by `. `.
+private bool isItemId(string s) pure nothrow @nogc
+{
+    import std.ascii : isDigit;
+    size_t i;
+    while (i < s.length && s[i].isDigit) i++;
+    return i > 0 && i + 1 < s.length && s[i] == '.' && s[i + 1] == ' ';
+}
+
+unittest
+{
+    // Goal/title continuation lines that merely look like items stay as typed.
+    assert(planSymbols("[x] 2026 release") == "[x] 2026 release");
+    assert(planSymbols("[ ] 3.5 kg") == "[ ] 3.5 kg");
+    assert(planSymbols("[ ] 12") == "[ ] 12");
+    assert(planSymbols("[>] 12. x") == "◐ 12. x");
 }
 
 unittest
