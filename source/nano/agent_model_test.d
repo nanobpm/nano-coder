@@ -208,7 +208,11 @@ class Probing : Interfering, CapabilityProbe
     Shared!bool gate;
     /// Set once `probeCapabilities` has returned its answer: the probe worker
     /// is about to exit, so awaiting it (not `probes`, which turns mid-work)
-    /// synchronises a test with the worker's termination.
+    /// tells a test the worker's result is final. The worker can still be
+    /// unwinding, though, so a test that must see the result *published*
+    /// awaits termination instead (`Agent.settleProbes` joins the thread and
+    /// collects; a `done`-gated `collectProbes` can run in the unwind window
+    /// and skip the still-running worker).
     Shared!bool done;
     Shared!int probes, windowProbes;
     this(string model, LLMResponse[] script, size_t window, Shared!bool gate, Shared!bool done, Shared!int probes, Shared!int windowProbes)
@@ -370,6 +374,7 @@ unittest
 // unconditionally, so an oversized prompt is never sent (PR #260 review).
 unittest
 {
+    import core.time : seconds;
     import nano.safeio : Shared;
     auto p = Probes.make(false);
     auto agent = agentFor(new Interfering("first", [LLMResponse("unused")]));
@@ -390,16 +395,18 @@ unittest
     // The probe's result must land after prepareCall's first threshold check
     // but before its apply: only the unconditional recheck can catch it.
     // Keep the probe gated until the first check has read the state (the
-    // hook at agent.d:813), then wait for the worker to finish there — never
+    // hook at agent.d:874), then wait for the worker to finish there — never
     // block inside the publish hook: a probe that completes before the first
     // collection publishes on the agent thread, and blocking there deadlocks
-    // the test against the very check hook that would release it. Await
-    // `done`, not `probes`: the counter turns mid-work, so it can pass while
-    // the worker still runs, leaving the fallback window in place for both
-    // collections and the normal request consuming SUM instead of compacting.
+    // the test against the very check hook that would release it. Settle the
+    // probe, don't await a flag: `done` (and `probes`) turns mid-work, so it
+    // can pass while the worker still unwinds, leaving the fallback window
+    // in place for both collections and the normal request consuming SUM
+    // instead of compacting. `settleProbes` joins the worker and publishes
+    // its result, so the recheck below sees the probed window.
     agent.onThresholdChecked = {
         p.gate.update((ref bool open) { open = true; });
-        p.done.await((ref const bool d) => d, (ref bool _) {});
+        assert(agent.settleProbes(5.seconds), "the probe worker finished and published");
     };
     auto ev = new CountingEvents;
     assert(agent.run("go", ev) == "done");
