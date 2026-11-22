@@ -137,6 +137,11 @@ struct Message
     bool continuation;
     /// A fired timer or pending-timer nudge (`timer`; implies automatic).
     bool timer;
+    /// With `timer`: the firing was delivered as its own turn (the idle
+    /// prompt or `--wait-timers`, `timer_turn`), not mid-turn. It starts a
+    /// turn, so replay treats it as a turn boundary and shows its notice
+    /// even in quiet mode, as live does.
+    bool timerTurn;
     /// User role: a Stop hook's rejection of the preceding answer
     /// (`stop_blocked`; implies automatic).
     bool stopBlocked;

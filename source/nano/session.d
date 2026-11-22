@@ -309,6 +309,7 @@ JSONValue messageRecord(const ref Message m) pure
     if (m.autoInitiated) j["auto_initiated"] = true;
     if (m.continuation) j["continuation"] = true;
     if (m.timer) j["timer"] = true;
+    if (m.timerTurn) j["timer_turn"] = true;
     if (m.stopBlocked) j["stop_blocked"] = true;
     if (m.steered) j["steered"] = true;
     if (m.hookContext) j["hook_context"] = true;
@@ -381,6 +382,7 @@ Message messageFromRecord(JSONValue j) pure
         // Sub-kinds of an automatic turn.
         case "continuation": m.continuation = v.type == JSONType.true_; break;
         case "timer": m.timer = v.type == JSONType.true_; break;
+        case "timer_turn": m.timerTurn = v.type == JSONType.true_; break;
         default: extra[k] = v;
         }
     }

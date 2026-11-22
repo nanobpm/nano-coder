@@ -1607,7 +1607,7 @@ string timersText(Agent agent)
 /// (backward walk) so the two cannot drift apart.
 bool replayTransparent(const ref Message x) pure nothrow @safe
 {
-    return x.role == Role.system || (x.role == Role.user && (x.hookContext || (x.timer && !x.continuation)));
+    return x.role == Role.system || (x.role == Role.user && (x.hookContext || (x.timer && !x.timerTurn && !x.continuation)));
 }
 
 /// What of an assistant message a quiet replay shows (Rust ui.rs quiet
@@ -1711,7 +1711,8 @@ string replayQuietShown(const Message[] msgs, size_t i) pure nothrow @safe
 private bool closesTurn(const ref Message m) pure @safe
 {
     // A mid-turn steer continues the turn it interrupts.
-    return m.role == Role.user && isUserRequest(m) && !m.steered;
+    // An idle / --wait-timers timer firing starts a turn of its own.
+    return m.role == Role.user && ((isUserRequest(m) && !m.steered) || (m.timer && m.timerTurn));
 }
 
 /// `quietTurnLast` for every message at once, in linear time.
@@ -1946,6 +1947,19 @@ unittest
     assert(replayAnswerQuiet(timed2, 0) == "one two", "a timer before the reminder is transparent");
     auto timed3 = [cut("one "), cont, tick, cut("two "), cont, Message.assistant("three")];
     assert(replayAnswerQuiet(timed3, 3) == "two three", "a timer before a continued chunk keeps it continued");
+    // An idle / --wait-timers firing starts a new turn: not transparent, a
+    // turn boundary, so a capped answer before it stands and a capped
+    // tool-calling reply before it closes its own turn.
+    auto idleTick = Message.auto_("fired");
+    idleTick.timer = true;
+    idleTick.timerTurn = true;
+    assert(!replayTransparent(idleTick) && closesTurn(idleTick), "an idle timer turn is a boundary");
+    auto idled = [cut("one "), idleTick, Message.assistant("two")];
+    assert(replayAnswerQuiet(idled, 0) == "one ", "a turn-starting timer does not continue the prior answer");
+    auto capTool = Message.assistant("partial", [ToolCall("c1", "bash", parseJSON("{}"))]);
+    auto capped3 = [Message.user("go"), capTool, idleTick, Message.assistant("later")];
+    assert(replayQuietShownTurn(capped3, 1) == "partial", "a capped tool reply before an idle timer turn shows");
+    assert(replayQuietShownTurn(capped3, 1, quietTurnLasts(capped3)) == "partial");
 
     // Hook-only context (a resumed turn's SessionStart block) is model-only
     // like a timer: it never printed live, so it is transparent — a resumed
@@ -2020,6 +2034,13 @@ void replayTranscript(Agent agent, Console console)
             // Stop-hook reminders and idle-timer turns are autoInitiated.
             // A timer firing printed its notice live (kept in `pinText`);
             // replay restores it the same way. Pending nudges stay hidden.
+            if (m.timer && m.timerTurn && m.pinText.length)
+            {
+                // A turn-starting firing printed its notice live even in
+                // quiet mode (plain dim line), so replay does too.
+                writeln(console.dim(sanitizeBlock(m.pinText)));
+                break;
+            }
             if (m.timer && !m.continuation && m.pinText.length)
             {
                 console.userMessage(sanitizeBlock(m.pinText));

@@ -875,6 +875,7 @@ class Agent
                 // `pinText`, so replay restores the notice instead of
                 // hiding the whole message as a model-only automatic input.
                 um.timer = true;
+                um.timerTurn = true;
                 um.pinText = timerNotice;
             }
             hasPending = true;

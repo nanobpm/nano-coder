@@ -167,5 +167,5 @@ unittest
     auto r = restore(log.path);
     resumed.loadRestored(r, some(new SessionLog(log.path)));
     auto rm = resumed.replayMessages[$ - 2];
-    assert(rm.role == Role.user && rm.timer && rm.pinText == notice, rm.pinText);
+    assert(rm.role == Role.user && rm.timer && rm.timerTurn && rm.pinText == notice, rm.pinText);
 }
