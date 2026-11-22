@@ -2967,6 +2967,10 @@ int runMain(string[] args)
             if (fired is null) continue;
             stdErr.writeln(console.dim(notice));
             agent.automaticInput = true;
+            // The turn's message carries the notice it just printed, so
+            // replay restores it (as a mid-turn firing's message does).
+            agent.timerInput = true;
+            agent.timerInputNotice = notice;
             return "\x00" ~ fired;
         }
         return null;
@@ -3151,6 +3155,10 @@ int runMain(string[] args)
                 line = agent.takeFiredTimers(notice);
                 writeln(console.dim(notice));
                 agent.automaticInput = true;
+                // The turn's message carries the notice it just printed, so
+                // replay restores it (as a mid-turn firing's message does).
+                agent.timerInput = true;
+                agent.timerInputNotice = notice;
                 line = "\x00" ~ line;
             }
             else if (r.outcome == Outcome.stopped && idleNow())

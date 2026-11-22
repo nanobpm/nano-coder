@@ -548,6 +548,14 @@ class Agent
     /// Set before `run` when the input is harness-initiated (a fired timer);
     /// `run` consumes it.
     bool automaticInput;
+    /// Set alongside `automaticInput` when the harness-initiated input is a
+    /// fired timer's message (`takeFiredTimers`): the notice the firing
+    /// printed live. `run` consumes both and marks the message `timer` with
+    /// the notice in `pinText`, so replay restores the notice exactly like a
+    /// mid-turn firing (`fireDueTimers`) — an automatic input without them
+    /// replays as nothing, losing the visible notice.
+    bool timerInput;
+    string timerInputNotice;
     /// The genuine user requests folded by earlier compactions, so each
     /// compaction rebuilds the pinned block from originals (Rust's
     /// `pre_compaction_transcript`, trimmed to requests).
@@ -622,6 +630,11 @@ class Agent
         // A harness-initiated input (a fired timer): never pinned as a request.
         bool automatic = automaticInput;
         automaticInput = false;
+        // A fired timer's turn also carries the notice it printed live.
+        bool timer = timerInput;
+        string timerNotice = timerInputNotice;
+        timerInput = false;
+        timerInputNotice = null;
         if (givenId.length)
             if (auto done = givenId in completedInputs)
             {
@@ -648,7 +661,7 @@ class Agent
         turnHistoryCalls = 0;
         scope (exit) requestThinking = Option!string.init;
         string response;
-        try response = runTurn(input, ev, resetControl, automatic, inputId, resuming);
+        try response = runTurn(input, ev, resetControl, automatic, inputId, resuming, timer, timerNotice);
         catch (Exception e)
         {
             log.ifSome((SessionLog l) {
@@ -759,7 +772,7 @@ class Agent
         ~ "no trailing period.";
 
     private string runTurn(string input, AgentEvents ev, bool resetControl, bool automatic = false,
-        string inputId = null, bool resuming = false)
+        string inputId = null, bool resuming = false, bool timer = false, string timerNotice = null)
     {
         if (resetControl) control.startTurn();
         stopBlocks = 0;
@@ -855,6 +868,15 @@ class Agent
             auto um = Message.user(input);
             um.pinText = pinText;
             um.autoInitiated = automatic;
+            if (timer)
+            {
+                // A fired timer's turn: flag it like a mid-turn firing
+                // (`fireDueTimers`) and keep the notice it printed live in
+                // `pinText`, so replay restores the notice instead of
+                // hiding the whole message as a model-only automatic input.
+                um.timer = true;
+                um.pinText = timerNotice;
+            }
             hasPending = true;
             pending = PendingInput(inputId, typed, messages.length);
             push(um);
@@ -2936,6 +2958,27 @@ unittest
     agent.pinStash.assign([Message.user("old")]);
     agent.restart("sys", Option!SessionLog.init);
     assert(agent.pinStash.isEmpty);
+}
+
+// A fired timer delivered as a turn (the idle prompt or `--wait-timers`)
+// marks its message `timer` with the live notice in `pinText`, so replay
+// restores the notice instead of hiding the message as a model-only
+// automatic input. The flags are one-shot, like `automaticInput`.
+unittest
+{
+    import nano.providers.mock;
+    auto agent = new Agent(new MockClient([LLMResponse("ok"), LLMResponse("ok")]), new ToolRegistry, Policy.init, "sys");
+    agent.automaticInput = true;
+    agent.timerInput = true;
+    agent.timerInputNotice = "⏰ timer 1 fired: look again";
+    agent.run("timer fired text", new NullEvents);
+    auto tm = agent.messages[1];
+    assert(tm.autoInitiated && tm.timer, "a timer turn's message is flagged timer");
+    assert(tm.pinText == "⏰ timer 1 fired: look again", tm.pinText);
+    assert(!agent.timerInput && agent.timerInputNotice is null && !agent.automaticInput, "the flags are one-shot");
+    // The next turn is a plain one: no timer flag, no notice.
+    agent.run("plain", new NullEvents);
+    assert(!agent.messages[3].timer && agent.messages[3].pinText is null && !agent.messages[3].autoInitiated);
 }
 
 // Round-5 review fix for issue #205: replacing the agent's log closes the
