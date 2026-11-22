@@ -754,13 +754,24 @@ class Agent
             control.absorbed(s);
         }
         fireDueTimers(ev);
+        // Publish finished probes first: one can lower the window, which
+        // the threshold check below must see.
+        collectProbes();
         if (overThreshold())
         {
             CompactReport rep;
             compact(rep, CompactTrigger.threshold);
             if (control.isCancelled) return false;
         }
-        applyModelRequest();
+        // A switch (or a probe collected with it) can lower the window
+        // again: recheck before the request goes out.
+        if (applyModelRequest() || collectProbes())
+            if (overThreshold())
+            {
+                CompactReport rep;
+                compact(rep, CompactTrigger.threshold);
+                if (control.isCancelled) return false;
+            }
         if (auto level = control.takeThinkingRequest())
         {
             import nano.thinking : sessionSetting;
@@ -1445,6 +1456,14 @@ class Agent
             // call (callers reset the control for a manual run).
             applyModelRequest();
             if (control.isCancelled) return false;
+            // The switch, or a probe it collected, can change the window:
+            // size the summary for the model that will run it.
+            if (auto now = contextWindow())
+                if (now != window)
+                {
+                    window = now;
+                    budget = ctx.summaryOutputBudget(window, toLong(outputBase));
+                }
             auto inputWindow = saturatingSub(window, budget);
             auto chars = checkedMul(max(saturatingSub(inputWindow, 2_000), 2_000), 3);
             auto request = "Conversation to summarize:\n\n" ~ ctx.renderTranscript(summarized, chars, smart);
