@@ -78,6 +78,7 @@ static import nano.settings_dialog;
 static import nano.shell;
 static import nano.skills;
 static import nano.status;
+static import nano.subagent;
 static import nano.temperature;
 static import nano.thinking;
 static import nano.timers;
@@ -167,6 +168,7 @@ private alias modules = imported!"std.meta".AliasSeq!(
     nano.shell,
     nano.skills,
     nano.status,
+    nano.subagent,
     nano.temperature,
     nano.thinking,
     nano.timers,

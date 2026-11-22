@@ -32,6 +32,10 @@ struct Row
     string callId; // tool result's call id (null = none), or the call's id
     long toolDurationMs = -1;
     string arguments;
+    /// An `agent` result: the sub-agent's own log, and its rows (expanded
+    /// by `load` when the log is there).
+    string subLog;
+    Row[] sub;
     string compactMode;
     string compactModel;
     // Per-request metrics.
@@ -215,6 +219,12 @@ struct Trajectory
                 if (m !is null) head ~= "  " ~ m;
                 o ~= sanitizeTerminal(head);
                 foreach (l; splitNl(row.text)) o ~= sanitizeTerminal("      " ~ l);
+                if (row.subLog.length) o ~= sanitizeTerminal("      ↳ sub-agent log: " ~ row.subLog);
+                foreach (ref sr; row.sub)
+                {
+                    o ~= sanitizeTerminal(format("      │ %s %s", bullet(sr), sr.cited));
+                    foreach (l; splitNl(sr.text)) o ~= sanitizeTerminal("      │     " ~ l);
+                }
             }
             if (turn.response !is null)
             {
@@ -280,6 +290,13 @@ struct Trajectory
                 if (m !is null) o ~= "_" ~ m ~ "_";
                 auto text = trim(row.text);
                 if (text.length) o ~= ["", fence(sanitizeMarkdown(text))];
+                if (row.subLog.length) o ~= ["", "_Sub-agent log: `" ~ sanitizeMarkdown(row.subLog) ~ "`_"];
+                foreach (ref sr; row.sub)
+                {
+                    o ~= ["", "#### ↳ " ~ sanitizeMarkdown(sr.cited)];
+                    auto st = trim(sr.text);
+                    if (st.length) o ~= ["", fence(sanitizeMarkdown(st))];
+                }
             }
             if (turn.response !is null)
             {
@@ -343,7 +360,20 @@ Trajectory load(string path, string expectedId = null)
         lines ~= lineNo;
         raws ~= line;
     }
-    return Trajectory.fromRecords(records, lines, raws);
+    auto t = Trajectory.fromRecords(records, lines, raws);
+    // Sub-agents' logs (the `agent` tool) expand under their results.
+    import std.file : exists;
+    foreach (ref turn; t.turns)
+        foreach (ref row; turn.rows)
+        {
+            if (!row.subLog.length) continue;
+            // Session tidying may have compressed the child log since.
+            auto sub = row.subLog.exists ? row.subLog
+                : (row.subLog ~ ".gz").exists ? row.subLog ~ ".gz" : null;
+            if (sub !is null)
+                foreach (ref st; load(sub).turns) row.sub ~= st.rows;
+        }
+    return t;
 }
 
 private:
@@ -462,6 +492,7 @@ void appendMessageRows(ref Turn turn, const JSONValue m, ulong line, ref string 
                         text ~= Attachment.fromJSON(at).placeholder;
                     }
         r.text = text;
+        r.subLog = str(m, "sub_log", null);
         r.timestamp = ts;
         turn.rows ~= r;
     }
@@ -911,6 +942,13 @@ J rowJson(const ref Row r) pure
     if (r.temperature !is null) j.add("temperature", J.s(r.temperature));
     if (r.thinkingLevel !is null) j.add("thinking_level", J.s(r.thinkingLevel));
     if (r.timestamp !is null) j.add("timestamp", J.s(r.timestamp));
+    if (r.subLog.length)
+    {
+        j.add("sub_log", J.s(r.subLog));
+        J rs = J.arr;
+        foreach (ref sr; r.sub) rs.items ~= rowJson(sr);
+        j.add("sub_rows", rs);
+    }
     return j;
 }
 

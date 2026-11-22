@@ -489,6 +489,16 @@ The picker reads `.index.jsonl` in the session directory: one summary per sessio
 end of each turn. It is only a cache. A session that is missing from it, or whose log changed
 since it was indexed, is summarized from its log again, and deleting the file rebuilds it.
 
+**Sub-agents.** The `agent` tool hands a broad, read-only investigation (`task`) to a fresh agent
+with its own context window; only its report (with `file:line` citations and its turns, tokens and
+time) comes back. Several `agent` calls in one reply run in parallel, up to
+`subagent_max_concurrency`; a call that can change files (an edit, `bash`) between them is a barrier,
+so an `agent` call after it starts only once the change is made. A sub-agent has `read_file`, `grep` and `glob` (no shell, so it cannot change files); every call goes
+through this session's permission policy and hooks (a denied call is an error for the sub-agent, it
+never prompts), Esc/Ctrl-C stops it, and its usage counts toward the session's. Its log is written
+next to the session's (`<session>/sub-<call id>.jsonl`), referenced from the `agent` result, and
+expanded by `--trajectory`.
+
 **Titles.** With `session_titles = true`, once a session has a prompt that says something (not
 just "hi"), nano-coder asks the model for a title of at most six words in the background. It uses
 `title_model` (a cheap one is enough) or the session's model. The request is a few hundred tokens,
@@ -583,6 +593,12 @@ session_compress_after_days = 14        # gzip logs idle this long at startup (0
 # session_retention_days = 0           # delete logs untouched this long (0 = keep; named sessions are kept)
 session_titles = false                  # ask the model for a few-word title per session (--resume picker)
 # title_model = "openai/gpt-4o-mini"    # model for titles (default: the session's model)
+subagents = true                        # offer the `agent` tool: read-only sub-agents with their own context
+# subagent_model = "openai/gpt-4o-mini" # model for sub-agents (default: the session's; a call may name one)
+subagent_max_concurrency = 4            # sub-agents running at once (several `agent` calls in one reply)
+subagent_timeout_secs = 600             # per sub-agent caps; past one it reports what it has, marked truncated
+subagent_max_turns = 40
+subagent_max_tokens = 1000000
 auto_compact = true                     # summarize automatically when the context fills up
 auto_compact_threshold = 0.8            # fraction of the context window
 compaction_mode = "smart"               # smart | standard (see Smart compaction)

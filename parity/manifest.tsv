@@ -1357,7 +1357,7 @@ ui.rs::the_prompt_spins_during_a_turn_and_shows_ready_after	test
 ui.rs::the_transcript_cache_invalidates_when_items_change	na	D has no item model or wrapped-transcript cache: the frame thread re-wraps the byte transcript per render
 ui.rs::tool_args_text_keeps_malformed_arguments_verbatim	test
 ui.rs::tool_result_inherits_expansion_from_its_call	test
-ui.rs::trailing_thinking_merges_interleaved_reasoning_fragments	gap	D's append-only console closes the thinking block when the answer starts; reasoning interleaved after answer text opens a second block and splits the answer, where Rust's frame items merge them
+ui.rs::trailing_thinking_merges_interleaved_reasoning_fragments	test
 ui.rs::trailing_thinking_never_overwrites_previous_response_reasoning	test
 ui.rs::trailing_thinking_reconciles_truncated_streamed_reasoning	na	D's console accumulates every reasoning delta whatever the verbosity (verbosity only decides what is printed), so the streamed reasoning is never short of the final one
 ui.rs::transient_note_stays_out_of_the_transcript_and_clears_on_turn_end	na	D transient hints are the line editor hint, outside the transcript and cleared per read
