@@ -86,6 +86,11 @@ string unwrapReminder(string content) pure nothrow
     import std.string : startsWith, endsWith;
     enum pre = "<system-reminder>\n", post = "\n</system-reminder>";
     if (!content.startsWith(pre) || !content.endsWith(post)) return null;
+    // Both delimiters must fit without overlapping: a malformed wrapper like
+    // "<system-reminder>\n</system-reminder>" passes both checks yet shares
+    // the newline, and slicing [pre.length .. $ - post.length] would invert
+    // the bounds. Not a wrapper: fall back to the raw content.
+    if (content.length < pre.length + post.length) return null;
     return content[pre.length .. $ - post.length];
 }
 

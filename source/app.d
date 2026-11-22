@@ -1992,6 +1992,11 @@ unittest
     auto raw = Message.auto_("bare reason");
     raw.stopBlocked = true;
     assert(rejectionReason(raw) == "bare reason", "a flagged unwrapped message is not dropped");
+    // A malformed wrapper whose delimiters overlap at the newline passes both
+    // delimiter checks but cannot be sliced: the raw content is the reason.
+    auto malformed = Message.auto_("<system-reminder>\n</system-reminder>");
+    assert(rejectionReason(malformed) == "<system-reminder>\n</system-reminder>",
+        "an overlapping wrapper falls back to the raw reason");
 }
 
 bool rejectionAt(const Message[] msgs, size_t i) pure nothrow @nogc @safe
@@ -2071,6 +2076,11 @@ unittest
     assert(unwrapReminder("plain") is null);
     assert(unwrapReminder("<system-reminder>\nonly prefix") is null);
     assert(unwrapReminder("") is null);
+    // A malformed wrapper whose delimiters overlap at the newline is not a
+    // wrapper: slicing it would invert the bounds, so it falls back to raw.
+    assert(unwrapReminder("<system-reminder>\n</system-reminder>") is null);
+    // The empty wrapper is the shortest valid one.
+    assert(unwrapReminder("<system-reminder>\n\n</system-reminder>") == "");
 }
 
 string planText(Agent agent) pure
