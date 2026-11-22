@@ -223,3 +223,41 @@ unittest
     assert(agent.run("go", new NullEvents) == "done");
     assert(order == ["look", "look", "change", "look", "look"], order.to!string);
 }
+
+/// Returns at once, counting itself in `arrived`.
+JobResult quick(string argsJson, immutable(string)[] context)
+{
+    atomicOp!"+="(arrived, 1);
+    return JobResult("quick");
+}
+
+// A worker that finished before a cancel keeps its result, even though the
+// agent collects it only after the cancel.
+unittest
+{
+    import nano.clock : monoNow, since, sleepFor;
+    import core.time : msecs, seconds;
+    atomicStore(arrived, 0);
+    auto reg = new ToolRegistry;
+    Agent agent;
+    Concurrency fast;
+    fast.readOnly = true;
+    fast.offload = (JSONValue a) => Job(&quick, a.toString, null);
+    reg.register(def("fast"), (JSONValue a) => "sequential", fast);
+    // On the agent's thread: waits for the worker to finish, then cancels.
+    reg.register(def("stop"), (JSONValue a) {
+        auto start = monoNow;
+        while (atomicLoad(arrived) < 1 && since(start) < 10.seconds) sleepFor(1.msecs);
+        sleepFor(20.msecs);
+        agent.control.cancel();
+        return "stopped";
+    }, Concurrency(true));
+    auto mock = new MockClient([reply([call("a", "fast"), call("b", "stop")]), LLMResponse("never")]);
+    agent = new Agent(mock, reg, Policy.init, "sys");
+    assert(agent.run("go", new NullEvents) == cancelledResponse);
+    assert(results(agent) == [
+        `["a", "fast", "quick", "false"]`,
+        `["b", "stop", "stopped", "false"]`,
+    ], results(agent).to!string);
+}
+

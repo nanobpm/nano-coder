@@ -887,7 +887,7 @@ class Agent
     /// (`settle`, on this thread). grep/glob walk the tree with per-call
     /// `Ignores`/regexes and rebuild the Read-deny scan from rule text
     /// (`Rule.matches` keeps its compiled copy per thread). The history
-    /// tools read the session log, which is appended only after the run. The
+    /// tools are barriers (they read results logged by earlier calls). The
     /// spill directory, spill set and truncation are thread-local and used
     /// on this thread only (truncation happens after the run). Stats, the
     /// loop detector, memory recall and the frame UI are touched only here,
@@ -898,7 +898,10 @@ class Agent
         if (outcomeTool && name == outcomeToolName) return false;
         if (planTools && isPlanTool(name)) return name == "plan_show";
         if (timerTools && isTimerTool(name)) return name == "timer_list";
-        if (hist.isHistoryTool(name)) return historyEnabled;
+        // History tools are barriers: they must see the preceding calls'
+        // logged results, and history_read's spill bookkeeping is the
+        // agent thread's own.
+        if (hist.isHistoryTool(name)) return false;
         return tools.readOnly(name);
     }
 
@@ -917,20 +920,22 @@ class Agent
         typeof(recallTurnNotes) notesBefore;
     }
 
-    /// A history tool on a worker thread: the log path is its context. Its
-    /// errors read as they do on the agent's thread (the bare message).
-    private static JobResult historyJob(string argsJson, immutable(string)[] context)
+    /// What a worker hands back: the job's result, and whether the turn was
+    /// already cancelled when the job finished (decided on the worker, so a
+    /// result completed before a cancel keeps its result however late the
+    /// agent collects it).
+    private static struct WorkerDone
     {
-        auto args = parseJSON(argsJson);
-        try return JobResult(context[1] == hist.searchTool ? hist.search(context[0], args) : hist.read(context[0], args));
-        catch (hist.HistoryError e) return JobResult(e.msg, true);
+        JobResult result;
+        bool afterCancel;
     }
 
     /// A worker: run the job, then say which call finished.
-    private static JobResult worker(Job job, size_t index, Chan!size_t finished)
+    private static WorkerDone worker(Job job, size_t index, Chan!size_t finished)
     {
         scope (exit) finished.put(index);
-        return runJob(job);
+        auto res = runJob(job);
+        return WorkerDone(res, cancelRequested());
     }
 
     /// Run consecutive read-only calls concurrently (issue #222). In call
@@ -956,19 +961,20 @@ class Agent
         auto offloaded = new bool[n];
         auto finished = new bool[n];
         auto results = new JobResult[n];
+        // Calls never admitted because a cancel arrived first: no hooks,
+        // reported as interrupted.
+        auto skipped = new bool[n];
         foreach (k, ref call; calls)
         {
             ev.toolStart(call);
+            if (control.isCancelled)
+            {
+                skipped[k] = true;
+                continue;
+            }
             admitted[k] = admit(call, stopReason, runs[k].result, runs[k].effectiveArgs, contexts[k]);
             if (!admitted[k]) continue;
-            if (historyEnabled && hist.isHistoryTool(call.name))
-            {
-                auto logPath = log.unwrap("history tools are offered only with a session log").path;
-                turnHistoryCalls++;
-                jobs[k] = Job(&historyJob, runs[k].effectiveArgs.jsonText, [logPath, call.name]);
-                offloaded[k] = true;
-            }
-            else if (tools.has(call.name))
+            if (tools.has(call.name))
             {
                 auto mode = tools.concurrency(call.name);
                 // Packaging only copies text: the tool's own checks run in the job.
@@ -981,8 +987,20 @@ class Agent
         }
         // The workers, launched in call order while not cancelled.
         auto done = Chan!size_t.make;
-        auto handles = new Join!JobResult[n];
+        auto handles = new Join!WorkerDone[n];
         size_t next, running;
+        // Every started worker is joined on every exit path (a failed spawn
+        // or a throwing in-memory tool included), so none outlives the turn.
+        scope (failure)
+            while (running)
+            {
+                size_t k;
+                done.take(k);
+                // `runJob` turns a job's exception into a result, so this
+                // only waits.
+                handles[k].join();
+                running--;
+            }
         void launch()
         {
             for (; running < maxConcurrentTools && next < n && !control.isCancelled; next++)
@@ -1006,10 +1024,11 @@ class Agent
         {
             size_t k;
             done.take(k);
-            results[k] = handles[k].join();
+            auto w = handles[k].join();
             running--;
+            results[k] = w.result;
             // Finished after a cancellation: reported as interrupted.
-            finished[k] = !control.isCancelled;
+            finished[k] = !w.afterCancel;
             launch();
         }
         foreach (k, ref call; calls)
@@ -1018,6 +1037,7 @@ class Agent
             c.recallBefore = recallState.dup;
             c.notesBefore = recallTurnNotes;
             if (loopStop !is null) c.result = loopStoppedToolResult;
+            else if (skipped[k]) c.result = cancelledToolResult;
             else if (!admitted[k]) c.ran = true;
             else if (!finished[k]) c.result = cancelledToolResult;
             else
