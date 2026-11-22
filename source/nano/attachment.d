@@ -448,7 +448,7 @@ string[][] sipsCommands(uint orientation, ImageFormat codec, uint maxSide, strin
     // sips doesn't promise the order of -r and -f within one call, and the
     // mirrored orientations need the rotation first: give each its own call.
     if (rotate.length && flip.length)
-        return [["/usr/bin/sips"] ~ rotate ~ ["-s", "format", "png", input, "--out", mid],
+        return [["/usr/bin/sips"] ~ rotate ~ ["-s", "format", "png", "-Z", format("%s", maxSide), input, "--out", mid],
             ["/usr/bin/sips"] ~ flip ~ encode ~ [mid, "--out", output]];
     return [["/usr/bin/sips"] ~ rotate ~ flip ~ encode ~ [input, "--out", output]];
 }
@@ -845,6 +845,8 @@ unittest
     auto t = sipsCommands(7, ImageFormat.png, 8, "i", "m", "o");
     assert(t.length == 2 && t[0][1 .. 3] == ["-r", "270"] && t[0][$ - 1] == "m"
         && t[1][1 .. 3] == ["-f", "horizontal"] && t[1][$ - 3] == "m");
+    // The intermediate is already bounded, so a big photo isn't flipped at full size.
+    assert(t[0][3 .. 9] == ["-s", "format", "png", "-Z", "8", "i"]);
 }
 
 // An encoder's copied orientation is cleared once its pixels are upright.
@@ -884,7 +886,8 @@ version (OSX) unittest
     import std.process : execute, thisProcessID;
     if (!exists_("/usr/bin/sips")) return;
     auto root = __FILE_FULL_PATH__.dirName.dirName.dirName;
-    ImageLimits lim = {acceptedMediaTypes: ["image/png"], maxDimension: 16};
+    ImageLimits pngLim = {acceptedMediaTypes: ["image/png"], maxDimension: 16};
+    ImageLimits jpegLim = {acceptedMediaTypes: ["image/jpeg"], maxDimension: 16};
     // The colour at (x, y) of a 24/32-bit BMP: rows of BGR(A), bottom-up
     // unless the height is negative.
     string colour(const(ubyte)[] bmp, uint x, uint y)
@@ -897,6 +900,10 @@ version (OSX) unittest
         auto b = bmp[p] > 128, g = bmp[p + 1] > 128, r = bmp[p + 2] > 128;
         return r && g && b ? "white" : r ? "red" : g ? "green" : b ? "blue" : "black";
     }
+    foreach (lim; [pngLim, jpegLim])
+    {
+    auto codec = lim.acceptedMediaTypes[0] == "image/png" ? ImageFormat.png : ImageFormat.jpeg;
+    auto ext = codec == ImageFormat.png ? ".png" : ".jpg";
     foreach (o, want; [5: ["red", "green", "blue", "white"], 6: ["green", "red", "white", "blue"],
             8: ["blue", "white", "red", "green"]])
     {
@@ -904,16 +911,19 @@ version (OSX) unittest
         assert(exifOrientation(src, ImageFormat.jpeg) == o);
         auto p = prepare(src, ImageFormat.jpeg, lim);
         // Upright: 8×16, and the stored pixels, not just a tag, are turned.
-        assert(p.mediaType == "image/png" && p.width == 8 && p.height == 16, format("%s: %s", o, p));
+        assert(p.mediaType == lim.acceptedMediaTypes[0] && p.width == 8 && p.height == 16, format("%s: %s", o, p));
         assert(dimensions(p.bytes) == [8, 16]);
-        assert(clearOrientation(p.bytes, ImageFormat.png) == p.bytes, "the result still carries orientation metadata");
+        // EXIF orientation is 1 and no XMP (or PNG eXIf) remains to re-rotate it.
+        assert(exifOrientation(p.bytes, codec) == 1);
+        assert(clearOrientation(p.bytes, codec) == p.bytes, "the result still carries orientation metadata");
         auto stem = buildPath(tempDir, format("nano-att-orient-%s-%s", thisProcessID, o));
-        scope (exit) foreach (f; [stem ~ ".png", stem ~ ".bmp"]) if (exists_(f)) remove(f);
-        write(stem ~ ".png", p.bytes);
-        auto r = execute(["/usr/bin/sips", "-s", "format", "bmp", stem ~ ".png", "--out", stem ~ ".bmp"]);
+        scope (exit) foreach (f; [stem ~ ext, stem ~ ".bmp"]) if (exists_(f)) remove(f);
+        write(stem ~ ext, p.bytes);
+        auto r = execute(["/usr/bin/sips", "-s", "format", "bmp", stem ~ ext, "--out", stem ~ ".bmp"]);
         assert(r.status == 0, r.output);
         auto bmp = readBytes(stem ~ ".bmp");
         assert([colour(bmp, 1, 1), colour(bmp, 6, 1), colour(bmp, 1, 14), colour(bmp, 6, 14)] == want,
-            format("orientation %s: %s", o, [colour(bmp, 1, 1), colour(bmp, 6, 1), colour(bmp, 1, 14), colour(bmp, 6, 14)]));
+            format("%s orientation %s: %s", ext, o, [colour(bmp, 1, 1), colour(bmp, 6, 1), colour(bmp, 1, 14), colour(bmp, 6, 14)]));
+    }
     }
 }
