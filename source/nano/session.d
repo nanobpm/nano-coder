@@ -931,25 +931,38 @@ unittest // escaped_type_decodes_before_comparison
     assert(skimType(`{"type":3}`) is null);
 }
 
-/// Whether `raw` is a JSON integer that `std.json` reads as `JSONType.integer`
-/// (fits a long), and its value.
-private bool rawLong(const(char)[] raw, out long v) pure nothrow @nogc
+/// Whether `raw` is a JSON integer `jsonUnsigned` accepts (no leading `-`,
+/// fits a ulong), and its value. The skim scan must read numbers exactly as
+/// `restore`'s full decode does: a signed read would keep a `-1` floor or
+/// pending position the full decode drops, and drop a `uinteger` above
+/// `long.max` the full decode keeps (issue #240).
+private bool rawUnsigned(const(char)[] raw, out ulong v) pure nothrow @nogc
 {
     import std.ascii : isDigit;
-    size_t i;
-    bool neg = raw.length && raw[0] == '-';
-    if (neg) i = 1;
-    if (i >= raw.length) return false;
-    long acc;
-    for (; i < raw.length; ++i)
+    if (!raw.length || raw[0] == '-') return false;
+    ulong acc;
+    foreach (c; raw)
     {
-        if (!raw[i].isDigit) return false;
-        immutable int d = raw[i] - '0';
-        if (neg ? acc < (long.min + d) / 10 : acc > (long.max - d) / 10) return false;
-        acc = neg ? acc * 10 - d : acc * 10 + d;
+        if (!c.isDigit) return false;
+        immutable uint d = c - '0';
+        if (acc > (ulong.max - d) / 10) return false;
+        acc = acc * 10 + d;
     }
     v = acc;
     return true;
+}
+
+unittest
+{
+    ulong v;
+    assert(rawUnsigned("0", v) && v == 0);
+    assert(rawUnsigned("42", v) && v == 42);
+    assert(rawUnsigned("18446744073709551615", v) && v == ulong.max);
+    assert(!rawUnsigned("-1", v));
+    assert(!rawUnsigned("18446744073709551616", v)); // above ulong.max
+    assert(!rawUnsigned("1.5", v));
+    assert(!rawUnsigned("", v));
+    assert(!rawUnsigned("-", v));
 }
 
 /// Call `dg` with the raw text of each element of the raw JSON array `arr`.
@@ -1044,11 +1057,13 @@ private ulong lastFullReplace(string path, out ulong floor)
             if ((k == "folded_base" || k == "pinned_base") && v != "null") delta = true;
             else if (k == "summarized")
             {
-                // `[first, last]`: the second element, as `restore` reads it.
+                // `[first, last]`: the second element, as `restore` reads it
+                // (unsigned: a `-1` or a `uinteger` above long.max must land
+                // exactly where the full decode lands).
                 const(char)[][] parts;
                 skimArray(v, (e) { parts ~= e; });
-                long last;
-                if (parts.length == 2 && rawLong(parts[1], last)) fl = last;
+                ulong last;
+                if (parts.length == 2 && rawUnsigned(parts[1], last)) fl = last;
             }
             return true;
         });
@@ -1119,8 +1134,8 @@ private Restored restoreLog(string path, bool skipSuperseded)
                 auto data = skimField(line, "data");
                 skimmedLen = skimCount(skimField(data, "messages"));
                 auto posRaw = skimField(data, "pending_position");
-                long posVal;
-                immutable posInt = rawLong(posRaw, posVal);
+                ulong posVal;
+                immutable posInt = rawUnsigned(posRaw, posVal);
                 if (!(r.hasPending && posInt))
                 {
                     r.hasPending = false;
@@ -2621,4 +2636,73 @@ unittest // escaped_type_delta_lowers_the_skim_floor (issue #244)
     write(path, log);
     auto skimmed = restoreLog(path, true), fullR = restoreLog(path, false);
     assert(skimmed == fullR, "an escaped-type delta still lowers the skim floor");
+}
+
+unittest // skim_floor_reads_summarized_unsigned (issue #244)
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, write;
+    import std.path : buildPath;
+    auto dir = buildPath(tempDir, "nano-d-skimflooru-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    static JSONValue rec(Message m) { return messageRecord(m); }
+    string line(string type, JSONValue data) { return JSONValue(["type": JSONValue(type), "data": data]).toString ~ "\n"; }
+    // A full replace whose `summarized` end is signed-hostile: `-1` (which
+    // the full decode's jsonUnsigned rejects, leaving the floor at 0) and a
+    // uinteger above long.max (which a signed skim read rejects but the full
+    // decode accepts). The skimmed restore must land where the full one does.
+    foreach (i, end; [`-1`, `18446744073709551615`])
+    {
+        immutable id = "skimflooru" ~ i.to!string;
+        auto log = `{"type":"session","data":{"version":1,"id":"` ~ id ~ `","created_at":"x"}}` ~ "\n";
+        auto early = Message.user("early question");
+        log ~= line("input", JSONValue(["id": "in-0", "text": "early question"]));
+        log ~= line("message", rec(early));
+        log ~= line("message", rec(Message.assistant("early answer")));
+        JSONValue full = ["messages": JSONValue([rec(Message.user("summary"))])];
+        full["folded"] = JSONValue([rec(early)]);
+        auto rl = line("replace", full);
+        // Splice the raw summarized end in unquoted, past std.json's tagging.
+        import std.array : replace;
+        rl = rl.replace(`"summarized":`, `"summarized":[2,` ~ end ~ `],"x":`);
+        log ~= rl;
+        auto path = buildPath(dir, id ~ ".jsonl");
+        write(path, log);
+        auto skimmed = restoreLog(path, true), fullR = restoreLog(path, false);
+        assert(skimmed == fullR, "a signed-hostile summarized end (" ~ end ~ ") skims like the full decode");
+    }
+}
+
+unittest // skim_pending_position_reads_unsigned (issue #244)
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, write;
+    import std.path : buildPath;
+    auto dir = buildPath(tempDir, "nano-d-skimposu-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    static JSONValue rec(Message m) { return messageRecord(m); }
+    string line(string type, JSONValue data) { return JSONValue(["type": JSONValue(type), "data": data]).toString ~ "\n"; }
+    // An in-flight input, then a full replace, then a superseded delta whose
+    // `pending_position` is signed-hostile: `-1` (full decode drops the
+    // pending input) and a uinteger above long.max (full decode keeps it).
+    foreach (i, pos; [`-1`, `18446744073709551615`])
+    {
+        immutable id = "skimposu" ~ i.to!string;
+        auto log = `{"type":"session","data":{"version":1,"id":"` ~ id ~ `","created_at":"x"}}` ~ "\n";
+        log ~= line("input", JSONValue(["id": "in-0", "text": "crash here"]));
+        JSONValue full = ["messages": JSONValue([rec(Message.user("summary"))])];
+        full["folded"] = JSONValue(cast(JSONValue[]) []);
+        log ~= line("replace", full);
+        JSONValue delta = ["messages": JSONValue([rec(Message.user("summary 2"))])];
+        delta["folded"] = JSONValue(cast(JSONValue[]) []);
+        delta["folded_base"] = 1;
+        auto dl = line("replace", delta);
+        import std.array : replace;
+        dl = dl.replace(`"folded_base":1`, `"folded_base":1,"pending_position":` ~ pos);
+        log ~= dl;
+        auto path = buildPath(dir, id ~ ".jsonl");
+        write(path, log);
+        auto skimmed = restoreLog(path, true), fullR = restoreLog(path, false);
+        assert(skimmed == fullR, "a signed-hostile pending_position (" ~ pos ~ ") skims like the full decode");
+    }
 }
