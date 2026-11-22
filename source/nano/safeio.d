@@ -1076,7 +1076,10 @@ unittest
 
 /// Create a fresh temp file beside `base` in `dir` holding `content`, opened
 /// exclusively (`O_CREAT | O_EXCL`, which never follows a symlink) under an
-/// unpredictable name, retrying on a collision. Returns its path.
+/// unpredictable name, retrying on a collision. Returns its path. The file is
+/// private (0600) while being written: the caller restores the target's
+/// permissions before publishing it with a rename. The name is bounded so a
+/// long `base` can't push it past the filesystem's component limit.
 string writeTemp(string dir, string base, const(ubyte)[] content) @trusted
 {
     import core.sys.posix.fcntl : open, O_WRONLY, O_CREAT, O_EXCL, O_NOFOLLOW;
@@ -1089,10 +1092,14 @@ string writeTemp(string dir, string base, const(ubyte)[] content) @trusted
     import std.conv : octal;
     import std.random : uniform;
     import std.string : toStringz;
+    // A 255-byte component limit is common; the suffix needs a dot, the PID
+    // and 16 hex digits, so cap the basename to keep the whole name under it.
+    enum maxBase = 240 - 20 - 10;
+    if (base.length > maxBase) base = base[$ - maxBase .. $];
     foreach (_; 0 .. 100)
     {
         auto tmp = buildPath(dir, format(".%s.tmp-%s-%016x", base, thisProcessID, uniform!ulong));
-        auto fd = open(tmp.toStringz, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, octal!666);
+        auto fd = open(tmp.toStringz, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, octal!600);
         if (fd < 0)
         {
             if (errno == EEXIST) continue;

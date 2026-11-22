@@ -977,12 +977,18 @@ private string applyHunk(string text, const PatchHunk h, size_t n, ref string[] 
         throw fail(format("marked `*** End of File` but matches at line %s, not at the end of the file", lineAt(text, r[0])));
     if (found.how.length) notes ~= format("%s: %s matched %s", display, where, found.how);
     endAt = r[1];
-    // The tail was deleted when the hunk ends in removed lines and adds
-    // nothing after its leading context.
+    // Whether the file's last line is still followed by a line of the hunk
+    // (context or added), rather than removed — tracked from the hunk's
+    // operations, never inferred from the resulting text: an unchanged last
+    // line would otherwise be mistaken for a retained tail. The tail is kept
+    // when the hunk's last operation leaves a line after the replaced region:
+    // trailing context, or an addition after the last removal.
     size_t pre;
     while (pre < h.old_.length && pre < h.new_.length && h.old_[pre] == h.new_[pre]) pre++;
-    bool tailKept = h.old_.length && h.new_.length && h.old_[$ - 1] == h.new_[$ - 1];
-    newTail = tailKept || h.new_.length > pre;
+    size_t suf;
+    while (suf < h.old_.length - pre && suf < h.new_.length - pre
+            && h.old_[$ - 1 - suf] == h.new_[$ - 1 - suf]) suf++;
+    newTail = suf > 0 || h.new_.length - pre >= h.old_.length - pre - suf;
     return text[0 .. r[0]] ~ found.news[0] ~ text[r[1] .. $];
 }
 
@@ -1015,11 +1021,14 @@ string unifiedDiff(string from, string to, string a, string b) pure
 {
     // A final line with no newline compares unequal to the same text with
     // one: it carries a `\n` (which no line contains) and is printed with
-    // the standard `\ No newline at end of file` marker.
+    // the standard `\ No newline at end of file` marker. Carriage returns
+    // stay on their lines: a CRLF line and its LF twin differ, and the diff
+    // keeps the endings each side had.
     enum noEol = "\n";
     string[] keyed(string s)
     {
-        auto ls = textLines(s);
+        auto ls = s.split("\n");
+        if (ls.length && ls[$ - 1].length == 0) ls = ls[0 .. $ - 1];
         if (ls.length && !s.endsWith("\n")) ls[$ - 1] = ls[$ - 1] ~ noEol;
         return ls;
     }
@@ -1101,6 +1110,7 @@ private struct Staged
     bool changed;
     string after; /// the content after the patch, when present and changed
     size_t movedFrom = size_t.max; /// index of the move's source (max: none)
+    size_t origin = size_t.max; /// the chain's original source index (max: this entry)
     uint mode; /// permission bits to write with (from disk, or the move's source)
     bool hasMode; /// whether `mode` is known
     uint origMode; /// the path's own permission bits before the patch, for rollback
@@ -1198,6 +1208,7 @@ private void commitStaged(Staged[] staged, ReadState state)
         }
     size_t done;
     string[] madeDirs; /// directories this commit created, to remove on rollback
+    string[] unrolled; /// paths whose rollback failed, reported with the error
     scope (failure)
     {
         // Undo writes first, then remove the directories they needed, and only
@@ -1208,7 +1219,8 @@ private void commitStaged(Staged[] staged, ReadState state)
             {
                 if (!s.changed || s.present != writes) continue;
                 try rollBack(s);
-                catch (FileException) {} // rollback is best effort: the error that triggered it is reported
+                catch (FileException e)
+                    unrolled ~= format("%s (%s)", s.display, e.msg);
             }
         }
         undo(true);
@@ -1219,24 +1231,32 @@ private void commitStaged(Staged[] staged, ReadState state)
         }
         undo(false);
     }
-    enum undone = " (earlier changes were rolled back)";
+    string undone()
+    {
+        // Claim a rollback only when restoration actually succeeded.
+        return unrolled.length
+            ? format("; ROLLBACK FAILED for %s; the tree is partially modified", unrolled.join(", "))
+            : " (earlier changes were rolled back)";
+    }
     foreach (i, ref s; staged)
     {
         scope (success) done = i + 1;
         if (!s.changed) continue;
         if (!s.present && !s.existed) continue;
         try checkUnchanged(s);
-        catch (ToolError e) throw new ToolError(e.msg ~ undone);
+        catch (ToolError e) throw new ToolError(e.msg ~ undone());
         if (!s.present)
         {
             try remove(s.path);
-            catch (FileException e) throw new ToolError(format("apply_patch: delete %s: %s%s", s.display, e.msg, undone));
+            catch (FileException e) throw new ToolError(format("apply_patch: delete %s: %s%s", s.display, e.msg, undone()));
             continue;
         }
-        auto path = writeTarget(s.path);
+        // A deleted-then-recreated symlink is replaced, not followed: the
+        // entry the patch deleted is gone, so the rename lands on its path.
+        auto path = s.wasLink ? s.path : writeTarget(s.path);
         for (auto d = path.dirName; !linkPresent(d) && d != d.dirName; d = d.dirName) madeDirs ~= d;
         try mkdirRecurse(path.dirName);
-        catch (FileException e) throw new ToolError(format("apply_patch: create %s: %s%s", path.dirName, e.msg, undone));
+        catch (FileException e) throw new ToolError(format("apply_patch: create %s: %s%s", path.dirName, e.msg, undone()));
         string tmp;
         try
         {
@@ -1251,12 +1271,12 @@ private void commitStaged(Staged[] staged, ReadState state)
         catch (ToolError e)
         {
             dropTemp(tmp);
-            throw new ToolError(e.msg ~ undone);
+            throw new ToolError(e.msg ~ undone());
         }
         catch (FileException e)
         {
             dropTemp(tmp);
-            throw new ToolError(format("apply_patch: write %s: %s%s", s.display, e.msg, undone));
+            throw new ToolError(format("apply_patch: write %s: %s%s", s.display, e.msg, undone()));
         }
     }
     foreach (ref s; staged)
@@ -1365,6 +1385,9 @@ string applyPatch(JSONValue args, ReadState state)
             staged[d].present = staged[d].changed = true;
             staged[d].after = updated;
             staged[d].movedFrom = k;
+            // Provenance follows the chain: a move of a move still diffs and
+            // reports against the original source, not the intermediate name.
+            staged[d].origin = staged[k].origin != size_t.max ? staged[k].origin : k;
             staged[d].mode = staged[k].mode;
             staged[d].hasMode = staged[k].hasMode;
             if (rawMove)
@@ -1392,9 +1415,10 @@ string applyPatch(JSONValue args, ReadState state)
             owner[key] = k;
         }
     }
-    // The summary and diff. A move shows as one rename of its source.
+    // The summary and diff. A move shows as one rename of its original
+    // source, even across a chain of moves.
     auto movedAway = new bool[staged.length];
-    foreach (ref s; staged) if (s.present && s.movedFrom != size_t.max) movedAway[s.movedFrom] = true;
+    foreach (ref s; staged) if (s.present && s.origin != size_t.max) movedAway[s.origin] = true;
     string summary, diff;
     size_t changedFiles;
     foreach (k, ref s; staged)
@@ -1406,7 +1430,8 @@ string applyPatch(JSONValue args, ReadState state)
         changedFiles++;
         if (s.present && s.movedFrom != size_t.max)
         {
-            auto src = staged[s.movedFrom].display;
+            auto o = s.origin != size_t.max ? s.origin : s.movedFrom;
+            auto src = staged[o].display;
             summary ~= format("  R %s -> %s\n", src, s.display);
             if (s.binary)
             {
@@ -1414,7 +1439,7 @@ string applyPatch(JSONValue args, ReadState state)
                 continue;
             }
             string before;
-            if (staged[s.movedFrom].existed && !originalText(s.movedFrom, before))
+            if (staged[o].existed && !originalText(o, before))
             {
                 diff ~= format("--- a/%s\n+++ b/%s\n(binary; renamed and replaced)\n", src, s.display);
                 continue;
@@ -1534,7 +1559,12 @@ version (unittest)
 
     private bool tempPresent(string path)
     {
-        auto prefix = "." ~ path.baseName ~ ".tmp-";
+        // A long basename is truncated in the temp name (see writeTemp), so
+        // match the truncated prefix too.
+        auto base = path.baseName;
+        enum maxBase = 240 - 20 - 10;
+        if (base.length > maxBase) base = base[$ - maxBase .. $];
+        auto prefix = "." ~ base ~ ".tmp-";
         foreach (e; dirEntries(path.dirName, SpanMode.shallow))
             if (e.name.baseName.startsWith(prefix)) return true;
         return false;
@@ -2296,4 +2326,45 @@ unittest // review round 4: final-newline state in diffs, identical move destina
     out_ = applyPatch(j("patch", pt("*** Delete File: " ~ bin, "*** Add File: " ~ bin, "+text")), st);
     assert(out_.indexOf("(binary; replaced)") >= 0 && readText(bin) == "text\n", out_);
     remove(n); remove(b); remove(bin);
+}
+
+unittest // review round 6: private bounded temp files, EOF newline state, CRLF diffs, symlink replacement, move chains
+{
+    import std.array : replicate;
+    auto st = new ReadState;
+    // A long target basename still yields a temp name under the component limit.
+    auto longName = tmpFile("p-" ~ "x".replicate(235) ~ ".txt", "v1\n");
+    applyPatch(j("patch", pt("*** Update File: " ~ longName, "@@", "-v1", "+v2")), st);
+    assert(readText(longName) == "v2\n" && !tempPresent(longName));
+    // Deleting an unterminated tail keeps the previous line's terminator, even
+    // when its text equals the deleted line's.
+    auto t1 = tmpFile("p-eof1.txt", "x\nx");
+    applyPatch(j("patch", pt("*** Update File: " ~ t1, "@@", " x", "-x")), st);
+    assert(readText(t1) == "x\n", readText(t1));
+    auto t2 = tmpFile("p-eof2.txt", "a\nb");
+    applyPatch(j("patch", pt("*** Update File: " ~ t2, "@@", "-a", "+A", "-b")), st);
+    assert(readText(t2) == "A\n", readText(t2));
+    // CRLF vs LF lines differ, and a replacement keeps each side's endings.
+    auto d = unifiedDiff("a", "b", "x\r\n", "x\n");
+    assert(d == "--- a\n+++ b\n@@ -1,1 +1,1 @@\n-x\r\n+x\n", d);
+    auto cr = tmpFile("p-crlf-diff.txt", "x\r\ny\r\n");
+    auto out_ = applyPatch(j("patch", pt("*** Update File: " ~ cr, "@@", "-x", "+X")), st);
+    assert(out_.indexOf("-x\r\n+X\r\n") >= 0, out_);
+    assert(readText(cr) == "X\r\ny\r\n");
+    // Deleting a symlink and adding a file at its path replaces the link.
+    auto tgt = tmpFile("p-lk-real.txt", "real\n");
+    auto lk = tmpFile("p-lk.txt", null);
+    if (isLink(lk) || lk.exists) remove(lk);
+    symlink(tgt, lk);
+    out_ = applyPatch(j("patch", pt("*** Delete File: " ~ lk, "*** Add File: " ~ lk, "+new")), st);
+    assert(!isLink(lk) && readText(lk) == "new\n" && readText(tgt) == "real\n", out_);
+    // A move chain reports and diffs against the original source.
+    auto ma = tmpFile("p-chain-a.txt", "one\ntwo\n");
+    auto mb = tmpFile("p-chain-b.txt", null);
+    auto mc = tmpFile("p-chain-c.txt", null);
+    out_ = applyPatch(j("patch", pt("*** Move File: " ~ ma ~ " -> " ~ mb, "*** Move File: " ~ mb ~ " -> " ~ mc)), st);
+    assert(out_.indexOf(" R " ~ ma ~ " -> " ~ mc) >= 0 && out_.indexOf(" D ") < 0, out_);
+    assert(out_.indexOf("--- a/" ~ ma ~ "\n+++ b/" ~ mc ~ "\n") >= 0, out_);
+    assert(!ma.exists && !mb.exists && readText(mc) == "one\ntwo\n");
+    remove(longName); remove(t1); remove(t2); remove(cr); remove(tgt); remove(lk); remove(mc);
 }
