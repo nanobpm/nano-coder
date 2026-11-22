@@ -991,7 +991,12 @@ struct Transcript
         foreach (ref f; folds) any |= f.expanded;
         if (!any) return false;
         string[] nextLines;
-        nextLines.reserve(lines.length);
+        // Reserve the collapsed size, not `lines.length`: the new array is
+        // kept, so an expanded-sized reservation would outlive the collapse.
+        size_t total = lines.length;
+        foreach (ref f; folds)
+            if (f.expanded) total = total - f.length + f.collapsed.length;
+        nextLines.reserve(total);
         size_t at; // old index the next segment starts at
         foreach (ref f; folds)
         {
