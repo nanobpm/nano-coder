@@ -55,7 +55,7 @@ import nano.control : TurnControl, FdLineReader;
 import nano.instructions : ProjectInstructions, InstructionOptions = Options, expandHome;
 import core.atomic : atomicLoad, atomicStore, cas;
 
-enum string packageVersion = "1.6.5";
+enum string packageVersion = "1.6.6";
 enum string versionString = "nano-coder " ~ packageVersion;
 
 enum string usage = `Usage: nano-coder [--model provider/model] [--config PATH] [-p PROMPT]
@@ -1853,6 +1853,13 @@ unittest
 void replayTranscript(Agent agent, Console console)
 {
     auto msgs = agent.replayMessages;
+    // Hold the frame while the history is written: each line would otherwise
+    // render its own synchronized frame, and a real terminal shows the whole
+    // conversation scrolling past. Released last (scope exits run in
+    // reverse), so the replay and the status bar appear in one frame.
+    auto frame = gFrame;
+    if (frame) frame.hold(true);
+    scope (exit) if (frame) frame.hold(false);
     // Each toolEnd would refresh the view (a token estimate over the whole
     // conversation): quadratic on long sessions, so refresh once at the end.
     auto after = console.afterStep;
@@ -2913,7 +2920,7 @@ int runMain(string[] args)
             "nano-coder v" ~ packageVersion,
             format("Model: %s (provider: %s)", client.modelName, client.providerName),
         ];
-        agent.log.ifSome((SessionLog l) { banner ~= format("Session: %s (resume with --resume %s)", l.id, l.id); });
+        agent.log.ifSome((SessionLog l) { banner ~= format("Session: %s (resume with nano-coder --resume %s)", l.id, l.id); });
         foreach (pi; instructions)
         {
             foreach (f; pi.loadedPaths) banner ~= "Instructions: " ~ f;
@@ -2949,7 +2956,7 @@ int runMain(string[] args)
     void goodbye()
     {
         writeln("\nGoodbye!");
-        agent.log.ifSome((SessionLog l) { writefln("Session: %s (resume with --resume %s)", l.id, l.id); });
+        agent.log.ifSome((SessionLog l) { writefln("Session: %s (resume with nano-coder --resume %s)", l.id, l.id); });
         stdOut.flush();
     }
     for (;;)
@@ -3137,7 +3144,7 @@ int runMain(string[] args)
                     agent.useHooks(loadHooks(cwd), false);
                     if (gFrame) gFrame.clear();
                     refreshStatus();
-                    log.match!(l => writefln("Session: %s (resume with --resume %s)", l.id, l.id),
+                    log.match!(l => writefln("Session: %s (resume with nano-coder --resume %s)", l.id, l.id),
                         () => writefln("Session: %s", newSessionId()));
                     continue;
                 }
@@ -3161,7 +3168,7 @@ int runMain(string[] args)
                     auto exe = launchExe();
                     // Printed after the frame hands the terminal back, so it stays on screen.
                     if (gFrame) gFrame.suspend();
-                    writefln("\nRelaunching into session %s (resume later with --resume %s)", id, id);
+                    writefln("\nRelaunching into session %s (resume later with nano-coder --resume %s)", id, id);
                     stdOut.flush();
                     leaveKeyMode();
                     nano.herdr.release();
@@ -3299,7 +3306,7 @@ int runMain(string[] args)
                     if (gFrame) { gFrame.clear(); replayTranscript(agent, console); }
                     foreach (n; loadNotes) stdErr.writeln(n);
                     stdErr.flush();
-                    writefln("Resumed session %s (resume later with --resume %s)", id, id);
+                    writefln("Resumed session %s (resume later with nano-coder --resume %s)", id, id);
                     continue;
                 }
                 case "/trajectory":

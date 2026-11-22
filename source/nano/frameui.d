@@ -32,7 +32,8 @@ private struct Close { Chan!(immutable(string)[]) lines; }
 private struct Busy { bool on; }
 private struct WorkPause { bool paused; }
 private struct Toggle {}
-private alias Request = SumType!(Draw, Commit, Redraw, Clear, Suspend, Resume, Close, Busy, WorkPause, Toggle);
+private struct Hold { bool on; Chan!bool done; }
+private alias Request = SumType!(Draw, Commit, Redraw, Clear, Suspend, Resume, Close, Busy, WorkPause, Toggle, Hold);
 
 /// The frame renderer, as seen from other threads: a sendable handle to the
 /// thread that owns the transcript and the renderer (an actor). Copies
@@ -154,6 +155,18 @@ struct FrameUi
     /// Ctrl-O: expands or collapses the latest fold (`foldMark`).
     void toggleExpand() { send(Request(Toggle())); }
 
+    /// Holds (`true`) or releases (`false`) rendering: while held, output
+    /// still collects in the transcript but nothing reaches the terminal;
+    /// the release reads what is waiting and renders it in one frame. A
+    /// bulk write (the resume replay) then appears at once instead of
+    /// visibly scrolling past frame by frame.
+    void hold(bool on)
+    {
+        stdOut.flush();
+        stdErr.flush();
+        sendWait((Chan!bool d) => Request(Hold(on, d)));
+    }
+
     /// Empties the transcript (`/restart`).
     void clear()
     {
@@ -195,6 +208,13 @@ private void frameThread(Isolated!FrameState state, Chan!Request requests)
                     return false;
                 },
                 (Redraw _) { f.render(); return false; },
+                (Hold h) {
+                    f.drain();
+                    f.held = h.on;
+                    if (!h.on) f.render();
+                    h.done.put(true);
+                    return false;
+                },
                 (Toggle _) {
                     f.drain();
                     if (f.transcript.toggleLatest()) f.render();
@@ -261,6 +281,8 @@ private final class FrameState
     immutable(string)[] editorRows;
     NotNull!FrameRenderer renderer;
     bool paused;
+    /// Rendering held for a bulk write (`FrameUi.hold`).
+    bool held;
     size_t lastW, lastH;
     Debouncer debounce = Debouncer(150);
 
@@ -273,7 +295,7 @@ private final class FrameState
 
     void render()
     {
-        if (paused) return;
+        if (paused || held) return;
         auto w = terminalWidth(tty), h = terminalHeight(tty);
         lastW = w;
         lastH = h;
@@ -319,4 +341,21 @@ private final class FrameState
         // even when no output arrives.
         else if (busy && nowMs() - lastRenderMs >= spinnerIntervalMs) render();
     }
+}
+
+unittest
+{
+    // A held frame renders nothing; the release draws the collected output once.
+    string[] outs;
+    auto f = new FrameState(new FrameRenderer((string s) { outs ~= s; }));
+    f.held = true;
+    foreach (i; 0 .. 50)
+    {
+        f.transcript.feed("line\n".representation);
+        f.render();
+    }
+    assert(outs.length == 0, "a held frame writes nothing to the terminal");
+    f.held = false;
+    f.render();
+    assert(outs.length == 1, "the release renders once");
 }
