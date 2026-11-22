@@ -1929,7 +1929,17 @@ class Agent
         bool isOutcome = outcomeTool && call.name == outcomeToolName;
         bool isHistory = historyEnabled && hist.isHistoryTool(call.name);
         bool isTimer = timerTools && isTimerTool(call.name);
-        if (!isPlan && !isOutcome && !isHistory && !isTimer && !tools.has(call.name))
+        bool isAgent = subagentsEnabled && call.name == subToolName;
+        // An `agent` call was checked when its reply's sub-agents launched.
+        if (isAgent)
+            if (auto gate = call.id in subGates)
+            {
+                if (gate.deny !is null) { refused = gate.deny; return false; }
+                args = gate.args;
+                context ~= gate.context;
+                return true;
+            }
+        if (!isPlan && !isOutcome && !isHistory && !isTimer && !isAgent && !tools.has(call.name))
         {
             refused = format("Tool '%s' not found. Available: %s", call.name, toolNames());
             return false;
