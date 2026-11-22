@@ -1,5 +1,5 @@
-// Conventional Commits, enforced on PR commits (.github/workflows/commitlint.yml)
-// and optionally locally (.githooks/commit-msg). semantic-release reads the
+// Conventional Commits, enforced on PR titles (.github/workflows/commitlint.yml;
+// the title is the squash-merge commit subject on main) and optionally locally (.githooks/commit-msg). semantic-release reads the
 // types to pick the next version; see RELEASING.md.
 export default {
   extends: ['@commitlint/config-conventional'],

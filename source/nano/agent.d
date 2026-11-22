@@ -78,6 +78,22 @@ string wrapReminder(string text) pure nothrow
     return "<system-reminder>\n" ~ text ~ "\n</system-reminder>";
 }
 
+/// The text a `wrapReminder` note wraps, or null when `content` is not one.
+/// Replay shows a Stop hook's rejection reason as the user message it
+/// printed live, so it needs the reason back out of the wrapper.
+string unwrapReminder(string content) pure nothrow
+{
+    import std.string : startsWith, endsWith;
+    enum pre = "<system-reminder>\n", post = "\n</system-reminder>";
+    if (!content.startsWith(pre) || !content.endsWith(post)) return null;
+    // Both delimiters must fit without overlapping: a malformed wrapper like
+    // "<system-reminder>\n</system-reminder>" passes both checks yet shares
+    // the newline, and slicing [pre.length .. $ - post.length] would invert
+    // the bounds. Not a wrapper: fall back to the raw content.
+    if (content.length < pre.length + post.length) return null;
+    return content[pre.length .. $ - post.length];
+}
+
 
 /// A `report_outcome` call the agent rejects: `Outcome.fromArgs`'s error, or
 /// the verify reminder. Its message is the tool result for the model.
@@ -689,7 +705,9 @@ class Agent
                     },
                     (StopBlocked b) {
                         hasReported = false;
-                        push(Message.auto_(wrapReminder(b.reason)));
+                        auto rej = Message.auto_(wrapReminder(b.reason));
+                        rej.stopBlocked = true;
+                        push(rej);
                         ev.userMessage(b.reason);
                     },
                     (RunTools _) { next ~= runToolCalls(r, ev, loopStop); },
@@ -725,7 +743,9 @@ class Agent
     {
         foreach (s; control.takePending)
         {
-            push(Message.user(s.text));
+            auto sm = Message.user(s.text);
+            sm.steered = true;
+            push(sm);
             ev.userMessage(s.text);
             control.absorbed(s);
         }
@@ -1701,7 +1721,12 @@ class Agent
             if (!m.timestamp.length) m.timestamp = nowStamp();
             newLog.ifSome((SessionLog l) { m.logLine = l.append(m); });
         }
-        messages = messages.length && messages[0].role == Role.system ? messages[0 .. 1] : null;
+        // Keep only the system message of the replaced conversation — and
+        // copy it: `messages[0 .. 1]` would stay a slice of the old backing
+        // array, keeping the whole previous conversation reachable through
+        // its allocation, which the conservative GC then scans and the
+        // post-resume `releaseHeap` cannot reclaim.
+        messages = messages.length && messages[0].role == Role.system ? messages[0 .. 1].dup : null;
         foreach (ref m; r.conversation)
             if (m.role != Role.system) messages ~= m;
         replaceLog(newLog);
@@ -2912,6 +2937,26 @@ unittest
     assert(isClose(agent.sessionAic, 0.0432) && agent.sessionInputTokens == 30);
     agent.resetSessionCounters();
     assert(!agent.hasSessionAic && agent.sessionAic == 0 && agent.sessionInputTokens == 0);
+}
+
+// Resuming over a system-message-only session must not keep the replaced
+// conversation's backing array alive through a slice: `loadRestored` copies
+// the kept system message so the old allocation is collectable.
+unittest
+{
+    import nano.session : Restored;
+    import nano.providers.mock;
+    auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "sys");
+    agent.messages ~= [Message.user("u1"), Message.assistant("a1")];
+    // Restore a system-only conversation so nothing is appended after the
+    // kept system message: an append could reallocate and mask a missing copy.
+    auto old = agent.messages;
+    Restored r;
+    agent.loadRestored(r, Option!SessionLog.init);
+    assert(agent.messages.length == 1 && agent.messages[0].role == Role.system);
+    assert(agent.messages.ptr !is old.ptr, "kept system message aliases the old array");
+    old[0].content = "overwritten";
+    assert(agent.messages[0].content == "sys", agent.messages[0].content);
 }
 
 /// The tool result a crash left unwritten (Rust's INTERRUPTED_TOOL_RESULT).

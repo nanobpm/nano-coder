@@ -515,7 +515,10 @@ elsewhere. A test can then install a `FakeClock` (per thread) to pick "now" and 
 instant. Timeouts and grace periods that tests run into are parameters, so a test passes a
 short one rather than waiting out the production value. The test runner
 (`source/nano/testenv_test.d`) fails a module whose tests take over 1 s, unless
-`scripts/slow-tests` gives it a higher limit and a reason; `NANO_TEST_TIMES=N dub test` lists the
+`scripts/slow-tests` gives it a higher limit and a reason. The limits are wall-clock, so a busy
+host doesn't fail a correct change: before failing a module, the runner times a fixed calibration
+(CPU, short sleeps, process spawns) and scales the limits by how much slower it ran than on an idle
+machine, at most 3x. `NANO_TEST_TIMES=N dub test` lists the
 N slowest modules. `NANO_TEST_JOBS=N` runs modules in parallel (`scripts/ci.sh` uses 4); modules
 that change process-wide state (the cancel flag, environment variables) are listed in
 `scripts/serial-tests` and run alone first.
