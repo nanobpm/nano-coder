@@ -298,7 +298,8 @@ unittest
     string[] beats;
     heartbeatSink = (string line) { beats ~= line; if (beats.length == 2) write(flag, ""); };
     heartbeatInterval = 40.msecs;
-    auto cmd = "i=0; while [ ! -e '" ~ flag ~ "' ] && [ $i -lt 500 ]; do sleep 0.01; i=$((i+1)); done";
+    import std.array : replace;
+    auto cmd = "i=0; while [ ! -e '" ~ flag.replace("'", "'\\''") ~ "' ] && [ $i -lt 500 ]; do sleep 0.01; i=$((i+1)); done";
     auto r = run(cmd, 10.seconds);
     assert(!r.timedOut && r.exitCode == 0);
     assert(beats.length >= 2, "expected ≥2 heartbeats, got " ~ beats.length.to!string);
@@ -326,7 +327,8 @@ unittest
     string[] beats;
     heartbeatSink = (string line) { beats ~= line; write(flag, ""); };
     heartbeatInterval = 30.msecs;
-    auto cmd = "i=0; while [ ! -e '" ~ flag ~ "' ] && [ $i -lt 500 ]; do sleep 0.01; i=$((i+1)); done; printf done";
+    import std.array : replace;
+    auto cmd = "i=0; while [ ! -e '" ~ flag.replace("'", "'\\''") ~ "' ] && [ $i -lt 500 ]; do sleep 0.01; i=$((i+1)); done; printf done";
     JSONValue args; args["command"] = cmd;
     auto text = execute(args);
     assert(beats.length >= 1, "expected ≥1 heartbeat");
