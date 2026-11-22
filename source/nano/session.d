@@ -811,7 +811,51 @@ private size_t skipJSONValue(const(char)[] s, size_t i) pure nothrow @nogc
     return i;
 }
 
-/// Call `dg` with each top-level key (raw, unescaped) and the raw text of its
+/// Decode the JSON escapes in the raw key text `key` in place of the slice
+/// (a fresh copy only when it has any); false for a malformed escape.
+private bool unescapeKey(ref const(char)[] key) pure @safe
+{
+    import std.ascii : isHexDigit;
+    import std.utf : encode;
+    size_t i;
+    while (i < key.length && key[i] != '\\') ++i;
+    if (i == key.length) return true;
+    char[] o = key[0 .. i].dup;
+    for (; i < key.length; ++i)
+    {
+        if (key[i] != '\\') { o ~= key[i]; continue; }
+        if (++i >= key.length) return false;
+        switch (key[i])
+        {
+            case '"': case '\\': case '/': o ~= key[i]; break;
+            case 'b': o ~= '\b'; break;
+            case 'f': o ~= '\f'; break;
+            case 'n': o ~= '\n'; break;
+            case 'r': o ~= '\r'; break;
+            case 't': o ~= '\t'; break;
+            case 'u':
+                if (i + 4 >= key.length) return false;
+                dchar c = 0;
+                foreach (h; key[i + 1 .. i + 5])
+                {
+                    if (!h.isHexDigit) return false;
+                    c = c * 16 + (h <= '9' ? h - '0' : (h | 0x20) - 'a' + 10);
+                }
+                i += 4;
+                // Surrogates never spell a key we compare against: keep them
+                // distinct but harmless.
+                if (c >= 0xD800 && c <= 0xDFFF) c = 0xFFFD;
+                char[4] buf;
+                o ~= buf[0 .. encode(buf, c)];
+                break;
+            default: return false;
+        }
+    }
+    key = o;
+    return true;
+}
+
+/// Call `dg` with each top-level key (JSON escapes decoded) and the raw text of its
 /// value in the JSON object `obj`, without parsing the values (issue #244: a
 /// superseded compaction snapshot is skimmed, not decoded). Stops when `dg`
 /// returns false; false for text that isn't an object.
@@ -831,7 +875,10 @@ private bool skimObject(const(char)[] obj, scope bool delegate(const(char)[] key
         if (obj[i] != '"') return false;
         auto ke = skipJSONValue(obj, i);
         if (ke > obj.length || ke < i + 2) return false;
-        auto key = obj[i + 1 .. ke - 1];
+        const(char)[] key = obj[i + 1 .. ke - 1];
+        // An escaped key (`"folded\u005fbase"`) must compare by its decoded
+        // value, or a delta could be misread as a full snapshot.
+        if (!unescapeKey(key)) return false;
         i = ke;
         ws();
         if (i >= obj.length || obj[i] != ':') return false;
@@ -844,6 +891,13 @@ private bool skimObject(const(char)[] obj, scope bool delegate(const(char)[] key
         ws();
         if (i < obj.length && obj[i] == ',') ++i;
     }
+}
+
+unittest // escaped_keys_are_decoded_before_comparison
+{
+    assert(skimField(`{"folded\u005fbase":[1],"x":2}`, "folded_base") == "[1]");
+    assert(skimField(`{"a\"b":3}`, `a"b`) == "3");
+    assert(skimField(`{"bad\uZZZZ":1}`, "bad") is null);
 }
 
 /// The raw value of top-level `key` in the JSON object `obj`, or null.
@@ -962,7 +1016,8 @@ private ulong lastFullReplace(string path, out ulong floor)
         auto data = skimField(line, "data");
         bool delta;
         ulong fl = 0;
-        skimObject(data, (k, v) {
+        // Fail closed: an unreadable `data` is never taken as a full snapshot.
+        immutable ok = skimObject(data, (k, v) {
             if ((k == "folded_base" || k == "pinned_base") && v != "null") delta = true;
             else if (k == "summarized")
             {
@@ -974,6 +1029,7 @@ private ulong lastFullReplace(string path, out ulong floor)
             }
             return true;
         });
+        if (!ok) delta = true;
         if (!delta) { at = lineNo; floor = fl; }
         else if (at && fl < floor) floor = fl;
     });
@@ -2480,4 +2536,31 @@ unittest // skim_floor_counts_later_delta_replaces (issue #244)
     write(path, log);
     auto skimmed = restoreLog(path, true), fullR = restoreLog(path, false);
     assert(skimmed == fullR, "a later delta lowers the skim floor");
+}
+
+unittest // escaped_delta_key_is_not_a_full_snapshot (issue #244)
+{
+    import std.array : replace;
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, write;
+    import std.path : buildPath;
+    auto dir = buildPath(tempDir, "nano-d-skimesc-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    static JSONValue rec(Message m) { return messageRecord(m); }
+    string line(string type, JSONValue data) { return JSONValue(["type": JSONValue(type), "data": data]).toString ~ "\n"; }
+    auto log = `{"type":"session","data":{"version":1,"id":"skimesc","created_at":"x"}}` ~ "\n";
+    auto one = Message.user("one"), two = Message.user("two");
+    log ~= line("message", rec(one));
+    JSONValue full = ["messages": JSONValue([rec(Message.user("summary"))])];
+    full["folded"] = JSONValue([rec(one)]);
+    log ~= line("replace", full);
+    JSONValue delta = ["messages": JSONValue([rec(Message.user("summary 2"))])];
+    delta["folded"] = JSONValue([rec(two)]);
+    delta["folded_base"] = 1;
+    log ~= line("replace", delta).replace(`"folded_base"`, `"folded\u005fbase"`);
+    auto path = buildPath(dir, "skimesc.jsonl");
+    write(path, log);
+    auto skimmed = restoreLog(path, true), fullR = restoreLog(path, false);
+    assert(skimmed == fullR, "an escaped delta key still marks a delta");
+    assert(skimmed.replayStash.length == 2, "the earlier folded stash survives");
 }
