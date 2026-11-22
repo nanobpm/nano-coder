@@ -167,7 +167,8 @@ fi
 # improving a count needs no edit under scripts/ and parallel PRs can't
 # conflict over one. A count that gets worse fails, unless a commit since the
 # merge base carries a reviewed `Ratchet-Override: <name> <reason>` trailer.
-#   NANO_RATCHET_BASE     the target branch (default origin/main)
+#   NANO_RATCHET_BASE     the target branch or commit (default origin/main;
+#                         CI sets the pre-push commit on pushes to main)
 #   NANO_RATCHET_REQUIRE  1: fail when the base can't be found (CI lint sets
 #                         it); otherwise the comparison is skipped with a note
 # Base counts are cached in the git dir by merge-base commit and script hash.
@@ -224,9 +225,16 @@ else
     else
         tree=$(mktemp -d)
         rmdir "$tree"
+        # Remove the worktree however we leave, interrupts included.
+        drop_tree() { git worktree remove --force "$tree" >/dev/null 2>&1; rm -rf "$tree"; git worktree prune >/dev/null 2>&1; }
+        trap drop_tree EXIT
+        trap 'drop_tree; trap - EXIT; exit 130' INT
+        trap 'drop_tree; trap - EXIT; exit 143' TERM
+        trap 'drop_tree; trap - EXIT; exit 129' HUP
         git worktree add -q --detach "$tree" "$base" >/dev/null 2>&1 || { echo "Error: git worktree add $base failed" >&2; exit 1; }
-        then_=$(measure "$tree" "the merge base $base") || { git worktree remove --force "$tree"; exit 1; }
-        git worktree remove --force "$tree"
+        then_=$(measure "$tree" "the merge base $base") || exit 1
+        drop_tree
+        trap - EXIT INT TERM HUP
         # Publish atomically: concurrent checks in other worktrees share it.
         mkdir -p "$cache" && part=$(mktemp "$cache/.$key.XXXXXX") &&
             printf '%s\n' "$then_" > "$part" && mv -f "$part" "$cache/$key"
