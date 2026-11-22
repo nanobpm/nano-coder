@@ -314,7 +314,7 @@ string login(scope void delegate(string) @safe note, scope void delegate(long se
     }
     long interval = num(device, "interval", 5);
     if (interval < 1) interval = 1;
-    auto deadline = wallNow.toUnixTime + num(device, "expires_in", 900);
+    auto deadline = deviceDeadline(wallNow.toUnixTime, num(device, "expires_in", 900));
     note("UNOFFICIAL: this signs in as the VS Code Copilot extension; use at your own risk.");
     note(format("Open %s and enter code: %s", uri, userCode));
     note("Waiting for authorization...");
@@ -369,4 +369,19 @@ unittest
     auto path = saveCredentials(StoredCredentials("gho_x", "github.com", "2026-01-01T00:00:00Z"), dir);
     assert((getAttributes(path) & octal!777) == octal!600);
     assert(loadCredentials(c, dir) && c.oauthToken == "gho_x" && c.domain == "github.com");
+}
+
+/// Device-login deadline: saturates instead of wrapping on a huge expires_in.
+long deviceDeadline(long now, long secs) pure nothrow @safe @nogc
+{
+    if (secs < 0) secs = 0;
+    return secs > long.max - now ? long.max : now + secs;
+}
+
+unittest
+{
+    assert(deviceDeadline(100, 900) == 1000);
+    assert(deviceDeadline(100, long.max) == long.max);
+    assert(deviceDeadline(100, long.max - 100) == long.max);
+    assert(deviceDeadline(100, -5) == 100);
 }

@@ -937,6 +937,12 @@ unittest
     assertThrown(titledIds(dir), "a corrupt index must not read as 'nothing titled'");
     // Invalid UTF-8 hides titles the same way: strict load must throw on it
     // too, while a non-strict listing still skips the unreadable line.
+    // Fresh index with only valid lines plus the bad-UTF-8 line, so the
+    // assertion cannot pass merely because of the bad-JSON line above.
+    std.file.remove(indexPath(dir));
+    list(dir);
+    setTitle(titled, "Keep me");
+    assert(titledIds(dir).length == 1, "the rebuilt index loads cleanly");
     std.file.append(indexPath(dir), cast(const(ubyte)[]) [0xFF, 0xFE, '\n']);
     assertThrown(titledIds(dir), "invalid UTF-8 must not read as 'nothing titled' either");
     assert(list(dir).length >= 1, "a non-strict load still skips the bad line");
