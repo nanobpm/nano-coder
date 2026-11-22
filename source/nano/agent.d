@@ -78,6 +78,17 @@ string wrapReminder(string text) pure nothrow
     return "<system-reminder>\n" ~ text ~ "\n</system-reminder>";
 }
 
+/// The text a `wrapReminder` note wraps, or null when `content` is not one.
+/// Replay shows a Stop hook's rejection reason as the user message it
+/// printed live, so it needs the reason back out of the wrapper.
+string unwrapReminder(string content) pure nothrow
+{
+    import std.string : startsWith, endsWith;
+    enum pre = "<system-reminder>\n", post = "\n</system-reminder>";
+    if (!content.startsWith(pre) || !content.endsWith(post)) return null;
+    return content[pre.length .. $ - post.length];
+}
+
 
 /// A `report_outcome` call the agent rejects: `Outcome.fromArgs`'s error, or
 /// the verify reminder. Its message is the tool result for the model.

@@ -1884,6 +1884,17 @@ void replayTranscript(Agent agent, Console console)
         case Role.system: break;
         case Role.user:
         {
+            // A Stop hook's rejection printed live as a user message
+            // (`ev.userMessage(b.reason)`, agent.d): replay shows the reason
+            // the same way (quiet keeps it hidden), unwrapped from its
+            // reminder. New logs flag it `stopBlocked`; older logs have the
+            // unflagged automatic wrapped reminder `stopRejected` recognises.
+            if (rejectionAt(msgs, i))
+            {
+                auto reason = m.stopBlocked ? unwrapReminder(m.content) : m.content;
+                if (reason.strip.length) console.userMessage(sanitizeBlock(reason));
+                break;
+            }
             // Model-only reminders (hook context, output-limit continuations,
             // timer firings and nudges) were never typed by the user.
             // Stop-hook reminders and idle-timer turns are autoInitiated.
@@ -1951,10 +1962,23 @@ bool stopRejected(const Message[] msgs, size_t i) pure nothrow @nogc @safe
     size_t k = i + 1;
     while (k < msgs.length && msgs[k].role == Role.system) k++;
     if (k >= msgs.length) return false;
-    const n = &msgs[k];
+    return msgs[k].steered || rejectionAt(msgs, k);
+}
+
+/// Whether `msgs[i]` is a Stop hook's rejection of the answer before it:
+/// flagged `stop_blocked` in new logs; in older logs an unflagged automatic
+/// wrapped reminder (an idle timer turn's message is automatic but starts
+/// with the raw notice). The same shape `stopRejected` looks for one message
+/// later. A mid-turn steer supersedes too but is not a rejection: it shows
+/// through the steer path instead.
+bool rejectionAt(const Message[] msgs, size_t i) pure nothrow @nogc @safe
+{
+    import std.algorithm.searching : startsWith;
+    if (i >= msgs.length) return false;
+    const n = &msgs[i];
     if (n.role != Role.user) return false;
-    if (n.stopBlocked || n.steered) return true;
-    return n.autoInitiated && !n.continuation && !n.timer && !n.hookContext
+    if (n.stopBlocked) return true;
+    return n.autoInitiated && !n.steered && !n.continuation && !n.timer && !n.hookContext
         && n.content.startsWith("<system-reminder>");
 }
 
@@ -1997,6 +2021,33 @@ unittest
     assert(stopRejected(compacted, 0));
     assert(stopRejected(compacted, 3));
     assert(!stopRejected(compacted, 6));
+
+    // rejectionAt is the per-message shape stopRejected looks for one
+    // message later: a flagged rejection or a legacy unflagged automatic
+    // wrapped reminder. A steer supersedes but is not a rejection, and
+    // other automatic messages (continuation, timer, hook context) are not.
+    assert(rejectionAt(msgs, 1), "the legacy wrapped reminder is a rejection");
+    assert(rejectionAt(turns, 3), "a flagged rejection is one regardless of content");
+    assert(!rejectionAt(turns, 1), "a user-typed reminder lookalike is not");
+    assert(!rejectionAt(steered, 1), "a steer supersedes but is no rejection");
+    assert(!rejectionAt(msgs, 3), "a continuation reminder is not");
+    assert(!rejectionAt(msgs, 5), "a flagged timer is not");
+    assert(!rejectionAt(msgs, 7), "an idle timer turn's raw notice is not");
+    assert(!rejectionAt(msgs, 0), "an assistant message is not");
+    assert(!rejectionAt(msgs, msgs.length), "out of range is not");
+    auto hookCtx = Message.auto_(wrapReminder("session context"));
+    hookCtx.hookContext = true;
+    assert(!rejectionAt([hookCtx], 0), "hook context is not");
+}
+
+unittest
+{
+    import nano.agent : unwrapReminder, wrapReminder;
+    assert(unwrapReminder(wrapReminder("keep going")) == "keep going");
+    assert(unwrapReminder(wrapReminder("multi\nline\nreason")) == "multi\nline\nreason");
+    assert(unwrapReminder("plain") is null);
+    assert(unwrapReminder("<system-reminder>\nonly prefix") is null);
+    assert(unwrapReminder("") is null);
 }
 
 string planText(Agent agent) pure
