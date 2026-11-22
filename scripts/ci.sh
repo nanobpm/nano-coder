@@ -5,7 +5,7 @@
 #
 #   scripts/ci.sh [all|lint|test|quick]   (default: all)
 #
-#   lint   check-safe and dscanner                     (CI job `lint`)
+#   lint   check-safe, ratchet tests, dscanner                    (CI job `lint`)
 #   test   unit tests, release build and smoke checks  (CI jobs `test (<os>)`)
 #   quick  check-safe, both builds typechecked, unit tests (pre-push)
 #   all    lint + test
@@ -32,7 +32,16 @@ typecheck() {
 
 lint() {
     step "check-safe"
-    ./scripts/check-safe.sh
+    # In CI the ratchets must be compared against the merge base (the
+    # workflow fetches full history so origin/main is there); outside CI the
+    # caller's NANO_RATCHET_REQUIRE is kept.
+    if [ -n "${CI:-}" ]; then
+        NANO_RATCHET_REQUIRE=1 ./scripts/check-safe.sh
+    else
+        ./scripts/check-safe.sh
+    fi
+    step "ratchet tests"
+    ./scripts/test-ratchets.sh
     step "dscanner"
     dub run -q dscanner@0.16.0-beta.5 -- --styleCheck --config dscanner.ini source
 }
