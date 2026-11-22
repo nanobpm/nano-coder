@@ -219,6 +219,47 @@ struct ConfiguredWindow
     string source;
 }
 
+/// Folded tool outputs longer than this keep only their log reference in
+/// the replay stash.
+enum size_t stashSlimBytes = 512;
+
+/// The replay stash with the content dropped for entries with a log
+/// (`Agent.replayStashLog`) read back from their log lines. An entry whose
+/// line can't be read keeps its empty content.
+const(Message)[] rehydrateStash(const(Message)[] stash, Option!SessionLog[] logs)
+{
+    import nano.session_history : load;
+    bool any;
+    foreach (l; logs) any |= l.isSome;
+    if (!any) return stash;
+    Message[ulong][SessionLog] byLog;
+    import nano.safeio : deepCopy;
+    const(Message)[] o;
+    o.reserve(stash.length);
+    foreach (i, ref m; stash)
+    {
+        if (i >= logs.length || logs[i].isNone) { o ~= m; continue; }
+        Message x = deepCopy(m);
+        auto src = logs[i].unwrap("isSome");
+        if (src !in byLog)
+        {
+            Message[ulong] at;
+            // The path is read at replay time, not at slimming time: a
+            // recovery (`SessionLog.recoverReplaced`) may have moved the
+            // writer since, and the stale path would name a foreign file.
+            try
+                foreach (e; load(src.path))
+                    if (e.message.role == Role.tool) at[e.id] = e.message;
+            catch (Exception) {} // an unreadable log: the entries replay empty
+            byLog[src] = at;
+        }
+        if (auto r = x.logLine in byLog[src])
+            if (r.toolCallId == x.toolCallId) x.content = r.content;
+        o ~= x;
+    }
+    return o;
+}
+
 /// One path an apply_patch call touches, as the file-tool call that would
 /// change it directly (for the per-path hooks).
 private struct PatchEdit
@@ -362,6 +403,27 @@ class Agent
     /// The real turns folded by compactions since the last plain replacement:
     /// a replay (ACP session/load) shows them in place of the summary.
     Message[] replayStash;
+    /// Per `replayStash` entry: the session log its content was dropped for
+    /// (it is read back from its `logLine` there on replay), or null when the
+    /// entry keeps its content (or, with no log, dropped it). Long sessions would otherwise hold every
+    /// folded tool output in memory (issue #248).
+    /// The live `SessionLog`, not its path at slimming time:
+    /// `SessionLog.recoverReplaced` can move the writer to a recovery file
+    /// (changing `l.path`) after the reference was taken, and a saved path
+    /// would then name a foreign file the replay reads empty or unrelated
+    /// output from.
+    Option!SessionLog[] replayStashLog;
+    /// Log lines whose in-memory content a compaction clipped: their content
+    /// differs from the log record, so the stash keeps it.
+    bool[ulong] clippedLines;
+    /// Log lines up to this one came from a restored session, whose clipping
+    /// is unknown (`clippedLines` is not persisted): their content is never
+    /// dropped from the stash.
+    ulong restoredLineFloor;
+    /// The session logs `replayStashLog` has handed out, so a slimmed entry's
+    /// reference stays valid for the session's life even across a `restart`
+    /// (which closes the outgoing log: a replay still reads it back).
+    private SessionLog[] stashRefLogs;
     /// history_search / history_read calls in the current turn (logged on its turn_end).
     uint turnHistoryCalls;
     /// The thinking level the turn's latest request sent (as the status line
@@ -1882,6 +1944,8 @@ class Agent
         auto savedMessages = messages;
         auto savedPinStash = pinStash;
         auto savedReplayStash = replayStash;
+        auto savedReplayStashLog = replayStashLog;
+        auto savedClippedLines = clippedLines.dup;
         auto savedReplayRestated = replayRestated;
         auto savedPending = pending;
         auto savedCalibLen = calibLen;
@@ -1896,6 +1960,8 @@ class Agent
                 messages = savedMessages;
                 pinStash = savedPinStash;
                 replayStash = savedReplayStash;
+                replayStashLog = savedReplayStashLog;
+                clippedLines = savedClippedLines;
                 replayRestated = savedReplayRestated;
                 pending = savedPending;
                 calibLen = savedCalibLen;
@@ -1942,13 +2008,41 @@ class Agent
             foreach (ref x; next[bodyStart + 1 .. $])
                 if (x.role == Role.tool)
                     foreach (c; ctx.clippedContent(x, clipTo))
+                    {
+                        if (x.logLine && c != x.content) clippedLines[x.logLine] = true;
                         x.content = smart && x.logLine
                             ? c ~ format("\n[clipped at compaction; history_read #%s has it whole]", x.logLine) : c;
+                    }
         }
         messages = next;
         calibLen = 0;
         size_t stashBase = replayStash.length;
-        replayStash = extendsStash ? replayStash ~ folded : folded;
+        // A copy: `folded` is persisted whole below.
+        replayStash = extendsStash ? replayStash ~ folded : folded.dup;
+        {
+            // The live log holds the folded turns: keep only references to
+            // large tool outputs (`replayMessages` reads them back). Without
+            // a log nothing can replay them (a replay needs a resumed or
+            // loaded session), so they are dropped.
+            // The reference is the log itself, not its path: a recovery can
+            // move the writer to a new path after this, and the replay must
+            // follow it rather than read a foreign file at the stale path.
+            auto srcs = extendsStash ? replayStashLog.dup : null;
+            srcs.length = stashBase;
+            foreach (ref x; replayStash[stashBase .. $])
+            {
+                bool slim = x.role == Role.tool && x.content.length > stashSlimBytes && !x.attachments.length
+                    && (log.isNone || (x.logLine > restoredLineFloor && x.logLine !in clippedLines));
+                srcs ~= slim ? log : Option!SessionLog.init;
+                if (slim) x.content = null;
+            }
+            replayStashLog = srcs;
+            log.ifSome((SessionLog l) @safe {
+                bool held;
+                foreach (s; stashRefLogs) held |= s is l;
+                if (!held) stashRefLogs ~= l;
+            });
+        }
         replayRestated = replayStash.length && hasPending && pending.position < split
             ? some(pendingPos) : Option!size_t.init;
         if (hasPending)
@@ -2646,10 +2740,10 @@ class Agent
     /// The messages a replay shows (Rust `replay_history`): the stashed
     /// pre-compaction turns, then the conversation without its synthetic
     /// summary (the first non-system message) or the restated input.
-    const(Message)[] replayMessages() pure const
+    const(Message)[] replayMessages()
     {
         if (!replayStash.length) return messages;
-        const(Message)[] o = replayStash;
+        const(Message)[] o = rehydrateStash(replayStash, replayStashLog);
         bool skipped;
         foreach (i, ref m; messages)
         {
@@ -2700,6 +2794,12 @@ class Agent
         historyHintPending = r.historyAvailable && !r.historyHintConsumed;
         pinStash = r.pinStash;
         replayStash = r.replayStash;
+        replayStashLog = null;
+        stashRefLogs = null;
+        clippedLines = null;
+        restoredLineFloor = 0;
+        foreach (ref m; messages)
+            if (m.logLine > restoredLineFloor) restoredLineFloor = m.logLine;
         replayRestated = r.replayRestated;
         adoptPending(r);
         plan = Plan.init;
@@ -2740,7 +2840,7 @@ class Agent
     {
         import nano.mode : AgentMode;
         bool plan = control.mode == AgentMode.plan;
-        if (plan == promptPlan || !messages.length) return;
+        if (plan == promptPlan || !messages.length || messages[0].role != Role.system) return;
         messages[0].content = render(plan);
         calibLen = calibTokens = 0; // the usage anchor counted the old prompt
         promptPlan = plan;
@@ -2782,10 +2882,17 @@ class Agent
     void restart(string system, Option!SessionLog newLog)
     {
         import nano.mode : AgentMode;
-        messages = [Message.system(system)];
+        // An empty system prompt (e.g. an ACP host without one) sends no
+        // system message at all: some providers reject an empty one.
+        messages = system.length ? [Message.system(system)] : null;
         promptPlan = false; // the caller renders `system` for normal mode
         replaceLog(newLog);
-        log.ifSome((SessionLog l) { l.append(messages[0]); });
+        if (messages.length) log.ifSome((SessionLog l) { l.append(messages[0]); });
+        // A new session must not answer a prompt from the previous session's
+        // idempotency cache (issue #248).
+        completedInputs = null;
+        completedStops = null;
+        completedOutcomes = null;
         control.mode = AgentMode.normal;
         sessionThinking.nullify();
         plan = Plan.init;
@@ -2801,6 +2908,10 @@ class Agent
         resetIdleCompaction();
         pinStash = null;
         replayStash = null;
+        replayStashLog = null;
+        stashRefLogs = null;
+        clippedLines = null;
+        restoredLineFloor = 0;
         replayRestated = Option!size_t.init;
         hasPending = false;
         historyAvailable = historyHintPending = false;
@@ -3939,6 +4050,24 @@ unittest
     assert(agent.messages.ptr !is old.ptr, "kept system message aliases the old array");
     old[0].content = "overwritten";
     assert(agent.messages[0].content == "sys", agent.messages[0].content);
+}
+
+// `restart` starts a clean session: no idempotency cache carried over from the
+// previous session, and no empty system message when there is no prompt.
+unittest
+{
+    import nano.providers.mock;
+    auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "sys");
+    agent.completedInputs["id1"] = "old";
+    agent.completedStops["id1"] = StopReason.cancelled;
+    agent.completedOutcomes["id1"] = JSONValue(1);
+    agent.restart("", Option!SessionLog.init);
+    assert(agent.completedInputs.length == 0);
+    assert(agent.completedStops.length == 0);
+    assert(agent.completedOutcomes.length == 0);
+    assert(agent.messages.length == 0);
+    agent.restart("sys2", Option!SessionLog.init);
+    assert(agent.messages.length == 1 && agent.messages[0].content == "sys2");
 }
 
 /// The tool result a crash left unwritten (Rust's INTERRUPTED_TOOL_RESULT).

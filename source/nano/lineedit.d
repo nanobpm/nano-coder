@@ -119,7 +119,7 @@ enum K
     backspace, delete_, killEnd, clearLine, eraseWord, tab, escape, interrupt, eof, paste, ignored, closed,
     /// Shift-Tab (CSI Z): cycle the agent mode.
     cycleMode,
-    /// Ctrl-O: expand or collapse the latest tool call/result or thought.
+    /// Ctrl-O: expand the next batch of tool calls/results and thoughts, or collapse them.
     toggleExpand,
 }
 

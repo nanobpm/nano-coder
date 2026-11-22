@@ -55,7 +55,7 @@ import nano.control : TurnControl, FdLineReader;
 import nano.instructions : ProjectInstructions, InstructionOptions = Options, expandHome;
 import core.atomic : atomicLoad, atomicStore, cas;
 
-enum string packageVersion = "1.10.0";
+enum string packageVersion = "1.10.1";
 enum string versionString = "nano-coder " ~ packageVersion;
 
 enum string usage = `Usage: nano-coder [--model provider/model] [--config PATH] [-p PROMPT]
@@ -963,7 +963,12 @@ unittest
     assert(!names.canFind("echo"), "no vestigial echo tool");
 }
 
-void setVerbosity(Verbosity v) { atomicStore(gVerbosity, v); }
+void setVerbosity(Verbosity v)
+{
+    atomicStore(gVerbosity, v);
+    // Existing tool results and thoughts follow the switch, not just new ones.
+    if (auto f = gFrame) f.setVerbose(v >= Verbosity.verbose);
+}
 
 // What the frame's status bar shows (status.rs).
 import nano.status : Stats, Activity, RateMeter;
@@ -1132,7 +1137,9 @@ struct Screen
             blockStamp = stamp();
             thinkText = null;
             thinkStart = nowMs();
-            blockExpanded = verbose;
+            // The frame folds the reasoning (its verbose mode expands the
+            // fold), so Ctrl-O and a verbosity switch can collapse it.
+            blockExpanded = verbose && !gFrame;
             if (blockExpanded) write(blockStamp ~ thinkStyle("∴ Thinking") ~ "\n");
         }
         bool first = !thinkText.length;
@@ -1407,7 +1414,7 @@ unittest
     auto thoughts = t.lines.filter!(l => l.canFind("Thought for")).array;
     assert(thoughts.length == 1 && thoughts[0].canFind("12 chars"), t.lines.to!string);
     assert(t.cur.endsWith(" AB") || t.cur == "AB", t.cur);
-    assert(t.toggleLatest());
+    assert(t.toggle());
     assert(t.lines.canFind("    first second"), t.lines.to!string);
     // A later answer chunk carries on the same line.
     s.captured = null;
@@ -1601,7 +1608,7 @@ class Console : AgentEvents
             import nano.plan : planSymbols;
             if (renderMarkdown && call.name.startsWith("plan_")) clean = planSymbols(clean);
         }
-        auto shown = stampBlock(st, toolResult(!isError, clean, verbose, w > 8 + st.length ? w - 8 - (st.length ? stampWidth : 0) : 1));
+        auto shown = stampBlock(st, toolResult(!isError, clean, verbose && !gFrame, w > 8 + st.length ? w - 8 - (st.length ? stampWidth : 0) : 1));
         write(shown);
         // Ctrl-O shows every line, together with the call's arguments.
         if (gFrame) write(foldMark(call.id, shown.lineCount, stampBlock(st, expandedResult(!isError, clean, color))));
@@ -3193,6 +3200,7 @@ int runMain(string[] args)
         // The app owns the screen and re-renders it (`nano.frameui`); the
         // editor draws only through it.
         gFrame = FrameUi.install(&frameStatus);
+        if (auto f = gFrame) f.setVerbose(verbosity >= Verbosity.verbose);
         if (!gFrame)
         {
             leaveKeyMode();

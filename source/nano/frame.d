@@ -731,13 +731,116 @@ string refoldMark(string id, string collapsed, string expanded) pure
         ~ Base64.encode(collapsed.representation).idup ~ ";" ~ Base64.encode(expanded.representation).idup ~ "\x07";
 }
 
-/// A block of transcript lines with an alternate (expanded or collapsed) form.
+/// Where a fold's expanded text lives: in an anonymous temporary file
+/// (deleted by the system when the process exits), so a long session holds
+/// none of it in memory. Without a file (no writable temporary directory, or
+/// `memoryOnly`), only the latest texts are kept, within `budget` bytes.
+struct FoldStore
+{
+    import std.stdio : File;
+    private File spill;
+    private bool onDisk;
+    private ulong end;
+    // The in-memory fallback, oldest first.
+    private string[ulong] mem;
+    private ulong[] order;
+    private size_t memBytes, head;
+    /// The fallback's byte budget.
+    size_t budget = 4 << 20;
+
+    private bool opened;
+    /// Never use a file (tests; and once a file failed).
+    bool memoryOnly;
+
+    private void open()
+    {
+        if (opened) return;
+        opened = true;
+        if (memoryOnly) return;
+        onDisk = io(() { spill = File.tmpfile(); }); // no temporary file: keep the latest texts in memory
+    }
+
+    /// Runs a file operation; false when it threw.
+    private static bool io(scope void delegate() @safe op)
+    {
+        try { op(); return true; }
+        catch (Exception) { return false; } // the callers fall back (memory, a collapsed fold)
+    }
+
+    /// Whether texts go to the temporary file.
+    bool backedByFile() { open(); return onDisk; }
+
+    /// Stores `text`; the returned reference reads it back.
+    FoldRef put(string text)
+    {
+        open();
+        if (onDisk)
+        {
+            immutable at = end;
+            if (io(() { spill.seek(at); spill.rawWrite(text.representation); }))
+            {
+                end += text.length;
+                return FoldRef(at, text.length);
+            }
+            onDisk = false; // a full disk: memory from here on
+        }
+        return putMemory(text);
+    }
+
+    /// `put` without a file: the latest texts within `budget`.
+    private FoldRef putMemory(string text) pure
+    {
+        auto key = end++ | (1UL << 63);
+        mem[key] = text;
+        order ~= key;
+        memBytes += text.length;
+        while (memBytes > budget && head < order.length)
+        {
+            auto k = order[head++];
+            if (auto t = k in mem) { memBytes -= t.length; mem.remove(k); }
+        }
+        if (head > 1024 && head * 2 > order.length) { order = order[head .. $].dup; head = 0; }
+        return FoldRef(key, text.length);
+    }
+
+    /// The text `r` refers to; false when it is gone (evicted from memory).
+    bool get(FoldRef r, out string text)
+    {
+        if (r.at & (1UL << 63))
+        {
+            auto t = r.at in mem;
+            if (t is null) return false;
+            text = *t;
+            return true;
+        }
+        auto buf = new ubyte[r.length];
+        const(ubyte)[] got;
+        // An unreadable spill file: the fold stays collapsed.
+        if (!io(() { spill.seek(r.at); got = spill.rawRead(buf); }) || got.length != r.length) return false;
+        import nano.safeio : utf8Text;
+        text = utf8Text(got);
+        return true;
+    }
+}
+
+/// A stored fold text (`FoldStore.put`).
+struct FoldRef
+{
+    ulong at;
+    size_t length;
+}
+
+/// A block of transcript lines that can show its expanded text instead.
+/// Only the reference is kept; while expanded, `collapsed` holds the short form.
 private struct Fold
 {
     string id;
     size_t start, length;
-    string[] other;
-    bool expanded;
+    FoldRef text;
+    string[] collapsed;
+    /// The text until `Transcript.settle` stores it.
+    string fresh;
+    bool expanded, lost, stored;
 }
 
 /// The transcript as the logical lines the console printed. `feed` takes
@@ -750,8 +853,33 @@ struct Transcript
     string cur;
     /// Bounded: the oldest lines go once there are more than this.
     size_t cap = 20_000;
+    /// Folds one Ctrl-O expands (about two screens' worth).
+    size_t batch = 20;
+    /// Folds switching to verbose expands.
+    size_t verboseCap = 200;
+    /// Where fold texts go (`settle`).
+    FoldStore store;
     private ubyte[] pending;
-    private bool cr;
+    private bool cr, verbose;
+    /// Inside an unfinished OSC longer than `oscCap`: its bytes are dropped
+    /// until the BEL/ST that ends it, so `pending` stays bounded.
+    private bool skippingOsc;
+    /// Longest unfinished OSC buffered in `pending` (bytes) before the rest
+    /// of it is discarded; an endless escape must not grow memory.
+    size_t oscCap = 4_096;
+    /// Longest fold or refold mark (`foldMark`, `refoldMark`) collected in
+    /// `foldOscBuf`: their Base64 payload is a whole tool result or thought,
+    /// far past `oscCap` and the frame's 8 KiB reads. Past it the mark is
+    /// dropped like any over-long OSC. The buffer is released as soon as the
+    /// mark ends, so nothing outlives one mark.
+    size_t foldOscCap = 8 << 20;
+    /// The body of an unfinished fold or refold mark, appended per read (no
+    /// rescan of what came before, so a big mark costs linear time).
+    private ubyte[] foldOscBuf;
+    private bool inFoldOsc;
+    /// The last read ended on the ESC of a possible ST (`ESC \\`) while
+    /// collecting or discarding an OSC; a `\\` first in the next read ends it.
+    private bool oscEsc;
     private string[][] cache;
     private size_t cacheWidth;
     private Fold[] folds;
@@ -771,9 +899,10 @@ struct Transcript
     private void flushDeferred() pure
     {
         if (!deferredReady) return;
-        foreach (d; deferred) { auto f = d.fold; f.start = lines.length; lines ~= d.shown; folds ~= f; }
+        foreach (d; deferred) appendFold(d.fold, d.shown);
         deferred = null;
         deferredReady = false;
+        enforceByteCap();
     }
 
     void clear() pure
@@ -783,15 +912,68 @@ struct Transcript
         cur = null;
         cache = null;
         cr = false;
+        skippingOsc = false;
+        inFoldOsc = oscEsc = false;
+        foldOscBuf = null;
+        heldBytes = 0;
+        sweepFloor = size_t.max;
         prunedIds = null;
         prunedOrder = null;
         deferred = null;
         deferredReady = false;
+        unsettled = false;
     }
 
     void feed(scope const(ubyte)[] bytes) pure
     {
         import std.string : indexOf;
+        if ((skippingOsc || inFoldOsc) && !bytes.length) return;
+        if (skippingOsc || inFoldOsc)
+        {
+            // Collect a fold mark, or discard an over-long OSC, up to its
+            // terminator: BEL, or ST, whose ESC may have ended the last read.
+            size_t j, term;
+            if (oscEsc && bytes.length && bytes[0] == '\\') term = 1;
+            else
+            {
+                if (oscEsc && inFoldOsc && bytes.length) foldOscBuf ~= 0x1b; // a lone ESC was payload
+                oscEsc = false;
+                while (j < bytes.length)
+                {
+                    if (bytes[j] == 0x07) { term = 1; break; }
+                    if (bytes[j] == 0x1b && j + 1 < bytes.length && bytes[j + 1] == '\\') { term = 2; break; }
+                    j++;
+                }
+            }
+            if (!term)
+            {
+                auto body = bytes;
+                if (body.length && body[$ - 1] == 0x1b) { oscEsc = true; body = body[0 .. $ - 1]; }
+                if (inFoldOsc)
+                {
+                    if (foldOscBuf.length + body.length > foldOscCap) dropFoldOsc();
+                    else foldOscBuf ~= body;
+                }
+                return;
+            }
+            oscEsc = false;
+            if (inFoldOsc)
+            {
+                if (foldOscBuf.length + j <= foldOscCap)
+                {
+                    foldOscBuf ~= bytes[0 .. j];
+                    import nano.safeio : lossyText;
+                    auto mark = lossyText(foldOscBuf);
+                    foldOscBuf = null;
+                    inFoldOsc = false;
+                    osc(mark);
+                }
+                else dropFoldOsc();
+            }
+            inFoldOsc = skippingOsc = false;
+            foldOscBuf = null;
+            bytes = bytes[j + term .. $];
+        }
         auto buf = pending ~ bytes;
         // Hold back an incomplete UTF-8 sequence for the next call.
         size_t end = buf.length, k = 0;
@@ -821,7 +1003,30 @@ struct Transcript
                     auto bel = rest.indexOf('\x07'), st = rest.indexOf("\x1b\\");
                     if (bel < 0 && st < 0)
                     {
+                        import std.algorithm : startsWith;
+                        if (rest.startsWith(foldOsc ~ ";") || rest.startsWith(refoldOsc ~ ";"))
+                        {
+                            // A fold mark: collect it apart from `pending`.
+                            auto body = rest.representation ~ pending;
+                            pending = null;
+                            if (body.length && body[$ - 1] == 0x1b) { oscEsc = true; body = body[0 .. $ - 1]; }
+                            inFoldOsc = true;
+                            if (body.length > foldOscCap) dropFoldOsc();
+                            else foldOscBuf = body.dup;
+                            enforceByteCap();
+                            return;
+                        }
+                        if (s.length - at + pending.length > oscCap)
+                        {
+                            // Keep a trailing ESC: it may start the ST.
+                            oscEsc = s[$ - 1] == '\x1b' && !pending.length;
+                            pending = null;
+                            skippingOsc = true;
+                            enforceByteCap();
+                            return;
+                        }
                         pending = s[at .. $].representation.dup ~ pending;
+                        enforceByteCap();
                         return;
                     }
                     auto end_ = bel >= 0 && (st < 0 || bel < st) ? bel : st;
@@ -850,26 +1055,49 @@ struct Transcript
             // rendering (escapeMarks / mdinline.clean).
             cur ~= s[at .. i];
         }
+        // `cur` counts toward the cap live (`bytesHeld` adds it), so a
+        // megabyte unfinished line is bounded and a split read is charged
+        // exactly once (issue #248 review).
+        enforceByteCap();
+    }
+
+    /// Gives up on an over-long fold mark: the rest of it is discarded.
+    private void dropFoldOsc() pure
+    {
+        foldOscBuf = null;
+        inFoldOsc = false;
+        skippingOsc = true;
     }
 
     private void endLine() pure
     {
         flushDeferred();
         lines ~= cur;
+        heldBytes += lineCost(cur);
         cur = null;
         cr = false;
         if (deferred.length) deferredReady = true;
         if (lines.length > cap)
         {
             auto drop = lines.length - cap * 9 / 10;
-            lines = lines[drop .. $];
-            cache = cache.length > drop ? cache[drop .. $] : null;
-            Fold[] kept;
+            // A fold the cut runs through goes whole, with its metadata,
+            // so no expanded remnant is left that can't be collapsed.
             foreach (f; folds)
-                if (f.start >= drop) { f.start -= drop; kept ~= f; }
-                else if (f.id.length) notePruned(f.id);
-            folds = kept;
+                if (f.start < drop && f.start + f.length > drop)
+                    drop = f.start + f.length;
+            if (drop > lines.length) drop = lines.length;
+            foreach (l; lines[0 .. drop]) heldBytes = saturatingSub(heldBytes, lineCost(l));
+            // Copy, not slice: a suffix slice pins the dropped rows'
+            // backing array (and their text) under a conservative GC.
+            lines = lines[drop .. $].dup;
+            cache = cache.length > drop ? cache[drop .. $].dup : null;
+            // A discarded expanded fold's collapsed stash is dropped too:
+            // it was counted in `heldBytes` (issue #248 review).
+            pruneFolds(drop);
         }
+        // Long lines (and folds streaming in expanded) grow the transcript
+        // without ever crossing the line cap: bound the bytes too.
+        enforceByteCap();
     }
 
     /// Remembers a pruned fold's id, forgetting the oldest past `maxPruned`.
@@ -888,8 +1116,7 @@ struct Transcript
     /// A fold mark (`foldMark`); anything else is dropped.
     private void osc(string body) pure
     {
-        import std.algorithm : splitter;
-        import std.array : array, split;
+        import std.array : split;
         import std.base64 : Base64;
         import std.conv : to;
         auto parts = body.split(";");
@@ -903,92 +1130,407 @@ struct Transcript
             auto n = parts[2].to!size_t;
             auto expanded = utf8Text(Base64.decode(parts[3]));
             if (!n || n > lines.length) return;
-            import std.string : stripRight;
-            folds ~= Fold(id, lines.length - n, n, expanded.stripRight("\n").split("\n"));
-            // A result arrives expanded when its call already is.
-            if (id.length)
-                foreach (f; folds[0 .. $ - 1])
-                    if (f.id == id && f.expanded) { swap(folds.length - 1, true); break; }
+            folds ~= Fold(id, lines.length - n, n);
+            folds[$ - 1].fresh = expanded;
+            // A result arrives expanded when its call already is, and every
+            // fold does in verbose.
+            bool want = verbose;
+            if (id.length && !want)
+                foreach_reverse (ref f; folds[0 .. $ - 1])
+                    if (f.id == id) { want = f.expanded; break; }
+            if (want)
+            {
+                swapIn(folds.length - 1, expanded);
+                // An automatic expansion (verbose, or a result following its
+                // expanded call) inserts the fold's text without a completed
+                // line ever checking the byte cap; enforce it now or the
+                // transcript sits over budget until the next line ends.
+                enforceByteCap();
+            }
         }
         catch (Exception) {} // a malformed OSC from the terminal is ignored, like any unknown escape
     }
 
     /// A refold mark (`refoldMark`): rewrites the latest fold with its id.
+    /// The new expanded text is held in `fresh` until the next `settle`
+    /// moves it into `store` (this runs inside the pure `feed`); only an
+    /// expanded fold keeps lines in memory, its shown text plus the
+    /// collapsed stash, both counted in `heldBytes`.
     private void refold(string[] parts) pure
     {
         import std.array : split;
         import std.base64 : Base64;
         import std.string : stripRight;
+        import nano.safeio : utf8Text;
+        auto id = utf8Text(Base64.decode(parts[1]));
+        auto collapsed = utf8Text(Base64.decode(parts[2])).stripRight("\n").split("\n");
+        auto expandedText = utf8Text(Base64.decode(parts[3]));
+        if (!id.length) return;
+        foreach_reverse (k; 0 .. folds.length)
         {
-            import nano.safeio : utf8Text;
-            auto id = utf8Text(Base64.decode(parts[1]));
-            auto collapsed = utf8Text(Base64.decode(parts[2])).stripRight("\n").split("\n");
-            auto expanded = utf8Text(Base64.decode(parts[3])).stripRight("\n").split("\n");
-            if (!id.length) return;
-            foreach_reverse (k; 0 .. folds.length)
+            if (folds[k].id != id) continue;
+            auto f = &folds[k];
+            string[] shownNow;
+            if (f.expanded)
             {
-                if (folds[k].id != id) continue;
-                auto f = &folds[k];
-                auto shownNow = f.expanded ? expanded : collapsed;
-                f.other = f.expanded ? collapsed : expanded;
-                immutable oldLength = f.length;
-                lines = lines[0 .. f.start] ~ shownNow ~ lines[f.start + oldLength .. $];
-                f.length = shownNow.length;
-                foreach (ref g; folds)
-                    if (g.start > f.start) g.start = g.start - oldLength + shownNow.length;
-                if (cache.length > f.start) cache = cache[0 .. f.start];
-                return;
+                shownNow = expandedText.stripRight("\n").split("\n");
+                foreach (c; f.collapsed) heldBytes = saturatingSub(heldBytes, lineCost(c));
+                f.collapsed = collapsed;
+                foreach (c; collapsed) heldBytes += lineCost(c);
             }
-            // Its fold was pruned: show the update as a fresh fold at the end,
-            // so late reasoning is not lost. While an unfinished line is in
-            // `cur` it waits for that line to end, so the line stays whole.
-            Fold f;
-            f.id = id;
-            f.length = collapsed.length;
-            f.other = expanded;
-            foreach (ref d; deferred)
-                if (d.fold.id == id) { d = Deferred(f, collapsed); return; }
-            if (id !in prunedIds) return;
-            prunedIds.remove(id);
-            import std.algorithm : countUntil, remove;
-            auto at = prunedOrder.countUntil(id);
-            if (at >= 0) prunedOrder = prunedOrder.remove(at);
-            if (cur.length || deferred.length) { deferred ~= Deferred(f, collapsed); return; }
-            f.start = lines.length;
-            lines ~= collapsed;
-            folds ~= f;
+            else shownNow = collapsed;
+            f.fresh = expandedText;
+            f.text = FoldRef.init;
+            f.stored = false;
+            f.lost = false;
+            unsettled = true;
+            immutable oldLength = f.length;
+            foreach (l; lines[f.start .. f.start + oldLength])
+                heldBytes = saturatingSub(heldBytes, lineCost(l));
+            foreach (l; shownNow) heldBytes += lineCost(l);
+            lines = lines[0 .. f.start] ~ shownNow ~ lines[f.start + oldLength .. $];
+            f.length = shownNow.length;
+            foreach (ref g; folds)
+                if (g.start > f.start) g.start = g.start - oldLength + shownNow.length;
+            if (cache.length > f.start) cache = cache[0 .. f.start];
+            enforceByteCap();
+            return;
         }
+        // Its fold was pruned: show the update as a fresh fold at the end,
+        // so late reasoning is not lost. While an unfinished line is in
+        // `cur` it waits for that line to end, so the line stays whole.
+        Fold f;
+        f.id = id;
+        f.length = collapsed.length;
+        f.fresh = expandedText;
+        foreach (ref d; deferred)
+            if (d.fold.id == id) { d = Deferred(f, collapsed); return; }
+        if (id !in prunedIds) return;
+        prunedIds.remove(id);
+        import std.algorithm : countUntil, remove;
+        auto at = prunedOrder.countUntil(id);
+        if (at >= 0) prunedOrder = prunedOrder.remove(at);
+        if (cur.length || deferred.length) { deferred ~= Deferred(f, collapsed); return; }
+        appendFold(f, collapsed);
+        enforceByteCap();
     }
 
-    /// Ctrl-O: swap the latest fold (with the others sharing its id) between
-    /// collapsed and expanded. False when there is none.
-    bool toggleLatest() pure
+    /// Appends re-added fold `f`, collapsed as `shown`, at the end; its
+    /// text waits in `fresh` for `settle`.
+    private void appendFold(Fold f, string[] shown) pure
+    {
+        f.start = lines.length;
+        lines ~= shown;
+        foreach (l; shown) heldBytes += lineCost(l);
+        folds ~= f;
+        unsettled = true;
+        // Verbose expands every fold as it arrives; a re-added one is no
+        // different, or it would stay collapsed with no way back short of
+        // leaving verbose (issue #248 review). Its text is still `fresh`.
+        if (verbose) swapIn(folds.length - 1, folds[$ - 1].fresh);
+    }
+
+    /// A refold or re-add left an unstored fold that is not at the end.
+    private bool unsettled;
+
+    /// Ctrl-O: expands the next batch of collapsed folds, going up from the
+    /// bottom (with the others sharing their ids); once every fold has been
+    /// expanded, collapses them all. False when nothing changed.
+    ///
+    /// The sweep's progress is the lowest fold it has reached (`sweepFloor`),
+    /// not the expanded state: a sibling expanded by id can sit below the
+    /// fold that pulled it in (a call above its result), and the byte cap
+    /// can collapse an expansion right away - tracking the expanded state
+    /// made every press re-expand the same folds from the bottom, so the
+    /// older ones were never reached and collapse-all never came (issue #248
+    /// review). The floor persists across a collapse, so the sweep keeps
+    /// going up; reaching the top collapses everything and restarts it from
+    /// the bottom. Folds that arrive mid-sweep sit below the floor, so they
+    /// are not expanded until the sweep wraps (collapse-all, then the next
+    /// press starts from the bottom again).
+    bool toggle()
     {
         flushDeferred();
-        if (!folds.length) return false;
-        auto latest = folds[$ - 1];
-        bool want = !latest.expanded;
-        foreach_reverse (k; 0 .. folds.length)
-            if (k == folds.length - 1 || (latest.id.length && folds[k].id == latest.id)) swap(k, want);
+        settle();
+        size_t floor = sweepFloor > folds.length ? folds.length : sweepFloor;
+        size_t todo = batch, changed, reached = floor;
+        foreach_reverse (k; 0 .. floor)
+        {
+            if (!todo) break;
+            if (folds[k].lost) continue;
+            // Only a fold that actually expands (itself or a sibling)
+            // uses a batch slot; unreadable ones are skipped past.
+            bool any = swap(k, true);
+            if (folds[k].id.length)
+                foreach_reverse (j; 0 .. folds.length)
+                    if (j != k && folds[j].id == folds[k].id) any |= swap(j, true);
+            if (any) { changed++; todo--; reached = k; }
+        }
+        if (changed)
+        {
+            // The batch just asked for is evicted last: collapsing it again
+            // at once would hide those folds on every cycle (issue #248
+            // review), so older expansions go first.
+            enforceByteCap(reached, floor);
+            sweepFloor = reached;
+            return true;
+        }
+        // Nothing left to expand above the sweep: the press collapses
+        // everything, and the sweep starts over from the bottom.
+        return collapseAll();
+    }
+
+    /// Where the Ctrl-O sweep continues: the lowest fold it has reached
+    /// (issue #248 review). `size_t.max` before the first press and after a
+    /// collapse, so the next sweep starts from the bottom.
+    private size_t sweepFloor = size_t.max;
+
+    /// Collapses every expanded fold and restarts the Ctrl-O sweep from the
+    /// bottom. False when none was.
+    /// Rebuilds the transcript in one pass: per-fold `swapIn` would rebuild
+    /// the whole line array and rescan every fold each time, so collapsing
+    /// thousands of folds (Ctrl-O cycling back, leaving verbose) would be
+    /// quadratic, blocking the frame thread (issue #248).
+    bool collapseAll() pure
+    {
+        sweepFloor = size_t.max;
+        bool any;
+        foreach (ref f; folds) any |= f.expanded;
+        if (!any) return false;
+        string[] nextLines;
+        // Reserve the collapsed size, not `lines.length`: the new array is
+        // kept, so an expanded-sized reservation would outlive the collapse.
+        size_t total = lines.length;
+        foreach (ref f; folds)
+            if (f.expanded) total = total - f.length + f.collapsed.length;
+        nextLines.reserve(total);
+        size_t at; // old index the next segment starts at
+        foreach (ref f; folds)
+        {
+            nextLines ~= lines[at .. f.start];
+            immutable oldLength = f.length;
+            if (f.expanded)
+            {
+                nextLines ~= f.collapsed;
+                // The expanded form (oldLength lines) leaves `lines`; the
+                // collapsed stash moves into `lines` in its place (it is the
+                // same array, so it is not freed, just relocated). The held
+                // total therefore drops by exactly the expanded lines.
+                foreach (l; lines[f.start .. f.start + oldLength])
+                    heldBytes = saturatingSub(heldBytes, lineCost(l));
+                f.length = f.collapsed.length;
+                f.collapsed = null;
+                f.expanded = false;
+            }
+            else nextLines ~= lines[f.start .. f.start + f.length];
+            at = f.start + oldLength; // old end of this fold
+            f.start = nextLines.length - f.length;
+        }
+        nextLines ~= lines[at .. $];
+        lines = nextLines;
+        cache = null;
         return true;
     }
 
-    /// Shows fold `k` expanded (`want`) or collapsed.
-    private void swap(size_t k, bool want) pure
+    /// The transcript's byte size: every line, plus the unfinished one and
+    /// the collapsed forms held for expanded folds. Expansion inserts a
+    /// fold's full text into `lines`, so this is also what Ctrl-O retains.
+    /// O(1): `heldBytes` tracks the rows incrementally (`cur` is added live,
+    /// endLine's drop, swapIn, collapseAll, clear), so the per-line cap
+    /// check stays off the O(lines) walk that made streaming output
+    /// quadratic (issue #248 review).
+    private size_t bytesHeld() const pure nothrow @nogc
     {
+        return heldBytes + cur.length;
+    }
+
+    /// What one held row costs: its text plus its `string[]` slot, so
+    /// millions of tiny expanded rows can't hide behind a small text
+    /// total (issue #248 review).
+    private static size_t lineCost(scope const(char)[] l) pure nothrow @nogc
+    {
+        return l.length + string.sizeof;
+    }
+
+    /// `cap` bounds lines, not bytes: a single line can be megabytes, and
+    /// Ctrl-O or verbose expansion inserts whole fold texts without a
+    /// completed line ever checking the cap, so an idle transcript could
+    /// grow without bound (issue #248 review). Once past `byteCap`, collapse
+    /// the oldest expanded folds (newest first would fight the user reading
+    /// the bottom); their texts stay in `store`, so nothing is lost. When no
+    /// fold is left to collapse, drop the oldest ordinary lines, and finally
+    /// truncate the unfinished line: plain output is bounded the same way.
+    size_t byteCap = 16 << 20;
+
+    /// Running total `bytesHeld` recomputes; kept in sync by every mutation
+    /// so the cap checks are O(1) instead of walking every line.
+    private size_t heldBytes;
+
+    /// Folds in `keepFrom .. keepTo` that a Ctrl-O press just expanded
+    /// (with their siblings by id) are collapsed only after every other
+    /// expanded fold.
+    private void enforceByteCap(size_t keepFrom = 0, size_t keepTo = 0) pure
+    {
+        if (bytesHeld() <= byteCap) return;
+        bool[] keep;
+        if (keepFrom < keepTo && keepTo <= folds.length)
         {
-            auto f = &folds[k];
-            if (f.expanded == want) return;
-            auto shown = lines[f.start .. f.start + f.length].dup;
-            lines = lines[0 .. f.start] ~ f.other ~ lines[f.start + f.length .. $];
-            immutable oldLength = f.length, newLength = f.other.length;
-            f.length = f.other.length;
-            f.other = shown;
-            f.expanded = want;
-            foreach (ref g; folds)
-                if (g.start > f.start) g.start = g.start - oldLength + newLength;
-            if (cache.length > f.start) cache = cache[0 .. f.start];
+            keep = new bool[folds.length];
+            foreach (k; keepFrom .. keepTo)
+                if (folds[k].expanded)
+                    foreach (j; 0 .. folds.length)
+                        if (j == k || (folds[k].id.length && folds[j].id == folds[k].id))
+                            keep[j] = true;
         }
+        foreach (pass; 0 .. 2)
+            foreach (k; 0 .. folds.length)
+            {
+                if (!folds[k].expanded || (pass == 0 && keep.length && keep[k])) continue;
+                swapIn(k, null); // updates heldBytes by the shrink
+                if (bytesHeld() <= byteCap) return;
+            }
+        // Ordinary output: no fold is left to collapse, so the oldest lines
+        // go, down to the low-water mark. A fold the cut runs through goes whole, with its metadata, so
+        // no collapsed remnant is left that can't be expanded.
+        if (lines.length)
+        {
+            // Prune to a low-water mark (3/4 of the cap), as the line cap
+            // does, so the copy below is amortised over many lines instead
+            // of repeating for every new line once full (issue #248 review).
+            immutable lowWater = byteCap - byteCap / 4;
+            size_t drop;
+            while (drop < lines.length && bytesHeld() > lowWater)
+                heldBytes = saturatingSub(heldBytes, lineCost(lines[drop++]));
+            if (drop)
+            {
+                size_t whole = drop;
+                foreach (f; folds)
+                    if (f.start < whole && f.start + f.length > whole)
+                        whole = f.start + f.length;
+                if (whole > lines.length) whole = lines.length;
+                // The fold-aligned extension's lines are not subtracted yet.
+                foreach (l; lines[drop .. whole])
+                    heldBytes = saturatingSub(heldBytes, lineCost(l));
+                // Copy so the pruned rows' backing array is released.
+                lines = lines[whole .. $].dup;
+                cache = cache.length > whole ? cache[whole .. $].dup : null;
+                pruneFolds(whole);
+                if (bytesHeld() <= byteCap) return;
+            }
+        }
+        // Only the unfinished line can still be over: keep its tail, where
+        // the live output is.
+        if (cur.length > byteCap)
+        {
+            // Start on a code-point boundary so no character is cut in
+            // half, and copy: a slice would pin (and keep appending into)
+            // the original oversized block.
+            size_t from = cur.length - byteCap;
+            while (from < cur.length && (cur[from] & 0xC0) == 0x80) from++;
+            cur = cur[from .. $].idup;
+        }
+    }
+
+    /// Drops the folds starting before line `cut` (the lines above it were
+    /// just removed), shifts the rest up, subtracts the dropped folds'
+    /// collapsed stashes from `heldBytes`, and moves the Ctrl-O sweep floor
+    /// down by the number dropped so it keeps pointing at the same fold.
+    private void pruneFolds(size_t cut) pure
+    {
+        Fold[] kept;
+        size_t gone;
+        foreach (f; folds)
+        {
+            if (f.start >= cut) { f.start -= cut; kept ~= f; continue; }
+            gone++;
+            if (f.id.length) notePruned(f.id);
+            foreach (c; f.collapsed) heldBytes = saturatingSub(heldBytes, lineCost(c));
+        }
+        folds = kept;
+        if (sweepFloor != size_t.max) sweepFloor = saturatingSub(sweepFloor, gone);
+    }
+
+    /// Verbose: expands the latest `verboseCap` folds, and every new one;
+    /// leaving it collapses them all. True when the transcript changed.
+    bool setVerbose(bool on)
+    {
+        flushDeferred();
+        settle();
+        if (on == verbose) return false;
+        verbose = on;
+        if (!on) return collapseAll();
+        bool any;
+        size_t n;
+        foreach_reverse (k; 0 .. folds.length)
+        {
+            if (n++ >= verboseCap) break;
+            any |= swap(k, true);
+        }
+        if (any) enforceByteCap();
+        return any;
+    }
+
+    /// Moves the texts of new folds into `store`, so the transcript holds
+    /// none (the frame calls it after each read).
+    void settle()
+    {
+        size_t from = folds.length;
+        if (unsettled) from = 0;
+        else while (from && !folds[from - 1].stored) from--;
+        unsettled = false;
+        foreach (ref f; folds[from .. $])
+        {
+            if (f.stored) continue;
+            f.text = store.put(f.fresh);
+            f.fresh = null;
+            f.stored = true;
+        }
+    }
+
+    /// Shows fold `k` expanded (`want`) or collapsed. False when it can't
+    /// (already so, or its text is gone).
+    private bool swap(size_t k, bool want)
+    {
+        auto f = &folds[k];
+        if (f.expanded == want || f.lost) return false;
+        if (!want) return swapIn(k, null);
+        string text = f.fresh;
+        if (f.stored && !store.get(f.text, text)) { f.lost = true; return false; }
+        return swapIn(k, text);
+    }
+
+    /// Shows fold `k` as `text` (expanded), or collapsed when null.
+    private bool swapIn(size_t k, string text) pure
+    {
+        auto f = &folds[k];
+        immutable want = text !is null;
+        if (f.expanded == want) return false;
+        string[] next;
+        if (want)
+        {
+            import std.string : stripRight;
+            import std.array : split;
+            next = text.stripRight("\n").split("\n");
+            f.collapsed = lines[f.start .. f.start + f.length].dup;
+            foreach (c; f.collapsed) heldBytes += lineCost(c);
+        }
+        else
+        {
+            next = f.collapsed;
+            foreach (c; f.collapsed) heldBytes = saturatingSub(heldBytes, lineCost(c));
+            f.collapsed = null;
+        }
+        foreach (l; lines[f.start .. f.start + f.length])
+            heldBytes = saturatingSub(heldBytes, lineCost(l));
+        foreach (l; next) heldBytes += lineCost(l);
+        lines = lines[0 .. f.start] ~ next ~ lines[f.start + f.length .. $];
+        immutable oldLength = f.length, newLength = next.length, at = f.start;
+        f.length = newLength;
+        f.expanded = want;
+        foreach (ref g; folds)
+            if (g.start > at) g.start = g.start - oldLength + newLength;
+        if (cache.length > at) cache = cache[0 .. at];
+        return true;
     }
 
     /// Every line wrapped to `width` (the unfinished line last, if any).
@@ -1512,28 +2054,31 @@ unittest
 {
     void put(ref Transcript t, string s) { t.feed(s.representation); }
     Transcript t;
-    string rows;
-    foreach (i; 1 .. 16) rows ~= format("row %s\n", i);
+    t.batch = 1;
     put(t, "● bash ls\n" ~ foldMark("call_1", 1, "● bash ls\n    {\n      \"command\": \"ls\"\n    }\n"));
     put(t, "● read a.rs\n" ~ foldMark("call_2", 1, "● read a.rs\n    {\"path\": \"a.rs\"}\n"));
     put(t, "interleaved command output\n");
     put(t, "  ⎿ file-a (+1 lines)\n" ~ foldMark("call_1", 1, expandedResult(true, "file-a\nfile-b", false)));
     auto collapsed = t.lines.dup;
     assert(collapsed.length == 4, format("%s", collapsed));
-    assert(t.toggleLatest());
+    assert(t.toggle());
     // call_1 and its result expand; call_2 and the output between are untouched.
     assert(t.lines == ["● bash ls", "    {", "      \"command\": \"ls\"", "    }", "● read a.rs",
         "interleaved command output", "  ⎿ file-a", "    file-b"], format("%s", t.lines));
     foreach (w; [12, 20, 80])
         foreach (l; t.render(w)) assert(visibleWidth(l) <= w);
-    assert(t.toggleLatest());
+    // The next press reaches further up: call_2.
+    assert(t.toggle());
+    assert(t.lines[4 .. 6] == ["● read a.rs", "    {\"path\": \"a.rs\"}"], format("%s", t.lines));
+    // Everything is expanded: the next press collapses it all.
+    assert(t.toggle());
     assert(t.lines == collapsed);
     // A result that arrives later expands with its already-expanded call.
     put(t, "● bash pwd\n" ~ foldMark("call_3", 1, "● bash pwd\n    {}\n"));
-    assert(t.toggleLatest());
+    assert(t.toggle());
     put(t, "  ⎿ /x (+1 lines)\n" ~ foldMark("call_3", 1, "  ⎿ /x\n    /y\n"));
     assert(t.lines[$ - 4 .. $] == ["● bash pwd", "    {}", "  ⎿ /x", "    /y"], format("%s", t.lines));
-    assert(t.toggleLatest()); // collapses the pair
+    assert(t.collapseAll());
     assert(t.lines[$ - 2 .. $] == ["● bash pwd", "  ⎿ /x (+1 lines)"]);
 }
 
@@ -1541,21 +2086,120 @@ unittest
 unittest
 {
     Transcript t;
-    assert(!t.toggleLatest());
+    assert(!t.toggle());
     auto mark = foldMark("", 1, "∴ Thought for 1.5s\n    first idea\n    second\n");
     // A mark split across reads still applies.
     t.feed(("∴ Thought for 1.5s\n" ~ mark[0 .. 9]).representation);
     t.feed(mark[9 .. $].representation);
     t.feed("after\n".representation);
     assert(t.lines == ["∴ Thought for 1.5s", "after"]);
-    assert(t.toggleLatest());
+    assert(t.toggle());
     assert(t.lines == ["∴ Thought for 1.5s", "    first idea", "    second", "after"]);
     // Other OSC sequences are dropped; a fold scrolled past the cap goes.
     t.feed("\x1b]0;title\x07x\n".representation);
     assert(t.lines[$ - 1] == "x");
     t.cap = 4;
     t.feed("a\nb\nc\n".representation);
-    assert(!t.toggleLatest());
+    assert(!t.toggle());
+}
+
+// Ctrl-O expands in batches going up from the bottom, so folds scrolled off
+// the screen expand too; once all are expanded it collapses them all.
+unittest
+{
+    import std.algorithm : startsWith;
+    Transcript t;
+    t.batch = 3;
+    foreach (i; 0 .. 7)
+        t.feed((format("r%s\n", i) ~ foldMark(format("c%s", i), 1, format("r%s\n  full %s\n", i, i))).representation);
+    t.feed("answer\n".representation);
+    size_t expanded() { size_t n; foreach (l; t.lines) n += l.startsWith("  full"); return n; }
+    assert(t.toggle() && expanded == 3 && t.lines[$ - 3 .. $] == ["r6", "  full 6", "answer"]);
+    assert(t.lines[0] == "r0", "the oldest stay collapsed");
+    assert(t.toggle() && expanded == 6);
+    assert(t.toggle() && expanded == 7 && t.lines[0 .. 2] == ["r0", "  full 0"]);
+    assert(t.toggle() && expanded == 0 && t.lines.length == 8);
+}
+
+// Collapsing a mix of expanded and collapsed folds rebuilds the transcript
+// in one pass: every fold's collapsed form returns at its own place, the
+// lines between folds are untouched, and later folds still expand at their
+// updated offsets (issue #248 review).
+unittest
+{
+    import std.algorithm : startsWith;
+    Transcript t;
+    t.batch = 2;
+    foreach (i; 0 .. 5)
+        t.feed((format("r%s\n", i) ~ foldMark(format("c%s", i), 1, format("r%s\n  full %s\n", i, i))).representation);
+    t.feed("tail\n".representation);
+    auto collapsed = t.lines.dup;
+    // Expand the bottom two folds, then the next two: a mix of expanded
+    // (c3, c4) and collapsed (c0..c2) folds with gaps.
+    assert(t.toggle());
+    assert(t.toggle());
+    size_t expanded() { size_t n; foreach (l; t.lines) n += l.startsWith("  full"); return n; }
+    assert(expanded == 4);
+    assert(t.collapseAll());
+    assert(t.lines == collapsed, format("%s", t.lines));
+    assert(!t.collapseAll(), "already collapsed: nothing to do");
+    // The folds still work afterwards: expansion lands at the right offsets.
+    assert(t.toggle());
+    assert(t.lines == ["r0", "r1", "r2", "r3", "  full 3", "r4", "  full 4", "tail"], format("%s", t.lines));
+}
+
+// The rendered markdown marks survive the stdout pipe into the transcript.
+unittest
+{
+    import std.algorithm : canFind;
+    import std.array : join;
+    import nano.markdown : render;
+    Transcript t;
+    t.feed(cast(const(ubyte)[]) (render("```\nls -la /tmp\n```", 40) ~ "\n"));
+    assert(t.lines.canFind!(l => l.canFind(verbatimMark)), t.lines.join("|"));
+    foreach (l; t.render(40)) assert(!l.canFind("\uFFFD"), l);
+}
+
+// Fold texts live in the store, not in the transcript: a file by default,
+// and in memory within a byte budget without one (the oldest are lost).
+unittest
+{
+    FoldStore disk;
+    if (disk.backedByFile)
+    {
+        auto a = disk.put("alpha"), b = disk.put("beta é");
+        string s;
+        assert(disk.get(b, s) && s == "beta é");
+        assert(disk.get(a, s) && s == "alpha");
+    }
+    Transcript t;
+    t.store.memoryOnly = true;
+    t.store.budget = 20;
+    t.batch = 10;
+    foreach (i; 0 .. 4)
+        t.feed((format("r%s\n", i) ~ foldMark("", 1, format("r%s\n  0123456\n", i))).representation);
+    // Each text is 13 bytes: only the latest fits the budget.
+    assert(t.toggle());
+    assert(t.lines == ["r0", "r1", "r2", "r3", "  0123456"], format("%s", t.lines));
+    assert(t.toggle(), "all that can expand is expanded: collapse");
+    assert(t.lines == ["r0", "r1", "r2", "r3"]);
+}
+
+// Verbose expands the existing folds (the latest `verboseCap`) and every
+// new one; leaving it collapses them.
+unittest
+{
+    Transcript t;
+    t.verboseCap = 2;
+    foreach (i; 0 .. 3)
+        t.feed((format("r%s\n", i) ~ foldMark("", 1, format("r%s\n  full\n", i))).representation);
+    assert(t.setVerbose(true));
+    assert(t.lines == ["r0", "r1", "  full", "r2", "  full"], format("%s", t.lines));
+    t.feed(("r3\n" ~ foldMark("", 1, "r3\n  full\n")).representation);
+    assert(t.lines[$ - 2 .. $] == ["r3", "  full"]);
+    assert(!t.setVerbose(true));
+    assert(t.setVerbose(false));
+    assert(t.lines == ["r0", "r1", "r2", "r3"]);
 }
 
 // Refold marks (the frame side of ui.rs::trailing_thinking_merges_interleaved_reasoning_fragments).
@@ -1570,13 +2214,13 @@ unittest
     t.feed(refoldMark("think-1", "∴ Thought for 2.0s · 12 chars\n", "∴ Thought for 2.0s · 12 chars\n    first second\n").representation);
     t.feed("C\n".representation);
     assert(t.lines == ["∴ Thought for 2.0s · 12 chars", "ABC"], t.lines.to!string);
-    assert(t.toggleLatest());
+    assert(t.toggle());
     assert(t.lines == ["∴ Thought for 2.0s · 12 chars", "    first second", "ABC"], t.lines.to!string);
     // Refolding while expanded redraws the expanded form; collapsing again
     // shows the latest summary.
     t.feed(refoldMark("think-1", "∴ Thought for 3.0s\n", "∴ Thought for 3.0s\n    x\n    y\n").representation);
     assert(t.lines == ["∴ Thought for 3.0s", "    x", "    y", "ABC"], t.lines.to!string);
-    assert(t.toggleLatest());
+    assert(t.toggle());
     assert(t.lines == ["∴ Thought for 3.0s", "ABC"], t.lines.to!string);
     // An unknown id changes nothing.
     t.feed(refoldMark("nope", "z\n", "z\n").representation);
@@ -1593,7 +2237,7 @@ unittest
     foreach (i; 0 .. 12) t.feed((i.to!string ~ "\n").representation);
     t.feed(refoldMark("think-1", "∴ Thought more\n", "∴ Thought more\n    a b\n").representation);
     assert(t.lines[$ - 1] == "∴ Thought more", t.lines.to!string);
-    assert(t.toggleLatest());
+    assert(t.toggle());
     assert(t.lines[$ - 2 .. $] == ["∴ Thought more", "    a b"], t.lines.to!string);
     // clear() forgets pruned ids: a later refold for one changes nothing.
     t.feed(("∴ T2\n" ~ foldMark("think-2", 1, "∴ T2\n    b\n")).representation);
@@ -1616,7 +2260,7 @@ unittest
     t.feed(refoldMark("think-1", "∴ Thought most\n", "∴ Thought most\n    a b c\n").representation);
     t.feed("C\n".representation);
     assert(t.render(80)[$ - 2 .. $] == ["ABC", "∴ Thought most"]);
-    assert(t.toggleLatest());
+    assert(t.toggle());
     assert(t.lines[$ - 2 .. $] == ["∴ Thought most", "    a b c"], t.lines.to!string);
 }
 
@@ -1682,6 +2326,56 @@ unittest
 unittest
 {
     import std.conv : to;
+    // A refold of a fold whose text is already in the store (settled):
+    // the new expanded text replaces the stored one, collapsed and expanded,
+    // and nothing of it stays in the transcript once settled again.
+    foreach (memoryOnly; [false, true])
+    {
+        Transcript t;
+        t.store.memoryOnly = memoryOnly;
+        t.feed(("∴ T1\n" ~ foldMark("think-1", 1, "∴ T1\n    old\n") ~ "tail\n").representation);
+        t.settle();
+        assert(t.folds[0].stored && t.folds[0].fresh is null);
+        // Collapsed: the summary is redrawn, the new text is stored on settle.
+        t.feed(refoldMark("think-1", "∴ T2\n", "∴ T2\n    new\n").representation);
+        assert(t.lines == ["∴ T2", "tail"], t.lines.to!string);
+        t.settle();
+        assert(t.folds[0].stored && t.folds[0].fresh is null);
+        assert(t.toggle());
+        assert(t.lines == ["∴ T2", "    new", "tail"], t.lines.to!string);
+        // Expanded: the expanded text is redrawn and the collapsed stash updated.
+        t.feed(refoldMark("think-1", "∴ T3\n", "∴ T3\n    newer\n    more\n").representation);
+        assert(t.lines == ["∴ T3", "    newer", "    more", "tail"], t.lines.to!string);
+        t.settle();
+        assert(t.folds[0].stored && t.folds[0].fresh is null);
+        assert(t.toggle());
+        assert(t.lines == ["∴ T3", "tail"], t.lines.to!string);
+        assert(t.toggle());
+        assert(t.lines == ["∴ T3", "    newer", "    more", "tail"], t.lines.to!string);
+        // The held total matches a recount after the refolds.
+        size_t want;
+        foreach (l; t.lines) want += t.lineCost(l);
+        foreach (f; t.folds) foreach (c; f.collapsed) want += t.lineCost(c);
+        assert(t.heldBytes == want);
+    }
+    {
+        // A pruned stored fold re-added by a refold is stored on settle.
+        Transcript t;
+        t.cap = 10;
+        t.feed(("∴ T\n" ~ foldMark("think-1", 1, "∴ T\n    a\n")).representation);
+        t.settle();
+        foreach (i; 0 .. 12) t.feed((i.to!string ~ "\n").representation);
+        t.feed(refoldMark("think-1", "∴ T more\n", "∴ T more\n    a b\n").representation);
+        t.settle();
+        assert(t.folds[$ - 1].stored && t.folds[$ - 1].fresh is null);
+        assert(t.toggle());
+        assert(t.lines[$ - 2 .. $] == ["∴ T more", "    a b"], t.lines.to!string);
+    }
+}
+
+unittest
+{
+    import std.conv : to;
     // Pruned-id bookkeeping is bounded.
     Transcript t;
     t.cap = 10;
@@ -1733,4 +2427,479 @@ unittest
     screen = null;
     r.render(t ~ ["new", "a", "status"], 20, 4, t.length + 1);
     assert(screen.canFind("\x1b[3J"), screen);
+}
+
+// Pruning past the cap drops a fold it cuts through whole, so no expanded
+// remnant outlives its metadata; Ctrl-O skips unreadable folds without
+// spending batch slots on them.
+unittest
+{
+    import std.algorithm : canFind;
+    Transcript t;
+    t.cap = 10;
+    t.setVerbose(true);
+    t.feed(("r\n" ~ foldMark("c", 1, "r\n  a\n  b\n  c\n  d\n")).representation);
+    foreach (i; 0 .. 7) t.feed(format("x%s\n", i).representation);
+    // 12 lines > cap: the cut (at 3) runs through the fold (0 .. 5).
+    assert(!t.lines.canFind("  d") && !t.lines.canFind("  c"), format("%s", t.lines));
+    assert(t.folds.length == 0);
+    assert(t.lines[0] == "x0", format("%s", t.lines));
+
+    Transcript u;
+    u.batch = 1;
+    foreach (i; 0 .. 3)
+        u.feed((format("r%s\n", i) ~ foldMark(format("c%s", i), 1, format("r%s\n  full %s\n", i, i))).representation);
+    u.settle();
+    u.folds[2].lost = true;
+    u.folds[1].lost = true;
+    assert(u.toggle());
+    assert(u.lines.canFind("  full 0"), format("%s", u.lines));
+}
+
+// The line cap does not bound expansion: Ctrl-O and verbose insert whole
+// fold texts into `lines` without a completed line ever checking it, so an
+// idle transcript could grow without bound. The byte cap collapses the
+// oldest expanded folds once it is exceeded; their texts stay in the store,
+// so a later Ctrl-O reads them back (issue #248 review).
+unittest
+{
+    import std.algorithm : canFind;
+    import std.array : replicate;
+    Transcript t;
+    t.byteCap = 1_024;
+    t.store.memoryOnly = true;
+    foreach (i; 0 .. 4)
+        t.feed((format("r%s\n", i) ~ foldMark(format("c%s", i), 1,
+            format("r%s\n%s\n", i, "x".replicate(400)))).representation);
+    t.settle();
+    // Ctrl-O expands the newest batch first; the byte cap then collapses the
+    // oldest ones, keeping the transcript under it.
+    assert(t.toggle());
+    assert(t.bytesHeld() <= t.byteCap, format!"%s held"(t.bytesHeld()));
+    assert(t.lines.canFind("x".replicate(400)), "the newest fold stays expanded");
+    assert(!t.folds[0].expanded && !t.folds[1].expanded,
+        "the oldest folds collapse first");
+    // Nothing is lost: the sweep had reached the top, so the next press
+    // collapses, and the one after re-expands the newest from the store.
+    t.batch = 20;
+    assert(t.toggle() && !t.folds[0].expanded, "the sweep collapses at the top");
+    assert(t.toggle() && t.lines.canFind("x".replicate(400)),
+        "and re-expands from the store on the next sweep");
+    assert(t.bytesHeld() <= t.byteCap, format!"%s held"(t.bytesHeld()));
+    // Verbose expansion is bounded the same way.
+    Transcript v;
+    v.byteCap = 1_024;
+    v.store.memoryOnly = true;
+    foreach (i; 0 .. 4)
+        v.feed((format("r%s\n", i) ~ foldMark(format("c%s", i), 1,
+            format("r%s\n%s\n", i, "y".replicate(400)))).representation);
+    v.settle();
+    assert(v.setVerbose(true));
+    assert(v.bytesHeld() <= v.byteCap, format!"%s held"(v.bytesHeld()));
+    // And a fold streaming in already expanded is bounded as it completes.
+    Transcript w;
+    w.byteCap = 1_024;
+    w.store.memoryOnly = true;
+    w.setVerbose(true);
+    foreach (i; 0 .. 4)
+        w.feed((format("r%s\n", i) ~ foldMark(format("c%s", i), 1,
+            format("r%s\n%s\n", i, "z".replicate(400)))).representation);
+    // No trailing line: the cap is enforced as each automatic expansion
+    // lands, not only when the next line ends (issue #248 review).
+    assert(w.bytesHeld() <= w.byteCap, format!"%s held"(w.bytesHeld()));
+    w.feed("tail\n".representation);
+    assert(w.bytesHeld() <= w.byteCap, format!"%s held"(w.bytesHeld()));
+}
+
+// The byte cap must not trap fold navigation: when a batch's expansions push
+// the transcript over budget, the cap collapses the oldest of them - and
+// those folds must not be re-expanded by the next press, or the sweep would
+// spin on the same folds and collapse-all would never come (issue #248
+// review). The sweep's progress is the lowest fold it reached, so the press
+// after the cap has collapsed the survivors finds nothing new and collapses,
+// then the cycle restarts - it never spins.
+unittest
+{
+    import std.algorithm : startsWith;
+    import std.array : replicate;
+    Transcript t;
+    t.byteCap = 1_024;
+    t.store.memoryOnly = true;
+    t.batch = 4; // one press selects every fold; the cap keeps the newest two
+    foreach (i; 0 .. 4)
+        t.feed((format("r%s\n", i) ~ foldMark(format("c%s", i), 1,
+            format("r%s\n%s\n", i, "x".replicate(400)))).representation);
+    t.settle();
+    size_t expanded() { size_t n; foreach (l; t.lines) n += l.startsWith("x".replicate(400)); return n; }
+    // The cap holds the newest two of the four 400-byte bodies expanded.
+    assert(t.toggle() && expanded == 2, format!"%s expanded"(expanded));
+    assert(t.lines[$ - 1] == "x".replicate(400), "the newest fold stays expanded");
+    // The sweep reached the top (every fold was selected), so the next press
+    // collapses the survivors instead of re-expanding the same folds.
+    assert(t.toggle() && expanded == 0, "collapse-all is reached");
+    // And the cycle restarts from the bottom rather than wedging.
+    assert(t.toggle() && expanded == 2, "the cycle restarts");
+    assert(t.toggle() && expanded == 0, "and collapses again");
+}
+
+// An unfinished OSC must not grow `pending` without bound; text after its
+// terminator still lands.
+unittest
+{
+    Transcript t;
+    t.oscCap = 64;
+    t.feed(cast(const(ubyte)[]) "\x1b]0;");
+    foreach (_; 0 .. 1_000) t.feed(cast(const(ubyte)[]) "xxxxxxxxxxxxxxxx");
+    assert(t.pending.length <= t.oscCap);
+    t.feed(cast(const(ubyte)[]) "yy\x07after\n");
+    assert(t.lines == ["after"], format!"%s"(t.lines));
+    t.feed(cast(const(ubyte)[]) "\x1b]0;");
+    foreach (_; 0 .. 100) t.feed(cast(const(ubyte)[]) "xxxxxxxxxxxxxxxx");
+    t.feed(cast(const(ubyte)[]) "\x1b\\next\n");
+    assert(t.lines == ["after", "next"], format!"%s"(t.lines));
+}
+
+// An ST split across reads (ESC last in one, `\\` first in the next) ends a
+// discarded OSC and a fold mark alike; nothing after it is swallowed.
+unittest
+{
+    // Discarded (over `oscCap`), split right after entering the discard.
+    Transcript t;
+    t.oscCap = 8;
+    t.feed(cast(const(ubyte)[]) "\x1b]0;xxxxxxxxxxxx\x1b");
+    t.feed(cast(const(ubyte)[]) "\\a\n");
+    assert(t.lines == ["a"], format!"%s"(t.lines));
+    // Split while already discarding.
+    t.feed(cast(const(ubyte)[]) "\x1b]0;xxxxxxxxxxxx");
+    t.feed(cast(const(ubyte)[]) "yyyy\x1b");
+    t.feed(cast(const(ubyte)[]) "\\b\n");
+    assert(t.lines == ["a", "b"], format!"%s"(t.lines));
+    // A fold mark ended by a split ST still registers its fold.
+    auto mark = foldMark("id", 1, "b\n    out\n");
+    mark = mark[0 .. $ - 1] ~ "\x1b";
+    t.feed(cast(const(ubyte)[]) mark);
+    t.feed(cast(const(ubyte)[]) "\\c\n");
+    assert(t.lines == ["a", "b", "c"], format!"%s"(t.lines));
+    assert(t.toggle());
+    assert(t.lines == ["a", "b", "    out", "c"], format!"%s"(t.lines));
+}
+
+// A fold mark far past `oscCap` (a large result), fed in the frame's
+// 8 KiB reads, still registers its fold; one past `foldOscCap` is dropped
+// without swallowing what follows it.
+unittest
+{
+    import std.array : replicate;
+    import std.algorithm : min;
+    Transcript t;
+    auto big = "r\n" ~ ("    " ~ "y".replicate(70) ~ "\n").replicate(500);
+    auto stream = "r\n" ~ foldMark("tool-1", 1, big) ~ "after\n";
+    for (size_t at = 0; at < stream.length; at += 8192)
+        t.feed(cast(const(ubyte)[]) stream[at .. min(at + 8192, stream.length)]);
+    assert(t.lines == ["r", "after"], format!"%s"(t.lines));
+    assert(!t.foldOscBuf.length && !t.inFoldOsc);
+    assert(t.toggle());
+    assert(t.lines.length == 502, format!"%s"(t.lines.length));
+    Transcript u;
+    u.foldOscCap = 1024;
+    for (size_t at = 0; at < stream.length; at += 8192)
+        u.feed(cast(const(ubyte)[]) stream[at .. min(at + 8192, stream.length)]);
+    assert(u.lines == ["r", "after"], format!"%s"(u.lines));
+    assert(!u.foldOscBuf.length && !u.toggle());
+}
+
+// `bytesHeld` is a running total, not a walk: it must match a from-scratch
+// recount after every mutation that moves bytes in or out (endLine's line
+// and its drop past the line cap, swapIn's expand and collapse, collapseAll,
+// clear), or the O(1) cap check drifts from what the transcript holds.
+unittest
+{
+    import std.array : replicate;
+    // The from-scratch recount `heldBytes` stands in for.
+    size_t recount(ref Transcript t)
+    {
+        size_t n = t.cur.length;
+        foreach (l; t.lines) n += Transcript.lineCost(l);
+        foreach (ref f; t.folds)
+            if (f.expanded)
+                foreach (c; f.collapsed) n += Transcript.lineCost(c);
+        return n;
+    }
+
+    Transcript t;
+    t.store.memoryOnly = true;
+    t.cap = 6; // small, so endLine's drop path runs
+    assert(t.bytesHeld() == recount(t));
+    foreach (i; 0 .. 4)
+        t.feed((format("r%s\n", i) ~ foldMark(format("c%s", i), 1,
+            format("r%s\n%s\n", i, "x".replicate(40)))).representation);
+    t.settle();
+    assert(t.bytesHeld() == recount(t), "after streaming folds in");
+    assert(t.toggle(), "expand a batch");
+    assert(t.bytesHeld() == recount(t), "after expand");
+    // The second press expands the rest; whether it leaves any expanded
+    // depends on the byte cap, so collapse whatever is still open.
+    t.toggle();
+    assert(t.bytesHeld() == recount(t), "after expanding the rest");
+    t.collapseAll();
+    assert(t.bytesHeld() == recount(t), "after collapseAll");
+    // Long plain lines push the oldest out past the line cap.
+    foreach (i; 0 .. 20) t.feed((format("line%s\n", i)).representation);
+    assert(t.bytesHeld() == recount(t), "after the line-cap drop");
+    // The unfinished line is counted too, mid-feed and once it ends.
+    t.feed("unfinished".representation);
+    assert(t.bytesHeld() == recount(t), "the unfinished line is counted");
+    t.feed("\n".representation);
+    assert(t.bytesHeld() == recount(t), "and stays counted once finished");
+    t.clear();
+    assert(t.bytesHeld() == 0 && t.bytesHeld() == recount(t), "after clear");
+}
+
+// A discarded expanded fold's collapsed stash leaves the transcript with it:
+// both were counted in `heldBytes`, so pruning only the displayed lines
+// overcounts forever and eventually collapses valid expansions even when the
+// transcript fits the budget (issue #248 review).
+unittest
+{
+    import std.array : replicate;
+    size_t recount(ref Transcript t)
+    {
+        size_t n = t.cur.length;
+        foreach (l; t.lines) n += Transcript.lineCost(l);
+        foreach (ref f; t.folds)
+            if (f.expanded)
+                foreach (c; f.collapsed) n += Transcript.lineCost(c);
+        return n;
+    }
+
+    Transcript t;
+    t.store.memoryOnly = true;
+    t.cap = 4; // the line-cap drop runs while a fold is expanded
+    t.feed(("r0\n" ~ foldMark("c0", 1, "r0\n" ~ "x".replicate(40) ~ "\n")).representation);
+    t.settle();
+    assert(t.toggle(), "the fold expands");
+    assert(t.bytesHeld() == recount(t));
+    foreach (i; 0 .. 6) t.feed((format("f%s\n", i)).representation);
+    assert(t.folds.length == 0, "the expanded fold is pruned whole");
+    assert(t.bytesHeld() == recount(t),
+        "its collapsed stash leaves the accounting too");
+}
+
+// The byte cap bounds ordinary output too: with no fold left to collapse,
+// the oldest lines go, and an unfinished line is truncated to its tail - the
+// live end (issue #248 review).
+unittest
+{
+    import std.array : replicate;
+    Transcript t;
+    t.byteCap = 1_024;
+    t.store.memoryOnly = true;
+    // One 2 KiB completed line, no folds anywhere.
+    t.feed(("a".replicate(2_048) ~ "\n").representation);
+    assert(t.bytesHeld() <= t.byteCap, format!"%s held"(t.bytesHeld()));
+    assert(t.lines.length == 0, "the over-cap line is dropped");
+    // An unfinished line over the cap keeps its tail.
+    t.feed("b".replicate(2_048).representation);
+    assert(t.bytesHeld() <= t.byteCap, format!"%s held"(t.bytesHeld()));
+    assert(t.cur.length == t.byteCap, format!"%s"(t.cur.length));
+    // And a mix: the newest lines stay.
+    Transcript u;
+    u.byteCap = 1_024;
+    u.store.memoryOnly = true;
+    foreach (i; 0 .. 8)
+        u.feed((format("l%s:", i) ~ "y".replicate(200) ~ "\n").representation);
+    assert(u.bytesHeld() <= u.byteCap, format!"%s held"(u.bytesHeld()));
+    assert(u.lines[$ - 1][0 .. 3] == "l7:", "the newest line stays");
+    // A cut that would run through a collapsed fold drops it whole, with its
+    // metadata, so no remnant is left that can't be expanded.
+    Transcript m;
+    m.byteCap = 1_024;
+    m.store.memoryOnly = true;
+    // A collapsed fold, then plain output that overflows the cap past it.
+    m.feed(("r0\n" ~ foldMark("c0", 1, "r0\n" ~ "z".replicate(60) ~ "\n")).representation);
+    foreach (i; 0 .. 8)
+        m.feed((format("p%s:", i) ~ "y".replicate(200) ~ "\n").representation);
+    assert(m.bytesHeld() <= m.byteCap, format!"%s held"(m.bytesHeld()));
+    // The fold is either whole or gone - never a partial remnant.
+    foreach (ref f; m.folds)
+        assert(f.start + f.length <= m.lines.length, "fold stays within the lines");
+}
+
+// Once a fold's expanded text alone exceeds the byte cap, a Ctrl-O press
+// expands it and the cap immediately collapses it again. The press still
+// reports the change, and the next press finds nothing new to expand and
+// collapses (a no-op here), so repeated presses keep cycling expand ->
+// collapse instead of spinning on the fold the cap keeps undoing (issue #248
+// review).
+unittest
+{
+    import std.array : replicate;
+    import std.algorithm : canFind;
+    import std.conv : to;
+    Transcript t;
+    t.byteCap = 1_024;
+    t.store.memoryOnly = true;
+    t.batch = 20; // one press reaches every fold
+    // One fold whose expanded text (~2 KiB) exceeds the cap on its own.
+    t.feed(("r0\n" ~ foldMark("c0", 1,
+        "r0\n" ~ "x".replicate(2_000) ~ "\n")).representation);
+    t.settle();
+    // The press expands the fold and the cap collapses it straight back.
+    assert(t.toggle(), "the press expands (then the cap undoes it)");
+    assert(!t.folds[0].expanded, "the over-cap fold is collapsed again");
+    // Repeated presses never wedge: they alternate expand -> collapse, and
+    // the fold stays collapsed under the cap throughout. The loop ends on an
+    // expand, so one more press collapses and restarts the sweep from the
+    // bottom.
+    foreach (press; 0 .. 4)
+    {
+        t.toggle();
+        assert(!t.folds[0].expanded, "press " ~ press.to!string ~ " leaves it collapsed");
+    }
+    assert(!t.toggle(), "the sweep collapses and restarts");
+    // And the text is not lost: with a larger cap the fold expands again.
+    t.byteCap = 1 << 20;
+    assert(t.toggle(), "with headroom the fold expands once more");
+    assert(t.lines.canFind("x".replicate(2_000)));
+}
+
+// Truncating the unfinished line never cuts a UTF-8 character in half, and
+// the kept tail is a fresh copy, not a slice pinning the oversized block
+// (issue #248 review).
+unittest
+{
+    import std.array : replicate;
+    import std.utf : validate;
+    Transcript t;
+    t.byteCap = 1_024;
+    t.store.memoryOnly = true;
+    // "€" is 3 bytes; 1_025 of them put the cut mid-character.
+    auto big = "€".replicate(1_025);
+    t.feed(big.representation);
+    validate(t.cur);
+    assert(t.cur.length <= t.byteCap);
+    assert(t.bytesHeld() <= t.byteCap, format!"%s held"(t.bytesHeld()));
+    assert(t.cur.length + 2 >= t.byteCap, "at most a partial character is lost");
+}
+
+// Dropping folds moves the Ctrl-O sweep floor with them, so the next press
+// carries on from the same fold instead of re-expanding passed ones.
+unittest
+{
+    Transcript t;
+    t.store.memoryOnly = true;
+    foreach (i; 0 .. 4)
+        t.feed((format("r%s\n", i) ~ foldMark(format("c%s", i), 1, "x\n")).representation);
+    assert(t.folds.length == 4);
+    t.sweepFloor = 2;
+    // Lines above fold 1 go: folds 0 is dropped, the floor follows.
+    t.pruneFolds(t.folds[1].start);
+    assert(t.folds.length == 3);
+    assert(t.sweepFloor == 1, format!"%s"(t.sweepFloor));
+    t.sweepFloor = size_t.max;
+    t.pruneFolds(t.folds[1].start);
+    assert(t.sweepFloor == size_t.max);
+}
+
+// A line split across reads is charged once: 600 bytes then a newline
+// keeps the row under a 1 KiB cap, exactly as one read would (issue #248
+// review). An incomplete OSC still leaves the count exact and capped.
+unittest
+{
+    import std.array : replicate;
+    Transcript split, whole;
+    split.byteCap = whole.byteCap = 1_024;
+    split.feed("a".replicate(600).representation);
+    split.feed("\n".representation);
+    whole.feed(("a".replicate(600) ~ "\n").representation);
+    assert(split.lines == whole.lines && split.lines.length == 1);
+    assert(split.bytesHeld() == whole.bytesHeld());
+
+    Transcript o;
+    o.byteCap = 1_024;
+    o.feed(("b".replicate(2_000) ~ "\x1b]9;unterminated").representation);
+    assert(o.cur.length <= o.byteCap);
+    assert(o.bytesHeld() <= o.byteCap, format!"%s held"(o.bytesHeld()));
+}
+
+// Row storage counts: many tiny rows are charged their slots, so they
+// can't exceed the cap on text size alone (issue #248 review).
+unittest
+{
+    Transcript t;
+    t.byteCap = 1_024;
+    t.cap = size_t.max;
+    foreach (i; 0 .. 1_000) t.feed("x\n".representation);
+    assert(t.bytesHeld() <= t.byteCap, format!"%s held"(t.bytesHeld()));
+    assert(t.lines.length * (1 + string.sizeof) <= t.byteCap);
+}
+
+// Byte-cap eviction of ordinary lines prunes down to a low-water mark, so
+// once full, the transcript is not copied again on every new line: many
+// lines pass before the next prune (issue #248 review).
+unittest
+{
+    import std.array : replicate;
+    Transcript t;
+    t.byteCap = 64 * 1_024;
+    t.store.memoryOnly = true;
+    immutable row = "y".replicate(1_000) ~ "\n";
+    size_t prunes, last = size_t.max;
+    foreach (i; 0 .. 1_000)
+    {
+        t.feed(row.representation);
+        assert(t.bytesHeld() <= t.byteCap);
+        // A prune shows up as the line count going down.
+        if (last != size_t.max && t.lines.length < last) prunes++;
+        last = t.lines.length;
+    }
+    assert(prunes > 0 && prunes < 100, format!"%s prunes"(prunes));
+}
+
+// Ctrl-O keeps the batch it just expanded: older expansions are collapsed
+// for the byte cap first, so every batch is shown on some press (issue #248
+// review: folds 0/1 were collapsed at once and never seen).
+unittest
+{
+    import std.array : replicate;
+    Transcript t;
+    t.byteCap = 1_024;
+    t.store.memoryOnly = true;
+    t.batch = 2;
+    foreach (i; 0 .. 4)
+        t.feed((format("r%s\n", i) ~ foldMark(format("c%s", i), 1,
+            format("r%s\n%s\n", i, "x".replicate(400)))).representation);
+    t.settle();
+    assert(t.toggle() && t.folds[2].expanded && t.folds[3].expanded);
+    assert(t.toggle());
+    assert(t.folds[0].expanded && t.folds[1].expanded, "the requested batch shows");
+    assert(!t.folds[2].expanded && !t.folds[3].expanded, "older expansions go first");
+    assert(t.bytesHeld() <= t.byteCap, format!"%s held"(t.bytesHeld()));
+}
+
+// In verbose, a pruned fold re-added by a refold arrives expanded, at once
+// or after a deferred line ends, within the byte cap (issue #248 review).
+unittest
+{
+    import std.conv : to;
+    foreach (deferredLine; [false, true])
+    {
+        Transcript t;
+        t.cap = 10;
+        t.store.memoryOnly = true;
+        t.setVerbose(true); // no folds yet: false, but the mode is on
+        t.feed(("∴ Thought\n" ~ foldMark("think-1", 1, "∴ Thought\n    a\n")).representation);
+        foreach (i; 0 .. 12) t.feed((i.to!string ~ "\n").representation);
+        if (deferredLine) t.feed("mid".representation);
+        t.feed(refoldMark("think-1", "∴ Thought more\n", "∴ Thought more\n    a b\n").representation);
+        // A deferred re-add lands when the next text follows the line end.
+        if (deferredLine) t.feed("\nz".representation);
+        assert(t.folds.length && t.folds[$ - 1].id == "think-1" && t.folds[$ - 1].expanded, t.lines.to!string);
+        immutable at = t.folds[$ - 1].start;
+        assert(t.lines[at .. at + 2] == ["∴ Thought more", "    a b"], t.lines.to!string);
+        assert(t.bytesHeld() <= t.byteCap);
+        t.settle();
+        assert(t.collapseAll() && t.lines[t.folds[$ - 1].start] == "∴ Thought more", t.lines.to!string);
+        assert(t.folds[$ - 1].length == 1);
+    }
 }

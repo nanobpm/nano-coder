@@ -111,3 +111,103 @@ unittest
     assert(r.replayStash.length == agent.replayStash.length, "the stash is rebuilt from the log");
     assert(users(r.replayStash) == ["ping", "pong"]);
 }
+
+// The stash keeps only log references for large folded tool outputs (a long
+// session would otherwise hold every one); the replay reads them back, and
+// the log's replace record still holds them whole (issue #248).
+unittest
+{
+    auto dir = buildPath(tempDir, "nano-d-agent-replay-slim");
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto agent = agentWith([LLMResponse("", "", [ToolCall.fromRaw("b1", "big", `{}`)]), LLMResponse("done"),
+        LLMResponse("SUMMARY: one")]);
+    auto log = new SessionLog(dir, "mock/m", "/w");
+    agent.log = some(log);
+    log.append(agent.messages[0]);
+    agent.run("go", new NullEvents);
+    assert(compactNow(agent));
+    auto stashed = agent.replayStash.filter!(m => m.role == Role.tool).array;
+    assert(stashed.length == 1 && !stashed[0].content.length, "the output is not held in memory");
+    auto shown = agent.replayMessages.filter!(m => m.role == Role.tool).array;
+    assert(shown.length == 1 && shown[0].content == "x".replicate(8_000), "the replay reads it from the log");
+    auto r = restore(log.path);
+    auto restored = r.replayStash.filter!(m => m.role == Role.tool).array;
+    assert(restored.length == 1 && restored[0].content == "x".replicate(8_000), "the log keeps it whole");
+    // Without a log nothing replays it: the stash drops it.
+    auto plain = agentWith([LLMResponse("", "", [ToolCall.fromRaw("b1", "big", `{}`)]), LLMResponse("done"),
+        LLMResponse("SUMMARY: one")]);
+    plain.run("go", new NullEvents);
+    assert(compactNow(plain));
+    assert(!plain.replayStash.filter!(m => m.role == Role.tool).front.content.length);
+    assert(users(plain.replayMessages).canFind("go"), "the turn itself still replays");
+}
+
+// A new session after a resume (ACP `session/new`, `/restart`) resets the
+// restored-session provenance: a `restoredLineFloor` left over from the
+// loaded session would stop every later compaction from slimming this
+// session's large tool outputs, keeping them in memory for good (issue #248
+// review).
+unittest
+{
+    auto dir = buildPath(tempDir, "nano-d-agent-restart-slim");
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto agent = agentWith([LLMResponse("", "", [ToolCall.fromRaw("b1", "big", `{}`)]), LLMResponse("done"),
+        LLMResponse("SUMMARY: one")]);
+    // Simulate a resumed session: a restored conversation whose log lines
+    // are all at or below the floor `loadRestored` computes.
+    import nano.session : Restored;
+    Restored r;
+    auto restoredMsg = Message.user("old turn");
+    restoredMsg.logLine = 7;
+    r.conversation = [restoredMsg];
+    agent.loadRestored(r, Option!SessionLog.init);
+    assert(agent.restoredLineFloor == 7);
+    // The new session (what ACP `session/new` now does through `restart`).
+    auto log = new SessionLog(dir, "mock/m", "/w");
+    agent.restart("sys", some(log));
+    assert(!agent.restoredLineFloor, "the new session has no restored provenance");
+    agent.run("go", new NullEvents);
+    assert(compactNow(agent));
+    auto stashed = agent.replayStash.filter!(m => m.role == Role.tool).array;
+    assert(stashed.length == 1 && !stashed[0].content.length,
+        "a leftover floor would keep the new session's output in memory");
+}
+
+// A slimmed stash entry references its log, not the log's path at slimming
+// time: when a later write finds the log replaced and moves the writer to a
+// recovery file (`SessionLog.recoverReplaced`), the replay must follow it —
+// the stale path names a foreign file, whose lines replay empty or unrelated
+// output (issue #248 review).
+unittest
+{
+    import std.file : remove, rename, write_file = write;
+    auto dir = buildPath(tempDir, "nano-d-agent-replay-recovery");
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto agent = agentWith([LLMResponse("", "", [ToolCall.fromRaw("b1", "big", `{}`)]), LLMResponse("done"),
+        LLMResponse("SUMMARY: one"), LLMResponse("after")]);
+    auto log = new SessionLog(dir, "mock/m", "/w");
+    agent.log = some(log);
+    log.append(agent.messages[0]);
+    agent.run("go", new NullEvents);
+    assert(compactNow(agent));
+    auto stashed = agent.replayStash.filter!(m => m.role == Role.tool).array;
+    assert(stashed.length == 1 && !stashed[0].content.length, "the output is not held in memory");
+    // The log is replaced by a foreign file (not a prefix of ours): the next
+    // write moves this session to a recovery log beside it.
+    auto original = log.path;
+    remove(original);
+    write_file(original, "{\"type\":\"session\",\"data\":{}}\n");
+    agent.run("after", new NullEvents);
+    assert(log.path != original, "the writer moved to a recovery log");
+    // The replay reads the slimmed output from the recovery log, not the
+    // foreign file at the stale path.
+    auto shown = agent.replayMessages.filter!(m => m.role == Role.tool).array;
+    assert(shown.length == 1 && shown[0].content == "x".replicate(8_000),
+        shown.length ? shown[0].content[0 .. 40] : "no tool message");
+}
