@@ -582,14 +582,23 @@ class SessionLog
                         done = true;
                         how = "it was removed; restored it from this session's records";
                     }
+                    else next.close(); // contended or re-replaced: no fd leak into the loop below
                 }
             }
             else
             {
                 // Lock first, then compare the whole locked file's bytes
                 // (not just its length) and re-check the path still names it.
+                // A contention or an inode change abandons the in-place
+                // repair for the recovery log below: close `next` first, or
+                // the loop's `next = createPrivate(...)` overwrites and
+                // leaks the fd.
                 next = openExistingForAppend(path);
-                if (tryLock(next) == LockResult.contended || !sameFile(next, path)) return;
+                if (tryLock(next) == LockResult.contended || !sameFile(next, path))
+                {
+                    next.close();
+                    return;
+                }
                 auto theirs = readAll(next);
                 if (theirs.length <= ours.length && ours[0 .. theirs.length] == theirs)
                 {
@@ -618,8 +627,22 @@ class SessionLog
                 import std.exception : collectException;
                 // Lost the race for this name (or cannot create it): try the next.
                 if (collectException(next = createPrivate(target)) !is null) continue;
-                awaitLock(next, target);
-                if (!sameFile(next, target)) { next.close(); continue; }
+                // Same for a name whose lock another process won first: close
+                // the fd and remove the empty file we just published, then try
+                // the next name — never abort the whole recovery over one
+                // contended name (and never leak the fd or the header-less
+                // file). Any other lock failure still throws.
+                try
+                {
+                    awaitLock(next, target);
+                }
+                catch (Exception) // contended name: skip it, try the next
+                {
+                    next.close();
+                    if (target.exists) remove(target);
+                    continue;
+                }
+                if (!sameFile(next, target)) { next.close(); remove(target); continue; }
                 next.rawWrite(withHeaderId(ours, rid));
                 next.flush();
                 made = true;
@@ -2329,4 +2352,82 @@ unittest
     a.close();
     assert(readText(p).canFind("still-writing"));
     assert(p !in openHere);
+}
+
+@("a contended in-place repair falls through to a recovery log and leaks no fd (#237)")
+unittest
+{
+    import std.algorithm : canFind, count;
+    auto dir = buildPath(tempDir, format("nano-coder-contended-%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/x");
+    log.warn = (string) {};
+    log.input("i1", "kappa");
+    auto p = log.path;
+    // Replace the path with a foreign file whose lock another handle holds:
+    // the in-place repair is contended, so recovery must fall through to a
+    // recovery log — closing the contended fd it opened, not leaking it.
+    auto foreign = buildPath(dir, "foreign.jsonl");
+    std.file.write(foreign, "{\"type\":\"session\",\"data\":{}}\n");
+    auto holder = openExistingForAppend(foreign);
+    assert(tryLock(holder) == LockResult.acquired);
+    scope (exit) holder.close();
+    rename(foreign, p);
+    log.input("i2", "lambda");
+    auto rec = log.path;
+    log.close();
+    assert(rec != p && rec.exists, "a contended in-place repair recovers to a recovery log");
+    auto now = readText(rec);
+    assert(now.canFind("kappa") && now.canFind("lambda"), now);
+    assert(now.count('\n') == 3, now); // header + both records: nothing lost
+    assert(readText(p) == "{\"type\":\"session\",\"data\":{}}\n", "the foreign file is untouched");
+    // A leaked fd keeps its flock after close(): the recovered log's lock
+    // must be free again.
+    auto probe = openExistingForAppend(rec);
+    scope (exit) probe.close();
+    assert(tryLock(probe) == LockResult.acquired, "no leaked fd still locks the recovery log");
+    restore(rec); // a resumable session: its header names the recovery id
+}
+
+@("a contended recovery name is skipped, its empty file removed, and the next name used (#237)")
+unittest
+{
+    import std.algorithm : canFind, count;
+    import std.file : dirEntries, SpanMode;
+    auto dir = buildPath(tempDir, format("nano-coder-racename-%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/x");
+    log.warn = (string) {};
+    log.input("i1", "mu");
+    auto p = log.path;
+    // Rewrite the path with foreign content so recovery needs a recovery log,
+    // then sit on the first recovery name's lock: recovery must skip the
+    // contended name (closing its fd and removing the empty, header-less file
+    // it published) and continue at N+1 — not abort the whole recovery.
+    remove(p);
+    std.file.write(p, "{\"type\":\"session\",\"data\":{}}\n");
+    auto stem = recoveryStem(log.id);
+    auto first = buildPath(dir, stem ~ ".recovered-1.jsonl");
+    auto squatter = createPrivate(first);
+    assert(tryLock(squatter) == LockResult.acquired);
+    scope (exit) squatter.close();
+    log.input("i2", "nu");
+    auto rec = log.path;
+    log.close();
+    assert(rec == buildPath(dir, stem ~ ".recovered-2.jsonl"), rec);
+    auto now = readText(rec);
+    assert(now.canFind("mu") && now.canFind("nu"), now);
+    assert(now.count('\n') == 3, now);
+    // The contended name is left exactly as the squatter had it: present,
+    // empty, and still exclusively the squatter's (no second writer, no
+    // leaked fd, no partial header).
+    assert(readText(first) == "", "the skipped name stays header-less for its lock holder");
+    auto probe = openExistingForAppend(rec);
+    scope (exit) probe.close();
+    assert(tryLock(probe) == LockResult.acquired, "the adopted recovery log is free after close");
+    assert(dirEntries(dir, "*.recovered-*.jsonl", SpanMode.shallow).array.length == 2,
+        "no extra empty recovery files left behind");
+    restore(rec);
 }
