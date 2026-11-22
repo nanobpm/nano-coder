@@ -309,10 +309,12 @@ string[] editorLines(string prompt, dstring text, size_t cursor, size_t width) p
     return lines;
 }
 
-/// The whole frame: transcript, editor, then the status bar as the last line.
+/// The whole frame: transcript, editor, then the status bar as the last
+/// line (a multi-line status, such as live sub-agent rows, ends the frame).
 string[] compose(const string[] transcript, const string[] editor, string status) pure
 {
-    return transcript.dup ~ editor.dup ~ status;
+    import std.array : split;
+    return transcript.dup ~ editor.dup ~ status.split("\n");
 }
 
 /// The dim `⏸N queued` row under the editor (null when nothing is queued).
@@ -926,6 +928,7 @@ unittest
     ed = editorLines("› ", "abcdef"d, 0, 5);
     assert(ed.length == 2 && ed[0].canFind("\x1b[7ma\x1b[27m"));
     assert(compose(["t"], ["e"], "s") == ["t", "e", "s"]);
+    assert(compose(["t"], ["e"], "a\ns") == ["t", "e", "a", "s"]);
     assert(queueIndicator(0, 40) is null && queueIndicator(2, 40).canFind("⏸2 queued"));
     assert(firstDiff(["a", "b"], ["a", "b"]) == -1 && firstDiff(["a", "b"], ["a", "c"]) == 1 && firstDiff(["a"], ["a", "b"]) == 1);
     assert(linePhysicalRows("abcdef", 3) == 2 && linePhysicalRows("", 3) == 1 && linePhysicalRows("ab中", 3) == 2);

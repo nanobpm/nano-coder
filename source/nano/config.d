@@ -411,6 +411,15 @@ struct Config
     bool sessionTitles;
     /// The model titles come from (`title_model`); null uses the session's.
     string titleModel;
+    /// Offer the `agent` tool (read-only sub-agents, `subagents`).
+    bool subagents = true;
+    /// The model sub-agents run on (`subagent_model`); null: the session's.
+    string subagentModel;
+    /// Sub-agents running at once (`subagent_max_concurrency`).
+    long subagentMaxConcurrency = 4;
+    /// Per sub-agent caps (`subagent_timeout_secs`, `subagent_max_turns`,
+    /// `subagent_max_tokens`).
+    long subagentTimeoutSecs = 600, subagentMaxTurns = 40, subagentMaxTokens = 1_000_000;
     long maxIterations = 0;
     long bashTimeoutSecs = 600;
     /// Bash heartbeat interval (`bash_heartbeat_secs`): how often a running
@@ -510,6 +519,12 @@ struct Config
         if (auto v = "max_iterations" in doc) c.maxIterations = v.integer;
         if (auto v = "session_titles" in doc) c.sessionTitles = v.boolean;
         if (auto v = "title_model" in doc) c.titleModel = v.str;
+        if (auto v = "subagents" in doc) c.subagents = v.boolean;
+        if (auto v = "subagent_model" in doc) c.subagentModel = v.str;
+        if (auto v = "subagent_max_concurrency" in doc) c.subagentMaxConcurrency = v.integer;
+        if (auto v = "subagent_timeout_secs" in doc) c.subagentTimeoutSecs = v.integer;
+        if (auto v = "subagent_max_turns" in doc) c.subagentMaxTurns = v.integer;
+        if (auto v = "subagent_max_tokens" in doc) c.subagentMaxTokens = v.integer;
         if (auto v = "bash_timeout_secs" in doc) c.bashTimeoutSecs = v.integer;
         if (auto v = "bash_heartbeat_secs" in doc) c.bashHeartbeatSecs = v.integer;
         if (auto v = "plan_tools" in doc) c.planTools = v.boolean;

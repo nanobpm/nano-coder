@@ -352,6 +352,7 @@ private void writeStdoutLine(string l)
 
 final class AcpServer : AgentEvents
 {
+    mixin AgentEventDefaults;
     private NotNull!Agent agent;
     private Host host;
     private void delegate(string line) writeLine_;
@@ -445,8 +446,42 @@ final class AcpServer : AgentEvents
         toolUpdate(call.id, result, isError);
     }
 
+    /// Sub-agent progress: an in-progress update on each `agent` call
+    /// (a `tool_call` upsert, as later calls haven't started on the client).
+    void subagents(const imported!"nano.subagent".SubProgress[] all)
+    {
+        import nano.subagent : progressLine;
+        foreach (ref p; all)
+        {
+            // A call whose final result already went out keeps its terminal
+            // status: a late progress note must not flip it back to
+            // in_progress (a cancelled call would appear to run forever).
+            if (p.callId in terminalCalls) continue;
+            subCalls[p.callId] = true;
+            if (p.done)
+            {
+                terminalCalls[p.callId] = true;
+                update(JSONValue(["sessionUpdate": JSONValue("tool_call_update"), "toolCallId": JSONValue(p.callId),
+                    "status": JSONValue("completed"),
+                    "content": JSONValue([JSONValue(["type": JSONValue("content"), "content": textBlock(progressLine(p))])])]));
+                continue;
+            }
+            update(JSONValue(["sessionUpdate": JSONValue("tool_call"), "toolCallId": JSONValue(p.callId),
+                "title": JSONValue("agent"), "kind": JSONValue(toolKind("agent")), "status": JSONValue("in_progress"),
+                "content": JSONValue([JSONValue(["type": JSONValue("content"), "content": textBlock(progressLine(p))])])]));
+        }
+    }
+
+    /// Calls whose final tool result (or done progress) went out; later
+    /// progress for them is dropped.
+    private bool[string] terminalCalls;
+    /// The current turn's sub-agent calls (those that reported progress):
+    /// only they are tracked in terminalCalls. Both are cleared per turn.
+    private bool[string] subCalls;
+
     private void toolUpdate(string id, string output, bool isError)
     {
+        if (id in subCalls) terminalCalls[id] = true;
         update(JSONValue(["sessionUpdate": JSONValue("tool_call_update"), "toolCallId": JSONValue(id),
             "status": JSONValue(isError ? "failed" : "completed"), "rawOutput": JSONValue(output),
             "content": JSONValue([JSONValue(["type": JSONValue("content"), "content": textBlock(output)])])]));
@@ -562,7 +597,13 @@ final class AcpServer : AgentEvents
                 reply(rpcResult(id, JSONValue(["stopReason": "end_turn", "response": note])));
                 return;
             }
+            // Terminal-status bookkeeping covers one turn's sub-agent
+            // calls; release the previous turn's.
+            subCalls = null;
+            terminalCalls = null;
             runTurn(id, text, inputId(params));
+            subCalls = null;
+            terminalCalls = null;
             return;
         default:
             if (hasId && method !is null) reply(rpcError(id, -32601, "method not found: " ~ method));

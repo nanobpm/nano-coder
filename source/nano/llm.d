@@ -148,6 +148,8 @@ struct Message
     /// User role: the user-typed text when hook context was appended to
     /// `content` (`pin_text`); compaction pins this instead (issue #66).
     string pinText;
+    /// Tool role (`agent`): the sub-agent's own session log (`sub_log`).
+    string subLog;
     /// Assistant: provider reasoning items replayed on later requests.
     JSONValue[] thinkingBlocks;
     /// Fields the D port doesn't model (e.g. Anthropic `thinking_blocks`),

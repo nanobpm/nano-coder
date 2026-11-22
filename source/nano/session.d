@@ -311,6 +311,7 @@ JSONValue messageRecord(const ref Message m) pure
     if (m.steered) j["steered"] = true;
     if (m.hookContext) j["hook_context"] = true;
     if (m.pinText.length) j["pin_text"] = m.pinText;
+    if (m.subLog.length) j["sub_log"] = m.subLog;
     return j;
 }
 
@@ -376,6 +377,7 @@ Message messageFromRecord(JSONValue j) pure
         case "steered": m.steered = v.type == JSONType.true_; break;
         case "hook_context": m.hookContext = v.type == JSONType.true_; break;
         case "pin_text": if (v.type == JSONType.string) m.pinText = v.str; break;
+        case "sub_log": if (v.type == JSONType.string) m.subLog = v.str; break;
         // Sub-kinds of an automatic turn.
         case "continuation": m.continuation = v.type == JSONType.true_; break;
         case "timer": m.timer = v.type == JSONType.true_; break;
@@ -2000,6 +2002,24 @@ TidyResult tidySessions(string dir, long compressAfterDays, long retentionDays)
     bool mayDelete = retentionDays > 0;
     try named = titledIds(dir);
     catch (Exception) mayDelete = false; // unknown titles: compress only, delete nothing
+    tidyDir(dir, now, compressAfterDays, retentionDays, mayDelete, named, result);
+    // Sub-agent logs sit one level down (<session>/sub-<call>.jsonl): the
+    // same rules apply to them, except that a named (retained) parent
+    // session keeps its children too: compressed, never deleted.
+    foreach (DirEntry e; dirEntries(dir, SpanMode.shallow, false))
+        if (e.isDir && !e.name.baseName.endsWith(".attachments"))
+            tidyDir(e.name, now, compressAfterDays, retentionDays, mayDelete && e.name.baseName !in named, named, result);
+    try std.file.write(stampPath, "");
+    catch (Exception) {} // a stamp that won't write just tidies again next start
+    return result;
+}
+
+/// One directory's pass of `tidySessions` (also used for the child-log
+/// directories one level down).
+private void tidyDir(string dir, SysTime now, long compressAfterDays, long retentionDays,
+        bool mayDelete, const bool[string] named, ref TidyResult result)
+{
+    import nano.session_index : indexFile;
     foreach (DirEntry e; dirEntries(dir, SpanMode.shallow, false))
     {
         auto name = e.name.baseName;
@@ -2055,9 +2075,6 @@ TidyResult tidySessions(string dir, long compressAfterDays, long retentionDays)
         }
         catch (Exception) {} // one unreadable log must not stop the pass
     }
-    try std.file.write(stampPath, "");
-    catch (Exception) {} // a stamp that won't write just tidies again next start
-    return result;
 }
 
 /// How long ago `then` was, briefly.
@@ -2744,6 +2761,38 @@ unittest
         collectException(new SessionLog(f.path).close()); // either outcome: only the registration matters
     }
     assert(f.path !in openHere, "no stale registration after a failed open");
+}
+
+// A titled (retained) session keeps its sub-agent logs: they may be
+// compressed but are never deleted; an untitled one's expire (#231 review).
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, setTimes;
+    import core.time : days;
+    import nano.session_index : list, setTitle;
+    auto dir = buildPath(tempDir, "nano-d-tidy-children");
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    string childOf(string id)
+    {
+        auto t = new SessionLog(dir, "mock/m", "/w", id);
+        t.input("in-1", "a session " ~ id);
+        t.close();
+        auto sub = buildPath(dir, id);
+        mkdirRecurse(sub);
+        auto c = buildPath(sub, "sub-x.jsonl");
+        std.file.write(c, "{}\n");
+        setTimes(c, wallNow - 200.days, wallNow - 200.days);
+        return c;
+    }
+    auto keptChild = childOf("kept");
+    auto goneChild = childOf("gone");
+    list(dir);
+    setTitle(buildPath(dir, "kept.jsonl"), "Keep me");
+    auto r = tidySessions(dir, 0, 180);
+    assert(keptChild.exists, "a titled session's child log is retained");
+    assert(!goneChild.exists && r.deleted == 1, format("%s", r));
 }
 
 // Review fixes for issue #205 (round 8): an archive resume never replaces an
