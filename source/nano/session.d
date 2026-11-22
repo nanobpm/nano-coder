@@ -512,6 +512,11 @@ class SessionLog
     /// Tests: the next write fails (Rust `fail_next_persist`).
     bool failNextWrite;
 
+    /// Tests: invoked with each recovery candidate's path right after its
+    /// exclusive create, so a test can swap the destination before the
+    /// post-sync identity re-check (simulating a concurrent replacement).
+    void delegate(string) swapAfterCreate;
+
     /// Tests: whether `close` has released this writer's handle.
     bool isOpenForWrite() const @safe { return f.isOpen; }
 
@@ -636,7 +641,11 @@ class SessionLog
             {
                 auto rid = format("%s.recovered-%s", stem, n);
                 target = buildPath(dir, rid ~ ".jsonl");
-                if (target.exists) continue;
+                // A name whose compressed archive exists belongs to an
+                // earlier recovered session tidy-up compressed: reusing it
+                // would shadow that archive (`findSession` prefers the plain
+                // log) and strand its history, so skip to the next name.
+                if (target.exists || (target ~ ".gz").exists) continue;
                 // Exclusive create, then lock before anything else can, and
                 // confirm the locked inode is still the one at the path.
                 import std.exception : collectException;
@@ -651,12 +660,21 @@ class SessionLog
                 // records (or a replacement), and removing it could orphan them.
                 bool locked = collectException(awaitLock(next, target)) is null;
                 if (!locked || !sameFile(next, target)) { next.close(); continue; }
+                // Test seam: let a test swap the destination now, so the
+                // post-sync re-check below is exercised against a real race.
+                if (swapAfterCreate !is null) swapAfterCreate(target);
                 {
                     // A failed write or sync closes the candidate: never leak it.
                     scope (failure) next.close();
                     next.rawWrite(withHeaderId(ours, rid));
                     syncLog(next, target);
                 }
+                // Revalidate after the write+sync, before adopting: if another
+                // process replaced `target` meanwhile, `next` is now an
+                // unlinked inode and adopting it would send this session's
+                // appends into a file nobody can read back. Close it and try
+                // the next name rather than report a successful recovery.
+                if (!sameFile(next, target)) { next.close(); continue; }
                 made = true;
                 break;
             }
@@ -2644,4 +2662,76 @@ unittest
     assert(log.id != oldId);
     assert(readText(buildPath(dir, log.id ~ ".attachments", "blob.png")) == "PNG");
     assert(buildPath(oldAtt, "blob.png").exists, "the originals stay for the old log");
+}
+
+@("recovery skips a name whose compressed archive already exists (#237)")
+unittest
+{
+    import std.algorithm : canFind, count;
+    auto dir = buildPath(tempDir, format("nano-coder-recgz-%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/x");
+    log.warn = (string) {};
+    log.input("i1", "pi");
+    auto p = log.path;
+    auto stem = recoveryStem(log.id);
+    // An earlier recovered session was tidied up to `<stem>.recovered-1.jsonl.gz`.
+    // A later recovery must not take the plain `recovered-1` name: that would
+    // shadow the archive (`findSession` prefers a plain log) and strand it.
+    auto gz = buildPath(dir, stem ~ ".recovered-1.jsonl.gz");
+    std.file.write(gz, "x");
+    remove(p);
+    std.file.write(p, "{\"type\":\"session\",\"data\":{}}\n");
+    log.input("i2", "rho");
+    auto rec = log.path;
+    log.close();
+    assert(rec == buildPath(dir, stem ~ ".recovered-2.jsonl"), rec);
+    auto now = readText(rec);
+    assert(now.canFind("pi") && now.canFind("rho"), now);
+    assert(gz.exists, "the earlier archive is left in place");
+    // And the archive stays resumable by its own id once the plain squat is gone.
+    assert(findSession(dir, stem ~ ".recovered-1") == gz);
+    restore(rec);
+}
+
+@("a destination replaced after the final sync is not adopted (#237)")
+unittest
+{
+    import std.algorithm : canFind;
+    auto dir = buildPath(tempDir, format("nano-coder-recswap-%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/x");
+    log.warn = (string) {};
+    log.input("i1", "sigma");
+    auto p = log.path;
+    auto stem = recoveryStem(log.id);
+    // Force the recovery-log path, and pre-create the first recovery name so
+    // the loop adopts the second. Then swap that second name between the
+    // recovery's create+lock and its post-sync identity re-check: the writer
+    // must detect the swap, close the unlinked candidate, and fall to the
+    // next name instead of adopting (and appending to) an unlinked inode.
+    remove(p);
+    std.file.write(p, "{\"type\":\"session\",\"data\":{}}\n");
+    auto first = buildPath(dir, stem ~ ".recovered-1.jsonl");
+    std.file.write(first, ""); // taken, so the loop moves to recovered-2
+    // A swap hook: when recovery creates recovered-2, replace the path with a
+    // foreign file before the post-sync sameFile re-check runs.
+    auto second = buildPath(dir, stem ~ ".recovered-2.jsonl");
+    log.swapAfterCreate = (string created) {
+        if (created == second)
+        {
+            remove(created);
+            std.file.write(created, "{\"type\":\"session\",\"data\":{}}\n");
+        }
+    };
+    log.input("i2", "tau");
+    auto rec = log.path;
+    log.close();
+    // The swapped candidate (recovered-2) was not adopted; recovery used the next.
+    assert(rec == buildPath(dir, stem ~ ".recovered-3.jsonl"), rec);
+    auto now = readText(rec);
+    assert(now.canFind("sigma") && now.canFind("tau"), now);
+    restore(rec);
 }
