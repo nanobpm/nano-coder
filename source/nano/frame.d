@@ -742,6 +742,12 @@ struct Transcript
     private Fold[] folds;
     /// Ids of folds pruned by the line cap: a refold for one re-adds it.
     private bool[string] prunedIds;
+    /// `prunedIds` in pruning order, so the oldest are forgotten past `maxPruned`.
+    private string[] prunedOrder;
+    private enum maxPruned = 256;
+    /// Re-added folds waiting for the unfinished line in `cur` to end.
+    private Deferred[] deferred;
+    private static struct Deferred { Fold fold; string[] shown; }
 
     void clear() pure
     {
@@ -750,6 +756,9 @@ struct Transcript
         cur = null;
         cache = null;
         cr = false;
+        prunedIds = null;
+        prunedOrder = null;
+        deferred = null;
     }
 
     void feed(scope const(ubyte)[] bytes) pure
@@ -819,6 +828,8 @@ struct Transcript
         lines ~= cur;
         cur = null;
         cr = false;
+        foreach (d; deferred) { auto f = d.fold; f.start = lines.length; lines ~= d.shown; folds ~= f; }
+        deferred = null;
         if (lines.length > cap)
         {
             auto drop = lines.length - cap * 9 / 10;
@@ -827,8 +838,21 @@ struct Transcript
             Fold[] kept;
             foreach (f; folds)
                 if (f.start >= drop) { f.start -= drop; kept ~= f; }
-                else if (f.id.length) prunedIds[f.id] = true;
+                else if (f.id.length) notePruned(f.id);
             folds = kept;
+        }
+    }
+
+    /// Remembers a pruned fold's id, forgetting the oldest past `maxPruned`.
+    private void notePruned(string id) pure
+    {
+        if (id in prunedIds) return;
+        prunedIds[id] = true;
+        prunedOrder ~= id;
+        if (prunedOrder.length > maxPruned)
+        {
+            prunedIds.remove(prunedOrder[0]);
+            prunedOrder = prunedOrder[1 .. $].dup;
         }
     }
 
@@ -886,18 +910,23 @@ struct Transcript
                 return;
             }
             // Its fold was pruned: show the update as a fresh fold at the end,
-            // so late reasoning is not lost.
-            if (id in prunedIds)
-            {
-                prunedIds.remove(id);
-                Fold f;
-                f.id = id;
-                f.start = lines.length;
-                f.length = collapsed.length;
-                f.other = expanded;
-                lines ~= collapsed;
-                folds ~= f;
-            }
+            // so late reasoning is not lost. While an unfinished line is in
+            // `cur` it waits for that line to end, so the line stays whole.
+            Fold f;
+            f.id = id;
+            f.length = collapsed.length;
+            f.other = expanded;
+            foreach (ref d; deferred)
+                if (d.fold.id == id) { d = Deferred(f, collapsed); return; }
+            if (id !in prunedIds) return;
+            prunedIds.remove(id);
+            import std.algorithm : countUntil, remove;
+            auto at = prunedOrder.countUntil(id);
+            if (at >= 0) prunedOrder = prunedOrder.remove(at);
+            if (cur.length) { deferred ~= Deferred(f, collapsed); return; }
+            f.start = lines.length;
+            lines ~= collapsed;
+            folds ~= f;
         }
     }
 
@@ -1529,6 +1558,40 @@ unittest
     assert(t.lines[$ - 1] == "∴ Thought more", t.lines.to!string);
     assert(t.toggleLatest());
     assert(t.lines[$ - 2 .. $] == ["∴ Thought more", "    a b"], t.lines.to!string);
+    // clear() forgets pruned ids: a later refold for one changes nothing.
+    t.feed(("∴ T2\n" ~ foldMark("think-2", 1, "∴ T2\n    b\n")).representation);
+    foreach (i; 0 .. 12) t.feed((i.to!string ~ "\n").representation);
+    t.clear();
+    t.feed(refoldMark("think-2", "∴ T2 more\n", "∴ T2 more\n").representation);
+    assert(t.lines.length == 0, t.lines.to!string);
+}
+
+unittest
+{
+    import std.conv : to;
+    // A pruned refold arriving mid-line waits for the line to end.
+    Transcript t;
+    t.cap = 10;
+    t.feed(("∴ Thought\n" ~ foldMark("think-1", 1, "∴ Thought\n    a\n")).representation);
+    foreach (i; 0 .. 12) t.feed((i.to!string ~ "\n").representation);
+    t.feed("AB".representation);
+    t.feed(refoldMark("think-1", "∴ Thought more\n", "∴ Thought more\n    a b\n").representation);
+    t.feed(refoldMark("think-1", "∴ Thought most\n", "∴ Thought most\n    a b c\n").representation);
+    t.feed("C\n".representation);
+    assert(t.lines[$ - 2 .. $] == ["ABC", "∴ Thought most"], t.lines.to!string);
+    assert(t.toggleLatest());
+    assert(t.lines[$ - 2 .. $] == ["∴ Thought most", "    a b c"], t.lines.to!string);
+}
+
+unittest
+{
+    import std.conv : to;
+    // Pruned-id bookkeeping is bounded.
+    Transcript t;
+    t.cap = 10;
+    foreach (i; 0 .. 400)
+        t.feed(("x\n" ~ foldMark("id-" ~ i.to!string, 1, "x\n    y\n")).representation);
+    assert(t.prunedOrder.length <= t.maxPruned && t.prunedIds.length == t.prunedOrder.length);
 }
 
 // Repeated tall-editor shrinks with output between them: the second freeze
