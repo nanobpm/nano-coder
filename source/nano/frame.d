@@ -902,6 +902,7 @@ struct Transcript
         foreach (d; deferred) appendFold(d.fold, d.shown);
         deferred = null;
         deferredReady = false;
+        enforceByteCap();
     }
 
     void clear() pure
@@ -1223,6 +1224,10 @@ struct Transcript
         foreach (l; shown) heldBytes += lineCost(l);
         folds ~= f;
         unsettled = true;
+        // Verbose expands every fold as it arrives; a re-added one is no
+        // different, or it would stay collapsed with no way back short of
+        // leaving verbose (issue #248 review). Its text is still `fresh`.
+        if (verbose) swapIn(folds.length - 1, folds[$ - 1].fresh);
     }
 
     /// A refold or re-add left an unstored fold that is not at the end.
@@ -1263,7 +1268,10 @@ struct Transcript
         }
         if (changed)
         {
-            enforceByteCap();
+            // The batch just asked for is evicted last: collapsing it again
+            // at once would hide those folds on every cycle (issue #248
+            // review), so older expansions go first.
+            enforceByteCap(reached, floor);
             sweepFloor = reached;
             return true;
         }
@@ -1358,15 +1366,29 @@ struct Transcript
     /// so the cap checks are O(1) instead of walking every line.
     private size_t heldBytes;
 
-    private void enforceByteCap() pure
+    /// Folds in `keepFrom .. keepTo` that a Ctrl-O press just expanded
+    /// (with their siblings by id) are collapsed only after every other
+    /// expanded fold.
+    private void enforceByteCap(size_t keepFrom = 0, size_t keepTo = 0) pure
     {
         if (bytesHeld() <= byteCap) return;
-        foreach (k; 0 .. folds.length)
+        bool[] keep;
+        if (keepFrom < keepTo && keepTo <= folds.length)
         {
-            if (!folds[k].expanded) continue;
-            swapIn(k, null); // updates heldBytes by the shrink
-            if (bytesHeld() <= byteCap) return;
+            keep = new bool[folds.length];
+            foreach (k; keepFrom .. keepTo)
+                if (folds[k].expanded)
+                    foreach (j; 0 .. folds.length)
+                        if (j == k || (folds[k].id.length && folds[j].id == folds[k].id))
+                            keep[j] = true;
         }
+        foreach (pass; 0 .. 2)
+            foreach (k; 0 .. folds.length)
+            {
+                if (!folds[k].expanded || (pass == 0 && keep.length && keep[k])) continue;
+                swapIn(k, null); // updates heldBytes by the shrink
+                if (bytesHeld() <= byteCap) return;
+            }
         // Ordinary output: no fold is left to collapse, so the oldest lines
         // go, down to the low-water mark. A fold the cut runs through goes whole, with its metadata, so
         // no collapsed remnant is left that can't be expanded.
@@ -2832,4 +2854,52 @@ unittest
         last = t.lines.length;
     }
     assert(prunes > 0 && prunes < 100, format!"%s prunes"(prunes));
+}
+
+// Ctrl-O keeps the batch it just expanded: older expansions are collapsed
+// for the byte cap first, so every batch is shown on some press (issue #248
+// review: folds 0/1 were collapsed at once and never seen).
+unittest
+{
+    import std.array : replicate;
+    Transcript t;
+    t.byteCap = 1_024;
+    t.store.memoryOnly = true;
+    t.batch = 2;
+    foreach (i; 0 .. 4)
+        t.feed((format("r%s\n", i) ~ foldMark(format("c%s", i), 1,
+            format("r%s\n%s\n", i, "x".replicate(400)))).representation);
+    t.settle();
+    assert(t.toggle() && t.folds[2].expanded && t.folds[3].expanded);
+    assert(t.toggle());
+    assert(t.folds[0].expanded && t.folds[1].expanded, "the requested batch shows");
+    assert(!t.folds[2].expanded && !t.folds[3].expanded, "older expansions go first");
+    assert(t.bytesHeld() <= t.byteCap, format!"%s held"(t.bytesHeld()));
+}
+
+// In verbose, a pruned fold re-added by a refold arrives expanded, at once
+// or after a deferred line ends, within the byte cap (issue #248 review).
+unittest
+{
+    import std.conv : to;
+    foreach (deferredLine; [false, true])
+    {
+        Transcript t;
+        t.cap = 10;
+        t.store.memoryOnly = true;
+        t.setVerbose(true); // no folds yet: false, but the mode is on
+        t.feed(("∴ Thought\n" ~ foldMark("think-1", 1, "∴ Thought\n    a\n")).representation);
+        foreach (i; 0 .. 12) t.feed((i.to!string ~ "\n").representation);
+        if (deferredLine) t.feed("mid".representation);
+        t.feed(refoldMark("think-1", "∴ Thought more\n", "∴ Thought more\n    a b\n").representation);
+        // A deferred re-add lands when the next text follows the line end.
+        if (deferredLine) t.feed("\nz".representation);
+        assert(t.folds.length && t.folds[$ - 1].id == "think-1" && t.folds[$ - 1].expanded, t.lines.to!string);
+        immutable at = t.folds[$ - 1].start;
+        assert(t.lines[at .. at + 2] == ["∴ Thought more", "    a b"], t.lines.to!string);
+        assert(t.bytesHeld() <= t.byteCap);
+        t.settle();
+        assert(t.collapseAll() && t.lines[t.folds[$ - 1].start] == "∴ Thought more", t.lines.to!string);
+        assert(t.folds[$ - 1].length == 1);
+    }
 }
