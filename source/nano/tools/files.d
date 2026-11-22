@@ -1118,6 +1118,7 @@ private struct Staged
     bool binary; /// `after` holds raw bytes carried through a pure rename
     bool wasLink; /// the path was a symlink before the patch
     string linkTarget; /// its target then, to restore it on rollback
+    bool recreated; /// deleted and re-added in this patch: write the entry itself, not through a link
 }
 
 /// `path` relative to the working directory when inside it.
@@ -1138,7 +1139,7 @@ private string writeTarget(string path)
 /// symlinked parent directories of a new file. Deletes act on the entry itself.
 private string effectiveTarget(const ref Staged s)
 {
-    if (!s.present) return s.path;
+    if (!s.present || s.recreated) return s.path;
     auto t = writeTarget(s.path);
     if (t != s.path) return t;
     auto r = realPath(s.path);
@@ -1184,12 +1185,13 @@ private void rollBack(const ref Staged s)
         rename(tmp, s.path);
         return;
     }
-    auto target = writeTarget(s.path);
+    auto target = s.recreated ? s.path : writeTarget(s.path);
     ubyte[] current;
     try current = readBytes(target);
     catch (FileException) return;
     if (current != s.after.representation) return; // edited since we wrote it: keep that edit
     if (!s.existed) { remove(s.path); return; }
+    if (s.recreated && s.wasLink) { remove(s.path); symlink(s.linkTarget, s.path); return; }
     auto tmp = writeTemp(target.dirName, target.baseName, s.before);
     if (s.hasOrigMode) chmodPath(tmp, s.origMode);
     rename(tmp, target);
@@ -1253,7 +1255,8 @@ private void commitStaged(Staged[] staged, ReadState state)
         }
         // A deleted-then-recreated symlink is replaced, not followed: the
         // entry the patch deleted is gone, so the rename lands on its path.
-        auto path = s.wasLink ? s.path : writeTarget(s.path);
+        // A plain update writes through the link, like edit/write_file.
+        auto path = s.recreated ? s.path : writeTarget(s.path);
         for (auto d = path.dirName; !linkPresent(d) && d != d.dirName; d = d.dirName) madeDirs ~= d;
         try mkdirRecurse(path.dirName);
         catch (FileException e) throw new ToolError(format("apply_patch: create %s: %s%s", path.dirName, e.msg, undone()));
@@ -1353,6 +1356,7 @@ string applyPatch(JSONValue args, ReadState state)
         case PatchKind.add:
             if (staged[k].present)
                 throw new ToolError(format("apply_patch: Add File %s: it already exists; use Update File to change it", staged[k].display));
+            if (staged[k].existed) staged[k].recreated = true; // deleted earlier in this patch
             staged[k].present = staged[k].changed = true;
             staged[k].after = fp.content;
             break;
@@ -1382,6 +1386,7 @@ string applyPatch(JSONValue args, ReadState state)
             staged[k].present = false;
             staged[k].changed = true;
             staged[k].after = null;
+            if (staged[d].existed) staged[d].recreated = true; // deleted earlier in this patch
             staged[d].present = staged[d].changed = true;
             staged[d].after = updated;
             staged[d].movedFrom = k;
@@ -2358,6 +2363,11 @@ unittest // review round 6: private bounded temp files, EOF newline state, CRLF 
     symlink(tgt, lk);
     out_ = applyPatch(j("patch", pt("*** Delete File: " ~ lk, "*** Add File: " ~ lk, "+new")), st);
     assert(!isLink(lk) && readText(lk) == "new\n" && readText(tgt) == "real\n", out_);
+    // A plain Update File through a symlink writes through it and keeps the link.
+    remove(lk);
+    symlink(tgt, lk);
+    out_ = applyPatch(j("patch", pt("*** Update File: " ~ lk, "@@", "-real", "+changed")), st);
+    assert(isLink(lk) && readText(tgt) == "changed\n", out_);
     // A move chain reports and diffs against the original source.
     auto ma = tmpFile("p-chain-a.txt", "one\ntwo\n");
     auto mb = tmpFile("p-chain-b.txt", null);
