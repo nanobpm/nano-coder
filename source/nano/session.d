@@ -568,6 +568,11 @@ class SessionLog
         import std.exception : collectException;
         // A failed in-place repair falls through to the recovery log below.
         collectException(() {
+            // Whatever path leaves the in-place repair undone (non-prefix
+            // rewrite, contention, a throw) must release `next`: the loop
+            // below reassigns it, which would leak the fd and keep a lock
+            // on the foreign file at the original path.
+            scope (exit) if (!done && next.isOpen) next.close();
             if (!path.exists)
             {
                 // Removed or moved away: put our records back at the path.
@@ -2318,6 +2323,13 @@ unittest
         log.input("i2", "delta");
         auto rec = log.path;
         log.input("i3", "epsilon");
+        {
+            // The foreign file at the original path must not stay locked
+            // by a leaked in-place-repair fd while this writer lives on.
+            auto probe = File(p, "r+");
+            assert(tryLock(probe) == LockResult.acquired, "a leaked fd still locks the rewritten path");
+            probe.close();
+        }
         log.close();
         assert(rec != p && rec.exists);
         auto now = readText(rec);
