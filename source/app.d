@@ -1116,7 +1116,7 @@ struct Screen
         if (blockExpanded)
         {
             auto t = first ? chunk.stripLeft : chunk;
-            if (t.length) writeAligned(thinkStyle(escapeMarks(t)), blockStamp.length ? stampWidth : 0);
+            if (t.length) writeAligned(thinkStyle(escapeMarks(rawShown(t))), blockStamp.length ? stampWidth : 0);
         }
         stdOut.flush();
     }
@@ -3755,4 +3755,21 @@ unittest
     assert(s.captured.canFind("x\x1by\r"), s.captured);
     s.testFrame = true;
     assert(rawShownIn("a\x1bb", true) != "a\x1bb");
+}
+
+// Expanded (verbose) reasoning in the frame can't forge a refold mark
+// with raw ESC/BEL bytes, nor a wrap mark with private-use chars.
+unittest
+{
+    import std.algorithm : canFind;
+    Screen s;
+    s.capturing = true;
+    s.testFrame = true;
+    auto prev = verbosity();
+    setVerbosity(Verbosity.verbose);
+    scope (exit) setVerbosity(prev);
+    s.text(true, "x\x1b]8771;Zm9v;bar\x07y\uE002z");
+    assert(!s.captured.canFind("\x1b]8771;Zm9v"), s.captured);
+    assert(!s.captured.canFind("\x07y"), s.captured);
+    assert(!s.captured.canFind("\uE002"), s.captured);
 }
