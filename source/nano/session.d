@@ -588,6 +588,7 @@ class SessionLog
                     if (tryLock(next) != LockResult.contended && sameFile(next, path)
                         && readAll(next) == ours && sameFile(next, path))
                     {
+                        syncLog(next, path);
                         done = true;
                         how = "it was removed; restored it from this session's records";
                     }
@@ -611,8 +612,13 @@ class SessionLog
                 auto theirs = readAll(next);
                 if (theirs.length <= ours.length && ours[0 .. theirs.length] == theirs)
                 {
+                    // The replacement may be wider than our private log
+                    // (e.g. 0644): narrow it before appending private
+                    // records, or fall back to a private recovery log.
+                    import nano.safeio : fchmodFd;
+                    if (fchmodFd(fileno(next.getFP), octal!600) != 0) return;
                     next.rawWrite(ours[theirs.length .. $]);
-                    next.flush();
+                    syncLog(next, path);
                     done = true;
                     how = "it was replaced; appended the records the new file was missing";
                 }
@@ -645,8 +651,12 @@ class SessionLog
                 // records (or a replacement), and removing it could orphan them.
                 bool locked = collectException(awaitLock(next, target)) is null;
                 if (!locked || !sameFile(next, target)) { next.close(); continue; }
-                next.rawWrite(withHeaderId(ours, rid));
-                next.flush();
+                {
+                    // A failed write or sync closes the candidate: never leak it.
+                    scope (failure) next.close();
+                    next.rawWrite(withHeaderId(ours, rid));
+                    syncLog(next, target);
+                }
                 made = true;
                 break;
             }
@@ -1384,14 +1394,30 @@ private void copyAttachments(string from, string to)
 {
     import std.file : dirEntries, SpanMode, isDir, mkdirRecurse, copy;
     import std.exception : collectException;
-    if (!from.exists || !from.isDir) return;
-    collectException(mkdirRecurse(to));
-    foreach (e; dirEntries(from, SpanMode.shallow))
-    {
-        if (!e.isFile) continue;
-        auto dest = buildPath(to, e.name.baseName);
-        if (!dest.exists) collectException(copy(e.name, dest));
-    }
+    // The whole traversal is best-effort: an unreadable dir or a failing
+    // entry stat must not abort recovery (the warning and the pending
+    // record still have to be written).
+    collectException(() {
+        if (!from.exists || !from.isDir) return;
+        collectException(mkdirRecurse(to));
+        foreach (e; dirEntries(from, SpanMode.shallow))
+        {
+            bool file;
+            if (collectException(file = e.isFile) !is null || !file) continue;
+            auto dest = buildPath(to, e.name.baseName);
+            if (!dest.exists) collectException(copy(e.name, dest));
+        }
+    }());
+}
+
+/// Flush and fsync `f` (the log at `path`) and its parent directory, so
+/// recovered records survive a power loss before being reported. Throws.
+private void syncLog(ref File f, string path)
+{
+    import nano.safeio : fsyncFd;
+    f.flush();
+    if (fsyncFd(fileno(f.getFP)) != 0) throw new Exception("cannot sync " ~ path);
+    syncDirOf(path);
 }
 
 /// `path` opened for appending without ever creating it.
@@ -2292,8 +2318,10 @@ unittest
         auto text = readText(p);
         rename(p, p ~ ".moved");
         std.file.write(p, text);
+        setAttributes(p, octal!644); // a world-readable replacement
         log.input("i2", "second");
         log.close();
+        assert((getAttributes(p) & octal!777) == octal!600, "the replacement is narrowed before appending");
         auto now = readText(p);
         assert(now.canFind("first") && now.canFind("second"), now);
         assert(now.count('\n') == 3);
