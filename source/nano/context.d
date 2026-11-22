@@ -938,6 +938,125 @@ enum size_t pinnedWindowShare = 8;
 /// The floor of the block's overall allowance, in tokens.
 enum size_t pinnedMinAllowanceTokens = 600;
 
+/// The middle of the request sequence a bounded pin stash dropped (issue
+/// #221): `count` requests spanning log lines `lo`–`hi` (0 when no dropped
+/// request had a log line). `pinnedUserRequests` renders the omission note
+/// from this exactly as it does when it computes the range itself.
+struct PinDrop
+{
+    size_t count;
+    ulong lo, hi;
+}
+
+/// The byte budget bounding a pin stash's retained RENDERED text (issue
+/// #221): an unbounded stash cost ~12 MB on a real 6,946-request session, so
+/// the stash keeps the first request plus the newest requests whose rendered
+/// text fits this budget and folds the evicted middle into a `PinDrop`. The
+/// budget is generous — the 1M-token window's pinned-block allowance is
+/// 500 KB and a render clips every later request to `pinnedLaterChars` — so
+/// only a stash far past anything a window can render is ever bounded, and
+/// charging rendered text (never the full `content` a hook context may bloat)
+/// keeps every request a real window would show. A single oversized request
+/// is retained whole: the render clips it, and dropping it would only save
+/// the stash a copy the renderer never shows.
+enum size_t pinStashBudgetBytes = 512 * 1_024;
+
+/// The bytes a stashed request costs the bounded stash (issue #221): what the
+/// pinned block actually renders from it — `pinText` when set, else
+/// `content`, clipped to the per-request render budget (`pinnedFirstChars`
+/// for the first request, `pinnedLaterChars` for the rest, plus a smart
+/// label's room) — plus the newline. Charging rendered text, not the whole
+/// retained `Message`, means a large appended hook-context block never
+/// triggers an eviction, and the budget never drops a request the renderer
+/// would have shown whole. Cheap — string lengths only — so appending stays
+/// O(1).
+size_t pinStashBytes(const ref Message m, bool first) pure @safe
+{
+    auto text = m.pinText.length ? m.pinText : m.content;
+    auto budget = first ? pinnedFirstChars : pinnedLaterChars;
+    // Later requests render whitespace-collapsed (`split.join(" ")`), so
+    // charge their normalized length; the first keeps its formatting (only
+    // `strip`ped).
+    auto len = first ? stripLength(text) : collapsedLength(text);
+    // The smart `#N: ` label is carved out of the per-request budget.
+    if (!first && m.logLine)
+    {
+        ulong digits = m.logLine;
+        size_t label = 3; // "#" ~ digits ~ ": "
+        do { label++; digits /= 10; } while (digits);
+        budget = saturatingSub(budget, label);
+    }
+    if (len <= budget) return len + 1;
+    // Clipped: `clipBytes` scales its char budget for multi-byte text and can
+    // return well under `budget`, so charge what it actually emits — never
+    // more than the renderer shows (only over-budget requests pay this).
+    // `clipBytes` is not monotonic in its byte budget (a smaller budget can
+    // land on a boundary that fits MORE bytes), so a smart label's room can
+    // overcharge a standard render: charge the worse of the two renders —
+    // labelled and unlabelled — never dropping a request either mode shows.
+    import std.array : join, split;
+    import std.string : strip;
+    string norm = first ? text.strip.idup : text.split.join(" ").idup;
+    auto clipped = clipBytes(norm, budget).length;
+    if (!first && m.logLine)
+    {
+        auto standard = clipBytes(norm, pinnedLaterChars).length;
+        if (standard > clipped) clipped = standard;
+    }
+    return clipped + 1;
+}
+
+/// The byte length of `text` once leading/trailing whitespace is stripped.
+private size_t stripLength(const(char)[] text) pure nothrow @safe @nogc
+{
+    return collapsedLengthImpl(text, false);
+}
+
+/// The byte length of `text.split.join(" ")` — whitespace runs collapsed to
+/// one space, ends stripped — computed without allocating.
+size_t collapsedLength(const(char)[] text) pure nothrow @safe @nogc
+{
+    return collapsedLengthImpl(text, true);
+}
+
+private size_t collapsedLengthImpl(const(char)[] text, bool collapse) pure nothrow @safe @nogc
+{
+    import std.typecons : Yes;
+    import std.uni : isWhite;
+    import std.utf : decode;
+
+    size_t total, pendingWs;
+    bool seen;
+    size_t i;
+    while (i < text.length)
+    {
+        auto start = i;
+        auto c = decode!(Yes.useReplacementDchar)(text, i);
+        auto w = checkedSub(i, start);
+        if (isWhite(c))
+        {
+            if (seen) pendingWs += w;
+            continue;
+        }
+        if (pendingWs) total += collapse ? 1 : pendingWs;
+        pendingWs = 0;
+        seen = true;
+        total += w;
+    }
+    return total;
+}
+
+@safe unittest
+{
+    import std.array : array, join, split;
+    import std.range : repeat;
+    foreach (t; ["", "   ", "a", "  a  b\t\n c  ", "x\u2003\u2003y", "request" ~ ' '.repeat(200).array.idup ~ "7"])
+    {
+        assert(collapsedLength(t) == (cast(string) t).split.join(" ").length, t);
+        assert(stripLength(t) == (cast(string) t).strip.length, t);
+    }
+}
+
 /// `clip` bounded by UTF-8 bytes rather than characters, cut on a character
 /// boundary, so a byte/token budget holds for non-ASCII text too.
 string clipBytes(string text, size_t maxBytes) pure
@@ -985,10 +1104,27 @@ private string requestText(const ref Message m) pure { return (m.pinText.length 
 /// them by one covering log span.
 string pinnedUserRequests(const Message[] prior, const Message[] new_, bool smart, size_t windowTokens) pure
 {
+    return pinnedUserRequests(prior, new_, smart, windowTokens, PinDrop.init);
+}
+
+/// ditto, for a bounded stash (issue #221): `prior` holds only the first and
+/// the most recent requests, and `drop` describes the requests the bound
+/// dropped between them, so the omission note covers exactly the requests the
+/// unbounded form would have named. The retained tail keeps append order
+/// (the bound evicts oldest-first), so the requests are already in log order
+/// and are sorted only defensively; `prior[0]` stays first — it is the
+/// logical first request even when it carries no log line.
+string pinnedUserRequests(const Message[] prior, const Message[] new_, bool smart, size_t windowTokens,
+    PinDrop drop) pure
+{
     const(Message)[] requests;
     foreach (ref m; prior) if (isUserRequest(m)) requests ~= m;
     foreach (ref m; new_) if (isUserRequest(m)) requests ~= m;
     if (!requests.length) return null;
+    // Keep append order: the stash is append-ordered already (the bound
+    // evicts oldest-first), and ID-less requests (legacy pins, restated
+    // pending inputs) can precede logged ones, so sorting by log line would
+    // reorder chronology and let a tight window keep older requests.
     auto allowance = max(windowTokens / pinnedWindowShare, pinnedMinAllowanceTokens) * 4;
     auto prefixCost = pinnedRequestsPrefix.length + 1;
     size_t remaining = saturatingSub(allowance, prefixCost);
@@ -1012,8 +1148,15 @@ string pinnedUserRequests(const Message[] prior, const Message[] new_, bool smar
     static size_t cost(string l) { return l.length + 1; }
     auto suffix = new size_t[n + 1];
     foreach_reverse (i; 0 .. n) suffix[i] = suffix[i + 1] + cost(lines[i]);
-    // span[i]: min/max log ID over requests[1 .. i] (0: none).
+    // span[i]: min/max log ID over requests[1 .. i] (0: none). The bounded
+    // stash's dropped middle (`drop`) sits between requests[0] and
+    // requests[1], so it folds into every span from index 1 on.
     auto spanLo = new ulong[n + 1], spanHi = new ulong[n + 1];
+    if (drop.count)
+    {
+        spanLo[1] = drop.lo;
+        spanHi[1] = drop.hi;
+    }
     foreach (i; 1 .. n)
     {
         spanLo[i + 1] = spanLo[i];
@@ -1027,7 +1170,7 @@ string pinnedUserRequests(const Message[] prior, const Message[] new_, bool smar
     string note(bool keepFirst, size_t tailStart)
     {
         auto t = max(tailStart, 1);
-        auto omitted = (t - 1) + (keepFirst ? 0 : 1);
+        auto omitted = (t - 1) + (keepFirst ? 0 : 1) + (t >= 1 ? drop.count : 0);
         if (!omitted) return null;
         ulong lo = spanLo[t], hi = spanHi[t];
         if (!keepFirst)
@@ -1140,6 +1283,167 @@ unittest
         req("the latest ask", 40)], true, 4_800);
     if (pinned.canFind("omitted from this pin")) assert(pinned.canFind("#9"), pinned);
     assert(pinned.canFind("#40: the latest ask"), pinned);
+}
+
+// A bounded stash (issue #221) renders a correct first/newest-tail view at
+// every window — the newest requests, an omission note naming the dropped
+// middle by count and log span, the window's allowance respected — and is
+// byte-identical to the unbounded render whenever the stash fits the byte
+// budget (the common case: thousands of short requests).
+unittest
+{
+    // The bounded stash the byte budget produces, computed independently:
+    // the first request plus the newest ones whose rendered text fits the
+    // budget.
+    static void check(const Message[] all)
+    {
+        size_t bytes;
+        foreach (i, ref m; all) bytes += pinStashBytes(m, i == 0);
+        const(Message)[] kept;
+        PinDrop drop;
+        if (bytes <= pinStashBudgetBytes) kept = all;
+        else
+        {
+            kept ~= all[0];
+            size_t tail = pinStashBytes(all[0], true);
+            size_t start = all.length;
+            while (start > 1 && tail + pinStashBytes(all[start - 1], false) <= pinStashBudgetBytes)
+                tail += pinStashBytes(all[--start], false);
+            foreach (ref m; all[1 .. start])
+            {
+                drop.count++;
+                if (auto id = m.logLine)
+                {
+                    drop.lo = drop.lo ? min(drop.lo, id) : id;
+                    drop.hi = max(drop.hi, id);
+                }
+            }
+            kept ~= all[start .. $];
+        }
+        foreach (smart; [false, true])
+            foreach (window; [8_000, 128_000, 200_000, 1_000_000])
+            {
+                auto bounded = pinnedUserRequests(null, kept, smart, window, drop);
+                auto full = pinnedUserRequests(null, all, smart, window);
+                if (!drop.count)
+                {
+                    // Within the budget the stash is whole: identical bytes.
+                    assert(bounded == full, "unbounded stash renders differently at window " ~ window.to!string);
+                    continue;
+                }
+                // Past the budget: the newest requests still render, the
+                // omission note covers the dropped middle plus whatever the
+                // window drops itself, and the allowance holds. At a window
+                // too small for even one request the render is null — the
+                // unbounded behaviour, kept.
+                auto allowance = max(window / pinnedWindowShare, pinnedMinAllowanceTokens) * 4;
+                if (bounded is null)
+                {
+                    assert(full is null, "the unbounded render fits a window the bounded one does not");
+                    continue;
+                }
+                assert(nchars_(bounded) <= allowance, "bounded render exceeds the allowance");
+                assert(bounded.canFind("omitted from this pin"), "the dropped middle is noted");
+                // The newest request renders — in smart mode its `#N: ` label
+                // is carved out of the per-request budget, and a clip elides
+                // the middle, so check the head and tail fragments.
+                auto newest = requestText(all[$ - 1]);
+                if (smart)
+                {
+                    auto id = all[$ - 1].logLine;
+                    auto label = format("#%s: ", id);
+                    assert(bounded.canFind(label), "the newest request keeps its label");
+                    auto room = pinnedLaterChars - label.length;
+                    if (newest.length > room) newest = clipBytes(newest, room);
+                }
+                else if (newest.length > pinnedLaterChars) newest = clipBytes(newest, pinnedLaterChars);
+                if (newest.length <= 60) assert(bounded.canFind(newest), "the newest request renders");
+                else
+                {
+                    assert(bounded.canFind(newest[0 .. 30]), "the newest request's head renders");
+                    assert(bounded.canFind(newest[$ - 30 .. $]), "the newest request's tail renders");
+                }
+            }
+    }
+    static Message[] requests(size_t count, size_t textBytes)
+    {
+        import std.array : replicate;
+        Message[] all;
+        foreach (i; 0 .. count)
+            all ~= req(format("request number %s: ", i) ~ "x".replicate(textBytes), 10 + 2 * i);
+        return all;
+    }
+    check(requests(3, 40)); // far under the budget: no drop
+    check(requests(6_946, 40)); // the real session that motivated the bound
+    check(requests(3_000, 200)); // ~600 KB of text: the budget binds
+    check(requests(600, 1_000)); // long requests: fewer retained
+    // The budget charges RENDERED text, so 600 requests of ~1 KB — 600 KB of
+    // raw content but ≤ 200 rendered bytes each — are ALL retained: the
+    // renderer shows each of them whole, so the bound must not drop one
+    // (#221's byte-identical rendering requirement).
+    check(requests(600, 1_000));
+    // Multibyte text over the per-request render budget: `clipBytes` is not
+    // monotonic in its byte budget, so a smart label's carved room can clip
+    // FEWER bytes than the standard render shows. The charge covers both
+    // renders, so the bound never drops a request either mode shows whole —
+    // the review's case: 110 `é` requests with 5-digit log ids.
+    {
+        import std.array : replicate;
+        Message[] uni;
+        foreach (i; 0 .. 2_800)
+            uni ~= req("é".replicate(110), 10_000 + i);
+        check(uni);
+        // The charge itself never exceeds what either mode renders (+newline).
+        auto charge = pinStashBytes(uni[1], false);
+        auto smartRoom = pinnedLaterChars - "#10001: ".length;
+        auto smartLen = clipBytes("é".replicate(110), smartRoom).length;
+        auto standardLen = clipBytes("é".replicate(110), pinnedLaterChars).length;
+        assert(charge == max(smartLen, standardLen) + 1, "the worse of the two renders is charged");
+    }
+    {
+        size_t rendered;
+        auto rs = requests(600, 1_000);
+        foreach (i, ref m; rs) rendered += pinStashBytes(m, i == 0);
+        assert(rendered <= pinStashBudgetBytes, "600 renderable requests fit the budget");
+    }
+    // A short prompt with a huge appended hook-context block costs only its
+    // `pinText` — the bloat the renderer never shows never triggers eviction.
+    {
+        import std.array : replicate;
+        auto hooked = requests(3, 40);
+        foreach (ref m; hooked)
+        {
+            m.pinText = m.content;
+            m.content = m.content ~ " " ~ replicate("h", pinStashBudgetBytes);
+        }
+        check(hooked);
+    }
+    // A single request larger than the whole budget is still retained (the
+    // render clips it; dropping it would lose the goal). With rendered-text
+    // charging the first request's cost is capped at `pinnedFirstChars`, so
+    // an over-budget stash now only ever comes from MANY requests — but the
+    // first-is-always-kept guarantee still holds by construction.
+    auto huge = requests(1, pinStashBudgetBytes * 2) ~ requests(2, 40);
+    auto pinned = pinnedUserRequests(null, huge[0 .. 1], true, 128_000,
+        PinDrop(2, huge[1].logLine, huge[2].logLine));
+    assert(pinned.canFind("request number 0: ") && pinned.canFind("omitted from this pin"), pinned);
+}
+
+// The dropped middle's metadata drives the omission note: the count and the
+// `#lo-#hi` span are exactly what the unbounded form computes when the window
+// drops the same requests.
+unittest
+{
+    auto pinned = pinnedUserRequests(null, [req("the goal", 2), req("the latest ask", 40)], true, 4_800,
+        PinDrop(1, 9, 9));
+    // The bounded stash always notes its dropped middle, even when the window
+    // would have fitted it — the note is what the stash knows.
+    assert(pinned.canFind("1 earlier request(s) omitted") && pinned.canFind("full text at #9"), pinned);
+    assert(pinned.canFind("#2: the goal") && pinned.canFind("#40: the latest ask"), pinned);
+    // A dropped span renders as a range.
+    auto spanned = pinnedUserRequests(null, [req("the goal", 2), req("the latest ask", 40)], true, 4_800,
+        PinDrop(3, 9, 24));
+    assert(spanned.canFind("3 earlier request(s) omitted") && spanned.canFind("#9-#24"), spanned);
 }
 
 // rust: context.rs::pinned_requests_strip_hook_output_from_a_prompt
@@ -1266,4 +1570,20 @@ unittest
     auto bracketed = Message.user("[constraint] use port 8080");
     assert(!renderTranscript([bracketed], 10_000, true).canFind("[earlier summary]"));
     assert(smartSummaryNote(2, 40).canFind("#2–#40"));
+}
+
+/// Charges never exceed what the renderer emits for clipped multi-byte text,
+/// and ID-less requests keep append order (no sort to the end).
+unittest
+{
+    import std.array : replicate;
+    Message m; m.role = Role.user; m.content = "😀".replicate(400);
+    auto rendered = clipBytes(m.content, pinnedLaterChars);
+    assert(pinStashBytes(m, false) == rendered.length + 1);
+    Message a; a.role = Role.user; a.content = "goal";
+    Message b; b.role = Role.user; b.content = "idless-old";
+    Message c; c.role = Role.user; c.content = "logged-new"; c.logLine = 7;
+    import std.string : indexOf;
+    auto out_ = pinnedUserRequests([a, b, c], null, false, 1_000_000);
+    assert(out_.indexOf("idless-old") < out_.indexOf("logged-new"), "append order kept");
 }

@@ -18,6 +18,9 @@ import nano.session;
 import nano.tools : ToolRegistry;
 import nano.permissions : Policy;
 import nano.providers.mock : MockClient;
+import ctx = nano.context;
+import std.algorithm : min, max;
+import std.conv : to;
 
 private:
 
@@ -767,4 +770,136 @@ unittest
     auto agent2 = new Agent(new MockClient(null), echoTools, Policy.init, "sys");
     agent2.loadRestored(r2, some(new SessionLog(path)));
     agent2.log.unwrap("adopted").close();
+}
+
+// The bounded pin stash (issue #221): a failed compaction's rollback
+// restores the dropped-range metadata, the logical count and the byte tally,
+// not just the retained messages.
+unittest
+{
+    import std.exception : assertThrown;
+    import std.array : replicate;
+    auto dir = freshDir("pinbound-rollback");
+    auto agent = new Agent(new MockClient([LLMResponse("SUM")]), echoTools, Policy.init, "sys");
+    agent.log = some(new SessionLog(dir, "mock/m", "/w"));
+    // A stash already past the bound, as a long session's restore leaves it:
+    // the first request plus a newest tail whose RENDERED text fills the
+    // budget (each later request renders up to `pinnedLaterChars` bytes), and
+    // a dropped middle of 100 requests.
+    enum tail = 5_000;
+    Message[] retained;
+    retained ~= Message.user("the original goal");
+    foreach (i; 0 .. tail - 1)
+    {
+        auto m = Message.user("request " ~ i.to!string ~ " " ~ "x".replicate(ctx.pinStashBudgetBytes / tail));
+        m.logLine = 20 + 2 * i;
+        retained ~= m;
+    }
+    agent.pinStash.adopt(retained, ctx.PinDrop(100, 20, 238), retained.length + 100);
+    assert(agent.pinStash.retainedBytes > ctx.pinStashBudgetBytes / 2, "the tail fills the budget");
+    auto before = agent.pinStash.snapshot();
+    // A compaction folds two more requests and fails to persist: everything
+    // rolls back (one folded message would leave nothing to compact).
+    agent.messages ~= [Message.user("one more request"), Message.user("and another")];
+    agent.log.unwrap("set").failNextWrite = true;
+    CompactReport rep;
+    assertThrown(agent.compact(rep));
+    assert(agent.pinStash.length == before.logical, "the logical count rolls back");
+    assert(agent.pinStash.retained == before.store.length, "the retained copy rolls back");
+    assert(agent.pinStash.retainedBytes == before.bytes, "the byte tally rolls back");
+    assert(agent.pinStash.drop == before.drop, "the dropped range rolls back");
+    assert(agent.pinStash[0].content == "the original goal");
+}
+
+// The bounded pin stash round-trips through the log (issue #221): a stash
+// grown past the bound writes the same `pinned_base` values the unbounded
+// implementation would, and the resumed stash renders the same pinned block.
+unittest
+{
+    import std.algorithm : canFind;
+    import std.json : parseJSON, JSONValue;
+    import std.string : lineSplitter;
+    import std.array : array, replicate;
+    auto dir = freshDir("pinbound-roundtrip");
+    auto mock = new MockClient([LLMResponse("SUMMARY ONE"), LLMResponse("SUMMARY TWO")]);
+    auto agent = new Agent(mock, echoTools, Policy.init, "sys");
+    agent.log = some(new SessionLog(dir, "mock/m", "/w"));
+    // A stash already past the bound, as a long session's restore leaves it:
+    // 3,000 requests of ~200 bytes (~600 KB of text) exceed the budget, so
+    // the retained copy is the first plus a newest tail and the middle is
+    // dropped. Seed the log with the full stash (a plain replacement's full
+    // restatement) so the compactions' deltas chain onto it.
+    enum n = 3_000;
+    Message[] all;
+    foreach (i; 0 .. n)
+    {
+        auto m = Message.user("request number " ~ i.to!string ~ ": " ~ "x".replicate(180));
+        m.logLine = 10 + 2 * i;
+        all ~= m;
+    }
+    agent.log.unwrap("set").replace([Message.user("seed")], 0, 0, null, null, all);
+    // The retained tail the byte budget keeps, computed independently.
+    size_t tailBytes = ctx.pinStashBytes(all[0], true);
+    size_t tailStart = n;
+    while (tailStart > 1 && tailBytes + ctx.pinStashBytes(all[tailStart - 1], false) <= ctx.pinStashBudgetBytes)
+        tailBytes += ctx.pinStashBytes(all[--tailStart], false);
+    auto retained = all[0 .. 1] ~ all[tailStart .. $];
+    ctx.PinDrop drop;
+    foreach (ref m; all[1 .. tailStart])
+    {
+        drop.count++;
+        if (auto id = m.logLine)
+        {
+            drop.lo = drop.lo ? min(drop.lo, id) : id;
+            drop.hi = max(drop.hi, id);
+        }
+    }
+    agent.pinStash.adopt(retained.dup, drop, n);
+    // Two compactions, each folding one more request past the bound. (A
+    // compaction needs a conversation to fold: two user turns, one kept.)
+    agent.messages ~= Message.user("a fresh request");
+    agent.messages ~= Message.user("kept turn one");
+    CompactReport rep;
+    assert(agent.compact(rep));
+    // The byte budget keeps the newest requests whose text fits: the fresh
+    // 16-byte request is retained, evicting one ~200-byte retained request.
+    assert(agent.pinStash.length == n + 1 && agent.pinStash.retained <= retained.length + 1,
+        "the bound holds after a compaction appends");
+    assert(agent.pinStash.retainedBytes <= ctx.pinStashBudgetBytes, "the byte budget holds");
+    // The second compaction folds the kept turn too: every user request in
+    // the folded range joins the stash.
+    agent.messages ~= Message.user("a second fresh request");
+    agent.messages ~= Message.user("kept turn two");
+    assert(agent.compact(rep));
+    assert(agent.pinStash.length == n + 3);
+    // The log's pinned_base values are the LOGICAL counts the unbounded
+    // implementation would write.
+    auto log = agent.log.unwrap("set");
+    auto lines = readText(log.path).lineSplitter.array;
+    size_t[] bases;
+    foreach (l; lines)
+    {
+        auto j = parseJSON(l);
+        if (j["type"].str != "replace") continue;
+        if (auto b = "pinned_base" in j["data"]) bases ~= cast(size_t) b.integer;
+    }
+    assert(bases == [n, n + 1], "pinned_base is the logical count");
+    // Resume: the stash is bounded and renders a correct pinned block — the
+    // newest requests plus an omission note covering the dropped middle.
+    auto r = restore(log.path);
+    assert(r.pinLogical == n + 3 && r.pinStash.length <= retained.length + 3);
+    auto resumed = new Agent(new MockClient([]), echoTools, Policy.init, "sys");
+    resumed.loadRestored(r, some(new SessionLog(log.path)));
+    assert(resumed.pinStash.length == n + 3 && resumed.pinStash.retainedBytes <= ctx.pinStashBudgetBytes);
+    assert(resumed.pinStash.drop.count == n + 3 - resumed.pinStash.retained, "the middle stays dropped");
+    assert(resumed.pinStash[0].content == all[0].content, "the first request survives the round-trip");
+    foreach (smart; [false, true])
+        foreach (window; [8_000, 128_000, 1_000_000])
+        {
+            auto pinned = ctx.pinnedUserRequests(resumed.pinStash[], null, smart, window, resumed.pinStash.drop);
+            if (pinned is null) continue; // a window too small for even one request
+            assert(pinned.canFind("omitted from this pin") && pinned.canFind("a second fresh request"),
+                "the resumed stash renders the newest request and notes the drop");
+        }
+    resumed.log.unwrap("resumed").close();
 }

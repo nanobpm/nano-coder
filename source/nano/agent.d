@@ -78,6 +78,22 @@ string wrapReminder(string text) pure nothrow
     return "<system-reminder>\n" ~ text ~ "\n</system-reminder>";
 }
 
+/// The text a `wrapReminder` note wraps, or null when `content` is not one.
+/// Replay shows a Stop hook's rejection reason as the user message it
+/// printed live, so it needs the reason back out of the wrapper.
+string unwrapReminder(string content) pure nothrow
+{
+    import std.string : startsWith, endsWith;
+    enum pre = "<system-reminder>\n", post = "\n</system-reminder>";
+    if (!content.startsWith(pre) || !content.endsWith(post)) return null;
+    // Both delimiters must fit without overlapping: a malformed wrapper like
+    // "<system-reminder>\n</system-reminder>" passes both checks yet shares
+    // the newline, and slicing [pre.length .. $ - post.length] would invert
+    // the bounds. Not a wrapper: fall back to the raw content.
+    if (content.length < pre.length + post.length) return null;
+    return content[pre.length .. $ - post.length];
+}
+
 
 /// A `report_outcome` call the agent rejects: `Outcome.fromArgs`'s error, or
 /// the verify reminder. Its message is the tool result for the model.
@@ -175,44 +191,201 @@ struct ConfiguredWindow
 /// compaction rebuilds the pinned block from originals (Rust's
 /// `pre_compaction_transcript`, trimmed to requests).
 ///
-/// A thin named wrapper around the message sequence (epic #221 seam): the
-/// representation is a private `Message[]` for now, but callers reach it only
-/// through the named members below, so a later slice can bound or re-encode it
-/// without touching call sites. There is deliberately NO `alias this` and no
-/// implicit conversion to or from `Message[]` — a raw array enters only via
-/// `adopt`/`append`/`assign` and leaves only via the named read members.
+/// A thin named wrapper around the message sequence (epic #221 seam): there
+/// is deliberately NO `alias this` and no implicit conversion to or from
+/// `Message[]` — a raw array enters only via `adopt`/`append`/`assign` and
+/// leaves only via the named read members.
+///
+/// The stash is BOUNDED (issue #221): an unbounded copy cost ~12 MB on a
+/// real 6,946-request session, yet `pinnedUserRequests` renders only the
+/// first request and as many recent requests as fit its window/8 allowance.
+/// So `store` keeps the first request plus the newest requests whose text
+/// fits a generous fixed byte budget (`ctx.pinStashBudgetBytes`), and the
+/// dropped middle lives on as `drop` (its count and log-line span — the
+/// omission note renders from it exactly as before). `base`/`length` keep
+/// reporting the LOGICAL count of requests ever stashed, because the session
+/// log's `pinned_base` delta base is written from it; only the in-memory
+/// copy is bounded.
 struct PinStash
 {
+    /// The backing buffer. `store[dead_]` is the first request and
+    /// `store[dead_ + 1 .. $]` the retained tail in APPEND order (oldest
+    /// first); `store[0 .. dead_]` are evicted slots awaiting compaction.
     private Message[] store;
+    /// Evicted slots at the front of `store` (see `bound`).
+    private size_t dead_;
+    /// The requests the bound dropped between the first and the tail.
+    private ctx.PinDrop drop_;
+    /// The logical count of requests ever stashed (what `pinned_base` sees).
+    private size_t logical_;
+    /// The retained requests' RENDERED text bytes (what the budget bounds):
+    /// the first is charged the first-request render budget, the rest the
+    /// later-request one — never the full `content` a hook context may bloat.
+    private size_t bytes_;
 
     /// The count the on-disk delta base (`pinned_base`) is written from: the
-    /// logical number of requests the stash represents.
-    size_t base() const pure nothrow @safe @nogc { return store.length; }
-    /// The number of requests currently held.
-    size_t length() const pure nothrow @safe @nogc { return store.length; }
+    /// logical number of requests the stash represents, NOT the bounded
+    /// in-memory count.
+    size_t base() const pure nothrow @safe @nogc { return logical_; }
+    /// The logical number of requests the stash holds (dropped ones included).
+    size_t length() const pure nothrow @safe @nogc { return logical_; }
     /// Whether the stash holds nothing.
-    bool isEmpty() const pure nothrow @safe @nogc { return store.length == 0; }
+    bool isEmpty() const pure nothrow @safe @nogc { return logical_ == 0; }
 
-    /// Read-only element access (for `pinnedUserRequests` and tests).
-    ref const(Message) opIndex(size_t i) const pure nothrow @safe @nogc { return store[i]; }
-    /// Read-only range access over the held requests.
-    const(Message)[] opSlice() const pure nothrow @safe @nogc { return store; }
+    /// Read-only element access over the RETAINED requests (for
+    /// `pinnedUserRequests` and tests): index 0 is the first request, the
+    /// rest are the newest, oldest first.
+    ref const(Message) opIndex(size_t i) const pure nothrow @safe @nogc { return store[dead_ + i]; }
+    /// Read-only range access over the retained requests.
+    const(Message)[] opSlice() const pure nothrow @safe @nogc { return store[dead_ .. $]; }
+    /// The number of requests retained in memory.
+    size_t retained() const pure nothrow @safe @nogc { return checkedSub(store.length, dead_); }
+    /// The retained requests' rendered text bytes (≤ `ctx.pinStashBudgetBytes`
+    /// unless one request is oversized).
+    size_t retainedBytes() const pure nothrow @safe @nogc { return bytes_; }
+    /// The bound's bookkeeping: how many requests were dropped between the
+    /// first and the retained tail, and their log-line span.
+    ctx.PinDrop drop() const pure nothrow @safe @nogc { return drop_; }
 
-    /// Append one folded request (compaction).
-    void append(Message m) pure @safe { store ~= m; }
-    /// Take over a restored sequence (adoption from `Restored`).
-    void adopt(Message[] msgs) pure nothrow @safe @nogc { store = msgs; }
-    /// Test-only setter: replace the held sequence.
-    void assign(Message[] msgs) pure nothrow @safe @nogc { store = msgs; }
+    /// Append one folded request (compaction), then re-apply the bound:
+    /// amortized O(1) per append (see `bound`). The first request into an
+    /// empty stash is charged the first-request budget, like adoption.
+    void append(Message m) pure @safe
+    {
+        auto first = retained == 0;
+        store ~= m;
+        bytes_ += ctx.pinStashBytes(m, first);
+        logical_++;
+        bound();
+    }
+    /// Take over a restored sequence (adoption from `Restored`), which
+    /// restore already bounded: `msgs` is its retained copy, `d` its dropped
+    /// middle, `logical` the full logical count.
+    void adopt(Message[] msgs, ctx.PinDrop d, size_t logical) pure @safe
+    {
+        store = msgs;
+        dead_ = 0;
+        drop_ = d;
+        logical_ = logical;
+        bytes_ = 0;
+        foreach (i, ref m; store) bytes_ += ctx.pinStashBytes(m, i == 0);
+    }
+    /// Test-only setter: replace the held sequence (unbounded).
+    void assign(Message[] msgs) pure @safe
+    {
+        adopt(msgs, ctx.PinDrop.init, msgs.length);
+    }
     /// Drop every held request (session reset).
-    void clear() pure nothrow @safe @nogc { store = null; }
+    void clear() pure nothrow @safe @nogc
+    {
+        store = null;
+        dead_ = 0;
+        drop_ = ctx.PinDrop.init;
+        logical_ = 0;
+        bytes_ = 0;
+    }
 
-    /// A snapshot for rollback: a copy of the slice (length + pointer), so a
-    /// later `~= x` (which may reallocate the live buffer) never disturbs it.
-    /// This matches the pre-seam rollback, which copied the dynamic array.
-    Message[] snapshot() pure nothrow @safe @nogc { return store; }
+    /// A snapshot for rollback: a private COPY of the retained requests plus
+    /// the bound metadata. The copy matters: `bound` writes the live buffer
+    /// in place and `~=` may extend into its spare capacity, so a shared
+    /// slice would see a later append/eviction overwrite a saved request.
+    PinSnapshot snapshot() pure nothrow @safe
+    {
+        return PinSnapshot(store[dead_ .. $].dup, drop_, logical_, bytes_);
+    }
     /// Restore from a `snapshot` copy (takes ownership of the copy).
-    void restoreFrom(Message[] snap) pure nothrow @safe @nogc { store = snap; }
+    void restoreFrom(PinSnapshot snap) pure nothrow @safe @nogc
+    {
+        store = snap.store;
+        dead_ = 0;
+        drop_ = snap.drop;
+        logical_ = snap.logical;
+        bytes_ = snap.bytes;
+    }
+
+    /// Keep the first request and the newest requests whose rendered text
+    /// fits `ctx.pinStashBudgetBytes`, evicting the OLDEST tail request first
+    /// and folding it into `drop_` (its count grows, its log-line span
+    /// widens), so the dropped requests are always one contiguous middle.
+    /// No-op while everything fits; a single oversized request is retained
+    /// whole (the render clips it). Each eviction is O(1): the first request
+    /// moves forward one slot over the evicted one, leaving a dead slot at
+    /// the front; the buffer is compacted once the dead slots outnumber the
+    /// live ones, so the copy is amortized O(1) per eviction.
+    private void bound() pure @safe
+    {
+        while (retained > 1 && bytes_ > ctx.pinStashBudgetBytes)
+        {
+            auto m = store[dead_ + 1];
+            bytes_ -= ctx.pinStashBytes(m, false);
+            drop_.count++;
+            if (auto id = m.logLine)
+            {
+                drop_.lo = drop_.lo ? min(drop_.lo, id) : id;
+                drop_.hi = max(drop_.hi, id);
+            }
+            store[dead_ + 1] = store[dead_];
+            store[dead_] = Message.init; // release the evicted payload
+            dead_++;
+        }
+        if (dead_ && dead_ >= retained)
+        {
+            store = store[dead_ .. $].dup;
+            dead_ = 0;
+        }
+    }
+}
+
+// The bound evicts the OLDEST tail request across consecutive evictions,
+// keeping the dropped requests one contiguous middle (issue #221).
+@safe unittest
+{
+    import std.array : replicate;
+    import std.conv : to;
+    PinStash st;
+    auto big = "y".replicate(ctx.pinnedLaterChars);
+    foreach (i; 0 .. 6_000)
+    {
+        auto m = Message.user("r" ~ i.to!string ~ " " ~ big);
+        m.logLine = 10 + i;
+        st.append(m);
+    }
+    assert(st.drop.count > 3, "several consecutive evictions happened");
+    assert(st[0].logLine == 10, "the first request survives");
+    auto tail = st[][1 .. $];
+    foreach (k, ref m; tail) assert(m.logLine == 10 + 1 + st.drop.count + k, "the tail is the newest, in order");
+    assert(st.drop.lo == 11 && st.drop.hi == 10 + st.drop.count, "the dropped middle is contiguous");
+    assert(st.retainedBytes <= ctx.pinStashBudgetBytes);
+}
+
+// A rollback snapshot is not disturbed by later appends/evictions that reuse
+// the live buffer, and the first append is charged the first-request budget.
+@safe unittest
+{
+    import std.array : replicate;
+    import std.conv : to;
+    PinStash st;
+    auto goal = Message.user("g".replicate(ctx.pinnedFirstChars * 2));
+    st.append(goal);
+    assert(st.retainedBytes == ctx.pinStashBytes(goal, true), "first append uses the first-request cap");
+    auto big = "y".replicate(ctx.pinnedLaterChars);
+    foreach (i; 0 .. 5_000) st.append(Message.user("a" ~ i.to!string ~ " " ~ big));
+    auto snap = st.snapshot();
+    auto saved = snap.store.dup;
+    foreach (i; 0 .. 50) st.append(Message.user("b" ~ i.to!string ~ " " ~ big));
+    st.restoreFrom(snap);
+    assert(st.retained == saved.length);
+    foreach (k; 0 .. saved.length) assert(st[k].content == saved[k].content, "the snapshot's retained sequence survives");
+}
+
+/// A `PinStash` rollback snapshot: the retained requests plus the bound
+/// metadata (dropped range, logical count and byte tally).
+struct PinSnapshot
+{
+    Message[] store;
+    ctx.PinDrop drop;
+    size_t logical;
+    size_t bytes;
 }
 
 /// The real turns folded by compactions since the last plain replacement:
@@ -247,7 +420,7 @@ struct ReplayStash
     /// Take over a restored sequence (adoption from `Restored`).
     void adopt(Message[] msgs) pure nothrow @safe @nogc { store = msgs; }
     /// Test-only setter: replace the held sequence.
-    void assign(Message[] msgs) pure nothrow @safe @nogc { store = msgs; }
+    void assign(Message[] msgs) pure @safe { store = msgs; }
     /// Drop every held turn (session reset).
     void clear() pure nothrow @safe @nogc { store = null; }
 
@@ -375,6 +548,14 @@ class Agent
     /// Set before `run` when the input is harness-initiated (a fired timer);
     /// `run` consumes it.
     bool automaticInput;
+    /// Set alongside `automaticInput` when the harness-initiated input is a
+    /// fired timer's message (`takeFiredTimers`): the notice the firing
+    /// printed live. `run` consumes both and marks the message `timer` with
+    /// the notice in `pinText`, so replay restores the notice exactly like a
+    /// mid-turn firing (`fireDueTimers`) — an automatic input without them
+    /// replays as nothing, losing the visible notice.
+    bool timerInput;
+    string timerInputNotice;
     /// The genuine user requests folded by earlier compactions, so each
     /// compaction rebuilds the pinned block from originals (Rust's
     /// `pre_compaction_transcript`, trimmed to requests).
@@ -449,6 +630,11 @@ class Agent
         // A harness-initiated input (a fired timer): never pinned as a request.
         bool automatic = automaticInput;
         automaticInput = false;
+        // A fired timer's turn also carries the notice it printed live.
+        bool timer = timerInput;
+        string timerNotice = timerInputNotice;
+        timerInput = false;
+        timerInputNotice = null;
         if (givenId.length)
             if (auto done = givenId in completedInputs)
             {
@@ -475,7 +661,7 @@ class Agent
         turnHistoryCalls = 0;
         scope (exit) requestThinking = Option!string.init;
         string response;
-        try response = runTurn(input, ev, resetControl, automatic, inputId, resuming);
+        try response = runTurn(input, ev, resetControl, automatic, inputId, resuming, timer, timerNotice);
         catch (Exception e)
         {
             log.ifSome((SessionLog l) {
@@ -484,6 +670,10 @@ class Agent
             });
             throw e;
         }
+        // A turn the request cap stopped closes on a tool-calling reply: mark
+        // it (in memory; a later replace record carries it) so quiet replay
+        // can tell a capped turn from one a crash interrupted.
+        if (lastStop == StopReason.maxTurnRequests) markCapped(messages);
         log.ifSome((SessionLog l) {
             l.turnEnd(inputId, response, lastStop, hasOutcome ? lastOutcome.toJSON : JSONValue.init,
                 turnHistoryCalls);
@@ -586,7 +776,7 @@ class Agent
         ~ "no trailing period.";
 
     private string runTurn(string input, AgentEvents ev, bool resetControl, bool automatic = false,
-        string inputId = null, bool resuming = false)
+        string inputId = null, bool resuming = false, bool timer = false, string timerNotice = null)
     {
         if (resetControl) control.startTurn();
         stopBlocks = 0;
@@ -682,6 +872,16 @@ class Agent
             auto um = Message.user(input);
             um.pinText = pinText;
             um.autoInitiated = automatic;
+            if (timer)
+            {
+                // A fired timer's turn: flag it like a mid-turn firing
+                // (`fireDueTimers`) and keep the notice it printed live in
+                // `pinText`, so replay restores the notice instead of
+                // hiding the whole message as a model-only automatic input.
+                um.timer = true;
+                um.timerTurn = true;
+                um.pinText = timerNotice;
+            }
             hasPending = true;
             pending = PendingInput(inputId, typed, messages.length);
             push(um);
@@ -777,7 +977,9 @@ class Agent
                     },
                     (StopBlocked b) {
                         hasReported = false;
-                        push(Message.auto_(wrapReminder(b.reason)));
+                        auto rej = Message.auto_(wrapReminder(b.reason));
+                        rej.stopBlocked = true;
+                        push(rej);
                         ev.userMessage(b.reason);
                     },
                     (RunTools _) { next ~= runToolCalls(r, ev, loopStop); },
@@ -813,7 +1015,9 @@ class Agent
     {
         foreach (s; control.takePending)
         {
-            push(Message.user(s.text));
+            auto sm = Message.user(s.text);
+            sm.steered = true;
+            push(sm);
             ev.userMessage(s.text);
             control.absorbed(s);
         }
@@ -1500,8 +1704,10 @@ class Agent
         }
         if (planTools && !plan.empty) summary ~= "\n\n" ~ plan.contextNote();
         // Pin the user's own words, rebuilt from the originals every time.
+        // The stash is bounded: `pinStash.drop` names the middle it dropped,
+        // so the pinned block's omission note is unchanged.
         if (compactionPinRequests)
-            if (auto pinned = ctx.pinnedUserRequests(pinStash[], summarized, smart, window))
+            if (auto pinned = ctx.pinnedUserRequests(pinStash[], summarized, smart, window, pinStash.drop))
                 summary ~= "\n\n" ~ pinned;
         // The requests this compaction adds to the pinned block (the stash so
         // far is their base): the log records only these, so a session holds
@@ -1806,7 +2012,7 @@ class Agent
         completedOutcomes = r.completedOutcomes;
         historyAvailable = r.historyAvailable;
         historyHintPending = r.historyAvailable && !r.historyHintConsumed;
-        pinStash.adopt(r.pinStash);
+        pinStash.adopt(r.pinStash, r.pinDrop, r.pinLogical);
         replayRestated = r.replayRestated;
         replayStash.adopt(r.replayStash);
         adoptPending(r);
@@ -2162,6 +2368,7 @@ class Agent
             auto text = takeFiredTimers(notice);
             auto tm = Message.auto_(wrapReminder(text));
             tm.timer = true;
+            tm.pinText = notice; // the visible notice, for replay
             push(tm);
             ev.userMessage(notice);
             return;
@@ -2756,6 +2963,27 @@ unittest
     agent.pinStash.assign([Message.user("old")]);
     agent.restart("sys", Option!SessionLog.init);
     assert(agent.pinStash.isEmpty);
+}
+
+// A fired timer delivered as a turn (the idle prompt or `--wait-timers`)
+// marks its message `timer` with the live notice in `pinText`, so replay
+// restores the notice instead of hiding the message as a model-only
+// automatic input. The flags are one-shot, like `automaticInput`.
+unittest
+{
+    import nano.providers.mock;
+    auto agent = new Agent(new MockClient([LLMResponse("ok"), LLMResponse("ok")]), new ToolRegistry, Policy.init, "sys");
+    agent.automaticInput = true;
+    agent.timerInput = true;
+    agent.timerInputNotice = "⏰ timer 1 fired: look again";
+    agent.run("timer fired text", new NullEvents);
+    auto tm = agent.messages[1];
+    assert(tm.autoInitiated && tm.timer, "a timer turn's message is flagged timer");
+    assert(tm.pinText == "⏰ timer 1 fired: look again", tm.pinText);
+    assert(!agent.timerInput && agent.timerInputNotice is null && !agent.automaticInput, "the flags are one-shot");
+    // The next turn is a plain one: no timer flag, no notice.
+    agent.run("plain", new NullEvents);
+    assert(!agent.messages[3].timer && agent.messages[3].pinText is null && !agent.messages[3].autoInitiated);
 }
 
 // Round-5 review fix for issue #205: replacing the agent's log closes the

@@ -114,6 +114,12 @@ unittest
         agent.run("go", new NullEvents);
         assert(agent.lastStop == StopReason.maxTurnRequests);
         assert(mock.seen.length == headlessSafetyCap);
+        // The capped turn's closing tool-calling reply is marked for replay.
+        import std.algorithm : filter;
+        import std.array : array;
+        auto replies = agent.messages.filter!(m => m.role == Role.assistant).array;
+        assert(replies[$ - 1].stopReason == "max_turn_requests");
+        assert(replies.length < 2 || replies[$ - 2].stopReason != "max_turn_requests");
     }
 }
 

@@ -9,3 +9,6 @@ nano.providers.openai_test 3000 a stream must outlast the 1 s idle timeout
 nano.http 3000 real sockets: refused, stalled and redirected connections
 nano.providers.anthropic_test 2500 scripted streaming server with drip delays
 nano.keycmd 2500 key commands run into their timeouts and drain grace
+nano.context 6000 the bounded-pin-stash test renders thousands of requests at several windows
+nano.session 5000 the bounded-pin-stash restore tests build and parse ~3,000-request JSON logs
+nano.agent_resume_test 3000 the bounded-pin-stash round-trip compacts and resumes a ~3,000-request session

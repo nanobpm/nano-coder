@@ -126,3 +126,46 @@ unittest
     assert(threw && agent.timers.items.length == 1 && !agent.timers.pending.length, "still due");
     assert(agent.takeFiredTimers(notice).length && agent.timers.pending.length == 1);
 }
+
+// A fired timer delivered as a turn (the idle prompt or `--wait-timers` path
+// in app.d) logs its message `timer`-flagged with the live notice in
+// `pinText`; a resume restores both, so replay shows the notice exactly like
+// a mid-turn firing's message.
+unittest
+{
+    import nano.providers.mock : MockClient;
+    import nano.session : restore;
+    import std.algorithm : canFind;
+    import std.file : exists, rmdirRecurse, tempDir;
+    import std.path : buildPath;
+    auto dir = buildPath(tempDir, "nano-timer-turn-replay");
+    if (exists(dir)) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto agent = new Agent(new MockClient([LLMResponse("on it")]), new ToolRegistry, Policy.init, "sys");
+    long clock = 1_000_000;
+    agent.now = () => clock;
+    auto log = new SessionLog(dir, "mock/m", "/w");
+    log.append(agent.messages[0]);
+    agent.log = some(log);
+    agent.runTimerTool("timer_set", parseJSON(`{"after": "5m", "note": "check CI"}`));
+    clock += 600;
+    // The idle-prompt / --wait-timers delivery: take the firing, print the
+    // notice, run the fired text as a harness-initiated timer turn.
+    string notice;
+    auto fired = agent.takeFiredTimers(notice);
+    assert(fired.length && notice.canFind("check CI"), notice);
+    agent.automaticInput = true;
+    agent.timerInput = true;
+    agent.timerInputNotice = notice;
+    agent.run(fired, new NullEvents);
+    auto tm = agent.messages[$ - 2];
+    assert(tm.role == Role.user && tm.timer && tm.autoInitiated, "the turn's message is a timer firing");
+    assert(tm.pinText == notice, tm.pinText);
+
+    // A resume restores the flag and notice from the log.
+    auto resumed = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "sys");
+    auto r = restore(log.path);
+    resumed.loadRestored(r, some(new SessionLog(log.path)));
+    auto rm = resumed.replayMessages[$ - 2];
+    assert(rm.role == Role.user && rm.timer && rm.timerTurn && rm.pinText == notice, rm.pinText);
+}
