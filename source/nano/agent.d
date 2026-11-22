@@ -1860,7 +1860,7 @@ class Agent
     {
         import nano.mode : AgentMode;
         bool plan = control.mode == AgentMode.plan;
-        if (plan == promptPlan || !messages.length) return;
+        if (plan == promptPlan || !messages.length || messages[0].role != Role.system) return;
         messages[0].content = render(plan);
         calibLen = calibTokens = 0; // the usage anchor counted the old prompt
         promptPlan = plan;
@@ -1902,10 +1902,17 @@ class Agent
     void restart(string system, Option!SessionLog newLog)
     {
         import nano.mode : AgentMode;
-        messages = [Message.system(system)];
+        // An empty system prompt (e.g. an ACP host without one) sends no
+        // system message at all: some providers reject an empty one.
+        messages = system.length ? [Message.system(system)] : null;
         promptPlan = false; // the caller renders `system` for normal mode
         replaceLog(newLog);
-        log.ifSome((SessionLog l) { l.append(messages[0]); });
+        if (messages.length) log.ifSome((SessionLog l) { l.append(messages[0]); });
+        // A new session must not answer a prompt from the previous session's
+        // idempotency cache (issue #248).
+        completedInputs = null;
+        completedStops = null;
+        completedOutcomes = null;
         control.mode = AgentMode.normal;
         sessionThinking.nullify();
         plan = Plan.init;
@@ -3041,6 +3048,24 @@ unittest
     assert(agent.messages.ptr !is old.ptr, "kept system message aliases the old array");
     old[0].content = "overwritten";
     assert(agent.messages[0].content == "sys", agent.messages[0].content);
+}
+
+// `restart` starts a clean session: no idempotency cache carried over from the
+// previous session, and no empty system message when there is no prompt.
+unittest
+{
+    import nano.providers.mock;
+    auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "sys");
+    agent.completedInputs["id1"] = "old";
+    agent.completedStops["id1"] = StopReason.cancelled;
+    agent.completedOutcomes["id1"] = JSONValue(1);
+    agent.restart("", Option!SessionLog.init);
+    assert(agent.completedInputs.length == 0);
+    assert(agent.completedStops.length == 0);
+    assert(agent.completedOutcomes.length == 0);
+    assert(agent.messages.length == 0);
+    agent.restart("sys2", Option!SessionLog.init);
+    assert(agent.messages.length == 1 && agent.messages[0].content == "sys2");
 }
 
 /// The tool result a crash left unwritten (Rust's INTERRUPTED_TOOL_RESULT).
