@@ -920,6 +920,12 @@ class Agent
         typeof(recallTurnNotes) notesBefore;
     }
 
+    version (unittest)
+    {
+        /// Test hook: called by a worker right after it reads `afterCancel`.
+        static shared void function() @safe workerRecordedHook;
+    }
+
     /// What a worker hands back: the job's result, and whether the turn was
     /// already cancelled when the job finished (decided on the worker, so a
     /// result completed before a cancel keeps its result however late the
@@ -935,7 +941,11 @@ class Agent
     {
         scope (exit) finished.put(index);
         auto res = runJob(job);
-        return WorkerDone(res, cancelRequested());
+        auto afterCancel = cancelRequested();
+        import core.atomic : atomicLoad;
+        version (unittest)
+            if (auto hook = atomicLoad(workerRecordedHook)) hook();
+        return WorkerDone(res, afterCancel);
     }
 
     /// Run consecutive read-only calls concurrently (issue #222). In call
@@ -996,10 +1006,12 @@ class Agent
             {
                 size_t k;
                 done.take(k);
+                // Counted off before the join: a join that rethrows has still
+                // consumed this worker's notification.
+                running--;
                 // `runJob` turns a job's exception into a result, so this
                 // only waits.
                 handles[k].join();
-                running--;
             }
         void launch()
         {
@@ -1018,14 +1030,17 @@ class Agent
                 bool isError;
                 results[k].text = execute(call, runs[k].effectiveArgs, isError);
                 results[k].error = isError;
-                finished[k] = true;
+                // Finished after a cancellation (the worker rule): interrupted.
+                finished[k] = !control.isCancelled;
             }
         while (running)
         {
             size_t k;
             done.take(k);
-            auto w = handles[k].join();
+            // Before the join, so a rethrowing join leaves the failure guard
+            // waiting only for notifications still to come.
             running--;
+            auto w = handles[k].join();
             results[k] = w.result;
             // Finished after a cancellation: reported as interrupted.
             finished[k] = !w.afterCancel;
@@ -1039,10 +1054,10 @@ class Agent
             // Cancellation outranks a loop stop for a call that never ran:
             // an interrupted call reports the interrupted result even when an
             // earlier finished call tripped the loop detector.
-            if (skipped[k]) c.result = cancelledToolResult;
-            else if (!admitted[k]) c.ran = true;
-            else if (!finished[k]) c.result = cancelledToolResult;
+            // A loop stop outranks a refusal, as in the sequential path.
+            if (skipped[k] || (admitted[k] && !finished[k])) c.result = cancelledToolResult;
             else if (loopStop !is null) c.result = loopStoppedToolResult;
+            else if (!admitted[k]) c.ran = true;
             else
             {
                 auto res = results[k];

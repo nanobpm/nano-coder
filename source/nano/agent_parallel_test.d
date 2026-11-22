@@ -199,7 +199,7 @@ unittest
     assert(mock.seen.length == 1);
     assert(results(agent) == [
         `["a", "slow", "` ~ cancelledToolResult ~ `", "true"]`,
-        `["b", "stop", "stopped", "false"]`,
+        `["b", "stop", "` ~ cancelledToolResult ~ `", "true"]`,
         `["c", "slow", "` ~ cancelledToolResult ~ `", "true"]`,
     ], results(agent).to!string);
     // The next turn starts clean.
@@ -231,42 +231,18 @@ JobResult quick(string argsJson, immutable(string)[] context)
     return JobResult("quick");
 }
 
-/// Set by the worker running `quick` once its result is in and it is about to
-/// read the cancel flag for its `afterCancel` metadata. `stop` waits for this
-/// acknowledgment instead of a fixed delay, so the cancel is ordered after the
-/// worker's bookkeeping rather than racing it (issue #222 review).
+/// Set by `Agent.worker` (through its test hook) once it has read the cancel
+/// flag for its `afterCancel` metadata. `stop` waits for this instead of a
+/// fixed delay, so the cancel is ordered after the worker's actual read.
 shared bool workerRecorded;
 
-/// Wraps `quick`: reads the cancel flag the way the worker will for
-/// `afterCancel`, then signals that the metadata point is reached. Because
-/// `stop` waits for the signal before cancelling, both this read and the
-/// worker's own read observe "not cancelled", so the finished call keeps its
-/// result.
-JobResult quickAck(string argsJson, immutable(string)[] context)
-{
-    import nano.control : cancelRequested;
-    auto res = quick(argsJson, context);
-    // Read (and discard) the flag the worker reads next; the signal below
-    // orders `stop`'s cancel after it.
-    cast(void) cancelRequested();
-    atomicStore(workerRecorded, true);
-    return res;
-}
-
-/// How many `fast` workers have read their `afterCancel` metadata.
+/// How many workers have read their `afterCancel` metadata.
 shared int fastDone;
 
-/// `quick`, then count this worker as past its `afterCancel` read, so a test
-/// can cancel only once every `fast` call is recorded as finished (not
-/// interrupted). Reads the flag first so the count means "finished before any
-/// later cancel".
-JobResult quickCounted(string argsJson, immutable(string)[] context)
+void recordWorker() @safe
 {
-    import nano.control : cancelRequested;
-    auto res = quick(argsJson, context);
-    cast(void) cancelRequested();
     atomicOp!"+="(fastDone, 1);
-    return res;
+    atomicStore(workerRecorded, true);
 }
 
 // A worker that finished before a cancel keeps its result, even though the
@@ -277,11 +253,13 @@ unittest
     import core.time : msecs, seconds;
     atomicStore(arrived, 0);
     atomicStore(workerRecorded, false);
+    atomicStore(Agent.workerRecordedHook, &recordWorker);
+    scope (exit) atomicStore(Agent.workerRecordedHook, null);
     auto reg = new ToolRegistry;
     Agent agent;
     Concurrency fast;
     fast.readOnly = true;
-    fast.offload = (JSONValue a) => Job(&quickAck, a.toString, null);
+    fast.offload = (JSONValue a) => Job(&quick, a.toString, null);
     reg.register(def("fast"), (JSONValue a) => "sequential", fast);
     // On the agent's thread: waits for the worker to record its completion
     // metadata, then cancels.
@@ -296,7 +274,7 @@ unittest
     assert(agent.run("go", new NullEvents) == cancelledResponse);
     assert(results(agent) == [
         `["a", "fast", "quick", "false"]`,
-        `["b", "stop", "stopped", "false"]`,
+        `["b", "stop", "` ~ cancelledToolResult ~ `", "true"]`,
     ], results(agent).to!string);
 }
 
@@ -312,13 +290,15 @@ unittest
     atomicStore(arrived, 0);
     atomicStore(fastDone, 0);
     atomicStore(released, false);
+    atomicStore(Agent.workerRecordedHook, &recordWorker);
+    scope (exit) atomicStore(Agent.workerRecordedHook, null);
     auto reg = new ToolRegistry;
     Agent agent;
     // The five identical calls run `quick`, counting each past its metadata
     // read so the cancel lands only once all five are recorded finished.
     Concurrency fast;
     fast.readOnly = true;
-    fast.offload = (JSONValue a) => Job(&quickCounted, a.toString, null);
+    fast.offload = (JSONValue a) => Job(&quick, a.toString, null);
     reg.register(def("fast"), (JSONValue a) => "sequential", fast);
     Concurrency slow;
     slow.readOnly = true;
@@ -350,5 +330,7 @@ unittest
     // not the loop-stop one.
     assert(r[5] == `["f", "slow", "` ~ cancelledToolResult ~ `", "true"]`, r.to!string);
     assert(!r[5].canFind(loopStoppedToolResult), r[5]);
+    // The fifth fast call did trip the loop detector's hard stop.
+    assert(r[4].canFind("repeated too many times"), r[4]);
 }
 
