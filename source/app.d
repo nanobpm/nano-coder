@@ -16,6 +16,7 @@ import std.json;
 import std.format : format;
 import std.string : strip, stripRight, startsWith, indexOf;
 import nano.turn_commands : LiveView, splitCmd, timing, Timing;
+import nano.context : isUserRequest;
 import nano.markdown : MarkdownStream, renderMarkdownText = render;
 import std.array : join;
 static import std.string;
@@ -1185,6 +1186,14 @@ struct Screen
         finishThinking();
         streamedThinking = false;
     }
+
+    /// A saved session's reasoning block, replayed whole: verbose expands it,
+    /// normal mode folds it under its summary like a block that just ended.
+    void replayThinking(string reasoning)
+    {
+        thinkingDelta(reasoning);
+        finishThinking();
+    }
 }
 
 // rust: ui.rs::trailing_thinking_never_overwrites_previous_response_reasoning
@@ -1293,6 +1302,14 @@ class Console : AgentEvents
     void note(string text) { link.note(text); }
 
     void endLine() { link.endLine(); }
+
+    /// A replayed message's saved reasoning, shown before its answer (quiet
+    /// hides reasoning live, so replay hides it too).
+    void replayThinking(string reasoning)
+    {
+        if (quiet || !reasoning.length) return;
+        link.screen.update((ref Screen s) { s.replayThinking(reasoning); });
+    }
 
     /// plan_add/plan_update show as the checklist, not as calls.
     private bool quietTool(const ref ToolCall call) { return !verbose && (call.name == "plan_add" || call.name == "plan_update"); }
@@ -1683,6 +1700,56 @@ string replayQuietShown(const Message[] msgs, size_t i) pure nothrow @safe
     return replayAnswerQuiet(msgs, i);
 }
 
+/// The last assistant message of the turn `msgs[i]` belongs to, or
+/// `msgs.length` when the turn's end is not in the log. A turn closes at the
+/// next genuine user request (transparent harness messages — system notes,
+/// hook context, timer firings — belong to the turn they sit inside); a turn
+/// that runs to the end of the log closes there.
+private size_t quietTurnLast(const Message[] msgs, size_t i) pure @safe
+{
+    size_t j = i + 1;
+    while (j < msgs.length && (msgs[j].role != Role.user || !isUserRequest(msgs[j]))) j++;
+    size_t last = j;
+    while (last > 0 && msgs[last - 1].role != Role.assistant) last--;
+    return last > 0 ? last - 1 : msgs.length;
+}
+
+/// What quiet replay prints for assistant message `msgs[i]` —
+/// `replayQuietShown`, except that a turn that closes on a tool-calling
+/// message (the request cap stops the loop there) shows that message's own
+/// content: live quiet dropped those answer deltas, so a resume that keeps
+/// the message hidden loses output the completed turn displayed. The cap's
+/// stop note itself is a live-only notice, never logged, so replay cannot
+/// reprint it; the response text it accompanied is what survives.
+string replayQuietShownTurn(const Message[] msgs, size_t i) pure @safe
+{
+    if (msgs[i].role != Role.assistant) return null;
+    if (msgs[i].toolCalls.length && quietTurnLast(msgs, i) == i && msgs[i].content.strip.length)
+        return msgs[i].content;
+    return replayQuietShown(msgs, i);
+}
+
+unittest
+{
+    Message[] msgs;
+    msgs ~= Message.user("goal");
+    msgs ~= Message.assistant("working", [ToolCall("c1", "bash", JSONValue.init)]);
+    msgs ~= Message.toolResult("c1", "bash", "ok");
+    msgs ~= Message.assistant("more", [ToolCall("c2", "bash", JSONValue.init)]);
+    msgs ~= Message.toolResult("c2", "bash", "ok");
+    msgs ~= Message.user("next goal");
+    msgs ~= Message.assistant("done");
+    // A turn that closed on a tool-calling message (the request cap) shows
+    // the response live quiet dropped; an earlier tool-calling reply of the
+    // same turn stays hidden (its turn went on).
+    assert(replayQuietShownTurn(msgs, 1) is null);
+    assert(replayQuietShownTurn(msgs, 3) == "more");
+    assert(replayQuietShownTurn(msgs, 6) == "done");
+    // A turn closed by a tool-free message is unaffected.
+    auto plain = [Message.user("g"), Message.assistant("hi")];
+    assert(replayQuietShownTurn(plain, 1) == "hi");
+}
+
 unittest
 {
     import nano.agent : wrapReminder;
@@ -1921,7 +1988,10 @@ void replayTranscript(Agent agent, Console console)
             // prints it whole at the segment's first cut-off chunk (which
             // accumulates the later chunks), suppressing every later chunk a
             // reminder continues — their text is already in that whole.
-            const shown = console.quiet ? replayQuietShown(msgs, i) : m.content;
+            // The saved reasoning replays before the answer (verbose expands
+            // it, normal folds it, quiet hides it as live does).
+            console.replayThinking(m.thinking);
+            const shown = console.quiet ? replayQuietShownTurn(msgs, i) : m.content;
             if (shown.strip.length) writeln(stampBlock(console.stamp(), console.display(escapeMarks(sanitizeBlock(shown))).stripRight));
             foreach (j, ref c; m.toolCalls) pending ~= [i, j];
             break;

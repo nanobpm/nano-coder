@@ -990,10 +990,20 @@ size_t pinStashBytes(const ref Message m, bool first) pure @safe
     // Clipped: `clipBytes` scales its char budget for multi-byte text and can
     // return well under `budget`, so charge what it actually emits — never
     // more than the renderer shows (only over-budget requests pay this).
+    // `clipBytes` is not monotonic in its byte budget (a smaller budget can
+    // land on a boundary that fits MORE bytes), so a smart label's room can
+    // overcharge a standard render: charge the worse of the two renders —
+    // labelled and unlabelled — never dropping a request either mode shows.
     import std.array : join, split;
     import std.string : strip;
     string norm = first ? text.strip.idup : text.split.join(" ").idup;
-    return clipBytes(norm, budget).length + 1;
+    auto clipped = clipBytes(norm, budget).length;
+    if (!first && m.logLine)
+    {
+        auto standard = clipBytes(norm, pinnedLaterChars).length;
+        if (standard > clipped) clipped = standard;
+    }
+    return clipped + 1;
 }
 
 /// The byte length of `text` once leading/trailing whitespace is stripped.
@@ -1372,6 +1382,24 @@ unittest
     // renderer shows each of them whole, so the bound must not drop one
     // (#221's byte-identical rendering requirement).
     check(requests(600, 1_000));
+    // Multibyte text over the per-request render budget: `clipBytes` is not
+    // monotonic in its byte budget, so a smart label's carved room can clip
+    // FEWER bytes than the standard render shows. The charge covers both
+    // renders, so the bound never drops a request either mode shows whole —
+    // the review's case: 110 `é` requests with 5-digit log ids.
+    {
+        import std.array : replicate;
+        Message[] uni;
+        foreach (i; 0 .. 2_800)
+            uni ~= req("é".replicate(110), 10_000 + i);
+        check(uni);
+        // The charge itself never exceeds what either mode renders (+newline).
+        auto charge = pinStashBytes(uni[1], false);
+        auto smartRoom = pinnedLaterChars - "#10001: ".length;
+        auto smartLen = clipBytes("é".replicate(110), smartRoom).length;
+        auto standardLen = clipBytes("é".replicate(110), pinnedLaterChars).length;
+        assert(charge == max(smartLen, standardLen) + 1, "the worse of the two renders is charged");
+    }
     {
         size_t rendered;
         auto rs = requests(600, 1_000);

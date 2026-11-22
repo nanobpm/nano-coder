@@ -285,7 +285,14 @@ private void mergeLines(const(ubyte)[] bytes, ref Summary[string] map, ref size_
     {
         const(char)[] raw;
         try raw = utf8View(rawBytes);
-        catch (UTFException) { if (rawBytes.length) lines++; continue; } // invalid UTF-8: unreadable
+        catch (UTFException)
+        {
+            if (rawBytes.length) lines++;
+            // Strict callers (retention) must not guess at titles an
+            // unreadable line hid; a cache load just skips the line.
+            if (strict && rawBytes.length) throw new Exception("session index has a corrupt line");
+            continue; // invalid UTF-8: unreadable
+        }
         auto line = raw.strip;
         if (!line.length) continue;
         lines++;
@@ -928,6 +935,10 @@ unittest
     std.file.append(indexPath(dir), cast(const(ubyte)[]) "{not json\n");
     import std.exception : assertThrown;
     assertThrown(titledIds(dir), "a corrupt index must not read as 'nothing titled'");
+    // An invalid-UTF-8 line is just as unreadable: strict load must throw too.
+    import std.file : write;
+    write(indexPath(dir), cast(const(ubyte)[]) [0x7b, 0xff, 0x7d, 0x0a]);
+    assertThrown(titledIds(dir), "an unreadable index line must not read as 'nothing titled'");
 }
 
 // Round-8 review fix for issue #205: a titled log that can no longer be
