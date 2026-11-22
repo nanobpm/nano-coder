@@ -167,44 +167,137 @@ struct ConfiguredWindow
 /// compaction rebuilds the pinned block from originals (Rust's
 /// `pre_compaction_transcript`, trimmed to requests).
 ///
-/// A thin named wrapper around the message sequence (epic #221 seam): the
-/// representation is a private `Message[]` for now, but callers reach it only
-/// through the named members below, so a later slice can bound or re-encode it
-/// without touching call sites. There is deliberately NO `alias this` and no
-/// implicit conversion to or from `Message[]` — a raw array enters only via
-/// `adopt`/`append`/`assign` and leaves only via the named read members.
+/// A thin named wrapper around the message sequence (epic #221 seam): there
+/// is deliberately NO `alias this` and no implicit conversion to or from
+/// `Message[]` — a raw array enters only via `adopt`/`append`/`assign` and
+/// leaves only via the named read members.
+///
+/// The stash is BOUNDED (issue #221): an unbounded copy cost ~12 MB on a
+/// real 6,946-request session, yet `pinnedUserRequests` renders only the
+/// first request and as many recent requests as fit its window/8 allowance.
+/// So `store` keeps the first request plus the newest requests whose text
+/// fits a generous fixed byte budget (`ctx.pinStashBudgetBytes`), and the
+/// dropped middle lives on as `drop` (its count and log-line span — the
+/// omission note renders from it exactly as before). `base`/`length` keep
+/// reporting the LOGICAL count of requests ever stashed, because the session
+/// log's `pinned_base` delta base is written from it; only the in-memory
+/// copy is bounded.
 struct PinStash
 {
     private Message[] store;
+    /// The requests the bound dropped between `store[0]` and `store[1]`.
+    private ctx.PinDrop drop_;
+    /// The logical count of requests ever stashed (what `pinned_base` sees).
+    private size_t logical_;
+    /// The retained requests' text bytes (what the budget bounds).
+    private size_t bytes_;
 
     /// The count the on-disk delta base (`pinned_base`) is written from: the
-    /// logical number of requests the stash represents.
-    size_t base() const pure nothrow @safe @nogc { return store.length; }
-    /// The number of requests currently held.
-    size_t length() const pure nothrow @safe @nogc { return store.length; }
+    /// logical number of requests the stash represents, NOT the bounded
+    /// in-memory count.
+    size_t base() const pure nothrow @safe @nogc { return logical_; }
+    /// The logical number of requests the stash holds (dropped ones included).
+    size_t length() const pure nothrow @safe @nogc { return logical_; }
     /// Whether the stash holds nothing.
-    bool isEmpty() const pure nothrow @safe @nogc { return store.length == 0; }
+    bool isEmpty() const pure nothrow @safe @nogc { return logical_ == 0; }
 
-    /// Read-only element access (for `pinnedUserRequests` and tests).
+    /// Read-only element access over the RETAINED requests (for
+    /// `pinnedUserRequests` and tests): index 0 is the first request, the
+    /// rest are the newest.
     ref const(Message) opIndex(size_t i) const pure nothrow @safe @nogc { return store[i]; }
-    /// Read-only range access over the held requests.
+    /// Read-only range access over the retained requests.
     const(Message)[] opSlice() const pure nothrow @safe @nogc { return store; }
+    /// The number of requests retained in memory.
+    size_t retained() const pure nothrow @safe @nogc { return store.length; }
+    /// The retained requests' text bytes (≤ `ctx.pinStashBudgetBytes` unless
+    /// one request is oversized).
+    size_t retainedBytes() const pure nothrow @safe @nogc { return bytes_; }
+    /// The bound's bookkeeping: how many requests were dropped between the
+    /// first and the retained tail, and their log-line span.
+    ctx.PinDrop drop() const pure nothrow @safe @nogc { return drop_; }
 
-    /// Append one folded request (compaction).
-    void append(Message m) pure @safe { store ~= m; }
-    /// Take over a restored sequence (adoption from `Restored`).
-    void adopt(Message[] msgs) pure nothrow @safe @nogc { store = msgs; }
-    /// Test-only setter: replace the held sequence.
-    void assign(Message[] msgs) pure nothrow @safe @nogc { store = msgs; }
+    /// Append one folded request (compaction), then re-apply the bound: O(1)
+    /// per append — the byte tally moves one request at a time.
+    void append(Message m) pure @safe
+    {
+        store ~= m;
+        bytes_ += ctx.pinStashBytes(m);
+        logical_++;
+        bound();
+    }
+    /// Take over a restored sequence (adoption from `Restored`), which
+    /// restore already bounded: `msgs` is its retained copy, `d` its dropped
+    /// middle, `logical` the full logical count.
+    void adopt(Message[] msgs, ctx.PinDrop d, size_t logical) pure nothrow @safe @nogc
+    {
+        store = msgs;
+        drop_ = d;
+        logical_ = logical;
+        bytes_ = 0;
+        foreach (ref m; store) bytes_ += ctx.pinStashBytes(m);
+    }
+    /// Test-only setter: replace the held sequence (unbounded).
+    void assign(Message[] msgs) pure nothrow @safe @nogc
+    {
+        adopt(msgs, ctx.PinDrop.init, msgs.length);
+    }
     /// Drop every held request (session reset).
-    void clear() pure nothrow @safe @nogc { store = null; }
+    void clear() pure nothrow @safe @nogc
+    {
+        store = null;
+        drop_ = ctx.PinDrop.init;
+        logical_ = 0;
+        bytes_ = 0;
+    }
 
-    /// A snapshot for rollback: a copy of the slice (length + pointer), so a
-    /// later `~= x` (which may reallocate the live buffer) never disturbs it.
-    /// This matches the pre-seam rollback, which copied the dynamic array.
-    Message[] snapshot() pure nothrow @safe @nogc { return store; }
+    /// A snapshot for rollback: the retained copy plus the bound metadata, so
+    /// a failed compaction restores the dropped range and the logical count
+    /// as well as the messages. The message slice itself is a (length +
+    /// pointer) copy, so a later `~= x` (which may reallocate the live
+    /// buffer) never disturbs it.
+    PinSnapshot snapshot() pure nothrow @safe @nogc
+    {
+        return PinSnapshot(store, drop_, logical_, bytes_);
+    }
     /// Restore from a `snapshot` copy (takes ownership of the copy).
-    void restoreFrom(Message[] snap) pure nothrow @safe @nogc { store = snap; }
+    void restoreFrom(PinSnapshot snap) pure nothrow @safe @nogc
+    {
+        store = snap.store;
+        drop_ = snap.drop;
+        logical_ = snap.logical;
+        bytes_ = snap.bytes;
+    }
+
+    /// Keep the first request and the newest requests whose text fits
+    /// `ctx.pinStashBudgetBytes`, folding the evicted middle into `drop_`
+    /// (its count grows, its log-line span widens). No-op while everything
+    /// fits; a single oversized request is retained whole (the render clips
+    /// it — dropping it would only lose text the renderer never shows).
+    private void bound() pure @safe
+    {
+        while (store.length > 1 && bytes_ > ctx.pinStashBudgetBytes)
+        {
+            auto m = store[1];
+            bytes_ -= ctx.pinStashBytes(m);
+            drop_.count++;
+            if (auto id = m.logLine)
+            {
+                drop_.lo = drop_.lo ? min(drop_.lo, id) : id;
+                drop_.hi = max(drop_.hi, id);
+            }
+            store = store[0 .. 1] ~ store[2 .. $];
+        }
+    }
+}
+
+/// A `PinStash` rollback snapshot: the retained requests plus the bound
+/// metadata (dropped range, logical count and byte tally).
+struct PinSnapshot
+{
+    Message[] store;
+    ctx.PinDrop drop;
+    size_t logical;
+    size_t bytes;
 }
 
 /// The real turns folded by compactions since the last plain replacement:
@@ -1476,8 +1569,10 @@ class Agent
         }
         if (planTools && !plan.empty) summary ~= "\n\n" ~ plan.contextNote();
         // Pin the user's own words, rebuilt from the originals every time.
+        // The stash is bounded: `pinStash.drop` names the middle it dropped,
+        // so the pinned block's omission note is unchanged.
         if (compactionPinRequests)
-            if (auto pinned = ctx.pinnedUserRequests(pinStash[], summarized, smart, window))
+            if (auto pinned = ctx.pinnedUserRequests(pinStash[], summarized, smart, window, pinStash.drop))
                 summary ~= "\n\n" ~ pinned;
         // The requests this compaction adds to the pinned block (the stash so
         // far is their base): the log records only these, so a session holds
@@ -1777,7 +1872,7 @@ class Agent
         completedOutcomes = r.completedOutcomes;
         historyAvailable = r.historyAvailable;
         historyHintPending = r.historyAvailable && !r.historyHintConsumed;
-        pinStash.adopt(r.pinStash);
+        pinStash.adopt(r.pinStash, r.pinDrop, r.pinLogical);
         replayRestated = r.replayRestated;
         replayStash.adopt(r.replayStash);
         adoptPending(r);

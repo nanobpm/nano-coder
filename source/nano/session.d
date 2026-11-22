@@ -18,11 +18,12 @@ import std.stdio : fileno;
 import std.datetime.systime : Clock;
 import core.time : dur;
 import std.process : environment, thisProcessID;
-import std.algorithm : sort, filter, map;
+import std.algorithm : sort, filter, map, min, max;
 import std.array : array;
 import nano.llm;
 import nano.option : Option, some, ifSome;
 import nano.plan : Plan;
+import ctx = nano.context;
 
 /// The extension tidy-up compresses a session log to (`<id>.jsonl.gz`).
 enum string compressedExtension = ".jsonl.gz";
@@ -740,8 +741,15 @@ struct Restored
     /// record, reset by a later replace; null when the session never had one.
     JSONValue recall;
     /// The user requests folded by compactions (`pinned_requests`, or a Rust
-    /// log's `folded` stash), for rebuilding the pinned block.
+    /// log's `folded` stash), for rebuilding the pinned block. BOUNDED
+    /// (issue #221): the first request plus the newest ones that could render
+    /// under the largest window; `pinDrop` describes the dropped middle and
+    /// `pinLogical` the full logical count (what `pinned_base` means).
     Message[] pinStash;
+    /// The requests the bound dropped between `pinStash[0]` and `pinStash[1]`.
+    ctx.PinDrop pinDrop;
+    /// The logical count of requests ever stashed (dropped ones included).
+    size_t pinLogical;
     /// The real turns folded by the compactions since the last plain
     /// replacement (Rust's `folded` stash): a replay shows these in place of
     /// the synthetic summary.
@@ -1012,16 +1020,23 @@ private void restoreReplayStash(alias decode)(JSONValue data, const string[] inp
 /// this helper decodes ITSELF and applies onto the read-only cumulative
 /// `foldedStash` — it never reads the replay helper's decoded output, so the
 /// pin representation can change without touching the replay path.
+///
+/// The stash is BOUNDED in memory (issue #221): `r.pinStash` holds the first
+/// request plus the newest requests whose text fits `ctx.pinStashBudgetBytes`,
+/// `r.pinDrop` the dropped middle's count and log-line span, and `r.pinLogical`
+/// the logical count `pinned_base` refers to. A delta's base is LOGICAL, so it
+/// is mapped onto the retained copy plus the dropped range (`pinTruncate`); the
+/// session log records and the on-disk format are unchanged.
 private void restorePinStash(alias decode)(JSONValue data, const string[] inputs, ref Message[] foldedStash, ref Restored r)
 {
     auto pins = "pinned_requests" in data, pinBase = "pinned_base" in data;
     if (pins !is null && pinBase !is null && pinBase.type == JSONType.integer)
     {
         auto b = cast(size_t) pinBase.integer;
-        auto kept = b < r.pinStash.length ? r.pinStash[0 .. b] : r.pinStash;
-        r.pinStash = kept ~ decode(*pins, inputs);
+        pinTruncate(r, b);
+        pinExtend(r, decode(*pins, inputs));
     }
-    else if (pins !is null) r.pinStash = decode(*pins, inputs);
+    else if (pins !is null) pinAdoptFull(r, decode(*pins, inputs));
     else
     {
         // Rust-era fallback: no `pinned_requests` field, so the pin stash is
@@ -1035,15 +1050,85 @@ private void restorePinStash(alias decode)(JSONValue data, const string[] inputs
             auto b = cast(size_t) base.integer;
             auto delta = decode(*folded, inputs);
             if ((b < foldedStash.length ? b : foldedStash.length) + delta.length > 0)
-                r.pinStash = foldedStash[0 .. (b < foldedStash.length ? b : foldedStash.length)] ~ delta;
-            else r.pinStash = null;
+                pinAdoptFull(r, foldedStash[0 .. (b < foldedStash.length ? b : foldedStash.length)] ~ delta);
+            else pinAdoptFull(r, null);
         }
         else if (folded !is null)
         {
             auto full = decode(*folded, inputs);
-            r.pinStash = full.length ? full : null;
+            pinAdoptFull(r, full.length ? full : null);
         }
-        else r.pinStash = null;
+        else pinAdoptFull(r, null);
+    }
+}
+
+/// A full restatement replaces the pin stash (restore): the sequence is
+/// re-bounded and the logical count becomes its length.
+private void pinAdoptFull(ref Restored r, Message[] full)
+{
+    r.pinStash = full;
+    r.pinDrop = ctx.PinDrop.init;
+    r.pinLogical = full.length;
+    pinBound(r);
+}
+
+/// Truncate the pin stash to a LOGICAL base of `b` requests (restore): a base
+/// that reaches into the dropped middle un-drops its tail — those requests
+/// are gone from memory, so the retained copy keeps only what the base still
+/// covers and the dropped range shrinks to its uncovered head.
+private void pinTruncate(ref Restored r, size_t b)
+{
+    if (b >= r.pinLogical) return;
+    if (b == 0)
+    {
+        r.pinStash = null;
+        r.pinDrop = ctx.PinDrop.init;
+        r.pinLogical = 0;
+        return;
+    }
+    // The first request is always retained, so it always survives a base ≥ 1.
+    auto tailKept = b - 1 < r.pinStash.length - 1 ? b - 1 : r.pinStash.length - 1;
+    auto tailDropped = r.pinStash.length - 1 - tailKept;
+    r.pinStash = r.pinStash[0 .. 1 + tailKept];
+    // The uncovered head of the old middle stays dropped; its span no longer
+    // covers the un-dropped tail's log lines (unknown — they were dropped),
+    // which only a base smaller than the next delta's true base can produce
+    // (a torn or hand-edited log).
+    if (tailDropped < r.pinDrop.count)
+    {
+        r.pinDrop.count -= tailDropped;
+        if (r.pinDrop.count == 0) r.pinDrop = ctx.PinDrop.init;
+    }
+    r.pinLogical = b;
+}
+
+/// Extend the pin stash with a delta's requests (restore), then re-apply the
+/// bound.
+private void pinExtend(ref Restored r, Message[] delta)
+{
+    r.pinStash ~= delta;
+    r.pinLogical += delta.length;
+    pinBound(r);
+}
+
+/// Keep the first request and the newest requests whose text fits
+/// `ctx.pinStashBudgetBytes`, folding the evicted middle into `r.pinDrop`. A
+/// single oversized request is retained whole (the render clips it).
+private void pinBound(ref Restored r)
+{
+    size_t bytes;
+    foreach (ref m; r.pinStash) bytes += ctx.pinStashBytes(m);
+    while (r.pinStash.length > 1 && bytes > ctx.pinStashBudgetBytes)
+    {
+        auto m = r.pinStash[1];
+        bytes -= ctx.pinStashBytes(m);
+        r.pinDrop.count++;
+        if (auto id = m.logLine)
+        {
+            r.pinDrop.lo = r.pinDrop.lo ? min(r.pinDrop.lo, id) : id;
+            r.pinDrop.hi = max(r.pinDrop.hi, id);
+        }
+        r.pinStash = r.pinStash[0 .. 1] ~ r.pinStash[2 .. $];
     }
 }
 
@@ -1683,6 +1768,151 @@ unittest
         ~ line("replace", rep([rec(Message.user("two"))], 9)));
     auto r2 = restore(path2);
     assert(r2.pinStash.length == 2 && r2.pinStash[1].content == "two");
+}
+
+// The pin stash is bounded in memory (issue #221): a restored session with
+// thousands of stashed requests keeps only the first plus the newest that fit
+// the byte budget, while `pinLogical` reports the full count and `pinDrop`
+// the dropped middle's span — and the block it renders is byte-identical to
+// the unbounded stash's while the stash fits the budget.
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, write;
+    import std.path : buildPath;
+    auto dir = buildPath(tempDir, "nano-d-pinbound-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    static JSONValue rec(Message m) { return messageRecord(m); }
+    string line(string type, JSONValue data) { return JSONValue(["type": JSONValue(type), "data": data]).toString ~ "\n"; }
+    static JSONValue bigLog(Message[] all)
+    {
+        JSONValue[] pins;
+        foreach (m; all) pins ~= rec(m);
+        JSONValue d = ["messages": JSONValue([rec(Message.user("summary"))])];
+        d["pinned_requests"] = pins;
+        return d;
+    }
+    static Message[] requests(size_t n, size_t textBytes)
+    {
+        import std.array : replicate;
+        Message[] all;
+        foreach (i; 0 .. n)
+        {
+            auto m = Message.user(format("request number %s: ", i) ~ "x".replicate(textBytes));
+            m.logLine = 10 + 2 * i;
+            all ~= m;
+        }
+        return all;
+    }
+    // The 6,946-request session that motivated the bound, as one full
+    // restatement (what a Rust-era or pre-#205 log looks like). Short
+    // requests: the whole stash fits the byte budget, so nothing is dropped
+    // and the render is the unbounded one.
+    auto all = requests(6_946, 40);
+    auto path = buildPath(dir, "big.jsonl");
+    write(path, `{"type":"session","data":{"version":1,"id":"big","created_at":"x"}}` ~ "\n" ~ line("replace", bigLog(all)));
+    auto r = restore(path);
+    assert(r.pinLogical == all.length, "the logical count is the full stash");
+    assert(r.pinStash.length == all.length, "a stash within the budget is kept whole");
+    assert(r.pinDrop.count == 0, "nothing is dropped");
+    foreach (smart; [false, true])
+        foreach (window; [8_000, 128_000, 200_000, 1_000_000])
+            assert(ctx.pinnedUserRequests(r.pinStash, null, smart, window, r.pinDrop)
+                == ctx.pinnedUserRequests(all, null, smart, window), "a whole stash renders identically");
+    // The same session with ~200-byte requests (~1.4 MB of text): the budget
+    // binds — the first and the newest requests are retained, the middle is
+    // the dropped span, and the retained text stays within the budget.
+    // (3,000 requests keep the JSON build and the renders fast; the bound
+    // logic is count-independent.)
+    auto big = requests(3_000, 200);
+    auto path2 = buildPath(dir, "big2.jsonl");
+    write(path2, `{"type":"session","data":{"version":1,"id":"big2","created_at":"x"}}` ~ "\n" ~ line("replace", bigLog(big)));
+    auto r2 = restore(path2);
+    assert(r2.pinLogical == big.length, "the logical count is still the full stash");
+    assert(r2.pinStash.length < big.length, "the in-memory stash is bounded");
+    assert(r2.pinDrop.count == big.length - r2.pinStash.length, "the rest is the dropped middle");
+    size_t retainedBytes;
+    foreach (ref m; r2.pinStash) retainedBytes += ctx.pinStashBytes(m);
+    assert(retainedBytes <= ctx.pinStashBudgetBytes, "the retained text fits the budget");
+    assert(r2.pinStash[0].content == big[0].content, "the first request is retained");
+    assert(r2.pinStash[$ - 1].content == big[$ - 1].content, "the newest request is retained");
+    assert(r2.pinDrop.lo == big[1].logLine && r2.pinDrop.hi == big[big.length - r2.pinStash.length].logLine,
+        "the dropped span covers exactly the evicted middle");
+    foreach (smart; [false, true])
+        foreach (window; [8_000, 128_000, 200_000, 1_000_000])
+        {
+            auto pinned = ctx.pinnedUserRequests(r2.pinStash, null, smart, window, r2.pinDrop);
+            assert(pinned.canFind("omitted from this pin") && pinned.canFind("request number 2999"),
+                "the bounded render keeps the newest request and notes the drop");
+        }
+}
+
+// A `pinned_base` delta chain round-trips through the bound (issue #221):
+// the base is logical, so a delta extending it maps onto the retained copy
+// plus the dropped range, and a resumed agent writes the same `pinned_base`
+// values the unbounded implementation would.
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, write;
+    import std.path : buildPath;
+    auto dir = buildPath(tempDir, "nano-d-pinbounddelta-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    static JSONValue rec(Message m) { return messageRecord(m); }
+    string line(string type, JSONValue data) { return JSONValue(["type": JSONValue(type), "data": data]).toString ~ "\n"; }
+    JSONValue rep(JSONValue[] pins, long base = -1)
+    {
+        JSONValue d = ["messages": JSONValue([rec(Message.user("summary"))])];
+        d["pinned_requests"] = pins;
+        if (base >= 0) d["pinned_base"] = base;
+        return d;
+    }
+    Message[] all;
+    foreach (i; 0 .. 5_000)
+    {
+        auto m = Message.user(format("request %s", i));
+        m.logLine = 10 + 2 * i;
+        all ~= m;
+    }
+    JSONValue[] first, second, third;
+    foreach (m; all[0 .. 3_000]) first ~= rec(m);
+    foreach (m; all[3_000 .. 4_500]) second ~= rec(m);
+    foreach (m; all[4_500 .. 5_000]) third ~= rec(m);
+    // Full restatement, then two deltas. The stash stays within the byte
+    // budget, so it is kept whole and renders exactly the unbounded block.
+    auto path = buildPath(dir, "chain.jsonl");
+    write(path, `{"type":"session","data":{"version":1,"id":"chain","created_at":"x"}}` ~ "\n"
+        ~ line("replace", rep(first))
+        ~ line("replace", rep(second, 3_000))
+        ~ line("replace", rep(third, 4_500)));
+    auto r = restore(path);
+    assert(r.pinLogical == 5_000 && r.pinStash.length == 5_000 && r.pinDrop.count == 0);
+    assert(r.pinStash[0].content == "request 0" && r.pinStash[$ - 1].content == "request 4999");
+    assert(ctx.pinnedUserRequests(r.pinStash, null, true, 128_000, r.pinDrop)
+        == ctx.pinnedUserRequests(all, null, true, 128_000), "the delta chain renders identically");
+    // A delta whose base reaches into the dropped middle: the un-dropped
+    // tail is gone from memory, so the retained copy keeps what the base
+    // still covers and the dropped range shrinks to its uncovered head. (A
+    // base smaller than the next delta's true base means a torn or
+    // hand-edited log — well-formed logs never do this.)
+    auto path2 = buildPath(dir, "chain2.jsonl");
+    write(path2, `{"type":"session","data":{"version":1,"id":"chain2","created_at":"x"}}` ~ "\n"
+        ~ line("replace", rep(first))
+        ~ line("replace", rep(second, 3_000))
+        ~ line("replace", rep(third, 100)));
+    auto r2 = restore(path2);
+    assert(r2.pinLogical == 600, "the base truncates logically");
+    assert(r2.pinStash.length == 600 && r2.pinDrop.count == 0,
+        "a truncated stash within the budget is whole again");
+    assert(r2.pinStash[0].content == "request 0" && r2.pinStash[99].content == "request 99"
+        && r2.pinStash[100].content == "request 4500" && r2.pinStash[$ - 1].content == "request 4999");
+    // A base past the logical length keeps the whole stash (torn log).
+    auto path3 = buildPath(dir, "chain3.jsonl");
+    write(path3, `{"type":"session","data":{"version":1,"id":"chain3","created_at":"x"}}` ~ "\n"
+        ~ line("replace", rep(first))
+        ~ line("replace", rep(second, 99_000)));
+    auto r3 = restore(path3);
+    assert(r3.pinLogical == 4_500 && r3.pinStash[$ - 1].content == "request 4499");
 }
 
 // Plan changes log as deltas applied onto the plan so far, with a full

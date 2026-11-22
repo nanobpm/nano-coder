@@ -937,6 +937,35 @@ enum size_t pinnedWindowShare = 8;
 /// The floor of the block's overall allowance, in tokens.
 enum size_t pinnedMinAllowanceTokens = 600;
 
+/// The middle of the request sequence a bounded pin stash dropped (issue
+/// #221): `count` requests spanning log lines `lo`–`hi` (0 when no dropped
+/// request had a log line). `pinnedUserRequests` renders the omission note
+/// from this exactly as it does when it computes the range itself.
+struct PinDrop
+{
+    size_t count;
+    ulong lo, hi;
+}
+
+/// The byte budget bounding a pin stash's retained request text (issue
+/// #221): an unbounded stash cost ~12 MB on a real 6,946-request session, so
+/// the stash keeps the first request plus the newest requests whose retained
+/// text fits this budget and folds the evicted middle into a `PinDrop`. The
+/// budget is generous — the 1M-token window's pinned-block allowance is
+/// 500 KB and a render clips every later request to `pinnedLaterChars` — so
+/// only a stash far past anything a window can render is ever bounded. A
+/// single oversized request is retained whole: the render clips it, and
+/// dropping it would only save the stash a copy the renderer never shows.
+enum size_t pinStashBudgetBytes = 512 * 1_024;
+
+/// The bytes a stashed request costs the bounded stash (issue #221): the
+/// text the pinned block renders from (`pinText` when set, else `content`).
+/// Cheap — string lengths only — so appending stays O(1).
+size_t pinStashBytes(const ref Message m) pure nothrow @safe @nogc
+{
+    return (m.pinText.length ? m.pinText.length : m.content.length) + 1;
+}
+
 /// `clip` bounded by UTF-8 bytes rather than characters, cut on a character
 /// boundary, so a byte/token budget holds for non-ASCII text too.
 string clipBytes(string text, size_t maxBytes) pure
@@ -984,6 +1013,16 @@ private string requestText(const ref Message m) pure { return (m.pinText.length 
 /// them by one covering log span.
 string pinnedUserRequests(const Message[] prior, const Message[] new_, bool smart, size_t windowTokens) pure
 {
+    return pinnedUserRequests(prior, new_, smart, windowTokens, PinDrop.init);
+}
+
+/// ditto, for a bounded stash (issue #221): `prior` holds only the first and
+/// the most recent requests, and `drop` describes the requests the bound
+/// dropped between them, so the omission note covers exactly the requests the
+/// unbounded form would have named.
+string pinnedUserRequests(const Message[] prior, const Message[] new_, bool smart, size_t windowTokens,
+    PinDrop drop) pure
+{
     const(Message)[] requests;
     foreach (ref m; prior) if (isUserRequest(m)) requests ~= m;
     foreach (ref m; new_) if (isUserRequest(m)) requests ~= m;
@@ -1011,8 +1050,15 @@ string pinnedUserRequests(const Message[] prior, const Message[] new_, bool smar
     static size_t cost(string l) { return l.length + 1; }
     auto suffix = new size_t[n + 1];
     foreach_reverse (i; 0 .. n) suffix[i] = suffix[i + 1] + cost(lines[i]);
-    // span[i]: min/max log ID over requests[1 .. i] (0: none).
+    // span[i]: min/max log ID over requests[1 .. i] (0: none). The bounded
+    // stash's dropped middle (`drop`) sits between requests[0] and
+    // requests[1], so it folds into every span from index 1 on.
     auto spanLo = new ulong[n + 1], spanHi = new ulong[n + 1];
+    if (drop.count)
+    {
+        spanLo[1] = drop.lo;
+        spanHi[1] = drop.hi;
+    }
     foreach (i; 1 .. n)
     {
         spanLo[i + 1] = spanLo[i];
@@ -1026,7 +1072,7 @@ string pinnedUserRequests(const Message[] prior, const Message[] new_, bool smar
     string note(bool keepFirst, size_t tailStart)
     {
         auto t = max(tailStart, 1);
-        auto omitted = (t - 1) + (keepFirst ? 0 : 1);
+        auto omitted = (t - 1) + (keepFirst ? 0 : 1) + (t >= 1 ? drop.count : 0);
         if (!omitted) return null;
         ulong lo = spanLo[t], hi = spanHi[t];
         if (!keepFirst)
@@ -1139,6 +1185,125 @@ unittest
         req("the latest ask", 40)], true, 4_800);
     if (pinned.canFind("omitted from this pin")) assert(pinned.canFind("#9"), pinned);
     assert(pinned.canFind("#40: the latest ask"), pinned);
+}
+
+// A bounded stash (issue #221) renders a correct first/newest-tail view at
+// every window — the newest requests, an omission note naming the dropped
+// middle by count and log span, the window's allowance respected — and is
+// byte-identical to the unbounded render whenever the stash fits the byte
+// budget (the common case: thousands of short requests).
+unittest
+{
+    // The bounded stash the byte budget produces, computed independently:
+    // the first request plus the newest ones whose text fits the budget.
+    static void check(const Message[] all)
+    {
+        size_t bytes;
+        foreach (ref m; all) bytes += pinStashBytes(m);
+        const(Message)[] kept;
+        PinDrop drop;
+        if (bytes <= pinStashBudgetBytes) kept = all;
+        else
+        {
+            kept ~= all[0];
+            size_t tail = pinStashBytes(all[0]);
+            size_t start = all.length;
+            while (start > 1 && tail + pinStashBytes(all[start - 1]) <= pinStashBudgetBytes)
+                tail += pinStashBytes(all[--start]);
+            foreach (ref m; all[1 .. start])
+            {
+                drop.count++;
+                if (auto id = m.logLine)
+                {
+                    drop.lo = drop.lo ? min(drop.lo, id) : id;
+                    drop.hi = max(drop.hi, id);
+                }
+            }
+            kept ~= all[start .. $];
+        }
+        foreach (smart; [false, true])
+            foreach (window; [8_000, 128_000, 200_000, 1_000_000])
+            {
+                auto bounded = pinnedUserRequests(null, kept, smart, window, drop);
+                auto full = pinnedUserRequests(null, all, smart, window);
+                if (!drop.count)
+                {
+                    // Within the budget the stash is whole: identical bytes.
+                    assert(bounded == full, "unbounded stash renders differently at window " ~ window.to!string);
+                    continue;
+                }
+                // Past the budget: the newest requests still render, the
+                // omission note covers the dropped middle plus whatever the
+                // window drops itself, and the allowance holds. At a window
+                // too small for even one request the render is null — the
+                // unbounded behaviour, kept.
+                auto allowance = max(window / pinnedWindowShare, pinnedMinAllowanceTokens) * 4;
+                if (bounded is null)
+                {
+                    assert(full is null, "the unbounded render fits a window the bounded one does not");
+                    continue;
+                }
+                assert(nchars_(bounded) <= allowance, "bounded render exceeds the allowance");
+                assert(bounded.canFind("omitted from this pin"), "the dropped middle is noted");
+                // The newest request renders — in smart mode its `#N: ` label
+                // is carved out of the per-request budget, and a clip elides
+                // the middle, so check the head and tail fragments.
+                auto newest = requestText(all[$ - 1]);
+                if (smart)
+                {
+                    auto id = all[$ - 1].logLine;
+                    auto label = format("#%s: ", id);
+                    assert(bounded.canFind(label), "the newest request keeps its label");
+                    auto room = pinnedLaterChars - label.length;
+                    if (newest.length > room) newest = clipBytes(newest, room);
+                }
+                else if (newest.length > pinnedLaterChars) newest = clipBytes(newest, pinnedLaterChars);
+                if (newest.length <= 60) assert(bounded.canFind(newest), "the newest request renders");
+                else
+                {
+                    assert(bounded.canFind(newest[0 .. 30]), "the newest request's head renders");
+                    assert(bounded.canFind(newest[$ - 30 .. $]), "the newest request's tail renders");
+                }
+            }
+    }
+    static Message[] requests(size_t count, size_t textBytes)
+    {
+        import std.array : replicate;
+        Message[] all;
+        foreach (i; 0 .. count)
+            all ~= req(format("request number %s: ", i) ~ "x".replicate(textBytes), 10 + 2 * i);
+        return all;
+    }
+    check(requests(3, 40)); // far under the budget: no drop
+    check(requests(6_946, 40)); // the real session that motivated the bound
+    check(requests(3_000, 200)); // ~600 KB of text: the budget binds
+    check(requests(600, 1_000)); // long requests: fewer retained
+    // A single request larger than the whole budget is still retained (the
+    // render clips it; dropping it would lose the goal).
+    auto huge = requests(1, pinStashBudgetBytes * 2) ~ requests(2, 40);
+    size_t hugeBytes;
+    foreach (ref m; huge) hugeBytes += pinStashBytes(m);
+    assert(hugeBytes > pinStashBudgetBytes);
+    auto pinned = pinnedUserRequests(null, huge[0 .. 1], true, 128_000,
+        PinDrop(2, huge[1].logLine, huge[2].logLine));
+    assert(pinned.canFind("request number 0: ") && pinned.canFind("omitted from this pin"), pinned);
+}
+
+// The dropped middle's metadata drives the omission note: the count and the
+// `#lo-#hi` span are exactly what the unbounded form computes when the window
+// drops the same requests.
+unittest
+{
+    auto pinned = pinnedUserRequests(null, [req("the goal", 2), req("the latest ask", 40)], true, 4_800,
+        PinDrop(1, 9, 9));
+    // The bounded stash always notes its dropped middle, even when the window
+    // would have fitted it — the note is what the stash knows.
+    assert(pinned.canFind("1 earlier request(s) omitted") && pinned.canFind("full text at #9"), pinned);
+    assert(pinned.canFind("#2: the goal") && pinned.canFind("#40: the latest ask"), pinned);
+    // A dropped span renders as a range.
+    auto spanned = pinnedUserRequests(null, [req("the goal", 2), req("the latest ask", 40)], true, 4_800,
+        PinDrop(3, 9, 24));
+    assert(spanned.canFind("3 earlier request(s) omitted") && spanned.canFind("#9-#24"), spanned);
 }
 
 // rust: context.rs::pinned_requests_strip_hook_output_from_a_prompt
