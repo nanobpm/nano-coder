@@ -9,6 +9,14 @@ module nano.safeio;
 
 import std.stdio : File;
 
+/// druntime GC options, read once before `main`. The GC returns memory to
+/// the OS only a whole pool at a time (`GC.minimize`), and by default pools
+/// grow to 64 MB. After a resume parses a long session log, the survivors are
+/// spread over those large pools, so almost none of the freed heap goes back
+/// (a 59 MB log kept ~330 MB resident with 38 MB live). Small fixed-size pools
+/// let far more of them empty out and be released: 336 -> 237 MB there.
+extern (C) __gshared string[] rt_options = ["gcopt=maxPoolSize:4 incPoolSize:0 initReserve:0"];
+
 /// `std.stdio.stdout`. Phobos marks it @system only because the `File` is a
 /// `__gshared` global; every `File` operation locks the stream itself.
 @property ref File stdOut() @trusted

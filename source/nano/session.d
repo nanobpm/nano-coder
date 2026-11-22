@@ -307,6 +307,8 @@ JSONValue messageRecord(const ref Message m) pure
     if (m.autoInitiated) j["auto_initiated"] = true;
     if (m.continuation) j["continuation"] = true;
     if (m.timer) j["timer"] = true;
+    if (m.stopBlocked) j["stop_blocked"] = true;
+    if (m.steered) j["steered"] = true;
     if (m.hookContext) j["hook_context"] = true;
     if (m.pinText.length) j["pin_text"] = m.pinText;
     return j;
@@ -368,8 +370,10 @@ Message messageFromRecord(JSONValue j) pure
         case "stop_reason": m.stopReason = v.str; break;
         case "temperature": if (v.type == JSONType.string) m.temperature = v.str; break;
         case "thinking_level": if (v.type == JSONType.string) m.thinkingLevel = v.str; break;
-        case "log_line": if (v.type == JSONType.integer) m.logLine = v.integer; break; // direct records: the physical line wins
+        case "log_line": { ulong n; if (jsonUnsigned(v, n)) m.logLine = n; } break; // direct records: the physical line wins
         case "auto_initiated": m.autoInitiated = v.type == JSONType.true_; break;
+        case "stop_blocked": m.stopBlocked = v.type == JSONType.true_; break;
+        case "steered": m.steered = v.type == JSONType.true_; break;
         case "hook_context": m.hookContext = v.type == JSONType.true_; break;
         case "pin_text": if (v.type == JSONType.string) m.pinText = v.str; break;
         // Sub-kinds of an automatic turn.
@@ -896,31 +900,42 @@ Restored restore(string path)
             {
                 ulong floor;
                 if (auto sum = "summarized" in data)
-                    if (sum.type == JSONType.array && sum.arrayNoRef.length == 2) floor = sum.arrayNoRef[1].integer;
+                    if (sum.type == JSONType.array && sum.arrayNoRef.length == 2)
+                    {
+                        ulong fu;
+                        if (jsonUnsigned(sum.arrayNoRef[1], fu)) floor = fu;
+                    }
                 backfillLogLines(r.conversation, originals, floor);
             }
             foreach (ref m; r.conversation) backfillPinText(m, inputs);
             {
                 // An in-flight input survives a mid-turn compaction at
-                // `pending_position`, with its continuation snapshot.
+                // `pending_position`, with its continuation snapshot. Every
+                // number here is read through `jsonUnsigned`: the writer
+                // logs them from a `size_t`, which std.json tags `uinteger`,
+                // and an integer-only check misreads a self-written log
+                // (issue #240).
                 auto pos = "pending_position" in data;
-                if (r.hasPending && pos !is null && pos.type == JSONType.integer)
+                ulong posN;
+                if (r.hasPending && pos !is null && jsonUnsigned(*pos, posN))
                 {
-                    r.pending.position = toSize(pos.integer);
+                    r.pending.position = toSize(posN);
                     r.pending.hasContinuation = false;
                     r.pending.answer = null;
                     r.pending.count = 0;
                     auto c = "continuation" in data;
                     if (c !is null && c.type == JSONType.array && c.arrayNoRef.length == 2)
                     {
+                        ulong cn;
                         r.pending.hasContinuation = true;
                         r.pending.answer = c.arrayNoRef[0].str;
-                        r.pending.count = toSize(c.arrayNoRef[1].integer);
+                        r.pending.count = jsonUnsigned(c.arrayNoRef[1], cn) ? toSize(cn) : 0;
                     }
                     r.pending.hasBase = true;
                     r.pending.base = r.conversation.length;
                     auto rn = "pending_recall_notes" in data;
-                    r.pending.recallNotes = rn !is null && rn.type == JSONType.integer ? toSize(rn.integer) : 0;
+                    ulong rnn;
+                    r.pending.recallNotes = rn !is null && jsonUnsigned(*rn, rnn) ? toSize(rnn) : 0;
                 }
                 else
                 {
@@ -944,9 +959,10 @@ Restored restore(string path)
                 // Rust's cumulative stash of folded turns: full, or a delta on a base.
                 auto folded = "folded" in data, base = "folded_base" in data;
                 bool active;
-                if (folded !is null && base !is null && base.type == JSONType.integer)
+                ulong foldedBaseN;
+                if (folded !is null && base !is null && jsonUnsigned(*base, foldedBaseN))
                 {
-                    auto b = toSize(base.integer);
+                    auto b = toSize(foldedBaseN);
                     auto delta = decode(*folded, inputs);
                     if ((b < rustStash.length ? b : rustStash.length) + delta.length > 0)
                     {
@@ -963,14 +979,18 @@ Restored restore(string path)
                 r.replayStash = rustStash.dup;
                 r.replayRestated = Option!size_t.init;
                 if (auto at = "restated" in data)
-                    if (active && at.type == JSONType.integer && at.integer >= 0) r.replayRestated = some(toSize(at.integer));
+                {
+                    ulong atN;
+                    if (active && jsonUnsigned(*at, atN)) r.replayRestated = some(toSize(atN));
+                }
                 // The pinned block: a full `pinned_requests` restatement, or a
                 // delta extending the first `pinned_base` of the stash so far
                 // (issue #205). With neither, a Rust log's folded stash is it.
                 auto pins = "pinned_requests" in data, pinBase = "pinned_base" in data;
-                if (pins !is null && pinBase !is null && pinBase.type == JSONType.integer && pinBase.integer >= 0)
+                ulong pinBaseN;
+                if (pins !is null && pinBase !is null && jsonUnsigned(*pinBase, pinBaseN))
                 {
-                    auto b = toSize(pinBase.integer);
+                    auto b = toSize(pinBaseN);
                     auto kept = b < r.pinStash.length ? r.pinStash[0 .. b] : r.pinStash;
                     r.pinStash = kept ~ decode(*pins, inputs);
                 }
@@ -1572,10 +1592,16 @@ unittest
     hook.hookContext = true;
     auto p = Message.user("goal\n\n<system-reminder>x</system-reminder>");
     p.pinText = "goal";
-    log.replace([Message.auto_("note"), hook], 1, 2, "standard", "m", [p]);
+    auto sb = Message.auto_("<system-reminder>no</system-reminder>");
+    sb.stopBlocked = true;
+    auto st = Message.user("steer");
+    st.steered = true;
+    log.replace([Message.auto_("note"), hook, sb, st], 1, 2, "standard", "m", [p]);
     auto r = restore(log.path);
     assert(r.pinStash.length == 1 && r.pinStash[0].pinText == "goal");
-    assert(r.conversation[0].autoInitiated && r.conversation[1].hookContext);
+    assert(r.conversation[0].autoInitiated && r.conversation[1].hookContext
+        && r.conversation[2].stopBlocked && !r.conversation[0].stopBlocked
+        && r.conversation[3].steered && !r.conversation[2].steered);
     log.replace([Message.user("x")]);
     assert(restore(log.path).pinStash.length == 0, "a plain replace clears the stash");
     // A compaction that folds no new request still logs its base, so the
@@ -1637,6 +1663,113 @@ unittest
         ~ line("replace", rep([rec(Message.user("two"))], 9)));
     auto r2 = restore(path2);
     assert(r2.pinStash.length == 2 && r2.pinStash[1].content == "two");
+}
+
+// `SessionLog.replace` writes `pinned_base`, `folded_base` and `restated`
+// from a `size_t`, which std.json tags `uinteger`; `restore` must read its
+// own log back (issue #240 — an integer-only check dropped the delta's base,
+// so a resume restored only the delta and lost the earlier pins).
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse;
+    import std.path : buildPath;
+    auto dir = buildPath(tempDir, "nano-d-uintbase-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/w");
+    static Message pin(string text)
+    {
+        auto m = Message.user(text);
+        m.pinText = text;
+        return m;
+    }
+
+    // First compaction pins one request and folds two turns (full forms).
+    log.replace([Message.auto_("s1")], 1, 2, "standard", "m", [pin("one")], null,
+        [Message.user("t1"), Message.assistant("a1")]);
+    // Second compaction adds a pinned delta on `pinned_base` 1, a folded delta
+    // on `folded_base` 2, and restates the in-flight input at conversation
+    // index 0 — all three bases written as `uinteger`.
+    log.replace([Message.auto_("s2")], 3, 4, "standard", "m", [pin("two")], null,
+        [Message.user("t2")], some(size_t(2)), some(size_t(0)), some(size_t(1)));
+    auto r = restore(log.path);
+    assert(r.pinStash.length == 2 && r.pinStash[0].pinText == "one" && r.pinStash[1].pinText == "two",
+        "a self-written pinned delta extends the kept prefix, not replaces it");
+    assert(r.replayStash.length == 3 && r.replayStash[0].content == "t1"
+        && r.replayStash[2].content == "t2", "a self-written folded delta extends the stash");
+    assert(!r.replayRestated.isNone, "a self-written `restated` reads back");
+    foreach (at; r.replayRestated) assert(at == 0);
+
+    // A mid-turn compaction's pending fields are uinteger-tagged too.
+    auto log2 = new SessionLog(dir, "mock/m", "/w");
+    log2.input("in-1", "work");
+    auto p = PendingInput("in-1", "work", 1);
+    p.hasContinuation = true;
+    p.answer = "half";
+    p.count = 2;
+    p.recallNotes = 3;
+    log2.replace([Message.user("work")], 0, 0, null, null, null, &p);
+    auto r2 = restore(log2.path);
+    assert(r2.hasPending && r2.pending.position == 1, "pending_position reads back");
+    assert(r2.pending.hasContinuation && r2.pending.answer == "half" && r2.pending.count == 2,
+        "the continuation snapshot reads back");
+    assert(r2.pending.recallNotes == 3, "pending_recall_notes reads back");
+
+    // A `uinteger`-tagged base in the log itself: parseJSON tags a number
+    // above long.max `uinteger` on every Phobos, so this exercises the
+    // integer-only misread directly (a base past the stash keeps it whole).
+    import std.file : write;
+    static JSONValue rec(Message m) { return messageRecord(m); }
+    auto path3 = buildPath(dir, "ub.jsonl");
+    write(path3, `{"type":"session","data":{"version":1,"id":"ub","created_at":"x"}}` ~ "\n"
+        ~ JSONValue(["type": JSONValue("replace"), "data": JSONValue([
+            "messages": JSONValue([rec(Message.user("s"))]),
+            "pinned_requests": JSONValue([rec(pin("one"))]),
+        ])]).toString ~ "\n"
+        ~ `{"type":"replace","data":{"messages":[],"pinned_base":18446744073709551615,"pinned_requests":[]}}` ~ "\n");
+    auto r3 = restore(path3);
+    assert(r3.pinStash.length == 1 && r3.pinStash[0].pinText == "one",
+        "a uinteger-tagged pinned_base reads as a base, not as a torn log");
+}
+
+// Guard for the class (issue #240): `restore` must never gate a numeric read
+// on the `integer` tag alone — a `size_t` round-trips through std.json as
+// `uinteger`. Every number `restore` reads goes through `jsonUnsigned` (or
+// `jsonSigned`), which accepts both tags; this test fails if a direct
+// `.type == JSONType.integer` comparison creeps back into `restore`.
+unittest
+{
+    import std.algorithm : canFind, findSplit, splitter;
+    import std.file : readText;
+    import std.string : indexOf;
+    const src = readText(__FILE__);
+    const start = src.indexOf("Restored restore(string path)");
+    assert(start >= 0, "restore's definition is found in this file");
+    const rest = src[start .. $];
+    const tail = rest.findSplit("\n}\n")[2]; // restore's body ends at its first column-0 `}`
+    const body = rest[0 .. $ - tail.length];
+    assert(body.canFind("jsonUnsigned"), "restore reads numbers through jsonUnsigned");
+    assert(!body.canFind("JSONType.integer"),
+        "restore compares no .type against JSONType.integer directly: a size_t logs as uinteger");
+    // messageFromRecord decodes embedded records too: `log_line` is a ulong.
+    const mstart = src.indexOf("Message messageFromRecord(JSONValue j)");
+    assert(mstart >= 0, "messageFromRecord's definition is found in this file");
+    const mrest = src[mstart .. $];
+    const mbody = mrest[0 .. $ - mrest.findSplit("\n}\n")[2].length];
+    foreach (line; mbody.splitter('\n'))
+        if (line.canFind(`"log_line"`))
+            assert(line.canFind("jsonUnsigned") && !line.canFind("JSONType.integer"),
+                "messageFromRecord reads log_line through jsonUnsigned: a ulong logs as uinteger");
+}
+
+// An embedded record's `log_line` (a ulong, tagged uinteger) round-trips.
+unittest
+{
+    auto m = Message.user("x");
+    m.logLine = 42;
+    auto j = messageRecord(m);
+    assert(j["log_line"].type == JSONType.uinteger);
+    assert(messageFromRecord(j).logLine == 42);
 }
 
 // Plan changes log as deltas applied onto the plan so far, with a full
