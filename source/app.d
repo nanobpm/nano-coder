@@ -1078,7 +1078,9 @@ struct Screen
             blockStamp = stamp();
             thinkText = null;
             thinkStart = nowMs();
-            blockExpanded = verbose;
+            // The frame folds the reasoning (its verbose mode expands the
+            // fold), so Ctrl-O and a verbosity switch can collapse it.
+            blockExpanded = verbose && !gFrame;
             if (blockExpanded) write(blockStamp ~ thinkStyle("∴ Thinking") ~ "\n");
         }
         bool first = !thinkText.length;
@@ -1334,7 +1336,7 @@ class Console : AgentEvents
         auto st = stamp();
         auto w = (isTerminal(1) ? terminalWidth() : 80);
         auto clean = sanitizeBlock(result);
-        auto shown = stampBlock(st, toolResult(!isError, clean, verbose, w > 8 + st.length ? w - 8 - (st.length ? stampWidth : 0) : 1));
+        auto shown = stampBlock(st, toolResult(!isError, clean, verbose && !gFrame, w > 8 + st.length ? w - 8 - (st.length ? stampWidth : 0) : 1));
         write(shown);
         // Ctrl-O shows every line, together with the call's arguments.
         if (gFrame) write(foldMark(call.id, shown.lineCount, stampBlock(st, expandedResult(!isError, clean, color))));

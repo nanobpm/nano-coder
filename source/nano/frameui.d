@@ -303,9 +303,9 @@ private final class FrameState
         for (;;)
         {
             auto n = readFd_(readFd, buf[]);
-            if (n > 0) { transcript.feed(buf[0 .. n]); continue; }
-            // Fold texts go to the store, out of memory.
-            transcript.settle();
+            // Fold texts go to the store, out of memory, after every read so
+            // a long drain holds none of them.
+            if (n > 0) { transcript.feed(buf[0 .. n]); transcript.settle(); continue; }
             return n != 0;
         }
     }

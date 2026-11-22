@@ -356,6 +356,10 @@ class Agent
     /// Log lines whose in-memory content a compaction clipped: their content
     /// differs from the log record, so the stash keeps it.
     bool[ulong] clippedLines;
+    /// Log lines up to this one came from a restored session, whose clipping
+    /// is unknown (`clippedLines` is not persisted): their content is never
+    /// dropped from the stash.
+    ulong restoredLineFloor;
     /// history_search / history_read calls in the current turn (logged on its turn_end).
     uint turnHistoryCalls;
     /// The thinking level the turn's latest request sent (as the status line
@@ -1492,6 +1496,7 @@ class Agent
         auto savedPinStash = pinStash;
         auto savedReplayStash = replayStash;
         auto savedReplayStashLog = replayStashLog;
+        auto savedClippedLines = clippedLines.dup;
         auto savedReplayRestated = replayRestated;
         auto savedPending = pending;
         auto savedCalibLen = calibLen;
@@ -1507,6 +1512,7 @@ class Agent
                 pinStash = savedPinStash;
                 replayStash = savedReplayStash;
                 replayStashLog = savedReplayStashLog;
+                clippedLines = savedClippedLines;
                 replayRestated = savedReplayRestated;
                 pending = savedPending;
                 calibLen = savedCalibLen;
@@ -1576,7 +1582,7 @@ class Agent
             foreach (ref x; replayStash[stashBase .. $])
             {
                 bool slim = x.role == Role.tool && x.content.length > stashSlimBytes && !x.attachments.length
-                    && (!logPath.length || (x.logLine && x.logLine !in clippedLines));
+                    && (!logPath.length || (x.logLine > restoredLineFloor && x.logLine !in clippedLines));
                 srcs ~= slim ? logPath : null;
                 if (slim) x.content = null;
             }
@@ -1811,6 +1817,9 @@ class Agent
         replayStash = r.replayStash;
         replayStashLog = null;
         clippedLines = null;
+        restoredLineFloor = 0;
+        foreach (ref m; messages)
+            if (m.logLine > restoredLineFloor) restoredLineFloor = m.logLine;
         replayRestated = r.replayRestated;
         adoptPending(r);
         plan = Plan.init;
@@ -1914,6 +1923,7 @@ class Agent
         replayStash = null;
         replayStashLog = null;
         clippedLines = null;
+        restoredLineFloor = 0;
         replayRestated = Option!size_t.init;
         hasPending = false;
         historyAvailable = historyHintPending = false;
