@@ -15,6 +15,7 @@ module nano.subagent;
 
 import core.atomic : atomicLoad, atomicStore;
 import core.time : MonoTime, Duration, seconds;
+import std.algorithm : canFind;
 import std.format : format;
 import std.json;
 import nano.llm;
@@ -129,6 +130,9 @@ struct ToolReply
 {
     string text;
     bool isError;
+    /// `read_file` only, on success: the path that was actually read (after
+    /// any hook rewrite), so the child's footer lists real reads.
+    string effectivePath;
 }
 
 /// Set by the parent to stop a sub-agent at its next step: a copyable,
@@ -327,6 +331,10 @@ private final class ChildEvents : imported!"nano.agent".AgentEvents
         ToolReply r;
         if (!down.take(r)) throw new SubStop("the parent went away");
         if (r.isError) throw new ToolError(r.text);
+        // The parent reports the path it actually read; a denied, missing or
+        // limit-blocked file is not a read, and a hook-rewritten read lists
+        // the effective path, not the requested one.
+        if (r.effectivePath.length && !filesRead.canFind(r.effectivePath)) filesRead ~= r.effectivePath;
         return r.text;
     }
 
@@ -334,13 +342,6 @@ private final class ChildEvents : imported!"nano.agent".AgentEvents
     void toolStart(const ref ToolCall call)
     {
         toolCalls++;
-        if (call.name == "read_file")
-            if (auto p = "path" in call.arguments)
-                if (p.type == JSONType.string)
-                {
-                    import std.algorithm : canFind;
-                    if (!filesRead.canFind(p.str)) filesRead ~= p.str;
-                }
         progress();
     }
     void toolEnd(const ref ToolCall call, string result, bool isError) {}
@@ -448,8 +449,15 @@ SubResult runChild(immutable SubSpec spec, immutable(SubClientFactory) factory, 
         {
             import std.file : exists;
             import std.path : buildPath;
+            import nano.session : compressedExtension;
+            // Both the plain and the tidied-up compressed name are occupied:
+            // reusing an id whose earlier log was compressed would make the
+            // old `sub_log` references expand this child's transcript
+            // instead (trajectory.load prefers the plain file).
             string id = spec.logId;
-            for (size_t n = 2; buildPath(spec.logDir, id ~ ".jsonl").exists; n++) id = format("%s-%s", spec.logId, n);
+            bool taken(string i) { return buildPath(spec.logDir, i ~ ".jsonl").exists
+                || buildPath(spec.logDir, i ~ compressedExtension).exists; }
+            for (size_t n = 2; taken(id); n++) id = format("%s-%s", spec.logId, n);
             auto log = new SessionLog(spec.logDir, spec.model, spec.cwd, id);
             agent.log = some(log);
             res.logPath = log.path;

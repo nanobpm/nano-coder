@@ -434,3 +434,96 @@ unittest
     auto r = childReadReport(buildPath(dir, "sub"), Policy.init);
     assert(r.canFind("READ: "), r);
 }
+
+// The footer's "files read" lists only successful reads, at the path the
+// parent actually read: a denied read and a missing file never appear.
+unittest
+{
+    import std.conv : to;
+    import std.file : mkdirRecurse, write;
+    auto dir = buildPath(tempDir, "nano-sub-filesread-" ~ monoNow.ticks.to!string);
+    mkdirRecurse(dir);
+    scope (exit) if (dir.exists) rmdirRecurse(dir);
+    auto ok = buildPath(dir, "ok.txt");
+    auto secret = buildPath(dir, ".env");
+    write(ok, "hi\n");
+    write(secret, "TOKEN=hunter2\n");
+    Policy p;
+    p.deny ~= parseRule("Read(**/.env)");
+    final class ReadThree : SubClientFactory
+    {
+        string ok, secret, missing;
+        this(string ok, string secret, string missing) immutable
+        {
+            this.ok = ok; this.secret = secret; this.missing = missing;
+        }
+        LLMClient make(string spec) const
+        {
+            return new MockClient([LLMResponse("", "", [
+                ToolCall.fromRaw("r1", "read_file", JSONValue(["path": ok]).toString),
+                ToolCall.fromRaw("r2", "read_file", JSONValue(["path": secret]).toString),
+                ToolCall.fromRaw("r3", "read_file", JSONValue(["path": missing]).toString)]),
+                report("read what I could")]);
+        }
+    }
+    import nano.tools.files : registerFiles = register, ReadState;
+    auto reg = new ToolRegistry;
+    registerFiles(reg, new ReadState);
+    auto parent = new MockClient([LLMResponse("", "", [ToolCall.fromRaw("c", "agent",
+        `{"task":"read them","model":"mock/read"}`)]), LLMResponse("done")]);
+    auto agent = new Agent(parent, reg, p, "sys");
+    agent.subagentClients = new immutable ReadThree(ok, secret, buildPath(dir, "missing.txt"));
+    agent.run("go", new NullEvents);
+    auto r = toolResultText(agent, "c");
+    assert(r.canFind("files read: " ~ ok), r);
+    assert(!r.canFind(".env") && !r.canFind("missing.txt"), r);
+}
+
+// A reused tool-call id never reuses a compressed child log's filename: both
+// the plain and the tidied-up `.jsonl.gz` name count as occupied, so the new
+// child gets a fresh id and the old `sub_log` reference still expands the
+// original transcript.
+unittest
+{
+    import std.conv : to;
+    import std.file : mkdirRecurse, write;
+    auto dir = buildPath(tempDir, "nano-sub-logid-" ~ monoNow.ticks.to!string);
+    mkdirRecurse(dir);
+    scope (exit) if (dir.exists) rmdirRecurse(dir);
+    final class Immediate : SubClientFactory
+    {
+        LLMClient make(string spec) const { return new MockClient([report("first child")]); }
+    }
+    import nano.session : gzipLog;
+    auto parent = new MockClient([LLMResponse("", "", [ToolCall.fromRaw("c", "agent",
+        `{"task":"one","model":"mock/imm"}`)]), LLMResponse("done")]);
+    auto agent = new Agent(parent, new ToolRegistry, Policy.init, "sys");
+    agent.subagentClients = new immutable Immediate;
+    auto logDir = buildPath(dir, "log");
+    agent.log = some(new SessionLog(logDir, "mock/m", "/w"));
+    agent.run("go", new NullEvents);
+    auto first = toolResultText(agent, "c");
+    // Tidy-up compresses the child log; only the `.jsonl.gz` name remains.
+    // (The child log lives in the parent log's id-named subdirectory.)
+    import std.path : stripExtension;
+    auto childDir = agent.log.unwrap("set").path.stripExtension;
+    auto firstLog = buildPath(childDir, "sub-c.jsonl");
+    assert(firstLog.exists, firstLog);
+    write(firstLog ~ ".gz", gzipLog(readText(firstLog)));
+    import std.file : remove;
+    remove(firstLog);
+    foreach (l; agent.log) l.close();
+    // A resumed session keeps its log path (so its child-log directory is the
+    // same) and can reuse a tool-call id: the new child must not take the
+    // compressed log's plain filename. Reopening the same path models that.
+    auto parent2 = new MockClient([LLMResponse("", "", [ToolCall.fromRaw("c", "agent",
+        `{"task":"two","model":"mock/imm"}`)]), LLMResponse("done")]);
+    auto agent2 = new Agent(parent2, new ToolRegistry, Policy.init, "sys");
+    agent2.subagentClients = new immutable Immediate;
+    agent2.log = some(new SessionLog(agent.log.unwrap("set").path));
+    agent2.run("go", new NullEvents);
+    assert(!firstLog.exists, "the plain name stayed with the compressed log");
+    auto second = buildPath(childDir, "sub-c-2.jsonl");
+    assert(second.exists, "the reused id got a fresh filename: " ~ second);
+    assert(readText(second).canFind("first child"), "the new child's transcript");
+}

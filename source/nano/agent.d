@@ -1841,7 +1841,18 @@ class Agent
                     // registry throws) must still wake the child: close
                     // its reply channel so its `down.take` ends instead
                     // of blocking cleanup forever.
-                    try rep.text = runTool(call, "tool_use", rep.isError);
+                    try
+                    {
+                        bool dispatched;
+                        JSONValue effectiveArgs;
+                        rep.text = runTool(call, "tool_use", rep.isError, dispatched, effectiveArgs);
+                        // Tell the child which path it actually read (after
+                        // any hook rewrite); only a dispatched, successful
+                        // read counts as one.
+                        if (!rep.isError && dispatched && m.name == "read_file")
+                            if (auto p = "path" in effectiveArgs)
+                                if (p.type == JSONType.string) rep.effectivePath = p.str;
+                    }
                     catch (Exception e)
                     {
                         subSlots[i].down.close();
