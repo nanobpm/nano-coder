@@ -402,6 +402,10 @@ class SessionLog
     string id;
     string path;
     private File f;
+    /// The shared registration of `f` (its refcount), tied to the handle
+    /// rather than the path: a recovery that re-registers the path must not
+    /// let an old sharer's `close` release the replacement handle.
+    private Held* held;
     /// Lines written so far: the next record's physical line is `lines + 1`.
     private ulong lines;
 
@@ -416,7 +420,7 @@ class SessionLog
         f = createPrivate(path);
         // A brand-new file: only an unsupported filesystem can refuse.
         if (tryLock(f) == LockResult.contended) throw new Exception("session log " ~ path ~ " is locked");
-        shareHandle(path, f);
+        held = shareHandle(path, f);
         scope (failure) close();
         JSONValue h = ["id": this.id, "created_at": nowStamp(), "cwd": cwd, "model": model];
         h["version"] = formatVersion;
@@ -461,11 +465,12 @@ class SessionLog
         validateId(id);
         // Lock before reading or truncating, so tidy-up cannot compress or
         // delete the log underneath this writer.
-        if (auto held = path in openHere)
+        if (auto shared_ = path in openHere)
         {
             // This process already holds the log open and locked: share that
             // locked handle (a second open would be a separate, unlocked
             // file description once the first closes).
+            held = *shared_;
             f = held.file;
             held.refs++;
         }
@@ -476,7 +481,7 @@ class SessionLog
             f = openExistingForAppend(path);
             awaitLock(f, path);
             if (!sameFile(f, path)) { f.close(); throw new Exception("session log " ~ path ~ " was removed"); }
-            shareHandle(path, f);
+            held = shareHandle(path, f);
         }
         scope (failure) close();
         // Count the committed lines in fixed-size chunks: a long session's
@@ -516,12 +521,14 @@ class SessionLog
         if (!f.isOpen) return;
         // AA removal does not run destructors: close the shared handle
         // explicitly when the last writer goes, releasing the lock.
-        if (auto held = path in openHere)
-            if (--held.refs == 0)
-            {
-                held.file.close();
-                openHere.remove(path);
-            }
+        if (held !is null && --held.refs == 0)
+        {
+            held.file.close();
+            // Only drop the path's registration if it is still this handle.
+            if (auto cur = path in openHere)
+                if (*cur is held) openHere.remove(path);
+        }
+        held = null;
         f.detach();
     }
 
@@ -532,7 +539,12 @@ class SessionLog
             failNextWrite = false;
             throw new Exception("session log write failed (injected)");
         }
-        if (!sameFile(f, path)) recoverReplaced();
+        if (!sameFile(f, path))
+        {
+            recoverReplaced();
+            // The header itself hit the replacement: name the recovery id.
+            { import std.string : assumeUTF; if (lines == 0) line = withHeaderId(line.representation, id).assumeUTF.idup; }
+        }
         f.write(line);
         f.flush();
         ++lines;
@@ -549,18 +561,7 @@ class SessionLog
     /// tell the user.
     private void recoverReplaced()
     {
-        import std.stdio : SEEK_END;
-        f.flush();
-        f.seek(0);
-        ubyte[] ours;
-        auto buf = new ubyte[](64 * 1024);
-        for (;;)
-        {
-            auto chunk = f.rawRead(buf);
-            if (!chunk.length) break;
-            ours ~= chunk;
-        }
-        f.seek(0, SEEK_END);
+        auto ours = readAll(f);
         string target = path, how;
         File next;
         bool done;
@@ -585,36 +586,46 @@ class SessionLog
             }
             else
             {
+                // Lock first, then compare the whole locked file's bytes
+                // (not just its length) and re-check the path still names it.
+                next = openExistingForAppend(path);
+                if (tryLock(next) == LockResult.contended || !sameFile(next, path)) return;
+                auto theirs = readAll(next);
+                if (theirs.length <= ours.length && ours[0 .. theirs.length] == theirs)
                 {
-                    auto theirs = readBytes(path);
-                    if (theirs.length <= ours.length && ours[0 .. theirs.length] == theirs)
-                    {
-                        next = openExistingForAppend(path);
-                        if (tryLock(next) != LockResult.contended && sameFile(next, path)
-                            && readBytes(path).length == theirs.length)
-                        {
-                            next.rawWrite(ours[theirs.length .. $]);
-                            next.flush();
-                            done = true;
-                            how = "it was replaced; appended the records the new file was missing";
-                        }
-                    }
+                    next.rawWrite(ours[theirs.length .. $]);
+                    next.flush();
+                    done = true;
+                    how = "it was replaced; appended the records the new file was missing";
                 }
             }
         }());
         if (!done)
         {
             // The path holds something else: keep the whole session in a
-            // recovery log beside it (a resumable session id of its own).
-            auto base = path.stripExtension;
+            // recovery log beside it, a resumable session of its own: its
+            // header names the recovery id (same line count, so `#N` IDs hold).
+            auto dir = path.dirName;
+            auto stem = recoveryStem(id);
+            bool made;
             foreach (n; 1 .. 1000)
             {
-                target = format("%s.recovered-%s.jsonl", base, n);
-                if (!target.exists) break;
+                auto rid = format("%s.recovered-%s", stem, n);
+                target = buildPath(dir, rid ~ ".jsonl");
+                if (target.exists) continue;
+                // Exclusive create, then lock before anything else can, and
+                // confirm the locked inode is still the one at the path.
+                import std.exception : collectException;
+                // Lost the race for this name (or cannot create it): try the next.
+                if (collectException(next = createPrivate(target)) !is null) continue;
+                awaitLock(next, target);
+                if (!sameFile(next, target)) { next.close(); continue; }
+                next.rawWrite(withHeaderId(ours, rid));
+                next.flush();
+                made = true;
+                break;
             }
-            writePrivate(target, ours, octal!600);
-            next = openExistingForAppend(target);
-            tryLock(next);
+            if (!made) throw new Exception("session log " ~ path ~ " was replaced and no recovery log could be created");
             how = "it was replaced by a different file; this session continues in " ~ target
                 ~ " (resume it with --resume " ~ target.baseName.stripExtension ~ ")";
         }
@@ -623,7 +634,7 @@ class SessionLog
         f = next;
         path = target;
         id = path.baseName.stripExtension;
-        shareHandle(path, f);
+        held = shareHandle(path, f);
         auto msg = "WARNING: session log " ~ old ~ " no longer names the file this session was writing: "
             ~ how ~ ". Nothing was lost.";
         if (warn) warn(msg);
@@ -1251,11 +1262,73 @@ private struct Held { File file; size_t refs; }
 
 /// Logs this thread holds open and locked, so an in-process reopen shares
 /// the locked handle instead of opening an unlocked second description.
-private Held[string] openHere;
+private Held*[string] openHere;
 
-private void shareHandle(string path, File f)
+private Held* shareHandle(string path, File f)
 {
-    openHere[path] = Held(f, 1);
+    auto h = new Held(f, 1);
+    openHere[path] = h;
+    return h;
+}
+
+/// Every byte `f` holds, read from its start (the position is left at EOF).
+private ubyte[] readAll(ref File f)
+{
+    import std.stdio : SEEK_END;
+    f.flush();
+    f.seek(0);
+    ubyte[] all;
+    auto buf = new ubyte[](64 * 1024);
+    for (;;)
+    {
+        auto chunk = f.rawRead(buf);
+        if (!chunk.length) break;
+        all ~= chunk;
+    }
+    f.seek(0, SEEK_END);
+    return all;
+}
+
+/// The id stem for a recovery log of session `id`: any earlier
+/// `.recovered-N` suffix dropped (so repeats do not stack), and cut short
+/// enough that `<stem>.recovered-999` still passes `validateId`.
+string recoveryStem(string id) pure
+{
+    import std.ascii : isDigit;
+    import std.string : lastIndexOf;
+    auto stem = id;
+    auto at = stem.lastIndexOf(".recovered-");
+    if (at >= 0)
+    {
+        auto n = stem[at + ".recovered-".length .. $];
+        bool digits = n.length > 0;
+        foreach (c; n) digits = digits && c.isDigit;
+        if (digits) stem = stem[0 .. at];
+    }
+    enum room = 128 - ".recovered-999".length;
+    if (stem.length > room) stem = stem[0 .. room];
+    return stem;
+}
+
+/// `text` with its first line's `session` header renamed to `newId`; other
+/// lines and the line count are untouched. Text without a parseable header
+/// line comes back unchanged (an empty `newId` also leaves it unchanged).
+const(ubyte)[] withHeaderId(const(ubyte)[] text, string newId)
+{
+    import std.algorithm : countUntil;
+    import std.exception : collectException;
+    import std.string : assumeUTF;
+    if (!newId.length) return text;
+    auto nl = text.countUntil('\n');
+    if (nl < 0) return text;
+    JSONValue j;
+    // Not a JSON header line: nothing to rename, keep the bytes as they are.
+    if (collectException(j = parseJSON(text[0 .. nl].assumeUTF)) !is null) return text;
+    if (j.type != JSONType.object || "type" !in j || j["type"].type != JSONType.string
+        || j["type"].str != "session" || "data" !in j || j["data"].type != JSONType.object)
+        return text;
+    j["data"]["id"] = newId;
+    return record("session", j["data"]).representation ~ text[nl + 1 .. $];
 }
 
 /// Lock `f` for a writer, waiting briefly while a tidy-up holds it (a
@@ -2200,5 +2273,60 @@ unittest
         assert(readText(p) == "{\"type\":\"session\",\"data\":{}}\n");
         assert(warned.length == 3 && warned[2].canFind(rec));
         validateId(log.id);
+        // The recovery is a resumable session: its header names its id.
+        restore(rec); // throws on a header id mismatch
+        assert(parseJSON(readText(rec).lineSplitter.front)["data"]["id"].str == log.id);
+        assert(findSession(dir, log.id) == rec);
     }
+    // 4. Rewritten with different content of the same length: not a prefix.
+    {
+        auto log = new SessionLog(dir, "mock/m", "/x");
+        log.warn = (string m) { warned ~= m; };
+        log.input("i1", "zeta");
+        auto p = log.path;
+        auto text = readText(p);
+        remove(p);
+        { import std.array : replace; std.file.write(p, text.replace("zeta", "ZETA")); }
+        log.input("i2", "eta");
+        auto rec = log.path;
+        log.close();
+        assert(rec != p, "an equal-length rewrite must not be treated as a prefix");
+        assert(readText(rec).canFind("zeta") && readText(rec).canFind("eta"));
+        assert(readText(p).canFind("ZETA") && !readText(p).canFind("eta"));
+    }
+}
+
+@("recovery ids stay valid for long and repeatedly recovered ids (#237)")
+unittest
+{
+    auto longId = new char[](128);
+    longId[] = 'a';
+    auto stem = recoveryStem(longId.idup);
+    validateId(stem ~ ".recovered-999");
+    assert(recoveryStem("sess-x.recovered-3") == "sess-x");
+    assert(recoveryStem("sess-x.recovered-") == "sess-x.recovered-");
+    assert(withHeaderId("{\"type\":\"session\",\"data\":{\"id\":\"a\"}}\nrest\n".representation, "b")
+        == "{\"type\":\"session\",\"data\":{\"id\":\"b\"}}\nrest\n".representation);
+    assert(withHeaderId("not json\n".representation, "b") == "not json\n".representation);
+}
+
+@("closing an old sharer after an in-place recovery keeps the recovered handle (#237)")
+unittest
+{
+    import std.algorithm : canFind;
+    auto dir = buildPath(tempDir, format("nano-coder-sharers-%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto a = new SessionLog(dir, "mock/m", "/x");
+    a.warn = (string) {};
+    auto b = new SessionLog(a.path); // shares a's handle
+    auto p = a.path;
+    remove(p);
+    a.input("i1", "after-removal"); // recovers in place: a new handle at p
+    b.close(); // must not close a's recovered handle
+    assert(a.isOpenForWrite);
+    a.input("i2", "still-writing");
+    a.close();
+    assert(readText(p).canFind("still-writing"));
+    assert(p !in openHere);
 }
