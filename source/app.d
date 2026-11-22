@@ -1308,7 +1308,10 @@ class Console : AgentEvents
     void replayThinking(string reasoning)
     {
         if (quiet || !reasoning.length) return;
-        link.screen.update((ref Screen s) { s.replayThinking(reasoning); });
+        // Saved reasoning is untrusted log text: strip terminal controls as
+        // replay does for answers and prompts.
+        auto clean = sanitizeBlock(reasoning);
+        link.screen.update((ref Screen s) { s.replayThinking(clean); });
     }
 
     /// plan_add/plan_update show as the checklist, not as calls.
@@ -1705,10 +1708,34 @@ string replayQuietShown(const Message[] msgs, size_t i) pure nothrow @safe
 /// next genuine user request (transparent harness messages — system notes,
 /// hook context, timer firings — belong to the turn they sit inside); a turn
 /// that runs to the end of the log closes there.
+private bool closesTurn(const ref Message m) pure @safe
+{
+    // A mid-turn steer continues the turn it interrupts.
+    return m.role == Role.user && isUserRequest(m) && !m.steered;
+}
+
+/// `quietTurnLast` for every message at once, in linear time.
+size_t[] quietTurnLasts(const Message[] msgs) pure @safe
+{
+    // lastBefore[j]: the last assistant message before index j.
+    auto lastBefore = new size_t[msgs.length + 1];
+    lastBefore[0] = msgs.length;
+    foreach (j; 0 .. msgs.length)
+        lastBefore[j + 1] = msgs[j].role == Role.assistant ? j : lastBefore[j];
+    auto r = new size_t[msgs.length];
+    size_t close = msgs.length; // the first turn-closing message after k
+    foreach_reverse (k; 0 .. msgs.length)
+    {
+        r[k] = lastBefore[close];
+        if (closesTurn(msgs[k])) close = k;
+    }
+    return r;
+}
+
 private size_t quietTurnLast(const Message[] msgs, size_t i) pure @safe
 {
     size_t j = i + 1;
-    while (j < msgs.length && (msgs[j].role != Role.user || !isUserRequest(msgs[j]))) j++;
+    while (j < msgs.length && !closesTurn(msgs[j])) j++;
     size_t last = j;
     while (last > 0 && msgs[last - 1].role != Role.assistant) last--;
     return last > 0 ? last - 1 : msgs.length;
@@ -1721,10 +1748,11 @@ private size_t quietTurnLast(const Message[] msgs, size_t i) pure @safe
 /// the message hidden loses output the completed turn displayed. The cap's
 /// stop note itself is a live-only notice, never logged, so replay cannot
 /// reprint it; the response text it accompanied is what survives.
-string replayQuietShownTurn(const Message[] msgs, size_t i) pure @safe
+string replayQuietShownTurn(const Message[] msgs, size_t i, const size_t[] lasts = null) pure @safe
 {
     if (msgs[i].role != Role.assistant) return null;
-    if (msgs[i].toolCalls.length && quietTurnLast(msgs, i) == i && msgs[i].content.strip.length)
+    if (msgs[i].toolCalls.length && msgs[i].content.strip.length
+        && (lasts.length ? lasts[i] : quietTurnLast(msgs, i)) == i)
         return msgs[i].content;
     return replayQuietShown(msgs, i);
 }
@@ -1748,6 +1776,30 @@ unittest
     // A turn closed by a tool-free message is unaffected.
     auto plain = [Message.user("g"), Message.assistant("hi")];
     assert(replayQuietShownTurn(plain, 1) == "hi");
+}
+
+unittest
+{
+    // A mid-turn steer continues the turn: the tool-calling reply before it
+    // stays hidden; only the turn's final answer shows.
+    Message[] msgs;
+    msgs ~= Message.user("goal");
+    msgs ~= Message.assistant("working", [ToolCall("c1", "bash", JSONValue.init)]);
+    msgs ~= Message.toolResult("c1", "bash", "ok");
+    auto st = Message.user("shorter");
+    st.steered = true;
+    msgs ~= st;
+    msgs ~= Message.assistant("done");
+    assert(replayQuietShownTurn(msgs, 1) is null, "a steer does not close the turn");
+    auto lasts = quietTurnLasts(msgs);
+    assert(replayQuietShownTurn(msgs, 1, lasts) is null);
+    assert(replayQuietShownTurn(msgs, 4, lasts) == "done");
+    // The linear pass agrees with the per-message scan.
+    Message[] mix = [Message.user("g"), Message.assistant("a", [ToolCall("c", "bash", JSONValue.init)]),
+        Message.toolResult("c", "bash", "ok"), Message.user("n"), Message.toolResult("x", "bash", "y"),
+        Message.assistant("b", [ToolCall("d", "bash", JSONValue.init)]), st, Message.assistant("c")];
+    auto ml = quietTurnLasts(mix);
+    foreach (k; 0 .. mix.length) assert(ml[k] == quietTurnLast(mix, k));
 }
 
 unittest
@@ -1942,6 +1994,7 @@ void replayTranscript(Agent agent, Console console)
         pending = null;
     }
     scope (exit) console.replayTime = null;
+    const turnLasts = console.quiet ? quietTurnLasts(msgs) : null;
     foreach (i, ref m; msgs)
     {
         if (m.role != Role.tool) flushPending();
@@ -1965,6 +2018,13 @@ void replayTranscript(Agent agent, Console console)
             // Model-only reminders (hook context, output-limit continuations,
             // timer firings and nudges) were never typed by the user.
             // Stop-hook reminders and idle-timer turns are autoInitiated.
+            // A timer firing printed its notice live (kept in `pinText`);
+            // replay restores it the same way. Pending nudges stay hidden.
+            if (m.timer && !m.continuation && m.pinText.length)
+            {
+                console.userMessage(sanitizeBlock(m.pinText));
+                break;
+            }
             if (m.hookContext || m.continuation || m.timer || m.autoInitiated) break;
             // Hook context appended to the prompt was never shown live.
             auto typed = m.pinText.length ? m.pinText : m.content;
@@ -1991,7 +2051,7 @@ void replayTranscript(Agent agent, Console console)
             // The saved reasoning replays before the answer (verbose expands
             // it, normal folds it, quiet hides it as live does).
             console.replayThinking(m.thinking);
-            const shown = console.quiet ? replayQuietShownTurn(msgs, i) : m.content;
+            const shown = console.quiet ? replayQuietShownTurn(msgs, i, turnLasts) : m.content;
             if (shown.strip.length) writeln(stampBlock(console.stamp(), console.display(escapeMarks(sanitizeBlock(shown))).stripRight));
             foreach (j, ref c; m.toolCalls) pending ~= [i, j];
             break;

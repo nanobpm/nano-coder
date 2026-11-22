@@ -2341,6 +2341,7 @@ class Agent
             auto text = takeFiredTimers(notice);
             auto tm = Message.auto_(wrapReminder(text));
             tm.timer = true;
+            tm.pinText = notice; // the visible notice, for replay
             push(tm);
             ev.userMessage(notice);
             return;
