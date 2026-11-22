@@ -10,7 +10,8 @@ import nano.arith : checkedMul, checkedSub, saturatingAdd, saturatingSub, clampT
 import nano.option : Option, some, none, match, ifSome, orElse, unwrap, NotNull;
 import nano.result : orThrow, toOption, match, unwrap;
 
-import nano.safeio : Isolated, JoinHandle, spawnDaemon, stdErr, stdOut;
+import nano.safeio : Isolated, Join, JoinHandle, spawnDaemon, stdErr, stdOut;
+import nano.probe : ProbeState;
 
 import std.json;
 import std.format : format;
@@ -205,8 +206,11 @@ class Agent
     Nullable!Thinking sessionThinking;
     /// The provider settings for a provider name (null when unknown).
     const(ProviderConfig)* delegate(string name) providerLookup;
-    /// What the endpoint reports about the current model.
-    Capabilities capabilities;
+    /// What the endpoint reports about the current model, and the probe
+    /// generations that guard it (`nano.probe`).
+    ProbeState probe;
+    /// The reports themselves.
+    ref inout(Capabilities) capabilities() inout pure return { return probe.caps; }
     private ProviderConfig noProvider;
     Option!SessionLog log;
     TokenUsage lastUsage;
@@ -1136,11 +1140,94 @@ class Agent
         return ProviderKind.mock;
     }
 
-    /// Ask the endpoint what the current model supports (after a model change).
+    /// Ask the endpoint what the current model supports (at startup or a
+    /// direct model change), waiting for the answer. A configured window wins,
+    /// so only the thinking half runs then. Any background probe in flight is
+    /// superseded.
     void refreshCapabilities()
     {
-        capabilities = Capabilities.init;
-        if (auto probe = cast(CapabilityProbe) client.nonNull) capabilities = probe.probeCapabilities();
+        probe.beginDetect();
+        auto caps = probeOf(client.nonNull, !configuredWindow);
+        if (configuredWindow) probe.storeWithoutWindow(caps);
+        else probe.store(caps);
+    }
+
+    /// What `c` reports (nothing for a client that can't probe, or on failure).
+    private static Capabilities probeOf(LLMClient c, bool window)
+    {
+        Capabilities caps;
+        try
+            if (auto p = cast(CapabilityProbe) c) caps = p.probeCapabilities(window);
+        catch (Exception) {} // a failed probe means "unknown": the fallbacks stand
+        return caps;
+    }
+
+    /// Builds a fresh client for a `provider/model` spec, for a background
+    /// probe after a mid-turn switch (null: mid-turn switches don't probe).
+    LLMClient delegate(string spec) probeClient;
+
+    /// A background probe: the generation it publishes under, and its thread.
+    private static struct PendingProbe
+    {
+        ulong generation;
+        Join!(Isolated!Capabilities) thread;
+    }
+    private PendingProbe[] pendingProbes;
+
+    /// Probe the current client on a background thread (after a mid-turn
+    /// switch), so the next model call goes out at once, with the fallback
+    /// window, until `collectProbes` publishes the result.
+    private void startBackgroundProbe()
+    {
+        auto generation = probe.beginDetect();
+        if (probeClient is null) return;
+        LLMClient c;
+        try c = probeClient(client.providerName ~ "/" ~ client.modelName);
+        catch (Exception) return; // the probe is optional: the fallbacks stand
+        // Isolated: `probeClient` builds a new client from a resolved
+        // (deep-copied) config, and only the probe thread keeps it.
+        pendingProbes ~= PendingProbe(generation,
+            spawnDaemon(&runProbe, Isolated!LLMClient.assumeIsolated(c), configuredWindow == 0));
+    }
+
+    /// Runs on the probe thread: what `client` reports (nothing on failure).
+    private static Isolated!Capabilities runProbe(Isolated!LLMClient client, bool window)
+    {
+        auto caps = probeOf(client.unwrap, window);
+        // Isolated: built on this thread, and only the result box keeps it.
+        return Isolated!Capabilities.assumeIsolated(caps);
+    }
+
+    /// Publish the background probes that finished; a result from a model
+    /// a later switch superseded is discarded. Whether one was published.
+    bool collectProbes()
+    {
+        bool published;
+        PendingProbe[] still;
+        foreach (ref p; pendingProbes)
+        {
+            if (p.thread.running) { if (probe.isCurrent(p.generation)) still ~= p; continue; }
+            auto result = p.thread.join();
+            published |= probe.publishIfCurrent(p.generation, result.unwrap);
+        }
+        pendingProbes = still;
+        return published;
+    }
+
+    /// Wait up to `max` for the live background probe (a superseded one is
+    /// never published), then publish; false if it still runs.
+    bool settleProbes(Duration max)
+    {
+        import core.time : msecs;
+        auto deadline = monoNow + max;
+        foreach (ref p; pendingProbes)
+            while (probe.isCurrent(p.generation) && p.thread.running)
+            {
+                if (monoNow >= deadline) { collectProbes(); return false; }
+                sleepFor(5.msecs);
+            }
+        collectProbes();
+        return true;
     }
 
     /// The thinking level the current model is sent, and why. A fixed budget
@@ -2001,8 +2088,11 @@ class Agent
     /// Apply a queued `/model`, if any; whether there was one.
     bool applyModelRequest()
     {
+        collectProbes();
         auto spec = control.takeModelRequest();
         if (!spec.length) return false;
+        midTurnSwitch = true;
+        scope (exit) midTurnSwitch = false;
         if (onModelRequest !is null) onModelRequest(spec);
         return true;
     }
@@ -2026,8 +2116,13 @@ class Agent
         setConfiguredWindow(window);
         learnedWindow = 0;
         learnedMaxOutput = 0;
-        refreshCapabilities();
+        // A mid-turn switch never waits on the endpoint.
+        if (midTurnSwitch) startBackgroundProbe();
+        else refreshCapabilities();
     }
+
+    /// Set while a queued `/model` applies (`useClient` then probes in the background).
+    private bool midTurnSwitch;
 
     /// Timers the agent set for itself (`timer_*` tools).
     Timers timers;

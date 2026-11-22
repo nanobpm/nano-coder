@@ -198,3 +198,126 @@ unittest
     assert(agent.control.takeModelRequest() is null, "dropped, not re-queued");
     assert(failures.length == 1 && failures[0].startsWith("flaky/x: ") && failures[0].canFind("api_key_command"));
 }
+
+/// A scripted client whose capability probe reports `window` tokens once
+/// `gate` opens, counting its probes and whether they asked for the window.
+class Probing : Interfering, CapabilityProbe
+{
+    import nano.safeio : Shared;
+    size_t window;
+    Shared!bool gate;
+    Shared!int probes, windowProbes;
+    this(string model, LLMResponse[] script, size_t window, Shared!bool gate, Shared!int probes, Shared!int windowProbes)
+    {
+        super(model, script);
+        this.window = window;
+        this.gate = gate;
+        this.probes = probes;
+        this.windowProbes = windowProbes;
+    }
+    Capabilities probeCapabilities(bool withWindow = true)
+    {
+        gate.await((ref const bool open) => open, (ref bool _) {});
+        probes.update((ref int n) { n++; });
+        if (withWindow) windowProbes.update((ref int n) { n++; });
+        Capabilities c;
+        c.maxOutput = 1_234;
+        if (withWindow) { c.window = window; c.windowSource = model; }
+        return c;
+    }
+}
+
+/// Probe counters and a gate shared by the switched-to client and the fresh
+/// clients the agent builds for its background probes.
+struct Probes
+{
+    import nano.safeio : Shared;
+    Shared!bool gate;
+    Shared!int probes, windowProbes;
+    static Probes make(bool open)
+    {
+        return Probes(Shared!bool.make(open), Shared!int.make(0), Shared!int.make(0));
+    }
+    Probing client(string model, LLMResponse[] script, size_t window)
+    {
+        return new Probing(model, script, window, gate, probes, windowProbes);
+    }
+}
+
+// A mid-turn `/model` to a spec with a configured window: the window is
+// authoritative at once, only the thinking half is probed, and in the background.
+// rust: agent.rs::mid_turn_model_switch_with_a_configured_window_skips_the_probe
+unittest
+{
+    import core.time : seconds;
+    auto p = Probes.make(true);
+    auto first = new Interfering("first", [toolCall("c1")]);
+    auto agent = agentFor(first);
+    agent.probeClient = (string spec) => cast(LLMClient) p.client("probed", null, 4_096);
+    agent.onModelRequest = (string spec) {
+        agent.useClient(p.client("probed", [LLMResponse("done")], 4_096), ConfiguredWindow(111_111, "provider context_window"));
+    };
+    first.hook = (size_t call) { if (call == 1) agent.control.requestModel("mock/probed"); };
+    assert(agent.run("hi", new NullEvents) == "done");
+    assert(agent.lastStop == StopReason.endTurn && agent.client.modelName == "probed", "switched mid-turn");
+    assert(agent.settleProbes(5.seconds));
+    string source;
+    assert(agent.contextWindow(source) == 111_111 && source == "provider context_window", source);
+    assert(agent.capabilities.window == 0, "a configured window skips the endpoint's window probe");
+    assert(p.probes.get == 1 && p.windowProbes.get == 0, "only the thinking half ran");
+    assert(agent.capabilities.maxOutput == 1_234, "the rest of the probe is published");
+}
+
+// Without a configured window the probe still runs, but on a background
+// thread: the next model call doesn't wait for it, and the result is
+// published once it lands.
+// rust: agent.rs::mid_turn_model_switch_without_a_configured_window_probes_in_the_background
+unittest
+{
+    import core.time : seconds;
+    auto p = Probes.make(false); // the endpoint doesn't answer until the turn is over
+    auto first = new Interfering("first", [toolCall("c1")]);
+    auto agent = agentFor(first);
+    agent.probeClient = (string spec) => cast(LLMClient) p.client("probed", null, 4_096);
+    agent.onModelRequest = (string spec) {
+        agent.useClient(p.client("probed", [LLMResponse("done")], 4_096), ConfiguredWindow.init);
+    };
+    first.hook = (size_t call) { if (call == 1) agent.control.requestModel("mock/probed"); };
+    assert(agent.run("hi", new NullEvents) == "done", "the turn finished while the probe was stalled");
+    assert(agent.client.modelName == "probed");
+    string source;
+    agent.contextWindow(source);
+    assert(source == "default" || source == "known for the model name", source);
+    p.gate.update((ref bool open) { open = true; });
+    assert(agent.settleProbes(5.seconds));
+    assert(agent.contextWindow(source) == 4_096 && source == "reported by the endpoint (probed)", source);
+    assert(p.windowProbes.get == 1);
+}
+
+// A probe for one model that lands after a later switch must not overwrite
+// the newer model's reports.
+// rust: agent.rs::a_stale_background_probe_is_discarded_after_a_later_switch
+unittest
+{
+    import core.time : seconds;
+    auto slow = Probes.make(false);
+    auto fast = Probes.make(true);
+    auto agent = agentFor(new Interfering("first", []));
+    agent.probeClient = (string spec) => cast(LLMClient) (spec.canFind("slow")
+        ? slow.client("slow", null, 999) : fast.client("fast", null, 4_096));
+    agent.onModelRequest = (string spec) {
+        auto c = spec.canFind("slow") ? slow.client("slow", null, 999) : fast.client("fast", null, 4_096);
+        agent.useClient(c, ConfiguredWindow.init);
+    };
+    agent.control.requestModel("mock/slow");
+    assert(agent.applyModelRequest());
+    agent.control.requestModel("mock/fast");
+    assert(agent.applyModelRequest());
+    assert(agent.settleProbes(5.seconds), "the stale probe is not waited for");
+    assert(agent.capabilities.window == 4_096);
+    slow.gate.update((ref bool open) { open = true; });
+    slow.probes.await((ref const int n) => n == 1, (ref int _) {}); // the stale probe finished
+    agent.collectProbes();
+    assert(agent.capabilities.window == 4_096 && agent.capabilities.windowSource == "fast",
+        "the stale probe did not overwrite the live model's window");
+}

@@ -2399,6 +2399,7 @@ int runMain(string[] args)
     agent.sessionTitles = cfg.sessionTitles;
     agent.titleModel = cfg.titleModel;
     agent.titleClient = (string spec) => makeClient(resolve(cfg, spec));
+    agent.probeClient = (string spec) => makeClient(resolve(cfg, spec));
     agent.planTools = cfg.planTools;
     agent.timerTools = !o.acp; // ACP has no idle loop to fire them
     agent.outcomeTool = cfg.outcomeTool;

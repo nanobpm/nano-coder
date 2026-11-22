@@ -393,10 +393,13 @@ struct Capabilities
     size_t maxOutput;
 }
 
-/// A client that can ask its endpoint what the model supports.
+/// A client that can ask its endpoint what the model supports. With
+/// `window` false (a configured window wins anyway) the window half is
+/// skipped: no window-only follow-up requests are made, and the agent
+/// ignores any window the shared responses carried.
 interface CapabilityProbe
 {
-    Capabilities probeCapabilities();
+    Capabilities probeCapabilities(bool window = true);
 }
 
 interface LLMClient

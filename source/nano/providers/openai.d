@@ -256,7 +256,7 @@ class OpenAIClient : LLMClient, CapabilityProbe, KindedClient
 
     /// Thinking levels and vision from `/models`, then (by server) llama.cpp
     /// `/props` or Ollama `/api/show` (port of `detect_capabilities`).
-    Capabilities probeCapabilities()
+    Capabilities probeCapabilities(bool window = true)
     {
         import nano.thinking : Reported;
         import nano.vision : Vision;
@@ -298,9 +298,9 @@ class OpenAIClient : LLMClient, CapabilityProbe, KindedClient
             auto show = probe(root ~ "/api/show", JSONValue(["model": p.model]).jsonText);
             if (c.thinking.isNull) c.thinking = Reported.fromOllamaShow(show);
             if (c.vision.isNull) c.vision = Vision.fromOllamaShow(show);
-            if (!c.window) ollamaWindow(probe(root ~ "/api/ps"), show, p.model, c);
+            if (window && !c.window) ollamaWindow(probe(root ~ "/api/ps"), show, p.model, c);
         }
-        else if (!c.window && (p.name == "lmstudio" || root.endsWith(":1234")))
+        else if (window && !c.window && (p.name == "lmstudio" || root.endsWith(":1234")))
         {
             auto listed = modelEntry(probe(root ~ "/api/v0/models"), p.model);
             if (auto n = tokensAt(listed, ["loaded_context_length"]))
