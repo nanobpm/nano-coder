@@ -224,7 +224,7 @@ private bool entity(string s, size_t i, out string text, out size_t next) pure
         try
         {
             auto v = name[1] == 'x' || name[1] == 'X' ? name[2 .. $].to!uint(16) : name[1 .. $].to!uint;
-            dchar c = v == 0 || !isValidDchar(v) ? '\uFFFD' : cast(dchar) v;
+            dchar c = v == 0 || !isValidDchar(v) ? '\uFFFD' : dchar(v);
             char[4] buf;
             text = buf[0 .. encode(buf, c)].idup;
             return true;
@@ -474,7 +474,7 @@ private struct Flatten
                 links = links[0 .. $ - 1];
                 auto bare = x.url.length > 7 && x.url[0 .. 7] == "mailto:" ? x.url[7 .. $] : x.url;
                 if (x.url.length && seen != x.url && seen != bare)
-                    emit(" (" ~ x.url ~ ")", cast(ubyte)((style & ~UNDERLINE) | FAINT));
+                    emit(" (" ~ x.url ~ ")", (style & ~UNDERLINE) | FAINT);
                 break;
             case K.image:
                 emit("[image: ", style | FAINT);

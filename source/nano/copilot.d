@@ -3,6 +3,8 @@
 module nano.copilot;
 
 @safe:
+
+import std.string : representation;
 import nano.safeio : jsonText, jsonPretty;
 import nano.clock : wallNow;
 
@@ -173,7 +175,7 @@ void writePrivateAtomic(string path, string text)
         size_t done;
         while (done < text.length)
         {
-            auto n = writeFd(fd, cast(const(ubyte)[]) text[done .. $]);
+            auto n = writeFd(fd, text[done .. $].representation);
             if (n <= 0) throw new Exception("write " ~ tmp ~ " failed");
             done += n;
         }

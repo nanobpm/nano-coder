@@ -2,6 +2,8 @@
 module nano.providers.openai_test;
 @safe:
 
+import std.string : representation;
+
 version (unittest):
 
 import std.algorithm : canFind;
@@ -228,7 +230,7 @@ Stored storedPng(string dir, string path, uint w, uint h, bool keep = true)
     Attachment a;
     a.mediaType = "image/png";
     a.path = path;
-    a.sha256 = sha256Hex(keep ? bytes : cast(immutable(ubyte)[]) "missing-bytes");
+    a.sha256 = sha256Hex(keep ? bytes : "missing-bytes".representation);
     a.width = w;
     a.height = h;
     a.bytes = bytes.length;

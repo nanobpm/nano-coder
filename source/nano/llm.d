@@ -2,6 +2,8 @@
 module nano.llm;
 
 @safe:
+
+import std.conv : to;
 import nano.safeio : jsonText, jsonPretty;
 
 import std.json;
@@ -135,6 +137,12 @@ struct Message
     bool continuation;
     /// A fired timer or pending-timer nudge (`timer`; implies automatic).
     bool timer;
+    /// User role: a Stop hook's rejection of the preceding answer
+    /// (`stop_blocked`; implies automatic).
+    bool stopBlocked;
+    /// User role: a steer typed mid-turn (`steered`); the turn goes on, so
+    /// it supersedes the answer before it in quiet replay.
+    bool steered;
     /// User role: entirely harness hook context (`hook_context`), never pinned.
     bool hookContext;
     /// User role: the user-typed text when hook context was appended to
@@ -197,7 +205,7 @@ struct Message
         auto names = ["system", "user", "assistant", "tool"];
         auto r = names.countUntil(j["role"].str);
         if (r < 0) throw new Exception("unknown role " ~ j["role"].str);
-        m.role = cast(Role) r;
+        m.role = r.to!Role;
         if (auto c = "content" in j) m.content = c.type == JSONType.string ? c.str : "";
         if (auto calls = "tool_calls" in j)
             foreach (c; calls.arrayNoRef)

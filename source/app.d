@@ -5,7 +5,7 @@ module app;
 @safe:
 import nano.safeio : jsonText, jsonPretty;
 import nano.clock : monoNow, sleepFor, wallNow;
-import nano.arith : saturatingSub;
+import nano.arith : saturatingSub, toSize;
 import nano.option : Option, some, none, match, ifSome, unwrap, notNull, NotNull, nullable;
 import nano.result : match, unwrap, unwrapErr, orThrow;
 
@@ -30,7 +30,7 @@ import nano.tools;
 import nano.tools.bash : bashDefinition = definition, bashExecute = execute,
     bashHeartbeatSink = heartbeatSink, bashHeartbeatInterval = heartbeatInterval;
 import nano.tools.files : ReadState, registerFiles = register;
-import nano.tools.search : DenyScan, registerSearch = register;
+import nano.tools.search : Denied, DenyScan, registerSearch = register;
 import nano.permissions;
 import nano.session;
 import nano.toml : parseToml;
@@ -55,7 +55,7 @@ import nano.control : TurnControl, FdLineReader;
 import nano.instructions : ProjectInstructions, InstructionOptions = Options, expandHome;
 import core.atomic : atomicLoad, atomicStore, cas;
 
-enum string packageVersion = "1.6.1";
+enum string packageVersion = "1.6.3";
 enum string versionString = "nano-coder " ~ packageVersion;
 
 enum string usage = `Usage: nano-coder [--model provider/model] [--config PATH] [-p PROMPT]
@@ -877,9 +877,38 @@ string stamp(bool color)
 {
     import std.datetime.systime : Clock;
     if (!atomicLoad(gTimestamps)) return "";
-    auto t = wallNow;
+    return formatStamp(color, wallNow);
+}
+
+private string formatStamp(T)(bool color, T t)
+{
     auto s = format("%02d:%02d:%02d", t.hour, t.minute, t.second);
     return color ? "\x1b[2m" ~ s ~ "\x1b[0m " : s ~ " ";
+}
+
+/// The stamp for a saved message's RFC 3339 `timestamp`, in local time; the
+/// current time when it is missing or unreadable (sessions from before
+/// timestamps were logged).
+string stampAt(bool color, string timestamp)
+{
+    import std.datetime.systime : SysTime;
+    if (!atomicLoad(gTimestamps)) return "";
+    if (timestamp.length)
+        try return formatStamp(color, SysTime.fromISOExtString(timestamp).toLocalTime);
+        catch (Exception) {} // malformed: fall back to now
+    return stamp(color);
+}
+
+unittest
+{
+    import std.datetime.systime : SysTime;
+    auto was = atomicLoad(gTimestamps);
+    scope (exit) atomicStore(gTimestamps, was);
+    atomicStore(gTimestamps, true);
+    auto t = SysTime.fromISOExtString("2026-01-02T03:04:05.250+13:00").toLocalTime;
+    assert(stampAt(false, "2026-01-02T03:04:05.250+13:00") == format("%02d:%02d:%02d ", t.hour, t.minute, t.second));
+    assert(stampAt(false, "garbage").length == 9);
+    assert(stampAt(false, "").length == 9);
 }
 
 /// `text` with `stamp` before the first line and its width in spaces before the rest.
@@ -919,7 +948,7 @@ unittest
     import std.array : array;
     Config c;
     auto reg = new ToolRegistry;
-    registerBuiltinTools(reg, c, new ReadState, (string root) @safe => cast(bool delegate(string) @safe) null);
+    registerBuiltinTools(reg, c, new ReadState, (string root) @safe => Denied.init);
     auto names = reg.definitions.map!(d => d.name).array;
     assert(names.canFind("grep") && names.canFind("glob") && names.canFind("bash") && names.canFind("edit_file"));
     assert(!names.canFind("echo"), "no vestigial echo tool");
@@ -959,8 +988,13 @@ void updateStatus(scope void delegate(ref Stats) @safe f)
 {
     if (!gFrame) return;
     gStats.update(f);
-    gFrame.redraw();
+    if (!gStatusBatched) gFrame.redraw();
 }
+
+/// Set while a transcript replays: status changes still land in `gStats`
+/// but skip the redraw (each copies the whole retained transcript), so a
+/// tool-heavy resume redraws once, at the final idle reset.
+bool gStatusBatched;
 
 /// The agent's side of the status line: model, context, plan, mode, tokens.
 
@@ -1214,7 +1248,10 @@ class Console : AgentEvents
         return gFrame ? shown : dropSoftWraps(shown);
     }
 
-    string stamp() { return .stamp(color); }
+    /// While replaying a saved session: the message's own timestamp, so
+    /// replayed lines carry their original time.
+    string replayTime;
+    string stamp() { return replayTime.length ? stampAt(color, replayTime) : .stamp(color); }
 
     this(bool color, bool tty = false)
     {
@@ -1262,6 +1299,7 @@ class Console : AgentEvents
 
     void toolStart(const ref ToolCall call)
     {
+        import nano.trajectory : terminalSafe;
         string name = call.name;
         updateStatus((ref Stats s) {
             s.activity = Activity.tool;
@@ -1273,10 +1311,10 @@ class Console : AgentEvents
         meter.reset(nowMs);
         if (quiet || quietTool(call)) return;
         endLine();
-        auto line = stamp() ~ (color ? "\x1b[38;5;114m●\x1b[0m " : "● ") ~ bold(escapeMarks(call.name)) ~ " " ~ dim(summary(call));
+        auto line = stamp() ~ (color ? "\x1b[38;5;114m●\x1b[0m " : "● ") ~ bold(escapeMarks(terminalSafe(call.name))) ~ " " ~ dim(terminalSafe(summary(call)));
         writeln(line);
         // Ctrl-O shows the full arguments under the call.
-        if (gFrame) write(foldMark(call.id, 1, line ~ "\n" ~ expandedBody(argsText(call), color ? "\x1b[2m" : "")));
+        if (gFrame) write(foldMark(call.id, 1, line ~ "\n" ~ expandedBody(sanitizeBlock(argsText(call)), color ? "\x1b[2m" : "")));
         stdOut.flush();
     }
 
@@ -1457,8 +1495,8 @@ unittest
 /// provider's (0: none), and which one it is.
 ConfiguredWindow windowFor(const ref Config c, const ref ProviderConfig p) pure
 {
-    if (c.contextWindow > 0) return ConfiguredWindow(cast(size_t) c.contextWindow, "context_window in config");
-    if (p.contextWindow > 0) return ConfiguredWindow(cast(size_t) p.contextWindow, "provider context_window");
+    if (c.contextWindow > 0) return ConfiguredWindow(toSize(c.contextWindow), "context_window in config");
+    if (p.contextWindow > 0) return ConfiguredWindow(toSize(p.contextWindow), "provider context_window");
     return ConfiguredWindow.init;
 }
 
@@ -1542,6 +1580,509 @@ string timersText(Agent agent)
         : agent.timers.list(agent.timerNow(), true).stripRight;
 }
 
+/// Transparent to an output-limit continuation: system messages
+/// (compaction), timer firings/nudges and hook-only context are not user
+/// input, so one between a reminder and the reply keeps the accumulated
+/// answer. Shared by replayAnswerQuiet (forward walk) and replayTranscript
+/// (backward walk) so the two cannot drift apart.
+bool replayTransparent(const ref Message x) pure nothrow @safe
+{
+    return x.role == Role.system || (x.role == Role.user && (x.hookContext || (x.timer && !x.continuation)));
+}
+
+/// What of an assistant message a quiet replay shows (Rust ui.rs quiet
+/// mode): live, an answer's deltas stream only while nothing supersedes
+/// them — a tool call or a Stop-hook rejection hides them, and an
+/// output-limit chunk a later tool call discarded never prints. A replay
+/// sees whole messages, so the same rule is: nothing with tool calls,
+/// nothing a rejection supersedes, and of an output-limit continuation
+/// only the chunks that stood — a chunk a continuation carried into the
+/// segment's accepted answer shows there, one a tool call or rejection
+/// discarded doesn't.
+string replayAnswerQuiet(const Message[] msgs, size_t i) pure nothrow @safe
+{
+    import nano.llm : isLengthStop;
+    const m = msgs[i];
+    if (m.toolCalls.length || stopRejected(msgs, i)) return null;
+    if (!isLengthStop(m.stopReason)) return m.content;
+    // A cut-off chunk: the continuation reminder carries the answer on.
+    size_t k = i + 1;
+    while (k < msgs.length && replayTransparent(msgs[k])) k++;
+    // The log cut short on the chunk (a crash before the reminder): it was
+    // the turn's visible tail, so it shows.
+    if (k >= msgs.length) return m.content;
+    // No reminder: the request/continuation budget ran out and the turn
+    // finished on the cut-off chunk, which stood — unless a steer or a
+    // rejection superseded it (stopRejected above already covers those).
+    if (msgs[k].role == Role.user && !msgs[k].continuation) return m.content;
+    if (msgs[k].role != Role.user) return null;
+    // A chunk resolves to the accepted answer from itself on: itself plus
+    // the later chunks of its segment (the segment's final chunk is its own
+    // text). replayTranscript prints that once, at the segment's first
+    // chunk, suppressing the chunks a reminder continues.
+    // The segment runs from the reminder on; the first message that closes
+    // it decides whether the accumulated chunks stood.
+    string kept = m.content;
+    bool afterCut = false; // the previous segment message was a cut-off chunk
+    for (size_t j = k + 1; j < msgs.length; j++)
+    {
+        const n = msgs[j];
+        if (replayTransparent(n)) continue;
+        final switch (n.role)
+        {
+        case Role.system: break;
+        case Role.user:
+            // A further reminder continues the segment.
+            if (n.continuation) { afterCut = false; break; }
+            // A rejection or steer discarded it; so did a new prompt that
+            // arrived while a reminder still awaited its reply.
+            if (n.stopBlocked || n.steered || !afterCut) return null;
+            // A new turn after a capped chunk: the budget ended the turn on
+            // the accumulated answer, which stood.
+            return kept;
+        case Role.assistant:
+            // Discarded with the tool call that replaced the answer.
+            if (n.toolCalls.length) return null;
+            if (stopRejected(msgs, j)) return null;
+            if (isLengthStop(n.stopReason)) { kept ~= n.content; afterCut = true; break; }
+            return kept ~ n.content;
+        case Role.tool: return null;
+        }
+    }
+    // The log ends on a capped chunk: the turn's visible tail.
+    if (afterCut) return kept;
+    return null; // the log ends mid-segment: no accepted answer to show
+}
+
+/// What quiet replay prints for assistant message `msgs[i]` — replayAnswerQuiet
+/// unless an earlier chunk of the same continuation segment already printed
+/// the accumulated whole. Live quiet prints an accepted answer once, at turn
+/// end; replay prints it whole at the segment's first cut-off chunk (which
+/// accumulates the later chunks), so every later chunk a reminder continues —
+/// including the segment's final, non-length-stop chunk — is suppressed. A
+/// chunk only suppresses when an earlier cut-off chunk of its segment is in
+/// the log to carry the whole: a log truncated to mid-segment (e.g. after a
+/// compaction) still shows the tail it has.
+string replayQuietShown(const Message[] msgs, size_t i) pure nothrow @safe
+{
+    import nano.llm : isLengthStop;
+    if (msgs[i].role != Role.assistant) return null;
+    // Walk the segment backward: over transparent messages, then a
+    // continuation reminder, to the chunk that reminder continues.
+    size_t back = i;
+    while (back > 0)
+    {
+        size_t k = back;
+        while (k > 0 && replayTransparent(msgs[k - 1])) k--;
+        if (k == 0 || msgs[k - 1].role != Role.user || !msgs[k - 1].continuation) break;
+        back = k - 1; // the reminder; the chunk it continues precedes it
+        while (back > 0 && replayTransparent(msgs[back - 1])) back--;
+        if (back > 0 && msgs[back - 1].role == Role.assistant && isLengthStop(msgs[back - 1].stopReason))
+            return null; // an earlier cut-off chunk prints the whole
+    }
+    return replayAnswerQuiet(msgs, i);
+}
+
+unittest
+{
+    import nano.agent : wrapReminder;
+    auto cont = Message.auto_(wrapReminder("cut off"));
+    cont.continuation = true;
+    Message cut(string text)
+    {
+        auto m = Message.assistant(text);
+        m.stopReason = "max_tokens";
+        return m;
+    }
+
+    // The accepted answer of a continued segment prints exactly once, at the
+    // segment's first cut-off chunk — the final chunk is not a length stop,
+    // yet its text is already in that whole.
+    auto ok = [cut("one "), cont, cut("two "), cont, Message.assistant("three")];
+    assert(replayQuietShown(ok, 0) == "one two three");
+    assert(replayQuietShown(ok, 2) is null, "a continued chunk is suppressed");
+    assert(replayQuietShown(ok, 4) is null, "the segment's final chunk is suppressed too");
+    size_t prints;
+    foreach (j; 0 .. ok.length) if (replayQuietShown(ok, j) !is null) prints++;
+    assert(prints == 1, "the accepted answer prints exactly once");
+
+    // A log truncated to mid-segment (a compaction boundary) has no earlier
+    // chunk to carry the whole: the tail it has still shows.
+    auto tail = [cont, Message.assistant("three")];
+    assert(replayQuietShown(tail, 1) == "three", "a truncated log shows the tail it has");
+    auto tail2 = [cont, cut("two "), cont, Message.assistant("three")];
+    assert(replayQuietShown(tail2, 1) == "two three", "the first in-log chunk carries the whole");
+    assert(replayQuietShown(tail2, 3) is null);
+
+    // Transparent messages between a chunk and its reminder keep the segment.
+    auto tick = Message.auto_(wrapReminder("timer"));
+    tick.timer = true;
+    auto timed = [cut("one "), cont, tick, cut("two "), cont, tick, Message.assistant("three")];
+    assert(replayQuietShown(timed, 0) == "one two three");
+    assert(replayQuietShown(timed, 3) is null);
+    assert(replayQuietShown(timed, 6) is null);
+
+    // A segment a tool call discarded prints nothing; the fresh answer shows.
+    auto call = Message.assistant("", [ToolCall.fromRaw("c1", "echo", `{}`)]);
+    auto discarded = [cut("lost "), cont, call, Message.toolResult("c1", "echo", "pong"), Message.assistant("fresh")];
+    assert(replayQuietShown(discarded, 0) is null);
+    assert(replayQuietShown(discarded, 2) is null);
+    assert(replayQuietShown(discarded, 4) == "fresh");
+
+    // A rejected segment prints nothing either.
+    auto rej = Message.auto_(wrapReminder("keep going"));
+    rej.stopBlocked = true;
+    auto blocked = [cut("lost "), cont, Message.assistant("draft"), rej, Message.assistant("final")];
+    assert(replayQuietShown(blocked, 0) is null);
+    assert(replayQuietShown(blocked, 2) is null, "a rejected draft stays hidden");
+    assert(replayQuietShown(blocked, 4) == "final");
+
+    // Plain turns and capped answers are unaffected.
+    auto plain = [Message.assistant("hi"), Message.assistant("bye")];
+    assert(replayQuietShown(plain, 0) == "hi" && replayQuietShown(plain, 1) == "bye");
+    auto capped = [cut("capped"), Message.user("next"), Message.assistant("ok")];
+    assert(replayQuietShown(capped, 0) == "capped");
+    assert(replayQuietShown(capped, 2) == "ok");
+}
+
+unittest
+{
+    import nano.agent : wrapReminder;
+    import std.json : JSONValue;
+    auto cont = Message.auto_(wrapReminder("cut off"));
+    cont.continuation = true;
+    Message cut(string text)
+    {
+        auto m = Message.assistant(text);
+        m.stopReason = "max_tokens";
+        return m;
+    }
+
+    // The cited sequence: a discarded chunk must not print; only the
+    // accepted answer shows.
+    auto call = Message.assistant("", [ToolCall.fromRaw("c1", "echo", `{}`)]);
+    assert(call.toolCalls.length == 1, "fromRaw builds the call");
+    auto msgs = [cut("lost "), cont, call, Message.toolResult("c1", "echo", "pong"), Message.assistant("fresh")];
+    assert(replayAnswerQuiet(msgs, 0) is null, "a chunk a tool call discarded is dropped");
+    assert(msgs.length == 5 && msgs[2].toolCalls.length == 1 && msgs[3].role == Role.tool, "the sequence's layout");
+    assert(replayAnswerQuiet(msgs, 2) is null, "an answer carrying tool calls stays hidden in quiet");
+    assert(replayAnswerQuiet(msgs, 4) == "fresh");
+
+    // A continuation that stood: a cut-off chunk resolves to the accepted
+    // answer from itself on (itself plus the later chunks of its segment);
+    // the segment's final chunk is its own text. replayTranscript prints the
+    // whole once, at the segment's first chunk, suppressing the rest.
+    auto ok = [cut("one "), cont, cut("two "), cont, Message.assistant("three")];
+    assert(replayAnswerQuiet(ok, 0) == "one two three", "ok0=" ~ replayAnswerQuiet(ok, 0));
+    assert(replayAnswerQuiet(ok, 2) == "two three", "ok2=" ~ replayAnswerQuiet(ok, 2));
+    assert(replayAnswerQuiet(ok, 4) == "three", "ok4=" ~ replayAnswerQuiet(ok, 4));
+
+    // A chunk the log cuts short on (crash before the reminder) shows: it
+    // was the turn's visible tail.
+    auto torn = [cut("half a file")];
+    assert(replayAnswerQuiet(torn, 0) == "half a file");
+
+    // A chunk a Stop-hook rejection supersedes is dropped.
+    auto rej = Message.auto_(wrapReminder("keep going"));
+    rej.stopBlocked = true;
+    auto blocked = [cut("lost "), cont, Message.assistant("draft"), rej, Message.assistant("final")];
+    assert(replayAnswerQuiet(blocked, 0) is null, "a chunk whose segment ends rejected is dropped");
+    assert(replayAnswerQuiet(blocked, 2) is null);
+    assert(replayAnswerQuiet(blocked, 4) == "final");
+
+    // A chunk a mid-turn steer supersedes is dropped too.
+    auto steer = Message.user("shorter");
+    steer.steered = true;
+    auto steered = [cut("lost "), cont, steer, Message.assistant("short")];
+    assert(replayAnswerQuiet(steered, 0) is null, "a chunk whose segment a steer cut short is dropped");
+    assert(replayAnswerQuiet(steered, 3) == "short");
+
+    // A system message between a chunk and its reminder (a compaction
+    // boundary) is skipped, as stopRejected skips it.
+    auto compacted = [cut("lost "), Message.system("summary"), cont, call, Message.assistant("fresh")];
+    assert(replayAnswerQuiet(compacted, 0) is null);
+    assert(replayAnswerQuiet(compacted, 4) == "fresh");
+
+    // Plain answers are unaffected: shown unless tool calls or a rejection.
+    auto plain = [Message.assistant("hi"), Message.assistant("bye")];
+    assert(replayAnswerQuiet(plain, 0) == "hi" && replayAnswerQuiet(plain, 1) == "bye");
+
+    // A capped answer (budget exhausted, no reminder) followed by a new
+    // prompt stood: it shows, single- and multi-chunk.
+    auto capped = [cut("capped"), Message.user("next"), Message.assistant("ok")];
+    assert(replayAnswerQuiet(capped, 0) == "capped", "a capped turn's answer stays after a new prompt");
+    auto capped2 = [cut("one "), cont, cut("two"), Message.user("next"), Message.assistant("ok")];
+    assert(replayAnswerQuiet(capped2, 0) == "one two", "a capped multi-chunk answer shows whole");
+    assert(replayAnswerQuiet(capped2, 2) == "two");
+    // A new prompt while a reminder awaits its reply still discards.
+    auto aborted = [cut("lost"), cont, Message.user("next"), Message.assistant("ok")];
+    assert(replayAnswerQuiet(aborted, 0) is null, "aborted0=[" ~ replayAnswerQuiet(aborted, 0) ~ "]");
+
+    // A timer firing during a continued answer keeps the retained prefix.
+    auto tick = Message.auto_(wrapReminder("timer"));
+    tick.timer = true;
+    auto timed = [cut("one "), cont, tick, Message.assistant("two")];
+    assert(replayAnswerQuiet(timed, 0) == "one two", "a timer during a continuation keeps the prefix");
+    auto timed2 = [cut("one "), tick, cont, Message.assistant("two")];
+    assert(replayAnswerQuiet(timed2, 0) == "one two", "a timer before the reminder is transparent");
+    auto timed3 = [cut("one "), cont, tick, cut("two "), cont, Message.assistant("three")];
+    assert(replayAnswerQuiet(timed3, 3) == "two three", "a timer before a continued chunk keeps it continued");
+
+    // Hook-only context (a resumed turn's SessionStart block) is model-only
+    // like a timer: it never printed live, so it is transparent — a resumed
+    // interrupted turn (`cut → reminder → hookContext → answer`) keeps the
+    // cutoff prefix its continuation stood on.
+    auto hook = Message.user(wrapReminder("session context"));
+    hook.hookContext = true;
+    auto hooked = [cut("one "), cont, hook, Message.assistant("two")];
+    assert(replayAnswerQuiet(hooked, 0) == "one two", "hook context between reminder and reply keeps the prefix");
+    assert(replayAnswerQuiet(hooked, 3) == "two");
+    auto hooked2 = [cut("one "), cont, hook, cut("two "), cont, Message.assistant("three")];
+    assert(replayAnswerQuiet(hooked2, 0) == "one two three", "hook context mid-segment keeps the segment");
+    assert(replayAnswerQuiet(hooked2, 3) == "two three");
+    assert(replayAnswerQuiet(hooked2, 5) == "three");
+}
+
+/// Rebuild the transcript of a loaded session on the frame (Rust
+/// `replay_history` in frame mode): the frame owns the screen, so without
+/// this a resumed or relaunched session opens with an empty transcript.
+/// Prompts, answers, tool calls and results show as they did live, stamped
+/// with their saved times; after a
+/// compaction the pre-compaction turns replay instead of the summary.
+void replayTranscript(Agent agent, Console console)
+{
+    auto msgs = agent.replayMessages;
+    // Each toolEnd would refresh the view (a token estimate over the whole
+    // conversation): quadratic on long sessions, so refresh once at the end.
+    auto after = console.afterStep;
+    console.afterStep = null;
+    scope (exit) { console.afterStep = after; if (after !is null) after(); }
+    // Batch status redraws until the final idle reset below.
+    const wasBatched = gStatusBatched;
+    gStatusBatched = true;
+    scope (exit) gStatusBatched = wasBatched;
+    // Tool calls whose header waits for its result, so each header shows
+    // directly above its own output (several calls in one message would
+    // otherwise stack every header above all the results).
+    size_t[2][] pending; // [message, call] index into msgs
+    void flushPending()
+    {
+        foreach (p; pending)
+        {
+            console.replayTime = msgs[p[0]].timestamp;
+            console.toolStart(msgs[p[0]].toolCalls[p[1]]);
+        }
+        pending = null;
+    }
+    scope (exit) console.replayTime = null;
+    foreach (i, ref m; msgs)
+    {
+        if (m.role != Role.tool) flushPending();
+        console.replayTime = m.timestamp;
+        final switch (m.role)
+        {
+        case Role.system: break;
+        case Role.user:
+        {
+            // A Stop hook's rejection printed live as a user message
+            // (`ev.userMessage(b.reason)`, agent.d): replay shows the reason
+            // the same way (quiet keeps it hidden), unwrapped from its
+            // reminder. New logs flag it `stopBlocked`; older logs have the
+            // unflagged automatic wrapped reminder `stopRejected` recognises.
+            if (rejectionAt(msgs, i))
+            {
+                auto reason = rejectionReason(m);
+                if (reason.strip.length) console.userMessage(sanitizeBlock(reason));
+                break;
+            }
+            // Model-only reminders (hook context, output-limit continuations,
+            // timer firings and nudges) were never typed by the user.
+            // Stop-hook reminders and idle-timer turns are autoInitiated.
+            if (m.hookContext || m.continuation || m.timer || m.autoInitiated) break;
+            // Hook context appended to the prompt was never shown live.
+            auto typed = m.pinText.length ? m.pinText : m.content;
+            // A steer rendered live through the shared user-message renderer
+            // (`↪`, hidden in quiet mode), not as a fresh `›` prompt.
+            if (m.steered) { if (typed.strip.length) console.userMessage(sanitizeBlock(typed)); break; }
+            if (typed.strip.length)
+                writeln(stampBlock(console.stamp(), console.bold("› ") ~ escapeMarks(sanitizeBlock(typed))));
+            break;
+        }
+        case Role.assistant:
+            // Escape literal markers before rendering, keeping the renderer's
+            // own soft-wrap / verbatim markers.
+            // Quiet mode shows only final answers live (no tool calls);
+            // an output-limit cut-off has no tool calls, so it stays — but
+            // only when its continuation stood: a chunk a later tool call
+            // or rejection discarded never printed live.
+            // A Stop hook rejecting the answer supersedes it: live quiet
+            // mode keeps only the answer that finally stood.
+            // Live quiet prints an accepted answer once, at turn end; replay
+            // prints it whole at the segment's first cut-off chunk (which
+            // accumulates the later chunks), suppressing every later chunk a
+            // reminder continues — their text is already in that whole.
+            const shown = console.quiet ? replayQuietShown(msgs, i) : m.content;
+            if (shown.strip.length) writeln(stampBlock(console.stamp(), console.display(escapeMarks(sanitizeBlock(shown))).stripRight));
+            foreach (j, ref c; m.toolCalls) pending ~= [i, j];
+            break;
+        case Role.tool:
+            foreach (k, p; pending)
+            {
+                auto c = msgs[p[0]].toolCalls[p[1]];
+                if (c.id != m.toolCallId) continue;
+                console.replayTime = msgs[p[0]].timestamp;
+                console.toolStart(c);
+                console.replayTime = m.timestamp;
+                console.toolEnd(c, toolResultDisplay(m.content, m.attachments), m.isError);
+                pending = pending[0 .. k] ~ pending[k + 1 .. $];
+                break;
+            }
+            break;
+        }
+    }
+    flushPending();
+    if (!agent.plan.empty && !console.quiet) writeln(escapeMarks(sanitizeBlock(planText(agent))));
+    // toolStart/toolEnd drive the live status; the replay leaves it idle
+    // (and this one redraw covers every batched change).
+    gStatusBatched = wasBatched;
+    updateStatus((ref Stats s) { s.activity = Activity.idle; s.tool = null; s.tokensPerSec = 0;
+        s.historySearches = s.historyReads = 0; });
+    stdOut.flush();
+}
+
+/// Whether the answer `msgs[i]` was superseded within its turn: the next
+/// non-system message is a Stop hook's rejection or a mid-turn steer. New
+/// logs flag both explicitly (`stop_blocked`, `steered`); for older logs, fall
+/// back to an unflagged automatic wrapped reminder (an idle timer turn's
+/// message is automatic but starts with the raw notice). System messages
+/// (e.g. a compaction summary between stash and conversation) are skipped.
+bool stopRejected(const Message[] msgs, size_t i) pure nothrow @nogc @safe
+{
+    import std.algorithm.searching : startsWith;
+    size_t k = i + 1;
+    while (k < msgs.length && msgs[k].role == Role.system) k++;
+    if (k >= msgs.length) return false;
+    return msgs[k].steered || rejectionAt(msgs, k);
+}
+
+/// Whether `msgs[i]` is a Stop hook's rejection of the answer before it:
+/// flagged `stop_blocked` in new logs; in older logs an unflagged automatic
+/// wrapped reminder (an idle timer turn's message is automatic but starts
+/// with the raw notice). The same shape `stopRejected` looks for one message
+/// later. A mid-turn steer supersedes too but is not a rejection: it shows
+/// through the steer path instead.
+/// The reason a Stop-hook rejection message carries, as printed live: the
+/// wrapped reminder unwrapped for both flagged and legacy (unflagged) logs,
+/// falling back to the raw content when it is not wrapped so nothing is lost.
+string rejectionReason(const ref Message m) @safe
+{
+    import nano.agent : unwrapReminder;
+    auto unwrapped = unwrapReminder(m.content);
+    return unwrapped !is null ? unwrapped : m.content;
+}
+
+unittest
+{
+    import nano.agent : wrapReminder;
+    auto legacy = Message.auto_(wrapReminder("keep going"));
+    assert(rejectionReason(legacy) == "keep going", "a legacy wrapped rejection is unwrapped");
+    auto flagged = Message.auto_(wrapReminder("multi\nline"));
+    flagged.stopBlocked = true;
+    assert(rejectionReason(flagged) == "multi\nline");
+    auto raw = Message.auto_("bare reason");
+    raw.stopBlocked = true;
+    assert(rejectionReason(raw) == "bare reason", "a flagged unwrapped message is not dropped");
+    // A malformed wrapper whose delimiters overlap at the newline passes both
+    // delimiter checks but cannot be sliced: the raw content is the reason.
+    auto malformed = Message.auto_("<system-reminder>\n</system-reminder>");
+    assert(rejectionReason(malformed) == "<system-reminder>\n</system-reminder>",
+        "an overlapping wrapper falls back to the raw reason");
+}
+
+bool rejectionAt(const Message[] msgs, size_t i) pure nothrow @nogc @safe
+{
+    import std.algorithm.searching : startsWith;
+    if (i >= msgs.length) return false;
+    const n = &msgs[i];
+    if (n.role != Role.user) return false;
+    if (n.stopBlocked) return true;
+    return n.autoInitiated && !n.steered && !n.continuation && !n.timer && !n.hookContext
+        && n.content.startsWith("<system-reminder>");
+}
+
+unittest
+{
+    import nano.agent : wrapReminder;
+    auto hook = Message.auto_(wrapReminder("keep going"));
+    auto cont = Message.auto_(wrapReminder("cut off"));
+    cont.continuation = true;
+    // Mid-turn timers are flagged `timer`; an idle timer turn's input isn't.
+    auto timerNew = Message.auto_(wrapReminder("Timer 1, set at 10:00, fired: check"));
+    timerNew.timer = true;
+    auto timerOld = Message.auto_("Timer 2, set at 10:00, fired: check");
+    auto msgs = [Message.assistant("first"), hook, Message.assistant("second"), cont, Message.assistant("third"),
+        timerNew, Message.assistant("fourth"), timerOld, Message.assistant("tail")];
+    assert(stopRejected(msgs, 0));
+    assert(!stopRejected(msgs, 2));
+    assert(!stopRejected(msgs, 4));
+    assert(!stopRejected(msgs, 6));
+    assert(!stopRejected(msgs, 8));
+    // An unflagged user message (a new turn) never supersedes; a flagged
+    // Stop-hook rejection does regardless of its content.
+    auto flagged = Message.auto_("reason");
+    flagged.stopBlocked = true;
+    auto turns = [Message.assistant("a1"), Message.user("<system-reminder>next"), Message.assistant("a2"),
+        flagged, Message.assistant("a3")];
+    assert(!stopRejected(turns, 0));
+    assert(stopRejected(turns, 2));
+    assert(!stopRejected(turns, 4));
+    // Answer -> mid-turn steer -> answer: only the final answer stands.
+    auto steer = Message.user("shorter");
+    steer.steered = true;
+    auto steered = [Message.assistant("a1"), steer, Message.assistant("a2")];
+    assert(stopRejected(steered, 0));
+    assert(!stopRejected(steered, 2));
+    // A compaction boundary inserts a system message between an answer and
+    // its rejection (or a steer): it is skipped.
+    auto compacted = [Message.assistant("a1"), Message.system("summary"), flagged, Message.assistant("a2"),
+        Message.system("summary"), steer, Message.assistant("a3"), Message.system("summary")];
+    assert(stopRejected(compacted, 0));
+    assert(stopRejected(compacted, 3));
+    assert(!stopRejected(compacted, 6));
+
+    // rejectionAt is the per-message shape stopRejected looks for one
+    // message later: a flagged rejection or a legacy unflagged automatic
+    // wrapped reminder. A steer supersedes but is not a rejection, and
+    // other automatic messages (continuation, timer, hook context) are not.
+    assert(rejectionAt(msgs, 1), "the legacy wrapped reminder is a rejection");
+    assert(rejectionAt(turns, 3), "a flagged rejection is one regardless of content");
+    assert(!rejectionAt(turns, 1), "a user-typed reminder lookalike is not");
+    assert(!rejectionAt(steered, 1), "a steer supersedes but is no rejection");
+    assert(!rejectionAt(msgs, 3), "a continuation reminder is not");
+    assert(!rejectionAt(msgs, 5), "a flagged timer is not");
+    assert(!rejectionAt(msgs, 7), "an idle timer turn's raw notice is not");
+    assert(!rejectionAt(msgs, 0), "an assistant message is not");
+    assert(!rejectionAt(msgs, msgs.length), "out of range is not");
+    auto hookCtx = Message.auto_(wrapReminder("session context"));
+    hookCtx.hookContext = true;
+    assert(!rejectionAt([hookCtx], 0), "hook context is not");
+}
+
+unittest
+{
+    import nano.agent : unwrapReminder, wrapReminder;
+    assert(unwrapReminder(wrapReminder("keep going")) == "keep going");
+    assert(unwrapReminder(wrapReminder("multi\nline\nreason")) == "multi\nline\nreason");
+    assert(unwrapReminder("plain") is null);
+    assert(unwrapReminder("<system-reminder>\nonly prefix") is null);
+    assert(unwrapReminder("") is null);
+    // A malformed wrapper whose delimiters overlap at the newline is not a
+    // wrapper: slicing it would invert the bounds, so it falls back to raw.
+    assert(unwrapReminder("<system-reminder>\n</system-reminder>") is null);
+    // The empty wrapper is the shortest valid one.
+    assert(unwrapReminder("<system-reminder>\n\n</system-reminder>") == "");
+}
+
 string planText(Agent agent) pure
 {
     return agent.plan.empty ? "No plan yet. The agent makes one with the plan_add tool."
@@ -1582,11 +2123,27 @@ string contextReport(Agent agent)
     out_ ~= format("Session:      %s input, %s output tokens", agent.sessionInputTokens, agent.sessionOutputTokens);
     if (agent.hasSessionAic) out_ ~= format("AI Credits:   %.2f used this session", agent.sessionAic);
     out_ ~= agent.autoCompact
-        ? format("Auto-compact: at %.0f%% (~%s tokens); compacted %s time(s)", agent.autoCompactThreshold * 100,
-            cast(size_t)(window * agent.autoCompactThreshold), agent.compactions)
+        ? format("Auto-compact: at %.0f%% (~%s tokens); compacted %s time(s)", agent.effectiveAutoCompactThreshold * 100,
+            imported!"std.conv".to!size_t(window * agent.effectiveAutoCompactThreshold), agent.compactions)
         : "Auto-compact: off";
     out_ ~= format("Compaction:   %s mode (/compact --smart or --standard overrides once)", modeName(agent.compactionMode));
     return out_.join("\n");
+}
+
+// A negative configured threshold is clamped for the report too: building
+// it (as refreshView does before every turn) must not throw on the token count.
+unittest
+{
+    import std.algorithm : canFind;
+    import nano.providers.mock : MockClient;
+    import nano.tools : ToolRegistry;
+    import nano.permissions : Policy;
+    auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "system");
+    agent.configuredWindow = 100_000;
+    agent.autoCompact = true;
+    agent.autoCompactThreshold = -0.5;
+    auto report = contextReport(agent);
+    assert(report.canFind("Auto-compact: at 10% (~10000 tokens)"), report);
 }
 
 /// The agent, for `main`'s exit (title requests may still be in flight).
@@ -1733,7 +2290,7 @@ int runMain(string[] args)
         // Before the agent exists, the policy it will be built with.
         immutable has = built.match!(a => a.policy.readDenyScan(getcwd(), scan),
             () => policy.readDenyScan(getcwd(), scan));
-        if (!has) return cast(bool delegate(string) @safe) null;
+        if (!has) return Denied.init;
         auto forRoot = scan.forRoot(root);
         return (string path) @safe => forRoot.denied(path);
     });
@@ -1929,8 +2486,11 @@ int runMain(string[] args)
     }
 
     /// Load a saved session into the agent: its conversation, plan and log.
-    void loadSession(string path)
+    /// Load a saved session; returns its diagnostics so a frame caller can
+    /// print them after clearing and replaying the transcript.
+    string[] loadSession(string path)
     {
+        string[] notes;
         // Lock the log first, then read the state the lock covers: a writer
         // finishing a turn while the lock wait blocks would otherwise be
         // adopted from a pre-turn snapshot and the turn re-run. A failure
@@ -1947,29 +2507,36 @@ int runMain(string[] args)
             scope (failure) if (!agent.ownsLog(incoming)) incoming.close();
             newLog = some(incoming);
             restored = restore(incoming.path);
-            auto notes = agent.loadRestored(restored, newLog);
-            foreach (note; notes)
-                stdErr.writeln("nano-coder: ignoring ", note);
+            foreach (note; agent.loadRestored(restored, newLog))
+                notes ~= "nano-coder: ignoring " ~ note;
         }
         else
         {
             restored = restore(path);
             foreach (note; agent.loadRestored(restored, newLog))
-                stdErr.writeln("nano-coder: ignoring ", note);
+                notes ~= "nano-coder: ignoring " ~ note;
         }
         updateStatus((ref Stats s) { s.historySearches = s.historyReads = 0; });
         if (!agent.timers.empty)
-            stdErr.writefln("%s timer%s still set (/timers lists them)", agent.timers.items.length,
+            notes ~= format("%s timer%s still set (/timers lists them)", agent.timers.items.length,
                 agent.timers.items.length == 1 ? "" : "s");
-        stdErr.writefln("resumed %s (%s messages)", restored.id, agent.messages.length - 1);
+        notes ~= format("resumed %s (%s messages)", restored.id, agent.messages.length - 1);
         if (restored.pendingInput.length)
-            stdErr.writefln("the last prompt never finished (the session was interrupted): %s",
+            notes ~= format("the last prompt never finished (the session was interrupted): %s",
                 oneLine(restored.pendingInput));
+        // Reading a long session's log parses every record of it (a log can
+        // run to hundreds of MB of superseded compaction snapshots); the
+        // agent keeps only the live state. Drop the parse and hand the freed
+        // heap back to the OS, or the GC keeps the load's peak for the
+        // life of the process.
+        restored = Restored.init;
+        releaseHeap();
+        return notes;
     }
 
     try
     {
-        if (o.hasResume) loadSession(findSession(sessionDir, o.resume, cwd));
+        if (o.hasResume) foreach (n; loadSession(findSession(sessionDir, o.resume, cwd))) stdErr.writeln(n);
         else if (!o.noSession)
         {
             auto log = new SessionLog(sessionDir, spec, cwd);
@@ -2118,14 +2685,14 @@ int runMain(string[] args)
         h.configPath = cfgPath;
         h.recents = () => recents.models;
         h.switchModel = (string spec) {
-            try { switchModel(spec); return cast(string) null; }
+            try { switchModel(spec); return string.init; }
             catch (Exception e) return e.msg;
         };
         h.listModels = (string name) => makeClient(resolve(cfg, name)).listModels();
         h.refreshSystem = () { agent.messages[0].content = systemFor(cwd, agent.promptPlan); };
         h.refreshClient = (string name) {
             import nano.settings : editRebuilds;
-            if (!editRebuilds(cfg, name, agent.client.providerName)) return cast(string) null;
+            if (!editRebuilds(cfg, name, agent.client.providerName)) return string.init;
             // The client's own provider was edited: keep its model. Otherwise the
             // configured model now resolves to the edited provider: build that.
             auto spec = agent.client.providerName == name ? name ~ "/" ~ agent.client.modelName : cfg.model;
@@ -2345,6 +2912,8 @@ int runMain(string[] args)
         banner ~= "Type /help for commands";
         writeln(stampBlock(console.stamp(), banner.join("\n")));
     }
+    // The frame owns the screen: rebuild a resumed session's transcript on it.
+    if (gFrame && o.hasResume) replayTranscript(agent, console);
     import core.time : MonoTime, msecs;
     import nano.lineedit : DoublePress, interruptWindowMs;
     auto exitPress = DoublePress(interruptWindowMs); // idle Ctrl-C twice exits
@@ -2711,8 +3280,12 @@ int runMain(string[] args)
                     try { validateId(id); path = nano.session.findSession(sessionDir, id); ok = path.isFile; }
                     catch (Exception) {} // an invalid ID or unreadable path is reported as "no saved session" just below
                     if (!ok) { writefln("No saved session %s: /resume without an ID lists them", JSONValue(id).jsonText); continue; }
-                    try loadSession(path);
+                    string[] loadNotes;
+                    try loadNotes = loadSession(path);
                     catch (Exception e) { writeln(e.msg); continue; }
+                    if (gFrame) { gFrame.clear(); replayTranscript(agent, console); }
+                    foreach (n; loadNotes) stdErr.writeln(n);
+                    stdErr.flush();
                     writefln("Resumed session %s (resume later with --resume %s)", id, id);
                     continue;
                 }

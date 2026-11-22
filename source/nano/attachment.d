@@ -15,6 +15,15 @@
 module nano.attachment;
 
 @safe:
+
+import std.bitmanip : nativeToBigEndian;
+
+import nano.arith : toSize;
+
+import std.conv : to;
+
+import std.string : representation;
+import nano.safeio : bytesOf, lossyText;
 import nano.clock : stdTimeNow;
 
 import nano.safeio : readBytes, readImmutableBytes;
@@ -35,11 +44,11 @@ enum ImageFormat { png, jpeg, gif, webp }
 Nullable!ImageFormat sniff(const(ubyte)[] b) pure
 {
     Nullable!ImageFormat r;
-    if (b.length >= 8 && b[0 .. 8] == cast(const(ubyte)[]) "\x89PNG\r\n\x1a\n") r = ImageFormat.png;
+    if (b.length >= 8 && b[0 .. 8] == "\x89PNG\r\n\x1a\n".representation) r = ImageFormat.png;
     else if (b.length >= 3 && b[0] == 0xff && b[1] == 0xd8 && b[2] == 0xff) r = ImageFormat.jpeg;
-    else if (b.length >= 6 && (b[0 .. 6] == cast(const(ubyte)[]) "GIF87a" || b[0 .. 6] == cast(const(ubyte)[]) "GIF89a"))
+    else if (b.length >= 6 && (b[0 .. 6] == "GIF87a".representation || b[0 .. 6] == "GIF89a".representation))
         r = ImageFormat.gif;
-    else if (b.length >= 12 && b[0 .. 4] == cast(const(ubyte)[]) "RIFF" && b[8 .. 12] == cast(const(ubyte)[]) "WEBP")
+    else if (b.length >= 12 && b[0 .. 4] == "RIFF".representation && b[8 .. 12] == "WEBP".representation)
         r = ImageFormat.webp;
     return r;
 }
@@ -90,7 +99,7 @@ uint[2] dimensions(const(ubyte)[] b)
     final switch (f.get)
     {
         case ImageFormat.png:
-            if (b.length < 24 || b[12 .. 16] != cast(const(ubyte)[]) "IHDR") throw new Exception("truncated PNG header");
+            if (b.length < 24 || b[12 .. 16] != "IHDR".representation) throw new Exception("truncated PNG header");
             return [be32(b, 16), be32(b, 20)];
         case ImageFormat.gif:
             if (b.length < 10) throw new Exception("truncated GIF header");
@@ -105,7 +114,7 @@ uint[2] dimensions(const(ubyte)[] b)
 private uint[2] webpDimensions(const(ubyte)[] b) pure
 {
     if (b.length < 30) throw new Exception("truncated WebP header");
-    auto chunk = (cast(const(char)[]) b[12 .. 16]).idup;
+    auto chunk = lossyText(b[12 .. 16]);
     if (chunk == "VP8X") return [le24(b, 24) + 1, le24(b, 27) + 1];
     if (chunk == "VP8L")
     {
@@ -167,7 +176,7 @@ uint exifOrientation(const(ubyte)[] b, ImageFormat f)
     if (f != ImageFormat.jpeg) return 1;
     uint result = 1;
     try jpegSegments(b, (ubyte m, const(ubyte)[] seg) {
-        if (m != 0xe1 || seg.length < 14 || seg[0 .. 6] != cast(const(ubyte)[]) "Exif\0\0") return false;
+        if (m != 0xe1 || seg.length < 14 || seg[0 .. 6] != "Exif\0\0".representation) return false;
         auto t = seg[6 .. $];
         bool le = t[0] == 'I';
         uint u16(size_t i) { return i + 2 <= t.length ? (le ? le16(t, i) : be16(t, i)) : 0; }
@@ -200,8 +209,8 @@ uint[2] scaledDimensions(uint w, uint h, uint maxDim) pure
     import std.math : round;
     auto longest = w > h ? w : h;
     if (longest <= maxDim) return [w, h];
-    double scale = cast(double) maxDim / longest;
-    uint nw = cast(uint) round(w * scale), nh = cast(uint) round(h * scale);
+    double scale = double(maxDim) / longest;
+    uint nw = round(w * scale).to!uint, nh = round(h * scale).to!uint;
     return [nw < 1 ? 1 : nw, nh < 1 ? 1 : nh];
 }
 
@@ -265,9 +274,9 @@ struct Attachment
         a.path = s("path");
         a.sha256 = s("sha256");
         a.extension = s("extension");
-        a.width = cast(uint) n("width");
-        a.height = cast(uint) n("height");
-        a.bytes = cast(size_t) n("bytes");
+        a.width = n("width").to!uint;
+        a.height = n("height").to!uint;
+        a.bytes = toSize(n("bytes"));
         return a;
     }
 }
@@ -488,8 +497,8 @@ version (unittest)
     /// A PNG header claiming `w`×`h`, padded to `size` bytes.
     immutable(ubyte)[] fakePng(uint w, uint h, size_t size = 64) pure
     {
-        ubyte[] b = cast(ubyte[]) "\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".dup;
-        foreach (v; [w, h]) b ~= [cast(ubyte)(v >> 24), cast(ubyte)(v >> 16), cast(ubyte)(v >> 8), cast(ubyte) v];
+        ubyte[] b = bytesOf("\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR");
+        foreach (v; [w, h]) b ~= nativeToBigEndian(v)[];
         while (b.length < size) b ~= 0;
         return b.idup;
     }
@@ -501,14 +510,18 @@ version (unittest)
         if (orientation)
         {
             // APP1: "Exif\0\0" + big-endian TIFF, IFD0 at 8 with one entry.
-            ubyte[] t = cast(ubyte[]) "MM\0\x2a\0\0\0\x08".dup;
-            t ~= cast(ubyte[]) [0, 1, 0x01, 0x12, 0, 3, 0, 0, 0, 1, 0, orientation, 0, 0, 0, 0, 0, 0];
-            ubyte[] seg = cast(ubyte[]) "Exif\0\0".dup ~ t;
+            ubyte[] t = bytesOf("MM\0\x2a\0\0\0\x08");
+            t ~= [0, 1, 0x01, 0x12, 0, 3, 0, 0, 0, 1, 0, orientation.to!ubyte, 0, 0, 0, 0, 0, 0];
+            ubyte[] seg = bytesOf("Exif\0\0") ~ t;
             auto len = seg.length + 2;
-            b ~= cast(ubyte[]) [0xff, 0xe1, len >> 8, len & 0xff];
+            b ~= [0xff, 0xe1];
+            b ~= nativeToBigEndian(len.to!ushort)[];
             b ~= seg;
         }
-        b ~= [0xff, 0xc0, 0, 11, 8, cast(ubyte)(h >> 8), cast(ubyte) h, cast(ubyte)(w >> 8), cast(ubyte) w, 1, 1, 0x11, 0];
+        b ~= [0xff, 0xc0, 0, 11, 8];
+        b ~= nativeToBigEndian(h.to!ushort)[];
+        b ~= nativeToBigEndian(w.to!ushort)[];
+        b ~= [1, 1, 0x11, 0];
         b ~= [0xff, 0xda, 0, 2, 0xff, 0xd9];
         return b.idup;
     }
@@ -521,18 +534,18 @@ unittest
 {
     assert(sniff(fakePng(1, 1)).get == ImageFormat.png);
     assert(sniff(fakeJpeg(1, 1)).get == ImageFormat.jpeg);
-    assert(sniff(cast(const(ubyte)[]) "GIF89a\x05\0\x07\0").get == ImageFormat.gif);
-    assert(sniff(cast(const(ubyte)[]) "hello").isNull);
+    assert(sniff("GIF89a\x05\0\x07\0".representation).get == ImageFormat.gif);
+    assert(sniff("hello".representation).isNull);
     assert(dimensions(fakePng(640, 480)) == [640, 480]);
-    assert(dimensions(cast(const(ubyte)[]) "GIF89a\x05\0\x07\0") == [5, 7]);
+    assert(dimensions("GIF89a\x05\0\x07\0".representation) == [5, 7]);
     assert(dimensions(fakeJpeg(300, 200)) == [300, 200]);
     // WebP extended: 24-bit width-1 / height-1 at 24 and 27.
-    ubyte[] webp = cast(ubyte[]) "RIFF\0\0\0\0WEBPVP8X\x0a\0\0\0\0\0\0\0".dup;
+    ubyte[] webp = bytesOf("RIFF\0\0\0\0WEBPVP8X\x0a\0\0\0\0\0\0\0");
     webp ~= cast(ubyte[]) [99, 0, 0, 49, 0, 0];
     assert(dimensions(webp) == [100, 50]);
     assert(exifOrientation(fakeJpeg(300, 200, 6), ImageFormat.jpeg) == 6);
     assert(exifOrientation(fakeJpeg(300, 200), ImageFormat.jpeg) == 1);
-    assert(sha256Hex(cast(const(ubyte)[]) "abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    assert(sha256Hex("abc".representation) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     assert(scaledDimensions(3000, 1500, 1568) == [1568, 784]);
 }
 
@@ -638,7 +651,7 @@ unittest
     };
     // GIF to a JPEG/PNG model: re-encoded as JPEG, stored as .jpg.
     srcW = 20; srcH = 20;
-    auto gif = cast(immutable(ubyte)[]) "GIF89a\x14\0\x14\0";
+    auto gif = "GIF89a\x14\0\x14\0".representation;
     ImageLimits jp = {acceptedMediaTypes: ["image/jpeg", "image/png"]};
     auto g = prepare(gif, ImageFormat.gif, jp, enc);
     assert(g.mediaType == "image/jpeg" && g.extension == "jpg" && sniff(g.bytes).get == ImageFormat.jpeg);
@@ -694,7 +707,7 @@ unittest
     assert(readForLimits(dir, small, tiny, enc).isNull);
 
     // A stricter media type re-encodes GIF into the accepted PNG.
-    auto gif = stored(cast(immutable(ubyte)[]) "GIF89a\x14\0\x14\0", "gif", "image/gif");
+    auto gif = stored("GIF89a\x14\0\x14\0".representation, "gif", "image/gif");
     ImageLimits pngOnly = {acceptedMediaTypes: ["image/png"]};
     auto r = readForLimits(dir, gif, pngOnly, enc);
     assert(!r.isNull && r.get.mediaType == "image/png" && sniff(Base64.decode(r.get.dataBase64)).get == ImageFormat.png);

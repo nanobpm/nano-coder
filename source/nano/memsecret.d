@@ -102,7 +102,7 @@ private bool endsWithCredentialLabel(string text) pure
         return true;
     if (words.length)
     {
-        auto w = words[$ - 1].filter!(c => c < 0x80 && isAlphaNum(cast(char) c)).to!string;
+        auto w = words[$ - 1].filter!(c => c < 0x80 && isAlphaNum(c)).to!string;
         if (["secret", "password", "passwd", "token", "credential", "credentials", "pass", "pwd", "passphrase"].canFind(w))
             return true;
     }
@@ -138,7 +138,7 @@ private bool isPlaceholder(string value) pure
 private bool isShellVarName(string name) pure
 {
     if (!name.length || !(isAlpha(name[0]) || name[0] == '_')) return false;
-    return name.all!(c => c < 0x80 && (isAlphaNum(cast(char) c) || c == '_'));
+    return name.all!(c => c < 0x80 && (isAlphaNum(c) || c == '_'));
 }
 
 private bool isMask(string s) pure
@@ -230,9 +230,9 @@ private string percentDecodeLossy(string s) pure
         {
             int hex(char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; }
             auto hi = hex(s[i + 1]), lo = hex(s[i + 2]);
-            if (hi >= 0 && lo >= 0) { out_ ~= cast(ubyte)(hi * 16 + lo); i += 3; continue; }
+            if (hi >= 0 && lo >= 0) { out_ ~= (hi * 16 + lo).to!ubyte; i += 3; continue; }
         }
-        out_ ~= cast(ubyte) s[i++];
+        out_ ~= s[i++];
     }
     return lossyUtf8(out_);
 }
@@ -243,13 +243,13 @@ private bool isCredentialQueryKey(string key) pure
     static immutable affix = ["token", "secret", "auth"];
     static immutable whole = ["auth", "authorization", "authz", "token", "secret"];
     static immutable short_ = ["key", "sig", "pat", "sso", "pass", "passphrase"];
-    auto k = key.filter!(c => c < 0x80 && isAlphaNum(cast(char) c)).to!string.toLower;
+    auto k = key.filter!(c => c < 0x80 && isAlphaNum(c)).to!string.toLower;
     if (substr.any!(n => k.canFind(n))) return true;
     if (short_.canFind(k)) return true;
     foreach (segment; key.toLower.split!(c => c == '-' || c == '_' || c == '.'))
     {
         if (!segment.length) continue;
-        auto seg = segment.filter!(c => c < 0x80 && isAlphaNum(cast(char) c)).to!string;
+        auto seg = segment.filter!(c => c < 0x80 && isAlphaNum(c)).to!string;
         if (whole.canFind(seg) || short_.canFind(seg)) return true;
         foreach (n; affix)
         {

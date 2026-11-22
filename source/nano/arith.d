@@ -62,6 +62,21 @@ size_t checkedAdd(size_t a, size_t b) pure nothrow @nogc
     return r;
 }
 
+/// `a + b`, or `size_t.max` when that overflows (Rust's `saturating_add`).
+///
+/// For totals fed by outside numbers — a provider's reported token usage, a
+/// stored count read back from a file — where clamping to the largest
+/// representable size keeps a downstream "is the context too big?" check
+/// conservative, while halting would let a malformed report crash a
+/// successful operation's bookkeeping.
+size_t saturatingAdd(size_t a, size_t b) pure nothrow @nogc
+{
+    import core.checkedint : addu;
+    bool overflow;
+    auto r = addu(a, b, overflow);
+    return overflow ? size_t.max : r;
+}
+
 /// `a * b`; halts on overflow.
 size_t checkedMul(size_t a, size_t b) pure nothrow @nogc
 {
@@ -87,6 +102,9 @@ unittest
     assert(checkedSub(10, 3) == 7);
     assert(checkedSub(4, 4) == 0);
     assert(checkedAdd(size_t.max - 1, 1) == size_t.max);
+    assert(saturatingAdd(size_t.max - 1, 1) == size_t.max);
+    assert(saturatingAdd(size_t.max, 1) == size_t.max);
+    assert(saturatingAdd(3, 4) == 7);
     assert(checkedMul(1 << 20, 1 << 10) == 1 << 30);
 }
 
@@ -101,5 +119,62 @@ unittest
     static assert(!__traits(compiles, { enum x = checkedMul(size_t.max / 2 + 1, 2); }));
     static assert(__traits(compiles, { enum x = checkedSub(4, 3); }));
     static assert(__traits(compiles, { enum x = checkedAdd(1, 2); }));
+    static assert(__traits(compiles, { enum x = saturatingAdd(size_t.max, 1); }));
+    static assert(saturatingAdd(size_t.max, 1) == size_t.max);
     static assert(__traits(compiles, { enum x = checkedMul(3, 2); }));
+}
+
+/// A count or index from outside (JSON, config, a file) as a `size_t`:
+/// throws `ConvException` when it is negative (or, for `ulong` on 32-bit,
+/// too large), so bad input fails where it enters instead of wrapping to an
+/// enormous size downstream.
+size_t toSize(T)(T v) if (isIntegral!T)
+{
+    import std.conv : to;
+    return v.to!size_t;
+}
+
+/// `toSize` without throwing: `none` when `v` doesn't fit.
+auto trySize(T)(T v) nothrow @nogc if (isIntegral!T)
+{
+    import nano.option : Option, some, none;
+    static if (isSigned!T) if (v < 0) return Option!size_t(none);
+    static if (T.max > size_t.max) if (v > size_t.max) return Option!size_t(none);
+    return some(size_t(v));
+}
+
+/// A length as a `long`, for arithmetic that may go negative. Halts if it
+/// doesn't fit (a length over 2^63 is a broken invariant, not input).
+long toLong(size_t v) nothrow @nogc
+{
+    if (v > long.max) assert(0, "length overflow");
+    return long(v);
+}
+
+/// An external count (a provider's context window or output cap) as a
+/// `long`, saturating at `long.max`: oversized input is clamped, not fatal.
+long clampToLong(size_t v) pure nothrow @nogc @safe
+{
+    return v > long.max ? long.max : long(v);
+}
+
+unittest
+{
+    assert(clampToLong(size_t(9)) == 9);
+    assert(clampToLong(size_t.max) == long.max);
+    assert(clampToLong(size_t(long.max)) == long.max);
+}
+
+unittest
+{
+    import std.conv : ConvException;
+    import nano.option : orElse;
+    import std.exception : assertThrown;
+    assert(toSize(5L) == 5);
+    assert(toSize(0) == 0);
+    assertThrown!ConvException(toSize(-1L));
+    assert(trySize(7L).orElse(size_t(0)) == 7);
+    assert(trySize(-7L).isNone);
+    assert(toLong(size_t(9)) == 9);
+    static assert(!__traits(compiles, { enum x = toLong(size_t.max); }));
 }
