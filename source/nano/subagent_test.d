@@ -101,6 +101,9 @@ final class Scripts : SubClientFactory
                     s ~= LLMResponse(i == 0 ? "partial: looked at a.d:1" : "", "",
                         [ToolCall.fromRaw("g", "grep", JSONValue(["pattern": JSONValue(i)]).toString)]);
                 return new MockClient(s);
+            case "mock/after":
+                return new MockClient([LLMResponse("", "", [ToolCall.fromRaw("g", "grep", `{"pattern":"after-edit"}`)]),
+                    report("saw the edit")]);
             case "mock/nested":
                 return new MockClient([LLMResponse("", "", [ToolCall.fromRaw("a", "agent", `{"task":"deeper"}`)]),
                     report("no nesting")]);
@@ -120,6 +123,8 @@ final class Fixture
     Agent agent;
     MockClient parent;
     string[] grepped, bashed;
+    /// Every grep and bash, in the order they ran.
+    string[] order;
     string dir;
 
     this(LLMResponse[] script, Policy policy = Policy.init)
@@ -128,11 +133,13 @@ final class Fixture
         auto reg = new ToolRegistry;
         reg.register(ToolDefinition("grep", "search", parseJSON(`{"type":"object"}`)), (JSONValue a) {
             grepped ~= a["pattern"].toString;
+            order ~= "grep " ~ a["pattern"].str;
             if (a["pattern"].toString == `"trigger-cancel"`) agent.control.cancel();
             return "src/p.d:12: parse()";
         });
         reg.register(ToolDefinition("bash", "run", parseJSON(`{"type":"object"}`)), (JSONValue a) {
             bashed ~= a["command"].str;
+            order ~= "bash " ~ a["command"].str;
             if (a["command"].str == "trigger-cancel") agent.control.cancel();
             return "ok";
         });
@@ -526,4 +533,40 @@ unittest
     auto second = buildPath(childDir, "sub-c-2.jsonl");
     assert(second.exists, "the reused id got a fresh filename: " ~ second);
     assert(readText(second).canFind("first child"), "the new child's transcript");
+}
+
+// A mutation between two `agent` calls is a barrier: the second child does
+// not start (so none of its reads run) until the edit ran, even while the
+// parent waits on the first child.
+unittest
+{
+    auto f = new Fixture([LLMResponse("", "", [ToolCall.fromRaw("a1", "agent", agentCall("first", "mock/search")),
+        ToolCall.fromRaw("e", "bash", `{"command":"edit"}`),
+        ToolCall.fromRaw("a2", "agent", agentCall("second", "mock/after"))]), LLMResponse("ok")]);
+    assert(f.agent.run("go", new NullEvents) == "ok");
+    import std.algorithm : countUntil;
+    auto edit = f.order.countUntil("bash edit"), read = f.order.countUntil("grep after-edit");
+    assert(edit >= 0 && read > edit, "the second child read before the edit");
+    assert(f.toolResult("a2").canFind("saw the edit"));
+}
+
+// With a concurrency cap of one, the report that shows a child finishing
+// also shows its replacement running (it has a live row from the start).
+unittest
+{
+    import nano.subagent : SubProgress;
+    final class Seen : NullEvents
+    {
+        SubProgress[][] reports;
+        override void subagents(const(SubProgress)[] all) { reports ~= all.dup; }
+    }
+    auto f = new Fixture([LLMResponse("", "", [ToolCall.fromRaw("q1", "agent", agentCall("1", "mock/parallel")),
+        ToolCall.fromRaw("q2", "agent", agentCall("2", "mock/parallel"))]), LLMResponse("ok")]);
+    f.agent.subagentMaxConcurrency = 1;
+    auto ev = new Seen;
+    assert(f.agent.run("go", ev) == "ok");
+    bool together;
+    foreach (r; ev.reports)
+        if (r.canFind!(p => p.callId == "q1" && p.done) && r.canFind!(p => p.callId == "q2" && !p.done)) together = true;
+    assert(together, "the replacement was started after the report");
 }

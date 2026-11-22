@@ -986,7 +986,19 @@ string frameStatus(size_t width)
     auto stats = gStats.get;
     import nano.frame : fit;
     string rows;
-    foreach (l; stats.subagents) rows ~= fit("\x1b[2m  " ~ l ~ "\x1b[0m", width ? width : 1) ~ "\n";
+    if (stats.subagents.length)
+    {
+        import nano.subagent : progressLine;
+        import nano.trajectory : terminalSafe;
+        // Formatted now, not when the child last reported: the elapsed time
+        // moves during a long model request that sends no progress.
+        auto now = monoNow;
+        foreach (ref l; stats.subagents)
+        {
+            auto p = l.at(now);
+            rows ~= fit("\x1b[2m  " ~ terminalSafe(progressLine(p)) ~ "\x1b[0m", width ? width : 1) ~ "\n";
+        }
+    }
     return rows ~ renderStatus(stats, width);
 }
 
@@ -1331,26 +1343,27 @@ class Console : AgentEvents
         stdOut.flush();
     }
 
-    private string[string] subRows;
+    private imported!"nano.status".LiveSubagent[string] subRows;
     /// Sub-agents: a live row per running one (above the status bar); each prints a
     /// line when it finishes (the `agent` result follows in call order).
     void subagents(const imported!"nano.subagent".SubProgress[] all)
     {
         import nano.subagent : progressLine;
         import nano.trajectory : terminalSafe;
+        import nano.status : LiveSubagent;
         // Rows for the running ones (frame renderer), kept by call id; a
         // finished one collapses to its line in the transcript.
         foreach (ref p; all)
         {
             string id = p.callId;
             if (p.done) subRows.remove(id);
-            else subRows[id] = progressLine(p);
+            else subRows[id] = LiveSubagent(p, monoNow);
         }
         import std.algorithm : sort;
-        string[] rows;
-        foreach (id; subRows.keys.sort) rows ~= terminalSafe(subRows[id]);
+        immutable(LiveSubagent)[] rows;
+        foreach (id; subRows.keys.sort) rows ~= subRows[id];
         auto label = rows.length ? format("agent ×%s", rows.length) : "agent";
-        updateStatus((ref Stats s) { s.tool = label; s.subagents = rows.idup; });
+        updateStatus((ref Stats s) { s.tool = label; s.subagents = rows; });
         if (quiet) return;
         foreach (ref p; all)
             if (p.done)

@@ -492,7 +492,8 @@ since it was indexed, is summarized from its log again, and deleting the file re
 **Sub-agents.** The `agent` tool hands a broad, read-only investigation (`task`) to a fresh agent
 with its own context window; only its report (with `file:line` citations and its turns, tokens and
 time) comes back. Several `agent` calls in one reply run in parallel, up to
-`subagent_max_concurrency`. A sub-agent has `read_file`, `grep` and `glob` (no shell, so it cannot change files); every call goes
+`subagent_max_concurrency`; a call that can change files (an edit, `bash`) between them is a barrier,
+so an `agent` call after it starts only once the change is made. A sub-agent has `read_file`, `grep` and `glob` (no shell, so it cannot change files); every call goes
 through this session's permission policy and hooks (a denied call is an error for the sub-agent, it
 never prompts), Esc/Ctrl-C stops it, and its usage counts toward the session's. Its log is written
 next to the session's (`<session>/sub-<call id>.jsonl`), referenced from the `agent` result, and

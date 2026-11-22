@@ -85,6 +85,12 @@ interface AgentEvents
     /// listed once, as they finish. Renderers that show progress override
     /// this; events classes that don't care mix in `AgentEventDefaults`.
     void subagents(const(SubProgress)[] all);
+    /// A compaction's summary request (a model call that is not a turn's
+    /// generation) is about to start. A sub-agent counts it toward its
+    /// budget without spending its one reporting-grace call on it
+    /// (nano.subagent.ChildEvents); everyone else treats it as a
+    /// generation (`AgentEventDefaults`).
+    void summaryStart();
 }
 
 /// No-op defaults for the `AgentEvents` members an events class need not
@@ -94,6 +100,7 @@ mixin template AgentEventDefaults()
 {
     void beforeFreshCall() {}
     void subagents(const imported!"nano.subagent".SubProgress[] all) {}
+    void summaryStart() { generationStart(); }
 }
 
 /// Wrap text the model should read as a system note, not user words.
@@ -875,14 +882,20 @@ class Agent
     private Event runToolCalls(const ref LLMResponse r, AgentEvents ev, ref string loopStop)
     {
         loopStop = null;
-        // The reply's `agent` calls start together (up to the concurrency
-        // cap); each result is taken in order below.
+        // The `agent` calls of each barrier-free stretch of the reply start
+        // together (up to the concurrency cap) when the loop reaches the
+        // stretch; each result is taken in order below. A child never
+        // starts before an earlier mutation, so "agent, edit, agent" has
+        // the second child read the edit.
         // Guard first: a failed launch still stops children already started.
         scope (exit) finishSubagents();
-        launchSubagents(r, ev);
+        resetSubagents(ev);
         auto calls = r.toolCalls;
         for (size_t i = 0; i < calls.length;)
         {
+            if (subagentsEnabled && calls[i].name == subToolName && (calls[i].id in subGates) is null
+                && loopStop is null)
+                launchSubagents(r, i);
             size_t j = i;
             while (j < calls.length && concurrentEligible(calls[j].name)) j++;
             if (j > i + 1 && !control.isCancelled && loopStop is null)
@@ -1673,7 +1686,7 @@ class Agent
                 // A compaction is a model call too: a sub-agent's budget
                 // counts it (its turn cap and token cap), so emit the same
                 // events a turn's call does.
-                foreach (e; ev) e.generationStart();
+                foreach (e; ev) e.summaryStart();
                 auto r = client.chat(req, (bool, string) {});
                 summaryMs = since(swStart).total!"msecs";
                 summaryUsage = r.usage;
@@ -2078,23 +2091,42 @@ class Agent
 
     bool subagentsEnabled() pure const { return subagentClients.get !is null; }
 
-    /// Check and start the `agent` calls in `r` (the rest wait for a slot).
-    private void launchSubagents(const ref LLMResponse r, AgentEvents ev)
+    /// Clear the previous reply's sub-agent state before a reply's tools run.
+    private void resetSubagents(AgentEvents ev)
     {
-        import nano.subagent : parseArgs, systemPrompt, encodeDefinition, forwardable;
-        import std.file : getcwd;
-        import std.path : stripExtension;
         subSlots = null;
         subGates = null;
         subLogs = null;
         subRunning = 0;
+        subUp = Chan!SubMsg.init;
         subEvents = some(ev);
+    }
+
+    /// Where the barrier-free stretch of `calls` starting at `from` ends:
+    /// the first call that is neither an `agent` call nor eligible to run
+    /// beside reads (an edit, bash, a hooked call ...).
+    private size_t subSegmentEnd(const(ToolCall)[] calls, size_t from)
+    {
+        auto j = from;
+        while (j < calls.length && (calls[j].name == subToolName || concurrentEligible(calls[j].name))) j++;
+        return j;
+    }
+
+    /// Check and start the `agent` calls in the barrier-free stretch of `r`
+    /// that begins at call `from` (the rest wait for a slot). Later
+    /// stretches launch when the loop reaches them, after the mutations
+    /// between.
+    private void launchSubagents(const ref LLMResponse r, size_t from)
+    {
+        import nano.subagent : parseArgs, systemPrompt, encodeDefinition, forwardable;
+        import std.file : getcwd;
+        import std.path : stripExtension;
         if (!subagentsEnabled) return;
         string cwd;
         immutable(string)[] defs;
-        foreach (call; r.toolCalls)
+        foreach (call; r.toolCalls[from .. subSegmentEnd(r.toolCalls, from)])
         {
-            if (call.name != subToolName || control.isCancelled) continue;
+            if (call.name != subToolName || control.isCancelled || (call.id in subGates) !is null) continue;
             // An invalid call is reported by runTool, as for any tool.
             if (call.rawArgumentsError(r.stopReason)) continue;
             SubGate g;
@@ -2126,14 +2158,15 @@ class Agent
             subGates[call.id] = g;
         }
         if (!subSlots.length) return;
-        subUp = Chan!SubMsg.make;
-        startSubagents();
-        reportSubagents();
+        if (!subUp) subUp = Chan!SubMsg.make;
+        if (startSubagents()) reportSubagents();
     }
 
     /// Start waiting sub-agents while there is room (none once cancelled).
-    private void startSubagents()
+    /// True when one started (the caller reports it).
+    private bool startSubagents()
     {
+        bool any;
         import nano.safeio : spawn;
         import nano.subagent : runChild;
         auto cap = subagentMaxConcurrency ? subagentMaxConcurrency : 1;
@@ -2156,7 +2189,9 @@ class Agent
             subSlots[i].started = true;
             subSlots[i].start = monoNow;
             subRunning++;
+            any = true;
         }
+        return any;
     }
 
     /// Handle one message from a running sub-agent: run its tool call
@@ -2233,8 +2268,11 @@ class Agent
                 subRunning--;
                 // Usage rolls up into this session's totals (status line, /cost).
                 recordUsage(subSlots[i].result.usage);
-                reportSubagents();
+                // Start the replacements first, so the one report shows
+                // them running (a child sends no progress during its first
+                // model request).
                 startSubagents();
+                reportSubagents();
                 break;
         }
     }
@@ -2247,7 +2285,7 @@ class Agent
         auto i = gate.slot;
         while (!subSlots[i].finished)
         {
-            if (!subSlots[i].started) startSubagents();
+            if (!subSlots[i].started && startSubagents()) reportSubagents();
             if (!subSlots[i].finished && subRunning) pumpSubagents();
         }
         auto res = subSlots[i].result;

@@ -363,6 +363,18 @@ private final class ChildEvents : imported!"nano.agent".AgentEvents
         generations++;
     }
 
+    /// A compaction's summary call: counted toward the budget like any model
+    /// call, but it does not spend the reporting grace (it carries no
+    /// tools, so the child could not report in it). Once the grace call
+    /// has gone out, nothing more runs.
+    void summaryStart()
+    {
+        if (abort.aborted) throw new SubStop("stopped by the parent");
+        checkLimits();
+        if (limitHit !is null && gensSinceLimit >= 1) throw new SubStop(limitHit);
+        generations++;
+    }
+
     /// Before a fresh call's steers drain and its request is built (the
     /// agent calls this from its CallModel step): a limit first seen now
     /// still gets its reminder into the grace request.
@@ -375,6 +387,31 @@ private final class ChildEvents : imported!"nano.agent".AgentEvents
 
     /// A child's own progress is reported through its channel, not rendered.
     void subagents(const(SubProgress)[] all) {}
+}
+
+// A compaction needed after the limit does not spend the reporting grace:
+// the summary call counts toward the budget, the following tool-enabled
+// call still runs, and only the one after that stops the child.
+unittest
+{
+    SubLimits lim;
+    lim.turns = 1;
+    immutable spec = SubSpec(0, "c", "t", "m", "s", null, lim);
+    auto st = new ChildEvents(spec, Chan!SubMsg.make, Chan!ToolReply.make, SubAbort.make);
+    st.generationStart(); // the one allowed call
+    st.beforeFreshCall();
+    assert(st.limitHit !is null);
+    st.summaryStart(); // compaction before the grace call
+    assert(st.generations == 2, "the summary counts toward the budget");
+    st.generationStart(); // the grace call, still available
+    bool stopped;
+    try st.summaryStart();
+    catch (SubStop) stopped = true;
+    assert(stopped, "no more model calls after the grace call");
+    stopped = false;
+    try st.generationStart();
+    catch (SubStop) stopped = true;
+    assert(stopped);
 }
 
 /// The text of the child's latest assistant reply, for a partial report.

@@ -60,16 +60,14 @@ bool cancelRequested() @safe nothrow @nogc
     return atomicLoad(gCancel);
 }
 
-/// Poll `scope_` first on this thread until `popCancelScope`. The pointee
-/// must outlive the pop (the child's abort cell does).
-void pushCancelScope(scope shared(bool)* scope_) @safe nothrow @nogc
+/// Poll `scope_` first on this thread until `popCancelScope`. The
+/// parameter is escaping (not `scope`), so DIP1000 rejects a pointer to a
+/// stack local from a `@safe` caller: only a GC-owned flag (the child's
+/// abort cell) can be installed, and it lives as long as the slot does.
+void pushCancelScope(shared(bool)* scope_) @safe nothrow @nogc
 {
     if (cancelScopeDepth >= cancelScopes.length) return; // deeper than ever nested: fall back to the global flag
-    // `@trusted`: the pointer is `shared`, so no thread-local aliasing
-    // escapes; the slot is this thread's own and is cleared by
-    // `popCancelScope` before the pointee can die (the child's abort cell
-    // outlives its run, which the scope wraps).
-    () @trusted { cancelScopes[cancelScopeDepth] = scope_; }();
+    cancelScopes[cancelScopeDepth] = scope_;
     cancelScopeDepth++;
 }
 
@@ -91,12 +89,14 @@ unittest
 {
     import core.atomic : atomicLoad, atomicStore;
     assert(!cancelRequested);
-    shared bool hit;
-    pushCancelScope(&hit);
+    auto hit = new shared bool;
+    pushCancelScope(hit);
     assert(!cancelRequested);
-    atomicStore(hit, true);
+    atomicStore(*hit, true);
     assert(cancelRequested);
     popCancelScope();
+    // A stack flag cannot be installed: the parameter escapes.
+    static assert(!__traits(compiles, () @safe { shared bool local; pushCancelScope(&local); }));
     assert(!cancelRequested);
     // A null slot falls back to the flag.
     pushCancelScope(null);

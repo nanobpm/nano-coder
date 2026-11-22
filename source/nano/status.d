@@ -40,11 +40,41 @@ struct Stats
     uint compactions;
     Activity activity;
     string tool; /// the running tool (activity == tool)
-    /// One live line per running sub-agent (shown above the status bar).
-    immutable(string)[] subagents;
+    /// One live row per running sub-agent (shown above the status bar);
+    /// the line is formatted at each redraw so its elapsed time keeps
+    /// moving between the child's events.
+    immutable(LiveSubagent)[] subagents;
     double tokensPerSec = 0; /// live output rate (0: none)
 
     double percent() pure const { return window == 0 ? 0.0 : tokens * 100.0 / window; }
+}
+
+/// A running sub-agent's last progress and when it arrived: the row's
+/// elapsed time is `progress.elapsed` plus the time since `seen`.
+struct LiveSubagent
+{
+    imported!"nano.subagent".SubProgress progress;
+    imported!"core.time".MonoTime seen;
+
+    /// The progress as of `now`.
+    imported!"nano.subagent".SubProgress at(imported!"core.time".MonoTime now) const pure nothrow @nogc
+    {
+        imported!"nano.subagent".SubProgress p = progress;
+        if (now > seen) p.elapsed += now - seen;
+        return p;
+    }
+}
+
+unittest
+{
+    import core.time : MonoTime, seconds;
+    import nano.subagent : SubProgress;
+    auto t0 = MonoTime.zero + 100.seconds;
+    SubProgress p;
+    p.elapsed = 2.seconds;
+    auto row = LiveSubagent(p, t0);
+    assert(row.at(t0 + 30.seconds).elapsed == 32.seconds, "elapsed keeps moving between events");
+    assert(row.at(t0).elapsed == 2.seconds);
 }
 
 /// `12.3 tok/s` / `45 tok/s`.
