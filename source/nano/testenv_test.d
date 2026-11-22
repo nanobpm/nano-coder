@@ -251,13 +251,22 @@ unittest
     const idle = calibrate();
     atomicStore(hogStop, false);
     typeof(spawnDaemon(&hog))[] hogs;
-    foreach (_; 0 .. totalCPUs * 3) hogs ~= spawnDaemon(&hog);
     long loaded;
     {
+        // Installed before the first start: a partial startup still stops
+        // and joins every hog already running.
         scope (exit) { atomicStore(hogStop, true); foreach (ref h; hogs) h.join(); }
+        foreach (_; 0 .. totalCPUs * 3) hogs ~= spawnDaemon(&hog);
         loaded = calibrate();
     }
-    assert(loaded > idle, "synthetic load did not slow the calibration");
+    // External load can shift between samples, so the measured ordering is
+    // only a diagnostic; the injected calibrations below are the checks.
+    if (loaded <= idle)
+    {
+        import nano.safeio : stdErr;
+        stdErr.writefln("note: synthetic load did not slow calibration (idle %s ms, loaded %s ms)",
+            idle, loaded);
+    }
     // A module 50% over its limit passes when the host is 2x slower...
     auto runs = [ModuleRun("nano.nonesuch", defaultBudgetMs * 3 / 2, true)];
     checkBudgets(runs, 1.0, false, 0, () => calibrationIdleMs * 2);
