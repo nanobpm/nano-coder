@@ -252,6 +252,13 @@ unittest
     auto plain = load(parentLog).toPlain;
     assert(plain.canFind("sub-agent log: " ~ child) && plain.canFind("│") && plain.canFind("forbidden-cmd"), plain);
     assert(load(parentLog).toJson.canFind(`"sub_rows"`));
+    // After session tidying compresses the child log, the reference (still
+    // the .jsonl path) resolves to the archive.
+    import nano.session : gzipLog;
+    import std.file : write, remove;
+    write(child ~ ".gz", gzipLog(readText(child)));
+    remove(child);
+    assert(load(parentLog).toPlain.canFind("forbidden-cmd"), "compressed child rows still expand");
 }
 
 // Limits: past its turn cap the child gets one more call to report, then
@@ -354,4 +361,76 @@ unittest
     f.agent.subagentLimits = lim;
     assert(f.agent.run("go", new NullEvents) == "ok");
     assert(f.toolResult("t").canFind("[truncated: token limit (100 tokens)"), f.toolResult("t"));
+}
+
+/// A child model that reads `target`, then reports the read's result text
+/// verbatim, so a test can see what the parent answered.
+final class ReadEcho : MockClient
+{
+    this(string target)
+    {
+        super([LLMResponse("", "", [ToolCall.fromRaw("r", "read_file", JSONValue(["path": target]).toString)])]);
+    }
+
+    override LLMResponse chat(const ref ChatRequest req, StreamSink sink)
+    {
+        if (script.length) return super.chat(req, sink);
+        string last;
+        foreach (ref m; req.messages) if (m.role == Role.tool) last = m.content;
+        return report("READ: " ~ last);
+    }
+}
+
+/// Runs one parent turn whose single `agent` call has a ReadEcho child read
+/// `target` under `policy`; returns the child's report.
+string childReadReport(string target, Policy policy)
+{
+    final class EchoFactory : SubClientFactory
+    {
+        string t;
+        this(string t) immutable { this.t = t; }
+        LLMClient make(string spec) const { return new ReadEcho(t); }
+        void configure(Agent a, string spec) const {}
+    }
+    import nano.tools.files : registerFiles = register, ReadState;
+    auto reg = new ToolRegistry;
+    registerFiles(reg, new ReadState);
+    auto parent = new MockClient([LLMResponse("", "", [ToolCall.fromRaw("c", "agent",
+        `{"task":"read it","model":"mock/read"}`)]), LLMResponse("done")]);
+    auto agent = new Agent(parent, reg, policy, "sys");
+    agent.subagentClients = new immutable EchoFactory(target);
+    agent.run("go", new NullEvents);
+    return toolResultText(agent, "c");
+}
+
+// A child's read_file goes through the parent's permission rules: a path the
+// parent denies is refused for the child too (review round 5).
+unittest
+{
+    import std.conv : to;
+    import std.file : mkdirRecurse, write;
+    auto dir = buildPath(tempDir, "nano-sub-readdeny-" ~ monoNow.ticks.to!string);
+    mkdirRecurse(dir);
+    scope (exit) if (dir.exists) rmdirRecurse(dir);
+    auto secret = buildPath(dir, ".env");
+    write(secret, "TOKEN=hunter2\n");
+    Policy p;
+    p.deny ~= parseRule("Read(**/.env)");
+    auto r = childReadReport(secret, p);
+    assert(r.canFind("READ: ") && !r.canFind("hunter2"), r);
+    // Without the rule the same read succeeds.
+    assert(childReadReport(secret, Policy.init).canFind("hunter2"));
+}
+
+// An ordinary I/O failure in a child's read still answers the child (it must
+// not block waiting for a reply): a directory is not a readable file.
+unittest
+{
+    import std.conv : to;
+    import std.file : mkdirRecurse;
+    auto dir = buildPath(tempDir, "nano-sub-readerr-" ~ monoNow.ticks.to!string);
+    mkdirRecurse(buildPath(dir, "sub"));
+    scope (exit) if (dir.exists) rmdirRecurse(dir);
+    auto r = childReadReport(buildPath(dir, "sub"), Policy.init);
+    assert(r.canFind("READ: "), r);
 }

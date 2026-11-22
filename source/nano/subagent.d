@@ -132,19 +132,33 @@ struct ToolReply
 }
 
 /// Set by the parent to stop a sub-agent at its next step: a copyable,
-/// sendable handle (like `Chan`). The cell is `shared` so the child's
-/// cancellation scope (nano.control) can publish its address on its thread.
+/// sendable handle (like `Chan`). Every copy points at one heap-allocated
+/// `shared` cell, so the parent's `abort` reaches the child's events and its
+/// cancellation scope (nano.control) on the child's thread.
 struct SubAbort
 {
     import core.atomic : atomicLoad, atomicStore;
-    /// Set once by `abort`; polled by `aborted`.
-    private shared bool flag;
+    /// The one cell all copies share; null only in `SubAbort.init`, which
+    /// never aborts.
+    private shared(bool)* flag;
 
-    static SubAbort make() { return SubAbort.init; }
-    void abort() { atomicStore(flag, true); }
-    bool aborted() nothrow @nogc { return atomicLoad(flag); }
+    static SubAbort make() { return SubAbort(new shared bool); }
+    void abort() { if (flag !is null) atomicStore(*flag, true); }
+    bool aborted() const nothrow @nogc { return flag !is null && atomicLoad(*flag); }
     /// The cell the child's cancellation scope points at.
-    shared(bool)* ptr() return { return &flag; }
+    shared(bool)* ptr() { return flag is null ? (flag = new shared bool) : flag; }
+}
+
+unittest
+{
+    // A copy (as passed to spawn and kept in the child's events) sees the
+    // parent's abort: the handles share one cell.
+    auto a = SubAbort.make;
+    auto b = a;
+    assert(!b.aborted);
+    a.abort();
+    assert(b.aborted);
+    assert(a.ptr is b.ptr);
 }
 
 /// What a sub-agent did. Sendable: it crosses back through `join`.

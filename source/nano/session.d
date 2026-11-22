@@ -1348,10 +1348,11 @@ TidyResult tidySessions(string dir, long compressAfterDays, long retentionDays)
     catch (Exception) mayDelete = false; // unknown titles: compress only, delete nothing
     tidyDir(dir, now, compressAfterDays, retentionDays, mayDelete, named, result);
     // Sub-agent logs sit one level down (<session>/sub-<call>.jsonl): the
-    // same retention and compression rules apply to them.
+    // same rules apply to them, except that a named (retained) parent
+    // session keeps its children too: compressed, never deleted.
     foreach (DirEntry e; dirEntries(dir, SpanMode.shallow, false))
         if (e.isDir && !e.name.baseName.endsWith(".attachments"))
-            tidyDir(e.name, now, compressAfterDays, retentionDays, mayDelete, named, result);
+            tidyDir(e.name, now, compressAfterDays, retentionDays, mayDelete && e.name.baseName !in named, named, result);
     try std.file.write(stampPath, "");
     catch (Exception) {} // a stamp that won't write just tidies again next start
     return result;
@@ -2104,6 +2105,38 @@ unittest
         collectException(new SessionLog(f.path).close()); // either outcome: only the registration matters
     }
     assert(f.path !in openHere, "no stale registration after a failed open");
+}
+
+// A titled (retained) session keeps its sub-agent logs: they may be
+// compressed but are never deleted; an untitled one's expire (#231 review).
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, setTimes;
+    import core.time : days;
+    import nano.session_index : list, setTitle;
+    auto dir = buildPath(tempDir, "nano-d-tidy-children");
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    string childOf(string id)
+    {
+        auto t = new SessionLog(dir, "mock/m", "/w", id);
+        t.input("in-1", "a session " ~ id);
+        t.close();
+        auto sub = buildPath(dir, id);
+        mkdirRecurse(sub);
+        auto c = buildPath(sub, "sub-x.jsonl");
+        std.file.write(c, "{}\n");
+        setTimes(c, wallNow - 200.days, wallNow - 200.days);
+        return c;
+    }
+    auto keptChild = childOf("kept");
+    auto goneChild = childOf("gone");
+    list(dir);
+    setTitle(buildPath(dir, "kept.jsonl"), "Keep me");
+    auto r = tidySessions(dir, 0, 180);
+    assert(keptChild.exists, "a titled session's child log is retained");
+    assert(!goneChild.exists && r.deleted == 1, format("%s", r));
 }
 
 // Review fixes for issue #205 (round 8): an archive resume never replaces an

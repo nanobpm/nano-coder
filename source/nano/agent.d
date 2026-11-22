@@ -1674,6 +1674,11 @@ class Agent
                 out_ = call.name == hist.searchTool ? hist.search(logPath, args) : hist.read(logPath, args);
             }
             else if (isTimer) out_ = runTimerTool(call.name, args);
+            else if (call.name == "read_file" && childReadState.isSome)
+            {
+                import nano.tools.files : readFile;
+                out_ = readFile(args, childReadState.unwrap("checked isSome"));
+            }
             else out_ = isPlan ? runPlanTool(call.name, args) : tools.execute(call.name, args);
             isError = false;
         }
@@ -1708,6 +1713,9 @@ class Agent
     private Chan!SubMsg subUp;
     private size_t subRunning, subCallSeq;
     private Option!AgentEvents subEvents;
+    /// Set only while runTool runs a sub-agent's read_file: the child's own
+    /// read registry, kept apart from the parent's.
+    private Option!(imported!"nano.tools.files".ReadState) childReadState;
 
     bool subagentsEnabled() pure const { return subagentClients.get !is null; }
 
@@ -1815,34 +1823,29 @@ class Agent
                 else
                 {
                     auto call = ToolCall.fromRaw(format("%s.%s", subSlots[i].callId, ++subCallSeq), m.name, m.args);
-                    // A child's read_file runs on a fresh ReadState: the
+                    // A child's read_file runs on its own ReadState: the
                     // parent's registry would record the read, letting a
                     // later parent write pass the read-before-write check on
-                    // a file the parent model never saw.
-                    if (m.name == "read_file")
+                    // a file the parent model never saw. It still goes
+                    // through runTool, so the parent's permission rules and
+                    // hooks apply as for every forwarded tool.
+                    if (m.name == "read_file" && subSlots[i].readState.isNone)
                     {
-                        import nano.tools.files : readFile, ReadState;
+                        import nano.tools.files : ReadState;
                         import nano.option : some;
-                        if (subSlots[i].readState.isNone) subSlots[i].readState = some(new ReadState);
-                        try
-                        {
-                            rep.text = readFile(call.arguments, subSlots[i].readState.unwrap("set above"));
-                            rep.isError = false;
-                        }
-                        catch (ToolError e) rep.text = e.msg;
+                        subSlots[i].readState = some(new ReadState);
                     }
-                    else
+                    childReadState = m.name == "read_file" ? subSlots[i].readState : typeof(childReadState).init;
+                    scope (exit) childReadState = typeof(childReadState).init;
+                    // A dispatch failure (a hook cannot start, the
+                    // registry throws) must still wake the child: close
+                    // its reply channel so its `down.take` ends instead
+                    // of blocking cleanup forever.
+                    try rep.text = runTool(call, "tool_use", rep.isError);
+                    catch (Exception e)
                     {
-                        // A dispatch failure (a hook cannot start, the
-                        // registry throws) must still wake the child: close
-                        // its reply channel so its `down.take` ends instead
-                        // of blocking cleanup forever.
-                        try rep.text = runTool(call, "tool_use", rep.isError);
-                        catch (Exception e)
-                        {
-                            subSlots[i].down.close();
-                            rep.text = format("%s failed: %s", m.name, e.msg);
-                        }
+                        subSlots[i].down.close();
+                        rep.text = format("%s failed: %s", m.name, e.msg);
                     }
                 }
                 // After a dispatch failure the channel is closed and the

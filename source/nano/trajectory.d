@@ -365,8 +365,14 @@ Trajectory load(string path, string expectedId = null)
     import std.file : exists;
     foreach (ref turn; t.turns)
         foreach (ref row; turn.rows)
-            if (row.subLog.length && row.subLog.exists)
-                foreach (ref st; load(row.subLog).turns) row.sub ~= st.rows;
+        {
+            if (!row.subLog.length) continue;
+            // Session tidying may have compressed the child log since.
+            auto sub = row.subLog.exists ? row.subLog
+                : (row.subLog ~ ".gz").exists ? row.subLog ~ ".gz" : null;
+            if (sub !is null)
+                foreach (ref st; load(sub).turns) row.sub ~= st.rows;
+        }
     return t;
 }
 

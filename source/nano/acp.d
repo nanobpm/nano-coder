@@ -457,6 +457,7 @@ final class AcpServer : AgentEvents
             // status: a late progress note must not flip it back to
             // in_progress (a cancelled call would appear to run forever).
             if (p.callId in terminalCalls) continue;
+            subCalls[p.callId] = true;
             if (p.done)
             {
                 terminalCalls[p.callId] = true;
@@ -474,10 +475,13 @@ final class AcpServer : AgentEvents
     /// Calls whose final tool result (or done progress) went out; later
     /// progress for them is dropped.
     private bool[string] terminalCalls;
+    /// The current turn's sub-agent calls (those that reported progress):
+    /// only they are tracked in terminalCalls. Both are cleared per turn.
+    private bool[string] subCalls;
 
     private void toolUpdate(string id, string output, bool isError)
     {
-        terminalCalls[id] = true;
+        if (id in subCalls) terminalCalls[id] = true;
         update(JSONValue(["sessionUpdate": JSONValue("tool_call_update"), "toolCallId": JSONValue(id),
             "status": JSONValue(isError ? "failed" : "completed"), "rawOutput": JSONValue(output),
             "content": JSONValue([JSONValue(["type": JSONValue("content"), "content": textBlock(output)])])]));
@@ -593,7 +597,13 @@ final class AcpServer : AgentEvents
                 reply(rpcResult(id, JSONValue(["stopReason": "end_turn", "response": note])));
                 return;
             }
+            // Terminal-status bookkeeping covers one turn's sub-agent
+            // calls; release the previous turn's.
+            subCalls = null;
+            terminalCalls = null;
             runTurn(id, text, inputId(params));
+            subCalls = null;
+            terminalCalls = null;
             return;
         default:
             if (hasId && method !is null) reply(rpcError(id, -32601, "method not found: " ~ method));
