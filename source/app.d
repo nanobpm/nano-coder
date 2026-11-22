@@ -2907,7 +2907,7 @@ int runMain(string[] args)
             "nano-coder v" ~ packageVersion,
             format("Model: %s (provider: %s)", client.modelName, client.providerName),
         ];
-        agent.log.ifSome((SessionLog l) { banner ~= format("Session: %s (resume with --resume %s)", l.id, l.id); });
+        agent.log.ifSome((SessionLog l) { banner ~= format("Session: %s (resume with nano-coder --resume %s)", l.id, l.id); });
         foreach (pi; instructions)
         {
             foreach (f; pi.loadedPaths) banner ~= "Instructions: " ~ f;
@@ -2943,7 +2943,7 @@ int runMain(string[] args)
     void goodbye()
     {
         writeln("\nGoodbye!");
-        agent.log.ifSome((SessionLog l) { writefln("Session: %s (resume with --resume %s)", l.id, l.id); });
+        agent.log.ifSome((SessionLog l) { writefln("Session: %s (resume with nano-coder --resume %s)", l.id, l.id); });
         stdOut.flush();
     }
     for (;;)
@@ -3131,7 +3131,7 @@ int runMain(string[] args)
                     agent.useHooks(loadHooks(cwd), false);
                     if (gFrame) gFrame.clear();
                     refreshStatus();
-                    log.match!(l => writefln("Session: %s (resume with --resume %s)", l.id, l.id),
+                    log.match!(l => writefln("Session: %s (resume with nano-coder --resume %s)", l.id, l.id),
                         () => writefln("Session: %s", newSessionId()));
                     continue;
                 }
@@ -3155,7 +3155,7 @@ int runMain(string[] args)
                     auto exe = launchExe();
                     // Printed after the frame hands the terminal back, so it stays on screen.
                     if (gFrame) gFrame.suspend();
-                    writefln("\nRelaunching into session %s (resume later with --resume %s)", id, id);
+                    writefln("\nRelaunching into session %s (resume later with nano-coder --resume %s)", id, id);
                     stdOut.flush();
                     leaveKeyMode();
                     nano.herdr.release();
@@ -3293,7 +3293,7 @@ int runMain(string[] args)
                     if (gFrame) { gFrame.clear(); replayTranscript(agent, console); }
                     foreach (n; loadNotes) stdErr.writeln(n);
                     stdErr.flush();
-                    writefln("Resumed session %s (resume later with --resume %s)", id, id);
+                    writefln("Resumed session %s (resume later with nano-coder --resume %s)", id, id);
                     continue;
                 }
                 case "/trajectory":
