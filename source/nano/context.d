@@ -1092,10 +1092,10 @@ string pinnedUserRequests(const Message[] prior, const Message[] new_, bool smar
 /// ditto, for a bounded stash (issue #221): `prior` holds only the first and
 /// the most recent requests, and `drop` describes the requests the bound
 /// dropped between them, so the omission note covers exactly the requests the
-/// unbounded form would have named. The retained tail is an unordered set
-/// (the bound evicts by swap), so the requests are sorted back into log order
-/// before rendering; `prior[0]` stays first — it is the logical first request
-/// even when it carries no log line.
+/// unbounded form would have named. The retained tail keeps append order
+/// (the bound evicts oldest-first), so the requests are already in log order
+/// and are sorted only defensively; `prior[0]` stays first — it is the
+/// logical first request even when it carries no log line.
 string pinnedUserRequests(const Message[] prior, const Message[] new_, bool smart, size_t windowTokens,
     PinDrop drop) pure
 {
