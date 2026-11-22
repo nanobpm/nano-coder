@@ -161,6 +161,21 @@ int fchmodFd(int fd, uint mode) @trusted
     return fchmod(fd, cast(mode_t) mode);
 }
 
+/// The mode `open(2)` gives a new file created with 0666: 0666 less the
+/// process umask, read once at startup (reading it means setting it, which
+/// is only safe before other threads exist).
+immutable uint newFileMode;
+
+// Safe: umask(2) takes and returns a plain mode, touching no memory.
+shared static this() @trusted
+{
+    import core.sys.posix.sys.stat : umask;
+    import std.conv : octal;
+    auto old = umask(0);
+    umask(old);
+    newFileMode = octal!666 & ~uint(old);
+}
+
 /// `stat(2)`'s `st_mode` for `path`; false when the path can't be stat'ed.
 bool statMode(string path, out uint mode) @trusted
 {
@@ -1077,8 +1092,9 @@ unittest
 /// Create a fresh temp file beside `base` in `dir` holding `content`, opened
 /// exclusively (`O_CREAT | O_EXCL`, which never follows a symlink) under an
 /// unpredictable name, retrying on a collision. Returns its path. The file is
-/// private (0600) while being written: the caller restores the target's
-/// permissions before publishing it with a rename. The name is bounded so a
+/// private (0600) while being written, then given `newFileMode`; a caller
+/// replacing an existing file restores that file's permissions before
+/// publishing it with a rename. The name is bounded so a
 /// long `base` can't push it past the filesystem's component limit.
 string writeTemp(string dir, string base, const(ubyte)[] content) @trusted
 {
@@ -1118,6 +1134,10 @@ string writeTemp(string dir, string base, const(ubyte)[] content) @trusted
             }
             rest = rest[n .. $];
         }
+        // Leave the default creation mode (0666 less the umask) on it, as
+        // `open(2)` would for a fresh file; callers replacing an existing
+        // target then copy that target's mode over this.
+        if (fchmodFd(fd, newFileMode) != 0) throw new FileException(tmp, errno);
         return tmp;
     }
     throw new FileException(dir, "could not create a unique temporary file");

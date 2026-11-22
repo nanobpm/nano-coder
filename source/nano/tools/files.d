@@ -728,6 +728,9 @@ struct PatchHunk
     string anchor;
     string[] old_, new_;
     bool eof; /// `*** End of File`: the hunk must end at the end of the file
+    /// The hunk's last operation (' ', '-' or '+'): whether a line still
+    /// follows the replaced region's end, which the line arrays can't tell.
+    char lastOp = ' ';
     size_t line; /// 1-based line in the patch where the hunk starts
 }
 
@@ -836,6 +839,7 @@ FilePatch[] parsePatch(string patch) pure
                     any = true;
                     if (x.length == 0) { h.old_ ~= ""; h.new_ ~= ""; trailingBlank++; continue; }
                     trailingBlank = 0;
+                    h.lastOp = x[0];
                     switch (x[0])
                     {
                     case ' ': h.old_ ~= x[1 .. $]; h.new_ ~= x[1 .. $]; break;
@@ -977,18 +981,11 @@ private string applyHunk(string text, const PatchHunk h, size_t n, ref string[] 
         throw fail(format("marked `*** End of File` but matches at line %s, not at the end of the file", lineAt(text, r[0])));
     if (found.how.length) notes ~= format("%s: %s matched %s", display, where, found.how);
     endAt = r[1];
-    // Whether the file's last line is still followed by a line of the hunk
-    // (context or added), rather than removed — tracked from the hunk's
-    // operations, never inferred from the resulting text: an unchanged last
-    // line would otherwise be mistaken for a retained tail. The tail is kept
-    // when the hunk's last operation leaves a line after the replaced region:
-    // trailing context, or an addition after the last removal.
-    size_t pre;
-    while (pre < h.old_.length && pre < h.new_.length && h.old_[pre] == h.new_[pre]) pre++;
-    size_t suf;
-    while (suf < h.old_.length - pre && suf < h.new_.length - pre
-            && h.old_[$ - 1 - suf] == h.new_[$ - 1 - suf]) suf++;
-    newTail = suf > 0 || h.new_.length - pre >= h.old_.length - pre - suf;
+    // Whether the replaced region still ends with a line of the hunk
+    // (context or added) rather than a removal — taken from the hunk's last
+    // operation as parsed, never inferred from the line arrays or resulting
+    // text: `-a -b +A` and `-a +A -b` have identical arrays but differ here.
+    newTail = h.lastOp != '-';
     return text[0 .. r[0]] ~ found.news[0] ~ text[r[1] .. $];
 }
 
@@ -2377,4 +2374,32 @@ unittest // review round 6: private bounded temp files, EOF newline state, CRLF 
     assert(out_.indexOf("--- a/" ~ ma ~ "\n+++ b/" ~ mc ~ "\n") >= 0, out_);
     assert(!ma.exists && !mb.exists && readText(mc) == "one\ntwo\n");
     remove(longName); remove(t1); remove(t2); remove(cr); remove(tgt); remove(lk); remove(mc);
+}
+
+unittest // review round 7: new files get the umask-filtered default mode; EOF state from the hunk's last operation
+{
+    import std.file : getAttributes;
+    import nano.safeio : newFileMode;
+    auto st = new ReadState;
+    // New files from write_file and Add File are not left at the private 0600 staging mode.
+    auto w = tmpFile("p-mode-write.txt", null);
+    if (w.exists) remove(w);
+    writeFile(JSONValue(["path": w, "content": "x\n"]), st);
+    assert((getAttributes(w) & octal!777) == newFileMode);
+    auto ad = tmpFile("p-mode-add.txt", null);
+    if (ad.exists) remove(ad);
+    applyPatch(j("patch", pt("*** Add File: " ~ ad, "+x")), st);
+    assert((getAttributes(ad) & octal!777) == newFileMode);
+    // Same line arrays, different last operation: an addition ending the hunk
+    // keeps the unterminated tail; a removal ending it exposes a real newline.
+    auto t1 = tmpFile("p-eof7a.txt", "a\nb");
+    applyPatch(j("patch", pt("*** Update File: " ~ t1, "@@", "-a", "-b", "+A")), st);
+    assert(readText(t1) == "A", readText(t1));
+    auto t2 = tmpFile("p-eof7b.txt", "a\nb");
+    applyPatch(j("patch", pt("*** Update File: " ~ t2, "@@", "-a", "+A", "-b")), st);
+    assert(readText(t2) == "A\n", readText(t2));
+    auto t3 = tmpFile("p-eof7c.txt", "a\nb");
+    applyPatch(j("patch", pt("*** Update File: " ~ t3, "@@", " a", "-b", "+B")), st);
+    assert(readText(t3) == "a\nB", readText(t3));
+    remove(w); remove(ad); remove(t1); remove(t2); remove(t3);
 }
