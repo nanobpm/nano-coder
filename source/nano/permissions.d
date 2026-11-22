@@ -378,6 +378,16 @@ struct Policy
         return true;
     }
 
+    /// The sources of the rules `readDenyScan` uses, so another thread can
+    /// rebuild the scan with `parseRule` (a `Policy` isn't sendable).
+    immutable(string)[] readDenySources() const
+    {
+        immutable(string)[] r;
+        foreach (ref r_; deny)
+            if (r_.subject == Subject.path && r_.appliesTo("read_file")) r ~= r_.source;
+        return r;
+    }
+
     /// The source of the `Read(...)` deny rule covering `path`, or null.
     private string readDenyRule(string path, string cwd)
     {

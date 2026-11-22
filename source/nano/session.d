@@ -402,6 +402,10 @@ class SessionLog
     string id;
     string path;
     private File f;
+    /// The shared registration of `f` (its refcount), tied to the handle
+    /// rather than the path: a recovery that re-registers the path must not
+    /// let an old sharer's `close` release the replacement handle.
+    private Held* held;
     /// Lines written so far: the next record's physical line is `lines + 1`.
     private ulong lines;
 
@@ -416,7 +420,7 @@ class SessionLog
         f = createPrivate(path);
         // A brand-new file: only an unsupported filesystem can refuse.
         if (tryLock(f) == LockResult.contended) throw new Exception("session log " ~ path ~ " is locked");
-        shareHandle(path, f);
+        held = shareHandle(path, f);
         scope (failure) close();
         JSONValue h = ["id": this.id, "created_at": nowStamp(), "cwd": cwd, "model": model];
         h["version"] = formatVersion;
@@ -461,11 +465,12 @@ class SessionLog
         validateId(id);
         // Lock before reading or truncating, so tidy-up cannot compress or
         // delete the log underneath this writer.
-        if (auto held = path in openHere)
+        if (auto shared_ = path in openHere)
         {
             // This process already holds the log open and locked: share that
             // locked handle (a second open would be a separate, unlocked
             // file description once the first closes).
+            held = *shared_;
             f = held.file;
             held.refs++;
         }
@@ -476,7 +481,7 @@ class SessionLog
             f = openExistingForAppend(path);
             awaitLock(f, path);
             if (!sameFile(f, path)) { f.close(); throw new Exception("session log " ~ path ~ " was removed"); }
-            shareHandle(path, f);
+            held = shareHandle(path, f);
         }
         scope (failure) close();
         // Count the committed lines in fixed-size chunks: a long session's
@@ -507,6 +512,11 @@ class SessionLog
     /// Tests: the next write fails (Rust `fail_next_persist`).
     bool failNextWrite;
 
+    /// Tests: invoked with each recovery candidate's path right after its
+    /// exclusive create, so a test can swap the destination before the
+    /// post-sync identity re-check (simulating a concurrent replacement).
+    void delegate(string) swapAfterCreate;
+
     /// Tests: whether `close` has released this writer's handle.
     bool isOpenForWrite() const @safe { return f.isOpen; }
 
@@ -516,12 +526,14 @@ class SessionLog
         if (!f.isOpen) return;
         // AA removal does not run destructors: close the shared handle
         // explicitly when the last writer goes, releasing the lock.
-        if (auto held = path in openHere)
-            if (--held.refs == 0)
-            {
-                held.file.close();
-                openHere.remove(path);
-            }
+        if (held !is null && --held.refs == 0)
+        {
+            held.file.close();
+            // Only drop the path's registration if it is still this handle.
+            if (auto cur = path in openHere)
+                if (*cur is held) openHere.remove(path);
+        }
+        held = null;
         f.detach();
     }
 
@@ -532,9 +544,179 @@ class SessionLog
             failNextWrite = false;
             throw new Exception("session log write failed (injected)");
         }
+        if (!sameFile(f, path))
+        {
+            recoverReplaced();
+            // The header itself hit the replacement: name the recovery id.
+            { import std.string : assumeUTF; if (lines == 0) line = withHeaderId(line.representation, id).assumeUTF.idup; }
+        }
         f.write(line);
         f.flush();
         ++lines;
+    }
+
+    /// Where the warning about a replaced log goes (tests capture it).
+    void delegate(string) warn;
+
+    /// The path no longer names the file this writer holds open (something
+    /// moved, deleted or rewrote the live log). Appending on would write into
+    /// an orphan nobody can read again (issue #237), so move to a file that
+    /// holds every record: the path itself when it is gone or a prefix of
+    /// ours (append what it lacks), else a recovery file next to it. Always
+    /// tell the user.
+    private void recoverReplaced()
+    {
+        auto ours = readAll(f);
+        string target = path, how;
+        File next;
+        bool done;
+        import std.exception : collectException;
+        // A failed in-place repair falls through to the recovery log below.
+        collectException(() {
+            // Whatever path leaves the in-place repair undone (non-prefix
+            // rewrite, contention, a throw) must release `next`: the loop
+            // below reassigns it, which would leak the fd and keep a lock
+            // on the foreign file at the original path.
+            scope (exit) if (!done && next.isOpen) next.close();
+            if (!path.exists)
+            {
+                // Removed or moved away: put our records back at the path.
+                {
+                    auto tmp = format("%s.tmp-%s", path, thisProcessID);
+                    scope (failure) if (tmp.exists) remove(tmp);
+                    writePrivate(tmp, ours, octal!600);
+                    publishOver(tmp, path);
+                    next = openExistingForAppend(path);
+                    // Locked, still at the path, AND holding exactly our
+                    // records: a replacement that slipped in between the
+                    // publish and this reopen must not count as restored.
+                    if (tryLock(next) != LockResult.contended && sameFile(next, path)
+                        && readAll(next) == ours && sameFile(next, path))
+                    {
+                        syncLog(next, path);
+                        done = true;
+                        how = "it was removed; restored it from this session's records";
+                    }
+                    else next.close(); // contended or re-replaced: no fd leak into the loop below
+                }
+            }
+            else
+            {
+                // Lock first, then compare the whole locked file's bytes
+                // (not just its length) and re-check the path still names it.
+                // A contention or an inode change abandons the in-place
+                // repair for the recovery log below: close `next` first, or
+                // the loop's `next = createPrivate(...)` overwrites and
+                // leaks the fd.
+                next = openExistingForAppend(path);
+                if (tryLock(next) == LockResult.contended || !sameFile(next, path))
+                {
+                    next.close();
+                    return;
+                }
+                auto theirs = readAll(next);
+                if (theirs.length <= ours.length && ours[0 .. theirs.length] == theirs)
+                {
+                    // The replacement may be wider than our private log
+                    // (e.g. 0644): narrow it before appending private
+                    // records, or fall back to a private recovery log.
+                    import nano.safeio : fchmodFd;
+                    if (fchmodFd(fileno(next.getFP), octal!600) != 0) return;
+                    // Re-verify immediately before appending: a writer that
+                    // ignores flock (or rewrote the inode meanwhile) would
+                    // make the suffix land against a stale prefix, a gap or
+                    // overlap. Any change: fall back to the recovery log.
+                    if (!sameFile(next, path) || readAll(next) != theirs) return;
+                    next.rawWrite(ours[theirs.length .. $]);
+                    syncLog(next, path);
+                    // And confirm the result is exactly our records at the path.
+                    if (!sameFile(next, path) || readAll(next) != ours) return;
+                    done = true;
+                    how = "it was replaced; appended the records the new file was missing";
+                }
+            }
+        }());
+        if (!done)
+        {
+            // The path holds something else: keep the whole session in a
+            // recovery log beside it, a resumable session of its own: its
+            // header names the recovery id (same line count, so `#N` IDs hold).
+            auto dir = path.dirName;
+            auto stem = recoveryStem(id);
+            bool made;
+            foreach (n; 1 .. 1000)
+            {
+                auto rid = format("%s.recovered-%s", stem, n);
+                target = buildPath(dir, rid ~ ".jsonl");
+                // A name whose compressed archive exists belongs to an
+                // earlier recovered session tidy-up compressed: reusing it
+                // would shadow that archive (`findSession` prefers the plain
+                // log) and strand its history, so skip to the next name.
+                if (target.exists || (target ~ ".gz").exists) continue;
+                // Exclusive create, then lock before anything else can, and
+                // confirm the locked inode is still the one at the path.
+                import std.exception : collectException;
+                // Lost the race for this name (or cannot create it): try the next.
+                // The exclusive-create descriptor itself is kept (never a
+                // reopen of the name), so a swap of the path cannot hand us
+                // someone else's file.
+                if (collectException(next = createPrivate(target)) !is null) continue;
+                // A name whose lock another writer won, or whose path no
+                // longer names our inode: close our fd and try the next name.
+                // Never unlink it: the path may now hold another writer's
+                // records (or a replacement), and removing it could orphan them.
+                bool locked = collectException(awaitLock(next, target)) is null;
+                if (!locked || !sameFile(next, target)) { next.close(); continue; }
+                // Test seam: let a test swap the destination now, so the
+                // post-sync re-check below is exercised against a real race.
+                if (swapAfterCreate !is null) swapAfterCreate(target);
+                {
+                    // A failed write or sync closes the candidate: never leak it.
+                    scope (failure) next.close();
+                    next.rawWrite(withHeaderId(ours, rid));
+                    syncLog(next, target);
+                }
+                // An in-place rewrite of the same inode (a writer that
+                // ignores flock) is invisible to `sameFile`: adopt the
+                // candidate only if it holds exactly our records under the
+                // recovery header, else close it and try the next name.
+                if (readAll(next) != withHeaderId(ours, rid)) { next.close(); continue; }
+                // Revalidate after the write+sync, before adopting: if another
+                // process replaced `target` meanwhile, `next` is now an
+                // unlinked inode and adopting it would send this session's
+                // appends into a file nobody can read back. Close it and try
+                // the next name rather than report a successful recovery.
+                if (!sameFile(next, target)) { next.close(); continue; }
+                made = true;
+                break;
+            }
+            if (!made) throw new Exception("session log " ~ path ~ " was replaced and no recovery log could be created");
+            how = "it was replaced by a different file; this session continues in " ~ target
+                ~ " (resume it with --resume " ~ target.baseName.stripExtension ~ ")";
+        }
+        immutable old = path;
+        immutable oldId = id;
+        close();
+        f = next;
+        path = target;
+        id = path.baseName.stripExtension;
+        held = shareHandle(path, f);
+        // A new id moves the attachments dir (`<id>.attachments`): copy the
+        // stored images there so the recovered session still sees them,
+        // leaving the originals for the old log.
+        if (id != oldId) copyAttachments(buildPath(old.dirName, oldId ~ ".attachments"),
+            buildPath(path.dirName, id ~ ".attachments"));
+        auto msg = "WARNING: session log " ~ old ~ " no longer names the file this session was writing: "
+            ~ how ~ ". Nothing was lost.";
+        if (warn) warn(msg);
+        else
+        {
+            import nano.safeio : stdErr;
+            import std.exception : collectException;
+            // Best-effort diagnostic: a closed or unwritable stderr must not
+            // abort the caller's pending write after a successful recovery.
+            if (collectException(stdErr.writeln("\n", msg)) !is null) {}
+        }
     }
 
     /// Log a message; returns its physical line (its `#N` ID).
@@ -1533,11 +1715,73 @@ private struct Held { File file; size_t refs; }
 
 /// Logs this thread holds open and locked, so an in-process reopen shares
 /// the locked handle instead of opening an unlocked second description.
-private Held[string] openHere;
+private Held*[string] openHere;
 
-private void shareHandle(string path, File f)
+private Held* shareHandle(string path, File f)
 {
-    openHere[path] = Held(f, 1);
+    auto h = new Held(f, 1);
+    openHere[path] = h;
+    return h;
+}
+
+/// Every byte `f` holds, read from its start (the position is left at EOF).
+private ubyte[] readAll(ref File f)
+{
+    import std.stdio : SEEK_END;
+    f.flush();
+    f.seek(0);
+    ubyte[] all;
+    auto buf = new ubyte[](64 * 1024);
+    for (;;)
+    {
+        auto chunk = f.rawRead(buf);
+        if (!chunk.length) break;
+        all ~= chunk;
+    }
+    f.seek(0, SEEK_END);
+    return all;
+}
+
+/// The id stem for a recovery log of session `id`: any earlier
+/// `.recovered-N` suffix dropped (so repeats do not stack), and cut short
+/// enough that `<stem>.recovered-999` still passes `validateId`.
+string recoveryStem(string id) pure
+{
+    import std.ascii : isDigit;
+    import std.string : lastIndexOf;
+    auto stem = id;
+    auto at = stem.lastIndexOf(".recovered-");
+    if (at >= 0)
+    {
+        auto n = stem[at + ".recovered-".length .. $];
+        bool digits = n.length > 0;
+        foreach (c; n) digits = digits && c.isDigit;
+        if (digits) stem = stem[0 .. at];
+    }
+    enum room = 128 - ".recovered-999".length;
+    if (stem.length > room) stem = stem[0 .. room];
+    return stem;
+}
+
+/// `text` with its first line's `session` header renamed to `newId`; other
+/// lines and the line count are untouched. Text without a parseable header
+/// line comes back unchanged (an empty `newId` also leaves it unchanged).
+const(ubyte)[] withHeaderId(const(ubyte)[] text, string newId)
+{
+    import std.algorithm : countUntil;
+    import std.exception : collectException;
+    import std.string : assumeUTF;
+    if (!newId.length) return text;
+    auto nl = text.countUntil('\n');
+    if (nl < 0) return text;
+    JSONValue j;
+    // Not a JSON header line: nothing to rename, keep the bytes as they are.
+    if (collectException(j = parseJSON(text[0 .. nl].assumeUTF)) !is null) return text;
+    if (j.type != JSONType.object || "type" !in j || j["type"].type != JSONType.string
+        || j["type"].str != "session" || "data" !in j || j["data"].type != JSONType.object)
+        return text;
+    j["data"]["id"] = newId;
+    return record("session", j["data"]).representation ~ text[nl + 1 .. $];
 }
 
 /// Lock `f` for a writer, waiting briefly while a tidy-up holds it (a
@@ -1556,22 +1800,70 @@ private void awaitLock(ref File f, string path)
     throw new Exception("session log " ~ path ~ " is locked by another process (tidy-up?); try again");
 }
 
-/// `path` opened for appending without ever creating it.
-private File openExistingForAppend(string path) @trusted
+/// Copy every file of the attachments dir `from` into `to` (best-effort:
+/// a failed copy leaves that image unavailable, never aborts recovery).
+private void copyAttachments(string from, string to)
 {
-    import core.sys.posix.fcntl : open, O_WRONLY, O_APPEND;
+    import std.file : dirEntries, SpanMode, isDir, mkdirRecurse, copy;
+    import std.exception : collectException;
+    // The whole traversal is best-effort: an unreadable dir or a failing
+    // entry stat must not abort recovery (the warning and the pending
+    // record still have to be written).
+    collectException(() {
+        if (!from.exists || !from.isDir) return;
+        collectException(mkdirRecurse(to));
+        foreach (e; dirEntries(from, SpanMode.shallow))
+        {
+            bool file;
+            if (collectException(file = e.isFile) !is null || !file) continue;
+            auto dest = buildPath(to, e.name.baseName);
+            if (!dest.exists) collectException(copy(e.name, dest));
+        }
+    }());
+}
+
+/// Flush and fsync `f` (the log at `path`) and its parent directory, so
+/// recovered records survive a power loss before being reported. Throws.
+private void syncLog(ref File f, string path)
+{
+    import nano.safeio : fsyncFd;
+    f.flush();
+    if (fsyncFd(fileno(f.getFP)) != 0) throw new Exception("cannot sync " ~ path);
+    syncDirOf(path);
+}
+
+/// `path` opened for appending without ever creating it.
+private File openExistingForAppend(string path) { return openLog(path, false); }
+
+/// `path` opened read/write + append + close-on-exec; `create` makes it
+/// exclusively (0600), keeping that very descriptor.
+private File openLog(string path, bool create) @trusted
+{
+    import core.sys.posix.fcntl : open, fcntl, O_RDWR, O_APPEND, O_CREAT, O_EXCL, F_SETFD, FD_CLOEXEC;
+    import nano.safeio : fchmodFd;
     import std.string : toStringz;
     import core.stdc.errno : errno, ENOENT;
     import std.exception : ErrnoException;
-    auto fd = open(path.toStringz, O_WRONLY | O_APPEND);
+    // O_RDWR: a writer that finds its log replaced reads its own records
+    // back to recover them. Close-on-exec: a `/relaunch` exec must not
+    // inherit the fd and its flock, or the new image's resume is contended.
+    version (linux) enum int cloexec = 0x80000; // O_CLOEXEC
+    else version (OSX) enum int cloexec = 0x1000000;
+    else enum int cloexec = 0;
+    auto fd = create
+        ? open(path.toStringz, O_RDWR | O_APPEND | O_CREAT | O_EXCL | cloexec, octal!600)
+        : open(path.toStringz, O_RDWR | O_APPEND | cloexec);
     if (fd < 0)
     {
         immutable err = errno;
+        if (create) throw new ErrnoException("cannot create " ~ path, err);
         if (err == ENOENT) throw new Exception("session log " ~ path ~ " does not exist");
         throw new ErrnoException("cannot open session log " ~ path, err);
     }
+    fcntl(fd, F_SETFD, FD_CLOEXEC); // also where O_CLOEXEC is unknown
+    if (create) fchmodFd(fd, octal!600); // never wider, whatever the umask
     File f;
-    f.fdopen(fd, "a");
+    f.fdopen(fd, "a+");
     return f;
 }
 
@@ -1633,10 +1925,11 @@ private void writePrivate(string path, const(ubyte)[] data, uint mode)
 }
 
 /// A new session log opened for appending, created owner-only (0600).
+/// The descriptor from the exclusive create itself is returned (read/write,
+/// append, close-on-exec): reopening the name would race a replacement.
 private File createPrivate(string path)
 {
-    writePrivate(path, null, octal!600);
-    return File(path, "a");
+    return openLog(path, true);
 }
 
 /// fsync `path`'s parent directory, so a created or removed directory entry
@@ -2754,4 +3047,349 @@ unittest // skim_pending_position_reads_unsigned (issue #244)
             "the pending input " ~ (survives ? "survives " : "is dropped by ") ~ pos ~ " exactly as the full decode");
         if (survives) assert(skimmed.pendingInput == "crash here", "the input text survives " ~ pos);
     }
+}
+
+@("a session log's fd is close-on-exec, so a relaunched image can lock it (#237)")
+unittest
+{
+    import std.process : spawnProcess, wait, Config;
+    auto dir = buildPath(tempDir, format("nano-coder-cloexec-%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/x");
+    scope (exit) log.close();
+    immutable fd = log.f.fileno;
+    auto resumed = new SessionLog(log.path); // shared in-process handle
+    resumed.close();
+    // Exec level: an exec'd image must not see the fd (and its flock).
+    auto script = format("test ! -e /dev/fd/%s", fd);
+    // inheritFDs: std.process closes nothing, so only FD_CLOEXEC can.
+    auto pid = spawnProcess(["/bin/sh", "-c", script], null, Config.inheritFDs);
+    assert(wait(pid) == 0, "the log fd survived exec");
+}
+
+@("a log replaced under a live writer loses nothing silently (#237)")
+unittest
+{
+    import std.algorithm : canFind, count;
+    auto dir = buildPath(tempDir, format("nano-coder-replaced-%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    string[] warned;
+
+    // 1. Replaced by a copy (a prefix of ours): the path gets the rest.
+    {
+        auto log = new SessionLog(dir, "mock/m", "/x");
+        log.warn = (string m) { warned ~= m; };
+        log.input("i1", "first");
+        auto p = log.path;
+        auto text = readText(p);
+        rename(p, p ~ ".moved");
+        std.file.write(p, text);
+        setAttributes(p, octal!644); // a world-readable replacement
+        log.input("i2", "second");
+        log.close();
+        assert((getAttributes(p) & octal!777) == octal!600, "the replacement is narrowed before appending");
+        auto now = readText(p);
+        assert(now.canFind("first") && now.canFind("second"), now);
+        assert(now.count('\n') == 3);
+        assert(warned.length == 1 && warned[0].canFind("missing"), warned[0]);
+    }
+    // 2. Removed: the path is restored with every record.
+    {
+        auto log = new SessionLog(dir, "mock/m", "/x");
+        log.warn = (string m) { warned ~= m; };
+        log.input("i1", "alpha");
+        auto p = log.path;
+        remove(p);
+        log.input("i2", "beta");
+        log.close();
+        auto now = readText(p);
+        assert(now.canFind("alpha") && now.canFind("beta"), now);
+        assert(warned.length == 2 && warned[1].canFind("removed"));
+    }
+    // 3. Rewritten with different content (e.g. compacted): a recovery log.
+    {
+        auto log = new SessionLog(dir, "mock/m", "/x");
+        log.warn = (string m) { warned ~= m; };
+        log.input("i1", "gamma");
+        auto p = log.path;
+        remove(p);
+        std.file.write(p, "{\"type\":\"session\",\"data\":{}}\n");
+        log.input("i2", "delta");
+        auto rec = log.path;
+        log.input("i3", "epsilon");
+        {
+            // The foreign file at the original path must not stay locked
+            // by a leaked in-place-repair fd while this writer lives on.
+            auto probe = File(p, "r+");
+            assert(tryLock(probe) == LockResult.acquired, "a leaked fd still locks the rewritten path");
+            probe.close();
+        }
+        log.close();
+        assert(rec != p && rec.exists);
+        auto now = readText(rec);
+        assert(now.canFind("gamma") && now.canFind("delta") && now.canFind("epsilon"), now);
+        assert(readText(p) == "{\"type\":\"session\",\"data\":{}}\n");
+        assert(warned.length == 3 && warned[2].canFind(rec));
+        validateId(log.id);
+        // The recovery is a resumable session: its header names its id.
+        restore(rec); // throws on a header id mismatch
+        assert(parseJSON(readText(rec).lineSplitter.front)["data"]["id"].str == log.id);
+        assert(findSession(dir, log.id) == rec);
+    }
+    // 4. Rewritten with different content of the same length: not a prefix.
+    {
+        auto log = new SessionLog(dir, "mock/m", "/x");
+        log.warn = (string m) { warned ~= m; };
+        log.input("i1", "zeta");
+        auto p = log.path;
+        auto text = readText(p);
+        remove(p);
+        { import std.array : replace; std.file.write(p, text.replace("zeta", "ZETA")); }
+        log.input("i2", "eta");
+        auto rec = log.path;
+        log.close();
+        assert(rec != p, "an equal-length rewrite must not be treated as a prefix");
+        assert(readText(rec).canFind("zeta") && readText(rec).canFind("eta"));
+        assert(readText(p).canFind("ZETA") && !readText(p).canFind("eta"));
+    }
+}
+
+@("recovery ids stay valid for long and repeatedly recovered ids (#237)")
+unittest
+{
+    auto longId = new char[](128);
+    longId[] = 'a';
+    auto stem = recoveryStem(longId.idup);
+    validateId(stem ~ ".recovered-999");
+    assert(recoveryStem("sess-x.recovered-3") == "sess-x");
+    assert(recoveryStem("sess-x.recovered-") == "sess-x.recovered-");
+    assert(withHeaderId("{\"type\":\"session\",\"data\":{\"id\":\"a\"}}\nrest\n".representation, "b")
+        == "{\"type\":\"session\",\"data\":{\"id\":\"b\"}}\nrest\n".representation);
+    assert(withHeaderId("not json\n".representation, "b") == "not json\n".representation);
+}
+
+@("closing an old sharer after an in-place recovery keeps the recovered handle (#237)")
+unittest
+{
+    import std.algorithm : canFind;
+    auto dir = buildPath(tempDir, format("nano-coder-sharers-%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto a = new SessionLog(dir, "mock/m", "/x");
+    a.warn = (string) {};
+    auto b = new SessionLog(a.path); // shares a's handle
+    auto p = a.path;
+    remove(p);
+    a.input("i1", "after-removal"); // recovers in place: a new handle at p
+    b.close(); // must not close a's recovered handle
+    assert(a.isOpenForWrite);
+    a.input("i2", "still-writing");
+    a.close();
+    assert(readText(p).canFind("still-writing"));
+    assert(p !in openHere);
+}
+
+@("a contended in-place repair falls through to a recovery log and leaks no fd (#237)")
+unittest
+{
+    import std.algorithm : canFind, count;
+    auto dir = buildPath(tempDir, format("nano-coder-contended-%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/x");
+    log.warn = (string) {};
+    log.input("i1", "kappa");
+    auto p = log.path;
+    // Replace the path with a foreign file whose lock another handle holds:
+    // the in-place repair is contended, so recovery must fall through to a
+    // recovery log — closing the contended fd it opened, not leaking it.
+    auto foreign = buildPath(dir, "foreign.jsonl");
+    std.file.write(foreign, "{\"type\":\"session\",\"data\":{}}\n");
+    auto holder = openExistingForAppend(foreign);
+    assert(tryLock(holder) == LockResult.acquired);
+    scope (exit) holder.close();
+    rename(foreign, p);
+    log.input("i2", "lambda");
+    auto rec = log.path;
+    log.close();
+    assert(rec != p && rec.exists, "a contended in-place repair recovers to a recovery log");
+    auto now = readText(rec);
+    assert(now.canFind("kappa") && now.canFind("lambda"), now);
+    assert(now.count('\n') == 3, now); // header + both records: nothing lost
+    assert(readText(p) == "{\"type\":\"session\",\"data\":{}}\n", "the foreign file is untouched");
+    // A leaked fd keeps its flock after close(): the recovered log's lock
+    // must be free again.
+    auto probe = openExistingForAppend(rec);
+    scope (exit) probe.close();
+    assert(tryLock(probe) == LockResult.acquired, "no leaked fd still locks the recovery log");
+    restore(rec); // a resumable session: its header names the recovery id
+}
+
+@("a contended recovery name is skipped, never unlinked, and the next name used (#237)")
+unittest
+{
+    import std.algorithm : canFind, count;
+    import std.file : dirEntries, SpanMode;
+    auto dir = buildPath(tempDir, format("nano-coder-racename-%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/x");
+    log.warn = (string) {};
+    log.input("i1", "mu");
+    auto p = log.path;
+    // Rewrite the path with foreign content so recovery needs a recovery log,
+    // then sit on the first recovery name's lock: recovery must skip the
+    // contended name (closing its fd and removing the empty, header-less file
+    // it published) and continue at N+1 — not abort the whole recovery.
+    remove(p);
+    std.file.write(p, "{\"type\":\"session\",\"data\":{}}\n");
+    auto stem = recoveryStem(log.id);
+    auto first = buildPath(dir, stem ~ ".recovered-1.jsonl");
+    auto squatter = createPrivate(first);
+    assert(tryLock(squatter) == LockResult.acquired);
+    scope (exit) squatter.close();
+    log.input("i2", "nu");
+    auto rec = log.path;
+    log.close();
+    assert(rec == buildPath(dir, stem ~ ".recovered-2.jsonl"), rec);
+    auto now = readText(rec);
+    assert(now.canFind("mu") && now.canFind("nu"), now);
+    assert(now.count('\n') == 3, now);
+    // The contended name is left exactly as the squatter had it: present,
+    // empty, and still exclusively the squatter's (no second writer, no
+    // leaked fd, no partial header).
+    assert(readText(first) == "", "the skipped name stays header-less for its lock holder");
+    auto probe = openExistingForAppend(rec);
+    scope (exit) probe.close();
+    assert(tryLock(probe) == LockResult.acquired, "the adopted recovery log is free after close");
+    assert(dirEntries(dir, "*.recovered-*.jsonl", SpanMode.shallow).array.length == 2,
+        "no extra empty recovery files left behind");
+    restore(rec);
+}
+
+@("a recovery log under a new id keeps the session's attachments (#237)")
+unittest
+{
+    auto dir = buildPath(tempDir, format("nano-coder-recatt-%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/x");
+    log.warn = (string) {};
+    log.input("i1", "img");
+    auto p = log.path, oldId = log.id;
+    auto oldAtt = buildPath(dir, oldId ~ ".attachments");
+    mkdirRecurse(oldAtt);
+    std.file.write(buildPath(oldAtt, "blob.png"), "PNG");
+    remove(p);
+    std.file.write(p, "{\"type\":\"session\",\"data\":{}}\n");
+    log.input("i2", "after");
+    log.close();
+    assert(log.id != oldId);
+    assert(readText(buildPath(dir, log.id ~ ".attachments", "blob.png")) == "PNG");
+    assert(buildPath(oldAtt, "blob.png").exists, "the originals stay for the old log");
+}
+
+@("recovery skips a name whose compressed archive already exists (#237)")
+unittest
+{
+    import std.algorithm : canFind, count;
+    auto dir = buildPath(tempDir, format("nano-coder-recgz-%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/x");
+    log.warn = (string) {};
+    log.input("i1", "pi");
+    auto p = log.path;
+    auto stem = recoveryStem(log.id);
+    // An earlier recovered session was tidied up to `<stem>.recovered-1.jsonl.gz`.
+    // A later recovery must not take the plain `recovered-1` name: that would
+    // shadow the archive (`findSession` prefers a plain log) and strand it.
+    auto gz = buildPath(dir, stem ~ ".recovered-1.jsonl.gz");
+    std.file.write(gz, "x");
+    remove(p);
+    std.file.write(p, "{\"type\":\"session\",\"data\":{}}\n");
+    log.input("i2", "rho");
+    auto rec = log.path;
+    log.close();
+    assert(rec == buildPath(dir, stem ~ ".recovered-2.jsonl"), rec);
+    auto now = readText(rec);
+    assert(now.canFind("pi") && now.canFind("rho"), now);
+    assert(gz.exists, "the earlier archive is left in place");
+    // And the archive stays resumable by its own id once the plain squat is gone.
+    assert(findSession(dir, stem ~ ".recovered-1") == gz);
+    restore(rec);
+}
+
+@("a destination replaced after the final sync is not adopted (#237)")
+unittest
+{
+    import std.algorithm : canFind;
+    auto dir = buildPath(tempDir, format("nano-coder-recswap-%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/x");
+    log.warn = (string) {};
+    log.input("i1", "sigma");
+    auto p = log.path;
+    auto stem = recoveryStem(log.id);
+    // Force the recovery-log path, and pre-create the first recovery name so
+    // the loop adopts the second. Then swap that second name between the
+    // recovery's create+lock and its post-sync identity re-check: the writer
+    // must detect the swap, close the unlinked candidate, and fall to the
+    // next name instead of adopting (and appending to) an unlinked inode.
+    remove(p);
+    std.file.write(p, "{\"type\":\"session\",\"data\":{}}\n");
+    auto first = buildPath(dir, stem ~ ".recovered-1.jsonl");
+    std.file.write(first, ""); // taken, so the loop moves to recovered-2
+    // A swap hook: when recovery creates recovered-2, replace the path with a
+    // foreign file before the post-sync sameFile re-check runs.
+    auto second = buildPath(dir, stem ~ ".recovered-2.jsonl");
+    log.swapAfterCreate = (string created) {
+        if (created == second)
+        {
+            remove(created);
+            std.file.write(created, "{\"type\":\"session\",\"data\":{}}\n");
+        }
+    };
+    log.input("i2", "tau");
+    auto rec = log.path;
+    log.close();
+    // The swapped candidate (recovered-2) was not adopted; recovery used the next.
+    assert(rec == buildPath(dir, stem ~ ".recovered-3.jsonl"), rec);
+    auto now = readText(rec);
+    assert(now.canFind("sigma") && now.canFind("tau"), now);
+    restore(rec);
+}
+
+// An in-place rewrite of the recovery candidate (same inode, so `sameFile`
+// still matches) must not be adopted: recovery verifies the bytes.
+unittest
+{
+    import std.algorithm : canFind;
+    import std.array : replicate;
+    auto dir = buildPath(tempDir, format("nano-coder-recinplace-%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/x");
+    log.warn = (string) {};
+    log.input("i1", "sigma");
+    auto p = log.path;
+    auto stem = recoveryStem(log.id);
+    remove(p);
+    std.file.write(p, "{\"type\":\"session\",\"data\":{}}\n");
+    auto first = buildPath(dir, stem ~ ".recovered-1.jsonl");
+    log.swapAfterCreate = (string created) {
+        // Same inode: truncate-and-write, longer than our records.
+        if (created == first)
+            std.file.write(created, "{\"type\":\"session\",\"data\":{\"id\":\"foreign\"}}\n" ~ "x".replicate(8192) ~ "\n");
+    };
+    log.input("i2", "tau");
+    auto rec = log.path;
+    log.close();
+    assert(rec == buildPath(dir, stem ~ ".recovered-2.jsonl"), rec);
+    auto now = readText(rec);
+    assert(now.canFind("sigma") && now.canFind("tau") && !now.canFind("foreign"), now);
+    restore(rec);
 }
