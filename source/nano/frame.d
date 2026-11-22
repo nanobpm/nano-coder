@@ -740,6 +740,8 @@ struct Transcript
     private string[][] cache;
     private size_t cacheWidth;
     private Fold[] folds;
+    /// Ids of folds pruned by the line cap: a refold for one re-adds it.
+    private bool[string] prunedIds;
 
     void clear() pure
     {
@@ -825,6 +827,7 @@ struct Transcript
             Fold[] kept;
             foreach (f; folds)
                 if (f.start >= drop) { f.start -= drop; kept ~= f; }
+                else if (f.id.length) prunedIds[f.id] = true;
             folds = kept;
         }
     }
@@ -881,6 +884,19 @@ struct Transcript
                     if (g.start > f.start) g.start = g.start - oldLength + shownNow.length;
                 if (cache.length > f.start) cache = cache[0 .. f.start];
                 return;
+            }
+            // Its fold was pruned: show the update as a fresh fold at the end,
+            // so late reasoning is not lost.
+            if (id in prunedIds)
+            {
+                prunedIds.remove(id);
+                Fold f;
+                f.id = id;
+                f.start = lines.length;
+                f.length = collapsed.length;
+                f.other = expanded;
+                lines ~= collapsed;
+                folds ~= f;
             }
         }
     }
@@ -1499,6 +1515,20 @@ unittest
     // An unknown id changes nothing.
     t.feed(refoldMark("nope", "z\n", "z\n").representation);
     assert(t.lines == ["∴ Thought for 3.0s", "ABC"]);
+}
+
+unittest
+{
+    import std.conv : to;
+    // A refold whose fold was pruned by the line cap re-adds it at the end.
+    Transcript t;
+    t.cap = 10;
+    t.feed(("∴ Thought\n" ~ foldMark("think-1", 1, "∴ Thought\n    a\n")).representation);
+    foreach (i; 0 .. 12) t.feed((i.to!string ~ "\n").representation);
+    t.feed(refoldMark("think-1", "∴ Thought more\n", "∴ Thought more\n    a b\n").representation);
+    assert(t.lines[$ - 1] == "∴ Thought more", t.lines.to!string);
+    assert(t.toggleLatest());
+    assert(t.lines[$ - 2 .. $] == ["∴ Thought more", "    a b"], t.lines.to!string);
 }
 
 // Repeated tall-editor shrinks with output between them: the second freeze

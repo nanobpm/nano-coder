@@ -1017,7 +1017,7 @@ struct Screen
     // thought), and reasoning streamed after its answer started: that joins
     // the block instead of opening a second one that splits the answer.
     private string thinkId;
-    private long thinkMs, lateStart;
+    private long thinkMs, lateStart, lateMs;
     private bool late, thoughtThisCall;
     private string lateText;
     private static size_t thinkSeq;
@@ -1164,9 +1164,11 @@ struct Screen
     private void mergeLate()
     {
         if (!late) { lateText = null; return; }
-        if (lateStart) thinkMs += nowMs() - lateStart;
+        if (lateStart) { thinkMs += nowMs() - lateStart; lateMs += nowMs() - lateStart; }
+        immutable lateFor = lateMs;
         late = false;
         lateStart = 0;
+        lateMs = 0;
         auto rest = lateText;
         lateText = null;
         if (framed && thinkId.length)
@@ -1182,6 +1184,8 @@ struct Screen
         midLine = false;
         answering = false;
         thinkingDelta(rest);
+        // Time the late reasoning as it streamed, not this replay.
+        thinkStart = nowMs() - lateFor;
         finishThinking();
     }
 
@@ -1201,7 +1205,7 @@ struct Screen
         }
         if (!chunk.length) return;
         streamedAnswer ~= chunk;
-        if (late && lateStart) { thinkMs += nowMs() - lateStart; lateStart = 0; }
+        if (late && lateStart) { thinkMs += nowMs() - lateStart; lateMs += nowMs() - lateStart; lateStart = 0; }
         finishThinking();
         if (!answering)
         {
@@ -1262,6 +1266,7 @@ struct Screen
         late = false;
         lateText = null;
         lateStart = 0;
+        lateMs = 0;
         thinkId = null;
         thoughtThisCall = false;
     }
