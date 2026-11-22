@@ -23,7 +23,7 @@ import std.format : format;
 import std.regex : regex, matchFirst, Regex;
 import std.string : strip, indexOf, toLower;
 import std.algorithm : canFind, any, all, startsWith, endsWith, filter;
-import std.array : array, join;
+import std.array : array, join, replace;
 import std.algorithm : map;
 import std.sumtype : SumType, match;
 import nano.shell : parse, Simple;
@@ -338,6 +338,21 @@ struct Policy
                     foreach (p; [absolute, resolved])
                         if (!sandbox.allowsWrite(p, cwd))
                             return format("%s is outside the %s sandbox's writable directories", p, sandbox.mode.modeName);
+                return null;
+            case "apply_patch":
+                // Every path the patch touches (both ends of a move) passes
+                // the same checks as a direct edit of it. A patch that doesn't
+                // parse touches nothing; the tool reports the parse error.
+                auto patch = stringArg(args, "patch");
+                if (patch is null) return null;
+                import nano.tools : ToolError;
+                import nano.tools.files : patchPaths;
+                string[] paths;
+                try paths = patchPaths(patch);
+                catch (ToolError) return null; // unparseable: the tool rejects it before touching any path
+                foreach (p; paths)
+                    if (auto r = reasonIn("edit_file", JSONValue(["path": p]), cwd, ask))
+                        return r.replace("denies edit_file on", "denies apply_patch on");
                 return null;
             case "grep", "glob":
                 auto root = stringArg(args, "path");

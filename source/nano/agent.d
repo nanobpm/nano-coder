@@ -171,6 +171,14 @@ struct ConfiguredWindow
     string source;
 }
 
+/// One path an apply_patch call touches, as the file-tool call that would
+/// change it directly (for the per-path hooks).
+private struct PatchEdit
+{
+    string name;
+    JSONValue args;
+}
+
 class Agent
 {
     NotNull!LLMClient client;
@@ -843,7 +851,8 @@ class Agent
                 }
                 // A successful edit marks the tree unchecked; a bash call
                 // that started (even one exiting non-zero) is the check.
-                if (!isError && (call.name == "write_file" || call.name == "edit_file")) editsSinceCheck = true;
+                auto patched = call.name == "apply_patch" && dispatched ? patchTouches(effectiveArgs, isError) : null;
+                if (!isError && (call.name == "write_file" || call.name == "edit_file" || patched.length)) editsSinceCheck = true;
                 else if (dispatched && !isError && call.name == "bash") editsSinceCheck = false;
                 if (call.name == "read_file") result = imageResult(result, isError, attachments);
                 // Deeper instruction files and scoped rules attach to the first
@@ -857,11 +866,18 @@ class Agent
                                 if (auto nested = pi.nestedFor(p.str, getcwd())) result ~= nested;
                             });
                         }
+                foreach (p; patched)
+                {
+                    import std.file : getcwd;
+                    instructions.ifSome((ProjectInstructions pi) {
+                        if (auto nested = pi.nestedFor(p, getcwd())) result ~= nested;
+                    });
+                }
                 // Memory recall (Rust #167): a note for each memory whose
                 // anchors appear in this call's arguments and whose full
                 // text is not already in context. Only calls that ran.
                 if (dispatched)
-                    foreach (note; recallMemories(call.name, effectiveArgs, !isError, result))
+                    foreach (note; recallMemories(call.name, withPaths(effectiveArgs, patched), !isError, result))
                         result ~= "\n\n" ~ wrap(note);
                 if (hist.isHistoryTool(call.name)) historyHintPending = false;
                 else if (historyHintPending && historyEnabled && hist.looksFailed(call.name, !isError, result))
@@ -1609,6 +1625,10 @@ class Agent
             }
             if (deny !is null) return withContext(deny, context);
         }
+        // apply_patch: each touched path also passes the hooks as a direct
+        // edit of it would (the policy already checked every path).
+        if (call.name == "apply_patch")
+            if (auto deny = patchPathHooks(call, args, context)) return withContext(deny, context);
         dispatched = true;
         effectiveArgs = args;
         string out_;
@@ -1651,7 +1671,81 @@ class Agent
             if (auto ctx = o.contextBlock) context ~= ctx;
             if (o.blocked && o.blockReason.strip.length) context ~= o.blockReason;
         }
+        if (call.name == "apply_patch" && !isError)
+            foreach (edit; patchEdits(args))
+                foreach (h; hooks)
+                {
+                    auto o = h.runPostToolUse(edit.name, edit.args, out_, call.id);
+                    if (auto ctx = o.contextBlock) context ~= ctx;
+                    if (o.blocked && o.blockReason.strip.length) context ~= o.blockReason;
+                }
         return withContext(out_, context);
+    }
+
+    /// An apply_patch call's touched paths as the file-tool calls a direct
+    /// change would make: `write_file` for an added file or a move's
+    /// destination, `edit_file` otherwise (with the path only). None when the
+    /// patch doesn't parse or is a dry run, which writes nothing.
+    private static PatchEdit[] patchEdits(JSONValue args)
+    {
+        import nano.tools : ToolError;
+        import nano.tools.files : parsePatch, PatchKind, FilePatch;
+        auto p = "patch" in args;
+        if (p is null || p.type != JSONType.string) return null;
+        if (auto d = "dry_run" in args) if (d.type == JSONType.true_) return null;
+        FilePatch[] files;
+        try files = parsePatch(p.str);
+        catch (ToolError) return null; // unparseable: the tool reports it and touches nothing
+        PatchEdit[] out_;
+        foreach (fp; files)
+        {
+            out_ ~= PatchEdit(fp.kind == PatchKind.add ? "write_file" : "edit_file", JSONValue(["path": fp.path]));
+            if (fp.moveTo !is null) out_ ~= PatchEdit("write_file", JSONValue(["path": fp.moveTo]));
+        }
+        return out_;
+    }
+
+    /// Run the PreToolUse hooks for each path an apply_patch call touches.
+    /// A hook can deny or add context; it can't rewrite one path of a patch,
+    /// so an input rewrite blocks the call. Null when every path may proceed.
+    private string patchPathHooks(const ToolCall call, JSONValue args, ref string[] context)
+    {
+        foreach (edit; patchEdits(args))
+            foreach (h; hooks)
+            {
+                auto o = h.runPreToolUse(edit.name, edit.args, call.id);
+                if (auto ctx = o.contextBlock) context ~= ctx;
+                auto path = edit.args["path"].str;
+                if (o.denies)
+                    return o.blockReason.length ? o.blockReason : format("blocked by a PreToolUse hook (on %s)", path);
+                if (o.decision == Decision.ask)
+                    return o.blockReason.strip.length ? o.blockReason
+                        : format("a PreToolUse hook requested confirmation (ask) for %s, which nano cannot prompt for yet; blocking the call", path);
+                if (o.updatedInput.type != JSONType.null_)
+                    return format("a PreToolUse hook rewrote the input for %s, which apply_patch cannot apply to one path of a patch; "
+                            ~ "use edit_file or write_file for that file", path);
+            }
+        return null;
+    }
+
+    /// The paths a successful, non-dry-run apply_patch call changed.
+    private static string[] patchTouches(JSONValue args, bool isError)
+    {
+        if (isError) return null;
+        string[] out_;
+        foreach (e; patchEdits(args)) out_ ~= e.args["path"].str;
+        return out_;
+    }
+
+    /// The call's arguments with the patch's paths listed, so memory recall
+    /// sees them as it sees a file tool's `path`.
+    private static JSONValue withPaths(JSONValue args, string[] paths)
+    {
+        if (!paths.length || args.type != JSONType.object) return args;
+        JSONValue r = JSONValue(string[string].init);
+        foreach (k, v; args.objectNoRef) r[k] = v;
+        r["paths"] = JSONValue(paths);
+        return r;
     }
 
     /// Instruction files: nested ones attach to file-tool results.
@@ -3438,3 +3532,79 @@ unittest // at most two notes per input; refused calls never recall
     assert(pinCount(b) == 0);
 }
 
+
+// apply_patch passes the same gate as the file tools for every touched path:
+// a policy-denied path in a multi-file patch writes nothing and is named,
+// plan mode blocks it, an `Edit` hook sees each path, and a successful patch
+// counts as an edit for verify-before-complete.
+unittest
+{
+    import nano.providers.mock;
+    import nano.claude_hooks : Hook, Event;
+    import nano.tools.files : ReadState, registerFiles = register;
+    import std.algorithm : canFind;
+    import std.file : tempDir, write, readText, mkdirRecurse, rmdirRecurse, exists;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    import core.time : seconds;
+    auto dir = buildPath(tempDir, format("nano-agent-patch-%s", thisProcessID));
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto ok = buildPath(dir, "ok.txt"), secret = buildPath(dir, ".env");
+    write(ok, "one\n");
+    write(secret, "KEY=1\n");
+    string patchFor(string target)
+    {
+        return "*** Begin Patch\n*** Update File: " ~ ok ~ "\n@@\n-one\n+two\n*** Update File: " ~ target
+            ~ "\n@@\n-KEY=1\n+KEY=2\n*** End Patch\n";
+    }
+    auto call = (string id, string patch) => ToolCall.fromRaw(id, "apply_patch", JSONValue(["patch": patch]).toString);
+    string toolText(Agent a, string id)
+    {
+        foreach (m; a.messages) if (m.role == Role.tool && m.toolCallId == id) return m.content;
+        assert(0, "no tool result for " ~ id);
+    }
+    auto reg = new ToolRegistry;
+    registerFiles(reg, new ReadState);
+    auto ev = new NullEvents;
+
+    // A deny rule on one path blocks the whole patch: nothing is written.
+    auto mock = new MockClient([LLMResponse("", "", [call("p1", patchFor(secret))]), LLMResponse("done")]);
+    auto agent = new Agent(mock, reg, Policy.fromConfig(parseJSON(`{"deny":["Edit(**/.env)"]}`)), "sys");
+    agent.run("patch", ev);
+    auto t = toolText(agent, "p1");
+    assert(t.canFind("denies apply_patch on " ~ secret), t);
+    assert(readText(ok) == "one\n" && readText(secret) == "KEY=1\n");
+
+    // Plan mode blocks it like edit_file.
+    mock = new MockClient([LLMResponse("", "", [call("p2", patchFor(secret))]), LLMResponse("done")]);
+    agent = new Agent(mock, reg, Policy.init, "sys");
+    agent.control.mode = AgentMode.plan;
+    agent.run("patch", ev);
+    assert(toolText(agent, "p2").canFind("disabled in plan mode"), toolText(agent, "p2"));
+    assert(readText(ok) == "one\n");
+    agent.control.mode = AgentMode.normal;
+
+    // A PreToolUse hook matching `Edit` sees each path and can deny one.
+    Hook h;
+    h.event = Event.preToolUse;
+    h.matcher = "Edit";
+    h.command = `grep -q '\.env' && { echo "no env edits" >&2; exit 2; }; exit 0`;
+    h.timeout = 10.seconds;
+    mock = new MockClient([LLMResponse("", "", [call("p3", patchFor(secret))]), LLMResponse("done")]);
+    agent = new Agent(mock, reg, Policy.init, "sys");
+    agent.hooks = some(new HookManager([h], tempDir));
+    agent.run("patch", ev);
+    assert(toolText(agent, "p3").canFind("no env edits"), toolText(agent, "p3"));
+    assert(readText(ok) == "one\n" && readText(secret) == "KEY=1\n");
+
+    // Applied: both files change, and completing needs a check first.
+    auto done = ToolCall.fromRaw("o1", "report_outcome", `{"status":"completed","summary":"done"}`);
+    mock = new MockClient([LLMResponse("", "", [call("p4", patchFor(secret)), done]),
+        LLMResponse("", "", [ToolCall.fromRaw("o2", "report_outcome", `{"status":"completed","summary":"done"}`)])]);
+    agent = new Agent(mock, reg, Policy.init, "sys");
+    agent.run("patch", ev);
+    assert(toolText(agent, "p4").canFind("Applied patch to 2 file(s)"), toolText(agent, "p4"));
+    assert(readText(ok) == "two\n" && readText(secret) == "KEY=2\n");
+    assert(toolText(agent, "o1").canFind(verifyReminder));
+}

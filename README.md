@@ -185,7 +185,7 @@ source/
     ├── copilot.d    # UNOFFICIAL Copilot-subscription provider (login, tokens)
     ├── tools/       # Tool registry and the built-in tools
     │   ├── bash.d       # bash tool: timeout, file capture, bounded output
-    │   ├── files.d      # read_file / write_file / edit_file
+    │   ├── files.d      # read_file / write_file / edit_file / apply_patch
     │   └── search.d     # glob / grep
     ├── shell.d      # Bash parser used by the permission checks
     ├── permissions.d, guard.d # Allow/deny rules and built-in guards against destructive commands
@@ -300,6 +300,19 @@ phases). Disable them with `--no-hooks`, or granularly via the
   it retries ignoring `read_file` line-number prefixes, then trailing whitespace, then
   indentation (re-indenting `new_string` to fit), and uses such a match only if it is unique;
   otherwise the error shows the closest lines. Returns the edited lines with 3 lines of context.
+- `apply_patch` - Apply a content-anchored patch (`patch`, optional `dry_run`) that updates, adds,
+  deletes and moves any number of files in one call:
+  `*** Begin Patch` / `*** Update File: path` (hunks of ` ` context, `-` and `+` lines, each
+  optionally after an `@@ <nearby line>` anchor) / `*** Add File: path` (`+` lines) /
+  `*** Delete File: path` / `*** Move File: from -> to` / `*** End Patch`. No line numbers: each hunk
+  must match exactly one place, using `edit_file`'s matching (exact, then ignoring trailing
+  whitespace, then indentation; the tier used is reported), and applies to the file as the
+  earlier hunks left it. Atomic: every hunk is applied in memory first, and nothing is written
+  unless all succeed; a failure names the file and hunk and shows the closest lines. Every
+  touched path (both ends of a move) passes the permission rules, plan mode, sandbox and the
+  `Edit`/`Write` hooks exactly as a direct edit would. Returns the applied unified diff;
+  `dry_run` returns it and writes nothing. A file read earlier that has changed on disk since
+  must be read again first. Prefer `edit_file` for one surgical edit.
 - `edit_file`, and `write_file` over an existing file, require the file to have been read with
   `read_file` (or written by these tools) in this process, and to be unchanged on disk since.
   Otherwise they ask the model to read it again, so an edit can't land on stale text.
@@ -340,7 +353,7 @@ wins. An allow rule approves a shell command only when *every* command in it mat
 | `Bash(rm -rf *)` | a shell command; `*` matches anything, including spaces and `/` |
 | `Bash(git push:*)` | `git push` alone or with any arguments |
 | `Read(~/.ssh/**)` | `read_file` paths and files `grep`/`glob` may reveal; `**` crosses directories, `*` does not |
-| `Edit(**/.env)` / `Write(...)` | `write_file` and `edit_file` paths (relative to the working directory, or absolute) |
+| `Edit(**/.env)` / `Write(...)` | `write_file` and `edit_file` paths, and every path an `apply_patch` touches (relative to the working directory, or absolute) |
 | `write_file`, `bash`, any tool name | every call to that tool |
 
 **Shell commands are parsed, not pattern-matched as text.** The command line is split on `;`,
@@ -385,7 +398,7 @@ write only to:
   `~/Library/Caches`, `~/.gradle`, `~/go/pkg/mod`, ...) and `writable` paths
 - `read-only`: temp directories and `writable` paths
 
-`write_file` and `edit_file` are held to the same directories. `network = false` blocks
+`write_file`, `edit_file` and `apply_patch` are held to the same directories. `network = false` blocks
 outbound connections (macOS: except to localhost; Linux: all TCP, which needs Linux 6.7+).
 If the sandbox is enabled but cannot be applied, commands fail instead of running
 unsandboxed. When a sandboxed command fails with a permission error, the result tells the
@@ -433,7 +446,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
 - `/model [provider/model]` - Show the current model and pick a new one. The list starts with the last four models you used (the current one marked; the previous one highlighted, so `/model` then Enter switches back), then the providers: pick a provider to scroll its model list (Esc steps back). With an argument, switches directly (conversation is kept). Typing `/model ` shows a type-ahead of the current model, recently used models, and each configured provider's default model; Tab completes (a bare provider name completes to its default model). Recently used models are kept in `~/.local/share/nano-coder/recent-models.json`
 - `/mode [normal|plan|auto]` - Show or set the agent mode (Shift+Tab cycles it, at the prompt or mid-turn):
   - **normal** - full tools; reaching a positive turn cap asks whether to keep going
-  - **plan** - read-only: mutating tools (`bash`, `write_file`, `edit_file`) are gated, only analysis and output
+  - **plan** - read-only: mutating tools (`bash`, `write_file`, `edit_file`, `apply_patch`) are gated, only analysis and output
   - **auto** - no turn cap (headless runs still get the 300-call safety cap); a `question` left unanswered for 15s is answered with "the user is away from the keyboard, make the best decision you can"
 - `/thinking [level|default|off|reset]` - Show the thinking level in use and the levels the current model takes, or set one for this session (`reset` goes back to the configured level). See [Thinking](#thinking)
 - `/providers` - List providers, endpoints and whether their API key is available
@@ -1112,7 +1125,7 @@ alternatives).
 
 **Deeper directories and path rules load lazily.** Instruction files deeper than the working
 directory, such as `pkg/AGENTS.md`, and rules whose `paths` match are attached to the result
-of the first `read_file`, `write_file` or `edit_file` call that touches a matching path, once
+of the first `read_file`, `write_file`, `edit_file` or `apply_patch` call that touches a matching path, once
 each. After a compaction they are attached again the next time they apply. Files that the
 `bash` tool touches don't trigger this.
 

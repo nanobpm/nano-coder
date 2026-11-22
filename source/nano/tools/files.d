@@ -42,6 +42,14 @@ class ReadState
     void record(string path, const(void)[] content) { seen[key(path)] = sha256Of(content); }
     void forget(string path) { seen.remove(key(path)); }
 
+    /// Whether the model read `path` and its bytes on disk (`current`) have
+    /// changed since: what it saw is stale. False for a file never read.
+    bool staleRead(string path, const(ubyte)[] current)
+    {
+        auto s = key(path) in seen;
+        return s !is null && *s != sha256Of(current);
+    }
+
     /// Fail unless `current` (the file's bytes on disk) is what the model last saw.
     void checkFresh(string path, const(ubyte)[] current, string tool)
     {
@@ -703,6 +711,541 @@ string editFile(JSONValue args, ReadState state)
             found.how.length ? " (matched " ~ found.how ~ ")" : "", snippet(updated, newRanges));
 }
 
+// ---------------------------------------------------------------------------
+// apply_patch: an atomic, content-anchored, multi-file patch.
+// ---------------------------------------------------------------------------
+
+/// One hunk of an `*** Update File` section: the `@@` anchor line's text
+/// (empty: none), the lines it expects (context and `-`) and the lines that
+/// replace them (context and `+`).
+struct PatchHunk
+{
+    string anchor;
+    string[] old_, new_;
+    bool eof; /// `*** End of File`: the hunk must end at the end of the file
+    size_t line; /// 1-based line in the patch where the hunk starts
+}
+
+enum PatchKind { add, delete_, update }
+
+/// One file section of a patch. `*** Move File: a -> b` and `*** Update
+/// File: a` + `*** Move to: b` are both an update with `moveTo` set.
+struct FilePatch
+{
+    PatchKind kind;
+    string path;
+    string moveTo; /// null: not moved
+    string content; /// add: the new file's text
+    PatchHunk[] hunks;
+}
+
+private bool isSectionHeader(string l) pure
+{
+    return l.startsWith("*** ") && l.stripRight != "*** End of File";
+}
+
+/// Parse the `*** Begin Patch` ... `*** End Patch` format. Errors name the
+/// patch line.
+FilePatch[] parsePatch(string patch) pure
+{
+    auto lines = textLines(patch);
+    size_t lo, hi = lines.length;
+    while (lo < hi && lines[lo].strip.length == 0) lo++;
+    while (hi > lo && lines[hi - 1].strip.length == 0) hi--;
+    if (lo == hi || lines[lo].strip != "*** Begin Patch")
+        throw new ToolError("apply_patch: the patch must start with a `*** Begin Patch` line");
+    if (hi < lo + 2 || lines[hi - 1].strip != "*** End Patch")
+        throw new ToolError("apply_patch: the patch must end with an `*** End Patch` line");
+    auto end = hi - 1;
+    ToolError err(size_t at, string m) { return new ToolError(format("apply_patch: patch line %s: %s", at + 1, m)); }
+    string pathOf(size_t at, string p)
+    {
+        p = p.strip;
+        if (!p.length) throw err(at, "missing file path");
+        return p;
+    }
+    FilePatch[] out_;
+    size_t i = lo + 1;
+    while (i < end)
+    {
+        auto l = lines[i];
+        string rest;
+        if (l.strip.length == 0) { i++; continue; }
+        if (chop(l, "*** Add File: ", rest))
+        {
+            auto fp = FilePatch(PatchKind.add, pathOf(i, rest));
+            i++;
+            string[] body_;
+            for (; i < end && !isSectionHeader(lines[i]); i++)
+            {
+                if (lines[i].length == 0) continue; // a blank separator line, not file content
+                if (!lines[i].startsWith("+")) throw err(i, "every line of an added file starts with `+`");
+                body_ ~= lines[i][1 .. $];
+            }
+            fp.content = body_.length ? body_.join("\n") ~ "\n" : "";
+            out_ ~= fp;
+        }
+        else if (chop(l, "*** Delete File: ", rest))
+        {
+            out_ ~= FilePatch(PatchKind.delete_, pathOf(i, rest));
+            i++;
+        }
+        else if (chop(l, "*** Update File: ", rest) || l.startsWith("*** Move File: "))
+        {
+            FilePatch fp;
+            fp.kind = PatchKind.update;
+            string mv;
+            if (chop(l, "*** Move File: ", mv))
+            {
+                auto arrow = mv.indexOf(" -> ");
+                if (arrow < 0) throw err(i, "a move is written `*** Move File: <from> -> <to>`");
+                fp.path = pathOf(i, mv[0 .. arrow]);
+                fp.moveTo = pathOf(i, mv[arrow + 4 .. $]);
+            }
+            else fp.path = pathOf(i, rest);
+            i++;
+            if (i < end && chop(lines[i], "*** Move to: ", rest))
+            {
+                if (fp.moveTo !is null) throw err(i, "the file is already being moved");
+                fp.moveTo = pathOf(i, rest);
+                i++;
+            }
+            while (i < end && !isSectionHeader(lines[i]))
+            {
+                PatchHunk h;
+                h.line = i + 1;
+                if (lines[i].startsWith("@@"))
+                {
+                    h.anchor = lines[i][2 .. $].strip;
+                    import std.regex : ctRegex, matchFirst;
+                    if (!matchFirst(h.anchor, ctRegex!`^-\d+(,\d+)? \+\d+`).empty)
+                        throw err(i, "line-number hunk headers are not supported; write `@@` alone or `@@ <a nearby line, such as a signature>`");
+                    i++;
+                }
+                bool any;
+                size_t trailingBlank;
+                for (; i < end && !lines[i].startsWith("@@") && !isSectionHeader(lines[i]); i++)
+                {
+                    auto x = lines[i];
+                    if (x.stripRight == "*** End of File") { h.eof = true; i++; break; }
+                    any = true;
+                    if (x.length == 0) { h.old_ ~= ""; h.new_ ~= ""; trailingBlank++; continue; }
+                    trailingBlank = 0;
+                    switch (x[0])
+                    {
+                    case ' ': h.old_ ~= x[1 .. $]; h.new_ ~= x[1 .. $]; break;
+                    case '-': h.old_ ~= x[1 .. $]; break;
+                    case '+': h.new_ ~= x[1 .. $]; break;
+                    default: throw err(i, "a hunk line starts with ' ' (context), '-' (remove) or '+' (add)");
+                    }
+                }
+                // Bare blank lines at the end of a hunk separate sections; they are not context.
+                h.old_ = h.old_[0 .. $ - trailingBlank];
+                h.new_ = h.new_[0 .. $ - trailingBlank];
+                if (!any) throw err(h.line - 1, "empty hunk");
+                if (h.old_ == h.new_) throw err(h.line - 1, "the hunk changes nothing (no '-' or '+' lines)");
+                fp.hunks ~= h;
+            }
+            if (!fp.hunks.length && fp.moveTo is null)
+                throw err(i - 1, format("`*** Update File: %s` has no hunks", fp.path));
+            out_ ~= fp;
+        }
+        else
+            throw err(i, "expected `*** Add File: `, `*** Delete File: `, `*** Update File: `, `*** Move File: ` or `*** End Patch`");
+    }
+    if (!out_.length) throw new ToolError("apply_patch: the patch changes no files");
+    return out_;
+}
+
+/// Every path a patch touches (both ends of a move), as written: the
+/// permission policy and the agent's per-path side effects check each one.
+string[] patchPaths(string patch) pure
+{
+    string[] out_;
+    foreach (fp; parsePatch(patch))
+    {
+        out_ ~= fp.path;
+        if (fp.moveTo !is null) out_ ~= fp.moveTo;
+    }
+    return out_;
+}
+
+/// Byte offsets just past each line that the `@@` anchor names: the line
+/// equal to it, else equal ignoring surrounding whitespace, else containing it.
+private size_t[] anchorHits(string text, string anchor) pure
+{
+    auto spans = lineSpans(text);
+    auto a = anchor.strip;
+    foreach (tier; 0 .. 3)
+    {
+        size_t[] hits;
+        foreach (sp; spans)
+        {
+            auto l = text[sp[0] .. sp[1]];
+            if (tier == 0 ? l == anchor : tier == 1 ? l.strip == a : l.indexOf(a) >= 0) hits ~= sp[2];
+        }
+        if (hits.length) return hits;
+    }
+    return null;
+}
+
+/// The hunk's expected lines, to compare with the closest candidate.
+private string expectedLines(const PatchHunk h) pure
+{
+    string o;
+    foreach (l; h.old_) o ~= "  | " ~ l ~ "\n";
+    return o;
+}
+
+/// Apply one hunk to `text` (the file after the earlier hunks).
+private string applyHunk(string text, const PatchHunk h, size_t n, ref string[] notes, string display) pure
+{
+    auto where = format("hunk %s (patch line %s)%s", n, h.line, h.anchor.length ? format(" at `@@ %s`", h.anchor) : "");
+    ToolError fail(string m) { return new ToolError(format("apply_patch: %s: %s: %s", display, where, m)); }
+    auto oldT = h.old_.length ? h.old_.join("\n") ~ "\n" : "";
+    auto newT = h.new_.length ? h.new_.join("\n") ~ "\n" : "";
+    size_t[] bases = [0];
+    if (h.anchor.length)
+    {
+        bases = anchorHits(text, h.anchor);
+        if (!bases.length) throw fail("the anchor line was not found" ~ nearMiss(text, h.anchor));
+    }
+    if (h.eof && h.old_.length)
+    {
+        // `*** End of File`: only the file's last lines can match.
+        auto spans = lineSpans(text);
+        if (spans.length < h.old_.length)
+            throw fail("marked `*** End of File` but the file has fewer lines than the hunk expects");
+        bases = [spans[spans.length - h.old_.length][0]];
+    }
+    if (oldT.length == 0)
+    {
+        // Pure insertion: after the anchor line, else at the end of the file.
+        if (bases.length > 1)
+            throw fail(format("the anchor matches %s lines (%s, %s, ...) and the hunk has no context lines to tell them apart",
+                    bases.length, lineAt(text, bases[0]) - 1, lineAt(text, bases[1]) - 1));
+        auto at = h.anchor.length && !h.eof ? bases[0] : text.length;
+        return text[0 .. at] ~ toEndingsAt(text, at, at, newT) ~ text[at .. $];
+    }
+    Located found;
+    bool have;
+    string firstError;
+    foreach (b; bases)
+    {
+        Located f;
+        try f = locate(text[b .. $], oldT, newT, false);
+        catch (ToolError e) { if (firstError is null) firstError = e.msg; continue; }
+        foreach (ref r; f.ranges) r = [r[0] + b, r[1] + b];
+        if (!have) { found = f; have = true; }
+        else if (found.ranges != f.ranges)
+            throw fail(format("the hunk matches after more than one anchor line (lines %s and %s); add context lines to make it unique",
+                    lineAt(text, found.ranges[0][0]), lineAt(text, f.ranges[0][0])));
+    }
+    if (!have)
+    {
+        if (firstError.startsWith("old_string not found"))
+            throw fail("the context and '-' lines were not found" ~ nearMiss(text, oldT) ~ "\nThe hunk expects:\n" ~ expectedLines(h));
+        throw fail(firstError.replace(" or set replace_all", "").replace("new_string", "the hunk").replace("old_string", "the hunk"));
+    }
+    auto r = found.ranges[0];
+    if (h.eof && r[1] != text.length)
+        throw fail(format("marked `*** End of File` but matches at line %s, not at the end of the file", lineAt(text, r[0])));
+    if (found.how.length) notes ~= format("%s: %s matched %s", display, where, found.how);
+    return text[0 .. r[0]] ~ found.news[0] ~ text[r[1] .. $];
+}
+
+/// Apply an update's hunks in order, each to the result of the ones before.
+string applyHunks(string text, const PatchHunk[] hunks, ref string[] notes, string display) pure
+{
+    // Work on text with a final newline so the last line matches like any other.
+    bool hadNl = text.length == 0 || text.endsWith("\n");
+    auto work = hadNl ? text : text ~ "\n";
+    foreach (n, h; hunks) work = applyHunk(work, h, n + 1, notes, display);
+    if (!hadNl && work.endsWith("\n")) work = work[0 .. $ - 1];
+    return work;
+}
+
+/// A unified diff of `a` -> `b` with three lines of context.
+string unifiedDiff(string from, string to, string a, string b) pure
+{
+    auto x = textLines(a), y = textLines(b);
+    size_t pre;
+    while (pre < x.length && pre < y.length && x[pre] == y[pre]) pre++;
+    size_t suf;
+    while (suf < x.length - pre && suf < y.length - pre && x[$ - 1 - suf] == y[$ - 1 - suf]) suf++;
+    auto xm = x[pre .. $ - suf], ym = y[pre .. $ - suf];
+    char[] tags;
+    string[] text;
+    void op(char t, string l) { tags ~= t; text ~= l; }
+    foreach (l; x[0 .. pre]) op(' ', l);
+    enum maxCells = 4_000_000;
+    if (xm.length && ym.length && xm.length * ym.length <= maxCells)
+    {
+        // Longest common subsequence of the differing middle.
+        auto w = ym.length + 1;
+        auto dp = new uint[(xm.length + 1) * w];
+        foreach_reverse (i; 0 .. xm.length)
+            foreach_reverse (j; 0 .. ym.length)
+                dp[i * w + j] = xm[i] == ym[j] ? dp[(i + 1) * w + j + 1] + 1 : max(dp[(i + 1) * w + j], dp[i * w + j + 1]);
+        size_t i, j;
+        while (i < xm.length && j < ym.length)
+        {
+            if (xm[i] == ym[j]) { op(' ', xm[i]); i++; j++; }
+            else if (dp[(i + 1) * w + j] >= dp[i * w + j + 1]) op('-', xm[i++]);
+            else op('+', ym[j++]);
+        }
+        foreach (l; xm[i .. $]) op('-', l);
+        foreach (l; ym[j .. $]) op('+', l);
+    }
+    else
+    {
+        foreach (l; xm) op('-', l);
+        foreach (l; ym) op('+', l);
+    }
+    foreach (l; x[$ - suf .. $]) op(' ', l);
+    string out_ = format("--- %s\n+++ %s\n", from, to);
+    enum ctx = 3;
+    size_t k;
+    while (k < tags.length)
+    {
+        while (k < tags.length && tags[k] == ' ') k++;
+        if (k == tags.length) break;
+        auto s = saturatingSub(k, ctx);
+        auto e = k;
+        // Extend over changes separated by at most 2 * ctx unchanged lines.
+        for (;;)
+        {
+            while (e < tags.length && tags[e] != ' ') e++;
+            auto next = e;
+            while (next < tags.length && tags[next] == ' ') next++;
+            if (next < tags.length && next - e <= 2 * ctx) { e = next; continue; }
+            break;
+        }
+        auto stop = min(e + ctx, tags.length);
+        size_t oldStart = 1, newStart = 1, oldN, newN;
+        foreach (t; tags[0 .. s]) { if (t != '+') oldStart++; if (t != '-') newStart++; }
+        foreach (t; tags[s .. stop]) { if (t != '+') oldN++; if (t != '-') newN++; }
+        out_ ~= format("@@ -%s,%s +%s,%s @@\n", oldN ? oldStart : oldStart - 1, oldN, newN ? newStart : newStart - 1, newN);
+        foreach (idx; s .. stop) out_ ~= tags[idx] ~ text[idx] ~ "\n";
+        k = stop;
+    }
+    return out_;
+}
+
+/// What a patch does to one path, staged in memory until every hunk applied.
+private struct Staged
+{
+    string path; /// resolved
+    string display; /// as shown in the result
+    bool existed; /// on disk before the patch
+    const(ubyte)[] before; /// its bytes then
+    bool present; /// after the patch
+    bool changed;
+    string after; /// the content after the patch, when present and changed
+    size_t movedFrom = size_t.max; /// index of the move's source (max: none)
+}
+
+/// `path` relative to the working directory when inside it.
+private string displayPath(string path)
+{
+    auto cwd = getcwd;
+    return path.startsWith(cwd ~ "/") ? path[cwd.length + 1 .. $] : path;
+}
+
+private string writeTarget(string path)
+{
+    if (!isLink(path)) return path;
+    auto r = realPath(path);
+    return r !is null ? r : path;
+}
+
+/// Write the staged changes. Every target is re-checked against what was
+/// staged first; a write that then fails rolls back the ones before it.
+private void commitStaged(Staged[] staged, ReadState state)
+{
+    foreach (ref s; staged)
+    {
+        if (!s.changed) continue;
+        if (!s.existed)
+        {
+            if (linkPresent(s.path))
+                throw new ToolError(format("apply_patch: %s was created while the patch was being prepared; nothing was written", s.display));
+            continue;
+        }
+        ubyte[] current;
+        try current = readBytes(s.path);
+        catch (FileException e) throw new ToolError(format("apply_patch: re-read %s: %s; nothing was written", s.display, e.msg));
+        if (current != s.before)
+            throw new ToolError(format("apply_patch: %s changed while the patch was being prepared; nothing was written", s.display));
+    }
+    size_t done;
+    scope (failure)
+        foreach_reverse (ref s; staged[0 .. done])
+        {
+            if (!s.changed) continue;
+            try
+            {
+                if (s.existed) write(writeTarget(s.path), s.before);
+                else if (linkPresent(s.path)) remove(s.path);
+            }
+            catch (FileException) {} // rollback is best effort: the error that triggered it is reported
+        }
+    import std.process : thisProcessID;
+    foreach (i, ref s; staged)
+    {
+        scope (success) done = i + 1;
+        if (!s.changed) continue;
+        if (!s.present)
+        {
+            if (!s.existed) continue;
+            try remove(s.path);
+            catch (FileException e) throw new ToolError(format("apply_patch: delete %s: %s (earlier changes were rolled back)", s.display, e.msg));
+            continue;
+        }
+        auto path = writeTarget(s.path);
+        try mkdirRecurse(path.dirName);
+        catch (FileException e) throw new ToolError(format("apply_patch: create %s: %s (earlier changes were rolled back)", path.dirName, e.msg));
+        auto tmp = buildPath(path.dirName, format(".%s.tmp-%s", path.baseName, thisProcessID));
+        try
+        {
+            write(tmp, s.after);
+            uint mode;
+            if (statMode(path, mode)) chmodPath(tmp, mode & octal!7777);
+            rename(tmp, path);
+        }
+        catch (FileException e)
+        {
+            if (linkPresent(tmp)) remove(tmp);
+            throw new ToolError(format("apply_patch: write %s: %s (earlier changes were rolled back)", s.display, e.msg));
+        }
+    }
+    foreach (ref s; staged)
+        if (s.changed)
+        {
+            if (s.present) state.record(s.path, s.after);
+            else state.forget(s.path);
+        }
+}
+
+string applyPatch(JSONValue args, ReadState state)
+{
+    auto patch = requireString(args, "patch", "apply_patch");
+    auto dry = optBool(args, "dry_run", false);
+    auto files = parsePatch(patch);
+    Staged[] staged;
+    size_t[string] index;
+    size_t at(string raw)
+    {
+        auto path = resolvePath(raw);
+        if (auto k = path in index) return *k;
+        Staged s;
+        s.path = path;
+        s.display = displayPath(path);
+        if (linkPresent(path))
+        {
+            if (path.exists && path.isDir) throw new ToolError(format("apply_patch: %s is a directory", s.display));
+            ubyte[] bytes;
+            try bytes = readBytes(path);
+            catch (FileException e) throw new ToolError(format("apply_patch: read %s: %s", s.display, e.msg));
+            if (state.staleRead(path, bytes))
+                throw new ToolError(format("apply_patch: %s has changed since it was last read (by a command, a tool or the user); "
+                        ~ "read it again before patching it", s.display));
+            s.existed = s.present = true;
+            s.before = bytes;
+        }
+        index[path] = staged.length;
+        staged ~= s;
+        return staged.length - 1;
+    }
+    string original(size_t k)
+    {
+        import std.utf : UTFException;
+        try return utf8Text(staged[k].before);
+        catch (UTFException) throw new ToolError(format("apply_patch: %s is not valid UTF-8", staged[k].display));
+    }
+    string[] notes;
+    foreach (fp; files)
+    {
+        auto k = at(fp.path);
+        final switch (fp.kind)
+        {
+        case PatchKind.add:
+            if (staged[k].present)
+                throw new ToolError(format("apply_patch: Add File %s: it already exists; use Update File to change it", staged[k].display));
+            staged[k].present = staged[k].changed = true;
+            staged[k].after = fp.content;
+            break;
+        case PatchKind.delete_:
+            if (!staged[k].present) throw new ToolError(format("apply_patch: Delete File %s: it does not exist", staged[k].display));
+            staged[k].present = false;
+            staged[k].changed = true;
+            staged[k].after = null;
+            break;
+        case PatchKind.update:
+            if (!staged[k].present)
+                throw new ToolError(format("apply_patch: Update File %s: it does not exist; use Add File to create it", staged[k].display));
+            auto updated = applyHunks(staged[k].changed ? staged[k].after : original(k), fp.hunks, notes, staged[k].display);
+            if (fp.moveTo is null)
+            {
+                staged[k].after = updated;
+                staged[k].changed = true;
+                break;
+            }
+            auto d = at(fp.moveTo);
+            if (d == k) throw new ToolError(format("apply_patch: Move File %s: the source and destination are the same", staged[k].display));
+            if (staged[d].present)
+                throw new ToolError(format("apply_patch: Move File %s -> %s: the destination already exists", staged[k].display, staged[d].display));
+            staged[k].present = false;
+            staged[k].changed = true;
+            staged[k].after = null;
+            staged[d].present = staged[d].changed = true;
+            staged[d].after = updated;
+            staged[d].movedFrom = k;
+            break;
+        }
+    }
+    // The summary and diff. A move shows as one rename of its source.
+    auto movedAway = new bool[staged.length];
+    foreach (ref s; staged) if (s.present && s.movedFrom != size_t.max) movedAway[s.movedFrom] = true;
+    string summary, diff;
+    size_t changedFiles;
+    foreach (k, ref s; staged)
+    {
+        if (!s.changed || (!s.existed && !s.present)) continue;
+        if (!s.present && movedAway[k]) continue;
+        if (s.present && s.existed && s.after == original(k)) continue;
+        changedFiles++;
+        if (s.present && s.movedFrom != size_t.max)
+        {
+            auto src = staged[s.movedFrom].display;
+            auto before = staged[s.movedFrom].existed ? original(s.movedFrom) : "";
+            summary ~= format("  R %s -> %s\n", src, s.display);
+            auto d = unifiedDiff("a/" ~ src, "b/" ~ s.display, before, s.after);
+            diff ~= d.count('\n') > 2 ? d : d ~ "(renamed; content unchanged)\n";
+        }
+        else if (!s.present)
+        {
+            summary ~= format("  D %s\n", s.display);
+            diff ~= unifiedDiff("a/" ~ s.display, "/dev/null", original(k), "");
+        }
+        else if (!s.existed)
+        {
+            summary ~= format("  A %s\n", s.display);
+            diff ~= unifiedDiff("/dev/null", "b/" ~ s.display, "", s.after);
+        }
+        else
+        {
+            summary ~= format("  M %s\n", s.display);
+            diff ~= unifiedDiff("a/" ~ s.display, "b/" ~ s.display, original(k), s.after);
+        }
+    }
+    if (!dry) commitStaged(staged, state);
+    auto head = dry ? format("Dry run: the patch applies cleanly; nothing was written. It would change %s file(s):\n", changedFiles)
+        : format("Applied patch to %s file(s):\n", changedFiles);
+    auto noteText = notes.length ? "\n" ~ notes.join("\n") ~ "\n" : "";
+    return head ~ summary ~ noteText ~ "\n" ~ diff;
+}
+
 void register(ToolRegistry tools, ReadState state)
 {
     tools.register(ToolDefinition("read_file",
@@ -715,12 +1258,13 @@ void register(ToolRegistry tools, ReadState state)
             "required":["path"]}`)),
         (JSONValue a) => readFile(a, state));
     tools.register(ToolDefinition("write_file",
-        "Create a file, or overwrite one you have read, creating parent directories. Prefer edit_file for changes to existing files.",
+        "Create a file, or overwrite one you have read, creating parent directories. Prefer edit_file (one change) or apply_patch (several) for changes to existing files.",
         parseJSON(`{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}`)),
         (JSONValue a) => writeFile(a, state));
     tools.register(ToolDefinition("edit_file",
         "Replace text in a file you have read (read it again if it changed since). old_string must match exactly once unless replace_all is true; "
-        ~ "if there is no exact match, a unique match ignoring trailing whitespace or indentation is used. Returns the edited lines with context.",
+        ~ "if there is no exact match, a unique match ignoring trailing whitespace or indentation is used. Returns the edited lines with context. "
+        ~ "Best for one surgical edit; for changes in several places or files, use apply_patch.",
         parseJSON(`{"type":"object","properties":{
             "path":{"type":"string"},
             "old_string":{"type":"string","description":"Exact text to replace, including whitespace"},
@@ -728,6 +1272,22 @@ void register(ToolRegistry tools, ReadState state)
             "replace_all":{"type":"boolean","description":"Replace every occurrence (default false)"}},
             "required":["path","old_string","new_string"]}`)),
         (JSONValue a) => editFile(a, state));
+    tools.register(ToolDefinition("apply_patch",
+        "Apply a patch that changes one or more files at once, atomically: every hunk must apply or nothing is written. "
+        ~ "Use it for multi-location or multi-file changes (and to add, delete or move files); use edit_file for a single surgical edit. "
+        ~ "Format (no line numbers; hunks are anchored by content):\n"
+        ~ "*** Begin Patch\n*** Update File: src/a.d\n@@ void run(\n context line\n-removed line\n+added line\n context line\n"
+        ~ "*** Add File: src/b.d\n+every line of the new file, prefixed with +\n*** Delete File: old.sh\n"
+        ~ "*** Move File: from.d -> to.d\n*** End Patch\n"
+        ~ "An `@@` line names a nearby line (e.g. a signature) to narrow the search; `@@` alone is allowed. Each hunk needs a few "
+        ~ "unchanged context lines and must match exactly one place (trailing whitespace, then indentation, are relaxed if needed); "
+        ~ "hunks apply in order, each to the file as the earlier ones left it. A move may be followed by hunks. "
+        ~ "Returns the applied unified diff; dry_run returns it without writing.",
+        parseJSON(`{"type":"object","properties":{
+            "patch":{"type":"string","description":"The patch, from *** Begin Patch to *** End Patch"},
+            "dry_run":{"type":"boolean","description":"Check the patch and return its diff without writing anything (default false)"}},
+            "required":["patch"]}`)),
+        (JSONValue a) => applyPatch(a, state));
 }
 
 version (unittest)
@@ -1278,4 +1838,136 @@ unittest
     st.record(pic, fakePng(40, 20));
     writeFile(JSONValue(["path": pic, "content": "replaced"]), st);
     assert(readText(pic) == "replaced");
+}
+
+// ---- apply_patch ----
+
+version (unittest)
+{
+    private string patchErr(ReadState st, string patch, bool dry = false)
+    {
+        try applyPatch(j("patch", patch, "dry_run", dry), st);
+        catch (ToolError e) return e.msg;
+        assert(false, "patch should have failed");
+    }
+
+    private string pt(string[] body_...) { return "*** Begin Patch\n" ~ body_.join("\n") ~ "\n*** End Patch\n"; }
+}
+
+unittest // parse errors name the patch line
+{
+    auto st = new ReadState;
+    assert(patchErr(st, "nope").indexOf("must start with a `*** Begin Patch`") >= 0);
+    assert(patchErr(st, "*** Begin Patch\n*** Delete File: x").indexOf("must end with") >= 0);
+    assert(patchErr(st, pt()).indexOf("changes no files") >= 0);
+    auto e = patchErr(st, pt("*** Update File: a.txt", "@@", " x", "?y"));
+    assert(e.indexOf("patch line 5") >= 0 && e.indexOf("starts with ' '") >= 0, e);
+    assert(patchErr(st, pt("*** Update File: a.txt", "@@ -1,3 +1,4 @@", "-x")).indexOf("line-number hunk headers") >= 0);
+    assert(patchErr(st, pt("*** Update File: a.txt")).indexOf("has no hunks") >= 0);
+    assert(patchErr(st, pt("*** Add File: n.txt", "oops")).indexOf("starts with `+`") >= 0);
+    assert(patchErr(st, pt("*** Frobnicate: a")).indexOf("expected `*** Add File") >= 0);
+    assert(patchErr(st, pt("*** Move File: a.txt b.txt")).indexOf("Move File: <from> -> <to>") >= 0);
+    assert(patchErr(st, pt("*** Update File: a.txt", "@@", " same")).indexOf("changes nothing") >= 0);
+    assert(patchPaths(pt("*** Move File: a -> b", "*** Delete File: c", "*** Update File: d", "*** Move to: e", "@@", "-x"))
+        == ["a", "b", "c", "d", "e"]);
+}
+
+unittest // multi-hunk, multi-file update with anchors, add, delete and move
+{
+    auto st = new ReadState;
+    auto a = tmpFile("p-a.d", "void f()\n{\n    int x = 1;\n    return;\n}\nvoid g()\n{\n    int x = 1;\n    return;\n}\n");
+    auto b = tmpFile("p-b.txt", "gone\n");
+    auto c = tmpFile("p-c.txt", "keep\nme\n");
+    auto n = tmpFile("p-new/deep.txt", null);
+    auto m = tmpFile("p-moved.txt", null);
+    auto out_ = applyPatch(j("patch", pt(
+        "*** Update File: " ~ a,
+        "@@ void g()",
+        " {",
+        "-    int x = 1;",
+        "+    int x = 2;",
+        "@@ void f()",
+        " {",
+        "     int x = 1;",
+        "+    int y = 3;",
+        "*** Add File: " ~ n,
+        "+hello",
+        "+world",
+        "*** Delete File: " ~ b,
+        "*** Move File: " ~ c ~ " -> " ~ m,
+        "@@",
+        " keep",
+        "-me",
+        "+you")), st);
+    assert(readText(a) == "void f()\n{\n    int x = 1;\n    int y = 3;\n    return;\n}\nvoid g()\n{\n    int x = 2;\n    return;\n}\n", readText(a));
+    assert(readText(n) == "hello\nworld\n" && !b.exists && !c.exists && readText(m) == "keep\nyou\n");
+    assert(out_.startsWith("Applied patch to 4 file(s):"), out_);
+    assert(out_.indexOf("+++ b/" ~ a) >= 0 && out_.indexOf("-    int x = 1;\n+    int x = 2;\n") >= 0, out_);
+    assert(out_.indexOf("--- /dev/null\n+++ b/" ~ n ~ "\n@@ -0,0 +1,2 @@\n+hello\n+world\n") >= 0, out_);
+    assert(out_.indexOf("+++ /dev/null") >= 0 && out_.indexOf("  R " ~ c ~ " -> " ~ m) >= 0, out_);
+    // Written files count as read: edit_file may follow without a read.
+    editFile(j("path", n, "old_string", "hello", "new_string", "hi"), st);
+}
+
+unittest // every match tier, reported; ambiguous and missing hunks
+{
+    auto st = new ReadState;
+    auto p = tmpFile("p-tier.py", "def f():\n    x = 1  \n    return x\n");
+    auto out_ = applyPatch(j("patch", pt("*** Update File: " ~ p, "@@", "-    x = 1", "+    x = 2")), st);
+    assert(out_.indexOf("matched ignoring trailing whitespace") >= 0, out_);
+    out_ = applyPatch(j("patch", pt("*** Update File: " ~ p, "@@", "-x = 2", "+x = 3", " return x")), st);
+    assert(out_.indexOf("matched ignoring indentation") >= 0, out_);
+    assert(readText(p) == "def f():\n    x = 3\n    return x\n", readText(p));
+    out_ = applyPatch(j("patch", pt("*** Update File: " ~ p, "@@ def f():", "-    x = 3", "+    x = 4")), st);
+    assert(out_.indexOf("matched") < 0, out_);
+
+    auto q = tmpFile("p-amb.txt", "a\nb\na\nb\n");
+    auto e = patchErr(st, pt("*** Update File: " ~ q, "@@", "-a", "+z", " b"));
+    assert(e.indexOf("p-amb.txt: hunk 1") >= 0 && e.indexOf("occurs 2 times") >= 0 && e.indexOf("replace_all") < 0, e);
+    e = patchErr(st, pt("*** Update File: " ~ q, "@@", " a", "-c", "+z"));
+    assert(e.indexOf("were not found") >= 0 && e.indexOf("Closest match (1 of 2 lines agree), lines 1-2") >= 0, e);
+    assert(e.indexOf("     2\tb") >= 0 && e.indexOf("The hunk expects:\n  | a\n  | c\n") >= 0, e);
+    assert(patchErr(st, pt("*** Update File: " ~ q, "@@ nowhere", "-a", "+z")).indexOf("anchor line was not found") >= 0);
+    // An anchor narrows an otherwise ambiguous hunk.
+    auto r = tmpFile("p-anchor.txt", "one:\n  x\ntwo:\n  x\n");
+    applyPatch(j("patch", pt("*** Update File: " ~ r, "@@ two:", "-  x", "+  y")), st);
+    assert(readText(r) == "one:\n  x\ntwo:\n  y\n");
+    // End of File, a pure insertion after an anchor, and a file without a final newline.
+    auto s = tmpFile("p-eof.txt", "x\ny\nx");
+    applyPatch(j("patch", pt("*** Update File: " ~ s, "@@", "-x", "+z", "*** End of File", "@@ y", "+inserted")), st);
+    assert(readText(s) == "x\ny\ninserted\nz", readText(s));
+    assert(readText(q) == "a\nb\na\nb\n" && st.staleRead(q, readBytes(q)) == false);
+}
+
+unittest // atomic: one failing hunk or file writes nothing; dry run writes nothing
+{
+    auto st = new ReadState;
+    auto a = tmpFile("p-at1.txt", "one\n");
+    auto b = tmpFile("p-at2.txt", "two\n");
+    auto n = tmpFile("p-at-new.txt", null);
+    auto e = patchErr(st, pt("*** Update File: " ~ a, "@@", "-one", "+ONE", "*** Add File: " ~ n, "+x",
+            "*** Update File: " ~ b, "@@", "-three", "+3"));
+    assert(e.indexOf("p-at2.txt: hunk 1") >= 0, e);
+    assert(readText(a) == "one\n" && readText(b) == "two\n" && !n.exists);
+    assert(patchErr(st, pt("*** Add File: " ~ a, "+x")).indexOf("already exists") >= 0);
+    assert(patchErr(st, pt("*** Delete File: " ~ n)).indexOf("does not exist") >= 0);
+    assert(patchErr(st, pt("*** Move File: " ~ a ~ " -> " ~ b)).indexOf("destination already exists") >= 0);
+    auto out_ = applyPatch(j("patch", pt("*** Update File: " ~ a, "@@", "-one", "+ONE", "*** Delete File: " ~ b), "dry_run", true), st);
+    assert(out_.startsWith("Dry run:") && out_.indexOf("-one\n+ONE\n") >= 0 && out_.indexOf("  D ") >= 0, out_);
+    assert(readText(a) == "one\n" && b.exists);
+    // A file read and changed since is stale, as with edit_file.
+    readFile(j("path", a), st);
+    write(a, "changed\n");
+    assert(patchErr(st, pt("*** Update File: " ~ a, "@@", "-changed", "+x")).indexOf("changed since it was last read") >= 0);
+    assert(readText(a) == "changed\n");
+}
+
+unittest // the unified diff
+{
+    assert(unifiedDiff("a", "b", "1\n2\n3\n", "1\n2\n3\n") == "--- a\n+++ b\n");
+    string lines;
+    foreach (i; 1 .. 21) lines ~= format("%s\n", i);
+    auto changed = lines.replace("\n2\n", "\ntwo\n").replace("\n19\n", "\nnineteen\n");
+    auto d = unifiedDiff("a", "b", lines, changed);
+    assert(d == "--- a\n+++ b\n@@ -1,5 +1,5 @@\n 1\n-2\n+two\n 3\n 4\n 5\n@@ -16,5 +16,5 @@\n 16\n 17\n 18\n-19\n+nineteen\n 20\n", d);
 }
