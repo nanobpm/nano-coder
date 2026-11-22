@@ -25,7 +25,7 @@ import nano.clock : monoNow, since;
 enum string toolName = "agent";
 
 /// The tools a v1 sub-agent may call (the history tools run on its own log).
-immutable string[] readOnlyTools = ["read_file", "grep", "glob", "bash"];
+immutable string[] readOnlyTools = ["read_file", "grep", "glob"];
 
 /// Whether a sub-agent may call `name` through its parent.
 bool forwardable(string name) pure nothrow
@@ -59,7 +59,7 @@ ToolDefinition definition() pure
 {
     return ToolDefinition(toolName,
         "Run a read-only sub-agent: a fresh agent with its own context window investigates `task` with read_file, "
-        ~ "grep, glob and bash (under your permission rules) and returns only its final report, so the "
+        ~ "grep and glob (under your permission rules; no shell, so it cannot change files) and returns only its final report, so the "
         ~ "intermediate output never enters your context. Use it for broad searches (dozens of greps and reads "
         ~ "across a codebase) and for independent investigations; several agent calls in one reply run in "
         ~ "parallel. Don't use it for a single lookup you can do with one grep or read_file. The sub-agent sees "
@@ -77,7 +77,7 @@ ToolDefinition definition() pure
 string systemPrompt(string cwd, string today) pure
 {
     return "You are a read-only sub-agent of a coding agent. You were given one task; investigate it with the "
-        ~ "tools you have (read_file, grep, glob, bash) and finish by calling report_outcome, whose summary is your "
+        ~ "tools you have (read_file, grep, glob) and finish by calling report_outcome, whose summary is your "
         ~ "report: the only thing the parent agent will see. You cannot edit files, ask questions or talk to the "
         ~ "user. Be thorough but efficient: search broadly first, then read what matters.\n\n"
         ~ "The report must stand on its own: answer the task directly, cite file:line (e.g. src/app.d:120) for "
@@ -555,6 +555,8 @@ unittest
     assert(collectExceptionMsg(parseArgs(parseJSON(`{"task":" "}`), 600)).canFind("empty"));
     assert(collectExceptionMsg(parseArgs(parseJSON(`{"task":"x","timeout_s":0}`), 600)).canFind("positive"));
     assert(forwardable("grep") && !forwardable("write_file") && !forwardable("agent"));
+    // No shell: the parent sandbox is writable, so bash would break read-only.
+    assert(!forwardable("bash"));
     SubResult r;
     r.report = "found it at a.d:3";
     r.truncated = true;

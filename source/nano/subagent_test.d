@@ -94,7 +94,7 @@ final class Scripts : SubClientFactory
                 return new MockClient([LLMResponse("", "", [ToolCall.fromRaw("b", "bash", `{"command":"forbidden-cmd now"}`)]),
                     report("could not run it")]);
             case "mock/cancel":
-                return new MockClient([LLMResponse("", "", [ToolCall.fromRaw("b", "bash", `{"command":"trigger-cancel"}`)])]);
+                return new MockClient([LLMResponse("", "", [ToolCall.fromRaw("g", "grep", `{"pattern":"trigger-cancel"}`)])]);
             case "mock/loop":
                 LLMResponse[] s;
                 foreach (i; 0 .. 8)
@@ -128,6 +128,7 @@ final class Fixture
         auto reg = new ToolRegistry;
         reg.register(ToolDefinition("grep", "search", parseJSON(`{"type":"object"}`)), (JSONValue a) {
             grepped ~= a["pattern"].toString;
+            if (a["pattern"].toString == `"trigger-cancel"`) agent.control.cancel();
             return "src/p.d:12: parse()";
         });
         reg.register(ToolDefinition("bash", "run", parseJSON(`{"type":"object"}`)), (JSONValue a) {
@@ -217,7 +218,7 @@ unittest
     auto f = new Fixture([LLMResponse("", "", [ToolCall.fromRaw("c", "agent", agentCall("x", "mock/cancel"))]),
         LLMResponse("never")]);
     assert(f.agent.run("go", new NullEvents) == cancelledResponse);
-    assert(f.bashed == ["trigger-cancel"]);
+    assert(f.grepped == [`"trigger-cancel"`]);
     f.agent.control.startTurn();
 }
 
@@ -233,7 +234,7 @@ unittest
     f.persist();
     scope (exit) if (f.dir.exists) rmdirRecurse(f.dir);
     assert(f.agent.run("go", new NullEvents) == "ok");
-    assert(!f.bashed.length, "denied before it ran");
+    assert(!f.bashed.length, "refused before it ran (no shell for sub-agents)");
     assert(f.toolResult("d1").canFind("could not run it"));
     Message parentResult;
     foreach (m; f.agent.messages) if (m.toolCallId == "d1") parentResult = m;

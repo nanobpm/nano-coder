@@ -842,8 +842,9 @@ class Agent
         loopStop = null;
         // The reply's `agent` calls start together (up to the concurrency
         // cap); each result is taken in order below.
-        launchSubagents(r, ev);
+        // Guard first: a failed launch still stops children already started.
         scope (exit) finishSubagents();
+        launchSubagents(r, ev);
         foreach (call; r.toolCalls)
         {
             ev.toolStart(call);
@@ -1781,6 +1782,7 @@ class Agent
                 ToolReply rep;
                 rep.isError = true;
                 if (control.isCancelled) rep.text = cancelledToolResult;
+                else if (subSlots[i].abort.aborted) rep.text = loopStoppedToolResult;
                 else if (!forwardable(m.name)) rep.text = format("%s is not available to a read-only sub-agent", m.name);
                 else
                 {
