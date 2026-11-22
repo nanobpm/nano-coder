@@ -1891,7 +1891,7 @@ void replayTranscript(Agent agent, Console console)
             // unflagged automatic wrapped reminder `stopRejected` recognises.
             if (rejectionAt(msgs, i))
             {
-                auto reason = m.stopBlocked ? unwrapReminder(m.content) : m.content;
+                auto reason = rejectionReason(m);
                 if (reason.strip.length) console.userMessage(sanitizeBlock(reason));
                 break;
             }
@@ -1971,6 +1971,29 @@ bool stopRejected(const Message[] msgs, size_t i) pure nothrow @nogc @safe
 /// with the raw notice). The same shape `stopRejected` looks for one message
 /// later. A mid-turn steer supersedes too but is not a rejection: it shows
 /// through the steer path instead.
+/// The reason a Stop-hook rejection message carries, as printed live: the
+/// wrapped reminder unwrapped for both flagged and legacy (unflagged) logs,
+/// falling back to the raw content when it is not wrapped so nothing is lost.
+string rejectionReason(const ref Message m) @safe
+{
+    import nano.agent : unwrapReminder;
+    auto unwrapped = unwrapReminder(m.content);
+    return unwrapped !is null ? unwrapped : m.content;
+}
+
+unittest
+{
+    import nano.agent : wrapReminder;
+    auto legacy = Message.auto_(wrapReminder("keep going"));
+    assert(rejectionReason(legacy) == "keep going", "a legacy wrapped rejection is unwrapped");
+    auto flagged = Message.auto_(wrapReminder("multi\nline"));
+    flagged.stopBlocked = true;
+    assert(rejectionReason(flagged) == "multi\nline");
+    auto raw = Message.auto_("bare reason");
+    raw.stopBlocked = true;
+    assert(rejectionReason(raw) == "bare reason", "a flagged unwrapped message is not dropped");
+}
+
 bool rejectionAt(const Message[] msgs, size_t i) pure nothrow @nogc @safe
 {
     import std.algorithm.searching : startsWith;
