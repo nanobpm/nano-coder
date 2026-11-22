@@ -914,6 +914,12 @@ struct Transcript
         if (lines.length > cap)
         {
             auto drop = lines.length - cap * 9 / 10;
+            // A fold the cut runs through goes whole, with its metadata,
+            // so no expanded remnant is left that can't be collapsed.
+            foreach (f; folds)
+                if (f.start < drop && f.start + f.length > drop)
+                    drop = f.start + f.length;
+            if (drop > lines.length) drop = lines.length;
             lines = lines[drop .. $];
             cache = cache.length > drop ? cache[drop .. $] : null;
             Fold[] kept;
@@ -962,11 +968,13 @@ struct Transcript
         {
             if (!todo) break;
             if (folds[k].expanded || folds[k].lost) continue;
-            if (swap(k, true)) changed++;
-            todo--;
+            // Only a fold that actually expands (itself or a sibling)
+            // uses a batch slot; unreadable ones are skipped past.
+            bool any = swap(k, true);
             if (folds[k].id.length)
                 foreach_reverse (j; 0 .. folds.length)
-                    if (j != k && folds[j].id == folds[k].id) swap(j, true);
+                    if (j != k && folds[j].id == folds[k].id) any |= swap(j, true);
+            if (any) { changed++; todo--; }
         }
         if (changed) return true;
         return collapseAll();
@@ -1733,4 +1741,31 @@ unittest
     screen = null;
     r.render(t ~ ["new", "a", "status"], 20, 4, t.length + 1);
     assert(screen.canFind("\x1b[3J"), screen);
+}
+
+// Pruning past the cap drops a fold it cuts through whole, so no expanded
+// remnant outlives its metadata; Ctrl-O skips unreadable folds without
+// spending batch slots on them.
+unittest
+{
+    import std.algorithm : canFind;
+    Transcript t;
+    t.cap = 10;
+    t.setVerbose(true);
+    t.feed(("r\n" ~ foldMark("c", 1, "r\n  a\n  b\n  c\n  d\n")).representation);
+    foreach (i; 0 .. 7) t.feed(format("x%s\n", i).representation);
+    // 12 lines > cap: the cut (at 3) runs through the fold (0 .. 5).
+    assert(!t.lines.canFind("  d") && !t.lines.canFind("  c"), format("%s", t.lines));
+    assert(t.folds.length == 0);
+    assert(t.lines[0] == "x0", format("%s", t.lines));
+
+    Transcript u;
+    u.batch = 1;
+    foreach (i; 0 .. 3)
+        u.feed((format("r%s\n", i) ~ foldMark(format("c%s", i), 1, format("r%s\n  full %s\n", i, i))).representation);
+    u.settle();
+    u.folds[2].lost = true;
+    u.folds[1].lost = true;
+    assert(u.toggle());
+    assert(u.lines.canFind("  full 0"), format("%s", u.lines));
 }
