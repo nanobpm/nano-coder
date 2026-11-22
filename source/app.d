@@ -1329,6 +1329,12 @@ class Console : AgentEvents
         auto st = stamp();
         auto w = (isTerminal(1) ? terminalWidth() : 80);
         auto clean = sanitizeBlock(result);
+        {
+            // A plan tool's result is the rendered plan: show its marks as symbols.
+            import std.algorithm.searching : startsWith;
+            import nano.plan : planSymbols;
+            if (renderMarkdown && call.name.startsWith("plan_")) clean = planSymbols(clean);
+        }
         auto shown = stampBlock(st, toolResult(!isError, clean, verbose, w > 8 + st.length ? w - 8 - (st.length ? stampWidth : 0) : 1));
         write(shown);
         // Ctrl-O shows every line, together with the call's arguments.
@@ -1948,7 +1954,7 @@ void replayTranscript(Agent agent, Console console)
         }
     }
     flushPending();
-    if (!agent.plan.empty && !console.quiet) writeln(escapeMarks(sanitizeBlock(planText(agent))));
+    if (!agent.plan.empty && !console.quiet) writeln(escapeMarks(sanitizeBlock(planText(agent, console.renderMarkdown))));
     // toolStart/toolEnd drive the live status; the replay leaves it idle
     // (and this one redraw covers every batched change).
     gStatusBatched = wasBatched;
@@ -2090,10 +2096,14 @@ unittest
     assert(unwrapReminder("<system-reminder>\n\n</system-reminder>") == "");
 }
 
-string planText(Agent agent) pure
+/// The plan for `/plan` and replay; `symbols` (a rendering terminal) shows
+/// item marks as ☐/◐/☑/⊘/☒ like rendered markdown task lists.
+string planText(Agent agent, bool symbols = false) pure
 {
-    return agent.plan.empty ? "No plan yet. The agent makes one with the plan_add tool."
-        : agent.plan.render(true, size_t.max).stripRight;
+    import nano.plan : planSymbols;
+    if (agent.plan.empty) return "No plan yet. The agent makes one with the plan_add tool.";
+    auto text = agent.plan.render(true, size_t.max).stripRight;
+    return symbols ? planSymbols(text) : text;
 }
 
 string modeListing(AgentMode current) pure
@@ -2647,7 +2657,7 @@ int runMain(string[] args)
         view.set("/tools", toolsListing(agent));
         view.set("/skills", skillsListing(skills));
         view.set("/session", sessionText(agent));
-        view.set("/plan", planText(agent));
+        view.set("/plan", planText(agent, console.renderMarkdown));
         view.set("/timers", timersText(agent));
         view.set("/context", contextReport(agent));
         view.set("log", agent.log.match!(l => l.path, () => string.init));
@@ -3224,7 +3234,7 @@ int runMain(string[] args)
                     writeln(runQueueCommand(queue, agent.control.nonNull, arg));
                     continue;
                 case "/plan":
-                    writeln(planText(agent));
+                    writeln(planText(agent, console.renderMarkdown));
                     continue;
                 case "/timers":
                     writeln(timersText(agent));
