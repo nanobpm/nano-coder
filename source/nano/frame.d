@@ -843,6 +843,7 @@ struct Transcript
         cache = null;
         cr = false;
         heldBytes = 0;
+        sweepFloor = size_t.max;
     }
 
     void feed(scope const(ubyte)[] bytes) pure
@@ -861,6 +862,7 @@ struct Transcript
         pending = buf[end .. $].dup;
         import nano.safeio : lossyText;
         auto s = lossyText(buf[0 .. end]);
+        immutable curBefore = cur.length;
         size_t i;
         while (i < s.length)
         {
@@ -905,6 +907,13 @@ struct Transcript
             // rendering (escapeMarks / mdinline.clean).
             cur ~= s[at .. i];
         }
+        // `cur` is counted in `heldBytes` too: an unfinished line can be
+        // megabytes, and excluding it would let it grow past the byte cap
+        // unchecked (issue #248 review). `endLine` moves `cur` into `lines`
+        // without touching the total, so the delta here is exact.
+        heldBytes = saturatingSub(heldBytes, curBefore);
+        heldBytes += cur.length;
+        enforceByteCap();
     }
 
     private void endLine() pure
@@ -927,7 +936,13 @@ struct Transcript
             cache = cache.length > drop ? cache[drop .. $] : null;
             Fold[] kept;
             foreach (f; folds)
-                if (f.start >= drop) { f.start -= drop; kept ~= f; }
+            {
+                if (f.start >= drop) { f.start -= drop; kept ~= f; continue; }
+                // A discarded expanded fold's collapsed stash is dropped too:
+                // it was counted in `heldBytes`, so subtract it here or the
+                // running total overcounts forever (issue #248 review).
+                foreach (c; f.collapsed) heldBytes = saturatingSub(heldBytes, c.length);
+            }
             folds = kept;
         }
         // Long lines (and folds streaming in expanded) grow the transcript
@@ -958,50 +973,74 @@ struct Transcript
             if (id.length && !want)
                 foreach_reverse (ref f; folds[0 .. $ - 1])
                     if (f.id == id) { want = f.expanded; break; }
-            if (want) swapIn(folds.length - 1, expanded);
+            if (want)
+            {
+                swapIn(folds.length - 1, expanded);
+                // An automatic expansion (verbose, or a result following its
+                // expanded call) inserts the fold's text without a completed
+                // line ever checking the byte cap; enforce it now or the
+                // transcript sits over budget until the next line ends.
+                enforceByteCap();
+            }
         }
         catch (Exception) {} // a malformed OSC from the terminal is ignored, like any unknown escape
     }
 
     /// Ctrl-O: expands the next batch of collapsed folds, going up from the
-    /// bottom (with the others sharing their ids); once every fold is
+    /// bottom (with the others sharing their ids); once every fold has been
     /// expanded, collapses them all. False when nothing changed.
+    ///
+    /// The sweep's progress is the lowest fold it has reached (`sweepFloor`),
+    /// not the expanded state: a sibling expanded by id can sit below the
+    /// fold that pulled it in (a call above its result), and the byte cap
+    /// can collapse an expansion right away - tracking the expanded state
+    /// made every press re-expand the same folds from the bottom, so the
+    /// older ones were never reached and collapse-all never came (issue #248
+    /// review). The floor persists across a collapse, so the sweep keeps
+    /// going up; reaching the top collapses everything and restarts it from
+    /// the bottom.
     bool toggle()
     {
         settle();
-        size_t todo = batch, changed;
-        foreach_reverse (k; 0 .. folds.length)
+        size_t floor = sweepFloor > folds.length ? folds.length : sweepFloor;
+        size_t todo = batch, changed, reached = floor;
+        foreach_reverse (k; 0 .. floor)
         {
             if (!todo) break;
-            if (folds[k].expanded || folds[k].lost) continue;
+            if (folds[k].lost) continue;
             // Only a fold that actually expands (itself or a sibling)
             // uses a batch slot; unreadable ones are skipped past.
             bool any = swap(k, true);
             if (folds[k].id.length)
                 foreach_reverse (j; 0 .. folds.length)
                     if (j != k && folds[j].id == folds[k].id) any |= swap(j, true);
-            if (any) { changed++; todo--; }
+            if (any) { changed++; todo--; reached = k; }
         }
         if (changed)
         {
-            immutable expandedBefore = heldBytes;
             enforceByteCap();
-            bool anyExpanded;
-            foreach (ref f; folds) anyExpanded |= f.expanded;
-            return heldBytes < expandedBefore && !anyExpanded
-                ? collapseAll()
-                : true;
+            sweepFloor = reached;
+            return true;
         }
+        // Nothing left to expand above the sweep: the press collapses
+        // everything, and the sweep starts over from the bottom.
         return collapseAll();
     }
 
-    /// Collapses every expanded fold. False when none was.
+    /// Where the Ctrl-O sweep continues: the lowest fold it has reached
+    /// (issue #248 review). `size_t.max` before the first press and after a
+    /// collapse, so the next sweep starts from the bottom.
+    private size_t sweepFloor = size_t.max;
+
+    /// Collapses every expanded fold and restarts the Ctrl-O sweep from the
+    /// bottom. False when none was.
     /// Rebuilds the transcript in one pass: per-fold `swapIn` would rebuild
     /// the whole line array and rescan every fold each time, so collapsing
     /// thousands of folds (Ctrl-O cycling back, leaving verbose) would be
     /// quadratic, blocking the frame thread (issue #248).
     bool collapseAll() pure
     {
+        sweepFloor = size_t.max;
         bool any;
         foreach (ref f; folds) any |= f.expanded;
         if (!any) return false;
@@ -1043,9 +1082,10 @@ struct Transcript
     /// The transcript's byte size: every line, plus the unfinished one and
     /// the collapsed forms held for expanded folds. Expansion inserts a
     /// fold's full text into `lines`, so this is also what Ctrl-O retains.
-    /// O(1): `heldBytes` tracks it incrementally (endLine's drop, swapIn,
-    /// collapseAll, clear), so the per-line cap check stays off the O(lines)
-    /// walk that made streaming output quadratic (issue #248 review).
+    /// O(1): `heldBytes` tracks it incrementally (feed's `cur` delta,
+    /// endLine's drop, swapIn, collapseAll, clear), so the per-line cap
+    /// check stays off the O(lines) walk that made streaming output
+    /// quadratic (issue #248 review).
     private size_t bytesHeld() pure
     {
         return heldBytes;
@@ -1056,7 +1096,9 @@ struct Transcript
     /// completed line ever checking the cap, so an idle transcript could
     /// grow without bound (issue #248 review). Once past `byteCap`, collapse
     /// the oldest expanded folds (newest first would fight the user reading
-    /// the bottom); their texts stay in `store`, so nothing is lost.
+    /// the bottom); their texts stay in `store`, so nothing is lost. When no
+    /// fold is left to collapse, drop the oldest ordinary lines, and finally
+    /// truncate the unfinished line: plain output is bounded the same way.
     size_t byteCap = 16 << 20;
 
     /// Running total `bytesHeld` recomputes; kept in sync by every mutation
@@ -1071,6 +1113,43 @@ struct Transcript
             if (!folds[k].expanded) continue;
             swapIn(k, null); // updates heldBytes by the shrink
             if (heldBytes <= byteCap) return;
+        }
+        // Ordinary output: no fold is left to collapse, so the oldest lines
+        // go. A fold the cut runs through goes whole, with its metadata, so
+        // no collapsed remnant is left that can't be expanded.
+        if (lines.length)
+        {
+            size_t drop;
+            while (drop < lines.length && heldBytes > byteCap)
+                heldBytes -= lines[drop++].length;
+            if (drop)
+            {
+                size_t whole = drop;
+                foreach (f; folds)
+                    if (f.start < whole && f.start + f.length > whole)
+                        whole = f.start + f.length;
+                if (whole > lines.length) whole = lines.length;
+                // The fold-aligned extension's lines are not subtracted yet.
+                foreach (l; lines[drop .. whole])
+                    heldBytes = saturatingSub(heldBytes, l.length);
+                lines = lines[whole .. $];
+                cache = cache.length > whole ? cache[whole .. $] : null;
+                Fold[] kept;
+                foreach (f; folds)
+                {
+                    if (f.start >= whole) { f.start -= whole; kept ~= f; continue; }
+                    foreach (c; f.collapsed) heldBytes = saturatingSub(heldBytes, c.length);
+                }
+                folds = kept;
+                if (heldBytes <= byteCap) return;
+            }
+        }
+        // Only the unfinished line can still be over: keep its tail, where
+        // the live output is.
+        if (cur.length > byteCap)
+        {
+            heldBytes = saturatingSub(heldBytes, cur.length - byteCap);
+            cur = cur[$ - byteCap .. $];
         }
     }
 
@@ -1911,10 +1990,13 @@ unittest
     assert(t.lines.canFind("x".replicate(400)), "the newest fold stays expanded");
     assert(!t.folds[0].expanded && !t.folds[1].expanded,
         "the oldest folds collapse first");
-    // Nothing is lost: the collapsed folds expand again from the store.
+    // Nothing is lost: the sweep had reached the top, so the next press
+    // collapses, and the one after re-expands the newest from the store.
     t.batch = 20;
-    assert(t.toggle());
-    assert(t.lines.canFind("x".replicate(400)));
+    assert(t.toggle() && !t.folds[0].expanded, "the sweep collapses at the top");
+    assert(t.toggle() && t.lines.canFind("x".replicate(400)),
+        "and re-expands from the store on the next sweep");
+    assert(t.bytesHeld() <= t.byteCap, format!"%s held"(t.bytesHeld()));
     // Verbose expansion is bounded the same way.
     Transcript v;
     v.byteCap = 1_024;
@@ -1933,8 +2015,42 @@ unittest
     foreach (i; 0 .. 4)
         w.feed((format("r%s\n", i) ~ foldMark(format("c%s", i), 1,
             format("r%s\n%s\n", i, "z".replicate(400)))).representation);
+    // No trailing line: the cap is enforced as each automatic expansion
+    // lands, not only when the next line ends (issue #248 review).
+    assert(w.bytesHeld() <= w.byteCap, format!"%s held"(w.bytesHeld()));
     w.feed("tail\n".representation);
     assert(w.bytesHeld() <= w.byteCap, format!"%s held"(w.bytesHeld()));
+}
+
+// The byte cap must not trap fold navigation: when a batch's expansions push
+// the transcript over budget, the cap collapses the oldest of them - and
+// those folds must not be re-expanded by the next press, or the sweep would
+// spin on the same folds and collapse-all would never come (issue #248
+// review). The sweep's progress is the lowest fold it reached, so the press
+// after the cap has collapsed the survivors finds nothing new and collapses,
+// then the cycle restarts - it never spins.
+unittest
+{
+    import std.algorithm : startsWith;
+    import std.array : replicate;
+    Transcript t;
+    t.byteCap = 1_024;
+    t.store.memoryOnly = true;
+    t.batch = 4; // one press selects every fold; the cap keeps the newest two
+    foreach (i; 0 .. 4)
+        t.feed((format("r%s\n", i) ~ foldMark(format("c%s", i), 1,
+            format("r%s\n%s\n", i, "x".replicate(400)))).representation);
+    t.settle();
+    size_t expanded() { size_t n; foreach (l; t.lines) n += l.startsWith("x".replicate(400)); return n; }
+    // The cap holds the newest two of the four 400-byte bodies expanded.
+    assert(t.toggle() && expanded == 2, format!"%s expanded"(expanded));
+    assert(t.lines[$ - 1] == "x".replicate(400), "the newest fold stays expanded");
+    // The sweep reached the top (every fold was selected), so the next press
+    // collapses the survivors instead of re-expanding the same folds.
+    assert(t.toggle() && expanded == 0, "collapse-all is reached");
+    // And the cycle restarts from the bottom rather than wedging.
+    assert(t.toggle() && expanded == 2, "the cycle restarts");
+    assert(t.toggle() && expanded == 0, "and collapses again");
 }
 
 // `bytesHeld` is a running total, not a walk: it must match a from-scratch
@@ -1975,15 +2091,91 @@ unittest
     // Long plain lines push the oldest out past the line cap.
     foreach (i; 0 .. 20) t.feed((format("line%s\n", i)).representation);
     assert(t.bytesHeld() == recount(t), "after the line-cap drop");
+    // The unfinished line is counted too, mid-feed and once it ends.
+    t.feed("unfinished".representation);
+    assert(t.bytesHeld() == recount(t), "the unfinished line is counted");
+    t.feed("\n".representation);
+    assert(t.bytesHeld() == recount(t), "and stays counted once finished");
     t.clear();
     assert(t.bytesHeld() == 0 && t.bytesHeld() == recount(t), "after clear");
 }
 
+// A discarded expanded fold's collapsed stash leaves the transcript with it:
+// both were counted in `heldBytes`, so pruning only the displayed lines
+// overcounts forever and eventually collapses valid expansions even when the
+// transcript fits the budget (issue #248 review).
+unittest
+{
+    import std.array : replicate;
+    size_t recount(ref Transcript t)
+    {
+        size_t n = t.cur.length;
+        foreach (l; t.lines) n += l.length;
+        foreach (ref f; t.folds)
+            if (f.expanded)
+                foreach (c; f.collapsed) n += c.length;
+        return n;
+    }
+
+    Transcript t;
+    t.store.memoryOnly = true;
+    t.cap = 4; // the line-cap drop runs while a fold is expanded
+    t.feed(("r0\n" ~ foldMark("c0", 1, "r0\n" ~ "x".replicate(40) ~ "\n")).representation);
+    t.settle();
+    assert(t.toggle(), "the fold expands");
+    assert(t.bytesHeld() == recount(t));
+    foreach (i; 0 .. 6) t.feed((format("f%s\n", i)).representation);
+    assert(t.folds.length == 0, "the expanded fold is pruned whole");
+    assert(t.bytesHeld() == recount(t),
+        "its collapsed stash leaves the accounting too");
+}
+
+// The byte cap bounds ordinary output too: with no fold left to collapse,
+// the oldest lines go, and an unfinished line is truncated to its tail - the
+// live end (issue #248 review).
+unittest
+{
+    import std.array : replicate;
+    Transcript t;
+    t.byteCap = 1_024;
+    t.store.memoryOnly = true;
+    // One 2 KiB completed line, no folds anywhere.
+    t.feed(("a".replicate(2_048) ~ "\n").representation);
+    assert(t.bytesHeld() <= t.byteCap, format!"%s held"(t.bytesHeld()));
+    assert(t.lines.length == 0, "the over-cap line is dropped");
+    // An unfinished line over the cap keeps its tail.
+    t.feed("b".replicate(2_048).representation);
+    assert(t.bytesHeld() <= t.byteCap, format!"%s held"(t.bytesHeld()));
+    assert(t.cur.length == t.byteCap, format!"%s"(t.cur.length));
+    // And a mix: the newest lines stay.
+    Transcript u;
+    u.byteCap = 1_024;
+    u.store.memoryOnly = true;
+    foreach (i; 0 .. 8)
+        u.feed((format("l%s:", i) ~ "y".replicate(200) ~ "\n").representation);
+    assert(u.bytesHeld() <= u.byteCap, format!"%s held"(u.bytesHeld()));
+    assert(u.lines[$ - 1][0 .. 3] == "l7:", "the newest line stays");
+    // A cut that would run through a collapsed fold drops it whole, with its
+    // metadata, so no remnant is left that can't be expanded.
+    Transcript m;
+    m.byteCap = 1_024;
+    m.store.memoryOnly = true;
+    // A collapsed fold, then plain output that overflows the cap past it.
+    m.feed(("r0\n" ~ foldMark("c0", 1, "r0\n" ~ "z".replicate(60) ~ "\n")).representation);
+    foreach (i; 0 .. 8)
+        m.feed((format("p%s:", i) ~ "y".replicate(200) ~ "\n").representation);
+    assert(m.bytesHeld() <= m.byteCap, format!"%s held"(m.bytesHeld()));
+    // The fold is either whole or gone - never a partial remnant.
+    foreach (ref f; m.folds)
+        assert(f.start + f.length <= m.lines.length, "fold stays within the lines");
+}
+
 // Once a fold's expanded text alone exceeds the byte cap, a Ctrl-O press
-// expands it and the cap immediately collapses it again. That press must
-// still count as the cycle's "collapse" turn - nothing is left expanded - so
-// repeated presses keep cycling expanding -> collapsing instead of spinning
-// forever on a fold the cap keeps undoing (issue #248 review).
+// expands it and the cap immediately collapses it again. The press still
+// reports the change, and the next press finds nothing new to expand and
+// collapses (a no-op here), so repeated presses keep cycling expand ->
+// collapse instead of spinning on the fold the cap keeps undoing (issue #248
+// review).
 unittest
 {
     import std.array : replicate;
@@ -1997,17 +2189,19 @@ unittest
     t.feed(("r0\n" ~ foldMark("c0", 1,
         "r0\n" ~ "x".replicate(2_000) ~ "\n")).representation);
     t.settle();
-    // The press expands the fold and the cap collapses it straight back, so
-    // the transcript ends unchanged: toggle reports false (nothing changed).
-    assert(!t.toggle(), "the cap undoes the whole expansion: nothing changed");
+    // The press expands the fold and the cap collapses it straight back.
+    assert(t.toggle(), "the press expands (then the cap undoes it)");
     assert(!t.folds[0].expanded, "the over-cap fold is collapsed again");
-    // Repeated presses never wedge: the transcript stays collapsed and each
-    // press keeps reporting no change rather than re-expanding forever.
+    // Repeated presses never wedge: they alternate expand -> collapse, and
+    // the fold stays collapsed under the cap throughout. The loop ends on an
+    // expand, so one more press collapses and restarts the sweep from the
+    // bottom.
     foreach (press; 0 .. 4)
     {
-        assert(!t.toggle(), "press " ~ press.to!string ~ " still nothing to expand");
-        assert(!t.folds[0].expanded);
+        t.toggle();
+        assert(!t.folds[0].expanded, "press " ~ press.to!string ~ " leaves it collapsed");
     }
+    assert(!t.toggle(), "the sweep collapses and restarts");
     // And the text is not lost: with a larger cap the fold expands again.
     t.byteCap = 1 << 20;
     assert(t.toggle(), "with headroom the fold expands once more");
