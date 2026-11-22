@@ -13,11 +13,18 @@ import std.regex : regex, matchFirst, matchAll, Regex;
 import std.string : indexOf, lastIndexOf, strip, toLower;
 import std.conv : to;
 
+/// Compiled patterns, per thread (module variables are thread-local): every
+/// memory save checks text and evidence against ~16 patterns, and compiling
+/// them each time made a save cost milliseconds (issue #253).
+private Regex!char[string] compiled;
+
 private Regex!char re(string pattern)
 {
+    if (auto r = pattern in compiled) return *r;
+    const key = pattern;
     auto flags = "";
     if (pattern.startsWith("(?i)")) { pattern = pattern[4 .. $]; flags = "i"; }
-    return regex(pattern, flags);
+    return compiled[key] = regex(pattern, flags);
 }
 
 private string trimQuotes(string s, string set) pure
