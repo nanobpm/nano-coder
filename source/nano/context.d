@@ -973,6 +973,10 @@ size_t pinStashBytes(const ref Message m, bool first) pure nothrow @safe @nogc
 {
     auto text = m.pinText.length ? m.pinText : m.content;
     auto budget = first ? pinnedFirstChars : pinnedLaterChars;
+    // Later requests render whitespace-collapsed (`split.join(" ")`), so
+    // charge their normalized length; the first keeps its formatting (only
+    // `strip`ped).
+    auto len = first ? stripLength(text) : collapsedLength(text);
     // The smart `#N: ` label is carved out of the per-request budget.
     if (!first && m.logLine)
     {
@@ -981,7 +985,58 @@ size_t pinStashBytes(const ref Message m, bool first) pure nothrow @safe @nogc
         do { label++; digits /= 10; } while (digits);
         budget = saturatingSub(budget, label);
     }
-    return min(text.length, budget) + 1;
+    return min(len, budget) + 1;
+}
+
+/// The byte length of `text` once leading/trailing whitespace is stripped.
+private size_t stripLength(const(char)[] text) pure nothrow @safe @nogc
+{
+    return collapsedLengthImpl(text, false);
+}
+
+/// The byte length of `text.split.join(" ")` — whitespace runs collapsed to
+/// one space, ends stripped — computed without allocating.
+size_t collapsedLength(const(char)[] text) pure nothrow @safe @nogc
+{
+    return collapsedLengthImpl(text, true);
+}
+
+private size_t collapsedLengthImpl(const(char)[] text, bool collapse) pure nothrow @safe @nogc
+{
+    import std.typecons : Yes;
+    import std.uni : isWhite;
+    import std.utf : decode;
+
+    size_t total, pendingWs;
+    bool seen;
+    size_t i;
+    while (i < text.length)
+    {
+        auto start = i;
+        auto c = decode!(Yes.useReplacementDchar)(text, i);
+        auto w = checkedSub(i, start);
+        if (isWhite(c))
+        {
+            if (seen) pendingWs += w;
+            continue;
+        }
+        if (pendingWs) total += collapse ? 1 : pendingWs;
+        pendingWs = 0;
+        seen = true;
+        total += w;
+    }
+    return total;
+}
+
+@safe unittest
+{
+    import std.array : array, join, split;
+    import std.range : repeat;
+    foreach (t; ["", "   ", "a", "  a  b\t\n c  ", "x\u2003\u2003y", "request" ~ ' '.repeat(200).array.idup ~ "7"])
+    {
+        assert(collapsedLength(t) == (cast(string) t).split.join(" ").length, t);
+        assert(stripLength(t) == (cast(string) t).strip.length, t);
+    }
 }
 
 /// `clip` bounded by UTF-8 bytes rather than characters, cut on a character
@@ -1051,8 +1106,8 @@ string pinnedUserRequests(const Message[] prior, const Message[] new_, bool smar
     if (requests.length > 2)
     {
         import std.algorithm : isSorted;
-        // The tail is append-ordered already — only the bound's swap-eviction
-        // disturbs it — so sort lazily and by index (the elements are const).
+        // The tail is append-ordered already (the bound evicts oldest-first);
+        // sort defensively, lazily and by index (the elements are const).
         if (!isSorted!((a, b) => a.logLine < b.logLine)(requests[1 .. $]))
         {
             import std.algorithm : makeIndex;

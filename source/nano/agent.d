@@ -184,13 +184,18 @@ struct ConfiguredWindow
 /// copy is bounded.
 struct PinStash
 {
+    /// The backing buffer. `store[dead_]` is the first request and
+    /// `store[dead_ + 1 .. $]` the retained tail in APPEND order (oldest
+    /// first); `store[0 .. dead_]` are evicted slots awaiting compaction.
     private Message[] store;
-    /// The requests the bound dropped between `store[0]` and `store[1]`.
+    /// Evicted slots at the front of `store` (see `bound`).
+    private size_t dead_;
+    /// The requests the bound dropped between the first and the tail.
     private ctx.PinDrop drop_;
     /// The logical count of requests ever stashed (what `pinned_base` sees).
     private size_t logical_;
     /// The retained requests' RENDERED text bytes (what the budget bounds):
-    /// index 0 is charged the first-request render budget, the rest the
+    /// the first is charged the first-request render budget, the rest the
     /// later-request one — never the full `content` a hook context may bloat.
     private size_t bytes_;
 
@@ -205,12 +210,12 @@ struct PinStash
 
     /// Read-only element access over the RETAINED requests (for
     /// `pinnedUserRequests` and tests): index 0 is the first request, the
-    /// rest are the newest.
-    ref const(Message) opIndex(size_t i) const pure nothrow @safe @nogc { return store[i]; }
+    /// rest are the newest, oldest first.
+    ref const(Message) opIndex(size_t i) const pure nothrow @safe @nogc { return store[dead_ + i]; }
     /// Read-only range access over the retained requests.
-    const(Message)[] opSlice() const pure nothrow @safe @nogc { return store; }
+    const(Message)[] opSlice() const pure nothrow @safe @nogc { return store[dead_ .. $]; }
     /// The number of requests retained in memory.
-    size_t retained() const pure nothrow @safe @nogc { return store.length; }
+    size_t retained() const pure nothrow @safe @nogc { return checkedSub(store.length, dead_); }
     /// The retained requests' rendered text bytes (≤ `ctx.pinStashBudgetBytes`
     /// unless one request is oversized).
     size_t retainedBytes() const pure nothrow @safe @nogc { return bytes_; }
@@ -218,16 +223,14 @@ struct PinStash
     /// first and the retained tail, and their log-line span.
     ctx.PinDrop drop() const pure nothrow @safe @nogc { return drop_; }
 
-    /// Append one folded request (compaction), then re-apply the bound: O(1)
-    /// per append — the byte tally moves one request at a time, and an
-    /// eviction swaps the evicted slot with the tail instead of copying the
-    /// retained array (the stash is an unordered set of the newest requests:
-    /// the renderer sorts them back into log order, so order within the
-    /// retained tail is not observable).
+    /// Append one folded request (compaction), then re-apply the bound:
+    /// amortized O(1) per append (see `bound`). The first request into an
+    /// empty stash is charged the first-request budget, like adoption.
     void append(Message m) pure @safe
     {
+        auto first = retained == 0;
         store ~= m;
-        bytes_ += ctx.pinStashBytes(m, false);
+        bytes_ += ctx.pinStashBytes(m, first);
         logical_++;
         bound();
     }
@@ -237,6 +240,7 @@ struct PinStash
     void adopt(Message[] msgs, ctx.PinDrop d, size_t logical) pure nothrow @safe @nogc
     {
         store = msgs;
+        dead_ = 0;
         drop_ = d;
         logical_ = logical;
         bytes_ = 0;
@@ -251,41 +255,44 @@ struct PinStash
     void clear() pure nothrow @safe @nogc
     {
         store = null;
+        dead_ = 0;
         drop_ = ctx.PinDrop.init;
         logical_ = 0;
         bytes_ = 0;
     }
 
-    /// A snapshot for rollback: the retained copy plus the bound metadata, so
-    /// a failed compaction restores the dropped range and the logical count
-    /// as well as the messages. The message slice itself is a (length +
-    /// pointer) copy, so a later `~= x` (which may reallocate the live
-    /// buffer) never disturbs it.
-    PinSnapshot snapshot() pure nothrow @safe @nogc
+    /// A snapshot for rollback: a private COPY of the retained requests plus
+    /// the bound metadata. The copy matters: `bound` writes the live buffer
+    /// in place and `~=` may extend into its spare capacity, so a shared
+    /// slice would see a later append/eviction overwrite a saved request.
+    PinSnapshot snapshot() pure nothrow @safe
     {
-        return PinSnapshot(store, drop_, logical_, bytes_);
+        return PinSnapshot(store[dead_ .. $].dup, drop_, logical_, bytes_);
     }
     /// Restore from a `snapshot` copy (takes ownership of the copy).
     void restoreFrom(PinSnapshot snap) pure nothrow @safe @nogc
     {
         store = snap.store;
+        dead_ = 0;
         drop_ = snap.drop;
         logical_ = snap.logical;
         bytes_ = snap.bytes;
     }
 
     /// Keep the first request and the newest requests whose rendered text
-    /// fits `ctx.pinStashBudgetBytes`, folding the evicted middle into `drop_`
-    /// (its count grows, its log-line span widens). No-op while everything
-    /// fits; a single oversized request is retained whole (the render clips
-    /// it — dropping it would only lose text the renderer never shows). Each
-    /// eviction is O(1): the evicted slot takes the tail element and the array
-    /// shortens by one — no per-eviction copy of the retained requests.
+    /// fits `ctx.pinStashBudgetBytes`, evicting the OLDEST tail request first
+    /// and folding it into `drop_` (its count grows, its log-line span
+    /// widens), so the dropped requests are always one contiguous middle.
+    /// No-op while everything fits; a single oversized request is retained
+    /// whole (the render clips it). Each eviction is O(1): the first request
+    /// moves forward one slot over the evicted one, leaving a dead slot at
+    /// the front; the buffer is compacted once the dead slots outnumber the
+    /// live ones, so the copy is amortized O(1) per eviction.
     private void bound() pure @safe
     {
-        while (store.length > 1 && bytes_ > ctx.pinStashBudgetBytes)
+        while (retained > 1 && bytes_ > ctx.pinStashBudgetBytes)
         {
-            auto m = store[1];
+            auto m = store[dead_ + 1];
             bytes_ -= ctx.pinStashBytes(m, false);
             drop_.count++;
             if (auto id = m.logLine)
@@ -293,15 +300,58 @@ struct PinStash
                 drop_.lo = drop_.lo ? min(drop_.lo, id) : id;
                 drop_.hi = max(drop_.hi, id);
             }
-            // O(1) eviction: move the tail into the freed slot, drop the
-            // tail. The renderer re-sorts by log line, so the swap's reorder
-            // is not observable; the evicted payload's last reference dies.
-            bytes_ -= ctx.pinStashBytes(store[$ - 1], false);
-            store[1] = store[$ - 1];
-            store = store[0 .. $ - 1];
-            bytes_ += ctx.pinStashBytes(store[1], false);
+            store[dead_ + 1] = store[dead_];
+            store[dead_] = Message.init; // release the evicted payload
+            dead_++;
+        }
+        if (dead_ && dead_ >= retained)
+        {
+            store = store[dead_ .. $].dup;
+            dead_ = 0;
         }
     }
+}
+
+// The bound evicts the OLDEST tail request across consecutive evictions,
+// keeping the dropped requests one contiguous middle (issue #221).
+@safe unittest
+{
+    import std.array : replicate;
+    import std.conv : to;
+    PinStash st;
+    auto big = "y".replicate(ctx.pinnedLaterChars);
+    foreach (i; 0 .. 6_000)
+    {
+        auto m = Message.user("r" ~ i.to!string ~ " " ~ big);
+        m.logLine = 10 + i;
+        st.append(m);
+    }
+    assert(st.drop.count > 3, "several consecutive evictions happened");
+    assert(st[0].logLine == 10, "the first request survives");
+    auto tail = st[][1 .. $];
+    foreach (k, ref m; tail) assert(m.logLine == 10 + 1 + st.drop.count + k, "the tail is the newest, in order");
+    assert(st.drop.lo == 11 && st.drop.hi == 10 + st.drop.count, "the dropped middle is contiguous");
+    assert(st.retainedBytes <= ctx.pinStashBudgetBytes);
+}
+
+// A rollback snapshot is not disturbed by later appends/evictions that reuse
+// the live buffer, and the first append is charged the first-request budget.
+@safe unittest
+{
+    import std.array : replicate;
+    import std.conv : to;
+    PinStash st;
+    auto goal = Message.user("g".replicate(ctx.pinnedFirstChars * 2));
+    st.append(goal);
+    assert(st.retainedBytes == ctx.pinStashBytes(goal, true), "first append uses the first-request cap");
+    auto big = "y".replicate(ctx.pinnedLaterChars);
+    foreach (i; 0 .. 5_000) st.append(Message.user("a" ~ i.to!string ~ " " ~ big));
+    auto snap = st.snapshot();
+    auto saved = snap.store.dup;
+    foreach (i; 0 .. 50) st.append(Message.user("b" ~ i.to!string ~ " " ~ big));
+    st.restoreFrom(snap);
+    assert(st.retained == saved.length);
+    foreach (k; 0 .. saved.length) assert(st[k].content == saved[k].content, "the snapshot's retained sequence survives");
 }
 
 /// A `PinStash` rollback snapshot: the retained requests plus the bound
