@@ -81,6 +81,33 @@ private string mark(Status s) pure nothrow
 
 private bool closed(Status s) pure nothrow { return s == Status.done || s == Status.dropped; }
 
+/// A rendered plan (`Plan.render`, or a plan tool's result) for the
+/// terminal: each item's ASCII mark becomes a symbol, matching the ☐/☑ of
+/// rendered markdown task lists. The model keeps seeing the ASCII form;
+/// only item lines change (notes and other text are left alone).
+string planSymbols(string text) pure
+{
+    import std.ascii : isDigit;
+    import std.array : split;
+    static immutable string[2][5] marks = [["[ ] ", "☐ "], ["[>] ", "◐ "], ["[x] ", "☑ "], ["[!] ", "⊘ "], ["[-] ", "☒ "]];
+    auto lines = text.split("\n");
+    foreach (ref l; lines)
+        foreach (m; marks)
+            if (l.startsWith(m[0]) && l.length > 4 && l[4].isDigit)
+            {
+                l = m[1] ~ l[4 .. $];
+                break;
+            }
+    return lines.join("\n");
+}
+
+unittest
+{
+    auto text = "Plan (1/5 done):\n[ ] 1. a\n[>] 2. b\n[x] 3. c\n      - [x] note text\n[!] 4. d\n[-] 5. e\n[x] not an item";
+    assert(planSymbols(text) == "Plan (1/5 done):\n☐ 1. a\n◐ 2. b\n☑ 3. c\n      - [x] note text\n⊘ 4. d\n☒ 5. e\n[x] not an item",
+        planSymbols(text));
+}
+
 struct PlanItem
 {
     uint id;
