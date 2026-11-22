@@ -934,16 +934,9 @@ struct Transcript
             foreach (l; lines[0 .. drop]) heldBytes = saturatingSub(heldBytes, l.length);
             lines = lines[drop .. $];
             cache = cache.length > drop ? cache[drop .. $] : null;
-            Fold[] kept;
-            foreach (f; folds)
-            {
-                if (f.start >= drop) { f.start -= drop; kept ~= f; continue; }
-                // A discarded expanded fold's collapsed stash is dropped too:
-                // it was counted in `heldBytes`, so subtract it here or the
-                // running total overcounts forever (issue #248 review).
-                foreach (c; f.collapsed) heldBytes = saturatingSub(heldBytes, c.length);
-            }
-            folds = kept;
+            // A discarded expanded fold's collapsed stash is dropped too:
+            // it was counted in `heldBytes` (issue #248 review).
+            pruneFolds(drop);
         }
         // Long lines (and folds streaming in expanded) grow the transcript
         // without ever crossing the line cap: bound the bytes too.
@@ -998,7 +991,9 @@ struct Transcript
     /// older ones were never reached and collapse-all never came (issue #248
     /// review). The floor persists across a collapse, so the sweep keeps
     /// going up; reaching the top collapses everything and restarts it from
-    /// the bottom.
+    /// the bottom. Folds that arrive mid-sweep sit below the floor, so they
+    /// are not expanded until the sweep wraps (collapse-all, then the next
+    /// press starts from the bottom again).
     bool toggle()
     {
         settle();
@@ -1134,13 +1129,7 @@ struct Transcript
                     heldBytes = saturatingSub(heldBytes, l.length);
                 lines = lines[whole .. $];
                 cache = cache.length > whole ? cache[whole .. $] : null;
-                Fold[] kept;
-                foreach (f; folds)
-                {
-                    if (f.start >= whole) { f.start -= whole; kept ~= f; continue; }
-                    foreach (c; f.collapsed) heldBytes = saturatingSub(heldBytes, c.length);
-                }
-                folds = kept;
+                pruneFolds(whole);
                 if (heldBytes <= byteCap) return;
             }
         }
@@ -1148,9 +1137,32 @@ struct Transcript
         // the live output is.
         if (cur.length > byteCap)
         {
-            heldBytes = saturatingSub(heldBytes, cur.length - byteCap);
-            cur = cur[$ - byteCap .. $];
+            // Start on a code-point boundary so no character is cut in
+            // half, and copy: a slice would pin (and keep appending into)
+            // the original oversized block.
+            size_t from = cur.length - byteCap;
+            while (from < cur.length && (cur[from] & 0xC0) == 0x80) from++;
+            heldBytes = saturatingSub(heldBytes, from);
+            cur = cur[from .. $].idup;
         }
+    }
+
+    /// Drops the folds starting before line `cut` (the lines above it were
+    /// just removed), shifts the rest up, subtracts the dropped folds'
+    /// collapsed stashes from `heldBytes`, and moves the Ctrl-O sweep floor
+    /// down by the number dropped so it keeps pointing at the same fold.
+    private void pruneFolds(size_t cut) pure
+    {
+        Fold[] kept;
+        size_t gone;
+        foreach (f; folds)
+        {
+            if (f.start >= cut) { f.start -= cut; kept ~= f; continue; }
+            gone++;
+            foreach (c; f.collapsed) heldBytes = saturatingSub(heldBytes, c.length);
+        }
+        folds = kept;
+        if (sweepFloor != size_t.max) sweepFloor = saturatingSub(sweepFloor, gone);
     }
 
     /// Verbose: expands the latest `verboseCap` folds, and every new one;
@@ -2206,4 +2218,42 @@ unittest
     t.byteCap = 1 << 20;
     assert(t.toggle(), "with headroom the fold expands once more");
     assert(t.lines.canFind("x".replicate(2_000)));
+}
+
+// Truncating the unfinished line never cuts a UTF-8 character in half, and
+// the kept tail is a fresh copy, not a slice pinning the oversized block
+// (issue #248 review).
+unittest
+{
+    import std.array : replicate;
+    import std.utf : validate;
+    Transcript t;
+    t.byteCap = 1_024;
+    t.store.memoryOnly = true;
+    // "€" is 3 bytes; 1_025 of them put the cut mid-character.
+    auto big = "€".replicate(1_025);
+    t.feed(big.representation);
+    validate(t.cur);
+    assert(t.cur.length <= t.byteCap);
+    assert(t.bytesHeld() <= t.byteCap, format!"%s held"(t.bytesHeld()));
+    assert(t.cur.length + 2 >= t.byteCap, "at most a partial character is lost");
+}
+
+// Dropping folds moves the Ctrl-O sweep floor with them, so the next press
+// carries on from the same fold instead of re-expanding passed ones.
+unittest
+{
+    Transcript t;
+    t.store.memoryOnly = true;
+    foreach (i; 0 .. 4)
+        t.feed((format("r%s\n", i) ~ foldMark(format("c%s", i), 1, "x\n")).representation);
+    assert(t.folds.length == 4);
+    t.sweepFloor = 2;
+    // Lines above fold 1 go: folds 0 is dropped, the floor follows.
+    t.pruneFolds(t.folds[1].start);
+    assert(t.folds.length == 3);
+    assert(t.sweepFloor == 1, format!"%s"(t.sweepFloor));
+    t.sweepFloor = size_t.max;
+    t.pruneFolds(t.folds[1].start);
+    assert(t.sweepFloor == size_t.max);
 }
