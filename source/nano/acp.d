@@ -46,7 +46,7 @@ import std.array : join;
 
 /// Commands `handle` services over ACP. Reaching the slash fallback with one
 /// of these means only its arguments were not accepted.
-immutable string[] acpCommandRoots = ["/compact", "/settings", "/tools", "/plan", "/providers", "/model"];
+immutable string[] acpCommandRoots = ["/compact", "/settings", "/tools", "/plan", "/providers", "/model", "/subagents"];
 
 JSONValue rpcResult(JSONValue id, JSONValue result) pure
 {
@@ -200,6 +200,9 @@ struct Host
     string[] delegate() providerNames;
     /// The configured `model` and `system_prompt`, for `/settings`.
     string configModel, configSystemPrompt;
+    /// Write `subagents = on` to the user config (`/subagents on|off --save`);
+    /// returns where it saved or why it could not. Null: --save is refused.
+    string delegate(bool on) saveSubagents;
 }
 
 /// Input id for idempotent prompts: `messageId`, or `_meta.inputId`.
@@ -700,6 +703,29 @@ final class AcpServer : AgentEvents
             if (temp.warning.length) warnings ~= temp.warning;
             if (th.warning.length) warnings ~= th.warning;
             if (warnings.length) body_["warning"] = warnings.join("\n");
+            return rpcResult(id, body_);
+        }
+        if (text == "/subagents" || text.startsWith("/subagents "))
+        {
+            import nano.subagent : parseToggle, statusText;
+            auto p = parseToggle(text["/subagents".length .. $]);
+            if (p.isErr) return rpcError(id, -32602, p.unwrapErr("isErr"));
+            auto t = p.unwrap("isOk");
+            JSONValue body_ = ["stopReason": "end_turn"];
+            if (!t.show)
+            {
+                if (!agent.subagentsEnabled) return rpcError(id, -32602, "sub-agents are not available in this session");
+                if (t.save && host.saveSubagents is null) return rpcError(id, -32602, "/subagents: --save is not available");
+                agent.subagentsOn = t.on;
+                if (t.save) body_["saved"] = host.saveSubagents(t.on);
+            }
+            auto model = agent.subagentModel.length ? agent.subagentModel
+                : agent.client.providerName ~ "/" ~ agent.client.modelName;
+            body_["subagents"] = agent.subagentsOffered;
+            JSONValue[] models;
+            foreach (c; agent.subagentCandidates) models ~= JSONValue(c.model);
+            body_["models"] = models;
+            body_["text"] = statusText(agent.subagentsOffered, agent.subagentCandidates, model, agent.subagentLimits);
             return rpcResult(id, body_);
         }
         if (text == "/thinking" || text.startsWith("/thinking "))

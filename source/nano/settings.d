@@ -18,7 +18,7 @@ import nano.result : toOption, unwrap;
 /// What a visit changed (each saved as its own key).
 struct Changes
 {
-    bool model, temperature, thinking, maxTokens, maxIterations, systemPrompt, compaction, verbosity;
+    bool model, temperature, thinking, maxTokens, maxIterations, systemPrompt, compaction, verbosity, subagents;
     bool[string] providerTemperatures, providerThinking, providers;
     /// "provider\0model" pairs.
     bool[string] modelTemperatures, modelThinking;
@@ -26,7 +26,7 @@ struct Changes
     bool any() pure const
     {
         return model || temperature || thinking || maxTokens || maxIterations || systemPrompt || compaction
-            || verbosity || providerTemperatures.length || providerThinking.length || providers.length
+            || verbosity || subagents || providerTemperatures.length || providerThinking.length || providers.length
             || modelTemperatures.length || modelThinking.length;
     }
 }
@@ -310,6 +310,7 @@ string applyChanges(string doc, const ref Config c, const ref Changes ch, const 
     if (ch.maxIterations) doc = tomlSet(doc, [], "max_iterations", format("%s", c.maxIterations));
     if (ch.systemPrompt) doc = tomlSet(doc, [], "system_prompt", tomlString(c.systemPrompt));
     if (ch.verbosity) doc = tomlSet(doc, [], "verbosity", tomlString(c.verbosity.vname));
+    if (ch.subagents) doc = tomlSet(doc, [], "subagents", c.subagents ? "true" : "false");
     // The retired `renderer` key (Rust #133) is dropped on any save.
     doc = tomlSet(doc, [], "renderer", null);
     if (ch.compaction)

@@ -800,6 +800,71 @@ final class ConfigClients : imported!"nano.subagent".SubClientFactory
     LLMClient make(string spec) const { return makeClient(resolve(cfg, spec)); }
 }
 
+/// Give `agent` sub-agents from `cfg`: clients from a frozen copy (so
+/// `/subagents on` works even when the config starts them off), the limits,
+/// and the `[[subagent_models]]` that resolve (each one that doesn't is
+/// reported on stderr when `report`: at startup, not on the later
+/// re-runs after a provider edit).
+void configureSubagents(Agent agent, const ref Config cfg, bool report)
+{
+    import nano.subagent : SubLimits, SubCandidate;
+    import nano.arith : toSize;
+    import nano.config : usableSubagentModels;
+    agent.subagentClients = new immutable ConfigClients(frozenConfig(cfg));
+    agent.subagentModel = cfg.subagentModel;
+    agent.subagentMaxConcurrency = cfg.subagentMaxConcurrency > 0 ? toSize(cfg.subagentMaxConcurrency) : 1;
+    SubLimits lim;
+    if (cfg.subagentTimeoutSecs > 0) lim.timeoutSecs = cfg.subagentTimeoutSecs;
+    if (cfg.subagentMaxTurns > 0) lim.turns = toSize(cfg.subagentMaxTurns);
+    if (cfg.subagentMaxTokens > 0) lim.tokens = cfg.subagentMaxTokens;
+    agent.subagentLimits = lim;
+    string[] warnings = cfg.warnings.dup;
+    immutable(SubCandidate)[] cands;
+    foreach (m; usableSubagentModels(cfg, warnings))
+    {
+        auto l = lim;
+        if (m.timeoutSecs > 0) l.timeoutSecs = m.timeoutSecs;
+        if (m.maxTurns > 0) l.turns = toSize(m.maxTurns);
+        if (m.maxTokens > 0) l.tokens = m.maxTokens;
+        cands ~= SubCandidate(m.model, m.use, l);
+    }
+    agent.subagentCandidates = cands;
+    if (report) foreach (w; warnings) stdErr.writeln("nano-coder: warning: ", w);
+}
+
+/// Write `subagents = on` into the user config file; says where, or why
+/// it could not.
+string saveSubagentsSetting(ref Config cfg, bool on)
+{
+    import nano.settings : Changes, save;
+    cfg.subagents = on;
+    Changes ch;
+    ch.subagents = true;
+    try save(cfg, ch, null, cfg.path);
+    catch (Exception e) return "could not save: " ~ e.msg;
+    return "saved to " ~ cfg.path;
+}
+
+/// Run `/subagents [on|off] [--save]` on `agent`: show the state, or switch
+/// the `agent` tool for the session (and the user config with `--save`).
+string subagentsCommand(Agent agent, ref Config cfg, string arg)
+{
+    import nano.subagent : parseToggle, statusText;
+    import nano.result : unwrap, unwrapErr;
+    auto p = parseToggle(arg);
+    if (p.isErr) return p.unwrapErr("isErr");
+    auto t = p.unwrap("isOk");
+    auto model = agent.subagentModel.length ? agent.subagentModel : agent.client.providerName ~ "/" ~ agent.client.modelName;
+    if (t.show) return statusText(agent.subagentsOffered, agent.subagentCandidates, model, agent.subagentLimits);
+    if (!agent.subagentsEnabled) return "Sub-agents are not available in this session";
+    auto was = agent.subagentsOn;
+    agent.subagentsOn = t.on;
+    auto msg = format("Sub-agents %s for this session", t.on ? "on" : "off");
+    if (was != t.on) msg ~= " (the tool list changed, so the provider's prompt cache is rebuilt once)";
+    if (t.save) msg ~= "; " ~ saveSubagentsSetting(cfg, t.on);
+    return msg;
+}
+
 /// A frozen copy of `cfg`, for another thread.
 immutable(Config) frozenConfig(const ref Config cfg) pure
 {
@@ -2694,19 +2759,8 @@ int runMain(string[] args)
     agent.sessionTitles = cfg.sessionTitles;
     agent.titleModel = cfg.titleModel;
     agent.titleClient = (string spec) => makeClient(resolve(cfg, spec));
-    if (cfg.subagents)
-    {
-        import nano.subagent : SubLimits;
-        import nano.arith : toSize;
-        agent.subagentClients = new immutable ConfigClients(frozenConfig(cfg));
-        agent.subagentModel = cfg.subagentModel;
-        agent.subagentMaxConcurrency = cfg.subagentMaxConcurrency > 0 ? toSize(cfg.subagentMaxConcurrency) : 1;
-        SubLimits lim;
-        if (cfg.subagentTimeoutSecs > 0) lim.timeoutSecs = cfg.subagentTimeoutSecs;
-        if (cfg.subagentMaxTurns > 0) lim.turns = toSize(cfg.subagentMaxTurns);
-        if (cfg.subagentMaxTokens > 0) lim.tokens = cfg.subagentMaxTokens;
-        agent.subagentLimits = lim;
-    }
+    agent.subagentsOn = cfg.subagents;
+    configureSubagents(agent, cfg, true);
     agent.planTools = cfg.planTools;
     agent.timerTools = !o.acp; // ACP has no idle loop to fire them
     agent.outcomeTool = cfg.outcomeTool;
@@ -2772,6 +2826,7 @@ int runMain(string[] args)
         host.providerNames = () => enabledProviderNames(cfg.providers);
         host.configModel = cfg.model;
         host.configSystemPrompt = cfg.systemPrompt;
+        host.saveSubagents = (bool on) => saveSubagentsSetting(cfg, on);
         host.sessionMeta = () {
             JSONValue meta = ["projectInstructions": JSONValue(instructions.match!(pi => pi.loadedPaths, () => string[].init)),
                 "skills": JSONValue(skills.names)];
@@ -3010,8 +3065,7 @@ int runMain(string[] args)
             // Sub-agents build clients from a config frozen at startup;
             // re-freeze after every provider edit so children see the new
             // credentials/endpoints (and a newly added provider).
-            if (cfg.subagents)
-                agent.subagentClients = new immutable ConfigClients(frozenConfig(cfg));
+            configureSubagents(agent, cfg, false);
             if (!editRebuilds(cfg, name, agent.client.providerName)) return string.init;
             // The client's own provider was edited: keep its model. Otherwise the
             // configured model now resolves to the edited provider: build that.
@@ -3557,6 +3611,9 @@ int runMain(string[] args)
                     continue;
                 case "/version":
                     writeln(versionString);
+                    continue;
+                case "/subagents":
+                    writeln(subagentsCommand(agent, cfg, arg));
                     continue;
                 case "/tools":
                     writeln(toolsListing(agent));

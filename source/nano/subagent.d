@@ -55,23 +55,119 @@ struct SubLimits
     ulong tokens = 1_000_000;
 }
 
-/// The `agent` tool's definition.
-ToolDefinition definition() pure
+/// A model the `agent` tool offers (`[[subagent_models]]`): what it is
+/// for, and the limits of a sub-agent on it.
+struct SubCandidate
 {
-    return ToolDefinition(toolName,
-        "Run a read-only sub-agent: a fresh agent with its own context window investigates `task` with read_file, "
+    string model, use;
+    SubLimits limits;
+}
+
+/// The `agent` tool's definition: with `candidates`, `model` is an enum of
+/// them (the first the default) and the description says what each is for;
+/// without, `model` is any `provider/model`.
+ToolDefinition definition(const(SubCandidate)[] candidates = null) pure
+{
+    import std.json : JSONValue;
+    string desc = "Run a read-only sub-agent: a fresh agent with its own context window investigates `task` with read_file, "
         ~ "grep and glob (under your permission rules; no shell, so it cannot change files) and returns only its final report, so the "
         ~ "intermediate output never enters your context. Use it for broad searches (dozens of greps and reads "
         ~ "across a codebase) and for independent investigations; several agent calls in one reply run in "
         ~ "parallel. Don't use it for a single lookup you can do with one grep or read_file. The sub-agent sees "
         ~ "nothing of this conversation: state the task completely (what to find, where to look, what to report). "
-        ~ "It cannot edit files. Its report cites file:line for its claims.",
-        parseJSON(`{"type":"object","properties":{`
-            ~ `"task":{"type":"string","description":"The complete, self-contained task and what the report should contain."},`
-            ~ `"tools":{"type":"string","enum":["read-only"],"description":"The tool set (only \"read-only\" for now)."},`
-            ~ `"model":{"type":"string","description":"provider/model to run it on (default: subagent_model, else your model)."},`
-            ~ `"timeout_s":{"type":"integer","description":"Wall-clock limit in seconds (default 600)."}`
-            ~ `},"required":["task"]}`));
+        ~ "It cannot edit files. Its report cites file:line for its claims.";
+    auto params = parseJSON(`{"type":"object","properties":{`
+        ~ `"task":{"type":"string","description":"The complete, self-contained task and what the report should contain."},`
+        ~ `"tools":{"type":"string","enum":["read-only"],"description":"The tool set (only \"read-only\" for now)."},`
+        ~ `"model":{"type":"string","description":"provider/model to run it on (default: subagent_model, else your model)."},`
+        ~ `"timeout_s":{"type":"integer","description":"Wall-clock limit in seconds (default 600)."}`
+        ~ `},"required":["task"]}`);
+    if (candidates.length)
+    {
+        desc ~= "\n\nModels you can run it on (`model`; default " ~ candidates[0].model ~ "):";
+        JSONValue[] names;
+        foreach (c; candidates)
+        {
+            names ~= JSONValue(c.model);
+            desc ~= "\n- " ~ c.model ~ (c.use.length ? ": " ~ c.use : "");
+        }
+        params["properties"]["model"] = JSONValue(["type": JSONValue("string"), "enum": JSONValue(names),
+            "description": JSONValue("The model to run it on (default " ~ candidates[0].model ~ ").")]);
+        params["properties"]["timeout_s"]["description"] = JSONValue("Wall-clock limit in seconds (default: the model's limit).");
+    }
+    return ToolDefinition(toolName, desc, params);
+}
+
+/// The model and limits for a call: with `candidates`, the one it names
+/// (the first when none is named; a ToolError listing them for any other);
+/// without, its model, else `fallback`, under `base`. An explicit
+/// `timeout_s` wins over the limit either way.
+SubCandidate choose(const SubArgs a, const(SubCandidate)[] candidates, string fallback, SubLimits base) pure
+{
+    import nano.tools : ToolError;
+    SubCandidate c;
+    if (!candidates.length) c = SubCandidate(a.model.length ? a.model : fallback, null, base);
+    else if (!a.model.length) c = candidates[0];
+    else
+    {
+        bool found;
+        foreach (x; candidates) if (x.model == a.model) { c = x; found = true; break; }
+        if (!found)
+        {
+            string list;
+            foreach (i, x; candidates) list ~= (i ? ", " : "") ~ x.model;
+            throw new ToolError(format("agent: model \"%s\" is not one of the sub-agent models: %s", a.model, list));
+        }
+    }
+    if (a.timeoutSet) c.limits.timeoutSecs = a.timeoutSecs;
+    return c;
+}
+
+/// A parsed `/subagents` argument: show the state, or switch it (and
+/// with `--save` write it to the user config too).
+struct SubToggle
+{
+    /// No `on`/`off`: just show.
+    bool show;
+    bool on, save;
+}
+
+/// Parse `/subagents [on|off] [--save]`.
+imported!"nano.result".Result!(SubToggle, string) parseToggle(string arg) pure
+{
+    import std.string : split;
+    alias R = imported!"nano.result".Result!(SubToggle, string);
+    SubToggle t = SubToggle(true);
+    bool chosen;
+    foreach (w; arg.split)
+    {
+        if (w == "--save") t.save = true;
+        else if ((w == "on" || w == "off") && !chosen) { t.on = w == "on"; t.show = false; chosen = true; }
+        else return R.err(format(`/subagents: unexpected "%s" (usage: /subagents [on|off] [--save])`, w));
+    }
+    if (t.save && t.show) return R.err("/subagents: --save needs on or off");
+    return R.ok(t);
+}
+
+/// What `/subagents` shows: on or off, and the models a sub-agent may run
+/// on with their limits.
+string statusText(bool on, const(SubCandidate)[] candidates, string defaultModel, SubLimits base) pure
+{
+    string lim(SubLimits l)
+    {
+        return format("timeout %ss, %s turns, %s tokens", l.timeoutSecs, l.turns, l.tokens);
+    }
+    auto s = "Sub-agents (the agent tool): " ~ (on ? "on" : "off") ~ "\n";
+    if (!candidates.length)
+        s ~= format("Model: %s (any provider/model the agent names)\nLimits: %s", defaultModel, lim(base));
+    else
+    {
+        s ~= "Models (the first is the default):";
+        foreach (c; candidates)
+            s ~= format("\n  %s%s — %s", c.model, c.use.length ? " (" ~ c.use ~ ")" : "", lim(c.limits));
+    }
+    return s ~ "\n/subagents on|off switches them for this session (--save also writes the config); "
+        ~ "the change invalidates the provider's prompt cache once.";
 }
 
 /// The system prompt of a sub-agent.
@@ -91,6 +187,8 @@ struct SubArgs
 {
     string task, model;
     long timeoutSecs;
+    /// The call gave `timeout_s` (it overrides a candidate's limit).
+    bool timeoutSet;
 }
 
 /// Parse and check an `agent` call's arguments; throws a ToolError.
@@ -106,6 +204,7 @@ SubArgs parseArgs(JSONValue args, long defaultTimeout) pure
         throw new ToolError(format(`agent: tools must be "read-only" (edit-capable sub-agents are not supported), got "%s"`, set));
     a.model = optString(args, "model");
     a.timeoutSecs = optInt(args, "timeout_s", defaultTimeout);
+    a.timeoutSet = args.type == JSONType.object && ("timeout_s" in args.objectNoRef) !is null;
     if (a.timeoutSecs <= 0) throw new ToolError("agent: timeout_s must be a positive number of seconds");
     return a;
 }
@@ -652,6 +751,37 @@ unittest
     import std.exception : collectExceptionMsg;
     import std.algorithm : canFind;
     assert(parseArgs(parseJSON(`{"task":"x"}`), 600).timeoutSecs == 600);
+    {
+        // Candidates: an enum and their uses; without, a free-form model.
+        import std.exception : collectExceptionMsg;
+        import nano.result : unwrap;
+        auto free = definition();
+        assert(("enum" in free.parameters["properties"]["model"].objectNoRef) is null);
+        immutable cands = [SubCandidate("a/x", "quick searches", SubLimits(5, 60, 100)), SubCandidate("b/y", "hard analysis")];
+        auto d = definition(cands);
+        auto e = d.parameters["properties"]["model"]["enum"].arrayNoRef;
+        assert(e.length == 2 && e[0].str == "a/x" && e[1].str == "b/y");
+        assert(d.description.canFind("- a/x: quick searches") && d.description.canFind("- b/y: hard analysis"));
+        assert(d.description.canFind("default a/x"));
+        // Omitted model: the first, with its limits; outside the list: an error naming them.
+        auto c = choose(parseArgs(parseJSON(`{"task":"t"}`), 600), cands, "z/z", SubLimits.init);
+        assert(c.model == "a/x" && c.limits.turns == 5 && c.limits.timeoutSecs == 60);
+        assert(choose(parseArgs(parseJSON(`{"task":"t","model":"b/y","timeout_s":7}`), 600), cands, "z/z",
+            SubLimits.init).limits.timeoutSecs == 7);
+        auto msg = collectExceptionMsg(choose(parseArgs(parseJSON(`{"task":"t","model":"q/q"}`), 600), cands, "z/z", SubLimits.init));
+        assert(msg.canFind(`"q/q"`) && msg.canFind("a/x, b/y"), msg);
+        // No list: free-form, else the fallback.
+        assert(choose(parseArgs(parseJSON(`{"task":"t","model":"q/q"}`), 600), null, "z/z", SubLimits.init).model == "q/q");
+        assert(choose(parseArgs(parseJSON(`{"task":"t"}`), 600), null, "z/z", SubLimits.init).model == "z/z");
+        // /subagents arguments and status.
+        assert(parseToggle("").unwrap("ok").show);
+        auto t = parseToggle("off --save").unwrap("ok");
+        assert(!t.show && !t.on && t.save);
+        assert(parseToggle("on").unwrap("ok").on && parseToggle("maybe").isErr && parseToggle("--save").isErr);
+        auto st = statusText(true, cands, "z/z", SubLimits.init);
+        assert(st.canFind(": on") && st.canFind("a/x (quick searches) — timeout 60s, 5 turns, 100 tokens"), st);
+        assert(statusText(false, null, "z/z", SubLimits.init).canFind("off\nModel: z/z"));
+    }
     assert(parseArgs(parseJSON(`{"task":"x","timeout_s":5,"model":"m/n"}`), 600).model == "m/n");
     assert(collectExceptionMsg(parseArgs(parseJSON(`{"task":"x","tools":"all"}`), 600)).canFind("read-only"));
     assert(collectExceptionMsg(parseArgs(parseJSON(`{"task":" "}`), 600)).canFind("empty"));
