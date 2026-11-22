@@ -350,13 +350,21 @@ struct Policy
                 auto patch = stringArg(args, "patch");
                 if (patch is null) return null;
                 import nano.tools : ToolError;
-                import nano.tools.files : patchPaths;
-                string[] paths;
-                try paths = patchPaths(patch);
+                import nano.tools.files : parsePatch, PatchKind, FilePatch;
+                FilePatch[] files;
+                try files = parsePatch(patch);
                 catch (ToolError) return null; // unparseable: the tool rejects it before touching any path
-                foreach (p; paths)
-                    if (auto r = reasonIn("edit_file", JSONValue(["path": p]), cwd, ask))
-                        return r.replace("denies edit_file on", "denies apply_patch on");
+                foreach (fp; files)
+                {
+                    // Delete/Update read the existing file (its text lands in
+                    // the diff, even on a dry run), so it must be readable too.
+                    if (fp.kind != PatchKind.add)
+                        if (auto r = reasonIn("read_file", JSONValue(["path": fp.path]), cwd, ask))
+                            return r.replace("denies read_file on", "denies apply_patch on");
+                    foreach (p; fp.moveTo is null ? [fp.path] : [fp.path, fp.moveTo])
+                        if (auto r = reasonIn("edit_file", JSONValue(["path": p]), cwd, ask))
+                            return r.replace("denies edit_file on", "denies apply_patch on");
+                }
                 return null;
             case "grep", "glob":
                 auto root = stringArg(args, "path");
@@ -528,6 +536,21 @@ unittest
     assert(p.check("apply_patch", patch) is null);
     p.deny ~= parseRule("apply_patch");
     assert(p.check("apply_patch", patch) !is null);
+}
+
+unittest
+{
+    // A path read_file may not show can't be read through apply_patch either
+    // (a dry-run Delete/Update would put its text in the diff), but a
+    // read-denied path may still be created by Add File.
+    Policy p;
+    p.deny = [parseRule("Read(**/.env)")];
+    JSONValue pt(string body_) { return JSONValue(["patch": "*** Begin Patch\n" ~ body_ ~ "*** End Patch\n"]); }
+    assert(p.check("apply_patch", pt("*** Delete File: /x/.env\n")) !is null);
+    assert(p.check("apply_patch", pt("*** Update File: /x/.env\n@@\n-a\n+b\n")) !is null);
+    assert(p.check("apply_patch", pt("*** Move File: /x/.env -> /x/b\n")) !is null);
+    assert(p.check("apply_patch", pt("*** Add File: /x/.env\n+a\n")) is null);
+    assert(p.check("apply_patch", pt("*** Delete File: /x/ok\n")) is null);
 }
 
 /// Read-deny rules prepared for judging many walked paths (`Policy.readDenyScan`).

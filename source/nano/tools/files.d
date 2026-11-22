@@ -1013,7 +1013,17 @@ string applyHunks(string text, const PatchHunk[] hunks, ref string[] notes, stri
 /// A unified diff of `a` -> `b` with three lines of context.
 string unifiedDiff(string from, string to, string a, string b) pure
 {
-    auto x = textLines(a), y = textLines(b);
+    // A final line with no newline compares unequal to the same text with
+    // one: it carries a `\n` (which no line contains) and is printed with
+    // the standard `\ No newline at end of file` marker.
+    enum noEol = "\n";
+    string[] keyed(string s)
+    {
+        auto ls = textLines(s);
+        if (ls.length && !s.endsWith("\n")) ls[$ - 1] = ls[$ - 1] ~ noEol;
+        return ls;
+    }
+    auto x = keyed(a), y = keyed(b);
     size_t pre;
     while (pre < x.length && pre < y.length && x[pre] == y[pre]) pre++;
     size_t suf;
@@ -1071,7 +1081,10 @@ string unifiedDiff(string from, string to, string a, string b) pure
         foreach (t; tags[0 .. s]) { if (t != '+') oldStart++; if (t != '-') newStart++; }
         foreach (t; tags[s .. stop]) { if (t != '+') oldN++; if (t != '-') newN++; }
         out_ ~= format("@@ -%s,%s +%s,%s @@\n", oldN ? oldStart : oldStart - 1, oldN, newN ? newStart : newStart - 1, newN);
-        foreach (idx; s .. stop) out_ ~= tags[idx] ~ text[idx] ~ "\n";
+        foreach (idx; s .. stop)
+            out_ ~= text[idx].endsWith(noEol)
+                ? tags[idx] ~ text[idx][0 .. $ - noEol.length] ~ "\n\\ No newline at end of file\n"
+                : tags[idx] ~ text[idx] ~ "\n";
         k = stop;
     }
     return out_;
@@ -1296,6 +1309,15 @@ string applyPatch(JSONValue args, ReadState state)
         staged ~= s;
         return staged.length - 1;
     }
+    // The original as text for a diff, or null when it isn't UTF-8 (a
+    // Delete/Add or a move needs no matching, so a binary original is fine).
+    bool originalText(size_t k, out string t)
+    {
+        import std.utf : UTFException;
+        try t = utf8Text(staged[k].before);
+        catch (UTFException) return false;
+        return true;
+    }
     string original(size_t k)
     {
         import std.utf : UTFException;
@@ -1379,7 +1401,8 @@ string applyPatch(JSONValue args, ReadState state)
     {
         if (!s.changed || (!s.existed && !s.present)) continue;
         if (!s.present && movedAway[k]) continue;
-        if (s.present && s.existed && s.after == original(k)) continue;
+        // Unchanged in place. A move destination never is: its source goes.
+        if (s.present && s.existed && s.movedFrom == size_t.max && s.after.representation == s.before) continue;
         changedFiles++;
         if (s.present && s.movedFrom != size_t.max)
         {
@@ -1390,7 +1413,12 @@ string applyPatch(JSONValue args, ReadState state)
                 diff ~= format("--- a/%s\n+++ b/%s\n(binary; renamed)\n", src, s.display);
                 continue;
             }
-            auto before = staged[s.movedFrom].existed ? original(s.movedFrom) : "";
+            string before;
+            if (staged[s.movedFrom].existed && !originalText(s.movedFrom, before))
+            {
+                diff ~= format("--- a/%s\n+++ b/%s\n(binary; renamed and replaced)\n", src, s.display);
+                continue;
+            }
             auto d = unifiedDiff("a/" ~ src, "b/" ~ s.display, before, s.after);
             diff ~= d.count('\n') > 2 ? d : d ~ "(renamed; content unchanged)\n";
         }
@@ -1398,11 +1426,8 @@ string applyPatch(JSONValue args, ReadState state)
         {
             summary ~= format("  D %s\n", s.display);
             // A delete needs no matching, so a binary file may go too.
-            import std.utf : UTFException;
-            bool text = true;
-            try utf8Text(s.before);
-            catch (UTFException) text = false;
-            diff ~= text ? unifiedDiff("a/" ~ s.display, "/dev/null", original(k), "")
+            string before;
+            diff ~= originalText(k, before) ? unifiedDiff("a/" ~ s.display, "/dev/null", before, "")
                 : format("--- a/%s\n+++ /dev/null\n(binary; deleted)\n", s.display);
         }
         else if (!s.existed)
@@ -1413,7 +1438,9 @@ string applyPatch(JSONValue args, ReadState state)
         else
         {
             summary ~= format("  M %s\n", s.display);
-            diff ~= unifiedDiff("a/" ~ s.display, "b/" ~ s.display, original(k), s.after);
+            string before;
+            diff ~= originalText(k, before) ? unifiedDiff("a/" ~ s.display, "b/" ~ s.display, before, s.after)
+                : format("--- a/%s\n+++ b/%s\n(binary; replaced)\n", s.display, s.display);
         }
     }
     if (!dry) commitStaged(staged, state);
@@ -2246,4 +2273,27 @@ unittest // review round 3: overlapping hunks, CRLF without a final newline, rol
     assert(readText(dst) == "dst\n" && (getAttributes(dst) & octal!777) == octal!755);
     assert(readText(src) == "src\n" && (getAttributes(src) & octal!777) == octal!644);
     remove(dst); remove(src); remove(a); remove(blocker);
+}
+
+unittest // review round 4: final-newline state in diffs, identical move destinations, binary delete-and-add
+{
+    auto st = new ReadState;
+    // A final line without a newline is marked, and gaining one is a change.
+    assert(unifiedDiff("a", "b", "x", "y") == "--- a\n+++ b\n@@ -1,1 +1,1 @@\n-x\n\\ No newline at end of file\n+y\n\\ No newline at end of file\n");
+    assert(unifiedDiff("a", "b", "x", "x\n") == "--- a\n+++ b\n@@ -1,1 +1,1 @@\n-x\n\\ No newline at end of file\n+x\n");
+    auto n = tmpFile("p-noeol.txt", "x");
+    auto out_ = applyPatch(j("patch", pt("*** Delete File: " ~ n, "*** Add File: " ~ n, "+x")), st);
+    assert(out_.indexOf("1 file(s)") >= 0 && out_.indexOf("No newline") >= 0, out_);
+    // Moving onto a deleted file with the same content still moves.
+    auto a = tmpFile("p-same-a.txt", "x\n");
+    auto b = tmpFile("p-same-b.txt", "x\n");
+    out_ = applyPatch(j("patch", pt("*** Delete File: " ~ b, "*** Move File: " ~ a ~ " -> " ~ b)), st);
+    assert(out_.indexOf("1 file(s)") >= 0 && out_.indexOf(" R ") >= 0, out_);
+    assert(!a.exists && readText(b) == "x\n");
+    // A binary file can be replaced by a text one at the same path.
+    auto bin = tmpFile("p-binrep.dat", null);
+    std.file.write(bin, cast(const(ubyte)[])[0xff, 0xfe]);
+    out_ = applyPatch(j("patch", pt("*** Delete File: " ~ bin, "*** Add File: " ~ bin, "+text")), st);
+    assert(out_.indexOf("(binary; replaced)") >= 0 && readText(bin) == "text\n", out_);
+    remove(n); remove(b); remove(bin);
 }

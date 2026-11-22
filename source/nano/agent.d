@@ -1627,8 +1627,16 @@ class Agent
         }
         // apply_patch: each touched path also passes the hooks as a direct
         // edit of it would (the policy already checked every path).
+        // The per-path hook inputs are built once, before the patch runs: a
+        // move deletes its source, so rebuilding them afterwards would lose
+        // the content the post-hooks should see.
+        PatchEdit[] patchInputs;
         if (call.name == "apply_patch")
-            if (auto deny = patchPathHooks(call, args, context)) return withContext(deny, context);
+        {
+            patchInputs = patchEdits(args, true);
+            if (auto deny = patchPathHooks(call, patchInputs, context)) return withContext(deny, context);
+            if (auto d = "dry_run" in args) if (d.type == JSONType.true_) patchInputs = null;
+        }
         dispatched = true;
         effectiveArgs = args;
         string out_;
@@ -1672,7 +1680,7 @@ class Agent
             if (o.blocked && o.blockReason.strip.length) context ~= o.blockReason;
         }
         if (call.name == "apply_patch" && !isError)
-            foreach (edit; patchEdits(args))
+            foreach (edit; patchInputs)
                 foreach (h; hooks)
                 {
                     auto o = h.runPostToolUse(edit.name, edit.args, out_, call.id);
@@ -1699,56 +1707,88 @@ class Agent
         catch (ToolError) return null; // unparseable: the tool reports it and touches nothing
         PatchEdit[] out_;
         // Hooks that inspect content (`content`, `old_string`, `new_string`)
-        // see the same fields a direct write_file/edit_file would carry.
+        // see the same fields a direct write_file/edit_file would carry. A
+        // move's destination content comes from the patch's own sequential
+        // state (an earlier section's Add/Update), as the tool stages it,
+        // never from stale disk.
+        import nano.tools.files : applyHunks, resolvePath;
+        import std.file : readText, FileException;
+        import std.utf : UTFException;
+        string[string] staged; // path -> text after the sections so far
+        bool[string] absent, unknown;
+        bool textOf(string path, out string c)
+        {
+            auto key = resolvePath(path);
+            if (key in absent || key in unknown) return false;
+            if (auto t = key in staged) { c = *t; return true; }
+            try { c = readText(key); return true; }
+            catch (FileException) return false;
+            catch (UTFException) return false;
+        }
+        void set(string path, bool known, string c)
+        {
+            auto key = resolvePath(path);
+            absent.remove(key); unknown.remove(key); staged.remove(key);
+            if (known) staged[key] = c; else unknown[key] = true;
+        }
+        void drop(string path)
+        {
+            auto key = resolvePath(path);
+            staged.remove(key); unknown.remove(key);
+            absent[key] = true;
+        }
         foreach (fp; files)
         {
             if (fp.kind == PatchKind.add)
+            {
                 out_ ~= PatchEdit("write_file", JSONValue(["path": fp.path, "content": fp.content]));
-            else if (fp.hunks.length == 0)
+                set(fp.path, true, fp.content);
+                continue;
+            }
+            if (fp.kind == PatchKind.delete_)
+            {
+                out_ ~= PatchEdit("edit_file", JSONValue(["path": fp.path]));
+                drop(fp.path);
+                continue;
+            }
+            if (fp.hunks.length == 0)
                 out_ ~= PatchEdit("edit_file", JSONValue(["path": fp.path]));
             else
                 foreach (h; fp.hunks)
                     out_ ~= PatchEdit("edit_file", JSONValue(["path": fp.path,
                         "old_string": h.old_.length ? h.old_.join("\n") ~ "\n" : "",
                         "new_string": h.new_.length ? h.new_.join("\n") ~ "\n" : ""]));
-            if (fp.moveTo !is null)
+            string updated;
+            bool known = textOf(fp.path, updated);
+            if (known && fp.hunks.length)
             {
-                JSONValue w = JSONValue(["path": fp.moveTo]);
-                string c;
-                if (movedContent(fp, c)) w["content"] = c;
-                out_ ~= PatchEdit("write_file", w);
+                try
+                {
+                    string[] notes;
+                    updated = applyHunks(updated, fp.hunks, notes, fp.path);
+                }
+                catch (ToolError) known = false; // the tool fails the same way and writes nothing
             }
+            if (fp.moveTo is null)
+            {
+                set(fp.path, known, updated);
+                continue;
+            }
+            JSONValue w = JSONValue(["path": fp.moveTo]);
+            if (known) w["content"] = updated;
+            out_ ~= PatchEdit("write_file", w);
+            drop(fp.path);
+            set(fp.moveTo, known, updated);
         }
         return out_;
-    }
-
-    /// The text a move's destination would receive: the source with the
-    /// section's hunks applied. False when that can't be computed (the tool
-    /// then fails the same way and writes nothing).
-    private static bool movedContent(const imported!"nano.tools.files".FilePatch fp, out string content)
-    {
-        import nano.tools : ToolError;
-        import nano.tools.files : applyHunks, resolvePath;
-        import std.file : readText, FileException;
-        import std.utf : UTFException;
-        try
-        {
-            string[] notes;
-            auto t = applyHunks(readText(resolvePath(fp.path)), fp.hunks, notes, fp.path);
-            content = t;
-            return true;
-        }
-        catch (ToolError) return false;
-        catch (FileException) return false;
-        catch (UTFException) return false;
     }
 
     /// Run the PreToolUse hooks for each path an apply_patch call touches.
     /// A hook can deny or add context; it can't rewrite one path of a patch,
     /// so an input rewrite blocks the call. Null when every path may proceed.
-    private string patchPathHooks(const ToolCall call, JSONValue args, ref string[] context)
+    private string patchPathHooks(const ToolCall call, PatchEdit[] edits, ref string[] context)
     {
-        foreach (edit; patchEdits(args, true))
+        foreach (edit; edits)
             foreach (h; hooks)
             {
                 auto o = h.runPreToolUse(edit.name, edit.args, call.id);
@@ -3654,4 +3694,26 @@ unittest // apply_patch hooks see the content a direct write_file/edit_file woul
     assert(edits.length == 2);
     assert(edits[0].name == "write_file" && edits[0].args["content"].str == "hello\n");
     assert(edits[1].name == "edit_file" && edits[1].args["old_string"].str == "old\n" && edits[1].args["new_string"].str == "new\n");
+}
+
+unittest // a move's destination hook input comes from the patch's own sequential state
+{
+    // An earlier Add supplies the moved content (nothing is on disk).
+    auto added = JSONValue(["patch": "*** Begin Patch\n*** Add File: nano-test-none/a.txt\n+SECRET\n"
+        ~ "*** Move File: nano-test-none/a.txt -> nano-test-none/b.txt\n*** End Patch\n"]);
+    auto edits = Agent.patchEdits(added);
+    assert(edits.length == 3 && edits[2].name == "write_file");
+    assert(edits[2].args["content"].str == "SECRET\n", edits[2].args.toString);
+    // An earlier Update is carried into the move, and the move's own hunks apply on top.
+    auto updated = JSONValue(["patch": "*** Begin Patch\n*** Add File: nano-test-none/c.txt\n+one\n"
+        ~ "*** Update File: nano-test-none/c.txt\n@@\n-one\n+two\n"
+        ~ "*** Update File: nano-test-none/c.txt\n*** Move to: nano-test-none/d.txt\n@@\n-two\n+three\n*** End Patch\n"]);
+    edits = Agent.patchEdits(updated);
+    assert(edits[$ - 1].args["path"].str == "nano-test-none/d.txt" && edits[$ - 1].args["content"].str == "three\n",
+        edits[$ - 1].args.toString);
+    // A source deleted earlier in the patch yields no content rather than stale disk text.
+    auto deleted = JSONValue(["patch": "*** Begin Patch\n*** Delete File: nano-test-none/e.txt\n"
+        ~ "*** Move File: nano-test-none/e.txt -> nano-test-none/f.txt\n*** End Patch\n"]);
+    edits = Agent.patchEdits(deleted);
+    assert("content" !in edits[$ - 1].args.objectNoRef);
 }
