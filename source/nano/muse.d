@@ -643,6 +643,8 @@ unittest
 // would read as "already expired" to `needsRefresh` and the login deadline).
 unittest
 {
+    import nano.clock : FakeClock, wallNow;
+    auto clock = FakeClock.install(wallNow); // freeze: every `now` read agrees
     const t = now;
     assert(expiryAt(60) == t + 60);
     assert(expiryAt(long.max) == long.max);
