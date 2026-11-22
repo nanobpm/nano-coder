@@ -368,13 +368,13 @@ struct Plan
     private string renderWith(bool openNotes, bool closedNotes) pure const
     {
         string out_;
-        if (goal.length) out_ ~= "Goal: " ~ goal ~ "\n";
+        if (goal.length) out_ ~= "Goal: " ~ goal.replace("\n", "\n      ") ~ "\n";
         auto pr = progress();
         out_ ~= format!"Plan (%s/%s done):\n"(pr[0], pr[1]);
         foreach (ref it; items)
         {
             auto after = it.after.length ? " (after " ~ it.after.map!(a => a.to!string).join(", ") ~ ")" : "";
-            out_ ~= format!"%s %s. %s%s\n"(it.status.mark, it.id, it.title, after);
+            out_ ~= format!"%s %s. %s%s\n"(it.status.mark, it.id, it.title.replace("\n", "\n      "), after);
             auto show = it.status.closed ? closedNotes : openNotes;
             if (show)
                 foreach (n; it.notes) out_ ~= "      - " ~ n.replace("\n", "\n        ") ~ "\n";
@@ -388,7 +388,7 @@ struct Plan
         else
         {
             auto label = nx[0].status == Status.inProgress ? "In progress" : "Next";
-            out_ ~= label ~ ": " ~ nx.map!(i => format!"%s. %s"(i.id, i.title)).join("; ") ~ "\n";
+            out_ ~= label ~ ": " ~ nx.map!(i => format!"%s. %s"(i.id, i.title.replace("\n", "\n      "))).join("; ") ~ "\n";
         }
         return out_;
     }
@@ -746,6 +746,17 @@ private string fitWidth(string s, size_t width) pure
         w += cw;
     }
     return out_ ~ "…";
+}
+
+unittest // multiline goal/title continuation lines are indented, so planSymbols leaves them alone
+{
+    Plan p;
+    p.goal = "G\n[x] 9. fake";
+    p.items ~= PlanItem(1, "Ship\n[x] 2. done already");
+    auto t = planSymbols(p.render(true, size_t.max));
+    assert(t.canFind("      [x] 2. done already"), t);
+    assert(t.canFind("      [x] 9. fake"), t);
+    assert(!t.canFind("\u2611"), t);
 }
 
 unittest // checklist
