@@ -1229,6 +1229,10 @@ struct Screen
         finishThinking();
         flushMarkdown();
         mergeLate();
+        // The call is over: its thinking block is closed, so reasoning from a
+        // later call never refolds it.
+        thinkId = null;
+        thoughtThisCall = false;
         if (midLine) writeln();
         midLine = false;
         answering = false;
@@ -1249,7 +1253,15 @@ struct Screen
     }
 
     /// A resent reply follows: what streamed before is abandoned.
-    void restart() pure { streamedAnswer = null; }
+    void restart() pure
+    {
+        streamedAnswer = null;
+        late = false;
+        lateText = null;
+        lateStart = 0;
+        thinkId = null;
+        thoughtThisCall = false;
+    }
 
     /// The model call ended: reasoning that didn't stream shows now, like a
     /// block that just ended.
@@ -1271,6 +1283,31 @@ unittest
     Screen s;
     s.text(true, "  ");
     assert(!s.thinking && !s.streamedThinking, "blank reasoning must not hide the call's full reasoning");
+}
+
+// A call ended by endLine (restart, quiet reply, interrupted call) closes
+// its thinking block: the next call's late reasoning gets its own block.
+unittest
+{
+    import std.algorithm : canFind, filter;
+    import std.array : array;
+    import std.string : representation;
+    import std.conv : to;
+    import nano.frame : Transcript;
+    Screen s;
+    s.capturing = true;
+    s.testFrame = true;
+    s.text(true, "x");
+    s.text(false, "A");
+    s.endLine();
+    s.text(false, "B");
+    s.text(true, "y");
+    s.endReasoning("y");
+    Transcript t;
+    t.feed(s.captured.representation);
+    auto thoughts = t.lines.filter!(l => l.canFind("Thought for")).array;
+    assert(thoughts.length == 2, t.lines.to!string);
+    assert(thoughts[0].canFind("1 chars") && thoughts[1].canFind("1 chars"), t.lines.to!string);
 }
 
 // rust: ui.rs::trailing_thinking_merges_interleaved_reasoning_fragments
