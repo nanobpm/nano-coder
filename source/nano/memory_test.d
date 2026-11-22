@@ -466,17 +466,25 @@ unittest // sanitize_key, project keys, tool set, run
     assert(sanitizeKey("github.com/nanobpm/nano-coder").startsWith("github.com-nanobpm-nano-coder-"));
     assert(sanitizeKey("a/".replicate(100)).length <= 80 + 17);
 
-    import std.process : execute;
     import nano.skills : canonical;
+    // A repository laid out by hand: `git init` and `git remote add` are two
+    // process spawns each, which dominated this module's time on a loaded
+    // host (issue #253). projectKey still asks the real git about it.
+    void fakeRepo(string repo, string origin)
+    {
+        mkdirRecurse(buildPath(repo, ".git", "objects"));
+        mkdirRecurse(buildPath(repo, ".git", "refs", "heads"));
+        write(buildPath(repo, ".git", "HEAD"), "ref: refs/heads/main\n");
+        write(buildPath(repo, ".git", "config"), "[core]\n\trepositoryformatversion = 0\n\tbare = false\n"
+            ~ "[remote \"origin\"]\n\turl = " ~ origin ~ "\n");
+    }
     auto dir = canonical(tmp("relorigin"));
     string[] keys;
     foreach (team; ["team-a", "team-b"])
     {
         auto repo = buildPath(dir, team, "repo");
-        mkdirRecurse(repo);
         mkdirRecurse(buildPath(dir, "origin.git"));
-        execute(["git", "-C", repo, "init", "-q"]);
-        execute(["git", "-C", repo, "remote", "add", "origin", "../../origin.git"]);
+        fakeRepo(repo, "../../origin.git");
         keys ~= projectKey(repo);
     }
     assert(keys[0] == keys[1] && !keys[0].canFind(".."), keys.join(" vs "));
@@ -484,9 +492,7 @@ unittest // sanitize_key, project keys, tool set, run
     mkdirRecurse(buildPath(dir, "elsewhere", "origin.git"));
     symlink(buildPath(dir, "elsewhere"), buildPath(dir, "link"));
     auto repo = buildPath(dir, "link", "repo");
-    mkdirRecurse(repo);
-    execute(["git", "-C", repo, "init", "-q"]);
-    execute(["git", "-C", repo, "remote", "add", "origin", "../origin.git"]);
+    fakeRepo(repo, "../origin.git");
     assert(projectKey(repo) == normalizeRemote(buildPath(dir, "elsewhere", "origin.git")), projectKey(repo));
 
     string[] names(bool w) { string[] r; foreach (d; definitions(w)) r ~= d.name; return r; }
