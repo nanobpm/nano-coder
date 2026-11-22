@@ -285,7 +285,14 @@ private void mergeLines(const(ubyte)[] bytes, ref Summary[string] map, ref size_
     {
         const(char)[] raw;
         try raw = utf8View(rawBytes);
-        catch (UTFException) { if (rawBytes.length) lines++; continue; } // invalid UTF-8: unreadable
+        catch (UTFException)
+        {
+            // Strict callers (retention) must not guess at titles a corrupt
+            // line hid, exactly like the `Summary.fromJson` catch below.
+            if (strict) throw new Exception("session index has a corrupt line");
+            if (rawBytes.length) lines++;
+            continue; // invalid UTF-8: unreadable
+        }
         auto line = raw.strip;
         if (!line.length) continue;
         lines++;
@@ -928,6 +935,11 @@ unittest
     std.file.append(indexPath(dir), cast(const(ubyte)[]) "{not json\n");
     import std.exception : assertThrown;
     assertThrown(titledIds(dir), "a corrupt index must not read as 'nothing titled'");
+    // Invalid UTF-8 hides titles the same way: strict load must throw on it
+    // too, while a non-strict listing still skips the unreadable line.
+    std.file.append(indexPath(dir), cast(const(ubyte)[]) [0xFF, 0xFE, '\n']);
+    assertThrown(titledIds(dir), "invalid UTF-8 must not read as 'nothing titled' either");
+    assert(list(dir).length >= 1, "a non-strict load still skips the bad line");
 }
 
 // Round-8 review fix for issue #205: a titled log that can no longer be

@@ -251,6 +251,15 @@ private long now()
     return wallNow.toUnixTime;
 }
 
+/// An absolute expiry from a relative `expires_in`: `now + secs`, saturated
+/// at `long.max` so an oversized duration can never wrap the sum negative
+/// (which would read as "already expired").
+private long expiryAt(long secs)
+{
+    const t = now;
+    return secs > long.max - t ? long.max : t + secs;
+}
+
 /// A minted Meta API key and the endpoint it is valid for.
 struct MintedKey
 {
@@ -337,7 +346,7 @@ Nullable!OauthGrant refreshGrant(const Endpoints e, const OauthGrant grant)
     auto rt = strField(v, "refresh_token");
     g.refreshToken = rt !is null ? rt : grant.refreshToken;
     auto expiresIn = intField(v, "expires_in");
-    g.expiresAt = expiresIn.isNull ? grant.expiresAt : Nullable!long(now + expiresIn.get);
+    g.expiresAt = expiresIn.isNull ? grant.expiresAt : Nullable!long(expiryAt(expiresIn.get));
     return Nullable!OauthGrant(g);
 }
 
@@ -360,7 +369,7 @@ string login(scope void delegate(string) @safe note, scope void delegate(long se
     long interval = iv.isNull ? 5 : iv.get;
     if (interval < 1) interval = 1;
     auto ex = intField(device, "expires_in");
-    auto deadline = now + (ex.isNull ? 900 : ex.get);
+    auto deadline = ex.isNull ? now + 900 : expiryAt(ex.get);
     note("UNOFFICIAL: this signs in as the Muse Code CLI; use at your own risk.");
     note(format("Open %s and enter code: %s", uri, userCode));
     note("Waiting for authorization...");
@@ -378,7 +387,7 @@ string login(scope void delegate(string) @safe note, scope void delegate(long se
             StoredCredentials c;
             c.oauthToken = token;
             c.refreshToken = strField(poll, "refresh_token");
-            if (!expiresIn.isNull) c.expiresAt = now + expiresIn.get;
+            if (!expiresIn.isNull) c.expiresAt = expiryAt(expiresIn.get);
             c.apiKey = minted.apiKey;
             c.apiBase = minted.baseUrl;
             c.createdAt = wallNow(UTC()).toISOExtString;
@@ -627,4 +636,18 @@ unittest
     assert(contextLimit(JSONValue(["context_limit": JSONValue(200_000u)])) == 200_000);
     assert(contextLimit(JSONValue(["context_limit": JSONValue(ulong.max)])) == long.max);
     assert(outputLimit(JSONValue(["output_limit": JSONValue(-1)])) == 0);
+}
+
+// `expiryAt` adds a relative `expires_in` to the current time; an oversized
+// duration must saturate at long.max, never wrap the sum negative (which
+// would read as "already expired" to `needsRefresh` and the login deadline).
+unittest
+{
+    const t = now;
+    assert(expiryAt(60) == t + 60);
+    assert(expiryAt(long.max) == long.max);
+    assert(expiryAt(long.max - t) == long.max);
+    assert(expiryAt(long.max - t - 1) == long.max - 1);
+    // A saturated expiry is never in the past.
+    assert(expiryAt(long.max) >= t);
 }
