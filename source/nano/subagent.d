@@ -1026,6 +1026,9 @@ struct SubInfo
 {
     /// Its handle (`sub-N`), model and state (queued, running, done, cancelled, truncated).
     string id, model, state;
+    /// Its launch sequence: a combined listing sorts on it, so it stays
+    /// oldest first even when children enter the archive out of launch order.
+    size_t seq;
     /// The first line of its task, cut to `taskCols` characters.
     string task;
     size_t turns;
@@ -1174,10 +1177,10 @@ unittest // the listing, mixed states
 {
     import std.algorithm : count;
     assert(listingText(null, 0) == "No sub-agents in this session yet.");
-    auto all = [SubInfo("sub-1", "a/x", "done", firstLine("find it\nmore"), 3, 1500, 12),
-        SubInfo("sub-2", "b/y", "running", "scan", 1, 10, 4, true),
-        SubInfo("sub-3", "a/x", "queued", "later", 0, 0, 0, true),
-        SubInfo("sub-4", "a/x", "cancelled", "stop me", 2, 20, 7, true)];
+    auto all = [SubInfo("sub-1", "a/x", "done", 1, firstLine("find it\nmore"), 3, 1500, 12),
+        SubInfo("sub-2", "b/y", "running", 2, "scan", 1, 10, 4, true),
+        SubInfo("sub-3", "a/x", "queued", 3, "later", 0, 0, 0, true),
+        SubInfo("sub-4", "a/x", "cancelled", 4, "stop me", 2, 20, 7, true)];
     auto t = listingText(all, 5);
     assert(t.canFind("5 earlier ones not shown"), t);
     assert(t.canFind("sub-1  a/x  done  3 turns · 1.5k tokens · 12s  find it\n"), t);

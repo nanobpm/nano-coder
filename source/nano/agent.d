@@ -2465,6 +2465,7 @@ class Agent
         import nano.subagent : SubInfo, firstLine;
         SubInfo i;
         i.id = s.id;
+        i.seq = s.spec.slot;
         i.model = s.spec.model;
         i.state = s.state;
         i.task = firstLine(s.task);
@@ -2488,9 +2489,14 @@ class Agent
     /// from `onSubagentsChanged`, which runs while a message is handled.
     imported!"nano.subagent".SubInfo[] subagentSnapshot(out size_t forgotten)
     {
+        import std.algorithm : sort;
         forgotten = subForgotten;
         auto all = subHistory.dup;
         foreach (ref s; subSlots) all ~= infoOf(s);
+        // Slots leave `subSlots` as they finish, not in launch order, so the
+        // archive alone is not oldest first: sort the combination on the
+        // launch sequence.
+        sort!((a, b) => a.seq < b.seq)(all);
         return all;
     }
 

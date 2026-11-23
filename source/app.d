@@ -918,6 +918,18 @@ void showSubagentLog(string id, string path, Console console)
     gStatusBatched = true;
     scope (exit) gStatusBatched = wasBatched;
     scope (exit) console.replayTime = null;
+    // A replay runs no tools, so the child's `history_search`/`history_read`
+    // calls must not accumulate in the parent's status counters: keep them
+    // aside and put them back afterwards.
+    size_t savedSearches, savedReads;
+    if (gFrame) gStats.update((ref Stats s) {
+        savedSearches = s.historySearches;
+        savedReads = s.historyReads;
+    });
+    scope (exit) if (gFrame) gStats.update((ref Stats s) {
+        s.historySearches = savedSearches;
+        s.historyReads = savedReads;
+    });
     writeln(console.bold(format("── %s transcript ──", id)));
     // The calls of the latest assistant message waiting for their results,
     // so each header shows directly above its own output.
@@ -4258,4 +4270,36 @@ unittest
     assert(!s.captured.canFind("\x1b]8771;Zm9v"), s.captured);
     assert(!s.captured.canFind("\x07y"), s.captured);
     assert(!s.captured.canFind("\uE002"), s.captured);
+}
+
+// `/subagents show` replays a child's tools without counting its
+// `history_search`/`history_read` calls in the parent's status counters
+// (issue #267).
+unittest
+{
+    import std.file : tempDir, remove;
+    import std.path : buildPath;
+    import std.stdio : File;
+    import std.conv : to;
+    import nano.session : messageRecord;
+    auto p = buildPath(tempDir, "nano-replay-" ~ to!string(monoNow.ticks) ~ ".jsonl");
+    scope (exit) remove(p);
+    {
+        auto f = File(p, "wb");
+        auto hs = Message.assistant("", [ToolCall.fromRaw("c1", "history_search", `{"query":"q"}`)]);
+        auto hr = Message.assistant("", [ToolCall.fromRaw("c2", "history_read", `{"id":"1"}`)]);
+        auto hsResult = Message.toolResult("c1", "history_search", "a hit");
+        auto hrResult = Message.toolResult("c2", "history_read", "a line");
+        f.write(`{"type":"message","data":` ~ messageRecord(hs).jsonText ~ "}\n");
+        f.write(`{"type":"message","data":` ~ messageRecord(hsResult).jsonText ~ "}\n");
+        f.write(`{"type":"message","data":` ~ messageRecord(hr).jsonText ~ "}\n");
+        f.write(`{"type":"message","data":` ~ messageRecord(hrResult).jsonText ~ "}\n");
+    }
+    auto before = gStats.get;
+    scope (exit) gStats.update((ref Stats s) { s = before; });
+    gStats.update((ref Stats s) { s.historySearches = 4; s.historyReads = 2; });
+    showSubagentLog("sub-1", p, new Console(false));
+    auto after = gStats.get;
+    assert(after.historySearches == 4 && after.historyReads == 2,
+        format("replay counted the child's history calls: %ss %sr", after.historySearches, after.historyReads));
 }

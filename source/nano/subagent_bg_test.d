@@ -566,3 +566,33 @@ unittest
     auto text = f.agent.takeBackgroundResults(notice);
     assert(text.canFind("cut off") && text.canFind("cancelled before the sub-agent started"), text);
 }
+
+// The combined `/subagents` snapshot stays oldest first even when a
+// later-launched child is archived before an earlier one still running
+// (issue #267): pruning delivered results past `keepDelivered` archives
+// them in finish order, not launch order.
+unittest
+{
+    import nano.subagent : keepDelivered;
+    import std.format : format;
+    import std.range : iota;
+    import std.algorithm : map;
+    import std.array : array;
+    atomicStore(gateOpen, false);
+    scope (exit) atomicStore(gateOpen, false);
+    LLMResponse[] script = [LLMResponse("", "", [bg("b1", "mock/gated")]
+        ~ iota(2, cast(int) keepDelivered + 2).map!(i => bg(format("b%s", i), "mock/search")).array),
+        LLMResponse("launched"), LLMResponse("saw them")];
+    auto f = new Fixture(new OpensGate(script));
+    scope (exit) f.cleanup();
+    assert(f.agent.run("go", new NullEvents) == "launched");
+    // The quick children finish and are delivered while the gated sub-1
+    // still runs; pruning archives sub-2..sub-17 ahead of it.
+    assert(f.agent.run("next", new NullEvents) == "saw them");
+    size_t forgotten;
+    auto all = f.agent.subagentList(forgotten);
+    assert(all.length == keepDelivered + 1, all.length.to!string);
+    foreach (k, ref i; all) assert(i.id == format("sub-%s", k + 1), i.id);
+    foreach (k; 1 .. all.length) assert(all[k - 1].seq < all[k].seq);
+    f.agent.stopSubagents();
+}
