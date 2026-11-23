@@ -74,6 +74,7 @@ static import nano.sandbox;
 static import nano.session;
 static import nano.session_history;
 static import nano.session_index;
+static import nano.cross_session;
 static import nano.settings;
 static import nano.settings_dialog;
 static import nano.shell;
@@ -165,6 +166,7 @@ private alias modules = imported!"std.meta".AliasSeq!(
     nano.session,
     nano.session_history,
     nano.session_index,
+    nano.cross_session,
     nano.settings,
     nano.settings_dialog,
     nano.shell,

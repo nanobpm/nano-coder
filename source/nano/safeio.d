@@ -161,6 +161,29 @@ int fchmodFd(int fd, uint mode) @trusted
     return fchmod(fd, cast(mode_t) mode);
 }
 
+/// How a non-blocking lock attempt ended.
+enum LockResult { acquired, contended, unsupported }
+
+/// Open `path` read-only and try the same exclusive non-blocking flock a
+/// session writer holds for its life (issue #271: a `contended` answer means
+/// a live process has the log open). The fd is closed before returning, so
+/// the probe never holds the lock itself. `unsupported` is any other failure
+/// (a missing file, ENOLCK, ...): the caller treats it as "not live".
+LockResult tryLockFile(string path) @trusted nothrow
+{
+    import core.sys.posix.fcntl : O_RDONLY;
+    import core.sys.posix.unistd : close;
+    import core.stdc.errno : errno, EWOULDBLOCK, EAGAIN;
+    // flock(2) takes an fd and flags, touching no memory.
+    extern (C) int flock(int, int) nothrow @nogc;
+    enum LOCK_EX = 2, LOCK_NB = 4;
+    auto fd = openPath(path, O_RDONLY);
+    if (fd < 0) return LockResult.unsupported;
+    scope (exit) close(fd);
+    if (flock(fd, LOCK_EX | LOCK_NB) == 0) return LockResult.acquired;
+    return errno == EWOULDBLOCK || errno == EAGAIN ? LockResult.contended : LockResult.unsupported;
+}
+
 /// The mode `open(2)` gives a new file created with 0666: 0666 less the
 /// process umask, read once at startup (reading it means setting it, which
 /// is only safe before other threads exist).

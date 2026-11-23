@@ -17,6 +17,8 @@ import nano.llm : Message, Role, ToolDefinition;
 
 enum searchTool = "history_search";
 enum readTool = "history_read";
+/// `sessions_list` (issue #271): the sessions this one can read from.
+enum sessionsTool = "sessions_list";
 
 /// Appended once to a failed tool result after a smart compaction.
 enum string failedToolHint = "[If you are looking for something from earlier in this session (an error, a command "
@@ -30,7 +32,7 @@ class HistoryError : Exception
     this(string msg) pure @safe { super(msg); }
 }
 
-bool isHistoryTool(string name) pure @safe { return name == searchTool || name == readTool; }
+bool isHistoryTool(string name) pure @safe { return name == searchTool || name == readTool || name == sessionsTool; }
 
 /// A call that failed, including a bash command that ran but reported failure.
 bool looksFailed(string tool, bool ok, string result) pure @safe
@@ -62,11 +64,23 @@ ToolDefinition[] definitions() pure
             ~ "phrase, an identifier, a flag) over common words, and use order=oldest for things from early on. "
             ~ "An assistant message that follows tool output is often a paraphrase: read the output it names. "
             ~ "Results are history, not the current state of files.",
-            parseJSON(`{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression (case-insensitive); plain text works too"},"role":{"type":"string","enum":["user","assistant","tool"],"description":"Only messages with this role. Command output and errors are in tool messages; omit role to search everything"},"before":{"type":"integer","description":"Only messages with an ID below this"},"after":{"type":"integer","description":"Only messages with an ID above this"},"order":{"type":"string","enum":["newest","oldest"],"description":"Result order (default newest first)"},"limit":{"type":"integer","description":"Maximum messages returned (default 20, max 100)"}},"required":["pattern"]}`)),
+            parseJSON(`{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression (case-insensitive); plain text works too"},"role":{"type":"string","enum":["user","assistant","tool"],"description":"Only messages with this role. Command output and errors are in tool messages; omit role to search everything"},"before":{"type":"integer","description":"Only messages with an ID below this"},"after":{"type":"integer","description":"Only messages with an ID above this"},"order":{"type":"string","enum":["newest","oldest"],"description":"Result order (default newest first)"},"limit":{"type":"integer","description":"Maximum messages returned (default 20, max 100)"},"session":{"type":"string","description":"Read another session: its id, a unique id prefix, or a title from sessions_list. Omit for this session."}},"required":["pattern"]}`)),
         ToolDefinition(readTool,
             "Read one original message of this session in full by its ID (#N from a summary or history_search).",
-            parseJSON(`{"type":"object","properties":{"id":{"type":"integer","description":"Message ID (the N in #N)"},"max_output_length":{"type":"integer","description":"Maximum characters to return (default 40000)"}},"required":["id"]}`)),
+            parseJSON(`{"type":"object","properties":{"id":{"type":"integer","description":"Message ID (the N in #N)"},"max_output_length":{"type":"integer","description":"Maximum characters to return (default 40000)"},"session":{"type":"string","description":"Read another session: its id, a unique id prefix, or a title from sessions_list. Omit for this session."}},"required":["id"]}`)),
     ];
+}
+
+/// The `sessions_list` definition, offered only with `cross_session_history`
+/// (issue #271): without the setting the history tools keep their old shape.
+ToolDefinition sessionsDefinition() pure
+{
+    return ToolDefinition(sessionsTool,
+        "List this machine's nano-coder sessions, newest first: id, title or first request, working directory, "
+        ~ "last activity, and whether a process currently has the session open ([live]). Pass an id, a unique id "
+        ~ "prefix or a title as the `session` argument of history_search/history_read to read that session's "
+        ~ "history. Reading a session from another working directory may be blocked by the permission policy.",
+        parseJSON(`{"type":"object","properties":{"filter":{"type":"string","description":"Only sessions whose id, title or working directory contains this (case-insensitive)"}}}`));
 }
 
 struct Entry
