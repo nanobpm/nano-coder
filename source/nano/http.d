@@ -75,7 +75,15 @@ int perform(const ref Request req, out string body_, out ResponseMeta meta,
 {
     auto http = HTTP(req.url);
     http.method = req.method == "GET" ? HTTP.Method.get : HTTP.Method.post;
-    foreach (k, v; req.headers) http.addRequestHeader(k, v);
+    // Content-Type goes with the body below: std.net.curl's `postData` would
+    // add a second one, which some gateways never answer.
+    string contentType = "application/json";
+    foreach (k, v; req.headers)
+    {
+        import std.uni : sicmp;
+        if (sicmp(k, "Content-Type") == 0) contentType = v;
+        else http.addRequestHeader(k, v);
+    }
     http.connectTimeout = req.connectTimeout;
     // libcurl's low-speed limit acts as an idle timeout: fail after `idleTimeout`
     // seconds below 1 byte/s, without capping a slow but steady stream.
@@ -85,7 +93,7 @@ int perform(const ref Request req, out string body_, out ResponseMeta meta,
     if (req.method != "GET")
     {
         const(void)[] payload = req.body_;
-        http.postData = payload;
+        http.setPostData(payload, contentType);
     }
     // A cancelled turn aborts the transfer (libcurl polls this about once a second
     // and on every chunk).
@@ -648,4 +656,23 @@ unittest
     assert(monoNow - start < 3.seconds, "a redirect loop was waited out as an outage: " ~ msg);
     assert(msg.length && !msg.canFind("network unavailable"), msg);
     srv.finish();
+}
+
+// A POST carries exactly one Content-Type. std.net.curl's `postData` adds
+// `application/octet-stream` on top of ours, and some gateways (Alibaba
+// Cloud Model Studio) never answer a request with two.
+unittest
+{
+    import std.algorithm : canFind, count;
+    import std.string : toLower;
+    import nano.testserver : serve, Reply;
+    auto srv = serve([Reply(200, "Content-Type: application/json\r\n", `{"ok":true}`)]);
+    RetryPolicy p;
+    p.maxRetries = 0;
+    postJson(srv.url ~ "/x", null, JSONValue(1), "probe", p, [], 5);
+    auto seen = srv.finish();
+    assert(seen.length == 1);
+    auto h = seen[0].headers.toLower;
+    assert(h.count("content-type:") == 1, seen[0].headers);
+    assert(h.canFind("content-type: application/json"), seen[0].headers);
 }
