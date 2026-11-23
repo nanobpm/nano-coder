@@ -327,6 +327,8 @@ phases). Disable them with `--no-hooks`, or granularly via the
   `read_file` (or written by these tools) in this process, and to be unchanged on disk since.
   Otherwise they ask the model to read it again, so an edit can't land on stale text.
 - `plan_add`, `plan_update`, `plan_show` - The agent's task plan (see [Task Plans](#task-plans)).
+- `session_settings` - The agent reads or adjusts its own session's settings (see
+  [Agent-adjusted compaction](#agent-adjusted-compaction)).
 - `report_outcome` - Report the task `completed`, `blocked` or `needs_input`, with a `summary`; ends
   the turn (see [Outcomes](#outcomes)).
 - `question` - Ask the user a structured question and wait for the answer, without ending the turn.
@@ -1177,6 +1179,27 @@ each with its `(#N)`, plus the pinned requests and the plan as usual. It says wh
 things are rather than what they mean, so the agent leans on the history tools. An
 earlier extract summary is merged rather than nested, so each section stays capped. See
 [#273](https://github.com/nanobpm/nano-coder/issues/273) for its measurement against smart.
+
+#### Agent-adjusted compaction
+
+The `session_settings` tool lets the agent manage its own context (issue
+[#293](https://github.com/nanobpm/nano-coder/issues/293)):
+
+- `action: "get"` - the effective settings: model, compaction mode, auto-compaction and its
+  threshold, context use and window, whether the history tools are on.
+- `action: "set"`, `key: "compaction_mode"`, `value: standard|smart|extract` - changes the mode
+  for **this session only**. Nothing is written to `config.toml`; a resumed session starts from
+  the config again. After a change, the same setting can't change again for 3 turns.
+- `action: "compact_now"` (optional `mode`, `focus`) - compacts before the agent's next request,
+  e.g. before reading something large or once old tool output is no longer needed. It doesn't
+  change the session's mode.
+
+Every change takes a `reason`, is shown as an `[agent] …` line and is logged as a `setting`
+record; a compaction's `replace` record carries its `trigger` (`manual`, `threshold`,
+`overflow`, `idle` or `agent`), which `scripts/compaction-report.py` tabulates. Security and
+cost settings (permissions, sandbox, yolo, hooks, providers and keys, model, thinking) are
+refused whatever the request, so a prompt injection can't loosen them. Sub-agents don't get
+the tool. It is allowed in plan mode: it changes the harness, not the workspace.
 
 #### Cross-session history
 
