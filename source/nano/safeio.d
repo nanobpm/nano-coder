@@ -15,7 +15,12 @@ import std.stdio : File;
 /// spread over those large pools, so almost none of the freed heap goes back
 /// (a 59 MB log kept ~330 MB resident with 38 MB live). Small fixed-size pools
 /// let far more of them empty out and be released: 336 -> 237 MB there.
-extern (C) __gshared string[] rt_options = ["gcopt=maxPoolSize:4 incPoolSize:0 initReserve:0"];
+/// `heapSizeFactor` (default 2) is how far the heap may outgrow the live
+/// set before a collection: a resume's replay decodes thousands of folded
+/// messages of short-lived garbage, and at 2 the heap doubled into pools the
+/// few survivors then pinned. Resuming an 82 MB log settled at 139 MB at the
+/// default, 91 MB at 1.25 (1.1: 82 MB, for ~8% more CPU on the resume).
+extern (C) __gshared string[] rt_options = ["gcopt=maxPoolSize:4 incPoolSize:0 initReserve:0 heapSizeFactor:1.25"];
 
 /// `std.stdio.stdout`. Phobos marks it @system only because the `File` is a
 /// `__gshared` global; every `File` operation locks the stream itself.
