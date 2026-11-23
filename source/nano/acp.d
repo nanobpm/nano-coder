@@ -748,15 +748,19 @@ final class AcpServer : AgentEvents
         }
         if (text.startsWith("/model ") && host.makeClient !is null)
         {
-            try agent.client = host.makeClient(text[7 .. $].strip);
-            catch (Exception e) return rpcError(id, -32602, e.msg);
-            agent.refreshCapabilities();
+            auto spec = text[7 .. $].strip;
+            LLMClient c;
+            ConfiguredWindow w;
+            try
             {
-                // A resume restores the session's model (#297).
-                SessionSettings ss;
-                ss.model = agent.client.providerName ~ "/" ~ agent.client.modelName;
-                agent.logSettings(ss);
+                c = host.makeClient(spec);
+                w = host.windowFor !is null ? host.windowFor(spec) : defaultConfiguredWindow;
             }
+            catch (Exception e) return rpcError(id, -32602, e.msg);
+            // Through `useClient` so the previous client's configured window,
+            // learned window and max output are reset, the new model probed,
+            // and the `settings` record logged for resume (#297).
+            agent.useClient(c, w, true);
             auto temp = agent.temperatureNow;
             auto th = agent.thinking();
             JSONValue body_ = ["stopReason": "end_turn", "provider": agent.client.providerName,
@@ -1420,10 +1424,14 @@ unittest
 
     auto agent1 = new Agent(new MockClient([]), new ToolRegistry, Policy.init, null);
     agent1.subagentClients = new immutable NoClients;
+    agent1.setConfiguredWindow(ConfiguredWindow(7_777, "startup provider"));
+    agent1.learnedWindow = 4_000;
+    agent1.learnedMaxOutput = 512;
     string[] lines1;
     Host host1;
     host1.systemPrompt = (string cwd) => "sys";
     host1.makeClient = (string spec) => new NamedMock("alt", spec);
+    host1.windowFor = (string spec) => ConfiguredWindow(5_555, "switched provider");
     host1.sessionDir = dir;
     host1.version_ = "test";
     auto srv1 = new AcpServer(agent1, host1, (string l) { lines1 ~= l; });
@@ -1433,6 +1441,8 @@ unittest
     srv1.receive(`{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"prompt":[{"type":"text","text":"/thinking high"}]}}`);
     srv1.close();
     assert(srv1.run());
+    assert(agent1.configuredWindow == 5_555);
+    assert(agent1.learnedWindow == 0 && agent1.learnedMaxOutput == 0);
     auto sid = parseJSON(lines1[0])["result"]["sessionId"].str;
     agent1.replaceLog(Option!SessionLog.init);
 
