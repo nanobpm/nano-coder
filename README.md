@@ -1185,7 +1185,7 @@ earlier extract summary is merged rather than nested, so each section stays capp
 The `session_settings` tool lets the agent manage its own context (issue
 [#293](https://github.com/nanobpm/nano-coder/issues/293)):
 
-- `action: "get"` - the effective settings: model, compaction mode, auto-compaction and its
+- `action: "get"` - the effective settings: nano-coder version, model, compaction mode, auto-compaction and its
   threshold, context use and window, whether the history tools are on.
 - `action: "set"`, `key: "compaction_mode"`, `value: standard|smart|extract` - changes the mode
   for **this session only**. Nothing is written to `config.toml`; a resumed session starts from

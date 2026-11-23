@@ -51,8 +51,8 @@ struct Request
 ToolDefinition definition()
 {
     return ToolDefinition(toolName,
-        "Read or adjust this session's harness settings. action \"get\" shows the effective settings (model, "
-        ~ "compaction mode and threshold, context use). action \"set\" changes one setting for this session only "
+        "Read or adjust this session's harness settings. action \"get\" shows the effective settings (nano-coder "
+        ~ "version, model, compaction mode and threshold, context use). action \"set\" changes one setting for this session only "
         ~ "(never the user's config); allowed keys: " ~ format("%-(%s, %)", writableKeys) ~ ". action "
         ~ "\"compact_now\" compacts the context before your next request (optional mode and focus), e.g. before "
         ~ "reading something large or when old tool output is no longer needed. compaction_mode: standard (model "
