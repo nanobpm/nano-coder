@@ -3631,13 +3631,13 @@ int runMain(string[] args)
                     writeln(versionString);
                     continue;
                 case "/subagents":
-                    writeln(subagentsCommand(agent, cfg, arg));
+                    writeln(escapeMarks(sanitizeBlock(subagentsCommand(agent, cfg, arg))));
                     continue;
                 case "/tools":
-                    writeln(toolsListing(agent));
+                    writeln(escapeMarks(sanitizeBlock(toolsListing(agent))));
                     continue;
                 case "/skills":
-                    writeln(skillsListing(skills));
+                    writeln(escapeMarks(sanitizeBlock(skillsListing(skills))));
                     continue;
                 case "/resume":
                 {
