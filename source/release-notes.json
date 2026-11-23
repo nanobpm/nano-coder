@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.13.0", "date": "2026-11-23", "items": [
+      {"type":"feat","scope":"subagents","title":"background sub-agents the agent can check, read, cancel and wait on","pr":285}
+    ]},
     {"version": "1.12.1", "date": "2026-11-23", "items": [
       {"type":"perf","scope":"session","title":"resume heap no longer scales with the session log size","pr":269}
     ]},
@@ -438,9 +441,6 @@
     ]},
     {"version": "0.20.0", "date": "2026-09-29", "items": [
       {"type":"feat","scope":"cli","title":"app-owned frame renderer behind renderer=\"frame\"","pr":48}
-    ]},
-    {"version": "0.19.2", "date": "2026-09-28", "items": [
-      {"type":"fix","scope":"cli","title":"keep the status bar pinned on resize (revert #35)","pr":45}
     ]}
   ]
 }
