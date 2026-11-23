@@ -416,6 +416,9 @@ class Agent
     /// compaction rebuilds the pinned block from originals (Rust's
     /// `pre_compaction_transcript`, trimmed to requests).
     Message[] pinStash;
+    /// The restored `pinStash` dropped legacy non-request entries, so the
+    /// next compaction writes it in full rather than as a delta (issue #301).
+    bool pinStashRestate;
     /// The real turns folded by compactions since the last plain replacement:
     /// a replay (ACP session/load) shows them in place of the summary.
     Message[] replayStash;
@@ -2110,8 +2113,9 @@ class Agent
                 pending = savedPending;
                 calibLen = savedCalibLen;
             }
-        size_t pinnedBase = pinStash.length;
-        Message[] pinnedNew;
+        // A full restatement (no base) after a restore dropped legacy entries.
+        auto pinnedBase = pinStashRestate ? Option!size_t.init : some(pinStash.length);
+        Message[] pinnedNew = pinStashRestate ? pinStash.dup : null;
         foreach (ref x; summarized)
             if (ctx.isUserRequest(x)) { pinStash ~= x; pinnedNew ~= x; }
 
@@ -2199,11 +2203,12 @@ class Agent
             import std.conv : to;
             l.replace(messages, first, last, ctx.modeName(m), client.providerName ~ "/" ~ client.modelName, pinnedNew,
                 hasPending ? &pending : null, folded, extendsStash ? some(stashBase) : Option!size_t.init, replayRestated,
-                some(pinnedBase), trigger.to!string);
+                pinnedBase, trigger.to!string);
         });
         // The replace record is durable: the live state now matches the log,
         // so nothing past this point may roll it back.
         persisted = true;
+        pinStashRestate = false;
         // The replacement drops recalled notes' full text from context, so
         // every memory may be recalled again (except those the retained
         // system message's index renders in full: `indexShown` is kept).
@@ -3547,7 +3552,13 @@ class Agent
         completedOutcomes = r.completedOutcomes;
         historyAvailable = r.historyAvailable;
         historyHintPending = r.historyAvailable && !r.historyHintConsumed;
-        pinStash = r.pinStash;
+        // Only user requests are pinned (`pinnedUserRequests` ignores the
+        // rest). An older log's stash also holds folded tool and assistant
+        // turns (issue #301); drop them, and have the next compaction restate
+        // the stash in full, because its `pinned_base` would count them.
+        pinStash = null;
+        foreach (ref m; r.pinStash) if (ctx.isUserRequest(m)) pinStash ~= m;
+        pinStashRestate = pinStash.length != r.pinStash.length;
         replayStash = r.replayStash;
         replayStashLog = null;
         stashRefLogs = null;
@@ -3674,6 +3685,7 @@ class Agent
         compactFloor = 0;
         resetIdleCompaction();
         pinStash = null;
+        pinStashRestate = false;
         replayStash = null;
         replayStashLog = null;
         stashRefLogs = null;

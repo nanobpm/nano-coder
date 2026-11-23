@@ -1838,6 +1838,23 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
                     return o;
                 }
                 auto pins = "pinned_requests" in data, pinBase = "pinned_base" in data;
+                // Logs written before compaction pinned only user requests
+                // hold every folded turn in `pinned_requests` (issue #301: one
+                // had 6,998, 12 MB, kept for the session's life). Only user
+                // messages can be pinned, so the others shrink to an empty
+                // placeholder that keeps the `pinned_base` indexes right;
+                // `Agent.loadRestored` drops them.
+                static Message[] pinsOnly(Message[] ms)
+                {
+                    foreach (ref m; ms)
+                        if (m.role != Role.user)
+                        {
+                            Message p;
+                            p.role = Role.tool;
+                            m = p;
+                        }
+                    return ms;
+                }
                 // Folded turns whose large tool output matches its direct
                 // record drop it: a replay reads it back from the log, and the
                 // resumed session no longer holds every folded output (issue
@@ -1898,9 +1915,9 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
                 {
                     auto b = toSize(pinBaseN);
                     auto kept = b < r.pinStash.length ? r.pinStash[0 .. b] : r.pinStash;
-                    r.pinStash = kept ~ decode(*pins, inputs);
+                    r.pinStash = kept ~ pinsOnly(decode(*pins, inputs));
                 }
-                else r.pinStash = pins !is null ? decode(*pins, inputs) : rustStash;
+                else r.pinStash = pins !is null ? pinsOnly(decode(*pins, inputs)) : rustStash;
             }
             {
                 auto mode = "mode" in data;
