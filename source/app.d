@@ -3338,6 +3338,7 @@ int runMain(string[] args)
 
     bool interactive = isTerminal(0);
     Chan!string updateHints; // update hints for an idle prompt
+    Chan!string releaseNotice; // the fetched release notice, recorded once shown
     if (interactive && isTerminal(1) && environment.get("TERM", "") != "dumb"
         && environment.get("NANO_CODER_PLAIN_INPUT") is null && enterKeyMode(0))
     {
@@ -3403,6 +3404,8 @@ int runMain(string[] args)
     if (interactive)
     {
         import nano.release_notes : embedded, lastVersionPath, needsFetch, runNotice, startupNotice;
+        // The record is updated only once the fetched notice is on screen, so
+        // quitting before it lands shows it again next start.
         import std.array : join;
         auto notesPath = lastVersionPath();
         auto notes = embedded();
@@ -3410,8 +3413,8 @@ int runMain(string[] args)
         // synchronous path shows the compare link.
         if (editor.isSome && needsFetch(notesPath, packageVersion, cfg.showReleaseNotes, notes))
         {
-            if (!updateHints) updateHints = Chan!string.make;
-            spawnDaemon(&runNotice, notesPath, packageVersion, updateHints);
+            releaseNotice = Chan!string.make;
+            spawnDaemon(&runNotice, notesPath, packageVersion, releaseNotice);
         }
         else if (auto lines = startupNotice(notesPath, packageVersion, cfg.showReleaseNotes, notes))
             writeln(stampBlock(console.stamp(), lines.join("\n")));
@@ -3495,6 +3498,17 @@ int runMain(string[] args)
             string updateHint;
             if (updateHints && updateHints.tryTake(updateHint)) writeln(console.dim(updateHint));
             updateHint = null;
+            string fetchedNotice;
+            // Shows the fetched release notice, then records the version: once shown, it is done.
+            void showNotice() @safe
+            {
+                import nano.release_notes : lastVersionPath, writeLastVersion;
+                writeln(console.dim(fetchedNotice));
+                writeLastVersion(lastVersionPath(), packageVersion);
+                releaseNotice = Chan!string.init; // sent once
+                fetchedNotice = null;
+            }
+            if (releaseNotice && releaseNotice.tryTake(fetchedNotice)) showNotice();
             // An idle compaction is due once the prompt (and any draft) sat
             // untouched for the hold, unless the exit window is armed (#186).
             auto promptShown = monoNow;
@@ -3523,7 +3537,8 @@ int runMain(string[] args)
                 || timerNow()
                 || subNow()
                 || idleNow()
-                || (updateHints && updateHints.tryTake(updateHint));
+                || (updateHints && updateHints.tryTake(updateHint))
+                || (releaseNotice && releaseNotice.tryTake(fetchedNotice));
             auto r = ed.readLine(.stamp(false) ~ "› ", console.stamp() ~ glyphMark ~ " ", false, lapse);
             ed.restyle = null;
             syncMode(); // Shift-Tab at the prompt switched the mode
@@ -3579,9 +3594,10 @@ int runMain(string[] args)
                 else if (agent.control.nonNull.isCancelled) writeln(console.dim("[idle compaction cancelled]"));
                 continue;
             }
-            else if (r.outcome == Outcome.stopped && updateHint.length)
+            else if (r.outcome == Outcome.stopped && (updateHint.length || fetchedNotice.length))
             {
-                writeln(console.dim(updateHint));
+                if (updateHint.length) writeln(console.dim(updateHint));
+                if (fetchedNotice.length) showNotice();
                 quietPrompt = true;
                 continue;
             }
@@ -3777,9 +3793,11 @@ int runMain(string[] args)
                     continue;
                 case "/changes":
                 {
-                    import nano.release_notes : changesCommand, embedded, fetchUrl;
+                    // No fetch here: it would block the prompt; notes the build
+                    // lacks give a compare link.
+                    import nano.release_notes : changesCommand, embedded;
                     import std.array : join;
-                    writeln(changesCommand(arg, packageVersion, embedded(), (string url) => fetchUrl(url)).join("\n"));
+                    writeln(changesCommand(arg, packageVersion, embedded()).join("\n"));
                     continue;
                 }
                 case "/tools":

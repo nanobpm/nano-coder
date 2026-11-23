@@ -650,7 +650,9 @@ then "…and N more" with a compare link.
   Headless prompts (`-p`, piped stdin) show nothing and leave the record alone.
 - `show_release_notes = false` turns the notice off (the record is still kept).
 - `/changes` shows the changes of this release again; `/changes 1.8.0` shows everything
-  since 1.8.0.
+  since 1.8.0. It never fetches: versions the build's notes lack give a compare link.
+- A fetched start-up notice is recorded only once shown: quitting before it arrives shows it
+  again at the next start.
 
 ## Configuration
 

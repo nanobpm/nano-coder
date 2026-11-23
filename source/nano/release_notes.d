@@ -438,6 +438,15 @@ string[] startupNotice(string path, string running, bool enabled, const Release[
     return d.show ? notesFor(notes, d.from, running, fetch) : null;
 }
 
+/// The start-up notice without updating the record at `path`: the caller
+/// records the running version (`writeLastVersion`) once it has shown it, so
+/// quitting before a background fetch lands keeps the notice for next start.
+string[] pendingNotice(string path, string running, const Release[] notes, scope Fetcher fetch = null)
+{
+    auto d = decide(readLastVersion(path), running, true);
+    return d.show ? notesFor(notes, d.from, running, fetch) : null;
+}
+
 /// Whether the start-up notice needs the network: an upgrade the embedded notes don't cover.
 bool needsFetch(string path, string running, bool enabled, const Release[] notes)
 {
@@ -464,6 +473,9 @@ unittest
     writeLastVersion(path, "0.9.0");
     assert(needsFetch(path, "1.2.0", true, notes));
     assert(!needsFetch(path, "1.2.0", false, notes), "setting off");
+    // The background path leaves the record until the notice is shown.
+    assert(pendingNotice(path, "1.2.0", notes, delegate string(string url) => null).length);
+    assert(readLastVersion(path) == some("0.9.0"), "not recorded before it is shown");
 }
 
 /// The default fetcher: the GitHub API with short timeouts, at most
@@ -487,12 +499,14 @@ string fetchUrl(string url)
 }
 
 /// The background notice thread: computes the start-up notice (fetching what
-/// the embedded notes lack) and sends it, as one text, to `out_`.
+/// the embedded notes lack) and sends it, as one text, to `out_`. The record
+/// is left for the receiver to update once the notice is on screen.
 void runNotice(string path, string running, Chan!string out_)
 {
     import std.array : join;
-    auto lines = startupNotice(path, running, true, embedded(), (string url) => fetchUrl(url));
+    auto lines = pendingNotice(path, running, embedded(), (string url) => fetchUrl(url));
     if (lines.length) out_.put(lines.join("\n"));
+    else writeLastVersion(path, running); // nothing to show, nothing to lose
 }
 
 import nano.safeio : Chan;
