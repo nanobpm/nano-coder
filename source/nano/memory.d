@@ -539,10 +539,26 @@ final class Store
         {
             auto cutoff = expiryCutoff();
             auto before = f.entries.length;
-            f.entries = f.entries.filter!(e => e.isSuperseded || e.lastUsedTime >= cutoff).array;
+            f.entries = keepUnexpired(f.entries, cutoff);
             if (prune && f.entries.length != before) writeAll(p, f.entries, f.unknown);
         }
         return f;
+    }
+
+    /// The entries that survive expiry: a current entry if used since
+    /// `cutoff`; a superseded one only while its superseder (transitively)
+    /// survives, so history stays reachable but is pruned with its chain.
+    private static Entry[] keepUnexpired(Entry[] entries, SysTime cutoff)
+    {
+        bool[string] kept;
+        foreach (e; entries) if (!e.isSuperseded && e.lastUsedTime >= cutoff) kept[e.id] = true;
+        for (bool grew = true; grew;)
+        {
+            grew = false;
+            foreach (e; entries)
+                if (e.isSuperseded && e.id !in kept && e.supersededBy in kept) { kept[e.id] = true; grew = true; }
+        }
+        return entries.filter!(e => (e.id in kept) !is null).array;
     }
 
     /// Save a fact. Refuses obvious secrets, line breaks and over-long text.

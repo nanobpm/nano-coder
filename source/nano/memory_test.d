@@ -989,6 +989,22 @@ unittest // superseded records outlive the expiry cutoff
     assert(s.get(old.id).isSome);
 }
 
+unittest // a superseded record is pruned once its superseder expires
+{
+    auto s = store(tmp("facts-supersede-expiry-chain"));
+    auto old = s.save(Scope.user, "merlin has 32GB of memory", null, null);
+    SaveOptions o;
+    o.supersedes = [old.id];
+    o.distinct = true;
+    auto fresh = s.saveFact(Scope.user, "merlin has 64GB of memory", null, null, null, null, false, o).entry;
+    Entry prev;
+    foreach (x; s.get(old.id)) prev = x.e;
+    writeAll(s.path(Scope.user), [backdate(prev, defaultExpiryDays + 5), backdate(fresh, defaultExpiryDays + 5)], null);
+    s.search("nothing matches this", null);
+    assert(s.get(old.id).isNone);
+    assert(s.get(fresh.id).isNone);
+}
+
 unittest // search bumps last_used only for the hits it displays
 {
     import std.format : format;
