@@ -1,7 +1,8 @@
 /// A resumed session's heap is bounded by its context, not by its log
 /// (issue #263): the folded tool outputs a compacted session's log holds
 /// twice (direct record and replace record) are not kept in memory after a
-/// resume, so the heap left after `restore` + `loadRestored` +
+/// resume, and a transcript replay that reads them back does not keep them:
+/// the heap left after `restore` + `loadRestored` + replay +
 /// `releaseHeap` is the same small bound for a small and a large log.
 module nano.session_resume_memory_test;
 @safe:
@@ -103,8 +104,33 @@ size_t usedAfterCollect() nothrow
     return GC.stats.usedSize;
 }
 
+/// The content bytes `agent`'s replay shows. A separate frame, so no
+/// stale stack slot of the caller still points at the replayed messages
+/// when it measures the heap.
+pragma(inline, false)
+size_t replayedBytes(Agent agent)
+{
+    size_t n;
+    foreach (ref m; agent.replayMessages) n += m.content.length;
+    return n;
+}
+
+/// Overwrite the stack below the caller's frame. The GC scans the stack
+/// conservatively, so a dead slot of the replay that still points at its
+/// rehydrated messages would otherwise keep them alive into the measurement
+/// (seen: about 0.6 MB for the large log) and mask what the agent retains.
+pragma(inline, false)
+void clobberStack() nothrow
+{
+    ubyte[64 * 1024] junk = 1;
+    foreach (ref b; junk) b ^= 1;
+}
+
 /// The GC heap a resumed agent keeps of the log at `path`.
-size_t retainedByResume(string path, out size_t stash)
+/// It replays the transcript too (rehydrating the folded tool outputs from
+/// the log), so a replay that retained what it read back would also fail;
+/// `replayed` is the content bytes the replay produced.
+size_t retainedByResume(string path, out size_t stash, out size_t replayed)
 {
     auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "sys");
     immutable before = usedAfterCollect();
@@ -113,6 +139,8 @@ size_t retainedByResume(string path, out size_t stash)
         agent.loadRestored(r, some(new SessionLog(path)));
         r = Restored.init;
     }
+    replayed = replayedBytes(agent);
+    clobberStack();
     immutable after = usedAfterCollect();
     stash = agent.replayStash.length;
     agent.log.ifSome((SessionLog l) { l.close(); });
@@ -124,10 +152,13 @@ unittest
     auto dir = buildPath(tempDir, "nano-d-resume-memory-" ~ newSessionId);
     mkdirRecurse(dir);
     scope (exit) rmdirRecurse(dir);
-    size_t smallStash, largeStash;
-    immutable small = retainedByResume(writeLog(dir, "small", 300_000), smallStash);
-    immutable large = retainedByResume(writeLog(dir, "large", 1_200_000), largeStash);
+    size_t smallStash, largeStash, smallReplayed, largeReplayed;
+    immutable small = retainedByResume(writeLog(dir, "small", 300_000), smallStash, smallReplayed);
+    immutable large = retainedByResume(writeLog(dir, "large", 1_200_000), largeStash, largeReplayed);
     assert(largeStash > 3 * smallStash, "the large log folds more turns");
+    // The replay really rehydrated the folded outputs (well over the bound),
+    // yet none of it stays on the heap once the replayed messages are dropped.
+    assert(largeReplayed > 500_000, text("replay rehydrated only ", largeReplayed, " B"));
     // The large log's folded tool outputs alone are ~0.6 MB: holding them
     // (the pre-#263 resume) fails this; the stash's per-entry metadata fits.
     enum bound = 300_000;
