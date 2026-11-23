@@ -570,3 +570,24 @@ unittest
         if (r.canFind!(p => p.callId == "q1" && p.done) && r.canFind!(p => p.callId == "q2" && !p.done)) together = true;
     assert(together, "the replacement was started after the report");
 }
+
+// `/subagents off` leaves the agent tool out of the next request (and an
+// agent call then is an unknown tool); with candidates, the offered tool
+// lists them and an omitted model runs on the first.
+unittest
+{
+    import nano.subagent : SubCandidate;
+    auto f = new Fixture([LLMResponse("", "", [ToolCall.fromRaw("c1", "agent", `{"task":"find the parser"}`)]),
+        LLMResponse("done")]);
+    f.agent.subagentCandidates = [SubCandidate("mock/search", "searches", SubLimits(3, 30, 1000))];
+    auto tool = f.agent.offeredTools;
+    size_t i;
+    while (tool[i].name != "agent") i++;
+    assert(tool[i].parameters["properties"]["model"]["enum"][0].str == "mock/search");
+    f.agent.subagentsOn = false;
+    assert(!f.agent.offeredTools.canFind!(t => t.name == "agent"));
+    assert(f.agent.run("go", new NullEvents) == "done");
+    assert(f.toolResult("c1").canFind("agent"), "an agent call while off is not run as a sub-agent");
+    f.agent.subagentsOn = true;
+    assert(f.agent.offeredTools.canFind!(t => t.name == "agent"));
+}

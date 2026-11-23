@@ -1177,3 +1177,37 @@ unittest
     t = "hello world\n";
     assert(enforceSlashInvariant(t) is null && t == "hello world\n");
 }
+
+// `/subagents off|on` over ACP switches the agent tool for the next request.
+unittest
+{
+    import nano.providers.mock;
+    import nano.tools;
+    import nano.permissions : Policy;
+    import nano.subagent : SubClientFactory;
+    static final class NoClients : SubClientFactory
+    {
+        LLMClient make(string spec) const { assert(0, "no sub-agent runs here"); }
+    }
+    auto agent = new Agent(new MockClient([LLMResponse("ok")]), new ToolRegistry, Policy.init, null);
+    agent.subagentClients = new immutable NoClients;
+    string[] lines;
+    auto srv = new AcpServer(agent, Host((string cwd) => "sys", null, null, "test"), (string l) { lines ~= l; });
+    srv.receive(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}`);
+    srv.receive(`{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"prompt":[{"type":"text","text":"/subagents off"}]}}`);
+    srv.receive(`{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"prompt":[{"type":"text","text":"/tools"}]}}`);
+    srv.receive(`{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"prompt":[{"type":"text","text":"/subagents on --save"}]}}`);
+    srv.receive(`{"jsonrpc":"2.0","id":5,"method":"session/prompt","params":{"prompt":[{"type":"text","text":"/subagents on"}]}}`);
+    srv.close();
+    assert(srv.run());
+    JSONValue[long] byId;
+    foreach (l; lines)
+    {
+        auto m = parseJSON(l);
+        if ("id" in m) byId[m["id"].integer] = m;
+    }
+    assert(!byId[2]["result"]["subagents"].boolean, lines.format!"%s");
+    assert(!byId[3]["result"]["tools"].arrayNoRef.canFind!(t => t.str == "agent"));
+    assert(byId[4]["error"]["message"].str.canFind("--save"), "no host save: refused");
+    assert(byId[5]["result"]["subagents"].boolean && agent.offeredTools.canFind!(t => t.name == "agent"));
+}
