@@ -3301,8 +3301,10 @@ int runMain(string[] args)
     {
         // Peer messages accepted so far join this turn's steers (or wait for
         // the prompt): route before the key reader starts and after it stops.
+        // No pass on exit: the turn is still mid-turn there, so a peer
+        // request would be steered into `control` with nobody to collect it.
+        // The explicit pass before the late take and the idle prompt cover it.
         peerRouter.routePending(queue);
-        scope (exit) peerRouter.routePending(queue);
         // Route during `work` too, so a busy session's peer steers reach
         // this turn (and their senders hear back) instead of timing out.
         auto pumpHalt = Shared!bool.make(false);
@@ -3359,18 +3361,19 @@ int runMain(string[] args)
         // Steers that arrived after the agent's last step run as the next prompts.
         // One the user steered at the prompt keeps its `/queue` id.
         auto late = agent.control.takePending;
-        // A cancelled turn drops them (Rust: only a successful cancelled outcome).
-        if (ok && agent.control.nonNull.isCancelled)
-        {
-            foreach (t; late) stdErr.writeln(console.dim("[steer dropped: " ~ t.text ~ "]"));
-            late = null;
-        }
-        // A peer's late steer runs later as a peer prompt (loop guard kept).
+        // Before the cancel drop: its sender was told `queued`, so a
+        // peer's late steer runs later as a peer prompt (loop guard kept).
         {
             import std.algorithm : filter;
             import std.array : array;
             foreach (t; late) if (t.fromPeer) peerRouter.requeueLate(t.text);
             late = late.filter!(t => !t.fromPeer).array;
+        }
+        // A cancelled turn drops them (Rust: only a successful cancelled outcome).
+        if (ok && agent.control.nonNull.isCancelled)
+        {
+            foreach (t; late) stdErr.writeln(console.dim("[steer dropped: " ~ t.text ~ "]"));
+            late = null;
         }
         if (inbox)
             foreach_reverse (t; late) inbox.put(t.text, true);

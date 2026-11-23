@@ -435,7 +435,12 @@ struct PeerListener
                 sendReply(conn, responseLine(id, Status.refused, "the target session did not answer in time"));
                 return;
             }
-            cell.await((ref const ReplyCell c) => c.resolved, (ref ReplyCell c) { r = c; }, 120.seconds);
+            // Never report success for an unanswered request.
+            if (!cell.await((ref const ReplyCell c) => c.resolved, (ref ReplyCell c) { r = c; }, 120.seconds))
+            {
+                sendReply(conn, responseLine(id, Status.refused, "the target session did not answer in time"));
+                return;
+            }
         }
         sendReply(conn, responseLine(id, r.status, r.note));
     }
