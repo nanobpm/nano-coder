@@ -76,24 +76,37 @@ struct Entry
 }
 
 /// The log's message records with their IDs. Torn or unknown lines are skipped.
-Entry[] load(string path)
+/// `want`: decode only the lines it accepts (by ID), so a caller that needs a
+/// few messages of a long log holds only those; the log is streamed, never
+/// read whole (issue #263).
+Entry[] load(string path, scope bool delegate(ulong id) @safe want = null)
 {
-    import std.string : lineSplitter;
-    import nano.session : messageFromRecord, logText;
+    import nano.session : messageFromRecord, eachLogLine;
     Entry[] out_;
-    ulong n;
-    foreach (line; logText(path).lineSplitter)
-    {
-        ++n;
-        if (!line.canFind(`"message"`)) continue; // cheap pre-filter; any JSON spacing is valid
+    eachLogLine(path, (line, n) {
+        if (want !is null && !want(n)) return;
+        // Cheap pre-filter; any JSON spacing is valid, and a line with a
+        // `\u` escape may spell the type escaped, so it reaches the decoder.
+        if (!line.canFind(`"message"`) && !line.canFind(`\u`)) return;
         try
         {
             auto rec = parseJSON(line);
             if (rec["type"].str == "message") out_ ~= Entry(n, messageFromRecord(rec["data"]));
         }
         catch (Exception) {} // skip a torn or corrupt line, like the resume loader does
-    }
+    }, false);
     return out_;
+}
+
+unittest // escaped_type_reaches_the_decoder
+{
+    import std.file : write, remove, tempDir;
+    import std.path : buildPath;
+    auto p = buildPath(tempDir, "nano-d-history-escaped-type.jsonl");
+    write(p, `{"type":"mess\u0061ge","data":{"role":"tool","content":"out","tool_call_id":"c"}}` ~ "\n");
+    scope (exit) remove(p);
+    auto es = load(p);
+    assert(es.length == 1 && es[0].message.content == "out");
 }
 
 string roleName(Role r) pure @safe

@@ -132,9 +132,22 @@ unittest
     assert(stashed.length == 1 && !stashed[0].content.length, "the output is not held in memory");
     auto shown = agent.replayMessages.filter!(m => m.role == Role.tool).array;
     assert(shown.length == 1 && shown[0].content == "x".replicate(8_000), "the replay reads it from the log");
+    // A resume slims it the same way (issue #263): the log's direct record
+    // holds the same text, and the resumed agent's replay reads it back.
     auto r = restore(log.path);
     auto restored = r.replayStash.filter!(m => m.role == Role.tool).array;
-    assert(restored.length == 1 && restored[0].content == "x".replicate(8_000), "the log keeps it whole");
+    assert(restored.length == 1 && !restored[0].content.length, "a resume does not hold it either");
+    auto resumed = agentWith([]);
+    resumed.loadRestored(r, some(new SessionLog(log.path)));
+    shown = resumed.replayMessages.filter!(m => m.role == Role.tool).array;
+    assert(shown.length == 1 && shown[0].content == "x".replicate(8_000), "the resumed replay reads it from the log");
+    // A load without a log (`--no-session`) keeps it: nothing could read it back.
+    auto unslim = restore(log.path, false);
+    assert(!unslim.replayStashSlim.canFind(true));
+    auto noLog = agentWith([]);
+    noLog.loadRestored(unslim, Option!SessionLog.init);
+    shown = noLog.replayMessages.filter!(m => m.role == Role.tool).array;
+    assert(shown.length == 1 && shown[0].content == "x".replicate(8_000), "a log-less load replays it in full");
     // Without a log nothing replays it: the stash drops it.
     auto plain = agentWith([LLMResponse("", "", [ToolCall.fromRaw("b1", "big", `{}`)]), LLMResponse("done"),
         LLMResponse("SUMMARY: one")]);
