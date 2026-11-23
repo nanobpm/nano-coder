@@ -603,3 +603,28 @@ unittest
     assert(f.agent.run("go", new NullEvents) == "done");
     assert(!f.agent.subagentsOn && !f.agent.control.takeSubagentsRequest());
 }
+
+// `/subagents off` queued while a request is in flight applies to its
+// retry too: a stream-interruption retry no longer offers the agent tool.
+unittest
+{
+    import nano.http : StreamInterrupted;
+    auto f = new Fixture([]);
+    bool[] offered;
+    f.agent.client = new class MockClient
+    {
+        this() { super([]); }
+        override LLMResponse chat(const ref ChatRequest req, StreamSink sink)
+        {
+            offered ~= req.tools.canFind!(t => t.name == "agent");
+            if (offered.length == 1)
+            {
+                f.agent.control.requestSubagents(false);
+                throw new StreamInterrupted("dropped");
+            }
+            return LLMResponse("done");
+        }
+    };
+    assert(f.agent.run("go", new NullEvents) == "done");
+    assert(offered == [true, false], "the retry honours the toggle");
+}

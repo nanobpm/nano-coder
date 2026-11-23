@@ -862,9 +862,6 @@ class Agent
             if (control.isCancelled) return false;
         }
         applyModelRequest();
-        // `/subagents on|off` typed mid-turn: the next request's tool list
-        // follows it; sub-agents already running finish.
-        if (auto sub = control.takeSubagentsRequest()) subagentsOn = sub == 1;
         if (auto level = control.takeThinkingRequest())
         {
             import nano.thinking : sessionSetting;
@@ -878,6 +875,9 @@ class Agent
     /// how it failed (`CallFailed`, with the exception kept in `failure`).
     private Event callModel(AgentEvents ev, MonoTime swStart, out LLMResponse r, out Exception failure)
     {
+        // `/subagents on|off` typed mid-turn: every request, retries
+        // included, follows it; sub-agents already running finish.
+        if (auto sub = control.takeSubagentsRequest()) subagentsOn = sub == 1;
         ChatRequest req;
         req.messages = messages;
         req.tools = offeredTools();
