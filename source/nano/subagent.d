@@ -1046,12 +1046,22 @@ enum size_t taskCols = 60;
 string firstLine(string text, size_t max = taskCols) pure
 {
     import std.string : indexOf;
-    import std.range : walkLength;
-    import std.utf : toUTF8;
-    import std.array : array;
+    import std.utf : decode;
     auto nl = text.indexOf('\n');
     if (nl >= 0) text = text[0 .. nl];
-    if (max && text.walkLength > max) return toUTF8(text.array[0 .. max - 1]) ~ "…";
+    // Walk at most `max` code points, so a huge one-line task costs no
+    // allocation beyond the kept prefix.
+    if (max)
+    {
+        size_t i, cut, n;
+        while (i < text.length && n < max)
+        {
+            if (n == max - 1) cut = i;
+            decode(text, i);
+            ++n;
+        }
+        if (i < text.length) return text[0 .. cut].idup ~ "…";
+    }
     // A copy: a slice would keep a long task body alive in the listing history.
     return text.idup;
 }
@@ -1063,6 +1073,9 @@ unittest // the first line is a copy, not a slice of the task
     auto line = firstLine(task);
     assert(line == "short" && line.ptr != task.ptr);
     auto plain = "only";
+    assert(firstLine("abcdef", 4) == "abc…");
+    assert(firstLine("abcd", 4) == "abcd");
+    assert(firstLine("äöüßé", 3) == "äö…");
     assert(firstLine(plain).ptr != plain.ptr);
 }
 

@@ -897,6 +897,9 @@ private string subagentsToggle(Agent agent, ref Config cfg, imported!"nano.subag
     return msg;
 }
 
+/// Replays shown so far by `/subagents show` (UI thread only).
+private size_t gReplaySeq;
+
 /// `/subagents show`: render a sub-agent's transcript on the frame as the
 /// main transcript replays (prompts, answers, tool calls with their folded
 /// output), streaming its log a message at a time rather than loading it.
@@ -920,6 +923,9 @@ void showSubagentLog(string id, string path, Console console)
     // so each header shows directly above its own output.
     ToolCall[] pending;
     string pendingTime;
+    // A per-replay prefix on tool-call ids, so folds of two replays (or of
+    // children reusing ids) never share a key in the frame.
+    immutable prefix = format("replay%s:", ++gReplaySeq);
     void flush()
     {
         console.replayTime = pendingTime;
@@ -940,12 +946,13 @@ void showSubagentLog(string id, string path, Console console)
                 if (m.content.strip.length && !(console.quiet && m.toolCalls.length))
                     writeln(stampBlock(console.stamp(), console.display(escapeMarks(sanitizeBlock(m.content))).stripRight));
                 pending = m.toolCalls.dup;
+                foreach (ref c; pending) c.id = prefix ~ c.id;
                 pendingTime = m.timestamp;
                 break;
             case Role.tool:
                 foreach (k, c; pending)
                 {
-                    if (c.id != m.toolCallId) continue;
+                    if (c.id != prefix ~ m.toolCallId) continue;
                     console.replayTime = pendingTime;
                     console.toolStart(c);
                     console.replayTime = m.timestamp;
