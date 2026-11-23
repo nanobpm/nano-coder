@@ -3691,6 +3691,12 @@ class Agent
 
     /// The memory store (null: memory off). Recall from tool calls reads it.
     Option!(mem.Store) memory;
+    /// How tool calls recall memories (`memory_recall`): entity (default) or
+    /// the pre-entity anchor substring match.
+    mem.RecallMode memoryRecallMode = mem.RecallMode.entity;
+    /// The working directory's repository (`owner/repo`) entity recall adds
+    /// to every call; resolved once by the app (empty: no repo resolution).
+    string recallRepo;
     /// Memory recall from tool calls (Rust #167): which memories' full text
     /// is already in this context. Persisted in `recall` records; reset by
     /// compaction and a new session.
@@ -3752,7 +3758,9 @@ class Agent
             return null;
         }
         auto budget = saturatingSub(mem.recallNotesPerTurn, recallTurnNotes);
-        auto notes = mem.recall(memory, tool, args, recallState, indexShown, budget);
+        auto notes = memoryRecallMode == mem.RecallMode.entity
+            ? mem.recallEntities(memory, tool, args, recallRepo, recallState, indexShown, budget)
+            : mem.recall(memory, tool, args, recallState, indexShown, budget);
         string[] texts;
         foreach (n; notes)
         {

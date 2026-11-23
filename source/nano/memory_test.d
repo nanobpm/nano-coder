@@ -12,11 +12,13 @@ version (unittest):
 
 import nano.memory;
 import nano.memsecret;
-import std.algorithm : canFind, any;
+import std.algorithm : canFind, any, countUntil;
 import std.array : replicate, join;
+import std.conv : to;
+import std.format : format;
 import std.file;
 import std.path;
-import std.json : parseJSON;
+import std.json : parseJSON, JSONValue;
 import std.datetime.systime : Clock;
 import core.time : days, minutes;
 import std.string : lineSplitter, stripLeft, startsWith;
@@ -1146,4 +1148,423 @@ unittest // a failed registry write leaves the save and its supersession uncommi
     auto retry = s.saveFact(Scope.user, "merlin has 64GB of memory", null, null, null, null, false, o);
     assert(retry.saved);
     assert(!s.all().any!(x => x.e.id == old.id));
+}
+
+// ---------------------------------------------------------------------------
+// Entity recall (issue #280)
+
+unittest // entitiesFromCall: urls, ssh targets, gh -R, repo name, tool name
+{
+    // URLs resolve their host (port dropped).
+    auto e = entitiesFromCall("bash", parseJSON(`{"command":"curl http://merlin.local:8080/api"}`), "");
+    assert(e.canFind("host:merlin.local"), e.join(","));
+    assert(e.canFind("tool:bash"));
+    // ssh targets (user@ and bare).
+    e = entitiesFromCall("bash", parseJSON(`{"command":"ssh deploy@omarchy.local uptime"}`), "");
+    assert(e.canFind("host:omarchy.local"), e.join(","));
+    assert(e.canFind("tool:ssh"), e.join(",")); // first command word
+    e = entitiesFromCall("bash", parseJSON(`{"command":"scp deploy@merlin.local:/var/log/x ."}`), "");
+    assert(e.canFind("host:merlin.local"), e.join(","));
+    // ssh/scp options: `--flag=value`, and `-x value` / `--flag value` pairs.
+    e = entitiesFromCall("bash", parseJSON(`{"command":"ssh -p 2222 merlin"}`), "");
+    assert(e.canFind("host:merlin"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"ssh -i ~/.ssh/id_ed host.example.org"}`), "");
+    assert(e.canFind("host:host.example.org"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"ssh -o StrictHostKeyChecking=no -p 2222 deploy@merlin.local uptime"}`), "");
+    assert(e.canFind("host:merlin.local"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"ssh -J bastion -l admin merlin"}`), "");
+    assert(e.canFind("host:merlin"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"scp -P 22 f host.example.net:/x"}`), "");
+    assert(e.canFind("host:host.example.net"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"scp -i key f host.example.net:/x"}`), "");
+    assert(e.canFind("host:host.example.net"), e.join(","));
+    // Quoted URL with no path: the quote ends the authority.
+    e = entitiesFromCall("bash", parseJSON(`{"command":"curl \"http://merlin.local:8080\""}`), "");
+    assert(e.canFind("host:merlin.local"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"curl 'https://example.org'"}`), "");
+    assert(e.canFind("host:example.org"), e.join(","));
+    // ssh options by arity: flags, attached values, separate values.
+    foreach (c; ["ssh -v merlin.local uptime", "ssh -n merlin.local uptime", "ssh -p2222 merlin.local uptime",
+                 "ssh -vp 2222 merlin.local uptime", "ssh -tt -i key merlin.local uptime"])
+    {
+        e = entitiesFromCall("bash", parseJSON(`{"command":` ~ JSONValue(c).toString ~ `}`), "");
+        assert(e.canFind("host:merlin.local"), c ~ ": " ~ e.join(","));
+        assert(!e.canFind("host:uptime"), c ~ ": " ~ e.join(","));
+    }
+    // scp: every remote operand, and numeric flags.
+    foreach (c; ["scp source.example:/x dest.example:/y", "scp -3 source.example:/x dest.example:/y",
+                 "scp -3 -P 22 source.example:/x deploy@dest.example:/y",
+                 "scp -B source.example:/x dest.example:/y", "scp -R source.example:/x dest.example:/y",
+                 "scp -s source.example:/x dest.example:/y"])
+    {
+        e = entitiesFromCall("bash", parseJSON(`{"command":` ~ JSONValue(c).toString ~ `}`), "");
+        assert(e.canFind("host:source.example") && e.canFind("host:dest.example"), c ~ ": " ~ e.join(","));
+    }
+    // sftp's -B/-R/-s take a value.
+    e = entitiesFromCall("bash", parseJSON(`{"command":"sftp -B 32768 -R 64 merlin.local:/x"}`), "");
+    assert(e.canFind("host:merlin.local"), e.join(","));
+    // A command after `&&` still counts.
+    e = entitiesFromCall("bash", parseJSON(`{"command":"cd /x && ssh merlin df"}`), "");
+    assert(e.canFind("host:merlin") && !e.canFind("host:df"), e.join(","));
+    // Shell control words are syntax, not the executable: a conditional or
+    // loop still yields its commands' hosts, repos and tools.
+    e = entitiesFromCall("bash", parseJSON(`{"command":"if ssh merlin uptime; then gh -R acme/widgets pr list; fi"}`), "");
+    assert(e.canFind("host:merlin"), e.join(","));
+    assert(e.canFind("repo:acme/widgets"), e.join(","));
+    assert(e.canFind("tool:ssh") && e.canFind("tool:gh"), e.join(","));
+    assert(!e.canFind("tool:if") && !e.canFind("tool:then") && !e.canFind("tool:fi"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"if ssh merlin; then gh pr list; else ssh omarchy df; fi"}`), "");
+    assert(e.canFind("host:merlin") && e.canFind("host:omarchy"), e.join(","));
+    assert(!e.canFind("tool:else"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"while read -r h; do ssh \"$h\" uptime; done < hosts.txt"}`), "");
+    assert(e.canFind("tool:ssh") && e.canFind("tool:read"), e.join(","));
+    assert(!e.canFind("tool:while") && !e.canFind("tool:do") && !e.canFind("tool:done"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"for h in a b; do scp f merlin:/x; done"}`), "");
+    assert(e.canFind("host:merlin"), e.join(","));
+    assert(!e.canFind("tool:for") && !e.canFind("tool:in"), e.join(","));
+    // A loop or case header names a variable and values, not a tool.
+    e = entitiesFromCall("bash", parseJSON(`{"command":"for host in a b; do ssh merlin; done"}`), "");
+    assert(e.canFind("host:merlin") && !e.canFind("tool:host"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"select host in a b; do ssh merlin; done"}`), "");
+    assert(e.canFind("host:merlin") && !e.canFind("tool:host"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"case foo in a) ssh merlin ;; esac"}`), "");
+    assert(e.canFind("host:merlin") && !e.canFind("tool:foo"), e.join(","));
+    // A control word after the executable is an ordinary operand.
+    e = entitiesFromCall("bash", parseJSON(`{"command":"ssh -l done merlin uptime"}`), "");
+    assert(e.canFind("host:merlin") && !e.canFind("host:uptime"), e.join(","));
+    foreach (kw; ["done", "fi", "esac", "}", "]]"])
+    {
+        e = entitiesFromCall("bash", parseJSON(`{"command":"ssh ` ~ kw ~ `"}`), "");
+        assert(e.canFind("host:" ~ kw) || kw == "}" || kw == "]]", e.join(","));
+        assert(!e.canFind("tool:" ~ kw), e.join(","));
+    }
+    e = entitiesFromCall("bash", parseJSON(`{"command":"ssh -l in merlin"}`), "");
+    assert(e.canFind("host:merlin"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"until ssh merlin true; do sleep 1; done"}`), "");
+    assert(e.canFind("host:merlin") && !e.canFind("tool:until"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"case x in a) ssh merlin ;; esac"}`), "");
+    assert(e.canFind("host:merlin") && !e.canFind("tool:esac"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"! ssh merlin uptime"}`), "");
+    assert(e.canFind("host:merlin"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"{ ssh merlin; }"}`), "");
+    assert(e.canFind("host:merlin"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"if sudo ssh merlin; then echo ok; fi"}`), "");
+    assert(e.canFind("host:merlin") && e.canFind("tool:ssh"), e.join(","));
+    // A quoted keyword is a real word, not syntax: `"ssh"` here is the
+    // command, so `merlin` is its ssh target.
+    e = entitiesFromCall("bash", parseJSON(`{"command":"if \"ssh\" merlin; then echo quoted; fi"}`), "");
+    assert(e.canFind("host:merlin"), e.join(","));
+    // gh -R owner/repo and --repo, quoted or attached, case-preserved then
+    // lower-cased; a bare owner/repo operand is no selector.
+    e = entitiesFromCall("bash", parseJSON(`{"command":"gh issue view 280 -R nanobpm/nano-coder"}`), "");
+    assert(e.canFind("repo:nanobpm/nano-coder"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"gh pr list --repo acme/widgets"}`), "");
+    assert(e.canFind("repo:acme/widgets"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"gh -R \"Acme/Widgets\" pr list"}`), "");
+    assert(e.canFind("repo:acme/widgets"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"gh --repo=acme/widgets pr list"}`), "");
+    assert(e.canFind("repo:acme/widgets"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"scp -r acme/widgets merlin:/srv"}`), "");
+    assert(!e.canFind("repo:acme/widgets"), e.join(","));
+    assert(e.canFind("host:merlin"), e.join(","));
+    // The working directory's repository, resolved once and passed in.
+    e = entitiesFromCall("read_file", parseJSON(`{"path":"source/app.d"}`), "nanobpm/nano-coder");
+    assert(e.canFind("repo:nanobpm/nano-coder"), e.join(","));
+    // The tool name itself for a non-bash tool.
+    e = entitiesFromCall("read_file", parseJSON(`{"path":"/x/y"}`), "");
+    assert(e.canFind("tool:read_file"), e.join(","));
+}
+
+unittest // repoNameOf maps a project key to owner/repo
+{
+    assert(repoNameOf("github.com/nanobpm/nano-coder") == "nanobpm/nano-coder");
+    assert(repoNameOf("git@github.com:nanobpm/nano-coder.git") == "nanobpm/nano-coder");
+    assert(repoNameOf("https://github.com/acme/widgets.git") == "acme/widgets");
+    assert(repoNameOf("ssh://git@git.example.com/acme/widgets.git") == "acme/widgets");
+    assert(repoNameOf("lonely") is null);
+    // A key that is a local checkout path (a repository with no remote) names
+    // no owner/repo — not two bogus path segments.
+    assert(repoNameOf("/Users/x/proj") is null);
+    assert(repoNameOf("/home/u/work/nano-coder") is null);
+}
+
+private Entry saveTagged(Store s, string text, string[] entities, string factKind = null, string kind = null)
+{
+    SaveOptions o;
+    o.entities = entities;
+    o.factKind = factKind;
+    o.distinct = true;
+    auto r = s.saveFact(Scope.user, text, null, null, kind, null, false, o);
+    assert(r.saved, text);
+    return r.entry;
+}
+
+unittest // entity recall resolves via aliases and one-hop relations, ranks and caps
+{
+    auto s = store(tmp("recall-entity"));
+    // Registry: merlin.local is an alias of host:merlin; service:workforce runs_on it.
+    run(s, entityTool, parseJSON(`{"scope":"user","entity":"host:merlin","alias":"merlin.local"}`), null, false);
+    run(s, entityTool, parseJSON(`{"scope":"user","entity":"service:workforce","relation":"runs_on","target":"host:merlin"}`), null, false);
+    auto pitfall = saveTagged(s, "merlin OOMs under many workers", ["host:merlin"], "pitfall");
+    auto proc_ = saveTagged(s, "deploy merlin with just deploy", ["host:merlin"], "procedure");
+    auto svc = saveTagged(s, "workforce listens on 8080", ["service:workforce"], "fact");
+    auto other = saveTagged(s, "omarchy builds with ldc", ["host:omarchy"], "fact");
+    // Backdate the procedure so the pitfall's recency breaks their kind tie.
+    Entry[] bumped;
+    foreach (x; s.all()) { auto e = x.e; if (e.id == proc_.id) e = backdate(e, 1); bumped ~= e; }
+    writeAll(s.path(Scope.user), bumped, null);
+    Recall st;
+    bool[string] shown;
+    // ssh to the alias resolves host:merlin and, one hop, the service on it.
+    auto notes = recallEntities(s, "bash", parseJSON(`{"command":"ssh merlin.local"}`), "", st, shown, 5);
+    assert(notes.length == 3, notes.length.to!string);
+    // pitfall and procedure outrank a plain fact for command execution.
+    assert(notes[0].id == pitfall.id && notes[1].id == proc_.id, notes[0].id ~ " " ~ notes[1].id);
+    assert(notes[2].id == svc.id, "one hop to the service on the host");
+    // The note names the entity that triggered it.
+    assert(notes[0].text.canFind("host:merlin"), notes[0].text);
+    assert(notes[0].entity == "host:merlin");
+    // An unrelated entity is not recalled.
+    assert(!notes.any!(n => n.id == other.id));
+}
+
+unittest // entity recall: seen facts are not recalled again; cooldown per entity
+{
+    auto s = store(tmp("recall-entity-once"));
+    auto a = saveTagged(s, "merlin fact one", ["host:merlin"], "fact");
+    auto b = saveTagged(s, "merlin fact two", ["host:merlin"], "fact");
+    Recall st;
+    bool[string] shown;
+    auto args = parseJSON(`{"command":"ssh merlin"}`);
+    auto notes = recallEntities(s, "bash", args, "", st, shown, 5);
+    assert(notes.length == 2);
+    // Both are now seen and the entity is on cooldown: nothing new fires.
+    assert(!recallEntities(s, "bash", args, "", st, shown, 5).length);
+    // After the cooldown ages out, still nothing: both facts are seen.
+    foreach (_; 0 .. recallEntityCooldownCalls + 1) recallEntities(s, "bash", args, "", st, shown, 5);
+    assert(!recallEntities(s, "bash", args, "", st, shown, 5).length);
+}
+
+unittest // entity recall: count cap and byte budget
+{
+    auto s = store(tmp("recall-entity-cap"));
+    string[] ids;
+    foreach (i; 0 .. 6)
+        ids ~= saveTagged(s, format("merlin fact number %s with some padding text", i), ["host:merlin"], "fact").id;
+    Recall st;
+    bool[string] shown;
+    auto notes = recallEntities(s, "bash", parseJSON(`{"command":"ssh merlin"}`), "", st, shown, 10);
+    assert(notes.length == recallEntityMaxFacts, "count cap N");
+    size_t bytes;
+    foreach (n; notes) bytes += n.text.length;
+    assert(bytes <= recallEntityByteBudget, "byte budget");
+}
+
+unittest // entity recall: a fact the cap crowded out fires despite the cooldown
+{
+    auto s = store(tmp("recall-entity-cooldown-exception"));
+    string[] ids;
+    foreach (i; 0 .. recallEntityMaxFacts + 1)
+        ids ~= saveTagged(s, format("merlin fact number %s", i), ["host:merlin"], "fact").id;
+    // Distinct last-used recency ranks the facts, so the cap picks the first
+    // N and crowds out exactly the oldest. Minutes, not days: the store's
+    // expiry would prune a day-old entry.
+    Entry[] bumped;
+    foreach (x; s.all())
+    {
+        auto e = x.e;
+        e.lastUsedTime = wallNow - minutes(cast(long) ids.countUntil(e.id));
+        e.lastUsed = stamp(e.lastUsedTime);
+        bumped ~= e;
+    }
+    writeAll(s.path(Scope.user), bumped, null);
+    Recall st;
+    bool[string] shown;
+    auto args = parseJSON(`{"command":"ssh merlin"}`);
+    // The cap admits the first N facts; the entity goes on cooldown.
+    auto first = recallEntities(s, "bash", args, "", st, shown, 10);
+    assert(first.length == recallEntityMaxFacts, first.length.to!string);
+    assert(!first.any!(n => n.id == ids[$ - 1]));
+    // The crowded-out fact was never chosen, so the cooldown does not quiet it.
+    auto second = recallEntities(s, "bash", args, "", st, shown, 10);
+    assert(second.length == 1 && second[0].id == ids[$ - 1], second.length.to!string);
+    // Now every fact of the entity was chosen: the cooldown quiets them all.
+    assert(!recallEntities(s, "bash", args, "", st, shown, 10).length);
+}
+
+unittest // entity recall: rules fire every call, superseded never, fallback for untagged
+{
+    auto s = store(tmp("recall-entity-rules"));
+    auto rule = saveTagged(s, "never pkill on merlin", ["host:merlin"], "pitfall", "rule");
+    auto old = saveTagged(s, "merlin old fact", ["host:merlin"], "fact");
+    SaveOptions so;
+    so.entities = ["host:merlin"];
+    so.supersedes = [old.id];
+    s.saveFact(Scope.user, "merlin current fact", null, null, null, null, false, so);
+    // An untagged entry keeps anchor recall (fallback).
+    s.saveWith(Scope.user, "the fleet uses zzanchor-fleet for deploys", null, null, null, ["zzanchor-fleet"], true);
+    Recall st;
+    bool[string] shown;
+    auto args = parseJSON(`{"command":"ssh merlin"}`);
+    auto notes = recallEntities(s, "bash", args, "", st, shown, 5);
+    assert(notes.length >= 1 && notes[0].id == rule.id, "rule first");
+    assert(!notes.any!(n => n.id == old.id), "superseded never recalled");
+    // The rule fires again on the next matching call; the seen facts do not.
+    auto again = recallEntities(s, "bash", args, "", st, shown, 5);
+    assert(again.length == 1 && again[0].id == rule.id, "rule fires every call");
+    // Untagged fallback: an anchor in the arguments recalls it.
+    auto fb = recallEntities(s, "bash", parseJSON(`{"command":"echo zzanchor-fleet"}`), "", st, shown, 5);
+    assert(fb.length == 1 && fb[0].text.canFind("zzanchor-fleet"), fb.length.to!string);
+}
+
+unittest // entity recall: planning/editing tools rank decisions and preferences first
+{
+    auto s = store(tmp("recall-entity-edit"));
+    auto pitfall = saveTagged(s, "repo pitfall: do not edit generated files", ["repo:nanobpm/nano-coder"], "pitfall");
+    auto decision = saveTagged(s, "repo decision: use dub not make", ["repo:nanobpm/nano-coder"], "decision");
+    Recall st;
+    bool[string] shown;
+    // A `-R` flag resolves the repo; an edit tool ranks the decision first.
+    auto notes = recallEntities(s, "edit_file", parseJSON(`{"path":"source/app.d","note":"gh -R nanobpm/nano-coder"}`), "", st, shown, 5);
+    assert(notes.length == 2, notes.length.to!string);
+    assert(notes[0].id == decision.id, "decision before pitfall when editing");
+}
+
+unittest // memory_recall setting parses
+{
+    assert(parseRecallMode("entity") == RecallMode.entity);
+    assert(parseRecallMode("anchor") == RecallMode.anchor);
+    assert(parseRecallMode(" Anchor ") == RecallMode.anchor);
+    assert(fails(parseRecallMode("semantic")));
+}
+
+unittest // memory entities view groups facts under their entity
+{
+    auto s = store(tmp("memory-entities-view"));
+    saveTagged(s, "merlin has 64GB", ["host:merlin"], "fact");
+    saveTagged(s, "deploy merlin with just", ["host:merlin"], "procedure");
+    saveTagged(s, "workforce on 8080", ["service:workforce"], "fact");
+    s.save(Scope.user, "an untagged fact", null, null);
+    auto view = memoryCommand(s, "entities", true, false, true);
+    assert(view.canFind("host:merlin") && view.canFind("service:workforce"), view);
+    assert(view.canFind("merlin has 64GB") && view.canFind("workforce on 8080"), view);
+    assert(view.canFind("1 untagged"), view);
+}
+
+unittest // entity recall works for an argumentless call (tool and repo entities)
+{
+    auto s = store(tmp("recall-entity-noargs"));
+    auto r = saveTagged(s, "plan_show lists every note", ["tool:plan_show"], "fact");
+    auto q = saveTagged(s, "nano-coder builds with dub", ["repo:nanobpm/nano-coder"], "decision");
+    Recall st;
+    bool[string] shown;
+    auto notes = recallEntities(s, "plan_show", parseJSON(`{}`), "nanobpm/nano-coder", st, shown, 5);
+    assert(notes.any!(n => n.id == r.id) && notes.any!(n => n.id == q.id), notes.length.to!string);
+}
+
+unittest // entity recall: a rule fired repeatedly is recorded once per entity
+{
+    auto s = store(tmp("recall-entity-rule-once"));
+    auto r = saveTagged(s, "never reboot merlin by hand", ["host:merlin"], null, "rule");
+    Recall st;
+    bool[string] shown;
+    auto args = parseJSON(`{"command":"ssh merlin"}`);
+    foreach (_; 0 .. 10)
+        assert(recallEntities(s, "bash", args, "", st, shown, 5).any!(n => n.id == r.id));
+    assert(st.entityFired["host:merlin"].length == 1, st.entityFired["host:merlin"].length.to!string);
+}
+
+unittest // remoteHosts: quoted option values, shell operators, bare sftp, wrapped commands
+{
+    assert(remoteHosts(`ssh -o "StrictHostKeyChecking no" merlin.local uptime`) == ["merlin.local"]);
+    assert(remoteHosts(`ssh merlin.local; echo done`) == ["merlin.local"]);
+    assert(remoteHosts(`ssh merlin.local&&echo done`) == ["merlin.local"]);
+    assert(remoteHosts(`sftp deploy@merlin.local`) == ["merlin.local"]);
+    assert(remoteHosts(`sftp -P 22 merlin.local:/x`) == ["merlin.local"]);
+    assert(remoteHosts(`sudo -E ssh merlin`) == ["merlin"]);
+    // Wrapper options take values by arity: `sudo -u deploy ssh …` and
+    // `env -u HOME ssh …` skip the value; attached (`-udeploy`, `-uHOME`,
+    // `--unset=HOME`) stay one word.
+    assert(remoteHosts(`sudo -u deploy ssh merlin`) == ["merlin"]);
+    assert(remoteHosts(`sudo -udeploy ssh merlin`) == ["merlin"]);
+    assert(remoteHosts(`env -u HOME ssh merlin`) == ["merlin"]);
+    assert(remoteHosts(`env -uHOME ssh merlin`) == ["merlin"]);
+    assert(remoteHosts(`env --unset=HOME ssh merlin`) == ["merlin"]);
+    assert(remoteHosts(`sudo --user deploy ssh merlin`) == ["merlin"]);
+    // sftp's -b takes the batch file; the destination follows.
+    assert(remoteHosts(`sftp -b batch.txt deploy@merlin.local`) == ["merlin.local"]);
+    // A value letter inside a cluster takes the next word only when it is
+    // the cluster's last character (`sudo -Eu deploy`, `env -iu HOME`).
+    assert(remoteHosts(`sudo -Eu deploy ssh merlin`) == ["merlin"]);
+    assert(remoteHosts(`env -iu HOME ssh merlin`) == ["merlin"]);
+    assert(remoteHosts(`sudo -Eudeploy ssh merlin`) == ["merlin"]);
+    assert(remoteHosts(`env -iuHOME ssh merlin`) == ["merlin"]);
+    assert(remoteHosts(`bash -c "ssh merlin uptime"`) == ["merlin"]);
+    assert(remoteHosts("echo ssh\nssh omarchy") == ["omarchy"]);
+    // Control words are syntax: the conditional's and loop's commands yield
+    // their hosts, the keywords none.
+    assert(remoteHosts(`if ssh merlin uptime; then ssh omarchy df; fi`) == ["merlin", "omarchy"]);
+    assert(remoteHosts(`while read -r h; do ssh merlin; done`) == ["merlin"]);
+    assert(remoteHosts(`for h in a b; do scp f "$h":/x; done`) == []);
+    assert(remoteHosts(`until ssh merlin true; do sleep 1; done`) == ["merlin"]);
+    assert(remoteHosts(`case x in a) ssh merlin ;; esac`) == ["merlin"]);
+    assert(remoteHosts(`! ssh merlin uptime`) == ["merlin"]);
+    assert(remoteHosts(`{ ssh merlin; }`) == ["merlin"]);
+    assert(remoteHosts(`if sudo ssh merlin; then echo ok; fi`) == ["merlin"]);
+    // A quoted keyword is a real word: `"ssh"` runs a command named `ssh`,
+    // and `merlin` is its target.
+    assert(remoteHosts(`if "ssh" merlin; then echo quoted; fi`) == ["merlin"]);
+}
+
+unittest // every executable of a shell script becomes a tool entity
+{
+    auto e = entitiesFromCall("bash", parseJSON(`{"command":"cd /workspace && gh pr list"}`), "");
+    assert(e.canFind("tool:gh") && e.canFind("tool:cd"), e.to!string);
+    e = entitiesFromCall("bash", parseJSON(`{"command":"sudo gh pr list"}`), "");
+    assert(e.canFind("tool:gh"), e.to!string);
+    e = entitiesFromCall("bash", parseJSON(`{"command":"FOO=1 env -i make test | tee log"}`), "");
+    assert(e.canFind("tool:make") && e.canFind("tool:tee"), e.to!string);
+    // A nested `sh -c "…"` script's executables count too.
+    e = entitiesFromCall("bash", parseJSON(`{"command":"bash -c \"gh pr list\""}`), "");
+    assert(e.canFind("tool:gh"), e.to!string);
+    // Wrapper option values are not executables.
+    e = entitiesFromCall("bash", parseJSON(`{"command":"sudo -u deploy ssh merlin"}`), "");
+    assert(e.canFind("tool:ssh") && !e.canFind("tool:deploy"), e.to!string);
+    e = entitiesFromCall("bash", parseJSON(`{"command":"env -u HOME ssh merlin"}`), "");
+    assert(e.canFind("tool:ssh") && !e.canFind("tool:home"), e.to!string);
+    // Nor are the values of clustered wrapper options (`sudo -Eu deploy`,
+    // `env -iu HOME`): the value letter takes the next word only as the
+    // cluster's last character.
+    e = entitiesFromCall("bash", parseJSON(`{"command":"sudo -Eu deploy ssh merlin"}`), "");
+    assert(e.canFind("tool:ssh") && !e.canFind("tool:deploy"), e.to!string);
+    e = entitiesFromCall("bash", parseJSON(`{"command":"env -iu HOME ssh merlin"}`), "");
+    assert(e.canFind("tool:ssh") && !e.canFind("tool:home"), e.to!string);
+}
+
+unittest // aliases resolve within their own scope
+{
+    auto s = store(tmp("recall-entity-scoped"));
+    run(s, entityTool, parseJSON(`{"scope":"user","entity":"host:ci-a","alias":"build.local"}`), null, false);
+    run(s, entityTool, parseJSON(`{"scope":"project","entity":"host:ci-b","alias":"build.local"}`), null, false);
+    SaveOptions o;
+    o.entities = ["host:ci-b"];
+    o.factKind = "pitfall";
+    o.distinct = true;
+    auto r = s.saveFact(Scope.project, "ci-b needs a VPN", null, null, null, null, false, o);
+    assert(r.saved);
+    Recall st;
+    bool[string] shown;
+    auto notes = recallEntities(s, "bash", parseJSON(`{"command":"ssh build.local"}`), "", st, shown, 5);
+    assert(notes.any!(n => n.id == r.entry.id), notes.length.to!string);
+}
+
+unittest // plan_show ranks like a planning tool
+{
+    auto s = store(tmp("recall-entity-planshow"));
+    auto p = saveTagged(s, "merlin pitfall", ["repo:a/b"], "pitfall");
+    auto d = saveTagged(s, "merlin decision", ["repo:a/b"], "decision");
+    Recall st;
+    bool[string] shown;
+    auto notes = recallEntities(s, "plan_show", parseJSON(`{}`), "a/b", st, shown, 5);
+    assert(notes.length == 2 && notes[0].id == d.id, notes.length.to!string);
 }

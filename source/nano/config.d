@@ -9,7 +9,7 @@ import std.conv : to;
 import nano.safeio : jsonText, jsonPretty;
 
 import nano.skills : SkillsConfig;
-import nano.memory : MemoryMode, parseMemoryMode, defaultExpiryDays;
+import nano.memory : MemoryMode, parseMemoryMode, defaultExpiryDays, RecallMode, parseRecallMode;
 
 import std.json;
 import nano.sandbox : SandboxConfig;
@@ -438,6 +438,9 @@ struct Config
     string[] userProviders;
     SkillsConfig skills;
     MemoryMode memory = MemoryMode.on;
+    /// `memory_recall`: how tool calls recall memories — "entity" (default) or
+    /// "anchor" (the pre-entity substring match, kept to compare or roll back).
+    string memoryRecall = "entity";
     /// Hooks: `disable_hooks` (or `--no-hooks`), `disable_project_hooks`,
     /// `claude_user_hooks`, and nano's own `[hooks]` table (Claude's shape).
     /// Offer the `plan_*` tools (`plan_tools`, default on).
@@ -578,6 +581,7 @@ struct Config
         if (auto v = "memory" in doc) c.memory = parseMemoryMode(v.str);
         if (auto v = "memory_dir" in doc) c.memoryDir = expandTilde(v.str);
         if (auto v = "memory_expiry_days" in doc) c.memoryExpiryDays = v.integer;
+        if (auto v = "memory_recall" in doc) { parseRecallMode(v.str); c.memoryRecall = v.str.strip; }
         if (auto v = "skills" in doc) c.skills = SkillsConfig.fromToml(*v);
         if (auto ps = "providers" in doc)
             foreach (name, table; ps.objectNoRef)

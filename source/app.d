@@ -50,7 +50,7 @@ import nano.commands : helpText, isCommand, unescapePrompt;
 import core.thread : Thread;
 import nano.claude_hooks : HookManager, listingField, label, isProject;
 import nano.skills : Skills, skillsDefinition = definition;
-import nano.memory : MemoryStore = Store, MemoryMode, memorySessionTools = sessionTools, memoryDefaultDir = defaultDir, projectKey, Scope;
+import nano.memory : MemoryStore = Store, MemoryMode, memorySessionTools = sessionTools, memoryDefaultDir = defaultDir, projectKey, repoNameOf, Scope, parseRecallMode;
 import nano.control : TurnControl, FdLineReader;
 import nano.instructions : ProjectInstructions, InstructionOptions = Options, expandHome;
 import core.atomic : atomicLoad, atomicStore, cas;
@@ -2924,6 +2924,11 @@ int runMain(string[] args)
     // left waiting on its parent would otherwise hang process exit.
     scope (exit) agent.stopSubagents();
     agent.memory = memory;
+    agent.memoryRecallMode = parseRecallMode(cfg.memoryRecall);
+    // Resolve the repo entity once: a `cwd` never changes during a session,
+    // and resolving per call would spawn git processes on the agent loop.
+    auto recallKey = projectKey(cwd);
+    agent.recallRepo = recallKey is null ? null : repoNameOf(recallKey);
     agent.indexShown = indexShown;
     agent.instructions = instructions;
     agent.sessionTitles = cfg.sessionTitles;
@@ -3002,6 +3007,10 @@ int runMain(string[] args)
         bool plan = o.plan;
         host.systemPrompt = (string dir) {
             if (dir != cwd) skills = discoverSkills(dir);
+            // A session in another directory recalls that directory's repo
+            // facts; still resolved once per session, not per tool call.
+            auto key = projectKey(dir);
+            agent.recallRepo = key is null ? null : repoNameOf(key);
             return systemFor(dir, plan);
         };
         host.makeClient = (string s) => makeClient(resolve(cfg, s));

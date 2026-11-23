@@ -455,7 +455,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
 - `/subagents show <id>` - Render a sub-agent's transcript (prompt, answers, tool calls with folded output) from its log, read a message at a time, so even a long log shows without being loaded whole
 - `/subagents stop <id>` / `/subagents stop all` - Stop running or queued sub-agents as the agent's `agent_cancel` does: each gets a few seconds to report what it has (marked cancelled; one that can't is cut off), and the agent receives that as the sub-agent's result. Typed during a turn, it runs when the turn ends. Tab completes `show`/`stop` and the sub-agent ids. `show` and `stop` are terminal-only (not over ACP)
 - `/plan` - Show the agent's task plan with all notes
-- `/memory [forget ID]` - List cross-session memories with their ids, or delete one by id (see [Memory](#memory))
+- `/memory [entities] [forget ID]` - List cross-session memories with their ids, each entity's facts, or delete one by id (see [Memory](#memory))
 - `/hooks` - List the loaded external user hooks (from `.claude/settings.json` and friends), the files they came from, and any skipped entries (see [Lifecycle Hooks](#lifecycle-hooks))
 - `/queue [list|add text|remove N...|edit N text|clear]` - Show or edit the queued messages and unread steers. Works while a turn runs, so a queued message or steer can be removed or rewritten before it is sent.
 - `/model [provider/model]` - Show the current model and pick a new one. The list starts with the last four models you used (the current one marked; the previous one highlighted, so `/model` then Enter switches back), then the providers: pick a provider to scroll its model list (Esc steps back). With an argument, switches directly (conversation is kept). Typing `/model ` shows a type-ahead of the current model, recently used models, and each configured provider's default model; Tab completes (a bare provider name completes to its default model). Recently used models are kept in `~/.local/share/nano-coder/recent-models.json`
@@ -703,6 +703,7 @@ show_release_notes = true               # after an update, show what changed (se
 memory = "on"                           # on | read_only | off — cross-session memory (see Memory)
 # memory_dir = "/path/to/memory"        # default: <platform data dir>/nano-coder/memory
 memory_expiry_days = 90                 # expire memories unused this long (0 = never)
+memory_recall = "entity"                # entity | anchor — how tool calls recall memories (see Memory)
 
 [skills]                                # see Skills
 enabled = true
@@ -1436,6 +1437,21 @@ before they existed load unchanged.
   saves again with `supersedes: [ids]` or `distinct: true`.
 - `memory_search` filters by `entity` (an alias works) and `fact_kind`, and each hit ends with
   `{kind; entities; verified date}`. A search result is capped at 8,000 bytes.
+
+**Recall from tool calls.** After a tool runs, memories relevant to its arguments are attached
+to the result as a `<system-reminder>` note. With `memory_recall = "entity"` (the default) the
+call resolves to the entities it touches — hosts (URLs, `ssh`/`scp` targets), repos (`-R o/r`,
+the working directory's git remote) and the tool (the command name) — through the registry's
+aliases, following `reached_via` / `runs_on` / `part_of` one hop
+(`merlin.local:8080` → `host:merlin` and the services on it). At most 3 facts within 1,500 bytes
+are recalled, ranked: rules first, then `fact_kind` weighted by context (`pitfall` and
+`procedure` for command execution, `decision` and `preference` when planning or editing), then
+`verified_at` recency, then last-used. A superseded memory is never recalled, a hint already in
+context is not repeated, and an entity's other facts stay quiet for a few calls once one was
+recalled (unless a different fact would be chosen). Memories with no entities yet keep the older
+anchor-substring recall, so nothing regresses before they are migrated. The note names the
+entity that triggered it (`📌 host:merlin — …`), and `/memory entities` lists each entity's
+facts. Set `memory_recall = "anchor"` to compare or roll back to the pre-entity substring match.
 
 **Prompt.** A capped, dated index (most-recently-used first, ~4 KB with the guidance) is
 appended to the system prompt at session start, framed as "notes from earlier sessions; may be
