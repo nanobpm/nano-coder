@@ -198,3 +198,219 @@ unittest
     assert(agent.control.takeModelRequest() is null, "dropped, not re-queued");
     assert(failures.length == 1 && failures[0].startsWith("flaky/x: ") && failures[0].canFind("api_key_command"));
 }
+
+/// A scripted client whose capability probe reports `window` tokens once
+/// `gate` opens, counting its probes and whether they asked for the window.
+class Probing : Interfering, CapabilityProbe
+{
+    import nano.safeio : Shared;
+    size_t window;
+    Shared!bool gate;
+    /// Set once `probeCapabilities` has returned its answer: the probe worker
+    /// is about to exit, so awaiting it (not `probes`, which turns mid-work)
+    /// tells a test the worker's result is final. The worker can still be
+    /// unwinding, though, so a test that must see the result *published*
+    /// awaits termination instead (`Agent.settleProbes` joins the thread and
+    /// collects; a `done`-gated `collectProbes` can run in the unwind window
+    /// and skip the still-running worker).
+    Shared!bool done;
+    Shared!int probes, windowProbes;
+    this(string model, LLMResponse[] script, size_t window, Shared!bool gate, Shared!bool done, Shared!int probes, Shared!int windowProbes)
+    {
+        super(model, script);
+        this.window = window;
+        this.gate = gate;
+        this.done = done;
+        this.probes = probes;
+        this.windowProbes = windowProbes;
+    }
+    Capabilities probeCapabilities(bool withWindow = true)
+    {
+        gate.await((ref const bool open) => open, (ref bool _) {});
+        probes.update((ref int n) { n++; });
+        if (withWindow) windowProbes.update((ref int n) { n++; });
+        Capabilities c;
+        c.maxOutput = 1_234;
+        if (withWindow) { c.window = window; c.windowSource = model; }
+        done.update((ref bool d) { d = true; });
+        return c;
+    }
+}
+
+/// Probe counters and a gate shared by the switched-to client and the fresh
+/// clients the agent builds for its background probes.
+struct Probes
+{
+    import nano.safeio : Shared;
+    Shared!bool gate, done;
+    Shared!int probes, windowProbes;
+    static Probes make(bool open)
+    {
+        return Probes(Shared!bool.make(open), Shared!bool.make(false), Shared!int.make(0), Shared!int.make(0));
+    }
+    Probing client(string model, LLMResponse[] script, size_t window)
+    {
+        return new Probing(model, script, window, gate, done, probes, windowProbes);
+    }
+}
+
+// A mid-turn `/model` to a spec with a configured window: the window is
+// authoritative at once, only the thinking half is probed, and in the background.
+// rust: agent.rs::mid_turn_model_switch_with_a_configured_window_skips_the_probe
+unittest
+{
+    import core.time : seconds;
+    auto p = Probes.make(true);
+    auto first = new Interfering("first", [toolCall("c1")]);
+    auto agent = agentFor(first);
+    agent.probeClient = (string spec) => cast(LLMClient) p.client("probed", null, 4_096);
+    agent.onModelRequest = (string spec) {
+        agent.useClient(p.client("probed", [LLMResponse("done")], 4_096), ConfiguredWindow(111_111, "provider context_window"));
+    };
+    first.hook = (size_t call) { if (call == 1) agent.control.requestModel("mock/probed"); };
+    assert(agent.run("hi", new NullEvents) == "done");
+    assert(agent.lastStop == StopReason.endTurn && agent.client.modelName == "probed", "switched mid-turn");
+    assert(agent.settleProbes(5.seconds));
+    string source;
+    assert(agent.contextWindow(source) == 111_111 && source == "provider context_window", source);
+    assert(agent.capabilities.window == 0, "a configured window skips the endpoint's window probe");
+    assert(p.probes.get == 1 && p.windowProbes.get == 0, "only the thinking half ran");
+    assert(agent.capabilities.maxOutput == 1_234, "the rest of the probe is published");
+}
+
+// Without a configured window the probe still runs, but on a background
+// thread: the next model call doesn't wait for it, and the result is
+// published once it lands.
+// rust: agent.rs::mid_turn_model_switch_without_a_configured_window_probes_in_the_background
+unittest
+{
+    import core.time : seconds;
+    auto p = Probes.make(false); // the endpoint doesn't answer until the turn is over
+    auto first = new Interfering("first", [toolCall("c1")]);
+    auto agent = agentFor(first);
+    agent.probeClient = (string spec) => cast(LLMClient) p.client("probed", null, 4_096);
+    agent.onModelRequest = (string spec) {
+        agent.useClient(p.client("probed", [LLMResponse("done")], 4_096), ConfiguredWindow.init);
+    };
+    first.hook = (size_t call) { if (call == 1) agent.control.requestModel("mock/probed"); };
+    assert(agent.run("hi", new NullEvents) == "done", "the turn finished while the probe was stalled");
+    assert(agent.client.modelName == "probed");
+    string source;
+    agent.contextWindow(source);
+    assert(source == "default" || source == "known for the model name", source);
+    p.gate.update((ref bool open) { open = true; });
+    assert(agent.settleProbes(5.seconds));
+    assert(agent.contextWindow(source) == 4_096 && source == "reported by the endpoint (probed)", source);
+    assert(p.windowProbes.get == 1);
+}
+
+// A probe for one model that lands after a later switch must not overwrite
+// the newer model's reports.
+// rust: agent.rs::a_stale_background_probe_is_discarded_after_a_later_switch
+unittest
+{
+    import core.time : seconds;
+    auto slow = Probes.make(false);
+    auto fast = Probes.make(true);
+    auto agent = agentFor(new Interfering("first", []));
+    agent.probeClient = (string spec) => cast(LLMClient) (spec.canFind("slow")
+        ? slow.client("slow", null, 999) : fast.client("fast", null, 4_096));
+    agent.onModelRequest = (string spec) {
+        auto c = spec.canFind("slow") ? slow.client("slow", null, 999) : fast.client("fast", null, 4_096);
+        agent.useClient(c, ConfiguredWindow.init);
+    };
+    agent.control.requestModel("mock/slow");
+    assert(agent.applyModelRequest());
+    agent.control.requestModel("mock/fast");
+    assert(agent.applyModelRequest());
+    assert(agent.settleProbes(5.seconds), "the stale probe is not waited for");
+    assert(agent.capabilities.window == 4_096);
+    slow.gate.update((ref bool open) { open = true; });
+    slow.done.await((ref const bool d) => d, (ref bool _) {}); // the stale probe finished
+    agent.collectProbes();
+    assert(agent.capabilities.window == 4_096 && agent.capabilities.windowSource == "fast",
+        "the stale probe did not overwrite the live model's window");
+}
+
+/// Events that count summary starts and usage reports, to assert a
+/// threshold compaction in `prepareCall` notifies its consumers.
+class CountingEvents : NullEvents
+{
+    size_t summaries, usages;
+    override void summaryStart() { summaries++; }
+    override void usage(TokenUsage u) { usages++; }
+}
+
+string bigText()
+{
+    string big;
+    foreach (_; 0 .. 1_000) big ~= "0123456789";
+    return big;
+}
+
+// A threshold compaction triggered by the recheck after applying a queued
+// `/model` forwards the turn's events: the summary's generation and usage
+// reach the renderer (PR #260 review).
+unittest
+{
+    auto first = new Interfering("first", [toolCall("c1")]);
+    auto agent = agentFor(first);
+    auto small = new Interfering("small", [LLMResponse("SUM"), LLMResponse("done")]);
+    agent.onModelRequest = (string spec) { agent.useClient(small, ConfiguredWindow(4_000, "test")); };
+    first.hook = (size_t call) { if (call == 1) agent.control.requestModel("mock/small"); };
+    agent.compactionPinRequests = false;
+    auto big = bigText();
+    agent.messages ~= [Message.user(big), Message.assistant(big), Message.user("q"), Message.assistant("a")];
+    auto ev = new CountingEvents;
+    assert(agent.run("go", ev) == "done");
+    assert(small.seen.length == 2 && small.seen[0][0].content == ctx.summarySystemPrompt,
+        "the recheck compacted on the switched model");
+    assert(ev.summaries == 1, "summaryStart fired for the recheck compaction");
+    assert(ev.usages >= 2, "the summary's usage and the reply's usage both reported");
+}
+
+// A background probe that lands during `applyModelRequest` can shrink the
+// window even when no model request is queued: the threshold is rechecked
+// unconditionally, so an oversized prompt is never sent (PR #260 review).
+unittest
+{
+    import core.time : seconds;
+    import nano.safeio : Shared;
+    auto p = Probes.make(false);
+    auto agent = agentFor(new Interfering("first", [LLMResponse("unused")]));
+    Interfering probed;
+    agent.probeClient = (string spec) => cast(LLMClient) p.client("probed", null, 4_096);
+    agent.onModelRequest = (string spec) {
+        probed = p.client("probed", [LLMResponse("SUM"), LLMResponse("done")], 4_096);
+        agent.useClient(probed, ConfiguredWindow.init);
+    };
+    // The switch happens before the turn (e.g. typed at the prompt while the
+    // previous turn ran), so its probe is already in flight at prepareCall.
+    agent.control.requestModel("mock/probed");
+    assert(agent.applyModelRequest());
+    agent.compactionPinRequests = false;
+    auto big = bigText();
+    agent.messages ~= [Message.user(big), Message.assistant(big), Message.user("q"), Message.assistant("a")];
+    assert(!agent.overThreshold(), "under the default window's threshold until the probe lands");
+    // The probe's result must land after prepareCall's first threshold check
+    // but before its apply: only the unconditional recheck can catch it.
+    // Keep the probe gated until the first check has read the state (the
+    // hook at agent.d:880), then wait for the worker to finish there — never
+    // block inside the publish hook: a probe that completes before the first
+    // collection publishes on the agent thread, and blocking there deadlocks
+    // the test against the very check hook that would release it. Settle the
+    // probe, don't await a flag: `done` (and `probes`) turns mid-work, so it
+    // can pass while the worker still unwinds, leaving the fallback window
+    // in place for both collections and the normal request consuming SUM
+    // instead of compacting. `settleProbes` joins the worker and publishes
+    // its result, so the recheck below sees the probed window.
+    agent.onThresholdChecked = {
+        p.gate.update((ref bool open) { open = true; });
+        assert(agent.settleProbes(5.seconds), "the probe worker finished and published");
+    };
+    auto ev = new CountingEvents;
+    assert(agent.run("go", ev) == "done");
+    assert(probed !is null && probed.seen.length == 2 && probed.seen[0][0].content == ctx.summarySystemPrompt,
+        "the probe-shrunk window triggered a compaction before the prompt went out");
+    assert(ev.summaries == 1 && ev.usages >= 2, "the compaction notified its consumers");
+}
