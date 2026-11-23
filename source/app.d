@@ -1907,15 +1907,30 @@ Option!ProjectInstructions discoverInstructions(const ref Config c, string dir)
     return some(ProjectInstructions.discover(dir, o));
 }
 
-/// `/context`: window use, token totals, compaction settings.
-string toolsListing(Agent agent) pure { return agent.toolsListing; }
+/// `/tools`: one line per tool, sanitized here so every caller (the idle
+/// command and the mid-turn view) prints no raw control sequences.
+string toolsListing(Agent agent) pure { return sanitizeBlock(agent.toolsListing); }
 
+/// `/skills`: one line per skill, sanitized here for the same reason as
+/// `toolsListing` (skill names and descriptions come from files on disk).
 string skillsListing(const Skills skills) pure
 {
     if (skills.empty) return "No skills found.";
     string[] out_;
     foreach (sk; skills.skills) out_ ~= format("  %-20s %s", sk.name, firstLine(sk.description));
-    return out_.join("\n");
+    return sanitizeBlock(out_.join("\n"));
+}
+
+unittest
+{
+    import std.algorithm.searching : canFind;
+    import nano.skills : Skill;
+    // The mid-turn view stores the listing as-is, so it must already be clean.
+    auto sk = new Skills;
+    sk.skills ~= Skill("evil\x1b]0;t\x07", "desc \x1b[2J here", "/x");
+    auto listed = skillsListing(sk);
+    assert(!listed.canFind('\x1b') && !listed.canFind('\x07'), listed);
+    assert(listed.canFind("here"));
 }
 
 string sessionText(Agent agent) pure
@@ -3634,10 +3649,10 @@ int runMain(string[] args)
                     writeln(escapeMarks(sanitizeBlock(subagentsCommand(agent, cfg, arg))));
                     continue;
                 case "/tools":
-                    writeln(escapeMarks(sanitizeBlock(toolsListing(agent))));
+                    writeln(escapeMarks(toolsListing(agent)));
                     continue;
                 case "/skills":
-                    writeln(escapeMarks(sanitizeBlock(skillsListing(skills))));
+                    writeln(escapeMarks(skillsListing(skills)));
                     continue;
                 case "/resume":
                 {
