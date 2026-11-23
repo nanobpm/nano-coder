@@ -145,6 +145,11 @@ final class Skills
     /// What `fingerprintIn` saw just before this set was discovered: compared
     /// with a fresh one at each turn boundary to tell whether to rediscover.
     string fingerprint;
+    /// `.git/HEAD` of every candidate checkout of each `ai.lock` entry, and
+    /// what they looked like before loading: a locked commit installed (or
+    /// removed) later without touching `ai.lock` still shows as a change.
+    private string[] lockWatch;
+    private string lockPrint;
 
     static Skills discover(string cwd, const ref SkillsConfig config)
     {
@@ -238,6 +243,15 @@ final class Skills
     {
         auto locked = Locked.parse(entry);
         locked.validate(name);
+        // Watch the candidate checkouts before loading, so an install racing
+        // discovery still shows as a change next turn.
+        foreach (base; [locations.spmStore, locations.cache])
+            if (base.length)
+            {
+                auto head = buildPath(base, locked.store, ".git", "HEAD");
+                lockWatch ~= head;
+                lockPrint ~= statLine(head);
+            }
         auto checkout = canonical(checkoutFor(locked, config, locations));
         if (checkout is null) throw new Exception("checkout is missing");
         auto rel = locked.path.length ? locked.path : ".";
@@ -270,7 +284,10 @@ final class Skills
     /// discovered from (stat only: reads no `SKILL.md`).
     bool stale(string cwd, const ref SkillsConfig config, Locations locations) const
     {
-        return fingerprintIn(cwd, config, locations) != fingerprint;
+        if (fingerprintIn(cwd, config, locations) != fingerprint) return true;
+        string now;
+        foreach (head; lockWatch) now ~= statLine(head);
+        return now != lockPrint;
     }
 
     bool empty() pure const { return skills.length == 0; }
@@ -370,7 +387,8 @@ string describeChanges(const Skills before, const Skills after) pure
 /// directories it would scan (and their listings), each `SKILL.md`'s path,
 /// size and mtime, and `ai.lock`/`ai.json`. Same roots, depth cap and
 /// containment rules as discovery; no file contents are read. Locked
-/// checkouts are pinned by commit, so only `ai.lock` itself is watched.
+/// checkouts are pinned by commit; `Skills.stale` also watches whether
+/// each one is installed.
 string fingerprintIn(string cwd, const ref SkillsConfig config, Locations locations)
 {
     import std.array : appender;
@@ -443,7 +461,9 @@ private void fingerprintScan(Out)(string root, string dir, size_t depth, ref Out
             else if (auto rp = within(root, e.name)) if (rp.isDir) dirs ~= rp;
         }
     catch (FileException) { o ~= "?\0" ~ dir ~ "\0"; return; }
-    if (isSkill) { o ~= skillLine; return; }
+    // The folder too: a symlinked SKILL.md's line names only its target,
+    // so renaming the folder would otherwise go unseen.
+    if (isSkill) { o ~= "s\0" ~ dir ~ "\0" ~ skillLine; return; }
     o ~= "d\0" ~ dir ~ "\0";
     if (depth >= maxScanDepth) return;
     dirs.sort();
@@ -1069,6 +1089,41 @@ unittest // picks_up_edited_added_and_removed_skills_with_a_stat_only_check
     assert(!u.stale(repo, untrusted, locs(dir)));
     assert(!Skills.discoverIn(repo, untrusted, locs(dir)).names.canFind("evil"));
     assert(s.stale(repo, c, locs(dir))); // trusted config does watch it
+}
+
+unittest // sees_a_locked_checkout_installed_later_and_a_renamed_symlinked_skill_folder
+{
+    import std.array : replicate;
+    import std.file : rename, symlink;
+    auto dir = tmpRoot("lockwatch");
+    auto url = "https://github.com/acme/skills.git";
+    auto sha = "c".replicate(40);
+    auto repo = buildPath(dir, "repo");
+    mkdirRecurse(buildPath(repo, ".git"));
+    JSONValue entry = ["git": url, "reference": "tag:v1", "commit": sha, "path": "fmt", "store": storeKey(url, sha)];
+    put(buildPath(repo, "ai.lock"), JSONValue(["skills": JSONValue(["fmt": entry])]).toString);
+    auto c = cfg();
+    c.fetch = false;
+    auto s = Skills.discoverIn(repo, c, locs(dir));
+    assert(s.names == [] && s.warnings.length == 1, s.warnings.join("\n"));
+    assert(!s.stale(repo, c, locs(dir)));
+    // spm installs the pinned commit; ai.lock is untouched.
+    auto store = buildPath(dir, "spm/store", storeKey(url, sha));
+    put(buildPath(store, ".git/HEAD"), sha ~ "\n");
+    put(buildPath(store, "fmt/SKILL.md"), skillMd("fmt", "Format files."));
+    assert(s.stale(repo, c, locs(dir)));
+    auto fresh = Skills.discoverIn(repo, c, locs(dir));
+    assert(fresh.names == ["fmt"] && !fresh.stale(repo, c, locs(dir)));
+
+    // A symlinked SKILL.md inside the root: renaming its folder is a change.
+    auto home = buildPath(dir, "home");
+    put(buildPath(home, ".agents/skills/target.md"), skillMd("lnk", "Linked."));
+    mkdirRecurse(buildPath(home, ".agents/skills/a"));
+    symlink(buildPath(home, ".agents/skills/target.md"), buildPath(home, ".agents/skills/a/SKILL.md"));
+    auto u = Skills.discoverIn(repo, c, locs(dir));
+    assert(!u.stale(repo, c, locs(dir)));
+    rename(buildPath(home, ".agents/skills/a"), buildPath(home, ".agents/skills/b"));
+    assert(u.stale(repo, c, locs(dir)));
 }
 
 unittest // the_no_change_check_on_50_skills_is_cheap

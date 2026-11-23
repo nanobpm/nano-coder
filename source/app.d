@@ -2861,7 +2861,7 @@ int runMain(string[] args)
         if (!skillsOn) return new Skills;
         auto sc = skillsConfigFor(dir);
         auto s = Skills.discover(dir, sc);
-        foreach (w; s.warnings) stdErr.writeln("nano-coder: skills: ", w);
+        foreach (w; s.warnings) stdErr.writeln("nano-coder: skills: ", escapeMarks(sanitizeBlock(w)));
         return s;
     }
     Skills skills = discoverSkills(cwd);
@@ -2884,7 +2884,9 @@ int runMain(string[] args)
         auto sc = skillsConfigFor(skillsDir);
         if (!skills.stale(skillsDir, sc, Locations.fromEnv)) return null;
         auto fresh = discoverSkills(skillsDir);
-        auto change = describeChanges(skills, fresh);
+        // Skill names come from SKILL.md files: strip control sequences and
+        // frame markers before any caller prints them.
+        auto change = escapeMarks(sanitizeBlock(describeChanges(skills, fresh)));
         skills = fresh;
         if (!skills.empty) registerSkillTool();
         return change;
@@ -3034,6 +3036,12 @@ int runMain(string[] args)
         bool plan = o.plan;
         host.systemPrompt = (string dir) {
             if (dir != skillsDir) { skills = discoverSkills(dir); skillsDir = dir; }
+            else
+            {
+                // Same directory: the session's metadata must not be stale.
+                auto change = refreshSkills();
+                if (change.length) stdErr.writeln("nano-coder: skills: ", change);
+            }
             // A session in another directory recalls that directory's repo
             // facts; still resolved once per session, not per tool call.
             auto key = projectKey(dir);
