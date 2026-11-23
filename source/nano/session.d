@@ -311,8 +311,10 @@ string logHeaderCwd(string path)
 /// `model` field, else the header's `model`, or null if unreadable (issue #297).
 /// Used at `--resume` startup to select the saved model before constructing the
 /// startup client, so a disabled or failing default provider does not block
-/// resuming a session whose own provider is usable.
-string logSavedModel(string path)
+/// resuming a session whose own provider is usable. `fromHeader` is true when
+/// the model came from the header, which stores the spec verbatim (it may be a
+/// bare model containing `/`), not from a canonical `settings` record.
+string logSavedModel(string path, out bool fromHeader)
 {
     string model;
     try
@@ -329,7 +331,7 @@ string logSavedModel(string path)
             if (t is null || t.type != JSONType.string || d is null || d.type != JSONType.object) return;
             if (t.str != "session" && t.str != "settings") return;
             if (auto m = "model" in *d)
-                if (m.type == JSONType.string && m.str.length) model = m.str;
+                if (m.type == JSONType.string && m.str.length) { model = m.str; fromHeader = t.str == "session"; }
         });
     catch (Exception) {} // an unreadable or corrupt log falls back to config model
     return model;
@@ -343,7 +345,8 @@ unittest // logSavedModel: header model, overridden by settings.model, corrupt l
     auto log = new SessionLog(dir, "openai/gpt-4o", "/tmp");
     auto p = log.path;
     log.close();
-    assert(logSavedModel(p) == "openai/gpt-4o");
+    bool hdr;
+    assert(logSavedModel(p, hdr) == "openai/gpt-4o" && hdr);
 
     auto log2 = new SessionLog(p);
     SessionSettings s1;
@@ -353,13 +356,13 @@ unittest // logSavedModel: header model, overridden by settings.model, corrupt l
     s2.model = "anthropic/claude-sonnet";
     log2.settings(s2);
     log2.close();
-    assert(logSavedModel(p) == "anthropic/claude-sonnet");
+    assert(logSavedModel(p, hdr) == "anthropic/claude-sonnet" && !hdr);
 
     // Corrupt line and non-string model field are ignored.
     std.file.append(p, "{not json\n");
     std.file.append(p, `{"type":"settings","data":{"model":123}}` ~ "\n");
-    assert(logSavedModel(p) == "anthropic/claude-sonnet");
-    assert(logSavedModel(buildPath(dir, "missing.jsonl")) is null);
+    assert(logSavedModel(p, hdr) == "anthropic/claude-sonnet" && !hdr);
+    assert(logSavedModel(buildPath(dir, "missing.jsonl"), hdr) is null);
 }
 
 /// The session log directory: `NANO_CODER_SESSIONS`, else the configured

@@ -942,7 +942,9 @@ final class AcpServer : AgentEvents
 
         auto wanted = st.model.length ? st.model : headerModel;
         auto current = agent.client.providerName ~ "/" ~ agent.client.modelName;
-        if (wanted.length && wanted != host.configModel && host.savedModelKnown !is null && !host.savedModelKnown(wanted))
+        // Only a canonical settings record is checked: a header spec is verbatim
+        // and may be a bare model containing `/`.
+        if (st.model.length && wanted != host.configModel && host.savedModelKnown !is null && !host.savedModelKnown(wanted))
         {
             stdErr.writeln("nano-coder: ACP session/load: the provider of ", wanted,
                 " is not configured; using ", host.configModel);

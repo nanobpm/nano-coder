@@ -1254,12 +1254,14 @@ unittest // retainedRestartSettings: records only live settings that diverge fro
 /// Pick the initial startup model candidate for `--resume` (issue #297):
 /// explicit `-m` wins, else a saved model whose provider is configured, else
 /// `cfg.model`. Sets `note` when a saved model's provider was removed from
-/// config.
-string startupResumeModel(string explicitModel, string savedModel, const ref Config cfg, out string note) pure
+/// config. A header spec (`fromHeader`) is stored verbatim and may be a bare
+/// model containing `/` (e.g. `meta-llama/Llama-3`), so it is kept as is.
+string startupResumeModel(string explicitModel, string savedModel, bool fromHeader, const ref Config cfg,
+    out string note) pure
 {
     if (explicitModel.length) return explicitModel;
     if (!savedModel.length || savedModel == cfg.model) return cfg.model;
-    if (!savedProviderKnown(savedModel, cfg.providers))
+    if (!fromHeader && !savedProviderKnown(savedModel, cfg.providers))
     {
         note = format("the session's model %s is not available (provider %s is not configured); using %s from the config",
             savedModel, savedModel[0 .. savedModel.indexOf('/')], cfg.model);
@@ -1275,10 +1277,13 @@ unittest // startupResumeModel: explicit flag > configured saved model > config 
     cfg.model = "disabled-a/model-a";
     cfg.providers["b"] = ProviderConfig.init;
     string note;
-    assert(startupResumeModel("b/explicit", "b/saved", cfg, note) == "b/explicit" && !note.length);
-    assert(startupResumeModel(null, "b/saved", cfg, note) == "b/saved" && !note.length);
-    assert(startupResumeModel(null, "gone/saved", cfg, note) == "disabled-a/model-a" && note.canFind("gone/saved"));
-    assert(startupResumeModel(null, null, cfg, note) == "disabled-a/model-a" && !note.length);
+    assert(startupResumeModel("b/explicit", "b/saved", false, cfg, note) == "b/explicit" && !note.length);
+    assert(startupResumeModel(null, "b/saved", false, cfg, note) == "b/saved" && !note.length);
+    assert(startupResumeModel(null, "gone/saved", false, cfg, note) == "disabled-a/model-a" && note.canFind("gone/saved"));
+    // A legacy header spec with a slash is a bare model, not a removed provider.
+    note = null;
+    assert(startupResumeModel(null, "meta-llama/Llama-3", true, cfg, note) == "meta-llama/Llama-3" && !note.length);
+    assert(startupResumeModel(null, null, false, cfg, note) == "disabled-a/model-a" && !note.length);
 }
 
 void setVerbosity(Verbosity v)
@@ -2895,15 +2900,16 @@ int runMain(string[] args)
     string resumePath;
     string startupSavedModel;
     string startupModelFallbackNote;
+    bool startupSavedFromHeader;
     if (o.hasResume && !o.acp)
     {
         try resumePath = findSession(sessionDir, o.resume, cwd);
         catch (Exception e) die(e.msg);
         if (!o.model.length)
-            startupSavedModel = logSavedModel(resumePath);
+            startupSavedModel = logSavedModel(resumePath, startupSavedFromHeader);
     }
     auto spec = o.hasResume && !o.acp
-        ? startupResumeModel(o.model, startupSavedModel, cfg, startupModelFallbackNote)
+        ? startupResumeModel(o.model, startupSavedModel, startupSavedFromHeader, cfg, startupModelFallbackNote)
         : (o.model.length ? o.model : cfg.model);
     ConfiguredWindow configuredWindow;
     LLMClient client = () {
@@ -3522,10 +3528,11 @@ int runMain(string[] args)
         auto current = client.providerName ~ "/" ~ client.modelName;
         bool fromFlag = explicitFlags && o.model.length;
         bool switchedModel;
-        // A saved spec is always `provider/model`; a provider since removed
-        // from the config must fall back, not be reparsed as a bare model on
-        // the default provider.
-        if (wanted.length && !fromFlag && wanted != cfg.model && !savedProviderKnown(wanted, cfg.providers))
+        // A settings record's spec is always canonical `provider/model`; a
+        // provider since removed must fall back, not be reparsed as a bare
+        // model on the default provider. A header spec is stored verbatim
+        // and may be a bare model containing `/`, so it is not checked.
+        if (wanted.length && !fromFlag && st.model.length && wanted == st.model && wanted != cfg.model && !savedProviderKnown(wanted, cfg.providers))
         {
             notes ~= format("the session's model %s is not available (provider %s is not configured); using %s from the config",
                 wanted, wanted[0 .. wanted.indexOf('/')], cfg.model);
