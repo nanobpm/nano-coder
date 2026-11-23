@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.22.8", "date": "2026-11-24", "items": [
+      {"type":"perf","scope":"frame","title":"reduce scrollback memory amplification and bound InputHistory","pr":321}
+    ]},
     {"version": "1.22.7", "date": "2026-11-24", "items": [
       {"type":"fix","scope":"subagent","title":"agent_cancel always leaves the child one final report step","pr":323}
     ]},
@@ -438,9 +441,6 @@
     ]},
     {"version": "0.32.0", "date": "2026-10-02", "items": [
       {"type":"feat","scope":"","title":"cross-session memory (user + project scope)","pr":70}
-    ]},
-    {"version": "0.31.0", "date": "2026-10-01", "items": [
-      {"type":"feat","scope":"config","title":"move agentic-harness directories to nano-coder","pr":85}
     ]}
   ]
 }
