@@ -84,6 +84,7 @@ unittest
     auto prevCwd = getcwd();
     chdir(workspace);
     scope (exit) chdir(prevCwd);
+    workspace = getcwd(); // the real path (macOS: /var -> /private/var), as a live log records it
     finishedLog(root, "sess-other", workspace, "fix the flaky parser test", "error[E0308]: mismatched types at parser.rs:42");
 
     auto mock = new MockClient([LLMResponse("ok"), LLMResponse("SUMMARY (#2–#3)"),
@@ -126,6 +127,7 @@ unittest
     auto prevCwd = getcwd();
     chdir(workspace);
     scope (exit) chdir(prevCwd);
+    workspace = getcwd(); // the real path (macOS: /var -> /private/var), as a live log records it
     finishedLog(root, "sess-other", workspace, "fix the flaky parser test", "error[E0308]");
 
     auto mock = new MockClient([LLMResponse("ok"), LLMResponse("SUMMARY (#2–#3)"),
@@ -166,6 +168,7 @@ unittest
     auto prevCwd = getcwd();
     chdir(workspace);
     scope (exit) chdir(prevCwd);
+    workspace = getcwd(); // the real path (macOS: /var -> /private/var), as a live log records it
     auto other = finishedLog(root, "sess-other", elsewhere, "secret work", "the launch codes");
 
     auto mock = new MockClient([LLMResponse("ok"), LLMResponse("SUMMARY (#2–#3)"),
@@ -224,6 +227,7 @@ unittest
     auto prevCwd = getcwd();
     chdir(workspace);
     scope (exit) chdir(prevCwd);
+    workspace = getcwd(); // the real path (macOS: /var -> /private/var), as a live log records it
     finishedLog(root, "sess-other", elsewhere, "secret work", "the launch codes");
 
     auto mock = new MockClient([LLMResponse("ok"), LLMResponse("SUMMARY (#2–#3)"),
@@ -247,6 +251,7 @@ unittest
     auto prevCwd = getcwd();
     chdir(workspace);
     scope (exit) chdir(prevCwd);
+    workspace = getcwd(); // the real path (macOS: /var -> /private/var), as a live log records it
     auto log = new SessionLog(buildPath(root, "sessions"), "mock/m", workspace, "sess-big");
     log.input("in-1", "a long session with one needle deep inside");
     auto sys = Message.system("sys");
