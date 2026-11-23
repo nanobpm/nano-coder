@@ -428,8 +428,8 @@ argument set (`/model`, `/mode`, `/verbosity`, `/thinking`) get the same treatme
 argument: a type-ahead list narrows as you type and Tab completes it.
 
 - `/help` - Show available commands
-- `/compact [--smart|--standard] [focus]` - Summarize older messages with the current model,
-  keeping the latest message. `--smart` / `--standard` override `compaction_mode` for this
+- `/compact [--smart|--standard|--extract] [focus]` - Summarize older messages with the current model,
+  keeping the latest message. `--smart` / `--standard` / `--extract` override `compaction_mode` for this
   compaction (see [Smart compaction](#smart-compaction)). Optional text tells the
   summary what to focus on. Esc Esc or Ctrl-C cancels
 - `/verbosity [quiet|normal|verbose|debug]` - Show or set how much is printed (see below)
@@ -683,7 +683,7 @@ subagent_max_tokens = 1000000
 # [[subagent_models]] tables offer a fixed choice of models (see Sub-agents)
 auto_compact = true                     # summarize automatically when the context fills up
 auto_compact_threshold = 0.8            # fraction of the context window
-compaction_mode = "smart"               # smart | standard (see Smart compaction)
+compaction_mode = "smart"               # smart | standard | extract (see Smart compaction)
 # context_window = 128000               # override the window (providers can set it too)
 verbosity = "normal"                    # quiet | normal | verbose | debug (or --verbosity)
 timestamps = true                       # prefix CLI messages with the local time (HH:MM:SS)
@@ -1168,6 +1168,15 @@ session log, and falls back to a standard summary when `persist_sessions` is off
   - `history_read(id, max_output_length?, session?)` - one message in full, bounded like other tool
     output (the whole is spilled to a file when it is longer).
   Before a smart compaction the tools are not offered, so they cost nothing.
+
+**Extract mode** (`compaction_mode = "extract"`, or `/compact --extract`) is smart
+compaction whose summary is built in code instead of by the model: no request, so it
+costs no tokens and takes milliseconds. It lists the files touched, the shell commands
+and how they ended, error lines and links, and the agent's last words before compacting,
+each with its `(#N)`, plus the pinned requests and the plan as usual. It says where
+things are rather than what they mean, so the agent leans on the history tools. An
+earlier extract summary is merged rather than nested, so each section stays capped. See
+[#273](https://github.com/nanobpm/nano-coder/issues/273) for its measurement against smart.
 
 #### Cross-session history
 

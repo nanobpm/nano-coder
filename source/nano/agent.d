@@ -196,7 +196,7 @@ struct CompactReport
     string toString() pure const
     {
         auto s = format("%scompacted %s messages: ~%s -> ~%s tokens (%s -> %s messages)",
-            mode == ctx.CompactionMode.smart ? "smart-" : "", summarized, ctx.formatTokens(tokensBefore),
+            mode == ctx.CompactionMode.standard ? "" : ctx.modeName(mode) ~ "-", summarized, ctx.formatTokens(tokensBefore),
             ctx.formatTokens(tokensAfter), messagesBefore, messagesAfter);
         if (fallback !is null) s ~= format("; summary failed (%s), older messages were dropped", fallback);
         else if (truncated) s ~= "; the summary hit the output limit and is incomplete";
@@ -1813,7 +1813,7 @@ class Agent
         ctx.CompactionMode m = mode is null ? compactionMode : *mode;
         // Smart compaction points into the session log; without one it is standard.
         if (log.isNone) m = ctx.CompactionMode.standard;
-        bool smart = m == ctx.CompactionMode.smart;
+        bool smart = ctx.citesHistory(m);
         auto window = contextWindow();
         size_t bodyStart = messages.length && messages[0].role == Role.system ? 1 : 0;
         auto len = messages.length;
@@ -1854,7 +1854,15 @@ class Agent
         size_t drops;
         TokenUsage summaryUsage;
         long summaryMs = -1;
-        for (;;)
+        if (m == ctx.CompactionMode.extract)
+        {
+            // Built in code: no model call, so no usage, retry or fallback.
+            import nano.extract : extractSummary;
+            const swStart = monoNow;
+            summary = ctx.smartSummaryPrefix ~ "\n" ~ extractSummary(summarized) ~ "\n\n" ~ ctx.smartSummaryNote(first, last);
+            summaryMs = since(swStart).total!"msecs";
+        }
+        else for (;;)
         {
             // Every compaction (manual, threshold, overflow, idle) and its
             // retry summarizes on the model the user chose: a `/model` still
@@ -2091,7 +2099,7 @@ class Agent
         compactFloor = report.tokensAfter;
         idleGate.reset();
         compactions++;
-        historyAvailable = historyHintPending = m == ctx.CompactionMode.smart;
+        historyAvailable = historyHintPending = ctx.citesHistory(m);
         if (onCompacted !is null) onCompacted(report);
         return true;
     }

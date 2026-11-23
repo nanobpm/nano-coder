@@ -42,6 +42,12 @@ retrieval. With standard mode, `pass|lost` should be near zero. If it isn't,
 the model is guessing or the question leaks the answer. If smart mode has a
 high `pass|lost` but low `used hist`, check the answers in the results file.
 
+`--modes standard,smart,extract` adds extract compaction (issue #273): a
+smart summary built in code with no model call. It copies file paths,
+commands, error lines and links verbatim, so its `kept` is often higher than
+smart's; compare `pass`, and the `secs` and token columns, which include the
+summary request (zero for extract).
+
 | column | meaning |
 | --- | --- |
 | `95% CI` | Wilson interval of `pass\|lost` — the spread a point estimate hides |

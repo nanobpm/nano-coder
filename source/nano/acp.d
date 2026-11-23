@@ -660,7 +660,7 @@ final class AcpServer : AgentEvents
         if (text == "/compact" || text.startsWith("/compact "))
         {
             import nano.commands : parseCompactArgs;
-            import nano.context : CompactionMode;
+            import nano.context : CompactionMode, modeName;
             CompactionMode mode;
             string focus;
             bool hasMode = parseCompactArgs(text["/compact".length .. $], mode, focus);
@@ -681,7 +681,7 @@ final class AcpServer : AgentEvents
             b["tokensBefore"] = rep.tokensBefore;
             b["tokensAfter"] = rep.tokensAfter;
             b["summarized"] = rep.summarized;
-            b["mode"] = rep.mode == CompactionMode.smart ? "smart" : "standard";
+            b["mode"] = modeName(rep.mode);
             b["fallback"] = rep.fallback is null ? JSONValue(null) : JSONValue(rep.fallback);
             b["truncated"] = rep.truncated;
             return rpcResult(id, b);

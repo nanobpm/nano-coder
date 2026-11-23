@@ -84,7 +84,7 @@ test_() {
     ./nano-coder --version
     step "compaction eval self-test (fake model)"
     out=$(mktemp -d)
-    python3 eval/compaction/run.py --self-test --seeds 1 --filler-turns 4 --bin ./nano-coder --out "$out"
+    python3 eval/compaction/run.py --self-test --seeds 1 --filler-turns 4 --modes standard,smart,extract --bin ./nano-coder --out "$out"
     rm -rf "$out"
     step "npm launcher syntax"
     for f in npm/nano-coder/bin/nano-coder npm/nano-coder/lib/platform.js scripts/npm-packages.mjs \

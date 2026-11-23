@@ -2531,7 +2531,7 @@ string contextReport(Agent agent)
         ? format("Auto-compact: at %.0f%% (~%s tokens); compacted %s time(s)", agent.effectiveAutoCompactThreshold * 100,
             imported!"std.conv".to!size_t(window * agent.effectiveAutoCompactThreshold), agent.compactions)
         : "Auto-compact: off";
-    out_ ~= format("Compaction:   %s mode (/compact --smart or --standard overrides once)", modeName(agent.compactionMode));
+    out_ ~= format("Compaction:   %s mode (/compact --smart, --standard or --extract overrides once)", modeName(agent.compactionMode));
     return out_.join("\n");
 }
 

@@ -413,3 +413,31 @@ unittest
     m.record(24, 1_000);
     assert(m.finish(6, 1_000) == 6.0);
 }
+
+// Extract compaction (issue #273): the summary is built in code, so no
+// model call is made; it cites log lines, unlocks the history tools, and the
+// log records the mode so a resumed session keeps them.
+unittest
+{
+    auto mock = new MockClient([call("c1", "echo", `{}`), LLMResponse("done"),
+        call("h1", hist.readTool, `{"id":"#6"}`), LLMResponse("it said pong")]);
+    auto agent = logged("extract", mock);
+    agent.run("ping", new NullEvents);
+    auto calls = mock.seen.length;
+    auto mode = ctx.CompactionMode.extract;
+    CompactReport report;
+    assert(agent.compact(report, CompactTrigger.manual, &mode));
+    assert(mock.seen.length == calls, "no model call");
+    assert(report.toString.startsWith("extract-compacted 3 messages") && report.fallback is null, report.toString);
+    auto summary = agent.messages[1].content;
+    assert(summary.startsWith(ctx.smartSummaryPrefix) && summary.canFind("messages #4–#6"), summary);
+    import nano.extract : extractHeader;
+    assert(summary.canFind(extractHeader), summary);
+    assert(offersHistory(agent));
+    assert(agent.run("what did the tool say?", new NullEvents) == "it said pong");
+    auto path = agent.log.unwrap("logged").path;
+    JSONValue[] records;
+    foreach (line; readText(path).lineSplitter) records ~= parseJSON(line);
+    assert(records.any!(r => r["type"].str == "replace" && r["data"]["mode"].str == "extract"));
+    assert(restore(path).historyAvailable, "a resumed extract-compacted session keeps the history tools");
+}
