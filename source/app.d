@@ -2827,7 +2827,8 @@ int runMain(string[] args)
         }
         else
         {
-            restored = restore(path);
+            // No log to read slimmed folded outputs back from: keep them.
+            restored = restore(path, false);
             foreach (note; agent.loadRestored(restored, newLog))
                 notes ~= "nano-coder: ignoring " ~ note;
         }

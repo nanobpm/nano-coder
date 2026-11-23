@@ -1335,11 +1335,16 @@ private ulong lastFullReplace(string path, out ulong floor)
 }
 
 /// Read a session log (Rust format), dropping a torn last line.
-Restored restore(string path) => restoreLog(path, true);
+///
+/// `slimStash` drops large folded tool outputs that the log's direct records
+/// repeat (issue #263); the caller must then give `Agent.loadRestored` a log
+/// on `path` to read them back. Pass false when no log will be supplied (a
+/// `--no-session` load), or those folded turns would replay empty.
+Restored restore(string path, bool slimStash = true) => restoreLog(path, true, slimStash);
 
 /// `restore`, optionally decoding every record (`skipSuperseded` false: the
 /// reference the two-pass restore is tested against).
-private Restored restoreLog(string path, bool skipSuperseded)
+private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = true)
 {
     import std.algorithm : countUntil;
     Restored r;
@@ -1596,7 +1601,7 @@ private Restored restoreLog(string path, bool skipSuperseded)
                 bool[] slim(Message[] ms)
                 {
                     auto o = new bool[ms.length];
-                    if (pins is null) return o;
+                    if (pins is null || !slimStash) return o;
                     foreach (i, ref m; ms)
                         if (m.role == Role.tool && m.content.length > stashSlimBytes && !m.attachments.length)
                             if (auto k = m.logLine in toolKeys)
@@ -2526,7 +2531,7 @@ unittest
     import std.file : readText;
     import std.string : indexOf;
     const src = readText(__FILE__);
-    const start = src.indexOf("Restored restore(string path)");
+    const start = src.indexOf("private Restored restoreLog(string path");
     assert(start >= 0, "restore's definition is found in this file");
     const rest = src[start .. $];
     const tail = rest.findSplit("\n}\n")[2]; // restore's body ends at its first column-0 `}`
