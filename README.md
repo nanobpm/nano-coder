@@ -1222,7 +1222,7 @@ gets a fourth cross-session tool:
   permission policy as a `session_send(...)` rule.
 
 The delivered message joins the target's input labelled with its origin, e.g.
-`[from session ab88e980 · ts-performance-matrix] …`, and is logged like any input with
+`[from session 1234abcd · ts-performance-matrix] …`, and is logged like any input with
 the sender's full session id in the record (`from_session` on the input and message). Mid-turn it is steered into the running turn; idle it starts
 a turn. With `session_messages_confirm = true` (the default) the target first shows the
 message and waits for its user to accept or decline. A turn that was *started by* a peer

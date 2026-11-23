@@ -320,7 +320,7 @@ final class TurnControl
     size_t pendingSteerBytes() shared
     {
         size_t n;
-        foreach (m; state.get.steers) n += m.text.length;
+        foreach (m; state.get.steers) n += m.text.length + m.sender.length;
         return n;
     }
 
@@ -494,4 +494,14 @@ unittest
     validate(last);
     assert(last == "\uFFFD\uFFFD" && r.next is null);
     closeFd(fds[0]);
+}
+
+// A peer steer's budget counts its retained sender id too: a huge id with a
+// tiny body must not slip past the byte cap.
+unittest
+{
+    auto c = new shared TurnControl;
+    import std.array : replicate;
+    c.steerWithId("hi", 1, true, "x".replicate(1000));
+    assert(c.pendingSteerBytes == 1002);
 }

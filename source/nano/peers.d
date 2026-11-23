@@ -66,7 +66,9 @@ enum size_t maxQueuedBytes = 1024 * 1024;
 /// `[from session ab88e980 · ts-performance-matrix] …`.
 string label(string senderId, string title) pure
 {
-    auto brief = senderId.length > 8 ? senderId[0 .. 8] : senderId;
+    // Generated ids are `sess-<timestamp>-<random>`: their prefix is shared
+    // by every session, so a short label must keep the distinguishing tail.
+    auto brief = senderId.length > 8 ? senderId[$ - 8 .. $] : senderId;
     return title.strip.length
         ? format("[from session %s · %s]", brief, title.strip)
         : format("[from session %s]", brief);
@@ -74,8 +76,9 @@ string label(string senderId, string title) pure
 
 unittest
 {
-    assert(label("ab88e980-rest", "ts-performance-matrix") == "[from session ab88e980 · ts-performance-matrix]");
-    assert(label("ab88e980-rest", "  ") == "[from session ab88e980]");
+    assert(label("rest-ab88e980", "ts-performance-matrix") == "[from session ab88e980 · ts-performance-matrix]");
+    assert(label("rest-ab88e980", "  ") == "[from session ab88e980]");
+    assert(label("sess-20261124T101010-1234abcd", "") != label("sess-20261124T101010-9876fedc", ""));
     assert(label("short", "t") == "[from session short · t]");
 }
 
@@ -880,7 +883,7 @@ struct PeerRouter
                 import core.atomic : atomicLoad;
                 // Unread steers are bounded like the idle inbox; the budget
                 // frees as the turn reads them (or `/queue` withdraws them).
-                if (atomicLoad(control).pendingSteerBytes + labelled.length > maxQueuedBytes)
+                if (atomicLoad(control).pendingSteerBytes + labelled.length + req.pm.senderId.length > maxQueuedBytes)
                 {
                     answer(req.reply, Status.refused, "the target session's inbox is full; try again later");
                     continue;
@@ -1106,7 +1109,7 @@ unittest
     Inbound inbound;
     assert(router.takeWaiting(inbound), "the message waits for the prompt loop");
     assert(inbound.pm.senderId == "sess-sender" && inbound.pm.text == "hello there");
-    assert(inbound.labelled == "[from session sess-sen · a title] hello there", inbound.labelled);
+    assert(inbound.labelled == "[from session s-sender · a title] hello there", inbound.labelled);
     assert(!inbound.needsConfirm, "confirm off: no ask");
     settle(inbound, true);
 
@@ -1151,7 +1154,7 @@ unittest
     status = send(root, "sess-target", PeerMessage("sess-sender", null, "mid-turn note", "m-4", false), note);
     assert(status == Status.queued, note);
     auto pending = control.pendingSteers;
-    assert(pending.length == 1 && pending[0].text == "[from session sess-sen] mid-turn note", pending[0].text);
+    assert(pending.length == 1 && pending[0].text == "[from session s-sender] mid-turn note", pending[0].text);
     assert(pending[0].id >= 0, "listed in /queue");
     router.midTurn(false);
 

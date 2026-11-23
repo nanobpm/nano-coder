@@ -544,6 +544,16 @@ class Agent
         // Redelivering the id of an interrupted turn resumes it (its input
         // was logged already).
         bool resuming = hasPending && givenId.length && pending.id == givenId;
+        // A resumed turn keeps its persisted provenance: a peer input or an
+        // absorbed peer steer re-arms the loop guard whatever the caller says.
+        if (resuming)
+            foreach (i; pending.position .. messages.length)
+                if (messages[i].fromSession.length)
+                {
+                    peerTurn = true;
+                    if (!inputSender.length && i == pending.position) inputSender = messages[i].fromSession;
+                    break;
+                }
         if (!resuming) log.ifSome((SessionLog l) { l.input(inputId, input, inputSender); });
         turnHistoryCalls = 0;
         turnSerial++;
@@ -2341,7 +2351,8 @@ class Agent
         if (auto e = call.rawArgumentsError(stopReason)) { refused = e; return false; }
         bool isPlan = planTools && isPlanTool(call.name);
         bool isOutcome = outcomeTool && call.name == outcomeToolName;
-        bool isHistory = historyEnabled && hist.isHistoryTool(call.name);
+        bool isHistory = (historyEnabled && hist.isHistoryTool(call.name))
+            || (sessionsOffered && call.name == hist.sessionsTool);
         bool isTimer = timerTools && isTimerTool(call.name);
         bool isAgent = subagentsOffered && call.name == subToolName;
         bool isSubCtl = subagentsOffered && isSubControlTool(call.name);
@@ -2405,7 +2416,8 @@ class Agent
         isError = true;
         bool isPlan = planTools && isPlanTool(call.name);
         bool isOutcome = outcomeTool && call.name == outcomeToolName;
-        bool isHistory = historyEnabled && hist.isHistoryTool(call.name);
+        bool isHistory = (historyEnabled && hist.isHistoryTool(call.name))
+            || (sessionsOffered && call.name == hist.sessionsTool);
         bool isTimer = timerTools && isTimerTool(call.name);
         bool isAgent = subagentsOffered && call.name == subToolName;
         bool isSend = messagesOn && call.name == peers.sendTool;
@@ -3617,6 +3629,12 @@ class Agent
     /// Append the "look in history" hint to the next failed tool result.
     bool historyHintPending;
     bool historyEnabled() pure const { return log.isSome && historyAvailable; }
+    /// `sessions_list` is offered with history, and also whenever messaging
+    /// is on so `session_send` targets can be discovered before history is.
+    bool sessionsOffered() pure const
+    {
+        return log.isSome && crossSessionHistory && (historyAvailable || messagesOn);
+    }
 
     /// The messages a replay shows (Rust `replay_history`): the stashed
     /// pre-compaction turns, then the conversation without its synthetic
@@ -3933,7 +3951,7 @@ class Agent
     {
         auto all = tools.definitions ~ (planTools ? planDefinitions() : null)
             ~ (outcomeTool ? [outcomeDefinition()] : null) ~ (historyEnabled ? hist.definitions(crossSessionHistory) : null)
-            ~ (historyEnabled && crossSessionHistory ? [hist.sessionsDefinition()] : null)
+            ~ (sessionsOffered ? [hist.sessionsDefinition()] : null)
             ~ (messagesOn && log.isSome ? [peers.sendDefinition()] : null)
             ~ (timerTools ? timerDefinitions() : null) ~ (settingsTools ? [settings.definition()] : null)
             ~ (subagentsOffered ? [subDefinition(subagentCandidates)] ~ subControlDefinitions() : null);

@@ -94,6 +94,8 @@ unittest
     auto t = TwoSessions.make("nd-ap", mock);
     scope (exit) t.cleanup();
     assert(t.agent.offeredTools.any!(d => d.name == sendTool), "the tool is offered with messages on");
+    // Targets are discoverable before local history is: sessions_list rides with messaging.
+    assert(t.agent.offeredTools.any!(d => d.name == "sessions_list"), "sessions_list is offered with messages on");
 
     t.agent.run("send it", new NullEvents);
     auto result = lastToolResult(mock);
@@ -102,7 +104,7 @@ unittest
     // The target's router has the message, labelled with the sender.
     Inbound inbound;
     assert(t.targetRouter.takeWaiting(inbound), "the target received it");
-    assert(inbound.labelled.canFind("[from session sess-sen"), inbound.labelled);
+    assert(inbound.labelled.canFind("[from session s-sender"), inbound.labelled);
     assert(inbound.labelled.canFind("hello from the sender"), inbound.labelled);
     settle(inbound, true);
 

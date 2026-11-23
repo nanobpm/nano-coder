@@ -3270,9 +3270,10 @@ int runMain(string[] args)
     // this thread, so nothing old was routed between the switch and here.
     void rebindPeerListener()
     {
+        // Old-session deliveries go even when messages are off already.
+        peerRouter.discardAll();
         if (!peerListener.length) return;
         stopPeerListener();
-        peerRouter.discardAll();
         if (auto failed = startPeerListener())
         {
             agent.messagesOn = false;
@@ -3451,8 +3452,10 @@ int runMain(string[] args)
         // Route during `work` too, so a busy session's peer steers reach
         // this turn (and their senders hear back) instead of timing out.
         auto pumpHalt = Shared!bool.make(false);
-        auto pump = spawnDaemon(&pumpPeerRoutes, peerRouter, queue, pumpHalt);
-        bool pumpRunning = true;
+        // No listener, nothing to route: skip the polling thread.
+        bool pumpRunning = peerListener.length != 0;
+        typeof(spawnDaemon(&pumpPeerRoutes, peerRouter, queue, pumpHalt)) pump;
+        if (pumpRunning) pump = spawnDaemon(&pumpPeerRoutes, peerRouter, queue, pumpHalt);
         void stopPump()
         {
             if (!pumpRunning) return;

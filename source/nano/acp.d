@@ -1055,13 +1055,8 @@ final class AcpServer : AgentEvents
             // Steers that arrived too late: dropped on cancel, else queued as
             // prompts at the position each one arrived.
             auto leftover = agent.control.takePending;
-            if (agent.lastStop == StopReason.cancelled)
-            {
-                foreach (s; leftover)
-                    if (s.tag.type != JSONType.null_) send(rpcResult(s.tag, JSONValue(["stopReason": "cancelled"])));
-                return false;
-            }
-            // A peer's late steer runs later as a peer prompt (loop guard kept).
+            // A peer's late steer runs later as a peer prompt (loop guard
+            // kept), even on cancel: its sender was told it was queued.
             {
                 import std.algorithm : filter;
                 import std.array : array;
@@ -1070,6 +1065,12 @@ final class AcpServer : AgentEvents
                         stdErr.writeln(format("peer message from %s dropped: inbox full",
                             peers.PeerRouter.senderFromLabel(s.text)));
                 leftover = leftover.filter!(s => !s.fromPeer).array;
+            }
+            if (agent.lastStop == StopReason.cancelled)
+            {
+                foreach (s; leftover)
+                    if (s.tag.type != JSONType.null_) send(rpcResult(s.tag, JSONValue(["stopReason": "cancelled"])));
+                return false;
             }
             items = requeueSteers(items, leftover, marks, session);
             return true;
