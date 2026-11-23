@@ -185,8 +185,9 @@ unittest
     assert(largeStash > 3 * smallStash, "the large log folds more turns");
     assert(largeReplayed > 300_000, text("replay rehydrated only ", largeReplayed, " B"));
     // Each folded turn's reply holds ~20 KB of answer and reasoning, ~2 KB
-    // per stash entry: what stays is the entries' metadata only (#233 would
-    // turn that into line references too).
-    assert(large < largeStash * 600, text("resume keeps ", large, " B for ", largeStash,
+    // per stash entry, ~3.9 KB kept per entry when replies were not slimmed:
+    // what stays is the entries' metadata only (~0.6 KB on Linux, less on
+    // macOS; #233 would turn that into line references too).
+    assert(large < largeStash * 1000, text("resume keeps ", large, " B for ", largeStash,
         " stashed entries of a 1.2 MB log"));
 }
