@@ -1936,20 +1936,23 @@ private string[][] commandWords(string script)
             // Only the leading run of control words is syntax (`if !`,
             // `then {`); later ones are operands (`ssh -l done host`).
             size_t start;
-            bool header;
+            bool header, test;
             while (start < simple.words.length && !simple.words[start].quoted
                 && isControlWord(simple.words[start].text))
             {
                 auto t = simple.words[start].text;
                 if (t == "for" || t == "select" || t == "case") header = true;
+                if (t == "[[") test = true;
                 start++;
             }
             // A `for name in words` / `case word in` header names a
             // variable and values, never an executable: drop it whole.
             if (header) continue;
+            // Only a `[[ … ]]` test has a closing word in the same simple
+            // command; any other trailing keyword is an operand (`ssh done`).
             size_t end = simple.words.length;
-            while (end > start && !simple.words[end - 1].quoted
-                && isClosingWord(simple.words[end - 1].text))
+            if (test && end > start && !simple.words[end - 1].quoted
+                && simple.words[end - 1].text == "]]")
                 end--;
             string[] words;
             foreach (w; simple.words[start .. end]) words ~= w.text;
@@ -1959,13 +1962,6 @@ private string[][] commandWords(string script)
         foreach (line; script.splitLines)
             r ~= line.split.map!(w => w.strip(`"'`)).array;
     return r;
-}
-
-/// Whether a trailing unquoted word closes a compound command or test
-/// (`[[ -f x ]]`, `{ cmd; }`), so it is syntax rather than an operand.
-private bool isClosingWord(string w) pure
-{
-    return w == "]]" || w == "}" || w == "fi" || w == "done" || w == "esac";
 }
 
 /// Whether an unquoted word is shell syntax around a simple command rather

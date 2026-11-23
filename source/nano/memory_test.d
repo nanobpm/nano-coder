@@ -1232,6 +1232,12 @@ unittest // entitiesFromCall: urls, ssh targets, gh -R, repo name, tool name
     // A control word after the executable is an ordinary operand.
     e = entitiesFromCall("bash", parseJSON(`{"command":"ssh -l done merlin uptime"}`), "");
     assert(e.canFind("host:merlin") && !e.canFind("host:uptime"), e.join(","));
+    foreach (kw; ["done", "fi", "esac", "}", "]]"])
+    {
+        e = entitiesFromCall("bash", parseJSON(`{"command":"ssh ` ~ kw ~ `"}`), "");
+        assert(e.canFind("host:" ~ kw) || kw == "}" || kw == "]]", e.join(","));
+        assert(!e.canFind("tool:" ~ kw), e.join(","));
+    }
     e = entitiesFromCall("bash", parseJSON(`{"command":"ssh -l in merlin"}`), "");
     assert(e.canFind("host:merlin"), e.join(","));
     e = entitiesFromCall("bash", parseJSON(`{"command":"until ssh merlin true; do sleep 1; done"}`), "");
