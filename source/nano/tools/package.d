@@ -826,6 +826,57 @@ unittest
         assert(got.endsWith(expected[$ - 20 .. $]), "tail mismatch");
     }
 
+    // 1b. Complete-result equivalence (spill paths normalised only): a denial
+    //     phrase straddling a chunk boundary, and tails longer than one 64 KiB
+    //     chunk so the rolling-tail buffers rotate, ending both exactly on a
+    //     chunk boundary and with a partially filled current buffer.
+    {
+        import std.regex : replaceAll, regex;
+        auto spillRe = regex(`full output saved to (.*\.txt) \.\.\.\]`);
+        string norm(string s) { return s.replaceAll(spillRe, "full output saved to SPILL ...]"); }
+        void check(const(ubyte)[] raw, size_t limit, bool wantDenied, string label)
+        {
+            auto p = buildPath(tempDir, format("nano-d-trunc-full-%s.bin", thisProcessID));
+            scope (exit) if (p.exists) remove(p);
+            write(p, raw);
+            auto expected = truncateOutput(lossyUtf8(raw), limit, "full-ref");
+            auto em = expected.matchFirst(spillRe);
+            scope (exit) if (em && em[1].exists) remove(em[1]);
+            bool denied;
+            auto got = truncateFile(p, limit, "full-stream", denied, true);
+            auto gm = got.matchFirst(spillRe);
+            scope (exit) if (gm && gm[1].exists) remove(gm[1]);
+            assert(norm(got) == norm(expected), label ~ ": output mismatch");
+            assert(denied == wantDenied, label ~ ": denial mismatch");
+        }
+        enum chunk = 64 * 1024;
+        enum phrase = "Operation not permitted";
+        // Phrase split across the first chunk boundary.
+        {
+            ubyte[] raw;
+            raw.length = chunk - 10;
+            raw[] = 'a';
+            raw ~= cast(const(ubyte)[]) phrase;
+            raw ~= new ubyte[](chunk)[] = 'b';
+            check(raw, 50, true, "denial across boundary");
+        }
+        // Without the phrase, no denial (guards against a fail-open matcher).
+        {
+            auto raw = new ubyte[](3 * chunk);
+            raw[] = 'c';
+            check(raw, 50, false, "no denial");
+        }
+        // Tail larger than a chunk; file ends on a chunk boundary and mid-chunk.
+        foreach (extra; [0, 12_345])
+        {
+            auto raw = new ubyte[](8 * chunk + extra);
+            foreach (i, ref b; raw) b = cast(ubyte)('a' + (i * 7 + i / 977) % 26);
+            raw[5 * chunk + 3 .. 5 * chunk + 5] = [0xC3, 0xA9]; // multi-byte in tail
+            check(raw, 3 * chunk, false, format("rotation extra=%s", extra));
+            check(raw, 2 * chunk + 1, false, format("rotation odd extra=%s", extra));
+        }
+    }
+
     // 2. Memory bound: streaming a 16 MiB file must not grow GC heap by ~16 MiB.
     {
         auto p = buildPath(tempDir, format("nano-d-trunc-mem-%s.bin", thisProcessID));
