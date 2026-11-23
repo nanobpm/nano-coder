@@ -123,7 +123,12 @@ unittest
     scope (exit) t.cleanup();
 
     // A peer-started turn (fromPeer: the prompt loop's flag).
-    t.agent.run("[from session abcd1234] talk to the target", new NullEvents, true, null, true);
+    t.agent.run("[from session abcd1234] talk to the target", new NullEvents, true, null, true, "abcd1234-full-id");
+    {
+        import std.algorithm.searching : any;
+        assert(t.agent.messages.any!(m => m.role == Role.user && m.fromSession == "abcd1234-full-id"),
+            "a peer input keeps its full sender id");
+    }
     // The final request carries both tool results: the refused plain send
     // and the confirm-marked one that went through.
     string[] toolTexts;

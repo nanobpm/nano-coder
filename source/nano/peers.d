@@ -886,7 +886,7 @@ struct PeerRouter
                     continue;
                 }
                 auto id = queue.reserveId();
-                atomicLoad(control).steerWithId(labelled, id, true);
+                atomicLoad(control).steerWithId(labelled, id, true, req.pm.senderId);
                 answer(req.reply, Status.queued, "queued in the target session (visible and editable in /queue)");
             }
             else
@@ -959,12 +959,13 @@ struct PeerRouter
     /// it keeps its provenance (the loop guard) instead of becoming an
     /// ordinary prompt. Its sender was answered when it was steered.
     /// Returns false when the inbox is full and the message was dropped.
-    bool requeueLate(string labelled)
+    bool requeueLate(string labelled, string sender = null)
     {
         auto done = Shared!ReplyCell.make;
         answer(done, Status.queued, "queued");
         PeerMessage pm;
         pm.text = labelled;
+        pm.senderId = sender;
         // Its steer budget was freed when the turn drained it, so admit it
         // against the inbox cap (with one steer budget of headroom, since its
         // sender was already told `queued`). Beyond that it is dropped: the
@@ -1292,6 +1293,12 @@ unittest
     assert(s2.get.status == Status.refused, "unread peer steers are capped");
     auto steers = control.takePending;
     assert(steers.length == 1 && steers[0].fromPeer, "a peer steer keeps its provenance");
+    assert(steers[0].sender == "sess-a", "a peer steer keeps its full sender id");
+    assert(router.requeueLate(steers[0].text, steers[0].sender));
+    {
+        Inbound late;
+        assert(router.takeWaiting(late) && late.pm.senderId == "sess-a", "a requeued steer keeps its sender");
+    }
     auto s3 = Shared!ReplyCell.make;
     router.requests.put(PeerRequest(PeerMessage("sess-a", null, big, "m", false), s3));
     router.routePending(queue);

@@ -596,7 +596,7 @@ final class AcpServer : AgentEvents
                 peers.settle(inbound, true);
                 subCalls = null;
                 terminalCalls = null;
-                runTurn(JSONValue.init, inbound.labelled, null, true);
+                runTurn(JSONValue.init, inbound.labelled, null, true, inbound.pm.senderId);
                 subCalls = null;
                 terminalCalls = null;
                 continue;
@@ -1016,14 +1016,15 @@ final class AcpServer : AgentEvents
     }
 
     /// Run one prompt turn; the reader thread routes cancels and steers meanwhile.
-    private void runTurn(JSONValue id, string text, string givenId = null, bool fromPeer = false)
+    private void runTurn(JSONValue id, string text, string givenId = null, bool fromPeer = false,
+        string peerSender = null)
     {
         router.startTurn();
         peerRouter.midTurn(true);
         scope (exit) peerRouter.midTurn(false);
         immutable ulong[2] tokensBefore = [agent.sessionInputTokens, agent.sessionOutputTokens];
         string response;
-        try response = agent.run(text, this, false, givenId, fromPeer);
+        try response = agent.run(text, this, false, givenId, fromPeer, peerSender);
         catch (Exception e)
         {
             response = "Error: " ~ e.msg;
@@ -1065,7 +1066,7 @@ final class AcpServer : AgentEvents
                 import std.algorithm : filter;
                 import std.array : array;
                 foreach (s; leftover)
-                    if (s.fromPeer && !peerRouter.requeueLate(s.text))
+                    if (s.fromPeer && !peerRouter.requeueLate(s.text, s.sender))
                         stdErr.writeln(format("peer message from %s dropped: inbox full",
                             peers.PeerRouter.senderFromLabel(s.text)));
                 leftover = leftover.filter!(s => !s.fromPeer).array;

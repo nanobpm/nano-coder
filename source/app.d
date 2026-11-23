@@ -3286,6 +3286,7 @@ int runMain(string[] args)
             stdErr.writeln(console.red("[messages: " ~ failed ~ "]"));
     // A peer delivery that starts a turn is flagged for the loop guard.
     bool peerInput;
+    string peerSender; // its full sender session id
 
     // Recently used models lead the `/model` type-ahead (recents.rs).
     static import nano.recents;
@@ -3509,7 +3510,7 @@ int runMain(string[] args)
             import std.algorithm : filter;
             import std.array : array;
             foreach (t; late)
-                if (t.fromPeer && !peerRouter.requeueLate(t.text))
+                if (t.fromPeer && !peerRouter.requeueLate(t.text, t.sender))
                     stdErr.writeln(console.dim(format("[peer message from %s dropped: inbox full]",
                         escapeMarks(sanitizeBlock(PeerRouter.senderFromLabel(t.text))))));
             late = late.filter!(t => !t.fromPeer).array;
@@ -3533,7 +3534,7 @@ int runMain(string[] args)
         return ok;
     }
 
-    bool turn(string input, bool fromPeer = false) @safe
+    bool turn(string input, bool fromPeer = false, string peerSender = null) @safe
     {
         if (reloadInstructions())
             stdErr.writeln(console.dim("[instruction files changed: the system prompt now follows them]"));
@@ -3561,7 +3562,7 @@ int runMain(string[] args)
             console.finalAnswer = null;
             console.beginAnswerGuard();
             string response;
-            try response = agent.run(input, console, true, null, fromPeer);
+            try response = agent.run(input, console, true, null, fromPeer, peerSender);
             catch (Exception e)
             {
                 console.endLine();
@@ -3800,7 +3801,10 @@ int runMain(string[] args)
                 accepted = false;
                 foreach (ed; editor)
                 {
-                    auto a = askQuestions(ed, [q]);
+                    // Keep routing while the picker waits, so later senders hear
+                    // their status now rather than timing out (they queue
+                    // behind this one; the picker stays open).
+                    auto a = askQuestions(ed, [q], () @safe { peerRouter.routePending(queue); return false; });
                     accepted = a.match!((Answered got) => got.answers.length && got.answers[0] == "Accept", _ => false);
                 }
             }
@@ -3811,6 +3815,7 @@ int runMain(string[] args)
                 nano.herdr.report(nano.herdr.State.working, "message from a peer session");
                 line = inbound.labelled;
                 peerInput = true;
+                peerSender = inbound.pm.senderId;
             }
             else
             {
@@ -4025,7 +4030,9 @@ int runMain(string[] args)
         auto input = line.strip;
         if (!input.length) continue;
         auto asPeer = peerInput;
+        auto asPeerSender = peerSender;
         peerInput = false;
+        peerSender = null;
         if (!literal && isCommand(input))
         {
             auto sp = input.indexOf(' ');
@@ -4321,7 +4328,7 @@ int runMain(string[] args)
                     continue;
             }
         }
-        turn(input, asPeer);
+        turn(input, asPeer, asPeerSender);
     }
     goodbye();
     return 0;

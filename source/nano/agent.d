@@ -511,7 +511,7 @@ class Agent
     /// Pass `resetControl = false` when the caller already called
     /// `control.startTurn()`, so a cancel routed before `run` began is kept.
     string run(string input, AgentEvents ev, bool resetControl = true, string givenId = null,
-        bool fromPeer = false)
+        bool fromPeer = false, string peerSender = null)
     {
         import std.datetime.systime : Clock;
         import std.conv : to;
@@ -521,6 +521,7 @@ class Agent
         // The loop guard (issue #272): a peer-started turn can't send peer
         // messages unapproved; any other input lifts the guard.
         peerTurn = fromPeer;
+        inputSender = fromPeer ? peerSender : null;
         if (givenId.length)
             if (auto done = givenId in completedInputs)
             {
@@ -543,7 +544,7 @@ class Agent
         // Redelivering the id of an interrupted turn resumes it (its input
         // was logged already).
         bool resuming = hasPending && givenId.length && pending.id == givenId;
-        if (!resuming) log.ifSome((SessionLog l) { l.input(inputId, input); });
+        if (!resuming) log.ifSome((SessionLog l) { l.input(inputId, input, inputSender); });
         turnHistoryCalls = 0;
         turnSerial++;
         scope (exit) requestThinking = Option!string.init;
@@ -594,6 +595,9 @@ class Agent
     /// now needs the user's approval whatever the confirm setting, so two
     /// agents can't ping-pong. Cleared when the next turn starts.
     bool peerTurn;
+    /// The full session id of the peer that started this turn (issue
+    /// #272), persisted with its input; empty for any other input.
+    string inputSender;
 
     private ulong logSize()
     {
@@ -749,7 +753,9 @@ class Agent
             {
                 hasPending = true;
                 pending = PendingInput(inputId, typed, messages.length);
-                push(Message.user(input));
+                auto bm = Message.user(input);
+                bm.fromSession = inputSender;
+                push(bm);
                 auto reason = o.blockReason.strip.length ? o.blockReason : "Your message was blocked by a UserPromptSubmit hook.";
                 push(Message.assistant(reason, null));
                 ev.text(false, reason);
@@ -772,6 +778,7 @@ class Agent
             auto um = Message.user(input);
             um.pinText = pinText;
             um.autoInitiated = automatic;
+            um.fromSession = inputSender;
             hasPending = true;
             pending = PendingInput(inputId, typed, messages.length);
             push(um);
@@ -911,6 +918,7 @@ class Agent
         {
             auto sm = Message.user(s.text);
             sm.steered = true;
+            sm.fromSession = s.sender;
             push(sm);
             ev.userMessage(s.text);
             // A peer's steer makes the rest of this turn peer-driven: the

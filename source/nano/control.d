@@ -204,6 +204,8 @@ struct Steer
     /// Sent by a peer session (issue #272): a turn that reads it, or runs
     /// it later as a prompt, keeps the peer loop guard.
     bool fromPeer;
+    /// The sending peer's full session id (empty unless `fromPeer`).
+    string sender;
 
     this(string text, JSONValue tag = JSONValue.init)
     {
@@ -291,11 +293,12 @@ final class TurnControl
 
     /// Queue a steer carrying a `/queue` id, so it can be edited or
     /// withdrawn until the agent reads it.
-    void steerWithId(string text, size_t id, bool fromPeer = false) shared
+    void steerWithId(string text, size_t id, bool fromPeer = false, string sender = null) shared
     {
         auto m = Steer(text);
         m.id = id;
         m.fromPeer = fromPeer;
+        m.sender = sender;
         steer(m);
     }
 

@@ -1223,7 +1223,7 @@ gets a fourth cross-session tool:
 
 The delivered message joins the target's input labelled with its origin, e.g.
 `[from session ab88e980 · ts-performance-matrix] …`, and is logged like any input with
-the sender id in the record. Mid-turn it is steered into the running turn; idle it starts
+the sender's full session id in the record (`from_session` on the input and message). Mid-turn it is steered into the running turn; idle it starts
 a turn. With `session_messages_confirm = true` (the default) the target first shows the
 message and waits for its user to accept or decline. A turn that was *started by* a peer
 message cannot itself call `session_send` without `confirm: true` (which asks the
