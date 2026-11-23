@@ -1,5 +1,11 @@
 {
   "releases": [
+    {"version": "1.15.0", "date": "2026-11-23", "items": [
+      {"type":"feat","scope":"update","title":"show what changed since the previously run version after an update","pr":283}
+    ]},
+    {"version": "1.14.0", "date": "2026-11-23", "items": [
+      {"type":"feat","scope":"memory","title":"entities, fact kinds and supersession, with a conflict check on save","pr":284}
+    ]},
     {"version": "1.13.0", "date": "2026-11-23", "items": [
       {"type":"feat","scope":"subagents","title":"background sub-agents the agent can check, read, cancel and wait on","pr":285}
     ]},
@@ -435,12 +441,6 @@
     ]},
     {"version": "0.21.1", "date": "2026-09-30", "items": [
       {"type":"fix","scope":"providers","title":"surface malformed tool-call arguments instead of misreporting them","pr":51}
-    ]},
-    {"version": "0.21.0", "date": "2026-09-29", "items": [
-      {"type":"feat","scope":"cli","title":"recall input history with Up/Down at the prompt","pr":52}
-    ]},
-    {"version": "0.20.0", "date": "2026-09-29", "items": [
-      {"type":"feat","scope":"cli","title":"app-owned frame renderer behind renderer=\"frame\"","pr":48}
     ]}
   ]
 }
