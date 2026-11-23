@@ -105,6 +105,8 @@ string render(const Entry e)
     if (e.evidence !is null) j["evidence"] = e.evidence;
     if (e.entities.length) j["entities"] = JSONValue(e.entities);
     if (e.factKind !is null) j["fact_kind"] = e.factKind;
+    // Facts under different conditions are not contradictions: the model must see the condition.
+    if (e.validWhile !is null) j["valid_while"] = e.validWhile;
     j["created"] = e.created.length >= 10 ? e.created[0 .. 10] : e.created;
     return j.toString(JSONOptions.doNotEscapeSlashes);
 }
@@ -138,6 +140,8 @@ Reply with ONLY a JSON object, no prose:
 {"tags":[{"id":"...","entities":["type:name"],"fact_kind":"fact"}],
  "merges":[{"keep":"<id with the better text>","drop":["<duplicate id>"],"text":"<optional improved single-line text>","why":"..."}],
  "supersedes":[{"old":"<stale id>","new":"<newer id>","why":"..."}]}
+Entries with different valid_while conditions apply in different situations: never merge them, and do not
+supersede one by the other unless the newer one clearly covers the old condition too.
 Only merge true duplicates and only supersede when the newer entry clearly replaces the old one. Omit what you are unsure of.`;
 
 /// The user message for one batch: the batch, then a digest of tagged
@@ -150,7 +154,8 @@ string batchPrompt(const Entry[] batch, const Entry[] tagged)
     foreach (ref e; tagged)
     {
         auto line = render(e) ~ "\n";
-        if (ctx.length + line.length > contextBytes) break;
+        // Skip an entry that does not fit, so later (smaller) entries still take part.
+        if (ctx.length + line.length > contextBytes) continue;
         ctx ~= line;
     }
     if (ctx.length) o ~= "\nTAGGED entries (for duplicates and supersessions only):\n" ~ ctx;
@@ -161,6 +166,15 @@ string batchPrompt(const Entry[] batch, const Entry[] tagged)
 /// scope (`current`), tags only batch entries (`batchIds`), entities and
 /// kinds must parse. `invalid` counts the items dropped.
 Proposal[] parseProposals(string reply, const string[] batchIds, const string[] current, out size_t invalid)
+{
+    string[] rejected;
+    return parseProposals(reply, batchIds, current, invalid, rejected);
+}
+
+/// Ditto, also collecting the batch ids whose tag proposal was dropped as
+/// invalid, so the caller leaves them pending instead of marking them reviewed.
+Proposal[] parseProposals(string reply, const string[] batchIds, const string[] current, out size_t invalid,
+    out string[] rejected)
 {
     Proposal[] r;
     auto a = reply.indexOf('{'), b = reply.lastIndexOf('}');
@@ -193,6 +207,7 @@ Proposal[] parseProposals(string reply, const string[] batchIds, const string[] 
     {
         auto id = str(t, "id");
         if (!batchIds.canFind(id)) { invalid++; continue; }
+        void reject() { invalid++; if (!rejected.canFind(id)) rejected ~= id; }
         string[] ents;
         bool bad;
         foreach (raw; strs(t, "entities"))
@@ -206,7 +221,7 @@ Proposal[] parseProposals(string reply, const string[] batchIds, const string[] 
         if (ents.length > maxAnchors) ents = ents[0 .. maxAnchors];
         string kind = str(t, "fact_kind");
         if (kind !is null && !factKinds.canFind(kind)) kind = null;
-        if (!ents.length && kind is null) { invalid++; continue; }
+        if (!ents.length && kind is null) { reject(); continue; }
         if (bad) invalid++;
         r ~= Proposal(TagProposal(id, ents, kind));
     }
@@ -284,7 +299,7 @@ Applied apply(ref Entry[] entries, const Proposal[] accepted, const EntityRecord
         foreach (i, ref e; entries) if (e.id == id && !e.isSuperseded) return i;
         return -1;
     }
-    foreach (p; accepted)
+    foreach (p; applyOrder(accepted))
     {
         // Each change is checked as a whole: a result that a save would refuse
         // as secret-like (in any field or split across fields) is rolled back.
@@ -356,7 +371,7 @@ Applied apply(ref Entry[] entries, const Proposal[] accepted, const EntityRecord
                 n.merged += ds.length;
             },
             (const SupersedeProposal s) {
-                auto o = at(s.old), w = at(s.newer);
+                auto o = at(s.old), w = at(survivor(entries, s.newer));
                 if (o < 0 || w < 0 || o == w) { n.skipped++; return; }
                 entries[o].supersededBy = entries[w].id;
                 if (!entries[w].supersedes.canFind(entries[o].id)) entries[w].supersedes ~= entries[o].id;
@@ -372,6 +387,53 @@ Applied apply(ref Entry[] entries, const Proposal[] accepted, const EntityRecord
         }
     }
     return n;
+}
+
+/// `accepted` in the order `apply` runs it: everything but supersessions as
+/// given, then supersessions in dependency order, so in a chain A→B, B→C the
+/// link A→B is applied while B is still current (otherwise B→C hides B first
+/// and A stays current although it was reviewed). Links in a cycle keep their
+/// given order; `apply` skips the one whose entry is already superseded.
+const(Proposal)[] applyOrder(const Proposal[] accepted)
+{
+    const(Proposal)[] o;
+    const(SupersedeProposal)[] sups;
+    foreach (p; accepted)
+        p.match!((const SupersedeProposal s) { sups ~= s; }, (_) { o ~= p; });
+    auto done = new bool[sups.length];
+    for (size_t left = sups.length; left;)
+    {
+        bool progressed;
+        foreach (i, s; sups)
+        {
+            if (done[i]) continue;
+            // Wait while another pending link points at this one's old entry (it must run first).
+            bool blocked;
+            foreach (j, t; sups) if (j != i && !done[j] && t.newer == s.old) blocked = true;
+            if (blocked) continue;
+            o ~= Proposal(s);
+            done[i] = progressed = true;
+            left--;
+        }
+        if (!progressed) // a cycle: take the first remaining link as given
+            foreach (i, s; sups) if (!done[i]) { o ~= Proposal(s); done[i] = true; left--; break; }
+    }
+    return o;
+}
+
+/// The current entry `id` resolves to: itself, or the end of its
+/// supersededBy chain (bounded, so a corrupt cycle ends). Lets a supersession
+/// whose replacement was itself merged or superseded point at what survives.
+string survivor(const Entry[] entries, string id)
+{
+    foreach (_; 0 .. entries.length + 1)
+    {
+        string next;
+        foreach (ref e; entries) if (e.id == id) { next = e.supersededBy; break; }
+        if (!next.length) return id;
+        id = next;
+    }
+    return id;
 }
 
 /// The ids of the entries `p` changes.
@@ -447,7 +509,8 @@ string describe(const Proposal p, const Entry[] entries)
     import nano.trajectory : terminalSafe;
     string show(string id)
     {
-        foreach (ref e; entries) if (e.id == id) return format("[%s] %s", terminalSafe(id), terminalSafe(e.text));
+        // The tags include valid_while, so the user sees when two facts apply under different conditions.
+        foreach (ref e; entries) if (e.id == id) return format("[%s] %s%s", terminalSafe(id), terminalSafe(e.text), e.tags(false));
         return "[" ~ terminalSafe(id) ~ "]";
     }
     return p.match!(
@@ -653,9 +716,10 @@ Report migrate(Store store, Ask ask, Ui ui, Options opts)
             rep.batches++;
             auto tagged = now.filter!(e => !e.isSuperseded && !untagged(e)).array;
             size_t bad;
+            string[] rejected;
             ui.say(format("Asking the model about %s scope batch %s (%s entr%s)…", name(s), rep.batches, live.length,
                 live.length == 1 ? "y" : "ies"));
-            auto ps = parseProposals(ask(systemPrompt, batchPrompt(live, tagged)), ids, cur, bad);
+            auto ps = parseProposals(ask(systemPrompt, batchPrompt(live, tagged)), ids, cur, bad, rejected);
             rep.invalid += bad;
             if (opts.dryRun)
             {
@@ -697,7 +761,8 @@ Report migrate(Store store, Ask ask, Ui ui, Options opts)
             // A wholly invalid reply (malformed, truncated) reviewed nothing: leave the batch pending.
             if (!ps.length && bad) continue;
             // Entries of proposals skipped as stale stay pending so the next run offers them again.
-            foreach (id; ids) if (!staleIds.canFind(id)) progress.done[file][id] = true;
+            // So do entries whose proposal was dropped as invalid: nobody reviewed them.
+            foreach (id; ids) if (!staleIds.canFind(id) && !rejected.canFind(id)) progress.done[file][id] = true;
             progress.save(store.root);
         }
     }
@@ -743,4 +808,61 @@ unittest // entry ids are sanitised for the terminal
     auto e = Entry("x\x1b[2J", "t");
     assert(!describe(Proposal(TagProposal("x\x1b[2J")), [e]).canFind('\x1b'));
     assert(!describe(Proposal(TagProposal("y\x1b[2J")), []).canFind('\x1b'));
+}
+
+unittest // a supersession chain is applied in dependency order whatever the given order
+{
+    auto es = [Entry("a", "port 1"), Entry("b", "port 2"), Entry("c", "port 3")];
+    auto n = apply(es, [Proposal(SupersedeProposal("b", "c")), Proposal(SupersedeProposal("a", "b"))], null);
+    assert(n.superseded == 2 && n.skipped == 0);
+    assert(es[0].supersededBy == "b" && es[1].supersededBy == "c" && !es[2].isSuperseded);
+}
+
+unittest // a supersession whose replacement was merged away points at the survivor
+{
+    auto es = [Entry("a", "old"), Entry("b", "new"), Entry("c", "new")];
+    auto n = apply(es, [Proposal(MergeProposal("c", ["b"])), Proposal(SupersedeProposal("a", "b"))], null);
+    assert(n.superseded == 1 && es[0].supersededBy == "c");
+}
+
+unittest // a supersession cycle applies one link and skips the other
+{
+    auto es = [Entry("a", "x"), Entry("b", "y")];
+    auto n = apply(es, [Proposal(SupersedeProposal("a", "b")), Proposal(SupersedeProposal("b", "a"))], null);
+    assert(n.superseded == 1 && n.skipped == 1);
+    assert(es.filter!(e => !e.isSuperseded).walkLength == 1);
+}
+
+unittest // the model sees valid_while
+{
+    auto e = Entry("a", "port 8080");
+    e.validWhile = "version < 2";
+    assert(render(e).canFind(`"valid_while":"version < 2"`));
+}
+
+unittest // an oversized tagged entry is skipped, later ones still reach the digest
+{
+    import std.array : replicate;
+    auto big = Entry("big", "x".replicate(contextBytes + 10)), small = Entry("small", "tiny fact");
+    big.factKind = small.factKind = "fact";
+    auto p = batchPrompt([Entry("n", "new")], [big, small]);
+    assert(p.canFind(`"small"`) && !p.canFind(`"big"`));
+}
+
+unittest // confirmation shows the entries' tags, including valid_while
+{
+    auto a = Entry("a", "port 1"), b = Entry("b", "port 2");
+    a.validWhile = "v1";
+    b.factKind = "fact";
+    auto d = describe(Proposal(SupersedeProposal("a", "b")), [a, b]);
+    assert(d.canFind("valid while v1") && d.canFind("{fact}"));
+}
+
+unittest // a tag dropped as invalid is reported as rejected, not silently reviewed
+{
+    size_t bad;
+    string[] rejected;
+    auto ps = parseProposals(`{"tags":[{"id":"a","fact_kind":"fact"},{"id":"b","fact_kind":"bogus"}]}`,
+        ["a", "b"], ["a", "b"], bad, rejected);
+    assert(ps.length == 1 && bad == 1 && rejected == ["b"]);
 }

@@ -416,3 +416,24 @@ unittest // an entry changed between review and apply stays pending and is offer
     assert(r2.untagged == 1 && r2.tagged == 1 && calls == 2, r2.toString);
     assert(byId(s, id).factKind == "fact");
 }
+
+unittest // an entry whose tag was dropped as invalid stays pending while its batch mates are reviewed
+{
+    auto s = store(tmp("rejected-pending"));
+    auto a = s.save(Scope.user, "fact about host alpha", null, null).id;
+    auto b = s.save(Scope.user, "fact about host beta", null, null).id;
+    size_t calls;
+    Ask ask = (string system, string user) {
+        calls++;
+        return JSONValue(["tags": JSONValue([JSONValue(["id": JSONValue(a), "fact_kind": JSONValue("fact")]),
+            JSONValue(["id": JSONValue(b), "fact_kind": JSONValue("bogus")])])]).toString;
+    };
+    auto u = new Script;
+    u.selects = [0];
+    auto r1 = migrate(s, ask, u.ui, Options.init);
+    assert(r1.tagged == 1 && r1.invalid == 1, r1.toString);
+    auto v = new Script;
+    v.selects = [0];
+    auto r2 = migrate(s, ask, v.ui, Options.init);
+    assert(r2.untagged == 1 && calls == 2, r2.toString);
+}
