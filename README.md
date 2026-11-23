@@ -456,7 +456,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
 - `/subagents stop <id>` / `/subagents stop all` - Stop running or queued sub-agents as the agent's `agent_cancel` does: each gets a few seconds to report what it has (marked cancelled; one that can't is cut off), and the agent receives that as the sub-agent's result. Typed during a turn, it runs when the turn ends. Tab completes `show`/`stop` and the sub-agent ids. `show` and `stop` are terminal-only (not over ACP)
 - `/messages [on|off|confirm on|off] [--save]` - Without an argument, show whether this session sends and receives inter-session messages (see [Inter-session messages](#inter-session-messages)). `on` opens the registry socket and offers `session_send` from the next request; `off` closes it. `confirm on|off` switches whether an incoming message waits for you to accept it. `--save` writes `session_messages` / `session_messages_confirm` to the config file
 - `/plan` - Show the agent's task plan with all notes
-- `/memory [entities] [forget ID]` - List cross-session memories with their ids, each entity's facts, or delete one by id (see [Memory](#memory))
+- `/memory [entities] [forget ID] [migrate [--dry-run]]` - List cross-session memories with their ids, each entity's facts, delete one by id, or tag, merge and supersede existing memories with your confirmation (see [Memory](#memory))
 - `/hooks` - List the loaded external user hooks (from `.claude/settings.json` and friends), the files they came from, and any skipped entries (see [Lifecycle Hooks](#lifecycle-hooks))
 - `/queue [list|add text|remove N...|edit N text|clear]` - Show or edit the queued messages and unread steers. Works while a turn runs, so a queued message or steer can be removed or rewritten before it is sent.
 - `/model [provider/model]` - Show the current model and pick a new one. The list starts with the last four models you used (the current one marked; the previous one highlighted, so `/model` then Enter switches back), then the providers: pick a provider to scroll its model list (Esc steps back). With an argument, switches directly (conversation is kept). Typing `/model ` shows a type-ahead of the current model, recently used models, and each configured provider's default model; Tab completes (a bare provider name completes to its default model). Recently used models are kept in `~/.local/share/nano-coder/recent-models.json`
@@ -1498,6 +1498,33 @@ recalled (unless a different fact would be chosen). Memories with no entities ye
 anchor-substring recall, so nothing regresses before they are migrated. The note names the
 entity that triggered it (`📌 host:merlin — …`), and `/memory entities` lists each entity's
 facts. Set `memory_recall = "anchor"` to compare or roll back to the pre-entity substring match.
+
+**Migrating existing memories.** Memories saved before entities existed have no entities or
+`fact_kind`, and may include duplicates and facts a later note contradicts. `/memory migrate`
+(or `nano-coder --memory-migrate` from a shell) tidies them with the model's help:
+
+- Untagged entries not reviewed before are sent to the session's model in batches of at most
+  12 KB, each with a capped (6 KB) digest of the already-tagged entries. The model proposes,
+  per entry, entities and a `fact_kind`, and across the batch and the tagged set, duplicates to
+  merge and stale entries to supersede (naming the newer entry and why). Invalid proposals
+  (unknown ids, bad entity types) are dropped and counted.
+- Each batch's proposals are listed for review: **Accept all**, **Review each** (accept, skip
+  or edit each item: a tag's entities and kind, a merge's text), **Skip this batch**, or
+  **Stop** (resume later). Nothing changes without a confirmation.
+- A merge keeps the chosen entry with the better text and the union of the anchors, evidence
+  and entities; the duplicates and superseded entries stay on disk marked replaced
+  (`superseded_by`), so they are never recalled or listed but remain readable by id.
+- Before the first applied change, the memory files are copied to
+  `<memory dir>/backups/migrate-<timestamp>/` and the path is printed. To undo, copy the files
+  from there back into the memory directory.
+- Progress is recorded in `<memory dir>/migrate-progress.json` after each batch, so an
+  interrupted or stopped migration resumes where it left off, and a re-run only looks at
+  entries that are still untagged and were saved since (skipped batches are not offered again;
+  delete the progress file to review everything once more).
+- `--dry-run` (`/memory migrate --dry-run`, `nano-coder --memory-migrate --dry-run`) writes the
+  proposals to `<memory dir>/migrate-dry-run-<timestamp>.json` and changes nothing; it also
+  works when memory is read-only. Applying needs memory `on` and, in the REPL, an interactive
+  terminal outside Plan mode.
 
 **Prompt.** A capped, dated index (most-recently-used first, ~4 KB with the guidance) is
 appended to the system prompt at session start, framed as "notes from earlier sessions; may be

@@ -30,7 +30,7 @@ immutable Command[] commands = [
     Command("/verbosity", "[quiet|normal|verbose|debug]", "Show or set output detail"),
     Command("/plan", "", "Show the agent's task plan with notes"),
     Command("/timers", "", "List the timers the agent set for itself"),
-    Command("/memory", "[forget ID]", "List cross-session memories (or forget one by id)"),
+    Command("/memory", "[forget ID|entities|migrate [--dry-run]]", "List cross-session memories (forget one, view entities, or migrate: tag, merge and supersede with confirmation)"),
     Command("/hooks", "", "List loaded user hooks (.claude/settings.json and friends)"),
     Command("/queue", "[list|add text|remove N...|edit N text|clear]", "Show or edit the queued messages"),
     Command("/tools", "", "List available tools"),
@@ -523,7 +523,7 @@ unittest // menu rows
     auto few = menu("/", 80, 3);
     assert(few.length == 3 && few[2].canFind("more"));
     foreach (r; menu("/", 20, 20)) assert(r.count <= 19 + 30, r);
-    assert(helpText().canFind("/memory [forget ID]"));
+    assert(helpText().canFind("/memory [forget ID|entities|migrate [--dry-run]]"));
     assert(helpText().canFind("/version")); // rust: commands.rs::help_lists_version
 }
 
