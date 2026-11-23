@@ -23,7 +23,7 @@ import std.stdio : fileno;
 import std.datetime.systime : Clock;
 import core.time : dur;
 import std.process : environment, thisProcessID;
-import std.algorithm : sort, filter, map;
+import std.algorithm : sort, filter, map, min;
 import std.array : array;
 import nano.llm;
 import nano.option : Option, some, ifSome;
@@ -163,12 +163,14 @@ void streamLogLines(string path, scope void delegate(const(char)[] line) @safe s
 /// `streamLogLines` whose `sink` returns false to stop reading: nothing
 /// past that line is read or inflated (issue #271: the permission-header
 /// probe must not scan a denied session's whole log).
-void streamLogLinesUntil(string path, scope bool delegate(const(char)[] line) @safe sink)
+void streamLogLinesUntil(string path, scope bool delegate(const(char)[] line) @safe sink,
+    scope bool delegate(const(char)[] head) @safe keep = null)
 {
     import std.stdio : File;
     auto f = File(path, "rb");
     scope (exit) f.close();
     ubyte[] carry;
+    bool skipping;
     if (isCompressedLog(path))
     {
         auto gz = GunzipStream(path);
@@ -178,7 +180,7 @@ void streamLogLinesUntil(string path, scope bool delegate(const(char)[] line) @s
         {
             auto got = gz.read(f, buf);
             if (!got.length) break;
-            if (!feedChunk(carry, got, sink)) return;
+            if (!feedChunk(carry, skipping, got, sink, keep)) return;
         }
     }
     else
@@ -188,35 +190,55 @@ void streamLogLinesUntil(string path, scope bool delegate(const(char)[] line) @s
         {
             auto got = f.rawRead(buf);
             if (!got.length) break;
-            if (!feedChunk(carry, got, sink)) return;
+            if (!feedChunk(carry, skipping, got, sink, keep)) return;
         }
     }
 }
 
+/// The bytes of a line's start that a `keep` predicate sees.
+enum size_t lineHeadBytes = 64;
+
 /// Split one chunk into newline-terminated lines for `sink`, carrying a
-/// partial line over to the next chunk (a torn tail is dropped).
-private bool feedChunk(ref ubyte[] carry, const(ubyte)[] chunk, scope bool delegate(const(char)[]) @safe sink)
+/// partial line over to the next chunk (a torn tail is dropped). `keep`, if
+/// set, sees each line's first `lineHeadBytes` (or the whole of a shorter
+/// line): a line it rejects is skipped unbuffered, so a multi-megabyte
+/// record the caller doesn't want is never assembled (issue #234).
+private bool feedChunk(ref ubyte[] carry, ref bool skipping, const(ubyte)[] chunk,
+    scope bool delegate(const(char)[]) @safe sink, scope bool delegate(const(char)[]) @safe keep)
 {
+    import nano.safeio : asChars;
     size_t start;
     foreach (i, b; chunk)
         if (b == '\n')
         {
-            if (!emitLine(carry, chunk[start .. i], sink)) return false;
+            if (skipping) skipping = false;
+            else if (!emitLine(carry, chunk[start .. i], sink, keep)) return false;
+            carry = null;
             start = i + 1;
         }
-    if (start < chunk.length) carry ~= chunk[start .. $];
+    if (start < chunk.length && !skipping)
+    {
+        carry ~= chunk[start .. $];
+        if (keep !is null && carry.length >= lineHeadBytes && !keep(asChars(carry[0 .. lineHeadBytes])))
+        {
+            skipping = true;
+            carry = null;
+        }
+    }
     return true;
 }
 
 /// One line split out of the stream: the carried prefix plus the chunk
 /// slice, validated as UTF-8 (a malformed line is lossy-copied so a bad byte
 /// can't kill the stream; it fails to parse where decoded, as before).
-private bool emitLine(ref ubyte[] carry, const(ubyte)[] tail, scope bool delegate(const(char)[]) @safe sink)
+private bool emitLine(ref ubyte[] carry, const(ubyte)[] tail, scope bool delegate(const(char)[]) @safe sink,
+    scope bool delegate(const(char)[]) @safe keep)
 {
-    import nano.safeio : lossyText, utf8View;
+    import nano.safeio : asChars, lossyText, utf8View;
     import std.utf : UTFException;
     const(ubyte)[] line = carry.length ? carry ~ tail : tail;
     carry = null;
+    if (keep !is null && !keep(asChars(line[0 .. min(line.length, lineHeadBytes)]))) return true;
     const(char)[] text;
     try text = utf8View(line);
     catch (UTFException) text = lossyText(line);
@@ -284,6 +306,19 @@ private struct GunzipStream
 void foreachLogLineSkippingTorn(string path, scope void delegate(const(char)[]) @safe sink)
 {
     streamLogLines(path, sink);
+}
+
+/// `foreachLogLineSkippingTorn` that skips, unbuffered, each line whose
+/// first `lineHeadBytes` `keep` rejects. A skipped line still counts as a
+/// line for `sink`'s caller: it is reported as an empty line.
+void foreachLogLineSkippingTorn(string path, scope void delegate(const(char)[]) @safe sink,
+    scope bool delegate(const(char)[] head) @safe keep)
+{
+    streamLogLinesUntil(path, (line) { sink(line); return true; }, (head) {
+        if (keep(head)) return true;
+        sink(null);
+        return false;
+    });
 }
 
 /// The working directory recorded in the log's header (null for older logs
@@ -3870,4 +3905,28 @@ unittest
     streamLogLinesUntil(p, (line) { ++seen; return false; });
     assert(seen == 1);
     assert(logHeaderCwd(p) == "/w");
+}
+
+// A line `keep` rejects by its head is skipped whole, whether it is short or
+// spans many read chunks, plain or gzipped; the lines around it arrive
+// intact, and the skipped one is reported as an empty line (issue #234).
+unittest
+{
+    import std.array : replicate;
+    import std.file : write, remove, tempDir;
+    import std.path : buildPath;
+    auto big = `{"type":"replace","data":"` ~ "x".replicate(200_000) ~ `"}`;
+    auto text = `{"type":"message","data":1}` ~ "\n" ~ `{"type":"plan"}` ~ "\n" ~ big ~ "\n"
+        ~ `{"type":"message","data":2}` ~ "\n";
+    auto p = buildPath(tempDir, "nano-d-stream-keep.jsonl"), gz = p ~ ".gz";
+    write(p, text);
+    write(gz, gzipLog(text));
+    scope (exit) { remove(p); remove(gz); }
+    foreach (path; [p, gz])
+    {
+        string[] seen;
+        foreachLogLineSkippingTorn(path, (line) { seen ~= line.idup; },
+            (head) => !head.startsWith(`{"type":"replace"`) && !head.startsWith(`{"type":"plan"`));
+        assert(seen == [`{"type":"message","data":1}`, "", "", `{"type":"message","data":2}`], path);
+    }
 }
