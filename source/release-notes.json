@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.21.0", "date": "2026-11-23", "items": [
+      {"type":"feat","scope":"providers","title":"remove the unofficial Meta Muse Code provider","pr":299}
+    ]},
     {"version": "1.20.0", "date": "2026-11-23", "items": [
       {"type":"feat","scope":"subagents","title":"/subagents lists, shows and stops sub-agents","pr":287}
     ]},
@@ -438,9 +441,6 @@
     ]},
     {"version": "0.26.0", "date": "2026-09-30", "items": [
       {"type":"feat","scope":"cli","title":"list the last four models at the top of /model","pr":64}
-    ]},
-    {"version": "0.25.1", "date": "2026-09-30", "items": [
-      {"type":"fix","scope":"input","title":"handle Esc and Ctrl keys sent in kitty keyboard protocol form","pr":61}
     ]}
   ]
 }
