@@ -2406,6 +2406,9 @@ class Agent
                     immutable spec = SubSpec(seq, call.id, a.task, model,
                         systemPrompt(cwd, wallNow.toISOExtString[0 .. 10]), defs, limits,
                         log.match!(l => l.path.stripExtension, () => string.init), "sub-" ~ safeName(call.id), cwd);
+                    if (a.background && !backgroundSubagents)
+                        throw new ToolError("agent: background sub-agents are not available here (nothing serves "
+                            ~ "them between prompts); run it without background");
                     g.slot = seq;
                     g.launched = true;
                     subSlots ~= SubSlot(call.id, a.task, spec);
@@ -2479,9 +2482,12 @@ class Agent
         import nano.clock : sleepFor;
         import core.time : msecs;
         SubMsg m;
-        while (!subUp.tryTake(m))
+        // The deadline is checked before every take: a steady stream of
+        // sibling messages must not keep a wait running past it.
+        for (;;)
         {
             if (monoNow >= deadline) return false;
+            if (subUp.tryTake(m)) break;
             sleepFor(5.msecs);
         }
         handleSubMsg(m);
@@ -2617,7 +2623,9 @@ class Agent
         while (subSlots.any!(s => !s.background && !s.finished) || (all && subRunning)) pumpSubagents();
         dropSlots((ref const SubSlot s) => !s.background);
         subGates = null;
-        subEvents = none;
+        // Background children still running keep the observer: idle polling
+        // delivers their progress and the completion that ends their row.
+        if (!subagentsActive) subEvents = none;
     }
 
     private static void cancelUnstarted(ref SubSlot s)
@@ -2646,6 +2654,7 @@ class Agent
                 foreach (l; log) l.subagent(s.id, "stopped", s.result.toolText);
             }
         subSlots = null;
+        subEvents = none;
     }
 
     /// Whether a sub-agent is running or queued (the UI shows activity).
@@ -2816,7 +2825,9 @@ class Agent
         }
         subSlots[i].delivered = true;
         foreach (l; log) l.subagent(id, "cancelled", reason);
-        return resultText(subSlots[i]);
+        auto text = resultText(subSlots[i]);
+        pruneSubagents(); // cancelled slots count against the kept few too
+        return text;
     }
 
     /// `agent_wait`: block until the sub-agents finish or the timeout.
@@ -3102,6 +3113,10 @@ class Agent
     {
         import nano.mode : AgentMode;
         string[] dropped;
+        // Sub-agents belong to the session being left (issue #266): stop them
+        // before the conversation and log are replaced, for every loader
+        // (`/resume`, ACP `session/load`).
+        stopSubagents();
         // Repairs are logged first: a failed write leaves the live session as
         // it was — and closes the incoming log, which the agent never
         // adopted, so its descriptor and lock do not leak into `openHere`.
@@ -3454,6 +3469,9 @@ class Agent
     Timers timers;
     /// Offer the timer tools (off for ACP, which has no idle loop to fire them).
     bool timerTools = true;
+    /// Whether `agent` may start background sub-agents: only hosts that serve
+    /// them between turns (the CLI prompt loops). ACP sets it false (#266).
+    bool backgroundSubagents = true;
     /// Called after the timers change (the UI updates the status bar).
     void delegate() onTimersChanged;
     /// The clock timers run on (unix seconds); tests replace it.

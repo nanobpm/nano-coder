@@ -2800,6 +2800,10 @@ int runMain(string[] args)
     Agent agent = new Agent(client, tools, policy, systemFor(cwd, o.plan));
     built = some(agent);
     mainAgent = some(agent);
+    // Exiting stops every sub-agent, background ones included; their logs
+    // stay. Installed before the `--acp` and `-p` returns: a child thread
+    // left waiting on its parent would otherwise hang process exit.
+    scope (exit) agent.stopSubagents();
     agent.memory = memory;
     agent.indexShown = indexShown;
     agent.instructions = instructions;
@@ -2821,6 +2825,8 @@ int runMain(string[] args)
     configureSubagents(agent, cfg, true);
     agent.planTools = cfg.planTools;
     agent.timerTools = !o.acp; // ACP has no idle loop to fire them
+    // Nor to serve background sub-agents between prompts (issue #266).
+    agent.backgroundSubagents = !o.acp;
     agent.outcomeTool = cfg.outcomeTool;
     agent.remindersEnabled = cfg.reminders;
     agent.questions = questions;
@@ -3275,6 +3281,31 @@ int runMain(string[] args)
         return null;
     }
 
+    // The plain (no-editor) prompt's read: while background sub-agents run
+    // it polls, serving their tool calls and running a finished one's result
+    // as a turn, as the editor prompt does (issue #266).
+    string plainLine()
+    {
+        import nano.clock : sleepFor;
+        import core.time : msecs;
+        string l;
+        while (agent.subagentsActive || agent.backgroundResultsReady())
+        {
+            if (inbox.tryTake(l)) return l;
+            if (agent.backgroundResultsReady())
+            {
+                string notice;
+                auto text = agent.takeBackgroundResults(notice);
+                if (text is null) continue;
+                writeln(console.dim(notice));
+                agent.automaticInput = true;
+                return "\x00" ~ text;
+            }
+            sleepFor(20.msecs);
+        }
+        return takeLine(inbox);
+    }
+
     if (o.prompt.length)
     {
         bool ok = turn(o.prompt);
@@ -3367,8 +3398,6 @@ int runMain(string[] args)
     // Repeat the resume instruction on exit, so it is still on screen (and in
     // scrollback) after a long session pushed the banner away. Re-read the
     // log: `/restart` and `/resume` may have switched sessions.
-    // Exiting stops every sub-agent, background ones included; their logs stay.
-    scope (exit) agent.stopSubagents();
     void goodbye()
     {
         writeln("\nGoodbye!");
@@ -3449,7 +3478,11 @@ int runMain(string[] args)
             {
                 return deliverDueTimer(agent.backgroundResultsReady(), ed.holdsTimer(monoNow), false, exitPress.armed);
             }
+            // Esc Esc at the idle prompt stops background sub-agents.
+            bool stopBackground;
+            ed.onIdleEscEsc = () @safe { if (agent.subagentsActive) stopBackground = true; };
             lapse = () @safe => exitPress.deadline.match!(d => monoMs() > d, () => false)
+                || stopBackground
                 || timerNow()
                 || subNow()
                 || idleNow()
@@ -3457,7 +3490,15 @@ int runMain(string[] args)
             auto r = ed.readLine(.stamp(false) ~ "› ", console.stamp() ~ glyphMark ~ " ", false, lapse);
             ed.restyle = null;
             syncMode(); // Shift-Tab at the prompt switched the mode
+            ed.onIdleEscEsc = null;
             if (r.outcome == Outcome.eof) break;
+            if (r.outcome == Outcome.stopped && stopBackground)
+            {
+                agent.stopSubagents();
+                writeln(console.dim("[background sub-agents stopped]"));
+                quietPrompt = true;
+                continue;
+            }
             if (r.outcome == Outcome.stopped && timerNow())
             {
                 // Park a stale draft so the timer turn can't take it as a steer.
@@ -3529,7 +3570,7 @@ int runMain(string[] args)
         else
         {
             if (interactive) { write("\n" ~ console.stamp() ~ console.bold("› ")); stdOut.flush(); }
-            line = inbox ? takeLine(inbox) : stdinLine();
+            line = inbox ? plainLine() : stdinLine();
             // Headless --wait-timers: input is done, but pending timers still
             // run, each as the next prompt, until none are left (#150).
             if (line is null && suppressEofForTimers(o.waitTimers, interactive))

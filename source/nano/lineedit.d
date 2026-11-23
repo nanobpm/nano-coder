@@ -679,6 +679,9 @@ final class LineEditor
     void delegate(K) @safe onAction;
     /// Ctrl-O, at the prompt or mid-turn; the editor is left as it is.
     void delegate() @safe onToggle;
+    /// Esc Esc at the idle prompt (after clearing the input): the app
+    /// stops background sub-agents with it (issue #266). Null: clear only.
+    void delegate() @safe onIdleEscEsc;
     /// On submit, the styled prompt to redraw the line with (Rust's
     /// `restamp_prompt`: the timestamp becomes the submission time). It must
     /// keep the prompt's visible width.
@@ -856,6 +859,7 @@ final class LineEditor
                     if (!second) break;
                     if (turn) { erase(); return Result(Outcome.cancel); }
                     state.clear();
+                    if (onIdleEscEsc !is null) onIdleEscEsc();
                     break;
             }
             render();
@@ -1228,6 +1232,13 @@ unittest // slash commands: Tab, menu, rejection, Esc
     e = editor("abc\x1b\x1b", screen);
     e.nowMs = () => t += 100;
     assert(e.readLine("", "", true).outcome == Outcome.cancel);
+    // Idle Esc Esc runs the hook (stopping background sub-agents); one Esc doesn't.
+    int idleStops;
+    e = editor("abc\x1b\x1b\xffok\r", screen);
+    e.nowMs = () => t += 100;
+    e.onIdleEscEsc = () { idleStops++; };
+    assert(e.readLine("> ", "> ").text == "ok");
+    assert(idleStops == 1);
 }
 
 unittest // select

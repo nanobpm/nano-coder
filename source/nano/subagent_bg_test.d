@@ -108,6 +108,18 @@ final class Overlapping : MockClient
     }
 }
 
+/// A parent that opens the gate in its second model call: after the step's
+/// preparation, so a gated child cannot finish before that step's tools run.
+final class OpensGate : MockClient
+{
+    this(LLMResponse[] script) { super(script); }
+    override LLMResponse chat(const ref ChatRequest req, StreamSink sink)
+    {
+        if (seen.length == 1) atomicStore(gateOpen, true);
+        return super.chat(req, sink);
+    }
+}
+
 final class Scripts : SubClientFactory
 {
     LLMClient make(string spec) const
@@ -147,7 +159,12 @@ final class Fixture
 
     this(LLMResponse[] script)
     {
-        parent = new MockClient(script);
+        this(new MockClient(script));
+    }
+
+    this(MockClient client)
+    {
+        parent = client;
         auto reg = new ToolRegistry;
         reg.register(ToolDefinition("grep", "search", parseJSON(`{"type":"object"}`)), (JSONValue a) {
             if (a["pattern"].str == "trigger-cancel") agent.control.cancel();
@@ -187,6 +204,20 @@ final class Fixture
         }
     }
 
+    /// Serve the background children until none is running. A fast child
+    /// may finish (and be delivered) inside the turn that started it, so
+    /// waiting for an undelivered result could wait forever.
+    void awaitDone()
+    {
+        auto start = monoNow;
+        while (agent.subagentsActive)
+        {
+            assert(monoNow - start < 5.seconds, "the background child never finished");
+            agent.pollSubagents();
+            sleepFor(1.msecs);
+        }
+    }
+
     /// The reminders in the conversation that carry a background result.
     size_t deliveries(string needle)
     {
@@ -206,7 +237,7 @@ unittest
     assert(f.agent.run("go", new NullEvents) == "started it");
     auto r = f.toolResult("b1");
     assert(r.canFind("Started sub-1 in the background") && r.canFind("mock/search"), r);
-    f.awaitResult();
+    f.awaitDone();
     assert(f.agent.run("next", new NullEvents) == "got it");
     assert(f.deliveries("parser at src/p.d:12") == 1);
     auto seen = f.parent.seen[2];
@@ -287,13 +318,16 @@ unittest
 // the status on timeout.
 unittest
 {
-    auto f = new Fixture([calls(bg("b1", "mock/search")), calls(call("w", "agent_wait", `{"ids":["sub-1"],"timeout_s":30}`)),
-        LLMResponse("waited"), LLMResponse("no repeat")]);
+    // The gated child can't finish before the step that waits for it.
+    atomicStore(gateOpen, false);
+    atomicStore(gateReached, false);
+    auto f = new Fixture(new OpensGate([calls(bg("b1", "mock/gated")),
+        calls(call("w", "agent_wait", `{"ids":["sub-1"],"timeout_s":30}`)), LLMResponse("waited"), LLMResponse("no repeat")]));
     scope (exit) f.cleanup();
     assert(f.agent.run("go", new NullEvents) == "waited");
-    assert(f.toolResult("w").canFind("parser at src/p.d:12"), f.toolResult("w"));
+    assert(f.toolResult("w").canFind("gated report"), f.toolResult("w"));
     assert(f.agent.run("next", new NullEvents) == "no repeat");
-    assert(f.deliveries("parser at src/p.d:12") == 0, "agent_wait delivered it");
+    assert(f.deliveries("gated report") == 0, "agent_wait delivered it");
 
     auto g = new Fixture([calls(bg("h1", "mock/hang")), calls(call("w", "agent_wait", `{"ids":["sub-1"],"timeout_s":2}`)),
         LLMResponse("timed out")]);
@@ -357,10 +391,58 @@ unittest
     f.persist("resume");
     scope (exit) f.cleanup();
     assert(f.agent.run("go", new NullEvents) == "started");
-    f.awaitResult();
+    f.awaitDone();
     assert(f.agent.run("next", new NullEvents) == "got it");
     auto path = f.agent.log.unwrap("set").path;
     auto conv = restore(path).conversation;
     assert(conv.canFind!(m => m.content.canFind("Background sub-agent sub-1")
         && m.content.canFind("parser at src/p.d:12")), "the resumed conversation holds the result");
+}
+
+// Cancelled children are pruned like delivered ones: starting and
+// cancelling many keeps only the most recent few. Queued children (the cap
+// is held by a hanging one) cancel at once, keeping the test fast.
+unittest
+{
+    import std.format : format;
+    import nano.subagent : keepDelivered;
+    enum n = keepDelivered + 4;
+    ToolCall[] starts = [bg("h", "mock/hang")], cancels;
+    foreach (k; 0 .. n)
+    {
+        starts ~= bg(format("b%s", k), "mock/search");
+        cancels ~= call(format("c%s", k), "agent_cancel", format(`{"id":"sub-%s","reason":"r"}`, k + 2));
+    }
+    auto f = new Fixture([calls(starts), calls(cancels), calls(call("s", "agent_status", `{}`)), LLMResponse("done")]);
+    scope (exit) f.cleanup();
+    f.agent.subagentMaxConcurrency = 1;
+    assert(f.agent.run("go", new NullEvents) == "done");
+    auto st = f.toolResult("s");
+    assert(st.count("\n") + 1 == keepDelivered + 1, st); // the hanging one plus the kept few
+}
+
+// A host that can't serve background children between prompts (ACP)
+// refuses them; a blocking one still runs.
+unittest
+{
+    auto f = new Fixture([calls(bg("b1", "mock/search")), LLMResponse("refused")]);
+    scope (exit) f.cleanup();
+    f.agent.backgroundSubagents = false;
+    assert(f.agent.run("go", new NullEvents) == "refused");
+    assert(f.toolResult("b1").canFind("background sub-agents are not available here"), f.toolResult("b1"));
+    assert(!f.agent.subagentsActive);
+}
+
+// Loading another session stops the children of the one being left.
+unittest
+{
+    import nano.session : restore, Restored;
+    import nano.option : Option;
+    auto f = new Fixture([calls(bg("b1", "mock/hang")), LLMResponse("started")]);
+    scope (exit) f.cleanup();
+    assert(f.agent.run("go", new NullEvents) == "started");
+    assert(f.agent.subagentsActive);
+    Restored r;
+    f.agent.loadRestored(r, Option!SessionLog.init);
+    assert(!f.agent.subagentsActive, "the loader stopped them");
 }

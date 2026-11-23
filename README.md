@@ -85,7 +85,8 @@ Slash commands work mid-turn too, where it is safe:
 **Esc Esc** (twice within a second) or **Ctrl-C** cancels
 the running turn, killing any running bash command; a second Ctrl-C at the prompt exits.
 At the idle prompt, **Esc Esc** instead clears the input, so a half-typed or pasted prompt
-can be discarded without deleting it character by character.
+can be discarded without deleting it character by character; while background sub-agents run,
+it also stops them.
 With piped (non-terminal) stdin, lines read during a turn are queued as later prompts
 (never steer).
 
@@ -546,9 +547,11 @@ A background result is delivered once: as a reminder before the agent's next mod
 idle prompt, as an automatic turn (like a fired timer); an `agent_wait` or `agent_cancel` that returns
 it counts as delivery. Background and blocking sub-agents share `subagent_max_concurrency` (extra
 ones queue). A background sub-agent may outlive the turn that started it; its tool calls are served
-between the agent's steps and at the idle prompt. Esc Esc stops every sub-agent, background ones
-included; `/exit`, `/restart`, `/resume` and a relaunch stop them too (their logs stay, and a result
-never delivered is recorded in the session log). Their tool calls go through the session's policy
+between the agent's steps and at the idle prompt (the plain, no-editor prompt too). Esc Esc, mid-turn
+or at the idle prompt, stops every sub-agent, background ones included; `/exit`, `/restart`,
+`/resume`, an ACP `session/load`, the end of a `-p` run and a relaunch stop them too (their logs stay,
+and a result never delivered is recorded in the session log). Under `--acp`, which has no idle loop
+to serve them between prompts, `background: true` is refused; blocking sub-agents still run. Their tool calls go through the session's policy
 and hooks as above; the progress display shows them, and in Herdr the pane shows as working while
 any run.
 
