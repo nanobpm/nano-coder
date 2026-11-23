@@ -1,0 +1,111 @@
+/// The `session_settings` tool (issue #293): the agent reads and adjusts
+/// its own session's compaction, within the allowlist, logged and shown.
+module nano.agent_settings_test;
+@safe:
+
+version (unittest):
+
+import std.algorithm : all, any, canFind, filter, map, startsWith;
+import std.array : join;
+import std.array : array;
+import std.file : exists, readText, rmdirRecurse, tempDir;
+import std.json : JSONValue, parseJSON;
+import std.path : buildPath;
+import std.string : lineSplitter;
+import nano.agent;
+import nano.llm;
+import nano.option : some, unwrap;
+import nano.permissions : Policy;
+import nano.providers.mock : MockClient;
+import nano.session : SessionLog;
+import nano.tools : ToolRegistry;
+import ctx = nano.context;
+import nano.extract : extractHeader;
+
+private:
+
+LLMResponse call(string id, string args) { return LLMResponse("", "", [ToolCall.fromRaw(id, "session_settings", args)]); }
+
+Agent logged(string name, MockClient mock)
+{
+    auto dir = buildPath(tempDir, "nano-d-agent-settings-" ~ name);
+    if (dir.exists) rmdirRecurse(dir);
+    auto reg = new ToolRegistry;
+    reg.register(ToolDefinition("echo", "echo", parseJSON(`{"type":"object"}`)), (JSONValue a) => "pong");
+    auto agent = new Agent(mock, reg, Policy.init, "sys");
+    auto log = new SessionLog(dir, "mock/m", "/w");
+    log.append(agent.messages[0]);
+    agent.log = some(log);
+    return agent;
+}
+
+JSONValue[] records(Agent agent)
+{
+    JSONValue[] rs;
+    foreach (line; readText(agent.log.unwrap("logged").path).lineSplitter) rs ~= parseJSON(line);
+    return rs;
+}
+
+string[] settingsResults(MockClient mock)
+{
+    return mock.seen[$ - 1].filter!(m => m.role == Role.tool && m.toolName == "session_settings")
+        .map!(m => m.content).array;
+}
+
+// get reports the effective settings; set changes this session's mode,
+// logs it, and a second change inside the cooldown is refused.
+unittest
+{
+    auto mock = new MockClient([call("g", `{"action":"get"}`),
+        call("s1", `{"action":"set","key":"compaction_mode","value":"extract","reason":"huge logs ahead"}`),
+        call("s2", `{"action":"set","key":"compaction_mode","value":"smart"}`), LLMResponse("ok")]);
+    auto agent = logged("set", mock);
+    agent.compactionMode = ctx.CompactionMode.smart;
+    assert(agent.offeredTools.any!(d => d.name == "session_settings"));
+    agent.run("go", new NullEvents);
+    auto rs = settingsResults(mock);
+    assert(rs.length == 3, rs.join("|"));
+    assert(rs[0].canFind(`"compaction_mode": "smart"`) && rs[0].canFind(`"context_window"`), rs[0]);
+    assert(rs[1].canFind("smart → extract for this session"), rs[1]);
+    assert(rs[2].canFind("can change again"), rs[2]);
+    assert(agent.compactionMode == ctx.CompactionMode.extract);
+    assert(records(agent).any!(r => r["type"].str == "setting" && r["data"]["key"].str == "compaction_mode"
+        && r["data"]["old"].str == "smart" && r["data"]["new"].str == "extract" && r["data"]["reason"].str == "huge logs ahead"));
+}
+
+// Security and cost settings are refused, and change nothing.
+unittest
+{
+    auto mock = new MockClient([call("p", `{"action":"set","key":"permissions","value":"yolo"}`),
+        call("m", `{"action":"set","key":"model","value":"x/y"}`), LLMResponse("ok")]);
+    auto agent = logged("refuse", mock);
+    agent.run("go", new NullEvents);
+    auto tools = mock.seen[$ - 1].filter!(m => m.role == Role.tool).array;
+    assert(tools.length == 2 && tools.all!(t => t.isError && t.content.canFind("can't be changed by the agent")));
+    assert(!records(agent).any!(r => r["type"].str == "setting"));
+}
+
+// compact_now compacts before the next request (extract: no summary call),
+// and the replace record says the agent asked for it.
+unittest
+{
+    auto mock = new MockClient([LLMResponse("", "", [ToolCall.fromRaw("e", "echo", `{}`)]),
+        call("c", `{"action":"compact_now","mode":"extract","reason":"done with the logs"}`), LLMResponse("continued")]);
+    auto agent = logged("compact", mock);
+    agent.run("go", new NullEvents);
+    assert(mock.seen.length == 3, "no summary request for extract");
+    auto last = mock.seen[$ - 1];
+    assert(last.any!(m => m.role == Role.user && m.content.startsWith(ctx.smartSummaryPrefix) && m.content.canFind(extractHeader)));
+    assert(records(agent).any!(r => r["type"].str == "replace" && r["data"]["mode"].str == "extract"
+        && r["data"]["trigger"].str == "agent"));
+    assert(records(agent).any!(r => r["type"].str == "setting" && r["data"]["key"].str == "compact_now"));
+    assert(agent.compactionMode == ctx.CompactionMode.standard, "compact_now does not change the session mode");
+}
+
+// Turning the tool off (as sub-agents do) withdraws it.
+unittest
+{
+    auto agent = logged("off", new MockClient([]));
+    agent.settingsTools = false;
+    assert(!agent.offeredTools.any!(d => d.name == "session_settings"));
+}

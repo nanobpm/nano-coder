@@ -75,6 +75,8 @@ immutable string[] planAllowedTools = [
     "read_file", "grep", "glob", "get_time", "plan_add", "plan_update", "plan_show",
     // Timers are session state, not workspace changes: a plan can wait.
     "timer_set", "timer_list", "timer_cancel", "timer_done",
+    // Session settings change the harness, not the workspace.
+    "session_settings",
     "load_skill",
     "report_outcome", "question", "history_search", "history_read", "sessions_list", "memory_search",
     // Read-only sub-agents: their own calls are checked against plan mode.

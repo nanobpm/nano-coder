@@ -605,6 +605,7 @@ SubResult runChild(immutable SubSpec spec, immutable(SubClientFactory) factory, 
         st.agent = some(agent);
         agent.planTools = false;
         agent.timerTools = false;
+        agent.settingsTools = false;
         agent.outcomeTool = true;
         agent.verifyBeforeComplete = false;
         agent.maxIterations = spec.limits.turns + 2;
