@@ -18,7 +18,7 @@ import nano.memory;
 import nano.memsecret : looksLikeSecret, evidenceStatesLabelValue;
 import nano.safeio : jsonText, readBytes, utf8Text;
 import nano.clock : wallNow;
-import std.algorithm : any, canFind, filter, map, max, sort;
+import std.algorithm : all, any, canFind, filter, map, max, sort;
 import std.array : array, join;
 import std.format : format;
 import std.json;
@@ -169,7 +169,11 @@ Proposal[] parseProposals(string reply, const string[] batchIds, const string[] 
     if (!tryParseJson(reply[a .. b + 1], j) || j.type != JSONType.object) { invalid = 1; return r; }
     JSONValue[] list(string k)
     {
-        if (auto v = k in j) if (v.type == JSONType.array) return v.arrayNoRef;
+        if (auto v = k in j)
+        {
+            if (v.type == JSONType.array) return v.arrayNoRef;
+            invalid++; // a present but non-array collection is schema-invalid, not an empty one
+        }
         return null;
     }
     string str(JSONValue v, string k)
@@ -286,6 +290,7 @@ Applied apply(ref Entry[] entries, const Proposal[] accepted, const EntityRecord
         // as secret-like (in any field or split across fields) is rolled back.
         auto before = entries.dup;
         auto counts = n;
+        bool rollback; // a merge that can't keep every dropped entry's evidence
         p.match!(
             (const TagProposal t) {
                 auto i = at(t.id);
@@ -320,8 +325,14 @@ Applied apply(ref Entry[] entries, const Proposal[] accepted, const EntityRecord
                     if (d.evidence !is null && d.evidence != keep.evidence)
                     {
                         auto joined = keep.evidence is null ? d.evidence : keep.evidence ~ "; " ~ d.evidence;
-                        if (joined.byDchar.walkLength <= maxEvidenceChars && looksLikeSecret(joined) is null)
-                            keep.evidence = joined;
+                        // Superseding an entry whose evidence can't be kept would lose its
+                        // verification source: roll the whole merge back instead.
+                        if (joined.byDchar.walkLength > maxEvidenceChars || looksLikeSecret(joined) !is null)
+                        {
+                            rollback = true;
+                            return;
+                        }
+                        keep.evidence = joined;
                     }
                     if (keep.factKind is null) keep.factKind = d.factKind;
                     if (keep.kind is null && d.kind !is null) keep.kind = d.kind;
@@ -348,7 +359,7 @@ Applied apply(ref Entry[] entries, const Proposal[] accepted, const EntityRecord
                 if (!entries[w].supersedes.canFind(entries[o].id)) entries[w].supersedes ~= entries[o].id;
                 n.superseded++;
             });
-        bool refused;
+        bool refused = rollback;
         foreach (i, ref e; entries) if (e != before[i] && entryLooksSecret(e)) refused = true;
         if (refused)
         {
@@ -358,6 +369,44 @@ Applied apply(ref Entry[] entries, const Proposal[] accepted, const EntityRecord
         }
     }
     return n;
+}
+
+/// The ids of the entries `p` changes.
+const(string)[] touchedIds(const Proposal p) pure
+{
+    return p.match!(
+        (const TagProposal t) => [t.id],
+        (const MergeProposal m) => [m.keep] ~ m.drop.dup,
+        (const SupersedeProposal s) => [s.old, s.newer]);
+}
+
+/// Whether `a` and `b` hold the same memory content (usage stamps aside).
+bool sameContent(const Entry a, const Entry b) pure
+{
+    return a.id == b.id && a.text == b.text && a.evidence == b.evidence && a.kind == b.kind
+        && a.anchors == b.anchors && a.hasAnchors == b.hasAnchors && a.entities == b.entities
+        && a.factKind == b.factKind && a.supersedes == b.supersedes && a.validWhile == b.validWhile
+        && a.supersededBy == b.supersededBy && a.verifiedAt == b.verifiedAt;
+}
+
+/// The proposals of `accepted` whose touched entries are unchanged between
+/// the `reviewed` snapshot and `current`; `stale` counts the rest.
+Proposal[] freshOnly(Proposal[] accepted, const Entry[] reviewed, const Entry[] current, out size_t stale)
+{
+    bool same(string id)
+    {
+        ptrdiff_t r = -1, c = -1;
+        foreach (i, ref e; reviewed) if (e.id == id) r = i;
+        foreach (i, ref e; current) if (e.id == id) c = i;
+        return r >= 0 && c >= 0 && sameContent(reviewed[r], current[c]);
+    }
+    Proposal[] o;
+    foreach (p; accepted)
+    {
+        if (touchedIds(p).all!(id => same(id))) o ~= p;
+        else stale++;
+    }
+    return o;
 }
 
 /// One line describing a proposal, quoting the entries it touches.
@@ -435,13 +484,21 @@ struct Progress
 /// `root/backups/migrate-<stamp>/`; returns that directory.
 string backup(string root)
 {
-    import std.file : dirEntries, SpanMode, exists, isFile;
+    import std.file : dirEntries, SpanMode, exists, isFile, mkdir, mkdirRecurse, FileException;
     import std.string : startsWith, endsWith;
     auto t = wallNow;
     auto base = buildPath(root, "backups", format("migrate-%04d%02d%02d-%02d%02d%02d", t.year, t.month, t.day,
         t.hour, t.minute, t.second));
-    auto dir = base;
-    for (int i = 2; dir.exists; i++) dir = format("%s-%s", base, i);
+    // Reserve the directory atomically: mkdir fails when it exists, so two
+    // migrations starting in the same second never share (and overwrite) a backup.
+    mkdirRecurse(dirName(base));
+    string dir;
+    for (int i = 1; ; i++)
+    {
+        dir = i == 1 ? base : format("%s-%s", base, i);
+        try { mkdir(dir); break; }
+        catch (FileException e) { if (!dir.exists) throw e; }
+    }
     foreach (string p; dirEntries(root, SpanMode.depth))
     {
         auto rel = p[root.length .. $];
@@ -552,9 +609,13 @@ Report migrate(Store store, Ask ask, Ui ui, Options opts)
         {
             // Re-read: an earlier batch (or another session) may have changed the scope.
             auto now = store.scopeEntries(s);
-            string[] cur, ids;
+            progress = Progress.load(store.root); // another session may have reviewed some meanwhile
+            string[] cur, ids, want;
             foreach (ref e; now) if (!e.isSuperseded) cur ~= e.id;
-            const(Entry)[] live = batch.filter!(b => cur.canFind(b.id)).array;
+            foreach (ref b; batch) want ~= b.id;
+            // Ask about the entries as they are now, and only those still untagged and unreviewed.
+            const(Entry)[] live = now.filter!(e => !e.isSuperseded && want.canFind(e.id) && untagged(e)
+                && !progress.has(file, e.id)).array;
             foreach (ref e; live) ids ~= e.id;
             if (!live.length) continue;
             rep.batches++;
@@ -586,7 +647,15 @@ Report migrate(Store store, Ask ask, Ui ui, Options opts)
             {
                 if (rep.backup is null) { rep.backup = backup(store.root); ui.say("Backed up the memory files to " ~ rep.backup); }
                 Applied got;
-                store.editEntries(s, (ref Entry[] es, const EntityRecord[] records) { got = apply(es, accepted, records); });
+                size_t stale;
+                store.editEntries(s, (ref Entry[] es, const EntityRecord[] records) {
+                    // Apply only what the user reviewed: a proposal whose entries changed since
+                    // (another migration or session) would overwrite newer content.
+                    got = apply(es, freshOnly(accepted, now, es, stale), records);
+                });
+                if (stale) ui.say(format("Skipped %s proposal%s whose entries changed since review; re-run to review them again.",
+                    stale, stale == 1 ? "" : "s"));
+                got.skipped += stale;
                 rep.tagged += got.tagged;
                 rep.merged += got.merged;
                 rep.superseded += got.superseded;

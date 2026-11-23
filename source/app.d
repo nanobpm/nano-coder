@@ -4140,6 +4140,8 @@ int runMain(string[] args)
                         if (!dry && editor.isNone) { writeln("/memory migrate needs an interactive terminal"); continue; }
                         auto ui = editor.match!(e => editorMigrateUi(e), () => plainMigrateUi());
                         bool migrated;
+                        // A cancelled earlier turn leaves the flag set and the client polls it.
+                        agent.control.startTurn();
                         writeln(runMemoryMigrate(memory.unwrap("checked above"), agent.client, ui, dry, migrated));
                         // Applied batches (even before a later failure) change the memory index in the
                         // system prompt and which ids it shows in full: reinstall it.

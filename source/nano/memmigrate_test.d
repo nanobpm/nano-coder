@@ -352,3 +352,43 @@ unittest // a wholly invalid model reply leaves the batch pending
     assert(rep.invalid > 0);
     assert(!Progress.load(f.s.root).has("user.jsonl", f.dupA));
 }
+
+unittest // a present but non-array proposal collection counts as invalid
+{
+    size_t bad;
+    auto ps = parseProposals(`{"tags":{"id":"a","fact_kind":"fact"}}`, ["a"], ["a"], bad);
+    assert(!ps.length && bad == 1);
+}
+
+unittest // a merge that can't keep the dropped entry's evidence is rolled back whole
+{
+    import std.array : replicate;
+    Entry k, d;
+    k.id = "k"; k.text = "keep notes"; k.evidence = "a".replicate(300);
+    d.id = "d"; d.text = "drop notes"; d.evidence = "b".replicate(300);
+    Entry[] es = [k, d];
+    auto got = apply(es, [Proposal(MergeProposal("k", ["d"], null, null))], null);
+    assert(got.merged == 0 && got.skipped == 1);
+    assert(!es[1].isSuperseded && es[0].evidence == k.evidence);
+}
+
+unittest // proposals whose entries changed since review are not applied
+{
+    Entry a, b;
+    a.id = "a"; a.text = "one";
+    b.id = "b"; b.text = "two";
+    auto reviewed = [a, b];
+    auto changed = b;
+    changed.text = "two, edited elsewhere";
+    size_t stale;
+    auto ps = freshOnly([Proposal(TagProposal("a", ["tool:git"], null)), Proposal(MergeProposal("a", ["b"], null, null))],
+        reviewed, [a, changed], stale);
+    assert(ps.length == 1 && stale == 1);
+}
+
+unittest // concurrent backups reserve distinct directories
+{
+    auto f = fixture("backup-race");
+    auto x = backup(f.s.root), y = backup(f.s.root);
+    assert(x != y && x.exists && y.exists);
+}
