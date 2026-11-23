@@ -612,6 +612,44 @@ unittest
     assert(stopped);
 }
 
+// End to end through a real Agent (issue #322): the cancel lands after the
+// first request's steers drained, and the
+// model answers that request without tools. The queued reminder keeps the
+// turn going, so a second request goes out carrying it.
+unittest
+{
+    import nano.agent : Agent;
+    import nano.tools : ToolRegistry;
+    import nano.permissions : Policy;
+    import nano.providers.mock : MockClient;
+    import nano.option : some;
+    import std.algorithm : any;
+    immutable spec = SubSpec(0, "c", "t", "m", "s", null, SubLimits.init);
+    auto ab = SubAbort.make;
+    auto st = new ChildEvents(spec, Chan!SubMsg.make, Chan!ToolReply.make, ab);
+    bool[] reminded;
+    auto client = new class MockClient
+    {
+        this() { super([]); }
+        override LLMResponse chat(const ref ChatRequest req, StreamSink sink)
+        {
+            reminded ~= req.messages.any!(m => m.content.canFind("call report_outcome now"));
+            if (reminded.length > 1) return LLMResponse("the report");
+            // The cancel lands after this request's steers drained; this is
+            // the detection generationStart's late path performs.
+            ab.wrapUp();
+            st.checkLimits();
+            return LLMResponse("still looking");
+        }
+    };
+    auto agent = new Agent(client, new ToolRegistry, Policy.init, "s");
+    st.agent = some(agent);
+    agent.verifyBeforeComplete = false;
+    agent.run("go", st);
+    assert(reminded.length >= 2, "a tool-free reply must not end the turn before the reminder");
+    assert(!reminded[0] && reminded[1], "the next request carries the report reminder");
+}
+
 /// The text of the child's latest assistant reply, for a partial report.
 private string lastAssistantText(const Message[] ms) pure
 {
