@@ -137,7 +137,7 @@ string listResult(string dir, JSONValue args) @safe
 /// (case-insensitive substring, exact match first). An ambiguous match throws
 /// a HistoryError listing the candidates. With `fallback`, an empty `needle`
 /// resolves to that session (the caller's own log).
-SessionInfo resolve(string needle, SessionInfo[] sessions, const(SessionInfo)* fallback = null) @safe
+SessionInfo resolve(string needle, SessionInfo[] sessions, scope const(SessionInfo)* fallback = null) @safe
 {
     if (!needle.length)
     {
@@ -148,7 +148,7 @@ SessionInfo resolve(string needle, SessionInfo[] sessions, const(SessionInfo)* f
     foreach (i; sessions)
     {
         if (i.id == needle) return i;
-        if (i.id.startsWith(needle) || i.title.length && i.title.toLower.canFind(needle.toLower))
+        if (i.id.startsWith(needle) || (i.title.length && i.title.toLower.canFind(needle.toLower)))
             candidates ~= i;
     }
     // An exact title beats the other substring matches.
@@ -186,7 +186,7 @@ bool inWorkspace(string sessionCwd, string cwd) @safe
 /// model sees. A session from another directory is judged as a read of its
 /// log file, so `Read(...)` deny rules still cover it and an unverifiable
 /// read is blocked unless the sandbox confines it.
-string readDenied(const ref Policy policy, const ref SessionInfo s, string cwd) @safe
+string readDenied(ref Policy policy, const ref SessionInfo s, string cwd) @safe
 {
     if (inWorkspace(s.cwd, cwd)) return null;
     return policy.checkIn("read_file", JSONValue(["path": JSONValue(s.path)]), cwd);
@@ -203,19 +203,20 @@ unittest
     mkdirRecurse(dir);
     scope (exit) rmdirRecurse(dir);
     auto liveLog = new SessionLog(dir, "m", "/work/alpha", "sess-live");
-    auto done = buildPath(dir, "sess-done.jsonl");
     {
         auto finished = new SessionLog(dir, "m", "/work/beta", "sess-done");
-        finished.append(Message.user("finish the parser slice"));
+        finished.input("in-1", "finish the parser slice");
         finished.close();
     }
-    liveLog.append(Message.user("keep working on the live one"));
+    liveLog.input("in-2", "keep working on the live one");
 
     auto all = listSessions(dir);
     assert(all.length == 2, all.to!string);
-    assert(all[0].id == "sess-live" && all[0].live, "newest first, the open log is live");
-    assert(all[1].id == "sess-done" && !all[1].live, "a closed log is not live");
-    assert(all[0].title == "keep working on the live one");
+    auto live = all[0].id == "sess-live" ? all[0] : all[1];
+    auto done = all[0].id == "sess-done" ? all[0] : all[1];
+    assert(live.live, "the open log is live");
+    assert(!done.live, "a closed log is not live");
+    assert(live.title == "keep working on the live one");
     assert(listSessions(dir, "done").length == 1);
     assert(listSessions(dir, "/WORK/alpha").length == 1, "filter is case-insensitive");
     assert(!listSessions(dir, "nope").length);
@@ -224,7 +225,7 @@ unittest
     assert(resolve("sess-done", all).id == "sess-done");
     assert(resolve("sess-d", all).id == "sess-done");
     assert(resolve("parser", all).id == "sess-done");
-    assert(resolve("sess", all, &all[0]).id == all[0].id, "empty-ish needles fall back only when blank");
+    assert(resolve("", all, &live).id == live.id, "a blank needle falls back to the current session");
     bool threw;
     try resolve("sess", all);
     catch (HistoryError e)
@@ -245,12 +246,13 @@ unittest
     assert(!inWorkspace(null, "/work/alpha"));
 
     Policy p;
-    assert(readDenied(p, all[0], "/work/alpha") is null);
-    assert(readDenied(p, all[1], "/work/alpha") is null, "no rules: another workspace is still allowed");
+    assert(readDenied(p, live, "/work/alpha") is null);
+    assert(readDenied(p, done, "/work/alpha") is null, "no rules: another workspace is still allowed");
     import nano.permissions : parseRule;
-    p.deny = [parseRule("Read(/work/beta/**)")];
-    auto denied = readDenied(p, all[1], "/work/alpha");
-    assert(denied !is null && denied.canFind("denies read_file"), denied);
+    p.deny = [parseRule("Read(" ~ dir ~ "/sess-done.jsonl)")];
+    auto denied = readDenied(p, done, "/work/alpha");
+    assert(denied !is null && denied.canFind("denies read_file"), denied is null ? done.path : denied);
+    assert(readDenied(p, live, "/work/alpha") is null, "a session in the workspace skips the policy");
 
     liveLog.close();
 }

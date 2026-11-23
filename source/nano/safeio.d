@@ -174,15 +174,16 @@ LockResult tryLockFile(string path) @trusted nothrow
     import core.sys.posix.fcntl : O_RDONLY;
     import core.sys.posix.unistd : close;
     import core.stdc.errno : errno, EWOULDBLOCK, EAGAIN;
-    // flock(2) takes an fd and flags, touching no memory.
-    extern (C) int flock(int, int) nothrow @nogc;
-    enum LOCK_EX = 2, LOCK_NB = 4;
     auto fd = openPath(path, O_RDONLY);
     if (fd < 0) return LockResult.unsupported;
     scope (exit) close(fd);
-    if (flock(fd, LOCK_EX | LOCK_NB) == 0) return LockResult.acquired;
+    if (flockFd(fd, flockEx | flockNb) == 0) return LockResult.acquired;
     return errno == EWOULDBLOCK || errno == EAGAIN ? LockResult.contended : LockResult.unsupported;
 }
+
+// flock(2) takes an fd and flags, touching no memory.
+private extern (C) pragma(mangle, "flock") int flockFd(int, int) nothrow @nogc @system;
+private enum flockEx = 2, flockNb = 4;
 
 /// The mode `open(2)` gives a new file created with 0666: 0666 less the
 /// process umask, read once at startup (reading it means setting it, which
