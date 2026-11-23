@@ -253,7 +253,6 @@ string kindName(ProviderKind k) pure
         case ProviderKind.openai: return "openai";
         case ProviderKind.anthropic: return "anthropic";
         case ProviderKind.githubCopilot: return "github-copilot";
-        case ProviderKind.muse: return "muse";
         case ProviderKind.mock: return "mock";
     }
 }

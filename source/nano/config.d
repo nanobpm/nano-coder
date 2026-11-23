@@ -9,7 +9,7 @@ import std.conv : to;
 import nano.safeio : jsonText, jsonPretty;
 
 import nano.skills : SkillsConfig;
-import nano.memory : MemoryMode, parseMemoryMode, defaultExpiryDays;
+import nano.memory : MemoryMode, parseMemoryMode, defaultExpiryDays, RecallMode, parseRecallMode;
 
 import std.json;
 import nano.sandbox : SandboxConfig;
@@ -70,7 +70,7 @@ string[] strings(JSONValue v) pure
     return o;
 }
 
-enum ProviderKind { openai, anthropic, githubCopilot, muse, mock }
+enum ProviderKind { openai, anthropic, githubCopilot, mock }
 
 /// A client that speaks a real provider API reports which (Rust
 /// `LLMClient::kind`). The agent takes the kind from the live client, not the
@@ -87,9 +87,11 @@ ProviderKind parseKind(string s) pure
         case "openai", "openai-compatible", "openai-chat": return ProviderKind.openai;
         case "anthropic": return ProviderKind.anthropic;
         case "github-copilot", "github_copilot", "copilot": return ProviderKind.githubCopilot;
-        case "muse", "muse-code": return ProviderKind.muse;
+        case "muse", "muse-code":
+            throw new Exception("the unofficial Meta Muse Code provider was removed (it stopped working); "
+                ~ "use another provider");
         case "mock": return ProviderKind.mock;
-        default: throw new Exception(format("unknown provider kind %s (openai, anthropic, github-copilot, muse, mock)", s));
+        default: throw new Exception(format("unknown provider kind %s (openai, anthropic, github-copilot, mock)", s));
     }
 }
 
@@ -375,7 +377,6 @@ ProviderConfig[string] presets() pure
     // No base_url: the session token names the API endpoint.
     m["github-copilot"] = preset(ProviderKind.githubCopilot, null, "GITHUB_COPILOT_OAUTH_TOKEN", "gpt-4.1");
     // The endpoint is minted alongside the API key on login.
-    m["muse"] = preset(ProviderKind.muse, null, "META_API_KEY", "muse-spark-1.3");
     {
         import nano.qwen : defaultEndpoint;
         m["qwen"] = preset(O, defaultEndpoint.baseUrl, defaultEndpoint.apiKeyEnv);
@@ -437,6 +438,9 @@ struct Config
     string[] userProviders;
     SkillsConfig skills;
     MemoryMode memory = MemoryMode.on;
+    /// `memory_recall`: how tool calls recall memories — "entity" (default) or
+    /// "anchor" (the pre-entity substring match, kept to compare or roll back).
+    string memoryRecall = "entity";
     /// Hooks: `disable_hooks` (or `--no-hooks`), `disable_project_hooks`,
     /// `claude_user_hooks`, and nano's own `[hooks]` table (Claude's shape).
     /// Offer the `plan_*` tools (`plan_tools`, default on).
@@ -588,6 +592,7 @@ struct Config
         if (auto v = "memory" in doc) c.memory = parseMemoryMode(v.str);
         if (auto v = "memory_dir" in doc) c.memoryDir = expandTilde(v.str);
         if (auto v = "memory_expiry_days" in doc) c.memoryExpiryDays = v.integer;
+        if (auto v = "memory_recall" in doc) { parseRecallMode(v.str); c.memoryRecall = v.str.strip; }
         if (auto v = "skills" in doc) c.skills = SkillsConfig.fromToml(*v);
         if (auto ps = "providers" in doc)
             foreach (name, table; ps.objectNoRef)
@@ -630,8 +635,7 @@ struct ResolvedProvider
 bool reasonsOverResponses(ProviderKind kind, string model) pure @safe
 {
     import nano.copilot : isReasoningModel;
-    // Muse always speaks Responses and always reasons.
-    return kind == ProviderKind.muse || (kind == ProviderKind.githubCopilot && isReasoningModel(model));
+    return kind == ProviderKind.githubCopilot && isReasoningModel(model);
 }
 
 /// Split `provider/model` (or a bare provider, or a bare model).
@@ -696,7 +700,7 @@ string endpointProblem(string name, const ref ProviderConfig pc, string model) p
     final switch (kind)
     {
         case ProviderKind.mock: return null;
-        case ProviderKind.githubCopilot, ProviderKind.muse:
+        case ProviderKind.githubCopilot:
             return url.length ? baseUrlProblem(name, url) : null;
         case ProviderKind.openai, ProviderKind.anthropic:
             if (url is null) return format("provider \"%s\" has no base_url", name);
@@ -1127,13 +1131,12 @@ unittest
     auto kimi = resolve(c, "kimi/kimi-k3");
     assert(kimi.config.baseUrl == "https://api.moonshot.ai/v1" && kimi.replayReasoning);
     assert(kimi.config.dropParams == ["temperature"] && kimi.config.maxTokensParam == "max_completion_tokens");
-    auto muse = resolve(c, "muse");
-    assert(muse.model == "muse-spark-1.3" && muse.replayReasoning && muse.config.baseUrl == "");
     assert(collectExceptionMsg(resolve(c, "openai")).canFind("has no default_model"));
     assert(collectExceptionMsg(resolve(c, "nope/x")) is null); // a bare model on the default provider
     c.defaultProvider = "none";
     assert(collectExceptionMsg(resolve(c, "x")).canFind("known providers: anthropic, deepseek"));
-    assert(parseKind("muse-code") == ProviderKind.muse && parseKind("openai-compatible") == ProviderKind.openai);
+    assert(parseKind("openai-compatible") == ProviderKind.openai);
+    assert(collectExceptionMsg(parseKind("muse")).canFind("was removed"));
 }
 
 unittest
@@ -1174,8 +1177,6 @@ unittest
 // rust: providers/mod.rs::finish_body_deep_merges_nested_extra_body_objects
 // rust: providers/mod.rs::finish_body_keeps_resolved_temperature
 // rust: providers/mod.rs::copilot_endpoint_override_is_validated_when_present
-// rust: providers/mod.rs::muse_endpoint_override_is_validated_when_present
-// rust: providers/mod.rs::muse_defaults_to_reasoning_replay
 // rust: providers/mod.rs::validate_spec_rejects_a_provider_without_a_model
 // rust: providers/mod.rs::user_config_overrides_and_extends_presets
 unittest
@@ -1194,16 +1195,12 @@ unittest
     scope (exit) remove(path);
     string cfg(string body_) { write(path, body_); return path; }
     foreach (url; ["not a url", "ftp://host/v1", "https://host/v1?token=x", " https://host/v1", "   "])
-        foreach (kind; ["github-copilot", "muse"])
+        foreach (kind; ["github-copilot"])
         {
             auto c = Config.load(cfg(format("[providers.p]\nkind = %s\nbase_url = %s\n", tomlQuote(kind), tomlQuote(url))));
             assert(collectExceptionMsg(resolve(c, "p/m")).canFind("base_url"), kind ~ " " ~ url);
         }
-    auto c = Config.load(cfg("[providers.muse]\nkind = \"muse\"\n"));
-    assert(resolve(c, "muse/muse-spark-1.3").replayReasoning);
-    c = Config.load(cfg("[providers.muse]\nkind = \"muse\"\nreplay_reasoning = false\n"));
-    assert(!resolve(c, "muse/muse-spark-1.3").replayReasoning);
-    c = Config.load(cfg("[providers.bare]\nkind = \"openai\"\nbase_url = \"http://localhost:9/v1\"\n"));
+    auto c = Config.load(cfg("[providers.bare]\nkind = \"openai\"\nbase_url = \"http://localhost:9/v1\"\n"));
     assert(collectExceptionMsg(resolve(c, "bare")).canFind("no model"));
     c = Config.load(cfg("[providers.ollama]\nbase_url = \"http://merlin.local:11434/v1/\"\ndefault_model = \"qwen3:8b\"\n"
         ~ "[providers.ds4]\nkind = \"openai\"\nbase_url = \"http://localhost:8100/v1\"\ndefault_model = \"m\"\n"));

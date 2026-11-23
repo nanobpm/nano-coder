@@ -58,31 +58,6 @@ unittest
         .stopReason == "max_output_tokens");
 }
 
-// rust: providers/openai_responses.rs::muse_reasoning_round_trips_and_suppresses_temperature
-unittest
-{
-    import nano.config : Config, presets, resolve;
-    Config cfg;
-    cfg.providers = presets();
-    auto p = resolve(cfg, "muse/muse-spark-1.3");
-    assert(p.replayReasoning, "Muse must default to reasoning replay");
-    auto reasoning = parseJSON(`{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"plan"}],"encrypted_content":"enc"}`);
-    auto value = parseJSON(`{"status":"completed","output":[` ~ reasoning.toString
-        ~ `,{"type":"function_call","call_id":"c1","name":"bash","arguments":"{}"}]}`);
-    auto r = parseResponses(value, p.replayReasoning);
-    assert(r.thinkingBlocks == [reasoning]);
-    auto reply = Message.assistant("", [ToolCall.fromRaw("c1", "bash", `{}`)]);
-    reply.thinkingBlocks = r.thinkingBlocks;
-    ChatRequest req;
-    req.messages = [Message.user("go"), reply, Message.toolResult("c1", "bash", "ok")];
-    req.temperature = 0.7;
-    auto b = responsesBody(req, p, false);
-    assert(b["include"] == parseJSON(`["reasoning.encrypted_content"]`) && b["store"] == JSONValue(false));
-    assert("temperature" !in b, "Muse reasoning model kept temperature");
-    auto input = b["input"].arrayNoRef;
-    assert(input[1] == reasoning && input[2]["type"].str == "function_call" && input[2]["call_id"].str == "c1");
-}
-
 // rust: providers/openai_responses.rs::omits_temperature_for_reasoning_models_only
 unittest
 {

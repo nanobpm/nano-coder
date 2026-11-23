@@ -768,3 +768,64 @@ unittest
     agent2.loadRestored(r2, some(new SessionLog(path)));
     agent2.log.unwrap("adopted").close();
 }
+
+// A log from before compaction pinned only user requests holds folded tool
+// and assistant turns in `pinned_requests`, extended by later deltas (issue
+// #301). Resume keeps only the user requests, and the next compaction
+// restates the stash in full, so the log stops carrying the rest.
+unittest
+{
+    import std.algorithm : canFind, filter, map;
+    import std.array : array, split;
+    import std.file : mkdirRecurse, write, append;
+    import ctx = nano.context;
+    auto dir = freshDir("legacy-pins");
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    static string line(string type, JSONValue data)
+    {
+        return JSONValue(["type": JSONValue(type), "data": data]).toString ~ "\n";
+    }
+    static JSONValue recs(Message[] ms)
+    {
+        JSONValue[] o;
+        foreach (m; ms) o ~= messageRecord(m);
+        return JSONValue(o);
+    }
+    auto big = Message.toolResult("c1", "bash", "x".replicateText(4096));
+    JSONValue first = ["messages": recs([Message.system("sys"), Message.user("summary one")])];
+    first["pinned_requests"] = recs([Message.user("first goal"), Message.assistant("thinking aloud"), big]);
+    JSONValue second = ["messages": recs([Message.system("sys"), Message.user("summary two")])];
+    second["pinned_requests"] = recs([Message.user("second goal")]);
+    second["pinned_base"] = 3;
+    auto path = buildPath(dir, "legacy.jsonl");
+    write(path, `{"type":"session","data":{"version":1,"id":"legacy","created_at":"x"}}` ~ "\n"
+        ~ line("replace", first) ~ line("replace", second));
+
+    auto r = restore(path);
+    assert(r.pinStash.length == 4, "the delta still extends the right prefix");
+    assert(r.pinStash[2].content.length == 0, "a legacy tool entry is not held in full");
+
+    auto agent = new Agent(new MockClient([LLMResponse("ok"), LLMResponse("ok again")]), echoTools, Policy.init, "sys");
+    assert(agent.loadRestored(r, some(new SessionLog(path))).length == 0);
+    assert(agent.pinStash.map!(m => m.content).array == ["first goal", "second goal"]);
+    assert(agent.pinStashRestate);
+
+    agent.compactionMode = ctx.CompactionMode.extract;
+    agent.run("third goal", new NullEvents);
+    agent.run("fourth goal", new NullEvents);
+    CompactReport report;
+    assert(agent.compact(report));
+    assert(!agent.pinStashRestate, "a restatement is written once");
+    auto last = readText(path).split("\n").filter!(l => l.canFind(`"type":"replace"`)).array[$ - 1];
+    assert(!last.canFind(`"pinned_base"`), "the stash is restated in full");
+    auto again = restore(path);
+    assert(again.pinStash.map!(m => m.content).array.canFind("first goal")
+        && !again.pinStash.canFind!(m => m.role != Role.user), "the rewritten log pins only user requests");
+}
+
+string replicateText(string s, size_t n) pure
+{
+    import std.array : replicate;
+    return s.replicate(n);
+}

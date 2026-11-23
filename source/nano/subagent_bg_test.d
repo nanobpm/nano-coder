@@ -13,11 +13,12 @@ import std.algorithm : canFind, count;
 import std.file : exists, readText, rmdirRecurse, tempDir;
 import std.json : JSONValue, parseJSON;
 import std.path : buildPath;
+import std.conv : to;
 import nano.agent;
 import nano.clock : sleepFor, monoNow, FakeClock, wallNow;
 import nano.control : Cancelled, cancelRequested;
 import nano.llm;
-import nano.option : some, unwrap;
+import nano.option : Option, some, unwrap;
 import nano.permissions : Policy;
 import nano.providers.mock : MockClient;
 import nano.session : SessionLog;
@@ -437,7 +438,6 @@ unittest
 unittest
 {
     import nano.session : restore, Restored;
-    import nano.option : Option;
     auto f = new Fixture([calls(bg("b1", "mock/hang")), LLMResponse("started")]);
     scope (exit) f.cleanup();
     assert(f.agent.run("go", new NullEvents) == "started");
@@ -474,4 +474,125 @@ unittest
     string[] names;
     foreach (e; dirEntries(childDir, SpanMode.shallow)) names ~= e.name.baseName;
     assert(names.canFind!(n => n.startsWith("sub-1.")) && names.canFind!(n => n.startsWith("sub-2.")), format("%s", names));
+}
+
+// `/subagents` lists every sub-agent of the session in mixed states, with
+// finished blocking ones kept after their reply (issue #267).
+unittest
+{
+    auto f = new Fixture([calls(call("k1", "agent", `{"task":"blocking one\nsecond line","model":"mock/search"}`),
+        bg("b1", "mock/hang"), bg("b2", "mock/search")), LLMResponse("three")]);
+    f.persist("list");
+    scope (exit) f.cleanup();
+    f.agent.subagentMaxConcurrency = 1;
+    assert(f.agent.run("go", new NullEvents) == "three");
+    size_t forgotten;
+    auto all = f.agent.subagentList(forgotten);
+    assert(forgotten == 0 && all.length == 3, all.length.to!string);
+    assert(all[0].id == "sub-1" && all[0].state == "done" && all[0].task == "blocking one" && !all[0].background
+        && all[0].model == "mock/search" && all[0].turns == 2 && all[0].logPath.length);
+    assert(all[1].id == "sub-2" && all[1].state == "running" && all[1].background);
+    assert(all[2].id == "sub-3" && all[2].state == "queued");
+    assert(f.agent.subagentLog("sub-1").isOk && f.agent.subagentLog("sub-3").isErr
+        && f.agent.subagentLog("sub-9").isErr);
+    // Leaving the session (`/new`, `/restart`) forgets its sub-agents.
+    f.agent.restart("sys", Option!(imported!"nano.session".SessionLog).init);
+    all = f.agent.subagentList(forgotten);
+    assert(forgotten == 0 && all.length == 0, all.length.to!string);
+    assert(f.agent.stopSubagentsByUser("sub-1").canFind("No sub-agent sub-1"));
+}
+
+// The UI's id snapshot is refreshed mid-turn: `onSubagentsChanged` fires on
+// the agent's thread as the turn launches sub-agents, and the non-polling
+// snapshot it reads already lists them (issue #267).
+unittest
+{
+    auto f = new Fixture([calls(bg("b1", "mock/hang"), bg("b2", "mock/search")), LLMResponse("two")]);
+    f.persist("changed");
+    scope (exit) f.cleanup();
+    f.agent.subagentMaxConcurrency = 1;
+    string[] seen;
+    f.agent.onSubagentsChanged = () {
+        size_t forgotten;
+        seen = null;
+        foreach (ref i; f.agent.subagentSnapshot(forgotten)) seen ~= i.id;
+    };
+    assert(f.agent.run("go", new NullEvents) == "two");
+    assert(seen == ["sub-1", "sub-2"], seen.to!string);
+    f.agent.stopSubagents();
+}
+
+// `/subagents stop <id>`: the child reports what it has, marked cancelled,
+// and the parent gets it as a background result; an ended one says so.
+unittest
+{
+    auto f = new Fixture([calls(bg("b1", "mock/loop")), LLMResponse("started"), LLMResponse("saw it")]);
+    f.persist("userstop");
+    scope (exit) f.cleanup();
+    assert(f.agent.run("go", new NullEvents) == "started");
+    auto said = f.agent.stopSubagentsByUser("sub-1");
+    assert(said.canFind("Stopped sub-1"), said);
+    assert(!f.agent.subagentsActive);
+    assert(f.agent.stopSubagentsByUser("sub-1").canFind("already ended (cancelled)"));
+    assert(f.agent.stopSubagentsByUser("sub-7").canFind("No sub-agent sub-7"));
+    assert(f.agent.backgroundResultsReady());
+    assert(f.agent.run("next", new NullEvents) == "saw it");
+    auto seen = f.parent.seen[2];
+    assert(seen.canFind!(m => m.content.canFind("partial: half done") && m.content.canFind("ended: cancelled")
+        && m.content.canFind("cancelled by the user")), "the model got the cancelled result");
+    assert(readText(f.agent.log.unwrap("set").path).canFind(`"text":"stopped by the user"`));
+}
+
+// `/subagents stop all`: running and queued ones; one that can't report is
+// cut off (fake time).
+unittest
+{
+    auto f = new Fixture([calls(bg("b1", "mock/hang"), bg("b2", "mock/loop"), bg("b3", "mock/search")),
+        LLMResponse("started")]);
+    scope (exit) f.cleanup();
+    f.agent.subagentMaxConcurrency = 2;
+    assert(f.agent.run("go", new NullEvents) == "started");
+    string said;
+    {
+        auto clock = FakeClock.install(wallNow);
+        said = f.agent.stopSubagentsByUser("all");
+    }
+    assert(said.canFind("sub-1") && said.canFind("sub-2") && said.canFind("sub-3"), said);
+    assert(!f.agent.subagentsActive);
+    size_t forgotten;
+    foreach (ref i; f.agent.subagentList(forgotten)) assert(i.state == "cancelled", i.id ~ " " ~ i.state);
+    assert(f.agent.stopSubagentsByUser("all") == "No sub-agent is running.");
+    string notice;
+    auto text = f.agent.takeBackgroundResults(notice);
+    assert(text.canFind("cut off") && text.canFind("cancelled before the sub-agent started"), text);
+}
+
+// The combined `/subagents` snapshot stays oldest first even when a
+// later-launched child is archived before an earlier one still running
+// (issue #267): pruning delivered results past `keepDelivered` archives
+// them in finish order, not launch order.
+unittest
+{
+    import nano.subagent : keepDelivered;
+    import std.format : format;
+    import std.range : iota;
+    import std.algorithm : map;
+    import std.array : array;
+    atomicStore(gateOpen, false);
+    scope (exit) atomicStore(gateOpen, false);
+    LLMResponse[] script = [LLMResponse("", "", [bg("b1", "mock/gated")]
+        ~ iota(2, cast(int) keepDelivered + 2).map!(i => bg(format("b%s", i), "mock/search")).array),
+        LLMResponse("launched"), LLMResponse("saw them")];
+    auto f = new Fixture(new OpensGate(script));
+    scope (exit) f.cleanup();
+    assert(f.agent.run("go", new NullEvents) == "launched");
+    // The quick children finish and are delivered while the gated sub-1
+    // still runs; pruning archives sub-2..sub-17 ahead of it.
+    assert(f.agent.run("next", new NullEvents) == "saw them");
+    size_t forgotten;
+    auto all = f.agent.subagentList(forgotten);
+    assert(all.length == keepDelivered + 1, all.length.to!string);
+    foreach (k, ref i; all) assert(i.id == format("sub-%s", k + 1), i.id);
+    foreach (k; 1 .. all.length) assert(all[k - 1].seq < all[k].seq);
+    f.agent.stopSubagents();
 }

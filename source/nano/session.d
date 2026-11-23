@@ -23,10 +23,10 @@ import std.stdio : fileno;
 import std.datetime.systime : Clock;
 import core.time : dur;
 import std.process : environment, thisProcessID;
-import std.algorithm : sort, filter, map;
+import std.algorithm : sort, filter, map, min;
 import std.array : array;
 import nano.llm;
-import nano.option : Option, some, ifSome;
+import nano.option : Option, some, ifSome, match;
 import nano.plan : Plan;
 
 /// The extension tidy-up compresses a session log to (`<id>.jsonl.gz`).
@@ -58,8 +58,11 @@ string logText(string path)
 
 // zlib's C API writes only within the caller's buffers (sizes tracked in
 // avail_in/avail_out); the stream struct is plain C data.
+/// A corrupt or truncated stream throws `FileException`, so readers that
+/// report unreadable files handle it too.
 private string gunzipLog(const(ubyte)[] bytes, string path) @trusted
 {
+    import std.file : FileException;
     import etc.c.zlib : z_stream, inflateInit2, inflate, inflateEnd, Z_FINISH, Z_NO_FLUSH, Z_STREAM_END, Z_OK, Z_BUF_ERROR;
     import core.stdc.string : strlen;
     // A gzip wrapper needs raw inflate with windowBits 31 (15 + the 16 that
@@ -90,10 +93,10 @@ private string gunzipLog(const(ubyte)[] bytes, string path) @trusted
         used += window - zs.avail_out;
         if (rc == Z_STREAM_END) break;
         if (rc != Z_OK && rc != Z_BUF_ERROR)
-            throw new Exception(format("gunzip %s: %s", path,
+            throw new FileException(path, format("gunzip: %s",
                 zs.msg !is null ? zs.msg[0 .. strlen(zs.msg)] : "corrupt stream"));
         if (rc == Z_BUF_ERROR && zs.avail_in == 0 && fed == bytes.length && zs.avail_out != 0)
-            throw new Exception("gunzip " ~ path ~ ": truncated stream");
+            throw new FileException(path, "gunzip: truncated stream");
     }
     import std.exception : assumeUnique;
     import std.string : assumeUTF;
@@ -160,12 +163,14 @@ void streamLogLines(string path, scope void delegate(const(char)[] line) @safe s
 /// `streamLogLines` whose `sink` returns false to stop reading: nothing
 /// past that line is read or inflated (issue #271: the permission-header
 /// probe must not scan a denied session's whole log).
-void streamLogLinesUntil(string path, scope bool delegate(const(char)[] line) @safe sink)
+void streamLogLinesUntil(string path, scope bool delegate(const(char)[] line) @safe sink,
+    scope bool delegate(const(char)[] head) @safe keep = null)
 {
     import std.stdio : File;
     auto f = File(path, "rb");
     scope (exit) f.close();
     ubyte[] carry;
+    bool skipping;
     if (isCompressedLog(path))
     {
         auto gz = GunzipStream(path);
@@ -175,7 +180,7 @@ void streamLogLinesUntil(string path, scope bool delegate(const(char)[] line) @s
         {
             auto got = gz.read(f, buf);
             if (!got.length) break;
-            if (!feedChunk(carry, got, sink)) return;
+            if (!feedChunk(carry, skipping, got, sink, keep)) return;
         }
     }
     else
@@ -185,35 +190,55 @@ void streamLogLinesUntil(string path, scope bool delegate(const(char)[] line) @s
         {
             auto got = f.rawRead(buf);
             if (!got.length) break;
-            if (!feedChunk(carry, got, sink)) return;
+            if (!feedChunk(carry, skipping, got, sink, keep)) return;
         }
     }
 }
 
+/// The bytes of a line's start that a `keep` predicate sees.
+enum size_t lineHeadBytes = 64;
+
 /// Split one chunk into newline-terminated lines for `sink`, carrying a
-/// partial line over to the next chunk (a torn tail is dropped).
-private bool feedChunk(ref ubyte[] carry, const(ubyte)[] chunk, scope bool delegate(const(char)[]) @safe sink)
+/// partial line over to the next chunk (a torn tail is dropped). `keep`, if
+/// set, sees each line's first `lineHeadBytes` (or the whole of a shorter
+/// line): a line it rejects is skipped unbuffered, so a multi-megabyte
+/// record the caller doesn't want is never assembled (issue #234).
+private bool feedChunk(ref ubyte[] carry, ref bool skipping, const(ubyte)[] chunk,
+    scope bool delegate(const(char)[]) @safe sink, scope bool delegate(const(char)[]) @safe keep)
 {
+    import nano.safeio : asChars;
     size_t start;
     foreach (i, b; chunk)
         if (b == '\n')
         {
-            if (!emitLine(carry, chunk[start .. i], sink)) return false;
+            if (skipping) skipping = false;
+            else if (!emitLine(carry, chunk[start .. i], sink, keep)) return false;
+            carry = null;
             start = i + 1;
         }
-    if (start < chunk.length) carry ~= chunk[start .. $];
+    if (start < chunk.length && !skipping)
+    {
+        carry ~= chunk[start .. $];
+        if (keep !is null && carry.length >= lineHeadBytes && !keep(asChars(carry[0 .. lineHeadBytes])))
+        {
+            skipping = true;
+            carry = null;
+        }
+    }
     return true;
 }
 
 /// One line split out of the stream: the carried prefix plus the chunk
 /// slice, validated as UTF-8 (a malformed line is lossy-copied so a bad byte
 /// can't kill the stream; it fails to parse where decoded, as before).
-private bool emitLine(ref ubyte[] carry, const(ubyte)[] tail, scope bool delegate(const(char)[]) @safe sink)
+private bool emitLine(ref ubyte[] carry, const(ubyte)[] tail, scope bool delegate(const(char)[]) @safe sink,
+    scope bool delegate(const(char)[]) @safe keep)
 {
-    import nano.safeio : lossyText, utf8View;
+    import nano.safeio : asChars, lossyText, utf8View;
     import std.utf : UTFException;
     const(ubyte)[] line = carry.length ? carry ~ tail : tail;
     carry = null;
+    if (keep !is null && !keep(asChars(line[0 .. min(line.length, lineHeadBytes)]))) return true;
     const(char)[] text;
     try text = utf8View(line);
     catch (UTFException) text = lossyText(line);
@@ -283,6 +308,19 @@ void foreachLogLineSkippingTorn(string path, scope void delegate(const(char)[]) 
     streamLogLines(path, sink);
 }
 
+/// `foreachLogLineSkippingTorn` that skips, unbuffered, each line whose
+/// first `lineHeadBytes` `keep` rejects. A skipped line still counts as a
+/// line for `sink`'s caller: it is reported as an empty line.
+void foreachLogLineSkippingTorn(string path, scope void delegate(const(char)[]) @safe sink,
+    scope bool delegate(const(char)[] head) @safe keep)
+{
+    streamLogLinesUntil(path, (line) { sink(line); return true; }, (head) {
+        if (keep(head)) return true;
+        sink(null);
+        return false;
+    });
+}
+
 /// The working directory recorded in the log's header (null for older logs
 /// or an unreadable header), read from the first line only (issue #271:
 /// `sessions_list` checks a session's workspace before its log is opened or
@@ -346,6 +384,17 @@ size_t adoptPreviewSessions(string from, string to)
     }
     if (dirEntries(from, SpanMode.shallow).empty) collectException(rmdir(from));
     return moved;
+}
+
+unittest // a corrupt or truncated gzip log is a FileException, not a bare Exception
+{
+    import std.exception : assertThrown;
+    import std.file : FileException;
+    // A gzip header followed by garbage, and a header with no body.
+    immutable ubyte[] corrupt = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3, 0xff, 0xff, 0xff, 0xff];
+    immutable ubyte[] truncated = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
+    assertThrown!FileException(gunzipLog(corrupt, "x.jsonl.gz"));
+    assertThrown!FileException(gunzipLog(truncated, "x.jsonl.gz"));
 }
 
 unittest
@@ -1027,9 +1076,38 @@ class SessionLog
     }
 }
 
-/// Folded tool outputs longer than this keep only their log reference in
-/// the replay stash (live compactions and resumes alike).
+/// Folded tool results and assistant replies whose payload (`slimPayload`)
+/// is longer than this keep only their log reference in the replay stash
+/// (live compactions and resumes alike).
 enum size_t stashSlimBytes = 512;
+
+/// The bytes of a message's payload that a stashed copy can drop and read
+/// back from its log record: content, reasoning, and tool-call arguments.
+size_t slimPayload(const ref Message m) pure nothrow
+{
+    // Calls and provider reasoning items can hold arbitrarily large JSON
+    // that is costly to measure, so any structured payload counts as over
+    // the threshold: slimming it is always safe (the log holds it).
+    if (m.toolCalls.length || m.thinkingBlocks.length) return size_t.max;
+    return m.content.length + m.thinking.length;
+}
+
+/// Whether a stashed copy of `m` keeps only its log reference: a tool result
+/// or assistant reply with a large payload and no attachments.
+bool stashSlimmable(const ref Message m) pure nothrow
+{
+    return (m.role == Role.tool || m.role == Role.assistant) && !m.attachments.length
+        && slimPayload(m) > stashSlimBytes;
+}
+
+/// Drop the payload `stashSlimmable` measures; `rehydrateStash` restores it.
+void slimMessage(ref Message m) pure nothrow
+{
+    m.content = null;
+    m.thinking = null;
+    m.thinkingBlocks = null;
+    m.toolCalls = null;
+}
 
 /// Recover `pinText` for a user message logged before it was recorded: a
 /// legacy prompt with hook context appended (`<input>\n\n<system-reminder>…`)
@@ -1119,6 +1197,42 @@ private size_t contentDigest(const ref Message m)
     return h;
 }
 
+/// `contentDigest` plus every other field `slimMessage` drops (plain
+/// reasoning) and the timestamp `rehydrateStash` checks, so a folded copy is
+/// slimmed only when its direct record restores it exactly.
+private size_t recoveryDigest(const ref Message m)
+{
+    size_t h = contentDigest(m);
+    h = hashOf(m.thinking, h);
+    return hashOf(m.timestamp, h);
+}
+
+unittest // a folded copy differing only in discarded fields or timestamp is not recovered
+{
+    Message a;
+    a.role = Role.assistant;
+    a.content = "x";
+    a.thinking = "reasoning";
+    a.timestamp = "2026-01-01T00:00:00Z";
+    auto b = a;
+    assert(recoveryDigest(a) == recoveryDigest(b));
+    b.thinking = "other";
+    assert(contentDigest(a) == contentDigest(b));
+    assert(recoveryDigest(a) != recoveryDigest(b));
+    b = a;
+    b.timestamp = "2026-01-02T00:00:00Z";
+    assert(recoveryDigest(a) != recoveryDigest(b));
+}
+
+unittest // structured payloads (calls, reasoning items) always count as large
+{
+    Message m;
+    m.role = Role.assistant;
+    assert(!stashSlimmable(m));
+    m.toolCalls = [ToolCall.fromRaw("c", "write_file", `{"content":"` ~ "y" ~ `"}`)];
+    assert(stashSlimmable(m));
+}
+
 /// A direct message record `backfillLogLines` may match: its line and digest.
 private struct Original
 {
@@ -1147,20 +1261,6 @@ private void backfillLogLines(Message[] messages, const Original[] originals, ul
                 break;
             }
     }
-}
-
-/// The identity of a large tool result's content (issue #263): a folded
-/// stash entry whose content matches its direct record's can drop it and be
-/// read back from the log on replay.
-private struct ToolKey
-{
-    size_t length, hash;
-    string toolCallId;
-}
-
-private ToolKey toolKey(string toolCallId, const(char)[] content) pure nothrow
-{
-    return ToolKey(content.length, hashOf(content), toolCallId);
 }
 
 /// An input that was accepted but whose turn has not ended (Rust
@@ -1305,6 +1405,10 @@ private bool unescapeKey(ref const(char)[] key) pure @safe
 /// superseded compaction snapshot is skimmed, not decoded). Stops when `dg`
 /// returns false; false for text that isn't an object.
 private bool skimObject(const(char)[] obj, scope bool delegate(const(char)[] key, const(char)[] raw) @safe dg)
+    => skimObjectAt(obj, (k, s, e) => dg(k, obj[s .. e]));
+
+/// `skimObject`, giving each value as its `[start, end)` offsets in `obj`.
+private bool skimObjectAt(const(char)[] obj, scope bool delegate(const(char)[] key, size_t start, size_t end) @safe dg)
 {
     import std.ascii : isWhite;
     size_t i;
@@ -1331,7 +1435,7 @@ private bool skimObject(const(char)[] obj, scope bool delegate(const(char)[] key
         ws();
         auto ve = skipJSONValue(obj, i);
         if (ve > obj.length) return false;
-        if (!dg(key, obj[i .. ve])) return true;
+        if (!dg(key, i, ve)) return true;
         i = ve;
         ws();
         if (i < obj.length && obj[i] == ',') ++i;
@@ -1478,6 +1582,15 @@ private size_t skimCount(const(char)[] arr) pure nothrow @nogc
 void eachLogLine(string path, scope void delegate(const(char)[] line, ulong lineNo) @safe dg,
     bool requireCommitted = true)
 {
+    eachLogLineUntil(path, (const(char)[] line, ulong lineNo) { dg(line, lineNo); return true; },
+        requireCommitted);
+}
+
+/// `eachLogLine` whose `dg` returns false to stop reading: no further line
+/// is read from the file, so an early-stopping caller never scans to EOF.
+void eachLogLineUntil(string path, scope bool delegate(const(char)[] line, ulong lineNo) @safe dg,
+    bool requireCommitted = true)
+{
     ulong lineNo;
     if (isCompressedLog(path))
     {
@@ -1485,7 +1598,8 @@ void eachLogLine(string path, scope void delegate(const(char)[] line, ulong line
         auto committed = text.length;
         while (committed && text[committed - 1] != '\n') committed--;
         if (!committed && requireCommitted) throw new Exception("session log " ~ path ~ " has no committed records");
-        foreach (line; text[0 .. committed].lineSplitter) dg(line, ++lineNo);
+        foreach (line; text[0 .. committed].lineSplitter)
+            if (!dg(line, ++lineNo)) return;
         return;
     }
     import std.typecons : Yes;
@@ -1497,9 +1611,23 @@ void eachLogLine(string path, scope void delegate(const(char)[] line, ulong line
         any = true;
         auto l = line[0 .. $ - 1];
         if (l.length && l[$ - 1] == '\r') l = l[0 .. $ - 1];
-        dg(l, ++lineNo);
+        if (!dg(l, ++lineNo)) return;
     }
     if (!any && requireCommitted) throw new Exception("session log " ~ path ~ " has no committed records");
+}
+
+unittest // eachLogLineUntil stops reading at the first false
+{
+    import std.file : tempDir, remove;
+    import std.path : buildPath;
+    import std.conv : to;
+    import nano.clock : monoNow;
+    auto p = buildPath(tempDir, "nano-until-" ~ to!string(monoNow.ticks) ~ ".jsonl");
+    scope (exit) remove(p);
+    std.file.write(p, "a\nb\nc\nd\n");
+    ulong last;
+    eachLogLineUntil(p, (const(char)[] l, ulong n) { last = n; return n < 2; });
+    assert(last == 2);
 }
 
 /// Pass 1 of `restore` (issue #244): the line of the latest `replace` that
@@ -1509,18 +1637,21 @@ void eachLogLine(string path, scope void delegate(const(char)[] line, ulong line
 /// `floor` is the lowest `summarized` end of that replace and every later
 /// delta replace (an omitted range counts as 0), since `backfillLogLines`
 /// reads originals past each one's range.
-private ulong lastFullReplace(string path, out ulong floor)
+private ulong lastFullReplace(string path, out ulong floor, out ulong pinReset, out ulong lastReplace)
 {
     ulong at;
     eachLogLine(path, (line, lineNo) {
         auto type = skimType(line);
         if (type != "replace") return;
+        lastReplace = lineNo;
         auto data = skimField(line, "data");
-        bool delta;
+        bool delta, pinDelta, pins;
         ulong fl = 0;
         // Fail closed: an unreadable `data` is never taken as a full snapshot.
         immutable ok = skimObject(data, (k, v) {
             if ((k == "folded_base" || k == "pinned_base") && v != "null") delta = true;
+            if (k == "pinned_base" && v != "null") pinDelta = true;
+            else if (k == "pinned_requests") pins = true;
             else if (k == "summarized")
             {
                 // `[first, last]`: the second element, as `restore` reads it
@@ -1534,10 +1665,49 @@ private ulong lastFullReplace(string path, out ulong floor)
             return true;
         });
         if (!ok) delta = true;
+        // A full `pinned_requests` restatement replaces the pinned stash.
+        if (ok && pins && !pinDelta) pinReset = lineNo;
         if (!delta) { at = lineNo; floor = fl; }
         else if (at && fl < floor) floor = fl;
     });
     return at;
+}
+
+/// The size above which a superseded replace record's pinned requests and
+/// messages snapshot are cut out before it is decoded. Every record in the
+/// tests, so the skim-vs-full-decode equivalence tests cover the cut.
+version (unittest) private enum pinSkimBytes = 0;
+else private enum pinSkimBytes = 4096;
+
+/// `line` with its record's `data.<key>` emptied to `[]`, or `line`
+/// itself when it has none.
+private const(char)[] withoutField(const(char)[] line, string key)
+{
+    size_t ds, de, ps, pe;
+    bool data, pins;
+    skimObjectAt(line, (k, s, e) {
+        if (k != "data") return true;
+        ds = s;
+        de = e;
+        data = true;
+        return false;
+    });
+    if (!data) return line;
+    skimObjectAt(line[ds .. de], (k, s, e) {
+        if (k != key) return true;
+        ps = ds + s;
+        pe = ds + e;
+        pins = true;
+        return false;
+    });
+    return pins ? line[0 .. ps] ~ "[]" ~ line[pe .. $] : line;
+}
+
+unittest // withoutField_empties_only_that_field
+{
+    assert(withoutField(`{"type":"replace","data":{"a":1,"pinned_requests":[{"x":"]"}],"b":2}}`, "pinned_requests")
+        == `{"type":"replace","data":{"a":1,"pinned_requests":[],"b":2}}`);
+    assert(withoutField(`{"type":"replace","data":{"a":1}}`, "messages") == `{"type":"replace","data":{"a":1}}`);
 }
 
 /// Read a session log (Rust format), dropping a torn last line.
@@ -1559,7 +1729,11 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
     // the pending input, and the originals `backfillLogLines` reads past its
     // summarized range. Superseded snapshots and messages are skimmed.
     ulong floorL;
-    immutable skipBefore = skipSuperseded ? lastFullReplace(path, floorL) : 0;
+    ulong pinReset, lastReplace;
+    immutable skipBefore = skipSuperseded ? lastFullReplace(path, floorL, pinReset, lastReplace) : 0;
+    // Per decoded replace: the length of its `messages` snapshot when a later
+    // replace supersedes it, so the snapshot was not decoded.
+    Option!size_t cutMessages;
     // The conversation length before `skipBefore`, without building it.
     size_t skimmedLen;
     string pendingId;
@@ -1574,11 +1748,10 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
     Original[] originals;
     // The large direct tool results by line: a folded copy that matches
     // drops its content (issue #263).
-    ToolKey[ulong] toolKeys;
+    size_t[ulong] toolKeys;
     void noteTool(ulong lineNo, ref const Message m)
     {
-        if (m.role == Role.tool && m.content.length > stashSlimBytes && !m.attachments.length)
-            toolKeys[lineNo] = toolKey(m.toolCallId, m.content);
+        if (stashSlimmable(m)) toolKeys[lineNo] = recoveryDigest(m);
     }
     // Plan replay is bounded by the latest full snapshot (issue #205): deltas
     // before it are already folded in, so applying them would redo merges the
@@ -1608,10 +1781,16 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
                 skimmedLen++;
                 if (lineNo <= floorL)
                 {
-                    // Only a large tool result's key outlives the skim:
-                    // such a line is decoded below for `toolKeys`.
+                    // Only a large tool result's or reply's key outlives
+                    // the skim: such a line is decoded below for `toolKeys`.
                     auto data = skimField(line, "data");
-                    if (skimString(data, "role") != "tool" || skimField(data, "content").length <= stashSlimBytes)
+                    auto role = skimString(data, "role");
+                    // Structured payloads (calls, reasoning items) are
+                    // slimmable at any size (`slimPayload`), so mirror that.
+                    if ((role != "tool" && role != "assistant")
+                        || (data.length <= stashSlimBytes
+                            && !skimCount(skimField(data, "tool_calls"))
+                            && !skimCount(skimField(data, "thinking_blocks"))))
                     {
                         index++;
                         return;
@@ -1654,6 +1833,20 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
                 index++;
                 return;
             }
+        }
+        // A replace before the latest full pinned restatement: its pinned
+        // requests are replaced, so they are not decoded. On a log written
+        // before compaction pinned only user requests they can be most of
+        // the line (issue #301: 12 MB).
+        // Likewise a replace's `messages` snapshot, when a later replace
+        // restates the conversation: only its length matters until then.
+        cutMessages = Option!size_t.init;
+        if (skipSuperseded && line.length > pinSkimBytes && lineNo < lastReplace && skimType(line) == "replace")
+        {
+            if (lineNo < pinReset) line = withoutField(line, "pinned_requests");
+            size_t n = skimCount(skimField(skimField(line, "data"), "messages"));
+            line = withoutField(line, "messages");
+            cutMessages = some(n);
         }
         JSONValue rec;
         try rec = parseJSON(line);
@@ -1739,7 +1932,9 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
             break;
         case "replace":
             r.conversation = null;
-            foreach (m; data["messages"].arrayNoRef) r.conversation ~= messageFromRecord(m);
+            cutMessages.match!((size_t n) { r.conversation = new Message[n]; }, () {
+                foreach (m; data["messages"].arrayNoRef) r.conversation ~= messageFromRecord(m);
+            });
             {
                 ulong floor;
                 if (auto sum = "summarized" in data)
@@ -1800,20 +1995,38 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
                     return o;
                 }
                 auto pins = "pinned_requests" in data, pinBase = "pinned_base" in data;
+                // Logs written before compaction pinned only user requests
+                // hold every folded turn in `pinned_requests` (issue #301: one
+                // had 6,998, 12 MB, kept for the session's life). Only user
+                // messages can be pinned, so the others shrink to an empty
+                // placeholder that keeps the `pinned_base` indexes right;
+                // `Agent.loadRestored` drops them.
+                static Message[] pinsOnly(Message[] ms)
+                {
+                    foreach (ref m; ms)
+                        if (m.role != Role.user)
+                        {
+                            Message p;
+                            p.role = Role.tool;
+                            m = p;
+                        }
+                    return ms;
+                }
                 // Folded turns whose large tool output matches its direct
                 // record drop it: a replay reads it back from the log, and the
                 // resumed session no longer holds every folded output (issue
-                // #263). Not for a Rust log, whose pinned block shares the stash.
+                // #263). A Rust log's pinned block shares the stash, but only
+                // its user requests are pinned, and those are never slimmed.
                 bool[] slim(Message[] ms)
                 {
                     auto o = new bool[ms.length];
-                    if (pins is null || !slimStash) return o;
+                    if (!slimStash) return o;
                     foreach (i, ref m; ms)
-                        if (m.role == Role.tool && m.content.length > stashSlimBytes && !m.attachments.length)
+                        if (stashSlimmable(m))
                             if (auto k = m.logLine in toolKeys)
-                                if (*k == toolKey(m.toolCallId, m.content))
+                                if (*k == recoveryDigest(m))
                                 {
-                                    m.content = null;
+                                    slimMessage(m);
                                     o[i] = true;
                                 }
                     return o;
@@ -1860,9 +2073,9 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
                 {
                     auto b = toSize(pinBaseN);
                     auto kept = b < r.pinStash.length ? r.pinStash[0 .. b] : r.pinStash;
-                    r.pinStash = kept ~ decode(*pins, inputs);
+                    r.pinStash = kept ~ pinsOnly(decode(*pins, inputs));
                 }
-                else r.pinStash = pins !is null ? decode(*pins, inputs) : rustStash;
+                else r.pinStash = pins !is null ? pinsOnly(decode(*pins, inputs)) : rustStash;
             }
             {
                 auto mode = "mode" in data;
@@ -3815,4 +4028,94 @@ unittest
     streamLogLinesUntil(p, (line) { ++seen; return false; });
     assert(seen == 1);
     assert(logHeaderCwd(p) == "/w");
+}
+
+// A replace whose pinned requests a later full restatement replaces is
+// decoded without them (issue #301), and restores exactly what decoding
+// every record gives, even when its folded delta keeps it un-skimmed.
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, write;
+    import std.path : buildPath;
+    import std.array : replicate;
+    auto dir = buildPath(tempDir, "nano-d-skimpins-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    static JSONValue rec(Message m) { return messageRecord(m); }
+    string line(string type, JSONValue data) { return JSONValue(["type": JSONValue(type), "data": data]).toString ~ "\n"; }
+    auto log = `{"type":"session","data":{"version":1,"id":"skimpins","created_at":"x"}}` ~ "\n";
+    auto goal = Message.user("goal");
+    log ~= line("message", rec(goal));
+    JSONValue first = ["messages": JSONValue([rec(Message.user("summary"))])];
+    first["folded"] = JSONValue([rec(goal)]);
+    first["pinned_requests"] = JSONValue([rec(goal), rec(Message.toolResult("c", "bash", "x".replicate(8192)))]);
+    log ~= line("replace", first);
+    JSONValue second = ["messages": JSONValue([rec(Message.user("summary 2"))])];
+    second["folded"] = JSONValue(cast(JSONValue[]) []);
+    second["folded_base"] = 1;
+    second["pinned_requests"] = JSONValue([rec(Message.user("restated"))]);
+    log ~= line("replace", second);
+    auto path = buildPath(dir, "skimpins.jsonl");
+    write(path, log);
+    auto skimmed = restoreLog(path, true), fullR = restoreLog(path, false);
+    assert(skimmed == fullR, "cutting superseded pins restores the same state");
+    assert(skimmed.pinStash.length == 1 && skimmed.pinStash[0].content == "restated");
+}
+
+// A short assistant turn with a tool call or reasoning item is slimmable at
+// any size, so the skim must still decode it before the floor.
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, write;
+    import std.path : buildPath;
+    auto dir = buildPath(tempDir, "nano-d-skimcall-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    static JSONValue rec(Message m) { return messageRecord(m); }
+    string line(string type, JSONValue data) { return JSONValue(["type": JSONValue(type), "data": data]).toString ~ "\n"; }
+    auto log = `{"type":"session","data":{"version":1,"id":"skimcall","created_at":"x"}}` ~ "\n";
+    ulong lines = 1;
+    void add(string type, JSONValue data) { log ~= line(type, data); lines++; }
+    auto q = Message.user("q");
+    auto call = Message.assistant("x", [ToolCall.fromRaw("c1", "read_file", `{"path":"a"}`)]);
+    auto think = Message.assistant("y");
+    think.thinkingBlocks = [JSONValue(["t": 1])];
+    call.logLine = 3;
+    think.logLine = 4;
+    add("message", rec(q));
+    add("message", rec(call));
+    add("message", rec(think));
+    JSONValue full = ["messages": JSONValue([rec(Message.user("summary"))])];
+    full["folded"] = JSONValue([rec(q), rec(call), rec(think)]);
+    full["summarized"] = JSONValue([JSONValue(2), JSONValue(lines)]);
+    add("replace", full);
+    auto path = buildPath(dir, "skimcall.jsonl");
+    write(path, log);
+    auto skimmed = restoreLog(path, true), fullR = restoreLog(path, false);
+    assert(skimmed == fullR, "short structured replies are slimmed alike");
+    assert(skimmed.replayStashSlim == [false, true, true]);
+}
+
+// A line `keep` rejects by its head is skipped whole, whether it is short or
+// spans many read chunks, plain or gzipped; the lines around it arrive
+// intact, and the skipped one is reported as an empty line (issue #234).
+unittest
+{
+    import std.array : replicate;
+    import std.file : write, remove, tempDir;
+    import std.path : buildPath;
+    auto big = `{"type":"replace","data":"` ~ "x".replicate(200_000) ~ `"}`;
+    auto text = `{"type":"message","data":1}` ~ "\n" ~ `{"type":"plan"}` ~ "\n" ~ big ~ "\n"
+        ~ `{"type":"message","data":2}` ~ "\n";
+    auto p = buildPath(tempDir, "nano-d-stream-keep.jsonl"), gz = p ~ ".gz";
+    write(p, text);
+    write(gz, gzipLog(text));
+    scope (exit) { remove(p); remove(gz); }
+    foreach (path; [p, gz])
+    {
+        string[] seen;
+        foreachLogLineSkippingTorn(path, (line) { seen ~= line.idup; },
+            (head) => !head.startsWith(`{"type":"replace"`) && !head.startsWith(`{"type":"plan"`));
+        assert(seen == [`{"type":"message","data":1}`, "", "", `{"type":"message","data":2}`], path);
+    }
 }

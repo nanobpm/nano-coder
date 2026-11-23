@@ -47,7 +47,6 @@ static import nano.mdtable;
 static import nano.memory;
 static import nano.memsecret;
 static import nano.mode;
-static import nano.muse;
 static import nano.nullaudit;
 static import nano.option;
 static import nano.paths;
@@ -60,7 +59,6 @@ static import nano.result;
 static import nano.providers.anthropic;
 static import nano.providers.demo;
 static import nano.providers.mock;
-static import nano.providers.muse;
 static import nano.providers.openai;
 static import nano.providers;
 static import nano.providers.responses;
@@ -142,7 +140,6 @@ private alias modules = imported!"std.meta".AliasSeq!(
     nano.memory,
     nano.memsecret,
     nano.mode,
-    nano.muse,
     nano.nullaudit,
     nano.option,
     nano.paths,
@@ -155,7 +152,6 @@ private alias modules = imported!"std.meta".AliasSeq!(
     nano.providers.anthropic,
     nano.providers.demo,
     nano.providers.mock,
-    nano.providers.muse,
     nano.providers.openai,
     nano.providers,
     nano.providers.responses,

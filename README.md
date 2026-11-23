@@ -189,7 +189,6 @@ source/
     │   ├── openai.d     # OpenAI Chat Completions (and compatible servers)
     │   ├── responses.d  # OpenAI Responses API
     │   ├── anthropic.d  # Anthropic Messages API
-    │   ├── muse.d       # UNOFFICIAL Meta Muse Code provider
     │   ├── mock.d       # Offline scripted client
     │   └── demo.d       # Offline demo model (`--model demo/demo`)
     ├── copilot.d    # UNOFFICIAL Copilot-subscription provider (login, tokens)
@@ -452,9 +451,12 @@ argument: a type-ahead list narrows as you type and Tab completes it.
 - `/tools` - List registered tools
 - `/skills` - List the skills the agent can load, where each lives, and any loading warnings
 - `/subagents [on|off] [--save]` - Without an argument, show whether sub-agents are on and the models they may run on with their limits. `on`/`off` switches the `agent` tool for this session from the next request (sub-agents already running finish); `--save` also writes `subagents` to the config file. Changing the tool list invalidates the provider's prompt cache once. Works over ACP too (the result carries `subagents`, `models` and `text`, and `saved` with `--save`)
+- `/subagents` also lists every sub-agent of the session (the last 200; older ones are counted): its id, model, state (queued, running, done, cancelled, truncated), the first line of its task, turns, tokens and elapsed time
+- `/subagents show <id>` - Render a sub-agent's transcript (prompt, answers, tool calls with folded output) from its log, read a message at a time, so even a long log shows without being loaded whole
+- `/subagents stop <id>` / `/subagents stop all` - Stop running or queued sub-agents as the agent's `agent_cancel` does: each gets a few seconds to report what it has (marked cancelled; one that can't is cut off), and the agent receives that as the sub-agent's result. Typed during a turn, it runs when the turn ends. Tab completes `show`/`stop` and the sub-agent ids. `show` and `stop` are terminal-only (not over ACP)
 - `/messages [on|off|confirm on|off] [--save]` - Without an argument, show whether this session sends and receives inter-session messages (see [Inter-session messages](#inter-session-messages)). `on` opens the registry socket and offers `session_send` from the next request; `off` closes it. `confirm on|off` switches whether an incoming message waits for you to accept it. `--save` writes `session_messages` / `session_messages_confirm` to the config file
 - `/plan` - Show the agent's task plan with all notes
-- `/memory [forget ID]` - List cross-session memories with their ids, or delete one by id (see [Memory](#memory))
+- `/memory [entities] [forget ID]` - List cross-session memories with their ids, each entity's facts, or delete one by id (see [Memory](#memory))
 - `/hooks` - List the loaded external user hooks (from `.claude/settings.json` and friends), the files they came from, and any skipped entries (see [Lifecycle Hooks](#lifecycle-hooks))
 - `/queue [list|add text|remove N...|edit N text|clear]` - Show or edit the queued messages and unread steers. Works while a turn runs, so a queued message or steer can be removed or rewritten before it is sent.
 - `/model [provider/model]` - Show the current model and pick a new one. The list starts with the last four models you used (the current one marked; the previous one highlighted, so `/model` then Enter switches back), then the providers: pick a provider to scroll its model list (Esc steps back). With an argument, switches directly (conversation is kept). Typing `/model ` shows a type-ahead of the current model, recently used models, and each configured provider's default model; Tab completes (a bare provider name completes to its default model). Recently used models are kept in `~/.local/share/nano-coder/recent-models.json`
@@ -566,7 +568,7 @@ not on the next turn). The picker then shows `title · last prompt`. Titles live
 so older nano-coders can still read the logs. Deleting `index.jsonl` loses them; a new run then
 asks again on the session's next turn.
 
-Flags: `--login github-copilot|muse`, `--list-models PROVIDER`, `--trajectory SESSION_ID [--json|--markdown]`, `--acp`, `--model provider/model` (or `AGENTIC_HARNESS_MODEL`), `--resume [SESSION_ID|last]`, `--list-sessions [--all] [--json]`,
+Flags: `--login github-copilot`, `--list-models PROVIDER`, `--trajectory SESSION_ID [--json|--markdown]`, `--acp`, `--model provider/model` (or `AGENTIC_HARNESS_MODEL`), `--resume [SESSION_ID|last]`, `--list-sessions [--all] [--json]`,
 `--config PATH`, `--verbosity LEVEL` (`-v`), `--sandbox off|workspace|read-only` (or `NANO_CODER_SANDBOX`),
 `--allow RULE` and `--deny RULE` (repeatable; added to the config's rules), `--version` (`-V`).
 
@@ -704,6 +706,7 @@ show_release_notes = true               # after an update, show what changed (se
 memory = "on"                           # on | read_only | off — cross-session memory (see Memory)
 # memory_dir = "/path/to/memory"        # default: <platform data dir>/nano-coder/memory
 memory_expiry_days = 90                 # expire memories unused this long (0 = never)
+memory_recall = "entity"                # entity | anchor — how tool calls recall memories (see Memory)
 
 [skills]                                # see Skills
 enabled = true
@@ -752,7 +755,6 @@ Built-in presets:
 | `ollama` | openai | `http://localhost:11434/v1` | — |
 | `llamacpp` | openai | `http://localhost:8080/v1` | — |
 | `github-copilot` | github-copilot | from session token | `GITHUB_COPILOT_OAUTH_TOKEN` or `--login` (unofficial, see below) |
-| `muse` | muse | from minted key (`--login`); default Meta API endpoint (`META_API_KEY`) | `META_API_KEY` or `--login` (unofficial, see below) |
 | `mock` | mock | — | — |
 
 `kind = "openai"` means OpenAI Chat Completions, which also covers vLLM, LM Studio,
@@ -873,8 +875,6 @@ Endpoints that report levels:
 
 - **GitHub Copilot:** `/models` lists each model's levels, read with the same request as its
   context window.
-- **Meta Muse Code:** the model catalog (`/muse-code/models`) lists each model's
-  `reasoning_effort` tiers, read with the same request as its context window.
 - **Ollama:** a model with the `thinking` capability (`/api/show`) gets `off`, `low`,
   `medium` and `high`. Ollama refuses a level for a model without it, so none is sent then.
 - **llama.cpp:** the loaded model's chat template (`/props`) decides. A template with an
@@ -925,9 +925,7 @@ Whether a model can see images comes from, in order: a `vision = true|false` ove
 (global, `[providers.<name>]`, or `[providers.<name>.models."<model>"]`, like `thinking`);
 what the endpoint reports (GitHub Copilot `/models` `capabilities.supports.vision` and its
 `limits.vision`, Ollama `/api/show`'s `vision` capability, llama.cpp `/props`
-`modalities.vision`); a provider assumption (Meta Muse Code's catalog has no vision
-schema, so every visible, non-image-generation chat model is treated as vision-capable);
-and a built-in assumption for current Anthropic and OpenAI model
+`modalities.vision`); and a built-in assumption for current Anthropic and OpenAI model
 families. A model that can't see images gets the text error with a hint to switch models
 or set `vision = true`:
 
@@ -954,7 +952,7 @@ The old top-level `api_key` / `base_url` still work. They apply to `default_prov
 which becomes `openai` if it was `mock`.
 
 List a provider's models with `--list-models <provider>` (OpenAI-compatible endpoints,
-`github-copilot` and `muse`).
+and `github-copilot`).
 
 ### Local servers on another machine (macOS)
 
@@ -998,40 +996,6 @@ request. `GITHUB_COPILOT_DOMAIN` selects a GHE.com host.
 
 The sanctioned route is the [Copilot SDK](https://github.com/github/copilot-sdk), which
 drives the Copilot CLI's own agent loop rather than exposing the model.
-
-### Meta Muse Code (unofficial)
-
-The `muse` provider uses a Meta Muse Code subscription by authenticating **as the `muse` CLI
-does**: an RFC 8628 device-code login against `auth.meta.com` with Muse's public OAuth client
-id, a *mint* of that OAuth token for a short-lived Meta API key
-(`POST https://api.meta.ai/muse-code/key`), and model calls carrying Muse's client headers
-against the OpenAI-compatible Meta API at `https://api.meta.ai/v1`. Model calls use the
-OpenAI Responses API (`POST {base}/responses`). Like the Copilot provider this is **not a
-Meta-sanctioned integration**: it
-may breach Meta's terms or your organisation's policy, it can break without notice, and
-misuse could get an account flagged. It is never used unless you select it.
-
-The login only establishes *who you are*; your plan is checked at the mint, which returns the
-key plus your account state (`is_subs_active`, `subs_tier_name`, `require_payment`,
-`subs_usage`). So a subscription works through the same `--login muse`: the device flow
-completes, the mint confirms the plan, and calls are served against it. If the mint refuses —
-the account isn't enabled for the Model API, or no payment method/subscription is on it — the
-provider relays Meta's own message and the URL to fix it (`dev.meta.ai` to onboard,
-`accountscenter.meta.com/muse_code` to subscribe), and a lapsed subscription makes calls stop
-until you renew and log in again.
-
-```bash
-nano-coder --login muse                    # interactive; saves the OAuth token + minted key (0600)
-nano-coder --list-models muse
-nano-coder --model muse/muse-spark-1.3
-```
-
-Headless workers can't do the device flow; set `META_API_KEY` to a Meta API key instead. Note
-this is **a different credential lane from the subscription**: a raw key is metered/PAYG and
-carries no Muse Code plan, so it will not draw on a subscription (use `--login muse` for
-that). `META_API_KEY` takes priority over a stored login; the minted key and OAuth token live
-in `<data dir>/nano-coder/muse.json`. `MUSE_AUTH_BASE_URL` and `MUSE_MINT_BASE_URL` point the
-login and mint at other hosts.
 
 ### Retries
 
@@ -1132,7 +1096,6 @@ sets the window). The window a server has *loaded* is preferred over the model's
 | LM Studio | `/api/v0/models` `loaded_context_length` |
 | Ollama | `/api/ps` for a loaded model, else `num_ctx`; never the model maximum, since Ollama runs with a smaller default |
 | GitHub Copilot | `/models` `max_prompt_tokens` |
-| Meta Muse Code | `/muse-code/models` `context_limit` |
 
 Compaction asks the current model to summarize older messages, keeping the recent tail
 (up to 20k tokens, never starting at a tool result). Auto-compaction runs before a model
@@ -1514,6 +1477,21 @@ before they existed load unchanged.
   saves again with `supersedes: [ids]` or `distinct: true`.
 - `memory_search` filters by `entity` (an alias works) and `fact_kind`, and each hit ends with
   `{kind; entities; verified date}`. A search result is capped at 8,000 bytes.
+
+**Recall from tool calls.** After a tool runs, memories relevant to its arguments are attached
+to the result as a `<system-reminder>` note. With `memory_recall = "entity"` (the default) the
+call resolves to the entities it touches — hosts (URLs, `ssh`/`scp` targets), repos (`-R o/r`,
+the working directory's git remote) and the tool (the command name) — through the registry's
+aliases, following `reached_via` / `runs_on` / `part_of` one hop
+(`merlin.local:8080` → `host:merlin` and the services on it). At most 3 facts within 1,500 bytes
+are recalled, ranked: rules first, then `fact_kind` weighted by context (`pitfall` and
+`procedure` for command execution, `decision` and `preference` when planning or editing), then
+`verified_at` recency, then last-used. A superseded memory is never recalled, a hint already in
+context is not repeated, and an entity's other facts stay quiet for a few calls once one was
+recalled (unless a different fact would be chosen). Memories with no entities yet keep the older
+anchor-substring recall, so nothing regresses before they are migrated. The note names the
+entity that triggered it (`📌 host:merlin — …`), and `/memory entities` lists each entity's
+facts. Set `memory_recall = "anchor"` to compare or roll back to the pre-entity substring match.
 
 **Prompt.** A capped, dated index (most-recently-used first, ~4 KB with the guidance) is
 appended to the system prompt at session start, framed as "notes from earlier sessions; may be

@@ -145,7 +145,7 @@ imported!"nano.result".Result!(SubToggle, string) parseToggle(string arg) pure
     {
         if (w == "--save") t.save = true;
         else if ((w == "on" || w == "off") && !chosen) { t.on = w == "on"; t.show = false; chosen = true; }
-        else return R.err(format(`/subagents: unexpected "%s" (usage: /subagents [on|off] [--save])`, w));
+        else return R.err(format(`/subagents: unexpected "%s" (usage: %s)`, w, commandUsage));
     }
     if (t.save && t.show) return R.err("/subagents: --save needs on or off");
     return R.ok(t);
@@ -1015,4 +1015,245 @@ unittest
     assert(huge.canFind("hhhhhhhh…[line cut") && !huge.canFind("hhhhhhhhh")
         && huge.canFind("[next since: 1; more follows]"), huge);
     assert(readLogTail(p, 1, 8).canFind("next\n[next since: 2]"));
+}
+
+// ---- /subagents list, show and stop (issue #267) ----
+
+/// The `/subagents` usage line.
+enum string commandUsage = "/subagents [on|off] [--save] | show <id> | stop <id>|all";
+
+/// One sub-agent as `/subagents` lists it.
+struct SubInfo
+{
+    /// Its handle (`sub-N`), model and state (queued, running, done, cancelled, truncated).
+    string id, model, state;
+    /// Its launch sequence: a combined listing sorts on it, so it stays
+    /// oldest first even when children enter the archive out of launch order.
+    size_t seq;
+    /// The first line of its task, cut to `taskCols` characters.
+    string task;
+    size_t turns;
+    ulong tokens;
+    long elapsedSecs;
+    bool background;
+    /// Its log, once open (empty before it starts or without session logs).
+    string logPath;
+}
+
+/// Most finished sub-agents a session remembers for `/subagents` (older
+/// ones are counted only; their logs stay).
+enum size_t keepHistory = 200;
+/// Characters of a task's first line kept for the listing.
+enum size_t taskCols = 60;
+
+/// The first line of `text`, at most `max` characters (an ellipsis marks a cut).
+string firstLine(string text, size_t max = taskCols) pure
+{
+    import std.utf : decode;
+    // One bounded walk: stop at the newline or after `max` code points, so a
+    // huge one-line task is neither scanned nor copied beyond the prefix.
+    size_t i, cut, n;
+    while (i < text.length && text[i] != '\n' && (!max || n < max))
+    {
+        if (max && n == max - 1) cut = i;
+        decode(text, i);
+        ++n;
+    }
+    if (i < text.length && text[i] != '\n') return text[0 .. cut].idup ~ "…";
+    text = text[0 .. i];
+    // A copy: a slice would keep a long task body alive in the listing history.
+    return text.idup;
+}
+
+unittest // the first line is a copy, not a slice of the task
+{
+    import std.array : replicate;
+    auto task = "short\n" ~ "x".replicate(10_000);
+    auto line = firstLine(task);
+    assert(line == "short" && line.ptr != task.ptr);
+    auto plain = "only";
+    assert(firstLine("abcdef", 4) == "abc…");
+    assert(firstLine("abcd", 4) == "abcd");
+    assert(firstLine("äöüßé", 3) == "äö…");
+    assert(firstLine(plain).ptr != plain.ptr);
+}
+
+/// The log at `path` as it is now: the session tidy-up of another process may
+/// have compressed a finished child's `.jsonl` to `.jsonl.gz` since. Null
+/// when neither exists.
+string currentLogPath(string path)
+{
+    import std.file : exists;
+    if (path.exists) return path;
+    if ((path ~ ".gz").exists) return path ~ ".gz";
+    return null;
+}
+
+unittest // a compressed child log is found by its original path
+{
+    import std.file : tempDir, write, remove, exists;
+    import std.path : buildPath;
+    import std.conv : to;
+    import std.process : thisProcessID;
+    auto p = buildPath(tempDir, "nano-curlog-" ~ thisProcessID.to!string ~ ".jsonl");
+    assert(currentLogPath(p) is null);
+    write(p ~ ".gz", "");
+    scope (exit) remove(p ~ ".gz");
+    assert(currentLogPath(p) == p ~ ".gz");
+    write(p, "");
+    scope (exit) remove(p);
+    assert(currentLogPath(p) == p);
+}
+
+/// The sub-agent table `/subagents` shows below the on/off state; `forgotten`
+/// counts finished ones dropped from memory (`keepHistory`).
+string listingText(const(SubInfo)[] all, size_t forgotten) pure
+{
+    import nano.context : formatTokens;
+    import nano.arith : toSize;
+    if (!all.length && !forgotten) return "No sub-agents in this session yet.";
+    string s = "Sub-agents of this session:";
+    if (forgotten) s ~= format("\n  (%s earlier ones not shown; their logs stay)", forgotten);
+    foreach (ref i; all)
+        s ~= format("\n  %s  %s  %s%s  %s turns · %s tokens · %ss  %s", i.id, i.model, i.state,
+            i.background ? " (background)" : "", i.turns, formatTokens(toSize(i.tokens)), i.elapsedSecs, i.task);
+    return s ~ "\n/subagents show <id> shows a transcript; /subagents stop <id>|all stops them.";
+}
+
+/// `/subagents show <id>`.
+struct SubShowCmd
+{
+    string id;
+}
+
+/// `/subagents stop <id>` or `/subagents stop all` (`id` is then "all").
+struct SubStopCmd
+{
+    string id;
+}
+
+/// A `/subagents` argument that doesn't parse: the message to show.
+struct SubCmdError
+{
+    string message;
+}
+
+/// A parsed `/subagents` command, or why it doesn't parse.
+alias SubCommand = imported!"std.sumtype".SumType!(SubToggle, SubShowCmd, SubStopCmd, SubCmdError);
+
+/// Parse `/subagents [on|off] [--save]`, `show <id>` or `stop <id>|all`.
+SubCommand parseCommand(string arg) pure
+{
+    import std.string : split;
+    import nano.result : unwrap, unwrapErr;
+    auto w = arg.split;
+    if (w.length && (w[0] == "show" || w[0] == "stop"))
+    {
+        if (w.length != 2)
+            return SubCommand(SubCmdError(format("/subagents %s needs one sub-agent id%s (usage: %s)", w[0],
+                w[0] == "stop" ? " or all" : "", commandUsage)));
+        return w[0] == "show" ? SubCommand(SubShowCmd(w[1])) : SubCommand(SubStopCmd(w[1]));
+    }
+    auto t = parseToggle(arg);
+    if (t.isErr) return SubCommand(SubCmdError(t.unwrapErr("isErr")));
+    return SubCommand(t.unwrap("isOk"));
+}
+
+unittest
+{
+    import std.sumtype : match;
+    string kind(string a)
+    {
+        return parseCommand(a).match!((SubCmdError e) => "err: " ~ e.message,(SubToggle t) => t.show ? "show-state" : t.on ? "on" : "off",
+            (SubShowCmd s) => "show " ~ s.id, (SubStopCmd s) => "stop " ~ s.id);
+    }
+    assert(kind("") == "show-state" && kind("off") == "off" && kind(" on --save") == "on");
+    assert(kind("show sub-2") == "show sub-2" && kind("stop  sub-3 ") == "stop sub-3" && kind("stop all") == "stop all");
+    assert(kind("stop").canFind("needs one sub-agent id or all"));
+    assert(kind("show a b").canFind("needs one sub-agent id ("));
+    assert(kind("bogus").canFind("usage: /subagents [on|off] [--save] | show"));
+}
+
+unittest // the listing, mixed states
+{
+    import std.algorithm : count;
+    assert(listingText(null, 0) == "No sub-agents in this session yet.");
+    auto all = [SubInfo("sub-1", "a/x", "done", 1, firstLine("find it\nmore"), 3, 1500, 12),
+        SubInfo("sub-2", "b/y", "running", 2, "scan", 1, 10, 4, true),
+        SubInfo("sub-3", "a/x", "queued", 3, "later", 0, 0, 0, true),
+        SubInfo("sub-4", "a/x", "cancelled", 4, "stop me", 2, 20, 7, true)];
+    auto t = listingText(all, 5);
+    assert(t.canFind("5 earlier ones not shown"), t);
+    assert(t.canFind("sub-1  a/x  done  3 turns · 1.5k tokens · 12s  find it\n"), t);
+    assert(!t.canFind("more"), t);
+    assert(t.canFind("sub-2  b/y  running (background)") && t.canFind("sub-3  a/x  queued")
+        && t.canFind("sub-4  a/x  cancelled (background)  2 turns"), t);
+    assert(t.count("\n  sub-") == 4);
+    import std.array : replicate;
+    import std.range : walkLength;
+    assert(firstLine("é".replicate(100)).walkLength == taskCols);
+}
+
+/// Stream the conversation messages of a session log (a sub-agent's) to
+/// `dg`, one line at a time, so even a large log is never held whole.
+/// Other records (header, compaction, plans) are skipped; `dg` returns
+/// false to stop early.
+void eachLogMessage(string path, scope bool delegate(Message) @safe dg)
+{
+    import nano.session : eachLogLineUntil, messageFromRecord;
+    import std.algorithm : startsWith;
+    eachLogLineUntil(path, (const(char)[] line, ulong) {
+        // A record's type comes first (`record` in nano.session).
+        if (!line.startsWith(`{"type":"message"`)) return true;
+        Message m;
+        try
+        {
+            auto data = parseJSON(line)["data"];
+            // messageFromRecord rejects an unknown role: skip it like damage.
+            auto role = "role" in data;
+            if (role is null || role.type != JSONType.string || !["system", "user", "assistant", "tool"].canFind(role.str))
+                return true;
+            m = messageFromRecord(data);
+        }
+        catch (JSONException) return true; // a damaged record: skip it as a resume does
+        return dg(m);
+    }, false);
+}
+
+unittest // a large synthetic log streams in order, within the test budget
+{
+    import std.file : tempDir, remove;
+    import std.path : buildPath;
+    import std.stdio : File;
+    import std.array : replicate;
+    import std.conv : to;
+    import nano.session : messageRecord;
+    import core.memory : GC;
+    auto p = buildPath(tempDir, "nano-sublog-" ~ to!string(monoNow.ticks) ~ ".jsonl");
+    scope (exit) remove(p);
+    {
+        auto f = File(p, "wb");
+        f.write(`{"type":"session","data":{"version":1}}` ~ "\n");
+        auto pad = "x".replicate(1000);
+        foreach (i; 0 .. 4000)
+        {
+            auto m = i % 2 ? Message.assistant(to!string(i) ~ pad) : Message.user(to!string(i) ~ pad);
+            f.write(`{"type":"message","data":` ~ messageRecord(m).jsonText ~ "}\n");
+            if (i % 1000 == 0) f.write(`{"type":"plan","data":{}}` ~ "\n");
+        }
+        f.write(`{"type":"message","data":{"role":"user","content":"torn`); // no newline: not committed
+    }
+    size_t n;
+    bool ordered = true;
+    eachLogMessage(p, (Message m) {
+        import std.algorithm : startsWith;
+        if (!m.content.startsWith(to!string(n) ~ "x")) ordered = false;
+        n++;
+        return true;
+    });
+    assert(n == 4000 && ordered, to!string(n));
+    // Stopping early reads no further.
+    size_t seen;
+    eachLogMessage(p, (Message m) => ++seen < 3);
+    assert(seen == 3);
 }

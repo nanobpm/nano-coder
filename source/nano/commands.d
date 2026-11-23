@@ -6,7 +6,7 @@ module nano.commands;
 import nano.context : CompactionMode;
 
 import std.algorithm : filter, map, maxElement, min, startsWith, canFind, any;
-import std.array : array;
+import std.array : array, split, join;
 import std.format : format;
 import std.string : strip, indexOf;
 import std.uni : isWhite;
@@ -35,7 +35,7 @@ immutable Command[] commands = [
     Command("/queue", "[list|add text|remove N...|edit N text|clear]", "Show or edit the queued messages"),
     Command("/tools", "", "List available tools"),
     Command("/skills", "", "List skills the agent can load"),
-    Command("/subagents", "[on|off] [--save]", "Show sub-agent models, or switch the agent tool on/off"),
+    Command("/subagents", "[on|off] [--save] | show <id> | stop <id>|all", "List sub-agents, show or stop one, or switch the agent tool on/off"),
     Command("/messages", "[on|off|confirm on|off] [--save]", "Show or switch inter-session messages (session_send) and confirmation"),
     Command("/model", "[provider/model]", "Show the model and pick a new one (or switch directly)"),
     Command("/mode", "[normal|plan|auto]", "Show or set the agent mode (Shift+Tab cycles)"),
@@ -163,7 +163,12 @@ struct Suggestion
 /// set by the app, which has the config and the recents.
 Suggestion[] delegate() @safe modelSuggestionSource;
 
+/// The ids of the session's sub-agents (`sub-N`) with their state, for
+/// `/subagents show|stop` completion; set by the app, which has the agent.
+Suggestion[] delegate() @safe subagentIdSource;
+
 /// The line as `command` + the start of its first argument; null past it.
+/// `/subagents` takes its subcommand and id as one argument (`stop sub-2`).
 string[2] splitCommand(string line, out bool ok) pure
 {
     ok = false;
@@ -172,6 +177,15 @@ string[2] splitCommand(string line, out bool ok) pure
     if (i == line.length) return typeof(return).init;
     auto rest = line[i + 1 .. $];
     while (rest.length && isWhite(rest[0])) rest = rest[1 .. $];
+    if (line[0 .. i] == "/subagents")
+    {
+        auto w = rest.split;
+        auto open = !rest.length || !isWhite(rest[$ - 1]);
+        if (w.length == 1 && !open) w ~= "";
+        if (w.length > 2 || (w.length == 2 && w[0] != "show" && w[0] != "stop")) return typeof(return).init;
+        ok = true;
+        return [line[0 .. i], w.join(" ")];
+    }
     if (rest.any!isWhite) return typeof(return).init;
     ok = true;
     return [line[0 .. i], rest];
@@ -206,7 +220,6 @@ Suggestion[] modelSuggestions(const ref imported!"nano.config".Config cfg, strin
             case ProviderKind.openai: return "openai";
             case ProviderKind.anthropic: return "anthropic";
             case ProviderKind.githubCopilot: return "githubcopilot";
-            case ProviderKind.muse: return "muse";
             case ProviderKind.mock: return "mock";
         }
     }
@@ -254,6 +267,18 @@ Suggestion[] suggestions(string line)
                 Suggestion("reset", "drop the session level; use the configured one")];
             foreach (l; ORDER) all ~= Suggestion(l, "");
             break;
+        case "/subagents":
+            if (!parts[1].canFind(' '))
+            {
+                all = [Suggestion("on", "offer the agent tool"), Suggestion("off", "leave the agent tool out"),
+                    Suggestion("show", "a sub-agent's transcript"), Suggestion("stop", "stop a sub-agent, or all")];
+                break;
+            }
+            Suggestion[] ids = subagentIdSource !is null ? subagentIdSource() : null;
+            auto verb = parts[1][0 .. parts[1].indexOf(' ')];
+            if (verb == "stop") all ~= Suggestion("stop all", "every running or queued one");
+            foreach (x; ids) all ~= Suggestion(verb ~ " " ~ x.value, x.note);
+            break;
         default: break;
     }
     return all.filter!(x => x.value.startsWith(parts[1])).array;
@@ -265,7 +290,7 @@ bool hasArgumentMenu(string line) pure
 {
     bool ok;
     auto parts = splitCommand(line, ok);
-    return ok && ["/model", "/mode", "/verbosity", "/thinking"].canFind(parts[0]);
+    return ok && ["/model", "/mode", "/verbosity", "/thinking", "/subagents"].canFind(parts[0]);
 }
 
 /// What Tab turns the line into: a `/command` completes like `complete`; its
@@ -307,7 +332,8 @@ string[] suggestionMenu(const Suggestion[] found, string line, size_t cols, size
     bool ok;
     auto parts = splitCommand(line, ok);
     auto typed = ok ? parts[1].count : 0;
-    if (!found.length) return [fit("  no match (any provider/model ID works)", cols, [Style(0, "\x1b[2m")])];
+    if (!found.length)
+        return [fit(ok && parts[0] == "/model" ? "  no match (any provider/model ID works)" : "  no match", cols, [Style(0, "\x1b[2m")])];
     size_t width;
     foreach (x; found) width = width < x.value.count ? x.value.count : width;
     auto shown = found.length > maxRows ? maxRows - 1 : found.length;
@@ -592,4 +618,26 @@ base_url = "https://eu.openrouter.ai/api/v1"
     assert(nova.length, "configured model offered");
     assert(nova[0].note == "Nova Lite 1.0", nova[0].note);
     assert(!found.any!(s => s.value == "openrouter" || s.value.startsWith("openrouter/")), "disabled hidden");
+}
+
+unittest // `/subagents` completion: subcommands, then sub-agent ids (issue #267)
+{
+    auto saved = subagentIdSource;
+    scope (exit) subagentIdSource = saved;
+    subagentIdSource = () => [Suggestion("sub-1", "done · a"), Suggestion("sub-2", "running · b"),
+        Suggestion("sub-12", "queued · c")];
+    assert(completeLine("/subagents st") == "/subagents stop");
+    assert(completeLine("/subagents sh") == "/subagents show");
+    assert(completeLine("/subagents show sub-2") == "/subagents show sub-2");
+    assert(completeLine("/subagents show s") == "/subagents show sub-", "common prefix of the ids");
+    assert(completeLine("/subagents stop sub-12") == "/subagents stop sub-12");
+    assert(completeLine("/subagents stop a") == "/subagents stop all");
+    assert(completeLine("/subagents   stop  sub-2") == "/subagents stop sub-2", "spacing canonicalizes");
+    assert(completeLine("/subagents on x") is null && completeLine("/subagents stop sub-1 x") is null);
+    assert(hasArgumentMenu("/subagents ") && hasArgumentMenu("/subagents stop "));
+    auto rows = menu("/subagents stop ", 80, 8);
+    assert(rows.length == 4 && rows[0].canFind("all") && rows[0].canFind("every running") && rows[2].canFind("running · b"), rows.join("|"));
+    assert(menu("/subagents show zz", 80, 8)[0].canFind("no match") && !menu("/subagents show zz", 80, 8)[0].canFind("provider"));
+    subagentIdSource = null;
+    assert(suggestions("/subagents stop ").map!(x => x.value).array == ["stop all"]);
 }
