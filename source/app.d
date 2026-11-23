@@ -312,7 +312,9 @@ void readStdinLines(Chan!string inbox, bool color)
     for (;;)
     {
         auto line = input.next();
-        if (line is null) { inbox.close(); return; }
+        // An explicit null marks the end: `tryTake` can't tell a closed
+        // channel from an empty one, and the background poll uses it.
+        if (line is null) { inbox.put(null); inbox.close(); return; }
         auto text = line.strip;
         if (atomicLoad(gTurnRunning) && text.length
             && (!text.startsWith("/") || (!isCommand(text) && unescapePrompt(text) is null)))
@@ -1643,7 +1645,8 @@ class Console : AgentEvents
         // finished one collapses to its line in the transcript.
         foreach (ref p; all)
         {
-            string id = p.callId;
+            // The session-unique handle: provider call ids can repeat.
+            string id = p.handle.length ? p.handle : p.callId;
             if (p.done) subRows.remove(id);
             else subRows[id] = LiveSubagent(p, monoNow);
         }
@@ -2826,7 +2829,8 @@ int runMain(string[] args)
     agent.planTools = cfg.planTools;
     agent.timerTools = !o.acp; // ACP has no idle loop to fire them
     // Nor to serve background sub-agents between prompts (issue #266).
-    agent.backgroundSubagents = !o.acp;
+    // Piped stdin blocks on its read, so nothing serves them there either.
+    agent.backgroundSubagents = !o.acp && isTerminal(0);
     agent.outcomeTool = cfg.outcomeTool;
     agent.remindersEnabled = cfg.reminders;
     agent.questions = questions;
@@ -3498,14 +3502,15 @@ int runMain(string[] args)
             ed.restyle = null;
             syncMode(); // Shift-Tab at the prompt switched the mode
             ed.onIdleEscEsc = null;
-            if (r.outcome == Outcome.eof) break;
-            if (r.outcome == Outcome.stopped && stopBackground)
+            // Honour an idle Esc Esc whatever ended the read (a line typed
+            // before the lapse check keeps its text).
+            if (stopBackground)
             {
                 agent.stopSubagents();
                 writeln(console.dim("[background sub-agents stopped]"));
-                quietPrompt = true;
-                continue;
+                if (r.outcome == Outcome.stopped) { quietPrompt = true; continue; }
             }
+            if (r.outcome == Outcome.eof) break;
             if (r.outcome == Outcome.stopped && timerNow())
             {
                 // Park a stale draft so the timer turn can't take it as a steer.
@@ -3647,6 +3652,8 @@ int runMain(string[] args)
                             ~ "Use /restart for a fresh session.");
                         continue;
                     }
+                    // exec doesn't return, so the scope guard can't collect them.
+                    agent.stopSubagents();
                     auto exe = launchExe();
                     // Printed after the frame hands the terminal back, so it stays on screen.
                     if (gFrame) gFrame.suspend();

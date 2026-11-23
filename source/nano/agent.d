@@ -2408,7 +2408,7 @@ class Agent
                     auto seq = ++subSeq;
                     immutable spec = SubSpec(seq, call.id, a.task, model,
                         systemPrompt(cwd, wallNow.toISOExtString[0 .. 10]), defs, limits,
-                        log.match!(l => l.path.stripExtension, () => string.init), "sub-" ~ safeName(call.id), cwd);
+                        log.match!(l => l.path.stripExtension, () => string.init), format("sub-%s", seq), cwd);
                     if (a.background && !backgroundSubagents)
                         throw new ToolError("agent: background sub-agents are not available here (nothing serves "
                             ~ "them between prompts); run it without background");
@@ -2710,6 +2710,15 @@ class Agent
     {
         import nano.subagent : keepDelivered;
         import std.algorithm : count;
+        // A delivered result lives on in the conversation and the log:
+        // keep only the status metadata here.
+        foreach (ref s; subSlots)
+            if (s.background && s.delivered)
+            {
+                s.result.report = null;
+                s.recent = null;
+                s.readState = none;
+            }
         auto n = subSlots.count!(s => s.background && s.delivered);
         if (n <= keepDelivered) return;
         auto drop = saturatingSub(n, keepDelivered);
@@ -2886,6 +2895,7 @@ class Agent
             if (!s.started || s.reportedDone) continue;
             SubProgress p;
             p.callId = s.callId;
+            p.handle = s.id;
             p.task = s.task;
             p.index = i;
             p.toolCalls = s.toolCalls;

@@ -765,6 +765,8 @@ struct SubGate
 struct SubProgress
 {
     string callId, task;
+    /// The session-unique handle (`sub-N`); call ids can repeat across replies.
+    string handle;
     size_t index, toolCalls;
     ulong tokens;
     Duration elapsed;

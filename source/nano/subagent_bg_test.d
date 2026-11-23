@@ -446,3 +446,32 @@ unittest
     f.agent.loadRestored(r, Option!SessionLog.init);
     assert(!f.agent.subagentsActive, "the loader stopped them");
 }
+
+// A provider can repeat a call id across replies (OpenAI's fallback emits
+// `call_0` each time): two background starts with the same id still get
+// their own log file and progress row key.
+unittest
+{
+    import nano.subagent : SubProgress;
+    import std.file : dirEntries, SpanMode;
+    import std.path : baseName, stripExtension;
+    import std.algorithm : startsWith;
+    import std.format : format;
+    final class Rows : NullEvents
+    {
+        string[] handles;
+        override void subagents(const SubProgress[] all) { foreach (ref p; all) handles ~= p.handle; }
+    }
+    auto f = new Fixture([calls(bg("call_0", "mock/search")), calls(bg("call_0", "mock/search")),
+        LLMResponse("started both")]);
+    f.persist("dupid");
+    scope (exit) f.cleanup();
+    auto rows = new Rows;
+    assert(f.agent.run("go", rows) == "started both");
+    assert(rows.handles.canFind("sub-1") && rows.handles.canFind("sub-2"), format("%s", rows.handles));
+    f.agent.stopSubagents();
+    auto childDir = f.agent.log.unwrap("set").path.stripExtension;
+    string[] names;
+    foreach (e; dirEntries(childDir, SpanMode.shallow)) names ~= e.name.baseName;
+    assert(names.canFind!(n => n.startsWith("sub-1.")) && names.canFind!(n => n.startsWith("sub-2.")), format("%s", names));
+}
