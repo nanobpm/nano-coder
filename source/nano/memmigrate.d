@@ -194,8 +194,9 @@ Proposal[] parseProposals(string reply, const string[] batchIds, const string[] 
         foreach (raw; strs(t, "entities"))
         {
             string error;
-            auto ne = normalizeEntityOr(raw, error);
-            if (error !is null) bad = true; // an unknown type or bad name drops just that entity
+            // Check the raw value: lower-casing can hide a case-sensitive token shape (as saveFact does).
+            auto ne = looksLikeSecret(raw) !is null ? null : normalizeEntityOr(raw, error);
+            if (ne is null) bad = true; // a secret-like, unknown-type or bad name drops just that entity
             else if (!ents.canFind(ne)) ents ~= ne;
         }
         if (ents.length > maxAnchors) ents = ents[0 .. maxAnchors];
@@ -237,6 +238,33 @@ bool validText(string text)
     return looksLikeSecret(text) is null;
 }
 
+/// Whether `e`, as it would be rendered (text, evidence, valid_while and
+/// entity names together), trips the secret checks `memory_save` applies:
+/// each field alone and every split-field join. `apply` refuses a change
+/// whose result fails this, so migration never persists what a save refuses.
+bool entryLooksSecret(const Entry e)
+{
+    if (looksLikeSecret(e.text) !is null) return true;
+    string[] others;
+    if (e.evidence !is null) others ~= e.evidence;
+    if (e.validWhile !is null) others ~= e.validWhile;
+    foreach (o; others)
+        if (looksLikeSecret(o) !is null || looksLikeSecret(e.text ~ o) !is null || looksLikeSecret(e.text ~ " " ~ o) !is null
+                || evidenceStatesLabelValue(e.text, o))
+            return true;
+    if (e.evidence !is null && e.validWhile !is null
+            && (looksLikeSecret(e.evidence ~ e.validWhile) !is null || looksLikeSecret(e.evidence ~ " " ~ e.validWhile) !is null
+                || evidenceStatesLabelValue(e.evidence, e.validWhile)))
+        return true;
+    foreach (j; entitiesJoined(e.text, e.evidence, e.validWhile, e.entities)) if (looksLikeSecret(j) !is null) return true;
+    foreach (en; e.entities)
+    {
+        if (looksLikeSecret(en) !is null) return true;
+        foreach (o; [e.text] ~ others) if (evidenceStatesLabelValue(o, en)) return true;
+    }
+    return false;
+}
+
 /// Counts from `apply`.
 struct Applied { size_t tagged, merged, superseded, skipped; }
 
@@ -253,6 +281,11 @@ Applied apply(ref Entry[] entries, const Proposal[] accepted, const EntityRecord
         return -1;
     }
     foreach (p; accepted)
+    {
+        // Each change is checked as a whole: a result that a save would refuse
+        // as secret-like (in any field or split across fields) is rolled back.
+        auto before = entries.dup;
+        auto counts = n;
         p.match!(
             (const TagProposal t) {
                 auto i = at(t.id);
@@ -261,9 +294,9 @@ Applied apply(ref Entry[] entries, const Proposal[] accepted, const EntityRecord
                 foreach (en; t.entities)
                 {
                     auto id = resolveEntity(records, en);
-                    if (!e.entities.canFind(id) && e.entities.length < maxAnchors
-                            && looksLikeSecret(e.text ~ " " ~ id) is null && !evidenceStatesLabelValue(e.text, id))
-                        e.entities ~= id;
+                    if (e.entities.canFind(id) || e.entities.length >= maxAnchors) continue;
+                    e.entities ~= id;
+                    if (entryLooksSecret(*e)) e.entities = e.entities[0 .. $ - 1]; // drop just that entity
                 }
                 if (e.factKind is null && t.factKind !is null) e.factKind = t.factKind;
                 n.tagged++;
@@ -274,12 +307,15 @@ Applied apply(ref Entry[] entries, const Proposal[] accepted, const EntityRecord
                 foreach (d; m.drop) { auto i = at(d); if (i >= 0 && i != k) ds ~= i; }
                 if (k < 0 || !ds.length) { n.skipped++; return; }
                 auto keep = &entries[k];
-                bool explicit = keep.hasAnchors || ds.any!(i => entries[i].hasAnchors);
-                string[] anchors = explicit ? anchorsOf(*keep) : null;
+                // anchorsOf gives explicit anchors or, failing those, the ones inferred
+                // from text and evidence: keep the union so no trigger is lost.
+                string[] anchors = anchorsOf(*keep);
+                bool rule = keep.isRule;
                 foreach (i; ds)
                 {
                     auto d = &entries[i];
-                    if (explicit) foreach (an; anchorsOf(*d)) if (!anchors.canFind(an)) anchors ~= an;
+                    foreach (an; anchorsOf(*d)) if (!anchors.canFind(an)) anchors ~= an;
+                    rule = rule || d.isRule;
                     foreach (en; d.entities) if (!keep.entities.canFind(en)) keep.entities ~= en;
                     if (d.evidence !is null && d.evidence != keep.evidence)
                     {
@@ -293,13 +329,16 @@ Applied apply(ref Entry[] entries, const Proposal[] accepted, const EntityRecord
                     d.supersededBy = keep.id;
                     if (!keep.supersedes.canFind(d.id)) keep.supersedes ~= d.id;
                 }
-                if (explicit)
+                if (rule) keep.kind = "rule"; // a rule stays recalled on every matching call
+                if (keep.entities.length > maxAnchors) keep.entities = keep.entities[0 .. maxAnchors];
+                if (m.text !is null && validText(m.text)) keep.text = m.text;
+                // Pin the union as explicit anchors when the merged entry would no longer infer them all.
+                auto now_ = anchorsOf(*keep);
+                if (anchors.any!(a => !now_.canFind(a)))
                 {
                     keep.hasAnchors = true;
                     keep.anchors = anchors.length > maxAnchors ? anchors[0 .. maxAnchors] : anchors;
                 }
-                if (keep.entities.length > maxAnchors) keep.entities = keep.entities[0 .. maxAnchors];
-                if (m.text !is null && validText(m.text)) keep.text = m.text;
                 n.merged += ds.length;
             },
             (const SupersedeProposal s) {
@@ -309,6 +348,15 @@ Applied apply(ref Entry[] entries, const Proposal[] accepted, const EntityRecord
                 if (!entries[w].supersedes.canFind(entries[o].id)) entries[w].supersedes ~= entries[o].id;
                 n.superseded++;
             });
+        bool refused;
+        foreach (i, ref e; entries) if (e != before[i] && entryLooksSecret(e)) refused = true;
+        if (refused)
+        {
+            entries = before;
+            n = counts;
+            n.skipped++;
+        }
+    }
     return n;
 }
 
@@ -355,10 +403,15 @@ struct Progress
         return p;
     }
 
-    /// Write to `root` atomically.
-    void save(string root) const
+    /// Write to `root` atomically, under a lock, unioned with the ids on disk
+    /// so concurrent migrations never drop each other's progress.
+    void save(string root)
     {
         import std.string : representation;
+        auto path = buildPath(root, progressFile);
+        auto lock = FileLock(path);
+        foreach (k, ids; load(root).done)
+            foreach (id, _; ids) done[k][id] = true;
         JSONValue[string] d;
         foreach (k, ids; done)
         {
@@ -367,7 +420,7 @@ struct Progress
             d[k] = JSONValue(list);
         }
         auto j = JSONValue(["done": JSONValue(d)]);
-        writeBody(buildPath(root, progressFile), j.toString.representation);
+        writeBody(path, j.toString.representation);
     }
 
     /// Whether `id` in `file` was reviewed.
@@ -445,6 +498,7 @@ private Proposal[] edit(Proposal p, Ui ui)
             {
                 if (!raw.strip.length) continue;
                 string error;
+                if (looksLikeSecret(raw) !is null) { ui.say("  ignored: an entity name looks like a secret"); continue; }
                 auto ne = normalizeEntityOr(raw, error);
                 if (error !is null) ui.say("  ignored: " ~ error);
                 else if (!o.entities.canFind(ne)) o.entities ~= ne;
@@ -538,6 +592,8 @@ Report migrate(Store store, Ask ask, Ui ui, Options opts)
                 rep.superseded += got.superseded;
                 rep.skipped += got.skipped;
             }
+            // A wholly invalid reply (malformed, truncated) reviewed nothing: leave the batch pending.
+            if (!ps.length && bad) continue;
             foreach (id; ids) progress.done[file][id] = true;
             progress.save(store.root);
         }

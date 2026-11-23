@@ -1051,8 +1051,9 @@ Answer askQuestions(LineEditor editor, const Question[] qs, bool delegate() @saf
 import nano.ui : Verbosity, parseVerbosity, verbosityListing, providersListing;
 
 /// `/memory migrate` and `--memory-migrate` (issue #281): the model is the
-/// session's client; `ui` asks the user. Returns the report (or the error).
-string runMemoryMigrate(MemoryStore store, LLMClient client, nano.memmigrate.Ui ui, bool dryRun)
+/// session's client; `ui` asks the user. Returns the report (or the error);
+/// `ok` is false when the migration failed, so the CLI can exit nonzero.
+string runMemoryMigrate(MemoryStore store, LLMClient client, nano.memmigrate.Ui ui, bool dryRun, out bool ok)
 {
     nano.memmigrate.Options mo;
     mo.dryRun = dryRun;
@@ -1063,7 +1064,12 @@ string runMemoryMigrate(MemoryStore store, LLMClient client, nano.memmigrate.Ui 
         req.maxTokens = 8_192;
         return client.chat(req, (bool, string) {}).content;
     }
-    try return nano.memmigrate.migrate(store, &ask, ui, mo).toString;
+    try
+    {
+        auto r = nano.memmigrate.migrate(store, &ask, ui, mo).toString;
+        ok = true;
+        return r;
+    }
     catch (Exception e) return "memory migrate failed (applied batches are kept; run it again to resume): " ~ e.msg;
 }
 
@@ -1082,11 +1088,14 @@ nano.memmigrate.Ui plainMigrateUi()
         return n >= 1 && n <= labels.length ? ptrdiff_t(n - 1) : ptrdiff_t(-1);
     };
     ui.input = (string prompt, string initial) {
-        stdErr.write(prompt ~ (initial.length ? " [" ~ initial ~ "]" : "") ~ ": ");
+        // Enter keeps the suggestion; "-" clears the field explicitly.
+        stdErr.write(prompt ~ (initial.length ? " [" ~ initial ~ "] (Enter keeps it, - clears)" : " (- for empty)") ~ ": ");
         stdErr.flush();
         auto line = stdinLine();
         if (line is null) return string.init;
-        return line.strip.length ? line.strip : initial;
+        auto v = line.strip;
+        if (v == "-") return "";
+        return v.length ? v : initial;
     };
     ui.say = (string line) { writeln(line); stdOut.flush(); };
     return ui;
@@ -2945,9 +2954,10 @@ int runMain(string[] args)
             stdErr.writeln("nano-coder: memory is read-only in the config; --memory-migrate --dry-run only proposes");
             exitProcess(1);
         }
-        writeln(runMemoryMigrate(memory.unwrap("checked above"), client, plainMigrateUi(), o.dryRun));
+        bool ok;
+        writeln(runMemoryMigrate(memory.unwrap("checked above"), client, plainMigrateUi(), o.dryRun, ok));
         stdOut.flush();
-        exitProcess(0);
+        exitProcess(ok ? 0 : 1);
     }
     // A helper, not a foreach-body delegate: D closures share the loop variable.
     ToolHandler asToolError(string delegate(JSONValue) @safe handler)
@@ -4129,7 +4139,11 @@ int runMain(string[] args)
                         }
                         if (!dry && editor.isNone) { writeln("/memory migrate needs an interactive terminal"); continue; }
                         auto ui = editor.match!(e => editorMigrateUi(e), () => plainMigrateUi());
-                        writeln(runMemoryMigrate(memory.unwrap("checked above"), agent.client, ui, dry));
+                        bool migrated;
+                        writeln(runMemoryMigrate(memory.unwrap("checked above"), agent.client, ui, dry, migrated));
+                        // Applied batches (even before a later failure) change the memory index in the
+                        // system prompt and which ids it shows in full: reinstall it.
+                        if (!dry) agent.installSystem(systemFor(cwd, agent.promptPlan), indexShown);
                         continue;
                     }
                     {

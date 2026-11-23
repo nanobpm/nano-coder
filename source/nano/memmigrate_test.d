@@ -290,3 +290,65 @@ unittest // merging unions explicit anchors and entities
     assert(es[0].entities == ["tool:dub", "repo:nanobpm/nano-coder"] && es[0].factKind == "pitfall");
     assert(es[0].text == k.text && es[1].supersededBy == "k");
 }
+
+unittest // secret-like raw entity names are dropped before lower-casing hides them
+{
+    size_t bad;
+    auto ps = parseProposals(`{"tags":[{"id":"a","entities":["other:AKIAIOSFODNN7EXAMPLE","host:merlin"]}]}`, ["a"], ["a"], bad);
+    assert(ps.length == 1 && bad == 1);
+    ps[0].match!((TagProposal t) { assert(t.entities == ["host:merlin"]); }, (_) { assert(0); });
+}
+
+unittest // a tag whose entity completes a secret split with the evidence is not applied
+{
+    Entry e;
+    e.id = "a"; e.text = "database access notes"; e.evidence = "the admin password:";
+    Entry[] es = [e];
+    apply(es, [Proposal(TagProposal("a", ["other:hunter2xyz"], null))], null);
+    assert(!es[0].entities.canFind("other:hunter2xyz"));
+}
+
+unittest // a merge whose final entry reads as a secret is rolled back as a whole
+{
+    Entry k, d;
+    k.id = "k"; k.text = "database access notes"; k.evidence = "hunter2";
+    d.id = "d"; d.text = "db notes";
+    Entry[] es = [k, d];
+    auto got = apply(es, [Proposal(MergeProposal("k", ["d"], "database password", null))], null);
+    assert(got.merged == 0 && got.skipped == 1);
+    assert(es[0].text == "database access notes" && !es[1].isSuperseded);
+}
+
+unittest // merging keeps rule mode and the anchors inferred from the dropped entry
+{
+    Entry k, d;
+    k.id = "k"; k.text = "benchmarks need a release build"; k.kind = "hint";
+    d.id = "d"; d.text = "never benchmark ./nano-coder from `dub build`"; d.kind = "rule";
+    Entry[] es = [k, d];
+    auto inferred = anchorsOf(d);
+    assert(inferred.length);
+    apply(es, [Proposal(MergeProposal("k", ["d"], null, null))], null);
+    assert(es[0].isRule);
+    foreach (a; inferred) assert(anchorsOf(es[0]).canFind(a), a);
+}
+
+unittest // progress saves merge with the ids another session wrote
+{
+    auto root = tmp("progress-merge");
+    Progress a, b;
+    a.done["user.jsonl"]["x"] = true;
+    b.done["user.jsonl"]["y"] = true;
+    a.save(root);
+    b.save(root);
+    auto p = Progress.load(root);
+    assert(p.has("user.jsonl", "x") && p.has("user.jsonl", "y"));
+}
+
+unittest // a wholly invalid model reply leaves the batch pending
+{
+    auto f = fixture("invalid-reply");
+    auto u = new Script;
+    auto rep = migrate(f.s, delegate string(string a, string b) => "not json at all", u.ui, Options.init);
+    assert(rep.invalid > 0);
+    assert(!Progress.load(f.s.root).has("user.jsonl", f.dupA));
+}
