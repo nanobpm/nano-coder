@@ -85,7 +85,9 @@ Entry[] load(string path, scope bool delegate(ulong id) @safe want = null)
     Entry[] out_;
     eachLogLine(path, (line, n) {
         if (want !is null && !want(n)) return;
-        if (!line.canFind(`"message"`)) return; // cheap pre-filter; any JSON spacing is valid
+        // Cheap pre-filter; any JSON spacing is valid, and a line with a
+        // `\u` escape may spell the type escaped, so it reaches the decoder.
+        if (!line.canFind(`"message"`) && !line.canFind(`\u`)) return;
         try
         {
             auto rec = parseJSON(line);
@@ -94,6 +96,17 @@ Entry[] load(string path, scope bool delegate(ulong id) @safe want = null)
         catch (Exception) {} // skip a torn or corrupt line, like the resume loader does
     }, false);
     return out_;
+}
+
+unittest // escaped_type_reaches_the_decoder
+{
+    import std.file : write, remove, tempDir;
+    import std.path : buildPath;
+    auto p = buildPath(tempDir, "nano-d-history-escaped-type.jsonl");
+    write(p, `{"type":"mess\u0061ge","data":{"role":"tool","content":"out","tool_call_id":"c"}}` ~ "\n");
+    scope (exit) remove(p);
+    auto es = load(p);
+    assert(es.length == 1 && es[0].message.content == "out");
 }
 
 string roleName(Role r) pure @safe

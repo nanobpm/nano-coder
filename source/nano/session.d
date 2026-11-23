@@ -892,10 +892,15 @@ void backfillPinText(ref Message m, const InputKey[] inputs) pure
     if ((inputs.length && inputs[$ - 1].matches(m.content)) || !m.content.canFind(wrapStart)) return;
     if (inputs.any!(k => k.matches(m.content))) return;
     size_t found;
+    // Each distinct prefix length is hashed once, however many inputs share it.
+    size_t[size_t] prefixHash;
     foreach_reverse (ref input; inputs)
         if (m.content.length > input.length && input.length > found
-            && m.content[input.length .. $].stripLeft.startsWith(wrapStart) && input.matches(m.content[0 .. input.length]))
-            found = input.length;
+            && m.content[input.length .. $].stripLeft.startsWith(wrapStart))
+        {
+            auto h = prefixHash.require(input.length, hashOf(m.content[0 .. input.length]));
+            if (h == input.hash) found = input.length;
+        }
     if (found) m.pinText = m.content[0 .. found];
 }
 
@@ -1157,9 +1162,14 @@ private const(char)[] skimField(const(char)[] obj, string key)
 /// not a readable string. The raw value keeps its escapes, so an escaped
 /// spelling (`"repla\u0063e"`) must decode to the type the full decoder sees,
 /// or the skim scan and `restore` disagree on the record.
-private const(char)[] skimType(const(char)[] line)
+private const(char)[] skimType(const(char)[] line) => skimString(line, "type");
+
+/// The decoded string value of top-level `key` in `obj`, or null when it is
+/// not a readable string; escapes are decoded so comparisons match what the
+/// full decoder sees.
+private const(char)[] skimString(const(char)[] obj, string key)
 {
-    auto raw = skimField(line, "type");
+    auto raw = skimField(obj, key);
     if (raw.length < 2 || raw[0] != '"' || raw[$ - 1] != '"') return null;
     const(char)[] type = raw[1 .. $ - 1];
     // A malformed escape fails closed: the record is not skimmed by type.
@@ -1174,6 +1184,7 @@ unittest // escaped_type_decodes_before_comparison
     assert(skimType(`{"type":"mes\u0073age"}`) == "message");
     assert(skimType(`{"type":"bad\uZZZZ"}`) is null);
     assert(skimType(`{"type":3}`) is null);
+    assert(skimString(`{"role":"t\u006fol"}`, "role") == "tool");
 }
 
 /// Whether `raw` is a JSON integer `jsonUnsigned` accepts (no leading `-`
@@ -1405,7 +1416,7 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
                     // Only a large tool result's key outlives the skim:
                     // such a line is decoded below for `toolKeys`.
                     auto data = skimField(line, "data");
-                    if (skimField(data, "role") != `"tool"` || skimField(data, "content").length <= stashSlimBytes)
+                    if (skimString(data, "role") != "tool" || skimField(data, "content").length <= stashSlimBytes)
                     {
                         index++;
                         return;
