@@ -24,6 +24,7 @@ import std.process : environment;
 import core.stdc.stdlib : exit;
 import nano.config;
 import nano.llm;
+static import nano.memmigrate;
 import nano.agent;
 import nano.providers;
 import nano.tools;
@@ -65,6 +66,7 @@ enum string usage = `Usage: nano-coder [--model provider/model] [--config PATH] 
        nano-coder --list-sessions [--all] [--json]
        nano-coder --trajectory SESSION_ID [--json|--markdown]
        nano-coder --list-models PROVIDER[/model]
+       nano-coder --memory-migrate [--dry-run]
        nano-coder --login github-copilot
        nano-coder --version
 
@@ -76,12 +78,16 @@ REPL commands: /help lists them (/model, /mode, /verbosity, /providers, /restart
 Ctrl-C cancels a running turn; a line typed during a turn steers it.
 A repository's own skills and .claude/settings*.json hooks load only once you trust it: an
 interactive start asks "Trust this repo?" and remembers a yes; -p and piped runs skip them.
---yolo trusts the repository without asking (as --acp does).`;
+--yolo trusts the repository without asking (as --acp does).
+--memory-migrate tags, merges and supersedes the saved memories with the model's help, asking
+before each change (as /memory migrate does); --dry-run writes the proposals to a file instead.`;
 
 struct Options
 {
     string model, configPath, prompt, resume, listModels, sandbox, login, trajectory, verbosity;
     bool waitTimers, yolo, markdown, plan, noSession, noHooks, verbose, hasResume, acp, listSessions, all, json;
+    /// `--memory-migrate` and its `--dry-run`.
+    bool memoryMigrate, dryRun;
     string[] allow, deny;
 }
 
@@ -117,6 +123,8 @@ Options parseArgs(string[] args)
             case "--allow": o.allow ~= value(); break;
             case "--deny": o.deny ~= value(); break;
             case "--plan": o.plan = true; break;
+            case "--memory-migrate": o.memoryMigrate = true; break;
+            case "--dry-run": o.dryRun = true; break;
             case "--sandbox": o.sandbox = value(); break;
             case "--acp": o.acp = true; break;
             case "--list-sessions": o.listSessions = true; break;
@@ -149,6 +157,10 @@ Options parseArgs(string[] args)
     if (o.hasResume && o.trajectory !is null) fail("--resume and --trajectory are mutually exclusive");
     if (o.listSessions && (o.hasResume || o.acp || o.listModels.length || o.prompt.length || o.login.length))
         fail("--list-sessions can't be combined with --resume, --acp, --list-models, --login or -p");
+    if (o.dryRun && !o.memoryMigrate) fail("--dry-run requires --memory-migrate");
+    if (o.memoryMigrate && (o.hasResume || o.acp || o.listModels.length || o.prompt.length || o.login.length
+            || o.listSessions || o.trajectory !is null))
+        fail("--memory-migrate can't be combined with --resume, --acp, --list-models, --login, --list-sessions, --trajectory or -p");
     if (o.hasResume && o.login.length) fail("--resume and --login are mutually exclusive");
     if (o.hasResume && o.listModels.length) fail("--resume and --list-models are mutually exclusive");
     return o;
@@ -176,6 +188,8 @@ unittest
     assert(!ok("--resume", "--list-models", "openai") && !ok("--list-models", "openai", "--resume=sess-1"));
     assert(ok("--acp", "--resume", "sess-1"));
     assert(parseArgs(["nano-coder", "--resume", "sess-1"]).resume == "sess-1");
+    assert(ok("--memory-migrate") && ok("--memory-migrate", "--dry-run") && !ok("--dry-run"));
+    assert(!ok("--memory-migrate", "-p", "hi") && !ok("--memory-migrate", "--acp"));
     auto bare = parseArgs(["nano-coder", "--resume"]);
     assert(bare.hasResume && bare.resume == "");
     assert(parseArgs(["nano-coder", "--resume=-sess"]).resume == "-sess");
@@ -1035,6 +1049,59 @@ Answer askQuestions(LineEditor editor, const Question[] qs, bool delegate() @saf
 
 // The output detail level (ui.rs's global verbosity), read live by Console.
 import nano.ui : Verbosity, parseVerbosity, verbosityListing, providersListing;
+
+/// `/memory migrate` and `--memory-migrate` (issue #281): the model is the
+/// session's client; `ui` asks the user. Returns the report (or the error).
+string runMemoryMigrate(MemoryStore store, LLMClient client, nano.memmigrate.Ui ui, bool dryRun)
+{
+    nano.memmigrate.Options mo;
+    mo.dryRun = dryRun;
+    string ask(string system, string user)
+    {
+        ChatRequest req;
+        req.messages = [Message.system(system), Message.user(user)];
+        req.maxTokens = 8_192;
+        return client.chat(req, (bool, string) {}).content;
+    }
+    try return nano.memmigrate.migrate(store, &ask, ui, mo).toString;
+    catch (Exception e) return "memory migrate failed (applied batches are kept; run it again to resume): " ~ e.msg;
+}
+
+/// The migration review on plain stdin: numbered menus, typed answers.
+nano.memmigrate.Ui plainMigrateUi()
+{
+    nano.memmigrate.Ui ui;
+    ui.select = (string prompt, const string[] labels) {
+        foreach (i, l; labels) stdErr.writefln("  %s) %s", i + 1, l);
+        stdErr.write(format("%s [1-%s]: ", prompt, labels.length));
+        stdErr.flush();
+        auto line = stdinLine();
+        if (line is null) return ptrdiff_t(-1);
+        size_t n;
+        foreach (c; line.strip) { if (c < '0' || c > '9' || n > labels.length) return ptrdiff_t(-1); n = n * 10 + (c - '0'); }
+        return n >= 1 && n <= labels.length ? ptrdiff_t(n - 1) : ptrdiff_t(-1);
+    };
+    ui.input = (string prompt, string initial) {
+        stdErr.write(prompt ~ (initial.length ? " [" ~ initial ~ "]" : "") ~ ": ");
+        stdErr.flush();
+        auto line = stdinLine();
+        if (line is null) return string.init;
+        return line.strip.length ? line.strip : initial;
+    };
+    ui.say = (string line) { writeln(line); stdOut.flush(); };
+    return ui;
+}
+
+/// The migration review on the line editor (menus and pre-filled inputs).
+nano.memmigrate.Ui editorMigrateUi(LineEditor e)
+{
+    auto eu = new EditorUi(e);
+    nano.memmigrate.Ui ui;
+    ui.select = (string prompt, const string[] labels) => eu.select(prompt, labels, 0);
+    ui.input = (string prompt, string initial) => eu.input(prompt, initial);
+    ui.say = (string line) => eu.say(line);
+    return ui;
+}
 
 /// The `/settings` prompts on the line editor.
 final class EditorUi : SettingsUi
@@ -2870,6 +2937,18 @@ int runMain(string[] args)
         auto dir = cfg.memoryDir.length ? cfg.memoryDir : memoryDefaultDir();
         if (dir.length) memory = some(new MemoryStore(dir, projectKey(cwd), cfg.memoryExpiryDays < 0 ? 0 : cfg.memoryExpiryDays));
     }
+    if (o.memoryMigrate)
+    {
+        if (memory.isNone) { stdErr.writeln("nano-coder: memory is off"); exitProcess(1); }
+        if (!o.dryRun && cfg.memory != MemoryMode.on)
+        {
+            stdErr.writeln("nano-coder: memory is read-only in the config; --memory-migrate --dry-run only proposes");
+            exitProcess(1);
+        }
+        writeln(runMemoryMigrate(memory.unwrap("checked above"), client, plainMigrateUi(), o.dryRun));
+        stdOut.flush();
+        exitProcess(0);
+    }
     // A helper, not a foreach-body delegate: D closures share the loop variable.
     ToolHandler asToolError(string delegate(JSONValue) @safe handler)
     {
@@ -4034,6 +4113,25 @@ int runMain(string[] args)
                     continue;
                 case "/memory":
                     if (memory.isNone) { writeln("memory is off"); continue; }
+                    if (arg == "migrate" || arg.startsWith("migrate "))
+                    {
+                        auto rest = arg["migrate".length .. $].strip;
+                        if (rest.length && rest != "--dry-run")
+                        {
+                            writeln("Usage: /memory migrate [--dry-run]");
+                            continue;
+                        }
+                        bool dry = rest.length > 0;
+                        if (!dry && (!memoryWritable || agent.control.mode == AgentMode.plan))
+                        {
+                            writeln("Memory is read-only here; /memory migrate --dry-run only proposes changes.");
+                            continue;
+                        }
+                        if (!dry && editor.isNone) { writeln("/memory migrate needs an interactive terminal"); continue; }
+                        auto ui = editor.match!(e => editorMigrateUi(e), () => plainMigrateUi());
+                        writeln(runMemoryMigrate(memory.unwrap("checked above"), agent.client, ui, dry));
+                        continue;
+                    }
                     {
                         import nano.memory : memoryCommand;
                         auto store = memory.unwrap("checked on the line above");

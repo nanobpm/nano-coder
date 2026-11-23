@@ -45,6 +45,7 @@ static import nano.mdblock;
 static import nano.mdinline;
 static import nano.mdtable;
 static import nano.memory;
+static import nano.memmigrate;
 static import nano.memsecret;
 static import nano.mode;
 static import nano.nullaudit;
@@ -137,6 +138,7 @@ private alias modules = imported!"std.meta".AliasSeq!(
     nano.mdinline,
     nano.mdtable,
     nano.memory,
+    nano.memmigrate,
     nano.memsecret,
     nano.mode,
     nano.nullaudit,
