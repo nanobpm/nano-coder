@@ -299,6 +299,7 @@ string truncateFile(string path, size_t limit, string label, out bool denied, bo
     import std.string : representation;
     import nano.safeio : readBytes, asChars;
     import nano.sandbox : looksDenied;
+    import nano.arith : saturatingSub;
 
     denied = false;
     auto rawSize = getSize(path);
@@ -347,7 +348,8 @@ string truncateFile(string path, size_t limit, string label, out bool denied, bo
     // Small overlap for sandbox denial phrase matching across chunk boundaries
     // (longest phrase in looksDenied is 23 bytes).
     enum size_t deniedOverlap = 32;
-    string deniedCarry;
+    char[deniedOverlap * 2] deniedJoin; // carry + piece prefix, fixed: no per-chunk GC copy
+    size_t deniedCarryLen;
 
     static const(char)[] lastNChars(const(char)[] s, size_t n) pure nothrow @nogc
     {
@@ -381,12 +383,21 @@ string truncateFile(string path, size_t limit, string label, out bool denied, bo
         sha.put(piece.representation);
         if (checkDenied && !denied)
         {
-            auto probe = deniedCarry.length ? (deniedCarry ~ piece).idup : piece.idup;
-            if (looksDenied(probe)) denied = true;
+            // Scan the piece in place, plus a fixed-size join of the carried
+            // tail and the piece's head for phrases straddling the boundary.
+            auto pre = piece.length > deniedOverlap ? piece[0 .. deniedOverlap] : piece;
+            deniedJoin[deniedCarryLen .. deniedCarryLen + pre.length] = pre[];
+            auto joined = deniedJoin[0 .. deniedCarryLen + pre.length];
+            if (looksDenied(piece) || looksDenied(joined)) denied = true;
             else
             {
-                auto keep = probe.length > deniedOverlap ? probe[$ - deniedOverlap .. $] : probe;
-                deniedCarry = keep;
+                const(char)[] keep = piece.length >= deniedOverlap
+                    ? piece[$ - deniedOverlap .. $]
+                    : joined[saturatingSub(joined.length, deniedOverlap) .. $];
+                char[deniedOverlap] tmp;
+                tmp[0 .. keep.length] = keep[];
+                deniedJoin[0 .. keep.length] = tmp[0 .. keep.length];
+                deniedCarryLen = keep.length;
             }
         }
         if (headChars < headTarget)
@@ -816,18 +827,24 @@ unittest
             block[$ - 1] = '\n';
             foreach (_; 0 .. 256) f.rawWrite(block[]); // 16 MiB
         }
-        GC.collect();
-        auto before = GC.stats.allocatedInCurrentThread;
-        bool denied;
-        auto got = truncateFile(p, 1000, "mem-stream", denied, false);
-        auto allocated = GC.stats.allocatedInCurrentThread - before;
-        auto m = got.matchFirst(`full output saved to (.*\.txt) \.\.\.\]`);
-        scope (exit) if (m && m[1].exists) remove(m[1]);
-        assert(m && got.startsWith("H") && got.endsWith("z\n"));
-        assert(got.canFind("16776216 characters omitted"), got);
-        // Streaming 16 MiB should allocate well under 4 MiB total on the GC heap
-        // (old path allocated > 96 MiB: readBytes + lossyUtf8 + 4x toUTF32).
-        assert(allocated < 4 * 1024 * 1024, format("expected < 4 MiB allocated, got %s bytes", allocated));
+        // Both with and without sandbox-denial scanning (the sandboxed-failure path).
+        foreach (checkDenied; [false, true])
+        {
+            GC.collect();
+            auto before = GC.stats.allocatedInCurrentThread;
+            bool denied;
+            auto got = truncateFile(p, 1000, "mem-stream", denied, checkDenied);
+            auto allocated = GC.stats.allocatedInCurrentThread - before;
+            auto m = got.matchFirst(`full output saved to (.*\.txt) \.\.\.\]`);
+            scope (exit) if (m && m[1].exists) remove(m[1]);
+            assert(m && got.startsWith("H") && got.endsWith("z\n"));
+            assert(got.canFind("16776216 characters omitted"), got);
+            assert(!denied);
+            // Streaming 16 MiB should allocate well under 4 MiB total on the GC heap
+            // (old path allocated > 96 MiB: readBytes + lossyUtf8 + 4x toUTF32).
+            assert(allocated < 4 * 1024 * 1024, format("expected < 4 MiB allocated (checkDenied=%s), got %s bytes",
+                checkDenied, allocated));
+        }
     }
 }
 
