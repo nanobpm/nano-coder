@@ -99,12 +99,14 @@ int perform(const ref Request req, out string body_, out ResponseMeta meta,
     // and on every chunk).
     http.onProgress = (size_t a, size_t b, size_t c, size_t d) => cancelRequested() ? 1 : 0;
     ubyte[] buf;
+    size_t received; // bytes of the final response, buffered or streamed
     ushort statusCode;
     // Headers of the final response only (a redirect or 100 resets them).
     http.onReceiveStatusLine = (HTTP.StatusLine sl) {
         meta = ResponseMeta.init;
         statusCode = sl.code;
         buf = null;
+        received = 0;
     };
     http.onReceiveHeader = (in char[] key, in char[] value) {
         auto k = key.idup.toLower;
@@ -117,12 +119,11 @@ int perform(const ref Request req, out string body_, out ResponseMeta meta,
         // only to discard it. Non-SSE replies and error bodies are still buffered.
         immutable streamOnly = onChunk !is null && statusCode >= 200 && statusCode < 300
             && meta.contentType.indexOf("event-stream") >= 0;
-        if (!streamOnly)
-        {
-            // Returning less than offered makes libcurl abort before more is buffered.
-            if (req.maxBytes && buf.length + data.length > req.maxBytes) return 0;
-            buf ~= data;
-        }
+        // The cap bounds the transfer, not just what is retained: returning
+        // less than offered makes libcurl abort before more is buffered or streamed.
+        if (req.maxBytes && received + data.length > req.maxBytes) return 0;
+        received += data.length;
+        if (!streamOnly) buf ~= data;
         if (onChunk !is null) onChunk(asChars(data)); // unchecked: a chunk may end inside a character
         return data.length;
     };
@@ -757,5 +758,27 @@ unittest
         assert(caught.body_ == "data: err\n\n", caught.body_);
     }
 
+    srv.finish();
+}
+
+// The `maxBytes` cap bounds an unbuffered SSE stream too: the transfer aborts
+// instead of forwarding chunks past the limit.
+unittest
+{
+    import nano.testserver : serve, Reply;
+    import std.net.curl : CurlException;
+    auto srv = serve([Reply(200, "Content-Type: text/event-stream\r\n", "data: one\n\ndata: two\n\n")]);
+    Request req;
+    req.url = srv.url ~ "/sse";
+    req.body_ = "{}";
+    req.maxBytes = 5;
+    string body_;
+    ResponseMeta meta;
+    size_t forwarded;
+    bool threw;
+    try perform(req, body_, meta, (const(char)[] chunk) { forwarded += chunk.length; });
+    catch (CurlException) threw = true;
+    assert(threw, "expected the capped stream to abort");
+    assert(forwarded <= 5);
     srv.finish();
 }
