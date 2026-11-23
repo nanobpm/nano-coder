@@ -645,6 +645,7 @@ unittest
 /// not hold unshared mutable references, so neither a copy out of `get` nor
 /// anything `update` stores can alias the locked value from another thread.
 import std.traits : hasUnsharedAliasing;
+import core.time : Duration;
 final class Locked(T) if (!hasUnsharedAliasing!T)
 {
     import core.sync.mutex : Mutex;
@@ -694,6 +695,28 @@ final class Locked(T) if (!hasUnsharedAliasing!T)
         scope (exit) self.changed.notifyAll();
         return f(self.value);
     }
+
+    /// `await` with a bound: false when `timeout` lapses before `ready`
+    /// holds (nothing run); true after running `f` under the lock.
+    /// `@trusted`: as for `update`.
+    bool await(R = void)(scope bool delegate(ref const T) @safe ready, scope R delegate(ref T) @safe f,
+        Duration timeout) shared @trusted
+    {
+        import core.time : MonoTime;
+        auto self = cast() this;
+        self.mutex.lock();
+        scope (exit) self.mutex.unlock();
+        auto deadline = MonoTime.currTime + timeout;
+        while (!ready(self.value))
+        {
+            auto left = deadline - MonoTime.currTime;
+            if (left <= Duration.zero) return false;
+            self.changed.wait(left);
+        }
+        scope (exit) self.changed.notifyAll();
+        f(self.value);
+        return true;
+    }
 }
 
 /// A copyable, sendable handle to a `shared Locked!T` (like Rust's
@@ -714,6 +737,12 @@ struct Shared(T)
     R await(R = void)(scope bool delegate(ref const T) @safe ready, scope R delegate(ref T) @safe f)
     {
         return atomicLoad(impl).await!R(ready, f);
+    }
+    /// ditto
+    bool await(R = void)(scope bool delegate(ref const T) @safe ready, scope R delegate(ref T) @safe f,
+        Duration timeout)
+    {
+        return atomicLoad(impl).await!R(ready, f, timeout);
     }
 }
 

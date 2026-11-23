@@ -392,24 +392,17 @@ struct PeerListener
         auto cell = Shared!ReplyCell.make;
         requests.put(PeerRequest(pm.unwrap("isOk"), cell));
         // The UI thread answers within moments (mid-turn) or after the user
-        // decides (idle, confirm on): wait generously, but never forever —
-        // a wedged consumer must not pin the listener thread.
-        auto start = monoNow;
-        for (;;)
+        // decides (idle, confirm on): block on the cell's condition (woken
+        // by the answering update), bounded so a wedged consumer never pins
+        // the listener thread.
+        ReplyCell r;
+        auto answered = cell.await((ref const ReplyCell c) => c.resolved, (ref ReplyCell c) { r = c; }, 120.seconds);
+        if (!answered)
         {
-            auto r = cell.get;
-            if (r.resolved)
-            {
-                sendReply(conn, responseLine(id, r.status, r.note));
-                return;
-            }
-            if (since(start) > 120.seconds)
-            {
-                sendReply(conn, responseLine(id, Status.refused, "the target session did not answer in time"));
-                return;
-            }
-            sleepFor(5.msecs);
+            sendReply(conn, responseLine(id, Status.refused, "the target session did not answer in time"));
+            return;
         }
+        sendReply(conn, responseLine(id, r.status, r.note));
     }
 
     private static void sendReply(Socket conn, string reply)
@@ -615,13 +608,20 @@ struct PeerRouter
     static PeerRouter make(shared TurnControl control)
     {
         import core.atomic : atomicLoad, atomicStore;
-        PeerRouter r;
-        atomicStore(r.control, atomicLoad(control));
-        r.requests = Chan!PeerRequest.make;
-        r.waiting = Chan!WaitingItem.make;
-        r.confirmSetting = Shared!bool.make(true);
-        r.midTurnFlag = Shared!bool.make(false);
+        PeerRouter r = PeerRouter(Chan!PeerRequest.make, atomicLoad(control), Chan!WaitingItem.make,
+            Shared!bool.make(true), Shared!bool.make(false));
         return r;
+    }
+
+    private this(Chan!PeerRequest requests, shared TurnControl control, Chan!WaitingItem waiting,
+            Shared!bool confirmSetting, Shared!bool midTurnFlag)
+    {
+        import core.atomic : atomicStore;
+        this.requests = requests;
+        atomicStore(this.control, control);
+        this.waiting = waiting;
+        this.confirmSetting = confirmSetting;
+        this.midTurnFlag = midTurnFlag;
     }
 
     bool opCast(B : bool)() pure const { return !!requests; }
