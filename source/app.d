@@ -52,6 +52,7 @@ import nano.claude_hooks : HookManager, listingField, label, isProject;
 import nano.skills : Skills, SkillsConfig, skillsDefinition = definition;
 import nano.memory : MemoryStore = Store, MemoryMode, memorySessionTools = sessionTools, memoryDefaultDir = defaultDir, projectKey, repoNameOf, Scope, parseRecallMode;
 import nano.control : TurnControl, FdLineReader;
+import nano.peers : PeerListener, PeerRouter, Inbound, ListenError, settle, confirmQuestion;
 import nano.instructions : ProjectInstructions, InstructionOptions = Options, expandHome;
 import core.atomic : atomicLoad, atomicStore, cas;
 
@@ -613,6 +614,19 @@ bool deliverIdleCompact(bool due, imported!"core.time".Duration quietFor, import
     assert(idleCompactHoldFor(c) == 7.seconds);
 }
 
+/// Route accepted peer requests every few ms while a turn runs (issue
+/// #272), until `halt`: mid-turn ones join the turn's steers.
+void pumpPeerRoutes(PeerRouter peerRouter, MessageQueue queue, Shared!bool halt)
+{
+    import core.time : msecs;
+    import nano.clock : sleepFor;
+    while (!halt.get)
+    {
+        peerRouter.routePending(queue);
+        sleepFor(20.msecs);
+    }
+}
+
 Isolated!LineEditor turnKeys(Isolated!LineEditor owned, ConsoleLink console, shared(bool)* done, Chan!string held,
     QuestionBroker questions, MessageQueue queue, MidTurn mid)
 {
@@ -891,6 +905,77 @@ private string subagentsToggle(Agent agent, ref Config cfg, imported!"nano.subag
     if (was != t.on) msg ~= " (the tool list changed, so the provider's prompt cache is rebuilt once)";
     if (t.save) msg ~= "; " ~ saveSubagentsSetting(cfg, t.on);
     return msg;
+}
+
+/// Run `/messages [on|off|confirm on|off] [--save]` (issue #272): show the
+/// state, or switch inter-session messages (and confirmation) for this
+/// session; `--save` writes the user config.
+string messagesCommand(Agent agent, ref Config cfg, string arg, ref PeerRouter router,
+        bool listening, string delegate() @safe start, void delegate() @safe stop)
+{
+    import nano.settings : Changes, save;
+    import std.algorithm : endsWith;
+    import std.string : strip;
+    auto words = arg.strip;
+    bool saveIt;
+    if (words.endsWith("--save")) { saveIt = true; words = words[0 .. $ - "--save".length].strip; }
+
+    string stateText()
+    {
+        auto out_ = format("Messages %s: this session %s%s.", listening && agent.messagesOn ? "on" : "off",
+            listening && agent.messagesOn ? "listens for peer messages and offers session_send"
+                : "opens no socket and has no session_send",
+            router.confirm ? "; incoming messages wait for you to accept" : "; incoming messages are queued at once");
+        return out_;
+    }
+
+    string persist()
+    {
+        Changes ch;
+        ch.sessionMessages = true;
+        ch.sessionMessagesConfirm = true;
+        cfg.sessionMessages = agent.messagesOn;
+        cfg.sessionMessagesConfirm = router.confirm;
+        try
+        {
+            save(cfg, ch, null, cfg.path);
+            return "saved to " ~ cfg.path;
+        }
+        // save() throws only on an unwritable file or an unparseable existing
+        // config; both are reported, never swallowed.
+        catch (Exception e) return "could not save: " ~ e.msg;
+    }
+
+    if (!words.length) return stateText();
+    bool on;
+    bool confirmChange, confirmValue;
+    if (words == "on") on = true;
+    else if (words == "off") on = false;
+    else if (words == "confirm on") { confirmChange = true; confirmValue = true; }
+    else if (words == "confirm off") { confirmChange = true; confirmValue = false; }
+    else return "usage: /messages [on|off|confirm on|off] [--save]";
+
+    string out_;
+    if (confirmChange)
+    {
+        router.confirm(confirmValue);
+        out_ = format("Incoming messages %s for this session", confirmValue ? "wait for you to accept" : "are queued at once");
+    }
+    else if (on == agent.messagesOn && on == listening)
+        out_ = stateText();
+    else if (on)
+    {
+        if (auto failed = start()) out_ = "could not turn messages on: " ~ failed;
+        else out_ = "Messages on for this session (listening; session_send offered)";
+    }
+    else
+    {
+        stop();
+        agent.messagesOn = false;
+        out_ = "Messages off for this session (the socket is closed; session_send is gone from the next request)";
+    }
+    if (saveIt) out_ ~= "; " ~ persist();
+    return out_;
 }
 
 /// Replays shown so far by `/subagents show` (UI thread only).
@@ -1820,7 +1905,7 @@ class Console : AgentEvents
     {
         if (quiet) return;
         endLine();
-        writeln(stampBlock(stamp(), dim("↪ " ~ escapeMarks(text))));
+        writeln(stampBlock(stamp(), dim("↪ " ~ escapeMarks(sanitizeBlock(text)))));
     }
     /// Close the abandoned partial so the resent reply starts a fresh segment
     /// instead of joining the stale prefix.
@@ -3070,6 +3155,8 @@ int runMain(string[] args)
         host.configModel = cfg.model;
         host.configSystemPrompt = cfg.systemPrompt;
         host.saveSubagents = (bool on) => saveSubagentsSetting(cfg, on);
+        host.sessionMessages = cfg.sessionMessages;
+        host.sessionMessagesConfirm = cfg.sessionMessagesConfirm;
         host.sessionMeta = () {
             JSONValue meta = ["projectInstructions": JSONValue(instructions.match!(pi => pi.loadedPaths, () => string[].init)),
                 "skills": JSONValue(skills.names)];
@@ -3190,6 +3277,59 @@ int runMain(string[] args)
     Option!LineEditor editor;
     string[] held; // lines to run before reading the prompt again
     auto queue = MessageQueue.make; // Ctrl-Enter messages: one runs per following turn
+
+    // Inter-session messages (issue #272): with `session_messages` on this
+    // session listens on a registry socket; a delivery mid-turn joins the
+    // steers (visible in /queue), an idle one is confirmed (per
+    // `session_messages_confirm`) and starts a turn.
+    PeerRouter peerRouter;
+    // Zero or one listener (an Option can't hold a PeerListener: its NotNull
+    // has no default).
+    PeerListener[] peerListener;
+    void stopPeerListener()
+    {
+        foreach (ref l; peerListener) l.close();
+        peerListener = null;
+    }
+    scope (exit) stopPeerListener();
+    string startPeerListener()
+    {
+        import nano.peers : ensureDir, peersDir;
+        if (agent.log.isNone) return "this session isn't saved (--no-session), so it can't receive messages";
+        auto dir = peersDir();
+        if (!ensureDir(dir)) return "could not create the peers directory " ~ dir;
+        auto id = agent.log.unwrap("checked above").id;
+        try
+        {
+            peerListener = [PeerListener.listen(dir, id, peerRouter.requests)];
+            agent.messagesOn = true;
+            return null;
+        }
+        catch (ListenError e) return e.msg;
+    }
+    // After a session switch (/restart, /resume): drop what was addressed
+    // to the old session and listen under the new id. Routing only runs on
+    // this thread, so nothing old was routed between the switch and here.
+    void rebindPeerListener()
+    {
+        // Old-session deliveries go even when messages are off already.
+        peerRouter.discardAll();
+        if (!peerListener.length) return;
+        stopPeerListener();
+        if (auto failed = startPeerListener())
+        {
+            agent.messagesOn = false;
+            stdErr.writeln(console.red("[messages: " ~ failed ~ "]"));
+        }
+    }
+    peerRouter = PeerRouter.make(agent.control.nonNull);
+    peerRouter.confirm(cfg.sessionMessagesConfirm);
+    if (cfg.sessionMessages)
+        if (auto failed = startPeerListener())
+            stdErr.writeln(console.red("[messages: " ~ failed ~ "]"));
+    // A peer delivery that starts a turn is flagged for the loop guard.
+    bool peerInput;
+    string peerSender; // its full sender session id
 
     // Recently used models lead the `/model` type-ahead (recents.rs).
     static import nano.recents;
@@ -3345,6 +3485,27 @@ int runMain(string[] args)
     /// over afterwards run as the next prompts.
     bool driven(scope bool delegate() @safe work) @safe
     {
+        // Peer messages accepted so far join this turn's steers (or wait for
+        // the prompt): route before the key reader starts and after it stops.
+        // No pass on exit: the turn is still mid-turn there, so a peer
+        // request would be steered into `control` with nobody to collect it.
+        // The explicit pass before the late take and the idle prompt cover it.
+        peerRouter.routePending(queue);
+        // Route during `work` too, so a busy session's peer steers reach
+        // this turn (and their senders hear back) instead of timing out.
+        auto pumpHalt = Shared!bool.make(false);
+        // No listener, nothing to route: skip the polling thread.
+        bool pumpRunning = peerListener.length != 0;
+        typeof(spawnDaemon(&pumpPeerRoutes, peerRouter, queue, pumpHalt)) pump;
+        if (pumpRunning) pump = spawnDaemon(&pumpPeerRoutes, peerRouter, queue, pumpHalt);
+        void stopPump()
+        {
+            if (!pumpRunning) return;
+            pumpRunning = false;
+            pumpHalt.update((ref bool b) { b = true; });
+            pump.join();
+        }
+        scope (exit) stopPump();
         // With the line editor, keys typed during the turn steer it (a
         // `/command` waits for the turn to end); Ctrl-C or Esc Esc cancels.
         auto turnDone = new shared(bool);
@@ -3381,9 +3542,24 @@ int runMain(string[] args)
         // Stop the key reader before taking the late steers: one typed between
         // the take and the stop would land in `control` and never run.
         stopKeys();
+        // The final routing pass comes before the take, so a peer steer
+        // routed now is collected below rather than stranded in `control`.
+        stopPump();
+        peerRouter.routePending(queue);
         // Steers that arrived after the agent's last step run as the next prompts.
         // One the user steered at the prompt keeps its `/queue` id.
         auto late = agent.control.takePending;
+        // Before the cancel drop: its sender was told `queued`, so a
+        // peer's late steer runs later as a peer prompt (loop guard kept).
+        {
+            import std.algorithm : filter;
+            import std.array : array;
+            foreach (t; late)
+                if (t.fromPeer && !peerRouter.requeueLate(t.text, t.sender))
+                    stdErr.writeln(console.dim(format("[peer message from %s dropped: inbox full]",
+                        escapeMarks(sanitizeBlock(PeerRouter.senderFromLabel(t.text))))));
+            late = late.filter!(t => !t.fromPeer).array;
+        }
         // A cancelled turn drops them (Rust: only a successful cancelled outcome).
         if (ok && agent.control.nonNull.isCancelled)
         {
@@ -3403,7 +3579,7 @@ int runMain(string[] args)
         return ok;
     }
 
-    bool turn(string input) @safe
+    bool turn(string input, bool fromPeer = false, string peerSender = null) @safe
     {
         auto skillChange = refreshSkills();
         if (skillChange.length)
@@ -3414,6 +3590,8 @@ int runMain(string[] args)
         if (reloadInstructions())
             stdErr.writeln(console.dim("[instruction files changed: the system prompt now follows them]"));
         syncMode();
+        peerRouter.midTurn(true);
+        scope (exit) peerRouter.midTurn(false);
         nano.herdr.report(nano.herdr.State.working);
         nano.herdr.showTimer(!agent.timers.empty);
         // Follow timers set or cancelled during the turn too, not only the
@@ -3435,7 +3613,7 @@ int runMain(string[] args)
             console.finalAnswer = null;
             console.beginAnswerGuard();
             string response;
-            try response = agent.run(input, console);
+            try response = agent.run(input, console, true, null, fromPeer, peerSender);
             catch (Exception e)
             {
                 console.endLine();
@@ -3493,9 +3671,13 @@ int runMain(string[] args)
         import nano.clock : sleepFor;
         import core.time : msecs;
         string l;
-        while (agent.subagentsActive || agent.backgroundResultsReady())
+        while (agent.subagentsActive || agent.backgroundResultsReady() || peerListener.length)
         {
             if (inbox.tryTake(l)) return l;
+            // A peer delivery wakes the prompt: an empty line just loops
+            // back to the top, which confirms and runs it (issue #272).
+            peerRouter.routePending(queue);
+            if (peerRouter.hasWaiting) return "";
             if (agent.backgroundResultsReady())
             {
                 string notice;
@@ -3640,17 +3822,69 @@ int runMain(string[] args)
     {
         string line;
         QueuedMessage next;
-        if (held.length)
+        // A peer message that arrived between turns: confirm it (per the
+        // setting), then run it as the next input, flagged for the loop
+        // guard. Mid-turn deliveries were steered by routePending instead.
+        peerRouter.routePending(queue);
+        Inbound inbound;
+        peerInput = false;
+        // Lines the user typed during the last turn (`/messages off`,
+        // `/quit`, …) run first: a steady peer stream must not starve them.
+        if (!held.length && peerRouter.takeWaiting(inbound))
+        {
+            bool accepted = true;
+            if (inbound.needsConfirm)
+            {
+                import std.string : indexOf;
+                // Peer text is untrusted: strip terminal escapes and frame
+                // marks from every display copy (the model input is unchanged).
+                auto shownLabel = escapeMarks(sanitizeBlock(inbound.labelled));
+                auto bracket = shownLabel.indexOf(']');
+                writeln(console.dim("Message " ~ (bracket > 0 ? shownLabel[0 .. bracket + 1] : shownLabel) ~ ":"));
+                writeln(escapeMarks(sanitizeBlock(inbound.pm.text)));
+                import nano.question : Question, QuestionOption, Answered;
+                auto q = Question(confirmQuestion(inbound), null, [QuestionOption("Decline"), QuestionOption("Accept")]);
+                q.custom = false;
+                // Ask through the editor this loop owns: the broker's other
+                // end (the turn key reader) is not running at the idle
+                // prompt, so `questions.ask` would block forever. No editor
+                // (plain input) means no way to ask: decline.
+                accepted = false;
+                foreach (ed; editor)
+                {
+                    // Keep routing while the picker waits, so later senders hear
+                    // their status now rather than timing out (they queue
+                    // behind this one; the picker stays open).
+                    auto a = askQuestions(ed, [q], () @safe { peerRouter.routePending(queue); return false; });
+                    accepted = a.match!((Answered got) => got.answers.length && got.answers[0] == "Accept", _ => false);
+                }
+            }
+            settle(inbound, accepted);
+            if (accepted)
+            {
+                writeln(console.dim(format("[%s → starting a turn]", escapeMarks(sanitizeBlock(inbound.labelled)))));
+                nano.herdr.report(nano.herdr.State.working, "message from a peer session");
+                line = inbound.labelled;
+                peerInput = true;
+                peerSender = inbound.pm.senderId;
+            }
+            else
+            {
+                writeln(console.dim(format("[message %s declined]", escapeMarks(sanitizeBlock(inbound.labelled)))));
+                continue;
+            }
+        }
+        if (line is null && held.length)
         {
             line = held[0];
             held = held[1 .. $];
         }
-        else if (queue.pop(next))
+        else if (line is null && queue.pop(next))
         {
             writeln(console.dim(format("↧ queued #%s: %s", next.id, next.text.strip)));
             line = next.text;
         }
-        else if (editor.isSome)
+        else if (line is null && editor.isSome)
         {
             auto ed = editor.unwrap("checked on the line above");
             refreshStatus();
@@ -3722,6 +3956,13 @@ int runMain(string[] args)
             {
                 return deliverDueTimer(agent.backgroundResultsReady(), ed.holdsTimer(monoNow), false, exitPress.armed);
             }
+            // A peer delivery wakes the prompt (issue #272): the loop top
+            // confirms and runs it, the draft parked meanwhile.
+            bool peerNow() @safe
+            {
+                peerRouter.routePending(queue);
+                return peerRouter.hasWaiting;
+            }
             // Esc Esc at the idle prompt stops background sub-agents.
             bool stopBackground;
             ed.onIdleEscEsc = () @safe { if (agent.subagentsActive) stopBackground = true; };
@@ -3729,6 +3970,7 @@ int runMain(string[] args)
                 || stopBackground
                 || timerNow()
                 || subNow()
+                || peerNow()
                 || idleNow()
                 || (updateHints && updateHints.tryTake(updateHint))
                 || (releaseNotice && releaseNotice.tryTake(fetchedNotice));
@@ -3770,6 +4012,11 @@ int runMain(string[] args)
                 writeln(console.dim(notice));
                 agent.automaticInput = true;
                 line = "\x00" ~ line;
+            }
+            else if (r.outcome == Outcome.stopped && peerRouter.hasWaiting)
+            {
+                hasParkedDraft = ed.parkDraft(parkedDraft);
+                continue;
             }
             else if (r.outcome == Outcome.stopped && idleNow())
             {
@@ -3819,7 +4066,7 @@ int runMain(string[] args)
                 if (auto lit = unescapePrompt(line)) line = "\x00" ~ lit; // `//…`: a prompt starting with /
             }
         }
-        else
+        else if (line is null)
         {
             if (interactive) { write("\n" ~ console.stamp() ~ console.bold("› ")); stdOut.flush(); }
             line = inbox ? plainLine() : stdinLine();
@@ -3833,6 +4080,10 @@ int runMain(string[] args)
         if (literal) line = line[1 .. $];
         auto input = line.strip;
         if (!input.length) continue;
+        auto asPeer = peerInput;
+        auto asPeerSender = peerSender;
+        peerInput = false;
+        peerSender = null;
         if (!literal && isCommand(input))
         {
             auto sp = input.indexOf(' ');
@@ -3869,6 +4120,7 @@ int runMain(string[] args)
                     auto log = agent.log;
                     updateStatus((ref Stats s) { s.historySearches = s.historyReads = 0; });
                     agent.useHooks(loadHooks(cwd), false);
+                    rebindPeerListener();
                     if (gFrame) gFrame.clear();
                     refreshStatus();
                     log.match!(l => writefln("Session: %s (resume with nano-coder --resume %s)", l.id, l.id),
@@ -3994,6 +4246,13 @@ int runMain(string[] args)
                     else writeln(escapeMarks(sanitizeBlock(said)));
                     continue;
                 }
+                case "/messages":
+                {
+                    auto reply = messagesCommand(agent, cfg, arg, peerRouter, peerListener.length != 0,
+                        &startPeerListener, &stopPeerListener);
+                    writeln(reply);
+                    continue;
+                }
                 case "/changes":
                 {
                     // No fetch here: it would block the prompt; notes the build
@@ -4050,6 +4309,7 @@ int runMain(string[] args)
                     agent.stopSubagents(); // they belong to the session being left
                     try loadNotes = loadSession(path);
                     catch (Exception e) { writeln(e.msg); continue; }
+                    rebindPeerListener();
                     if (gFrame) { gFrame.clear(); replayTranscript(agent, console); releaseHeap(); }
                     foreach (n; loadNotes) stdErr.writeln(n);
                     stdErr.flush();
@@ -4119,7 +4379,7 @@ int runMain(string[] args)
                     continue;
             }
         }
-        turn(input);
+        turn(input, asPeer, asPeerSender);
     }
     goodbye();
     return 0;

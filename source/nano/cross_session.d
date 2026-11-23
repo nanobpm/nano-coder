@@ -48,6 +48,9 @@ struct SessionInfo
     string path;
     /// A process currently has the log open (it holds the log's flock).
     bool live;
+    /// The live session accepts inter-session messages (issue #272): it
+    /// listens on a registry socket (`session_messages` on).
+    bool messages;
 }
 
 /// What `Summary` names a session by (title, else first telling prompt).
@@ -70,6 +73,34 @@ private SessionInfo infoOf(Summary s, bool live) @safe
     i.path = s.path;
     i.live = live;
     return i;
+}
+
+/// Whether a live session accepts messages: its registry socket answers
+/// (issue #272). A stale socket (a dead session) is left for the next
+/// `session_send` to remove; here it just doesn't mark the session.
+private bool acceptsMessages(string id) @safe
+{
+    import std.file : exists;
+    import nano.peers : peersDir, socketPath;
+    import std.socket : Socket, UnixAddress, AddressFamily, SocketType, SocketException, SocketOSException;
+    auto path = socketPath(peersDir(), id);
+    if (!path.exists) return false;
+    auto s = new Socket(AddressFamily.UNIX, SocketType.STREAM);
+    scope (exit) s.close();
+    // Non-blocking: a listener whose backlog is full (busy routing) must not
+    // stall discovery; a would-block connect means a live listener.
+    s.blocking = false;
+    try
+    {
+        s.connect(new UnixAddress(path));
+        return true;
+    }
+    catch (SocketOSException e)
+    {
+        import core.stdc.errno : EAGAIN, EINPROGRESS;
+        return e.errorCode == EAGAIN || e.errorCode == EINPROGRESS; // else stale: not reachable
+    }
+    catch (SocketException) return false; // stale or refusing: not reachable
 }
 
 /// Whether a process currently holds `path`'s session lock. Probed by opening
@@ -109,6 +140,7 @@ SessionInfo[] listSessions(ref Policy policy, string dir, string cwd, string fil
     foreach (s; list(dir, false, &deniedPath))
     {
         auto i = infoOf(s, isLive(s.path));
+        if (i.live) i.messages = acceptsMessages(i.id);
         if (!i.cwd.length) i.cwd = logHeaderCwd(s.path);
         if (filter.length)
         {
@@ -116,6 +148,51 @@ SessionInfo[] listSessions(ref Policy policy, string dir, string cwd, string fil
             if (!i.id.toLower.canFind(f) && !i.title.toLower.canFind(f)
                 && !(i.cwd.length && i.cwd.toLower.canFind(f))) continue;
         }
+        out_ ~= i;
+    }
+    // A just-opened session listening for messages has no prompts yet, so
+    // the index omits it; list it too (after the same permission check) or
+    // `session_send` can't reach it until its user runs a turn.
+    foreach (i; listeningWithoutPrompts(dir, out_, &deniedPath))
+    {
+        if (filter.length)
+        {
+            auto f = filter.toLower;
+            if (!i.id.toLower.canFind(f) && !(i.cwd.length && i.cwd.toLower.canFind(f))) continue;
+        }
+        out_ ~= i;
+    }
+    return out_;
+}
+
+/// Live sessions with a peer socket and a log in `dir` that `known` doesn't
+/// already list (the index skips sessions without prompts).
+private SessionInfo[] listeningWithoutPrompts(string dir, const SessionInfo[] known,
+    scope bool delegate(string path) @safe denied) @safe
+{
+    import std.file : dirEntries, SpanMode, exists, FileException;
+    import std.path : baseName, buildPath, extension, stripExtension;
+    import nano.peers : peersDir;
+    import nano.session : logHeaderCwd;
+    SessionInfo[] out_;
+    auto pdir = peersDir();
+    if (!pdir.exists) return out_;
+    string[] socks;
+    try
+        foreach (e; dirEntries(pdir, "*.sock", SpanMode.shallow)) socks ~= e.name;
+    catch (FileException) return out_; // unreadable peers dir: nothing extra to list
+    foreach (sock; socks)
+    {
+        auto id = sock.baseName.stripExtension;
+        if (!id.length || known.canFind!((k, x) => k.id == x)(id)) continue;
+        auto path = buildPath(dir, id ~ ".jsonl");
+        if (!path.exists || denied(path) || !isLive(path) || !acceptsMessages(id)) continue;
+        SessionInfo i;
+        i.id = id;
+        i.path = path;
+        i.live = true;
+        i.messages = true;
+        i.cwd = logHeaderCwd(path);
         out_ ~= i;
     }
     return out_;
@@ -128,6 +205,7 @@ private string lineOf(const ref SessionInfo i) @safe
     auto out_ = format("%s  %s  %s  %s", i.id, label, i.cwd.length ? i.cwd : "(unknown cwd)",
         i.lastUsed.length >= 19 ? i.lastUsed[0 .. 19] : i.lastUsed);
     if (i.live) out_ ~= "  [live]";
+    if (i.messages) out_ ~= "  [messages]";
     return out_;
 }
 

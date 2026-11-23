@@ -50,6 +50,7 @@ static import nano.mode;
 static import nano.nullaudit;
 static import nano.option;
 static import nano.paths;
+static import nano.peers;
 static import nano.permissions;
 static import nano.plan;
 static import nano.probe;
@@ -142,6 +143,7 @@ private alias modules = imported!"std.meta".AliasSeq!(
     nano.nullaudit,
     nano.option,
     nano.paths,
+    nano.peers,
     nano.permissions,
     nano.plan,
     nano.probe,
