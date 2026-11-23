@@ -61,11 +61,13 @@ unittest
         call("s2", `{"action":"set","key":"compaction_mode","value":"smart"}`), LLMResponse("ok")]);
     auto agent = logged("set", mock);
     agent.compactionMode = ctx.CompactionMode.smart;
+    agent.harnessVersion = "9.9.9";
     assert(agent.offeredTools.any!(d => d.name == "session_settings"));
     agent.run("go", new NullEvents);
     auto rs = settingsResults(mock);
     assert(rs.length == 3, rs.join("|"));
-    assert(rs[0].canFind(`"compaction_mode": "smart"`) && rs[0].canFind(`"context_window"`), rs[0]);
+    assert(rs[0].canFind(`"compaction_mode": "smart"`) && rs[0].canFind(`"context_window"`)
+        && rs[0].canFind(`"nano_coder_version": "9.9.9"`), rs[0]);
     assert(rs[1].canFind("smart → extract for this session"), rs[1]);
     assert(rs[2].canFind("can change again"), rs[2]);
     assert(agent.compactionMode == ctx.CompactionMode.extract);

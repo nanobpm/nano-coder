@@ -3699,6 +3699,8 @@ class Agent
     Timers timers;
     /// Offer the timer tools (off for ACP, which has no idle loop to fire them).
     bool timerTools = true;
+    /// The nano-coder version, reported by `session_settings get`.
+    string harnessVersion;
     /// Offer `session_settings` (issue #293); sub-agents don't get it.
     bool settingsTools = true;
     /// Turns started in this process, for the settings cooldown.
@@ -3733,6 +3735,7 @@ class Agent
                     "history_tools": JSONValue(historyEnabled()),
                     "settable": JSONValue(settings.writableKeys.dup),
                 ];
+                if (harnessVersion.length) o["nano_coder_version"] = harnessVersion;
                 if (log.isNone) o["note"] = "no session log: smart and extract compaction fall back to standard";
                 return o.toPrettyString;
             case settings.Action.set:

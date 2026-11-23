@@ -2801,6 +2801,7 @@ int runMain(string[] args)
     auto questions = QuestionBroker.make;
     tools.register(questionDefinition, (JSONValue a) => questions.run(a));
     Agent agent = new Agent(client, tools, policy, systemFor(cwd, o.plan));
+    agent.harnessVersion = packageVersion;
     built = some(agent);
     mainAgent = some(agent);
     // Exiting stops every sub-agent, background ones included; their logs
