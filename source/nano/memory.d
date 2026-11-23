@@ -325,7 +325,11 @@ struct EntityRecord
     /// Parse one registry line; false for anything malformed (kept verbatim by the caller).
     static bool parse(const(ubyte)[] line, out EntityRecord r)
     {
-        auto text = lossyLine(line);
+        // Invalid UTF-8 would be rewritten as U+FFFD on the next registry
+        // edit: leave such a line unparsed so the caller keeps it verbatim.
+        string text;
+        try text = utf8Text(line);
+        catch (Exception) return false; // an invalid UTF-8 line is kept verbatim by the caller
         if (!text.length || text[0] != '{') return false;
         JSONValue j;
         if (!tryParseJson(text, j) || j.type != JSONType.object) return false;
@@ -382,12 +386,6 @@ struct EntityRecord
         auto colon = id.indexOf(':');
         return entity.startsWith(id[0 .. colon + 1]) && aliases.canFind(entity[colon + 1 .. $]);
     }
-}
-
-private string lossyLine(const(ubyte)[] line) pure
-{
-    import nano.safeio : lossyText;
-    return lossyText(line);
 }
 
 private bool tryParseJson(string text, out JSONValue j)
@@ -541,7 +539,7 @@ final class Store
         {
             auto cutoff = expiryCutoff();
             auto before = f.entries.length;
-            f.entries = f.entries.filter!(e => e.lastUsedTime >= cutoff).array;
+            f.entries = f.entries.filter!(e => e.isSuperseded || e.lastUsedTime >= cutoff).array;
             if (prune && f.entries.length != before) writeAll(p, f.entries, f.unknown);
         }
         return f;
@@ -617,6 +615,15 @@ final class Store
                 throw new Exception("refusing to save: the text and evidence together look like a secret. Memory is "
                     ~ "human-readable and shared across sessions; never store keys, tokens or passwords, even split "
                     ~ "across fields. Save where to find it instead.");
+        }
+        if (validWhile !is null)
+        {
+            // valid_while is rendered with the text and evidence too: check its joins.
+            foreach (other; evidence is null ? [text] : [text, evidence])
+                if (looksLikeSecret(other ~ validWhile) !is null || looksLikeSecret(other ~ " " ~ validWhile) !is null
+                        || evidenceStatesLabelValue(other, validWhile))
+                    throw new Exception("refusing to save: valid_while together with the text or evidence looks like "
+                        ~ "a secret. Never store keys, tokens or passwords, even split across fields.");
         }
         import std.random : uniform;
         auto now = wallNow;
@@ -735,9 +742,7 @@ final class Store
     /// Add a relation (`runs_on`, `reached_via`, `part_of`) from an entity to another.
     string addRelation(Scope s, string entity, string relation, string target)
     {
-        auto rel = relation.strip.toLower;
-        if (!entityRelations.canFind(rel))
-            throw new Exception(format("unknown relation %s; use one of %s", JSONValue(rel).jsonText, entityRelations.join(", ")));
+        auto rel = checkRelation(relation, target);
         auto t = checkedEntity(target);
         auto n = checkedEntity(entity);
         return editRegistry(s, n, (ref EntityRecord rec, EntityRecord[] all_) {
@@ -746,6 +751,16 @@ final class Store
             if (list is null) { rec.relations[rel] = null; list = rel in rec.relations; }
             if (!(*list).canFind(resolved)) *list ~= resolved;
         }, t);
+    }
+
+    /// Validate a relation name and its target; returns the normalized relation.
+    static string checkRelation(string relation, string target)
+    {
+        auto rel = relation.strip.toLower;
+        if (!entityRelations.canFind(rel))
+            throw new Exception(format("unknown relation %s; use one of %s", JSONValue(rel).jsonText, entityRelations.join(", ")));
+        checkedEntity(target);
+        return rel;
     }
 
     /// `normalizeEntity` behind the secret guard, applied to the raw value
@@ -861,22 +876,6 @@ final class Store
         import std.algorithm : SwapStrategy;
         hits.sort!((a, b) => a.e.lastUsedTime > b.e.lastUsedTime, SwapStrategy.stable);
         auto shown = hits[0 .. hits.length < defaultLimit ? $ : defaultLimit];
-        if (!readOnly)
-        {
-            auto now = wallNow;
-            foreach (ref l; loaded)
-            {
-                bool bumped;
-                foreach (ref e; l.f.entries)
-                    if (shown.any!(h => h.s == l.s && h.e.id == e.id))
-                    {
-                        e.lastUsed = stamp(now);
-                        e.lastUsedTime = now;
-                        bumped = true;
-                    }
-                if (bumped) writeAll(l.path, l.f.entries, l.f.unknown);
-            }
-        }
         // Reserve room for the omission notice and the footer so the whole
         // result, not only the hits, stays within `searchChars`.
         immutable reserve = searchFooter.length + moreNoticeMax;
@@ -898,6 +897,24 @@ final class Store
             if (used + line.length + 1 + reserve > searchChars) break;
             used += line.length + 1;
             lines ~= line;
+        }
+        // Only the hits actually displayed count as used.
+        shown = shown[0 .. lines.length];
+        if (!readOnly)
+        {
+            auto now = wallNow;
+            foreach (ref l; loaded)
+            {
+                bool bumped;
+                foreach (ref e; l.f.entries)
+                    if (shown.any!(h => h.s == l.s && h.e.id == e.id))
+                    {
+                        e.lastUsed = stamp(now);
+                        e.lastUsedTime = now;
+                        bumped = true;
+                    }
+                if (bumped) writeAll(l.path, l.f.entries, l.f.unknown);
+            }
         }
         auto out_ = lines.join("\n");
         if (hits.length > lines.length)
@@ -1144,6 +1161,13 @@ string run(Store store, string tool, JSONValue args, string session, bool readOn
         }
         if (readOnly) throw new Exception("memory is read-only in this session");
         if (entity is null) throw new Exception("entity is required to add an alias or relation");
+        // Validate the whole request before writing anything, so a rejected
+        // call leaves the registry unchanged.
+        if (relation !is null)
+        {
+            if (target is null) throw new Exception("relation needs a target entity");
+            Store.checkRelation(relation, target);
+        }
         string result;
         if (alias_ !is null) result = store.addAlias(es, entity, alias_);
         if (relation !is null)

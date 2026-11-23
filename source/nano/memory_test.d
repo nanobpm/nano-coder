@@ -948,3 +948,76 @@ unittest // entity listings stay within searchChars, cut on UTF-8 boundaries and
     assert(edited.length <= searchChars);
     validate(edited);
 }
+
+unittest // valid_while is checked together with the text and the evidence for split secrets
+{
+    auto s = store(tmp("facts-validwhile-split"));
+    SaveOptions o;
+    o.validWhile = "hunter2";
+    assert(fails(s.saveFact(Scope.user, "worker password:", null, null, null, null, false, o)));
+    assert(fails(s.saveFact(Scope.user, "a plain fact about the worker", "worker password:", null, null, null, false, o)));
+    o.validWhile = "nano-workforce >= 0.216";
+    assert(s.saveFact(Scope.user, "the worker runs nwf", null, null, null, null, false, o).saved);
+}
+
+unittest // registry lines with invalid UTF-8 are kept verbatim on rewrite
+{
+    auto s = store(tmp("facts-registry-utf8"));
+    auto p = s.registryPath(Scope.user);
+    mkdirRecurse(dirName(p));
+    const(ubyte)[] bad = `{"id":"host:a","aliases":["x`.representation ~ [ubyte(0xFF)] ~ `.local"]}`.representation;
+    write(p, bad ~ "\n".representation);
+    s.addAlias(Scope.user, "host:e", "e.local");
+    auto back = readBytes(p);
+    import std.algorithm : countUntil;
+    assert(back.countUntil(bad) >= 0);
+}
+
+unittest // superseded records outlive the expiry cutoff
+{
+    auto s = store(tmp("facts-supersede-expiry"));
+    auto old = s.save(Scope.user, "merlin has 32GB of memory", null, null);
+    SaveOptions o;
+    o.supersedes = [old.id];
+    o.distinct = true;
+    auto fresh = s.saveFact(Scope.user, "merlin has 64GB of memory", null, null, null, null, false, o).entry;
+    Entry prev;
+    foreach (x; s.get(old.id)) prev = x.e;
+    assert(prev.id == old.id);
+    writeAll(s.path(Scope.user), [backdate(prev, defaultExpiryDays + 5), fresh], null);
+    s.search("nothing matches this", null);
+    assert(s.get(old.id).isSome);
+}
+
+unittest // search bumps last_used only for the hits it displays
+{
+    import std.format : format;
+    import std.range : iota;
+    import std.algorithm : map;
+    auto s = new Store(buildPath(tmp("bump-shown"), "memory"), null, 0);
+    SaveOptions o;
+    o.distinct = true;
+    auto proto = s.saveFact(Scope.user, "bulky fact " ~ iota(150).map!(k => format("w%s", k)).join(" "),
+        iota(60).map!(k => format("e%s", k)).join(" "), null, null, null, false, o).entry;
+    Entry[] es;
+    foreach (i; 0 .. 20)
+    {
+        auto e = proto;
+        e.id = format("mem-bulky-%s", i);
+        es ~= backdate(e, 10);
+    }
+    writeAll(s.path(Scope.user), es, null);
+    auto out_ = s.search("bulky", null);
+    assert(out_.canFind("more not shown"), out_[$ - 100 .. $]);
+    size_t bumped;
+    foreach (x; s.all()) if (x.e.lastUsedTime > wallNow - minutes(1)) bumped++;
+    assert(bumped > 0 && bumped < 20);
+}
+
+unittest // a rejected relation leaves the registry unchanged even when an alias came with it
+{
+    auto s = store(tmp("facts-entity-atomic"));
+    assert(fails(run(s, entityTool, parseJSON(`{"scope":"user","entity":"host:m","alias":"m.local","relation":"runs_on"}`), null, false)));
+    assert(fails(run(s, entityTool, parseJSON(`{"scope":"user","entity":"host:m","alias":"m.local","relation":"likes","target":"host:y"}`), null, false)));
+    assert(!exists(s.registryPath(Scope.user)) || !readText(s.registryPath(Scope.user)).canFind("m.local"));
+}
