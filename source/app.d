@@ -3579,9 +3579,12 @@ int runMain(string[] args)
             if (inbound.needsConfirm)
             {
                 import std.string : indexOf;
-                auto bracket = inbound.labelled.indexOf(']');
-                writeln(console.dim("Message " ~ (bracket > 0 ? inbound.labelled[0 .. bracket + 1] : inbound.labelled) ~ ":"));
-                writeln(inbound.pm.text);
+                // Peer text is untrusted: strip terminal escapes and frame
+                // marks from every display copy (the model input is unchanged).
+                auto shownLabel = escapeMarks(sanitizeBlock(inbound.labelled));
+                auto bracket = shownLabel.indexOf(']');
+                writeln(console.dim("Message " ~ (bracket > 0 ? shownLabel[0 .. bracket + 1] : shownLabel) ~ ":"));
+                writeln(escapeMarks(sanitizeBlock(inbound.pm.text)));
                 import nano.question : Question, QuestionOption, Answered;
                 auto q = Question(confirmQuestion(inbound), null, [QuestionOption("Decline"), QuestionOption("Accept")]);
                 q.custom = false;
@@ -3591,14 +3594,14 @@ int runMain(string[] args)
             settle(inbound, accepted);
             if (accepted)
             {
-                writeln(console.dim(format("[%s → starting a turn]", inbound.labelled)));
+                writeln(console.dim(format("[%s → starting a turn]", escapeMarks(sanitizeBlock(inbound.labelled)))));
                 nano.herdr.report(nano.herdr.State.working, "message from a peer session");
                 line = inbound.labelled;
                 peerInput = true;
             }
             else
             {
-                writeln(console.dim(format("[message %s declined]", inbound.labelled)));
+                writeln(console.dim(format("[message %s declined]", escapeMarks(sanitizeBlock(inbound.labelled)))));
                 continue;
             }
         }

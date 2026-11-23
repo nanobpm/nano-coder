@@ -82,15 +82,23 @@ private bool acceptsMessages(string id) @safe
 {
     import std.file : exists;
     import nano.peers : peersDir, socketPath;
-    import std.socket : Socket, UnixAddress, AddressFamily, SocketType, SocketException;
+    import std.socket : Socket, UnixAddress, AddressFamily, SocketType, SocketException, SocketOSException;
     auto path = socketPath(peersDir(), id);
     if (!path.exists) return false;
     auto s = new Socket(AddressFamily.UNIX, SocketType.STREAM);
     scope (exit) s.close();
+    // Non-blocking: a listener whose backlog is full (busy routing) must not
+    // stall discovery; a would-block connect means a live listener.
+    s.blocking = false;
     try
     {
         s.connect(new UnixAddress(path));
         return true;
+    }
+    catch (SocketOSException e)
+    {
+        import core.stdc.errno : EAGAIN, EINPROGRESS;
+        return e.errorCode == EAGAIN || e.errorCode == EINPROGRESS; // else stale: not reachable
     }
     catch (SocketException) return false; // stale or refusing: not reachable
 }

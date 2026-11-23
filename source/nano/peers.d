@@ -57,6 +57,9 @@ enum sendTool = "session_send";
 /// The largest message accepted (the request line included): bigger sends
 /// are refused before they are read whole.
 enum size_t maxMessageBytes = 64 * 1024;
+/// Cap on the bytes of idle deliveries awaiting the user: a slow or absent
+/// user must not let peers grow the session's memory without bound.
+enum size_t maxQueuedBytes = 1024 * 1024;
 
 /// The label a delivered message carries, e.g.
 /// `[from session ab88e980 · ts-performance-matrix] …`.
@@ -351,6 +354,12 @@ struct PeerListener
             scope (exit) conn.close();
             // Same uid only: anything else is dropped unanswered.
             if (socketPeerUid(conn.handle) != long(getuid())) continue;
+            // Bound framing I/O: a client that connects and never finishes
+            // its line must not pin the sole listener (or `close`'s join).
+            import std.socket : SocketOptionLevel, SocketOption;
+            import core.time : seconds;
+            conn.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, 5.seconds);
+            conn.setOption(SocketOptionLevel.SOCKET, SocketOption.SNDTIMEO, 5.seconds);
             handle(conn, requests);
         }
     }
@@ -605,6 +614,8 @@ struct PeerRouter
     private Shared!bool confirmSetting;
     /// Whether the agent is mid-turn (set at each turn boundary).
     private Shared!bool midTurnFlag;
+    /// Bytes held by `waiting` (bounded by `maxQueuedBytes`).
+    private Shared!size_t queuedBytes;
 
     // A waiting delivery: the message's strings are immutable (sendable).
     private struct WaitingItem
@@ -620,6 +631,7 @@ struct PeerRouter
         import core.atomic : atomicLoad, atomicStore;
         PeerRouter r = PeerRouter(Chan!PeerRequest.make, atomicLoad(control), Chan!WaitingItem.make,
             Shared!bool.make(true), Shared!bool.make(false));
+        r.queuedBytes = Shared!size_t.make(0);
         return r;
     }
 
@@ -650,7 +662,9 @@ struct PeerRouter
         {
             auto labelled = label(req.pm.senderId, req.pm.senderTitle) ~ " " ~ req.pm.text;
             auto confirm = this.confirm || req.pm.confirm;
-            if (midTurn)
+            // Confirmation-requiring messages always wait for the user,
+            // even mid-turn: steering them in would bypass the approval.
+            if (midTurn && !confirm)
             {
                 auto id = queue.reserveId();
                 import core.atomic : atomicLoad;
@@ -659,6 +673,16 @@ struct PeerRouter
             }
             else
             {
+                auto bytes = labelled.length + req.pm.text.length;
+                bool admitted;
+                queuedBytes.update((ref size_t q) {
+                    if (q + bytes <= maxQueuedBytes) { q += bytes; admitted = true; }
+                });
+                if (!admitted)
+                {
+                    answer(req.reply, Status.refused, "the target session's inbox is full; try again later");
+                    continue;
+                }
                 waiting.put(WaitingItem(req.pm, labelled.idup, confirm, req.reply));
                 // Confirm off: delivered at once (the prompt loop starts the
                 // turn). Confirm on: the sender hears awaiting-confirmation
@@ -681,6 +705,8 @@ struct PeerRouter
     {
         WaitingItem item;
         if (!waiting.tryTake(item)) return false;
+        auto bytes = item.labelled.length + item.pm.text.length;
+        queuedBytes.update((ref size_t q) { import nano.arith : saturatingSub; q = saturatingSub(q, bytes); });
         first = Inbound(item.pm, item.labelled, item.needsConfirm, item.outcome);
         return true;
     }
@@ -800,6 +826,17 @@ unittest
     // Mid-turn: the message joins the steers under a /queue id (the pump
     // routes it; the steer is visible on the turn's control).
     router.midTurn(true);
+    // Confirm on mid-turn: still waits for the user, never steered in.
+    status = send(root, "sess-target", PeerMessage("sess-sender", null, "needs approval", "m-4a", false), note);
+    assert(status == Status.awaiting, note);
+    assert(control.pendingSteers.length == 0, "confirmation not bypassed mid-turn");
+    assert(router.takeWaiting(inbound));
+    settle(inbound, false);
+    router.confirm(false);
+    status = send(root, "sess-target", PeerMessage("sess-sender", null, "explicit", "m-4b", true), note);
+    assert(status == Status.awaiting, "explicit confirm waits mid-turn: " ~ note);
+    assert(router.takeWaiting(inbound));
+    settle(inbound, false);
     status = send(root, "sess-target", PeerMessage("sess-sender", null, "mid-turn note", "m-4", false), note);
     assert(status == Status.queued, note);
     auto pending = control.pendingSteers;
