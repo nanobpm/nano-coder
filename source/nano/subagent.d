@@ -377,6 +377,8 @@ private final class ChildEvents : imported!"nano.agent".AgentEvents
     ulong tokens;
     string limitHit;
     size_t gensSinceLimit;
+    /// Whether a fresh request has carried the report reminder since the limit.
+    bool reminderDelivered;
     /// The parent's `agent_cancel` asked for a final report.
     bool wrappedUp;
     string[] filesRead;
@@ -489,8 +491,16 @@ private final class ChildEvents : imported!"nano.agent".AgentEvents
             // this request's steers drained: the request lacks the report
             // reminder, so it is not the grace call. Leave the reminder to
             // the next fresh call (beforeFreshCall), which gets the grace
-            // (issue #322).
-            limitHit = limitWhy();
+            // (issue #322). Queue the reminder now too, so a tool-free
+            // answer to this request still leads to a reminded request.
+            checkLimits();
+            generations++;
+            return;
+        }
+        // A retry of a request that lacked the reminder (an interrupted
+        // stream or rejected output skips beforeFreshCall) is not the grace.
+        if (!reminderDelivered)
+        {
             generations++;
             return;
         }
@@ -518,7 +528,12 @@ private final class ChildEvents : imported!"nano.agent".AgentEvents
     {
         if (abort.aborted) throw new SubStop("stopped by the parent");
         checkLimits();
-        if (limitHit !is null && gensSinceLimit == 0) steerReportReminder();
+        if (limitHit !is null && gensSinceLimit == 0)
+        {
+            steerReportReminder();
+            // The steers drain after this, so the coming request carries it.
+            reminderDelivered = true;
+        }
     }
 
     /// A child's own progress is reported through its channel, not rendered.
@@ -574,6 +589,27 @@ unittest
         catch (SubStop) stopped = true;
         assert(stopped, "only one final step");
     }
+}
+
+// A retry (no beforeFreshCall) of the reminder-less request after the cancel
+// does not spend the grace either (issue #322).
+unittest
+{
+    immutable spec = SubSpec(0, "c", "t", "m", "s", null, SubLimits.init);
+    auto ab = SubAbort.make;
+    auto st = new ChildEvents(spec, Chan!SubMsg.make, Chan!ToolReply.make, ab);
+    st.beforeFreshCall();
+    ab.wrapUp();
+    st.generationStart(); // reminder-less request; stream interrupted
+    st.generationStart(); // its retry, still without the reminder
+    st.generationStart(); // another retry
+    assert(st.gensSinceLimit == 0, "retries without the reminder are not the grace");
+    st.beforeFreshCall();
+    st.generationStart(); // the grace call
+    bool stopped;
+    try st.generationStart();
+    catch (SubStop) stopped = true;
+    assert(stopped);
 }
 
 /// The text of the child's latest assistant reply, for a partial report.
