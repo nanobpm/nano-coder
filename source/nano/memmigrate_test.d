@@ -392,3 +392,26 @@ unittest // concurrent backups reserve distinct directories
     auto x = backup(f.s.root), y = backup(f.s.root);
     assert(x != y && x.exists && y.exists);
 }
+
+unittest // an entry changed between review and apply stays pending and is offered again
+{
+    auto s = store(tmp("stale-rerun"));
+    auto id = s.save(Scope.user, "fact about host alpha", null, null).id;
+    size_t calls;
+    Ask ask = (string system, string user) {
+        if (calls++ == 0) // another session edits the entry while the model is thinking
+            s.editEntries(Scope.user, (ref Entry[] es, const EntityRecord[] records) {
+                foreach (ref e; es) if (e.id == id) e.text = "fact about host alpha, edited";
+            });
+        return JSONValue(["tags": JSONValue([JSONValue(["id": JSONValue(id), "fact_kind": JSONValue("fact")])])]).toString;
+    };
+    auto u = new Script;
+    u.selects = [0];
+    auto r1 = migrate(s, ask, u.ui, Options.init);
+    assert(r1.tagged == 0 && byId(s, id).factKind != "fact", r1.toString);
+    auto v = new Script;
+    v.selects = [0];
+    auto r2 = migrate(s, ask, v.ui, Options.init);
+    assert(r2.untagged == 1 && r2.tagged == 1 && calls == 2, r2.toString);
+    assert(byId(s, id).factKind == "fact");
+}

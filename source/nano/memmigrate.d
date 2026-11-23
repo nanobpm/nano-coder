@@ -393,6 +393,15 @@ bool sameContent(const Entry a, const Entry b) pure
 /// the `reviewed` snapshot and `current`; `stale` counts the rest.
 Proposal[] freshOnly(Proposal[] accepted, const Entry[] reviewed, const Entry[] current, out size_t stale)
 {
+    string[] ignored;
+    return freshOnly(accepted, reviewed, current, stale, ignored);
+}
+
+/// Ditto, also collecting the ids touched by stale proposals so the caller can leave them
+/// unreviewed in the progress file (they must be offered again on the next run).
+Proposal[] freshOnly(Proposal[] accepted, const Entry[] reviewed, const Entry[] current, out size_t stale,
+    out string[] staleIds)
+{
     bool same(string id)
     {
         ptrdiff_t r = -1, c = -1;
@@ -404,7 +413,11 @@ Proposal[] freshOnly(Proposal[] accepted, const Entry[] reviewed, const Entry[] 
     foreach (p; accepted)
     {
         if (touchedIds(p).all!(id => same(id))) o ~= p;
-        else stale++;
+        else
+        {
+            stale++;
+            foreach (id; touchedIds(p)) staleIds ~= id;
+        }
     }
     return o;
 }
@@ -636,6 +649,7 @@ Report migrate(Store store, Ask ask, Ui ui, Options opts)
                 continue;
             }
             Proposal[] accepted;
+            string[] staleIds;
             if (ps.length)
             {
                 ui.say(format("%s scope, batch %s (%s entr%s):", name(s), rep.batches, live.length, live.length == 1 ? "y" : "ies"));
@@ -651,7 +665,7 @@ Report migrate(Store store, Ask ask, Ui ui, Options opts)
                 store.editEntries(s, (ref Entry[] es, const EntityRecord[] records) {
                     // Apply only what the user reviewed: a proposal whose entries changed since
                     // (another migration or session) would overwrite newer content.
-                    got = apply(es, freshOnly(accepted, now, es, stale), records);
+                    got = apply(es, freshOnly(accepted, now, es, stale, staleIds), records);
                 });
                 if (stale) ui.say(format("Skipped %s proposal%s whose entries changed since review; re-run to review them again.",
                     stale, stale == 1 ? "" : "s"));
@@ -663,7 +677,8 @@ Report migrate(Store store, Ask ask, Ui ui, Options opts)
             }
             // A wholly invalid reply (malformed, truncated) reviewed nothing: leave the batch pending.
             if (!ps.length && bad) continue;
-            foreach (id; ids) progress.done[file][id] = true;
+            // Entries of proposals skipped as stale stay pending so the next run offers them again.
+            foreach (id; ids) if (!staleIds.canFind(id)) progress.done[file][id] = true;
             progress.save(store.root);
         }
     }
