@@ -1815,8 +1815,10 @@ string[] remoteHosts(string line)
         bool isSsh = cmd == "ssh";
         if (!isSsh && cmd != "scp" && cmd != "sftp" && cmd != "rsync") continue;
         if (i > 0 && !isCommandStart(toks[i - 1])) continue;
-        // Short options taking a value (OpenSSH ssh, scp/sftp; rsync's -e/-f).
-        string withArg = isSsh ? "BbcDEeFIiJLlmOoPpQRSWw" : cmd == "rsync" ? "efTM" : "cDFiJloPSRsXB";
+        // Short options taking a value (OpenSSH ssh, scp, sftp; rsync's -e/-f).
+        // scp's -B/-R/-s are flags, but sftp's -B/-R/-s take a value.
+        string withArg = isSsh ? "BbcDEeFIiJLlmOoPpQRSWw" : cmd == "rsync" ? "efTM"
+            : cmd == "scp" ? "cDFiJloPSX" : "BcDFiJloPRSs";
         bool takesNext;
         foreach (u; toks[i + 1 .. $])
         {

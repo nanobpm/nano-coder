@@ -1193,11 +1193,16 @@ unittest // entitiesFromCall: urls, ssh targets, gh -R, repo name, tool name
     }
     // scp: every remote operand, and numeric flags.
     foreach (c; ["scp source.example:/x dest.example:/y", "scp -3 source.example:/x dest.example:/y",
-                 "scp -3 -P 22 source.example:/x deploy@dest.example:/y"])
+                 "scp -3 -P 22 source.example:/x deploy@dest.example:/y",
+                 "scp -B source.example:/x dest.example:/y", "scp -R source.example:/x dest.example:/y",
+                 "scp -s source.example:/x dest.example:/y"])
     {
         e = entitiesFromCall("bash", parseJSON(`{"command":` ~ JSONValue(c).toString ~ `}`), "");
         assert(e.canFind("host:source.example") && e.canFind("host:dest.example"), c ~ ": " ~ e.join(","));
     }
+    // sftp's -B/-R/-s take a value.
+    e = entitiesFromCall("bash", parseJSON(`{"command":"sftp -B 32768 -R 64 merlin.local:/x"}`), "");
+    assert(e.canFind("host:merlin.local"), e.join(","));
     // A command after `&&` still counts.
     e = entitiesFromCall("bash", parseJSON(`{"command":"cd /x && ssh merlin df"}`), "");
     assert(e.canFind("host:merlin") && !e.canFind("host:df"), e.join(","));
