@@ -877,8 +877,8 @@ struct InputKey
     /// The key of `text`.
     static InputKey of(const(char)[] text) pure nothrow @nogc => InputKey(text.length, hashOf(text));
 
-    /// Whether `text` is (by length and hash) this input.
-    bool matches(const(char)[] text) const pure nothrow @nogc => text.length == length && hashOf(text) == hash;
+    /// Whether this input is the same key (length and hash) as `other`.
+    bool opEquals(const ref InputKey other) const pure nothrow @nogc => length == other.length && hash == other.hash;
 }
 
 /// `backfillPinText` over input keys: the user-typed part is the matching
@@ -889,8 +889,11 @@ void backfillPinText(ref Message m, const InputKey[] inputs) pure
     import std.string : stripLeft;
     if (m.role != Role.user || m.pinText.length || m.hookContext) return;
     enum wrapStart = "<system-reminder>";
-    if ((inputs.length && inputs[$ - 1].matches(m.content)) || !m.content.canFind(wrapStart)) return;
-    if (inputs.any!(k => k.matches(m.content))) return;
+    if (!m.content.canFind(wrapStart)) return;
+    // The exact-match checks hash the content once, however many inputs share
+    // its length: comparing keys, not re-running `matches` per input.
+    const contentKey = InputKey.of(m.content);
+    if ((inputs.length && inputs[$ - 1] == contentKey) || inputs.any!(k => k == contentKey)) return;
     size_t found;
     // Each distinct prefix length is hashed once, however many inputs share it.
     size_t[size_t] prefixHash;
@@ -2375,6 +2378,29 @@ unittest
         backfillPinText(f, inputs);
         assert(f.pinText is null);
     }
+}
+
+// Many same-length inputs: the exact-match checks hash the message content
+// once, and the backfill still picks the matching prefix (issue #263 review).
+unittest
+{
+    import std.format : format;
+    // 64 distinct inputs of one length; none is a prefix of the wire message.
+    string[] same;
+    foreach (i; 0 .. 64) same ~= format("%016d", i);
+    auto wire = "answer 42\n\n<system-reminder>ctx</system-reminder>";
+    auto m = Message.user(wire);
+    backfillPinText(m, same);
+    assert(m.pinText is null, "no same-length input is a prefix");
+    // One of them is exactly the message: it must be recognised, not rehashed
+    // per candidate into a wrong prefix.
+    auto exact = Message.user(same[7]);
+    backfillPinText(exact, same);
+    assert(exact.pinText is null, "an exact input match is left alone");
+    // A real prefix among many same-length decoys is still found.
+    auto p = Message.user("answer 42\n\n<system-reminder>ctx</system-reminder>");
+    backfillPinText(p, same ~ ["answer 42"]);
+    assert(p.pinText == "answer 42");
 }
 
 // The pinned-request stash rides on the replace record (D's `pinned_requests`,
