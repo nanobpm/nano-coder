@@ -117,6 +117,37 @@ private bool isControl(dchar c) pure nothrow { return c < 0x20 || (c >= 0x7f && 
 string sanitize(string line) pure
 {
     enum TAB = 8;
+    // Fast path: when `line` has no tabs, control bytes, or non-SGR escapes,
+    // return it verbatim so `wrapAnsi` / `Transcript.cache` share the original
+    // backing string instead of allocating a duplicate copy (issue #310).
+    {
+        bool clean = true;
+        size_t p;
+        while (p < line.length)
+        {
+            auto c = decode(line, p);
+            if (c == '\x1b')
+            {
+                if (p < line.length && line[p] == '[')
+                {
+                    p++;
+                    dchar fin = 0;
+                    bool valid = true;
+                    while (p < line.length)
+                    {
+                        auto n = decode(line, p);
+                        if (isFinal(n)) { fin = n; break; }
+                        if (!((n >= '0' && n <= '9') || n == ';' || n == ':')) valid = false;
+                    }
+                    if (valid && fin == 'm') continue;
+                }
+                clean = false;
+                break;
+            }
+            if (c == '\t' || (c != cursorMark && isControl(c))) { clean = false; break; }
+        }
+        if (clean) return line;
+    }
     auto out_ = appender!string;
     size_t col, i;
     while (i < line.length)
@@ -193,6 +224,10 @@ string[] wrapAnsi(string line, size_t width) pure
     import std.string : stripRight, stripLeft, indexOf;
     if (width < 1) width = 1;
     line = sanitize(line);
+    // Fast path: if the sanitized line already fits in `width` cells, return a
+    // 1-element slice referencing `line` directly without rebuilding it into a
+    // new string. Cuts `Transcript.cache` text duplication when lines fit.
+    if (visibleWidth(line) <= width) return [line];
     // Code breaks by character: a space is content, and the row above a break
     // is always full, so the copy joins the rows with nothing added.
     immutable code = line.indexOf(verbatimMark) >= 0;
@@ -399,7 +434,10 @@ final class FrameRenderer
     // The logical transcript the frozen rows stand for: checked against the
     // incoming frame directly, since `prev[0 .. frozen]` may hold old editor
     // rows (after repeated shrinks) that no longer match the logical prefix.
-    private string[] frozenText;
+    // Stored as a SHA-256 digest rather than a copy of the whole scrollback
+    // `string[]` so shrinking the editor doesn't pin a second full transcript
+    // in memory (issue #310).
+    private ubyte[32] frozenHash;
     // A row of `prev` whose predecessor still carries a terminal wrap flag
     // (it was a continuation, now blank at the top of the screen): the
     // physical join survives until the row is redrawn from scratch.
@@ -437,8 +475,25 @@ final class FrameRenderer
         out_(buf[]);
         prev = frame.dup;
         frozen = frozenLogical = 0;
-        frozenText = null;
+        frozenHash = (ubyte[32]).init;
         staleJoin = size_t.max;
+    }
+
+    /// SHA-256 over `rows` with length prefixes so boundaries are unambiguous.
+    private static ubyte[32] hashRows(const string[] rows) pure nothrow
+    {
+        import std.digest.sha : SHA256;
+        import std.bitmanip : nativeToLittleEndian;
+        import std.string : representation;
+        SHA256 sha;
+        sha.start();
+        foreach (r; rows)
+        {
+            auto len = nativeToLittleEndian(ulong(r.length));
+            sha.put(len[]);
+            sha.put(r.representation);
+        }
+        return sha.finish();
     }
 
     /// Rewrites from the first changed row. Rows that went into the
@@ -457,7 +512,7 @@ final class FrameRenderer
         if (frozen)
         {
             if (frame.length < frozenLogical || prev.length < frozen
-                || frame[0 .. frozenLogical] != frozenText
+                || hashRows(frame[0 .. frozenLogical]) != frozenHash
                 || (gapAt != size_t.max && gapAt < frozenLogical))
                 return fullRedraw(inFrame, width, height);
             frame = prev[0 .. frozen] ~ frame[frozenLogical .. $];
@@ -472,7 +527,7 @@ final class FrameRenderer
         // A shorter frame keeps its height: blank rows open at the gap (the
         // transcript's end). Compose that first and diff against it, so a
         // shrink that leaves the scrolled-off rows alone never redraws.
-        auto shown = frame.dup;
+        string[] shown;
         if (frame.length < prev.length)
         {
             size_t at = gapAt <= frame.length ? gapAt : d;
@@ -484,7 +539,9 @@ final class FrameRenderer
                 at = top < frame.length ? top : frame.length;
                 while (at < frame.length && joins(frame, at)) at++;
             }
-            shown = frame[0 .. at] ~ new string[prev.length - frame.length] ~ frame[at .. $];
+            shown = new string[prev.length];
+            shown[0 .. at] = frame[0 .. at];
+            shown[at + (prev.length - frame.length) .. $] = frame[at .. $];
             auto sd = firstDiff(prev, shown);
             if (sd < 0) { prev = shown; return; }
             d = sd;
@@ -494,14 +551,19 @@ final class FrameRenderer
             if (d < top && gapAt <= frame.length && d >= gapAt
                 && frame.length - gapAt <= height && prev.length >= height)
             {
-                shown = prev[0 .. top].dup ~ new string[height - (frame.length - gapAt)] ~ frame[gapAt .. $];
+                immutable blank = height - (frame.length - gapAt);
+                shown.length = top + blank + (frame.length - gapAt);
+                shown[0 .. top] = prev[0 .. top];
+                shown[top .. top + blank] = null;
+                shown[top + blank .. $] = frame[gapAt .. $];
                 frozen = top;
                 frozenLogical = logicalGap;
-                frozenText = inFrame[0 .. logicalGap].dup;
+                frozenHash = hashRows(inFrame[0 .. logicalGap]);
                 d = firstDiff(prev, shown);
                 if (d < 0) { prev = shown; return; }
             }
         }
+        else shown = frame.dup;
         if (d < top) return fullRedraw(inFrame, width, height);
         size_t diff = d;
         // A soft-wrapped line is rewritten from its start, so the terminal
@@ -1360,7 +1422,7 @@ struct Transcript
     /// the bottom); their texts stay in `store`, so nothing is lost. When no
     /// fold is left to collapse, drop the oldest ordinary lines, and finally
     /// truncate the unfinished line: plain output is bounded the same way.
-    size_t byteCap = 16 << 20;
+    size_t byteCap = 8 << 20;
 
     /// Running total `bytesHeld` recomputes; kept in sync by every mutation
     /// so the cap checks are O(1) instead of walking every line.
@@ -1540,7 +1602,10 @@ struct Transcript
     {
         if (width != cacheWidth) { cache = null; cacheWidth = width; }
         while (cache.length < lines.length) cache ~= wrapAnsi(lines[cache.length], width);
+        size_t total;
+        foreach (w; cache) total += w.length;
         string[] out_;
+        out_.reserve(total);
         foreach (w; cache) out_ ~= w;
         if (deferredReady)
             foreach (d; deferred)
@@ -2902,4 +2967,53 @@ unittest
         assert(t.collapseAll() && t.lines[t.folds[$ - 1].start] == "∴ Thought more", t.lines.to!string);
         assert(t.folds[$ - 1].length == 1);
     }
+}
+
+// Steady-state scrollback memory amplification (issue #310):
+// - sanitize() and wrapAnsi() share the original backing string when lines fit
+//   and need no sanitization, so Transcript.cache does not duplicate line text.
+// - FrameRenderer tracks frozen scrollback with a 32-byte hash rather than a
+//   second copy of the scrollback string[].
+unittest
+{
+    import core.memory : GC;
+    import std.array : replicate;
+
+    // 1. Zero-copy sharing on clean fitting lines.
+    string clean = "\x1b[32mhello world\x1b[0m";
+    assert(sanitize(clean) is clean, "clean SGR line must not be copied");
+    auto wrapped = wrapAnsi(clean, 80);
+    assert(wrapped.length == 1 && wrapped[0] is clean, "fitting clean line must share backing string");
+
+    // 2. Render-cache + FrameRenderer steady-state allocation stays lean.
+    Transcript t;
+    t.byteCap = 2 << 20; // 2 MiB transcript cap
+    string row = "x".replicate(70) ~ "\n";
+    foreach (_; 0 .. 40_000) t.feed(row.representation); // ~2.8 MiB fed -> capped at <= 2 MiB
+    assert(t.bytesHeld() <= t.byteCap);
+
+    auto beforeRender = GC.stats.allocatedInCurrentThread;
+    auto rendered = t.render(80);
+    auto renderAlloc = GC.stats.allocatedInCurrentThread - beforeRender;
+    // All cached rows share their backing string with t.lines (no duplicate text).
+    assert(t.cache.length == t.lines.length);
+    foreach (i; 0 .. t.lines.length)
+        assert(t.cache[i].length == 1 && t.cache[i][0] is t.lines[i]);
+    // `t.render(80)` only allocates slice headers (cache + out_), not copies of
+    // the ~2 MiB of line text: verify per-thread allocation stays under 2 MiB.
+    assert(renderAlloc < 2 * 1024 * 1024, format("expected < 2 MiB for render, got %s bytes", renderAlloc));
+
+    auto r = new FrameRenderer((string s) {});
+    // Render with a 30-row editor (exceeding height=24 so part of it scrolls off),
+    // then shrink to 1 row to exercise the frozen scrollback path.
+    string[] bigEditor;
+    foreach (i; 0 .. 30) bigEditor ~= format("e%s", i);
+    r.render(rendered ~ bigEditor, 80, 24, rendered.length);
+    auto beforeShrink = GC.stats.allocatedInCurrentThread;
+    r.render(rendered ~ ["e0"], 80, 24, rendered.length);
+    auto shrinkAlloc = GC.stats.allocatedInCurrentThread - beforeShrink;
+    assert(r.frozen > 0 && r.frozenHash != (ubyte[32]).init);
+    // Differential shrink hashes the frozen prefix in place (32 bytes) instead
+    // of duplicating the scrollback string[].
+    assert(shrinkAlloc < 2 * 1024 * 1024, format("expected < 2 MiB for shrink, got %s bytes", shrinkAlloc));
 }
