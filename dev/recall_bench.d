@@ -1,7 +1,8 @@
 /+ Benchmark for issue #280: replay a realistic session's tool calls through
  + both recall modes over one memory store and report recalled bytes per call
  + and per turn, and how many recalled notes were about an entity the call
- + touched. Run: dub run --single dev/recall_bench.d  (from the repo root)
+ + touched. Run (from the repo root): ldc2 -preview=dip1000 -preview=nosharedaccess
+ + -I source -i dev/recall_bench.d -L-lcurl -of=/tmp/recall_bench && /tmp/recall_bench
  +/
 import nano.memory;
 import std.algorithm : canFind, any, map, sum;
@@ -13,6 +14,10 @@ import std.file : tempDir, mkdirRecurse, rmdirRecurse, exists;
 import std.path : buildPath;
 
 struct Call { string tool; string args; }
+
+/// Calls per user turn in the replay: the agent's recall budget
+/// (`recallNotesPerTurn`) is shared by every call in one turn.
+enum callsPerTurn = 4;
 
 // A session heavy on merlin/ssh/gh calls, like a fleet-operator shift.
 immutable Call[] sessionCalls = [
@@ -50,6 +55,11 @@ void main()
         SaveOptions o; o.entities = entities; o.factKind = factKind; o.distinct = true;
         store.saveFact(Scope.user, text, null, null, kind, null, false, o);
     }
+    // The registry the replay's calls resolve through: the hostnames they use
+    // are aliases, and the workforce service runs on merlin.
+    store.addAlias(Scope.user, "host:merlin", "merlin.local");
+    store.addAlias(Scope.user, "host:omarchy", "omarchy.local");
+    store.addRelation(Scope.user, "service:workforce", "runs_on", "host:merlin");
     // Facts about merlin (the call's target) — these are the relevant ones.
     tag("merlin OOMs under more than 8 workers; keep it at 6", ["host:merlin"], "pitfall");
     tag("deploy merlin with `just deploy` from ~/Work/merlin", ["host:merlin"], "procedure");
@@ -86,9 +96,15 @@ void main()
     }
     {
         Recall st; bool[string] shown;
-        foreach (c; sessionCalls)
+        size_t turnNotes;
+        foreach (i, c; sessionCalls)
         {
-            auto notes = recall(store, c.tool, parseJSON(c.args), st, shown, 100);
+            // A new turn every `callsPerTurn` calls; the budget is what the
+            // running agent has left for this turn (agent.d recallMemories).
+            if (i % callsPerTurn == 0) turnNotes = 0;
+            auto budget = recallNotesPerTurn > turnNotes ? recallNotesPerTurn - turnNotes : 0;
+            auto notes = recall(store, c.tool, parseJSON(c.args), st, shown, budget);
+            turnNotes += notes.length;
             foreach (n; notes)
             {
                 anchorNotes++;
@@ -100,9 +116,15 @@ void main()
     }
     {
         Recall st; bool[string] shown;
-        foreach (c; sessionCalls)
+        size_t turnNotes;
+        foreach (i, c; sessionCalls)
         {
-            auto notes = recallEntities(store, c.tool, parseJSON(c.args), "", st, shown, 100);
+            // A new turn every `callsPerTurn` calls; the budget is what the
+            // running agent has left for this turn (agent.d recallMemories).
+            if (i % callsPerTurn == 0) turnNotes = 0;
+            auto budget = recallNotesPerTurn > turnNotes ? recallNotesPerTurn - turnNotes : 0;
+            auto notes = recallEntities(store, c.tool, parseJSON(c.args), "", st, shown, budget);
+            turnNotes += notes.length;
             foreach (n; notes)
             {
                 entityNotes++;
@@ -113,10 +135,15 @@ void main()
         }
     }
     auto ncalls = sessionCalls.length;
-    writeln("== recall replay (issue #280): ", ncalls, " tool calls, 13 memories (many mention merlin.local) ==");
+    auto nturns = (ncalls + callsPerTurn - 1) / callsPerTurn;
+    // The relevant host and service facts must survive entity recall.
+    foreach (want; ["merlin OOMs", "deploy merlin", "workforce service runs_on"])
+        assert(entityDistinct.keys.any!(id => store.all().any!(x => x.e.id == id && x.e.text.canFind(want))),
+            "entity recall dropped: " ~ want);
+    writeln("== recall replay (issue #280): ", ncalls, " tool calls in ", nturns, " turns, 13 memories (many mention merlin.local) ==");
     writefln!"mode    notes  distinct  bytes/call  bytes/turn  relevant-notes  relevant-%%"();
-    writefln!"anchor  %5d  %8d  %10.1f  %10d  %14d  %10.0f"(anchorNotes, anchorDistinct.length, double(anchorBytes)/ncalls, anchorBytes, anchorRelevant, anchorNotes ? 100.0*anchorRelevant/anchorNotes : 0);
-    writefln!"entity  %5d  %8d  %10.1f  %10d  %14d  %10.0f"(entityNotes, entityDistinct.length, double(entityBytes)/ncalls, entityBytes, entityRelevant, entityNotes ? 100.0*entityRelevant/entityNotes : 0);
+    writefln!"anchor  %5d  %8d  %10.1f  %10d  %14d  %10.0f"(anchorNotes, anchorDistinct.length, double(anchorBytes)/ncalls, anchorBytes / nturns, anchorRelevant, anchorNotes ? 100.0*anchorRelevant/anchorNotes : 0);
+    writefln!"entity  %5d  %8d  %10.1f  %10d  %14d  %10.0f"(entityNotes, entityDistinct.length, double(entityBytes)/ncalls, entityBytes / nturns, entityRelevant, entityNotes ? 100.0*entityRelevant/entityNotes : 0);
 }
 
 import std.string : indexOf, startsWith;

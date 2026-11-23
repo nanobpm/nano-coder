@@ -1763,12 +1763,16 @@ string[] entitiesFromCall(string tool, const JSONValue args, string repoName)
     foreach (line; haystack.splitLines)
     {
         auto t = line.strip;
-        // `ssh [user@]host` (a bare target) and `scp/rsync … host:path`.
-        foreach (m; t.matchAll(reSshTarget)) add("host", hostKey(m[1]));
-        foreach (m; t.matchAll(reScpTarget)) add("host", hostKey(m[1]));
         // Repos: `-R owner/repo` (gh) and `--repo owner/repo`.
         foreach (m; t.matchAll(reRepoFlag)) add("repo", m[1]);
     }
+    // `ssh [user@]host` and `scp/rsync … host:path`, parsed from the raw
+    // command: option letters are case-sensitive (`-J` takes a value, `-j`
+    // doesn't), and `argumentText` lower-cases.
+    if (auto cmd = "command" in args)
+        if (cmd.type == JSONType.string)
+            foreach (line; cmd.str.splitLines)
+                foreach (h; remoteHosts(line.strip)) add("host", hostKey(h));
     // The working directory's repository, resolved once per session by the
     // caller (a `cwd` never changes between calls).
     add("repo", repoName);
@@ -1787,19 +1791,69 @@ string[] entitiesFromCall(string tool, const JSONValue args, string repoName)
     return found.keys;
 }
 
-private Regex!char reUrlAuthority, reSshTarget, reScpTarget, reRepoFlag;
+private Regex!char reUrlAuthority, reRepoFlag, reHostName;
 static this()
 {
-    reUrlAuthority = regex(`[a-z][a-z0-9+.-]*://(?:[^/@\s]+@)?([a-z0-9][a-z0-9.-]*)(?::\d+)?(?:[/?#\s]|$)`, "i");
-    // `ssh [user@]host`: the target is the first non-option operand; options
-    // may be `--flag=value`, `--flag value` or `-x value` (`-p 2222`, `-i key`).
-    // A value never starts with `-x` (that is the next option).
-    reSshTarget = regex(`(?:^|\s)ssh(?:\s+--?[a-z][a-z0-9-]*(?:=[^\s]+|\s+[^\s-]\S*)?)*\s+(?:[a-z0-9_.-]+@)?([a-z0-9][a-z0-9.-]*)(?:\s|$)`, "i");
-    // `scp`/`rsync`/`sftp` name a host as `host:path` (or `[user@]host:path`);
-    // options come first, in the same `--flag=value` / `--flag value` forms,
-    // and plain operands (other files) may precede the remote one.
-    reScpTarget = regex(`(?:^|\s)(?:scp|sftp|rsync)(?:\s+--?[a-z][a-z0-9-]*(?:=[^\s]+|\s+[^\s-]\S*)?|\s+[^\s-]\S*)*?\s+(?:[a-z0-9_.-]+@)?([a-z0-9][a-z0-9.-]*):[\w./~-]+`, "i");
+    reUrlAuthority = regex("[a-z][a-z0-9+.-]*://(?:[^/@\\s]+@)?([a-z0-9][a-z0-9.-]*)(?::\\d+)?(?:[/?#\\s\"'`]|$)", "i");
+    reHostName = regex(`^(?:[a-z0-9_.-]+@)?([a-z0-9][a-z0-9.-]*)$`, "i");
     reRepoFlag = regex(`(?:^|\s)(?:-R|--repo)[=\s]+([a-z0-9_.-]+/[a-z0-9_.-]+)(?:\s|$)`, "i");
+}
+
+/// The remote hosts a shell line names through `ssh`, `scp`, `sftp` or
+/// `rsync`. Options are parsed by arity (`ssh -v host`, `ssh -p2222 host`,
+/// `ssh -p 2222 host`, `scp -3 a:/x b:/y`), so an option's value is never
+/// taken for the host; `ssh` yields its destination, the copy tools every
+/// `[user@]host:path` operand.
+string[] remoteHosts(string line)
+{
+    import std.array : split;
+    string[] hosts;
+    auto toks = line.split;
+    foreach (i, t; toks)
+    {
+        auto cmd = t.strip(`"'`);
+        bool isSsh = cmd == "ssh";
+        if (!isSsh && cmd != "scp" && cmd != "sftp" && cmd != "rsync") continue;
+        if (i > 0 && !isCommandStart(toks[i - 1])) continue;
+        // Short options taking a value (OpenSSH ssh, scp/sftp; rsync's -e/-f).
+        string withArg = isSsh ? "BbcDEeFIiJLlmOoPpQRSWw" : cmd == "rsync" ? "efTM" : "cDFiJloPSRsXB";
+        bool takesNext;
+        foreach (u; toks[i + 1 .. $])
+        {
+            if (u == ";" || u == "&&" || u == "||" || u == "|") break;
+            if (takesNext) { takesNext = false; continue; }
+            if (u == "--") continue;
+            if (u.startsWith("--"))
+            {
+                // rsync `--rsh value`-style long options taking a separate value.
+                if (!u.canFind('=') && (u == "--rsh" || u == "--exclude" || u == "--include" || u == "--filter"))
+                    takesNext = true;
+                continue;
+            }
+            if (u.startsWith("-") && u.length > 1)
+            {
+                foreach (k, ch; u[1 .. $])
+                    if (withArg.canFind(ch)) { takesNext = k + 2 == u.length; break; }
+                continue;
+            }
+            auto op = u.strip(`"'`);
+            if (isSsh)
+            {
+                if (auto m = op.matchFirst(reHostName)) hosts ~= m[1];
+                break; // the destination is the first operand; the rest is the command
+            }
+            auto colon = op.indexOf(':');
+            if (colon > 0)
+                if (auto m = op[0 .. colon].matchFirst(reHostName)) hosts ~= m[1];
+        }
+    }
+    return hosts;
+}
+
+private bool isCommandStart(string prev) pure
+{
+    return prev == ";" || prev == "&&" || prev == "||" || prev == "|" || prev == "sudo"
+        || prev == "-c" || prev == "exec" || prev == "time" || prev == "nohup" || prev.endsWith(";");
 }
 
 /// The host key of a host[:port] or host-like token: lower-cased, trailing
@@ -1964,8 +2018,10 @@ struct RecallNote
 RecallNote[] recall(Store store, string tool, const JSONValue args, ref Recall state, const bool[string] shown, size_t budget)
 {
     if (budget == 0 || isMemoryTool(tool)) return null;
+    // No empty-argument early return: the tool and the working directory's
+    // repo resolve even for an argumentless call (`plan_show`); the haystack
+    // only feeds the legacy anchor fallback, which can't match when empty.
     auto haystack = argumentText(args);
-    if (!haystack.strip.length) return null;
     Store.Scoped[] all_ = store.allForRecall();
     Store.Scoped[] matched;
     foreach (x; all_)
@@ -1996,8 +2052,10 @@ RecallNote[] recallEntities(Store store, string tool, const JSONValue args, stri
     ref Recall state, const bool[string] shown, size_t budget)
 {
     if (budget == 0 || isMemoryTool(tool)) return null;
+    // No empty-argument early return: the tool and the working directory's
+    // repo resolve even for an argumentless call (`plan_show`); the haystack
+    // only feeds the legacy anchor fallback, which can't match when empty.
     auto haystack = argumentText(args);
-    if (!haystack.strip.length) return null;
     Store.Scoped[] all_ = store.allForRecall();
     EntityRecord[] records = store.allEntities();
     auto resolved = resolveCallEntities(records, entitiesFromCall(tool, args, repoName));
@@ -2057,7 +2115,10 @@ RecallNote[] recallEntities(Store store, string tool, const JSONValue args, stri
         state.fired[c.x.e.id] = true;
         if (c.entity !is null)
         {
-            state.entityFired[c.entity] ~= c.x.e.id;
+            // Once per entity/fact pair: a rule fires again and again, and
+            // must not grow (and get copied by `Recall.dup`) per call.
+            if (!state.entityFired.get(c.entity, null).canFind(c.x.e.id))
+                state.entityFired[c.entity] ~= c.x.e.id;
             state.entityCooldown[c.entity] = recallEntityCooldownCalls;
         }
         notes ~= RecallNote(c.x.e.id, text, c.entity);

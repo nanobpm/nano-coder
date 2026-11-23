@@ -2890,6 +2890,10 @@ int runMain(string[] args)
         bool plan = o.plan;
         host.systemPrompt = (string dir) {
             if (dir != cwd) skills = discoverSkills(dir);
+            // A session in another directory recalls that directory's repo
+            // facts; still resolved once per session, not per tool call.
+            auto key = projectKey(dir);
+            agent.recallRepo = key is null ? null : repoNameOf(key);
             return systemFor(dir, plan);
         };
         host.makeClient = (string s) => makeClient(resolve(cfg, s));

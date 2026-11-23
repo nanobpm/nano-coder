@@ -18,7 +18,7 @@ import std.conv : to;
 import std.format : format;
 import std.file;
 import std.path;
-import std.json : parseJSON;
+import std.json : parseJSON, JSONValue;
 import std.datetime.systime : Clock;
 import core.time : days, minutes;
 import std.string : lineSplitter, stripLeft, startsWith;
@@ -1178,6 +1178,29 @@ unittest // entitiesFromCall: urls, ssh targets, gh -R, repo name, tool name
     assert(e.canFind("host:host.example.net"), e.join(","));
     e = entitiesFromCall("bash", parseJSON(`{"command":"scp -i key f host.example.net:/x"}`), "");
     assert(e.canFind("host:host.example.net"), e.join(","));
+    // Quoted URL with no path: the quote ends the authority.
+    e = entitiesFromCall("bash", parseJSON(`{"command":"curl \"http://merlin.local:8080\""}`), "");
+    assert(e.canFind("host:merlin.local"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"curl 'https://example.org'"}`), "");
+    assert(e.canFind("host:example.org"), e.join(","));
+    // ssh options by arity: flags, attached values, separate values.
+    foreach (c; ["ssh -v merlin.local uptime", "ssh -n merlin.local uptime", "ssh -p2222 merlin.local uptime",
+                 "ssh -vp 2222 merlin.local uptime", "ssh -tt -i key merlin.local uptime"])
+    {
+        e = entitiesFromCall("bash", parseJSON(`{"command":` ~ JSONValue(c).toString ~ `}`), "");
+        assert(e.canFind("host:merlin.local"), c ~ ": " ~ e.join(","));
+        assert(!e.canFind("host:uptime"), c ~ ": " ~ e.join(","));
+    }
+    // scp: every remote operand, and numeric flags.
+    foreach (c; ["scp source.example:/x dest.example:/y", "scp -3 source.example:/x dest.example:/y",
+                 "scp -3 -P 22 source.example:/x deploy@dest.example:/y"])
+    {
+        e = entitiesFromCall("bash", parseJSON(`{"command":` ~ JSONValue(c).toString ~ `}`), "");
+        assert(e.canFind("host:source.example") && e.canFind("host:dest.example"), c ~ ": " ~ e.join(","));
+    }
+    // A command after `&&` still counts.
+    e = entitiesFromCall("bash", parseJSON(`{"command":"cd /x && ssh merlin df"}`), "");
+    assert(e.canFind("host:merlin") && !e.canFind("host:df"), e.join(","));
     // gh -R owner/repo and --repo.
     e = entitiesFromCall("bash", parseJSON(`{"command":"gh issue view 280 -R nanobpm/nano-coder"}`), "");
     assert(e.canFind("repo:nanobpm/nano-coder"), e.join(","));
@@ -1365,4 +1388,27 @@ unittest // memory entities view groups facts under their entity
     assert(view.canFind("host:merlin") && view.canFind("service:workforce"), view);
     assert(view.canFind("merlin has 64GB") && view.canFind("workforce on 8080"), view);
     assert(view.canFind("1 untagged"), view);
+}
+
+unittest // entity recall works for an argumentless call (tool and repo entities)
+{
+    auto s = store(tmp("recall-entity-noargs"));
+    auto r = saveTagged(s, "plan_show lists every note", ["tool:plan_show"], "fact");
+    auto q = saveTagged(s, "nano-coder builds with dub", ["repo:nanobpm/nano-coder"], "decision");
+    Recall st;
+    bool[string] shown;
+    auto notes = recallEntities(s, "plan_show", parseJSON(`{}`), "nanobpm/nano-coder", st, shown, 5);
+    assert(notes.any!(n => n.id == r.id) && notes.any!(n => n.id == q.id), notes.length.to!string);
+}
+
+unittest // entity recall: a rule fired repeatedly is recorded once per entity
+{
+    auto s = store(tmp("recall-entity-rule-once"));
+    auto r = saveTagged(s, "never reboot merlin by hand", ["host:merlin"], null, "rule");
+    Recall st;
+    bool[string] shown;
+    auto args = parseJSON(`{"command":"ssh merlin"}`);
+    foreach (_; 0 .. 10)
+        assert(recallEntities(s, "bash", args, "", st, shown, 5).any!(n => n.id == r.id));
+    assert(st.entityFired["host:merlin"].length == 1, st.entityFired["host:merlin"].length.to!string);
 }
