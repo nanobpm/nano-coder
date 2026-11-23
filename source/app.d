@@ -3367,6 +3367,8 @@ int runMain(string[] args)
     // Repeat the resume instruction on exit, so it is still on screen (and in
     // scrollback) after a long session pushed the banner away. Re-read the
     // log: `/restart` and `/resume` may have switched sessions.
+    // Exiting stops every sub-agent, background ones included; their logs stay.
+    scope (exit) agent.stopSubagents();
     void goodbye()
     {
         writeln("\nGoodbye!");
@@ -3397,7 +3399,9 @@ int runMain(string[] args)
             // Ready for input: tell Herdr, with the session to resume (re-read
             // each time so `/resume` and `/restart` are picked up).
             string resumeId = nano.herdr.active ? agent.log.match!(l => l.id, () => string.init) : null;
-            if (resumeId.length)
+            // Background sub-agents still running: the pane shows activity.
+            if (agent.subagentsActive) nano.herdr.report(nano.herdr.State.working);
+            else if (resumeId.length)
             {
                 auto resume = nano.herdr.resumeArgv(resumeId, agent.client.providerName ~ "/" ~ agent.client.modelName, herdrExtra);
                 if (resume !is null)
@@ -3439,8 +3443,15 @@ int runMain(string[] args)
                 return deliverDueTimer(agent.timers.anyDue(agent.timerNow()), ed.holdsTimer(monoNow), false,
                     exitPress.armed);
             }
+            // A finished background sub-agent's result runs as a turn, like a
+            // fired timer (issue #266); polling also serves their tool calls.
+            bool subNow() @safe
+            {
+                return deliverDueTimer(agent.backgroundResultsReady(), ed.holdsTimer(monoNow), false, exitPress.armed);
+            }
             lapse = () @safe => exitPress.deadline.match!(d => monoMs() > d, () => false)
                 || timerNow()
+                || subNow()
                 || idleNow()
                 || (updateHints && updateHints.tryTake(updateHint));
             auto r = ed.readLine(.stamp(false) ~ "› ", console.stamp() ~ glyphMark ~ " ", false, lapse);
@@ -3453,6 +3464,15 @@ int runMain(string[] args)
                 hasParkedDraft = ed.parkDraft(parkedDraft);
                 string notice;
                 line = agent.takeFiredTimers(notice);
+                writeln(console.dim(notice));
+                agent.automaticInput = true;
+                line = "\x00" ~ line;
+            }
+            else if (r.outcome == Outcome.stopped && subNow())
+            {
+                hasParkedDraft = ed.parkDraft(parkedDraft);
+                string notice;
+                line = agent.takeBackgroundResults(notice);
                 writeln(console.dim(notice));
                 agent.automaticInput = true;
                 line = "\x00" ~ line;
@@ -3718,6 +3738,7 @@ int runMain(string[] args)
                     catch (Exception) {} // an invalid ID or unreadable path is reported as "no saved session" just below
                     if (!ok) { writefln("No saved session %s: /resume without an ID lists them", JSONValue(id).jsonText); continue; }
                     string[] loadNotes;
+                    agent.stopSubagents(); // they belong to the session being left
                     try loadNotes = loadSession(path);
                     catch (Exception e) { writeln(e.msg); continue; }
                     if (gFrame) { gFrame.clear(); replayTranscript(agent, console); }

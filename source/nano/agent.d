@@ -55,7 +55,8 @@ import nano.session;
 import nano.control;
 import nano.claude_hooks : HookManager, Decision, HookOutcome = Outcome, applyUpdatedInput, maxStopBlocks;
 import nano.subagent : SubClientFactory, SubLimits, SubSlot, SubGate, SubMsg, SubKind, SubResult, SubProgress,
-    ToolReply, SubAbort, SubSpec, subToolName = toolName, subDefinition = definition, SubCandidate;
+    ToolReply, SubAbort, SubSpec, subToolName = toolName, subDefinition = definition, SubCandidate,
+    isSubControlTool = isControlTool, subControlDefinitions = controlDefinitions;
 import nano.safeio : Chan;
 import std.typecons : Rebindable;
 
@@ -517,6 +518,9 @@ class Agent
         turnHistoryCalls = 0;
         scope (exit) requestThinking = Option!string.init;
         string response;
+        // Esc Esc stops background sub-agents too (issue #266), wherever
+        // in the turn it landed.
+        scope (exit) if (control.isCancelled && subagentsActive) finishSubagents();
         try response = runTurn(input, ev, resetControl, automatic, inputId, resuming);
         catch (Exception e)
         {
@@ -868,6 +872,7 @@ class Agent
             control.absorbed(s);
         }
         fireDueTimers(ev);
+        deliverBackground(ev);
         // Publish finished probes first: one can lower the window, which
         // the threshold check below must see.
         collectProbes();
@@ -2164,6 +2169,7 @@ class Agent
         bool isHistory = historyEnabled && hist.isHistoryTool(call.name);
         bool isTimer = timerTools && isTimerTool(call.name);
         bool isAgent = subagentsOffered && call.name == subToolName;
+        bool isSubCtl = subagentsOffered && isSubControlTool(call.name);
         // An `agent` call was checked when its reply's sub-agents launched.
         if (isAgent)
             if (auto gate = call.id in subGates)
@@ -2173,7 +2179,7 @@ class Agent
                 context ~= gate.context;
                 return true;
             }
-        if (!isPlan && !isOutcome && !isHistory && !isTimer && !isAgent && !tools.has(call.name))
+        if (!isPlan && !isOutcome && !isHistory && !isTimer && !isAgent && !isSubCtl && !tools.has(call.name))
         {
             refused = format("Tool '%s' not found. Available: %s", call.name, toolNames());
             return false;
@@ -2229,6 +2235,7 @@ class Agent
         try
         {
             if (isAgent) out_ = runSubagent(call, call.id in subGates);
+            else if (subagentsOffered && isSubControlTool(call.name)) out_ = runSubControl(call.name, args);
             else if (isOutcome)
             {
                 auto o = Outcome.fromArgs(args).orThrow!(e => new OutcomeError(e));
@@ -2311,6 +2318,8 @@ class Agent
     private string[string] subLogs;
     private Chan!SubMsg subUp;
     private size_t subRunning, subCallSeq;
+    /// The last sub-agent number handed out (`sub-N`, `SubSpec.slot`).
+    private size_t subSeq;
     private Option!AgentEvents subEvents;
     /// Set only while runTool runs a sub-agent's read_file: the child's own
     /// read registry, kept apart from the parent's.
@@ -2325,12 +2334,29 @@ class Agent
     /// Clear the previous reply's sub-agent state before a reply's tools run.
     private void resetSubagents(AgentEvents ev)
     {
-        subSlots = null;
+        // Background sub-agents (issue #266) outlive their reply; the
+        // reply's blocking ones were collected by finishSubagents.
+        dropSlots((ref const SubSlot s) => !s.background);
         subGates = null;
         subLogs = null;
-        subRunning = 0;
-        subUp = Chan!SubMsg.init;
+        if (!subUp) subUp = Chan!SubMsg.make;
         subEvents = some(ev);
+    }
+
+    /// Remove the slots `gone` picks (a slot holds an immutable spec, so
+    /// it is copied, not moved, into the new array).
+    private void dropSlots(scope bool delegate(ref const SubSlot) @safe gone)
+    {
+        SubSlot[] kept;
+        foreach (ref s; subSlots) if (!gone(s)) kept ~= s;
+        subSlots = kept;
+    }
+
+    /// The position in `subSlots` of sub-agent number `seq`, or `size_t.max`.
+    private size_t slotOf(size_t seq) pure const nothrow
+    {
+        foreach (i, ref s; subSlots) if (s.spec.slot == seq) return i;
+        return size_t.max;
     }
 
     /// Where the barrier-free stretch of `calls` starting at `from` ends:
@@ -2376,19 +2402,21 @@ class Agent
                     auto picked = choose(a, subagentCandidates, subagentModel.length ? subagentModel
                         : client.providerName ~ "/" ~ client.modelName, subagentLimits);
                     auto limits = picked.limits, model = picked.model;
-                    immutable spec = SubSpec(subSlots.length, call.id, a.task, model,
+                    auto seq = ++subSeq;
+                    immutable spec = SubSpec(seq, call.id, a.task, model,
                         systemPrompt(cwd, wallNow.toISOExtString[0 .. 10]), defs, limits,
                         log.match!(l => l.path.stripExtension, () => string.init), "sub-" ~ safeName(call.id), cwd);
-                    g.slot = subSlots.length;
+                    g.slot = seq;
                     g.launched = true;
                     subSlots ~= SubSlot(call.id, a.task, spec);
+                    subSlots[$ - 1].background = a.background;
+                    subSlots[$ - 1].id = format("sub-%s", seq);
                 }
                 catch (ToolError e) g.argError = e.msg;
             }
             subGates[call.id] = g;
         }
         if (!subSlots.length) return;
-        if (!subUp) subUp = Chan!SubMsg.make;
         if (startSubagents()) reportSubagents();
     }
 
@@ -2429,14 +2457,47 @@ class Agent
     /// its result.
     private void pumpSubagents()
     {
-        import nano.subagent : forwardable;
         SubMsg m;
         // Every child sends `done` (even on failure) and nothing closes the
         // channel, so a take ends only with a message.
         if (!subUp.take(m)) assert(0, "the sub-agent channel closed");
-        auto i = m.slot;
+        handleSubMsg(m);
+    }
+
+    /// Serve the sub-agents' waiting messages without blocking: background
+    /// ones run while this agent is between steps or idle (issue #266).
+    void pollSubagents()
+    {
+        SubMsg m;
+        while (subRunning && subUp && subUp.tryTake(m)) handleSubMsg(m);
+    }
+
+    /// Wait for a sub-agent message until `deadline`, polling (the clock
+    /// may be fake in tests). False when the deadline passed first.
+    private bool pumpUntil(MonoTime deadline)
+    {
+        import nano.clock : sleepFor;
+        import core.time : msecs;
+        SubMsg m;
+        while (!subUp.tryTake(m))
+        {
+            if (monoNow >= deadline) return false;
+            sleepFor(5.msecs);
+        }
+        handleSubMsg(m);
+        return true;
+    }
+
+    private void handleSubMsg(SubMsg m)
+    {
+        import nano.subagent : forwardable, argSummary, recentCalls;
+        auto i = slotOf(m.slot);
+        assert(i != size_t.max, "a message from a forgotten sub-agent");
         final switch (m.kind)
         {
+            case SubKind.started:
+                subSlots[i].logPath = m.args;
+                break;
             case SubKind.tool:
                 ToolReply rep;
                 rep.isError = true;
@@ -2445,6 +2506,8 @@ class Agent
                 else if (!forwardable(m.name)) rep.text = format("%s is not available to a read-only sub-agent", m.name);
                 else
                 {
+                    subSlots[i].recent ~= m.name ~ "(" ~ argSummary(m.args) ~ ")";
+                    if (subSlots[i].recent.length > recentCalls) subSlots[i].recent = subSlots[i].recent[1 .. $].dup;
                     auto call = ToolCall.fromRaw(format("%s.%s", subSlots[i].callId, ++subCallSeq), m.name, m.args);
                     // A child's read_file runs on its own ReadState: the
                     // parent's registry would record the read, letting a
@@ -2488,6 +2551,7 @@ class Agent
                 break;
             case SubKind.progress:
                 subSlots[i].toolCalls = m.toolCalls;
+                subSlots[i].turns = m.turns;
                 subSlots[i].tokens = m.tokens;
                 reportSubagents();
                 break;
@@ -2495,6 +2559,8 @@ class Agent
                 subSlots[i].result = subSlots[i].handle.join();
                 subSlots[i].finished = true;
                 subSlots[i].toolCalls = subSlots[i].result.toolCalls;
+                subSlots[i].turns = subSlots[i].result.turns;
+                if (subSlots[i].result.logPath.length) subSlots[i].logPath = subSlots[i].result.logPath;
                 subRunning--;
                 // Usage rolls up into this session's totals (status line, /cost).
                 recordUsage(subSlots[i].result.usage);
@@ -2512,11 +2578,26 @@ class Agent
     {
         if (gate is null || !gate.launched)
             throw new ToolError(gate !is null && gate.argError.length ? gate.argError : "agent: the sub-agent did not start");
-        auto i = gate.slot;
-        while (!subSlots[i].finished)
+        auto seq = gate.slot;
+        auto i = slotOf(seq);
+        if (subSlots[i].background)
         {
             if (!subSlots[i].started && startSubagents()) reportSubagents();
-            if (!subSlots[i].finished && subRunning) pumpSubagents();
+            i = slotOf(seq);
+            auto sl = subSlots[i];
+            auto l = sl.spec.limits;
+            return format("Started %s in the background%s on %s (limits: %s turns, %ss, %s tokens). It keeps running "
+                ~ "while you work; its result arrives as a reminder on a later step (or from agent_wait). "
+                ~ "agent_status, agent_read, agent_cancel and agent_wait take its id.", sl.id,
+                sl.started ? "" : " (queued: the sub-agent concurrency cap is reached)", sl.spec.model, l.turns,
+                l.timeoutSecs, l.tokens);
+        }
+        for (;;)
+        {
+            i = slotOf(seq);
+            if (subSlots[i].finished) break;
+            if (!subSlots[i].started && startSubagents()) reportSubagents();
+            if (!subSlots[slotOf(seq)].finished && subRunning) pumpSubagents();
         }
         auto res = subSlots[i].result;
         if (res.logPath.length) subLogs[call.id] = res.logPath;
@@ -2527,13 +2608,259 @@ class Agent
     /// (a cancel or a loop stop skipped their calls).
     private void finishSubagents()
     {
+        import std.algorithm : any;
+        // Esc Esc stops background sub-agents too.
+        bool all = control.isCancelled;
         foreach (ref s; subSlots)
-            if (s.started && !s.finished) s.abort.abort();
-        foreach (ref s; subSlots) if (!s.started) s.finished = true;
-        while (subRunning) pumpSubagents();
-        subSlots = null;
+            if ((all || !s.background) && s.started && !s.finished) s.abort.abort();
+        foreach (ref s; subSlots) if ((all || !s.background) && !s.started) cancelUnstarted(s);
+        while (subSlots.any!(s => !s.background && !s.finished) || (all && subRunning)) pumpSubagents();
+        dropSlots((ref const SubSlot s) => !s.background);
         subGates = null;
         subEvents = none;
+    }
+
+    private static void cancelUnstarted(ref SubSlot s)
+    {
+        s.finished = true;
+        s.result.report = "(cancelled before the sub-agent started)";
+        s.result.truncated = s.result.cancelled = true;
+        s.result.truncatedReason = "cancelled";
+    }
+
+    /// Stop every sub-agent, background ones included, and wait for them
+    /// (session exit, relaunch, `/restart`). Their logs stay; results not
+    /// yet delivered are logged as a note.
+    void stopSubagents()
+    {
+        foreach (ref s; subSlots)
+        {
+            if (s.started && !s.finished) s.abort.abort();
+            else if (!s.started) cancelUnstarted(s);
+        }
+        while (subRunning) pumpSubagents();
+        foreach (ref s; subSlots)
+            if (s.background && !s.delivered)
+            {
+                s.delivered = true;
+                foreach (l; log) l.subagent(s.id, "stopped", s.result.toolText);
+            }
+        subSlots = null;
+    }
+
+    /// Whether a sub-agent is running or queued (the UI shows activity).
+    bool subagentsActive() pure const nothrow
+    {
+        foreach (ref s; subSlots) if (!s.finished) return true;
+        return false;
+    }
+
+    /// Whether a background sub-agent finished and its result waits for
+    /// delivery (serves waiting sub-agents first).
+    bool backgroundResultsReady()
+    {
+        pollSubagents();
+        foreach (ref s; subSlots) if (s.background && s.finished && !s.delivered) return true;
+        return false;
+    }
+
+    /// The text of the finished, undelivered background results, marking
+    /// them delivered (once only), or null. `notice` is the short line to show.
+    string takeBackgroundResults(out string notice)
+    {
+        string text;
+        string[] ids;
+        foreach (ref s; subSlots)
+            if (s.background && s.finished && !s.delivered)
+            {
+                s.delivered = true;
+                ids ~= s.id;
+                text ~= (text.length ? "\n\n" : "") ~ resultText(s);
+            }
+        pruneSubagents();
+        if (!ids.length) return null;
+        import std.array : join;
+        notice = format("[background sub-agent%s %s finished]", ids.length > 1 ? "s" : "", ids.join(", "));
+        return text;
+    }
+
+    private static string resultText(const ref SubSlot s)
+    {
+        import std.string : lineSplitter;
+        import std.range : front, empty;
+        auto first = s.task.lineSplitter;
+        return format("Background sub-agent %s (%s) %s:\n%s", s.id, first.empty ? "" : first.front,
+            s.state == "done" ? "finished" : "ended: " ~ s.state, s.result.toolText);
+    }
+
+    /// Forget delivered background sub-agents beyond the most recent few.
+    private void pruneSubagents()
+    {
+        import nano.subagent : keepDelivered;
+        import std.algorithm : count;
+        auto n = subSlots.count!(s => s.background && s.delivered);
+        if (n <= keepDelivered) return;
+        auto drop = saturatingSub(n, keepDelivered);
+        dropSlots((ref const SubSlot s) {
+            if (drop && s.background && s.delivered) { drop--; return true; }
+            return false;
+        });
+    }
+
+    /// Before a model call: serve background sub-agents, stop them on a
+    /// cancel, and deliver finished results as one reminder (issue #266).
+    private void deliverBackground(AgentEvents ev)
+    {
+        if (!subSlots.length) return;
+        if (control.isCancelled)
+        {
+            finishSubagents();
+            return;
+        }
+        if (!backgroundResultsReady()) return;
+        string notice;
+        auto text = takeBackgroundResults(notice);
+        if (text is null) return;
+        auto m = Message.auto_(wrapReminder(text));
+        m.timer = true;
+        push(m);
+        ev.userMessage(notice);
+    }
+
+    /// Run `agent_status`, `agent_read`, `agent_cancel` or `agent_wait`.
+    private string runSubControl(string name, JSONValue args)
+    {
+        import nano.subagent : statusTool, readTool, cancelTool, waitTool, readLogTail;
+        import nano.tools : optString, requireString, optInt;
+        pollSubagents();
+        size_t find(string id)
+        {
+            foreach (i, ref s; subSlots) if (s.id == id) return i;
+            string known;
+            foreach (ref s; subSlots) known ~= (known.length ? ", " : "") ~ s.id;
+            throw new ToolError(format("%s: no sub-agent %s (known: %s)", name, id, known.length ? known : "none"));
+        }
+        if (name == statusTool)
+        {
+            auto id = optString(args, "id");
+            if (id.length) return statusLine(subSlots[find(id)]);
+            if (!subSlots.length) return "No sub-agents in this session.";
+            string o;
+            foreach (ref s; subSlots) o ~= (o.length ? "\n" : "") ~ statusLine(s);
+            return o;
+        }
+        if (name == readTool)
+        {
+            auto i = find(requireString(args, "id", name));
+            auto since = optInt(args, "since", 0);
+            if (since < 0) throw new ToolError("agent_read: since must be 0 or more");
+            if (!subSlots[i].logPath.length)
+                return subSlots[i].started ? "(its log is not open yet; try again shortly)"
+                    : "(no log: it has not started" ~ (log.isNone ? ", or this session keeps no logs" : "") ~ ")";
+            import nano.arith : toSize;
+            return readLogTail(subSlots[i].logPath, toSize(since));
+        }
+        if (name == cancelTool)
+        {
+            auto id = requireString(args, "id", name);
+            auto reason = requireString(args, "reason", name);
+            return cancelSubagent(find(id), reason);
+        }
+        assert(name == waitTool);
+        return waitSubagents(args);
+    }
+
+    private string statusLine(const ref SubSlot s)
+    {
+        import std.array : join;
+        auto tokens = s.finished ? s.result.inputTokens + s.result.outputTokens : s.tokens;
+        auto el = s.started ? (s.finished ? s.result.durationMs / 1000 : since(s.start).total!"seconds") : 0;
+        auto o = format("%s [%s%s] %s: %s turns, %s tool calls, %s tokens, %ss", s.id, s.state,
+            s.background ? (s.delivered ? ", delivered" : "") : ", blocking", s.spec.model, s.turns, s.toolCalls, tokens, el);
+        if (s.recent.length) o ~= "; last: " ~ s.recent.join("; ");
+        return o;
+    }
+
+    /// `agent_cancel`: ask the sub-agent for a final report, wait up to
+    /// the grace period, then cut it off.
+    private string cancelSubagent(size_t i, string reason)
+    {
+        import nano.subagent : cancelGraceSecs;
+        import core.time : seconds;
+        auto seq = subSlots[i].spec.slot;
+        auto id = subSlots[i].id;
+        if (subSlots[i].finished) return format("%s already ended (%s); nothing to cancel.", id, subSlots[i].state);
+        subSlots[i].cancelReason = reason;
+        if (!subSlots[i].started) cancelUnstarted(subSlots[i]);
+        else
+        {
+            subSlots[i].abort.wrapUp();
+            auto deadline = monoNow + cancelGraceSecs.seconds;
+            bool cut;
+            while (!subSlots[slotOf(seq)].finished)
+            {
+                if (!cut && !pumpUntil(deadline))
+                {
+                    cut = true;
+                    subSlots[slotOf(seq)].abort.abort();
+                }
+                else if (cut) pumpSubagents();
+            }
+            i = slotOf(seq);
+            if (cut)
+            {
+                subSlots[i].result.report = format("(no report: it did not report within %ss and was cut off)", cancelGraceSecs);
+            }
+            subSlots[i].result.cancelled = subSlots[i].result.truncated = true;
+            subSlots[i].result.truncatedReason = "cancelled by the parent: " ~ reason;
+        }
+        subSlots[i].delivered = true;
+        foreach (l; log) l.subagent(id, "cancelled", reason);
+        return resultText(subSlots[i]);
+    }
+
+    /// `agent_wait`: block until the sub-agents finish or the timeout.
+    private string waitSubagents(JSONValue args)
+    {
+        import nano.subagent : maxWaitSecs;
+        import nano.tools : optInt;
+        import core.time : seconds;
+        auto ids = "ids" in args;
+        if (ids is null || ids.type != JSONType.array || !ids.arrayNoRef.length)
+            throw new ToolError("agent_wait: ids must be a non-empty list of sub-agent handles");
+        auto t = optInt(args, "timeout_s", 60);
+        if (t < 0) throw new ToolError("agent_wait: timeout_s must be 0 or more");
+        size_t[] seqs;
+        foreach (v; ids.arrayNoRef)
+        {
+            if (v.type != JSONType.string) throw new ToolError("agent_wait: ids must be strings such as sub-3");
+            bool found;
+            foreach (ref s; subSlots) if (s.id == v.str) { seqs ~= s.spec.slot; found = true; }
+            if (!found) throw new ToolError(format("agent_wait: no sub-agent %s", v.str));
+        }
+        auto deadline = monoNow + min(t, maxWaitSecs).seconds;
+        bool allDone()
+        {
+            foreach (q; seqs) if (!subSlots[slotOf(q)].finished) return false;
+            return true;
+        }
+        while (!allDone() && !control.isCancelled && pumpUntil(deadline)) {}
+        string o;
+        foreach (q; seqs)
+        {
+            auto i = slotOf(q);
+            string part;
+            if (!subSlots[i].finished) part = "still running: " ~ statusLine(subSlots[i]);
+            else if (subSlots[i].delivered) part = subSlots[i].id ~ ": its result was already delivered. " ~ statusLine(subSlots[i]);
+            else
+            {
+                subSlots[i].delivered = true;
+                part = resultText(subSlots[i]);
+            }
+            o ~= (o.length ? "\n\n" : "") ~ part;
+        }
+        pruneSubagents();
+        return o;
     }
 
     /// Show every started sub-agent's progress (renderers that support it).
@@ -2893,6 +3220,8 @@ class Agent
 
     void restart(string system, Option!SessionLog newLog)
     {
+        // Sub-agents belong to the session being left (issue #266).
+        stopSubagents();
         import nano.mode : AgentMode;
         // An empty system prompt (e.g. an ACP host without one) sends no
         // system message at all: some providers reject an empty one.
@@ -3033,7 +3362,7 @@ class Agent
     {
         auto all = tools.definitions ~ (planTools ? planDefinitions() : null)
             ~ (outcomeTool ? [outcomeDefinition()] : null) ~ (historyEnabled ? hist.definitions() : null)
-            ~ (timerTools ? timerDefinitions() : null) ~ (subagentsOffered ? [subDefinition(subagentCandidates)] : null);
+            ~ (timerTools ? timerDefinitions() : null) ~ (subagentsOffered ? [subDefinition(subagentCandidates)] ~ subControlDefinitions() : null);
         if (control.mode != AgentMode.plan) return all;
         ToolDefinition[] kept;
         foreach (t; all) if (planAllows(t.name)) kept ~= t;

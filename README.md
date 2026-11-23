@@ -528,6 +528,30 @@ disabled provider, no model) is dropped with a warning, as is a malformed entry;
 sub-agents run on `subagent_model` or the session's model and a call may name any model, as without
 the list. `subagents = false` starts sessions with the tool off; `/subagents on` turns it on.
 
+**Background sub-agents.** `agent(task, background: true)` starts the sub-agent and returns at once
+with a handle (`sub-3`), its model and its limits; the agent carries on while it runs. Four tools
+come with the `agent` tool:
+
+- `agent_status(id?)`: state (queued, running, done, cancelled, truncated), turns, tool calls,
+  tokens, elapsed time and its last few tool calls, for one sub-agent or all of this session's.
+- `agent_read(id, since?)`: its log (messages and tool calls) from line `since`, at most 16 KB,
+  ending with the `since` to continue from. The log is streamed, never loaded whole.
+- `agent_cancel(id, reason)`: asks it to report what it has in one final step; that report is the
+  result, marked cancelled and partial. One that can't report within 5 s is cut off with an empty
+  report.
+- `agent_wait(ids, timeout_s)`: blocks until they finish or the timeout passes, and returns their
+  results (or their status, for ones still running).
+
+A background result is delivered once: as a reminder before the agent's next model call, or, at the
+idle prompt, as an automatic turn (like a fired timer); an `agent_wait` or `agent_cancel` that returns
+it counts as delivery. Background and blocking sub-agents share `subagent_max_concurrency` (extra
+ones queue). A background sub-agent may outlive the turn that started it; its tool calls are served
+between the agent's steps and at the idle prompt. Esc Esc stops every sub-agent, background ones
+included; `/exit`, `/restart`, `/resume` and a relaunch stop them too (their logs stay, and a result
+never delivered is recorded in the session log). Their tool calls go through the session's policy
+and hooks as above; the progress display shows them, and in Herdr the pane shows as working while
+any run.
+
 **Titles.** With `session_titles = true`, once a session has a prompt that says something (not
 just "hi"), nano-coder asks the model for a title of at most six words in the background. It uses
 `title_model` (a cheap one is enough) or the session's model. The request is a few hundred tokens,
