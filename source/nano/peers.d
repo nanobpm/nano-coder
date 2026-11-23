@@ -374,10 +374,20 @@ struct PeerListener
             sendReply(conn, reply);
             return;
         }
+        // Refuse anything that isn't a JSON object *before* any objectNoRef
+        // lookup: `[]`, `5`, `"x"` are valid JSON but objectNoRef throws on
+        // them, and nothing here catches it — the listener thread would die
+        // and the session would silently stop accepting messages while its
+        // socket file stayed in place.
+        if (v.type != JSONType.object)
+        {
+            sendReply(conn, responseLine(id, Status.refused, "expected a message/send request"));
+            return;
+        }
         if (auto pid = "id" in v.objectNoRef) id = *pid;
         auto method = "method" in v.objectNoRef;
         auto params = "params" in v.objectNoRef;
-        if (v.type != JSONType.object || method is null || method.type != JSONType.string
+        if (method is null || method.type != JSONType.string
             || method.str != "message/send" || params is null)
         {
             sendReply(conn, responseLine(id, Status.refused, "expected a message/send request"));
@@ -811,6 +821,48 @@ unittest
     status = send(root, "sess-stale", PeerMessage("sess-sender", null, "hi", "m-6", false), note);
     assert(status == Status.notRunning, note);
     assert(!socketPath(root, "sess-stale").exists, "the stale socket is cleaned up: " ~ note);
+}
+
+// A same-uid client that sends valid *non-object* JSON (`[]`, `5`, `"x"`)
+// gets a refusal, not a dead listener: the type check runs before any
+// objectNoRef lookup, so the exception that killed the thread is gone and a
+// later, valid send is still delivered. Regression test for the listener
+// thread dying on objectNoRef's JSONException.
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse;
+    import std.path : buildPath;
+    import std.socket : Socket, UnixAddress, AddressFamily, SocketType;
+    import std.string : representation;
+    import nano.control : TurnControl;
+    import core.atomic : atomicLoad;
+    auto root = buildPath(tempDir, "nano-d-peers-nonobject");
+    scope (exit) rmdirRecurse(root);
+    mkdirRecurse(root);
+    auto control = new shared TurnControl;
+    auto router = PeerRouter.make(atomicLoad(control));
+    router.confirm(false);
+    auto listener = PeerListener.listen(root, "sess-target", router.requests);
+    scope (exit) listener.close();
+    auto pump = TestPump.start(router);
+    scope (exit) pump.stop();
+
+    // Send a raw non-object JSON line: refused, and the listener survives.
+    auto raw = new Socket(AddressFamily.UNIX, SocketType.STREAM);
+    scope (exit) raw.close();
+    raw.connect(new UnixAddress(socketPath(root, "sess-target")));
+    raw.send("[]\n".representation);
+    auto reply = readLine(raw);
+    assert(reply !is null, "the listener answers the non-object request");
+    assert(parseJSON(reply)["result"]["status"].str == "refused", reply);
+
+    // A second, valid send is still delivered: the listener thread lived.
+    string note;
+    auto status = send(root, "sess-target", PeerMessage("sess-sender", null, "still here", "m-1", false), note);
+    assert(status == Status.delivered, note);
+    Inbound inbound;
+    assert(router.takeWaiting(inbound), "the valid message waits for the loop");
+    settle(inbound, true);
 }
 
 // The same-uid check: a peer whose uid isn't the process's own is dropped.
