@@ -887,6 +887,13 @@ private string subagentsToggle(Agent agent, ref Config cfg, imported!"nano.subag
     agent.control.takeSubagentsRequest(); // a direct switch supersedes a queued one
     auto was = agent.subagentsOn;
     agent.subagentsOn = t.on;
+    if (was != t.on)
+    {
+        // A resume restores the session's sub-agents switch (#297).
+        SessionSettings s;
+        s.subagents = t.on ? 1 : 0;
+        agent.log.ifSome((SessionLog l) { l.settings(s); });
+    }
     auto msg = format("Sub-agents %s for this session", t.on ? "on" : "off");
     if (was != t.on) msg ~= " (the tool list changed, so the provider's prompt cache is rebuilt once)";
     if (t.save) msg ~= "; " ~ saveSubagentsSetting(cfg, t.on);
@@ -3056,6 +3063,19 @@ int runMain(string[] args)
         return 0;
     }
 
+
+
+    /// The settings of the session `loadSession` just loaded, waiting for the
+    /// resume path to apply them once `switchModel` and `syncMode` exist (D
+    /// orders declarations in a function body).
+    struct PendingSettings
+    {
+        SessionSettings st;
+        string headerModel;
+        bool set;
+    }
+    PendingSettings pendingSettings;
+
     /// Load a saved session into the agent: its conversation, plan and log.
     /// Load a saved session; returns its diagnostics so a frame caller can
     /// print them after clearing and replaying the transcript.
@@ -3089,6 +3109,15 @@ int runMain(string[] args)
                 notes ~= "nano-coder: ignoring " ~ note;
         }
         updateStatus((ref Stats s) { s.historySearches = s.historyReads = 0; });
+        // The restored runtime settings apply after `loadRestored` (which
+        // resets the mode and thinking) and after the log is adopted (so a
+        // model switch logs itself). `restored` is released below, so the
+        // applier keeps just the settings and the header model; the resume
+        // paths run it once `switchModel` and `syncMode` are declared (D
+        // orders declarations in a function body).
+        auto st = restored.settings;
+        auto headerModel = restored.model;
+        pendingSettings = PendingSettings(st, headerModel, true);
         if (!agent.timers.empty)
             notes ~= format("%s timer%s still set (/timers lists them)", agent.timers.items.length,
                 agent.timers.items.length == 1 ? "" : "s");
@@ -3106,9 +3135,12 @@ int runMain(string[] args)
         return notes;
     }
 
+
+
     try
     {
-        if (o.hasResume) foreach (n; loadSession(findSession(sessionDir, o.resume, cwd))) stdErr.writeln(n);
+        if (o.hasResume)
+            foreach (n; loadSession(findSession(sessionDir, o.resume, cwd))) stdErr.writeln(n);
         else if (!o.noSession)
         {
             auto log = new SessionLog(sessionDir, spec, cwd);
@@ -3180,6 +3212,13 @@ int runMain(string[] args)
         return modelSuggestions(cfg, currentSpec(), recent);
     };
 
+    /// Record a runtime settings change in the session log (issue #297): a
+    /// resumed session restores the latest record of each field.
+    void logSessionSettings(const SessionSettings s)
+    {
+        agent.log.ifSome((SessionLog l) { l.settings(s); });
+    }
+
     /// Switch the model (history carries over); the "Model set to" text.
     /// `queued`: a `/model` from mid-turn, already taken off the queue; a
     /// direct switch also drops one still queued.
@@ -3244,6 +3283,94 @@ int runMain(string[] args)
     agent.promptPlan = o.plan;
     void syncMode() { agent.syncModePrompt((bool plan) => systemFor(cwd, plan)); }
 
+
+
+    /// Apply the runtime settings a resumed session logged (issue #297), so
+    /// it carries on with the model, mode, verbosity, thinking level,
+    /// sub-agents switch and context settings it stopped with. Precedence:
+    /// an explicit `-m`/`--model` or `--verbosity` on the resume command line
+    /// wins, then the session's last recorded value, then the config default
+    /// (already in effect). The header's model is the starting value for a
+    /// log with no settings records. A provider or model that is gone falls
+    /// back to the config default with a notice; the resume never fails.
+    void applyRestoredSettings(const SessionSettings st, string headerModel, ref string[] notes)
+    {
+        import nano.context : parseCompactionMode;
+        import nano.thinking : Thinking;
+        import std.math : isNaN;
+
+        // The model: explicit flag > session's last record > session header >
+        // what the session already runs (the config default).
+        auto wanted = o.model.length ? o.model : st.model.length ? st.model : headerModel;
+        if (wanted.length && wanted != client.providerName ~ "/" ~ client.modelName)
+        {
+            try switchModel(wanted);
+            catch (Exception e)
+            {
+                notes ~= format("the session's model %s is not available (%s); using %s from the config",
+                    wanted, e.msg, spec);
+                // `switchModel` builds the new client before swapping, so a
+                // failure leaves the config default running.
+            }
+        }
+        if (st.mode.length)
+            parseMode(st.mode).match!((m) {
+                agent.control.mode = m;
+                syncMode();
+                updateStatus((ref Stats s) { s.mode = m; });
+            }, (e) { notes ~= "the saved mode: " ~ e; });
+        if (st.verbosity.length && !o.verbosity.length)
+        {
+            import nano.ui : allVerbosities, vname = name;
+            import std.algorithm.searching : find;
+            auto found = allVerbosities.find!(v => vname(v) == st.verbosity);
+            if (found.length) setVerbosity(found[0]);
+            else notes ~= "the saved verbosity is unknown: " ~ st.verbosity;
+        }
+        if (st.thinking.length)
+        {
+            // `sessionSetting` validated the level when it was logged.
+            Thinking t;
+            if (st.thinking == "off") t = Thinking.off;
+            else if (st.thinking != "default") t = Thinking.of(st.thinking);
+            agent.sessionThinking = t;
+        }
+        if (st.subagents >= 0) agent.subagentsOn = st.subagents != 0;
+        if (st.compactionMode.length)
+            parseCompactionMode(st.compactionMode).match!((m) { agent.compactionMode = m; },
+                () { notes ~= `the saved compaction mode "` ~ st.compactionMode ~ `" is unknown; using the config's`; });
+        if (st.autoCompact >= 0) agent.autoCompact = st.autoCompact != 0;
+        if (!st.autoCompactThreshold.isNaN) agent.autoCompactThreshold = st.autoCompactThreshold;
+        if (st.contextWindow >= 0)
+        {
+            if (st.contextWindow > 0)
+                agent.setConfiguredWindow(ConfiguredWindow(toSize(st.contextWindow), "the session's settings"));
+            else
+            {
+                // The session cleared the override: re-resolve from the config.
+                auto rp = resolve(cfg, client.providerName ~ "/" ~ client.modelName);
+                agent.setConfiguredWindow(windowFor(cfg, rp.config));
+            }
+        }
+    }
+
+    /// Apply the settings of the session just loaded, if any; the notes.
+    string[] applyPendingSettings()
+    {
+        string[] notes;
+        if (pendingSettings.set)
+        {
+            applyRestoredSettings(pendingSettings.st, pendingSettings.headerModel, notes);
+            pendingSettings = PendingSettings.init;
+        }
+        return notes;
+    }
+
+    // A `--resume`d session's runtime settings (issue #297) apply once the log
+    // is adopted and `switchModel`/`syncMode` exist (declaration order).
+    if (o.hasResume) foreach (n; applyPendingSettings()) stdErr.writeln("nano-coder: " ~ n);
+
+
     // Re-read the instruction files (AGENTS.md, CLAUDE.md, rules, your own
     // files) so edits apply without a restart. A change to what they put in
     // the system prompt rebuilds it (true); a change to on-demand rules (or
@@ -3294,7 +3421,13 @@ int runMain(string[] args)
             try { switchModel(spec); return ""; }
             catch (Exception e) return e.msg;
         };
-        onVerbosity = (Verbosity v) { setVerbosity(v); };
+        onVerbosity = (Verbosity v) {
+            setVerbosity(v);
+            SessionSettings s;
+            s.verbosity = nano.ui.name(v);
+            logSessionSettings(s);
+        };
+        h.logSettings = (const SessionSettings s) { logSessionSettings(s); };
         return h;
     }
 
@@ -3871,6 +4004,11 @@ int runMain(string[] args)
                         {
                             auto v = parseVerbosity(arg);
                             setVerbosity(v);
+                            {
+                                SessionSettings s;
+                                s.verbosity = nano.ui.name(v);
+                                logSessionSettings(s);
+                            }
                             writefln("Verbosity set to %s (%s); /settings saves it", nano.ui.name(v), nano.ui.describe(v));
                         }
                         catch (Exception e) writeln(e.msg);
@@ -3895,12 +4033,19 @@ int runMain(string[] args)
                     continue;
                 }
                 case "/thinking":
-                    import nano.thinking : statusText, sessionSetting;
+                    import nano.thinking : Thinking, statusText, sessionSetting;
                     if (arg.length)
                     {
                         auto setting = sessionSetting(arg);
                         if (setting.isErr) { writeln(setting.unwrapErr("isErr")); continue; }
                         agent.sessionThinking = setting.unwrap("isOk");
+                        {
+                            // A resume restores the session's thinking level (#297).
+                            auto t = agent.sessionThinking;
+                            SessionSettings s;
+                            s.thinking = t.isNull ? "default" : t.get.kind == Thinking.Kind.off ? "off" : t.get.level;
+                            logSessionSettings(s);
+                        }
                         auto r = agent.thinking();
                         writeln("Thinking set to ", r.describe);
                         if (r.warning.length) writeln("Warning: ", r.warning);
@@ -3932,6 +4077,12 @@ int runMain(string[] args)
                     parseMode(arg).match!((m) {
                         agent.control.mode = m;
                         syncMode();
+                        {
+                            // A resume restores the session's mode (#297).
+                            SessionSettings s;
+                            s.mode = m.name;
+                            logSessionSettings(s);
+                        }
                         writefln("Mode set to %s (%s)", m.name, m.describe);
                     }, e => writeln(e));
                     continue;
@@ -4002,6 +4153,7 @@ int runMain(string[] args)
                     agent.stopSubagents(); // they belong to the session being left
                     try loadNotes = loadSession(path);
                     catch (Exception e) { writeln(e.msg); continue; }
+                    foreach (n; applyPendingSettings()) loadNotes ~= "nano-coder: " ~ n;
                     if (gFrame) { gFrame.clear(); replayTranscript(agent, console); releaseHeap(); }
                     foreach (n; loadNotes) stdErr.writeln(n);
                     stdErr.flush();

@@ -25,6 +25,7 @@ import core.time : dur;
 import std.process : environment, thisProcessID;
 import std.algorithm : sort, filter, map;
 import std.array : array;
+import std.math : isNaN;
 import nano.llm;
 import nano.option : Option, some, ifSome;
 import nano.plan : Plan;
@@ -957,6 +958,26 @@ class SessionLog
             "recorded_at": nowStamp()])));
     }
 
+    /// A runtime setting changed (`/model`, `/mode`, `/verbosity`, `/thinking`,
+    /// `/subagents`, the context settings; issue #297): only the fields `s`
+    /// names are recorded, and on restore the latest record of each field
+    /// wins, so a resumed session carries on with the settings it stopped
+    /// with.
+    void settings(const SessionSettings s)
+    {
+        JSONValue d = ["recorded_at": nowStamp()];
+        if (s.model.length) d["model"] = s.model;
+        if (s.mode.length) d["mode"] = s.mode;
+        if (s.verbosity.length) d["verbosity"] = s.verbosity;
+        if (s.thinking.length) d["thinking"] = s.thinking;
+        if (s.subagents >= 0) d["subagents"] = s.subagents != 0;
+        if (s.compactionMode.length) d["compaction_mode"] = s.compactionMode;
+        if (s.autoCompact >= 0) d["auto_compact"] = s.autoCompact != 0;
+        if (!s.autoCompactThreshold.isNaN) d["auto_compact_threshold"] = s.autoCompactThreshold;
+        if (s.contextWindow >= 0) d["context_window"] = s.contextWindow;
+        write_(record("settings", d));
+    }
+
     /// The timers after a change; the latest record wins.
     void timers(JSONValue timers)
     {
@@ -1198,10 +1219,51 @@ struct PendingInput
     size_t recallNotes;
 }
 
+/// The session's runtime settings as a `settings` record logs them (issue
+/// #297): every field is absent-by-default, so a record changes only what it
+/// names and the latest record of each field wins on restore. The header's
+/// `model` is the starting value; a record's `model` supersedes it.
+struct SessionSettings
+{
+    /// `provider/model` (empty: unchanged).
+    string model;
+    /// `/mode` name: normal, plan or auto (empty: unchanged).
+    string mode;
+    /// `/verbosity` name (empty: unchanged).
+    string verbosity;
+    /// `/thinking`: "default", "off" or a level name (empty: unchanged).
+    string thinking;
+    /// `/subagents`: 1 on, 0 off, -1 unchanged.
+    int subagents = -1;
+    /// Compaction mode name: standard, smart or extract (empty: unchanged).
+    string compactionMode;
+    /// Auto-compaction: 1 on, 0 off, -1 unchanged.
+    int autoCompact = -1;
+    /// The auto-compaction threshold (NaN: unchanged).
+    double autoCompactThreshold = double.nan;
+    /// The context-window override in tokens; 0 clears it (-1: unchanged).
+    long contextWindow = -1;
+
+    /// Field-wise: the NaN "unchanged" threshold equals itself, which a
+    /// struct's default bitwise equality rejects.
+    bool opEquals(const ref SessionSettings o) const pure nothrow @nogc
+    {
+        import std.math : isNaN;
+        return model == o.model && mode == o.mode && verbosity == o.verbosity && thinking == o.thinking
+            && subagents == o.subagents && compactionMode == o.compactionMode && autoCompact == o.autoCompact
+            && (autoCompactThreshold == o.autoCompactThreshold
+                || (autoCompactThreshold.isNaN && o.autoCompactThreshold.isNaN))
+            && contextWindow == o.contextWindow;
+    }
+}
+
 /// What a session log restores to.
 struct Restored
 {
     string id, cwd, model, createdAt;
+    /// The runtime settings the log's `settings` records restore (issue #297);
+    /// `settings.model`, when set, supersedes `model`.
+    SessionSettings settings;
     Message[] conversation;
     /// The text of an input whose turn never ended (a crash mid-turn).
     string pendingInput;
@@ -1930,7 +1992,21 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
         case "recall":
             r.recall = data["recall"];
             break;
-        default: // hooks: audit only
+        case "settings":
+            // The latest record of each field wins (issue #297); a field a
+            // record omits keeps its earlier value.
+            if (auto v = "model" in data) r.settings.model = v.str;
+            if (auto v = "mode" in data) r.settings.mode = v.str;
+            if (auto v = "verbosity" in data) r.settings.verbosity = v.str;
+            if (auto v = "thinking" in data) r.settings.thinking = v.str;
+            if (auto v = "subagents" in data) r.settings.subagents = v.boolean ? 1 : 0;
+            if (auto v = "compaction_mode" in data) r.settings.compactionMode = v.str;
+            if (auto v = "auto_compact" in data) r.settings.autoCompact = v.boolean ? 1 : 0;
+            if (auto v = "auto_compact_threshold" in data)
+                r.settings.autoCompactThreshold = v.type == JSONType.float_ ? v.floating : v.integer;
+            if (auto v = "context_window" in data) r.settings.contextWindow = v.integer;
+            break;
+        default: // hooks, setting: audit only
             break;
         }
         index++;
@@ -2533,6 +2609,73 @@ unittest
     // A header from another format version is refused.
     std.file.write(buildPath(dir, "v9.jsonl"), `{"type":"session","data":{"version":9,"id":"v9","created_at":"x"}}` ~ "\n");
     assertThrown(restore(buildPath(dir, "v9.jsonl")));
+}
+
+// issue #297: settings records round-trip; the latest record of each field
+// wins, a record changes only what it names, and a log without any keeps the
+// defaults (the header's model is the starting value).
+unittest
+{
+    auto dir = buildPath(tempDir, "nano-coder-session-settings");
+    if (dir.exists) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/a", "/x");
+    auto sys = Message.system("sys");
+    log.append(sys);
+    // Old log, no settings records: every field is "unchanged".
+    auto r0 = restore(log.path);
+    auto noSettings = SessionSettings.init;
+    assert(r0.model == "mock/a" && r0.settings == noSettings);
+    SessionSettings s1;
+    s1.model = "mock/b";
+    s1.mode = "plan";
+    s1.verbosity = "verbose";
+    s1.thinking = "high";
+    s1.subagents = 0;
+    s1.compactionMode = "smart";
+    s1.autoCompact = 1;
+    s1.autoCompactThreshold = 0.7;
+    s1.contextWindow = 50_000;
+    log.settings(s1);
+    SessionSettings s2;
+    s2.model = "mock/c";
+    s2.subagents = 1;
+    log.settings(s2);
+    auto r = restore(log.path);
+    assert(r.model == "mock/a", "the header keeps the creation-time model");
+    assert(r.settings.model == "mock/c", "the latest record wins");
+    assert(r.settings.mode == "plan" && r.settings.verbosity == "verbose" && r.settings.thinking == "high");
+    assert(r.settings.subagents == 1 && r.settings.compactionMode == "smart");
+    assert(r.settings.autoCompact == 1);
+    // JSON text round-trips a double only approximately.
+    assert(imported!"std.math".isClose(r.settings.autoCompactThreshold, 0.7));
+    assert(r.settings.contextWindow == 50_000);
+    // A record names only what changed: the earlier record's fields survive.
+    auto lines = readText(log.path).lineSplitter.array;
+    auto rec = parseJSON(lines[$ - 1]);
+    assert(rec["type"].str == "settings" && rec["data"]["model"].str == "mock/c");
+    assert("mode" !in rec["data"] && rec["data"]["subagents"].boolean == true);
+    assert("recorded_at" in rec["data"]);
+    // A resumed log keeps accepting appends after the records.
+    auto again = new SessionLog(log.path);
+    auto more = Message.user("more");
+    again.append(more);
+    assert(restore(log.path).settings.model == "mock/c");
+}
+
+// issue #297: a settings record with a cleared context window (0) restores
+// as 0, distinct from "never recorded" (-1).
+unittest
+{
+    auto dir = buildPath(tempDir, "nano-coder-session-settings-clear");
+    if (dir.exists) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/a", "/x");
+    auto sys = Message.system("sys");
+    log.append(sys);
+    SessionSettings s;
+    s.contextWindow = 0;
+    log.settings(s);
+    auto r = restore(log.path);
+    assert(r.settings.contextWindow == 0);
 }
 
 // rust: session_index.rs::set_title_does_not_replace_an_existing_title

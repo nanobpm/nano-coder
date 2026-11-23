@@ -500,6 +500,19 @@ left out. Sessions from before this feature don't record their directory: they a
 directory, with `?` as the project. Without a terminal, `--resume` prints the list and exits.
 `--list-sessions [--all] [--json]` prints the list for scripts (`--all`: every directory).
 
+A resumed session carries on with the runtime settings it stopped with, not the config defaults:
+the model (`/model`), the mode (`/mode`), verbosity (`/verbosity`), the thinking level
+(`/thinking`), the sub-agents switch (`/subagents on|off`) and the context settings (compaction
+mode, auto-compact on/off and its threshold, and the context-window override, as changed in the
+`/settings` panel's Context section). Each change is logged when it happens and the latest value
+wins; a session logged before this feature starts from the model its header recorded. Precedence:
+an explicit `-m`/`--model` or `--verbosity` on the resume command line wins, then the session's
+last value, then the config default. If the session's provider or model is no longer available
+(the provider was removed or disabled), the resume falls back to the config default with a
+one-line notice instead of failing. The startup banner's `Model:` line shows the model the
+resumed session runs. `/relaunch` and the relaunch after `/update` keep the settings through the
+same path.
+
 The picker reads `.index.jsonl` in the session directory: one summary per session, updated at the
 end of each turn. It is only a cache. A session that is missing from it, or whose log changed
 since it was indexed, is summarized from its log again, and deleting the file rebuilds it.

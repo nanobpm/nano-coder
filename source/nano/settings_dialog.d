@@ -49,6 +49,9 @@ struct SettingsHost
     string delegate(string provider) @safe refreshClient;
     /// Where `/providers` key status reads stored logins (tests).
     string dataDir;
+    /// Records a runtime settings change in the session log (issue #297): a
+    /// resumed session restores it. Null in tests.
+    void delegate(const imported!"nano.session".SessionSettings s) @safe logSettings;
 }
 
 /// The bare `/model` picker: a recent model or a provider, then its model.
@@ -288,6 +291,17 @@ private bool editContext(SettingsUi ui, ref SettingsHost h)
     a.setConfiguredWindow(window > 0 ? ConfiguredWindow(toSize(window), "context_window in config")
         : pc !is null && pc.contextWindow > 0 ? ConfiguredWindow(toSize(pc.contextWindow), "provider context_window")
         : ConfiguredWindow.init);
+    if (h.logSettings !is null)
+    {
+        // A resume restores the session's context settings (issue #297),
+        // even when this change is also saved to the config.
+        imported!"nano.session".SessionSettings s;
+        s.autoCompact = auto_ ? 1 : 0;
+        s.autoCompactThreshold = threshold;
+        s.compactionMode = cfg.compactionMode;
+        s.contextWindow = window;
+        h.logSettings(s);
+    }
     return true;
 }
 

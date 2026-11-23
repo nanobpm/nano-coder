@@ -942,7 +942,14 @@ class Agent
     {
         // `/subagents on|off` typed mid-turn: every request, retries
         // included, follows it; sub-agents already running finish.
-        if (auto sub = control.takeSubagentsRequest()) subagentsOn = sub == 1;
+        if (auto sub = control.takeSubagentsRequest())
+        {
+            subagentsOn = sub == 1;
+            // A resume restores the session's sub-agents switch (#297).
+            SessionSettings ss;
+            ss.subagents = subagentsOn ? 1 : 0;
+            logSettings(ss);
+        }
         ChatRequest req;
         req.messages = messages;
         req.tools = offeredTools();
@@ -3881,6 +3888,17 @@ class Agent
         // A mid-turn switch never waits on the endpoint.
         if (midTurnSwitch) startBackgroundProbe();
         else refreshCapabilities();
+        // A resume restores the session's last model (issue #297).
+        SessionSettings s;
+        s.model = c.providerName ~ "/" ~ c.modelName;
+        logSettings(s);
+    }
+
+    /// Record a runtime settings change in the session log (issue #297): a
+    /// resumed session restores the latest record of each field.
+    private void logSettings(const SessionSettings s)
+    {
+        log.ifSome((SessionLog l) { l.settings(s); });
     }
 
     /// Set while a queued `/model` applies (`useClient` then probes in the background).
@@ -3941,6 +3959,12 @@ class Agent
                 compactionMode = r.mode;
                 settingChangedAt[r.key] = turnSerial;
                 announceSetting(r.key, old, next, r.reason);
+                {
+                    // A resume restores the session's compaction mode (#297).
+                    SessionSettings s;
+                    s.compactionMode = next;
+                    logSettings(s);
+                }
                 return format("%s: %s → %s for this session (the user's config is unchanged)", r.key, old, next);
             case settings.Action.compactNow:
                 agentCompact = true;

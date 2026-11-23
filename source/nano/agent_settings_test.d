@@ -111,3 +111,36 @@ unittest
     agent.settingsTools = false;
     assert(!agent.offeredTools.any!(d => d.name == "session_settings"));
 }
+
+// issue #297: a `session_settings` compaction-mode change also writes a
+// `settings` record, so a resume restores it.
+unittest
+{
+    auto mock = new MockClient([call("s", `{"action":"set","key":"compaction_mode","value":"extract"}`), LLMResponse("ok")]);
+    auto agent = logged("settings-record", mock);
+    agent.run("go", new NullEvents);
+    assert(records(agent).any!(r => r["type"].str == "settings" && r["data"]["compaction_mode"].str == "extract"));
+}
+
+// issue #297: a model switch writes a `settings` record with the new
+// provider/model, so a resume restores it.
+unittest
+{
+    auto agent = logged("model-record", new MockClient([]));
+    auto other = new MockClient([]);
+    agent.useClient(other, ConfiguredWindow.init);
+    assert(records(agent).any!(r => r["type"].str == "settings" && r["data"]["model"].str == "mock/mock"));
+}
+
+// issue #297: `/subagents off` mid-turn writes a `settings` record, so a
+// resume restores the switch.
+unittest
+{
+    auto mock = new MockClient([LLMResponse("ok")]);
+    auto agent = logged("subagents-record", mock);
+    agent.control.requestSubagents(false);
+    agent.run("go", new NullEvents);
+    assert(!agent.subagentsOn);
+    assert(records(agent).any!(r => r["type"].str == "settings" && "subagents" in r["data"]
+        && r["data"]["subagents"].boolean == false));
+}
