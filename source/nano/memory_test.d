@@ -1222,6 +1222,18 @@ unittest // entitiesFromCall: urls, ssh targets, gh -R, repo name, tool name
     e = entitiesFromCall("bash", parseJSON(`{"command":"for h in a b; do scp f merlin:/x; done"}`), "");
     assert(e.canFind("host:merlin"), e.join(","));
     assert(!e.canFind("tool:for") && !e.canFind("tool:in"), e.join(","));
+    // A loop or case header names a variable and values, not a tool.
+    e = entitiesFromCall("bash", parseJSON(`{"command":"for host in a b; do ssh merlin; done"}`), "");
+    assert(e.canFind("host:merlin") && !e.canFind("tool:host"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"select host in a b; do ssh merlin; done"}`), "");
+    assert(e.canFind("host:merlin") && !e.canFind("tool:host"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"case foo in a) ssh merlin ;; esac"}`), "");
+    assert(e.canFind("host:merlin") && !e.canFind("tool:foo"), e.join(","));
+    // A control word after the executable is an ordinary operand.
+    e = entitiesFromCall("bash", parseJSON(`{"command":"ssh -l done merlin uptime"}`), "");
+    assert(e.canFind("host:merlin") && !e.canFind("host:uptime"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"ssh -l in merlin"}`), "");
+    assert(e.canFind("host:merlin"), e.join(","));
     e = entitiesFromCall("bash", parseJSON(`{"command":"until ssh merlin true; do sleep 1; done"}`), "");
     assert(e.canFind("host:merlin") && !e.canFind("tool:until"), e.join(","));
     e = entitiesFromCall("bash", parseJSON(`{"command":"case x in a) ssh merlin ;; esac"}`), "");

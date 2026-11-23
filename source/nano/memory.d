@@ -1933,9 +1933,26 @@ private string[][] commandWords(string script)
     if (parsed.isOk)
         foreach (simple; parsed.unwrap("isOk was checked"))
         {
+            // Only the leading run of control words is syntax (`if !`,
+            // `then {`); later ones are operands (`ssh -l done host`).
+            size_t start;
+            bool header;
+            while (start < simple.words.length && !simple.words[start].quoted
+                && isControlWord(simple.words[start].text))
+            {
+                auto t = simple.words[start].text;
+                if (t == "for" || t == "select" || t == "case") header = true;
+                start++;
+            }
+            // A `for name in words` / `case word in` header names a
+            // variable and values, never an executable: drop it whole.
+            if (header) continue;
+            size_t end = simple.words.length;
+            while (end > start && !simple.words[end - 1].quoted
+                && isClosingWord(simple.words[end - 1].text))
+                end--;
             string[] words;
-            foreach (w; simple.words)
-                if (w.quoted || !isControlWord(w.text)) words ~= w.text;
+            foreach (w; simple.words[start .. end]) words ~= w.text;
             if (words.length) r ~= words;
         }
     else
@@ -1944,15 +1961,19 @@ private string[][] commandWords(string script)
     return r;
 }
 
+/// Whether a trailing unquoted word closes a compound command or test
+/// (`[[ -f x ]]`, `{ cmd; }`), so it is syntax rather than an operand.
+private bool isClosingWord(string w) pure
+{
+    return w == "]]" || w == "}" || w == "fi" || w == "done" || w == "esac";
+}
+
 /// Whether an unquoted word is shell syntax around a simple command rather
 /// than its executable or an operand: compound-command keywords (`if …
 /// then … fi`, `while … do … done`, `case … esac`), the `[[`/`]]` test
 /// brackets, the `{`/`}` group braces and the `!` pipeline negation.
-/// Quoted occurrences never reach here (`commandWords` keeps them). A
-/// loop's `for name in words` header keeps its words: none is a host
-/// (`reHostName` rejects the shell metacharacters a glob carries), and
-/// `commandNames` needs no extra guard — the header yields no executable
-/// the header itself does not name.
+/// `commandWords` only strips a leading run of these (and drops a whole
+/// `for`/`select`/`case` header); a quoted or later occurrence is an operand.
 private bool isControlWord(string w) pure
 {
     switch (w)
