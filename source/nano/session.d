@@ -1483,6 +1483,15 @@ private size_t skimCount(const(char)[] arr) pure nothrow @nogc
 void eachLogLine(string path, scope void delegate(const(char)[] line, ulong lineNo) @safe dg,
     bool requireCommitted = true)
 {
+    eachLogLineUntil(path, (const(char)[] line, ulong lineNo) { dg(line, lineNo); return true; },
+        requireCommitted);
+}
+
+/// `eachLogLine` whose `dg` returns false to stop reading: no further line
+/// is read from the file, so an early-stopping caller never scans to EOF.
+void eachLogLineUntil(string path, scope bool delegate(const(char)[] line, ulong lineNo) @safe dg,
+    bool requireCommitted = true)
+{
     ulong lineNo;
     if (isCompressedLog(path))
     {
@@ -1490,7 +1499,8 @@ void eachLogLine(string path, scope void delegate(const(char)[] line, ulong line
         auto committed = text.length;
         while (committed && text[committed - 1] != '\n') committed--;
         if (!committed && requireCommitted) throw new Exception("session log " ~ path ~ " has no committed records");
-        foreach (line; text[0 .. committed].lineSplitter) dg(line, ++lineNo);
+        foreach (line; text[0 .. committed].lineSplitter)
+            if (!dg(line, ++lineNo)) return;
         return;
     }
     import std.typecons : Yes;
@@ -1502,9 +1512,23 @@ void eachLogLine(string path, scope void delegate(const(char)[] line, ulong line
         any = true;
         auto l = line[0 .. $ - 1];
         if (l.length && l[$ - 1] == '\r') l = l[0 .. $ - 1];
-        dg(l, ++lineNo);
+        if (!dg(l, ++lineNo)) return;
     }
     if (!any && requireCommitted) throw new Exception("session log " ~ path ~ " has no committed records");
+}
+
+unittest // eachLogLineUntil stops reading at the first false
+{
+    import std.file : tempDir, remove;
+    import std.path : buildPath;
+    import std.conv : to;
+    import nano.clock : monoNow;
+    auto p = buildPath(tempDir, "nano-until-" ~ to!string(monoNow.ticks) ~ ".jsonl");
+    scope (exit) remove(p);
+    std.file.write(p, "a\nb\nc\nd\n");
+    ulong last;
+    eachLogLineUntil(p, (const(char)[] l, ulong n) { last = n; return n < 2; });
+    assert(last == 2);
 }
 
 /// Pass 1 of `restore` (issue #244): the line of the latest `replace` that

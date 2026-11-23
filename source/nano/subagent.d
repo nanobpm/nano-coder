@@ -1045,23 +1045,18 @@ enum size_t taskCols = 60;
 /// The first line of `text`, at most `max` characters (an ellipsis marks a cut).
 string firstLine(string text, size_t max = taskCols) pure
 {
-    import std.string : indexOf;
     import std.utf : decode;
-    auto nl = text.indexOf('\n');
-    if (nl >= 0) text = text[0 .. nl];
-    // Walk at most `max` code points, so a huge one-line task costs no
-    // allocation beyond the kept prefix.
-    if (max)
+    // One bounded walk: stop at the newline or after `max` code points, so a
+    // huge one-line task is neither scanned nor copied beyond the prefix.
+    size_t i, cut, n;
+    while (i < text.length && text[i] != '\n' && (!max || n < max))
     {
-        size_t i, cut, n;
-        while (i < text.length && n < max)
-        {
-            if (n == max - 1) cut = i;
-            decode(text, i);
-            ++n;
-        }
-        if (i < text.length) return text[0 .. cut].idup ~ "…";
+        if (max && n == max - 1) cut = i;
+        decode(text, i);
+        ++n;
     }
+    if (i < text.length && text[i] != '\n') return text[0 .. cut].idup ~ "…";
+    text = text[0 .. i];
     // A copy: a slice would keep a long task body alive in the listing history.
     return text.idup;
 }
@@ -1201,12 +1196,11 @@ unittest // the listing, mixed states
 /// false to stop early.
 void eachLogMessage(string path, scope bool delegate(Message) @safe dg)
 {
-    import nano.session : eachLogLine, messageFromRecord;
+    import nano.session : eachLogLineUntil, messageFromRecord;
     import std.algorithm : startsWith;
-    bool stop;
-    eachLogLine(path, (const(char)[] line, ulong) {
+    eachLogLineUntil(path, (const(char)[] line, ulong) {
         // A record's type comes first (`record` in nano.session).
-        if (stop || !line.startsWith(`{"type":"message"`)) return;
+        if (!line.startsWith(`{"type":"message"`)) return true;
         Message m;
         try
         {
@@ -1214,11 +1208,11 @@ void eachLogMessage(string path, scope bool delegate(Message) @safe dg)
             // messageFromRecord rejects an unknown role: skip it like damage.
             auto role = "role" in data;
             if (role is null || role.type != JSONType.string || !["system", "user", "assistant", "tool"].canFind(role.str))
-                return;
+                return true;
             m = messageFromRecord(data);
         }
-        catch (JSONException) return; // a damaged record: skip it as a resume does
-        if (!dg(m)) stop = true;
+        catch (JSONException) return true; // a damaged record: skip it as a resume does
+        return dg(m);
     }, false);
 }
 

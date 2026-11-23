@@ -939,9 +939,16 @@ void showSubagentLog(string id, string path, Console console)
         {
             case Role.system: break;
             case Role.user:
-                if (m.content.strip.length && !m.hookContext)
-                    writeln(stampBlock(console.stamp(), console.bold("› ") ~ escapeMarks(sanitizeBlock(m.content))));
+            {
+                // As the main replay: model-only reminders were never typed,
+                // and a steer (e.g. a stop's cancellation) is not a prompt.
+                if (m.hookContext || m.continuation || m.timer || m.autoInitiated) break;
+                auto typed = m.pinText.length ? m.pinText : m.content;
+                if (!typed.strip.length) break;
+                if (m.steered) console.userMessage(sanitizeBlock(typed));
+                else writeln(stampBlock(console.stamp(), console.bold("› ") ~ escapeMarks(sanitizeBlock(typed))));
                 break;
+            }
             case Role.assistant:
                 if (m.content.strip.length && !(console.quiet && m.toolCalls.length))
                     writeln(stampBlock(console.stamp(), console.display(escapeMarks(sanitizeBlock(m.content))).stripRight));
