@@ -3543,6 +3543,13 @@ int runMain(string[] args)
             ed.restyle = null;
             syncMode(); // Shift-Tab at the prompt switched the mode
             ed.onIdleEscEsc = null;
+            // Show a hint or notice the lapse already took before anything else:
+            // the timer and idle branches below would otherwise drop it, and the
+            // channel can't deliver it again.
+            immutable shownHint = updateHint.length || fetchedNotice.length;
+            if (updateHint.length) writeln(console.dim(updateHint));
+            updateHint = null;
+            if (fetchedNotice.length) showNotice();
             // Honour an idle Esc Esc whatever ended the read (a line typed
             // before the lapse check keeps its text).
             if (stopBackground)
@@ -3594,10 +3601,8 @@ int runMain(string[] args)
                 else if (agent.control.nonNull.isCancelled) writeln(console.dim("[idle compaction cancelled]"));
                 continue;
             }
-            else if (r.outcome == Outcome.stopped && (updateHint.length || fetchedNotice.length))
+            else if (r.outcome == Outcome.stopped && shownHint)
             {
-                if (updateHint.length) writeln(console.dim(updateHint));
-                if (fetchedNotice.length) showNotice();
                 quietPrompt = true;
                 continue;
             }
