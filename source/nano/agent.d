@@ -1550,6 +1550,9 @@ class Agent
     void refreshCapabilities()
     {
         probe.beginDetect();
+        // The switch supersedes any background probe: stop its HTTP calls now
+        // (it stays tracked until it exits and is joined).
+        if (probing) pendingProbe.abort.abort();
         auto caps = probeOf(client.nonNull, !configuredWindow);
         if (configuredWindow) probe.storeWithoutWindow(caps);
         else probe.store(caps);
@@ -1579,7 +1582,6 @@ class Agent
         SubAbort abort;
         MonoTime started;
         /// Past `probeDeadline`: cancelled, and its result never publishes.
-        bool expired;
     }
     /// What a probe thread returns: the capabilities, and whether it ran
     /// past its own deadline or was cancelled (then the result is dropped).
@@ -1673,15 +1675,16 @@ class Agent
                 // Stale: its result can never publish, so stop its HTTP calls.
                 if (!probe.isCurrent(p.generation)) p.abort.abort();
                 // Past the deadline: cancel it; its result will be dropped.
-                if (since(p.started) >= probeDeadline) { p.abort.abort(); p.expired = true; }
+                if (since(p.started) >= probeDeadline) p.abort.abort();
             }
             else
             {
                 auto outcome = p.thread.join().unwrap;
                 // Lateness is judged by when the probe finished (the worker
                 // flags it), not when it is collected: an on-time result
-                // collected after a long model call still publishes.
-                const late = p.expired || outcome.late;
+                // collected after a long model call still publishes, and a
+                // cancel that lands after the outcome was final can't expire it.
+                const late = outcome.late;
                 if (!late)
                     published = probe.publishIfCurrent(p.generation, outcome.caps, configuredWindow == 0);
                 probing = false;

@@ -526,9 +526,15 @@ unittest
 {
     import core.time : seconds, msecs;
     import nano.clock : sleepFor;
+    import core.time : hours;
+    import std.datetime.systime : SysTime;
+    import nano.clock : FakeClock;
+    // Fake time on this thread only: the worker runs on the real clock with a
+    // deadline it can't miss, while collection comes long past it.
+    auto clock = FakeClock.install(SysTime(0));
     auto p = Probes.make(true); // answers at once
     auto agent = agentFor(new Interfering("first", []));
-    agent.probeDeadline = 50.msecs;
+    agent.probeDeadline = 1.hours;
     agent.probeClient = (string spec) => cast(LLMClient) p.client("probed", null, 4_096);
     agent.onModelRequest = (string spec) {
         agent.useClient(p.client("probed", null, 4_096), ConfiguredWindow.init);
@@ -536,8 +542,8 @@ unittest
     agent.control.requestModel("mock/probed");
     assert(agent.applyModelRequest());
     p.done.await((ref const bool d) => d, (ref bool _) {});
-    sleepFor(100.msecs); // the worker has exited; collection comes past the deadline
-    assert(agent.settleProbes(5.seconds), "the on-time worker is joined");
+    sleepFor(2.hours); // collection comes past the deadline (fake time)
+    assert(agent.settleProbes(1_000.hours), "the on-time worker is joined");
     assert(agent.capabilities.window == 4_096, "the on-time result is published");
 }
 
@@ -622,4 +628,25 @@ unittest
     assert(probed !is null && probed.seen.length == 2 && probed.seen[0][0].content == ctx.summarySystemPrompt,
         "the probe-shrunk window triggered a compaction before the prompt went out");
     assert(ev.summaries == 1 && ev.usages >= 2, "the compaction notified its consumers");
+}
+
+// A direct switch (`useClient` → `refreshCapabilities`) cancels the running
+// background probe at once rather than letting it run to its deadline
+// (nano-coder#270).
+unittest
+{
+    import core.time : seconds;
+    auto p = Probes.make(false); // the probe blocks until cancelled
+    auto agent = agentFor(new Interfering("first", []));
+    agent.probeClient = (string spec) => cast(LLMClient) p.client("probed", null, 4_096);
+    agent.onModelRequest = (string spec) {
+        agent.useClient(p.client("probed", null, 4_096), ConfiguredWindow.init);
+    };
+    agent.control.requestModel("mock/probed");
+    assert(agent.applyModelRequest());
+    p.probes.await((ref const int n) => n == 1, (ref int _) {});
+    agent.useClient(new Interfering("second", []), ConfiguredWindow.init);
+    p.done.await((ref const bool d) => d, (ref bool _) {}); // bailed without the gate
+    assert(agent.settleProbes(5.seconds), "the cancelled probe is joined");
+    assert(p.probes.get == 1, "no probe for the switched-to client");
 }
