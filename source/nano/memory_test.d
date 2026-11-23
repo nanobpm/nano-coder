@@ -647,7 +647,7 @@ unittest // entries_without_kind_or_anchors_load_unchanged
         {
             found = true;
             assert(x.e.isRule && x.e.anchors == ["abc.local"] && x.e.toJson == saved.toJson);
-            assert(x.e.toJson.canFind(`"kind":"rule","anchors":["abc.local"]}`), x.e.toJson);
+            assert(x.e.toJson.canFind(`"kind":"rule","anchors":["abc.local"],"verified_at":"`), x.e.toJson);
         }
     assert(found);
     // Bad values make the line unknown (kept byte for byte), as serde would.
@@ -734,4 +734,416 @@ unittest
     import nano.memory : defaultDir;
     auto dir = defaultDir();
     assert(dir is null || !dir.startsWith(tempDir), dir);
+}
+
+unittest // new fields round-trip; old lines load unchanged; bad values are kept verbatim
+{
+    auto dir = tmp("facts-roundtrip");
+    auto s = store(dir);
+    SaveOptions o;
+    o.entities = [" Host:Merlin ", "tool:dub"];
+    o.factKind = "Procedure";
+    o.validWhile = "nano-workforce >= 0.216";
+    auto r = s.saveFact(Scope.user, "deploy merlin with `just deploy`", null, null, null, null, false, o);
+    assert(r.saved);
+    auto e = r.entry;
+    assert(e.entities == ["host:merlin", "tool:dub"] && e.factKind == "procedure" && e.verifiedAt == e.created[0 .. 10]);
+    Entry back;
+    assert(Entry.parse(e.toJson.representation, back));
+    assert(back.toJson == e.toJson && back.entities == e.entities && back.validWhile == o.validWhile);
+    foreach (bad; [`"fact_kind":"rumour"`, `"entities":"host:x"`, `"supersedes":[1]`, `"verified_at":3`])
+    {
+        Entry x;
+        assert(!Entry.parse((`{"id":"m","text":"t","created":"2099-01-01T00:00:00Z","last_used":"2099-01-01T00:00:00Z",` ~ bad ~ "}").representation, x), bad);
+    }
+    // Unknown entity type, missing name, unknown fact kind.
+    SaveOptions u;
+    u.entities = ["planet:mars"];
+    assert(fails(s.saveFact(Scope.user, "mars is red", null, null, null, null, false, u)));
+    u.entities = ["host:"];
+    assert(fails(s.saveFact(Scope.user, "mars is red", null, null, null, null, false, u)));
+    u.entities = ["mars"];
+    assert(fails(s.saveFact(Scope.user, "mars is red", null, null, null, null, false, u)));
+    u.entities = null;
+    u.factKind = "rumour";
+    assert(fails(s.saveFact(Scope.user, "mars is red", null, null, null, null, false, u)));
+    assert(normalizeEntity("  REPO:Nanobpm/Nano-Coder ") == "repo:nanobpm/nano-coder");
+}
+
+unittest // exact duplicates refused; near-duplicates and contradictions returned as candidates
+{
+    auto s = store(tmp("facts-conflicts"));
+    SaveOptions o;
+    o.entities = ["host:merlin"];
+    o.factKind = "fact";
+    auto first = s.saveFact(Scope.user, "merlin runs the worker fleet on port 8080", null, null, null, null, false, o).entry;
+    try { s.saveFact(Scope.user, "Merlin runs the  worker fleet on port 8080", null, null, null, null, false, o); assert(0); }
+    catch (Exception e) assert(e.msg.canFind(first.id) && !e.msg.canFind("8080"), e.msg);
+    // Near-duplicate: most words shared.
+    auto near = s.saveFact(Scope.user, "merlin runs the worker fleet on port 9090", null, null, null, null, false, o);
+    assert(!near.saved && near.candidates.length == 1 && near.candidates[0].id == first.id
+        && near.candidates[0].reason == "near-duplicate");
+    // Contradiction: different wording, same anchor.
+    SaveOptions a = o;
+    auto anchored = s.saveFact(Scope.user, "the fleet lives at `merlin.local` now", null, null, null, null, false, a).entry;
+    auto contra = s.saveFact(Scope.user, "nothing is served from `merlin.local` anymore", null, null, null, null, false, a);
+    assert(!contra.saved && contra.candidates.length == 1 && contra.candidates[0].id == anchored.id
+        && contra.candidates[0].reason == "possible contradiction");
+    // A different fact kind or entity is not a candidate; distinct saves anyway.
+    SaveOptions other = o;
+    other.factKind = "pitfall";
+    assert(s.saveFact(Scope.user, "merlin runs the worker fleet on port 9090", null, null, null, null, false, other).saved);
+    SaveOptions d = o;
+    d.distinct = true;
+    assert(s.saveFact(Scope.user, "merlin runs the worker fleet on port 9191 now", null, null, null, null, false, d).saved);
+    // The tool reports candidates instead of saving.
+    auto msg = run(s, saveTool, parseJSON(`{"scope":"user","text":"merlin runs the worker fleet on port 7070","entities":["host:merlin"],"fact_kind":"fact"}`), null, false);
+    assert(msg.startsWith("not saved:") && msg.canFind(first.id) && msg.canFind("supersedes"), msg);
+    // The duplicate check is scoped like the conflict check: same text under
+    // another fact kind or entity is a separate fact and saves.
+    SaveOptions dupKind = o;
+    dupKind.factKind = "pitfall";
+    dupKind.distinct = true;
+    assert(s.saveFact(Scope.user, "merlin runs the worker fleet on port 8080", null, null, null, null, false, dupKind).saved);
+    SaveOptions dupEnt = o;
+    dupEnt.entities = ["host:other"];
+    dupEnt.distinct = true;
+    assert(s.saveFact(Scope.user, "merlin runs the worker fleet on port 8080", null, null, null, null, false, dupEnt).saved);
+}
+
+unittest // supersedes hides the old entry from recall, index and search; still readable by id
+{
+    import nano.option : match;
+    auto s = store(tmp("facts-supersede"));
+    SaveOptions o;
+    o.entities = ["host:merlin"];
+    auto old = s.saveFact(Scope.user, "merlin is reached over `merlin.local`", null, null, null, null, false, o).entry;
+    o.supersedes = [old.id];
+    auto msg = run(s, saveTool, parseJSON(`{"scope":"user","text":"merlin is reached over tailscale at merlin.ts","entities":["host:merlin"],"supersedes":["` ~ old.id ~ `"]}`), null, false);
+    assert(msg.startsWith("remembered") && msg.canFind("replaces " ~ old.id), msg);
+    assert(!s.all().any!(x => x.e.id == old.id));
+    assert(!s.index(false).canFind(old.id));
+    assert(!s.search("merlin", null).canFind(old.id));
+    auto byId = s.search(old.id, null);
+    assert(byId.canFind(old.id) && byId.canFind("superseded by"), byId);
+    assert(s.get(old.id).match!(x => x.e.isSuperseded, () => false));
+    Recall st;
+    bool[string] shown;
+    auto notes = recall(s, "bash", parseJSON(`{"command":"ssh merlin.local"}`), st, shown, 2);
+    assert(!notes.any!(n => n.id == old.id));
+    // Superseding an unknown id fails.
+    SaveOptions bad;
+    bad.supersedes = ["mem-0"];
+    assert(fails(s.saveFact(Scope.user, "something else", null, null, null, null, false, bad)));
+}
+
+unittest // entity registry: aliases resolve, relations are stored and listed, search filters
+{
+    auto s = store(tmp("facts-registry"));
+    assert(run(s, entityTool, parseJSON(`{"scope":"user","entity":"host:merlin","alias":"Merlin.local"}`), null, false)
+        .canFind("aliases: merlin.local"));
+    run(s, entityTool, parseJSON(`{"scope":"user","entity":"host:merlin","alias":"merlin.ts"}`), null, false);
+    run(s, entityTool, parseJSON(`{"scope":"user","entity":"service:workforce","relation":"runs_on","target":"host:merlin.ts"}`), null, false);
+    assert(fails(run(s, entityTool, parseJSON(`{"scope":"user","entity":"host:x","relation":"likes","target":"host:y"}`), null, false)));
+    assert(fails(run(s, entityTool, parseJSON(`{"scope":"user","entity":"host:other","alias":"merlin.local"}`), null, false)));
+    auto listed = run(s, entityTool, parseJSON(`{"scope":"user"}`), null, true);
+    assert(listed.canFind("host:merlin (aliases: merlin.local, merlin.ts)") && listed.canFind("service:workforce (runs_on: host:merlin)"), listed);
+    assert(run(s, entityTool, parseJSON(`{"scope":"user","entity":"host:merlin.local"}`), null, true).startsWith("host:merlin"));
+    // A save naming an alias is stored under the canonical id.
+    auto msg = run(s, saveTool, parseJSON(`{"scope":"user","text":"merlin has 64GB","entities":["host:MERLIN.local"],"fact_kind":"fact"}`), null, false);
+    assert(msg.canFind("{fact; host:merlin; verified"), msg);
+    run(s, saveTool, parseJSON(`{"scope":"user","text":"use uv for python","entities":["tool:uv"],"fact_kind":"preference"}`), null, false);
+    assert(s.entities(Scope.user).any!(r => r.id == "tool:uv"), "unknown entity registered on save");
+    auto hits = run(s, searchTool, parseJSON(`{"entity":"host:merlin.ts"}`), null, true);
+    assert(hits.canFind("merlin has 64GB") && !hits.canFind("uv"), hits);
+    hits = run(s, searchTool, parseJSON(`{"fact_kind":"preference"}`), null, true);
+    assert(hits.canFind("uv") && !hits.canFind("64GB"), hits);
+    assert(fails(run(s, searchTool, parseJSON(`{"entity":"planet:x"}`), null, true)));
+    assert(fails(run(s, entityTool, parseJSON(`{"scope":"user","entity":"host:x","alias":"y"}`), null, true)));
+}
+
+unittest // memory_verify bumps verified_at; search and index stay within their byte caps
+{
+    auto dir = tmp("facts-verify");
+    auto s = store(dir);
+    enum line = `{"id":"mem-1","text":"old fact","created":"2099-01-01T00:00:00Z","last_used":"2099-01-01T00:00:00Z"}`;
+    mkdirRecurse(buildPath(dir, "memory"));
+    write(buildPath(dir, "memory", "user.jsonl"), line ~ "\n");
+    auto msg = run(s, verifyTool, parseJSON(`{"id":"mem-1"}`), null, false);
+    assert(msg.startsWith("verified user memory mem-1"), msg);
+    assert(s.all()[0].e.verifiedAt !is null);
+    assert(fails(run(s, verifyTool, parseJSON(`{"id":"mem-1"}`), null, true)));
+    SaveOptions o;
+    o.entities = ["other:" ~ "e".replicate(100), "other:" ~ "f".replicate(100)];
+    o.distinct = true;
+    foreach (i; 0 .. 12)
+    {
+        import std.format : format;
+        s.saveFact(Scope.user, format("fact %s ", i) ~ "y".replicate(700), "check " ~ "z".replicate(300), null, null, null, false, o);
+    }
+    auto hits = s.search("fact", null);
+    assert(hits.length <= searchChars, "search over its cap");
+    assert(s.index(true).length <= indexChars);
+}
+
+unittest // registry lines with unknown fields or non-string array values are kept verbatim on rewrite
+{
+    auto s = store(tmp("facts-registry-strict"));
+    auto p = s.registryPath(Scope.user);
+    mkdirRecurse(dirName(p));
+    immutable badArr = `{"id":"host:a","aliases":["a.local",42]}`;
+    immutable badField = `{"id":"host:b","aliases":[],"owner":"ops"}`;
+    immutable badRel = `{"id":"host:c","runs_on":"host:d"}`;
+    write(p, badArr ~ "\n" ~ badField ~ "\n" ~ badRel ~ "\n");
+    s.addAlias(Scope.user, "host:e", "e.local");
+    auto text = readText(p);
+    assert(text.canFind(badArr) && text.canFind(badField) && text.canFind(badRel), text);
+}
+
+unittest // entity names, aliases and relation ends pass the secret guard before lower-casing
+{
+    auto s = store(tmp("facts-entity-secret"));
+    SaveOptions o;
+    o.entities = ["other:password=hunter2"];
+    assert(fails(s.saveFact(Scope.user, "a plain fact", null, null, null, null, false, o)));
+    assert(fails(s.addAlias(Scope.user, "other:password=hunter2", "x.local")));
+    assert(fails(s.addAlias(Scope.user, "host:x", "password=hunter2")));
+    assert(fails(s.addRelation(Scope.user, "other:password=hunter2", "runs_on", "host:y")));
+    assert(fails(s.addRelation(Scope.user, "service:y", "runs_on", "other:password=hunter2")));
+    assert(!exists(s.registryPath(Scope.user)) || !readText(s.registryPath(Scope.user)).canFind("hunter2"));
+}
+
+unittest // an omitted fact_kind and an explicit "fact" are the same kind for exact duplicates
+{
+    auto s = store(tmp("facts-dup-kind"));
+    SaveOptions o;
+    o.entities = ["host:merlin"];
+    s.saveFact(Scope.user, "merlin has 64GB of memory", null, null, null, null, false, o);
+    o.factKind = "fact";
+    o.distinct = true;
+    assert(fails(s.saveFact(Scope.user, "merlin has 64GB of memory", null, null, null, null, false, o)));
+    o.factKind = null;
+    s.saveFact(Scope.user, "merlin runs nwf", null, null, null, null, false, o);
+    o.factKind = "fact";
+    assert(fails(s.saveFact(Scope.user, "merlin runs nwf", null, null, null, null, false, o)));
+}
+
+unittest // entity listings stay within searchChars, cut on UTF-8 boundaries and marked
+{
+    import std.utf : validate;
+    auto s = store(tmp("facts-registry-cap"));
+    foreach (i; 0 .. 120)
+    {
+        import std.format : format;
+        s.addAlias(Scope.user, "host:big", format("é-alias-%03d-", i) ~ "ü".replicate(40));
+        s.addAlias(Scope.user, format("host:h%03d", i), "x" ~ "y".replicate(100) ~ format("%03d", i));
+    }
+    auto one = run(s, entityTool, parseJSON(`{"scope":"user","entity":"host:big"}`), null, true);
+    assert(one.length <= searchChars && one.canFind("[truncated]"), one[$ - 40 .. $]);
+    validate(one);
+    auto all_ = run(s, entityTool, parseJSON(`{"scope":"user"}`), null, true);
+    assert(all_.length <= searchChars && all_.canFind("more not shown"));
+    validate(all_);
+    auto edited = s.addAlias(Scope.user, "host:big", "one-more");
+    assert(edited.length <= searchChars);
+    validate(edited);
+}
+
+unittest // valid_while is checked together with the text and the evidence for split secrets
+{
+    auto s = store(tmp("facts-validwhile-split"));
+    SaveOptions o;
+    o.validWhile = "hunter2";
+    assert(fails(s.saveFact(Scope.user, "worker password:", null, null, null, null, false, o)));
+    assert(fails(s.saveFact(Scope.user, "a plain fact about the worker", "worker password:", null, null, null, false, o)));
+    o.validWhile = "nano-workforce >= 0.216";
+    assert(s.saveFact(Scope.user, "the worker runs nwf", null, null, null, null, false, o).saved);
+}
+
+unittest // registry lines with invalid UTF-8 are kept verbatim on rewrite
+{
+    auto s = store(tmp("facts-registry-utf8"));
+    auto p = s.registryPath(Scope.user);
+    mkdirRecurse(dirName(p));
+    const(ubyte)[] bad = `{"id":"host:a","aliases":["x`.representation ~ [ubyte(0xFF)] ~ `.local"]}`.representation;
+    write(p, bad ~ "\n".representation);
+    s.addAlias(Scope.user, "host:e", "e.local");
+    auto back = readBytes(p);
+    import std.algorithm : countUntil;
+    assert(back.countUntil(bad) >= 0);
+}
+
+unittest // superseded records outlive the expiry cutoff
+{
+    auto s = store(tmp("facts-supersede-expiry"));
+    auto old = s.save(Scope.user, "merlin has 32GB of memory", null, null);
+    SaveOptions o;
+    o.supersedes = [old.id];
+    o.distinct = true;
+    auto fresh = s.saveFact(Scope.user, "merlin has 64GB of memory", null, null, null, null, false, o).entry;
+    Entry prev;
+    foreach (x; s.get(old.id)) prev = x.e;
+    assert(prev.id == old.id);
+    writeAll(s.path(Scope.user), [backdate(prev, defaultExpiryDays + 5), fresh], null);
+    s.search("nothing matches this", null);
+    assert(s.get(old.id).isSome);
+}
+
+unittest // a superseded record is pruned once its superseder expires
+{
+    auto s = store(tmp("facts-supersede-expiry-chain"));
+    auto old = s.save(Scope.user, "merlin has 32GB of memory", null, null);
+    SaveOptions o;
+    o.supersedes = [old.id];
+    o.distinct = true;
+    auto fresh = s.saveFact(Scope.user, "merlin has 64GB of memory", null, null, null, null, false, o).entry;
+    Entry prev;
+    foreach (x; s.get(old.id)) prev = x.e;
+    writeAll(s.path(Scope.user), [backdate(prev, defaultExpiryDays + 5), backdate(fresh, defaultExpiryDays + 5)], null);
+    s.search("nothing matches this", null);
+    assert(s.get(old.id).isNone);
+    assert(s.get(fresh.id).isNone);
+}
+
+unittest // search bumps last_used only for the hits it displays
+{
+    import std.format : format;
+    import std.range : iota;
+    import std.algorithm : map;
+    auto s = new Store(buildPath(tmp("bump-shown"), "memory"), null, 0);
+    SaveOptions o;
+    o.distinct = true;
+    auto proto = s.saveFact(Scope.user, "bulky fact " ~ iota(150).map!(k => format("w%s", k)).join(" "),
+        iota(60).map!(k => format("e%s", k)).join(" "), null, null, null, false, o).entry;
+    Entry[] es;
+    foreach (i; 0 .. 20)
+    {
+        auto e = proto;
+        e.id = format("mem-bulky-%s", i);
+        es ~= backdate(e, 10);
+    }
+    writeAll(s.path(Scope.user), es, null);
+    auto out_ = s.search("bulky", null);
+    assert(out_.canFind("more not shown"), out_[$ - 100 .. $]);
+    size_t bumped;
+    foreach (x; s.all()) if (x.e.lastUsedTime > wallNow - minutes(1)) bumped++;
+    assert(bumped > 0 && bumped < 20);
+}
+
+unittest // a rejected relation leaves the registry unchanged even when an alias came with it
+{
+    auto s = store(tmp("facts-entity-atomic"));
+    assert(fails(run(s, entityTool, parseJSON(`{"scope":"user","entity":"host:m","alias":"m.local","relation":"runs_on"}`), null, false)));
+    assert(fails(run(s, entityTool, parseJSON(`{"scope":"user","entity":"host:m","alias":"m.local","relation":"likes","target":"host:y"}`), null, false)));
+    assert(!exists(s.registryPath(Scope.user)) || !readText(s.registryPath(Scope.user)).canFind("m.local"));
+}
+
+unittest // resolved entity names are checked for credentials split across the text
+{
+    auto s = store(tmp("facts-entity-split-secret"));
+    SaveOptions o;
+    o.entities = ["other:hunter2"];
+    // Neither field alone looks like a secret; joined they are label + value.
+    assert(fails(s.saveFact(Scope.user, "worker password:", null, null, null, null, false, o)));
+    assert(s.get(s.save(Scope.user, "worker password is in keepassxc", null, null).id).isSome);
+    // The alias resolves to the canonical id, so the join is checked against it too.
+    run(s, entityTool, parseJSON(`{"scope":"user","entity":"other:token-value","alias":"hunter3"}`), null, false);
+    SaveOptions aliased;
+    aliased.entities = ["other:hunter3"];
+    assert(fails(s.saveFact(Scope.user, "worker password:", null, null, null, null, false, aliased)));
+    // Ordinary entities still save.
+    SaveOptions ok;
+    ok.entities = ["host:merlin"];
+    assert(s.saveFact(Scope.user, "merlin has 64GB of memory", null, null, null, null, false, ok).saved);
+}
+
+unittest // a long supersession chain is expiry-filtered in one pass, oldest or newest first
+{
+    import std.format : format;
+    import std.range : iota, retro;
+    import std.algorithm : map;
+    import std.array : array;
+    auto dir = tmp("facts-chain-order");
+    foreach (oldestFirst; [true, false])
+    {
+        auto s = store(dir ~ (oldestFirst ? "-old" : "-new"), "github.com/nanobpm/nano-coder", 90);
+        Entry[] es;
+        foreach (i; 0 .. 64)
+        {
+            Entry e;
+            e.id = format("mem-chain-%04d", i);
+            e.text = "chain fact " ~ format("%04d", i);
+            e.created = e.lastUsed = stamp(wallNow);
+            e.lastUsedTime = wallNow;
+            if (i + 1 < 64) e.supersededBy = format("mem-chain-%04d", i + 1);
+            es ~= e;
+        }
+        // Only the head of the chain is current; every ancestor must survive.
+        auto ordered = oldestFirst ? es : es.retro.array;
+        writeAll(s.path(Scope.user), ordered, null);
+        auto kept = s.all();
+        assert(kept.length == 1 && kept[0].e.id == "mem-chain-0063");
+        foreach (i; 0 .. 64) assert(s.get(format("mem-chain-%04d", i)).isSome);
+        // Backdate the head: the whole chain expires with it.
+        Entry head;
+        foreach (x; s.get("mem-chain-0063")) head = x.e;
+        Entry[] rest;
+        foreach (i; 0 .. 63) foreach (x; s.get(format("mem-chain-%04d", i))) rest ~= x.e;
+        writeAll(s.path(Scope.user), rest ~ backdate(head, 95), null);
+        assert(s.get("mem-chain-0000").isNone);
+    }
+}
+
+unittest // an unreadable registry on a filtered writable search releases the scope lock
+{
+    import core.time : seconds;
+    auto s = store(tmp("facts-search-lock"));
+    auto rp = s.registryPath(Scope.user);
+    mkdirRecurse(rp); // a directory where the registry file belongs: reads fail
+    SearchFilter f;
+    f.entity = "host:merlin";
+    assert(fails(s.searchFiltered("worker", null, false, f)));
+    rmdirRecurse(rp);
+    // The lock was released: the next writable operation does not time out.
+    auto deadline = wallNow + seconds(2);
+    auto again = s.save(Scope.user, "the worker runs nwf", null, null);
+    assert(wallNow < deadline);
+    assert(again.id.length);
+    assert(s.search("worker", null).canFind("nwf"));
+}
+
+unittest // a failing registry edit releases the scope lock
+{
+    auto s = store(tmp("facts-edit-lock"));
+    auto rp = s.registryPath(Scope.user);
+    mkdirRecurse(rp); // a directory where the registry file belongs: reads fail
+    assert(fails(s.addAlias(Scope.user, "host:m", "m.local")));
+    rmdirRecurse(rp);
+    // The lock was released: the next registry edit does not time out.
+    assert(s.addAlias(Scope.user, "host:m", "m.local").canFind("m.local"));
+}
+
+unittest // a failed registry write leaves the save and its supersession uncommitted
+{
+    auto s = store(tmp("facts-registry-first"));
+    SaveOptions first;
+    first.entities = ["host:merlin"];
+    auto old = s.saveFact(Scope.user, "merlin has 32GB of memory", null, null, null, null, false, first).entry;
+    // Make the registry path unwritable: a directory sits where the file belongs.
+    auto rp = s.registryPath(Scope.user);
+    auto backup = readText(rp);
+    remove(rp);
+    mkdirRecurse(rp);
+    SaveOptions o;
+    o.entities = ["host:merlin"];
+    o.supersedes = [old.id];
+    o.distinct = true;
+    assert(fails(s.saveFact(Scope.user, "merlin has 64GB of memory", null, null, null, null, false, o)));
+    rmdirRecurse(rp);
+    write(rp, backup);
+    // Nothing was committed: the old entry is still current and the retry succeeds.
+    assert(s.all().any!(x => x.e.id == old.id));
+    auto retry = s.saveFact(Scope.user, "merlin has 64GB of memory", null, null, null, null, false, o);
+    assert(retry.saved);
+    assert(!s.all().any!(x => x.e.id == old.id));
 }

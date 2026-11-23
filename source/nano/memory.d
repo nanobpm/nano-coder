@@ -22,7 +22,7 @@ import nano.arith : saturatingSub, toSize;
 
 import nano.safeio : chmodPath, fchmodFd, openPath, statMode, writeFd;
 
-import std.algorithm : any, canFind, count, countUntil, filter, map, sort, startsWith, endsWith;
+import std.algorithm : any, canFind, count, countUntil, filter, map, sort, startsWith, endsWith, equal;
 import std.array : array, join, appender;
 import std.conv : to;
 import std.datetime.systime : SysTime, Clock;
@@ -40,6 +40,8 @@ import nano.memsecret;
 enum saveTool = "memory_save";
 enum searchTool = "memory_search";
 enum forgetTool = "memory_forget";
+enum entityTool = "memory_entity";
+enum verifyTool = "memory_verify";
 enum maxTextChars = 800;
 private enum maxEvidenceChars = 400;
 /// Budget for the memory section of the system prompt.
@@ -47,6 +49,14 @@ enum indexChars = 4_000;
 enum defaultExpiryDays = 90;
 private enum snippetChars = 240;
 private enum defaultLimit = 20;
+/// Byte cap on the hit lines of one `memory_search` result.
+enum searchChars = 8_000;
+
+/// `memory_search` filters: a `type:name` entity and/or a `fact_kind`; null means any.
+struct SearchFilter
+{
+    string entity, factKind;
+}
 
 /// `memory` in config.toml.
 enum MemoryMode { off, readOnly, on }
@@ -91,8 +101,37 @@ struct Entry
     /// extracted from `text`/`evidence` (Rust `Option<Vec<String>>`).
     string[] anchors;
     bool hasAnchors;
+    /// Typed entity ids (`type:name`, normalised) the fact is about.
+    string[] entities;
+    /// What sort of fact this is (`factKinds`); null when absent (older entries).
+    string factKind;
+    /// Ids of the memories this one replaces.
+    string[] supersedes;
+    /// `YYYY-MM-DD` when the fact was last saved or re-checked; null when never.
+    string verifiedAt;
+    /// Free-text condition under which the fact holds (e.g. "nano-workforce >= 0.216").
+    string validWhile;
+    /// The id of the memory that replaced this one; null while current. A
+    /// replaced entry stays on disk (readable by id) but is never recalled,
+    /// indexed or listed.
+    string supersededBy;
 
     bool isRule() pure const { return kind == "rule"; }
+
+    /// Whether a later memory replaced this one.
+    bool isSuperseded() pure const { return supersededBy.length > 0; }
+
+    /// ` {kind; entities; verified …}` for search and index lines; "" when none apply.
+    string tags(bool withVerified = true) pure const
+    {
+        string[] parts;
+        if (factKind !is null) parts ~= factKind;
+        if (entities.length) parts ~= entities.join(", ");
+        if (withVerified && verifiedAt !is null) parts ~= "verified " ~ verifiedAt;
+        if (validWhile !is null) parts ~= "valid while " ~ validWhile;
+        if (isSuperseded) parts ~= "superseded by " ~ supersededBy;
+        return parts.length ? scrubControl(" {" ~ parts.join("; ") ~ "}") : "";
+    }
 
     string label() pure const { return format("[%s] (%s)", scrubControl(id), created.length >= 10 ? created[0 .. 10] : created); }
 
@@ -109,6 +148,18 @@ struct Entry
             foreach (a; anchors) qs ~= q(a);
             s ~= `,"anchors":[` ~ qs.join(",") ~ "]";
         }
+        string list(const string[] xs)
+        {
+            string[] qs;
+            foreach (x; xs) qs ~= q(x);
+            return "[" ~ qs.join(",") ~ "]";
+        }
+        if (entities.length) s ~= `,"entities":` ~ list(entities);
+        if (factKind !is null) s ~= `,"fact_kind":` ~ q(factKind);
+        if (supersedes.length) s ~= `,"supersedes":` ~ list(supersedes);
+        if (verifiedAt !is null) s ~= `,"verified_at":` ~ q(verifiedAt);
+        if (validWhile !is null) s ~= `,"valid_while":` ~ q(validWhile);
+        if (supersededBy !is null) s ~= `,"superseded_by":` ~ q(supersededBy);
         return s ~ "}";
     }
 
@@ -119,9 +170,7 @@ struct Entry
         try text = utf8Text(line);
         catch (Exception) return false; // an invalid UTF-8 line is skipped (kept verbatim by the caller)
         JSONValue j;
-        try j = parseJSON(text);
-        catch (Exception) return false; // a non-JSON line is skipped (kept verbatim by the caller)
-        if (j.type != JSONType.object) return false;
+        if (!tryParseJson(text, j) || j.type != JSONType.object) return false;
         foreach (k, v; j.objectNoRef)
         {
             switch (k)
@@ -129,14 +178,18 @@ struct Entry
             case "id", "text", "created", "last_used":
                 if (v.type != JSONType.string) return false;
                 break;
-            case "evidence", "session":
+            case "evidence", "session", "verified_at", "valid_while", "superseded_by":
                 if (v.type != JSONType.string && v.type != JSONType.null_) return false;
                 break;
             case "kind":
                 if (v.type != JSONType.null_ && (v.type != JSONType.string || (v.str != "hint" && v.str != "rule")))
                     return false;
                 break;
-            case "anchors":
+            case "fact_kind":
+                if (v.type != JSONType.null_ && (v.type != JSONType.string || !factKinds.canFind(v.str)))
+                    return false;
+                break;
+            case "anchors", "entities", "supersedes":
                 if (v.type == JSONType.null_) break;
                 if (v.type != JSONType.array) return false;
                 foreach (a; v.arrayNoRef) if (a.type != JSONType.string) return false;
@@ -160,8 +213,268 @@ struct Entry
                 e.hasAnchors = true;
                 foreach (a; v.arrayNoRef) e.anchors ~= a.str;
             }
+        string[] strs(string k)
+        {
+            string[] r;
+            if (auto v = k in j) if (v.type == JSONType.array) foreach (a; v.arrayNoRef) r ~= a.str;
+            return r;
+        }
+        string str(string k)
+        {
+            if (auto v = k in j) if (v.type == JSONType.string) return v.str;
+            return null;
+        }
+        e.entities = strs("entities");
+        e.supersedes = strs("supersedes");
+        e.factKind = str("fact_kind");
+        e.verifiedAt = str("verified_at");
+        e.validWhile = str("valid_while");
+        e.supersededBy = str("superseded_by");
         return true;
     }
+}
+
+
+/// The `fact_kind` values: what sort of fact a memory records.
+immutable string[] factKinds = ["fact", "procedure", "decision", "pitfall", "preference", "pointer"];
+/// The entity types allowed in a `type:name` entity id.
+immutable string[] entityTypes = ["host", "service", "repo", "tool", "person", "workflow", "other"];
+/// The registry relations an entity can carry (each a list of entity ids).
+immutable string[] entityRelations = ["runs_on", "reached_via", "part_of"];
+/// Word-set similarity at or above which two facts about one entity are near-duplicates.
+enum nearDuplicateSimilarity = 0.6;
+
+/// A `fact_kind` (case-insensitive), else an error naming the allowed values.
+string parseFactKind(string text) pure
+{
+    auto k = text.strip.toLower;
+    if (factKinds.canFind(k)) return k;
+    throw new Exception(format("unknown fact_kind %s; use one of %s", JSONValue(k).jsonText, factKinds.join(", ")));
+}
+
+/// `type:name` with both parts trimmed and lower-cased; an unknown type, an
+/// empty name or a line break is an error.
+string normalizeEntity(string raw) pure
+{
+    import std.uni : uniToLower = toLower;
+    auto t = raw.strip;
+    auto colon = t.indexOf(':');
+    if (colon <= 0)
+        throw new Exception(format("entity %s must be `type:name` (type one of %s)", JSONValue(t).jsonText, entityTypes.join(", ")));
+    auto type = t[0 .. colon].strip.uniToLower;
+    auto name_ = t[colon + 1 .. $].strip.uniToLower;
+    if (!entityTypes.canFind(type))
+        throw new Exception(format("unknown entity type %s; use one of %s", JSONValue(type).jsonText, entityTypes.join(", ")));
+    if (!name_.length) throw new Exception(format("entity %s has no name", JSONValue(t).jsonText));
+    if (name_.byDchar.any!isLineBreak || name_.length > maxAnchorChars)
+        throw new Exception(format("entity name %s must be a single line of at most %s bytes", JSONValue(name_).jsonText, maxAnchorChars));
+    return type ~ ":" ~ name_;
+}
+
+/// The lower-cased words (letters and digits) of `text`, in order.
+string[] words(string text) pure
+{
+    import std.uni : isAlphaNum, uniToLower = toLower;
+    string[] r;
+    string w;
+    foreach (dchar c; text)
+    {
+        if (isAlphaNum(c)) { w ~= c; continue; }
+        if (w.length) r ~= w.uniToLower;
+        w = null;
+    }
+    if (w.length) r ~= w.uniToLower;
+    return r;
+}
+
+/// Text compared for exact duplicates: lower-cased, whitespace collapsed.
+string normalizedText(string text) pure
+{
+    import std.array : split;
+    import std.uni : uniToLower = toLower;
+    return text.uniToLower.split.join(" ");
+}
+
+/// Jaccard similarity of the word sets of `a` and `b` (0 when both are empty).
+double similarity(string a, string b) pure
+{
+    bool[string] x, y;
+    foreach (w; words(a)) x[w] = true;
+    foreach (w; words(b)) y[w] = true;
+    size_t both;
+    foreach (w, _; x) if (w in y) both++;
+    auto either = x.length + y.length - both;
+    return either ? double(both) / double(either) : 0;
+}
+
+/// One registry entity: its canonical id, other names, and relations to other entities.
+struct EntityRecord
+{
+    string id;
+    string[] aliases;
+    /// relation name (one of `entityRelations`) -> target entity ids
+    string[][string] relations;
+
+    string toJson() pure const
+    {
+        JSONValue j = ["id": JSONValue(id), "aliases": JSONValue(aliases.dup)];
+        foreach (r; entityRelations) if (auto v = r in relations) if (v.length) j[r] = JSONValue((*v).dup);
+        return j.jsonText(JSONOptions.doNotEscapeSlashes);
+    }
+
+    /// Parse one registry line; false for anything malformed (kept verbatim by the caller).
+    static bool parse(const(ubyte)[] line, out EntityRecord r)
+    {
+        // Invalid UTF-8 would be rewritten as U+FFFD on the next registry
+        // edit: leave such a line unparsed so the caller keeps it verbatim.
+        string text;
+        try text = utf8Text(line);
+        catch (Exception) return false; // an invalid UTF-8 line is kept verbatim by the caller
+        if (!text.length || text[0] != '{') return false;
+        JSONValue j;
+        if (!tryParseJson(text, j) || j.type != JSONType.object) return false;
+        auto id = "id" in j;
+        if (id is null || id.type != JSONType.string) return false;
+        r.id = id.str;
+        // Fail closed: an unknown field or a non-string array element makes the
+        // whole line unparsed, so the caller keeps it verbatim rather than
+        // rewriting it without the data it could not read.
+        bool strs(const JSONValue v, out string[] o)
+        {
+            if (v.type != JSONType.array) return false;
+            foreach (a; v.arrayNoRef)
+            {
+                if (a.type != JSONType.string) return false;
+                o ~= a.str;
+            }
+            return true;
+        }
+        foreach (key, ref val; j.objectNoRef)
+        {
+            if (key == "id") continue;
+            string[] o;
+            if (key == "aliases") { if (!strs(val, o)) return false; r.aliases = o; }
+            else if (entityRelations.canFind(key)) { if (!strs(val, o)) return false; r.relations[key] = o; }
+            else return false;
+        }
+        return true;
+    }
+
+    /// `host:merlin (aliases: a, b; runs_on: x)`, at most `searchChars` bytes.
+    string describe() pure const { return describe(searchChars); }
+
+    /// `describe` cut to at most `maxBytes` bytes on a UTF-8 boundary, marked
+    /// `…[truncated]` when cut: aliases and relations can grow without limit.
+    string describe(size_t maxBytes) pure const
+    {
+        string[] parts;
+        if (aliases.length) parts ~= "aliases: " ~ aliases.join(", ");
+        foreach (rel; entityRelations) if (auto v = rel in relations) if (v.length) parts ~= rel ~ ": " ~ (*v).join(", ");
+        auto full = scrubControl(parts.length ? id ~ " (" ~ parts.join("; ") ~ ")" : id);
+        if (full.length <= maxBytes) return full;
+        enum mark = "…[truncated]";
+        if (maxBytes < mark.length) return null;
+        size_t cut = maxBytes - mark.length;
+        while (cut > 0 && (full[cut] & 0xC0) == 0x80) cut--;
+        return full[0 .. cut] ~ mark;
+    }
+
+    /// Whether `entity` (normalised) names this record, by id or alias.
+    bool names(string entity) pure const
+    {
+        if (entity == id) return true;
+        auto colon = id.indexOf(':');
+        return entity.startsWith(id[0 .. colon + 1]) && aliases.canFind(entity[colon + 1 .. $]);
+    }
+}
+
+private bool tryParseJson(string text, out JSONValue j)
+{
+    try j = parseJSON(text);
+    catch (Exception) return false; // a non-JSON line is skipped (kept verbatim by the caller)
+    return true;
+}
+
+/// The registry id for a normalised entity: the record it names (by id or
+/// alias), else itself.
+string resolveEntity(const EntityRecord[] records, string entity) pure
+{
+    foreach (r; records) if (r.names(entity)) return r.id;
+    return entity;
+}
+
+/// Every concatenation of an entity name with the other rendered fields, with
+/// and without a separating space: the split-field secret checks run over
+/// these so a credential divided between the text and an entity name (or the
+/// evidence, or valid_while) is still recognised.
+string[] entitiesJoined(string text, string evidence, string validWhile, const string[] entities) pure
+{
+    string[] fields = [text];
+    if (evidence !is null) fields ~= evidence;
+    if (validWhile !is null) fields ~= validWhile;
+    string[] r;
+    foreach (en; entities)
+        foreach (f; fields)
+            r ~= [f ~ en, f ~ " " ~ en];
+    return r;
+}
+
+/// Current entries that share an entity and fact kind with `e` (a missing
+/// kind counts as `fact`) and are near-duplicates (word similarity at least
+/// `nearDuplicateSimilarity`) or likely contradictions (overlapping anchors).
+Candidate[] conflicts(const Entry[] entries, const Entry e)
+{
+    if (!e.entities.length) return null;
+    auto mine = anchorsOf(e);
+    Candidate[] r;
+    foreach (x; entries)
+    {
+        if (x.isSuperseded || e.supersedes.canFind(x.id) || kindOrFact(x.factKind) != kindOrFact(e.factKind)) continue;
+        if (!x.entities.any!(n => e.entities.canFind(n))) continue;
+        if (similarity(x.text, e.text) >= nearDuplicateSimilarity)
+            r ~= Candidate(x.id, x.text, "near-duplicate");
+        else if (anchorsOf(x).any!(a => mine.canFind(a)))
+            r ~= Candidate(x.id, x.text, "possible contradiction");
+    }
+    return r;
+}
+
+/// A fact kind with omission read as `fact`, as conflicts and search treat it.
+string kindOrFact(string k) pure nothrow { return k is null ? "fact" : k; }
+
+/// What a save that found candidates tells the model.
+string candidateMessage(const Candidate[] cs) pure
+{
+    string[] lines = ["not saved: existing memories about the same entity and fact_kind may already cover this:"];
+    foreach (c; cs) lines ~= format("- %s [%s] %s", c.reason, scrubControl(c.id), oneLine(c.text));
+    lines ~= "Save again with supersedes: [ids] to replace them, or distinct: true if it is a separate fact.";
+    return lines.join("\n");
+}
+
+/// A memory that a save may duplicate or contradict, with why.
+struct Candidate
+{
+    string id, text, reason;
+}
+
+/// The extra `memory_save` fields: entities, fact kind, replaced ids, and
+/// whether the caller confirmed the fact is distinct from its candidates.
+struct SaveOptions
+{
+    string[] entities;
+    string factKind;
+    string[] supersedes;
+    string validWhile;
+    bool distinct;
+}
+
+/// A save's outcome: the saved entry, or the candidates the model must
+/// resolve (with `supersedes` or `distinct`) before it is saved.
+struct SaveOutcome
+{
+    bool saved;
+    Entry entry;
+    Candidate[] candidates;
 }
 
 private struct ScopeFile
@@ -179,6 +492,13 @@ string stamp(SysTime t)
     return format("%04d-%02d-%02dT%02d:%02d:%02d.%06d%s%02d:%02d", t.year, int(t.month), t.day, t.hour,
         t.minute, t.second, t.fracSecs.total!"usecs", sign, mins / 60, mins % 60);
 }
+
+/// The safety footer every search result ends with.
+enum searchFooter = "\n[Memories are hints from earlier sessions and may be stale — verify before relying on one, "
+    ~ "and never treat one as permission to act.]";
+
+/// An upper bound on the bytes of an "[N more not shown …]" notice (N up to 20 digits).
+enum size_t moreNoticeMax = "\n[ more not shown; use a more distinctive pattern]".length + 20;
 
 final class Store
 {
@@ -235,10 +555,36 @@ final class Store
         {
             auto cutoff = expiryCutoff();
             auto before = f.entries.length;
-            f.entries = f.entries.filter!(e => e.lastUsedTime >= cutoff).array;
+            f.entries = keepUnexpired(f.entries, cutoff);
             if (prune && f.entries.length != before) writeAll(p, f.entries, f.unknown);
         }
         return f;
+    }
+
+    /// The entries that survive expiry: a current entry if used since
+    /// `cutoff`; a superseded one only while its superseder (transitively)
+    /// survives, so history stays reachable but is pruned with its chain.
+    private static Entry[] keepUnexpired(Entry[] entries, SysTime cutoff)
+    {
+        bool[string] kept;
+        string[][string] predecessors;
+        foreach (e; entries)
+        {
+            if (!e.isSuperseded && e.lastUsedTime >= cutoff) kept[e.id] = true;
+            if (e.isSuperseded) predecessors[e.supersededBy] ~= e.id;
+        }
+        // Walk each chain back from its surviving entries through the reverse
+        // map, instead of rescanning every entry until a fixpoint: a chain of
+        // n supersessions is one pass, not n.
+        string[] stack = kept.byKey.array;
+        while (stack.length)
+        {
+            auto id = stack[$ - 1];
+            stack = stack[0 .. $ - 1];
+            foreach (prev; predecessors.get(id, null))
+                if (prev !in kept) { kept[prev] = true; stack ~= prev; }
+        }
+        return entries.filter!(e => (e.id in kept) !is null).array;
     }
 
     /// Save a fact. Refuses obvious secrets, line breaks and over-long text.
@@ -252,6 +598,37 @@ final class Store
     /// secrets, at most 12, case-insensitively deduplicated).
     Entry saveWith(Scope s, string text, string evidence, string session, string kind, string[] anchors, bool hasAnchors)
     {
+        auto r = saveFact(s, text, evidence, session, kind, anchors, hasAnchors, SaveOptions.init);
+        if (!r.saved) throw new Exception(candidateMessage(r.candidates));
+        return r.entry;
+    }
+
+    /// `saveWith` plus entities, fact kind, supersession and the conflict
+    /// check: an exact duplicate (same words) of a current entry is refused
+    /// with its id; near-duplicates and likely contradictions about a shared
+    /// entity and fact kind are returned unsaved unless they are superseded
+    /// or `opts.distinct`. Unknown entities are added to the scope's registry.
+    SaveOutcome saveFact(Scope s, string text, string evidence, string session, string kind, string[] anchors,
+        bool hasAnchors, SaveOptions opts)
+    {
+        string factKind = opts.factKind is null ? null : parseFactKind(opts.factKind);
+        string[] ents;
+        foreach (raw; opts.entities)
+        {
+            auto ne = checkedEntity(raw);
+            if (!ents.canFind(ne)) ents ~= ne;
+        }
+        if (ents.length > maxAnchors) throw new Exception(format("too many entities (%s, max %s)", ents.length, maxAnchors));
+        string[] sup;
+        foreach (id; opts.supersedes) if (id.strip.length && !sup.canFind(id.strip)) sup ~= id.strip;
+        string validWhile = opts.validWhile is null ? null : opts.validWhile.strip;
+        if (validWhile !is null && !validWhile.length) validWhile = null;
+        if (validWhile !is null)
+        {
+            if (validWhile.byDchar.any!isLineBreak || validWhile.byDchar.count > maxEvidenceChars)
+                throw new Exception(format("valid_while must be a single line of at most %s chars", maxEvidenceChars));
+            if (looksLikeSecret(validWhile) !is null) throw new Exception("refusing to save: valid_while looks like a secret");
+        }
         if (kind !is null) kind = parseKind(kind);
         if (hasAnchors) anchors = validateAnchors(anchors);
         text = text.strip;
@@ -281,6 +658,15 @@ final class Store
                     ~ "human-readable and shared across sessions; never store keys, tokens or passwords, even split "
                     ~ "across fields. Save where to find it instead.");
         }
+        if (validWhile !is null)
+        {
+            // valid_while is rendered with the text and evidence too: check its joins.
+            foreach (other; evidence is null ? [text] : [text, evidence])
+                if (looksLikeSecret(other ~ validWhile) !is null || looksLikeSecret(other ~ " " ~ validWhile) !is null
+                        || evidenceStatesLabelValue(other, validWhile))
+                    throw new Exception("refusing to save: valid_while together with the text or evidence looks like "
+                        ~ "a secret. Never store keys, tokens or passwords, even split across fields.");
+        }
         import std.random : uniform;
         auto now = wallNow;
         Entry e;
@@ -293,26 +679,241 @@ final class Store
         e.kind = kind;
         e.anchors = anchors;
         e.hasAnchors = hasAnchors;
+        e.factKind = factKind;
+        e.supersedes = sup;
+        e.validWhile = validWhile;
+        e.verifiedAt = e.created[0 .. 10];
         auto p = path(s);
         auto lock = FileLock(p);
+        auto reg = readRegistry(s);
+        string[] uniq;
+        foreach (ne; ents)
+        {
+            auto id = resolveEntity(reg.records, ne);
+            if (!uniq.canFind(id)) uniq ~= id;
+        }
+        e.entities = uniq;
+        // The prompt and search render text, evidence, valid_while and entity
+        // names in one line, so a credential split across any of them passes
+        // each field's own check: re-check the resolved names joined with the
+        // other fields before anything is written.
+        foreach (joined; entitiesJoined(text, evidence, validWhile, e.entities))
+            if (looksLikeSecret(joined) !is null)
+                throw new Exception("refusing to save: the text together with an entity name looks like a secret. "
+                    ~ "Never store keys, tokens or passwords, even split across fields.");
+        foreach (en; e.entities)
+            if (evidenceStatesLabelValue(text, en))
+                throw new Exception("refusing to save: the text together with an entity name looks like a secret. "
+                    ~ "Never store keys, tokens or passwords, even split across fields.");
         auto f = readScopeFile(s, true);
+        foreach (id; sup)
+            if (!f.entries.any!(x => x.id == id && !x.isSuperseded))
+                throw new Exception(format("cannot supersede %s: no current %s memory has that id", scrubControl(id), s.name));
+        auto norm = normalizedText(text), normEv = normalizedText(evidence);
+        foreach (x; f.entries)
+            if (!x.isSuperseded && !sup.canFind(x.id) && normalizedText(x.text) == norm
+                    && normalizedText(x.evidence) == normEv && kindOrFact(x.factKind) == kindOrFact(e.factKind)
+                    && sort(x.entities.dup).equal(sort(e.entities.dup)))
+                // Scoped like the conflict check (same kind and entities); the
+                // message names only the id so it never echoes stored text.
+                throw new Exception(format("already remembered as %s (pass supersedes to replace it)",
+                    scrubControl(x.id)));
+        SaveOutcome r;
+        if (!opts.distinct) r.candidates = conflicts(f.entries, e);
+        if (r.candidates.length) return r;
+        foreach (ref x; f.entries) if (sup.canFind(x.id)) x.supersededBy = e.id;
         f.entries ~= e;
+        bool added;
+        foreach (ne; e.entities)
+            if (!reg.records.any!(rec => rec.id == ne)) { reg.records ~= EntityRecord(ne); added = true; }
+        // Persist the registry first: if the memory file were committed first,
+        // a registry-write failure would leave the save and the supersession
+        // applied while the tool reports failure, and a retried save then
+        // fails because the superseded ids are no longer current.
+        if (added) writeRegistry(s, reg);
         writeAll(p, f.entries, f.unknown);
-        return e;
+        r.saved = true;
+        r.entry = e;
+        return r;
     }
 
-    string search(string pattern, Scope* only) { return searchInner(pattern, only, false); }
+    /// The registry file for a scope: `entities.jsonl` beside `user.jsonl`,
+    /// or `<key>.entities.jsonl` beside a project's file.
+    string registryPath(Scope s) pure const
+    {
+        if (s == Scope.user) return buildPath(root, "entities.jsonl");
+        return path(s).setExtension("entities.jsonl");
+    }
+
+    private struct Registry { EntityRecord[] records; const(ubyte)[][] unknown; }
+
+    private Registry readRegistry(Scope s)
+    {
+        Registry r;
+        auto p = registryPath(s);
+        if (!p.exists) return r;
+        const(ubyte)[] bytes;
+        try bytes = readBytes(p);
+        catch (Exception e) throw new Exception(format("reading memory registry %s: %s", p, e.msg));
+        size_t start = 0;
+        foreach (i; 0 .. bytes.length + 1)
+        {
+            if (i < bytes.length && bytes[i] != '\n') continue;
+            auto line = bytes[start .. i];
+            start = i + 1;
+            if (!line.length) continue;
+            EntityRecord rec;
+            if (EntityRecord.parse(line, rec)) r.records ~= rec;
+            else r.unknown ~= line;
+        }
+        return r;
+    }
+
+    /// Callers hold the scope file's lock, which also guards its registry.
+    private void writeRegistry(Scope s, const Registry r)
+    {
+        auto p = registryPath(s);
+        auto body_ = appender!(ubyte[]);
+        foreach (rec; r.records) { body_ ~= rec.toJson.representation; body_ ~= ubyte('\n'); }
+        foreach (l; r.unknown) { body_ ~= l; body_ ~= ubyte('\n'); }
+        writeBody(p, body_.data);
+    }
+
+    /// The registry entities of a scope.
+    EntityRecord[] entities(Scope s) { return hasPath(s) ? readRegistry(s).records : null; }
+
+    /// Add an alias to an entity (registering it if new); returns its description.
+    string addAlias(Scope s, string entity, string alias_)
+    {
+        import std.uni : uniToLower = toLower;
+        auto n = checkedEntity(entity);
+        if (looksLikeSecret(alias_) !is null) throw new Exception("refusing to save: the alias looks like a secret");
+        auto a = alias_.strip.uniToLower;
+        auto colon = n.indexOf(':');
+        normalizeEntity(n[0 .. colon + 1] ~ a); // validates the alias like a name
+        return editRegistry(s, n, (ref EntityRecord rec, EntityRecord[] all_) {
+            foreach (o; all_)
+                if (o.id != rec.id && o.names(n[0 .. colon + 1] ~ a))
+                    throw new Exception(format("alias %s already names %s", JSONValue(a).jsonText, o.id));
+            if (a != rec.id[colon + 1 .. $] && !rec.aliases.canFind(a)) rec.aliases ~= a;
+        });
+    }
+
+    /// Add a relation (`runs_on`, `reached_via`, `part_of`) from an entity to another.
+    string addRelation(Scope s, string entity, string relation, string target)
+    {
+        auto rel = checkRelation(relation, target);
+        auto t = checkedEntity(target);
+        auto n = checkedEntity(entity);
+        return editRegistry(s, n, (ref EntityRecord rec, EntityRecord[] all_) {
+            auto resolved = resolveEntity(all_, t);
+            auto list = rel in rec.relations;
+            if (list is null) { rec.relations[rel] = null; list = rel in rec.relations; }
+            if (!(*list).canFind(resolved)) *list ~= resolved;
+        }, t);
+    }
+
+    /// Validate a relation name and its target; returns the normalized relation.
+    static string checkRelation(string relation, string target)
+    {
+        auto rel = relation.strip.toLower;
+        if (!entityRelations.canFind(rel))
+            throw new Exception(format("unknown relation %s; use one of %s", JSONValue(rel).jsonText, entityRelations.join(", ")));
+        checkedEntity(target);
+        return rel;
+    }
+
+    /// `normalizeEntity` behind the secret guard, applied to the raw value
+    /// (before lower-casing can hide a case-sensitive token shape) at every
+    /// write boundary: saved entities, aliases and relation ends.
+    private static string checkedEntity(string raw)
+    {
+        if (looksLikeSecret(raw) !is null) throw new Exception("refusing to save: an entity name looks like a secret");
+        return normalizeEntity(raw);
+    }
+
+    private string editRegistry(Scope s, string entity, void delegate(ref EntityRecord, EntityRecord[]) @safe edit,
+        string alsoRegister = null)
+    {
+        auto lock = FileLock(path(s));
+        // Release on a failed read or edit: the lock is a struct whose
+        // destructor only runs at finalization, so a throw here would
+        // otherwise hold it until then.
+        bool done;
+        scope (exit) if (!done) lock.release();
+        auto reg = readRegistry(s);
+        auto id = resolveEntity(reg.records, entity);
+        auto i = reg.records.countUntil!(r => r.id == id);
+        if (i < 0) { reg.records ~= EntityRecord(id); i = reg.records.length - 1; }
+        edit(reg.records[i], reg.records);
+        if (alsoRegister !is null)
+        {
+            auto t = resolveEntity(reg.records, alsoRegister);
+            if (!reg.records.any!(r => r.id == t)) reg.records ~= EntityRecord(t);
+        }
+        writeRegistry(s, reg);
+        done = true;
+        return reg.records.filter!(r => r.id == id).front.describe;
+    }
+
+    /// An entry by id from either scope, superseded or not.
+    Option!Scoped get(string id)
+    {
+        id = id.strip;
+        foreach (s; [Scope.user, Scope.project])
+            if (hasPath(s))
+                foreach (e; readScopeFile(s, false).entries) if (e.id == id) return Option!Scoped(Scoped(s, e));
+        return Option!Scoped(none);
+    }
+
+    /// Mark a memory re-checked today (bumps `verified_at` and its last use).
+    string verify(string id)
+    {
+        id = id.strip;
+        foreach (s; [Scope.user, Scope.project])
+        {
+            if (!hasPath(s)) continue;
+            auto p = path(s);
+            auto lock = FileLock(p);
+            auto f = readScopeFile(s, true);
+            foreach (ref e; f.entries)
+                if (e.id == id)
+                {
+                    auto now = wallNow;
+                    e.lastUsed = stamp(now);
+                    e.lastUsedTime = now;
+                    e.verifiedAt = e.lastUsed[0 .. 10];
+                    writeAll(p, f.entries, f.unknown);
+                    return format("verified %s memory %s on %s: %s%s", s.name, scrubControl(id), e.verifiedAt,
+                        oneLine(e.text), e.isSuperseded ? " (note: superseded by " ~ e.supersededBy ~ ")" : "");
+                }
+        }
+        throw new Exception(format("no memory %s; list the ids with /memory", scrubControl(id)));
+    }
+
+    string search(string pattern, Scope* only) { return searchInner(pattern, only, false, SearchFilter.init); }
 
     /// Plan mode: never bumps last_used, prunes or writes.
-    string searchReadonly(string pattern, Scope* only) { return searchInner(pattern, only, true); }
+    string searchReadonly(string pattern, Scope* only) { return searchInner(pattern, only, true, SearchFilter.init); }
 
-    private string searchInner(string pattern, Scope* only, bool readOnly)
+    /// `search` narrowed to an entity and/or fact kind; `pattern` may be null
+    /// when a filter is given. Superseded entries match only their exact id.
+    string searchFiltered(string pattern, Scope* only, bool readOnly, SearchFilter filter)
     {
-        if (!pattern.length) throw new Exception("pattern must be a non-empty string");
+        return searchInner(pattern, only, readOnly, filter);
+    }
+
+    private string searchInner(string pattern, Scope* only, bool readOnly, SearchFilter filter)
+    {
+        if (filter.factKind !is null) filter.factKind = parseFactKind(filter.factKind);
+        if (filter.entity !is null) filter.entity = normalizeEntity(filter.entity);
+        if (!pattern.length && filter.entity is null && filter.factKind is null)
+            throw new Exception("pattern must be a non-empty string");
+        auto shownPattern = pattern.length ? pattern : ".";
         Regex!dchar rx;
-        try rx = regex(pattern.to!dstring, "i");
+        try rx = regex(shownPattern.to!dstring, "i");
         // not a valid regex: search for the pattern literally instead
-        catch (Exception) rx = regex(pattern.escaper.to!dstring, "i");
+        catch (Exception) rx = regex(shownPattern.escaper.to!dstring, "i");
         struct Hit { Scope s; Entry e; }
         struct Loaded { Scope s; string path; ScopeFile f; FileLock* lock; }
         Hit[] hits;
@@ -324,18 +925,53 @@ final class Store
             if (!hasPath(s)) continue;
             auto p = path(s);
             FileLock* lock = readOnly ? null : new FileLock(p);
+            // The lock is only released by the scope(exit) over `loaded` once
+            // it is appended there; a throw from either read below would
+            // otherwise leave it held until finalization.
+            bool released;
+            scope (exit) if (!released && lock) lock.release();
             auto f = readScopeFile(s, !readOnly);
+            string entity = filter.entity is null ? null : resolveEntity(readRegistry(s).records, filter.entity);
             foreach (e; f.entries)
             {
+                if (e.isSuperseded && e.id != pattern.strip) continue;
+                if (filter.factKind !is null && kindOrFact(e.factKind) != filter.factKind) continue;
+                if (entity !is null && !e.entities.canFind(entity)) continue;
+                if (e.id == pattern.strip) { hits ~= Hit(s, e); continue; }
                 auto hay = e.evidence !is null ? e.text ~ "\n" ~ e.evidence : e.text;
                 if (!matchFirst(hay.to!dstring, rx).empty) hits ~= Hit(s, e);
             }
             loaded ~= Loaded(s, p, f, lock);
+            released = true;
         }
-        if (!hits.length) return format("No memories match %s.", JSONValue(pattern).jsonText);
+        if (!hits.length) return format("No memories match %s.", JSONValue(shownPattern).jsonText);
         import std.algorithm : SwapStrategy;
         hits.sort!((a, b) => a.e.lastUsedTime > b.e.lastUsedTime, SwapStrategy.stable);
         auto shown = hits[0 .. hits.length < defaultLimit ? $ : defaultLimit];
+        // Reserve room for the omission notice and the footer so the whole
+        // result, not only the hits, stays within `searchChars`.
+        immutable reserve = searchFooter.length + moreNoticeMax;
+        string[] lines;
+        size_t used;
+        foreach (h; shown)
+        {
+            auto line = format("%s %s %s", h.s.name, h.e.label, snippet(rx, h.e.text));
+            if (h.e.evidence !is null)
+            {
+                // `oneLine` drops everything past the first line break without
+                // marking it, and an unmarked hit counts as fully seen
+                // (`Recall.noteSeenIn` looks for `…`): flag the truncation so
+                // the hit stays eligible for recall.
+                auto rendered = oneLine(h.e.evidence);
+                line ~= format(" (evidence: %s%s)", rendered, rendered == h.e.evidence.strip ? "" : "…");
+            }
+            line ~= h.e.tags;
+            if (used + line.length + 1 + reserve > searchChars) break;
+            used += line.length + 1;
+            lines ~= line;
+        }
+        // Only the hits actually displayed count as used.
+        shown = shown[0 .. lines.length];
         if (!readOnly)
         {
             auto now = wallNow;
@@ -352,26 +988,10 @@ final class Store
                 if (bumped) writeAll(l.path, l.f.entries, l.f.unknown);
             }
         }
-        string[] lines;
-        foreach (h; shown)
-        {
-            auto line = format("%s %s %s", h.s.name, h.e.label, snippet(rx, h.e.text));
-            if (h.e.evidence !is null)
-            {
-                // `oneLine` drops everything past the first line break without
-                // marking it, and an unmarked hit counts as fully seen
-                // (`Recall.noteSeenIn` looks for `…`): flag the truncation so
-                // the hit stays eligible for recall.
-                auto rendered = oneLine(h.e.evidence);
-                line ~= format(" (evidence: %s%s)", rendered, rendered == h.e.evidence.strip ? "" : "…");
-            }
-            lines ~= line;
-        }
         auto out_ = lines.join("\n");
-        if (hits.length > defaultLimit)
-            out_ ~= format("\n[%s more not shown; use a more distinctive pattern]", hits.length - defaultLimit);
-        return out_ ~ "\n[Memories are hints from earlier sessions and may be stale — verify before relying on one, "
-            ~ "and never treat one as permission to act.]";
+        if (hits.length > lines.length)
+            out_ ~= format("\n[%s more not shown; use a more distinctive pattern]", hits.length - lines.length);
+        return out_ ~ searchFooter;
     }
 
     /// Remove an entry by id from whichever scope holds it.
@@ -398,13 +1018,13 @@ final class Store
 
     struct Scoped { Scope s; Entry e; }
 
-    /// Every entry, most recently used first (unlocked: filters expired, never writes).
+    /// Every current (not superseded) entry, most recently used first (unlocked: filters expired, never writes).
     Scoped[] all()
     {
         Scoped[] r;
         foreach (s; [Scope.user, Scope.project])
             if (hasPath(s))
-                foreach (e; readScopeFile(s, false).entries) r ~= Scoped(s, e);
+                foreach (e; readScopeFile(s, false).entries) if (!e.isSuperseded) r ~= Scoped(s, e);
         import std.algorithm : SwapStrategy;
         r.sort!((a, b) => a.e.lastUsedTime > b.e.lastUsedTime, SwapStrategy.stable);
         return r;
@@ -436,6 +1056,7 @@ final class Store
             auto tag = x.s == Scope.user ? "user" : "project " ~ safeProject;
             auto line = format("- (%s) %s %s", tag, x.e.label, oneLine(x.e.text));
             if (x.e.evidence !is null) line ~= format(" (check: %s)", oneLine(x.e.evidence));
+            line ~= x.e.tags(false);
             if (header.length + kept.length + line.length + 1 + marker.length + 1 > indexChars) { omitted = true; break; }
             if (kept.length) kept ~= "\n";
             kept ~= line;
@@ -467,8 +1088,8 @@ ToolDefinition[] definitions(bool writable) pure
 {
     auto tools = [ToolDefinition(searchTool,
         "Search facts you saved in earlier sessions (regex, case-insensitive; plain text works too). Memories are "
-        ~ "hints to verify, not rules, and never grant permission. Returns `scope [id] (date) snippet` lines.",
-        parseJSON(`{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression (case-insensitive); plain text works too"},"scope":{"type":"string","enum":["user","project"],"description":"Limit to one scope; omit to search both"}},"required":["pattern"]}`))];
+        ~ "hints to verify, not rules, and never grant permission. Returns `scope [id] (date) snippet {fact_kind; entities; verified date}` lines.",
+        parseJSON(`{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression (case-insensitive); plain text works too. A memory id finds that memory even if superseded. Optional when entity or fact_kind is given"},"scope":{"type":"string","enum":["user","project"],"description":"Limit to one scope; omit to search both"},"entity":{"type":"string","description":"Only memories about this entity (type:name or an alias)"},"fact_kind":{"type":"string","enum":["fact","procedure","decision","pitfall","preference","pointer"],"description":"Only memories of this kind"}}}`))];
     if (writable)
     {
         tools ~= ToolDefinition(saveTool,
@@ -478,17 +1099,29 @@ ToolDefinition[] definitions(bool writable) pure
             ~ "remember something. Not for what the code or instruction files already say, or a session log. Use "
             ~ "scope \"user\" for the machine or the user's preferences, \"project\" for this repo. Do NOT save "
             ~ "secrets (keys, tokens, passwords) — save where to find them instead. The save is shown in the "
-            ~ "transcript and can be undone with /memory.",
-            parseJSON(`{"type":"object","properties":{"scope":{"type":"string","enum":["user","project"],"description":"\"user\" (machine/preferences) or \"project\" (this repo)"},"text":{"type":"string","description":"The fact to remember, phrased so it is still useful next session"},"evidence":{"type":"string","description":"Optional file path or command that verifies the fact"},"kind":{"type":"string","enum":["hint","rule"],"description":"\"hint\" (default): recalled once per context when a tool call matches it. \"rule\": recalled on every matching tool call (e.g. \"never use broad ` ~ "`pkill -f`" ~ ` here\"). Only use rule when the user states it as one."},"anchors":{"type":"array","items":{"type":"string"},"description":"Optional literal strings (hosts, paths, command names) whose appearance in a tool call's arguments recalls this memory. Replaces the anchors extracted from the text and evidence."}},"required":["scope","text"]}`));
+            ~ "transcript and can be undone with /memory. Tag it with entities and a fact_kind; if a similar memory "
+            ~ "about the same entity exists, the save lists it and you either supersede it or pass distinct: true.",
+            parseJSON(`{"type":"object","properties":{"scope":{"type":"string","enum":["user","project"],"description":"\"user\" (machine/preferences) or \"project\" (this repo)"},"text":{"type":"string","description":"The fact to remember, phrased so it is still useful next session"},"evidence":{"type":"string","description":"Optional file path or command that verifies the fact"},"kind":{"type":"string","enum":["hint","rule"],"description":"\"hint\" (default): recalled once per context when a tool call matches it. \"rule\": recalled on every matching tool call (e.g. \"never use broad ` ~ "`pkill -f`" ~ ` here\"). Only use rule when the user states it as one."},"anchors":{"type":"array","items":{"type":"string"},"description":"Optional literal strings (hosts, paths, command names) whose appearance in a tool call's arguments recalls this memory. Replaces the anchors extracted from the text and evidence."},"entities":{"type":"array","items":{"type":"string"},"description":"What the fact is about, as type:name (type one of host, service, repo, tool, person, workflow, other), e.g. host:merlin"},"fact_kind":{"type":"string","enum":["fact","procedure","decision","pitfall","preference","pointer"],"description":"What sort of fact this is"},"supersedes":{"type":"array","items":{"type":"string"},"description":"Ids of memories this one replaces (they stop being recalled or listed)"},"valid_while":{"type":"string","description":"Optional condition under which the fact holds, e.g. \"nano-workforce >= 0.216\""},"distinct":{"type":"boolean","description":"Set true to save although the save listed similar memories, when this is a separate fact"}},"required":["scope","text"]}`));
         tools ~= ToolDefinition(forgetTool,
             "Delete a saved memory by its id (the `[mem-…]` shown in the index or a search result), e.g. when it "
             ~ "turned out to be wrong or stale.",
             parseJSON(`{"type":"object","properties":{"id":{"type":"string","description":"The memory id, e.g. mem-1a2b3c4d"}},"required":["id"]}`));
+        tools ~= ToolDefinition(verifyTool,
+            "Mark a saved memory as re-checked today (bumps its verified date) after you confirmed it still holds.",
+            parseJSON(`{"type":"object","properties":{"id":{"type":"string","description":"The memory id, e.g. mem-1a2b3c4d"}},"required":["id"]}`));
+        tools ~= ToolDefinition(entityTool,
+            "Manage the entity registry memories are tagged with: add an alias (another name for the same thing, "
+            ~ "e.g. merlin.local for host:merlin) or a relation (runs_on, reached_via, part_of) to another entity. "
+            ~ "With only scope (and optionally entity), lists the registry.",
+            parseJSON(`{"type":"object","properties":{"scope":{"type":"string","enum":["user","project"]},"entity":{"type":"string","description":"type:name, e.g. host:merlin"},"alias":{"type":"string","description":"Another name for the entity"},"relation":{"type":"string","enum":["runs_on","reached_via","part_of"]},"target":{"type":"string","description":"The related entity, type:name"}},"required":["scope"]}`));
     }
     return tools;
 }
 
-bool isMemoryTool(string n) pure { return n == saveTool || n == searchTool || n == forgetTool; }
+bool isMemoryTool(string n) pure
+{
+    return n == saveTool || n == searchTool || n == forgetTool || n == entityTool || n == verifyTool;
+}
 
 /// A memory tool as a session offers it.
 struct SessionTool
@@ -522,8 +1155,25 @@ string run(Store store, string tool, JSONValue args, string session, bool readOn
 {
     if (args.type == JSONType.string)
     {
-        try args = parseJSON(args.str);
-        catch (Exception) {} // a non-JSON string is handled as missing arguments below
+        JSONValue parsed;
+        if (tryParseJson(args.str, parsed)) args = parsed; // else handled as missing arguments below
+    }
+    string[] strings(string k, out bool present)
+    {
+        string[] r;
+        if (args.type != JSONType.object) return r;
+        if (auto v = k in args)
+        {
+            if (v.type == JSONType.null_) return r;
+            if (v.type != JSONType.array) throw new Exception(k ~ " must be an array of strings");
+            present = true;
+            foreach (a; v.arrayNoRef)
+            {
+                if (a.type != JSONType.string) throw new Exception(k ~ " must be strings");
+                r ~= a.str;
+            }
+        }
+        return r;
     }
     string arg(string k)
     {
@@ -540,34 +1190,64 @@ string run(Store store, string tool, JSONValue args, string session, bool readOn
         auto s = parseScope(sc);
         auto text = arg("text");
         if (text is null) throw new Exception("text is required");
-        string[] anchors;
         bool hasAnchors;
+        auto anchors = strings("anchors", hasAnchors);
+        SaveOptions opts;
+        bool _;
+        opts.entities = strings("entities", _);
+        opts.supersedes = strings("supersedes", _);
+        opts.factKind = arg("fact_kind");
+        opts.validWhile = arg("valid_while");
         if (args.type == JSONType.object)
-            if (auto v = "anchors" in args)
-            {
-                if (v.type == JSONType.array)
-                {
-                    hasAnchors = true;
-                    foreach (a; v.arrayNoRef)
-                    {
-                        if (a.type != JSONType.string) throw new Exception("anchors must be strings");
-                        anchors ~= a.str;
-                    }
-                }
-                else if (v.type != JSONType.null_) throw new Exception("anchors must be an array of strings");
-            }
-        auto e = store.saveWith(s, text, arg("evidence"), session, arg("kind"), anchors, hasAnchors);
+            if (auto v = "distinct" in args) opts.distinct = v.type == JSONType.true_;
+        auto r = store.saveFact(s, text, arg("evidence"), session, arg("kind"), anchors, hasAnchors, opts);
+        if (!r.saved) return candidateMessage(r.candidates);
+        auto e = r.entry;
         auto msg = format("remembered (%s, %s): %s", s.name, e.id, e.text);
         if (e.evidence !is null) msg ~= format(" (check: %s)", e.evidence);
         if (e.isRule) msg ~= " [rule]";
         if (e.hasAnchors) msg ~= format(" [anchors: %s]", e.anchors.join(", "));
+        msg ~= e.tags;
+        if (e.supersedes.length) msg ~= format(" (replaces %s)", e.supersedes.join(", "));
         return msg;
     case searchTool:
-        auto pattern = arg("pattern");
-        if (pattern is null) throw new Exception("pattern must be a non-empty string");
+        auto pattern = arg("pattern"); // null is refused by the search unless a filter is given
         Scope* only;
         if (auto sc = arg("scope")) only = new Scope(parseScope(sc));
-        return readOnly ? store.searchReadonly(pattern, only) : store.search(pattern, only);
+        return store.searchFiltered(pattern, only, readOnly, SearchFilter(arg("entity"), arg("fact_kind")));
+    case verifyTool:
+        if (readOnly) throw new Exception("memory is read-only in this session");
+        auto vid = arg("id");
+        if (vid is null) throw new Exception("id is required");
+        return store.verify(vid);
+    case entityTool:
+        auto esc = arg("scope");
+        if (esc is null) throw new Exception("scope is required");
+        auto es = parseScope(esc);
+        auto entity = arg("entity");
+        auto alias_ = arg("alias"), relation = arg("relation"), target = arg("target");
+        if (alias_ is null && relation is null)
+        {
+            if (target !is null) throw new Exception("target needs a relation");
+            return listEntities(store, es, entity);
+        }
+        if (readOnly) throw new Exception("memory is read-only in this session");
+        if (entity is null) throw new Exception("entity is required to add an alias or relation");
+        // Validate the whole request before writing anything, so a rejected
+        // call leaves the registry unchanged.
+        if (relation !is null)
+        {
+            if (target is null) throw new Exception("relation needs a target entity");
+            Store.checkRelation(relation, target);
+        }
+        string result;
+        if (alias_ !is null) result = store.addAlias(es, entity, alias_);
+        if (relation !is null)
+        {
+            if (target is null) throw new Exception("relation needs a target entity");
+            result = store.addRelation(es, entity, relation, target);
+        }
+        return "entity " ~ result;
     case forgetTool:
         if (readOnly) throw new Exception("memory is read-only in this session");
         auto id = arg("id");
@@ -576,6 +1256,35 @@ string run(Store store, string tool, JSONValue args, string session, bool readOn
     default:
         throw new Exception("unknown memory tool " ~ tool);
     }
+}
+
+/// The registry of a scope (or one entity of it), capped at `searchChars` bytes.
+string listEntities(Store store, Scope s, string entity)
+{
+    auto recs = store.entities(s);
+    if (entity !is null)
+    {
+        auto id = resolveEntity(recs, normalizeEntity(entity));
+        foreach (r; recs) if (r.id == id) return r.describe;
+        return format("no entity %s in the %s registry", scrubControl(id), s.name);
+    }
+    if (!recs.length) return format("the %s entity registry is empty", s.name);
+    // Reserve room for the omission notice so the whole listing stays within
+    // `searchChars`; each line is itself bounded by `describe`.
+    enum noticeMax = "\n[ more not shown; pass entity to see one]".length + 20;
+    string out_;
+    foreach (i, r; recs)
+    {
+        auto line = r.describe(searchChars - noticeMax - 1);
+        if (out_.length + line.length + 1 + noticeMax > searchChars)
+        {
+            out_ ~= format("\n[%s more not shown; pass entity to see one]", recs.length - i);
+            break;
+        }
+        if (out_.length) out_ ~= "\n";
+        out_ ~= line;
+    }
+    return out_;
 }
 
 /// `<data>/nano-coder/memory`, the Rust default (shared with it).
@@ -720,10 +1429,19 @@ void writeAll(string p, const Entry[] entries, const(ubyte[])[] unknown)
     import core.sys.posix.sys.stat : fchmod, stat_t, stat;
     import std.string : toStringz;
     import std.random : uniform;
-    createDirAllPrivate(p.dirName);
     auto body_ = appender!(ubyte[]);
     foreach (e; entries) { body_ ~= e.toJson.representation; body_ ~= ubyte('\n'); }
     foreach (l; unknown) { body_ ~= l; body_ ~= ubyte('\n'); }
+    writeBody(p, body_.data);
+}
+
+/// Atomically replace `p` with `data` (owner-only temp file, then rename).
+private void writeBody(string p, const(ubyte)[] data)
+{
+    import core.sys.posix.fcntl : O_WRONLY, O_CREAT, O_EXCL;
+    import core.sys.posix.unistd : close, getpid;
+    import std.random : uniform;
+    createDirAllPrivate(p.dirName);
     auto tmp = format("%s.tmp.%s.%08x", p.setExtension("jsonl"), getpid(), uniform!uint);
     auto fd = openPath(tmp, O_WRONLY | O_CREAT | O_EXCL, octal!600);
     if (fd < 0) throw new Exception("creating " ~ tmp);
@@ -732,7 +1450,6 @@ void writeAll(string p, const Entry[] entries, const(ubyte[])[] unknown)
     uint mode;
     if (statMode(p, mode) && fchmodFd(fd, mode & octal!7777) != 0)
         throw new Exception("setting permissions on " ~ tmp);
-    auto data = body_.data;
     while (data.length)
     {
         auto n = writeFd(fd, data);
