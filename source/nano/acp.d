@@ -965,6 +965,12 @@ final class AcpServer : AgentEvents
                 && host.configModel != current)
                 tryModel(host.configModel);
         }
+        else if (host.windowFor !is null && current.length)
+        {
+            // No rebuild: the reset above installed the startup provider's
+            // window; resolve the active provider's own.
+            agent.setConfiguredWindow(host.windowFor(current));
+        }
         if (st.mode.length)
         {
             import nano.result : match;
@@ -1488,4 +1494,17 @@ unittest
     assert(agent4.configuredWindow == 1234);
     assert(agent4.messages[0].content == "sys-normal");
     agent4.replaceLog(Option!SessionLog.init);
+
+    // No rebuild (the fallback is already the active model): the window is
+    // still resolved for the active provider, not left at the startup one.
+    auto agent5 = new Agent(new NamedMock("cfg", "default"), new ToolRegistry, Policy.init, null);
+    agent5.setConfiguredWindow(ConfiguredWindow(99, "startup provider"));
+    built4 = null;
+    auto srv5 = new AcpServer(agent5, host4, (string l) {});
+    srv5.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ sid ~ `"}}`);
+    srv5.close();
+    assert(srv5.run());
+    assert(built4.length == 0, built4[0]);
+    assert(agent5.configuredWindow == 1234);
+    agent5.replaceLog(Option!SessionLog.init);
 }

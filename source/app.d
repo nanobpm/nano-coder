@@ -3503,6 +3503,18 @@ int runMain(string[] args)
     // is adopted and `switchModel`/`syncMode` exist (declaration order).
     if (o.hasResume) foreach (n; applyPendingSettings(true)) stdErr.writeln("nano-coder: " ~ n);
 
+    // Explicit startup flags are recorded so a later flag-free resume keeps
+    // them (issue #297): a fresh session's header holds only the model, and a
+    // resumed one's last record would otherwise win over `-m`.
+    {
+        SessionSettings explicitSettings;
+        if (o.hasResume && o.model.length) explicitSettings.model = currentSpec();
+        if (o.plan) explicitSettings.mode = agent.control.mode.name;
+        if (o.verbosity.length) explicitSettings.verbosity = nano.ui.name(verbosity);
+        if (explicitSettings.model.length || explicitSettings.mode.length || explicitSettings.verbosity.length)
+            logSessionSettings(explicitSettings);
+    }
+
 
     // Re-read the instruction files (AGENTS.md, CLAUDE.md, rules, your own
     // files) so edits apply without a restart. A change to what they put in

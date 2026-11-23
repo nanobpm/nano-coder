@@ -3529,6 +3529,11 @@ class Agent
         // before the conversation and log are replaced, for every loader
         // (`/resume`, ACP `session/load`).
         leaveSessionSubagents();
+        // Setting requests queued for the session being left (model, thinking,
+        // sub-agents) must not apply to the loaded one on its next turn.
+        control.takeModelRequest();
+        control.takeThinkingRequest();
+        control.takeSubagentsRequest();
         // Repairs are logged first: a failed write leaves the live session as
         // it was — and closes the incoming log, which the agent never
         // adopted, so its descriptor and lock do not leak into `openHere`.
@@ -5558,4 +5563,22 @@ unittest // a move's destination hook input comes from the patch's own sequentia
         ~ "*** Move File: nano-test-none/e.txt -> nano-test-none/f.txt\n*** End Patch\n"]);
     edits = Agent.patchEdits(deleted);
     assert("content" !in edits[$ - 1].args.objectNoRef);
+}
+
+// issue #297: setting requests queued for the session being left (model,
+// thinking, sub-agents) are dropped when another session is loaded, so they
+// cannot overwrite the restored settings on its next turn.
+unittest
+{
+    import nano.session : Restored;
+    import nano.providers.mock;
+    auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "sys");
+    agent.control.requestModel("mock/old");
+    agent.control.requestThinking("high");
+    agent.control.requestSubagents(false);
+    Restored r;
+    agent.loadRestored(r, Option!SessionLog.init);
+    assert(agent.control.takeModelRequest() is null);
+    assert(agent.control.takeThinkingRequest() is null);
+    assert(agent.control.takeSubagentsRequest() == 0);
 }
