@@ -3279,6 +3279,18 @@ int runMain(string[] args)
         return 0;
     }
 
+    // The resumed session's prompts (bounded), until the editor is seeded
+    // with them: Up/Down recalls what was typed before the resume.
+    Option!(string[]) resumedInputs;
+    /// Replace the prompt editor's Up/Down history with the resumed
+    /// session's prompts (empty for a session without any), then drop the copy.
+    void seedInputHistory(Option!LineEditor ed)
+    {
+        resumedInputs.ifSome((string[] lines) {
+            ed.ifSome((LineEditor e) { e.state.history.seed(lines); });
+        });
+        resumedInputs = none;
+    }
     /// Load a saved session into the agent: its conversation, plan and log.
     /// Load a saved session; returns its diagnostics so a frame caller can
     /// print them after clearing and replaying the transcript.
@@ -3316,6 +3328,7 @@ int runMain(string[] args)
             notes ~= format("%s timer%s still set (/timers lists them)", agent.timers.items.length,
                 agent.timers.items.length == 1 ? "" : "s");
         notes ~= format("resumed %s (%s messages)", restored.id, agent.messages.length - 1);
+        resumedInputs = some(restored.recentInputs);
         if (restored.pendingInput.length)
             notes ~= format("the last prompt never finished (the session was interrupted): %s",
                 oneLine(restored.pendingInput));
@@ -3820,6 +3833,7 @@ int runMain(string[] args)
             die("could not start the terminal renderer");
         }
         editor = some(makeEditor(console.link, agent.control.nonNull));
+        seedInputHistory(editor);
         questions.interactive = true;
         refreshStatus();
         // The background update check (Rust #154): interactive terminal
@@ -4403,6 +4417,7 @@ int runMain(string[] args)
                     agent.stopSubagents(); // they belong to the session being left
                     try loadNotes = loadSession(path);
                     catch (Exception e) { writeln(e.msg); continue; }
+                    seedInputHistory(editor);
                     rebindPeerListener();
                     if (gFrame) { gFrame.clear(); replayTranscript(agent, console); releaseHeap(); }
                     foreach (n; loadNotes) stdErr.writeln(n);

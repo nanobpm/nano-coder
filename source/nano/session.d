@@ -28,6 +28,7 @@ import std.array : array;
 import nano.llm;
 import nano.option : Option, some, ifSome, match;
 import nano.plan : Plan;
+import nano.history : RecentInputs;
 
 /// The extension tidy-up compresses a session log to (`<id>.jsonl.gz`).
 enum string compressedExtension = ".jsonl.gz";
@@ -1295,6 +1296,10 @@ struct Restored
 {
     string id, cwd, model, createdAt;
     Message[] conversation;
+    /// The newest prompts typed in this session, oldest first (bounded by the
+    /// editor history's caps), for Up/Down recall after a resume. Prompts
+    /// sent by another session are not included.
+    string[] recentInputs;
     /// The text of an input whose turn never ended (a crash mid-turn).
     string pendingInput;
     /// That input in full, when `hasPending`.
@@ -1732,6 +1737,8 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
     // Every logged input's key (not its text: issue #263), to backfill
     // `pinText` on legacy messages.
     InputKey[] inputs;
+    // The newest typed prompts, for the editor's Up/Down history (bounded).
+    RecentInputs recentInputs;
     Message[] rustStash;
     // Per `rustStash` entry: its content was dropped (`Restored.replayStashSlim`).
     bool[] stashSlim;
@@ -1886,6 +1893,7 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
             pendingId = data["id"].str;
             r.pendingInput = data["text"].str;
             inputs ~= InputKey.of(r.pendingInput);
+            if ("from_session" !in data) recentInputs.put(r.pendingInput);
             r.hasPending = true;
             r.pending = PendingInput(pendingId, r.pendingInput,
                 lineNo < skipBefore ? skimmedLen : r.conversation.length);
@@ -2104,6 +2112,7 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
     });
     // Apply the deltas after the latest full snapshot, if any remain.
     if (planDeltas.length > planFrom) r.plan = planAt(planFrom);
+    r.recentInputs = recentInputs.lines;
     return r;
 }
 
@@ -4143,4 +4152,21 @@ unittest
     // Inflated chunks are short-lived garbage; what's held at once (live
     // and not yet collected) stays well under the inflated size.
     assert(peak - before < o.data.length / 4, text("read held ", peak - before, " B for ", o.data.length, " B inflated"));
+}
+
+unittest // a resumed session's typed prompts come back for Up/Down recall; peer-sent ones don't
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse;
+    import std.path : buildPath;
+    auto dir = buildPath(tempDir, "nano-d-recent-inputs-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/w");
+    log.input("in-1", "fix the race");
+    log.turnEnd("in-1", "", "end_turn");
+    log.input("in-2", "from a peer", "sess-other");
+    log.turnEnd("in-2", "", "end_turn");
+    log.input("in-3", "now add a test");
+    log.close();
+    assert(restore(log.path).recentInputs == ["fix the race", "now add a test"]);
 }

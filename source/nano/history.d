@@ -1,6 +1,7 @@
 /// Input history for the prompt's line editor: submitted lines, newest last,
 /// with shell-style Up/Down recall (port of `input_history.rs`). Session-scoped:
-/// nothing is written to disk.
+/// nothing is written to disk of its own; a resumed session is seeded from the
+/// prompts in its log (`RecentInputs`, `InputHistory.seed`).
 module nano.history;
 
 import std.string : strip;
@@ -45,6 +46,14 @@ struct InputHistory
         // Copy, not slice: a suffix slice pins dropped backing-array entries
         // under D's conservative GC.
         if (drop) lines = lines[drop .. $].dup;
+    }
+
+    /// Replace the history with `older` (oldest first), as if each had been
+    /// submitted in order: a resumed session recalls its earlier prompts.
+    void seed(const string[] older) pure
+    {
+        this = InputHistory.init;
+        foreach (l; older) record(l);
     }
 
     /// The entry one older than shown, or null at the oldest. The first call
@@ -100,6 +109,76 @@ struct HistoryBrowsing
 {
     private ptrdiff_t position = -1;
     private string draft;
+}
+
+/// The newest prompts of a long sequence, kept within `InputHistory`'s
+/// caps while it streams past: restoring a session log of 40k prompts holds
+/// at most about twice the history's budget, never the whole run.
+struct RecentInputs
+{
+    private string[] buf;
+    private size_t bytes;
+
+    /// Add the next prompt (newest last). Blank ones and any over the whole
+    /// byte budget are skipped, as `InputHistory.record` would.
+    void put(string line) pure
+    {
+        if (!line.strip.length || line.length + string.sizeof > InputHistory.maxBytes) return;
+        buf ~= line;
+        bytes += line.length + string.sizeof;
+        if (buf.length >= 2 * InputHistory.maxEntries || bytes > 2 * InputHistory.maxBytes) trim();
+    }
+
+    /// The kept prompts, oldest first, at most the history's caps.
+    string[] lines() pure
+    {
+        trim();
+        return buf;
+    }
+
+    /// Drop the oldest beyond the history's entry and byte caps (a copy, so
+    /// the dropped entries are not pinned by the backing array).
+    private void trim() pure
+    {
+        size_t keep, kept;
+        while (keep < buf.length && keep < InputHistory.maxEntries)
+        {
+            immutable c = buf[$ - 1 - keep].length + string.sizeof;
+            if (keep && kept + c > InputHistory.maxBytes) break;
+            kept += c;
+            ++keep;
+        }
+        if (keep == buf.length) return;
+        buf = buf[$ - keep .. $].dup;
+        bytes = kept;
+    }
+}
+
+unittest // a resumed session's prompts seed Up/Down recall, newest first
+{
+    RecentInputs r;
+    foreach (i; 0 .. 1000) r.put(i % 2 ? "even" : "odd");
+    r.put("  ");
+    r.put("last");
+    auto kept = r.lines;
+    assert(kept.length == InputHistory.maxEntries && kept[$ - 1] == "last", "newest kept within the entry cap");
+    InputHistory h;
+    h.record("from the old process");
+    h.seed(["first", "second", "second"]);
+    assert(h.lines == ["first", "second"], "seed replaces and dedupes like record");
+    assert(h.up("") == "second" && h.up("second") == "first");
+}
+
+unittest // the byte cap bounds the kept prompts, not just their count
+{
+    import std.array : replicate;
+    RecentInputs r;
+    auto big = "x".replicate(100 * 1024);
+    foreach (i; 0 .. 50) r.put(big);
+    r.put("x".replicate(InputHistory.maxBytes)); // over the whole budget: skipped
+    size_t total;
+    foreach (l; r.lines) total += l.length + string.sizeof;
+    assert(total <= InputHistory.maxBytes && r.lines.length == 5, "within maxBytes");
 }
 
 // rust: input_history.rs::parking_round_trips_the_browsing_state
