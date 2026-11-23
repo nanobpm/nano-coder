@@ -319,6 +319,9 @@ Applied apply(ref Entry[] entries, const Proposal[] accepted, const EntityRecord
                 foreach (i; ds)
                 {
                     auto d = &entries[i];
+                    // Different validity conditions are different facts: merging would silently
+                    // keep only one condition, so roll the whole merge back.
+                    if (d.validWhile != keep.validWhile) { rollback = true; return; }
                     foreach (an; anchorsOf(*d)) if (!anchors.canFind(an)) anchors ~= an;
                     rule = rule || d.isRule;
                     foreach (en; d.entities) if (!keep.entities.canFind(en)) keep.entities ~= en;
@@ -409,15 +412,31 @@ Proposal[] freshOnly(Proposal[] accepted, const Entry[] reviewed, const Entry[] 
         foreach (i, ref e; current) if (e.id == id) c = i;
         return r >= 0 && c >= 0 && sameContent(reviewed[r], current[c]);
     }
-    Proposal[] o;
-    foreach (p; accepted)
-    {
-        if (touchedIds(p).all!(id => same(id))) o ~= p;
-        else
+    // A proposal is deferred when its entries changed or when it overlaps (transitively)
+    // a deferred one: applying it alone would tag an entry whose merge is still pending,
+    // and the next run would then filter that entry out and never re-offer the merge.
+    auto deferred = new bool[accepted.length];
+    foreach (i, p; accepted)
+        if (!touchedIds(p).all!(id => same(id)))
         {
-            stale++;
-            foreach (id; touchedIds(p)) staleIds ~= id;
+            deferred[i] = true;
+            foreach (id; touchedIds(p)) if (!staleIds.canFind(id)) staleIds ~= id;
         }
+    for (bool grew = true; grew;)
+    {
+        grew = false;
+        foreach (i, p; accepted)
+            if (!deferred[i] && touchedIds(p).any!(id => staleIds.canFind(id)))
+            {
+                deferred[i] = grew = true;
+                foreach (id; touchedIds(p)) if (!staleIds.canFind(id)) staleIds ~= id;
+            }
+    }
+    Proposal[] o;
+    foreach (i, p; accepted)
+    {
+        if (deferred[i]) stale++;
+        else o ~= p;
     }
     return o;
 }
@@ -428,8 +447,8 @@ string describe(const Proposal p, const Entry[] entries)
     import nano.trajectory : terminalSafe;
     string show(string id)
     {
-        foreach (ref e; entries) if (e.id == id) return format("[%s] %s", id, terminalSafe(e.text));
-        return "[" ~ id ~ "]";
+        foreach (ref e; entries) if (e.id == id) return format("[%s] %s", terminalSafe(id), terminalSafe(e.text));
+        return "[" ~ terminalSafe(id) ~ "]";
     }
     return p.match!(
         (const TagProposal t) => format("tag %s\n      entities: %s; kind: %s", show(t.id),
@@ -692,4 +711,36 @@ Report migrate(Store store, Ask ask, Ui ui, Options opts)
     foreach (s; [Scope.user, Scope.project])
         if (store.hasScope(s)) rep.entriesAfter += current(s);
     return rep;
+}
+
+unittest // a fresh proposal overlapping a stale one is deferred too, transitively
+{
+    auto a = Entry("a", "alpha fact"), b = Entry("b", "beta fact"), c = Entry("c", "gamma fact"), d = Entry("d", "delta fact");
+    auto reviewed = [a, b, c, d];
+    auto b2 = b; b2.text = "beta changed";
+    Proposal[] ps = [Proposal(TagProposal("a")), Proposal(MergeProposal("a", ["b"])),
+        Proposal(SupersedeProposal("c", "a")), Proposal(TagProposal("d"))];
+    size_t stale;
+    string[] ids;
+    auto fresh = freshOnly(ps, reviewed, [a, b2, c, d], stale, ids);
+    assert(stale == 3);
+    assert(fresh.length == 1);
+    assert(ids.canFind("a") && ids.canFind("b") && ids.canFind("c"));
+}
+
+unittest // merges across differing validity conditions are rolled back
+{
+    auto a = Entry("a", "use flag x"), b = Entry("b", "use flag x");
+    a.validWhile = "v1"; b.validWhile = "v2";
+    auto es = [a, b];
+    auto n = apply(es, [Proposal(MergeProposal("a", ["b"]))], null);
+    assert(n.merged == 0 && n.skipped == 1);
+    assert(!es[1].isSuperseded);
+}
+
+unittest // entry ids are sanitised for the terminal
+{
+    auto e = Entry("x\x1b[2J", "t");
+    assert(!describe(Proposal(TagProposal("x\x1b[2J")), [e]).canFind('\x1b'));
+    assert(!describe(Proposal(TagProposal("y\x1b[2J")), []).canFind('\x1b'));
 }

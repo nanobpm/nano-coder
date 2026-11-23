@@ -383,7 +383,8 @@ unittest // proposals whose entries changed since review are not applied
     size_t stale;
     auto ps = freshOnly([Proposal(TagProposal("a", ["tool:git"], null)), Proposal(MergeProposal("a", ["b"], null, null))],
         reviewed, [a, changed], stale);
-    assert(ps.length == 1 && stale == 1);
+    // The tag on `a` overlaps the stale merge, so it is deferred too (a must stay pending).
+    assert(ps.length == 0 && stale == 2);
 }
 
 unittest // concurrent backups reserve distinct directories
