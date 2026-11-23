@@ -542,6 +542,9 @@ unittest
     agent.control.requestModel("mock/probed");
     assert(agent.applyModelRequest());
     p.done.await((ref const bool d) => d, (ref bool _) {});
+    // `done` fires before the worker records its verdict: wait for the thread
+    // to exit (real clock) so fake time can't reach its deadline check.
+    while (!agent.probeThreadExited) {}
     sleepFor(2.hours); // collection comes past the deadline (fake time)
     assert(agent.settleProbes(1_000.hours), "the on-time worker is joined");
     assert(agent.capabilities.window == 4_096, "the on-time result is published");

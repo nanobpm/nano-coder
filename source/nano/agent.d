@@ -1721,6 +1721,14 @@ class Agent
         return probing ? 1 : 0;
     }
 
+    /// Test-only: whether the tracked probe thread has exited (its outcome is
+    /// final), without collecting or publishing it, so a test can order fake
+    /// time after the worker's own lateness verdict.
+    version (unittest) bool probeThreadExited()
+    {
+        return !probing || !pendingProbe.thread.running;
+    }
+
     /// The thinking level the current model is sent, and why. A fixed budget
     /// must stay below the output cap: one that can't fit sends no level.
     ThinkingResolved thinking()
