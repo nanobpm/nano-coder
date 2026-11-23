@@ -260,7 +260,8 @@ private struct GunzipStream
     /// A reader over the log at `path`.
     this(string path) { this.path = path; }
 
-    /// The next inflated bytes (a copy of `buf`'s filled prefix); empty at
+    /// The next inflated bytes: `buf`'s filled prefix, valid until the next
+    /// read (the line splitter copies only a line that spans reads); empty at
     /// the stream's end. Throws on a corrupt or truncated stream.
     ubyte[] read(ref File f, ubyte[] buf)
     {
@@ -280,11 +281,11 @@ private struct GunzipStream
             if (rc == InflateStream.Rc.streamEnd)
             {
                 ended = true;
-                return used ? buf[0 .. used].dup : null;
+                return used ? buf[0 .. used] : null;
             }
             if (rc == InflateStream.Rc.error)
                 throw new Exception("gunzip " ~ path ~ ": " ~ zs.errorMessage);
-            if (used) return buf[0 .. used].dup;
+            if (used) return buf[0 .. used];
             // Z_BUF_ERROR with no output means zlib can make no progress: with
             // input still buffered that is a stuck stream, not a read more.
             if (zs.availIn) throw new Exception("gunzip " ~ path ~ ": corrupt stream (no progress)");
@@ -1591,29 +1592,15 @@ void eachLogLine(string path, scope void delegate(const(char)[] line, ulong line
 void eachLogLineUntil(string path, scope bool delegate(const(char)[] line, ulong lineNo) @safe dg,
     bool requireCommitted = true)
 {
+    // One streaming reader for plain and compressed logs alike (64 KB reads,
+    // a bounded inflate window): neither the file nor a decompressed copy is
+    // ever held whole.
     ulong lineNo;
-    if (isCompressedLog(path))
-    {
-        auto text = logText(path);
-        auto committed = text.length;
-        while (committed && text[committed - 1] != '\n') committed--;
-        if (!committed && requireCommitted) throw new Exception("session log " ~ path ~ " has no committed records");
-        foreach (line; text[0 .. committed].lineSplitter)
-            if (!dg(line, ++lineNo)) return;
-        return;
-    }
-    import std.typecons : Yes;
-    auto f = File(path, "rb");
-    bool any;
-    foreach (line; f.byLine(Yes.keepTerminator))
-    {
-        if (!line.length || line[$ - 1] != '\n') break; // torn
-        any = true;
-        auto l = line[0 .. $ - 1];
-        if (l.length && l[$ - 1] == '\r') l = l[0 .. $ - 1];
-        if (!dg(l, ++lineNo)) return;
-    }
-    if (!any && requireCommitted) throw new Exception("session log " ~ path ~ " has no committed records");
+    streamLogLinesUntil(path, (line) {
+        if (line.length && line[$ - 1] == '\r') line = line[0 .. $ - 1];
+        return dg(line, ++lineNo);
+    });
+    if (!lineNo && requireCommitted) throw new Exception("session log " ~ path ~ " has no committed records");
 }
 
 unittest // eachLogLineUntil stops reading at the first false
@@ -4118,4 +4105,35 @@ unittest
             (head) => !head.startsWith(`{"type":"replace"`) && !head.startsWith(`{"type":"plan"`));
         assert(seen == [`{"type":"message","data":1}`, "", "", `{"type":"message","data":2}`], path);
     }
+}
+
+// `eachLogLine` streams a compressed log through a bounded inflate window
+// rather than inflating it whole (issue #306): reading a gzipped log whose
+// lines are small allocates far less than its decompressed size.
+unittest
+{
+    import core.memory : GC;
+    import std.algorithm : max;
+    import std.array : appender;
+    import std.conv : text;
+    import std.file : write, remove, tempDir;
+    import std.path : buildPath;
+    auto o = appender!string;
+    o.put(`{"type":"session","data":{"version":1,"id":"g","created_at":"t"}}` ~ "\n");
+    foreach (i; 0 .. 40_000) o.put(text(`{"type":"input","data":{"id":"i`, i, `","text":"prompt `, i, `"}}`, "\n"));
+    auto p = buildPath(tempDir, "nano-d-eachline-gz.jsonl.gz");
+    write(p, gzipLog(o.data));
+    scope (exit) remove(p);
+    ulong lines;
+    GC.collect();
+    immutable before = GC.stats.usedSize;
+    size_t peak;
+    eachLogLine(p, (line, n) {
+        lines = n;
+        if (n % 1000 == 0) peak = max(peak, GC.stats.usedSize);
+    });
+    assert(lines == 40_001);
+    // Inflated chunks are short-lived garbage; what's held at once (live
+    // and not yet collected) stays well under the inflated size.
+    assert(peak - before < o.data.length / 4, text("read held ", peak - before, " B for ", o.data.length, " B inflated"));
 }
