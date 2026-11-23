@@ -43,14 +43,16 @@ struct TwoSessions
     PeerRouter targetRouter;
     PeerListener targetListener;
     MessageQueue targetQueue;
+    TestPump pump;
 
     static TwoSessions make(string name, MockClient mock)
     {
         import std.process : environment;
-        auto t = TwoSessions("", "", null, null, PeerRouter.init, PeerListener.init, MessageQueue.init);
+        auto t = TwoSessions("", "", null, null, PeerRouter.init, PeerListener.init, MessageQueue.init, TestPump.init);
         t.root = buildPath(tempDir, name);
         mkdirRecurse(buildPath(t.root, "sessions"));
         t.peers = buildPath(t.root, "peers");
+        mkdirRecurse(t.peers);
         environment["NANO_CODER_PEERS"] = t.peers;
         auto reg = new ToolRegistry;
         t.agent = new Agent(mock, reg, Policy.init, "sys");
@@ -66,12 +68,16 @@ struct TwoSessions
         t.targetRouter = PeerRouter.make(atomicLoad(control));
         t.targetQueue = MessageQueue.make;
         t.targetListener = PeerListener.listen(t.peers, "sess-target", t.targetRouter.requests);
+        // The prompt loop's routing pass, so a send is answered while the
+        // test thread is blocked in agent.run.
+        t.pump = TestPump.start(t.targetRouter);
         return t;
     }
 
     void cleanup()
     {
         import std.process : environment;
+        pump.stop();
         targetListener.close();
         ownLog.close();
         environment.remove("NANO_CODER_PEERS");
@@ -118,11 +124,15 @@ unittest
 
     // A peer-started turn (fromPeer: the prompt loop's flag).
     t.agent.run("[from session abcd1234] talk to the target", new NullEvents, true, null, true);
-    auto refused = lastToolResult(mock);
-    assert(refused.canFind("loop guard") || refused.canFind("started by a peer message"), refused);
+    // The final request carries both tool results: the refused plain send
+    // and the confirm-marked one that went through.
+    string[] toolTexts;
+    foreach (m; mock.seen[$ - 1])
+        if (m.role == Role.tool) toolTexts ~= m.content;
+    assert(toolTexts.length == 2, mock.seen[$ - 1].length.stringof);
+    assert(toolTexts[0].canFind("loop guard") || toolTexts[0].canFind("started by a peer message"), toolTexts[0]);
     // With confirm the send is allowed; the wire asks the target to confirm.
-    auto sent = lastToolResult(mock);
-    assert(sent.canFind("delivered") || sent.canFind("awaiting confirmation"), sent);
+    assert(toolTexts[1].canFind("delivered") || toolTexts[1].canFind("awaiting confirmation"), toolTexts[1]);
     Inbound inbound;
     assert(t.targetRouter.takeWaiting(inbound), "the confirm-marked message arrived");
     assert(inbound.needsConfirm, "the target's user is asked even with their confirm off");
@@ -139,9 +149,10 @@ unittest
 // session is an error listing how to find ids.
 unittest
 {
-    auto mock = new MockClient([
-        call("s1", sendTool, `{"to":"sess-target","text":"hi"}`), LLMResponse("r1"),
-        call("s2", sendTool, `{"to":"sess-nope","text":"hi"}`), LLMResponse("r2")]);
+    auto both = LLMResponse("", "", [
+        ToolCall.fromRaw("s1", sendTool, `{"to":"sess-target","text":"hi"}`),
+        ToolCall.fromRaw("s2", sendTool, `{"to":"sess-nope","text":"hi"}`)]);
+    auto mock = new MockClient([both, LLMResponse("done")]);
     auto t = TwoSessions.make("nano-d-agent-peers-off", mock);
     scope (exit) t.cleanup();
     t.targetListener.close(); // the target turned messages off

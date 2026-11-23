@@ -2299,6 +2299,7 @@ class Agent
         bool isTimer = timerTools && isTimerTool(call.name);
         bool isAgent = subagentsOffered && call.name == subToolName;
         bool isSubCtl = subagentsOffered && isSubControlTool(call.name);
+        bool isSend = messagesOn && call.name == peers.sendTool;
         // An `agent` call was checked when its reply's sub-agents launched.
         if (isAgent)
             if (auto gate = call.id in subGates)
@@ -2308,7 +2309,7 @@ class Agent
                 context ~= gate.context;
                 return true;
             }
-        if (!isPlan && !isOutcome && !isHistory && !isTimer && !isAgent && !isSubCtl && !tools.has(call.name))
+        if (!isPlan && !isOutcome && !isHistory && !isTimer && !isAgent && !isSubCtl && !isSend && !tools.has(call.name))
         {
             refused = format("Tool '%s' not found. Available: %s", call.name, toolNames());
             return false;

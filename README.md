@@ -450,6 +450,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
 - `/tools` - List registered tools
 - `/skills` - List the skills the agent can load, where each lives, and any loading warnings
 - `/subagents [on|off] [--save]` - Without an argument, show whether sub-agents are on and the models they may run on with their limits. `on`/`off` switches the `agent` tool for this session from the next request (sub-agents already running finish); `--save` also writes `subagents` to the config file. Changing the tool list invalidates the provider's prompt cache once. Works over ACP too (the result carries `subagents`, `models` and `text`, and `saved` with `--save`)
+- `/messages [on|off|confirm on|off] [--save]` - Without an argument, show whether this session sends and receives inter-session messages (see [Inter-session messages](#inter-session-messages)). `on` opens the registry socket and offers `session_send` from the next request; `off` closes it. `confirm on|off` switches whether an incoming message waits for you to accept it. `--save` writes `session_messages` / `session_messages_confirm` to the config file
 - `/plan` - Show the agent's task plan with all notes
 - `/memory [forget ID]` - List cross-session memories with their ids, or delete one by id (see [Memory](#memory))
 - `/hooks` - List the loaded external user hooks (from `.claude/settings.json` and friends), the files they came from, and any skipped entries (see [Lifecycle Hooks](#lifecycle-hooks))
@@ -669,6 +670,8 @@ bash_timeout_secs = 600
 # bash_heartbeat_secs = 60               # supervisor-visible "still running" note interval (or NANO_CODER_BASH_HEARTBEAT_SECS)
 persist_sessions = true
 cross_session_history = true            # sessions_list + a session argument on the history tools: read other sessions' logs
+session_messages = false                # listen for messages from other sessions + offer session_send (see Inter-session messages)
+session_messages_confirm = true         # ask before an incoming session message is queued/run
 # session_dir = "/path/to/sessions"    # default: <platform data dir>/nano-coder/sessions
 session_compress_after_days = 14        # gzip logs idle this long at startup (0 = never)
 # session_retention_days = 0           # delete logs untouched this long (0 = keep; named sessions are kept)
@@ -1213,6 +1216,43 @@ To judge whether it helps, the log records each compaction's `mode`, `model` and
 compactions, turns after the first compaction, turns that used the history tools, and
 reported outcomes. `eval/compaction/` has a harness that compares the two modes across
 providers and models on synthetic or forked real sessions (see its README). See [#29](https://github.com/nanobpm/nano-coder/issues/29) for the design.
+
+#### Inter-session messages
+
+Cross-session history lets an agent *read* another session's log; inter-session messages
+let it *talk* to a running one. With `session_messages = true` (default `false`) a session
+listens on a Unix socket in a peer registry (`<data dir>/peers/<session-id>.sock`, the
+directory created mode 0700; `NANO_CODER_PEERS` overrides the directory) and the agent
+gets a fourth cross-session tool:
+
+- `session_send(to, text, confirm?)` - deliver a message to another running session.
+  `to` resolves like the history tools' `session` argument (an id, a unique id prefix,
+  or a title from `sessions_list`, which marks reachable sessions `[messages]`). The
+  result is one of `delivered`, `queued` (the target is mid-turn; the message sits in its
+  `/queue`, visible, editable and withdrawable like a typed steer), `awaiting
+  confirmation` (the target's user is being asked), `refused` (the target has messages
+  off or declined), or `not running` (no live socket; a stale socket file from a dead
+  session is removed by the sender that finds it). The send goes through the sender's
+  permission policy as a `session_send(...)` rule.
+
+The delivered message joins the target's input labelled with its origin, e.g.
+`[from session ab88e980 · ts-performance-matrix] …`, and is logged like any input with
+the sender id in the record. Mid-turn it is steered into the running turn; idle it starts
+a turn. With `session_messages_confirm = true` (the default) the target first shows the
+message and waits for its user to accept or decline. A turn that was *started by* a peer
+message cannot itself call `session_send` without `confirm: true` (which asks the
+target's user whatever their confirm setting) — the loop guard, so two agents can't
+ping-pong. On the wire each message is one A2A-shaped JSON object per line (`role`,
+`parts` with `text`, `messageId`, `contextId` = the sender's session id), so a later A2A
+bridge can map it directly. The receiver serves only a peer with its own uid
+(`SO_PEERCRED`/`getpeereid`) and drops any other, and the 0700 registry directory keeps
+other users from planting or reaching a socket. `/messages on|off` and `/messages confirm
+on|off` switch the settings for the current session (`--save` writes them to the config
+file); `/messages` alone shows the state. With the Herdr integration active a received
+message shows as activity on the target's pane, and a session served over ACP can receive
+messages too (shown to the client as user input with the label; ACP has no question
+channel, so a message that would need confirmation is declined with a note asking the
+sender to re-send with confirm off).
 
 ## Project Instructions
 

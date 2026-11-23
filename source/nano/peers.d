@@ -650,10 +650,13 @@ struct PeerRouter
             else
             {
                 waiting.put(WaitingItem(req.pm, labelled.idup, confirm, req.reply));
-                if (!confirm)
-                    answer(req.reply, Status.delivered, "starts a turn in the target session");
-                // With confirm on the prompt loop asks, then settles the
-                // inbound (which answers the request's cell).
+                // Confirm off: delivered at once (the prompt loop starts the
+                // turn). Confirm on: the sender hears awaiting-confirmation
+                // at once — a slow user never pins the sender; the outcome
+                // is visible in the target's own log and /queue.
+                answer(req.reply, confirm ? Status.awaiting : Status.delivered,
+                    confirm ? "waiting for the target session's user to accept or decline"
+                        : "starts a turn in the target session");
             }
         }
     }
@@ -697,6 +700,48 @@ imported!"nano.llm".ToolDefinition sendDefinition() pure
 // Tests: two in-process sessions over real registry sockets.
 // ---------------------------------------------------------------------------
 
+version (unittest):
+
+/// A stand-in for the prompt loop's routing pass: drains the listener's
+/// channel into the router (answering mid-turn and confirm-off deliveries)
+/// until `stop`. Confirm-on deliveries wait in the router for the test to
+/// `takeWaiting` and `settle` them. Runs on a daemon thread because `send`
+/// blocks the calling test thread until the receiver answers.
+package(nano) struct TestPump
+{
+    import nano.queue : MessageQueue;
+    import nano.safeio : Shared, JoinHandle, spawnDaemon;
+    PeerRouter router;
+    MessageQueue queue;
+    Shared!bool halt;
+    JoinHandle thread;
+
+    static TestPump start(PeerRouter router)
+    {
+        auto p = TestPump(router, MessageQueue.make, Shared!bool.make(false));
+        p.thread = spawnDaemon(&pump, p.router, p.queue, p.halt);
+        return p;
+    }
+
+    void stop()
+    {
+        halt.update((ref bool b) { b = true; });
+        thread.join();
+    }
+
+    private static void pump(PeerRouter router, MessageQueue queue, Shared!bool halt)
+    {
+        import core.time : msecs;
+        import nano.clock : sleepFor;
+        while (!halt.get)
+        {
+            router.routePending(queue);
+            sleepFor(1.msecs);
+        }
+        router.routePending(queue);
+    }
+}
+
 // Two sessions: one listening, one sending. Delivery idle (confirm off) is
 // accepted and waits for the prompt loop; the wire is the A2A shape.
 unittest
@@ -711,9 +756,12 @@ unittest
     mkdirRecurse(root);
     auto control = new shared TurnControl;
     auto router = PeerRouter.make(atomicLoad(control));
+    router.confirm(false); // the receiver's setting is off until the test turns it on
     auto listener = PeerListener.listen(root, "sess-target", router.requests);
     scope (exit) listener.close();
     assert(socketPath(root, "sess-target").exists, "the registry socket exists");
+    auto pump = TestPump.start(router);
+    scope (exit) pump.stop();
 
     // Deliver: idle, confirm off → delivered at once, waiting for the loop.
     string note;
@@ -726,8 +774,8 @@ unittest
     assert(!inbound.needsConfirm, "confirm off: no ask");
     settle(inbound, true);
 
-    // Confirm on: the sender hears awaiting-confirmation; accepting and
-    // declining both reach the sender.
+    // Confirm on: the sender hears awaiting-confirmation at once (a slow
+    // user never pins the sender); the test settles the waiting inbound.
     router.confirm(true);
     status = send(root, "sess-target", PeerMessage("sess-sender", null, "please review", "m-2", false), note);
     assert(status == Status.awaiting, note);
@@ -739,12 +787,11 @@ unittest
     assert(router.takeWaiting(inbound));
     settle(inbound, false); // declined
 
-    // Mid-turn: the message joins the steers under a /queue id.
+    // Mid-turn: the message joins the steers under a /queue id (the pump
+    // routes it; the steer is visible on the turn's control).
     router.midTurn(true);
     status = send(root, "sess-target", PeerMessage("sess-sender", null, "mid-turn note", "m-4", false), note);
     assert(status == Status.queued, note);
-    auto queue = MessageQueue.make;
-    router.routePending(queue);
     auto pending = control.pendingSteers;
     assert(pending.length == 1 && pending[0].text == "[from session sess-sen] mid-turn note", pending[0].text);
     assert(pending[0].id >= 0, "listed in /queue");
