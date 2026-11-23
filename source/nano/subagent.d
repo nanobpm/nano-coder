@@ -635,17 +635,20 @@ unittest
         {
             reminded ~= req.messages.any!(m => m.content.canFind("call report_outcome now"));
             if (reminded.length > 1) return LLMResponse("the report");
-            // The cancel lands after this request's steers drained; this is
-            // the detection generationStart's late path performs.
-            ab.wrapUp();
-            st.checkLimits();
             return LLMResponse("still looking");
         }
     };
     auto agent = new Agent(client, new ToolRegistry, Policy.init, "s");
     st.agent = some(agent);
     agent.verifyBeforeComplete = false;
+    // The cancel lands after the first request's steers drained but before
+    // its generationStart, so the production late-detection path runs.
+    bool cancelled;
+    agent.onThresholdChecked = () {
+        if (!cancelled) { cancelled = true; ab.wrapUp(); }
+    };
     agent.run("go", st);
+    assert(cancelled);
     assert(reminded.length >= 2, "a tool-free reply must not end the turn before the reminder");
     assert(!reminded[0] && reminded[1], "the next request carries the report reminder");
 }
