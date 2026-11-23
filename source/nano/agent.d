@@ -11,7 +11,9 @@ import nano.option : Option, some, none, match, ifSome, orElse, unwrap, NotNull;
 import nano.result : orThrow, toOption, match, unwrap;
 
 import nano.safeio : Chan, Isolated, Join, JoinHandle, spawn, spawnDaemon, stdErr, stdOut;
+import nano.subagent : SubAbort;
 import nano.probe : ProbeState;
+import core.time : seconds;
 
 import std.json;
 import std.format : format;
@@ -197,7 +199,7 @@ struct CompactReport
     string toString() pure const
     {
         auto s = format("%scompacted %s messages: ~%s -> ~%s tokens (%s -> %s messages)",
-            mode == ctx.CompactionMode.smart ? "smart-" : "", summarized, ctx.formatTokens(tokensBefore),
+            mode == ctx.CompactionMode.standard ? "" : ctx.modeName(mode) ~ "-", summarized, ctx.formatTokens(tokensBefore),
             ctx.formatTokens(tokensAfter), messagesBefore, messagesAfter);
         if (fallback !is null) s ~= format("; summary failed (%s), older messages were dropped", fallback);
         else if (truncated) s ~= "; the summary hit the output limit and is incomplete";
@@ -1573,6 +1575,9 @@ class Agent
     void refreshCapabilities()
     {
         probe.beginDetect();
+        // The switch supersedes any background probe: stop its HTTP calls now
+        // (it stays tracked until it exits and is joined).
+        if (probing) pendingProbe.abort.abort();
         auto caps = probeOf(client.nonNull, !configuredWindow);
         if (configuredWindow) probe.storeWithoutWindow(caps);
         else probe.store(caps);
@@ -1592,68 +1597,161 @@ class Agent
     /// probe after a mid-turn switch (null: mid-turn switches don't probe).
     LLMClient delegate(string spec) probeClient;
 
-    /// A background probe: the generation it publishes under, and its thread.
+    /// A background probe: the generation it publishes under, its thread, the
+    /// abort flag its HTTP calls poll (set when a later switch supersedes it),
+    /// and when it started (for `probeDeadline`).
     private static struct PendingProbe
     {
         ulong generation;
-        Join!(Isolated!Capabilities) thread;
+        Join!(Isolated!ProbeOutcome) thread;
+        SubAbort abort;
+        MonoTime started;
     }
-    private PendingProbe[] pendingProbes;
+    /// What a probe thread returns: the capabilities, and whether it ran
+    /// past its own deadline or was cancelled (then the result is dropped).
+    private static struct ProbeOutcome
+    {
+        Capabilities caps;
+        bool late;
+    }
+    /// The one probe thread (running, or finished and not yet joined). A
+    /// superseded probe stays here, cancelled, until it finishes and is
+    /// joined, so at most one probe thread is ever alive.
+    private PendingProbe pendingProbe;
+    /// Whether `pendingProbe` holds a thread not yet joined or dropped.
+    private bool probing;
+    /// A generation that wants a probe but couldn't start one because a
+    /// probe thread was still alive; started once that thread is gone.
+    private Option!ulong wantedProbe;
+
+    /// How long a background probe may run before it is abandoned: past the
+    /// deadline it is cancelled (its HTTP calls bail at the next poll) and
+    /// dropped, and the fallback window stands. Bounds the life of a probe
+    /// against a hanging provider (nano-coder#270).
+    Duration probeDeadline = 30.seconds;
 
     /// Probe the current client on a background thread (after a mid-turn
     /// switch), so the next model call goes out at once, with the fallback
     /// window, until `collectProbes` publishes the result.
+    ///
+    /// At most one probe thread runs at a time: a switch that finds one still
+    /// running cancels it (it is stale by construction) and records the want
+    /// instead of spawning; `collectProbes` starts the wanted generation's
+    /// probe once the thread is joined. Rapid switches cost one thread, not
+    /// one per switch.
     private void startBackgroundProbe()
     {
         auto generation = probe.beginDetect();
         if (probeClient is null) return;
+        wantedProbe = some(generation);
+        collectProbes();
+    }
+
+    /// Start the background probe for `generation` (none may be alive).
+    private void spawnProbe(ulong generation)
+    {
         LLMClient c;
         try c = probeClient(client.providerName ~ "/" ~ client.modelName);
         catch (Exception) return; // the probe is optional: the fallbacks stand
+        auto abort = SubAbort.make;
         // Isolated: `probeClient` builds a new client from a resolved
         // (deep-copied) config, and only the probe thread keeps it.
-        pendingProbes ~= PendingProbe(generation,
-            spawnDaemon(&runProbe, Isolated!LLMClient.assumeIsolated(c), configuredWindow == 0));
+        pendingProbe = PendingProbe(generation,
+            spawnDaemon(&runProbe, Isolated!LLMClient.assumeIsolated(c), configuredWindow == 0, abort, probeDeadline),
+            abort, monoNow);
+        probing = true;
     }
 
     /// Runs on the probe thread: what `client` reports (nothing on failure).
-    private static Isolated!Capabilities runProbe(Isolated!LLMClient client, bool window)
+    /// The abort cell is this thread's cancellation scope, so a superseded
+    /// probe's HTTP calls bail at their next poll; the thread also sets its
+    /// own deadline, so a probe past `deadline` bails even while the agent
+    /// is blocked and not collecting. A late or cancelled result is flagged.
+    private static Isolated!ProbeOutcome runProbe(Isolated!LLMClient client, bool window, SubAbort abort,
+        Duration deadline)
     {
+        import nano.control : setCancelDeadline, pastCancelDeadline;
+        pushCancelScope(abort.ptr);
+        scope (exit) popCancelScope();
+        setCancelDeadline(monoNow + deadline);
+        scope (exit) setCancelDeadline(MonoTime.max);
         auto caps = probeOf(client.unwrap, window);
+        const late = abort.aborted || pastCancelDeadline();
         // Isolated: built on this thread, and only the result box keeps it.
-        return Isolated!Capabilities.assumeIsolated(caps);
+        return Isolated!ProbeOutcome.assumeIsolated(ProbeOutcome(caps, late));
     }
 
-    /// Publish the background probes that finished; a result from a model
-    /// a later switch superseded is discarded. Whether one was published.
+    /// Join the probe thread if it finished, publishing its result when its
+    /// generation is still live and it beat `probeDeadline` (anything else is
+    /// discarded). A running probe that is stale or past the deadline is
+    /// cancelled but stays tracked until it exits and is joined, so a probe
+    /// that ignores cancellation still blocks new ones: at most one probe
+    /// thread is ever alive. With no thread alive, the wanted generation's
+    /// probe starts. Whether a result was published.
     bool collectProbes()
     {
         bool published;
-        PendingProbe[] still;
-        foreach (ref p; pendingProbes)
+        if (probing)
         {
-            if (p.thread.running) { if (probe.isCurrent(p.generation)) still ~= p; continue; }
-            auto result = p.thread.join();
-            published |= probe.publishIfCurrent(p.generation, result.unwrap, configuredWindow == 0);
+            alias p = pendingProbe;
+            if (p.thread.running)
+            {
+                // Stale: its result can never publish, so stop its HTTP calls.
+                if (!probe.isCurrent(p.generation)) p.abort.abort();
+                // Past the deadline: cancel it; its result will be dropped.
+                if (since(p.started) >= probeDeadline) p.abort.abort();
+            }
+            else
+            {
+                auto outcome = p.thread.join().unwrap;
+                // Lateness is judged by when the probe finished (the worker
+                // flags it), not when it is collected: an on-time result
+                // collected after a long model call still publishes, and a
+                // cancel that lands after the outcome was final can't expire it.
+                const late = outcome.late;
+                if (!late)
+                    published = probe.publishIfCurrent(p.generation, outcome.caps, configuredWindow == 0);
+                probing = false;
+                pendingProbe = PendingProbe.init;
+            }
         }
-        pendingProbes = still;
+        const alive = probing;
+        if (!alive && probeClient !is null)
+            wantedProbe.ifSome((ref ulong g) {
+                if (probe.isCurrent(g)) spawnProbe(g);
+            });
+        if (!alive) wantedProbe = none;
         return published;
     }
 
     /// Wait up to `max` for the live background probe (a superseded one is
-    /// never published), then publish; false if it still runs.
+    /// joined first, then the wanted one is started and waited for), then
+    /// publish; false if it still runs.
     bool settleProbes(Duration max)
     {
         import core.time : msecs;
         auto deadline = monoNow + max;
-        foreach (ref p; pendingProbes)
-            while (probe.isCurrent(p.generation) && p.thread.running)
-            {
-                if (monoNow >= deadline) { collectProbes(); return false; }
-                sleepFor(5.msecs);
-            }
-        collectProbes();
-        return true;
+        for (;;)
+        {
+            collectProbes();
+            if (!probing) return true;
+            if (monoNow >= deadline) return false;
+            sleepFor(5.msecs);
+        }
+    }
+
+    /// Test-only: how many probe threads are tracked (at most one).
+    version (unittest) size_t probesInFlight()
+    {
+        return probing ? 1 : 0;
+    }
+
+    /// Test-only: whether the tracked probe thread has exited (its outcome is
+    /// final), without collecting or publishing it, so a test can order fake
+    /// time after the worker's own lateness verdict.
+    version (unittest) bool probeThreadExited()
+    {
+        return !probing || !pendingProbe.thread.running;
     }
 
     /// The thinking level the current model is sent, and why. A fixed budget
@@ -1827,7 +1925,7 @@ class Agent
         ctx.CompactionMode m = mode is null ? compactionMode : *mode;
         // Smart compaction points into the session log; without one it is standard.
         if (log.isNone) m = ctx.CompactionMode.standard;
-        bool smart = m == ctx.CompactionMode.smart;
+        bool smart = ctx.citesHistory(m);
         auto window = contextWindow();
         size_t bodyStart = messages.length && messages[0].role == Role.system ? 1 : 0;
         auto len = messages.length;
@@ -1868,7 +1966,15 @@ class Agent
         size_t drops;
         TokenUsage summaryUsage;
         long summaryMs = -1;
-        for (;;)
+        if (m == ctx.CompactionMode.extract)
+        {
+            // Built in code: no model call, so no usage, retry or fallback.
+            import nano.extract : extractSummary;
+            const swStart = monoNow;
+            summary = ctx.smartSummaryPrefix ~ "\n" ~ extractSummary(summarized) ~ "\n\n" ~ ctx.smartSummaryNote(first, last);
+            summaryMs = since(swStart).total!"msecs";
+        }
+        else for (;;)
         {
             // Every compaction (manual, threshold, overflow, idle) and its
             // retry summarizes on the model the user chose: a `/model` still
@@ -2105,7 +2211,7 @@ class Agent
         compactFloor = report.tokensAfter;
         idleGate.reset();
         compactions++;
-        historyAvailable = historyHintPending = m == ctx.CompactionMode.smart;
+        historyAvailable = historyHintPending = ctx.citesHistory(m);
         if (onCompacted !is null) onCompacted(report);
         return true;
     }

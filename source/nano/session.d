@@ -1857,7 +1857,8 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
             }
             {
                 auto mode = "mode" in data;
-                r.historyAvailable = mode !is null && mode.type == JSONType.string && mode.str == "smart";
+                r.historyAvailable = mode !is null && mode.type == JSONType.string
+                    && (mode.str == "smart" || mode.str == "extract");
                 r.historyHintConsumed = false;
             }
             // The replacement drops recalled notes from context, so recall

@@ -9,7 +9,7 @@ import nano.status : Stats;
 /// Copy the agent's live state into the status line's stats.
 void statusFromAgent(ref Stats s, Agent agent, string cwdShown)
 {
-    import nano.context : CompactionMode;
+    import nano.context : CompactionMode, citesHistory;
     s.provider = agent.client.providerName;
     s.model = agent.client.modelName;
     s.cwd = cwdShown;
@@ -33,6 +33,6 @@ void statusFromAgent(ref Stats s, Agent agent, string cwdShown)
     s.aic = agent.sessionAic;
     s.autoCompact = agent.autoCompact;
     s.threshold = agent.effectiveAutoCompactThreshold;
-    s.smartCompact = agent.compactionMode == CompactionMode.smart;
+    s.smartCompact = citesHistory(agent.compactionMode);
     s.compactions = agent.compactions;
 }
