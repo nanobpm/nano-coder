@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.22.3", "date": "2026-11-23", "items": [
+      {"type":"perf","scope":"session","title":"slim folded replies and Rust-era stashes on resume; skip superseded snapshots","pr":304}
+    ]},
     {"version": "1.22.2", "date": "2026-11-23", "items": [
       {"type":"perf","scope":"history","title":"skip non-message records by type without buffering them","pr":305}
     ]},
@@ -438,9 +441,6 @@
     ]},
     {"version": "0.29.1", "date": "2026-10-01", "items": [
       {"type":"fix","scope":"compact","title":"stream the summary request so idle-timeout proxies keep it alive","pr":82}
-    ]},
-    {"version": "0.29.0", "date": "2026-10-01", "items": [
-      {"type":"feat","scope":"status","title":"show home as ~ and elide the cwd's middle directories","pr":73}
     ]}
   ]
 }
