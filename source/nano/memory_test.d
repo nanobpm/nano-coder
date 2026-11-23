@@ -882,6 +882,69 @@ unittest // memory_verify bumps verified_at; search and index stay within their 
         s.saveFact(Scope.user, format("fact %s ", i) ~ "y".replicate(700), "check " ~ "z".replicate(300), null, null, null, false, o);
     }
     auto hits = s.search("fact", null);
-    assert(hits.length <= searchChars + 300, "search over its cap");
+    assert(hits.length <= searchChars, "search over its cap");
     assert(s.index(true).length <= indexChars);
+}
+
+unittest // registry lines with unknown fields or non-string array values are kept verbatim on rewrite
+{
+    auto s = store(tmp("facts-registry-strict"));
+    auto p = s.registryPath(Scope.user);
+    mkdirRecurse(dirName(p));
+    immutable badArr = `{"id":"host:a","aliases":["a.local",42]}`;
+    immutable badField = `{"id":"host:b","aliases":[],"owner":"ops"}`;
+    immutable badRel = `{"id":"host:c","runs_on":"host:d"}`;
+    write(p, badArr ~ "\n" ~ badField ~ "\n" ~ badRel ~ "\n");
+    s.addAlias(Scope.user, "host:e", "e.local");
+    auto text = readText(p);
+    assert(text.canFind(badArr) && text.canFind(badField) && text.canFind(badRel), text);
+}
+
+unittest // entity names, aliases and relation ends pass the secret guard before lower-casing
+{
+    auto s = store(tmp("facts-entity-secret"));
+    SaveOptions o;
+    o.entities = ["other:password=hunter2"];
+    assert(fails(s.saveFact(Scope.user, "a plain fact", null, null, null, null, false, o)));
+    assert(fails(s.addAlias(Scope.user, "other:password=hunter2", "x.local")));
+    assert(fails(s.addAlias(Scope.user, "host:x", "password=hunter2")));
+    assert(fails(s.addRelation(Scope.user, "other:password=hunter2", "runs_on", "host:y")));
+    assert(fails(s.addRelation(Scope.user, "service:y", "runs_on", "other:password=hunter2")));
+    assert(!exists(s.registryPath(Scope.user)) || !readText(s.registryPath(Scope.user)).canFind("hunter2"));
+}
+
+unittest // an omitted fact_kind and an explicit "fact" are the same kind for exact duplicates
+{
+    auto s = store(tmp("facts-dup-kind"));
+    SaveOptions o;
+    o.entities = ["host:merlin"];
+    s.saveFact(Scope.user, "merlin has 64GB of memory", null, null, null, null, false, o);
+    o.factKind = "fact";
+    o.distinct = true;
+    assert(fails(s.saveFact(Scope.user, "merlin has 64GB of memory", null, null, null, null, false, o)));
+    o.factKind = null;
+    s.saveFact(Scope.user, "merlin runs nwf", null, null, null, null, false, o);
+    o.factKind = "fact";
+    assert(fails(s.saveFact(Scope.user, "merlin runs nwf", null, null, null, null, false, o)));
+}
+
+unittest // entity listings stay within searchChars, cut on UTF-8 boundaries and marked
+{
+    import std.utf : validate;
+    auto s = store(tmp("facts-registry-cap"));
+    foreach (i; 0 .. 120)
+    {
+        import std.format : format;
+        s.addAlias(Scope.user, "host:big", format("é-alias-%03d-", i) ~ "ü".replicate(40));
+        s.addAlias(Scope.user, format("host:h%03d", i), "x" ~ "y".replicate(100) ~ format("%03d", i));
+    }
+    auto one = run(s, entityTool, parseJSON(`{"scope":"user","entity":"host:big"}`), null, true);
+    assert(one.length <= searchChars && one.canFind("[truncated]"), one[$ - 40 .. $]);
+    validate(one);
+    auto all_ = run(s, entityTool, parseJSON(`{"scope":"user"}`), null, true);
+    assert(all_.length <= searchChars && all_.canFind("more not shown"));
+    validate(all_);
+    auto edited = s.addAlias(Scope.user, "host:big", "one-more");
+    assert(edited.length <= searchChars);
+    validate(edited);
 }
