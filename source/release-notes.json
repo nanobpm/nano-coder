@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.24.0", "date": "2026-11-24", "items": [
+      {"type":"feat","scope":"sessions","title":"send messages between running sessions (session_send)","pr":295}
+    ]},
     {"version": "1.23.1", "date": "2026-11-24", "items": [
       {"type":"perf","scope":"tools","title":"stream bash output truncation and drop UTF-32 expansion","pr":317}
     ]},
@@ -438,9 +441,6 @@
     ]},
     {"version": "0.34.0", "date": "2026-10-02", "items": [
       {"type":"feat","scope":"settings","title":"apply provider edits and renderer switches live","pr":77}
-    ]},
-    {"version": "0.33.0", "date": "2026-10-02", "items": [
-      {"type":"feat","scope":"sessions","title":"pick a session to resume, with project and last prompt","pr":84}
     ]}
   ]
 }
