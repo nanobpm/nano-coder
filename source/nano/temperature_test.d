@@ -76,7 +76,6 @@ unittest
 }
 
 // rust: temperature.rs::models_without_temperature_only_use_the_default
-// rust: temperature.rs::muse_reasoning_models_ignore_a_configured_temperature
 unittest
 {
     ProviderConfig none;
@@ -91,12 +90,6 @@ unittest
     assert(isNaN(r.effective) && r.source == Source.required && r.warning.canFind("not finite"), r.warning);
     r = res(0.7, ProviderKind.openai, ("temperature = 0.5\ndrop_params = [\"temperature\"]\nextra_body = { temperature = nan }\n"), "k3");
     assert(r.source == Source.required && r.warning.canFind("not finite") && r.warning.canFind("0.5") && r.warning.canFind("ignored"), r.warning);
-
-    r = res(0.7, ProviderKind.muse, ("[models.\"muse-spark-1.3\"]\ntemperature = 0.3\n"), "muse-spark-1.3");
-    assert(isNaN(r.effective) && r.source == Source.required && r.fixed.canFind("reasoning model"));
-    assert(r.warning.canFind("0.3") && r.warning.canFind("ignored"), r.warning);
-    r = res(0.7, ProviderKind.muse, ("temperature = 0.5\n"), "muse-spark-1.3");
-    assert(isNaN(r.effective) && r.warning.canFind("0.5"), r.warning);
 }
 
 // rust: temperature.rs::most_specific_setting_wins

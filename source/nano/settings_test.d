@@ -21,50 +21,11 @@ private string scratch(string name)
     return d;
 }
 
-private string museLoginDir(string name)
-{
-    import muse = nano.muse;
-    auto d = scratch(name);
-    auto path = muse.credentialsPath(d);
-    mkdirRecurse(path.dirName);
-    write(path, `{"oauth_token":"tok","refresh_token":"refresh","api_key":"minted-key",`
-        ~ `"api_base":"https://api.meta.ai/v1","created_at":"2026-01-01T00:00:00Z"}`);
-    return d;
-}
-
-private ProviderConfig museProvider(string env = null, bool envSet = false)
-{
-    ProviderConfig p;
-    p.hasKind = true;
-    p.kind = ProviderKind.muse;
-    p.apiKeyEnv = env;
-    p.apiKeyEnvSet = envSet;
-    return p;
-}
-
-// rust: settings.rs::key_status_keeps_the_env_var_hint_when_a_muse_login_is_absent
-// rust: settings.rs::key_status_recognises_a_stored_muse_login_with_an_empty_api_key_env
-// rust: settings.rs::key_status_recognises_a_stored_muse_login_with_an_unset_api_key_env
-// rust: settings.rs::key_status_recognises_a_stored_muse_login_without_api_key_env
 // rust: settings.rs::key_status_reports_no_key_for_a_non_login_provider_without_credentials
-// rust: settings.rs::key_status_shows_the_muse_login_hint_when_no_env_var_and_not_logged_in
 unittest
 {
     auto none = scratch("nologin");
     scope (exit) rmdirRecurse(none);
-    auto login = museLoginDir("login");
-    scope (exit) rmdirRecurse(login);
-    enum unset = "NANO_CODER_TEST_MUSE_UNSET";
-
-    auto withEnv = museProvider(unset, true);
-    assert(keyStatus(withEnv, none) == "$" ~ unset ~ " missing; --login muse", keyStatus(withEnv, none));
-    assert(keyStatus(withEnv, login) == "logged in (unofficial)");
-    auto emptyEnv = museProvider("", true);
-    assert(keyStatus(emptyEnv, login) == "logged in (unofficial)");
-    auto bare = museProvider();
-    assert(keyStatus(bare, login) == "logged in (unofficial)");
-    assert(keyStatus(bare, none) == "not logged in; --login muse");
-
     ProviderConfig openai;
     openai.hasKind = true;
     openai.kind = ProviderKind.openai;

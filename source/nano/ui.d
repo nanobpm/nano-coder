@@ -72,13 +72,6 @@ string keyStatus(const ref ProviderConfig p, string dataDir = null)
         stored = copilot.loadCredentials(c, dataDir);
         login = "--login github-copilot";
     }
-    else if (p.hasKind && p.kind == ProviderKind.muse)
-    {
-        import muse = nano.muse;
-        muse.StoredCredentials c;
-        stored = muse.loadCredentials(c, dataDir);
-        login = "--login muse";
-    }
     if (stored) return "logged in (unofficial)";
     if (envVar !is null) return login !is null ? format("$%s missing; %s", envVar, login) : format("$%s missing", envVar);
     return login !is null ? "not logged in; " ~ login : "no key";
@@ -87,14 +80,7 @@ string keyStatus(const ref ProviderConfig p, string dataDir = null)
 /// Where a provider with no `base_url` gets its endpoint.
 string derivedEndpointSource(const ref ProviderConfig p)
 {
-    import std.process : environment;
     if (p.hasKind && p.kind == ProviderKind.githubCopilot) return "(from session token)";
-    if (p.hasKind && p.kind == ProviderKind.muse)
-    {
-        bool direct = p.apiKey.length || p.apiKeyCommand.length
-            || (p.apiKeyEnv.length && environment.get(p.apiKeyEnv, "").length);
-        return direct ? "(from API key)" : "(from minted key)";
-    }
     return "-";
 }
 
@@ -107,7 +93,6 @@ private string kindLabel(const ref ProviderConfig p) pure
         case ProviderKind.openai: return "openai";
         case ProviderKind.anthropic: return "anthropic";
         case ProviderKind.githubCopilot: return "githubcopilot";
-        case ProviderKind.muse: return "muse";
         case ProviderKind.mock: return "mock";
     }
 }
@@ -127,7 +112,6 @@ string providersListing(const ProviderConfig[string] providers, string defaultPr
     return out_;
 }
 
-// rust: settings.rs::derived_endpoint_source_distinguishes_muse_credential_lanes
 // rust: vision.rs::built_in_openai_assumption_is_scoped_to_the_first_party_api
 // rust: ui.rs::parses_and_orders_verbosity
 unittest
@@ -160,12 +144,6 @@ unittest
     c.apiKeyEnv = "NANO_UI_TEST_UNSET_VAR";
     assert(keyStatus(c, dir) == "$NANO_UI_TEST_UNSET_VAR missing; --login github-copilot");
     assert(derivedEndpointSource(c) == "(from session token)");
-    ProviderConfig m;
-    m.hasKind = true;
-    m.kind = ProviderKind.muse;
-    assert(derivedEndpointSource(m) == "(from minted key)");
-    m.apiKey = "x";
-    assert(derivedEndpointSource(m) == "(from API key)");
     ProviderConfig o;
     o.hasKind = true;
     o.kind = ProviderKind.openai;

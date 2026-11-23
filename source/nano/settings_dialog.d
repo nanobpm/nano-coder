@@ -441,9 +441,8 @@ private string editProvider(SettingsUi ui, ref SettingsHost h, ref string[] noti
     ProviderConfig preset = presetP !is null ? *presetP : ProviderConfig.init;
     string currentUrl = current.baseUrl.length ? current.baseUrl : name == "qwen" ? preset.baseUrl : "";
 
-    immutable kinds = [ProviderKind.openai, ProviderKind.anthropic, ProviderKind.githubCopilot, ProviderKind.muse];
-    auto kindLabels = ["OpenAI-compatible (/chat/completions)", "Anthropic (/messages)", "GitHub Copilot (unofficial)",
-        "Muse Code (unofficial)"];
+    immutable kinds = [ProviderKind.openai, ProviderKind.anthropic, ProviderKind.githubCopilot];
+    auto kindLabels = ["OpenAI-compatible (/chat/completions)", "Anthropic (/messages)", "GitHub Copilot (unofficial)"];
     size_t kindDefault;
     foreach (i, k; kinds) if (current.hasKind && current.kind == k) kindDefault = i;
     auto ki = ui.select("API kind", kindLabels, kindDefault);
@@ -473,7 +472,7 @@ private string editProvider(SettingsUi ui, ref SettingsHost h, ref string[] noti
         string dflt = forceUrl ? "" : current.baseUrl.length ? current.baseUrl
             : kind == ProviderKind.githubCopilot && choice == 0 && name !in cfg.providers && domain() == "github.com"
                 ? defaultApiBase : "";
-        bool optional = kind == ProviderKind.githubCopilot || kind == ProviderKind.muse;
+        bool optional = kind == ProviderKind.githubCopilot;
         for (;;)
         {
             auto u = ui.input("Base URL (e.g. http://merlin.local:8000/v1)", dflt);
@@ -550,7 +549,6 @@ private string kindLabelOf(ProviderKind k) pure nothrow
         case ProviderKind.openai: return "openai";
         case ProviderKind.anthropic: return "anthropic";
         case ProviderKind.githubCopilot: return "githubcopilot";
-        case ProviderKind.muse: return "muse";
         case ProviderKind.mock: return "mock";
     }
 }
