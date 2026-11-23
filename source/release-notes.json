@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.23.1", "date": "2026-11-24", "items": [
+      {"type":"perf","scope":"tools","title":"stream bash output truncation and drop UTF-32 expansion","pr":317}
+    ]},
     {"version": "1.23.0", "date": "2026-11-24", "items": [
       {"type":"feat","scope":"skills","title":"pick up added, removed and edited skills between turns","pr":320}
     ]},
@@ -438,9 +441,6 @@
     ]},
     {"version": "0.33.0", "date": "2026-10-02", "items": [
       {"type":"feat","scope":"sessions","title":"pick a session to resume, with project and last prompt","pr":84}
-    ]},
-    {"version": "0.32.1", "date": "2026-10-02", "items": [
-      {"type":"fix","scope":"","title":"update command in README","pr":89}
     ]}
   ]
 }
