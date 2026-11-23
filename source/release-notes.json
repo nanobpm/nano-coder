@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.16.0", "date": "2026-11-23", "items": [
+      {"type":"feat","scope":"sessions","title":"read another session's history (sessions_list, session argument)","pr":277}
+    ]},
     {"version": "1.15.1", "date": "2026-11-23", "items": [
       {"type":"fix","scope":"http","title":"send one Content-Type on POST requests","pr":291}
     ]},
@@ -438,9 +441,6 @@
     ]},
     {"version": "0.22.0", "date": "2026-09-30", "items": [
       {"type":"feat","scope":"cli","title":"steer a running turn with Enter, queue with Ctrl-Enter","pr":53}
-    ]},
-    {"version": "0.21.2", "date": "2026-09-30", "items": [
-      {"type":"fix","scope":"cli","title":"make Ctrl-C exit visible and robust in the frame renderer","pr":54}
     ]}
   ]
 }
