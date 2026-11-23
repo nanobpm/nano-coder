@@ -33,6 +33,7 @@ import std.conv : to;
 import std.file;
 import std.format : format;
 import std.json;
+import std.sumtype : SumType, match;
 import std.path;
 import std.process : environment;
 import std.string : strip, stripLeft, stripRight, indexOf, lineSplitter, toLower, chompPrefix, KeepTerminator;
@@ -142,6 +143,14 @@ final class Skills
     /// Problems found while loading (bad lock entries, failed fetches...).
     string[] warnings;
     private bool[string] seen;
+    /// What `fingerprintIn` saw just before this set was discovered: compared
+    /// with a fresh one at each turn boundary to tell whether to rediscover.
+    string fingerprint;
+    /// `.git/HEAD` of every candidate checkout of each `ai.lock` entry, and
+    /// what they looked like before loading: a locked commit installed (or
+    /// removed) later without touching `ai.lock` still shows as a change.
+    private LockWatch[] lockWatch;
+    private string lockPrint;
 
     static Skills discover(string cwd, const ref SkillsConfig config)
     {
@@ -151,6 +160,8 @@ final class Skills
     static Skills discoverIn(string cwd, const ref SkillsConfig config, Locations locations)
     {
         auto s = new Skills;
+        // Taken first, so an edit made during discovery shows as a change next time.
+        s.fingerprint = fingerprintIn(cwd, config, locations);
         auto c = canonical(cwd);
         if (c is null) c = cwd;
         auto root = gitRoot(c);
@@ -233,22 +244,37 @@ final class Skills
     {
         auto locked = Locked.parse(entry);
         locked.validate(name);
+        // Watch the candidate checkouts before loading, so an install racing
+        // discovery still shows as a change next turn.
+        foreach (base; [locations.spmStore, locations.cache])
+            if (base.length)
+                watch(LockWatch(FileWatch(buildPath(base, locked.store, ".git", "HEAD"))));
         auto checkout = canonical(checkoutFor(locked, config, locations));
         if (checkout is null) throw new Exception("checkout is missing");
         auto rel = locked.path.length ? locked.path : ".";
+        // Watch the logical files before any early exit, so creating or
+        // restoring them (HEAD unchanged) still shows as a change.
+        auto logical = buildPath(checkout, rel);
+        watch(LockWatch(FileWatch(isPlugin ? buildPath(logical, ".claude-plugin", "plugin.json")
+            : buildPath(logical, skillFile))));
         auto content = within(checkout, buildPath(checkout, rel));
         if (content is null) throw new Exception(format("path `%s` is missing or outside the checkout", rel));
         auto source = Source(Source.Kind.lock, locked.git, locked.commit);
         if (!isPlugin)
         {
-            if (within(checkout, buildPath(content, skillFile)) is null)
+            auto sf = within(checkout, buildPath(content, skillFile));
+            if (sf is null)
                 throw new Exception(format("no %s inside the checkout at the locked path", skillFile));
+            // The checkout's working tree may change without HEAD moving.
+            if (sf != buildPath(logical, skillFile)) watch(LockWatch(FileWatch(sf)));
             Skill sk;
             if (!readSkill(content, name, source, sk)) throw new Exception(format("no %s in the locked path", skillFile));
             push(sk);
             return;
         }
         auto skillsRel = pluginSkillsDir(content);
+        // Watched even when missing, so recreating the folder is a change.
+        watch(LockWatch(PluginWatch(checkout, buildPath(content, skillsRel))));
         auto skillsDir = within(checkout, buildPath(content, skillsRel));
         if (skillsDir is null || !skillsDir.isDir) return;
         auto dirs = listDir(skillsDir, SpanMode.shallow).map!(e => e.name).array.sort.array;
@@ -259,6 +285,23 @@ final class Skills
             Skill sk;
             if (readSkill(rp, null, source, sk)) push(sk);
         }
+    }
+
+    /// True when the skill files on disk no longer match what this set was
+    /// discovered from (stat only: reads no `SKILL.md`).
+    bool stale(string cwd, const ref SkillsConfig config, Locations locations) const
+    {
+        if (fingerprintIn(cwd, config, locations) != fingerprint) return true;
+        import std.array : appender;
+        auto now = appender!string;
+        foreach (w; lockWatch) now ~= watchLine(w);
+        return now[] != lockPrint;
+    }
+
+    private void watch(LockWatch w)
+    {
+        lockWatch ~= w;
+        lockPrint ~= watchLine(w);
     }
 
     bool empty() pure const { return skills.length == 0; }
@@ -332,6 +375,153 @@ ToolDefinition definition() pure
         parseJSON(`{"type":"object","properties":{"name":{"type":"string","description":"The skill's name, exactly as listed."}},"required":["name"]}`));
 }
 
+/// What changed between two skill sets, as `updated a; added b; removed c`
+/// (empty when names and descriptions are the same).
+string describeChanges(const Skills before, const Skills after) pure
+{
+    string[] updated, added, removed;
+    foreach (a; after.skills)
+    {
+        auto i = before.skills.countUntil!(b => b.name == a.name);
+        if (i < 0) added ~= a.name;
+        else if (before.skills[i].description != a.description || before.skills[i].dir != a.dir
+                || before.skills[i].source != a.source)
+            updated ~= a.name;
+    }
+    foreach (b; before.skills)
+        if (!after.skills.any!(a => a.name == b.name)) removed ~= b.name;
+    string[] parts;
+    if (updated.length) parts ~= "updated " ~ updated.join(", ");
+    if (added.length) parts ~= "added " ~ added.join(", ");
+    if (removed.length) parts ~= "removed " ~ removed.join(", ");
+    return parts.join("; ");
+}
+
+/// A stat-only signature of everything `Skills.discoverIn` would read: the
+/// directories it would scan (and their listings), each `SKILL.md`'s path,
+/// size and mtime, and `ai.lock`/`ai.json`. Same roots, depth cap and
+/// containment rules as discovery; no file contents are read. Locked
+/// checkouts are pinned by commit; `Skills.stale` also watches whether
+/// each one is installed.
+string fingerprintIn(string cwd, const ref SkillsConfig config, Locations locations)
+{
+    import std.array : appender;
+    auto o = appender!string;
+    auto c = canonical(cwd);
+    if (c is null) c = cwd;
+    auto root = gitRoot(c);
+    if (root is null) root = c;
+    auto confine = canonical(root);
+    void dirPrint(string dir, string limit)
+    {
+        o ~= "D\0" ~ dir ~ "\0";
+        auto r = canonical(dir);
+        if (r is null || (limit !is null && !startsWithPath(r, limit))) return;
+        fingerprintScan(r, r, 0, o);
+    }
+    foreach (dir; config.dirs) dirPrint(buildPath(root, dir), confine);
+    if (config.aiLock)
+        foreach (f; [lockFile, manifestFile]) o ~= statLine(buildPath(root, f));
+    foreach (dir; config.userDirs)
+    {
+        if (dir.startsWith("~/"))
+        {
+            if (locations.home.length) dirPrint(buildPath(locations.home, dir[2 .. $]), null);
+        }
+        else dirPrint(dir, null);
+    }
+    return o[];
+}
+
+/// A file whose stat is part of a locked entry's signature.
+private struct FileWatch { string path; }
+
+/// A plugin's skills folder (logical path, may be missing) inside its checkout.
+private struct PluginWatch { string checkout; string dir; }
+
+/// One watched item of a locked entry; recorded and re-checked in the same
+/// order by the same `watchLine`, so an unchanged set always compares equal.
+private alias LockWatch = SumType!(FileWatch, PluginWatch);
+
+private string watchLine(const LockWatch w)
+{
+    return w.match!(
+        (const FileWatch f) => statLine(f.path),
+        (const PluginWatch p) => pluginLine(p.checkout, p.dir));
+}
+
+/// A shallow signature of a plugin skills folder with the loader's child
+/// selection: every immediate child within the checkout, and its `SKILL.md`.
+private string pluginLine(string checkout, string logical)
+{
+    auto dir = within(checkout, logical);
+    bool isDir;
+    try isDir = dir !is null && dir.isDir;
+    catch (FileException) {} // vanished mid-check: missing now
+    if (!isDir) return "m\0" ~ logical ~ "\0";
+    string o = "p\0" ~ dir ~ "\0";
+    string[] names;
+    try names = listDir(dir, SpanMode.shallow).map!(e => e.name).array.sort.array;
+    catch (FileException) return o ~ "?\0";
+    foreach (d; names)
+    {
+        auto rp = within(checkout, d);
+        if (rp is null) { o ~= "x\0" ~ d ~ "\0"; continue; }
+        // The canonical folder too: a renamed symlink target is a change.
+        o ~= "c\0" ~ d ~ "\0" ~ rp ~ "\0";
+        auto sf = within(checkout, buildPath(rp, skillFile));
+        o ~= sf is null ? "-\0" : statLine(sf);
+    }
+    return o;
+}
+
+private string statLine(string path)
+{
+    try
+    {
+        if (!path.exists || !path.isFile) return "-\0" ~ path ~ "\0";
+        return format("F\0%s\0%s\0%s\0", path, getSize(path), timeLastModified(path).stdTime);
+    }
+    catch (FileException) return "?\0" ~ path ~ "\0"; // vanished mid-check: a change all the same
+}
+
+/// `scan`, recording what it looks at instead of collecting skills. A
+/// skill folder is recognised from its `SKILL.md` without listing it; other
+/// folders are listed once, a plain (non-symlink) entry under a canonical
+/// folder is taken as canonical, and only symlinks pay for a `realpath`
+/// containment check.
+private void fingerprintScan(Out)(string root, string dir, size_t depth, ref Out o)
+{
+    // A skill folder first, as `scan` does: its siblings are never listed.
+    if (auto sf = within(root, buildPath(dir, skillFile)))
+    {
+        bool file;
+        try file = sf.isFile;
+        catch (FileException) {} // vanished mid-check: not a skill now
+        // The folder too: a symlinked SKILL.md's line names only its
+        // target, so renaming the folder would otherwise go unseen.
+        if (file) { o ~= "s\0" ~ dir ~ "\0" ~ statLine(sf); return; }
+    }
+    o ~= "d\0" ~ dir ~ "\0";
+    if (depth >= maxScanDepth) return;
+    string[] dirs;
+    try
+        foreach (DirEntry e; listDir(dir, SpanMode.shallow))
+        {
+            // A directory named SKILL.md is searched like any other.
+            if (e.name.baseName.startsWith(".")) continue;
+            if (!e.isSymlink) { if (e.isDir && !e.name.pathSplitter.canFind(".git")) dirs ~= e.name; }
+            else if (auto rp = within(root, e.name)) if (rp.isDir) dirs ~= rp;
+        }
+    catch (FileException) { o ~= "?\0" ~ dir ~ "\0"; return; }
+    dirs.sort();
+    foreach (sub; dirs) fingerprintScan(root, sub, depth + 1, o);
+}
+
+/// `SKILL.md` files read by discovery on this thread (tests check the
+/// no-change path reads none).
+package size_t skillFileReads;
+
 // ---- helpers ----
 
 /// The rp path of `p` (symlinks resolved), or null if it doesn't exist.
@@ -389,6 +579,7 @@ private void scan(string root, string dir, size_t depth, ref string[] out_)
 private bool readSkill(string dir, string nameOverride, Source source, out Skill sk)
 {
     string text;
+    skillFileReads++;
     try text = lossyUtf8(readBytes(buildPath(dir, skillFile)));
     catch (Exception) return false; // an unreadable SKILL.md is not a skill
     string[2][] fields;
@@ -840,7 +1031,13 @@ unittest // loads_ai_lock_skills_and_plugin_skills_by_fetching_into_the_cache
     assert(listDir(repo, SpanMode.shallow, true).length == 2);
     // Second run reads the cache; fetching is not needed.
     c.fetch = false;
-    assert(Skills.discoverIn(repo, c, locs(dir)).names == ["lint", "triage"]);
+    auto again = Skills.discoverIn(repo, c, locs(dir));
+    assert(again.names == ["lint", "triage"]);
+    assert(!again.stale(repo, c, locs(dir)));
+    // An edit or a new skill inside the cached plugin checkout is a change.
+    auto cached = buildPath(dir, "cache", storeKey(url, sha));
+    put(buildPath(cached, "plugin/bundled/extra/SKILL.md"), skillMd("extra", "Extra."));
+    assert(again.stale(repo, c, locs(dir)));
 }
 
 // rust: skills.rs::prefers_the_spm_store_and_guards_untrusted_lock_entries
@@ -906,4 +1103,175 @@ unittest // parses_git_hosts, store_key_matches_spm
     assert(gitHost("file:///tmp/x") == "file");
     auto z = "0".replicate(40);
     assert(storeKey("https://github.com/camunda/skills.git", z) == "skills-f3b38a5efdfe31f3@" ~ z);
+}
+
+unittest // picks_up_edited_added_and_removed_skills_with_a_stat_only_check
+{
+    auto dir = tmpRoot("refresh");
+    auto repo = buildPath(dir, "repo");
+    mkdirRecurse(buildPath(repo, ".git"));
+    auto home = buildPath(dir, "home");
+    put(buildPath(home, ".agents/skills/web/SKILL.md"), skillMd("web", "Over plain HTTP with curl."));
+    put(buildPath(home, ".agents/skills/old/SKILL.md"), skillMd("old", "Old one."));
+    auto c = cfg();
+    auto s = Skills.discoverIn(repo, c, locs(dir));
+    auto index = s.renderIndex;
+
+    // Untouched: no rediscovery, no SKILL.md read, the same index bytes.
+    auto reads = skillFileReads;
+    assert(!s.stale(repo, c, locs(dir)));
+    assert(skillFileReads == reads);
+    assert(Skills.discoverIn(repo, c, locs(dir)).renderIndex == index);
+
+    // Edit a description, add one, remove one.
+    put(buildPath(home, ".agents/skills/web/SKILL.md"), skillMd("web", "Over HTTP with d8ctl, the CLI."));
+    put(buildPath(home, ".agents/skills/foo/SKILL.md"), skillMd("foo", "Foo things."));
+    rmdirRecurse(buildPath(home, ".agents/skills/old"));
+    assert(s.stale(repo, c, locs(dir)));
+    auto fresh = Skills.discoverIn(repo, c, locs(dir));
+    assert(describeChanges(s, fresh) == "updated web; added foo; removed old", describeChanges(s, fresh));
+    assert(fresh.renderIndex.canFind("d8ctl") && !fresh.renderIndex.canFind("old"));
+    assert(!fresh.stale(repo, c, locs(dir)));
+    assert(describeChanges(fresh, fresh) == "");
+
+    // An untrusted repository keeps no repo skills, before or after a change.
+    auto untrusted = cfg();
+    untrusted.dirs = null;
+    untrusted.aiLock = false;
+    auto u = Skills.discoverIn(repo, untrusted, locs(dir));
+    put(buildPath(repo, ".agents/skills/evil/SKILL.md"), skillMd("evil", "Repo skill."));
+    assert(!u.stale(repo, untrusted, locs(dir)));
+    assert(!Skills.discoverIn(repo, untrusted, locs(dir)).names.canFind("evil"));
+    assert(s.stale(repo, c, locs(dir))); // trusted config does watch it
+}
+
+unittest // sees_a_locked_checkout_installed_later_and_a_renamed_symlinked_skill_folder
+{
+    import std.array : replicate;
+    import std.file : rename, symlink;
+    auto dir = tmpRoot("lockwatch");
+    auto url = "https://github.com/acme/skills.git";
+    auto sha = "c".replicate(40);
+    auto repo = buildPath(dir, "repo");
+    mkdirRecurse(buildPath(repo, ".git"));
+    JSONValue entry = ["git": url, "reference": "tag:v1", "commit": sha, "path": "fmt", "store": storeKey(url, sha)];
+    put(buildPath(repo, "ai.lock"), JSONValue(["skills": JSONValue(["fmt": entry])]).toString);
+    auto c = cfg();
+    c.fetch = false;
+    auto s = Skills.discoverIn(repo, c, locs(dir));
+    assert(s.names == [] && s.warnings.length == 1, s.warnings.join("\n"));
+    assert(!s.stale(repo, c, locs(dir)));
+    // spm installs the pinned commit; ai.lock is untouched.
+    auto store = buildPath(dir, "spm/store", storeKey(url, sha));
+    put(buildPath(store, ".git/HEAD"), sha ~ "\n");
+    put(buildPath(store, "fmt/SKILL.md"), skillMd("fmt", "Format files."));
+    assert(s.stale(repo, c, locs(dir)));
+    auto fresh = Skills.discoverIn(repo, c, locs(dir));
+    assert(fresh.names == ["fmt"] && !fresh.stale(repo, c, locs(dir)));
+    // Editing the installed checkout's SKILL.md (HEAD unchanged) is a change.
+    put(buildPath(store, "fmt/SKILL.md"), skillMd("fmt", "Format files, now with more words."));
+    assert(fresh.stale(repo, c, locs(dir)));
+
+    // A symlinked SKILL.md inside the root: renaming its folder is a change.
+    auto home = buildPath(dir, "home");
+    put(buildPath(home, ".agents/skills/target.md"), skillMd("lnk", "Linked."));
+    mkdirRecurse(buildPath(home, ".agents/skills/a"));
+    symlink(buildPath(home, ".agents/skills/target.md"), buildPath(home, ".agents/skills/a/SKILL.md"));
+    auto u = Skills.discoverIn(repo, c, locs(dir));
+    assert(!u.stale(repo, c, locs(dir)));
+    rename(buildPath(home, ".agents/skills/a"), buildPath(home, ".agents/skills/b"));
+    assert(u.stale(repo, c, locs(dir)));
+}
+
+unittest // locked_plugin_watches_are_stable_and_see_metadata_folders_and_missing_files
+{
+    import std.array : replicate;
+    import std.file : rename;
+    auto dir = tmpRoot("pluginwatch");
+    auto url = "https://github.com/acme/skills.git";
+    auto sha = "d".replicate(40);
+    auto store = buildPath(dir, "spm/store", storeKey(url, sha));
+    put(buildPath(store, ".git/HEAD"), sha ~ "\n");
+    put(buildPath(store, "p1/skills/a/SKILL.md"), skillMd("a", "A."));
+    put(buildPath(store, "p2/skills/b/SKILL.md"), skillMd("b", "B."));
+    put(buildPath(store, "p2/other/c/SKILL.md"), skillMd("c", "C."));
+    auto repo = buildPath(dir, "repo");
+    mkdirRecurse(buildPath(repo, ".git"));
+    JSONValue entry(string path)
+    {
+        return JSONValue(["git": url, "reference": "tag:v1", "commit": sha, "path": path, "store": storeKey(url, sha)]);
+    }
+    JSONValue lock = ["plugins": JSONValue(["p1": entry("p1"), "p2": entry("p2")]),
+        "skills": JSONValue(["s": entry("s")])];
+    put(buildPath(repo, "ai.lock"), lock.toString);
+    auto c = cfg();
+    c.fetch = false;
+    auto s = Skills.discoverIn(repo, c, locs(dir));
+    assert(s.names == ["a", "b"], s.names.join(","));
+    // Two unchanged plugins are not stale.
+    assert(!s.stale(repo, c, locs(dir)));
+    // A missing locked SKILL.md appearing is a change.
+    put(buildPath(store, "s/SKILL.md"), skillMd("s", "S."));
+    assert(s.stale(repo, c, locs(dir)));
+    s = Skills.discoverIn(repo, c, locs(dir));
+    assert(s.names == ["s", "a", "b"] && !s.stale(repo, c, locs(dir)), s.names.join(","));
+    // Plugin metadata pointing at another folder is a change.
+    put(buildPath(store, "p2/.claude-plugin/plugin.json"), `{"skills":"other"}`);
+    assert(s.stale(repo, c, locs(dir)));
+    s = Skills.discoverIn(repo, c, locs(dir));
+    assert(s.names == ["s", "a", "c"] && !s.stale(repo, c, locs(dir)), s.names.join(","));
+    // A removed skills folder stays watched: recreating it is a change.
+    rename(buildPath(store, "p1/skills"), buildPath(store, "p1/gone"));
+    assert(s.stale(repo, c, locs(dir)));
+    s = Skills.discoverIn(repo, c, locs(dir));
+    assert(s.names == ["s", "c"] && !s.stale(repo, c, locs(dir)), s.names.join(","));
+    rename(buildPath(store, "p1/gone"), buildPath(store, "p1/skills"));
+    assert(s.stale(repo, c, locs(dir)));
+    // A hidden child the loader reads is watched too.
+    put(buildPath(store, "p1/skills/.h/SKILL.md"), skillMd("h", "H."));
+    s = Skills.discoverIn(repo, c, locs(dir));
+    assert(s.names.canFind("h") && !s.stale(repo, c, locs(dir)), s.names.join(","));
+    put(buildPath(store, "p1/skills/.h/SKILL.md"), skillMd("h", "H, edited at length."));
+    assert(s.stale(repo, c, locs(dir)));
+}
+
+unittest // fingerprints_a_directory_named_skill_md_and_ignores_skill_siblings
+{
+    auto dir = tmpRoot("nested");
+    auto repo = buildPath(dir, "repo");
+    mkdirRecurse(buildPath(repo, ".git"));
+    auto home = buildPath(dir, "home");
+    put(buildPath(home, ".agents/skills/SKILL.md/foo/SKILL.md"), skillMd("foo", "Foo."));
+    put(buildPath(home, ".agents/skills/web/SKILL.md"), skillMd("web", "Web."));
+    auto c = cfg();
+    auto s = Skills.discoverIn(repo, c, locs(dir));
+    assert(s.names.canFind("foo"), s.names.join(","));
+    // A supporting file beside a skill's SKILL.md is not part of the index.
+    put(buildPath(home, ".agents/skills/web/notes.txt"), "notes");
+    assert(!s.stale(repo, c, locs(dir)));
+    // Edits beneath a directory named SKILL.md are seen.
+    put(buildPath(home, ".agents/skills/SKILL.md/bar/SKILL.md"), skillMd("bar", "Bar."));
+    assert(s.stale(repo, c, locs(dir)));
+}
+
+unittest // the_no_change_check_on_50_skills_is_cheap
+{
+    auto dir = tmpRoot("bench");
+    auto home = buildPath(dir, "home");
+    foreach (i; 0 .. 50)
+        put(buildPath(home, format(".agents/skills/s%02d/SKILL.md", i)), skillMd(format("s%02d", i), "A skill."));
+    auto c = cfg();
+    auto s = Skills.discoverIn(dir, c, locs(dir));
+    assert(s.skills.length == 50);
+    enum runs = 20;
+    // Deterministic cost check: the no-change path reads no SKILL.md file.
+    auto reads = skillFileReads;
+    debug (benchSkills) auto t0 = monoNow;
+    foreach (_; 0 .. runs) assert(!s.stale(dir, c, locs(dir)));
+    assert(skillFileReads == reads);
+    debug (benchSkills)
+    {
+        import std.stdio : writeln;
+        writeln("skills no-change check, 50 skills: ", (monoNow - t0) / runs);
+    }
 }
