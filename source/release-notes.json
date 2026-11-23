@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.19.0", "date": "2026-11-23", "items": [
+      {"type":"feat","scope":"agent","title":"report the nano-coder version in session_settings get","pr":296}
+    ]},
     {"version": "1.18.0", "date": "2026-11-23", "items": [
       {"type":"feat","scope":"agent","title":"session_settings tool to read and adjust the session's compaction","pr":294}
     ]},
@@ -438,9 +441,6 @@
     ]},
     {"version": "0.25.0", "date": "2026-09-30", "items": [
       {"type":"feat","scope":"tui","title":"command menu in the frame renderer; make frame the default","pr":55}
-    ]},
-    {"version": "0.24.0", "date": "2026-09-30", "items": [
-      {"type":"feat","scope":"session","title":"record thinking, token usage and request duration per assistant message","pr":58}
     ]}
   ]
 }
