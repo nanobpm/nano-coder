@@ -438,6 +438,10 @@ final class FrameRenderer
     // `string[]` so shrinking the editor doesn't pin a second full transcript
     // in memory (issue #310).
     private ubyte[32] frozenHash;
+    // Cheap identity fingerprint of the same prefix (each row's ptr/length):
+    // the transcript cache shares backing strings across frames, so on the
+    // hot render path this matches and the SHA-256 content hash is skipped.
+    private ulong frozenIdHash;
     // A row of `prev` whose predecessor still carries a terminal wrap flag
     // (it was a continuation, now blank at the top of the screen): the
     // physical join survives until the row is redrawn from scratch.
@@ -476,7 +480,23 @@ final class FrameRenderer
         prev = frame.dup;
         frozen = frozenLogical = 0;
         frozenHash = (ubyte[32]).init;
+        frozenIdHash = 0;
         staleJoin = size_t.max;
+    }
+
+    /// Mixes each row's slice identity (pointer and length), not its bytes:
+    /// O(rows) word operations, used to skip `hashRows` when the frozen
+    /// prefix is the very same strings as last time.
+    private static ulong identityHash(const(string)[] rows) pure nothrow @nogc
+    {
+        ulong h = 0xcbf29ce484222325UL ^ rows.length;
+        foreach (r; rows)
+        {
+            h = (h ^ hashOf(r.length ? &r[0] : null)) * 0x100000001b3UL;
+            h = (h ^ r.length) * 0x100000001b3UL;
+            h ^= h >> 29;
+        }
+        return h;
     }
 
     /// SHA-256 over `rows` with length prefixes so boundaries are unambiguous.
@@ -512,7 +532,8 @@ final class FrameRenderer
         if (frozen)
         {
             if (frame.length < frozenLogical || prev.length < frozen
-                || hashRows(frame[0 .. frozenLogical]) != frozenHash
+                || (identityHash(frame[0 .. frozenLogical]) != frozenIdHash
+                    && hashRows(frame[0 .. frozenLogical]) != frozenHash)
                 || (gapAt != size_t.max && gapAt < frozenLogical))
                 return fullRedraw(inFrame, width, height);
             frame = prev[0 .. frozen] ~ frame[frozenLogical .. $];
@@ -559,6 +580,7 @@ final class FrameRenderer
                 frozen = top;
                 frozenLogical = logicalGap;
                 frozenHash = hashRows(inFrame[0 .. logicalGap]);
+                frozenIdHash = identityHash(inFrame[0 .. logicalGap]);
                 d = firstDiff(prev, shown);
                 if (d < 0) { prev = shown; return; }
             }
@@ -3013,6 +3035,12 @@ unittest
     r.render(rendered ~ ["e0"], 80, 24, rendered.length);
     auto shrinkAlloc = GC.stats.allocatedInCurrentThread - beforeShrink;
     assert(r.frozen > 0 && r.frozenHash != (ubyte[32]).init);
+    // The identity fingerprint matches the shared rows (fast path) but not
+    // equal-content copies, which fall back to the content hash.
+    assert(FrameRenderer.identityHash(rendered) == r.frozenIdHash);
+    string[] copies;
+    foreach (x; rendered) copies ~= x.idup;
+    assert(FrameRenderer.identityHash(copies) != r.frozenIdHash);
     // Differential shrink hashes the frozen prefix in place (32 bytes) instead
     // of duplicating the scrollback string[].
     assert(shrinkAlloc < 2 * 1024 * 1024, format("expected < 2 MiB for shrink, got %s bytes", shrinkAlloc));
