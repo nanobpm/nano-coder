@@ -2906,6 +2906,7 @@ unittest
     {
         auto p = tmpFile("stream-utf8.txt", null);
         scope (exit) if (p.exists) remove(p);
+        size_t pad;
         {
             auto f = File(p, "wb");
             // Line 1: exactly maxLineChars 'a's + "\r\n" -> must NOT be truncated.
@@ -2918,7 +2919,7 @@ unittest
                 f.rawWrite(filler);
                 written += filler.length;
             }
-            size_t pad = (64 * 1024 - 1) - written;
+            pad = (64 * 1024 - 1) - written;
             if (pad > 0) f.rawWrite("c".replicate(pad));
             f.rawWrite("€end\n");
         }
@@ -2928,6 +2929,10 @@ unittest
         assert(head.indexOf("     1\t" ~ "a".replicate(maxLineChars) ~ "\n") == 0);
         // Freshness check confirms ReadState received the exact full-file SHA-256.
         st.checkFresh(p, readBytes(p), "edit_file");
+        // The line holding the split '€' must come out whole, with no carried byte lost or doubled.
+        size_t lastLine = readBytes(p).count('\n');
+        auto tail = readFile(j("path", p, "offset", lastLine, "limit", 1), st);
+        assert(tail.indexOf(format("%6d\t%s€end\n", lastLine, "c".replicate(pad))) == 0, tail);
     }
 
     // 2. Memory bound: reading 10 lines from a 16 MiB file must stay well under 4 MiB GC allocated.
@@ -2950,6 +2955,26 @@ unittest
         auto allocated = GC.stats.allocatedInCurrentThread - before;
         assert(got.indexOf("    10\t") == 0, got);
         assert(got.indexOf("(262130 more lines; use offset=15 to continue)") > 0, got);
+        assert(allocated < 4 * 1024 * 1024, format("expected < 4 MiB allocated, got %s bytes", allocated));
+    }
+
+    // 3. Memory bound for one oversized line: an 8 MiB single line is truncated, not buffered whole.
+    {
+        auto p = tmpFile("stream-longline.txt", null);
+        scope (exit) if (p.exists) remove(p);
+        {
+            auto f = File(p, "wb");
+            string block = "z".replicate(64 * 1024);
+            foreach (_; 0 .. 128)
+                f.rawWrite(block);
+            f.rawWrite("\n");
+        }
+        auto st = new ReadState;
+        GC.collect();
+        auto before = GC.stats.allocatedInCurrentThread;
+        auto got = readFile(j("path", p, "offset", 1, "limit", 1), st);
+        auto allocated = GC.stats.allocatedInCurrentThread - before;
+        assert(got == "     1\t" ~ "z".replicate(maxLineChars) ~ " [line truncated]\n", got[0 .. min(got.length, 200)]);
         assert(allocated < 4 * 1024 * 1024, format("expected < 4 MiB allocated, got %s bytes", allocated));
     }
 }
