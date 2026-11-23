@@ -3910,6 +3910,20 @@ class Agent
     /// the old model doesn't.
     void useClient(LLMClient c, ConfiguredWindow window, bool logChange = true)
     {
+        if (logChange)
+        {
+            // A resume restores the session's last model (issue #297).
+            // Switching models resets the live context window to the new
+            // provider's configuration; record that concrete window (0: none),
+            // so a resume restores what is live now, not whatever the config
+            // resolves to later. Logged before the switch: a failed write
+            // leaves the old client in place.
+            SessionSettings s;
+            s.model = c.providerName ~ "/" ~ c.modelName;
+            import std.conv : to;
+            s.contextWindow = window.tokens.to!long;
+            logSettings(s);
+        }
         client = c;
         setConfiguredWindow(window);
         learnedWindow = 0;
@@ -3917,17 +3931,6 @@ class Agent
         // A mid-turn switch never waits on the endpoint.
         if (midTurnSwitch) startBackgroundProbe();
         else refreshCapabilities();
-        if (logChange)
-        {
-            // A resume restores the session's last model (issue #297).
-            // Switching models resets the live context window to the new
-            // provider's configuration, so record `contextWindow = 0` to clear
-            // any earlier session override on resume too.
-            SessionSettings s;
-            s.model = c.providerName ~ "/" ~ c.modelName;
-            s.contextWindow = 0;
-            logSettings(s);
-        }
     }
 
     /// Record a runtime settings change in the session log (issue #297): a

@@ -222,10 +222,15 @@ struct Host
     /// The configured context window for a model spec's provider (null: the
     /// startup window).
     ConfiguredWindow delegate(string spec) windowFor;
+    /// The provider's own context window for a model spec, ignoring the
+    /// top-level one: what a session's `context_window = 0` ("from
+    /// provider/model") restores. Null: the startup window.
+    ConfiguredWindow delegate(string spec) providerWindowFor;
     /// The configured `model` and `system_prompt`, for `/settings`.
     string configModel, configSystemPrompt;
     /// Write `subagents = on` to the user config (`/subagents on|off --save`);
-    /// returns where it saved or why it could not. Null: --save is refused.
+    /// returns where it saved or why it could not (starting "could not").
+    /// Null: --save is refused.
     string delegate(bool on) saveSubagents;
     /// "Updated X → Y" and what changed (#282), sent once as an info notice
     /// after the first session/new or session/load; null for none.
@@ -797,7 +802,14 @@ final class AcpServer : AgentEvents
                     ss.subagents = t.on ? 1 : 0;
                     agent.logSettings(ss);
                 }
-                if (t.save) body_["saved"] = host.saveSubagents(t.on);
+                if (t.save)
+                {
+                    auto saved = host.saveSubagents(t.on);
+                    body_["saved"] = saved;
+                    // A saved switch is the new default `session/new` resets
+                    // to, as a fresh process would read it; a failed save is not.
+                    if (!saved.startsWith("could not")) defaultSubagentsOn = t.on;
+                }
             }
             auto model = agent.subagentModel.length ? agent.subagentModel
                 : agent.client.providerName ~ "/" ~ agent.client.modelName;
@@ -1024,8 +1036,23 @@ final class AcpServer : AgentEvents
             parseCompactionMode(st.compactionMode).match!((m) { agent.compactionMode = m; }, () {});
         if (st.autoCompact >= 0) agent.autoCompact = st.autoCompact != 0;
         if (!st.autoCompactThreshold.isNaN) agent.autoCompactThreshold = st.autoCompactThreshold;
-        if (st.contextWindow > 0)
+        // A window recorded with a model (a switch records the window it made
+        // live) belongs to that model: it does not apply to a fallback.
+        const windowApplies = !st.model.length
+            || agent.client.providerName ~ "/" ~ agent.client.modelName == st.model;
+        if (!windowApplies) {}
+        else if (st.contextWindow > 0)
             agent.setConfiguredWindow(ConfiguredWindow(toSize(st.contextWindow), "the session's settings"));
+        else if (st.contextWindow == 0)
+        {
+            // 0 is "from provider/model": the provider's own window. A
+            // provider since removed from config keeps the current one.
+            import std.exception : collectException;
+            ConfiguredWindow w;
+            auto spec = agent.client.providerName ~ "/" ~ agent.client.modelName;
+            if (host.providerWindowFor is null) agent.setConfiguredWindow(defaultConfiguredWindow);
+            else if (collectException(w = host.providerWindowFor(spec)) is null) agent.setConfiguredWindow(w);
+        }
     }
 
     /// Replay the conversation as session/update notifications.
@@ -1423,6 +1450,35 @@ unittest
     assert(byId[5]["result"]["subagents"].boolean && agent.offeredTools.canFind!(t => t.name == "agent"));
 }
 
+// issue #297: `/subagents off --save` makes off the default `session/new`
+// resets to (as a fresh process would read it); a failed save does not.
+unittest
+{
+    import nano.providers.mock;
+    import nano.tools;
+    import nano.permissions : Policy;
+    import nano.subagent : SubClientFactory;
+    static final class NoClients : SubClientFactory
+    {
+        LLMClient make(string spec) const { assert(0, "no sub-agent runs here"); }
+    }
+    foreach (fail; [false, true])
+    {
+        auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, null);
+        agent.subagentClients = new immutable NoClients;
+        assert(agent.subagentsOn);
+        auto host = Host((string cwd) => "sys", null, null, "test");
+        host.saveSubagents = (bool on) => fail ? "could not save: disk full" : "saved to /cfg";
+        auto srv = new AcpServer(agent, host, (string l) {});
+        srv.receive(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}`);
+        srv.receive(`{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"prompt":[{"type":"text","text":"/subagents off --save"}]}}`);
+        srv.receive(`{"jsonrpc":"2.0","id":3,"method":"session/new","params":{}}`);
+        srv.close();
+        assert(srv.run());
+        assert(agent.subagentsOn == fail);
+    }
+}
+
 // issue #297: ACP `/model`, `/subagents` and `/thinking` log `settings`
 // records, and `session/load` restores them (without failing when a model is
 // unavailable).
@@ -1608,4 +1664,30 @@ unittest
     assert(srv7.run());
     assert(agent7.messages.length > 0);
     agent7.replaceLog(Option!SessionLog.init);
+
+    // A record of `context_window = 0` ("from provider/model": a switch with
+    // no configured window) restores the provider's own window, not the
+    // top-level one `windowFor` would resolve.
+    Host host8 = host1;
+    host8.windowFor = (string spec) => ConfiguredWindow.init;
+    auto agent8 = new Agent(new MockClient([]), new ToolRegistry, Policy.init, null);
+    string[] lines8;
+    auto srv8 = new AcpServer(agent8, host8, (string l) { lines8 ~= l; });
+    srv8.receive(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}`);
+    srv8.receive(`{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"prompt":[{"type":"text","text":"/model other"}]}}`);
+    srv8.close();
+    assert(srv8.run());
+    auto sid8 = parseJSON(lines8[0])["result"]["sessionId"].str;
+    agent8.replaceLog(Option!SessionLog.init);
+    Host host9 = host8;
+    host9.makeClient = (string spec) => new NamedMock("alt", "other");
+    host9.windowFor = (string spec) => ConfiguredWindow(64_000, "context_window in config");
+    host9.providerWindowFor = (string spec) => ConfiguredWindow(3_333, "provider context_window");
+    auto agent9 = new Agent(new MockClient([]), new ToolRegistry, Policy.init, null);
+    auto srv9 = new AcpServer(agent9, host9, (string l) {});
+    srv9.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ sid8 ~ `"}}`);
+    srv9.close();
+    assert(srv9.run());
+    assert(agent9.configuredWindow == 3_333);
+    agent9.replaceLog(Option!SessionLog.init);
 }

@@ -147,6 +147,30 @@ unittest
     assert(r.settings.contextWindow == 0);
 }
 
+// issue #297: a model switch records the concrete window it made live, so a
+// resume restores that window rather than re-resolving the config.
+unittest
+{
+    import nano.session : restore;
+    auto agent = logged("model-window", new MockClient([]));
+    agent.useClient(new MockClient([]), ConfiguredWindow(32_000, "provider context_window"));
+    assert(restore(agent.log.unwrap("logged").path).settings.contextWindow == 32_000);
+}
+
+// issue #297: a model switch whose settings write fails changes nothing: the
+// old client and window stay live.
+unittest
+{
+    auto agent = logged("model-write-fails", new MockClient([]));
+    auto old = agent.client;
+    agent.setConfiguredWindow(ConfiguredWindow(40_000, "context_window in config"));
+    agent.log.unwrap("logged").failNextWrite = true;
+    import std.exception : assertThrown;
+    assertThrown(agent.useClient(new MockClient([]), ConfiguredWindow(32_000, "provider context_window")));
+    assert(agent.client is old);
+    assert(agent.configuredWindow == 40_000);
+}
+
 // issue #297: `/subagents off` mid-turn writes a `settings` record, so a
 // resume restores the switch.
 unittest

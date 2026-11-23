@@ -1208,6 +1208,22 @@ struct RuntimeDefaults
     }
 }
 
+/// The configured window a session record of `context_window = 0` restores
+/// (issue #297): "from provider/model", as `/settings` offers it, so the
+/// provider's own `context_window` (`providerWindow`, 0: none) and never the
+/// top-level one.
+ConfiguredWindow providerWindow(long providerWindow) pure
+{
+    return providerWindow > 0 ? ConfiguredWindow(toSize(providerWindow), "provider context_window")
+        : ConfiguredWindow.init;
+}
+
+unittest // context_window 0 restores the provider's window, ignoring the top-level one
+{
+    assert(providerWindow(32_000).tokens == 32_000);
+    assert(providerWindow(0).tokens == 0);
+}
+
 /// Reset the runtime settings an in-process `/resume` must not carry from
 /// the session being left (issue #297) to the saved config defaults `d`:
 /// sub-agents, compaction mode, auto-compaction, its threshold and the mode;
@@ -1288,6 +1304,14 @@ SessionSettings retainedRestartSettings(const ref RuntimeDefaults d, Verbosity l
         s.contextWindow = liveConfiguredWindow.to!long;
         hasAny = true;
     }
+    else if (d.contextWindow > 0 && liveConfiguredWindowSource != "context_window in config"
+        && liveConfiguredWindowSource != "the session's settings")
+    {
+        // `/settings` set 0 ("from provider/model") over a saved top-level
+        // window: record 0 so a resume uses the provider's window too.
+        s.contextWindow = 0;
+        hasAny = true;
+    }
     return s;
 }
 
@@ -1328,10 +1352,18 @@ unittest // retainedRestartSettings: records only live settings that diverge fro
         64_000, "context_window in config", hasAny);
     assert(!hasAny && sameWin.contextWindow == -1);
 
-    // A provider/config window (not a session override) is not recorded.
+    // A provider window live over a saved top-level one (`/settings` set 0)
+    // is recorded as 0, "from provider/model".
     auto provWin = retainedRestartSettings(d, Verbosity.normal, true, CompactionMode.smart, true, 0.8,
         128_000, "provider context_window", hasAny);
-    assert(!hasAny && provWin.contextWindow == -1);
+    assert(hasAny && provWin.contextWindow == 0);
+
+    // Without a top-level window, the provider's is the default: not recorded.
+    cfg.contextWindow = 0;
+    d = RuntimeDefaults.of(cfg);
+    auto provOnly = retainedRestartSettings(d, Verbosity.normal, true, CompactionMode.smart, true, 0.8,
+        128_000, "provider context_window", hasAny);
+    assert(!hasAny && provOnly.contextWindow == -1);
 }
 
 unittest // an unsaved `/settings` Context edit survives `/restart` (issue #297)
@@ -3294,6 +3326,7 @@ int runMain(string[] args)
         host.modeSystemPrompt = (string dir, bool p) => systemFor(dir, p);
         host.savedModelKnown = (string s) => savedProviderKnown(s, cfg.providers);
         host.windowFor = (string s) => windowFor(cfg, resolve(cfg, s).config);
+        host.providerWindowFor = (string s) => providerWindow(resolve(cfg, s).config.contextWindow);
         host.sessionDir = o.noSession ? null : sessionDir;
         host.version_ = versionString;
         {
@@ -3717,14 +3750,19 @@ int runMain(string[] args)
                 () { notes ~= `the saved compaction mode "` ~ st.compactionMode ~ `" is unknown; using the config's`; });
         if (st.autoCompact >= 0) agent.autoCompact = st.autoCompact != 0;
         if (!st.autoCompactThreshold.isNaN) agent.autoCompactThreshold = st.autoCompactThreshold;
-        if (st.contextWindow >= 0)
+        // A window recorded with a model (a switch records the window it made
+        // live) belongs to that model: it does not apply to a fallback or a
+        // `-m` override.
+        if (st.contextWindow >= 0 && (!st.model.length
+            || agent.client.providerName ~ "/" ~ agent.client.modelName == st.model))
         {
             if (st.contextWindow > 0)
                 agent.setConfiguredWindow(ConfiguredWindow(toSize(st.contextWindow), "the session's settings"));
             else
             {
-                // The session cleared the override: re-resolve from the config.
-                agent.setConfiguredWindow(runtimeDefaults.window(cfg.providers.get(client.providerName, ProviderConfig.init).contextWindow));
+                // 0 is "from provider/model" (as `/settings` offers it): the
+                // provider's own window, not the top-level `context_window`.
+                agent.setConfiguredWindow(providerWindow(cfg.providers.get(client.providerName, ProviderConfig.init).contextWindow));
             }
         }
         // The warnings `/model` and `/thinking` show for the restored values.
