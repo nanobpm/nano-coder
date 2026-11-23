@@ -3776,7 +3776,9 @@ int runMain(string[] args)
         peerRouter.routePending(queue);
         Inbound inbound;
         peerInput = false;
-        if (peerRouter.takeWaiting(inbound))
+        // Lines the user typed during the last turn (`/messages off`,
+        // `/quit`, …) run first: a steady peer stream must not starve them.
+        if (!held.length && peerRouter.takeWaiting(inbound))
         {
             bool accepted = true;
             if (inbound.needsConfirm)

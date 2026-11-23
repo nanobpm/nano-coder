@@ -580,7 +580,7 @@ private string readLine(imported!"std.socket".Socket conn, Duration total = 30.s
 /// Whether a live session still answers the socket at `path`.
 private bool live(string path)
 {
-    import std.socket : Socket, UnixAddress, AddressFamily, SocketType, SocketException;
+    import std.socket : Socket, UnixAddress, AddressFamily, SocketType, SocketException, SocketOSException;
     auto s = new Socket(AddressFamily.UNIX, SocketType.STREAM);
     scope (exit) s.close();
     try
@@ -588,7 +588,23 @@ private bool live(string path)
         s.connect(new UnixAddress(path));
         return true;
     }
-    catch (SocketException) return false; // refused or missing: stale
+    catch (SocketOSException e) return !stale(e.errorCode);
+    catch (SocketException) return false; // no OS error code: treat as stale
+}
+
+/// Whether the last socket error proves nobody listens (refused or no
+/// such file); other errors (EINTR, EAGAIN, …) keep the socket.
+private bool stale(int code) pure nothrow @nogc
+{
+    import core.stdc.errno : ECONNREFUSED, ENOENT;
+    return code == ECONNREFUSED || code == ENOENT;
+}
+
+unittest
+{
+    import core.stdc.errno : ECONNREFUSED, ENOENT, EINTR, EAGAIN;
+    assert(stale(ECONNREFUSED) && stale(ENOENT));
+    assert(!stale(EINTR) && !stale(EAGAIN));
 }
 
 /// Deliver `pm` to the session listening at `<dir>/<to>.sock`; the outcome,
@@ -606,20 +622,30 @@ Status send(string dir, string to, PeerMessage pm, out string note)
     }
     auto s = new Socket(AddressFamily.UNIX, SocketType.STREAM);
     scope (exit) s.close();
-    import std.socket : SocketException, SocketOption, SocketOptionLevel, wouldHaveBlocked;
+    import std.socket : SocketException, SocketOSException, SocketOption, SocketOptionLevel, wouldHaveBlocked;
     import core.time : seconds;
     // Bound the whole exchange: a full backlog would block connect, and a
     // suspended receiver the reply read, pinning this tool call. The read
     // outlasts the receiver's own 120 s answer deadline.
     s.setOption(SocketOptionLevel.SOCKET, SocketOption.SNDTIMEO, 10.seconds);
     s.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, 130.seconds);
+    bool failed;
+    int code;
     try s.connect(new UnixAddress(path));
-    catch (SocketException)
+    catch (SocketOSException e) { failed = true; code = e.errorCode; }
+    catch (SocketException) failed = true; // no OS code: not provably stale
+    if (failed)
     {
         // A timeout is a busy receiver, not a dead one: keep its socket.
         if (wouldHaveBlocked())
         {
             note = format("session %s did not accept the connection in time", to);
+            return Status.refused;
+        }
+        // Only refused/missing proves nobody listens; keep it otherwise.
+        if (!stale(code))
+        {
+            note = format("session %s could not be reached; try again", to);
             return Status.refused;
         }
         // Stale: nobody is accepting. Remove it so the next listing is clean.
@@ -813,7 +839,7 @@ struct PeerRouter
             if (confirm && noConfirmChannel.get)
             {
                 answer(req.reply, Status.refused,
-                    "the target session can't ask its user to confirm; re-send with confirm off");
+                    "the target session can't ask its user to confirm; it accepts only sends without confirm, and only if its own session_messages_confirm is off");
                 continue;
             }
             // Confirmation-requiring messages always wait for the user,

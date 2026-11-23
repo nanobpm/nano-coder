@@ -589,12 +589,16 @@ final class AcpServer : AgentEvents
                 if (inbound.needsConfirm)
                 {
                     peers.settle(inbound, false,
-                        "the ACP session can't ask its user to confirm; re-send with confirm off");
+                        "the ACP session can't ask its user to confirm; it accepts only sends without confirm, and only if its own session_messages_confirm is off");
                     continue;
                 }
                 userMessage(inbound.labelled);
                 peers.settle(inbound, true);
+                subCalls = null;
+                terminalCalls = null;
                 runTurn(JSONValue.init, inbound.labelled, null, true);
+                subCalls = null;
+                terminalCalls = null;
                 continue;
             }
             bool woken;
