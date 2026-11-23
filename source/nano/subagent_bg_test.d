@@ -502,6 +502,26 @@ unittest
     assert(f.agent.stopSubagentsByUser("sub-1").canFind("No sub-agent sub-1"));
 }
 
+// The UI's id snapshot is refreshed mid-turn: `onSubagentsChanged` fires on
+// the agent's thread as the turn launches sub-agents, and the non-polling
+// snapshot it reads already lists them (issue #267).
+unittest
+{
+    auto f = new Fixture([calls(bg("b1", "mock/hang"), bg("b2", "mock/search")), LLMResponse("two")]);
+    f.persist("changed");
+    scope (exit) f.cleanup();
+    f.agent.subagentMaxConcurrency = 1;
+    string[] seen;
+    f.agent.onSubagentsChanged = () {
+        size_t forgotten;
+        seen = null;
+        foreach (ref i; f.agent.subagentSnapshot(forgotten)) seen ~= i.id;
+    };
+    assert(f.agent.run("go", new NullEvents) == "two");
+    assert(seen == ["sub-1", "sub-2"], seen.to!string);
+    f.agent.stopSubagents();
+}
+
 // `/subagents stop <id>`: the child reports what it has, marked cancelled,
 // and the parent gets it as a background result; an ended one says so.
 unittest

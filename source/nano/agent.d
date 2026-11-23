@@ -2481,6 +2481,13 @@ class Agent
     imported!"nano.subagent".SubInfo[] subagentList(out size_t forgotten)
     {
         pollSubagents();
+        return subagentSnapshot(forgotten);
+    }
+
+    /// `subagentList` without serving waiting messages first: safe to call
+    /// from `onSubagentsChanged`, which runs while a message is handled.
+    imported!"nano.subagent".SubInfo[] subagentSnapshot(out size_t forgotten)
+    {
         forgotten = subForgotten;
         auto all = subHistory.dup;
         foreach (ref s; subSlots) all ~= infoOf(s);
@@ -2653,6 +2660,17 @@ class Agent
         }
         if (!subSlots.length) return;
         if (startSubagents()) reportSubagents();
+        else subagentsChanged();
+    }
+
+    /// Called on this agent's thread when a sub-agent is launched, makes
+    /// progress, ends or is cancelled, so the UI's id snapshot (used by
+    /// `/subagents stop <Tab>` mid-turn) includes ones the turn spawned.
+    void delegate() onSubagentsChanged;
+
+    private void subagentsChanged()
+    {
+        if (onSubagentsChanged !is null) onSubagentsChanged();
     }
 
     /// Start waiting sub-agents while there is room (none once cancelled).
@@ -3048,6 +3066,7 @@ class Agent
     {
         import nano.subagent : cancelGraceSecs;
         import core.time : seconds;
+        scope (exit) subagentsChanged();
         auto seq = subSlots[i].spec.slot;
         auto id = subSlots[i].id;
         if (subSlots[i].finished) return format("%s already ended (%s); nothing to cancel.", id, subSlots[i].state);
@@ -3129,6 +3148,7 @@ class Agent
     /// Show every started sub-agent's progress (renderers that support it).
     private void reportSubagents()
     {
+        scope (exit) subagentsChanged();
         SubProgress[] all;
         foreach (i, ref s; subSlots)
         {

@@ -3125,7 +3125,8 @@ int runMain(string[] args)
     if (recents.canonicalize(cfg.providers, cfg.defaultProvider)) nano.recents.save(recentsPath, recents);
     string currentSpec() { return nano.recents.canonical(client.providerName ~ "/" ~ client.modelName, cfg.providers, cfg.defaultProvider); }
     // `/subagents show|stop` completion reads a snapshot of the ids, taken
-    // on this thread before each prompt: the key reader of a turn runs on
+    // on the agent's thread before each prompt and whenever a sub-agent
+    // changes: the key reader of a turn runs on
     // its own thread and must not touch the agent.
     import nano.commands : subagentIdSource, Suggestion;
     auto subIds = notNull(new shared Locked!(immutable(Suggestion)[]));
@@ -3133,10 +3134,13 @@ int runMain(string[] args)
     {
         size_t forgotten;
         immutable(Suggestion)[] ids;
-        foreach (ref i; agent.subagentList(forgotten))
+        foreach (ref i; agent.subagentSnapshot(forgotten))
             ids ~= immutable Suggestion(i.id, i.state ~ " · " ~ i.task);
         atomicLoad(subIds).update((ref immutable(Suggestion)[] v) { v = ids; });
     }
+    // Refreshed as sub-agents launch, progress, end or are cancelled, so a
+    // turn's own sub-agents complete mid-turn too.
+    agent.onSubagentsChanged = () { snapshotSubagentIds(); };
     subagentIdSource = () => atomicLoad(subIds).get.dup;
     modelSuggestionSource = () {
         string[] recent;
