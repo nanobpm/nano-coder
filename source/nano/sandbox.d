@@ -248,9 +248,12 @@ struct SandboxConfig
 }
 
 /// Whether `output` of a failed sandboxed command looks like a sandbox denial.
-bool looksDenied(string output) pure nothrow
+bool looksDenied(scope const(char)[] output) pure nothrow @nogc
 {
-    return ["Operation not permitted", "Read-only file system", "Permission denied"].any!(d => output.canFind(d));
+    static immutable phrases = ["Operation not permitted", "Read-only file system", "Permission denied"];
+    foreach (d; phrases)
+        if (output.canFind(d)) return true;
+    return false;
 }
 
 private:

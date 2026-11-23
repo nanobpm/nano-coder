@@ -49,14 +49,14 @@ import nano.settings_dialog : SettingsUi, SettingsHost, runSettings, pickModel, 
 import nano.commands : helpText, isCommand, unescapePrompt;
 import core.thread : Thread;
 import nano.claude_hooks : HookManager, listingField, label, isProject;
-import nano.skills : Skills, skillsDefinition = definition;
+import nano.skills : Skills, SkillsConfig, skillsDefinition = definition;
 import nano.memory : MemoryStore = Store, MemoryMode, memorySessionTools = sessionTools, memoryDefaultDir = defaultDir, projectKey, repoNameOf, Scope, parseRecallMode;
 import nano.control : TurnControl, FdLineReader;
 import nano.peers : PeerListener, PeerRouter, Inbound, ListenError, settle, confirmQuestion;
 import nano.instructions : ProjectInstructions, InstructionOptions = Options, expandHome;
 import core.atomic : atomicLoad, atomicStore, cas;
 
-enum string packageVersion = "1.22.3";
+enum string packageVersion = "1.23.1";
 enum string versionString = "nano-coder " ~ packageVersion;
 
 enum string usage = `Usage: nano-coder [--model provider/model] [--config PATH] [-p PROMPT]
@@ -2935,18 +2935,47 @@ int runMain(string[] args)
     // Off is an empty set (as in Rust), not null.
     // NANO_CODER_NO_SKILLS turns skills off for one run (as in Rust).
     bool skillsOn = cfg.skills.enabled && environment.get("NANO_CODER_NO_SKILLS") is null;
+    SkillsConfig skillsConfigFor(string dir)
+    {
+        auto sc = cfg.skills;
+        if (!trusted(dir)) { sc.dirs = null; sc.aiLock = false; }
+        return sc;
+    }
     Skills discoverSkills(string dir)
     {
         if (!skillsOn) return new Skills;
-        auto sc = cfg.skills;
-        if (!trusted(dir)) { sc.dirs = null; sc.aiLock = false; }
+        auto sc = skillsConfigFor(dir);
         auto s = Skills.discover(dir, sc);
-        foreach (w; s.warnings) stdErr.writeln("nano-coder: skills: ", w);
+        foreach (w; s.warnings) stdErr.writeln("nano-coder: skills: ", escapeMarks(sanitizeBlock(w)));
         return s;
     }
     Skills skills = discoverSkills(cwd);
-    if (skillsOn && (o.acp || !skills.empty))
+    string skillsDir = cwd;
+    bool skillToolOn;
+    void registerSkillTool()
+    {
+        if (skillToolOn) return;
+        skillToolOn = true;
         tools.register(skillsDefinition, (JSONValue a) => skills.load(a));
+    }
+    if (skillsOn && (o.acp || !skills.empty)) registerSkillTool();
+    // Between turns: a stat-only check of the skill files; on a change,
+    // rediscover and say what changed (empty: nothing did). The caller
+    // rebuilds the system prompt, so an unchanged set keeps it byte-identical.
+    string refreshSkills()
+    {
+        import nano.skills : describeChanges, Locations;
+        if (!skillsOn) return null;
+        auto sc = skillsConfigFor(skillsDir);
+        if (!skills.stale(skillsDir, sc, Locations.fromEnv)) return null;
+        auto fresh = discoverSkills(skillsDir);
+        // Skill names come from SKILL.md files: strip control sequences and
+        // frame markers before any caller prints them.
+        auto change = escapeMarks(sanitizeBlock(describeChanges(skills, fresh)));
+        skills = fresh;
+        if (!skills.empty) registerSkillTool();
+        return change;
+    }
     // Memory: read-only when no human vets saves live (ACP, -p, piped stdio) and in plan mode.
     Option!MemoryStore memory;
     bool memoryWritable = cfg.memory == MemoryMode.on && !o.acp && !o.prompt.length && isTerminal(0) && isTerminal(1);
@@ -3091,12 +3120,25 @@ int runMain(string[] args)
         Host host;
         bool plan = o.plan;
         host.systemPrompt = (string dir) {
-            if (dir != cwd) skills = discoverSkills(dir);
+            if (dir != skillsDir) { skills = discoverSkills(dir); skillsDir = dir; }
+            else
+            {
+                // Same directory: the session's metadata must not be stale.
+                auto change = refreshSkills();
+                if (change.length) stdErr.writeln("nano-coder: skills: ", change);
+            }
             // A session in another directory recalls that directory's repo
             // facts; still resolved once per session, not per tool call.
             auto key = projectKey(dir);
             agent.recallRepo = key is null ? null : repoNameOf(key);
             return systemFor(dir, plan);
+        };
+        host.beforePrompt = () {
+            auto change = refreshSkills();
+            if (!change.length) return null;
+            agent.installSystem(systemFor(skillsDir, plan), indexShown);
+            // Published to the ACP client as a `_nano/notice`, not the model.
+            return "skills: " ~ change;
         };
         host.makeClient = (string s) => makeClient(resolve(cfg, s));
         host.sessionDir = o.noSession ? null : sessionDir;
@@ -3539,6 +3581,12 @@ int runMain(string[] args)
 
     bool turn(string input, bool fromPeer = false, string peerSender = null) @safe
     {
+        auto skillChange = refreshSkills();
+        if (skillChange.length)
+        {
+            stdErr.writeln(console.dim("skills: " ~ skillChange));
+            agent.installSystem(systemFor(cwd, agent.promptPlan), indexShown);
+        }
         if (reloadInstructions())
             stdErr.writeln(console.dim("[instruction files changed: the system prompt now follows them]"));
         syncMode();

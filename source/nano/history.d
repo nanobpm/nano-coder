@@ -4,6 +4,7 @@
 module nano.history;
 
 import std.string : strip;
+import nano.arith : saturatingSub;
 
 @safe:
 pure:
@@ -12,19 +13,38 @@ struct InputHistory
 {
     /// Most entries kept; the oldest drop off the front.
     enum maxEntries = 200;
+    /// Byte cap across all stored entries, so large pasted prompts cannot pin
+    /// megabytes in session history (issue #310).
+    enum size_t maxBytes = 512 * 1024;
 
     string[] lines;
+    /// Running byte total of `lines` (text + slice header per entry).
+    private size_t heldBytes;
     /// While browsing: the entry shown (-1 = the draft at the bottom).
     private ptrdiff_t position = -1;
     /// The line before the first Up, restored by Down past the newest.
     private string draft;
 
+    private static size_t entryCost(string l) pure nothrow @nogc { return l.length + string.sizeof; }
+
     /// Record a submitted line; blanks and repeats of the previous line aren't kept.
     void record(string line) pure
     {
         if (!line.strip.length || (lines.length && lines[$ - 1] == line)) return;
+        // An entry over the whole budget is not kept at all: otherwise a huge
+        // paste would stay resident as the sole entry, unbounded.
+        if (entryCost(line) > maxBytes) return;
         lines ~= line;
-        if (lines.length > maxEntries) lines = lines[1 .. $];
+        heldBytes += entryCost(line);
+        size_t drop;
+        while (lines.length - drop > maxEntries || (lines.length - drop > 1 && heldBytes > maxBytes))
+        {
+            auto c = entryCost(lines[drop++]);
+            heldBytes = saturatingSub(heldBytes, c);
+        }
+        // Copy, not slice: a suffix slice pins dropped backing-array entries
+        // under D's conservative GC.
+        if (drop) lines = lines[drop .. $].dup;
     }
 
     /// The entry one older than shown, or null at the oldest. The first call
@@ -151,4 +171,22 @@ unittest
     assert(b.lines == ["one", " one "], "whitespace variants are kept verbatim");
     foreach (i; 0 .. InputHistory.maxEntries + 10) b.record(format("line %s", i));
     assert(b.lines.length == InputHistory.maxEntries && b.lines[0] == "line 10");
+
+    // Byte cap evicts oldest large entries while keeping at least the newest.
+    import std.array : replicate;
+    InputHistory big;
+    string chunk = "x".replicate(200 * 1024);
+    big.record(chunk ~ "1");
+    big.record(chunk ~ "2");
+    big.record(chunk ~ "3");
+    assert(big.lines.length == 2, "3 x 200 KiB exceeds 512 KiB cap; oldest evicted");
+    assert(big.lines[0][$ - 1] == '2' && big.lines[1][$ - 1] == '3');
+    // A single entry larger than maxBytes is not kept; earlier entries stay.
+    auto keptBefore = big.lines.dup;
+    string huge = "y".replicate(InputHistory.maxBytes + 1024);
+    big.record(huge);
+    assert(big.lines == keptBefore);
+    InputHistory solo;
+    solo.record(huge);
+    assert(solo.lines.length == 0);
 }

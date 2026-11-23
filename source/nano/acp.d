@@ -229,6 +229,11 @@ struct Host
     /// (`session_messages_confirm`, default true). ACP has no question
     /// channel, so a message under confirm is declined with a note.
     bool sessionMessagesConfirm = true;
+    /// Called before each prompt's turn: picks up between-turn changes
+    /// (edited skills) and rebuilds the system prompt if they changed it.
+    /// Returns a notice for the client (sent as `_nano/notice`, outside the
+    /// model's context), or null when nothing changed.
+    string delegate() beforePrompt;
 }
 
 /// Input id for idempotent prompts: `messageId`, or `_meta.inputId`.
@@ -460,6 +465,15 @@ final class AcpServer : AgentEvents
         releaseNoticeSent = true;
         notify("_nano/notice", JSONValue(["sessionId": JSONValue(sessionId), "level": JSONValue("info"),
             "text": JSONValue(host.releaseNotice)]));
+    }
+
+    /// An info `_nano/notice` for between-turn changes (e.g. skills
+    /// refreshed); nothing for empty text.
+    private void sendNotice(string text)
+    {
+        if (!text.length) return;
+        notify("_nano/notice", JSONValue(["sessionId": JSONValue(sessionId), "level": JSONValue("info"),
+            "text": JSONValue(text)]));
     }
 
     private void writeOut(string line)
@@ -709,6 +723,7 @@ final class AcpServer : AgentEvents
             // calls; release the previous turn's.
             subCalls = null;
             terminalCalls = null;
+            if (host.beforePrompt !is null) sendNotice(host.beforePrompt());
             runTurn(id, text, inputId(params));
             subCalls = null;
             terminalCalls = null;

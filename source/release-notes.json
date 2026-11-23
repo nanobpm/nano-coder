@@ -1,5 +1,26 @@
 {
   "releases": [
+    {"version": "1.23.1", "date": "2026-11-24", "items": [
+      {"type":"perf","scope":"tools","title":"stream bash output truncation and drop UTF-32 expansion","pr":317}
+    ]},
+    {"version": "1.23.0", "date": "2026-11-24", "items": [
+      {"type":"feat","scope":"skills","title":"pick up added, removed and edited skills between turns","pr":320}
+    ]},
+    {"version": "1.22.8", "date": "2026-11-24", "items": [
+      {"type":"perf","scope":"frame","title":"reduce scrollback memory amplification and bound InputHistory","pr":321}
+    ]},
+    {"version": "1.22.7", "date": "2026-11-24", "items": [
+      {"type":"fix","scope":"subagent","title":"agent_cancel always leaves the child one final report step","pr":323}
+    ]},
+    {"version": "1.22.6", "date": "2026-11-24", "items": [
+      {"type":"perf","scope":"tools","title":"stream read_file in chunks instead of reading whole files","pr":318}
+    ]},
+    {"version": "1.22.5", "date": "2026-11-24", "items": [
+      {"type":"perf","scope":"http","title":"stop buffering full SSE response bodies in http.perform","pr":314}
+    ]},
+    {"version": "1.22.4", "date": "2026-11-23", "items": [
+      {"type":"perf","scope":"session","title":"bound resume memory: stream log reads, smaller GC growth","pr":319}
+    ]},
     {"version": "1.22.3", "date": "2026-11-23", "items": [
       {"type":"perf","scope":"session","title":"slim folded replies and Rust-era stashes on resume; skip superseded snapshots","pr":304}
     ]},
@@ -420,27 +441,6 @@
     ]},
     {"version": "0.33.0", "date": "2026-10-02", "items": [
       {"type":"feat","scope":"sessions","title":"pick a session to resume, with project and last prompt","pr":84}
-    ]},
-    {"version": "0.32.1", "date": "2026-10-02", "items": [
-      {"type":"fix","scope":"","title":"update command in README","pr":89}
-    ]},
-    {"version": "0.32.0", "date": "2026-10-02", "items": [
-      {"type":"feat","scope":"","title":"cross-session memory (user + project scope)","pr":70}
-    ]},
-    {"version": "0.31.0", "date": "2026-10-01", "items": [
-      {"type":"feat","scope":"config","title":"move agentic-harness directories to nano-coder","pr":85}
-    ]},
-    {"version": "0.30.1", "date": "2026-10-01", "items": [
-      {"type":"fix","scope":"compaction","title":"leave room for reasoning in the summary and flag cut-off summaries","pr":88}
-    ]},
-    {"version": "0.30.0", "date": "2026-10-01", "items": [
-      {"type":"feat","scope":"config","title":"per-provider and per-model temperature, with model default","pr":79}
-    ]},
-    {"version": "0.29.2", "date": "2026-10-01", "items": [
-      {"type":"fix","scope":"context","title":"reserve max_tokens within the context window","pr":81}
-    ]},
-    {"version": "0.29.1", "date": "2026-10-01", "items": [
-      {"type":"fix","scope":"compact","title":"stream the summary request so idle-timeout proxies keep it alive","pr":82}
     ]}
   ]
 }

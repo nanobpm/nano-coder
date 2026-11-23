@@ -25,7 +25,7 @@ import std.json;
 import std.file;
 import std.path;
 import std.format : format;
-import std.string : strip, startsWith, endsWith;
+import std.string : strip, startsWith, endsWith, indexOf;
 static import std.string;
 import std.datetime.systime : SysTime, Clock;
 import std.algorithm : sort, any, filter, canFind, splitter, map;
@@ -233,22 +233,19 @@ private void foldInputsSince(string path, ulong from, ref Summary s)
 /// record that isn't a matching header of this format version.
 Summary summarize(string path)
 {
-    import nano.session : logText, logIdOf;
-    auto text = logText(path);
+    import nano.session : isCompressedLog, logIdOf, logText, streamLogLinesUntil;
     Summary s;
     s.path = path;
     s.lastUsed = timeLastModified(path);
     s.id = logIdOf(path);
-    s.logBytes = text.length;
     try validateId(s.id);
     catch (Exception e) throw new Exception(format("session log %s has an invalid id", path));
-    auto lines = committedLines(text.representation);
-    bool ok;
-    if (lines.length)
+    bool ok, first = true;
+    void header(const(char)[] line)
     {
         try
         {
-            auto h = parseJSON(lines[0]);
+            auto h = parseJSON(line);
             auto d = h["data"];
             if (h["type"].str == "session" && d["version"].integer == formatVersion && d["id"].str == s.id)
             {
@@ -260,10 +257,45 @@ Summary summarize(string path)
         }
         catch (Exception) {} // skip a corrupt line; a missing header is reported just below
     }
-    if (!ok) throw new Exception(format("session log %s has no resumable header", path));
-    foreach (line; lines[1 .. $])
+    if (isCompressedLog(path))
+    {
+        // An archive: summarized once and cached by its size.
+        auto text = logText(path);
+        s.logBytes = text.length;
+        auto lines = committedLines(text.representation);
+        if (lines.length) header(lines[0]);
+        if (!ok) throw new Exception(format("session log %s has no resumable header", path));
+        foreach (line; lines[1 .. $])
+            if (auto t = inputText(line)) foldInput(s, t);
+        return s;
+    }
+    // A live log is streamed, and a record that isn't an input is skipped by
+    // its head without being read whole: a long session's log can run to
+    // hundreds of MB, and summarizing it after a turn once held all of it.
+    s.logBytes = getSize(path);
+    streamLogLinesUntil(path, (line) {
+        if (first)
+        {
+            first = false;
+            header(line);
+            return ok;
+        }
         if (auto t = inputText(line)) foldInput(s, t);
+        return true;
+    }, (head) => first || mayBeInput(head));
+    if (!ok) throw new Exception(format("session log %s has no resumable header", path));
     return s;
+}
+
+/// A streamed line's head: false only for a record known not to be an input
+/// (its `{"type":"<type>"` prefix names another type).
+private bool mayBeInput(const(char)[] head) pure @safe
+{
+    enum prefix = `{"type":"`;
+    if (!head.startsWith(prefix)) return true;
+    auto rest = head[prefix.length .. $];
+    immutable q = rest.indexOf('"');
+    return q <= 0 || rest[0 .. q].canFind('\\') || rest[0 .. q] == "input";
 }
 
 private string indexPath(string dir) pure
@@ -1014,4 +1046,28 @@ unittest
     auto shown = list(dir, false, (string p) => p == archive);
     assert(shown.length == 1 && shown[0].title == "Keep me", "the plain twin keeps its title");
     assert("twin" in titledIds(dir), "its title survives the forced rewrite");
+}
+
+// Summarizing a live log streams it and skips every record that isn't an
+// input by its head (issue #306): a log of one huge compaction snapshot is
+// summarized without allocating anything like its size.
+unittest
+{
+    import core.memory : GC;
+    import std.array : replicate;
+    import std.conv : text;
+    import nano.session : newSessionId;
+    auto dir = buildPath(tempDir, "nano-d-index-stream-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto p = buildPath(dir, "s1.jsonl");
+    auto big = `{"type":"replace","data":{"messages":"` ~ "x".replicate(4_000_000) ~ `"}}` ~ "\n";
+    write(p, `{"type":"session","data":{"version":1,"id":"s1","created_at":"t"}}` ~ "\n"
+        ~ `{"type":"input","data":{"id":"i1","text":"first prompt"}}` ~ "\n" ~ big
+        ~ `{"type":"input","data":{"id":"i2","text":"second prompt"}}` ~ "\n");
+    immutable before = GC.stats.allocatedInCurrentThread;
+    auto s = summarize(p);
+    immutable spent = GC.stats.allocatedInCurrentThread - before;
+    assert(s.prompts == 2 && s.logBytes == getSize(p), text(s.prompts, " ", s.logBytes));
+    assert(spent < big.length / 4, text("summarize allocated ", spent, " B for a ", big.length, " B record"));
 }

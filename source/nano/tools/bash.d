@@ -96,18 +96,16 @@ struct BashResult
     bool cancelled;
 }
 
-BashResult run(string command, Duration timeout, string cwd = null, const SandboxConfig sandbox = SandboxConfig.init)
+private struct RunStatus
 {
-    import std.process : thisProcessID;
-    import std.datetime.systime : Clock;
-    static size_t n;
-    auto stem = buildPath(tempDir, format("nano-coder-bash-%s-%s-%s", thisProcessID, stdTimeNow, ++n));
-    auto outPath = stem ~ ".out", errPath = stem ~ ".err";
-    scope (exit)
-    {
-        if (outPath.exists) remove(outPath);
-        if (errPath.exists) remove(errPath);
-    }
+    int exitCode;
+    bool timedOut;
+    bool cancelled;
+}
+
+private RunStatus runToFiles(string command, Duration timeout, string outPath, string errPath,
+    string cwd = null, const SandboxConfig sandbox = SandboxConfig.init)
+{
     auto outF = File(outPath, "w"), errF = File(errPath, "w"), inF = File("/dev/null", "r");
     Config cfg;
     cfg.preExecFunction = () nothrow @nogc { newSession(); return true; };
@@ -122,7 +120,7 @@ BashResult run(string command, Duration timeout, string cwd = null, const Sandbo
     auto pid = spawnProcess(argv, inF, outF, errF, null, cfg, cwd);
     outF.close();
     errF.close();
-    BashResult r;
+    RunStatus r;
     auto started = monoNow;
     auto deadline = started + timeout;
     // The next heartbeat is due one interval in; it stops the moment the loop
@@ -158,6 +156,30 @@ BashResult run(string command, Duration timeout, string cwd = null, const Sandbo
         sleepFor(poll);
         if (poll < 20.msecs) poll = poll * 2 > 20.msecs ? 20.msecs : poll * 2;
     }
+    return r;
+}
+
+private string tempStem()
+{
+    import std.process : thisProcessID;
+    static size_t n;
+    return buildPath(tempDir, format("nano-coder-bash-%s-%s-%s", thisProcessID, stdTimeNow, ++n));
+}
+
+BashResult run(string command, Duration timeout, string cwd = null, const SandboxConfig sandbox = SandboxConfig.init)
+{
+    auto stem = tempStem();
+    auto outPath = stem ~ ".out", errPath = stem ~ ".err";
+    scope (exit)
+    {
+        if (outPath.exists) remove(outPath);
+        if (errPath.exists) remove(errPath);
+    }
+    auto st = runToFiles(command, timeout, outPath, errPath, cwd, sandbox);
+    BashResult r;
+    r.exitCode = st.exitCode;
+    r.timedOut = st.timedOut;
+    r.cancelled = st.cancelled;
     r.stdout_ = lossyUtf8(readBytes(outPath));
     r.stderr_ = lossyUtf8(readBytes(errPath));
     return r;
@@ -177,10 +199,21 @@ string execute(JSONValue args, long defaultTimeout = defaultTimeoutSecs, const S
     auto limit = optInt(args, "max_output_length", defaultMaxOutput);
     if (limit <= 0 || limit > maxOutputLimit)
         throw new ToolError(format(`bash argument "max_output_length" must be between 1 and %s`, maxOutputLimit));
-    auto r = run(command, secs.seconds, null, sandbox);
+    auto stem = tempStem();
+    auto outPath = stem ~ ".out", errPath = stem ~ ".err";
+    scope (exit)
+    {
+        if (outPath.exists) remove(outPath);
+        if (errPath.exists) remove(errPath);
+    }
+    auto r = runToFiles(command, secs.seconds, outPath, errPath, null, sandbox);
+    // Stream-truncate stdout and stderr directly from their temp files so a
+    // noisy command never loads its full output into GC memory (issue #307).
+    bool checkDenied = sandbox.active && !r.cancelled && !r.timedOut && r.exitCode != 0;
+    bool outDenied, errDenied;
+    auto o = truncateFile(outPath, toSize(limit), "bash-stdout", outDenied, checkDenied);
+    auto e = truncateFile(errPath, toSize(limit), "bash-stderr", errDenied, checkDenied && !outDenied);
     string text;
-    auto o = truncateOutput(r.stdout_, toSize(limit), "bash-stdout");
-    auto e = truncateOutput(r.stderr_, toSize(limit), "bash-stderr");
     if (o.length) text ~= o;
     if (e.length) text ~= (text.length && text[$ - 1] != '\n' ? "\n" : "") ~ "\nStderr:\n" ~ e;
     if (r.cancelled) text ~= "\n\nError: the turn was cancelled; the command was killed";
@@ -188,7 +221,7 @@ string execute(JSONValue args, long defaultTimeout = defaultTimeoutSecs, const S
     else if (r.exitCode != 0)
     {
         text ~= format("\n\nExit code: %s", r.exitCode);
-        if (sandbox.active && looksDenied(r.stdout_ ~ r.stderr_))
+        if (checkDenied && (outDenied || errDenied))
         {
             import std.file : getcwd;
             text ~= format("\nNote: %s.", sandbox.describe(getcwd()));
