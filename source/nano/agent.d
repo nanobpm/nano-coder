@@ -2887,6 +2887,16 @@ class Agent
         subEvents = none;
     }
 
+    /// Stop every sub-agent and forget the list `/subagents` shows: used
+    /// when the session is left (`/new`, `/restart`, `/resume`, ACP load),
+    /// so the next session does not list the previous one's sub-agents.
+    void leaveSessionSubagents()
+    {
+        stopSubagents();
+        subHistory = null;
+        subForgotten = 0;
+    }
+
     /// Whether a sub-agent is running or queued (the UI shows activity).
     bool subagentsActive() pure const nothrow
     {
@@ -3356,7 +3366,7 @@ class Agent
         // Sub-agents belong to the session being left (issue #266): stop them
         // before the conversation and log are replaced, for every loader
         // (`/resume`, ACP `session/load`).
-        stopSubagents();
+        leaveSessionSubagents();
         // Repairs are logged first: a failed write leaves the live session as
         // it was — and closes the incoming log, which the agent never
         // adopted, so its descriptor and lock do not leak into `openHere`.
@@ -3486,7 +3496,7 @@ class Agent
     void restart(string system, Option!SessionLog newLog)
     {
         // Sub-agents belong to the session being left (issue #266).
-        stopSubagents();
+        leaveSessionSubagents();
         import nano.mode : AgentMode;
         // An empty system prompt (e.g. an ACP host without one) sends no
         // system message at all: some providers reject an empty one.

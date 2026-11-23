@@ -18,7 +18,7 @@ import nano.agent;
 import nano.clock : sleepFor, monoNow, FakeClock, wallNow;
 import nano.control : Cancelled, cancelRequested;
 import nano.llm;
-import nano.option : some, unwrap;
+import nano.option : Option, some, unwrap;
 import nano.permissions : Policy;
 import nano.providers.mock : MockClient;
 import nano.session : SessionLog;
@@ -438,7 +438,6 @@ unittest
 unittest
 {
     import nano.session : restore, Restored;
-    import nano.option : Option;
     auto f = new Fixture([calls(bg("b1", "mock/hang")), LLMResponse("started")]);
     scope (exit) f.cleanup();
     assert(f.agent.run("go", new NullEvents) == "started");
@@ -496,6 +495,11 @@ unittest
     assert(all[2].id == "sub-3" && all[2].state == "queued");
     assert(f.agent.subagentLog("sub-1").isOk && f.agent.subagentLog("sub-3").isErr
         && f.agent.subagentLog("sub-9").isErr);
+    // Leaving the session (`/new`, `/restart`) forgets its sub-agents.
+    f.agent.restart("sys", Option!(imported!"nano.session".SessionLog).init);
+    all = f.agent.subagentList(forgotten);
+    assert(forgotten == 0 && all.length == 0, all.length.to!string);
+    assert(f.agent.stopSubagentsByUser("sub-1").canFind("No sub-agent sub-1"));
 }
 
 // `/subagents stop <id>`: the child reports what it has, marked cancelled,
