@@ -1445,6 +1445,12 @@ unittest // remoteHosts: quoted option values, shell operators, bare sftp, wrapp
     assert(remoteHosts(`sudo --user deploy ssh merlin`) == ["merlin"]);
     // sftp's -b takes the batch file; the destination follows.
     assert(remoteHosts(`sftp -b batch.txt deploy@merlin.local`) == ["merlin.local"]);
+    // A value letter inside a cluster takes the next word only when it is
+    // the cluster's last character (`sudo -Eu deploy`, `env -iu HOME`).
+    assert(remoteHosts(`sudo -Eu deploy ssh merlin`) == ["merlin"]);
+    assert(remoteHosts(`env -iu HOME ssh merlin`) == ["merlin"]);
+    assert(remoteHosts(`sudo -Eudeploy ssh merlin`) == ["merlin"]);
+    assert(remoteHosts(`env -iuHOME ssh merlin`) == ["merlin"]);
     assert(remoteHosts(`bash -c "ssh merlin uptime"`) == ["merlin"]);
     assert(remoteHosts("echo ssh\nssh omarchy") == ["omarchy"]);
 }
@@ -1464,6 +1470,13 @@ unittest // every executable of a shell script becomes a tool entity
     e = entitiesFromCall("bash", parseJSON(`{"command":"sudo -u deploy ssh merlin"}`), "");
     assert(e.canFind("tool:ssh") && !e.canFind("tool:deploy"), e.to!string);
     e = entitiesFromCall("bash", parseJSON(`{"command":"env -u HOME ssh merlin"}`), "");
+    assert(e.canFind("tool:ssh") && !e.canFind("tool:home"), e.to!string);
+    // Nor are the values of clustered wrapper options (`sudo -Eu deploy`,
+    // `env -iu HOME`): the value letter takes the next word only as the
+    // cluster's last character.
+    e = entitiesFromCall("bash", parseJSON(`{"command":"sudo -Eu deploy ssh merlin"}`), "");
+    assert(e.canFind("tool:ssh") && !e.canFind("tool:deploy"), e.to!string);
+    e = entitiesFromCall("bash", parseJSON(`{"command":"env -iu HOME ssh merlin"}`), "");
     assert(e.canFind("tool:ssh") && !e.canFind("tool:home"), e.to!string);
 }
 

@@ -1984,15 +1984,19 @@ private bool wrapperTakesValue(string cmd, string w) pure
             default: return false;
         }
     }
-    // A short-option cluster takes the next word when its last letter takes
-    // a value and nothing is attached (`sudo -Eu deploy`: attached to u).
-    foreach (ch; w[1 .. $])
+    // A short-option cluster takes the next word only when a value-taking
+    // letter is the cluster's last character: an earlier value letter has
+    // its value attached inside the cluster (`sudo -Eudeploy`), and a value
+    // letter followed by more letters is attached to them (`sudo -Eu` — `u`'s
+    // value would be the rest of the cluster, so the next word stays the
+    // executable: `sudo -Eu deploy ssh merlin`, `env -iu HOME ssh merlin`).
+    foreach (idx, ch; w[1 .. $])
     {
         auto takes = cmd == "sudo" ? "uUgGCDRrTth".canFind(ch)
             : cmd == "env" ? ch == 'u' || ch == 'C'
             : cmd == "time" ? ch == 'o' || ch == 'f'
             : false;
-        if (takes) return w.length == 2; // attached value: one word
+        if (takes) return idx == w.length - 2; // value letter is the last char
     }
     return false;
 }
