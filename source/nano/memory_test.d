@@ -778,7 +778,7 @@ unittest // exact duplicates refused; near-duplicates and contradictions returne
     o.factKind = "fact";
     auto first = s.saveFact(Scope.user, "merlin runs the worker fleet on port 8080", null, null, null, null, false, o).entry;
     try { s.saveFact(Scope.user, "Merlin runs the  worker fleet on port 8080", null, null, null, null, false, o); assert(0); }
-    catch (Exception e) assert(e.msg.canFind(first.id), e.msg);
+    catch (Exception e) assert(e.msg.canFind(first.id) && !e.msg.canFind("8080"), e.msg);
     // Near-duplicate: most words shared.
     auto near = s.saveFact(Scope.user, "merlin runs the worker fleet on port 9090", null, null, null, null, false, o);
     assert(!near.saved && near.candidates.length == 1 && near.candidates[0].id == first.id
@@ -799,6 +799,16 @@ unittest // exact duplicates refused; near-duplicates and contradictions returne
     // The tool reports candidates instead of saving.
     auto msg = run(s, saveTool, parseJSON(`{"scope":"user","text":"merlin runs the worker fleet on port 7070","entities":["host:merlin"],"fact_kind":"fact"}`), null, false);
     assert(msg.startsWith("not saved:") && msg.canFind(first.id) && msg.canFind("supersedes"), msg);
+    // The duplicate check is scoped like the conflict check: same text under
+    // another fact kind or entity is a separate fact and saves.
+    SaveOptions dupKind = o;
+    dupKind.factKind = "pitfall";
+    dupKind.distinct = true;
+    assert(s.saveFact(Scope.user, "merlin runs the worker fleet on port 8080", null, null, null, null, false, dupKind).saved);
+    SaveOptions dupEnt = o;
+    dupEnt.entities = ["host:other"];
+    dupEnt.distinct = true;
+    assert(s.saveFact(Scope.user, "merlin runs the worker fleet on port 8080", null, null, null, null, false, dupEnt).saved);
 }
 
 unittest // supersedes hides the old entry from recall, index and search; still readable by id

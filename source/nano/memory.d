@@ -22,7 +22,7 @@ import nano.arith : saturatingSub, toSize;
 
 import nano.safeio : chmodPath, fchmodFd, openPath, statMode, writeFd;
 
-import std.algorithm : any, canFind, count, countUntil, filter, map, sort, startsWith, endsWith;
+import std.algorithm : any, canFind, count, countUntil, filter, map, sort, startsWith, endsWith, equal;
 import std.array : array, join, appender;
 import std.conv : to;
 import std.datetime.systime : SysTime, Clock;
@@ -619,9 +619,12 @@ final class Store
         auto norm = normalizedText(text), normEv = normalizedText(evidence);
         foreach (x; f.entries)
             if (!x.isSuperseded && !sup.canFind(x.id) && normalizedText(x.text) == norm
-                    && normalizedText(x.evidence) == normEv)
-                throw new Exception(format("already remembered as %s: %s (pass supersedes to replace it)",
-                    scrubControl(x.id), oneLine(x.text)));
+                    && normalizedText(x.evidence) == normEv && x.factKind == e.factKind
+                    && sort(x.entities.dup).equal(sort(e.entities.dup)))
+                // Scoped like the conflict check (same kind and entities); the
+                // message names only the id so it never echoes stored text.
+                throw new Exception(format("already remembered as %s (pass supersedes to replace it)",
+                    scrubControl(x.id)));
         SaveOutcome r;
         if (!opts.distinct) r.candidates = conflicts(f.entries, e);
         if (r.candidates.length) return r;
