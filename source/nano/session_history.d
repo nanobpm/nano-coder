@@ -132,10 +132,14 @@ private bool messageLine(const(char)[] line, out Message m)
 {
     import nano.session : messageFromRecord;
     if (!line.canFind(`"message"`)) return false; // cheap pre-filter; any JSON spacing is valid
-    auto rec = parseJSON(line);
-    if (rec["type"].str != "message") return false;
-    m = messageFromRecord(rec["data"]);
-    return true;
+    try
+    {
+        auto rec = parseJSON(line);
+        if (rec["type"].str != "message") return false;
+        m = messageFromRecord(rec["data"]);
+        return true;
+    }
+    catch (Exception) return false; // a corrupt record is skipped alone; later records stay readable
 }
 
 string roleName(Role r) pure @safe
@@ -479,3 +483,25 @@ unittest
 }
 
 
+
+// Issue #271 review: one corrupt message record is skipped alone; later
+// records stay readable.
+unittest
+{
+    Message m;
+    assert(!messageLine(`{"type":"message","data":{"role":42}}`, m));
+    assert(!messageLine(`{"type":"message",`, m));
+}
+
+unittest
+{
+    import std.file : write, remove, tempDir;
+    import std.path : buildPath;
+    auto p = buildPath(tempDir, "nano-history-corrupt-mid.jsonl");
+    scope (exit) remove(p);
+    write(p, `{"type":"session","data":{}}` ~ "\n"
+        ~ `{"type":"message","data":{"role":42}}` ~ "\n"
+        ~ `{"type":"message","data":{"role":"user","content":"after"}}` ~ "\n");
+    auto es = load(p);
+    assert(es.length == 1 && es[0].id == 3, "the record after a corrupt one is still loaded");
+}

@@ -198,6 +198,8 @@ struct InflateStream
     /// How one `inflateInto` ended.
     enum Rc { ok, streamEnd, error }
 
+    private ubyte[] input; // owned copy of the bytes zlib is reading
+
     /// Whether the stream was never opened (or closed already).
     bool isNone() const pure @safe nothrow { return zs is null; }
 
@@ -231,7 +233,8 @@ struct InflateStream
     uint availIn()
     {
         import etc.c.zlib : z_stream;
-        // Reads one field of the C struct.
+        if (zs is null) return 0;
+        // Reads one field of the C struct (zs checked non-null above).
         return (() @trusted => (cast(z_stream*) zs).avail_in)();
     }
 
@@ -239,35 +242,49 @@ struct InflateStream
     uint availOut()
     {
         import etc.c.zlib : z_stream;
-        // Reads one field of the C struct.
+        if (zs is null) return 0;
+        // Reads one field of the C struct (zs checked non-null above).
         return (() @trusted => (cast(z_stream*) zs).avail_out)();
     }
 
-    /// Point the stream at the next compressed bytes (caller-owned).
-    void feed(scope const(ubyte)[] data, uint n)
+    /// Point the stream at the next compressed bytes. They are copied into
+    /// a buffer the stream owns, so zlib never keeps a pointer into the
+    /// caller's (possibly short-lived) memory between calls. At most
+    /// `uint.max` bytes are taken; throws on an unopened stream.
+    void feed(scope const(ubyte)[] data)
     {
         import etc.c.zlib : z_stream;
-        // Stores the caller's pointer in the C struct; zlib only reads it,
-        // and the data outlives the call (the caller feeds it from its own
-        // buffer, which stays put until the stream ends).
+        if (zs is null) throw new Exception("inflate: stream not open");
+        immutable n = data.length > uint.max ? uint.max : cast(uint) data.length;
+        if (input.length < n) input = new ubyte[](n);
+        input[0 .. n] = data[0 .. n];
+        // next_in points at the stream's own GC buffer, which lives as long
+        // as this struct (and is only replaced by a later feed that resets
+        // next_in); avail_in never exceeds its length.
         () @trusted {
             auto z = cast(z_stream*) zs;
-            z.next_in = data.ptr;
+            z.next_in = input.ptr;
             z.avail_in = n;
         }();
     }
 
-    /// Inflate into the caller's buffer; the filled size is
-    /// `buf.length - availOut`.
-    Rc inflateInto(scope ubyte[] buf, uint n)
+    /// Inflate into `buf` (at most `uint.max` bytes of it); the filled size
+    /// is `min(buf.length, uint.max) - availOut`. Throws on an unopened
+    /// stream.
+    Rc inflateInto(scope ubyte[] buf)
     {
         import etc.c.zlib : z_stream, inflate, Z_NO_FLUSH, Z_STREAM_END, Z_OK, Z_BUF_ERROR;
-        // zlib writes only within buf[0 .. n].
+        if (zs is null) throw new Exception("inflate: stream not open");
+        immutable n = buf.length > uint.max ? uint.max : cast(uint) buf.length;
+        // zlib writes only within buf[0 .. n], n <= buf.length; next_out is
+        // cleared before returning so no pointer into buf outlives the call.
         auto rc = () @trusted {
             auto z = cast(z_stream*) zs;
             z.next_out = buf.ptr;
             z.avail_out = n;
-            return inflate(z, Z_NO_FLUSH);
+            auto r = inflate(z, Z_NO_FLUSH);
+            z.next_out = null;
+            return r;
         }();
         if (rc == Z_STREAM_END) return Rc.streamEnd;
         if (rc == Z_OK || rc == Z_BUF_ERROR) return Rc.ok;
@@ -279,6 +296,7 @@ struct InflateStream
     {
         import etc.c.zlib : z_stream;
         import core.stdc.string : strlen;
+        if (zs is null) return "stream not open";
         // msg is a NUL-terminated C string owned by zlib; copied here.
         auto msg = (() @trusted => (cast(z_stream*) zs).msg)();
         if (msg is null) return "corrupt stream";
@@ -1278,4 +1296,16 @@ unittest // writeTemp applies the caller's final mode directly; a 0600 target's 
     auto u = writeTemp(tempDir, "wt-mode-default", cast(const(ubyte)[]) "d\n", newFileMode);
     scope (exit) remove(u);
     assert((getAttributes(u) & octal!7777) == newFileMode);
+}
+
+// Issue #271 review: an unopened inflate stream is rejected rather than
+// handed to zlib, and `feed` copies its input (no borrowed pointer kept).
+unittest
+{
+    import std.exception : assertThrown;
+    InflateStream z;
+    auto buf = new ubyte[](8);
+    assertThrown(z.inflateInto(buf));
+    assertThrown(z.feed(buf));
+    assert(z.availIn == 0 && z.availOut == 0);
 }

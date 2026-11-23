@@ -154,6 +154,14 @@ ubyte[] gzipLog(const(ubyte)[] text) @trusted
 /// `committedLines`.
 void streamLogLines(string path, scope void delegate(const(char)[] line) @safe sink)
 {
+    streamLogLinesUntil(path, (line) { sink(line); return true; });
+}
+
+/// `streamLogLines` whose `sink` returns false to stop reading: nothing
+/// past that line is read or inflated (issue #271: the permission-header
+/// probe must not scan a denied session's whole log).
+void streamLogLinesUntil(string path, scope bool delegate(const(char)[] line) @safe sink)
+{
     import std.stdio : File;
     auto f = File(path, "rb");
     scope (exit) f.close();
@@ -167,7 +175,7 @@ void streamLogLines(string path, scope void delegate(const(char)[] line) @safe s
         {
             auto got = gz.read(f, buf);
             if (!got.length) break;
-            feedChunk(carry, got, sink);
+            if (!feedChunk(carry, got, sink)) return;
         }
     }
     else
@@ -177,36 +185,39 @@ void streamLogLines(string path, scope void delegate(const(char)[] line) @safe s
         {
             auto got = f.rawRead(buf);
             if (!got.length) break;
-            feedChunk(carry, got, sink);
+            if (!feedChunk(carry, got, sink)) return;
         }
     }
 }
 
 /// Split one chunk into newline-terminated lines for `sink`, carrying a
 /// partial line over to the next chunk (a torn tail is dropped).
-private void feedChunk(ref ubyte[] carry, const(ubyte)[] chunk, scope void delegate(const(char)[]) @safe sink)
+private bool feedChunk(ref ubyte[] carry, const(ubyte)[] chunk, scope bool delegate(const(char)[]) @safe sink)
 {
     size_t start;
     foreach (i, b; chunk)
         if (b == '\n')
         {
-            emitLine(carry, chunk[start .. i], sink);
+            if (!emitLine(carry, chunk[start .. i], sink)) return false;
             start = i + 1;
         }
     if (start < chunk.length) carry ~= chunk[start .. $];
+    return true;
 }
 
 /// One line split out of the stream: the carried prefix plus the chunk
 /// slice, validated as UTF-8 (a malformed line is lossy-copied so a bad byte
 /// can't kill the stream; it fails to parse where decoded, as before).
-private void emitLine(ref ubyte[] carry, const(ubyte)[] tail, scope void delegate(const(char)[]) @safe sink)
+private bool emitLine(ref ubyte[] carry, const(ubyte)[] tail, scope bool delegate(const(char)[]) @safe sink)
 {
     import nano.safeio : lossyText, utf8View;
     import std.utf : UTFException;
     const(ubyte)[] line = carry.length ? carry ~ tail : tail;
     carry = null;
-    try sink(utf8View(line));
-    catch (UTFException) sink(lossyText(line));
+    const(char)[] text;
+    try text = utf8View(line);
+    catch (UTFException) text = lossyText(line);
+    return sink(text);
 }
 
 /// An incremental gzip reader over a log file: the gzip wrapper needs raw
@@ -237,10 +248,10 @@ private struct GunzipStream
             {
                 auto got = f.rawRead(inBuf);
                 if (!got.length) throw new Exception("gunzip " ~ path ~ ": truncated stream");
-                zs.feed(got, zlibWindow(got.length));
+                zs.feed(got);
             }
-            auto rc = zs.inflateInto(buf, zlibWindow(buf.length));
-            immutable used = buf.length - zs.availOut;
+            auto rc = zs.inflateInto(buf);
+            immutable used = zlibWindow(buf.length) - zs.availOut;
             if (rc == InflateStream.Rc.streamEnd)
             {
                 ended = true;
@@ -279,16 +290,16 @@ void foreachLogLineSkippingTorn(string path, scope void delegate(const(char)[]) 
 string logHeaderCwd(string path)
 {
     string cwd;
-    bool first = true;
-    foreachLogLineSkippingTorn(path, (line) {
-        if (!first) return;
-        first = false;
-        auto h = parseJSON(line);
-        if (h["type"].str != "session") return;
-        auto d = h["data"].objectNoRef;
-        if (auto c = "cwd" in d)
-            if (c.type == JSONType.string) cwd = c.str;
-    });
+    try
+        streamLogLinesUntil(path, (line) {
+            auto h = parseJSON(line);
+            if (h["type"].str != "session") return false;
+            auto d = h["data"].objectNoRef;
+            if (auto c = "cwd" in d)
+                if (c.type == JSONType.string) cwd = c.str;
+            return false; // the header is the first line: stop reading
+        });
+    catch (Exception) {} // an unreadable or corrupt header is no cwd, as documented
     return cwd;
 }
 
@@ -3765,4 +3776,19 @@ unittest
     auto now = readText(rec);
     assert(now.canFind("sigma") && now.canFind("tau") && !now.canFind("foreign"), now);
     restore(rec);
+}
+
+// Issue #271 review: `streamLogLinesUntil` stops at the first false, and
+// `logHeaderCwd` reads only the header.
+unittest
+{
+    import std.file : write, remove, tempDir;
+    import std.path : buildPath;
+    auto p = buildPath(tempDir, "nano-stream-until.jsonl");
+    scope (exit) remove(p);
+    write(p, `{"type":"session","data":{"cwd":"/w"}}` ~ "\n" ~ "not json\n" ~ "x\n");
+    size_t seen;
+    streamLogLinesUntil(p, (line) { ++seen; return false; });
+    assert(seen == 1);
+    assert(logHeaderCwd(p) == "/w");
 }

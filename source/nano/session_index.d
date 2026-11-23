@@ -510,8 +510,9 @@ bool[string] titledIds(string dir)
 /// fails on an unreadable or corrupt index (see `load`). `skip` hides a log
 /// from the listing entirely (issue #271: a session the permission policy
 /// denies is neither summarized nor reported from cached metadata, so its
-/// title or first request can't leak); skipped logs are left in the index
-/// untouched.
+/// title or first request can't leak); a skipped log's cached record is
+/// still carried into any index rewrite, so hiding it never erases its title
+/// (which protects the log from retention).
 Summary[] list(string dir, bool strictIndex = false, scope bool delegate(string path) @safe skip = null)
 {
     if (!dir.exists) return null;
@@ -521,6 +522,7 @@ Summary[] list(string dir, bool strictIndex = false, scope bool delegate(string 
     Summary[string] current;
     Summary[] updates;
     Summary[string] skippedTitled;
+    Summary[string] denied; // hidden from the listing, kept in the index
     foreach (DirEntry e; dirEntries(dir, SpanMode.shallow, false))
     {
         auto name = e.name.baseName;
@@ -530,7 +532,13 @@ Summary[] list(string dir, bool strictIndex = false, scope bool delegate(string 
         try validateId(id);
         catch (Exception) continue; // not a session log name: skip
         if (!e.isFile) continue;
-        if (skip !is null && skip(e.name)) continue; // denied: hide it entirely (issue #271)
+        if (skip !is null && skip(e.name))
+        {
+            // Denied: hide it entirely (issue #271), but keep its cached
+            // record so a rewrite doesn't drop its title.
+            if (auto c = id in index) { denied[id] = *c; index.remove(id); }
+            continue;
+        }
         if (compressed && buildPath(dir, id ~ ".jsonl").exists)
         {
             // The plain twin wins. An archive resume may publish it after the
@@ -593,7 +601,12 @@ Summary[] list(string dir, bool strictIndex = false, scope bool delegate(string 
     }
     try
     {
-        if (lines + updates.length > current.length * 2 + 64 || index.length) rewrite(dir, current, indexLen);
+        if (lines + updates.length > current.length * 2 + 64 || index.length)
+        {
+            Summary[string] all = current.dup;
+            foreach (id, d; denied) if (id !in all) all[id] = d;
+            rewrite(dir, all, indexLen);
+        }
         else append(dir, updates);
     }
     catch (Exception) {} // only a cache
@@ -961,4 +974,21 @@ unittest
     setTimes(buildPath(dir, ".tidy-stamp"), wallNow - 2.days, wallNow - 2.days);
     auto r = tidySessions(dir, 0, 180);
     assert(r.deleted == 0 && path.exists, "a named log is never deleted");
+}
+
+// Issue #271 review: a session hidden by `skip` keeps its index record (and
+// so its title) when the listing rewrites the index.
+unittest
+{
+    auto dir = testDir("skip-keeps-title");
+    scope (exit) rmdirRecurse(dir);
+    auto denied = writeLog(dir, "denied", ["Fix the deploy test please"]);
+    auto gone = writeLog(dir, "gone", ["Write the release notes now"]);
+    list(dir);
+    assert(setTitle(denied, "Keep me"));
+    import std.file : remove;
+    remove(gone); // a stale index entry forces a rewrite
+    auto shown = list(dir, false, (string p) => p == denied);
+    assert(shown.length == 0, "the denied session is hidden");
+    assert("denied" in titledIds(dir), "its title survives the rewrite");
 }
