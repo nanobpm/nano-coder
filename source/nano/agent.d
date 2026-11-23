@@ -219,10 +219,6 @@ struct ConfiguredWindow
     string source;
 }
 
-/// Folded tool outputs longer than this keep only their log reference in
-/// the replay stash.
-enum size_t stashSlimBytes = 512;
-
 /// The replay stash with the content dropped for entries with a log
 /// (`Agent.replayStashLog`) read back from their log lines. An entry whose
 /// line can't be read keeps its empty content.
@@ -232,7 +228,26 @@ const(Message)[] rehydrateStash(const(Message)[] stash, Option!SessionLog[] logs
     bool any;
     foreach (l; logs) any |= l.isSome;
     if (!any) return stash;
+    // The lines each log must give back: only those are decoded, streaming
+    // the log (issue #263: decoding it whole held every message of a long
+    // session at once, and the heap stayed at that peak).
+    bool[ulong][SessionLog] wanted;
+    foreach (i, ref m; stash)
+        if (i < logs.length)
+            logs[i].ifSome((SessionLog l) { wanted.require(l)[m.logLine] = true; });
     Message[ulong][SessionLog] byLog;
+    foreach (src, lines; wanted)
+    {
+        Message[ulong] at;
+        // The path is read at replay time, not at slimming time: a
+        // recovery (`SessionLog.recoverReplaced`) may have moved the
+        // writer since, and the stale path would name a foreign file.
+        try
+            foreach (e; load(src.path, (id) => (id in lines) !is null))
+                if (e.message.role == Role.tool) at[e.id] = e.message;
+        catch (Exception) {} // an unreadable log: the entries replay empty
+        byLog[src] = at;
+    }
     import nano.safeio : deepCopy;
     const(Message)[] o;
     o.reserve(stash.length);
@@ -241,18 +256,6 @@ const(Message)[] rehydrateStash(const(Message)[] stash, Option!SessionLog[] logs
         if (i >= logs.length || logs[i].isNone) { o ~= m; continue; }
         Message x = deepCopy(m);
         auto src = logs[i].unwrap("isSome");
-        if (src !in byLog)
-        {
-            Message[ulong] at;
-            // The path is read at replay time, not at slimming time: a
-            // recovery (`SessionLog.recoverReplaced`) may have moved the
-            // writer since, and the stale path would name a foreign file.
-            try
-                foreach (e; load(src.path))
-                    if (e.message.role == Role.tool) at[e.id] = e.message;
-            catch (Exception) {} // an unreadable log: the entries replay empty
-            byLog[src] = at;
-        }
         if (auto r = x.logLine in byLog[src])
             if (r.toolCallId == x.toolCallId) x.content = r.content;
         o ~= x;
@@ -2808,6 +2811,16 @@ class Agent
         replayStash = r.replayStash;
         replayStashLog = null;
         stashRefLogs = null;
+        // Entries `restore` slimmed read their content back from this log
+        // (issue #263); without one they replay empty, as a live compaction
+        // without a log drops them.
+        if (r.replayStashSlim.length)
+        {
+            replayStashLog = new Option!SessionLog[](replayStash.length);
+            foreach (i, slimmed; r.replayStashSlim)
+                if (slimmed && i < replayStashLog.length) replayStashLog[i] = newLog;
+            newLog.ifSome((SessionLog l) { stashRefLogs ~= l; });
+        }
         clippedLines = null;
         restoredLineFloor = 0;
         foreach (ref m; messages)
