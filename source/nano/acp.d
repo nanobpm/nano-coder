@@ -957,19 +957,25 @@ final class AcpServer : AgentEvents
                 stdErr.writeln("nano-coder: ACP session/load: could not restore model ", spec, ": ", e.msg);
             return e is null;
         }
+        bool switched;
         if (wanted.length && host.makeClient !is null && wanted != current)
         {
             // A failed restore falls back to the config model, not whatever
             // an earlier session on this server switched to.
-            if (!tryModel(wanted) && wanted != host.configModel && host.configModel.length
+            switched = tryModel(wanted);
+            if (!switched && wanted != host.configModel && host.configModel.length
                 && host.configModel != current)
-                tryModel(host.configModel);
+                switched = tryModel(host.configModel);
         }
-        else if (host.windowFor !is null && current.length)
+        if (!switched && host.windowFor !is null && current.length)
         {
             // No rebuild: the reset above installed the startup provider's
-            // window; resolve the active provider's own.
-            agent.setConfiguredWindow(host.windowFor(current));
+            // window; resolve the active provider's own. A provider since
+            // removed from config keeps the default rather than failing the load.
+            import std.exception : collectException;
+            ConfiguredWindow w;
+            if (collectException(w = host.windowFor(current)) is null)
+                agent.setConfiguredWindow(w);
         }
         if (st.mode.length)
         {
@@ -1507,4 +1513,27 @@ unittest
     assert(built4.length == 0, built4[0]);
     assert(agent5.configuredWindow == 1234);
     agent5.replaceLog(Option!SessionLog.init);
+
+    // A failed switch with the config model already active still resolves
+    // the active provider's window; a windowFor that throws keeps the load.
+    Host host6 = host4;
+    host6.savedModelKnown = (string spec) => true;
+    host6.makeClient = (string spec) { throw new Exception("no such model"); return new NamedMock("x", "y"); };
+    auto agent6 = new Agent(new NamedMock("cfg", "default"), new ToolRegistry, Policy.init, null);
+    agent6.setConfiguredWindow(ConfiguredWindow(99, "startup provider"));
+    auto srv6 = new AcpServer(agent6, host6, (string l) {});
+    srv6.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ sid ~ `"}}`);
+    srv6.close();
+    assert(srv6.run());
+    assert(agent6.configuredWindow == 1234);
+    agent6.replaceLog(Option!SessionLog.init);
+
+    host6.windowFor = (string spec) { throw new Exception("provider removed"); return ConfiguredWindow.init; };
+    auto agent7 = new Agent(new NamedMock("cfg", "default"), new ToolRegistry, Policy.init, null);
+    auto srv7 = new AcpServer(agent7, host6, (string l) {});
+    srv7.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ sid ~ `"}}`);
+    srv7.close();
+    assert(srv7.run());
+    assert(agent7.messages.length > 0);
+    agent7.replaceLog(Option!SessionLog.init);
 }

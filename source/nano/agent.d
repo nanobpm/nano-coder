@@ -3664,6 +3664,11 @@ class Agent
     {
         // Sub-agents belong to the session being left (issue #266).
         leaveSessionSubagents();
+        // Setting requests queued for the session being left must not apply
+        // to the new one on its first turn (issue #297).
+        control.takeModelRequest();
+        control.takeThinkingRequest();
+        control.takeSubagentsRequest();
         import nano.mode : AgentMode;
         // An empty system prompt (e.g. an ACP host without one) sends no
         // system message at all: some providers reject an empty one.
@@ -5578,6 +5583,21 @@ unittest
     agent.control.requestSubagents(false);
     Restored r;
     agent.loadRestored(r, Option!SessionLog.init);
+    assert(agent.control.takeModelRequest() is null);
+    assert(agent.control.takeThinkingRequest() is null);
+    assert(agent.control.takeSubagentsRequest() == 0);
+}
+
+// issue #297: `restart` (`/restart`, ACP `session/new`) also drops queued
+// setting requests from the session being left.
+unittest
+{
+    import nano.providers.mock;
+    auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "sys");
+    agent.control.requestModel("mock/old");
+    agent.control.requestThinking("high");
+    agent.control.requestSubagents(false);
+    agent.restart("sys", Option!SessionLog.init);
     assert(agent.control.takeModelRequest() is null);
     assert(agent.control.takeThinkingRequest() is null);
     assert(agent.control.takeSubagentsRequest() == 0);
