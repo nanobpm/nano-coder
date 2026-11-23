@@ -1790,7 +1790,7 @@ class Console : AgentEvents
     {
         if (quiet) return;
         endLine();
-        writeln(stampBlock(stamp(), dim("↪ " ~ escapeMarks(text))));
+        writeln(stampBlock(stamp(), dim("↪ " ~ escapeMarks(sanitizeBlock(text)))));
     }
     /// Close the abandoned partial so the resent reply starts a fresh segment
     /// instead of joining the stale prefix.

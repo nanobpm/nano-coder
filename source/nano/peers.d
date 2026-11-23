@@ -803,8 +803,16 @@ struct PeerRouter
         answer(done, Status.queued, "queued");
         PeerMessage pm;
         pm.text = labelled;
-        // Already admitted against the steer budget: not refused here.
-        queuedBytes.update((ref size_t q) { q += retainedBytes(pm, labelled); });
+        // Its steer budget was freed when the turn drained it, so admit it
+        // against the inbox cap (with one steer budget of headroom, since its
+        // sender was already told `queued`). Beyond that it is dropped: the
+        // inbox must stay bounded across any number of turns.
+        auto bytes = retainedBytes(pm, labelled);
+        bool admitted;
+        queuedBytes.update((ref size_t q) {
+            if (q + bytes <= 2 * maxQueuedBytes) { q += bytes; admitted = true; }
+        });
+        if (!admitted) return;
         waiting.put(WaitingItem(pm, labelled, false, done));
     }
 
@@ -1106,6 +1114,15 @@ unittest
     // A late peer steer runs later as a (pre-answered) peer prompt.
     router.requeueLate("[from session sess-a] later");
     assert(router.takeWaiting(m) && m.labelled == "[from session sess-a] later" && !m.needsConfirm);
+
+    // Late steers can't grow the inbox past its bound across turns.
+    {
+        auto quarter = "x".replicate(maxQueuedBytes / 4);
+        foreach (i; 0 .. 32) router.requeueLate(quarter);
+        size_t n;
+        while (router.takeWaiting(m)) n++;
+        assert(n > 0 && n < 32);
+    }
 
     // Leaving a session refuses its queued, waiting and steered messages.
     auto w = Shared!ReplyCell.make, q = Shared!ReplyCell.make;
