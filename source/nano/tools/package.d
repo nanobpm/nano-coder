@@ -297,7 +297,7 @@ string truncateFile(string path, size_t limit, string label, out bool denied, bo
     import std.ascii : LetterCase;
     import std.array : Appender;
     import std.string : representation;
-    import nano.safeio : readBytes, asChars;
+    import nano.safeio : asChars;
     import nano.sandbox : looksDenied;
     import nano.arith : saturatingSub;
 
@@ -308,7 +308,9 @@ string truncateFile(string path, size_t limit, string label, out bool denied, bo
     // UTF-8 code points (even if every byte is invalid -> 1 U+FFFD each).
     if (rawSize <= limit)
     {
-        auto text = lossyUtf8(readBytes(path));
+        // Cap at the sampled size: a background child may still be appending.
+        auto buf = new ubyte[rawSize];
+        auto text = lossyUtf8(File(path, "rb").rawRead(buf));
         if (checkDenied) denied = looksDenied(text);
         return text;
     }
@@ -320,7 +322,9 @@ string truncateFile(string path, size_t limit, string label, out bool denied, bo
     // boundaries, hashing the decoded UTF-8, capturing head + rolling tail,
     // and writing the sanitized full output to a spill file once we know it
     // exceeds `limit` characters.
-    auto spillPath = nextSpillPath(label);
+    // Allocated only when spilling actually starts: a file over `limit` bytes
+    // may still fit `limit` characters and then needs no spill directory.
+    string spillPath;
     File spillF;
     bool spilling;
     scope (failure)
@@ -329,7 +333,7 @@ string truncateFile(string path, size_t limit, string label, out bool denied, bo
         {
             import std.file : exists, remove;
             spillF.close();
-            if (spillPath.exists) remove(spillPath);
+            if (spillPath.length && spillPath.exists) remove(spillPath);
         }
     }
 
@@ -365,6 +369,7 @@ string truncateFile(string path, size_t limit, string label, out bool denied, bo
 
     auto startSpilling = () {
         if (spilling) return;
+        spillPath = nextSpillPath(label);
         spillF = File(spillPath, "wb");
         spilling = true;
         if (smallBuf.data.length) spillF.rawWrite(smallBuf.data);
@@ -468,10 +473,16 @@ string truncateFile(string path, size_t limit, string label, out bool denied, bo
     size_t carryLen;
     Appender!(char[]) decoded;
 
+    // Read only the `rawSize` bytes sampled above: background children left by
+    // the command may keep appending, and a live EOF could then never come.
+    ulong remaining = rawSize;
     for (;;)
     {
-        auto got = src.rawRead(chunkBuf[]);
+        if (remaining == 0) break;
+        auto want = remaining < chunkBuf.length ? remaining : chunkBuf.length;
+        auto got = src.rawRead(chunkBuf[0 .. want]);
         if (!got.length) break;
+        remaining -= got.length;
 
         // Decode `carry[0 .. carryLen]` + `got`, leaving an incomplete
         // trailing multi-byte UTF-8 sequence (at most 3 bytes) in `carry` for
@@ -845,6 +856,23 @@ unittest
             assert(allocated < 4 * 1024 * 1024, format("expected < 4 MiB allocated (checkDenied=%s), got %s bytes",
                 checkDenied, allocated));
         }
+    }
+
+    // 3. Over `limit` bytes but within `limit` characters: no spill is needed,
+    //    so an unusable spill directory must not matter.
+    {
+        auto p = buildPath(tempDir, format("nano-d-trunc-nospill-%s.bin", thisProcessID));
+        auto blocker = buildPath(tempDir, format("nano-d-trunc-blocker-%s", thisProcessID));
+        scope (exit) { if (p.exists) remove(p); if (blocker.exists) remove(blocker); }
+        string text;
+        foreach (_; 0 .. 30_000) text ~= "é";
+        write(p, text);
+        write(blocker, "not a dir");
+        auto saved = spillDir_;
+        setSpillDir(buildPath(blocker, "sub"));
+        scope (exit) setSpillDir(saved);
+        bool denied;
+        assert(truncateFile(p, 40_000, "nospill", denied) == text);
     }
 }
 
