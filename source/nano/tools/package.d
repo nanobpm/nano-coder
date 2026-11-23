@@ -260,6 +260,42 @@ string truncateOutput(string text, size_t limit, string label)
             chars[0 .. head].toUTF8, chars.length - limit, contentDigest(text), spill, chars[$ - tail .. $].toUTF8);
 }
 
+/// Keep the head and tail of `text` within `limit` UTF-8 bytes, marker
+/// included, cutting only on code-point boundaries. Use it where the cap is
+/// advertised in bytes (a listing of multi-byte titles must not exceed it).
+/// When cut, the full text is spilled and its path noted.
+string truncateOutputBytes(string text, size_t limit, string label)
+{
+    if (text.length <= limit) return text;
+    auto spill = spillFile(text, label);
+    auto marker = format("\n\n[... %s bytes omitted (sha256:%s); full output saved to %s ...]\n\n",
+        text.length, contentDigest(text), spill);
+    import nano.arith : saturatingSub;
+    auto budget = saturatingSub(limit, marker.length);
+    size_t head = budget * 2 / 3;
+    while (head > 0 && (text[head] & 0xC0) == 0x80) head--;
+    size_t tailStart = text.length - (budget - head);
+    while (tailStart < text.length && (text[tailStart] & 0xC0) == 0x80) tailStart++;
+    return text[0 .. head] ~ marker ~ text[tailStart .. $];
+}
+
+unittest
+{
+    import std.algorithm : canFind;
+    import std.array : replicate;
+    import std.file : remove;
+    import std.regex : matchFirst;
+    import std.utf : validate;
+    auto text = "\U0001F600".replicate(30_000); // 120 KB of 4-byte characters
+    auto t = truncateOutputBytes(text, 40_000, "test-bytes");
+    assert(t.length <= 40_000, "the cap counts bytes");
+    validate(t);
+    auto m = t.matchFirst(`full output saved to (.*\.txt) \.\.\.\]`);
+    assert(!m.empty);
+    remove(m[1]);
+    assert(truncateOutputBytes("short", 100, "x") == "short");
+}
+
 /// The first 16 hex digits of the text's SHA-256: the spill marker's
 /// identity, which the repeat detector keys on instead of the per-call path.
 string contentDigest(scope const(char)[] text) pure

@@ -136,7 +136,7 @@ private string lineOf(const ref SessionInfo i) @safe
 /// remainder is spilled to a file).
 string listResult(ref Policy policy, string dir, string cwd, JSONValue args) @safe
 {
-    import nano.tools : truncateOutput, defaultMaxOutput;
+    import nano.tools : truncateOutputBytes, defaultMaxOutput;
     string filter;
     if (args.type == JSONType.object)
         if (auto f = "filter" in args.objectNoRef)
@@ -146,7 +146,7 @@ string listResult(ref Policy policy, string dir, string cwd, JSONValue args) @sa
         return filter.length
             ? format("No sessions match %s.", JSONValue(filter).jsonText)
             : "No saved sessions.";
-    return truncateOutput(sessions.map!lineOf.array.join("\n"), defaultMaxOutput, "sessions-list");
+    return truncateOutputBytes(sessions.map!lineOf.array.join("\n"), defaultMaxOutput, "sessions-list");
 }
 
 /// `needle` as one session: an exact id, a unique id prefix, or a title match
@@ -197,10 +197,17 @@ string sessionArg(JSONValue args) pure @safe
 
 /// Whether `sessionCwd` is the current workspace or below it: those sessions
 /// may be read without a policy check.
+/// Both paths are canonicalized first (symlinks resolved), so a recorded cwd
+/// like `<workspace>/link` that points outside the workspace is foreign; a
+/// relative or unresolvable path is never in the workspace (fail closed).
 bool inWorkspace(string sessionCwd, string cwd) @safe
 {
-    if (!sessionCwd.length) return false;
-    return startsWithPath(normalize(sessionCwd), normalize(cwd));
+    import nano.paths : canonicalize;
+    import std.path : isAbsolute;
+    if (!sessionCwd.length || !cwd.length || !sessionCwd.isAbsolute || !cwd.isAbsolute) return false;
+    auto s = canonicalize(sessionCwd), c = canonicalize(cwd);
+    if (s is null || c is null) return false;
+    return startsWithPath(normalize(s), normalize(c));
 }
 
 /// Null when the session's log may be read from `cwd`, else the message the
@@ -239,32 +246,38 @@ unittest
     auto dir = buildPath(tempDir, "nano-d-cross-session-test");
     mkdirRecurse(dir);
     scope (exit) rmdirRecurse(dir);
-    auto liveLog = new SessionLog(dir, "m", "/work/alpha", "sess-live");
+    import nano.paths : canonicalize;
+    import std.string : toUpper;
+    auto root = buildPath(canonicalize(tempDir), "nano-d-cross-session-ws");
+    auto alpha = buildPath(root, "alpha"), beta = buildPath(root, "beta");
+    mkdirRecurse(buildPath(alpha, "sub")); mkdirRecurse(beta);
+    scope (exit) rmdirRecurse(root);
+    auto liveLog = new SessionLog(dir, "m", alpha, "sess-live");
     {
-        auto finished = new SessionLog(dir, "m", "/work/beta", "sess-done");
+        auto finished = new SessionLog(dir, "m", beta, "sess-done");
         finished.input("in-1", "finish the parser slice");
         finished.close();
     }
     liveLog.input("in-2", "keep working on the live one");
 
     Policy noRules;
-    auto all = listSessions(noRules, dir, "/work/alpha");
+    auto all = listSessions(noRules, dir, alpha);
     assert(all.length == 2, all.to!string);
     auto live = all[0].id == "sess-live" ? all[0] : all[1];
     auto done = all[0].id == "sess-done" ? all[0] : all[1];
     assert(live.live, "the open log is live");
     assert(!done.live, "a closed log is not live");
     assert(live.title == "keep working on the live one");
-    assert(listSessions(noRules, dir, "/work/alpha", "done").length == 1);
-    assert(listSessions(noRules, dir, "/work/alpha", "/WORK/alpha").length == 1, "filter is case-insensitive");
-    assert(!listSessions(noRules, dir, "/work/alpha", "nope").length);
+    assert(listSessions(noRules, dir, alpha, "done").length == 1);
+    assert(listSessions(noRules, dir, alpha, alpha.toUpper).length == 1, "filter is case-insensitive");
+    assert(!listSessions(noRules, dir, alpha, "nope").length);
 
     // A deny rule hides a foreign session from the listing entirely, cached
     // title and all; an in-workspace session stays.
     import nano.permissions : parseRule;
     Policy denying;
     denying.deny = [parseRule("Read(" ~ dir ~ "/sess-done.jsonl)")];
-    auto visible = listSessions(denying, dir, "/work/alpha");
+    auto visible = listSessions(denying, dir, alpha);
     assert(visible.length == 1 && visible[0].id == "sess-live", visible.to!string);
 
     // Resolve: exact id, unique prefix, title substring; ambiguity lists candidates.
@@ -289,9 +302,9 @@ unittest
     // ambiguous by title, case-insensitively; one exact title still wins over
     // a substring of the other.
     SessionInfo a, b, c;
-    a.id = "aaaa1111"; a.title = "Fix the parser"; a.path = "/x/a.jsonl"; a.cwd = "/work/alpha";
-    b.id = "bbbb2222"; b.title = "fix the parser"; b.path = "/x/b.jsonl"; b.cwd = "/work/alpha";
-    c.id = "cccc3333"; c.title = "Fix the parser tests"; c.path = "/x/c.jsonl"; c.cwd = "/work/alpha";
+    a.id = "aaaa1111"; a.title = "Fix the parser"; a.path = "/x/a.jsonl"; a.cwd = alpha;
+    b.id = "bbbb2222"; b.title = "fix the parser"; b.path = "/x/b.jsonl"; b.cwd = alpha;
+    c.id = "cccc3333"; c.title = "Fix the parser tests"; c.path = "/x/c.jsonl"; c.cwd = alpha;
     auto titled = [a, b, c];
     threw = false;
     try resolve("FIX THE PARSER", titled);
@@ -305,23 +318,34 @@ unittest
     assert(resolve("fix the parser tests", titled).id == "cccc3333", "one exact title beats the substring matches");
 
     // Workspace check: same tree or below it is fine, a sibling is not.
-    assert(inWorkspace("/work/alpha", "/work/alpha"));
-    assert(inWorkspace("/work/alpha/sub", "/work/alpha"));
-    assert(!inWorkspace("/work/beta", "/work/alpha"));
-    assert(!inWorkspace(null, "/work/alpha"));
+    assert(inWorkspace(alpha, alpha));
+    assert(inWorkspace(buildPath(alpha, "sub"), alpha));
+    assert(!inWorkspace(beta, alpha));
+    assert(!inWorkspace(null, alpha));
+    assert(!inWorkspace("relative/alpha", alpha), "a relative cwd is never in the workspace");
+    assert(!inWorkspace(buildPath(alpha, "missing"), alpha), "an unresolvable cwd fails closed");
+    // A symlink inside the workspace that points at a sibling is foreign.
+    {
+        import std.file : symlink;
+        auto link = buildPath(alpha, "linked");
+        symlink(beta, link);
+        assert(!inWorkspace(link, alpha), "a symlink to a sibling escapes the workspace");
+        SessionInfo viaLink = done; viaLink.cwd = link;
+        assert(needsConfirmation(viaLink, alpha), "a symlinked foreign cwd still asks");
+    }
 
     Policy p;
-    assert(readDenied(p, live, "/work/alpha") is null);
-    assert(readDenied(p, done, "/work/alpha") is null, "no rules: another workspace is still allowed");
+    assert(readDenied(p, live, alpha) is null);
+    assert(readDenied(p, done, alpha) is null, "no rules: another workspace is still allowed");
     p.deny = [parseRule("Read(" ~ dir ~ "/sess-done.jsonl)")];
-    auto denied = readDenied(p, done, "/work/alpha");
+    auto denied = readDenied(p, done, alpha);
     assert(denied !is null && denied.canFind("denies read_file"), denied is null ? done.path : denied);
-    assert(readDenied(p, live, "/work/alpha") is null, "a session in the workspace skips the policy");
+    assert(readDenied(p, live, alpha) is null, "a session in the workspace skips the policy");
 
     // Default-ask: a foreign session needs confirmation, an in-workspace one doesn't.
-    assert(needsConfirmation(done, "/work/alpha"));
-    assert(!needsConfirmation(live, "/work/alpha"));
-    assert(confirmQuestion(done).canFind("sess-done") && confirmQuestion(done).canFind("/work/beta"));
+    assert(needsConfirmation(done, alpha));
+    assert(!needsConfirmation(live, alpha));
+    assert(confirmQuestion(done).canFind("sess-done") && confirmQuestion(done).canFind(beta));
 
     liveLog.close();
 }

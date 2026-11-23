@@ -272,5 +272,9 @@ unittest
     agent.run("find the part", new NullEvents);
     auto elapsed = monoNow - started;
     assert(lastToolResult(mock).canFind("ZXQ-9917"), lastToolResult(mock));
-    assert(elapsed < 900.msecs, elapsed.toString);
+    // Wall-clock: judged against the host's current speed, like the module
+    // budgets, so a busy host doesn't fail it while a real regression still does.
+    import nano.testenv_test : calibrate, loadFactor;
+    if (elapsed >= 900.msecs)
+        assert(elapsed.total!"msecs" < cast(long)(900 * loadFactor(calibrate())), elapsed.toString);
 }
