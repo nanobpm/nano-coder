@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.17.0", "date": "2026-11-23", "items": [
+      {"type":"feat","scope":"compaction","title":"add extract mode, a summary built without a model call","pr":292}
+    ]},
     {"version": "1.16.0", "date": "2026-11-23", "items": [
       {"type":"feat","scope":"sessions","title":"read another session's history (sessions_list, session argument)","pr":277}
     ]},
@@ -438,9 +441,6 @@
     ]},
     {"version": "0.22.1", "date": "2026-09-30", "items": [
       {"type":"fix","scope":"cli","title":"stop wrapped input stacking copies of the prompt on redraw","pr":49}
-    ]},
-    {"version": "0.22.0", "date": "2026-09-30", "items": [
-      {"type":"feat","scope":"cli","title":"steer a running turn with Enter, queue with Ctrl-Enter","pr":53}
     ]}
   ]
 }
