@@ -647,7 +647,7 @@ unittest // entries_without_kind_or_anchors_load_unchanged
         {
             found = true;
             assert(x.e.isRule && x.e.anchors == ["abc.local"] && x.e.toJson == saved.toJson);
-            assert(x.e.toJson.canFind(`"kind":"rule","anchors":["abc.local"]}`), x.e.toJson);
+            assert(x.e.toJson.canFind(`"kind":"rule","anchors":["abc.local"],"verified_at":"`), x.e.toJson);
         }
     assert(found);
     // Bad values make the line unknown (kept byte for byte), as serde would.
@@ -734,4 +734,144 @@ unittest
     import nano.memory : defaultDir;
     auto dir = defaultDir();
     assert(dir is null || !dir.startsWith(tempDir), dir);
+}
+
+unittest // new fields round-trip; old lines load unchanged; bad values are kept verbatim
+{
+    auto dir = tmp("facts-roundtrip");
+    auto s = store(dir);
+    SaveOptions o;
+    o.entities = [" Host:Merlin ", "tool:dub"];
+    o.factKind = "Procedure";
+    o.validWhile = "nano-workforce >= 0.216";
+    auto r = s.saveFact(Scope.user, "deploy merlin with `just deploy`", null, null, null, null, false, o);
+    assert(r.saved);
+    auto e = r.entry;
+    assert(e.entities == ["host:merlin", "tool:dub"] && e.factKind == "procedure" && e.verifiedAt == e.created[0 .. 10]);
+    Entry back;
+    assert(Entry.parse(e.toJson.representation, back));
+    assert(back.toJson == e.toJson && back.entities == e.entities && back.validWhile == o.validWhile);
+    foreach (bad; [`"fact_kind":"rumour"`, `"entities":"host:x"`, `"supersedes":[1]`, `"verified_at":3`])
+    {
+        Entry x;
+        assert(!Entry.parse((`{"id":"m","text":"t","created":"2099-01-01T00:00:00Z","last_used":"2099-01-01T00:00:00Z",` ~ bad ~ "}").representation, x), bad);
+    }
+    // Unknown entity type, missing name, unknown fact kind.
+    SaveOptions u;
+    u.entities = ["planet:mars"];
+    assert(fails(s.saveFact(Scope.user, "mars is red", null, null, null, null, false, u)));
+    u.entities = ["host:"];
+    assert(fails(s.saveFact(Scope.user, "mars is red", null, null, null, null, false, u)));
+    u.entities = ["mars"];
+    assert(fails(s.saveFact(Scope.user, "mars is red", null, null, null, null, false, u)));
+    u.entities = null;
+    u.factKind = "rumour";
+    assert(fails(s.saveFact(Scope.user, "mars is red", null, null, null, null, false, u)));
+    assert(normalizeEntity("  REPO:Nanobpm/Nano-Coder ") == "repo:nanobpm/nano-coder");
+}
+
+unittest // exact duplicates refused; near-duplicates and contradictions returned as candidates
+{
+    auto s = store(tmp("facts-conflicts"));
+    SaveOptions o;
+    o.entities = ["host:merlin"];
+    o.factKind = "fact";
+    auto first = s.saveFact(Scope.user, "merlin runs the worker fleet on port 8080", null, null, null, null, false, o).entry;
+    try { s.saveFact(Scope.user, "Merlin runs the  worker fleet on port 8080", null, null, null, null, false, o); assert(0); }
+    catch (Exception e) assert(e.msg.canFind(first.id), e.msg);
+    // Near-duplicate: most words shared.
+    auto near = s.saveFact(Scope.user, "merlin runs the worker fleet on port 9090", null, null, null, null, false, o);
+    assert(!near.saved && near.candidates.length == 1 && near.candidates[0].id == first.id
+        && near.candidates[0].reason == "near-duplicate");
+    // Contradiction: different wording, same anchor.
+    SaveOptions a = o;
+    auto anchored = s.saveFact(Scope.user, "the fleet lives at `merlin.local` now", null, null, null, null, false, a).entry;
+    auto contra = s.saveFact(Scope.user, "nothing is served from `merlin.local` anymore", null, null, null, null, false, a);
+    assert(!contra.saved && contra.candidates.length == 1 && contra.candidates[0].id == anchored.id
+        && contra.candidates[0].reason == "possible contradiction");
+    // A different fact kind or entity is not a candidate; distinct saves anyway.
+    SaveOptions other = o;
+    other.factKind = "pitfall";
+    assert(s.saveFact(Scope.user, "merlin runs the worker fleet on port 9090", null, null, null, null, false, other).saved);
+    SaveOptions d = o;
+    d.distinct = true;
+    assert(s.saveFact(Scope.user, "merlin runs the worker fleet on port 9191 now", null, null, null, null, false, d).saved);
+    // The tool reports candidates instead of saving.
+    auto msg = run(s, saveTool, parseJSON(`{"scope":"user","text":"merlin runs the worker fleet on port 7070","entities":["host:merlin"],"fact_kind":"fact"}`), null, false);
+    assert(msg.startsWith("not saved:") && msg.canFind(first.id) && msg.canFind("supersedes"), msg);
+}
+
+unittest // supersedes hides the old entry from recall, index and search; still readable by id
+{
+    import nano.option : match;
+    auto s = store(tmp("facts-supersede"));
+    SaveOptions o;
+    o.entities = ["host:merlin"];
+    auto old = s.saveFact(Scope.user, "merlin is reached over `merlin.local`", null, null, null, null, false, o).entry;
+    o.supersedes = [old.id];
+    auto msg = run(s, saveTool, parseJSON(`{"scope":"user","text":"merlin is reached over tailscale at merlin.ts","entities":["host:merlin"],"supersedes":["` ~ old.id ~ `"]}`), null, false);
+    assert(msg.startsWith("remembered") && msg.canFind("replaces " ~ old.id), msg);
+    assert(!s.all().any!(x => x.e.id == old.id));
+    assert(!s.index(false).canFind(old.id));
+    assert(!s.search("merlin", null).canFind(old.id));
+    auto byId = s.search(old.id, null);
+    assert(byId.canFind(old.id) && byId.canFind("superseded by"), byId);
+    assert(s.get(old.id).match!(x => x.e.isSuperseded, () => false));
+    Recall st;
+    bool[string] shown;
+    auto notes = recall(s, "bash", parseJSON(`{"command":"ssh merlin.local"}`), st, shown, 2);
+    assert(!notes.any!(n => n.id == old.id));
+    // Superseding an unknown id fails.
+    SaveOptions bad;
+    bad.supersedes = ["mem-0"];
+    assert(fails(s.saveFact(Scope.user, "something else", null, null, null, null, false, bad)));
+}
+
+unittest // entity registry: aliases resolve, relations are stored and listed, search filters
+{
+    auto s = store(tmp("facts-registry"));
+    assert(run(s, entityTool, parseJSON(`{"scope":"user","entity":"host:merlin","alias":"Merlin.local"}`), null, false)
+        .canFind("aliases: merlin.local"));
+    run(s, entityTool, parseJSON(`{"scope":"user","entity":"host:merlin","alias":"merlin.ts"}`), null, false);
+    run(s, entityTool, parseJSON(`{"scope":"user","entity":"service:workforce","relation":"runs_on","target":"host:merlin.ts"}`), null, false);
+    assert(fails(run(s, entityTool, parseJSON(`{"scope":"user","entity":"host:x","relation":"likes","target":"host:y"}`), null, false)));
+    assert(fails(run(s, entityTool, parseJSON(`{"scope":"user","entity":"host:other","alias":"merlin.local"}`), null, false)));
+    auto listed = run(s, entityTool, parseJSON(`{"scope":"user"}`), null, true);
+    assert(listed.canFind("host:merlin (aliases: merlin.local, merlin.ts)") && listed.canFind("service:workforce (runs_on: host:merlin)"), listed);
+    assert(run(s, entityTool, parseJSON(`{"scope":"user","entity":"host:merlin.local"}`), null, true).startsWith("host:merlin"));
+    // A save naming an alias is stored under the canonical id.
+    auto msg = run(s, saveTool, parseJSON(`{"scope":"user","text":"merlin has 64GB","entities":["host:MERLIN.local"],"fact_kind":"fact"}`), null, false);
+    assert(msg.canFind("{fact; host:merlin; verified"), msg);
+    run(s, saveTool, parseJSON(`{"scope":"user","text":"use uv for python","entities":["tool:uv"],"fact_kind":"preference"}`), null, false);
+    assert(s.entities(Scope.user).any!(r => r.id == "tool:uv"), "unknown entity registered on save");
+    auto hits = run(s, searchTool, parseJSON(`{"entity":"host:merlin.ts"}`), null, true);
+    assert(hits.canFind("merlin has 64GB") && !hits.canFind("uv"), hits);
+    hits = run(s, searchTool, parseJSON(`{"fact_kind":"preference"}`), null, true);
+    assert(hits.canFind("uv") && !hits.canFind("64GB"), hits);
+    assert(fails(run(s, searchTool, parseJSON(`{"entity":"planet:x"}`), null, true)));
+    assert(fails(run(s, entityTool, parseJSON(`{"scope":"user","entity":"host:x","alias":"y"}`), null, true)));
+}
+
+unittest // memory_verify bumps verified_at; search and index stay within their byte caps
+{
+    auto dir = tmp("facts-verify");
+    auto s = store(dir);
+    enum line = `{"id":"mem-1","text":"old fact","created":"2099-01-01T00:00:00Z","last_used":"2099-01-01T00:00:00Z"}`;
+    mkdirRecurse(buildPath(dir, "memory"));
+    write(buildPath(dir, "memory", "user.jsonl"), line ~ "\n");
+    auto msg = run(s, verifyTool, parseJSON(`{"id":"mem-1"}`), null, false);
+    assert(msg.startsWith("verified user memory mem-1"), msg);
+    assert(s.all()[0].e.verifiedAt !is null);
+    assert(fails(run(s, verifyTool, parseJSON(`{"id":"mem-1"}`), null, true)));
+    SaveOptions o;
+    o.entities = ["other:" ~ "e".replicate(100), "other:" ~ "f".replicate(100)];
+    o.distinct = true;
+    foreach (i; 0 .. 12)
+    {
+        import std.format : format;
+        s.saveFact(Scope.user, format("fact %s ", i) ~ "y".replicate(700), "check " ~ "z".replicate(300), null, null, null, false, o);
+    }
+    auto hits = s.search("fact", null);
+    assert(hits.length <= searchChars + 300, "search over its cap");
+    assert(s.index(true).length <= indexChars);
 }

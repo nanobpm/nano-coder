@@ -213,7 +213,7 @@ source/
     ├── plan.d       # Task plan and the plan_add / plan_update / plan_show tools
     ├── queue.d      # The interactive message queue and the /queue editor
     ├── goal.d       # report_outcome tool (completed / blocked / needs_input)
-    ├── memory.d     # Cross-session memory: memory_save / memory_search / memory_forget
+    ├── memory.d     # Cross-session memory: memory_save / memory_search / memory_forget / memory_verify / memory_entity
     ├── mode.d       # Agent mode (normal / plan / auto) and the plan-mode tool gate
     ├── question.d   # question tool and the mid-turn question / turn-cap rendezvous
     ├── commands.d   # Slash-command table for /help and the as-you-type menu
@@ -333,7 +333,7 @@ phases). Disable them with `--no-hooks`, or granularly via the
   away message. Headless (ACP) sessions get an error instead.
 - `load_skill` - Return a skill's instructions and list its other files; `name`. Offered only
   when skills were found (see [Skills](#skills)).
-- `memory_save`, `memory_search`, `memory_forget` - Cross-session memory: facts the model saves
+- `memory_save`, `memory_search`, `memory_forget`, `memory_verify`, `memory_entity` - Cross-session memory: facts the model saves
   in one session and finds in later ones (see [Memory](#memory)). Offered when `memory` is on;
   read-only runs (headless/ACP) offer `memory_search` only.
 
@@ -1309,8 +1309,37 @@ evidence (a file path or command). Search is a case-insensitive regex
 over the text and the optional evidence, as in `history_search` - no embeddings or vector
 store.
 
-**Tools** (offered when `memory` is on): `memory_save(scope, text, evidence?)`,
-`memory_search(pattern, scope?)`, `memory_forget(id)`.
+**Tools** (offered when `memory` is on):
+`memory_save(scope, text, evidence?, kind?, anchors?, entities?, fact_kind?, supersedes?, valid_while?, distinct?)`,
+`memory_search(pattern?, scope?, entity?, fact_kind?)`, `memory_forget(id)`, `memory_verify(id)`,
+`memory_entity(scope, entity?, alias?, relation?, target?)`.
+
+**Entities, kinds and supersession.** All of these fields are optional; entries saved
+before they existed load unchanged.
+
+- `entities`: what the fact is about, as typed ids `type:name` with `type` one of `host`,
+  `service`, `repo`, `tool`, `person`, `workflow`, `other` (e.g. `host:merlin`). Names are
+  lower-cased and trimmed; an unknown type is an error.
+- `fact_kind`: `fact`, `procedure`, `decision`, `pitfall`, `preference` or `pointer`. (`kind`,
+  `hint` or `rule`, still decides how the memory is recalled.)
+- `valid_while`: free text saying when the fact holds (e.g. `nano-workforce >= 0.216`).
+- `verified_at`: the date the fact was saved or last re-checked; `memory_verify(id)` bumps it.
+- `supersedes`: ids of memories the new one replaces. A replaced memory stays in the file
+  (with `superseded_by`) and can still be read with `memory_search` on its exact id, but it is
+  never recalled, shown in the index or `/memory`, or matched by other searches.
+- **Entity registry:** each scope has an `entities.jsonl` (`<memory_dir>/entities.jsonl` for
+  `user`, `projects/<key>.entities.jsonl` for a project) listing each entity's id, aliases
+  (`merlin.local`, `merlin.ts` for `host:merlin`) and relations (`runs_on`, `reached_via`,
+  `part_of`). `memory_save` registers entities it hasn't seen; an alias resolves to its entity
+  on save and search. `memory_entity` adds an alias or a relation, or with no change lists the
+  registry (or one entity).
+- **Conflict check on save** (no model call): saving the same text and evidence as a current
+  memory is refused with the existing id. A memory sharing an entity and `fact_kind` (missing
+  counts as `fact`) that is a near-duplicate (word overlap ≥ 60%) or a likely contradiction
+  (a shared anchor such as a host or path) is listed back to the model instead of saving; it
+  saves again with `supersedes: [ids]` or `distinct: true`.
+- `memory_search` filters by `entity` (an alias works) and `fact_kind`, and each hit ends with
+  `{kind; entities; verified date}`. A search result is capped at 8,000 bytes.
 
 **Prompt.** A capped, dated index (most-recently-used first, ~4 KB with the guidance) is
 appended to the system prompt at session start, framed as "notes from earlier sessions; may be
