@@ -50,7 +50,7 @@ import nano.commands : helpText, isCommand, unescapePrompt;
 import core.thread : Thread;
 import nano.claude_hooks : HookManager, listingField, label, isProject;
 import nano.skills : Skills, skillsDefinition = definition;
-import nano.memory : MemoryStore = Store, MemoryMode, memorySessionTools = sessionTools, memoryDefaultDir = defaultDir, projectKey, Scope;
+import nano.memory : MemoryStore = Store, MemoryMode, memorySessionTools = sessionTools, memoryDefaultDir = defaultDir, projectKey, Scope, parseRecallMode;
 import nano.control : TurnControl, FdLineReader;
 import nano.instructions : ProjectInstructions, InstructionOptions = Options, expandHome;
 import core.atomic : atomicLoad, atomicStore, cas;
@@ -2808,6 +2808,8 @@ int runMain(string[] args)
     // left waiting on its parent would otherwise hang process exit.
     scope (exit) agent.stopSubagents();
     agent.memory = memory;
+    agent.memoryRecallMode = parseRecallMode(cfg.memoryRecall);
+    agent.recallCwd = cwd;
     agent.indexShown = indexShown;
     agent.instructions = instructions;
     agent.sessionTitles = cfg.sessionTitles;

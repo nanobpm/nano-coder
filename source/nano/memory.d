@@ -22,8 +22,8 @@ import nano.arith : saturatingSub, toSize;
 
 import nano.safeio : chmodPath, fchmodFd, openPath, statMode, writeFd;
 
-import std.algorithm : any, canFind, count, countUntil, filter, map, sort, startsWith, endsWith, equal;
-import std.array : array, join, appender;
+import std.algorithm : any, canFind, count, countUntil, filter, map, sort, startsWith, endsWith, equal, SwapStrategy;
+import std.array : array, join, appender, split;
 import std.conv : to;
 import std.datetime.systime : SysTime, Clock;
 import core.time : days;
@@ -31,8 +31,8 @@ import std.file;
 import std.format : format;
 import std.json;
 import std.path;
-import std.regex : regex, matchFirst, escaper, Regex;
-import std.string : strip, indexOf, toLower, splitLines;
+import std.regex : regex, matchFirst, matchAll, escaper, Regex;
+import std.string : strip, indexOf, toLower, splitLines, lineSplitter, lastIndexOf;
 import std.utf : byDchar, validate;
 import nano.llm : ToolDefinition;
 import nano.memsecret;
@@ -69,6 +69,22 @@ MemoryMode parseMemoryMode(string s) pure
     case "read_only": return MemoryMode.readOnly;
     case "on": return MemoryMode.on;
     default: throw new Exception(format("memory must be \"on\", \"read_only\" or \"off\", not %s", JSONValue(s).jsonText));
+    }
+}
+
+/// `memory_recall` in config.toml: how a tool call recalls memories.
+/// `entity` (default) resolves the entities a call touches and recalls their
+/// facts, ranked and capped; `anchor` keeps the pre-entity substring match so
+/// the two can be compared, or entity recall rolled back.
+enum RecallMode { entity, anchor }
+
+RecallMode parseRecallMode(string s) pure
+{
+    switch (s.strip.toLower)
+    {
+    case "entity": return RecallMode.entity;
+    case "anchor": return RecallMode.anchor;
+    default: throw new Exception(format("memory_recall must be \"entity\" or \"anchor\", not %s", JSONValue(s).jsonText));
     }
 }
 
@@ -782,6 +798,20 @@ final class Store
     /// The registry entities of a scope.
     EntityRecord[] entities(Scope s) { return hasPath(s) ? readRegistry(s).records : null; }
 
+    /// Both scopes' registry records, best-effort: an unreadable registry
+    /// contributes nothing (recall resolves to the raw ids).
+    EntityRecord[] allEntities()
+    {
+        EntityRecord[] records;
+        foreach (s; [Scope.user, Scope.project])
+            if (hasPath(s))
+            {
+                try records ~= readRegistry(s).records;
+                catch (Exception) {} // best effort: recall resolves to the raw ids
+            }
+        return records;
+    }
+
     /// Add an alias to an entity (registering it if new); returns its description.
     string addAlias(Scope s, string entity, string alias_)
     {
@@ -1028,6 +1058,14 @@ final class Store
         import std.algorithm : SwapStrategy;
         r.sort!((a, b) => a.e.lastUsedTime > b.e.lastUsedTime, SwapStrategy.stable);
         return r;
+    }
+
+    /// `all` for recall: best-effort, never throws — an unreadable store
+    /// recalls nothing rather than failing a tool call.
+    Scoped[] allForRecall() nothrow
+    {
+        try return all();
+        catch (Exception) return null; // recall is best effort: an unreadable store recalls nothing
     }
 
     /// The capped, dated index for the system prompt. `writable` adds save guidance.
@@ -1521,6 +1559,13 @@ private enum LOCK_EX = 2, LOCK_NB = 4, LOCK_UN = 8;
 
 /// Recall notes attached per input at most.
 enum recallNotesPerTurn = 2;
+/// Facts recalled per tool call at most in `entity` mode (the issue's N).
+enum recallEntityMaxFacts = 3;
+/// Byte budget for one tool call's recall notes in `entity` mode.
+enum recallEntityByteBudget = 1_500;
+/// A recalled entity's other facts stay quiet for this many tool calls (the
+/// issue's K), unless the call would recall a fact of it not chosen before.
+enum recallEntityCooldownCalls = 8;
 private enum maxAnchors = 12;
 private enum maxAnchorChars = 120;
 private enum minAnchorChars = 3;
@@ -1693,6 +1738,138 @@ bool containsAnchor(string haystack, string anchor) pure
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// Entity recall (issue #280): a tool call resolves to the entities it touches
+// — hosts (URLs, ssh targets), repos (`-R o/r`, the working directory's git
+// remote), paths (mapped to the project), and the tool (the command name) —
+// and recalls those entities' facts, ranked and capped, instead of every
+// memory whose anchors happen to be substrings of the arguments.
+
+/// The entity ids (unresolved `type:name`s) a tool call touches: hosts from
+/// URLs and `ssh`/`scp` targets, repos from a `-R owner/repo` flag and the
+/// working directory's git remote, the project from repo-rooted paths, and
+/// the tool itself. Pure: `cwd` is the only outside input (one git call).
+string[] entitiesFromCall(string tool, const JSONValue args, string cwd)
+{
+    bool[string] found;
+    void add(string type, string name)
+    {
+        if (name.length) found[type ~ ":" ~ name] = true;
+    }
+    auto haystack = argumentText(args);
+    // Hosts: every URL's authority, and `ssh`/`scp` targets.
+    foreach (m; haystack.matchAll(reUrlAuthority)) add("host", hostKey(m[1]));
+    foreach (line; haystack.splitLines)
+    {
+        auto t = line.strip;
+        // `ssh [user@]host` (a bare target) and `scp/rsync … host:path`.
+        foreach (m; t.matchAll(reSshTarget)) add("host", hostKey(m[1]));
+        foreach (m; t.matchAll(reScpTarget)) add("host", hostKey(m[1]));
+        // Repos: `-R owner/repo` (gh) and `--repo owner/repo`.
+        foreach (m; t.matchAll(reRepoFlag)) add("repo", m[1]);
+    }
+    // The working directory's repository, and paths inside it mapped to the
+    // project: a call that names repo files is about this repo.
+    string key;
+    if (cwd.length) key = projectKey(cwd);
+    if (key !is null && key.length)
+    {
+        if (auto name = repoNameOf(key)) add("repo", name);
+        bool touches;
+        foreach (line; haystack.splitLines)
+        {
+            auto t = line.strip;
+            if ((t.startsWith("/") || t.startsWith("~/")) && t.canFind('/')) { touches = true; break; }
+        }
+        if (touches)
+        {
+            if (auto name = repoNameOf(key)) add("repo", name);
+        }
+    }
+    // The tool (command) itself: `bash`, `read_file`, `gh`, …
+    add("tool", tool.strip.toLower);
+    // Also the first word of a shell command (`ssh …` -> tool:ssh).
+    if (tool == "bash")
+        if (auto cmd = "command" in args)
+            if (cmd.type == JSONType.string)
+            {
+                auto first = cmd.str.strip.splitLines.length ? cmd.str.strip.splitLines[0].strip : "";
+                auto w = first.length ? first.split[0] : "";
+                if (w.length >= 2 && w.length <= 40 && !w.canFind('/') && !w.canFind('='))
+                    add("tool", w.toLower);
+            }
+    return found.keys;
+}
+
+private Regex!char reUrlAuthority, reSshTarget, reScpTarget, reRepoFlag;
+static this()
+{
+    reUrlAuthority = regex(`[a-z][a-z0-9+.-]*://(?:[^/@\s]+@)?([a-z0-9][a-z0-9.-]*)(?::\d+)?(?:[/?#\s]|$)`, "i");
+    // `ssh [user@]host`: the target is the first non-flag operand.
+    reSshTarget = regex(`(?:^|\s)ssh(?:\s+--?[a-z][a-z0-9-]*=[^\s]+)*\s+(?:[a-z0-9_.-]+@)?([a-z0-9][a-z0-9.-]*)(?:\s|$)`, "i");
+    // `scp`/`rsync`/`sftp` name a host as `host:path` (or `[user@]host:path`).
+    reScpTarget = regex(`(?:^|\s)(?:scp|sftp|rsync)(?:\s+--?[a-z][a-z0-9-]*=[^\s]+)*\s+(?:[a-z0-9_.-]+@)?([a-z0-9][a-z0-9.-]*):[\w./~-]+`, "i");
+    reRepoFlag = regex(`(?:^|\s)(?:-R|--repo)[=\s]+([a-z0-9_.-]+/[a-z0-9_.-]+)(?:\s|$)`, "i");
+}
+
+/// The host key of a host[:port] or host-like token: lower-cased, trailing
+/// dot and port dropped (`merlin.local:8080` -> `merlin.local`).
+private string hostKey(string h) pure
+{
+    auto s = h.strip.toLower;
+    if (s.endsWith(".")) s = s[0 .. $ - 1];
+    auto colon = s.indexOf(':');
+    if (colon > 0) s = s[0 .. colon];
+    return s;
+}
+
+/// The `owner/repo` a project key names: the last two path segments of a
+/// remote (`github.com/nanobpm/nano-coder` or `git@host:org/repo`), else null.
+package(nano) string repoNameOf(string key) pure
+{
+    import std.array : split;
+    auto s = key.strip;
+    if (s.endsWith(".git")) s = s[0 .. $ - 4];
+    // scp-style git@host:org/repo — the repo starts after the ':'.
+    auto colon = s.indexOf(':');
+    if (colon > 0 && !s[0 .. colon].canFind('/')) s = s[colon + 1 .. $];
+    string[] segs;
+    foreach (p; s.split('/')) if (p.strip.length) segs ~= p.strip.toLower;
+    if (segs.length >= 2) return segs[$ - 2] ~ "/" ~ segs[$ - 1];
+    return null;
+}
+
+/// `entities` resolved through the registry `records` (aliases) and widened
+/// one hop over `reached_via` / `runs_on` / `part_of` (`merlin.local:8080` ->
+/// `host:merlin` and the services on it). Unknown entities resolve to
+/// themselves, so facts about them still match.
+string[] resolveCallEntities(const EntityRecord[] records, const string[] entities)
+{
+    if (!entities.length) return null;
+    bool[string] out_;
+    string[] frontier;
+    foreach (e; entities)
+    {
+        auto id = resolveEntity(records, e);
+        if (id !in out_) { out_[id] = true; frontier ~= id; }
+    }
+    // One hop: the relations of the resolved entities, both directions.
+    foreach (id; frontier)
+        foreach (r; records)
+        {
+            if (r.id == id)
+                foreach (rel; entityRelations)
+                    if (auto v = rel in r.relations)
+                        foreach (t; *v) out_[resolveEntity(records, t)] = true;
+            // Reverse: an entity that relates to `id` (a service on this host).
+            foreach (rel; entityRelations)
+                if (auto v = rel in r.relations)
+                    if ((*v).canFind(id) || (*v).any!(t => resolveEntity(records, t) == id))
+                        out_[r.id] = true;
+        }
+    return out_.keys;
+}
+
 /// Which memories' full text is already in this context. Persisted in the
 /// session log (`recall` records); a compaction resets it.
 struct Recall
@@ -1701,6 +1878,12 @@ struct Recall
     bool[string] seen;
     /// Recalled by a note and not yet followed by a `memory_search` hit.
     bool[string] fired;
+    /// Entity ids (resolved) a recall note named, with the facts of each
+    /// already recalled (`entity` mode; not persisted — a resume rebuilds it
+    /// from the notes that marked entries seen).
+    string[][string] entityFired;
+    /// Entity id -> tool calls left before its facts may be recalled again.
+    size_t[string] entityCooldown;
 
     bool empty() pure const { return !seen.length && !fired.length; }
 
@@ -1714,6 +1897,8 @@ struct Recall
         Recall r;
         foreach (k, _; seen) r.seen[k] = true;
         foreach (k, _; fired) r.fired[k] = true;
+        foreach (k, v; entityFired) r.entityFired[k] = v.dup;
+        foreach (k, v; entityCooldown) r.entityCooldown[k] = v;
         return r;
     }
 
@@ -1772,6 +1957,8 @@ private string[] sortedKeys(const bool[string] set) pure
 struct RecallNote
 {
     string id, text;
+    /// The entity that triggered the recall (`entity` mode); null in `anchor` mode.
+    string entity;
 }
 
 /// The notes for a tool call: memories whose anchors appear in its arguments,
@@ -1783,9 +1970,7 @@ RecallNote[] recall(Store store, string tool, const JSONValue args, ref Recall s
     if (budget == 0 || isMemoryTool(tool)) return null;
     auto haystack = argumentText(args);
     if (!haystack.strip.length) return null;
-    Store.Scoped[] all_;
-    try all_ = store.all();
-    catch (Exception) return null; // recall is best effort: an unreadable store recalls nothing
+    Store.Scoped[] all_ = store.allForRecall();
     Store.Scoped[] matched;
     foreach (x; all_)
         if ((x.e.isRule || (x.e.id !in state.seen && x.e.id !in shown))
@@ -1802,6 +1987,106 @@ RecallNote[] recall(Store store, string tool, const JSONValue args, ref Recall s
         notes ~= RecallNote(x.e.id, recallNoteText(x.s, x.e, now));
     }
     return notes;
+}
+
+/// Entity-mode recall (issue #280): the notes for a tool call, resolved from
+/// the entities it touches, ranked and capped at `recallEntityMaxFacts` facts
+/// within `recallEntityByteBudget` bytes. Entries with no entities (not yet
+/// migrated) keep the anchor match, so nothing regresses before migration.
+/// `cwd` resolves the working directory's repository. Marks each returned
+/// memory seen and fired, and its entity recalled (cooldown).
+RecallNote[] recallEntities(Store store, string tool, const JSONValue args, string cwd,
+    ref Recall state, const bool[string] shown, size_t budget)
+{
+    if (budget == 0 || isMemoryTool(tool)) return null;
+    auto haystack = argumentText(args);
+    if (!haystack.strip.length) return null;
+    Store.Scoped[] all_ = store.allForRecall();
+    EntityRecord[] records = store.allEntities();
+    auto resolved = resolveCallEntities(records, entitiesFromCall(tool, args, cwd));
+    auto now = wallNow;
+    // Age every entity cooldown by one call.
+    foreach (k, ref v; state.entityCooldown) if (v > 0) v--;
+    // Candidates: entity-tagged entries about a resolved entity, plus
+    // untagged entries whose anchors match (fallback). Skip what is already
+    // in context unless it is a rule.
+    struct Cand { Store.Scoped x; string entity; }
+    Cand[] cands;
+    foreach (x; all_)
+    {
+        if (!x.e.isRule && (x.e.id in state.seen || x.e.id in shown)) continue;
+        if (x.e.entities.length)
+        {
+            foreach (en; x.e.entities)
+            {
+                auto id = resolveEntity(records, en);
+                if (!resolved.canFind(id)) continue;
+                // Cooldown: an entity recalled in the last K calls stays quiet
+                // unless this fact of it was never chosen. A rule fires on
+                // every matching call regardless.
+                if (!x.e.isRule)
+                {
+                    auto left = state.entityCooldown.get(id, 0);
+                    if (left > 0 && state.entityFired.get(id, null).length) break;
+                }
+                cands ~= Cand(x, id);
+                break;
+            }
+        }
+        else if (anchorsOf(x.e).any!(a => containsAnchor(haystack, a)))
+            cands ~= Cand(x, null);
+    }
+    // Rank: rules first; then fact_kind weighted by context (pitfall and
+    // procedure for command execution, decision and preference when planning
+    // or editing); then verified_at recency; then last-used.
+    auto exec = isExecutionTool(tool);
+    cands.sort!((a, b) {
+        if (a.x.e.isRule != b.x.e.isRule) return a.x.e.isRule;
+        auto ka = kindWeight(a.x.e.factKind, exec), kb = kindWeight(b.x.e.factKind, exec);
+        if (ka != kb) return ka > kb;
+        if (a.x.e.verifiedAt != b.x.e.verifiedAt) return a.x.e.verifiedAt > b.x.e.verifiedAt;
+        return a.x.e.lastUsedTime > b.x.e.lastUsedTime;
+    }, SwapStrategy.stable);
+    RecallNote[] notes;
+    size_t bytes;
+    foreach (c; cands)
+    {
+        if (notes.length >= budget || notes.length >= recallEntityMaxFacts) break;
+        auto text = recallNoteText(c.x.s, c.x.e, now, c.entity);
+        if (bytes + text.length > recallEntityByteBudget) continue; // skip over-long, keep smaller ones
+        bytes += text.length;
+        state.seen[c.x.e.id] = true;
+        state.fired[c.x.e.id] = true;
+        if (c.entity !is null)
+        {
+            state.entityFired[c.entity] ~= c.x.e.id;
+            state.entityCooldown[c.entity] = recallEntityCooldownCalls;
+        }
+        notes ~= RecallNote(c.x.e.id, text, c.entity);
+    }
+    return notes;
+}
+
+private bool isExecutionTool(string tool) pure
+{
+    switch (tool)
+    {
+    case "read_file", "write_file", "edit_file", "apply_patch", "plan", "plan_add", "plan_update":
+        return false;
+    default:
+        return true;
+    }
+}
+
+/// The rank weight of a `fact_kind` in this context: higher recalls earlier.
+private int kindWeight(string factKind, bool exec) pure
+{
+    switch (kindOrFact(factKind))
+    {
+    case "pitfall", "procedure": return exec ? 3 : 1;
+    case "decision", "preference": return exec ? 1 : 3;
+    default: return 2;
+    }
 }
 
 /// Append a `fired`/`used` event to `recall.jsonl`. Best-effort: statistics
@@ -1862,12 +2147,13 @@ private string fullLine(string text) pure
 }
 
 /// The note: framed as an untrusted hint to verify, with its `check:` and a
-/// staleness signal.
-private string recallNoteText(Scope s, const Entry e, SysTime now) pure
+/// staleness signal. `entity` (entity recall) names what triggered it.
+private string recallNoteText(Scope s, const Entry e, SysTime now, string entity = null) pure
 {
     auto d = (now - e.lastUsedTime).total!"days";
     if (d < 0) d = 0;
-    auto note = format("📌 note from an earlier session (verify; %s%s): [%s] %s", s.name, e.isRule ? ", rule" : "",
+    auto note = format("📌 %snote from an earlier session (verify; %s%s): [%s] %s",
+        entity !is null ? scrubControl(entity) ~ " — " : "", s.name, e.isRule ? ", rule" : "",
         scrubControl(e.id), fullLine(e.text));
     if (e.evidence !is null) note ~= format(" (check: %s)", fullLine(e.evidence));
     return note ~ format(" (last used %s day%s ago; a hint, not permission to act)", d, d == 1 ? "" : "s");
@@ -1913,8 +2199,10 @@ private string memoryCommandText(Store store, string arg, bool writable, bool pl
         if (!writable) return "Memory is read-only in this session; /memory forget cannot delete entries.\n";
         return store.forget(id) ~ "\n";
     }
+    if (arg.strip == "entities")
+        return entitiesView(store);
     if (arg.length)
-        return format("Unknown /memory argument %s; use /memory or /memory forget <id>.\n",
+        return format("Unknown /memory argument %s; use /memory, /memory entities or /memory forget <id>.\n",
             JSONValue(arg).jsonText(JSONOptions.doNotEscapeSlashes));
     // Effective writability: plan mode has no memory_save tool either.
     bool canWrite = writable && !plan;
@@ -1936,6 +2224,44 @@ private string memoryCommandText(Store store, string arg, bool writable, bool pl
         // and how often that was followed by reading it.
         if (auto st = x.e.id in stats) row ~= format(" (recalled %s×, used %s×)", (*st)[0], (*st)[1]);
         o ~= row ~ "\n";
+    }
+    return o;
+}
+
+/// `/memory entities`: each entity's facts, grouped under the entity id, so a
+/// recall can be traced to what it resolved (issue #280).
+private string entitiesView(Store store)
+{
+    import nano.trajectory : terminalSafe;
+    auto all_ = store.all();
+    // Group current entries by each (resolved) entity they name.
+    string[][string] byEntity; // entity -> entry rows
+    size_t untagged;
+    EntityRecord[] records = store.allEntities();
+    foreach (x; all_)
+    {
+        if (!x.e.entities.length) { untagged++; continue; }
+        auto first = x.e.text.lineSplitter.empty ? "" : x.e.text.lineSplitter.front.strip;
+        auto row = format("    %s %s %s", name(x.s), x.e.label, terminalSafe(first));
+        foreach (en; x.e.entities)
+        {
+            auto id = resolveEntity(records, en);
+            if (!byEntity.get(id, null).canFind(row)) byEntity[id] ~= row;
+        }
+    }
+    if (!byEntity.length)
+        return untagged
+            ? format("No entities yet (%s memor%s untagged; tag saves with entities: [...] to recall by entity).\n",
+                untagged, untagged == 1 ? "y" : "ies")
+            : "No memories and no entities yet.\n";
+    auto ids = byEntity.keys;
+    sort(ids);
+    auto o = format("%s entit%s (%s untagged memor%s recall by anchor):\n", ids.length,
+        ids.length == 1 ? "y" : "ies", untagged, untagged == 1 ? "y" : "ies");
+    foreach (id; ids)
+    {
+        o ~= "  " ~ terminalSafe(id) ~ "\n";
+        foreach (row; byEntity[id]) o ~= row ~ "\n";
     }
     return o;
 }

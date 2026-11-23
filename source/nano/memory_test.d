@@ -14,6 +14,8 @@ import nano.memory;
 import nano.memsecret;
 import std.algorithm : canFind, any;
 import std.array : replicate, join;
+import std.conv : to;
+import std.format : format;
 import std.file;
 import std.path;
 import std.json : parseJSON;
@@ -1146,4 +1148,168 @@ unittest // a failed registry write leaves the save and its supersession uncommi
     auto retry = s.saveFact(Scope.user, "merlin has 64GB of memory", null, null, null, null, false, o);
     assert(retry.saved);
     assert(!s.all().any!(x => x.e.id == old.id));
+}
+
+// ---------------------------------------------------------------------------
+// Entity recall (issue #280)
+
+unittest // entitiesFromCall: urls, ssh targets, gh -R, paths, tool name
+{
+    // URLs resolve their host (port dropped).
+    auto e = entitiesFromCall("bash", parseJSON(`{"command":"curl http://merlin.local:8080/api"}`), "");
+    assert(e.canFind("host:merlin.local"), e.join(","));
+    assert(e.canFind("tool:bash"));
+    // ssh targets (user@ and bare).
+    e = entitiesFromCall("bash", parseJSON(`{"command":"ssh deploy@omarchy.local uptime"}`), "");
+    assert(e.canFind("host:omarchy.local"), e.join(","));
+    assert(e.canFind("tool:ssh"), e.join(",")); // first command word
+    e = entitiesFromCall("bash", parseJSON(`{"command":"scp deploy@merlin.local:/var/log/x ."}`), "");
+    assert(e.canFind("host:merlin.local"), e.join(","));
+    // gh -R owner/repo and --repo.
+    e = entitiesFromCall("bash", parseJSON(`{"command":"gh issue view 280 -R nanobpm/nano-coder"}`), "");
+    assert(e.canFind("repo:nanobpm/nano-coder"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"gh pr list --repo acme/widgets"}`), "");
+    assert(e.canFind("repo:acme/widgets"), e.join(","));
+    // The tool name itself for a non-bash tool.
+    e = entitiesFromCall("read_file", parseJSON(`{"path":"/x/y"}`), "");
+    assert(e.canFind("tool:read_file"), e.join(","));
+}
+
+unittest // repoNameOf maps a project key to owner/repo
+{
+    assert(repoNameOf("github.com/nanobpm/nano-coder") == "nanobpm/nano-coder");
+    assert(repoNameOf("git@github.com:nanobpm/nano-coder.git") == "nanobpm/nano-coder");
+    assert(repoNameOf("https://github.com/acme/widgets.git") == "acme/widgets");
+    assert(repoNameOf("lonely") is null);
+}
+
+private Entry saveTagged(Store s, string text, string[] entities, string factKind = null, string kind = null)
+{
+    SaveOptions o;
+    o.entities = entities;
+    o.factKind = factKind;
+    o.distinct = true;
+    auto r = s.saveFact(Scope.user, text, null, null, kind, null, false, o);
+    assert(r.saved, text);
+    return r.entry;
+}
+
+unittest // entity recall resolves via aliases and one-hop relations, ranks and caps
+{
+    auto s = store(tmp("recall-entity"));
+    // Registry: merlin.local is an alias of host:merlin; service:workforce runs_on it.
+    run(s, entityTool, parseJSON(`{"scope":"user","entity":"host:merlin","alias":"merlin.local"}`), null, false);
+    run(s, entityTool, parseJSON(`{"scope":"user","entity":"service:workforce","relation":"runs_on","target":"host:merlin"}`), null, false);
+    auto pitfall = saveTagged(s, "merlin OOMs under many workers", ["host:merlin"], "pitfall");
+    auto proc_ = saveTagged(s, "deploy merlin with just deploy", ["host:merlin"], "procedure");
+    auto svc = saveTagged(s, "workforce listens on 8080", ["service:workforce"], "fact");
+    auto other = saveTagged(s, "omarchy builds with ldc", ["host:omarchy"], "fact");
+    // Backdate the procedure so the pitfall's recency breaks their kind tie.
+    Entry[] bumped;
+    foreach (x; s.all()) { auto e = x.e; if (e.id == proc_.id) e = backdate(e, 1); bumped ~= e; }
+    writeAll(s.path(Scope.user), bumped, null);
+    Recall st;
+    bool[string] shown;
+    // ssh to the alias resolves host:merlin and, one hop, the service on it.
+    auto notes = recallEntities(s, "bash", parseJSON(`{"command":"ssh merlin.local"}`), "", st, shown, 5);
+    assert(notes.length == 3, notes.length.to!string);
+    // pitfall and procedure outrank a plain fact for command execution.
+    assert(notes[0].id == pitfall.id && notes[1].id == proc_.id, notes[0].id ~ " " ~ notes[1].id);
+    assert(notes[2].id == svc.id, "one hop to the service on the host");
+    // The note names the entity that triggered it.
+    assert(notes[0].text.canFind("host:merlin"), notes[0].text);
+    assert(notes[0].entity == "host:merlin");
+    // An unrelated entity is not recalled.
+    assert(!notes.any!(n => n.id == other.id));
+}
+
+unittest // entity recall: seen facts are not recalled again; cooldown per entity
+{
+    auto s = store(tmp("recall-entity-once"));
+    auto a = saveTagged(s, "merlin fact one", ["host:merlin"], "fact");
+    auto b = saveTagged(s, "merlin fact two", ["host:merlin"], "fact");
+    Recall st;
+    bool[string] shown;
+    auto args = parseJSON(`{"command":"ssh merlin"}`);
+    auto notes = recallEntities(s, "bash", args, "", st, shown, 5);
+    assert(notes.length == 2);
+    // Both are now seen and the entity is on cooldown: nothing new fires.
+    assert(!recallEntities(s, "bash", args, "", st, shown, 5).length);
+    // After the cooldown ages out, still nothing: both facts are seen.
+    foreach (_; 0 .. recallEntityCooldownCalls + 1) recallEntities(s, "bash", args, "", st, shown, 5);
+    assert(!recallEntities(s, "bash", args, "", st, shown, 5).length);
+}
+
+unittest // entity recall: count cap and byte budget
+{
+    auto s = store(tmp("recall-entity-cap"));
+    string[] ids;
+    foreach (i; 0 .. 6)
+        ids ~= saveTagged(s, format("merlin fact number %s with some padding text", i), ["host:merlin"], "fact").id;
+    Recall st;
+    bool[string] shown;
+    auto notes = recallEntities(s, "bash", parseJSON(`{"command":"ssh merlin"}`), "", st, shown, 10);
+    assert(notes.length == recallEntityMaxFacts, "count cap N");
+    size_t bytes;
+    foreach (n; notes) bytes += n.text.length;
+    assert(bytes <= recallEntityByteBudget, "byte budget");
+}
+
+unittest // entity recall: rules fire every call, superseded never, fallback for untagged
+{
+    auto s = store(tmp("recall-entity-rules"));
+    auto rule = saveTagged(s, "never pkill on merlin", ["host:merlin"], "pitfall", "rule");
+    auto old = saveTagged(s, "merlin old fact", ["host:merlin"], "fact");
+    SaveOptions so;
+    so.entities = ["host:merlin"];
+    so.supersedes = [old.id];
+    s.saveFact(Scope.user, "merlin current fact", null, null, null, null, false, so);
+    // An untagged entry keeps anchor recall (fallback).
+    s.saveWith(Scope.user, "the fleet uses zzanchor-fleet for deploys", null, null, null, ["zzanchor-fleet"], true);
+    Recall st;
+    bool[string] shown;
+    auto args = parseJSON(`{"command":"ssh merlin"}`);
+    auto notes = recallEntities(s, "bash", args, "", st, shown, 5);
+    assert(notes.length >= 1 && notes[0].id == rule.id, "rule first");
+    assert(!notes.any!(n => n.id == old.id), "superseded never recalled");
+    // The rule fires again on the next matching call; the seen facts do not.
+    auto again = recallEntities(s, "bash", args, "", st, shown, 5);
+    assert(again.length == 1 && again[0].id == rule.id, "rule fires every call");
+    // Untagged fallback: an anchor in the arguments recalls it.
+    auto fb = recallEntities(s, "bash", parseJSON(`{"command":"echo zzanchor-fleet"}`), "", st, shown, 5);
+    assert(fb.length == 1 && fb[0].text.canFind("zzanchor-fleet"), fb.length.to!string);
+}
+
+unittest // entity recall: planning/editing tools rank decisions and preferences first
+{
+    auto s = store(tmp("recall-entity-edit"));
+    auto pitfall = saveTagged(s, "repo pitfall: do not edit generated files", ["repo:nanobpm/nano-coder"], "pitfall");
+    auto decision = saveTagged(s, "repo decision: use dub not make", ["repo:nanobpm/nano-coder"], "decision");
+    Recall st;
+    bool[string] shown;
+    // A `-R` flag resolves the repo; an edit tool ranks the decision first.
+    auto notes = recallEntities(s, "edit_file", parseJSON(`{"path":"source/app.d","note":"gh -R nanobpm/nano-coder"}`), "", st, shown, 5);
+    assert(notes.length == 2, notes.length.to!string);
+    assert(notes[0].id == decision.id, "decision before pitfall when editing");
+}
+
+unittest // memory_recall setting parses
+{
+    assert(parseRecallMode("entity") == RecallMode.entity);
+    assert(parseRecallMode("anchor") == RecallMode.anchor);
+    assert(parseRecallMode(" Anchor ") == RecallMode.anchor);
+    assert(fails(parseRecallMode("semantic")));
+}
+
+unittest // memory entities view groups facts under their entity
+{
+    auto s = store(tmp("memory-entities-view"));
+    saveTagged(s, "merlin has 64GB", ["host:merlin"], "fact");
+    saveTagged(s, "deploy merlin with just", ["host:merlin"], "procedure");
+    saveTagged(s, "workforce on 8080", ["service:workforce"], "fact");
+    s.save(Scope.user, "an untagged fact", null, null);
+    auto view = memoryCommand(s, "entities", true, false, true);
+    assert(view.canFind("host:merlin") && view.canFind("service:workforce"), view);
+    assert(view.canFind("merlin has 64GB") && view.canFind("workforce on 8080"), view);
+    assert(view.canFind("1 untagged"), view);
 }
