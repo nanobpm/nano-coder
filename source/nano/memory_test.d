@@ -1417,3 +1417,53 @@ unittest // entity recall: a rule fired repeatedly is recorded once per entity
         assert(recallEntities(s, "bash", args, "", st, shown, 5).any!(n => n.id == r.id));
     assert(st.entityFired["host:merlin"].length == 1, st.entityFired["host:merlin"].length.to!string);
 }
+
+unittest // remoteHosts: quoted option values, shell operators, bare sftp, wrapped commands
+{
+    assert(remoteHosts(`ssh -o "StrictHostKeyChecking no" merlin.local uptime`) == ["merlin.local"]);
+    assert(remoteHosts(`ssh merlin.local; echo done`) == ["merlin.local"]);
+    assert(remoteHosts(`ssh merlin.local&&echo done`) == ["merlin.local"]);
+    assert(remoteHosts(`sftp deploy@merlin.local`) == ["merlin.local"]);
+    assert(remoteHosts(`sftp -P 22 merlin.local:/x`) == ["merlin.local"]);
+    assert(remoteHosts(`sudo -E ssh merlin`) == ["merlin"]);
+    assert(remoteHosts(`bash -c "ssh merlin uptime"`) == ["merlin"]);
+    assert(remoteHosts("echo ssh\nssh omarchy") == ["omarchy"]);
+}
+
+unittest // every executable of a shell script becomes a tool entity
+{
+    auto e = entitiesFromCall("bash", parseJSON(`{"command":"cd /workspace && gh pr list"}`), "");
+    assert(e.canFind("tool:gh") && e.canFind("tool:cd"), e.to!string);
+    e = entitiesFromCall("bash", parseJSON(`{"command":"sudo gh pr list"}`), "");
+    assert(e.canFind("tool:gh"), e.to!string);
+    e = entitiesFromCall("bash", parseJSON(`{"command":"FOO=1 env -i make test | tee log"}`), "");
+    assert(e.canFind("tool:make") && e.canFind("tool:tee"), e.to!string);
+}
+
+unittest // aliases resolve within their own scope
+{
+    auto s = store(tmp("recall-entity-scoped"));
+    run(s, entityTool, parseJSON(`{"scope":"user","entity":"host:ci-a","alias":"build.local"}`), null, false);
+    run(s, entityTool, parseJSON(`{"scope":"project","entity":"host:ci-b","alias":"build.local"}`), null, false);
+    SaveOptions o;
+    o.entities = ["host:ci-b"];
+    o.factKind = "pitfall";
+    o.distinct = true;
+    auto r = s.saveFact(Scope.project, "ci-b needs a VPN", null, null, null, null, false, o);
+    assert(r.saved);
+    Recall st;
+    bool[string] shown;
+    auto notes = recallEntities(s, "bash", parseJSON(`{"command":"ssh build.local"}`), "", st, shown, 5);
+    assert(notes.any!(n => n.id == r.entry.id), notes.length.to!string);
+}
+
+unittest // plan_show ranks like a planning tool
+{
+    auto s = store(tmp("recall-entity-planshow"));
+    auto p = saveTagged(s, "merlin pitfall", ["repo:a/b"], "pitfall");
+    auto d = saveTagged(s, "merlin decision", ["repo:a/b"], "decision");
+    Recall st;
+    bool[string] shown;
+    auto notes = recallEntities(s, "plan_show", parseJSON(`{}`), "a/b", st, shown, 5);
+    assert(notes.length == 2 && notes[0].id == d.id, notes.length.to!string);
+}

@@ -798,18 +798,22 @@ final class Store
     /// The registry entities of a scope.
     EntityRecord[] entities(Scope s) { return hasPath(s) ? readRegistry(s).records : null; }
 
-    /// Both scopes' registry records, best-effort: an unreadable registry
-    /// contributes nothing (recall resolves to the raw ids).
-    EntityRecord[] allEntities()
+    /// Each scope's registry records, best-effort (an unreadable registry
+    /// contributes none). Aliases resolve within the scope that defines
+    /// them: a user alias must not relabel a project's entity.
+    EntityRecord[][Scope] entitiesByScope()
     {
-        EntityRecord[] records;
+        EntityRecord[][Scope] r;
         foreach (s; [Scope.user, Scope.project])
+        {
+            r[s] = null;
             if (hasPath(s))
             {
-                try records ~= readRegistry(s).records;
+                try r[s] = readRegistry(s).records;
                 catch (Exception) {} // best effort: recall resolves to the raw ids
             }
-        return records;
+        }
+        return r;
     }
 
     /// Add an alias to an entity (registering it if new); returns its description.
@@ -1771,23 +1775,18 @@ string[] entitiesFromCall(string tool, const JSONValue args, string repoName)
     // doesn't), and `argumentText` lower-cases.
     if (auto cmd = "command" in args)
         if (cmd.type == JSONType.string)
-            foreach (line; cmd.str.splitLines)
-                foreach (h; remoteHosts(line.strip)) add("host", hostKey(h));
+            foreach (h; remoteHosts(cmd.str)) add("host", hostKey(h));
     // The working directory's repository, resolved once per session by the
     // caller (a `cwd` never changes between calls).
     add("repo", repoName);
     // The tool (command) itself: `bash`, `read_file`, `gh`, …
     add("tool", tool.strip.toLower);
-    // Also the first word of a shell command (`ssh …` -> tool:ssh).
+    // Also every executable a shell command runs (`cd /x && sudo gh …` ->
+    // tool:cd, tool:gh).
     if (tool == "bash")
         if (auto cmd = "command" in args)
             if (cmd.type == JSONType.string)
-            {
-                auto first = cmd.str.strip.splitLines.length ? cmd.str.strip.splitLines[0].strip : "";
-                auto w = first.length ? first.split[0] : "";
-                if (w.length >= 2 && w.length <= 40 && !w.canFind('/') && !w.canFind('='))
-                    add("tool", w.toLower);
-            }
+                foreach (w; commandNames(cmd.str)) add("tool", w);
     return found.keys;
 }
 
@@ -1799,63 +1798,119 @@ static this()
     reRepoFlag = regex(`(?:^|\s)(?:-R|--repo)[=\s]+([a-z0-9_.-]+/[a-z0-9_.-]+)(?:\s|$)`, "i");
 }
 
-/// The remote hosts a shell line names through `ssh`, `scp`, `sftp` or
-/// `rsync`. Options are parsed by arity (`ssh -v host`, `ssh -p2222 host`,
-/// `ssh -p 2222 host`, `scp -3 a:/x b:/y`), so an option's value is never
-/// taken for the host; `ssh` yields its destination, the copy tools every
-/// `[user@]host:path` operand.
-string[] remoteHosts(string line)
+/// The remote hosts a shell script names through `ssh`, `scp`, `sftp` or
+/// `rsync`. The script is split into simple commands by `nano.shell.parse`,
+/// so quoted operands (`-o "StrictHostKeyChecking no"`) stay one word and
+/// operators (`host; echo`) end a command. Options are parsed by arity
+/// (`ssh -v host`, `ssh -p2222 host`, `scp -3 a:/x b:/y`), so an option's
+/// value is never taken for the host; `ssh` and `sftp` yield their
+/// destination, the copy tools every `[user@]host:path` operand.
+string[] remoteHosts(string script)
 {
-    import std.array : split;
     string[] hosts;
-    auto toks = line.split;
-    foreach (i, t; toks)
+    foreach (words; commandWords(script))
     {
-        auto cmd = t.strip(`"'`);
-        bool isSsh = cmd == "ssh";
-        if (!isSsh && cmd != "scp" && cmd != "sftp" && cmd != "rsync") continue;
-        if (i > 0 && !isCommandStart(toks[i - 1])) continue;
+        auto at = commandIndex(words);
+        if (at >= words.length) continue;
+        auto cmd = words[at];
+        // `bash -c "ssh host …"`: the script is the next word.
+        if ((cmd == "sh" || cmd == "bash" || cmd == "zsh") && at + 2 < words.length && words[at + 1] == "-c")
+        {
+            hosts ~= remoteHosts(words[at + 2]);
+            continue;
+        }
+        bool isSsh = cmd == "ssh", isSftp = cmd == "sftp";
+        if (!isSsh && !isSftp && cmd != "scp" && cmd != "rsync") continue;
         // Short options taking a value (OpenSSH ssh, scp, sftp; rsync's -e/-f).
         // scp's -B/-R/-s are flags, but sftp's -B/-R/-s take a value.
         string withArg = isSsh ? "BbcDEeFIiJLlmOoPpQRSWw" : cmd == "rsync" ? "efTM"
             : cmd == "scp" ? "cDFiJloPSX" : "BcDFiJloPRSs";
-        bool takesNext;
-        foreach (u; toks[i + 1 .. $])
+        bool takesNext, opts = true;
+        foreach (u; words[at + 1 .. $])
         {
-            if (u == ";" || u == "&&" || u == "||" || u == "|") break;
             if (takesNext) { takesNext = false; continue; }
-            if (u == "--") continue;
-            if (u.startsWith("--"))
+            if (opts && u == "--") { opts = false; continue; }
+            if (opts && u.startsWith("--"))
             {
                 // rsync `--rsh value`-style long options taking a separate value.
                 if (!u.canFind('=') && (u == "--rsh" || u == "--exclude" || u == "--include" || u == "--filter"))
                     takesNext = true;
                 continue;
             }
-            if (u.startsWith("-") && u.length > 1)
+            if (opts && u.startsWith("-") && u.length > 1)
             {
                 foreach (k, ch; u[1 .. $])
                     if (withArg.canFind(ch)) { takesNext = k + 2 == u.length; break; }
                 continue;
             }
-            auto op = u.strip(`"'`);
-            if (isSsh)
+            auto colon = u.indexOf(':');
+            if (isSsh || isSftp)
             {
-                if (auto m = op.matchFirst(reHostName)) hosts ~= m[1];
-                break; // the destination is the first operand; the rest is the command
+                // The destination is the first operand (`[user@]host`, or
+                // sftp's `[user@]host:path`); the rest is the command.
+                auto h = isSftp && colon > 0 ? u[0 .. colon] : u;
+                if (auto m = h.matchFirst(reHostName)) hosts ~= m[1];
+                break;
             }
-            auto colon = op.indexOf(':');
             if (colon > 0)
-                if (auto m = op[0 .. colon].matchFirst(reHostName)) hosts ~= m[1];
+                if (auto m = u[0 .. colon].matchFirst(reHostName)) hosts ~= m[1];
         }
     }
     return hosts;
 }
 
-private bool isCommandStart(string prev) pure
+/// The words of each simple command in `script`, quotes removed. A script
+/// the shell parser rejects falls back to whitespace-split lines, so a
+/// half-typed command still yields its obvious names.
+private string[][] commandWords(string script)
 {
-    return prev == ";" || prev == "&&" || prev == "||" || prev == "|" || prev == "sudo"
-        || prev == "-c" || prev == "exec" || prev == "time" || prev == "nohup" || prev.endsWith(";");
+    import nano.shell : parse, Simple;
+    import nano.result : unwrap;
+    import std.string : splitLines;
+    string[][] r;
+    auto parsed = parse(script);
+    if (parsed.isOk)
+        foreach (simple; parsed.unwrap("isOk was checked"))
+            r ~= simple.words.map!(w => w.text).array;
+    else
+        foreach (line; script.splitLines)
+            r ~= line.split.map!(w => w.strip(`"'`)).array;
+    return r;
+}
+
+/// The index of the executable in a simple command's words: past variable
+/// assignments (`A=1 cmd`) and wrappers (`sudo`, `env`, `time`, `nohup`,
+/// `exec`, `command`) and their leading options. `words.length` if none.
+private size_t commandIndex(const string[] words) pure
+{
+    size_t i;
+    bool wrapped;
+    while (i < words.length)
+    {
+        auto w = words[i];
+        if (w.canFind('=') && !w.startsWith("-") && !w.startsWith("=")) { i++; continue; }
+        if (wrapped && w.startsWith("-")) { i++; continue; }
+        if (w == "sudo" || w == "env" || w == "time" || w == "nohup" || w == "exec" || w == "command")
+        { wrapped = true; i++; continue; }
+        return i;
+    }
+    return i;
+}
+
+/// The executable names a shell script runs (`cd /x && sudo gh pr list` ->
+/// `cd`, `gh`): plausible bare names only, lower-cased.
+string[] commandNames(string script)
+{
+    string[] names;
+    foreach (words; commandWords(script))
+    {
+        auto at = commandIndex(words);
+        if (at >= words.length) continue;
+        auto w = words[at];
+        if (w.length >= 2 && w.length <= 40 && !w.canFind('/') && !w.canFind('=') && !names.canFind(w.toLower))
+            names ~= w.toLower;
+    }
+    return names;
 }
 
 /// The host key of a host[:port] or host-like token: lower-cased, trailing
@@ -2059,8 +2114,11 @@ RecallNote[] recallEntities(Store store, string tool, const JSONValue args, stri
     // only feeds the legacy anchor fallback, which can't match when empty.
     auto haystack = argumentText(args);
     Store.Scoped[] all_ = store.allForRecall();
-    EntityRecord[] records = store.allEntities();
-    auto resolved = resolveCallEntities(records, entitiesFromCall(tool, args, repoName));
+    // Resolve per scope: each registry's aliases apply to its own entries.
+    auto byScope = store.entitiesByScope();
+    auto callEntities = entitiesFromCall(tool, args, repoName);
+    string[][Scope] resolvedIn;
+    foreach (s, recs; byScope) resolvedIn[s] = resolveCallEntities(recs, callEntities);
     auto now = wallNow;
     // Age every entity cooldown by one call.
     foreach (k, ref v; state.entityCooldown) if (v > 0) v--;
@@ -2074,6 +2132,8 @@ RecallNote[] recallEntities(Store store, string tool, const JSONValue args, stri
         if (!x.e.isRule && (x.e.id in state.seen || x.e.id in shown)) continue;
         if (x.e.entities.length)
         {
+            auto records = byScope.get(x.s, null);
+            auto resolved = resolvedIn.get(x.s, null);
             foreach (en; x.e.entities)
             {
                 auto id = resolveEntity(records, en);
@@ -2132,7 +2192,7 @@ private bool isExecutionTool(string tool) pure
 {
     switch (tool)
     {
-    case "read_file", "write_file", "edit_file", "apply_patch", "plan", "plan_add", "plan_update":
+    case "read_file", "write_file", "edit_file", "apply_patch", "plan", "plan_add", "plan_update", "plan_show":
         return false;
     default:
         return true;
@@ -2298,10 +2358,11 @@ private string entitiesView(Store store)
     // Group current entries by each (resolved) entity they name.
     string[][string] byEntity; // entity -> entry rows
     size_t untagged;
-    EntityRecord[] records = store.allEntities();
+    auto byScope = store.entitiesByScope();
     foreach (x; all_)
     {
         if (!x.e.entities.length) { untagged++; continue; }
+        auto records = byScope.get(x.s, null);
         auto first = x.e.text.lineSplitter.empty ? "" : x.e.text.lineSplitter.front.strip;
         auto row = format("    %s %s %s", name(x.s), x.e.label, terminalSafe(first));
         foreach (en; x.e.entities)
