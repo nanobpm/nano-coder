@@ -834,7 +834,7 @@ void configureSubagents(Agent agent, const ref Config cfg, bool report)
         cands ~= SubCandidate(m.model, m.use, l);
     }
     agent.subagentCandidates = cands;
-    if (report) foreach (w; warnings) stdErr.writeln("nano-coder: warning: ", w);
+    if (report) foreach (w; warnings) stdErr.writeln("nano-coder: warning: ", terminalSafe(w));
 }
 
 /// Write `subagents = on` into the user config file; says where, or why
@@ -1854,8 +1854,20 @@ ConfiguredWindow windowFor(const ref Config c, const ref ProviderConfig p) pure
 /// control character (so any escape sequence) dropped, tabs expanded.
 string sanitizeBlock(string s) pure
 {
+    import std.encoding : sanitize;
     import nano.trajectory : terminalSafe;
-    return terminalSafe(s, true);
+    // Repair malformed UTF-8 first: terminalSafe decodes and would throw.
+    return terminalSafe(sanitize(s), true);
+}
+
+/// The longest prefix of `s` of at most `max` bytes that does not end
+/// inside a UTF-8 sequence, so a byte cap never splits a character.
+string utf8Prefix(string s, size_t max) pure nothrow @nogc
+{
+    if (s.length <= max) return s;
+    size_t n = max;
+    while (n > 0 && (s[n] & 0xC0) == 0x80) --n;
+    return s[0 .. n];
 }
 
 size_t lineCount(string s) pure
@@ -1868,13 +1880,27 @@ string firstLine(string s) pure
 {
     auto nl = s.indexOf('\n');
     auto l = nl >= 0 ? s[0 .. nl] : s;
-    return l.length > 160 ? l[0 .. 160] ~ "…" : l;
+    return l.length > 160 ? utf8Prefix(l, 160) ~ "…" : l;
+}
+
+unittest
+{
+    import std.array : replicate;
+    import std.utf : validate;
+    // A byte cap landing inside a multi-byte character must not split it.
+    auto l = firstLine("a".replicate(159) ~ "é tail");
+    validate(l);
+    assert(l == "a".replicate(159) ~ "…");
+    validate(indent("b".replicate(1999) ~ "€x"));
+    // Malformed input is repaired, not thrown on.
+    assert(sanitizeBlock("ok \xC3") .length > 0);
+    assert(utf8Prefix("é", 1) == "");
 }
 
 string indent(string s) pure
 {
     import std.array : replace;
-    auto t = s.length > 2000 ? s[0 .. 2000] ~ "\n…" : s;
+    auto t = s.length > 2000 ? utf8Prefix(s, 2000) ~ "\n…" : s;
     return "    " ~ t.replace("\n", "\n    ");
 }
 
