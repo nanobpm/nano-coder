@@ -1057,15 +1057,11 @@ final class AcpServer : AgentEvents
             auto leftover = agent.control.takePending;
             // A peer's late steer runs later as a peer prompt (loop guard
             // kept), even on cancel: its sender was told it was queued.
-            {
-                import std.algorithm : filter;
-                import std.array : array;
-                foreach (s; leftover)
-                    if (s.fromPeer && !peerRouter.requeueLate(s.text, s.sender))
-                        stdErr.writeln(format("peer message from %s dropped: inbox full",
-                            peers.PeerRouter.senderFromLabel(s.text)));
-                leftover = leftover.filter!(s => !s.fromPeer).array;
-            }
+            leftover = requeuePeerSteers(leftover, (string text, string sender) {
+                if (peerRouter.requeueLate(text, sender)) return;
+                stdErr.writeln(format("peer message from %s dropped: inbox full",
+                    peers.PeerRouter.senderFromLabel(text)));
+            });
             if (agent.lastStop == StopReason.cancelled)
             {
                 foreach (s; leftover)
@@ -1076,6 +1072,30 @@ final class AcpServer : AgentEvents
             return true;
         });
     }
+}
+
+/// Hand every peer steer in `leftover` to `requeue` (its sender was told it
+/// was queued, so it runs later even when the turn was cancelled) and
+/// return the rest, which the caller answers or requeues as prompts.
+Steer[] requeuePeerSteers(Steer[] leftover, scope void delegate(string text, string sender) @safe requeue)
+{
+    Steer[] rest;
+    foreach (s; leftover)
+        if (s.fromPeer) requeue(s.text, s.sender);
+        else rest ~= s;
+    return rest;
+}
+
+unittest
+{
+    auto peer = Steer("[from session abcd1234] hi");
+    peer.fromPeer = true;
+    peer.sender = "abcd1234-full";
+    auto plain = Steer("user steer");
+    string[] got;
+    auto rest = requeuePeerSteers([plain, peer], (string t, string s) { got ~= s ~ "|" ~ t; });
+    assert(got == ["abcd1234-full|[from session abcd1234] hi"], got[0]);
+    assert(rest.length == 1 && rest[0].text == "user steer" && !rest[0].fromPeer);
 }
 
 /// Insert steers that missed their turn into `deferred` as prompts, each at

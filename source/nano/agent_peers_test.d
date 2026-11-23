@@ -175,3 +175,25 @@ unittest
 }
 
 import std.conv : to;
+
+// Resuming an interrupted peer-input turn (its id redelivered with no
+// sender) re-arms the loop guard and restores the full sender id from the
+// persisted message.
+unittest
+{
+    import nano.session : PendingInput;
+    auto mock = new MockClient([call("s1", sendTool, `{"to":"sess-target","text":"pong"}`), LLMResponse("done")]);
+    auto t = TwoSessions.make("nd-ap-resume", mock);
+    scope (exit) t.cleanup();
+    auto um = Message.user("[from session abcd1234] talk to the target");
+    um.fromSession = "abcd1234-full-id";
+    t.agent.messages ~= um;
+    t.agent.hasPending = true;
+    t.agent.pending = PendingInput("in-peer", um.content, t.agent.messages.length - 1);
+
+    t.agent.run(um.content, new NullEvents, true, "in-peer");
+    assert(t.agent.peerTurn, "the resumed peer turn keeps the loop guard");
+    assert(t.agent.inputSender == "abcd1234-full-id", t.agent.inputSender);
+    auto result = lastToolResult(mock);
+    assert(result.canFind("loop guard") || result.canFind("started by a peer message"), result);
+}
