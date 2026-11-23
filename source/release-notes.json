@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.22.0", "date": "2026-11-23", "items": [
+      {"type":"feat","scope":"memory","title":"recall by entity, ranked and capped","pr":288}
+    ]},
     {"version": "1.21.0", "date": "2026-11-23", "items": [
       {"type":"feat","scope":"providers","title":"remove the unofficial Meta Muse Code provider","pr":299}
     ]},
@@ -438,9 +441,6 @@
     ]},
     {"version": "0.27.0", "date": "2026-10-01", "items": [
       {"type":"feat","scope":"trajectory","title":"/trajectory view and --trajectory export","pr":63}
-    ]},
-    {"version": "0.26.0", "date": "2026-09-30", "items": [
-      {"type":"feat","scope":"cli","title":"list the last four models at the top of /model","pr":64}
     ]}
   ]
 }
