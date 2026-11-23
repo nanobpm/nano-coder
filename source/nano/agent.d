@@ -2434,8 +2434,151 @@ class Agent
     private void dropSlots(scope bool delegate(ref const SubSlot) @safe gone)
     {
         SubSlot[] kept;
-        foreach (ref s; subSlots) if (!gone(s)) kept ~= s;
+        foreach (ref s; subSlots)
+        {
+            if (!gone(s)) kept ~= s;
+            else archiveSlot(s);
+        }
         subSlots = kept;
+    }
+
+    /// Finished sub-agents no longer in `subSlots`, for `/subagents`
+    /// (issue #267): metadata only, at most `keepHistory`.
+    private imported!"nano.subagent".SubInfo[] subHistory;
+    /// Sub-agents dropped from `subHistory` past its cap.
+    private size_t subForgotten;
+
+    /// Remember a slot leaving `subSlots` (its metadata, not its result).
+    private void archiveSlot(ref const SubSlot s)
+    {
+        import nano.subagent : keepHistory;
+        subHistory ~= infoOf(s);
+        if (subHistory.length > keepHistory)
+        {
+            subForgotten += saturatingSub(subHistory.length, keepHistory);
+            subHistory = subHistory[$ - keepHistory .. $].dup;
+        }
+    }
+
+    private static imported!"nano.subagent".SubInfo infoOf(ref const SubSlot s)
+    {
+        import nano.subagent : SubInfo, firstLine;
+        SubInfo i;
+        i.id = s.id;
+        i.model = s.spec.model;
+        i.state = s.state;
+        i.task = firstLine(s.task);
+        i.turns = s.turns;
+        i.tokens = s.finished ? s.result.inputTokens + s.result.outputTokens : s.tokens;
+        i.elapsedSecs = s.started ? (s.finished ? s.result.durationMs / 1000 : since(s.start).total!"seconds") : 0;
+        i.background = s.background;
+        i.logPath = s.logPath.length ? s.logPath : s.result.logPath;
+        return i;
+    }
+
+    /// Every sub-agent of this session, oldest first, for `/subagents`;
+    /// `forgotten` counts the earliest ones no longer remembered.
+    imported!"nano.subagent".SubInfo[] subagentList(out size_t forgotten)
+    {
+        pollSubagents();
+        forgotten = subForgotten;
+        auto all = subHistory.dup;
+        foreach (ref s; subSlots) all ~= infoOf(s);
+        return all;
+    }
+
+    /// The log of sub-agent `id` (`/subagents show`), or why there is none.
+    imported!"nano.result".Result!(string, string) subagentLog(string id)
+    {
+        alias R = imported!"nano.result".Result!(string, string);
+        size_t forgotten;
+        foreach (ref i; subagentList(forgotten))
+        {
+            if (i.id != id) continue;
+            if (!i.logPath.length)
+                return R.err(format("%s has no log%s", id, i.state == "queued" ? " yet: it has not started"
+                    : log.isNone ? ": this session keeps no logs" : " yet"));
+            return R.ok(i.logPath);
+        }
+        return R.err(format("No sub-agent %s (/subagents lists them).", id));
+    }
+
+    /// `/subagents stop <id>|all`: stop running or queued sub-agents as
+    /// `agent_cancel` does (each gets a short final step to report, then is
+    /// cut off), started by the user. A background one's result reaches the
+    /// model like any finished one. Returns what happened.
+    string stopSubagentsByUser(string which)
+    {
+        import nano.subagent : cancelGraceSecs;
+        import core.time : seconds;
+        import std.array : join;
+        enum reason = "stopped by the user";
+        pollSubagents();
+        size_t[] seqs;
+        if (which == "all")
+        {
+            foreach (ref s; subSlots) if (!s.finished) seqs ~= s.spec.slot;
+            if (!seqs.length) return "No sub-agent is running.";
+        }
+        else
+        {
+            bool found;
+            foreach (ref s; subSlots)
+                if (s.id == which)
+                {
+                    found = true;
+                    if (s.finished) return format("%s already ended (%s); nothing to stop.", which, s.state);
+                    seqs ~= s.spec.slot;
+                }
+            if (!found)
+            {
+                foreach (ref h; subHistory)
+                    if (h.id == which) return format("%s already ended (%s); nothing to stop.", which, h.state);
+                return format("No sub-agent %s (/subagents lists them).", which);
+            }
+        }
+        foreach (q; seqs)
+        {
+            auto i = slotOf(q);
+            subSlots[i].cancelReason = reason;
+            if (!subSlots[i].started) cancelUnstarted(subSlots[i]);
+            else subSlots[i].abort.wrapUp();
+        }
+        bool done(size_t q) { return subSlots[slotOf(q)].finished; }
+        bool allDone()
+        {
+            foreach (q; seqs) if (!done(q)) return false;
+            return true;
+        }
+        auto deadline = monoNow + cancelGraceSecs.seconds;
+        bool[size_t] cut;
+        while (!allDone())
+        {
+            if (!cut.length && !pumpUntil(deadline))
+            {
+                foreach (q; seqs)
+                    if (!done(q))
+                    {
+                        cut[q] = true;
+                        subSlots[slotOf(q)].abort.abort();
+                    }
+            }
+            else if (cut.length) pumpSubagents();
+        }
+        string[] ids;
+        foreach (q; seqs)
+        {
+            auto i = slotOf(q);
+            if (q in cut)
+                subSlots[i].result.report = format("(no report: it did not report within %ss and was cut off)", cancelGraceSecs);
+            subSlots[i].result.cancelled = subSlots[i].result.truncated = true;
+            subSlots[i].result.truncatedReason = "cancelled by the user";
+            ids ~= subSlots[i].id;
+            foreach (l; log) l.subagent(subSlots[i].id, "cancelled", reason);
+        }
+        reportSubagents();
+        return format("Stopped %s; %s reaches the agent as a cancelled result.", ids.join(", "),
+            ids.length > 1 ? "each one's report" : "its report");
     }
 
     /// The position in `subSlots` of sub-agent number `seq`, or `size_t.max`.
@@ -2739,6 +2882,7 @@ class Agent
                 s.delivered = true;
                 foreach (l; log) l.subagent(s.id, "stopped", s.result.toolText);
             }
+        foreach (ref s; subSlots) archiveSlot(s);
         subSlots = null;
         subEvents = none;
     }

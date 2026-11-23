@@ -13,6 +13,7 @@ import std.algorithm : canFind, count;
 import std.file : exists, readText, rmdirRecurse, tempDir;
 import std.json : JSONValue, parseJSON;
 import std.path : buildPath;
+import std.conv : to;
 import nano.agent;
 import nano.clock : sleepFor, monoNow, FakeClock, wallNow;
 import nano.control : Cancelled, cancelRequested;
@@ -474,4 +475,70 @@ unittest
     string[] names;
     foreach (e; dirEntries(childDir, SpanMode.shallow)) names ~= e.name.baseName;
     assert(names.canFind!(n => n.startsWith("sub-1.")) && names.canFind!(n => n.startsWith("sub-2.")), format("%s", names));
+}
+
+// `/subagents` lists every sub-agent of the session in mixed states, with
+// finished blocking ones kept after their reply (issue #267).
+unittest
+{
+    auto f = new Fixture([calls(call("k1", "agent", `{"task":"blocking one\nsecond line","model":"mock/search"}`),
+        bg("b1", "mock/hang"), bg("b2", "mock/search")), LLMResponse("three")]);
+    f.persist("list");
+    scope (exit) f.cleanup();
+    f.agent.subagentMaxConcurrency = 1;
+    assert(f.agent.run("go", new NullEvents) == "three");
+    size_t forgotten;
+    auto all = f.agent.subagentList(forgotten);
+    assert(forgotten == 0 && all.length == 3, all.length.to!string);
+    assert(all[0].id == "sub-1" && all[0].state == "done" && all[0].task == "blocking one" && !all[0].background
+        && all[0].model == "mock/search" && all[0].turns == 2 && all[0].logPath.length);
+    assert(all[1].id == "sub-2" && all[1].state == "running" && all[1].background);
+    assert(all[2].id == "sub-3" && all[2].state == "queued");
+    assert(f.agent.subagentLog("sub-1").isOk && f.agent.subagentLog("sub-3").isErr
+        && f.agent.subagentLog("sub-9").isErr);
+}
+
+// `/subagents stop <id>`: the child reports what it has, marked cancelled,
+// and the parent gets it as a background result; an ended one says so.
+unittest
+{
+    auto f = new Fixture([calls(bg("b1", "mock/loop")), LLMResponse("started"), LLMResponse("saw it")]);
+    f.persist("userstop");
+    scope (exit) f.cleanup();
+    assert(f.agent.run("go", new NullEvents) == "started");
+    auto said = f.agent.stopSubagentsByUser("sub-1");
+    assert(said.canFind("Stopped sub-1"), said);
+    assert(!f.agent.subagentsActive);
+    assert(f.agent.stopSubagentsByUser("sub-1").canFind("already ended (cancelled)"));
+    assert(f.agent.stopSubagentsByUser("sub-7").canFind("No sub-agent sub-7"));
+    assert(f.agent.backgroundResultsReady());
+    assert(f.agent.run("next", new NullEvents) == "saw it");
+    auto seen = f.parent.seen[2];
+    assert(seen.canFind!(m => m.content.canFind("partial: half done") && m.content.canFind("ended: cancelled")
+        && m.content.canFind("cancelled by the user")), "the model got the cancelled result");
+    assert(readText(f.agent.log.unwrap("set").path).canFind(`"text":"stopped by the user"`));
+}
+
+// `/subagents stop all`: running and queued ones; one that can't report is
+// cut off (fake time).
+unittest
+{
+    auto f = new Fixture([calls(bg("b1", "mock/hang"), bg("b2", "mock/loop"), bg("b3", "mock/search")),
+        LLMResponse("started")]);
+    scope (exit) f.cleanup();
+    f.agent.subagentMaxConcurrency = 2;
+    assert(f.agent.run("go", new NullEvents) == "started");
+    string said;
+    {
+        auto clock = FakeClock.install(wallNow);
+        said = f.agent.stopSubagentsByUser("all");
+    }
+    assert(said.canFind("sub-1") && said.canFind("sub-2") && said.canFind("sub-3"), said);
+    assert(!f.agent.subagentsActive);
+    size_t forgotten;
+    foreach (ref i; f.agent.subagentList(forgotten)) assert(i.state == "cancelled", i.id ~ " " ~ i.state);
+    assert(f.agent.stopSubagentsByUser("all") == "No sub-agent is running.");
+    string notice;
+    auto text = f.agent.takeBackgroundResults(notice);
+    assert(text.canFind("cut off") && text.canFind("cancelled before the sub-agent started"), text);
 }

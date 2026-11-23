@@ -852,17 +852,35 @@ string saveSubagentsSetting(ref Config cfg, bool on)
     return "saved to " ~ cfg.path;
 }
 
-/// Run `/subagents [on|off] [--save]` on `agent`: show the state, or switch
-/// the `agent` tool for the session (and the user config with `--save`).
-string subagentsCommand(Agent agent, ref Config cfg, string arg)
+/// Run `/subagents` on `agent`: show the state and every sub-agent of the
+/// session, switch the `agent` tool (`on|off`, `--save` writes the user
+/// config), or stop sub-agents (`stop <id>|all`). `show <id>` returns its
+/// log path in `showLog` for the caller to render.
+string subagentsCommand(Agent agent, ref Config cfg, string arg, out string showLog)
 {
-    import nano.subagent : parseToggle, statusText;
-    import nano.result : unwrap, unwrapErr;
-    auto p = parseToggle(arg);
-    if (p.isErr) return p.unwrapErr("isErr");
-    auto t = p.unwrap("isOk");
+    import nano.subagent : parseCommand, SubToggle, SubShowCmd, SubStopCmd, SubCmdError;
+    string out_;
+    parseCommand(arg).match!(
+        (SubCmdError e) { out_ = e.message; },
+        (SubShowCmd s) {
+            agent.subagentLog(s.id).match!((string path) { showLog = path; }, (string why) { out_ = why; });
+        },
+        (SubStopCmd s) { out_ = agent.stopSubagentsByUser(s.id); },
+        (SubToggle t) { out_ = subagentsToggle(agent, cfg, t); });
+    return out_;
+}
+
+private string subagentsToggle(Agent agent, ref Config cfg, imported!"nano.subagent".SubToggle t)
+{
+    import nano.subagent : statusText, listingText;
     auto model = agent.subagentModel.length ? agent.subagentModel : agent.client.providerName ~ "/" ~ agent.client.modelName;
-    if (t.show) return statusText(agent.subagentsOffered, agent.subagentCandidates, model, agent.subagentLimits);
+    if (t.show)
+    {
+        size_t forgotten;
+        auto all = agent.subagentList(forgotten);
+        return statusText(agent.subagentsOffered, agent.subagentCandidates, model, agent.subagentLimits)
+            ~ "\n\n" ~ listingText(all, forgotten);
+    }
     if (!agent.subagentsEnabled) return "Sub-agents are not available in this session";
     agent.control.takeSubagentsRequest(); // a direct switch supersedes a queued one
     auto was = agent.subagentsOn;
@@ -871,6 +889,75 @@ string subagentsCommand(Agent agent, ref Config cfg, string arg)
     if (was != t.on) msg ~= " (the tool list changed, so the provider's prompt cache is rebuilt once)";
     if (t.save) msg ~= "; " ~ saveSubagentsSetting(cfg, t.on);
     return msg;
+}
+
+/// `/subagents show`: render a sub-agent's transcript on the frame as the
+/// main transcript replays (prompts, answers, tool calls with their folded
+/// output), streaming its log a message at a time rather than loading it.
+void showSubagentLog(string id, string path, Console console)
+{
+    import nano.subagent : eachLogMessage;
+    import std.exception : ErrnoException;
+    import std.file : FileException;
+    auto frame = gFrame;
+    if (frame) frame.hold(true);
+    scope (exit) if (frame) frame.hold(false);
+    auto after = console.afterStep;
+    console.afterStep = null;
+    scope (exit) console.afterStep = after;
+    const wasBatched = gStatusBatched;
+    gStatusBatched = true;
+    scope (exit) gStatusBatched = wasBatched;
+    scope (exit) console.replayTime = null;
+    writeln(console.bold(format("── %s transcript ──", id)));
+    // The calls of the latest assistant message waiting for their results,
+    // so each header shows directly above its own output.
+    ToolCall[] pending;
+    string pendingTime;
+    void flush()
+    {
+        console.replayTime = pendingTime;
+        foreach (c; pending) console.toolStart(c);
+        pending = null;
+    }
+    try eachLogMessage(path, (Message m) {
+        if (m.role != Role.tool) flush();
+        console.replayTime = m.timestamp;
+        final switch (m.role)
+        {
+            case Role.system: break;
+            case Role.user:
+                if (m.content.strip.length && !m.hookContext)
+                    writeln(stampBlock(console.stamp(), console.bold("› ") ~ escapeMarks(sanitizeBlock(m.content))));
+                break;
+            case Role.assistant:
+                if (m.content.strip.length && !(console.quiet && m.toolCalls.length))
+                    writeln(stampBlock(console.stamp(), console.display(escapeMarks(sanitizeBlock(m.content))).stripRight));
+                pending = m.toolCalls.dup;
+                pendingTime = m.timestamp;
+                break;
+            case Role.tool:
+                foreach (k, c; pending)
+                {
+                    if (c.id != m.toolCallId) continue;
+                    console.replayTime = pendingTime;
+                    console.toolStart(c);
+                    console.replayTime = m.timestamp;
+                    console.toolEnd(c, toolResultDisplay(m.content, m.attachments), m.isError);
+                    pending = pending[0 .. k] ~ pending[k + 1 .. $];
+                    break;
+                }
+                break;
+        }
+        return true;
+    });
+    catch (ErrnoException e) writeln("Could not read the sub-agent log: ", e.msg);
+    catch (FileException e) writeln("Could not read the sub-agent log: ", e.msg);
+    flush();
+    writeln(console.bold(format("── end of %s ──", id)));
+    gStatusBatched = wasBatched;
+    updateStatus((ref Stats s) { s.activity = Activity.idle; s.tool = null; s.tokensPerSec = 0; });
+    stdOut.flush();
 }
 
 /// A frozen copy of `cfg`, for another thread.
@@ -3031,6 +3118,20 @@ int runMain(string[] args)
     auto recents = nano.recents.load(recentsPath);
     if (recents.canonicalize(cfg.providers, cfg.defaultProvider)) nano.recents.save(recentsPath, recents);
     string currentSpec() { return nano.recents.canonical(client.providerName ~ "/" ~ client.modelName, cfg.providers, cfg.defaultProvider); }
+    // `/subagents show|stop` completion reads a snapshot of the ids, taken
+    // on this thread before each prompt: the key reader of a turn runs on
+    // its own thread and must not touch the agent.
+    import nano.commands : subagentIdSource, Suggestion;
+    auto subIds = new shared Locked!(immutable(Suggestion)[]);
+    void snapshotSubagentIds()
+    {
+        size_t forgotten;
+        immutable(Suggestion)[] ids;
+        foreach (ref i; agent.subagentList(forgotten))
+            ids ~= immutable Suggestion(i.id, i.state ~ " · " ~ i.task);
+        subIds.update((ref immutable(Suggestion)[] v) { v = ids; });
+    }
+    subagentIdSource = () => subIds.get.dup;
     modelSuggestionSource = () {
         string[] recent;
         synchronized recent = recents.models.dup;
@@ -3463,6 +3564,7 @@ int runMain(string[] args)
         {
             auto ed = editor.unwrap("checked on the line above");
             refreshStatus();
+            snapshotSubagentIds();
             if (!quietPrompt) write("\n");
             quietPrompt = false;
             stdOut.flush();
@@ -3795,8 +3897,13 @@ int runMain(string[] args)
                     writeln(versionString);
                     continue;
                 case "/subagents":
-                    writeln(escapeMarks(sanitizeBlock(subagentsCommand(agent, cfg, arg))));
+                {
+                    string showLog;
+                    auto said = subagentsCommand(agent, cfg, arg, showLog);
+                    if (showLog.length) showSubagentLog(arg.strip["show".length .. $].strip, showLog, console);
+                    else writeln(escapeMarks(sanitizeBlock(said)));
                     continue;
+                }
                 case "/changes":
                 {
                     // No fetch here: it would block the prompt; notes the build
