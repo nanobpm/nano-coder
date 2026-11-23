@@ -32,6 +32,7 @@ import nano.reminders : Reminders, wrap;
 import mem = nano.memory;
 import ctx = nano.context;
 import hist = nano.session_history;
+import cross = nano.cross_session;
 import nano.instructions : ProjectInstructions;
 import nano.thinking : Thinking, ThinkingResolved = Resolved, resolveThinking = resolve, Request, cappedBudget, Reported, ThinkingSource = Source;
 import temp = nano.temperature;
@@ -553,6 +554,11 @@ class Agent
     string titleModel;
     LLMClient delegate(string spec) titleClient;
     private bool[string] titlesRequested;
+
+    /// Read other sessions' logs (`cross_session_history`, issue #271): offer
+    /// `sessions_list` and honor the `session` argument of the history tools.
+    /// Off, the history tools behave as before and no other log is opened.
+    bool crossSessionHistory = true;
 
     private ulong logSize()
     {
@@ -2256,9 +2262,22 @@ class Agent
             else if (isHistory)
             {
                 // History tools are offered only when historyEnabled(), which needs a log.
-                auto logPath = log.unwrap("history tools are offered only with a session log").path;
+                auto ownLog = log.unwrap("history tools are offered only with a session log");
                 turnHistoryCalls++;
-                out_ = call.name == hist.searchTool ? hist.search(logPath, args) : hist.read(logPath, args);
+                if (call.name == hist.sessionsTool)
+                {
+                    if (!crossSessionHistory)
+                        throw new hist.HistoryError("sessions_list is disabled (cross_session_history = false)");
+                    import std.file : getcwd;
+                    out_ = cross.listResult(policy, sessionDirOf(ownLog), getcwd(), args);
+                }
+                else
+                {
+                    auto logPath = ownLog.path;
+                    if (auto denied = resolveSessionArg(args, ownLog, logPath))
+                        throw new hist.HistoryError(denied);
+                    out_ = call.name == hist.searchTool ? hist.search(logPath, args) : hist.read(logPath, args);
+                }
             }
             else if (isTimer) out_ = runTimerTool(call.name, args);
             else if (call.name == "read_file" && childReadState.isSome)
@@ -2277,6 +2296,62 @@ class Agent
         catch (QuestionError e) out_ = e.msg;
         catch (Exception e) out_ = format("%s failed: %s", call.name, e.msg);
         return out_;
+    }
+
+    /// The directory a session log lives in (where its sibling sessions are).
+    private static string sessionDirOf(SessionLog l)
+    {
+        import std.path : dirName;
+        return l.path.dirName;
+    }
+
+    /// Honor a history call's `session` argument (issue #271): resolve it to
+    /// one session's log and check the read against the permission policy.
+    /// Returns the message the model sees when the read may not happen (the
+    /// setting off, the policy denying another workspace's log, or the user
+    /// declining a cross-workspace read); on success `logPath` names the log
+    /// to stream and the result is null. Without the argument the call reads
+    /// the session's own log, as before.
+    private string resolveSessionArg(JSONValue args, SessionLog ownLog, ref string logPath)
+    {
+        import std.file : getcwd;
+        auto needle = cross.sessionArg(args);
+        if (!needle.length) return null;
+        if (!crossSessionHistory)
+            return "the session argument is disabled (cross_session_history = false)";
+        auto dir = sessionDirOf(ownLog);
+        auto cwd = getcwd();
+        auto sessions = cross.listSessions(policy, dir, cwd);
+        cross.SessionInfo self;
+        self.id = ownLog.id;
+        self.path = ownLog.path;
+        self.live = true;
+        self.cwd = cwd;
+        auto target = cross.resolve(needle, sessions, &self);
+        if (target.id == ownLog.id) return null; // this session: read as today
+        if (auto denied = cross.readDenied(policy, target, cwd)) return denied;
+        // Default-ask (issue #271): a session from another workspace is read
+        // only after the user confirms; headless (no answerer) fails closed.
+        if (cross.needsConfirmation(target, cwd) && !confirmedCrossRead(target))
+            return format("reading session %s from another workspace (%s) was not confirmed; "
+                ~ "the user must allow it first", target.id, target.cwd.length ? target.cwd : "unknown directory");
+        logPath = target.path;
+        return null;
+    }
+
+    /// Ask the user whether a cross-workspace session may be read; false when
+    /// they decline or no one can answer (headless fails closed, issue #271).
+    private bool confirmedCrossRead(const ref cross.SessionInfo target)
+    {
+        import nano.question : Question, QuestionOption, Answered;
+        if (!questions || !questions.interactive) return false;
+        auto q = Question(cross.confirmQuestion(target), null,
+            [QuestionOption("No"), QuestionOption("Yes")]);
+        q.custom = false;
+        auto a = questions.ask([q]);
+        return a.match!(
+            (Answered got) => got.answers.length && got.answers[0] == "Yes",
+            _ => false);
     }
 
     /// After a call ran: the PostToolUse hooks, and the hooks' context added.
@@ -3399,7 +3474,8 @@ class Agent
     ToolDefinition[] offeredTools() pure
     {
         auto all = tools.definitions ~ (planTools ? planDefinitions() : null)
-            ~ (outcomeTool ? [outcomeDefinition()] : null) ~ (historyEnabled ? hist.definitions() : null)
+            ~ (outcomeTool ? [outcomeDefinition()] : null) ~ (historyEnabled ? hist.definitions(crossSessionHistory) : null)
+            ~ (historyEnabled && crossSessionHistory ? [hist.sessionsDefinition()] : null)
             ~ (timerTools ? timerDefinitions() : null) ~ (subagentsOffered ? [subDefinition(subagentCandidates)] ~ subControlDefinitions() : null);
         if (control.mode != AgentMode.plan) return all;
         ToolDefinition[] kept;

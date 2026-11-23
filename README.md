@@ -668,6 +668,7 @@ system_prompt = "You are a helpful assistant with access to tools."
 bash_timeout_secs = 600
 # bash_heartbeat_secs = 60               # supervisor-visible "still running" note interval (or NANO_CODER_BASH_HEARTBEAT_SECS)
 persist_sessions = true
+cross_session_history = true            # sessions_list + a session argument on the history tools: read other sessions' logs
 # session_dir = "/path/to/sessions"    # default: <platform data dir>/nano-coder/sessions
 session_compress_after_days = 14        # gzip logs idle this long at startup (0 = never)
 # session_retention_days = 0           # delete logs untouched this long (0 = keep; named sessions are kept)
@@ -1159,14 +1160,42 @@ session log, and falls back to a standard summary when `persist_sessions` is off
   that the originals can be retrieved. Tool results clipped at compaction point at their ID.
 - **History tools.** Once a smart summary is in the context, the agent gets two tools
   over the current session's log (and only that one):
-  - `history_search(pattern, role?, before?, after?, order?, limit?)` - case-insensitive
+  - `history_search(pattern, role?, before?, after?, order?, limit?, session?)` - case-insensitive
     regex (or plain text) search. Newest first by default (`order=oldest` for early
     history); each matching message is one `#N role name (time): snippet` line with up to
     three snippets (and a `[K matches]` count when more matched). Earlier history lookups
     are not searched.
-  - `history_read(id, max_output_length?)` - one message in full, bounded like other tool
+  - `history_read(id, max_output_length?, session?)` - one message in full, bounded like other tool
     output (the whole is spilled to a file when it is longer).
   Before a smart compaction the tools are not offered, so they cost nothing.
+
+#### Cross-session history
+
+With `cross_session_history = true` (the default) the agent can also read *other* sessions'
+logs, so when several nano-coder sessions run on one machine context moves between them
+without copy-paste. A third tool joins the history tools, and `history_search`/`history_read`
+take an optional `session` argument:
+
+- `sessions_list(filter?)` - this machine's sessions, newest first: id, title or first
+  request, working directory, last activity, and `[live]` when a process currently has the
+  session open (probed with the session log's own lock). `filter` keeps sessions whose id,
+  title or directory contains it (case-insensitive), and the listing is capped in bytes like
+  any tool output.
+- `session` - an id, a unique id prefix, or a title from `sessions_list`. An ambiguous match
+  is an error listing the candidates; without the argument the tools read the current
+  session, as before.
+
+Reads are read-only and bounded: the other session's log is streamed like the current one
+(never loaded whole, same byte caps), and a live session's log is only read — never locked,
+moved or rewritten. A session whose working directory is the current workspace (or below
+it) may be read outright. Reading one from another directory asks for confirmation first
+(default ask): a question offers to allow it, a non-Yes answer refuses the read, and a
+headless run (no one to ask) refuses it closed. The permission policy still applies as a
+read of that log, so a `Read(...)` deny rule hides the session from `sessions_list`
+entirely — its title and first request are never shown. With
+`cross_session_history = false` there is no `sessions_list` tool, the history tools are
+advertised without the `session` argument (and refuse it if called with one), and other
+sessions' logs are never opened.
 
 To judge whether it helps, the log records each compaction's `mode`, `model` and the
 `summarized` line range (on the `replace` record), and each turn's `history_calls` (on

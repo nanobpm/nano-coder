@@ -76,7 +76,7 @@ immutable string[] planAllowedTools = [
     // Timers are session state, not workspace changes: a plan can wait.
     "timer_set", "timer_list", "timer_cancel", "timer_done",
     "load_skill",
-    "report_outcome", "question", "history_search", "history_read", "memory_search",
+    "report_outcome", "question", "history_search", "history_read", "sessions_list", "memory_search",
     // Read-only sub-agents: their own calls are checked against plan mode.
     "agent", "agent_status", "agent_read", "agent_cancel", "agent_wait",
 ];

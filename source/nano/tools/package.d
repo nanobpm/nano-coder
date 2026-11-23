@@ -260,6 +260,56 @@ string truncateOutput(string text, size_t limit, string label)
             chars[0 .. head].toUTF8, chars.length - limit, contentDigest(text), spill, chars[$ - tail .. $].toUTF8);
 }
 
+/// Keep the head and tail of `text` within `limit` UTF-8 bytes, marker
+/// included, cutting only on code-point boundaries. Use it where the cap is
+/// advertised in bytes (a listing of multi-byte titles must not exceed it).
+/// When cut, the full text is spilled and its path noted. A `limit` smaller
+/// than the marker itself yields the marker alone, which is then over `limit`:
+/// the spill path must never be dropped.
+string truncateOutputBytes(string text, size_t limit, string label)
+{
+    if (text.length <= limit) return text;
+    auto spill = spillFile(text, label);
+    auto digest = contentDigest(text);
+    enum fmt = "\n\n[... %s bytes omitted (sha256:%s); full output saved to %s ...]\n\n";
+    // Size the budget with text.length as the count: the real omitted count
+    // is no larger, so its marker is no longer and the result still fits.
+    import nano.arith : saturatingSub;
+    auto budget = saturatingSub(limit, format(fmt, text.length, digest, spill).length);
+    size_t head = budget * 2 / 3;
+    while (head > 0 && (text[head] & 0xC0) == 0x80) head--;
+    size_t tailStart = text.length - (budget - head);
+    while (tailStart < text.length && (text[tailStart] & 0xC0) == 0x80) tailStart++;
+    auto marker = format(fmt, tailStart - head, digest, spill);
+    return text[0 .. head] ~ marker ~ text[tailStart .. $];
+}
+
+unittest
+{
+    import std.algorithm : canFind;
+    import std.array : replicate;
+    import std.file : remove;
+    import std.regex : matchFirst;
+    import std.utf : validate;
+    auto text = "\U0001F600".replicate(30_000); // 120 KB of 4-byte characters
+    auto t = truncateOutputBytes(text, 40_000, "test-bytes");
+    assert(t.length <= 40_000, "the cap counts bytes");
+    validate(t);
+    auto m = t.matchFirst(`full output saved to (.*\.txt) \.\.\.\]`);
+    assert(!m.empty);
+    remove(m[1]);
+    // The marker counts the bytes actually cut, not the whole text.
+    import std.conv : to;
+    auto mk = t.matchFirst(`\n\n\[\.\.\. (\d+) bytes omitted.*\.\.\.\]\n\n`);
+    assert(!mk.empty && mk[1].to!size_t == text.length - (t.length - mk.hit.length), mk.hit);
+    assert(truncateOutputBytes("short", 100, "x") == "short");
+    // A limit below the marker's size keeps the marker (and spill path) alone.
+    auto tiny = truncateOutputBytes("x".replicate(500), 10, "test-tiny");
+    auto tm = tiny.matchFirst(`full output saved to (.*\.txt) \.\.\.\]`);
+    assert(!tm.empty && tiny.canFind("[... 500 bytes omitted"), tiny);
+    remove(tm[1]);
+}
+
 /// The first 16 hex digits of the text's SHA-256: the spill marker's
 /// identity, which the repeat detector keys on instead of the per-call path.
 string contentDigest(scope const(char)[] text) pure

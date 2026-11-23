@@ -145,6 +145,164 @@ ubyte[] gzipLog(const(ubyte)[] text) @trusted
     return out_[0 .. used].dup;
 }
 
+/// Feed every committed (newline-terminated) line of the log at `path` to
+/// `sink`, without holding the whole log: a plain log is read in 64 KiB
+/// chunks and a compressed one is inflated as it is read (issue #271: the
+/// history tools and the session index must stay bounded on a huge log, so
+/// they stream instead of `logText`-ing it whole). A trailing partial line
+/// (a torn write) is not committed and never reaches `sink`, matching
+/// `committedLines`.
+void streamLogLines(string path, scope void delegate(const(char)[] line) @safe sink)
+{
+    streamLogLinesUntil(path, (line) { sink(line); return true; });
+}
+
+/// `streamLogLines` whose `sink` returns false to stop reading: nothing
+/// past that line is read or inflated (issue #271: the permission-header
+/// probe must not scan a denied session's whole log).
+void streamLogLinesUntil(string path, scope bool delegate(const(char)[] line) @safe sink)
+{
+    import std.stdio : File;
+    auto f = File(path, "rb");
+    scope (exit) f.close();
+    ubyte[] carry;
+    if (isCompressedLog(path))
+    {
+        auto gz = GunzipStream(path);
+        scope (exit) gz.close();
+        auto buf = new ubyte[](64 * 1024);
+        for (;;)
+        {
+            auto got = gz.read(f, buf);
+            if (!got.length) break;
+            if (!feedChunk(carry, got, sink)) return;
+        }
+    }
+    else
+    {
+        auto buf = new ubyte[](64 * 1024);
+        for (;;)
+        {
+            auto got = f.rawRead(buf);
+            if (!got.length) break;
+            if (!feedChunk(carry, got, sink)) return;
+        }
+    }
+}
+
+/// Split one chunk into newline-terminated lines for `sink`, carrying a
+/// partial line over to the next chunk (a torn tail is dropped).
+private bool feedChunk(ref ubyte[] carry, const(ubyte)[] chunk, scope bool delegate(const(char)[]) @safe sink)
+{
+    size_t start;
+    foreach (i, b; chunk)
+        if (b == '\n')
+        {
+            if (!emitLine(carry, chunk[start .. i], sink)) return false;
+            start = i + 1;
+        }
+    if (start < chunk.length) carry ~= chunk[start .. $];
+    return true;
+}
+
+/// One line split out of the stream: the carried prefix plus the chunk
+/// slice, validated as UTF-8 (a malformed line is lossy-copied so a bad byte
+/// can't kill the stream; it fails to parse where decoded, as before).
+private bool emitLine(ref ubyte[] carry, const(ubyte)[] tail, scope bool delegate(const(char)[]) @safe sink)
+{
+    import nano.safeio : lossyText, utf8View;
+    import std.utf : UTFException;
+    const(ubyte)[] line = carry.length ? carry ~ tail : tail;
+    carry = null;
+    const(char)[] text;
+    try text = utf8View(line);
+    catch (UTFException) text = lossyText(line);
+    return sink(text);
+}
+
+/// An incremental gzip reader over a log file: the gzip wrapper needs raw
+/// inflate with windowBits 31, like `gunzipLog`, but the plain and
+/// compressed bytes stay bounded to their read buffers.
+private struct GunzipStream
+{
+    import std.stdio : File;
+    import nano.safeio : InflateStream;
+    private InflateStream zs;
+    private ubyte[] inBuf;
+    private string path;
+    private bool ended;
+
+    /// A reader over the log at `path`.
+    this(string path) { this.path = path; }
+
+    /// The next inflated bytes (a copy of `buf`'s filled prefix); empty at
+    /// the stream's end. Throws on a corrupt or truncated stream.
+    ubyte[] read(ref File f, ubyte[] buf)
+    {
+        if (ended) return null;
+        if (zs.isNone) zs = InflateStream.open(path);
+        if (!inBuf) inBuf = new ubyte[](64 * 1024);
+        for (;;)
+        {
+            if (zs.availIn == 0)
+            {
+                auto got = f.rawRead(inBuf);
+                if (!got.length) throw new Exception("gunzip " ~ path ~ ": truncated stream");
+                zs.feed(got);
+            }
+            auto rc = zs.inflateInto(buf);
+            immutable used = zlibWindow(buf.length) - zs.availOut;
+            if (rc == InflateStream.Rc.streamEnd)
+            {
+                ended = true;
+                return used ? buf[0 .. used].dup : null;
+            }
+            if (rc == InflateStream.Rc.error)
+                throw new Exception("gunzip " ~ path ~ ": " ~ zs.errorMessage);
+            if (used) return buf[0 .. used].dup;
+            // Z_BUF_ERROR with no output means zlib can make no progress: with
+            // input still buffered that is a stuck stream, not a read more.
+            if (zs.availIn) throw new Exception("gunzip " ~ path ~ ": corrupt stream (no progress)");
+            // else zlib wants more input; loop to read it.
+        }
+    }
+
+    /// End the zlib stream (idempotent).
+    void close()
+    {
+        zs.close();
+    }
+}
+
+/// `streamLogLines` for the history tools: a torn trailing line is dropped
+/// by the streamer and callers skip undecodable records themselves, but a
+/// missing or unreadable log or a corrupt/truncated archive throws, so a
+/// search never reports partial results as complete.
+void foreachLogLineSkippingTorn(string path, scope void delegate(const(char)[]) @safe sink)
+{
+    streamLogLines(path, sink);
+}
+
+/// The working directory recorded in the log's header (null for older logs
+/// or an unreadable header), read from the first line only (issue #271:
+/// `sessions_list` checks a session's workspace before its log is opened or
+/// its cached metadata shown, so the check must not read the log whole).
+string logHeaderCwd(string path)
+{
+    string cwd;
+    try
+        streamLogLinesUntil(path, (line) {
+            auto h = parseJSON(line);
+            if (h["type"].str != "session") return false;
+            auto d = h["data"].objectNoRef;
+            if (auto c = "cwd" in d)
+                if (c.type == JSONType.string) cwd = c.str;
+            return false; // the header is the first line: stop reading
+        });
+    catch (Exception) {} // an unreadable or corrupt header is no cwd, as documented
+    return cwd;
+}
+
 /// The session log directory: `NANO_CODER_SESSIONS`, else the configured
 /// `session_dir` (`~` expanded), else the platform data folder.
 string sessionDir(string configured = null)
@@ -1859,11 +2017,19 @@ package enum LockResult { acquired, contended, unsupported }
 /// is any other flock failure (ENOLCK, EOPNOTSUPP, ...): writers carry on
 /// best-effort, but destructive maintenance must treat it as not held.
 /// The lock lives until `f` is closed; flock marks the open file description.
+/// EINTR is retried: a signal that interrupted the call (SIGCHLD from a
+/// spawned test or hook process) says nothing about the lock's state, and
+/// macOS returns it even for a non-blocking flock.
 private LockResult tryLock(ref File f) @trusted
 {
-    import core.stdc.errno : errno, EWOULDBLOCK, EAGAIN;
-    if (flock(fileno(f.getFP), LOCK_EX | LOCK_NB) == 0) return LockResult.acquired;
-    return errno == EWOULDBLOCK || errno == EAGAIN ? LockResult.contended : LockResult.unsupported;
+    import core.stdc.errno : errno, EWOULDBLOCK, EAGAIN, EINTR;
+    for (;;)
+    {
+        if (flock(fileno(f.getFP), LOCK_EX | LOCK_NB) == 0) return LockResult.acquired;
+        immutable err = errno;
+        if (err == EINTR) continue;
+        return err == EWOULDBLOCK || err == EAGAIN ? LockResult.contended : LockResult.unsupported;
+    }
 }
 
 /// A locked log handle shared by this thread's writers of one path.
@@ -3349,7 +3515,9 @@ unittest
             // The foreign file at the original path must not stay locked
             // by a leaked in-place-repair fd while this writer lives on.
             auto probe = File(p, "r+");
-            assert(tryLock(probe) == LockResult.acquired, "a leaked fd still locks the rewritten path");
+            immutable probeLock = tryLock(probe);
+            assert(probeLock == LockResult.acquired,
+                "a leaked fd still locks the rewritten path (probe: " ~ probeLock.to!string ~ ")");
             probe.close();
         }
         log.close();
@@ -3449,7 +3617,9 @@ unittest
     // must be free again.
     auto probe = openExistingForAppend(rec);
     scope (exit) probe.close();
-    assert(tryLock(probe) == LockResult.acquired, "no leaked fd still locks the recovery log");
+    immutable probeLock = tryLock(probe);
+    assert(probeLock == LockResult.acquired,
+        "no leaked fd still locks the recovery log (probe: " ~ probeLock.to!string ~ ")");
     restore(rec); // a resumable session: its header names the recovery id
 }
 
@@ -3489,7 +3659,9 @@ unittest
     assert(readText(first) == "", "the skipped name stays header-less for its lock holder");
     auto probe = openExistingForAppend(rec);
     scope (exit) probe.close();
-    assert(tryLock(probe) == LockResult.acquired, "the adopted recovery log is free after close");
+    immutable probeLock = tryLock(probe);
+    assert(probeLock == LockResult.acquired,
+        "the adopted recovery log is free after close (probe: " ~ probeLock.to!string ~ ")");
     assert(dirEntries(dir, "*.recovered-*.jsonl", SpanMode.shallow).array.length == 2,
         "no extra empty recovery files left behind");
     restore(rec);
@@ -3618,4 +3790,19 @@ unittest
     auto now = readText(rec);
     assert(now.canFind("sigma") && now.canFind("tau") && !now.canFind("foreign"), now);
     restore(rec);
+}
+
+// Issue #271 review: `streamLogLinesUntil` stops at the first false, and
+// `logHeaderCwd` reads only the header.
+unittest
+{
+    import std.file : write, remove, tempDir;
+    import std.path : buildPath;
+    auto p = buildPath(tempDir, "nano-stream-until.jsonl");
+    scope (exit) remove(p);
+    write(p, `{"type":"session","data":{"cwd":"/w"}}` ~ "\n" ~ "not json\n" ~ "x\n");
+    size_t seen;
+    streamLogLinesUntil(p, (line) { ++seen; return false; });
+    assert(seen == 1);
+    assert(logHeaderCwd(p) == "/w");
 }

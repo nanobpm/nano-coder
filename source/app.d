@@ -2811,6 +2811,7 @@ int runMain(string[] args)
     agent.indexShown = indexShown;
     agent.instructions = instructions;
     agent.sessionTitles = cfg.sessionTitles;
+    agent.crossSessionHistory = cfg.crossSessionHistory;
     agent.titleModel = cfg.titleModel;
     agent.titleClient = (string spec) => makeClient(resolve(cfg, spec));
     // The provider the last switch resolved: a background probe builds its

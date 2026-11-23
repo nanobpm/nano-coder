@@ -466,6 +466,11 @@ struct Config
     bool idleCompact = true;
     /// Persist conversations as JSONL session logs (false: like --no-session).
     bool persistSessions = true;
+    /// Let the history tools read other sessions' logs (`cross_session_history`,
+    /// issue #271): the `sessions_list` tool and the `session` argument on
+    /// `history_search`/`history_read`. Off, the tools behave as before and
+    /// other sessions' logs are never opened.
+    bool crossSessionHistory = true;
     /// Session log directory (empty: the platform data folder).
     string sessionDir;
     /// Gzip session logs idle this many days at startup (0: never; issue #205).
@@ -554,6 +559,7 @@ struct Config
         if (auto v = "compaction_pin_requests" in doc) c.compactionPinRequests = v.boolean;
         if (auto v = "idle_compact" in doc) c.idleCompact = v.boolean;
         if (auto v = "persist_sessions" in doc) c.persistSessions = v.boolean;
+        if (auto v = "cross_session_history" in doc) c.crossSessionHistory = v.boolean;
         if (auto v = "session_dir" in doc) c.sessionDir = v.str;
         if (auto v = "session_compress_after_days" in doc) c.sessionCompressAfterDays = v.integer;
         if (auto v = "session_retention_days" in doc) c.sessionRetentionDays = v.integer;
