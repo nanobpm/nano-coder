@@ -1824,6 +1824,20 @@ class Agent
     /// The temperature the current model is sent, and why.
     temp.Resolved temperatureNow() { return temperatureFor(thinking().anthropicThinkingOn); }
 
+    /// The warnings a resumed session's restored settings bring (issue
+    /// #297), as `/model` (`model`: the model was switched) and `/thinking`
+    /// (`thinkingLevel`: a level was restored) would show them, so a restored
+    /// value the model does not support is not applied silently.
+    string[] restoreWarnings(bool model, bool thinkingLevel)
+    {
+        string[] w;
+        if (model)
+            if (auto t = temperatureNow.warning) w ~= t;
+        if (model || thinkingLevel)
+            if (auto t = thinking().warning) w ~= t;
+        return w;
+    }
+
     /// Whether (and how) the current model can view images.
     Nullable!Vision vision()
     {

@@ -875,6 +875,10 @@ final class AcpServer : AgentEvents
             agent.restart(sys, Option!SessionLog.init);
             sessionId = format("session-%x", stdTimeNow);
         }
+        // A new session starts from the startup defaults, not the settings a
+        // `session/load` restored (issue #297): its log has no record of
+        // them, so a later load would not reproduce them.
+        resetToStartupDefaults(true);
         if (host.loadHooks !is null) agent.useHooks(host.loadHooks(cwd), false);
     }
 
@@ -918,6 +922,30 @@ final class AcpServer : AgentEvents
         releaseHeap();
     }
 
+    /// Reset the runtime settings a session can change (issue #297) to the
+    /// server's startup defaults: sub-agents, compaction mode, auto-compaction,
+    /// its threshold, the mode and the configured window. With
+    /// `activeWindow`, the window is the active provider's (the model may
+    /// have been switched), else the startup one.
+    private void resetToStartupDefaults(bool activeWindow)
+    {
+        import nano.mode : AgentMode;
+        agent.subagentsOn = defaultSubagentsOn;
+        agent.compactionMode = defaultCompactionMode;
+        agent.autoCompact = defaultAutoCompact;
+        agent.autoCompactThreshold = defaultAutoCompactThreshold;
+        agent.control.mode = host.plan ? AgentMode.plan : AgentMode.normal;
+        agent.setConfiguredWindow(defaultConfiguredWindow);
+        if (activeWindow && host.windowFor !is null)
+        {
+            // A provider since removed from config keeps the default.
+            import std.exception : collectException;
+            ConfiguredWindow w;
+            if (collectException(w = host.windowFor(agent.client.providerName ~ "/" ~ agent.client.modelName)) is null)
+                agent.setConfiguredWindow(w);
+        }
+    }
+
     /// Apply the runtime settings a loaded session logged (issue #297): model,
     /// mode, thinking, sub-agents and context settings. A model that is no
     /// longer available keeps the current client rather than failing the load.
@@ -930,15 +958,7 @@ final class AcpServer : AgentEvents
 
         // Reset settings an earlier session on this server may have changed so
         // they do not leak into a loaded session with no record for them.
-        agent.subagentsOn = defaultSubagentsOn;
-        agent.compactionMode = defaultCompactionMode;
-        agent.autoCompact = defaultAutoCompact;
-        agent.autoCompactThreshold = defaultAutoCompactThreshold;
-        agent.setConfiguredWindow(defaultConfiguredWindow);
-        {
-            import nano.mode : AgentMode;
-            agent.control.mode = host.plan ? AgentMode.plan : AgentMode.normal;
-        }
+        resetToStartupDefaults(false);
 
         auto wanted = st.model.length ? st.model : headerModel;
         auto current = agent.client.providerName ~ "/" ~ agent.client.modelName;
@@ -992,7 +1012,13 @@ final class AcpServer : AgentEvents
         {
             auto setting = sessionSetting(st.thinking);
             if (!setting.isErr) agent.sessionThinking = setting.unwrap("isOk");
+            else stdErr.writeln("nano-coder: ACP session/load: the saved thinking level is invalid: ",
+                setting.unwrapErr("isErr"));
         }
+        // ACP has no notice channel: the warnings `/model` and `/thinking`
+        // show for the restored values go to stderr, as the fallbacks do.
+        foreach (w; agent.restoreWarnings(switched, st.thinking.length > 0))
+            stdErr.writeln("nano-coder: ACP session/load: warning: ", w);
         if (st.subagents >= 0) agent.subagentsOn = st.subagents != 0;
         if (st.compactionMode.length)
             parseCompactionMode(st.compactionMode).match!((m) { agent.compactionMode = m; }, () {});
@@ -1467,6 +1493,40 @@ unittest
     assert(!agent2.subagentsOn);
     assert(!agent2.sessionThinking.isNull && agent2.sessionThinking.get == Thinking.of("high"));
     agent2.replaceLog(Option!SessionLog.init);
+
+    // session/load then session/new: the new session starts from the startup
+    // defaults, not the loaded session's settings, so it behaves live as it
+    // does when reloaded (issue #297).
+    auto agentN = new Agent(new MockClient([]), new ToolRegistry, Policy.init, null);
+    agentN.subagentClients = new immutable NoClients;
+    agentN.setConfiguredWindow(ConfiguredWindow(8_888, "startup provider"));
+    const startSub = agentN.subagentsOn, startMode = agentN.compactionMode, startAuto = agentN.autoCompact;
+    Host hostN = host2;
+    hostN.makeClient = (string spec) => new NamedMock("alt", "other");
+    hostN.windowFor = (string spec) => ConfiguredWindow(6_666, "switched provider");
+    string[] linesN;
+    auto srvN = new AcpServer(agentN, hostN, (string l) { linesN ~= l; });
+    srvN.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ sid ~ `"}}`);
+    srvN.receive(`{"jsonrpc":"2.0","id":3,"method":"session/new","params":{}}`);
+    srvN.close();
+    assert(srvN.run());
+    assert(agentN.subagentsOn == startSub && startSub, linesN.format!"%s");
+    assert(agentN.compactionMode == startMode && agentN.autoCompact == startAuto);
+    assert(agentN.sessionThinking.isNull);
+    assert(agentN.configuredWindow == 6_666, "the active provider's window, not the loaded one's");
+    auto newSid = parseJSON(linesN[$ - 1])["result"]["sessionId"].str;
+    assert(newSid != sid);
+    agentN.replaceLog(Option!SessionLog.init);
+    // Reloading the new session reproduces what it had live.
+    auto agentR = new Agent(new MockClient([]), new ToolRegistry, Policy.init, null);
+    agentR.subagentClients = new immutable NoClients;
+    auto srvR = new AcpServer(agentR, hostN, (string l) {});
+    srvR.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ newSid ~ `"}}`);
+    srvR.close();
+    assert(srvR.run());
+    assert(agentR.subagentsOn == agentN.subagentsOn && agentR.compactionMode == agentN.compactionMode);
+    assert(agentR.sessionThinking.isNull);
+    agentR.replaceLog(Option!SessionLog.init);
 
     // An unavailable model during session/load falls back to the current client.
     auto agent3 = new Agent(new MockClient([]), new ToolRegistry, Policy.init, null);

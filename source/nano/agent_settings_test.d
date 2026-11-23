@@ -194,3 +194,18 @@ unittest
     assert(sessionSetting("reset").unwrap("ok").isNull == true);
     assert(sessionSetting("bad level!").isErr);
 }
+
+// A restored model or thinking level the model does not support brings the
+// warning `/model` or `/thinking` would show, not a silent change (issue #297).
+unittest
+{
+    import nano.thinking : Thinking;
+    auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "sys");
+    assert(agent.restoreWarnings(false, false).length == 0);
+    agent.sessionThinking = Thinking.of("xhigh");
+    auto w = agent.thinking().warning;
+    assert(w.length, "the mock model has no xhigh level");
+    assert(agent.restoreWarnings(false, true) == [w]);
+    assert(agent.restoreWarnings(true, false).canFind(w));
+    assert(agent.restoreWarnings(false, false).length == 0, "nothing restored, nothing to warn about");
+}

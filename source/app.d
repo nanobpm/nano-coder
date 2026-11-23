@@ -1176,12 +1176,93 @@ unittest
     assert(savedProviderKnown("bare", ps));
 }
 
+/// The config defaults of the runtime settings a session can override
+/// (issue #297), as saved in the config file. Snapshotted at startup and
+/// refreshed only when the config is saved: the `/settings` dialog edits the
+/// live `Config` before (or without) saving, so comparing against or
+/// resetting to that `Config` would treat an unsaved edit as the default.
+struct RuntimeDefaults
+{
+    Verbosity verbosity; /// `verbosity`
+    bool subagents; /// `subagents`
+    string compactionMode; /// `compaction_mode`
+    bool autoCompact; /// `auto_compact`
+    double autoCompactThreshold; /// `auto_compact_threshold`
+    long contextWindow; /// top-level `context_window` (0: none)
+
+    /// The defaults `c` holds.
+    static RuntimeDefaults of(const ref Config c) pure nothrow @nogc
+    {
+        return RuntimeDefaults(c.verbosity, c.subagents, c.compactionMode, c.autoCompact,
+            c.autoCompactThreshold, c.contextWindow);
+    }
+
+    /// The configured window under these defaults for a provider whose own
+    /// `context_window` is `providerWindow` (0: none), as `windowFor`
+    /// resolves it.
+    ConfiguredWindow window(long providerWindow) const pure
+    {
+        if (contextWindow > 0) return ConfiguredWindow(toSize(contextWindow), "context_window in config");
+        if (providerWindow > 0) return ConfiguredWindow(toSize(providerWindow), "provider context_window");
+        return ConfiguredWindow.init;
+    }
+}
+
+/// Reset the runtime settings an in-process `/resume` must not carry from
+/// the session being left (issue #297) to the saved config defaults `d`:
+/// sub-agents, compaction mode, auto-compaction, its threshold and the mode;
+/// the configured window too when `window` (`providerWindow`: the active
+/// provider's own `context_window`). Verbosity is the caller's (it lives in
+/// the UI).
+void resetRuntimeSettings(Agent agent, const ref RuntimeDefaults d, long providerWindow, bool window)
+{
+    import nano.context : parseCompactionMode;
+    agent.subagentsOn = d.subagents;
+    parseCompactionMode(d.compactionMode).match!((m) { agent.compactionMode = m; }, () {});
+    agent.autoCompact = d.autoCompact;
+    agent.autoCompactThreshold = d.autoCompactThreshold;
+    agent.control.mode = AgentMode.normal;
+    if (window) agent.setConfiguredWindow(d.window(providerWindow));
+}
+
+unittest // an unsaved `/settings` edit of cfg does not leak into a `/resume` (issue #297)
+{
+    import nano.context : CompactionMode;
+    import nano.permissions : Policy;
+    import nano.providers.mock : MockClient;
+    import nano.tools : ToolRegistry;
+    Config cfg;
+    cfg.compactionMode = "smart";
+    cfg.autoCompact = true;
+    cfg.autoCompactThreshold = 0.8;
+    cfg.subagents = true;
+    const defaults = RuntimeDefaults.of(cfg);
+    // The dialog's unsaved Context edit, as `editContext` applies it.
+    cfg.compactionMode = "extract";
+    cfg.autoCompact = false;
+    cfg.autoCompactThreshold = 0.5;
+    cfg.contextWindow = 64_000;
+    auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "sys");
+    agent.compactionMode = CompactionMode.extract;
+    agent.autoCompact = false;
+    agent.autoCompactThreshold = 0.5;
+    agent.subagentsOn = false;
+    agent.setConfiguredWindow(ConfiguredWindow(64_000, "context_window in config"));
+    resetRuntimeSettings(agent, defaults, 32_000, true);
+    assert(agent.compactionMode == CompactionMode.smart);
+    assert(agent.autoCompact && agent.autoCompactThreshold == 0.8 && agent.subagentsOn);
+    assert(agent.configuredWindow == 32_000 && agent.configuredWindowSource == "provider context_window");
+    resetRuntimeSettings(agent, defaults, 0, true);
+    assert(agent.configuredWindow == 0);
+}
+
 /// The runtime settings `/restart` carries over into the new session's log
 /// (issue #297): the new session keeps the live verbosity, sub-agents switch
-/// and context settings, so seeding any value that differs from the config
-/// ensures a later flag-free resume restores them instead of reverting to
-/// config defaults. Returns `hasAny` = true when at least one field is set.
-SessionSettings retainedRestartSettings(const ref Config cfg, Verbosity liveVerbosity,
+/// and context settings, so seeding any value that differs from the saved
+/// config defaults `d` ensures a later flag-free resume restores them instead
+/// of reverting to config defaults. Returns `hasAny` = true when at least one
+/// field is set.
+SessionSettings retainedRestartSettings(const ref RuntimeDefaults d, Verbosity liveVerbosity,
     bool liveSubagents, imported!"nano.context".CompactionMode liveCompactionMode, bool liveAutoCompact,
     double liveAutoCompactThreshold, size_t liveConfiguredWindow, string liveConfiguredWindowSource,
     out bool hasAny) pure
@@ -1189,11 +1270,11 @@ SessionSettings retainedRestartSettings(const ref Config cfg, Verbosity liveVerb
     import nano.context : modeName;
     import nano.ui : vname = name;
     SessionSettings s;
-    if (liveVerbosity != cfg.verbosity) { s.verbosity = vname(liveVerbosity); hasAny = true; }
-    if (liveSubagents != cfg.subagents) { s.subagents = liveSubagents ? 1 : 0; hasAny = true; }
-    if (modeName(liveCompactionMode) != cfg.compactionMode) { s.compactionMode = modeName(liveCompactionMode); hasAny = true; }
-    if (liveAutoCompact != cfg.autoCompact) { s.autoCompact = liveAutoCompact ? 1 : 0; hasAny = true; }
-    if (liveAutoCompactThreshold != cfg.autoCompactThreshold) { s.autoCompactThreshold = liveAutoCompactThreshold; hasAny = true; }
+    if (liveVerbosity != d.verbosity) { s.verbosity = vname(liveVerbosity); hasAny = true; }
+    if (liveSubagents != d.subagents) { s.subagents = liveSubagents ? 1 : 0; hasAny = true; }
+    if (modeName(liveCompactionMode) != d.compactionMode) { s.compactionMode = modeName(liveCompactionMode); hasAny = true; }
+    if (liveAutoCompact != d.autoCompact) { s.autoCompact = liveAutoCompact ? 1 : 0; hasAny = true; }
+    if (liveAutoCompactThreshold != d.autoCompactThreshold) { s.autoCompactThreshold = liveAutoCompactThreshold; hasAny = true; }
     if (liveConfiguredWindow > 0 && liveConfiguredWindowSource == "the session's settings")
     {
         import std.conv : to;
@@ -1201,7 +1282,7 @@ SessionSettings retainedRestartSettings(const ref Config cfg, Verbosity liveVerb
         hasAny = true;
     }
     else if (liveConfiguredWindow > 0 && liveConfiguredWindowSource == "context_window in config"
-        && liveConfiguredWindow != (cfg.contextWindow > 0 ? toSize(cfg.contextWindow) : 0))
+        && liveConfiguredWindow != (d.contextWindow > 0 ? toSize(d.contextWindow) : 0))
     {
         import std.conv : to;
         s.contextWindow = liveConfiguredWindow.to!long;
@@ -1219,12 +1300,13 @@ unittest // retainedRestartSettings: records only live settings that diverge fro
     cfg.compactionMode = "smart";
     cfg.autoCompact = true;
     cfg.autoCompactThreshold = 0.8;
+    auto d = RuntimeDefaults.of(cfg);
     bool hasAny;
     const SessionSettings empty;
-    auto same = retainedRestartSettings(cfg, Verbosity.normal, true, CompactionMode.smart, true, 0.8, 0, "", hasAny);
+    auto same = retainedRestartSettings(d, Verbosity.normal, true, CompactionMode.smart, true, 0.8, 0, "", hasAny);
     assert(!hasAny && same == empty);
 
-    auto changed = retainedRestartSettings(cfg, Verbosity.verbose, false, CompactionMode.extract, false, 0.65,
+    auto changed = retainedRestartSettings(d, Verbosity.verbose, false, CompactionMode.extract, false, 0.65,
         50_000, "the session's settings", hasAny);
     assert(hasAny);
     assert(changed.verbosity == "verbose");
@@ -1235,20 +1317,42 @@ unittest // retainedRestartSettings: records only live settings that diverge fro
     assert(changed.contextWindow == 50_000);
 
     // A `/settings` context_window edit (labelled "context_window in config") is also seeded.
-    auto dlgWin = retainedRestartSettings(cfg, Verbosity.normal, true, CompactionMode.smart, true, 0.8,
+    auto dlgWin = retainedRestartSettings(d, Verbosity.normal, true, CompactionMode.smart, true, 0.8,
         64_000, "context_window in config", hasAny);
     assert(hasAny && dlgWin.contextWindow == 64_000);
 
-    // A config context_window that matches cfg.contextWindow is not redundantly recorded.
+    // A saved config context_window that matches is not redundantly recorded.
     cfg.contextWindow = 64_000;
-    auto sameWin = retainedRestartSettings(cfg, Verbosity.normal, true, CompactionMode.smart, true, 0.8,
+    d = RuntimeDefaults.of(cfg);
+    auto sameWin = retainedRestartSettings(d, Verbosity.normal, true, CompactionMode.smart, true, 0.8,
         64_000, "context_window in config", hasAny);
     assert(!hasAny && sameWin.contextWindow == -1);
 
     // A provider/config window (not a session override) is not recorded.
-    auto provWin = retainedRestartSettings(cfg, Verbosity.normal, true, CompactionMode.smart, true, 0.8,
+    auto provWin = retainedRestartSettings(d, Verbosity.normal, true, CompactionMode.smart, true, 0.8,
         128_000, "provider context_window", hasAny);
     assert(!hasAny && provWin.contextWindow == -1);
+}
+
+unittest // an unsaved `/settings` Context edit survives `/restart` (issue #297)
+{
+    import nano.context : CompactionMode;
+    Config cfg;
+    cfg.compactionMode = "smart";
+    cfg.autoCompact = true;
+    cfg.autoCompactThreshold = 0.8;
+    const d = RuntimeDefaults.of(cfg);
+    // `editContext` writes the edit into cfg (and the agent) without saving.
+    cfg.compactionMode = "extract";
+    cfg.autoCompact = false;
+    cfg.autoCompactThreshold = 0.5;
+    cfg.contextWindow = 64_000;
+    bool hasAny;
+    auto s = retainedRestartSettings(d, cfg.verbosity, cfg.subagents, CompactionMode.extract, false, 0.5,
+        64_000, "context_window in config", hasAny);
+    assert(hasAny);
+    assert(s.compactionMode == "extract" && s.autoCompact == 0 && s.autoCompactThreshold == 0.5);
+    assert(s.contextWindow == 64_000);
 }
 
 /// Pick the initial startup model candidate for `--resume` (issue #297):
@@ -3168,6 +3272,9 @@ int runMain(string[] args)
     agent.refreshCapabilities();
     // A configured temperature or thinking level that is adjusted or ignored.
     if (!o.acp && !o.prompt.length) foreach (w; settingWarnings(agent)) stdErr.writeln("Warning: ", w);
+    // The saved config's runtime defaults (issue #297): `/settings` edits
+    // `cfg` before saving, so resets and `/restart` compare against this.
+    auto runtimeDefaults = RuntimeDefaults.of(cfg);
 
     if (o.acp)
     {
@@ -3510,12 +3617,8 @@ int runMain(string[] args)
             // Switching sessions in-process (`/resume`): reset settings the
             // session being left may have changed so they do not leak into a
             // target session with no `settings` record for them.
-            setVerbosity(cfg.verbosity);
-            agent.subagentsOn = cfg.subagents;
-            parseCompactionMode(cfg.compactionMode).match!((m) { agent.compactionMode = m; }, () {});
-            agent.autoCompact = cfg.autoCompact;
-            agent.autoCompactThreshold = cfg.autoCompactThreshold;
-            agent.control.mode = AgentMode.normal;
+            setVerbosity(runtimeDefaults.verbosity);
+            resetRuntimeSettings(agent, runtimeDefaults, 0, false);
         }
 
         // The model: explicit flag > session's last record > session header >
@@ -3570,13 +3673,12 @@ int runMain(string[] args)
                     wanted, e.msg, fallback);
             }
         }
-        if (!explicitFlags && !switchedModel && st.contextWindow < 0)
+        if (!explicitFlags && st.contextWindow < 0)
         {
-            // Reset any context-window override left by the previous session.
-            auto pc = client.providerName in cfg.providers;
-            agent.setConfiguredWindow(pc !is null ? windowFor(cfg, *pc)
-                : cfg.contextWindow > 0 ? ConfiguredWindow(toSize(cfg.contextWindow), "context_window in config")
-                : ConfiguredWindow.init);
+            // Reset any context-window override left by the previous session
+            // (a switched model's client was built with the live `cfg`, which
+            // may hold an unsaved `/settings` edit).
+            agent.setConfiguredWindow(runtimeDefaults.window(cfg.providers.get(client.providerName, ProviderConfig.init).contextWindow));
         }
         if (explicitFlags && o.plan)
         {
@@ -3622,12 +3724,11 @@ int runMain(string[] args)
             else
             {
                 // The session cleared the override: re-resolve from the config.
-                auto pc = client.providerName in cfg.providers;
-                agent.setConfiguredWindow(pc !is null ? windowFor(cfg, *pc)
-                    : cfg.contextWindow > 0 ? ConfiguredWindow(toSize(cfg.contextWindow), "context_window in config")
-                    : ConfiguredWindow.init);
+                agent.setConfiguredWindow(runtimeDefaults.window(cfg.providers.get(client.providerName, ProviderConfig.init).contextWindow));
             }
         }
+        // The warnings `/model` and `/thinking` show for the restored values.
+        foreach (w; agent.restoreWarnings(switchedModel, st.thinking.length > 0)) notes ~= "warning: " ~ w;
         lastLoggedMode = agent.control.mode;
         lastLoggedVerbosity = verbosity;
     }
@@ -3731,6 +3832,7 @@ int runMain(string[] args)
             logVerbosityIfChanged();
         };
         h.logSettings = (const SessionSettings s) { logSessionSettings(s); };
+        h.onSaved = () { runtimeDefaults = RuntimeDefaults.of(cfg); };
         return h;
     }
 
@@ -4261,7 +4363,7 @@ int runMain(string[] args)
                         // retains (verbosity, sub-agents, context settings) so
                         // a later flag-free resume restores them (issue #297).
                         bool hasRetained;
-                        auto retained = retainedRestartSettings(cfg, verbosity, agent.subagentsOn,
+                        auto retained = retainedRestartSettings(runtimeDefaults, verbosity, agent.subagentsOn,
                             agent.compactionMode, agent.autoCompact, agent.autoCompactThreshold,
                             agent.configuredWindow, agent.configuredWindowSource, hasRetained);
                         if (hasRetained) logSessionSettings(retained);
@@ -4400,6 +4502,8 @@ int runMain(string[] args)
                 {
                     string showLog;
                     auto said = subagentsCommand(agent, cfg, arg, showLog);
+                    // `--save` wrote the switch to the config: it is the new default.
+                    if (imported!"std.algorithm.searching".canFind(said, "; saved to ")) runtimeDefaults.subagents = cfg.subagents;
                     if (showLog.length) showSubagentLog(arg.strip["show".length .. $].strip, showLog, console);
                     else writeln(escapeMarks(sanitizeBlock(said)));
                     continue;

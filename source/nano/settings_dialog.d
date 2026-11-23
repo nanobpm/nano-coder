@@ -52,6 +52,9 @@ struct SettingsHost
     /// Records a runtime settings change in the session log (issue #297): a
     /// resumed session restores it. Null in tests.
     void delegate(const imported!"nano.session".SessionSettings s) @safe logSettings;
+    /// Called after the dialog saved the config, so the caller can take the
+    /// saved values as its new defaults (issue #297). Null in tests.
+    void delegate() @safe onSaved;
 }
 
 /// The bare `/model` picker: a recent model or a provider, then its model.
@@ -244,6 +247,7 @@ private void saveAndReport(SettingsUi ui, ref SettingsHost h, ref Changes change
         save(*h.cfg, changes, user, h.configPath);
         changes = Changes.init;
         notices = clearSaveFailures(notices);
+        if (h.onSaved !is null) h.onSaved();
         ui.say(format("Saved to %s", h.configPath));
     }
     catch (Exception e) notices ~= format("Could not save settings: %s", e.msg);
