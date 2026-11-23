@@ -1025,6 +1025,9 @@ final class AcpServer : AgentEvents
             response = "Error: " ~ e.msg;
             agent.lastStop = StopReason.endTurn;
         }
+        // Stop steering peers into this turn before endTurn collects the
+        // leftover steers: a later peer message queues for the next turn.
+        peerRouter.midTurn(false);
         router.endTurn((ref JSONValue[] items, const(size_t)[] marks, string session) {
             string stop = agent.lastStop;
             if (id.type != JSONType.null_)

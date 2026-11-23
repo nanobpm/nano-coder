@@ -44,6 +44,7 @@ import std.format : format;
 import std.json;
 import std.string : strip;
 import std.conv : octal;
+import core.time : Duration, seconds;
 
 import nano.option : NotNull, nullable;
 import nano.result : Result, unwrap, unwrapErr;
@@ -286,6 +287,9 @@ struct PeerListener
         Socket listener;
         JoinHandle thread;
         bool closed;
+        /// Set by close(): the listener thread stops waiting on an
+        /// unanswered request and exits promptly instead of after 120 s.
+        Shared!bool stop;
     }
 
     /// Listen on `<dir>/<id>.sock` (the directory must exist); accepted
@@ -314,7 +318,8 @@ struct PeerListener
         auto impl = new Impl;
         impl.path = path;
         impl.listener = socket;
-        impl.thread = spawnDaemon(&serve, impl.listener.handle, requests);
+        impl.stop = Shared!bool.make;
+        impl.thread = spawnDaemon(&serve, impl.listener.handle, requests, impl.stop);
         return PeerListener(NotNull!Impl(impl));
     }
 
@@ -329,16 +334,19 @@ struct PeerListener
         if (impl.closed) return;
         impl.closed = true;
         auto l = impl.listener;
-        // Wake the accept loop, then join it before unlinking so no accepted
-        // connection is dropped mid-handshake.
+        // Flag the thread (it polls the flag at least every 100 ms, also
+        // while waiting on an unanswered request), wake the accept loop, and
+        // join it before closing the fd, so the thread never sees the fd
+        // closed (and possibly reused) under it.
+        impl.stop.update((ref bool b) { b = true; });
         try l.shutdown(SocketShutdown.BOTH);
         catch (SocketException) {} // already closed: fine
-        l.close();
         impl.thread.join();
+        l.close();
         if (impl.path.exists) removeIfThere(impl.path);
     }
 
-    private static void serve(imported!"std.socket".socket_t handle_, Chan!PeerRequest requests)
+    private static void serve(imported!"std.socket".socket_t handle_, Chan!PeerRequest requests, Shared!bool stop)
     {
         import core.time : msecs;
         import std.socket : Socket, SocketSet, SocketException, AddressFamily, SocketType;
@@ -346,7 +354,7 @@ struct PeerListener
         import nano.safeio : socketPeerUid;
         auto listener = new Socket(handle_, AddressFamily.UNIX);
         auto set = new SocketSet;
-        for (;;)
+        while (!stop.get)
         {
             set.reset();
             set.add(listener);
@@ -366,19 +374,25 @@ struct PeerListener
             import core.time : seconds;
             conn.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, 5.seconds);
             conn.setOption(SocketOptionLevel.SOCKET, SocketOption.SNDTIMEO, 5.seconds);
-            handle(conn, requests);
+            handle(conn, requests, stop);
         }
     }
 
     /// One request/response exchange on an accepted connection: parse, hand
     /// to the UI thread, wait for its answer (bounded, so a stuck consumer
     /// never pins the listener), reply.
-    private static void handle(Socket conn, Chan!PeerRequest requests)
+    private static void handle(Socket conn, Chan!PeerRequest requests, Shared!bool stop)
     {
-        import nano.clock : monoNow, since, sleepFor;
+        import nano.clock : monoNow, since;
         import core.time : msecs, seconds;
         auto line = readLine(conn);
         if (line is null) return;
+        JSONValue id0 = JSONValue(0);
+        if (line.length > maxMessageBytes)
+        {
+            sendReply(conn, responseLine(id0, Status.refused, "message too long"));
+            return;
+        }
         JSONValue id = JSONValue(0);
         string reply;
         JSONValue v;
@@ -421,7 +435,7 @@ struct PeerListener
         // by the answering update), bounded so a wedged consumer never pins
         // the listener thread.
         ReplyCell r;
-        auto answered = cell.await((ref const ReplyCell c) => c.resolved, (ref ReplyCell c) { r = c; }, 120.seconds);
+        auto answered = awaitOrStop(cell, stop, r);
         if (!answered)
         {
             // Expire it atomically unless routing already claimed it (then
@@ -436,13 +450,33 @@ struct PeerListener
                 return;
             }
             // Never report success for an unanswered request.
-            if (!cell.await((ref const ReplyCell c) => c.resolved, (ref ReplyCell c) { r = c; }, 120.seconds))
+            if (!awaitOrStop(cell, stop, r))
             {
                 sendReply(conn, responseLine(id, Status.refused, "the target session did not answer in time"));
                 return;
             }
         }
         sendReply(conn, responseLine(id, r.status, r.note));
+    }
+
+    /// Wait up to 120 s for `cell` to resolve, in short slices so close()
+    /// (setting `stop`) ends the wait promptly; true when it resolved.
+    private static bool awaitOrStop(Shared!ReplyCell cell, Shared!bool stop, out ReplyCell r)
+    {
+        import nano.clock : monoNow, since;
+        import core.time : msecs, seconds;
+        ReplyCell got;
+        auto start = monoNow;
+        while (since(start) < 120.seconds)
+        {
+            if (cell.await((ref const ReplyCell c) => c.resolved, (ref ReplyCell c) { got = c; }, 100.msecs))
+            {
+                r = got;
+                return true;
+            }
+            if (stop.get) return false;
+        }
+        return false;
     }
 
     private static void sendReply(Socket conn, string reply)
@@ -473,12 +507,17 @@ string socketPath(string dir, string id)
 }
 
 /// Read one newline-terminated line (bounded), or null on a clean close.
-private string readLine(imported!"std.socket".Socket conn)
+private string readLine(imported!"std.socket".Socket conn, Duration total = 30.seconds)
 {
+    import nano.clock : monoNow, since;
     auto buf = appender!(char[]);
     ubyte[1] b;
+    auto start = monoNow;
     while (buf.data.length < maxMessageBytes + 1)
     {
+        // A total deadline, not only the per-receive timeout: a sender
+        // trickling one byte at a time must not hold the listener.
+        if (since(start) > total) return null;
         auto n = conn.receive(b[]);
         if (n == 0) return buf.data.length ? buf.data.idup : null; // closed
         if (n == conn.ERROR) return null; // interrupted or errored: treat as closed
@@ -543,7 +582,7 @@ Status send(string dir, string to, PeerMessage pm, out string note)
     {
         import std.string : representation;
         s.send(requestLine(pm, 1).representation);
-        line = readLine(s);
+        line = readLine(s, 140.seconds);
     }
     catch (SocketException e)
     {
@@ -558,6 +597,11 @@ Status send(string dir, string to, PeerMessage pm, out string note)
     try
     {
         auto v = parseJSON(line);
+        if (v.type != JSONType.object)
+        {
+            note = "a malformed response from the receiver";
+            return Status.refused;
+        }
         auto r = "result" in v.objectNoRef;
         if (r is null || r.type != JSONType.object)
         {
