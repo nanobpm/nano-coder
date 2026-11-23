@@ -935,6 +935,14 @@ class SessionLog
         write_(record("subagent", JSONValue(["id": id, "event": event, "text": text, "recorded_at": nowStamp()])));
     }
 
+    /// A session setting the agent changed (`session_settings`, issue #293).
+    /// Audit only: a resumed session starts from the config again.
+    void setting(string key, string old, string next, string reason)
+    {
+        write_(record("setting", JSONValue(["key": key, "old": old, "new": next, "reason": reason,
+            "recorded_at": nowStamp()])));
+    }
+
     /// The timers after a change; the latest record wins.
     void timers(JSONValue timers)
     {
@@ -984,12 +992,13 @@ class SessionLog
     void replace(const Message[] messages, ulong first = 0, ulong last = 0, string mode = null, string model = null,
         const Message[] pinStash = null, scope const(PendingInput)* pending = null, const Message[] folded = null,
         Option!size_t foldedBase = Option!size_t.init, Option!size_t restated = Option!size_t.init,
-        Option!size_t pinnedBase = Option!size_t.init)
+        Option!size_t pinnedBase = Option!size_t.init, string trigger = null)
     {
         JSONValue[] ms;
         foreach (ref m; messages) ms ~= messageRecord(m);
         JSONValue d = ["recorded_at": nowStamp()];
         d["messages"] = ms;
+        if (trigger.length) d["trigger"] = trigger;
         if (pinStash.length || !pinnedBase.isNone)
         {
             JSONValue[] ps;

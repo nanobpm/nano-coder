@@ -120,6 +120,29 @@ def cost_report(files):
           "Only compactions recorded by a build that logs summary usage carry tokens.")
 
 
+def trigger_report(files):
+    """Compactions by mode and trigger: manual (/compact), threshold, overflow,
+    idle, or agent (its session_settings compact_now, issue #293). Logs from
+    before triggers were recorded count as "unrecorded"."""
+    counts = defaultdict(int)
+    for path in files:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                data = record.get("data") or {}
+                if record.get("type") == "replace" and "mode" in data:
+                    counts[(data["mode"], data.get("trigger") or "unrecorded")] += 1
+    if not counts:
+        return
+    print("\nCompactions by trigger:")
+    print(f"{'mode':<9} {'trigger':<11} {'count':>6}")
+    for (mode, trigger), n in sorted(counts.items()):
+        print(f"{mode:<9} {trigger:<11} {n:>6}")
+
+
 def analyse(path):
     modes, compactions, model = set(), 0, "?"
     after = {"turns": 0, "with_history": 0, "history_calls": 0, "outcomes": Counter()}
@@ -177,6 +200,7 @@ def main():
         print(f"{model:<{width}} {mode:<9} {t['sessions']:>8} {t['compactions']:>8} {t['turns']:>7} {t['with_history']:>10} {t['history_calls']:>10}  {outcomes}")
     print("* turns that ended after the session's first compaction")
     cost_report(files)
+    trigger_report(files)
 
 
 if __name__ == "__main__":

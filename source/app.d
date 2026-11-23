@@ -56,7 +56,7 @@ import nano.peers : PeerListener, PeerRouter, Inbound, ListenError, settle, conf
 import nano.instructions : ProjectInstructions, InstructionOptions = Options, expandHome;
 import core.atomic : atomicLoad, atomicStore, cas;
 
-enum string packageVersion = "1.17.1";
+enum string packageVersion = "1.19.0";
 enum string versionString = "nano-coder " ~ packageVersion;
 
 enum string usage = `Usage: nano-coder [--model provider/model] [--config PATH] [-p PROMPT]
@@ -2873,6 +2873,7 @@ int runMain(string[] args)
     auto questions = QuestionBroker.make;
     tools.register(questionDefinition, (JSONValue a) => questions.run(a));
     Agent agent = new Agent(client, tools, policy, systemFor(cwd, o.plan));
+    agent.harnessVersion = packageVersion;
     built = some(agent);
     mainAgent = some(agent);
     // Exiting stops every sub-agent, background ones included; their logs

@@ -29,6 +29,7 @@ static import nano.frame;
 static import nano.frameui;
 static import nano.extract;
 static import nano.goal;
+static import nano.session_settings;
 static import nano.guard;
 static import nano.herdr;
 static import nano.history;
@@ -123,6 +124,7 @@ private alias modules = imported!"std.meta".AliasSeq!(
     nano.frameui,
     nano.extract,
     nano.goal,
+    nano.session_settings,
     nano.guard,
     nano.herdr,
     nano.history,

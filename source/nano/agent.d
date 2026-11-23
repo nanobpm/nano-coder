@@ -53,6 +53,7 @@ import nano.config : KindedClient, ProviderConfig, ProviderKind;
 import std.typecons : Nullable;
 import std.algorithm : min, max, clamp;
 import nano.plan : Plan, isPlanTool, planDefinitions = definitions;
+import settings = nano.session_settings;
 import nano.timers : Timers, TimerError, isTimerTool, timerDefinitions = definitions, firedMessage, firedNotice, pendingNudge, pendingNudgeEvery;
 import nano.permissions;
 import nano.session;
@@ -140,7 +141,15 @@ class OutcomeError : Exception
 }
 
 /// Why compaction was requested.
-enum CompactTrigger { manual, threshold, overflow, /** opportunistic, at the idle prompt (Rust #186); folds like threshold */ idle }
+/// A refused `session_settings` call; the message is for the model.
+class SettingsError : Exception
+{
+    this(string msg) pure { super(msg); }
+}
+
+/// Why compaction was requested.
+enum CompactTrigger { manual, threshold, overflow, /** opportunistic, at the idle prompt (Rust #186); folds like threshold */ idle,
+    /** the agent's `session_settings compact_now` (#293), before its next request; folds like threshold */ agent }
 
 /// Once-per-crossing gate for idle compaction (Rust `idle_compact.rs`): after
 /// an idle attempt that did not compact, it stays shut until the context grows
@@ -527,6 +536,7 @@ class Agent
         bool resuming = hasPending && givenId.length && pending.id == givenId;
         if (!resuming) log.ifSome((SessionLog l) { l.input(inputId, input); });
         turnHistoryCalls = 0;
+        turnSerial++;
         scope (exit) requestThinking = Option!string.init;
         string response;
         // Esc Esc stops background sub-agents too (issue #266), wherever
@@ -901,6 +911,16 @@ class Agent
         // Publish finished probes first: one can lower the window, which
         // the threshold check below must see.
         collectProbes();
+        if (agentCompact)
+        {
+            // Asked for by the agent (`session_settings compact_now`) during
+            // the last reply, so the tool results it waits on are in place.
+            agentCompact = false;
+            CompactReport rep;
+            compact(rep, CompactTrigger.agent, agentCompactHasMode ? &agentCompactMode : null,
+                agentCompactFocus.length ? agentCompactFocus : null, some(ev));
+            if (control.isCancelled) return false;
+        }
         if (overThreshold())
         {
             CompactReport rep;
@@ -1081,6 +1101,7 @@ class Agent
         if (hooks.match!(m => m.hasToolHooks(name), () => false)) return false;
         if (planTools && isPlanTool(name)) return name == "plan_show";
         if (timerTools && isTimerTool(name)) return name == "timer_list";
+        if (settingsTools && name == settings.toolName) return false;
         // History tools are barriers: they must see the preceding calls'
         // logged results, and history_read's spill bookkeeping is the
         // agent thread's own.
@@ -1346,7 +1367,7 @@ class Agent
     private string remind(const ref ToolCall call, bool ok, string result, ref string loopStop)
     {
         if ((planTools && isPlanTool(call.name)) || (outcomeTool && call.name == outcomeToolName)
-            || (timerTools && isTimerTool(call.name)))
+            || (timerTools && isTimerTool(call.name)) || (settingsTools && call.name == settings.toolName))
         {
             // Never counted, but they break a repeat streak.
             reminders.resetRepeat();
@@ -2189,9 +2210,10 @@ class Agent
             pending.base = messages.length;
         }
         log.ifSome((SessionLog l) {
+            import std.conv : to;
             l.replace(messages, first, last, ctx.modeName(m), client.providerName ~ "/" ~ client.modelName, pinnedNew,
                 hasPending ? &pending : null, folded, extendsStash ? some(stashBase) : Option!size_t.init, replayRestated,
-                some(pinnedBase));
+                some(pinnedBase), trigger.to!string);
         });
         // The replace record is durable: the live state now matches the log,
         // so nothing past this point may roll it back.
@@ -2300,6 +2322,7 @@ class Agent
         bool isAgent = subagentsOffered && call.name == subToolName;
         bool isSubCtl = subagentsOffered && isSubControlTool(call.name);
         bool isSend = messagesOn && call.name == peers.sendTool;
+        bool isSettings = settingsTools && call.name == settings.toolName;
         // An `agent` call was checked when its reply's sub-agents launched.
         if (isAgent)
             if (auto gate = call.id in subGates)
@@ -2309,7 +2332,7 @@ class Agent
                 context ~= gate.context;
                 return true;
             }
-        if (!isPlan && !isOutcome && !isHistory && !isTimer && !isAgent && !isSubCtl && !isSend && !tools.has(call.name))
+        if (!isPlan && !isOutcome && !isHistory && !isTimer && !isAgent && !isSubCtl && !isSend && !isSettings && !tools.has(call.name))
         {
             refused = format("Tool '%s' not found. Available: %s", call.name, toolNames());
             return false;
@@ -2368,6 +2391,7 @@ class Agent
             if (isSend) out_ = runSessionSend(args);
             else if (isAgent) out_ = runSubagent(call, call.id in subGates);
             else if (subagentsOffered && isSubControlTool(call.name)) out_ = runSubControl(call.name, args);
+            else if (settingsTools && call.name == settings.toolName) out_ = runSessionSettings(args);
             else if (isOutcome)
             {
                 auto o = Outcome.fromArgs(args).orThrow!(e => new OutcomeError(e));
@@ -3689,7 +3713,8 @@ class Agent
             ~ (outcomeTool ? [outcomeDefinition()] : null) ~ (historyEnabled ? hist.definitions(crossSessionHistory) : null)
             ~ (historyEnabled && crossSessionHistory ? [hist.sessionsDefinition()] : null)
             ~ (messagesOn && log.isSome ? [peers.sendDefinition()] : null)
-            ~ (timerTools ? timerDefinitions() : null) ~ (subagentsOffered ? [subDefinition(subagentCandidates)] ~ subControlDefinitions() : null);
+            ~ (timerTools ? timerDefinitions() : null) ~ (settingsTools ? [settings.definition()] : null)
+            ~ (subagentsOffered ? [subDefinition(subagentCandidates)] ~ subControlDefinitions() : null);
         if (control.mode != AgentMode.plan) return all;
         ToolDefinition[] kept;
         foreach (t; all) if (planAllows(t.name)) kept ~= t;
@@ -3781,6 +3806,77 @@ class Agent
     Timers timers;
     /// Offer the timer tools (off for ACP, which has no idle loop to fire them).
     bool timerTools = true;
+    /// The nano-coder version, reported by `session_settings get`.
+    string harnessVersion;
+    /// Offer `session_settings` (issue #293); sub-agents don't get it.
+    bool settingsTools = true;
+    /// Turns started in this process, for the settings cooldown.
+    private size_t turnSerial;
+    /// The turn each setting was last changed by the agent.
+    private size_t[string] settingChangedAt;
+    /// A `compact_now` waiting for the next request boundary.
+    private bool agentCompact, agentCompactHasMode;
+    private ctx.CompactionMode agentCompactMode;
+    private string agentCompactFocus;
+
+    /// The `session_settings` tool: read the session's settings, change an
+    /// allowlisted one for this session, or queue a compaction. Every
+    /// change is logged and announced.
+    private string runSessionSettings(JSONValue args)
+    {
+        import nano.result : orThrow;
+        auto r = settings.parse(args).orThrow!(e => new SettingsError(e));
+        final switch (r.action)
+        {
+            case settings.Action.get:
+                bool calibrated;
+                auto used = estimateContextTokens(calibrated);
+                auto window = contextWindow();
+                JSONValue o = [
+                    "model": JSONValue(client.providerName ~ "/" ~ client.modelName),
+                    "compaction_mode": JSONValue(ctx.modeName(compactionMode)),
+                    "auto_compact": JSONValue(autoCompact),
+                    "auto_compact_threshold": JSONValue(effectiveAutoCompactThreshold()),
+                    "context_tokens": JSONValue(used),
+                    "context_window": JSONValue(window),
+                    "history_tools": JSONValue(historyEnabled()),
+                    "settable": JSONValue(settings.writableKeys.dup),
+                ];
+                if (harnessVersion.length) o["nano_coder_version"] = harnessVersion;
+                if (log.isNone) o["note"] = "no session log: smart and extract compaction fall back to standard";
+                return o.toPrettyString;
+            case settings.Action.set:
+                auto old = ctx.modeName(compactionMode);
+                auto next = ctx.modeName(r.mode);
+                if (old == next) return format("%s is already %s", r.key, next);
+                if (auto at = r.key in settingChangedAt)
+                    if (turnSerial < *at + settings.settingCooldownTurns)
+                        throw new SettingsError(format("%s was changed %s turn(s) ago; it can change again "
+                            ~ "after %s turns, or the user can change it with /settings", r.key, turnSerial - *at,
+                            settings.settingCooldownTurns));
+                compactionMode = r.mode;
+                settingChangedAt[r.key] = turnSerial;
+                announceSetting(r.key, old, next, r.reason);
+                return format("%s: %s → %s for this session (the user's config is unchanged)", r.key, old, next);
+            case settings.Action.compactNow:
+                agentCompact = true;
+                agentCompactHasMode = r.hasMode;
+                agentCompactMode = r.mode;
+                agentCompactFocus = r.focus;
+                auto mode = ctx.modeName(r.hasMode ? r.mode : compactionMode);
+                announceSetting("compact_now", "", mode, r.reason);
+                return format("Compaction (%s) queued: it runs before your next request, then you continue from "
+                    ~ "the summary.", mode);
+        }
+    }
+
+    /// Log and show an agent-made settings change.
+    private void announceSetting(string key, string old, string next, string reason)
+    {
+        log.ifSome((SessionLog l) { l.setting(key, old, next, reason); });
+        stdErr.writefln("[agent] %s%s%s%s", key, old.length ? ": " ~ old ~ " → " : " ", next,
+            reason.length ? " (" ~ reason ~ ")" : "");
+    }
     /// Whether `agent` may start background sub-agents: only hosts that serve
     /// them between turns (the CLI prompt loops). ACP sets it false (#266).
     bool backgroundSubagents = true;
