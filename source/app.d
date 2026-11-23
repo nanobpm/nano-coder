@@ -3240,11 +3240,6 @@ int runMain(string[] args)
         // The replay read the folded turns' outputs back from the log
         // (issue #263): hand that transient heap back too.
         releaseHeap();
-        {
-            import core.memory : GC;
-            import std.file : append;
-            append("/tmp/nano263-debug.txt", format("used=%s free=%s\n", GC.stats.usedSize, GC.stats.freeSize));
-        }
     }
     import core.time : MonoTime, msecs;
     import nano.lineedit : DoublePress, interruptWindowMs;
