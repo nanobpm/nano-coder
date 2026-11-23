@@ -27,8 +27,10 @@ private:
 
 /// Write a nano-format log of about `bytes`: turns of four large tool results,
 /// compacted every two turns by delta `replace` records restating the
-/// folded turns (the shape of a long smart-compacted session).
-string writeLog(string dir, string id, size_t bytes)
+/// folded turns (the shape of a long smart-compacted session). With
+/// `heavyReplies` the tool outputs are short and the assistant replies carry
+/// the bulk: long answers and reasoning (issue #301).
+string writeLog(string dir, string id, size_t bytes, bool heavyReplies = false)
 {
     auto o = appender!string;
     ulong line;
@@ -64,16 +66,19 @@ string writeLog(string dir, string id, size_t bytes)
                 "arguments": JSONValue(["path": "f"])])];
             put("message", a);
             live ~= a;
-            auto t = msg("tool", text("output of ", cid, " ").replicate(500));
+            auto t = msg("tool", heavyReplies ? "ok" : text("output of ", cid, " ").replicate(500));
             t["tool_call_id"] = cid;
             t["name"] = "read";
             put("message", t);
             live ~= t;
         }
-        auto done = msg("assistant", text("done ", i));
+        auto done = msg("assistant", heavyReplies ? text("answer ", i, " ").replicate(1000) : text("done ", i));
+        if (heavyReplies) done["thinking"] = text("reasoning ", i, " ").replicate(1000);
         put("message", done);
         live ~= done;
-        put("turn_end", JSONValue(["input_id": iid, "response": done["content"].str]));
+        // The turn's response is kept per input id for redelivery; not what
+        // this measures, so it stays short.
+        put("turn_end", JSONValue(["input_id": iid, "response": text("done ", i)]));
         if (i % 2 == 1)
         {
             JSONValue[] pins;
@@ -111,7 +116,7 @@ pragma(inline, false)
 size_t replayedBytes(Agent agent)
 {
     size_t n;
-    foreach (ref m; agent.replayMessages) n += m.content.length;
+    foreach (ref m; agent.replayMessages) n += m.content.length + m.thinking.length;
     return n;
 }
 
@@ -164,4 +169,24 @@ unittest
     enum bound = 300_000;
     assert(small < bound && large < bound, text("resume keeps ", small, " B of a 0.3 MB log and ", large,
         " B of a 1.2 MB log; the bound is ", bound));
+}
+
+// The same bound when the bulk is assistant replies (long answers and
+// reasoning) rather than tool outputs: a folded reply keeps only its log
+// reference too, and the replay reads it back (issue #301).
+unittest
+{
+    auto dir = buildPath(tempDir, "nano-d-resume-memory-replies-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    size_t smallStash, largeStash, smallReplayed, largeReplayed;
+    immutable small = retainedByResume(writeLog(dir, "small", 300_000, true), smallStash, smallReplayed);
+    immutable large = retainedByResume(writeLog(dir, "large", 1_200_000, true), largeStash, largeReplayed);
+    assert(largeStash > 3 * smallStash, "the large log folds more turns");
+    assert(largeReplayed > 300_000, text("replay rehydrated only ", largeReplayed, " B"));
+    // Each folded turn's reply holds ~20 KB of answer and reasoning, ~2 KB
+    // per stash entry: what stays is the entries' metadata only (#233 would
+    // turn that into line references too).
+    assert(large < largeStash * 600, text("resume keeps ", large, " B for ", largeStash,
+        " stashed entries of a 1.2 MB log"));
 }

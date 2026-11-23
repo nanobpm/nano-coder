@@ -26,7 +26,7 @@ import std.process : environment, thisProcessID;
 import std.algorithm : sort, filter, map;
 import std.array : array;
 import nano.llm;
-import nano.option : Option, some, ifSome;
+import nano.option : Option, some, ifSome, match;
 import nano.plan : Plan;
 
 /// The extension tidy-up compresses a session log to (`<id>.jsonl.gz`).
@@ -1041,9 +1041,36 @@ class SessionLog
     }
 }
 
-/// Folded tool outputs longer than this keep only their log reference in
-/// the replay stash (live compactions and resumes alike).
+/// Folded tool results and assistant replies whose payload (`slimPayload`)
+/// is longer than this keep only their log reference in the replay stash
+/// (live compactions and resumes alike).
 enum size_t stashSlimBytes = 512;
+
+/// The bytes of a message's payload that a stashed copy can drop and read
+/// back from its log record: content, reasoning, and tool-call arguments.
+size_t slimPayload(const ref Message m) pure nothrow
+{
+    // Calls and provider reasoning items count a nominal size: measuring
+    // their JSON would cost what slimming saves.
+    return m.content.length + m.thinking.length + 256 * (m.toolCalls.length + m.thinkingBlocks.length);
+}
+
+/// Whether a stashed copy of `m` keeps only its log reference: a tool result
+/// or assistant reply with a large payload and no attachments.
+bool stashSlimmable(const ref Message m) pure nothrow
+{
+    return (m.role == Role.tool || m.role == Role.assistant) && !m.attachments.length
+        && slimPayload(m) > stashSlimBytes;
+}
+
+/// Drop the payload `stashSlimmable` measures; `rehydrateStash` restores it.
+void slimMessage(ref Message m) pure nothrow
+{
+    m.content = null;
+    m.thinking = null;
+    m.thinkingBlocks = null;
+    m.toolCalls = null;
+}
 
 /// Recover `pinText` for a user message logged before it was recorded: a
 /// legacy prompt with hook context appended (`<input>\n\n<system-reminder>…`)
@@ -1161,20 +1188,6 @@ private void backfillLogLines(Message[] messages, const Original[] originals, ul
                 break;
             }
     }
-}
-
-/// The identity of a large tool result's content (issue #263): a folded
-/// stash entry whose content matches its direct record's can drop it and be
-/// read back from the log on replay.
-private struct ToolKey
-{
-    size_t length, hash;
-    string toolCallId;
-}
-
-private ToolKey toolKey(string toolCallId, const(char)[] content) pure nothrow
-{
-    return ToolKey(content.length, hashOf(content), toolCallId);
 }
 
 /// An input that was accepted but whose turn has not ended (Rust
@@ -1319,6 +1332,10 @@ private bool unescapeKey(ref const(char)[] key) pure @safe
 /// superseded compaction snapshot is skimmed, not decoded). Stops when `dg`
 /// returns false; false for text that isn't an object.
 private bool skimObject(const(char)[] obj, scope bool delegate(const(char)[] key, const(char)[] raw) @safe dg)
+    => skimObjectAt(obj, (k, s, e) => dg(k, obj[s .. e]));
+
+/// `skimObject`, giving each value as its `[start, end)` offsets in `obj`.
+private bool skimObjectAt(const(char)[] obj, scope bool delegate(const(char)[] key, size_t start, size_t end) @safe dg)
 {
     import std.ascii : isWhite;
     size_t i;
@@ -1345,7 +1362,7 @@ private bool skimObject(const(char)[] obj, scope bool delegate(const(char)[] key
         ws();
         auto ve = skipJSONValue(obj, i);
         if (ve > obj.length) return false;
-        if (!dg(key, obj[i .. ve])) return true;
+        if (!dg(key, i, ve)) return true;
         i = ve;
         ws();
         if (i < obj.length && obj[i] == ',') ++i;
@@ -1547,18 +1564,21 @@ unittest // eachLogLineUntil stops reading at the first false
 /// `floor` is the lowest `summarized` end of that replace and every later
 /// delta replace (an omitted range counts as 0), since `backfillLogLines`
 /// reads originals past each one's range.
-private ulong lastFullReplace(string path, out ulong floor)
+private ulong lastFullReplace(string path, out ulong floor, out ulong pinReset, out ulong lastReplace)
 {
     ulong at;
     eachLogLine(path, (line, lineNo) {
         auto type = skimType(line);
         if (type != "replace") return;
+        lastReplace = lineNo;
         auto data = skimField(line, "data");
-        bool delta;
+        bool delta, pinDelta, pins;
         ulong fl = 0;
         // Fail closed: an unreadable `data` is never taken as a full snapshot.
         immutable ok = skimObject(data, (k, v) {
             if ((k == "folded_base" || k == "pinned_base") && v != "null") delta = true;
+            if (k == "pinned_base" && v != "null") pinDelta = true;
+            else if (k == "pinned_requests") pins = true;
             else if (k == "summarized")
             {
                 // `[first, last]`: the second element, as `restore` reads it
@@ -1572,10 +1592,49 @@ private ulong lastFullReplace(string path, out ulong floor)
             return true;
         });
         if (!ok) delta = true;
+        // A full `pinned_requests` restatement replaces the pinned stash.
+        if (ok && pins && !pinDelta) pinReset = lineNo;
         if (!delta) { at = lineNo; floor = fl; }
         else if (at && fl < floor) floor = fl;
     });
     return at;
+}
+
+/// The size above which a superseded replace record's pinned requests and
+/// messages snapshot are cut out before it is decoded. Every record in the
+/// tests, so the skim-vs-full-decode equivalence tests cover the cut.
+version (unittest) private enum pinSkimBytes = 0;
+else private enum pinSkimBytes = 4096;
+
+/// `line` with its record's `data.<key>` emptied to `[]`, or `line`
+/// itself when it has none.
+private const(char)[] withoutField(const(char)[] line, string key)
+{
+    size_t ds, de, ps, pe;
+    bool data, pins;
+    skimObjectAt(line, (k, s, e) {
+        if (k != "data") return true;
+        ds = s;
+        de = e;
+        data = true;
+        return false;
+    });
+    if (!data) return line;
+    skimObjectAt(line[ds .. de], (k, s, e) {
+        if (k != key) return true;
+        ps = ds + s;
+        pe = ds + e;
+        pins = true;
+        return false;
+    });
+    return pins ? line[0 .. ps] ~ "[]" ~ line[pe .. $] : line;
+}
+
+unittest // withoutField_empties_only_that_field
+{
+    assert(withoutField(`{"type":"replace","data":{"a":1,"pinned_requests":[{"x":"]"}],"b":2}}`, "pinned_requests")
+        == `{"type":"replace","data":{"a":1,"pinned_requests":[],"b":2}}`);
+    assert(withoutField(`{"type":"replace","data":{"a":1}}`, "messages") == `{"type":"replace","data":{"a":1}}`);
 }
 
 /// Read a session log (Rust format), dropping a torn last line.
@@ -1597,7 +1656,11 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
     // the pending input, and the originals `backfillLogLines` reads past its
     // summarized range. Superseded snapshots and messages are skimmed.
     ulong floorL;
-    immutable skipBefore = skipSuperseded ? lastFullReplace(path, floorL) : 0;
+    ulong pinReset, lastReplace;
+    immutable skipBefore = skipSuperseded ? lastFullReplace(path, floorL, pinReset, lastReplace) : 0;
+    // Per decoded replace: the length of its `messages` snapshot when a later
+    // replace supersedes it, so the snapshot was not decoded.
+    Option!size_t cutMessages;
     // The conversation length before `skipBefore`, without building it.
     size_t skimmedLen;
     string pendingId;
@@ -1612,11 +1675,10 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
     Original[] originals;
     // The large direct tool results by line: a folded copy that matches
     // drops its content (issue #263).
-    ToolKey[ulong] toolKeys;
+    size_t[ulong] toolKeys;
     void noteTool(ulong lineNo, ref const Message m)
     {
-        if (m.role == Role.tool && m.content.length > stashSlimBytes && !m.attachments.length)
-            toolKeys[lineNo] = toolKey(m.toolCallId, m.content);
+        if (stashSlimmable(m)) toolKeys[lineNo] = contentDigest(m);
     }
     // Plan replay is bounded by the latest full snapshot (issue #205): deltas
     // before it are already folded in, so applying them would redo merges the
@@ -1646,10 +1708,11 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
                 skimmedLen++;
                 if (lineNo <= floorL)
                 {
-                    // Only a large tool result's key outlives the skim:
-                    // such a line is decoded below for `toolKeys`.
+                    // Only a large tool result's or reply's key outlives
+                    // the skim: such a line is decoded below for `toolKeys`.
                     auto data = skimField(line, "data");
-                    if (skimString(data, "role") != "tool" || skimField(data, "content").length <= stashSlimBytes)
+                    auto role = skimString(data, "role");
+                    if ((role != "tool" && role != "assistant") || data.length <= stashSlimBytes)
                     {
                         index++;
                         return;
@@ -1692,6 +1755,20 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
                 index++;
                 return;
             }
+        }
+        // A replace before the latest full pinned restatement: its pinned
+        // requests are replaced, so they are not decoded. On a log written
+        // before compaction pinned only user requests they can be most of
+        // the line (issue #301: 12 MB).
+        // Likewise a replace's `messages` snapshot, when a later replace
+        // restates the conversation: only its length matters until then.
+        cutMessages = Option!size_t.init;
+        if (skipSuperseded && line.length > pinSkimBytes && lineNo < lastReplace && skimType(line) == "replace")
+        {
+            if (lineNo < pinReset) line = withoutField(line, "pinned_requests");
+            size_t n = skimCount(skimField(skimField(line, "data"), "messages"));
+            line = withoutField(line, "messages");
+            cutMessages = some(n);
         }
         JSONValue rec;
         try rec = parseJSON(line);
@@ -1777,7 +1854,9 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
             break;
         case "replace":
             r.conversation = null;
-            foreach (m; data["messages"].arrayNoRef) r.conversation ~= messageFromRecord(m);
+            cutMessages.match!((size_t n) { r.conversation = new Message[n]; }, () {
+                foreach (m; data["messages"].arrayNoRef) r.conversation ~= messageFromRecord(m);
+            });
             {
                 ulong floor;
                 if (auto sum = "summarized" in data)
@@ -1858,17 +1937,18 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
                 // Folded turns whose large tool output matches its direct
                 // record drop it: a replay reads it back from the log, and the
                 // resumed session no longer holds every folded output (issue
-                // #263). Not for a Rust log, whose pinned block shares the stash.
+                // #263). A Rust log's pinned block shares the stash, but only
+                // its user requests are pinned, and those are never slimmed.
                 bool[] slim(Message[] ms)
                 {
                     auto o = new bool[ms.length];
-                    if (pins is null || !slimStash) return o;
+                    if (!slimStash) return o;
                     foreach (i, ref m; ms)
-                        if (m.role == Role.tool && m.content.length > stashSlimBytes && !m.attachments.length)
+                        if (stashSlimmable(m))
                             if (auto k = m.logLine in toolKeys)
-                                if (*k == toolKey(m.toolCallId, m.content))
+                                if (*k == contentDigest(m))
                                 {
-                                    m.content = null;
+                                    slimMessage(m);
                                     o[i] = true;
                                 }
                     return o;
@@ -3870,4 +3950,36 @@ unittest
     streamLogLinesUntil(p, (line) { ++seen; return false; });
     assert(seen == 1);
     assert(logHeaderCwd(p) == "/w");
+}
+
+// A replace whose pinned requests a later full restatement replaces is
+// decoded without them (issue #301), and restores exactly what decoding
+// every record gives, even when its folded delta keeps it un-skimmed.
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, write;
+    import std.path : buildPath;
+    import std.array : replicate;
+    auto dir = buildPath(tempDir, "nano-d-skimpins-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    static JSONValue rec(Message m) { return messageRecord(m); }
+    string line(string type, JSONValue data) { return JSONValue(["type": JSONValue(type), "data": data]).toString ~ "\n"; }
+    auto log = `{"type":"session","data":{"version":1,"id":"skimpins","created_at":"x"}}` ~ "\n";
+    auto goal = Message.user("goal");
+    log ~= line("message", rec(goal));
+    JSONValue first = ["messages": JSONValue([rec(Message.user("summary"))])];
+    first["folded"] = JSONValue([rec(goal)]);
+    first["pinned_requests"] = JSONValue([rec(goal), rec(Message.toolResult("c", "bash", "x".replicate(8192)))]);
+    log ~= line("replace", first);
+    JSONValue second = ["messages": JSONValue([rec(Message.user("summary 2"))])];
+    second["folded"] = JSONValue(cast(JSONValue[]) []);
+    second["folded_base"] = 1;
+    second["pinned_requests"] = JSONValue([rec(Message.user("restated"))]);
+    log ~= line("replace", second);
+    auto path = buildPath(dir, "skimpins.jsonl");
+    write(path, log);
+    auto skimmed = restoreLog(path, true), fullR = restoreLog(path, false);
+    assert(skimmed == fullR, "cutting superseded pins restores the same state");
+    assert(skimmed.pinStash.length == 1 && skimmed.pinStash[0].content == "restated");
 }
