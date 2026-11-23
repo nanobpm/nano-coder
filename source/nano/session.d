@@ -1050,9 +1050,11 @@ enum size_t stashSlimBytes = 512;
 /// back from its log record: content, reasoning, and tool-call arguments.
 size_t slimPayload(const ref Message m) pure nothrow
 {
-    // Calls and provider reasoning items count a nominal size: measuring
-    // their JSON would cost what slimming saves.
-    return m.content.length + m.thinking.length + 256 * (m.toolCalls.length + m.thinkingBlocks.length);
+    // Calls and provider reasoning items can hold arbitrarily large JSON
+    // that is costly to measure, so any structured payload counts as over
+    // the threshold: slimming it is always safe (the log holds it).
+    if (m.toolCalls.length || m.thinkingBlocks.length) return size_t.max;
+    return m.content.length + m.thinking.length;
 }
 
 /// Whether a stashed copy of `m` keeps only its log reference: a tool result
@@ -1158,6 +1160,42 @@ private size_t contentDigest(const ref Message m)
     }
     if (m.thinkingBlocks.length) h = hashOf(JSONValue(m.thinkingBlocks.dup).toString, h);
     return h;
+}
+
+/// `contentDigest` plus every other field `slimMessage` drops (plain
+/// reasoning) and the timestamp `rehydrateStash` checks, so a folded copy is
+/// slimmed only when its direct record restores it exactly.
+private size_t recoveryDigest(const ref Message m)
+{
+    size_t h = contentDigest(m);
+    h = hashOf(m.thinking, h);
+    return hashOf(m.timestamp, h);
+}
+
+unittest // a folded copy differing only in discarded fields or timestamp is not recovered
+{
+    Message a;
+    a.role = Role.assistant;
+    a.content = "x";
+    a.thinking = "reasoning";
+    a.timestamp = "2026-01-01T00:00:00Z";
+    auto b = a;
+    assert(recoveryDigest(a) == recoveryDigest(b));
+    b.thinking = "other";
+    assert(contentDigest(a) == contentDigest(b));
+    assert(recoveryDigest(a) != recoveryDigest(b));
+    b = a;
+    b.timestamp = "2026-01-02T00:00:00Z";
+    assert(recoveryDigest(a) != recoveryDigest(b));
+}
+
+unittest // structured payloads (calls, reasoning items) always count as large
+{
+    Message m;
+    m.role = Role.assistant;
+    assert(!stashSlimmable(m));
+    m.toolCalls = [ToolCall.fromRaw("c", "write_file", `{"content":"` ~ "y" ~ `"}`)];
+    assert(stashSlimmable(m));
 }
 
 /// A direct message record `backfillLogLines` may match: its line and digest.
@@ -1678,7 +1716,7 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
     size_t[ulong] toolKeys;
     void noteTool(ulong lineNo, ref const Message m)
     {
-        if (stashSlimmable(m)) toolKeys[lineNo] = contentDigest(m);
+        if (stashSlimmable(m)) toolKeys[lineNo] = recoveryDigest(m);
     }
     // Plan replay is bounded by the latest full snapshot (issue #205): deltas
     // before it are already folded in, so applying them would redo merges the
@@ -1946,7 +1984,7 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
                     foreach (i, ref m; ms)
                         if (stashSlimmable(m))
                             if (auto k = m.logLine in toolKeys)
-                                if (*k == contentDigest(m))
+                                if (*k == recoveryDigest(m))
                                 {
                                     slimMessage(m);
                                     o[i] = true;
