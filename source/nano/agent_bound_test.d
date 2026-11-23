@@ -40,7 +40,8 @@ unittest
     agent.log = some(new SessionLog(dir, "mock/m", "/w"));
     foreach (id; ["in-a", "in-b", "in-c"]) agent.run("go " ~ id, new NullEvents, true, id);
     assert(agent.completedBytes <= cap && agent.completedInputs.length == 1, agent.completedBytes.to!string);
-    assert("in-c" in agent.completedInputs && "in-a" in agent.completedEvicted && "in-b" in agent.completedEvicted);
+    assert("in-c" in agent.completedInputs && agent.completedEvicted.mayContain("in-a")
+        && agent.completedEvicted.mayContain("in-b"));
     // The script is spent: a re-run would fail, so this is the log's copy.
     assert(agent.run("go in-a", new NullEvents, true, "in-a") == big("a"));
     assert(agent.lastStop == StopReason.endTurn);
@@ -64,6 +65,8 @@ unittest
     assert("bulk-999" in resumed.completedInputs && "bulk-0" !in resumed.completedInputs);
     assert(resumed.run("q", new NullEvents, true, "bulk-0") == "r".replicate(200) ~ "0");
     assert(resumed.run("q", new NullEvents, true, "in-b") == big("b"));
+    // The eviction record does not grow with the number of evicted turns.
+    assert(resumed.completedEvicted.byteSize <= 32 * 1024);
 
     // Restoring thousands of pinned requests keeps the stash bounded.
     Restored rp;

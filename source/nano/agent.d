@@ -294,6 +294,52 @@ private struct PatchEdit
     JSONValue args;
 }
 
+/// A fixed-size Bloom filter of evicted completed-input ids (issue #312):
+/// its memory is constant however many turns a session evicts. `mayContain`
+/// has no false negatives; a false positive is harmless (a log lookup).
+struct EvictedIds
+{
+    private enum words = 4_096; // 32 KiB, 262_144 bits
+    private ulong[] bits;
+
+    private static size_t[2] slots(string id) pure nothrow @nogc
+    {
+        immutable h = hashOf(id);
+        immutable g = hashOf(id, 0x9E37_79B9_7F4A_7C15UL) | 1;
+        return [h % (words * 64), (h + g) % (words * 64)];
+    }
+
+    /// Record `id` as evicted.
+    void add(string id) pure nothrow
+    {
+        if (bits.length == 0) bits = new ulong[words];
+        foreach (s; slots(id)) bits[s / 64] |= 1UL << (s % 64);
+    }
+
+    /// Whether `id` may have been evicted (never false for an added id).
+    bool mayContain(string id) const pure nothrow @nogc
+    {
+        if (bits.length == 0) return false;
+        foreach (s; slots(id)) if (!(bits[s / 64] & (1UL << (s % 64)))) return false;
+        return true;
+    }
+
+    /// The bytes the filter holds: constant once anything was added.
+    size_t byteSize() const pure nothrow @nogc => bits.length * ulong.sizeof;
+}
+
+unittest
+{
+    import std.conv : to;
+    EvictedIds e;
+    assert(!e.mayContain("x") && e.byteSize == 0);
+    foreach (i; 0 .. 20_000) e.add("in-" ~ i.to!string);
+    immutable size = e.byteSize;
+    foreach (i; 0 .. 20_000) assert(e.mayContain("in-" ~ i.to!string));
+    foreach (i; 20_000 .. 40_000) e.add("in-" ~ i.to!string);
+    assert(e.byteSize == size && size <= 32 * 1024);
+}
+
 class Agent
 {
     NotNull!LLMClient client;
@@ -345,9 +391,11 @@ class Agent
     size_t completedBytes;
     /// The byte cap on `completedInputs` (tests lower it).
     size_t completedCap = completedMaxBytes;
-    /// Ids evicted from `completedInputs`: redelivering one reads its
-    /// response back from the session log's `turn_end` record.
-    bool[string] completedEvicted;
+    /// Ids evicted from `completedInputs`, as a fixed-size Bloom filter so
+    /// it never grows with the session: redelivering one reads its response
+    /// back from the session log's `turn_end` record. A false positive only
+    /// costs a log scan that finds nothing; the turn then runs normally.
+    EvictedIds completedEvicted;
     /// Claude Code-compatible user hooks (null = none).
     Option!HookManager hooks;
     /// Whether this agent continues a restored session (`SessionStart` source).
@@ -552,7 +600,7 @@ class Agent
                 foreach (o; recorded) lastOutcome = o;
                 return *done;
             }
-            else if (givenId in completedEvicted)
+            else if (completedEvicted.mayContain(givenId))
             {
                 Option!CompletedTurn found;
                 log.ifSome((SessionLog l) { found = findCompletedTurn(l.path, givenId); });
@@ -628,7 +676,6 @@ class Agent
     {
         if (auto old = id in completedInputs) completedBytes = saturatingSub(completedBytes, old.length);
         else completedOrder ~= id;
-        completedEvicted.remove(id);
         completedInputs[id] = response;
         completedBytes += response.length;
     }
@@ -645,7 +692,7 @@ class Agent
             completedInputs.remove(id);
             completedStops.remove(id);
             completedOutcomes.remove(id);
-            completedEvicted[id] = true;
+            completedEvicted.add(id);
         }
         // A fresh array: a front slice would keep growing its old block.
         if (drop) completedOrder = completedOrder[drop .. $].dup;
@@ -3642,7 +3689,7 @@ class Agent
         completedInputs = r.completed;
         completedStops = r.completedStops;
         completedOutcomes = r.completedOutcomes;
-        completedEvicted = null;
+        completedEvicted = EvictedIds.init;
         // A hand-built `Restored` may lack the order: any order will do.
         completedOrder = r.completedOrder.length == r.completed.length ? r.completedOrder : r.completed.keys;
         completedBytes = 0;
@@ -3775,7 +3822,7 @@ class Agent
         completedOutcomes = null;
         completedOrder = null;
         completedBytes = 0;
-        completedEvicted = null;
+        completedEvicted = EvictedIds.init;
         control.mode = AgentMode.normal;
         sessionThinking.nullify();
         plan = Plan.init;
