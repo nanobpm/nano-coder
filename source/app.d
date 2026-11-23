@@ -3406,7 +3406,9 @@ int runMain(string[] args)
         import std.array : join;
         auto notesPath = lastVersionPath();
         auto notes = embedded();
-        if (needsFetch(notesPath, packageVersion, cfg.showReleaseNotes, notes))
+        // Only the line editor's idle prompt drains the hints; without it, the
+        // synchronous path shows the compare link.
+        if (editor.isSome && needsFetch(notesPath, packageVersion, cfg.showReleaseNotes, notes))
         {
             if (!updateHints) updateHints = Chan!string.make;
             spawnDaemon(&runNotice, notesPath, packageVersion, updateHints);

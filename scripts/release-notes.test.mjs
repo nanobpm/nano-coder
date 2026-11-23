@@ -115,6 +115,17 @@ test('--check accepts the generated file and ignores the unreleased tail, reject
     j.releases[1].items[0].title = 'edited';
     writeFileSync(out, formatNotes(j.releases));
     assert.equal(main(['--check', '--repo', f.dir, '--out', out]), 1);
+    // Deleting the oldest tagged release is caught.
+    f.commit('feat: three (#3)');
+    f.git('tag', 'v1.0.1');
+    assert.equal(main(['1.0.2', '--repo', f.dir, '--out', out]), 0);
+    assert.equal(main(['--check', '--repo', f.dir, '--out', out]), 0);
+    const full = JSON.parse(readFileSync(out, 'utf8')).releases;
+    writeFileSync(out, formatNotes(full.slice(0, -1)));
+    assert.equal(main(['--check', '--repo', f.dir, '--out', out]), 1, 'oldest release deleted');
+    // An untagged entry that is not the newest is rejected.
+    writeFileSync(out, formatNotes([full[1], full[0], full[2]]));
+    assert.equal(main(['--check', '--repo', f.dir, '--out', out]), 1, 'untagged in the middle');
   } finally {
     console.log = log;
     console.error = err;

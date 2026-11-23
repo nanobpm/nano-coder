@@ -158,7 +158,15 @@ function main(argv) {
     const committed = JSON.parse(readFileSync(out, 'utf8'));
     if (!Array.isArray(committed.releases)) { console.error(`${out}: no "releases" array`); return 1; }
     const kept = committed.releases.filter((r) => tags.has(r.version));
-    const want = formatNotes(buildNotes(repo, { cap, taggedOnly: true }).slice(0, kept.length || undefined));
+    // At most one untagged entry (the version being released), and only as the newest.
+    const tail = committed.releases.filter((r) => !tags.has(r.version));
+    if (tail.length > 1 || (tail.length === 1 && committed.releases[0] !== tail[0])) {
+      console.error(`${out}: untagged versions other than the newest: ${tail.map((r) => r.version).join(', ')}`);
+      return 1;
+    }
+    // The window comes from the cap, not from what the file kept, so deleted
+    // releases are caught: the tail takes one of the cap's slots.
+    const want = formatNotes(buildNotes(repo, { cap: Math.max(1, cap - tail.length), taggedOnly: true }));
     const have = formatNotes(kept);
     if (want !== have) {
       console.error(`${out} is not what git says; regenerate it with scripts/release-notes.mjs <version>`);

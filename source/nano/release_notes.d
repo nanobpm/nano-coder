@@ -25,6 +25,8 @@ enum releasesApiUrl = "https://api.github.com/repos/nanobpm/nano-coder/releases?
 enum size_t bulletCap = 15;
 /// The most bytes read from the releases API.
 enum size_t fetchByteCap = 4 << 20;
+/// The most release pages a fallback fetch reads.
+enum size_t fetchPageCap = 5;
 
 /// One user-facing change: a `feat`, `fix` or `perf` commit (or a breaking change).
 struct Item
@@ -245,7 +247,9 @@ string[] renderNotes(const Release[] releases, string from, string to, size_t ca
             {
                 if (it.type != g[0] || shown >= cap) continue;
                 if (!headed) { lines ~= g[1] ~ ":"; headed = true; }
-                string text = (it.breaking ? "BREAKING: " : "") ~ (it.scope_.length ? it.scope_ ~ ": " : "") ~ it.title;
+                // Titles come from commit subjects and GitHub release bodies: no escapes or frame markers.
+                import nano.trajectory : terminalSafe;
+                string text = terminalSafe((it.breaking ? "BREAKING: " : "") ~ (it.scope_.length ? it.scope_ ~ ": " : "") ~ it.title);
                 if (it.pr) text ~= format(" (%s/pull/%s)", repoUrl, it.pr);
                 lines ~= "  • " ~ text;
                 shown++;
@@ -273,6 +277,9 @@ unittest
     assert(bullets == 15);
     assert(c[$ - 1] == "…and 5 more: https://github.com/nanobpm/nano-coder/compare/v1.0.0...v2.0.0", c[$ - 1]);
     assert(renderNotes([Release("1.0.1", "", null)], "1.0.0", "1.0.1")[1].canFind("No user-facing changes"));
+    // Escapes in a title or scope are stripped.
+    auto e = renderNotes([Release("1.0.1", "", [Item("fix", "\x1b[31mui", "a\x1b]52;c;Zm8=\x07b")])], "1.0.0", "1.0.1");
+    assert(e[2] == "  • ui: ab", e[2]);
 }
 
 /// The notice when the changes are unknown: a heading and the compare link.
@@ -291,8 +298,21 @@ string[] notesFor(const Release[] notes, string from, string to, scope Fetcher f
     auto r = selectRange(notes, from, to);
     if (!r.complete && fetch !is null)
     {
-        auto body_ = fetch(releasesApiUrl);
-        if (body_.length) r = selectRange(parseGithubReleases(body_) ~ notes, from, to);
+        // Page back until the range is covered, within `fetchPageCap` pages
+        // and `fetchByteCap` bytes in all.
+        Release[] got;
+        size_t bytes;
+        foreach (page; 1 .. fetchPageCap + 1)
+        {
+            auto body_ = fetch(format("%s&page=%s", releasesApiUrl, page));
+            bytes += body_.length;
+            if (!body_.length || bytes > fetchByteCap) break;
+            auto rels = parseGithubReleases(body_);
+            if (!rels.length) break;
+            got ~= rels;
+            r = selectRange(got ~ notes, from, to);
+            if (r.complete) break;
+        }
     }
     return r.complete ? renderNotes(r.releases, from, to) : renderFallback(from, to);
 }
@@ -311,11 +331,25 @@ unittest
     assert(notesFor(notes, "1.2.0", "1.3.0") == renderFallback("1.2.0", "1.3.0"));
     // A fetch that fills the gap.
     auto good = delegate(string url) @safe {
-        assert(url == releasesApiUrl);
+        assert(url == releasesApiUrl ~ "&page=1");
         return `[{"tag_name": "v1.3.0", "body": "### Bug Fixes\n\n* fixed it ([#9](u))\n"}]`;
     };
     auto l = notesFor(notes, "1.1.0", "1.3.0", good);
     assert(l.canFind("  • fixed it (https://github.com/nanobpm/nano-coder/pull/9)") && l.canFind("  • two (https://github.com/nanobpm/nano-coder/pull/2)"), format("%s", l));
+    // A baseline older than the first page: later pages are fetched, up to the cap.
+    string[] urls;
+    auto paged = delegate(string url) @safe {
+        urls ~= url;
+        if (url.canFind("&page=1")) return `[{"tag_name": "v1.3.0", "body": "### Bug Fixes\n\n* new ([#9](u))\n"}]`;
+        if (url.canFind("&page=2")) return `[{"tag_name": "v1.0.0", "body": "### Features\n\n* old ([#1](u))\n"}]`;
+        return string.init;
+    };
+    l = notesFor(notes, "1.0.0", "1.3.0", paged);
+    assert(urls.length == 2 && l.canFind("  • new (https://github.com/nanobpm/nano-coder/pull/9)"), format("%s %s", urls, l));
+    urls = null;
+    auto endless = delegate(string url) @safe { urls ~= url; return `[{"tag_name": "v1.3.0", "body": ""}]`; };
+    assert(notesFor(notes, "0.1.0", "1.3.0", endless) == renderFallback("0.1.0", "1.3.0"));
+    assert(urls.length == fetchPageCap, "bounded");
 }
 
 /// What a start does about the notes: show them (from `from`) and/or record
@@ -443,14 +477,11 @@ string fetchUrl(string url)
     req.headers = ["Accept": "application/vnd.github+json", "User-Agent": "nano-coder (" ~ repoUrl ~ ")"];
     req.connectTimeout = 5.seconds;
     req.idleTimeout = 5.seconds;
+    req.maxBytes = fetchByteCap; // the transfer aborts past the cap
     string body_;
     int status;
-    size_t seen;
-    bool over;
-    // Past the cap the rest is still received (curl has no byte cap here) but the result is dropped.
-    if (collectException(status = perform(req, body_, (const(char)[] chunk) { seen += chunk.length; over = over || seen > fetchByteCap; })) !is null)
-        return null;
-    return status == 200 && !over && body_.length <= fetchByteCap ? body_ : null;
+    if (collectException(status = perform(req, body_)) !is null) return null;
+    return status == 200 ? body_ : null;
 }
 
 /// The background notice thread: computes the start-up notice (fetching what
