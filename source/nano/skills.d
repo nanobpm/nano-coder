@@ -33,6 +33,7 @@ import std.conv : to;
 import std.file;
 import std.format : format;
 import std.json;
+import std.sumtype : SumType, match;
 import std.path;
 import std.process : environment;
 import std.string : strip, stripLeft, stripRight, indexOf, lineSplitter, toLower, chompPrefix, KeepTerminator;
@@ -148,11 +149,8 @@ final class Skills
     /// `.git/HEAD` of every candidate checkout of each `ai.lock` entry, and
     /// what they looked like before loading: a locked commit installed (or
     /// removed) later without touching `ai.lock` still shows as a change.
-    private string[] lockWatch;
+    private LockWatch[] lockWatch;
     private string lockPrint;
-    /// Locked plugin skill folders (canonical, inside their checkout):
-    /// rescanned so an edit inside an installed checkout is a change.
-    private string[] lockDirs;
 
     static Skills discover(string cwd, const ref SkillsConfig config)
     {
@@ -250,14 +248,15 @@ final class Skills
         // discovery still shows as a change next turn.
         foreach (base; [locations.spmStore, locations.cache])
             if (base.length)
-            {
-                auto head = buildPath(base, locked.store, ".git", "HEAD");
-                lockWatch ~= head;
-                lockPrint ~= statLine(head);
-            }
+                watch(LockWatch(FileWatch(buildPath(base, locked.store, ".git", "HEAD"))));
         auto checkout = canonical(checkoutFor(locked, config, locations));
         if (checkout is null) throw new Exception("checkout is missing");
         auto rel = locked.path.length ? locked.path : ".";
+        // Watch the logical files before any early exit, so creating or
+        // restoring them (HEAD unchanged) still shows as a change.
+        auto logical = buildPath(checkout, rel);
+        watch(LockWatch(FileWatch(isPlugin ? buildPath(logical, ".claude-plugin", "plugin.json")
+            : buildPath(logical, skillFile))));
         auto content = within(checkout, buildPath(checkout, rel));
         if (content is null) throw new Exception(format("path `%s` is missing or outside the checkout", rel));
         auto source = Source(Source.Kind.lock, locked.git, locked.commit);
@@ -267,23 +266,17 @@ final class Skills
             if (sf is null)
                 throw new Exception(format("no %s inside the checkout at the locked path", skillFile));
             // The checkout's working tree may change without HEAD moving.
-            lockWatch ~= sf;
-            lockPrint ~= statLine(sf);
+            if (sf != buildPath(logical, skillFile)) watch(LockWatch(FileWatch(sf)));
             Skill sk;
             if (!readSkill(content, name, source, sk)) throw new Exception(format("no %s in the locked path", skillFile));
             push(sk);
             return;
         }
         auto skillsRel = pluginSkillsDir(content);
+        // Watched even when missing, so recreating the folder is a change.
+        watch(LockWatch(PluginWatch(checkout, buildPath(content, skillsRel))));
         auto skillsDir = within(checkout, buildPath(content, skillsRel));
         if (skillsDir is null || !skillsDir.isDir) return;
-        lockDirs ~= skillsDir;
-        {
-            import std.array : appender;
-            auto o = appender!string;
-            fingerprintScan(skillsDir, skillsDir, 0, o);
-            lockPrint ~= o[];
-        }
         auto dirs = listDir(skillsDir, SpanMode.shallow).map!(e => e.name).array.sort.array;
         foreach (d; dirs)
         {
@@ -301,9 +294,14 @@ final class Skills
         if (fingerprintIn(cwd, config, locations) != fingerprint) return true;
         import std.array : appender;
         auto now = appender!string;
-        foreach (head; lockWatch) now ~= statLine(head);
-        foreach (d; lockDirs) fingerprintScan(d, d, 0, now);
+        foreach (w; lockWatch) now ~= watchLine(w);
         return now[] != lockPrint;
+    }
+
+    private void watch(LockWatch w)
+    {
+        lockWatch ~= w;
+        lockPrint ~= watchLine(w);
     }
 
     bool empty() pure const { return skills.length == 0; }
@@ -433,6 +431,48 @@ string fingerprintIn(string cwd, const ref SkillsConfig config, Locations locati
         else dirPrint(dir, null);
     }
     return o[];
+}
+
+/// A file whose stat is part of a locked entry's signature.
+private struct FileWatch { string path; }
+
+/// A plugin's skills folder (logical path, may be missing) inside its checkout.
+private struct PluginWatch { string checkout; string dir; }
+
+/// One watched item of a locked entry; recorded and re-checked in the same
+/// order by the same `watchLine`, so an unchanged set always compares equal.
+private alias LockWatch = SumType!(FileWatch, PluginWatch);
+
+private string watchLine(const LockWatch w)
+{
+    return w.match!(
+        (const FileWatch f) => statLine(f.path),
+        (const PluginWatch p) => pluginLine(p.checkout, p.dir));
+}
+
+/// A shallow signature of a plugin skills folder with the loader's child
+/// selection: every immediate child within the checkout, and its `SKILL.md`.
+private string pluginLine(string checkout, string logical)
+{
+    auto dir = within(checkout, logical);
+    bool isDir;
+    try isDir = dir !is null && dir.isDir;
+    catch (FileException) {} // vanished mid-check: missing now
+    if (!isDir) return "m\0" ~ logical ~ "\0";
+    string o = "p\0" ~ dir ~ "\0";
+    string[] names;
+    try names = listDir(dir, SpanMode.shallow).map!(e => e.name).array.sort.array;
+    catch (FileException) return o ~ "?\0";
+    foreach (d; names)
+    {
+        auto rp = within(checkout, d);
+        if (rp is null) { o ~= "x\0" ~ d ~ "\0"; continue; }
+        // The canonical folder too: a renamed symlink target is a change.
+        o ~= "c\0" ~ d ~ "\0" ~ rp ~ "\0";
+        auto sf = within(checkout, buildPath(rp, skillFile));
+        o ~= sf is null ? "-\0" : statLine(sf);
+    }
+    return o;
 }
 
 private string statLine(string path)
@@ -1141,6 +1181,58 @@ unittest // sees_a_locked_checkout_installed_later_and_a_renamed_symlinked_skill
     assert(!u.stale(repo, c, locs(dir)));
     rename(buildPath(home, ".agents/skills/a"), buildPath(home, ".agents/skills/b"));
     assert(u.stale(repo, c, locs(dir)));
+}
+
+unittest // locked_plugin_watches_are_stable_and_see_metadata_folders_and_missing_files
+{
+    import std.array : replicate;
+    import std.file : rename;
+    auto dir = tmpRoot("pluginwatch");
+    auto url = "https://github.com/acme/skills.git";
+    auto sha = "d".replicate(40);
+    auto store = buildPath(dir, "spm/store", storeKey(url, sha));
+    put(buildPath(store, ".git/HEAD"), sha ~ "\n");
+    put(buildPath(store, "p1/skills/a/SKILL.md"), skillMd("a", "A."));
+    put(buildPath(store, "p2/skills/b/SKILL.md"), skillMd("b", "B."));
+    put(buildPath(store, "p2/other/c/SKILL.md"), skillMd("c", "C."));
+    auto repo = buildPath(dir, "repo");
+    mkdirRecurse(buildPath(repo, ".git"));
+    JSONValue entry(string path)
+    {
+        return JSONValue(["git": url, "reference": "tag:v1", "commit": sha, "path": path, "store": storeKey(url, sha)]);
+    }
+    JSONValue lock = ["plugins": JSONValue(["p1": entry("p1"), "p2": entry("p2")]),
+        "skills": JSONValue(["s": entry("s")])];
+    put(buildPath(repo, "ai.lock"), lock.toString);
+    auto c = cfg();
+    c.fetch = false;
+    auto s = Skills.discoverIn(repo, c, locs(dir));
+    assert(s.names == ["a", "b"], s.names.join(","));
+    // Two unchanged plugins are not stale.
+    assert(!s.stale(repo, c, locs(dir)));
+    // A missing locked SKILL.md appearing is a change.
+    put(buildPath(store, "s/SKILL.md"), skillMd("s", "S."));
+    assert(s.stale(repo, c, locs(dir)));
+    s = Skills.discoverIn(repo, c, locs(dir));
+    assert(s.names == ["s", "a", "b"] && !s.stale(repo, c, locs(dir)), s.names.join(","));
+    // Plugin metadata pointing at another folder is a change.
+    put(buildPath(store, "p2/.claude-plugin/plugin.json"), `{"skills":"other"}`);
+    assert(s.stale(repo, c, locs(dir)));
+    s = Skills.discoverIn(repo, c, locs(dir));
+    assert(s.names == ["s", "a", "c"] && !s.stale(repo, c, locs(dir)), s.names.join(","));
+    // A removed skills folder stays watched: recreating it is a change.
+    rename(buildPath(store, "p1/skills"), buildPath(store, "p1/gone"));
+    assert(s.stale(repo, c, locs(dir)));
+    s = Skills.discoverIn(repo, c, locs(dir));
+    assert(s.names == ["s", "c"] && !s.stale(repo, c, locs(dir)), s.names.join(","));
+    rename(buildPath(store, "p1/gone"), buildPath(store, "p1/skills"));
+    assert(s.stale(repo, c, locs(dir)));
+    // A hidden child the loader reads is watched too.
+    put(buildPath(store, "p1/skills/.h/SKILL.md"), skillMd("h", "H."));
+    s = Skills.discoverIn(repo, c, locs(dir));
+    assert(s.names.canFind("h") && !s.stale(repo, c, locs(dir)), s.names.join(","));
+    put(buildPath(store, "p1/skills/.h/SKILL.md"), skillMd("h", "H, edited at length."));
+    assert(s.stale(repo, c, locs(dir)));
 }
 
 unittest // fingerprints_a_directory_named_skill_md_and_ignores_skill_siblings
