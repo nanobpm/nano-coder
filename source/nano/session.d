@@ -1750,7 +1750,12 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
                     // the skim: such a line is decoded below for `toolKeys`.
                     auto data = skimField(line, "data");
                     auto role = skimString(data, "role");
-                    if ((role != "tool" && role != "assistant") || data.length <= stashSlimBytes)
+                    // Structured payloads (calls, reasoning items) are
+                    // slimmable at any size (`slimPayload`), so mirror that.
+                    if ((role != "tool" && role != "assistant")
+                        || (data.length <= stashSlimBytes
+                            && !skimCount(skimField(data, "tool_calls"))
+                            && !skimCount(skimField(data, "thinking_blocks"))))
                     {
                         index++;
                         return;
@@ -4020,4 +4025,38 @@ unittest
     auto skimmed = restoreLog(path, true), fullR = restoreLog(path, false);
     assert(skimmed == fullR, "cutting superseded pins restores the same state");
     assert(skimmed.pinStash.length == 1 && skimmed.pinStash[0].content == "restated");
+}
+
+// A short assistant turn with a tool call or reasoning item is slimmable at
+// any size, so the skim must still decode it before the floor.
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, write;
+    import std.path : buildPath;
+    auto dir = buildPath(tempDir, "nano-d-skimcall-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    static JSONValue rec(Message m) { return messageRecord(m); }
+    string line(string type, JSONValue data) { return JSONValue(["type": JSONValue(type), "data": data]).toString ~ "\n"; }
+    auto log = `{"type":"session","data":{"version":1,"id":"skimcall","created_at":"x"}}` ~ "\n";
+    ulong lines = 1;
+    void add(string type, JSONValue data) { log ~= line(type, data); lines++; }
+    auto q = Message.user("q");
+    auto call = Message.assistant("x", [ToolCall.fromRaw("c1", "read_file", `{"path":"a"}`)]);
+    auto think = Message.assistant("y");
+    think.thinkingBlocks = [JSONValue(["t": 1])];
+    call.logLine = 3;
+    think.logLine = 4;
+    add("message", rec(q));
+    add("message", rec(call));
+    add("message", rec(think));
+    JSONValue full = ["messages": JSONValue([rec(Message.user("summary"))])];
+    full["folded"] = JSONValue([rec(q), rec(call), rec(think)]);
+    full["summarized"] = JSONValue([JSONValue(2), JSONValue(lines)]);
+    add("replace", full);
+    auto path = buildPath(dir, "skimcall.jsonl");
+    write(path, log);
+    auto skimmed = restoreLog(path, true), fullR = restoreLog(path, false);
+    assert(skimmed == fullR, "short structured replies are slimmed alike");
+    assert(skimmed.replayStashSlim == [false, true, true]);
 }
