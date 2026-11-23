@@ -221,20 +221,42 @@ unittest
 
 private class Reports : MockClient, CapabilityProbe
 {
+    /// Each probe's `window` argument.
+    bool[] probes;
     this() { super(null); }
-    Capabilities probeCapabilities()
+    Capabilities probeCapabilities(bool window = true)
     {
+        import nano.thinking : Reported, Format;
+        probes ~= window;
         Capabilities c;
-        c.window = 65_536;
-        c.windowSource = "test";
+        c.thinking = Reported(["off", "on"], false, Format.effort);
+        if (window)
+        {
+            c.window = 65_536;
+            c.windowSource = "test";
+        }
         return c;
     }
     override string modelName() pure const { return "claude-test"; }
 }
 
+// With the window set in config, the window half of the probe is not run
+// (a configured LM Studio provider would otherwise make the needless
+// `/api/v0/models` follow-up), but the thinking half still is.
+// rust: agent.rs::a_configured_window_probes_only_the_thinking_levels
+unittest
+{
+    auto reports = new Reports;
+    auto agent = new Agent(reports, new ToolRegistry, Policy.init, null);
+    agent.setConfiguredWindow(ConfiguredWindow(32_000, "context_window in config"));
+    agent.refreshCapabilities();
+    assert(reports.probes == [false], "the discarded window half is not probed");
+    assert(agent.capabilities.thinking.get.levels == ["off", "on"], "the thinking levels are still probed");
+    assert(agent.capabilities.window == 0, "the configured window stands");
+}
+
 // The window's sources in order: config, then what the endpoint reports,
-// then the model name. (D probes even when config sets the window; skipping
-// that probe is part of the background-probe gap.)
+// then the model name.
 // rust: agent.rs::detected_window_sits_between_config_and_model_name
 unittest
 {

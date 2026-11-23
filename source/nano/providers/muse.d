@@ -179,7 +179,7 @@ class MuseClient : LLMClient, CapabilityProbe, KindedClient
     string[] listModels() { return listableModels(catalogJson(false)); }
 
     /// Thinking levels and vision from the model's catalog row.
-    Capabilities probeCapabilities()
+    Capabilities probeCapabilities(bool window = true)
     {
         import nano.thinking : Reported, Format;
         import nano.vision : Vision;

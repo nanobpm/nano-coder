@@ -55,7 +55,7 @@ import nano.control : TurnControl, FdLineReader;
 import nano.instructions : ProjectInstructions, InstructionOptions = Options, expandHome;
 import core.atomic : atomicLoad, atomicStore, cas;
 
-enum string packageVersion = "1.10.1";
+enum string packageVersion = "1.11.0";
 enum string versionString = "nano-coder " ~ packageVersion;
 
 enum string usage = `Usage: nano-coder [--model provider/model] [--config PATH] [-p PROMPT]
@@ -2765,6 +2765,17 @@ int runMain(string[] args)
     agent.sessionTitles = cfg.sessionTitles;
     agent.titleModel = cfg.titleModel;
     agent.titleClient = (string spec) => makeClient(resolve(cfg, spec));
+    // The provider the last switch resolved: a background probe builds its
+    // client from a deep copy, so `api_key_command` doesn't run again on the
+    // agent thread before the probe starts.
+    ResolvedProvider lastResolved;
+    agent.probeClient = (string spec) {
+        import nano.safeio : deepCopy;
+        if (lastResolved.name.length && spec == lastResolved.name ~ "/" ~ lastResolved.model)
+            return makeClient(deepCopy(lastResolved));
+        // Unknown spec: skip the optional probe rather than re-resolve here.
+        throw new Exception("no resolved provider for " ~ spec);
+    };
     agent.subagentsOn = cfg.subagents;
     configureSubagents(agent, cfg, true);
     agent.planTools = cfg.planTools;
@@ -2977,6 +2988,7 @@ int runMain(string[] args)
             auto rp = resolve(cfg, s);
             auto c = makeClient(rp);
             w = windowFor(cfg, rp.config);
+            lastResolved = rp;
             return c;
         }
         if (queued)
