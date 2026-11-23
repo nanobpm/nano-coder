@@ -348,6 +348,9 @@ void save(const ref Config c, const ref Changes ch, const ProviderConfig[string]
     doc = applyChanges(doc, c, ch, user);
     bool secret;
     foreach (ref p; user) if (p.apiKey.length) secret = true;
+    // The file may already hold inline keys of providers this save leaves
+    // alone; keep it private so a rewrite never widens their permissions.
+    foreach (ref p; c.providers) if (p.apiKey.length) secret = true;
     if (path.dirName.length) mkdirRecurse(path.dirName);
     auto tmp = path ~ ".tmp";
     write(tmp, doc);
@@ -528,4 +531,24 @@ unittest
     ch.model = true;
     save(c, ch, null, path);
     assert(readText(path) == "model = \"ollama/qwen3\"\n");
+}
+
+unittest
+{
+    // A save that touches no provider still keeps a file holding inline
+    // keys private (e.g. `/subagents off --save`).
+    import std.file : tempDir, remove, exists, getAttributes;
+    import std.path : buildPath;
+    import std.conv : octal;
+    auto path = buildPath(tempDir, "nano-settings-secret-test.toml");
+    scope (exit) if (path.exists) remove(path);
+    Config c;
+    ProviderConfig p;
+    p.apiKey = "k";
+    c.providers["box"] = p;
+    c.subagents = false;
+    Changes ch;
+    ch.subagents = true;
+    save(c, ch, null, path);
+    version (Posix) assert((getAttributes(path) & octal!7777) == octal!600);
 }

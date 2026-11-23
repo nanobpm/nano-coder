@@ -591,3 +591,15 @@ unittest
     f.agent.subagentsOn = true;
     assert(f.agent.offeredTools.canFind!(t => t.name == "agent"));
 }
+
+// `/subagents off` queued mid-turn takes effect before the next model
+// request of the same turn.
+unittest
+{
+    auto f = new Fixture([LLMResponse("", "", [ToolCall.fromRaw("c1", "read_file", `{"path":"nope"}`)]),
+        LLMResponse("done")]);
+    f.agent.control.requestSubagents(false);
+    assert(f.agent.subagentsOn);
+    assert(f.agent.run("go", new NullEvents) == "done");
+    assert(!f.agent.subagentsOn && !f.agent.control.takeSubagentsRequest());
+}

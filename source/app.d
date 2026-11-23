@@ -432,6 +432,11 @@ string midTurnCommand(string text, MidTurn ctx)
                 control.requestModel(arg);
                 return format("Model switch to %s queued; applies at the next model call (the history carries over)", arg);
             }
+            if (name == "/subagents")
+            {
+                control.requestSubagents(arg == "on");
+                return format("Sub-agents %s queued; applies from the agent's next model request (running sub-agents finish)", arg);
+            }
             return null;
     }
 }
@@ -857,6 +862,7 @@ string subagentsCommand(Agent agent, ref Config cfg, string arg)
     auto model = agent.subagentModel.length ? agent.subagentModel : agent.client.providerName ~ "/" ~ agent.client.modelName;
     if (t.show) return statusText(agent.subagentsOffered, agent.subagentCandidates, model, agent.subagentLimits);
     if (!agent.subagentsEnabled) return "Sub-agents are not available in this session";
+    agent.control.takeSubagentsRequest(); // a direct switch supersedes a queued one
     auto was = agent.subagentsOn;
     agent.subagentsOn = t.on;
     auto msg = format("Sub-agents %s for this session", t.on ? "on" : "off");

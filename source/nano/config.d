@@ -639,21 +639,49 @@ void parseModelSpec(string spec, const ProviderConfig[string] providers, string 
 /// control characters, no query or fragment.
 void validateHttpBaseUrl(string provider, string url) pure
 {
+    auto why = baseUrlProblem(provider, url);
+    if (why.length) throw new Exception(why);
+}
+
+/// Why `url` is not a usable http(s) base URL for `provider`; null when it
+/// is. Shared by `resolve` and the credential-free candidate filter.
+string baseUrlProblem(string provider, string url) pure
+{
     import std.uni : isWhite;
     import std.ascii : isControl;
-    import std.string : toLower, startsWith;
-    if (url.strip.length == 0) throw new Exception(format("provider \"%s\" has an empty base_url", provider));
+    import std.string : toLower;
+    if (url.strip.length == 0) return format("provider \"%s\" has an empty base_url", provider);
     foreach (dchar ch; url)
         if (isWhite(ch) || (ch < 0x80 && isControl(ch)) || (ch >= 0x80 && ch < 0xa0))
-            throw new Exception(format("provider \"%s\" base_url \"%s\" must not contain whitespace or control characters", provider, url));
+            return format("provider \"%s\" base_url \"%s\" must not contain whitespace or control characters", provider, url);
     auto colon = url.indexOf("://");
-    if (colon <= 0) throw new Exception(format("provider \"%s\" has a malformed base_url \"%s\"", provider, url));
+    if (colon <= 0) return format("provider \"%s\" has a malformed base_url \"%s\"", provider, url);
     auto scheme = url[0 .. colon].toLower;
     if (scheme != "http" && scheme != "https")
-        throw new Exception(format("provider \"%s\" base_url \"%s\" must be http(s), not \"%s\"", provider, url, scheme));
-    if (url.length == colon + 3) throw new Exception(format("provider \"%s\" has a malformed base_url \"%s\"", provider, url));
+        return format("provider \"%s\" base_url \"%s\" must be http(s), not \"%s\"", provider, url, scheme);
+    if (url.length == colon + 3) return format("provider \"%s\" has a malformed base_url \"%s\"", provider, url);
     if (url.indexOf('?') >= 0 || url.indexOf('#') >= 0)
-        throw new Exception(format("provider \"%s\" base_url \"%s\" must not contain a query or fragment", provider, url));
+        return format("provider \"%s\" base_url \"%s\" must not contain a query or fragment", provider, url);
+    return null;
+}
+
+/// Why provider `name` (`pc`) has no usable endpoint for `model`, honouring
+/// a model's own `base_url`; null when it has one. Fetches no key.
+string endpointProblem(string name, const ref ProviderConfig pc, string model) pure
+{
+    string url = pc.baseUrl;
+    if (auto ms = model in pc.models)
+        if (ms.baseUrl !is null) url = ms.baseUrl;
+    auto kind = pc.hasKind ? pc.kind : ProviderKind.openai;
+    final switch (kind)
+    {
+        case ProviderKind.mock: return null;
+        case ProviderKind.githubCopilot, ProviderKind.muse:
+            return url.length ? baseUrlProblem(name, url) : null;
+        case ProviderKind.openai, ProviderKind.anthropic:
+            if (url is null) return format("provider \"%s\" has no base_url", name);
+            return baseUrlProblem(name, url);
+    }
 }
 
 /// One `[[subagent_models]]` entry: a model the `agent` tool offers, what
@@ -716,7 +744,7 @@ string specProblem(const ref Config c, string spec) pure
     if (pc is null) return format("unknown provider \"%s\"", name);
     if (pc.disabled) return format("provider \"%s\" is disabled", name);
     if (!model.length && !pc.defaultModel.length) return format("no model given and provider \"%s\" has no default_model", name);
-    return null;
+    return endpointProblem(name, *pc, model.length ? model : pc.defaultModel);
 }
 
 /// The candidates of `c.subagentModels` that resolve against the configured
@@ -782,6 +810,30 @@ max_tokens = 9
     assert(!usableSubagentModels(c, w).length && !w.length);
 }
 
+unittest
+{
+    // A candidate whose endpoint `resolve` would reject is dropped up front:
+    // no base_url, a bad provider base_url, a bad model-specific base_url.
+    import std.algorithm : canFind;
+    auto c = regionalConfig(`[[subagent_models]]
+model = "openrouter-regional/amazon/nova-lite-v1"
+[[subagent_models]]
+model = "openrouter-regional/moonshotai/kimi-k3"
+`);
+    string[] w;
+    assert(usableSubagentModels(c, w).length == 2 && !w.length, format("%s", w));
+    c.providers["openrouter-regional"].models["amazon/nova-lite-v1"].baseUrl = "ftp://eu";
+    w = null;
+    auto ok = usableSubagentModels(c, w);
+    assert(ok.length == 1 && w.length == 1 && w[0].canFind("http(s)"), format("%s", w));
+    c.providers["openrouter-regional"].baseUrl = "https://x?q";
+    w = null;
+    assert(!usableSubagentModels(c, w).length && w[1].canFind("query"), format("%s", w));
+    c.providers["openrouter-regional"].baseUrl = null;
+    w = null;
+    assert(!usableSubagentModels(c, w).length && w[1].canFind("no base_url"), format("%s", w));
+}
+
 ResolvedProvider resolve(const ref Config c, string spec)
 {
     string name, model;
@@ -807,18 +859,8 @@ ResolvedProvider resolve(const ref Config c, string spec)
     if (auto ms = r.model in pc.models)
         if (ms.baseUrl !is null) r.config.baseUrl = ms.baseUrl;
     if (!r.config.hasKind) r.config.kind = ProviderKind.openai;
-    final switch (r.config.kind)
-    {
-        // Mock needs no endpoint; Copilot and Muse derive theirs unless overridden.
-        case ProviderKind.mock: break;
-        case ProviderKind.githubCopilot, ProviderKind.muse:
-            if (r.config.baseUrl.length) validateHttpBaseUrl(name, r.config.baseUrl);
-            break;
-        case ProviderKind.openai, ProviderKind.anthropic:
-            if (r.config.baseUrl is null) throw new Exception(format("provider \"%s\" has no base_url", name));
-            validateHttpBaseUrl(name, r.config.baseUrl);
-            break;
-    }
+    auto why = endpointProblem(name, *pc, r.model);
+    if (why.length) throw new Exception(why);
     r.config.baseUrl = r.config.baseUrl.stripRight('/');
     if (r.config.timeoutSecs <= 0) r.config.timeoutSecs = defaultTimeoutSecs();
     r.replayReasoning = pc.replayReasoning.isNull ? reasonsOverResponses(r.config.kind, r.model) : pc.replayReasoning.get;

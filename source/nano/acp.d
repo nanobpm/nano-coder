@@ -142,9 +142,11 @@ bool isJsonRpcRequest(JSONValue msg) pure
     return getStr(msg, "jsonrpc") == "2.0" && getStr(msg, "method") !is null;
 }
 
-enum DuringTurn { cancel, steer, defer }
+enum DuringTurn { cancel, steer, subagents, defer }
 
-/// How a message arriving mid-turn is routed; `steerText` is set for steer.
+/// How a message arriving mid-turn is routed; `steerText` is set for steer,
+/// and is "on" or "off" for subagents (`/subagents on|off` without --save,
+/// applied from the turn's next model request).
 DuringTurn classifyDuringTurn(JSONValue msg, string active, out string steerText) pure
 {
     auto params = get(msg, "params");
@@ -158,7 +160,17 @@ DuringTurn classifyDuringTurn(JSONValue msg, string active, out string steerText
         auto trimmed = text.strip;
         if (!trimmed.length) return DuringTurn.defer;
         auto u = unescapePrompt(trimmed);
-        if (isCommand(trimmed)) return DuringTurn.defer;
+        if (isCommand(trimmed))
+        {
+            import nano.turn_commands : splitCmd, timing, Timing;
+            auto p = splitCmd(trimmed);
+            if (p[0] == "/subagents" && timing(trimmed) == Timing.nextStep)
+            {
+                steerText = p[1];
+                return DuringTurn.subagents;
+            }
+            return DuringTurn.defer;
+        }
         steerText = u !is null ? u : text;
         return DuringTurn.steer;
     }
@@ -275,6 +287,14 @@ struct AcpRouter
                     st.steerMarks ~= st.items.length;
                     ctl.steer(Steer(steerText, get(msg, "id")));
                     return null;
+                case DuringTurn.subagents:
+                    ctl.requestSubagents(steerText == "on");
+                    auto sid = get(msg, "id");
+                    if (sid.type == JSONType.null_) return null;
+                    JSONValue b = ["stopReason": "end_turn"];
+                    b["queued"] = true;
+                    b["text"] = "Sub-agents " ~ steerText ~ " queued; applies from the agent's next model request";
+                    return rpcResult(sid, b).toString;
                 case DuringTurn.defer:
                     break;
                 }
@@ -716,6 +736,7 @@ final class AcpServer : AgentEvents
             {
                 if (!agent.subagentsEnabled) return rpcError(id, -32602, "sub-agents are not available in this session");
                 if (t.save && host.saveSubagents is null) return rpcError(id, -32602, "/subagents: --save is not available");
+                agent.control.takeSubagentsRequest(); // a direct switch supersedes a queued one
                 agent.subagentsOn = t.on;
                 if (t.save) body_["saved"] = host.saveSubagents(t.on);
             }
@@ -940,6 +961,11 @@ unittest
     auto prompt = (string x) => parseJSON(`{"method":"session/prompt","params":{"prompt":[{"type":"text","text":` ~ JSONValue(x).toString ~ `}]}}`);
     assert(classifyDuringTurn(prompt("//x"), null, s) == DuringTurn.steer && s == "/x");
     assert(classifyDuringTurn(prompt("/plan"), null, s) == DuringTurn.defer);
+    // `/subagents on|off` applies from the next request; --save waits.
+    assert(classifyDuringTurn(prompt("/subagents off"), null, s) == DuringTurn.subagents && s == "off");
+    assert(classifyDuringTurn(prompt("/subagents on"), null, s) == DuringTurn.subagents && s == "on");
+    assert(classifyDuringTurn(prompt("/subagents off --save"), null, s) == DuringTurn.defer);
+    assert(classifyDuringTurn(prompt("/subagents"), null, s) == DuringTurn.defer);
     assert(classifyDuringTurn(parseJSON(`{"method":"session/cancel","params":{"sessionId":"other"}}`), "me", s) == DuringTurn.defer);
     // Requeued escaped steers are re-escaped.
     auto q = requeueSteers(null, [Steer("/x")], [0], null);

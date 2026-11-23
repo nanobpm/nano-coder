@@ -204,7 +204,9 @@ SubArgs parseArgs(JSONValue args, long defaultTimeout) pure
         throw new ToolError(format(`agent: tools must be "read-only" (edit-capable sub-agents are not supported), got "%s"`, set));
     a.model = optString(args, "model");
     a.timeoutSecs = optInt(args, "timeout_s", defaultTimeout);
-    a.timeoutSet = args.type == JSONType.object && ("timeout_s" in args.objectNoRef) !is null;
+    if (args.type == JSONType.object)
+        if (auto t = "timeout_s" in args.objectNoRef)
+            a.timeoutSet = t.type != JSONType.null_; // null means omitted, as in optInt
     if (a.timeoutSecs <= 0) throw new ToolError("agent: timeout_s must be a positive number of seconds");
     return a;
 }
@@ -783,6 +785,9 @@ unittest
         assert(statusText(false, null, "z/z", SubLimits.init).canFind("off\nModel: z/z"));
     }
     assert(parseArgs(parseJSON(`{"task":"x","timeout_s":5,"model":"m/n"}`), 600).model == "m/n");
+    // A JSON null timeout is omitted, so a candidate's own limit stays.
+    assert(!parseArgs(parseJSON(`{"task":"x","timeout_s":null}`), 600).timeoutSet);
+    assert(parseArgs(parseJSON(`{"task":"x","timeout_s":5}`), 600).timeoutSet);
     assert(collectExceptionMsg(parseArgs(parseJSON(`{"task":"x","tools":"all"}`), 600)).canFind("read-only"));
     assert(collectExceptionMsg(parseArgs(parseJSON(`{"task":" "}`), 600)).canFind("empty"));
     assert(collectExceptionMsg(parseArgs(parseJSON(`{"task":"x","timeout_s":0}`), 600)).canFind("positive"));
