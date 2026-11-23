@@ -975,7 +975,10 @@ string readLogTail(string path, size_t since, size_t cap = readCap)
         foreach (b; got)
         {
             if (b == '\n') { if (finish()) break outer; }
-            else if (lineNo >= since) line ~= b;
+            // Keep at most cap + 1 bytes of a line: anything longer is cut
+            // to its head in finish(), so a multi-MB line never sits whole
+            // in memory.
+            else if (lineNo >= since && line.length <= cap) line ~= b;
         }
     }
     // A last line without a newline may still be being written: leave it.
@@ -1003,4 +1006,10 @@ unittest
     // A single line over the cap is cut and skipped.
     auto big = readLogTail(p, 1, 4);
     assert(big.canFind("yyyy…[line cut") && big.canFind("[next since: 2; more follows]"), big);
+    // A line far larger than the cap and the read buffer is cut to its head.
+    write(p, "h".replicate(200_000) ~ "\nnext\n");
+    auto huge = readLogTail(p, 0, 8);
+    assert(huge.canFind("hhhhhhhh…[line cut") && !huge.canFind("hhhhhhhhh")
+        && huge.canFind("[next since: 1; more follows]"), huge);
+    assert(readLogTail(p, 1, 8).canFind("next\n[next since: 2]"));
 }
