@@ -1300,6 +1300,9 @@ struct Restored
     string[string] completed;
     string[string] completedStops;
     JSONValue[string] completedOutcomes;
+    /// The `completed` ids oldest first, so a bounded holder drops the
+    /// oldest responses first (issue #312).
+    string[] completedOrder;
     /// The latest plan record (`{goal, items}`), or null.
     JSONValue plan;
     /// The latest timers record (`{last_id, items}`), or null.
@@ -1601,6 +1604,42 @@ void eachLogLineUntil(string path, scope bool delegate(const(char)[] line, ulong
         return dg(line, ++lineNo);
     });
     if (!lineNo && requireCommitted) throw new Exception("session log " ~ path ~ " has no committed records");
+}
+
+/// A finished turn as its `turn_end` record holds it.
+struct CompletedTurn
+{
+    /// The final response.
+    string response;
+    /// The stop reason (`end_turn` when not recorded).
+    string stopReason = "end_turn";
+    /// The recorded outcome object, or null.
+    JSONValue outcome;
+}
+
+/// The last `turn_end` record for input `inputId` in the log at `path`, read
+/// back when a bounded in-memory record dropped it (issue #312); none when
+/// the log is gone or holds no such record. Throws if the log is unreadable.
+Option!CompletedTurn findCompletedTurn(string path, string inputId)
+{
+    import std.algorithm.searching : canFind;
+    Option!CompletedTurn found;
+    auto needle = `"input_id":` ~ JSONValue(inputId).jsonText;
+    if (!path.exists) return found;
+    eachLogLine(path, (const(char)[] line, ulong) {
+        if (!line.canFind(`"type":"turn_end"`) || !line.canFind(needle)) return;
+        auto rec = parseJSON(line);
+        auto data = "data" in rec;
+        if (data is null || data.type != JSONType.object) return;
+        auto id = "input_id" in *data;
+        if (id is null || id.type != JSONType.string || id.str != inputId) return;
+        CompletedTurn t;
+        if (auto resp = "response" in *data) if (resp.type == JSONType.string) t.response = resp.str;
+        if (auto st = "stop_reason" in *data) if (st.type == JSONType.string) t.stopReason = st.str;
+        if (auto oc = "outcome" in *data) if (oc.type == JSONType.object) t.outcome = *oc;
+        found = some(t);
+    }, false);
+    return found;
 }
 
 unittest // eachLogLineUntil stops reading at the first false
@@ -1908,6 +1947,7 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
             {
                 auto iid = data["input_id"].str;
                 auto resp = "response" in data;
+                if (iid !in r.completed) r.completedOrder ~= iid;
                 r.completed[iid] = resp !is null && resp.type == JSONType.string ? resp.str : "";
                 auto st = "stop_reason" in data;
                 if (st !is null && st.type == JSONType.string && st.str != "end_turn") r.completedStops[iid] = st.str;
