@@ -2268,7 +2268,8 @@ class Agent
                 {
                     if (!crossSessionHistory)
                         throw new hist.HistoryError("sessions_list is disabled (cross_session_history = false)");
-                    out_ = cross.listResult(sessionDirOf(ownLog), args);
+                    import std.file : getcwd;
+                    out_ = cross.listResult(policy, sessionDirOf(ownLog), getcwd(), args);
                 }
                 else
                 {
@@ -2307,9 +2308,10 @@ class Agent
     /// Honor a history call's `session` argument (issue #271): resolve it to
     /// one session's log and check the read against the permission policy.
     /// Returns the message the model sees when the read may not happen (the
-    /// setting off, or the policy denying another workspace's log); on success
-    /// `logPath` names the log to stream and the result is null. Without the
-    /// argument the call reads the session's own log, as before.
+    /// setting off, the policy denying another workspace's log, or the user
+    /// declining a cross-workspace read); on success `logPath` names the log
+    /// to stream and the result is null. Without the argument the call reads
+    /// the session's own log, as before.
     private string resolveSessionArg(JSONValue args, SessionLog ownLog, ref string logPath)
     {
         import std.file : getcwd;
@@ -2318,18 +2320,38 @@ class Agent
         if (!crossSessionHistory)
             return "the session argument is disabled (cross_session_history = false)";
         auto dir = sessionDirOf(ownLog);
-        auto sessions = cross.listSessions(dir);
+        auto cwd = getcwd();
+        auto sessions = cross.listSessions(policy, dir, cwd);
         cross.SessionInfo self;
         self.id = ownLog.id;
         self.path = ownLog.path;
         self.live = true;
-        auto cwd = getcwd();
         self.cwd = cwd;
         auto target = cross.resolve(needle, sessions, &self);
         if (target.id == ownLog.id) return null; // this session: read as today
         if (auto denied = cross.readDenied(policy, target, cwd)) return denied;
+        // Default-ask (issue #271): a session from another workspace is read
+        // only after the user confirms; headless (no answerer) fails closed.
+        if (cross.needsConfirmation(target, cwd) && !confirmedCrossRead(target))
+            return format("reading session %s from another workspace (%s) was not confirmed; "
+                ~ "the user must allow it first", target.id, target.cwd.length ? target.cwd : "unknown directory");
         logPath = target.path;
         return null;
+    }
+
+    /// Ask the user whether a cross-workspace session may be read; false when
+    /// they decline or no one can answer (headless fails closed, issue #271).
+    private bool confirmedCrossRead(const ref cross.SessionInfo target)
+    {
+        import nano.question : Question, QuestionOption, Answered;
+        if (!questions || !questions.interactive) return false;
+        auto q = Question(cross.confirmQuestion(target), null,
+            [QuestionOption("No"), QuestionOption("Yes")]);
+        q.custom = false;
+        auto a = questions.ask([q]);
+        return a.match!(
+            (Answered got) => got.answers.length && got.answers[0] == "Yes",
+            _ => false);
     }
 
     /// After a call ran: the PostToolUse hooks, and the hooks' context added.
@@ -3452,7 +3474,7 @@ class Agent
     ToolDefinition[] offeredTools() pure
     {
         auto all = tools.definitions ~ (planTools ? planDefinitions() : null)
-            ~ (outcomeTool ? [outcomeDefinition()] : null) ~ (historyEnabled ? hist.definitions() : null)
+            ~ (outcomeTool ? [outcomeDefinition()] : null) ~ (historyEnabled ? hist.definitions(crossSessionHistory) : null)
             ~ (historyEnabled && crossSessionHistory ? [hist.sessionsDefinition()] : null)
             ~ (timerTools ? timerDefinitions() : null) ~ (subagentsOffered ? [subDefinition(subagentCandidates)] ~ subControlDefinitions() : null);
         if (control.mode != AgentMode.plan) return all;

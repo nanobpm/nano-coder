@@ -507,8 +507,12 @@ bool[string] titledIds(string dir)
 /// Sessions the index lacks, or whose log changed since it was indexed, are
 /// summarized from their logs, and the index is updated. A missing directory
 /// is no sessions; other filesystem errors propagate. `strictIndex` also
-/// fails on an unreadable or corrupt index (see `load`).
-Summary[] list(string dir, bool strictIndex = false)
+/// fails on an unreadable or corrupt index (see `load`). `skip` hides a log
+/// from the listing entirely (issue #271: a session the permission policy
+/// denies is neither summarized nor reported from cached metadata, so its
+/// title or first request can't leak); skipped logs are left in the index
+/// untouched.
+Summary[] list(string dir, bool strictIndex = false, scope bool delegate(string path) @safe skip = null)
 {
     if (!dir.exists) return null;
     auto indexLen = sizeOr0(indexPath(dir));
@@ -526,6 +530,7 @@ Summary[] list(string dir, bool strictIndex = false)
         try validateId(id);
         catch (Exception) continue; // not a session log name: skip
         if (!e.isFile) continue;
+        if (skip !is null && skip(e.name)) continue; // denied: hide it entirely (issue #271)
         if (compressed && buildPath(dir, id ~ ".jsonl").exists)
         {
             // The plain twin wins. An archive resume may publish it after the

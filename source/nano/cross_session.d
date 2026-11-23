@@ -88,12 +88,28 @@ private bool isLive(string path) @safe
 /// live flag probed. `filter` keeps sessions whose id, title or working
 /// directory contains it (case-insensitive). The current session is included
 /// (marked live) so an id prefix can be checked against it too.
-SessionInfo[] listSessions(string dir, string filter = null) @safe
+///
+/// Discovery is permission-aware (issue #271): a session another workspace's
+/// policy denies is omitted before its log is opened for summarizing and
+/// before any cached metadata (title, first request) is returned, so
+/// `sessions_list` can't leak a denied session's existence or contents. The
+/// check reads only each log's header line for its recorded cwd.
+SessionInfo[] listSessions(ref Policy policy, string dir, string cwd, string filter = null) @safe
 {
+    import nano.session : logHeaderCwd;
     SessionInfo[] out_;
-    foreach (s; list(dir))
+    // Deny before the index opens or reports a log (issue #271): the header's
+    // cwd decides whether the policy judges the log a foreign read.
+    bool deniedPath(string path)
+    {
+        auto sessionCwd = logHeaderCwd(path);
+        if (inWorkspace(sessionCwd, cwd)) return false;
+        return policy.checkIn("read_file", JSONValue(["path": JSONValue(path)]), cwd) !is null;
+    }
+    foreach (s; list(dir, false, &deniedPath))
     {
         auto i = infoOf(s, isLive(s.path));
+        if (!i.cwd.length) i.cwd = logHeaderCwd(s.path);
         if (filter.length)
         {
             auto f = filter.toLower;
@@ -118,14 +134,14 @@ private string lineOf(const ref SessionInfo i) @safe
 /// The `sessions_list` tool result: one `#id title cwd last-activity [live]`
 /// line per session, newest first, capped like other tool output (the
 /// remainder is spilled to a file).
-string listResult(string dir, JSONValue args) @safe
+string listResult(ref Policy policy, string dir, string cwd, JSONValue args) @safe
 {
     import nano.tools : truncateOutput, defaultMaxOutput;
     string filter;
     if (args.type == JSONType.object)
         if (auto f = "filter" in args.objectNoRef)
             if (f.type == JSONType.string) filter = f.str;
-    auto sessions = listSessions(dir, filter);
+    auto sessions = listSessions(policy, dir, cwd, filter);
     if (!sessions.length)
         return filter.length
             ? format("No sessions match %s.", JSONValue(filter).jsonText)
@@ -134,9 +150,11 @@ string listResult(string dir, JSONValue args) @safe
 }
 
 /// `needle` as one session: an exact id, a unique id prefix, or a title match
-/// (case-insensitive substring, exact match first). An ambiguous match throws
-/// a HistoryError listing the candidates. With `fallback`, an empty `needle`
-/// resolves to that session (the caller's own log).
+/// (case-insensitive; every exact-title match beats any substring match, so
+/// two sessions sharing a title report ambiguity instead of silently picking
+/// one). An ambiguous match throws a HistoryError listing the candidates.
+/// With `fallback`, an empty `needle` resolves to that session (the caller's
+/// own log).
 SessionInfo resolve(string needle, SessionInfo[] sessions, scope const(SessionInfo)* fallback = null) @safe
 {
     if (!needle.length)
@@ -151,9 +169,12 @@ SessionInfo resolve(string needle, SessionInfo[] sessions, scope const(SessionIn
         if (i.id.startsWith(needle) || (i.title.length && i.title.toLower.canFind(needle.toLower)))
             candidates ~= i;
     }
-    // An exact title beats the other substring matches.
+    // Case-insensitive exact titles beat the other substring matches; several
+    // sessions may share one title (identical first-request fallbacks too).
+    SessionInfo[] exact;
     foreach (ref c; candidates)
-        if (c.title == needle) return c;
+        if (c.title.toLower == needle.toLower) exact ~= c;
+    if (exact.length) candidates = exact;
     if (candidates.length == 1) return candidates[0];
     if (!candidates.length)
         throw new HistoryError(format("no session matches %s; sessions_list shows the ids and titles",
@@ -192,6 +213,22 @@ string readDenied(ref Policy policy, const ref SessionInfo s, string cwd) @safe
     return policy.checkIn("read_file", JSONValue(["path": JSONValue(s.path)]), cwd);
 }
 
+/// Whether reading `s` from `cwd` needs the user's confirmation first
+/// (issue #271's default-ask): any session outside the current workspace
+/// that the policy didn't already deny. In-workspace sessions never ask.
+bool needsConfirmation(const ref SessionInfo s, string cwd) @safe
+{
+    return !inWorkspace(s.cwd, cwd);
+}
+
+/// The question a cross-workspace read asks before it proceeds.
+string confirmQuestion(const ref SessionInfo s) @safe
+{
+    auto label = s.title.length ? s.title : "(no title)";
+    return format("Read session %s (%s) from %s? It belongs to another workspace.", s.id, label,
+        s.cwd.length ? s.cwd : "an unknown directory");
+}
+
 unittest
 {
     import std.file : tempDir, mkdirRecurse, rmdirRecurse;
@@ -210,16 +247,25 @@ unittest
     }
     liveLog.input("in-2", "keep working on the live one");
 
-    auto all = listSessions(dir);
+    Policy noRules;
+    auto all = listSessions(noRules, dir, "/work/alpha");
     assert(all.length == 2, all.to!string);
     auto live = all[0].id == "sess-live" ? all[0] : all[1];
     auto done = all[0].id == "sess-done" ? all[0] : all[1];
     assert(live.live, "the open log is live");
     assert(!done.live, "a closed log is not live");
     assert(live.title == "keep working on the live one");
-    assert(listSessions(dir, "done").length == 1);
-    assert(listSessions(dir, "/WORK/alpha").length == 1, "filter is case-insensitive");
-    assert(!listSessions(dir, "nope").length);
+    assert(listSessions(noRules, dir, "/work/alpha", "done").length == 1);
+    assert(listSessions(noRules, dir, "/work/alpha", "/WORK/alpha").length == 1, "filter is case-insensitive");
+    assert(!listSessions(noRules, dir, "/work/alpha", "nope").length);
+
+    // A deny rule hides a foreign session from the listing entirely, cached
+    // title and all; an in-workspace session stays.
+    import nano.permissions : parseRule;
+    Policy denying;
+    denying.deny = [parseRule("Read(" ~ dir ~ "/sess-done.jsonl)")];
+    auto visible = listSessions(denying, dir, "/work/alpha");
+    assert(visible.length == 1 && visible[0].id == "sess-live", visible.to!string);
 
     // Resolve: exact id, unique prefix, title substring; ambiguity lists candidates.
     assert(resolve("sess-done", all).id == "sess-done");
@@ -239,6 +285,25 @@ unittest
     catch (HistoryError e) { threw = true; assert(e.msg.canFind("no session matches"), e.msg); }
     assert(threw);
 
+    // Two sessions titled alike (identical first-request fallbacks too) are
+    // ambiguous by title, case-insensitively; one exact title still wins over
+    // a substring of the other.
+    SessionInfo a, b, c;
+    a.id = "aaaa1111"; a.title = "Fix the parser"; a.path = "/x/a.jsonl"; a.cwd = "/work/alpha";
+    b.id = "bbbb2222"; b.title = "fix the parser"; b.path = "/x/b.jsonl"; b.cwd = "/work/alpha";
+    c.id = "cccc3333"; c.title = "Fix the parser tests"; c.path = "/x/c.jsonl"; c.cwd = "/work/alpha";
+    auto titled = [a, b, c];
+    threw = false;
+    try resolve("FIX THE PARSER", titled);
+    catch (HistoryError e)
+    {
+        threw = true;
+        assert(e.msg.canFind("ambiguous") && e.msg.canFind("aaaa1111") && e.msg.canFind("bbbb2222")
+            && !e.msg.canFind("cccc3333"), e.msg);
+    }
+    assert(threw, "duplicate titles are ambiguous, not first-wins");
+    assert(resolve("fix the parser tests", titled).id == "cccc3333", "one exact title beats the substring matches");
+
     // Workspace check: same tree or below it is fine, a sibling is not.
     assert(inWorkspace("/work/alpha", "/work/alpha"));
     assert(inWorkspace("/work/alpha/sub", "/work/alpha"));
@@ -248,11 +313,15 @@ unittest
     Policy p;
     assert(readDenied(p, live, "/work/alpha") is null);
     assert(readDenied(p, done, "/work/alpha") is null, "no rules: another workspace is still allowed");
-    import nano.permissions : parseRule;
     p.deny = [parseRule("Read(" ~ dir ~ "/sess-done.jsonl)")];
     auto denied = readDenied(p, done, "/work/alpha");
     assert(denied !is null && denied.canFind("denies read_file"), denied is null ? done.path : denied);
     assert(readDenied(p, live, "/work/alpha") is null, "a session in the workspace skips the policy");
+
+    // Default-ask: a foreign session needs confirmation, an in-workspace one doesn't.
+    assert(needsConfirmation(done, "/work/alpha"));
+    assert(!needsConfirmation(live, "/work/alpha"));
+    assert(confirmQuestion(done).canFind("sess-done") && confirmQuestion(done).canFind("/work/beta"));
 
     liveLog.close();
 }

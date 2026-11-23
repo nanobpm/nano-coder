@@ -54,8 +54,11 @@ bool consumesHint(const ref Message m) pure @safe
     return false;
 }
 
-ToolDefinition[] definitions() pure
+ToolDefinition[] definitions(bool crossSession = true) pure
 {
+    // Without cross-session history the schemas keep their previous shape
+    // (issue #271): no `session` property is advertised at all.
+    immutable sessionProp = `,"session":{"type":"string","description":"Read another session: its id, a unique id prefix, or a title from sessions_list. Omit for this session."}`;
     return [
         ToolDefinition(searchTool,
             "Search the original messages of this session, including those folded into a compaction summary. "
@@ -64,10 +67,10 @@ ToolDefinition[] definitions() pure
             ~ "phrase, an identifier, a flag) over common words, and use order=oldest for things from early on. "
             ~ "An assistant message that follows tool output is often a paraphrase: read the output it names. "
             ~ "Results are history, not the current state of files.",
-            parseJSON(`{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression (case-insensitive); plain text works too"},"role":{"type":"string","enum":["user","assistant","tool"],"description":"Only messages with this role. Command output and errors are in tool messages; omit role to search everything"},"before":{"type":"integer","description":"Only messages with an ID below this"},"after":{"type":"integer","description":"Only messages with an ID above this"},"order":{"type":"string","enum":["newest","oldest"],"description":"Result order (default newest first)"},"limit":{"type":"integer","description":"Maximum messages returned (default 20, max 100)"},"session":{"type":"string","description":"Read another session: its id, a unique id prefix, or a title from sessions_list. Omit for this session."}},"required":["pattern"]}`)),
+            parseJSON(`{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression (case-insensitive); plain text works too"},"role":{"type":"string","enum":["user","assistant","tool"],"description":"Only messages with this role. Command output and errors are in tool messages; omit role to search everything"},"before":{"type":"integer","description":"Only messages with an ID below this"},"after":{"type":"integer","description":"Only messages with an ID above this"},"order":{"type":"string","enum":["newest","oldest"],"description":"Result order (default newest first)"},"limit":{"type":"integer","description":"Maximum messages returned (default 20, max 100)"}` ~ (crossSession ? sessionProp : "") ~ `},"required":["pattern"]}`)),
         ToolDefinition(readTool,
             "Read one original message of this session in full by its ID (#N from a summary or history_search).",
-            parseJSON(`{"type":"object","properties":{"id":{"type":"integer","description":"Message ID (the N in #N)"},"max_output_length":{"type":"integer","description":"Maximum characters to return (default 40000)"},"session":{"type":"string","description":"Read another session: its id, a unique id prefix, or a title from sessions_list. Omit for this session."}},"required":["id"]}`)),
+            parseJSON(`{"type":"object","properties":{"id":{"type":"integer","description":"Message ID (the N in #N)"},"max_output_length":{"type":"integer","description":"Maximum characters to return (default 40000)"}` ~ (crossSession ? sessionProp : "") ~ `},"required":["id"]}`)),
     ];
 }
 
@@ -121,6 +124,18 @@ unittest // escaped_type_reaches_the_decoder
     scope (exit) remove(p);
     auto es = load(p);
     assert(es.length == 1 && es[0].message.content == "out");
+}
+
+/// One message record parsed from a streamed line, or none when the line is
+/// not a decodable message record.
+private bool messageLine(const(char)[] line, out Message m)
+{
+    import nano.session : messageFromRecord;
+    if (!line.canFind(`"message"`)) return false; // cheap pre-filter; any JSON spacing is valid
+    auto rec = parseJSON(line);
+    if (rec["type"].str != "message") return false;
+    m = messageFromRecord(rec["data"]);
+    return true;
 }
 
 string roleName(Role r) pure @safe
@@ -223,23 +238,36 @@ string search(string path, JSONValue args)
             if (o.str == "oldest") oldestFirst = true;
             else if (o.str != "newest") throw new HistoryError(format(`order must be "newest" or "oldest", not "%s"`, o.str));
         }
-    auto messages = load(path);
-    size_t[] order;
-    foreach (i; 0 .. messages.length) order ~= oldestFirst ? i : messages.length - 1 - i;
+    // Stream the log (issue #271): only the `limit` newest/oldest hits are
+    // retained, plus the run of tool messages before one assistant hit, so a
+    // huge session's search stays bounded no matter its size.
+    import nano.session : foreachLogLineSkippingTorn;
+    import std.algorithm : min;
     string[] hits;
     size_t total;
     ulong omitFirst = ulong.max, omitLast;
     size_t[string] hidden;
-    foreach (i; order)
-    {
-        auto id = messages[i].id;
-        auto m = &messages[i].message;
-        if (m.role == Role.system || (before && id >= before) || (after && id <= after)) continue;
-        auto text = searchable(*m);
+    ulong[] pendingTools; // tool ids since the last non-tool message
+    struct Kept { ulong id; string line; }
+    Kept[] kept;
+    ulong n;
+    foreachLogLineSkippingTorn(path, (const(char)[] logLine) {
+        ++n;
+        Message m;
+        if (!messageLine(logLine, m)) return;
+        auto id = n;
+        if (m.role == Role.system || (before && id >= before) || (after && id <= after))
+        {
+            if (m.role != Role.tool) pendingTools = null;
+            return;
+        }
+        auto text = searchable(m);
         if (role.length && role != roleName(m.role))
         {
             if (!matchAll(text, re).empty) hidden[roleName(m.role)]++;
-            continue;
+            if (m.role != Role.tool) pendingTools = null;
+            else pendingTools ~= id;
+            return;
         }
         size_t count, shownUntil;
         size_t[2][] spans;
@@ -254,27 +282,48 @@ string search(string path, JSONValue args)
                 shownUntil = e + snippetChars;
             }
         }
-        if (!count) continue;
+        // The tools just before it: the run tracked above (reset below for
+        // this assistant message itself).
+        auto tools = pendingTools;
+        if (m.role == Role.tool) pendingTools ~= id;
+        else pendingTools = null;
+        if (!count) return;
         ++total;
-        if (hits.length >= limit)
-        {
-            if (id < omitFirst) omitFirst = id;
-            if (id > omitLast) omitLast = id;
-            continue;
-        }
-        auto line = label(id, *m);
+        auto line = label(id, m);
         if (count > 1) line ~= format(" [%s matches]", count);
         if (m.role == Role.assistant)
         {
-            ulong[] tools;
-            for (auto j = i; j > 0 && messages[j - 1].message.role == Role.tool; --j) tools ~= messages[j - 1].id;
             if (tools.length == 1) line ~= format(" [after tool output #%s]", tools[0]);
-            else if (tools.length > 1) line ~= format(" [after tool output #%s–#%s]", tools[$ - 1], tools[0]);
+            else if (tools.length > 1)
+                line ~= format(" [after tool output #%s–#%s]", tools[0], tools[$ - 1]);
         }
         line ~= ":";
         foreach (sp; spans) line ~= " " ~ snippet(text, sp[0], sp[1]);
-        hits ~= line;
-    }
+        if (oldestFirst)
+        {
+            if (kept.length < limit) kept ~= Kept(id, line);
+            else
+            {
+                if (id < omitFirst) omitFirst = id;
+                if (id > omitLast) omitLast = id;
+            }
+        }
+        else
+        {
+            kept ~= Kept(id, line);
+            if (kept.length > limit)
+            {
+                foreach (drop; kept[0 .. $ - limit])
+                {
+                    if (drop.id < omitFirst) omitFirst = drop.id;
+                    if (drop.id > omitLast) omitLast = drop.id;
+                }
+                kept = kept[$ - limit .. $].dup;
+            }
+        }
+    });
+    if (oldestFirst) foreach (ref k; kept) hits ~= k.line;
+    else foreach_reverse (ref k; kept) hits ~= k.line;
     string hiddenNote;
     if (hidden.length)
     {
@@ -314,13 +363,22 @@ string read(string path, JSONValue args)
         if (n <= 0) throw new HistoryError("max_output_length must be a positive integer");
         limit = min(toSize(n), maxOutputLimit);
     }
-    auto messages = load(path);
-    const(Entry)* found;
-    foreach (ref e; messages) if (e.id == id) found = &e;
-    if (found is null)
-        throw new HistoryError(format("no message #%s in this session (IDs are log lines; the latest is #%s)", id,
-            messages.length ? messages[$ - 1].id : 0));
-    auto m = &found.message;
+    // Stream the log (issue #271): only the target message is retained, so
+    // reading one message from a huge session stays bounded.
+    import nano.session : foreachLogLineSkippingTorn;
+    Message found;
+    bool have;
+    ulong latest, n;
+    foreachLogLineSkippingTorn(path, (const(char)[] logLine) {
+        ++n;
+        Message m;
+        if (!messageLine(logLine, m)) return;
+        latest = n;
+        if (n == id) { found = m; have = true; }
+    });
+    if (!have)
+        throw new HistoryError(format("no message #%s in this session (IDs are log lines; the latest is #%s)", id, latest));
+    auto m = &found;
     if (m.role == Role.system) throw new HistoryError(format("message #%s is a system message and cannot be read", id));
     auto text = label(id, *m) ~ "\n";
     // Reasoning models may carry their content only in thinking blocks; other
@@ -405,4 +463,19 @@ unittest
 
     assert(looksFailed("bash", true, "out\nExit code: 2") && !looksFailed("bash", true, "fine"));
     assert(looksFailed("read_file", false, "") && !looksFailed(searchTool, false, ""));
+
+    // A compressed log streams through the same search/read (issue #271):
+    // gunzip as it is read, never inflated whole.
+    import nano.session : gzipLog, logText;
+    import std.file : rename, write;
+    auto gzPath = log.path ~ ".gz";
+    write(gzPath, gzipLog(logText(log.path)));
+    // The plain twin wins when both exist, so move the plain one away.
+    rename(log.path, log.path ~ ".bak");
+    auto gzSearch = search(gzPath, parseJSON(`{"pattern":"fixed"}`));
+    assert(gzSearch.canFind("#6 assistant"), gzSearch);
+    assert(read(gzPath, parseJSON(`{"id":"#4"}`)).canFind("cargo test auth"));
+    assert(load(gzPath).length == 6, "the archive streams like the plain log: " ~ load(gzPath).length.to!string);
 }
+
+

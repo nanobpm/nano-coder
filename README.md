@@ -1188,10 +1188,14 @@ take an optional `session` argument:
 Reads are read-only and bounded: the other session's log is streamed like the current one
 (never loaded whole, same byte caps), and a live session's log is only read — never locked,
 moved or rewritten. A session whose working directory is the current workspace (or below
-it) may be read outright; one from another directory goes through the permission policy as
-a read of that log (default ask, so a `Read(...)` deny rule still hides it). With
-`cross_session_history = false` there is no `sessions_list` tool, the `session` argument is
-refused, and other sessions' logs are never opened.
+it) may be read outright. Reading one from another directory asks for confirmation first
+(default ask): a question offers to allow it, a non-Yes answer refuses the read, and a
+headless run (no one to ask) refuses it closed. The permission policy still applies as a
+read of that log, so a `Read(...)` deny rule hides the session from `sessions_list`
+entirely — its title and first request are never shown. With
+`cross_session_history = false` there is no `sessions_list` tool, the history tools are
+advertised without the `session` argument (and refuse it if called with one), and other
+sessions' logs are never opened.
 
 To judge whether it helps, the log records each compaction's `mode`, `model` and the
 `summarized` line range (on the `replace` record), and each turn's `history_calls` (on

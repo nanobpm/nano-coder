@@ -145,6 +145,153 @@ ubyte[] gzipLog(const(ubyte)[] text) @trusted
     return out_[0 .. used].dup;
 }
 
+/// Feed every committed (newline-terminated) line of the log at `path` to
+/// `sink`, without holding the whole log: a plain log is read in 64 KiB
+/// chunks and a compressed one is inflated as it is read (issue #271: the
+/// history tools and the session index must stay bounded on a huge log, so
+/// they stream instead of `logText`-ing it whole). A trailing partial line
+/// (a torn write) is not committed and never reaches `sink`, matching
+/// `committedLines`.
+void streamLogLines(string path, scope void delegate(const(char)[] line) @safe sink)
+{
+    import std.stdio : File;
+    auto f = File(path, "rb");
+    scope (exit) f.close();
+    ubyte[] carry;
+    if (isCompressedLog(path))
+    {
+        auto gz = GunzipStream(path);
+        scope (exit) gz.close();
+        auto buf = new ubyte[](64 * 1024);
+        for (;;)
+        {
+            auto got = gz.read(f, buf);
+            if (!got.length) break;
+            feedChunk(carry, got, sink);
+        }
+    }
+    else
+    {
+        auto buf = new ubyte[](64 * 1024);
+        for (;;)
+        {
+            auto got = f.rawRead(buf);
+            if (!got.length) break;
+            feedChunk(carry, got, sink);
+        }
+    }
+}
+
+/// Split one chunk into newline-terminated lines for `sink`, carrying a
+/// partial line over to the next chunk (a torn tail is dropped).
+private void feedChunk(ref ubyte[] carry, const(ubyte)[] chunk, scope void delegate(const(char)[]) @safe sink)
+{
+    size_t start;
+    foreach (i, b; chunk)
+        if (b == '\n')
+        {
+            emitLine(carry, chunk[start .. i], sink);
+            start = i + 1;
+        }
+    if (start < chunk.length) carry ~= chunk[start .. $];
+}
+
+/// One line split out of the stream: the carried prefix plus the chunk
+/// slice, validated as UTF-8 (a malformed line is lossy-copied so a bad byte
+/// can't kill the stream; it fails to parse where decoded, as before).
+private void emitLine(ref ubyte[] carry, const(ubyte)[] tail, scope void delegate(const(char)[]) @safe sink)
+{
+    import nano.safeio : lossyText, utf8View;
+    import std.utf : UTFException;
+    const(ubyte)[] line = carry.length ? carry ~ tail : tail;
+    carry = null;
+    try sink(utf8View(line));
+    catch (UTFException) sink(lossyText(line));
+}
+
+/// An incremental gzip reader over a log file: the gzip wrapper needs raw
+/// inflate with windowBits 31, like `gunzipLog`, but the plain and
+/// compressed bytes stay bounded to their read buffers.
+private struct GunzipStream
+{
+    import std.stdio : File;
+    import nano.safeio : InflateStream;
+    private InflateStream zs;
+    private ubyte[] inBuf;
+    private string path;
+    private bool ended;
+
+    /// A reader over the log at `path`.
+    this(string path) { this.path = path; }
+
+    /// The next inflated bytes (a copy of `buf`'s filled prefix); empty at
+    /// the stream's end. Throws on a corrupt or truncated stream.
+    ubyte[] read(ref File f, ubyte[] buf)
+    {
+        if (ended) return null;
+        if (zs.isNone) zs = InflateStream.open(path);
+        if (!inBuf) inBuf = new ubyte[](64 * 1024);
+        for (;;)
+        {
+            if (zs.availIn == 0)
+            {
+                auto got = f.rawRead(inBuf);
+                if (!got.length) throw new Exception("gunzip " ~ path ~ ": truncated stream");
+                zs.feed(got, zlibWindow(got.length));
+            }
+            auto rc = zs.inflateInto(buf, zlibWindow(buf.length));
+            immutable used = buf.length - zs.availOut;
+            if (rc == InflateStream.Rc.streamEnd)
+            {
+                ended = true;
+                return used ? buf[0 .. used].dup : null;
+            }
+            if (rc == InflateStream.Rc.error)
+                throw new Exception("gunzip " ~ path ~ ": " ~ zs.errorMessage);
+            if (used) return buf[0 .. used].dup;
+            // Z_BUF_ERROR with no output means zlib can make no progress: with
+            // input still buffered that is a stuck stream, not a read more.
+            if (zs.availIn) throw new Exception("gunzip " ~ path ~ ": corrupt stream (no progress)");
+            // else zlib wants more input; loop to read it.
+        }
+    }
+
+    /// End the zlib stream (idempotent).
+    void close()
+    {
+        zs.close();
+    }
+}
+
+/// `streamLogLines`, skipping a torn or corrupt line like the resume loader
+/// does (one shared try/catch so every caller streams).
+void foreachLogLineSkippingTorn(string path, scope void delegate(const(char)[]) @safe sink)
+{
+    try
+        streamLogLines(path, sink);
+    catch (Exception) {} // a torn or corrupt line is skipped, like the resume loader does
+}
+
+/// The working directory recorded in the log's header (null for older logs
+/// or an unreadable header), read from the first line only (issue #271:
+/// `sessions_list` checks a session's workspace before its log is opened or
+/// its cached metadata shown, so the check must not read the log whole).
+string logHeaderCwd(string path)
+{
+    string cwd;
+    bool first = true;
+    foreachLogLineSkippingTorn(path, (line) {
+        if (!first) return;
+        first = false;
+        auto h = parseJSON(line);
+        if (h["type"].str != "session") return;
+        auto d = h["data"].objectNoRef;
+        if (auto c = "cwd" in d)
+            if (c.type == JSONType.string) cwd = c.str;
+    });
+    return cwd;
+}
+
 /// The session log directory: `NANO_CODER_SESSIONS`, else the configured
 /// `session_dir` (`~` expanded), else the platform data folder.
 string sessionDir(string configured = null)

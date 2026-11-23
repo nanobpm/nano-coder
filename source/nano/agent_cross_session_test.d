@@ -18,6 +18,7 @@ import nano.option : some, unwrap;
 import nano.permissions : Policy, parseRule;
 import nano.providers.mock : MockClient;
 import nano.session : SessionLog;
+import nano.safeio : jsonText;
 import nano.tools : ToolRegistry;
 import ctx = nano.context;
 import hist = nano.session_history;
@@ -133,13 +134,26 @@ unittest
     agent.crossSessionHistory = false;
     assert(!agent.offeredTools.any!(d => d.name == hist.sessionsTool), "no sessions_list with the setting off");
     assert(agent.offeredTools.any!(d => d.name == hist.searchTool), "the history tools stay");
+    // The advertised schemas keep their previous shape: no `session` property.
+    foreach (d; agent.offeredTools)
+        if (d.name == hist.searchTool || d.name == hist.readTool)
+            assert(!d.parameters.jsonText.canFind(`"session"`), d.name ~ " still advertises session: " ~ d.parameters.jsonText);
+    // And with the setting on, both advertise it.
+    agent.crossSessionHistory = true;
+    foreach (d; agent.offeredTools)
+        if (d.name == hist.searchTool || d.name == hist.readTool)
+            assert(d.parameters.jsonText.canFind(`"session"`), d.name ~ " lost its session property");
 
+    agent.crossSessionHistory = false;
     agent.run("search the other session", new NullEvents);
     assert(lastToolResult(mock).canFind("cross_session_history = false"), lastToolResult(mock));
 }
 
 // A session from another working directory goes through the permission
-// policy as a read of its log: a Read deny rule blocks it.
+// policy as a read of its log: a Read deny rule hides it from discovery
+// entirely (no cached title or first request leaks), and without a rule the
+// cross-workspace read asks the user first — a non-Yes answer fails closed,
+// an explicit Yes lets it through.
 unittest
 {
     auto root = buildPath(tempDir, "nano-d-xs-perm");
@@ -155,19 +169,68 @@ unittest
     auto other = finishedLog(root, "sess-other", elsewhere, "secret work", "the launch codes");
 
     auto mock = new MockClient([LLMResponse("ok"), LLMResponse("SUMMARY (#2–#3)"),
-        call("s1", hist.searchTool, `{"pattern":"launch codes","session":"sess-other"}`), LLMResponse("blocked"),
-        call("s2", hist.searchTool, `{"pattern":"launch codes","session":"sess-other"}`), LLMResponse("allowed")]);
+        call("l1", hist.sessionsTool, `{}`), LLMResponse("listed"),
+        call("s1", hist.searchTool, `{"pattern":"launch codes","session":"sess-other"}`), LLMResponse("hidden"),
+        call("s2", hist.searchTool, `{"pattern":"launch codes","session":"sess-other"}`), LLMResponse("declined"),
+        call("s3", hist.searchTool, `{"pattern":"launch codes","session":"sess-other"}`), LLMResponse("allowed")]);
     auto agent = compacted(root, workspace, mock);
     agent.policy.deny = [parseRule("Read(" ~ root ~ "/sessions/sess-other.jsonl)")];
 
-    agent.run("search the other session", new NullEvents);
-    assert(lastToolResult(mock).canFind("denies read_file"), lastToolResult(mock));
+    // Denied: sessions_list never shows it (its title stays hidden), and
+    // resolving it by id fails as "no session matches", not with its metadata.
+    agent.run("list the sessions", new NullEvents);
+    assert(!lastToolResult(mock).canFind("sess-other") && !lastToolResult(mock).canFind("secret work"), lastToolResult(mock));
+    agent.run("search the denied session", new NullEvents);
+    assert(lastToolResult(mock).canFind("no session matches"), lastToolResult(mock));
 
-    // Without the rule, reading another workspace's log is allowed (the
-    // policy's default ask resolves under the caller's sandbox decision).
+    // Allowed by the policy but foreign: the read asks first; a "No" answer
+    // fails closed. The broker is resolved from a spawned answerer like the
+    // UI's key reader does.
+    import nano.question : Answer, Answered, QuestionBroker;
+    import nano.safeio : spawn;
+    import nano.clock : sleepFor;
+    import std.datetime : msecs;
     agent.policy.deny = null;
+    agent.questions = QuestionBroker.make;
+    agent.questions.interactive = true;
+    static void answer(QuestionBroker b, string a)
+    {
+        while (b.pending is null) sleepFor(1.msecs);
+        b.resolve(Answer(Answered([a])));
+    }
+    auto no = spawn(&answer, agent.questions, "No");
+    agent.run("search the other session", new NullEvents);
+    no.join();
+    assert(lastToolResult(mock).canFind("not confirmed"), lastToolResult(mock));
+
+    // A Yes answer lets the read through.
+    auto yes = spawn(&answer, agent.questions, "Yes");
     agent.run("search again", new NullEvents);
+    yes.join();
     assert(lastToolResult(mock).canFind("the launch codes"), lastToolResult(mock));
+}
+
+// Headless (no answerer), a cross-workspace read fails closed rather than
+// exposing the log.
+unittest
+{
+    auto root = buildPath(tempDir, "nano-d-xs-headless");
+    if (root.exists) rmdirRecurse(root);
+    scope (exit) rmdirRecurse(root);
+    auto workspace = buildPath(root, "work");
+    auto elsewhere = buildPath(root, "elsewhere");
+    mkdirRecurse(workspace);
+    mkdirRecurse(elsewhere);
+    auto prevCwd = getcwd();
+    chdir(workspace);
+    scope (exit) chdir(prevCwd);
+    finishedLog(root, "sess-other", elsewhere, "secret work", "the launch codes");
+
+    auto mock = new MockClient([LLMResponse("ok"), LLMResponse("SUMMARY (#2–#3)"),
+        call("s1", hist.searchTool, `{"pattern":"launch codes","session":"sess-other"}`), LLMResponse("blocked")]);
+    auto agent = compacted(root, workspace, mock);
+    agent.run("search the other session", new NullEvents);
+    assert(lastToolResult(mock).canFind("not confirmed"), lastToolResult(mock));
 }
 
 // A large log is searched within the module's time budget: the search

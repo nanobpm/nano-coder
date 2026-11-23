@@ -185,6 +185,108 @@ LockResult tryLockFile(string path) @trusted nothrow
 private extern (C) pragma(mangle, "flock") int flockFd(int, int) nothrow @nogc @system;
 private enum flockEx = 2, flockNb = 4;
 
+/// An incremental gzip inflate stream (issue #271: history and the session
+/// index stream a compressed log instead of inflating it whole). The zlib
+/// state is heap-allocated C data owned between `open` and `close`; every
+/// method writes only within the caller's buffers (sizes tracked in
+/// avail_in/avail_out), so the struct is memory safe to drive from @safe
+/// code through these small @trusted wrappers.
+struct InflateStream
+{
+    private void* zs; // etc.c.zlib z_stream
+
+    /// How one `inflateInto` ended.
+    enum Rc { ok, streamEnd, error }
+
+    /// Whether the stream was never opened (or closed already).
+    bool isNone() const pure @safe nothrow { return zs is null; }
+
+    /// A gzip inflate stream; throws when zlib can't start.
+    static InflateStream open(string path)
+    {
+        import etc.c.zlib : z_stream, inflateInit2;
+        // zlib's C API writes only within the caller's buffers; the stream
+        // struct is plain C data, heap-allocated so the caller holds a
+        // pointer, not the raw struct.
+        auto p = () @trusted {
+            auto z = new z_stream;
+            if (inflateInit2(z, 15 + 16) != 0 /* Z_OK */)
+                throw new Exception("inflate init failed for " ~ path);
+            return cast(void*) z;
+        }();
+        return InflateStream(p);
+    }
+
+    /// End the zlib stream (idempotent).
+    void close()
+    {
+        import etc.c.zlib : z_stream, inflateEnd;
+        if (zs is null) return;
+        // inflateEnd touches only the stream struct.
+        () @trusted { inflateEnd(cast(z_stream*) zs); }();
+        zs = null;
+    }
+
+    /// Compressed bytes still waiting to be consumed.
+    uint availIn()
+    {
+        import etc.c.zlib : z_stream;
+        // Reads one field of the C struct.
+        return (() @trusted => (cast(z_stream*) zs).avail_in)();
+    }
+
+    /// Room left in the last output buffer.
+    uint availOut()
+    {
+        import etc.c.zlib : z_stream;
+        // Reads one field of the C struct.
+        return (() @trusted => (cast(z_stream*) zs).avail_out)();
+    }
+
+    /// Point the stream at the next compressed bytes (caller-owned).
+    void feed(scope const(ubyte)[] data, uint n)
+    {
+        import etc.c.zlib : z_stream;
+        // Stores the caller's pointer in the C struct; zlib only reads it,
+        // and the data outlives the call (the caller feeds it from its own
+        // buffer, which stays put until the stream ends).
+        () @trusted {
+            auto z = cast(z_stream*) zs;
+            z.next_in = data.ptr;
+            z.avail_in = n;
+        }();
+    }
+
+    /// Inflate into the caller's buffer; the filled size is
+    /// `buf.length - availOut`.
+    Rc inflateInto(scope ubyte[] buf, uint n)
+    {
+        import etc.c.zlib : z_stream, inflate, Z_NO_FLUSH, Z_STREAM_END, Z_OK, Z_BUF_ERROR;
+        // zlib writes only within buf[0 .. n].
+        auto rc = () @trusted {
+            auto z = cast(z_stream*) zs;
+            z.next_out = buf.ptr;
+            z.avail_out = n;
+            return inflate(z, Z_NO_FLUSH);
+        }();
+        if (rc == Z_STREAM_END) return Rc.streamEnd;
+        if (rc == Z_OK || rc == Z_BUF_ERROR) return Rc.ok;
+        return Rc.error;
+    }
+
+    /// zlib's error text after `Rc.error`.
+    string errorMessage()
+    {
+        import etc.c.zlib : z_stream;
+        import core.stdc.string : strlen;
+        // msg is a NUL-terminated C string owned by zlib; copied here.
+        auto msg = (() @trusted => (cast(z_stream*) zs).msg)();
+        if (msg is null) return "corrupt stream";
+        // strlen counts the NUL terminator zlib guarantees.
+        return (() @trusted => msg[0 .. strlen(msg)].idup)();
+    }
+}
+
 /// The mode `open(2)` gives a new file created with 0666: 0666 less the
 /// process umask, read once at startup (reading it means setting it, which
 /// is only safe before other threads exist).
