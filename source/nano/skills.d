@@ -1081,9 +1081,14 @@ unittest // the_no_change_check_on_50_skills_is_cheap
     auto s = Skills.discoverIn(dir, c, locs(dir));
     assert(s.skills.length == 50);
     enum runs = 20;
-    auto t0 = monoNow;
+    // Deterministic cost check: the no-change path reads no SKILL.md file.
+    auto reads = skillFileReads;
+    debug (benchSkills) auto t0 = monoNow;
     foreach (_; 0 .. runs) assert(!s.stale(dir, c, locs(dir)));
-    auto per = (monoNow - t0) / runs;
-    debug (benchSkills) { import std.stdio : writeln; writeln("skills no-change check, 50 skills: ", per); }
-    assert(per.total!"msecs" < 50, per.toString);
+    assert(skillFileReads == reads);
+    debug (benchSkills)
+    {
+        import std.stdio : writeln;
+        writeln("skills no-change check, 50 skills: ", (monoNow - t0) / runs);
+    }
 }
