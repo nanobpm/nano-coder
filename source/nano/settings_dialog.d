@@ -272,16 +272,17 @@ private bool editContext(SettingsUi ui, ref SettingsHost h)
         }
     }
     auto m = ui.select("Compaction mode", ["standard: summary only",
-        "smart: summary cites the session log; history tools recover originals"],
-        cfg.compactionMode == "smart" ? 1 : 0);
+        "smart: summary cites the session log; history tools recover originals",
+        "extract: like smart, but the summary is built in code (no model call, instant)"],
+        cfg.compactionMode == "extract" ? 2 : cfg.compactionMode == "smart" ? 1 : 0);
     if (m < 0) return false;
     auto w = ui.input("Context window in tokens (0 = from provider/model)", format("%s", cfg.contextWindow));
     long window;
     if (w is null || !parseCount(w, window)) return false;
     cfg.autoCompact = a.autoCompact = auto_;
     cfg.autoCompactThreshold = a.autoCompactThreshold = threshold;
-    cfg.compactionMode = m == 1 ? "smart" : "standard";
-    a.compactionMode = m == 1 ? CompactionMode.smart : CompactionMode.standard;
+    cfg.compactionMode = m == 2 ? "extract" : m == 1 ? "smart" : "standard";
+    a.compactionMode = m == 2 ? CompactionMode.extract : m == 1 ? CompactionMode.smart : CompactionMode.standard;
     cfg.contextWindow = window;
     auto pc = a.client.providerName in cfg.providers;
     a.setConfiguredWindow(window > 0 ? ConfiguredWindow(toSize(window), "context_window in config")

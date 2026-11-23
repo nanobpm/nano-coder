@@ -1037,11 +1037,16 @@ def self_test_verdict(results):
             if not (r["passed"] and r["kept"]):
                 problems.append(f"{r['case']} {mode}: pinned detail should survive and pass "
                                 f"(passed={r['passed']} kept={r['kept']})")
-        elif r["kept"]:
+        elif r["kept"] and bare_mode != "extract":
             problems.append(f"{r['case']} {mode}: the detail survived a lossy summary?")
         elif bare_mode == "standard" and (r["passed"] or r["history_calls"]):
             problems.append(f"{r['case']} {mode}: passed={r['passed']} history_calls={r['history_calls']}")
         elif bare_mode == "smart" and not (r["passed"] and r["history_calls"]):
+            problems.append(f"{r['case']} {mode}: passed={r['passed']} history_calls={r['history_calls']}")
+        elif bare_mode == "extract" and not r["passed"]:
+            # The extract summary is built in code, not by the lossy fake
+            # model, so it may keep the detail itself; either way the
+            # oracle must answer (from the summary or the history tools).
             problems.append(f"{r['case']} {mode}: passed={r['passed']} history_calls={r['history_calls']}")
     print("\nself-test:", "OK" if not problems else "FAILED\n  " + "\n  ".join(problems))
     return 1 if problems else 0

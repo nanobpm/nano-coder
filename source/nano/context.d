@@ -82,9 +82,22 @@ string smartSummaryNote(ulong first, ulong last) pure
 }
 
 /// How compaction treats the history it folds away.
-enum CompactionMode { standard, smart }
+/// `extract` is smart compaction whose summary is built in code, with no
+/// model call (nano.extract, issue #273).
+enum CompactionMode { standard, smart, extract }
 
-string modeName(CompactionMode m) pure { return m == CompactionMode.smart ? "smart" : "standard"; }
+string modeName(CompactionMode m) pure
+{
+    final switch (m)
+    {
+        case CompactionMode.standard: return "standard";
+        case CompactionMode.smart: return "smart";
+        case CompactionMode.extract: return "extract";
+    }
+}
+
+/// Whether `m` keeps the session log's originals reachable (history tools).
+bool citesHistory(CompactionMode m) pure { return m != CompactionMode.standard; }
 
 /// The mode named `s` (any case), or none.
 Option!CompactionMode parseCompactionMode(string s) pure
@@ -94,6 +107,7 @@ Option!CompactionMode parseCompactionMode(string s) pure
     {
         case "standard": return some(CompactionMode.standard);
         case "smart": return some(CompactionMode.smart);
+        case "extract": return some(CompactionMode.extract);
         default: return Option!CompactionMode.init;
     }
 }

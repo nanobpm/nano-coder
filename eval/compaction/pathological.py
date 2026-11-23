@@ -249,10 +249,15 @@ def check(case, mode, records, seeded):
             problems.append(f"compaction {k} wrote an empty summary")
             continue
         sizes.append(len(summary))
-        if case.get("expect_fallback"):
+        if case.get("expect_fallback") and mode.startswith("extract"):
+            # Extract makes no model call, so a failing model can't fail it:
+            # it must write its normal summary.
+            if NO_SUMMARY in summary:
+                problems.append(f"compaction {k}: extract fell back, but it needs no model")
+        elif case.get("expect_fallback"):
             if NO_SUMMARY not in summary:
                 problems.append(f"compaction {k}: a failed or empty summary was not reported as missing")
-            if mode.startswith("smart") and "history_read" not in summary and "history_search" not in summary:
+            if not mode.startswith("standard") and "history_read" not in summary and "history_search" not in summary:
                 problems.append(f"compaction {k}: the fallback note doesn't point at the history tools")
         elif NO_SUMMARY in summary:
             problems.append(f"compaction {k} fell back unexpectedly")

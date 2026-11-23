@@ -27,6 +27,7 @@ static import nano.emoji;
 static import nano.emoji_table;
 static import nano.frame;
 static import nano.frameui;
+static import nano.extract;
 static import nano.goal;
 static import nano.guard;
 static import nano.herdr;
@@ -119,6 +120,7 @@ private alias modules = imported!"std.meta".AliasSeq!(
     nano.emoji_table,
     nano.frame,
     nano.frameui,
+    nano.extract,
     nano.goal,
     nano.guard,
     nano.herdr,

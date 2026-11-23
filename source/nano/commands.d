@@ -24,7 +24,7 @@ struct Command
 
 immutable Command[] commands = [
     Command("/help", "", "Show this help"),
-    Command("/compact", "[--smart|--standard] [focus]", "Summarize older messages to free context (optional mode and focus)"),
+    Command("/compact", "[--smart|--standard|--extract] [focus]", "Summarize older messages to free context (optional mode and focus)"),
     Command("/context", "", "Show context-window use and token totals"),
     Command("/settings", "", "View/edit settings"),
     Command("/verbosity", "[quiet|normal|verbose|debug]", "Show or set output detail"),
@@ -52,7 +52,7 @@ immutable Command[] commands = [
     Command("/quit", "", "Exit the agent (alias for /exit)"),
 ];
 
-/// `/compact` arguments: an optional `--smart`/`--standard`, then a focus.
+/// `/compact` arguments: an optional `--smart`/`--standard`/`--extract`, then a focus.
 /// Returns whether a mode was given.
 bool parseCompactArgs(string args, out CompactionMode mode, out string focus) pure
 {
@@ -63,6 +63,7 @@ bool parseCompactArgs(string args, out CompactionMode mode, out string focus) pu
     bool has = true;
     if (first == "--smart") mode = CompactionMode.smart;
     else if (first == "--standard") mode = CompactionMode.standard;
+    else if (first == "--extract") mode = CompactionMode.extract;
     else has = false;
     focus = has ? (sp < 0 ? "" : args[sp + 1 .. $].strip) : args;
     return has;
@@ -76,6 +77,7 @@ unittest
     assert(parseCompactArgs("--smart  the bug", m, f) && m == CompactionMode.smart && f == "the bug");
     assert(!parseCompactArgs("focus here", m, f) && f == "focus here");
     assert(parseCompactArgs("--standard", m, f) && m == CompactionMode.standard && f == "");
+    assert(parseCompactArgs("--extract x", m, f) && m == CompactionMode.extract && f == "x");
 }
 
 /// Why a submitted `/…` line can't be sent: its first word isn't a command.
