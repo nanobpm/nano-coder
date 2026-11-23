@@ -434,14 +434,10 @@ final class FrameRenderer
     // The logical transcript the frozen rows stand for: checked against the
     // incoming frame directly, since `prev[0 .. frozen]` may hold old editor
     // rows (after repeated shrinks) that no longer match the logical prefix.
-    // Stored as a SHA-256 digest rather than a copy of the whole scrollback
-    // `string[]` so shrinking the editor doesn't pin a second full transcript
-    // in memory (issue #310).
-    private ubyte[32] frozenHash;
-    // Cheap identity fingerprint of the same prefix (each row's ptr/length):
-    // the transcript cache shares backing strings across frames, so on the
-    // hot render path this matches and the SHA-256 content hash is skipped.
-    private ulong frozenIdHash;
+    // Kept as row slices (16 B per row, never the text): comparing them is
+    // a short-circuiting memcmp, far cheaper than hashing the scrollback on
+    // every render (PR review).
+    private string[] frozenText;
     // A row of `prev` whose predecessor still carries a terminal wrap flag
     // (it was a continuation, now blank at the top of the screen): the
     // physical join survives until the row is redrawn from scratch.
@@ -479,41 +475,8 @@ final class FrameRenderer
         out_(buf[]);
         prev = frame.dup;
         frozen = frozenLogical = 0;
-        frozenHash = (ubyte[32]).init;
-        frozenIdHash = 0;
+        frozenText = null;
         staleJoin = size_t.max;
-    }
-
-    /// Mixes each row's slice identity (pointer and length), not its bytes:
-    /// O(rows) word operations, used to skip `hashRows` when the frozen
-    /// prefix is the very same strings as last time.
-    private static ulong identityHash(const(string)[] rows) pure nothrow @nogc
-    {
-        ulong h = 0xcbf29ce484222325UL ^ rows.length;
-        foreach (r; rows)
-        {
-            h = (h ^ hashOf(r.length ? &r[0] : null)) * 0x100000001b3UL;
-            h = (h ^ r.length) * 0x100000001b3UL;
-            h ^= h >> 29;
-        }
-        return h;
-    }
-
-    /// SHA-256 over `rows` with length prefixes so boundaries are unambiguous.
-    private static ubyte[32] hashRows(const string[] rows) pure nothrow
-    {
-        import std.digest.sha : SHA256;
-        import std.bitmanip : nativeToLittleEndian;
-        import std.string : representation;
-        SHA256 sha;
-        sha.start();
-        foreach (r; rows)
-        {
-            auto len = nativeToLittleEndian(ulong(r.length));
-            sha.put(len[]);
-            sha.put(r.representation);
-        }
-        return sha.finish();
     }
 
     /// Rewrites from the first changed row. Rows that went into the
@@ -532,8 +495,7 @@ final class FrameRenderer
         if (frozen)
         {
             if (frame.length < frozenLogical || prev.length < frozen
-                || (identityHash(frame[0 .. frozenLogical]) != frozenIdHash
-                    && hashRows(frame[0 .. frozenLogical]) != frozenHash)
+                || frame[0 .. frozenLogical] != frozenText
                 || (gapAt != size_t.max && gapAt < frozenLogical))
                 return fullRedraw(inFrame, width, height);
             frame = prev[0 .. frozen] ~ frame[frozenLogical .. $];
@@ -579,8 +541,7 @@ final class FrameRenderer
                 shown[top + blank .. $] = frame[gapAt .. $];
                 frozen = top;
                 frozenLogical = logicalGap;
-                frozenHash = hashRows(inFrame[0 .. logicalGap]);
-                frozenIdHash = identityHash(inFrame[0 .. logicalGap]);
+                frozenText = inFrame[0 .. logicalGap].dup;
                 d = firstDiff(prev, shown);
                 if (d < 0) { prev = shown; return; }
             }
@@ -1444,7 +1405,7 @@ struct Transcript
     /// the bottom); their texts stay in `store`, so nothing is lost. When no
     /// fold is left to collapse, drop the oldest ordinary lines, and finally
     /// truncate the unfinished line: plain output is bounded the same way.
-    size_t byteCap = 8 << 20;
+    size_t byteCap = 16 << 20;
 
     /// Running total `bytesHeld` recomputes; kept in sync by every mutation
     /// so the cap checks are O(1) instead of walking every line.
@@ -2994,8 +2955,6 @@ unittest
 // Steady-state scrollback memory amplification (issue #310):
 // - sanitize() and wrapAnsi() share the original backing string when lines fit
 //   and need no sanitization, so Transcript.cache does not duplicate line text.
-// - FrameRenderer tracks frozen scrollback with a 32-byte hash rather than a
-//   second copy of the scrollback string[].
 unittest
 {
     import core.memory : GC;
@@ -3034,14 +2993,13 @@ unittest
     auto beforeShrink = GC.stats.allocatedInCurrentThread;
     r.render(rendered ~ ["e0"], 80, 24, rendered.length);
     auto shrinkAlloc = GC.stats.allocatedInCurrentThread - beforeShrink;
-    assert(r.frozen > 0 && r.frozenHash != (ubyte[32]).init);
-    // The identity fingerprint matches the shared rows (fast path) but not
-    // equal-content copies, which fall back to the content hash.
-    assert(FrameRenderer.identityHash(rendered) == r.frozenIdHash);
-    string[] copies;
-    foreach (x; rendered) copies ~= x.idup;
-    assert(FrameRenderer.identityHash(copies) != r.frozenIdHash);
-    // Differential shrink hashes the frozen prefix in place (32 bytes) instead
-    // of duplicating the scrollback string[].
+    assert(r.frozen > 0 && r.frozenText.length == rendered.length);
+    // Repeated renders over the large frozen region stay cheap: comparing the
+    // frozen slices allocates nothing proportional to the scrollback text.
+    auto beforeRepeat = GC.stats.allocatedInCurrentThread;
+    foreach (_; 0 .. 3) r.render(rendered ~ ["e0"], 80, 24, rendered.length);
+    auto repeatAlloc = GC.stats.allocatedInCurrentThread - beforeRepeat;
+    assert(repeatAlloc < 3 * 2 * 1024 * 1024, format("repeat renders allocated %s bytes", repeatAlloc));
+    // Differential shrink copies only slice headers, never the text.
     assert(shrinkAlloc < 2 * 1024 * 1024, format("expected < 2 MiB for shrink, got %s bytes", shrinkAlloc));
 }

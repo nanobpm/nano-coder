@@ -1032,7 +1032,7 @@ adds it to the message queue (one queued message runs per following turn; `/queu
 edits and removes them), and Esc Esc or Ctrl-C cancels the turn. The prompt supports
 editing: Left/Right move the cursor, Home/End (or Ctrl-A/Ctrl-E) jump to the start/end,
 Alt/Option-Left/Right (or Alt-B/Alt-F) move by word, and Up/Down recall submitted lines from
-the session's input history (Down past the newest restores what you were typing). The mouse is never captured, so the
+the session's input history (Down past the newest restores what you were typing; history keeps up to 200 entries and 512 KiB, and a single prompt over 512 KiB is not recalled). The mouse is never captured, so the
 terminal keeps its native behaviour — the wheel scrolls the scrollback and drag selects text. Backspace and Delete remove the character before/under the cursor, Ctrl-U clears the
 input, Ctrl-W deletes the word before the cursor, and Esc Esc (twice within a second)
 clears the whole input at the prompt. At the prompt between turns,

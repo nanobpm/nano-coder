@@ -31,6 +31,9 @@ struct InputHistory
     void record(string line) pure
     {
         if (!line.strip.length || (lines.length && lines[$ - 1] == line)) return;
+        // An entry over the whole budget is not kept at all: otherwise a huge
+        // paste would stay resident as the sole entry, unbounded.
+        if (entryCost(line) > maxBytes) return;
         lines ~= line;
         heldBytes += entryCost(line);
         size_t drop;
@@ -178,8 +181,12 @@ unittest
     big.record(chunk ~ "3");
     assert(big.lines.length == 2, "3 x 200 KiB exceeds 512 KiB cap; oldest evicted");
     assert(big.lines[0][$ - 1] == '2' && big.lines[1][$ - 1] == '3');
-    // A single entry larger than maxBytes is still kept as the sole entry.
+    // A single entry larger than maxBytes is not kept; earlier entries stay.
+    auto keptBefore = big.lines.dup;
     string huge = "y".replicate(InputHistory.maxBytes + 1024);
     big.record(huge);
-    assert(big.lines.length == 1 && big.lines[0] == huge);
+    assert(big.lines == keptBefore);
+    InputHistory solo;
+    solo.record(huge);
+    assert(solo.lines.length == 0);
 }
