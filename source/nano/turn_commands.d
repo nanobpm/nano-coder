@@ -48,6 +48,9 @@ Timing timing(string cmd) pure nothrow
     // `/thinking LEVEL` applies from the agent's next step; bare `/thinking`
     // lists the levels of the model in use, after the turn.
     if (name == "/thinking") return arg.length ? Timing.nextStep : Timing.afterTurn;
+    // `/subagents on|off` changes the next request's tools; `--save` writes
+    // the config, so it waits for the turn.
+    if (name == "/subagents" && (arg == "on" || arg == "off")) return Timing.nextStep;
     return Timing.afterTurn;
 }
 
@@ -101,6 +104,8 @@ unittest
         assert(timing("/mode") == immediate && timing("/mode plan") == nextStep);
         assert(timing("/model") == afterTurn && timing("/model mock/x") == nextStep);
         assert(timing("/thinking") == afterTurn && timing("/thinking high") == nextStep);
+        assert(timing("/subagents off") == nextStep && timing("/subagents on") == nextStep);
+        assert(timing("/subagents off --save") == afterTurn && timing("/subagents") == afterTurn);
         assert(timing("/compact") == afterTurn && timing("/restart") == afterTurn && timing("/resume") == afterTurn);
     }
     auto v = LiveView.make;

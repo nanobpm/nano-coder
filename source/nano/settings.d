@@ -18,7 +18,7 @@ import nano.result : toOption, unwrap;
 /// What a visit changed (each saved as its own key).
 struct Changes
 {
-    bool model, temperature, thinking, maxTokens, maxIterations, systemPrompt, compaction, verbosity;
+    bool model, temperature, thinking, maxTokens, maxIterations, systemPrompt, compaction, verbosity, subagents;
     bool[string] providerTemperatures, providerThinking, providers;
     /// "provider\0model" pairs.
     bool[string] modelTemperatures, modelThinking;
@@ -26,7 +26,7 @@ struct Changes
     bool any() pure const
     {
         return model || temperature || thinking || maxTokens || maxIterations || systemPrompt || compaction
-            || verbosity || providerTemperatures.length || providerThinking.length || providers.length
+            || verbosity || subagents || providerTemperatures.length || providerThinking.length || providers.length
             || modelTemperatures.length || modelThinking.length;
     }
 }
@@ -310,6 +310,7 @@ string applyChanges(string doc, const ref Config c, const ref Changes ch, const 
     if (ch.maxIterations) doc = tomlSet(doc, [], "max_iterations", format("%s", c.maxIterations));
     if (ch.systemPrompt) doc = tomlSet(doc, [], "system_prompt", tomlString(c.systemPrompt));
     if (ch.verbosity) doc = tomlSet(doc, [], "verbosity", tomlString(c.verbosity.vname));
+    if (ch.subagents) doc = tomlSet(doc, [], "subagents", c.subagents ? "true" : "false");
     // The retired `renderer` key (Rust #133) is dropped on any save.
     doc = tomlSet(doc, [], "renderer", null);
     if (ch.compaction)
@@ -347,6 +348,9 @@ void save(const ref Config c, const ref Changes ch, const ProviderConfig[string]
     doc = applyChanges(doc, c, ch, user);
     bool secret;
     foreach (ref p; user) if (p.apiKey.length) secret = true;
+    // The file may already hold inline keys of providers this save leaves
+    // alone; keep it private so a rewrite never widens their permissions.
+    foreach (ref p; c.providers) if (p.apiKey.length) secret = true;
     if (path.dirName.length) mkdirRecurse(path.dirName);
     auto tmp = path ~ ".tmp";
     write(tmp, doc);
@@ -527,4 +531,24 @@ unittest
     ch.model = true;
     save(c, ch, null, path);
     assert(readText(path) == "model = \"ollama/qwen3\"\n");
+}
+
+unittest
+{
+    // A save that touches no provider still keeps a file holding inline
+    // keys private (e.g. `/subagents off --save`).
+    import std.file : tempDir, remove, exists, getAttributes;
+    import std.path : buildPath;
+    import std.conv : octal;
+    auto path = buildPath(tempDir, "nano-settings-secret-test.toml");
+    scope (exit) if (path.exists) remove(path);
+    Config c;
+    ProviderConfig p;
+    p.apiKey = "k";
+    c.providers["box"] = p;
+    c.subagents = false;
+    Changes ch;
+    ch.subagents = true;
+    save(c, ch, null, path);
+    version (Posix) assert((getAttributes(path) & octal!7777) == octal!600);
 }

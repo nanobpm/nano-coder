@@ -432,6 +432,11 @@ string midTurnCommand(string text, MidTurn ctx)
                 control.requestModel(arg);
                 return format("Model switch to %s queued; applies at the next model call (the history carries over)", arg);
             }
+            if (name == "/subagents")
+            {
+                control.requestSubagents(arg == "on");
+                return format("Sub-agents %s queued; applies from the agent's next model request (running sub-agents finish)", arg);
+            }
             return null;
     }
 }
@@ -798,6 +803,72 @@ final class ConfigClients : imported!"nano.subagent".SubClientFactory
     private Config cfg;
     this(immutable Config cfg) immutable { this.cfg = cfg; }
     LLMClient make(string spec) const { return makeClient(resolve(cfg, spec)); }
+}
+
+/// Give `agent` sub-agents from `cfg`: clients from a frozen copy (so
+/// `/subagents on` works even when the config starts them off), the limits,
+/// and the `[[subagent_models]]` that resolve (each one that doesn't is
+/// reported on stderr when `report`: at startup, not on the later
+/// re-runs after a provider edit).
+void configureSubagents(Agent agent, const ref Config cfg, bool report)
+{
+    import nano.subagent : SubLimits, SubCandidate;
+    import nano.arith : toSize;
+    import nano.config : usableSubagentModels;
+    agent.subagentClients = new immutable ConfigClients(frozenConfig(cfg));
+    agent.subagentModel = cfg.subagentModel;
+    agent.subagentMaxConcurrency = cfg.subagentMaxConcurrency > 0 ? toSize(cfg.subagentMaxConcurrency) : 1;
+    SubLimits lim;
+    if (cfg.subagentTimeoutSecs > 0) lim.timeoutSecs = cfg.subagentTimeoutSecs;
+    if (cfg.subagentMaxTurns > 0) lim.turns = toSize(cfg.subagentMaxTurns);
+    if (cfg.subagentMaxTokens > 0) lim.tokens = cfg.subagentMaxTokens;
+    agent.subagentLimits = lim;
+    string[] warnings = cfg.warnings.dup;
+    immutable(SubCandidate)[] cands;
+    foreach (m; usableSubagentModels(cfg, warnings))
+    {
+        auto l = lim;
+        if (m.timeoutSecs > 0) l.timeoutSecs = m.timeoutSecs;
+        if (m.maxTurns > 0) l.turns = toSize(m.maxTurns);
+        if (m.maxTokens > 0) l.tokens = m.maxTokens;
+        cands ~= SubCandidate(m.model, m.use, l);
+    }
+    agent.subagentCandidates = cands;
+    if (report) foreach (w; warnings) stdErr.writeln("nano-coder: warning: ", terminalSafe(w));
+}
+
+/// Write `subagents = on` into the user config file; says where, or why
+/// it could not.
+string saveSubagentsSetting(ref Config cfg, bool on)
+{
+    import nano.settings : Changes, save;
+    cfg.subagents = on;
+    Changes ch;
+    ch.subagents = true;
+    try save(cfg, ch, null, cfg.path);
+    catch (Exception e) return "could not save: " ~ e.msg;
+    return "saved to " ~ cfg.path;
+}
+
+/// Run `/subagents [on|off] [--save]` on `agent`: show the state, or switch
+/// the `agent` tool for the session (and the user config with `--save`).
+string subagentsCommand(Agent agent, ref Config cfg, string arg)
+{
+    import nano.subagent : parseToggle, statusText;
+    import nano.result : unwrap, unwrapErr;
+    auto p = parseToggle(arg);
+    if (p.isErr) return p.unwrapErr("isErr");
+    auto t = p.unwrap("isOk");
+    auto model = agent.subagentModel.length ? agent.subagentModel : agent.client.providerName ~ "/" ~ agent.client.modelName;
+    if (t.show) return statusText(agent.subagentsOffered, agent.subagentCandidates, model, agent.subagentLimits);
+    if (!agent.subagentsEnabled) return "Sub-agents are not available in this session";
+    agent.control.takeSubagentsRequest(); // a direct switch supersedes a queued one
+    auto was = agent.subagentsOn;
+    agent.subagentsOn = t.on;
+    auto msg = format("Sub-agents %s for this session", t.on ? "on" : "off");
+    if (was != t.on) msg ~= " (the tool list changed, so the provider's prompt cache is rebuilt once)";
+    if (t.save) msg ~= "; " ~ saveSubagentsSetting(cfg, t.on);
+    return msg;
 }
 
 /// A frozen copy of `cfg`, for another thread.
@@ -1783,8 +1854,20 @@ ConfiguredWindow windowFor(const ref Config c, const ref ProviderConfig p) pure
 /// control character (so any escape sequence) dropped, tabs expanded.
 string sanitizeBlock(string s) pure
 {
+    import std.encoding : sanitize;
     import nano.trajectory : terminalSafe;
-    return terminalSafe(s, true);
+    // Repair malformed UTF-8 first: terminalSafe decodes and would throw.
+    return terminalSafe(sanitize(s), true);
+}
+
+/// The longest prefix of `s` of at most `max` bytes that does not end
+/// inside a UTF-8 sequence, so a byte cap never splits a character.
+string utf8Prefix(string s, size_t max) pure nothrow @nogc
+{
+    if (s.length <= max) return s;
+    size_t n = max;
+    while (n > 0 && (s[n] & 0xC0) == 0x80) --n;
+    return s[0 .. n];
 }
 
 size_t lineCount(string s) pure
@@ -1797,13 +1880,27 @@ string firstLine(string s) pure
 {
     auto nl = s.indexOf('\n');
     auto l = nl >= 0 ? s[0 .. nl] : s;
-    return l.length > 160 ? l[0 .. 160] ~ "…" : l;
+    return l.length > 160 ? utf8Prefix(l, 160) ~ "…" : l;
+}
+
+unittest
+{
+    import std.array : replicate;
+    import std.utf : validate;
+    // A byte cap landing inside a multi-byte character must not split it.
+    auto l = firstLine("a".replicate(159) ~ "é tail");
+    validate(l);
+    assert(l == "a".replicate(159) ~ "…");
+    validate(indent("b".replicate(1999) ~ "€x"));
+    // Malformed input is repaired, not thrown on.
+    assert(sanitizeBlock("ok \xC3") .length > 0);
+    assert(utf8Prefix("é", 1) == "");
 }
 
 string indent(string s) pure
 {
     import std.array : replace;
-    auto t = s.length > 2000 ? s[0 .. 2000] ~ "\n…" : s;
+    auto t = s.length > 2000 ? utf8Prefix(s, 2000) ~ "\n…" : s;
     return "    " ~ t.replace("\n", "\n    ");
 }
 
@@ -1836,15 +1933,30 @@ Option!ProjectInstructions discoverInstructions(const ref Config c, string dir)
     return some(ProjectInstructions.discover(dir, o));
 }
 
-/// `/context`: window use, token totals, compaction settings.
-string toolsListing(Agent agent) pure { return agent.toolsListing; }
+/// `/tools`: one line per tool, sanitized here so every caller (the idle
+/// command and the mid-turn view) prints no raw control sequences.
+string toolsListing(Agent agent) pure { return sanitizeBlock(agent.toolsListing); }
 
+/// `/skills`: one line per skill, sanitized here for the same reason as
+/// `toolsListing` (skill names and descriptions come from files on disk).
 string skillsListing(const Skills skills) pure
 {
     if (skills.empty) return "No skills found.";
     string[] out_;
     foreach (sk; skills.skills) out_ ~= format("  %-20s %s", sk.name, firstLine(sk.description));
-    return out_.join("\n");
+    return sanitizeBlock(out_.join("\n"));
+}
+
+unittest
+{
+    import std.algorithm.searching : canFind;
+    import nano.skills : Skill;
+    // The mid-turn view stores the listing as-is, so it must already be clean.
+    auto sk = new Skills;
+    sk.skills ~= Skill("evil\x1b]0;t\x07", "desc \x1b[2J here", "/x");
+    auto listed = skillsListing(sk);
+    assert(!listed.canFind('\x1b') && !listed.canFind('\x07'), listed);
+    assert(listed.canFind("here"));
 }
 
 string sessionText(Agent agent) pure
@@ -2705,19 +2817,8 @@ int runMain(string[] args)
         // Unknown spec: skip the optional probe rather than re-resolve here.
         throw new Exception("no resolved provider for " ~ spec);
     };
-    if (cfg.subagents)
-    {
-        import nano.subagent : SubLimits;
-        import nano.arith : toSize;
-        agent.subagentClients = new immutable ConfigClients(frozenConfig(cfg));
-        agent.subagentModel = cfg.subagentModel;
-        agent.subagentMaxConcurrency = cfg.subagentMaxConcurrency > 0 ? toSize(cfg.subagentMaxConcurrency) : 1;
-        SubLimits lim;
-        if (cfg.subagentTimeoutSecs > 0) lim.timeoutSecs = cfg.subagentTimeoutSecs;
-        if (cfg.subagentMaxTurns > 0) lim.turns = toSize(cfg.subagentMaxTurns);
-        if (cfg.subagentMaxTokens > 0) lim.tokens = cfg.subagentMaxTokens;
-        agent.subagentLimits = lim;
-    }
+    agent.subagentsOn = cfg.subagents;
+    configureSubagents(agent, cfg, true);
     agent.planTools = cfg.planTools;
     agent.timerTools = !o.acp; // ACP has no idle loop to fire them
     agent.outcomeTool = cfg.outcomeTool;
@@ -2783,6 +2884,7 @@ int runMain(string[] args)
         host.providerNames = () => enabledProviderNames(cfg.providers);
         host.configModel = cfg.model;
         host.configSystemPrompt = cfg.systemPrompt;
+        host.saveSubagents = (bool on) => saveSubagentsSetting(cfg, on);
         host.sessionMeta = () {
             JSONValue meta = ["projectInstructions": JSONValue(instructions.match!(pi => pi.loadedPaths, () => string[].init)),
                 "skills": JSONValue(skills.names)];
@@ -3022,8 +3124,7 @@ int runMain(string[] args)
             // Sub-agents build clients from a config frozen at startup;
             // re-freeze after every provider edit so children see the new
             // credentials/endpoints (and a newly added provider).
-            if (cfg.subagents)
-                agent.subagentClients = new immutable ConfigClients(frozenConfig(cfg));
+            configureSubagents(agent, cfg, false);
             if (!editRebuilds(cfg, name, agent.client.providerName)) return string.init;
             // The client's own provider was edited: keep its model. Otherwise the
             // configured model now resolves to the edited provider: build that.
@@ -3570,11 +3671,14 @@ int runMain(string[] args)
                 case "/version":
                     writeln(versionString);
                     continue;
+                case "/subagents":
+                    writeln(escapeMarks(sanitizeBlock(subagentsCommand(agent, cfg, arg))));
+                    continue;
                 case "/tools":
-                    writeln(toolsListing(agent));
+                    writeln(escapeMarks(toolsListing(agent)));
                     continue;
                 case "/skills":
-                    writeln(skillsListing(skills));
+                    writeln(escapeMarks(skillsListing(skills)));
                     continue;
                 case "/resume":
                 {

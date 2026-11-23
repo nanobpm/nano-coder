@@ -194,6 +194,8 @@ final class TurnControl
         string modelRequest;
         /// A `/thinking` argument typed mid-turn (null: none).
         string thinkingRequest;
+        /// A `/subagents on|off` typed mid-turn: 0 none, 1 on, 2 off.
+        int subagentsRequest;
     }
     private NotNull!(shared Locked!State) state;
     private int mode_;
@@ -212,6 +214,18 @@ final class TurnControl
     /// Ask the running turn to use a thinking level (`/thinking` mid-turn):
     /// the argument as typed (a level, `default`, `off` or `reset`).
     void requestThinking(string arg) shared { state.update((ref State s) { s.thinkingRequest = arg; }); }
+
+    /// Ask the running turn to switch the `agent` tool on or off from its
+    /// next model request (`/subagents on|off` mid-turn).
+    void requestSubagents(bool on) shared { state.update((ref State s) { s.subagentsRequest = on ? 1 : 2; }); }
+
+    /// The pending `/subagents` request, cleared: 0 none, 1 on, 2 off.
+    int takeSubagentsRequest() shared
+    {
+        int r;
+        state.update((ref State s) { r = s.subagentsRequest; s.subagentsRequest = 0; });
+        return r;
+    }
 
     /// The pending thinking request, cleared; null when none.
     string takeThinkingRequest() shared

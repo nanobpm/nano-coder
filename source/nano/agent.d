@@ -55,7 +55,7 @@ import nano.session;
 import nano.control;
 import nano.claude_hooks : HookManager, Decision, HookOutcome = Outcome, applyUpdatedInput, maxStopBlocks;
 import nano.subagent : SubClientFactory, SubLimits, SubSlot, SubGate, SubMsg, SubKind, SubResult, SubProgress,
-    ToolReply, SubAbort, SubSpec, subToolName = toolName, subDefinition = definition;
+    ToolReply, SubAbort, SubSpec, subToolName = toolName, subDefinition = definition, SubCandidate;
 import nano.safeio : Chan;
 import std.typecons : Rebindable;
 
@@ -904,6 +904,9 @@ class Agent
     /// how it failed (`CallFailed`, with the exception kept in `failure`).
     private Event callModel(AgentEvents ev, MonoTime swStart, out LLMResponse r, out Exception failure)
     {
+        // `/subagents on|off` typed mid-turn: every request, retries
+        // included, follows it; sub-agents already running finish.
+        if (auto sub = control.takeSubagentsRequest()) subagentsOn = sub == 1;
         ChatRequest req;
         req.messages = messages;
         req.tools = offeredTools();
@@ -984,7 +987,7 @@ class Agent
         auto calls = r.toolCalls;
         for (size_t i = 0; i < calls.length;)
         {
-            if (subagentsEnabled && calls[i].name == subToolName && (calls[i].id in subGates) is null
+            if (subagentsOffered && calls[i].name == subToolName && (calls[i].id in subGates) is null
                 && loopStop is null)
                 launchSubagents(r, i);
             size_t j = i;
@@ -2160,7 +2163,7 @@ class Agent
         bool isOutcome = outcomeTool && call.name == outcomeToolName;
         bool isHistory = historyEnabled && hist.isHistoryTool(call.name);
         bool isTimer = timerTools && isTimerTool(call.name);
-        bool isAgent = subagentsEnabled && call.name == subToolName;
+        bool isAgent = subagentsOffered && call.name == subToolName;
         // An `agent` call was checked when its reply's sub-agents launched.
         if (isAgent)
             if (auto gate = call.id in subGates)
@@ -2221,7 +2224,7 @@ class Agent
         bool isOutcome = outcomeTool && call.name == outcomeToolName;
         bool isHistory = historyEnabled && hist.isHistoryTool(call.name);
         bool isTimer = timerTools && isTimerTool(call.name);
-        bool isAgent = subagentsEnabled && call.name == subToolName;
+        bool isAgent = subagentsOffered && call.name == subToolName;
         string out_;
         try
         {
@@ -2295,6 +2298,12 @@ class Agent
     /// How many sub-agents run at once (`subagent_max_concurrency`).
     size_t subagentMaxConcurrency = 4;
     SubLimits subagentLimits;
+    /// The models the `agent` tool may pick (`[[subagent_models]]` that
+    /// resolve); empty: any model, defaulting to `subagentModel`.
+    immutable(SubCandidate)[] subagentCandidates;
+    /// The session's `/subagents on|off`: off leaves the `agent` tool out of
+    /// the next request (sub-agents already running finish).
+    bool subagentsOn = true;
     /// The current reply's sub-agents, the gate result of its `agent` calls
     /// by call id, and the child logs to reference.
     private SubSlot[] subSlots;
@@ -2308,6 +2317,10 @@ class Agent
     private Option!(imported!"nano.tools.files".ReadState) childReadState;
 
     bool subagentsEnabled() pure const { return subagentClients.get !is null; }
+
+    /// The `agent` tool goes into the next request: sub-agents are
+    /// available and the session has them on.
+    bool subagentsOffered() pure const { return subagentsEnabled && subagentsOn; }
 
     /// Clear the previous reply's sub-agent state before a reply's tools run.
     private void resetSubagents(AgentEvents ev)
@@ -2336,10 +2349,10 @@ class Agent
     /// between.
     private void launchSubagents(const ref LLMResponse r, size_t from)
     {
-        import nano.subagent : parseArgs, systemPrompt, encodeDefinition, forwardable;
+        import nano.subagent : parseArgs, systemPrompt, encodeDefinition, forwardable, choose;
         import std.file : getcwd;
         import std.path : stripExtension;
-        if (!subagentsEnabled) return;
+        if (!subagentsOffered) return;
         string cwd;
         immutable(string)[] defs;
         foreach (call; r.toolCalls[from .. subSegmentEnd(r.toolCalls, from)])
@@ -2360,10 +2373,9 @@ class Agent
                             if (forwardable(d.name) && (control.mode != AgentMode.plan || planAllows(d.name)))
                                 defs ~= encodeDefinition(d);
                     }
-                    auto limits = subagentLimits;
-                    limits.timeoutSecs = a.timeoutSecs;
-                    auto model = a.model.length ? a.model : subagentModel.length ? subagentModel
-                        : client.providerName ~ "/" ~ client.modelName;
+                    auto picked = choose(a, subagentCandidates, subagentModel.length ? subagentModel
+                        : client.providerName ~ "/" ~ client.modelName, subagentLimits);
+                    auto limits = picked.limits, model = picked.model;
                     immutable spec = SubSpec(subSlots.length, call.id, a.task, model,
                         systemPrompt(cwd, wallNow.toISOExtString[0 .. 10]), defs, limits,
                         log.match!(l => l.path.stripExtension, () => string.init), "sub-" ~ safeName(call.id), cwd);
@@ -3021,7 +3033,7 @@ class Agent
     {
         auto all = tools.definitions ~ (planTools ? planDefinitions() : null)
             ~ (outcomeTool ? [outcomeDefinition()] : null) ~ (historyEnabled ? hist.definitions() : null)
-            ~ (timerTools ? timerDefinitions() : null) ~ (subagentsEnabled ? [subDefinition()] : null);
+            ~ (timerTools ? timerDefinitions() : null) ~ (subagentsOffered ? [subDefinition(subagentCandidates)] : null);
         if (control.mode != AgentMode.plan) return all;
         ToolDefinition[] kept;
         foreach (t; all) if (planAllows(t.name)) kept ~= t;

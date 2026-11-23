@@ -35,6 +35,7 @@ immutable Command[] commands = [
     Command("/queue", "[list|add text|remove N...|edit N text|clear]", "Show or edit the queued messages"),
     Command("/tools", "", "List available tools"),
     Command("/skills", "", "List skills the agent can load"),
+    Command("/subagents", "[on|off] [--save]", "Show sub-agent models, or switch the agent tool on/off"),
     Command("/model", "[provider/model]", "Show the model and pick a new one (or switch directly)"),
     Command("/mode", "[normal|plan|auto]", "Show or set the agent mode (Shift+Tab cycles)"),
     Command("/thinking", "[level|default|off|reset]", "Show or set the thinking level for this session"),

@@ -420,6 +420,12 @@ struct Config
     /// Per sub-agent caps (`subagent_timeout_secs`, `subagent_max_turns`,
     /// `subagent_max_tokens`).
     long subagentTimeoutSecs = 600, subagentMaxTurns = 40, subagentMaxTokens = 1_000_000;
+    /// The curated models the `agent` tool may pick (`[[subagent_models]]`);
+    /// empty: any model, defaulting to `subagent_model`.
+    SubagentModel[] subagentModels;
+    /// Problems found while loading (bad `[[subagent_models]]` entries),
+    /// reported at startup; never fatal.
+    string[] warnings;
     long maxIterations = 0;
     long bashTimeoutSecs = 600;
     /// Bash heartbeat interval (`bash_heartbeat_secs`): how often a running
@@ -525,6 +531,7 @@ struct Config
         if (auto v = "subagent_timeout_secs" in doc) c.subagentTimeoutSecs = v.integer;
         if (auto v = "subagent_max_turns" in doc) c.subagentMaxTurns = v.integer;
         if (auto v = "subagent_max_tokens" in doc) c.subagentMaxTokens = v.integer;
+        if (auto v = "subagent_models" in doc) c.subagentModels = parseSubagentModels(*v, c.warnings);
         if (auto v = "bash_timeout_secs" in doc) c.bashTimeoutSecs = v.integer;
         if (auto v = "bash_heartbeat_secs" in doc) c.bashHeartbeatSecs = v.integer;
         if (auto v = "plan_tools" in doc) c.planTools = v.boolean;
@@ -632,21 +639,199 @@ void parseModelSpec(string spec, const ProviderConfig[string] providers, string 
 /// control characters, no query or fragment.
 void validateHttpBaseUrl(string provider, string url) pure
 {
+    auto why = baseUrlProblem(provider, url);
+    if (why.length) throw new Exception(why);
+}
+
+/// Why `url` is not a usable http(s) base URL for `provider`; null when it
+/// is. Shared by `resolve` and the credential-free candidate filter.
+string baseUrlProblem(string provider, string url) pure
+{
     import std.uni : isWhite;
     import std.ascii : isControl;
-    import std.string : toLower, startsWith;
-    if (url.strip.length == 0) throw new Exception(format("provider \"%s\" has an empty base_url", provider));
+    import std.string : toLower;
+    if (url.strip.length == 0) return format("provider \"%s\" has an empty base_url", provider);
     foreach (dchar ch; url)
         if (isWhite(ch) || (ch < 0x80 && isControl(ch)) || (ch >= 0x80 && ch < 0xa0))
-            throw new Exception(format("provider \"%s\" base_url \"%s\" must not contain whitespace or control characters", provider, url));
+            return format("provider \"%s\" base_url \"%s\" must not contain whitespace or control characters", provider, url);
     auto colon = url.indexOf("://");
-    if (colon <= 0) throw new Exception(format("provider \"%s\" has a malformed base_url \"%s\"", provider, url));
+    if (colon <= 0) return format("provider \"%s\" has a malformed base_url \"%s\"", provider, url);
     auto scheme = url[0 .. colon].toLower;
     if (scheme != "http" && scheme != "https")
-        throw new Exception(format("provider \"%s\" base_url \"%s\" must be http(s), not \"%s\"", provider, url, scheme));
-    if (url.length == colon + 3) throw new Exception(format("provider \"%s\" has a malformed base_url \"%s\"", provider, url));
+        return format("provider \"%s\" base_url \"%s\" must be http(s), not \"%s\"", provider, url, scheme);
+    if (url.length == colon + 3) return format("provider \"%s\" has a malformed base_url \"%s\"", provider, url);
     if (url.indexOf('?') >= 0 || url.indexOf('#') >= 0)
-        throw new Exception(format("provider \"%s\" base_url \"%s\" must not contain a query or fragment", provider, url));
+        return format("provider \"%s\" base_url \"%s\" must not contain a query or fragment", provider, url);
+    return null;
+}
+
+/// Why provider `name` (`pc`) has no usable endpoint for `model`, honouring
+/// a model's own `base_url`; null when it has one. Fetches no key.
+string endpointProblem(string name, const ref ProviderConfig pc, string model) pure
+{
+    string url = pc.baseUrl;
+    if (auto ms = model in pc.models)
+        if (ms.baseUrl !is null) url = ms.baseUrl;
+    auto kind = pc.hasKind ? pc.kind : ProviderKind.openai;
+    final switch (kind)
+    {
+        case ProviderKind.mock: return null;
+        case ProviderKind.githubCopilot, ProviderKind.muse:
+            return url.length ? baseUrlProblem(name, url) : null;
+        case ProviderKind.openai, ProviderKind.anthropic:
+            if (url is null) return format("provider \"%s\" has no base_url", name);
+            return baseUrlProblem(name, url);
+    }
+}
+
+/// One `[[subagent_models]]` entry: a model the `agent` tool offers, what
+/// to use it for, and its own limits (0: the `subagent_*` default).
+struct SubagentModel
+{
+    string model, use;
+    long timeoutSecs, maxTurns, maxTokens;
+}
+
+/// The `[[subagent_models]]` entries of `v`; a bad entry is skipped with a
+/// line in `warnings`, so a typo never stops the agent starting.
+SubagentModel[] parseSubagentModels(const JSONValue v, ref string[] warnings) pure
+{
+    SubagentModel[] out_;
+    if (v.type != JSONType.array)
+    {
+        warnings ~= "subagent_models must be a list of tables ([[subagent_models]]); ignored";
+        return null;
+    }
+    foreach (i, e; v.arrayNoRef)
+    {
+        string bad(string why) { return format("subagent_models entry %s %s; skipped", i + 1, why); }
+        if (e.type != JSONType.object) { warnings ~= bad("is not a table"); continue; }
+        auto m = "model" in e.objectNoRef;
+        if (m is null || m.type != JSONType.string || !m.str.strip.length) { warnings ~= bad("has no model"); continue; }
+        SubagentModel s;
+        s.model = m.str.strip;
+        bool ok = true;
+        if (auto u = "use" in e.objectNoRef)
+        {
+            if (u.type == JSONType.string) s.use = u.str.strip;
+            else { warnings ~= bad("has a use that is not a string"); ok = false; }
+        }
+        foreach (key; ["timeout_secs", "max_turns", "max_tokens"])
+            if (auto n = key in e.objectNoRef)
+            {
+                if (n.type != JSONType.integer || n.integer <= 0)
+                {
+                    warnings ~= bad("has a " ~ key ~ " that is not a positive integer");
+                    ok = false;
+                    break;
+                }
+                if (key == "timeout_secs") s.timeoutSecs = n.integer;
+                else if (key == "max_turns") s.maxTurns = n.integer;
+                else s.maxTokens = n.integer;
+            }
+        if (ok) out_ ~= s;
+    }
+    return out_;
+}
+
+/// Why `spec` doesn't name a usable model of `c` (an unknown or disabled
+/// provider, or no model); null when it does. Fetches no key.
+string specProblem(const ref Config c, string spec) pure
+{
+    string name, model;
+    parseModelSpec(spec, c.providers, c.defaultProvider, name, model);
+    auto pc = name in c.providers;
+    if (pc is null) return format("unknown provider \"%s\"", name);
+    if (pc.disabled) return format("provider \"%s\" is disabled", name);
+    if (!model.length && !pc.defaultModel.length) return format("no model given and provider \"%s\" has no default_model", name);
+    return endpointProblem(name, *pc, model.length ? model : pc.defaultModel);
+}
+
+/// The candidates of `c.subagentModels` that resolve against the configured
+/// providers (without fetching keys); each one that doesn't is dropped with
+/// a line in `warnings`.
+SubagentModel[] usableSubagentModels(const ref Config c, ref string[] warnings) pure
+{
+    SubagentModel[] out_;
+    foreach (m; c.subagentModels)
+    {
+        auto why = specProblem(c, m.model);
+        if (why.length) warnings ~= format("subagent model %s dropped: %s", m.model, why);
+        else out_ ~= m;
+    }
+    if (c.subagentModels.length && !out_.length)
+        warnings ~= "no subagent_models resolve; sub-agents use subagent_model or the session's model";
+    return out_;
+}
+
+unittest
+{
+    import nano.result : unwrap;
+    import std.algorithm : canFind;
+    string[] w;
+    auto doc = parseToml(`[[subagent_models]]
+model = "a/x"
+use = "quick"
+max_turns = 5
+[[subagent_models]]
+use = "no model"
+[[subagent_models]]
+model = "b/y"
+timeout_secs = -1
+[[subagent_models]]
+model = "c/z"
+`).unwrap("valid TOML");
+    auto ms = parseSubagentModels(doc["subagent_models"], w);
+    assert(ms.length == 2 && ms[0] == SubagentModel("a/x", "quick", 0, 5, 0) && ms[1].model == "c/z", format("%s", ms));
+    assert(w.length == 2 && w[0].canFind("entry 2") && w[1].canFind("timeout_secs"), format("%s", w));
+    w = null;
+    assert(parseSubagentModels(JSONValue("x"), w) is null && w.length == 1);
+}
+
+unittest
+{
+    // Unresolvable candidates are dropped; all of them: a fallback warning.
+    import std.algorithm : canFind;
+    auto c = regionalConfig(`[[subagent_models]]
+model = "mock/m"
+[[subagent_models]]
+model = "openrouter/x"
+max_tokens = 9
+`);
+    assert(c.subagentModels.length == 2 && c.subagentModels[1].maxTokens == 9 && !c.warnings.length);
+    string[] w;
+    auto ok = usableSubagentModels(c, w);
+    assert(ok.length == 1 && ok[0].model == "mock/m" && w.length == 1 && w[0].canFind("openrouter/x"), format("%s", w));
+    c.subagentModels = c.subagentModels[1 .. $];
+    w = null;
+    assert(!usableSubagentModels(c, w).length && w.length == 2 && w[1].canFind("no subagent_models"));
+    c.subagentModels = null;
+    w = null;
+    assert(!usableSubagentModels(c, w).length && !w.length);
+}
+
+unittest
+{
+    // A candidate whose endpoint `resolve` would reject is dropped up front:
+    // no base_url, a bad provider base_url, a bad model-specific base_url.
+    import std.algorithm : canFind;
+    auto c = regionalConfig(`[[subagent_models]]
+model = "openrouter-regional/amazon/nova-lite-v1"
+[[subagent_models]]
+model = "openrouter-regional/moonshotai/kimi-k3"
+`);
+    string[] w;
+    assert(usableSubagentModels(c, w).length == 2 && !w.length, format("%s", w));
+    c.providers["openrouter-regional"].models["amazon/nova-lite-v1"].baseUrl = "ftp://eu";
+    w = null;
+    auto ok = usableSubagentModels(c, w);
+    assert(ok.length == 1 && w.length == 1 && w[0].canFind("http(s)"), format("%s", w));
+    c.providers["openrouter-regional"].baseUrl = "https://x?q";
+    w = null;
+    assert(!usableSubagentModels(c, w).length && w[1].canFind("query"), format("%s", w));
+    c.providers["openrouter-regional"].baseUrl = null;
+    w = null;
+    assert(!usableSubagentModels(c, w).length && w[1].canFind("no base_url"), format("%s", w));
 }
 
 ResolvedProvider resolve(const ref Config c, string spec)
@@ -674,18 +859,8 @@ ResolvedProvider resolve(const ref Config c, string spec)
     if (auto ms = r.model in pc.models)
         if (ms.baseUrl !is null) r.config.baseUrl = ms.baseUrl;
     if (!r.config.hasKind) r.config.kind = ProviderKind.openai;
-    final switch (r.config.kind)
-    {
-        // Mock needs no endpoint; Copilot and Muse derive theirs unless overridden.
-        case ProviderKind.mock: break;
-        case ProviderKind.githubCopilot, ProviderKind.muse:
-            if (r.config.baseUrl.length) validateHttpBaseUrl(name, r.config.baseUrl);
-            break;
-        case ProviderKind.openai, ProviderKind.anthropic:
-            if (r.config.baseUrl is null) throw new Exception(format("provider \"%s\" has no base_url", name));
-            validateHttpBaseUrl(name, r.config.baseUrl);
-            break;
-    }
+    auto why = endpointProblem(name, *pc, r.model);
+    if (why.length) throw new Exception(why);
     r.config.baseUrl = r.config.baseUrl.stripRight('/');
     if (r.config.timeoutSecs <= 0) r.config.timeoutSecs = defaultTimeoutSecs();
     r.replayReasoning = pc.replayReasoning.isNull ? reasonsOverResponses(r.config.kind, r.model) : pc.replayReasoning.get;

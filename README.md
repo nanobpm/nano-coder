@@ -31,7 +31,7 @@ nano-coder --help
 - **Lifecycle Hooks**: an `AgentEvents` interface for observing agent behavior, plus
   Claude Code–compatible external user hooks loaded from `.claude/settings.json`
 - **Configuration**: TOML-based config file at `~/.config/nano-coder/config.toml`
-- **Commands**: `/help`, `/version`, `/compact`, `/context`, `/verbosity`, `/settings`, `/tools`, `/skills`, `/queue`, `/restart`, `/update`, `/relaunch`, `/exit`
+- **Commands**: `/help`, `/version`, `/compact`, `/context`, `/verbosity`, `/settings`, `/tools`, `/skills`, `/subagents`, `/queue`, `/restart`, `/update`, `/relaunch`, `/exit`
 - **Streaming output**: answers stream in, thinking shows collapsed, tool calls show inline
 - **Status line** as the bottom row of the terminal, plus manual and automatic context compaction
 - **Task plans**: `plan_*` tools keep a plan with notes outside the conversation, so long tasks survive compaction, resume and a change of worker
@@ -448,6 +448,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
     other settings. Leaving with unsaved changes asks whether to save
 - `/tools` - List registered tools
 - `/skills` - List the skills the agent can load, where each lives, and any loading warnings
+- `/subagents [on|off] [--save]` - Without an argument, show whether sub-agents are on and the models they may run on with their limits. `on`/`off` switches the `agent` tool for this session from the next request (sub-agents already running finish); `--save` also writes `subagents` to the config file. Changing the tool list invalidates the provider's prompt cache once. Works over ACP too (the result carries `subagents`, `models` and `text`, and `saved` with `--save`)
 - `/plan` - Show the agent's task plan with all notes
 - `/memory [forget ID]` - List cross-session memories with their ids, or delete one by id (see [Memory](#memory))
 - `/hooks` - List the loaded external user hooks (from `.claude/settings.json` and friends), the files they came from, and any skipped entries (see [Lifecycle Hooks](#lifecycle-hooks))
@@ -507,6 +508,25 @@ through this session's permission policy and hooks (a denied call is an error fo
 never prompts), Esc/Ctrl-C stops it, and its usage counts toward the session's. Its log is written
 next to the session's (`<session>/sub-<call id>.jsonl`), referenced from the `agent` result, and
 expanded by `--trajectory`.
+
+To give the agent a curated, cost-controlled choice of sub-agent models, list them:
+
+```toml
+[[subagent_models]]
+model = "github-copilot/claude-haiku-4.5"
+use   = "quick searches, reading and summarising files"
+max_turns = 20                 # optional: timeout_secs, max_turns, max_tokens override subagent_*
+[[subagent_models]]
+model = "github-copilot/gpt-5"
+use   = "harder analysis across many files"
+```
+
+The `agent` tool's `model` then becomes a choice of these (the description lists each with its
+`use`), the first is the default, and a call naming another model gets an error listing them.
+At startup each must resolve against the configured providers: one that doesn't (an unknown or
+disabled provider, no model) is dropped with a warning, as is a malformed entry; if none is left,
+sub-agents run on `subagent_model` or the session's model and a call may name any model, as without
+the list. `subagents = false` starts sessions with the tool off; `/subagents on` turns it on.
 
 **Titles.** With `session_titles = true`, once a session has a prompt that says something (not
 just "hi"), nano-coder asks the model for a title of at most six words in the background. It uses
@@ -608,6 +628,7 @@ subagent_max_concurrency = 4            # sub-agents running at once (several `a
 subagent_timeout_secs = 600             # per sub-agent caps; past one it reports what it has, marked truncated
 subagent_max_turns = 40
 subagent_max_tokens = 1000000
+# [[subagent_models]] tables offer a fixed choice of models (see Sub-agents)
 auto_compact = true                     # summarize automatically when the context fills up
 auto_compact_threshold = 0.8            # fraction of the context window
 compaction_mode = "smart"               # smart | standard (see Smart compaction)

@@ -46,7 +46,7 @@ import std.array : join;
 
 /// Commands `handle` services over ACP. Reaching the slash fallback with one
 /// of these means only its arguments were not accepted.
-immutable string[] acpCommandRoots = ["/compact", "/settings", "/tools", "/plan", "/providers", "/model"];
+immutable string[] acpCommandRoots = ["/compact", "/settings", "/tools", "/plan", "/providers", "/model", "/subagents"];
 
 JSONValue rpcResult(JSONValue id, JSONValue result) pure
 {
@@ -142,9 +142,11 @@ bool isJsonRpcRequest(JSONValue msg) pure
     return getStr(msg, "jsonrpc") == "2.0" && getStr(msg, "method") !is null;
 }
 
-enum DuringTurn { cancel, steer, defer }
+enum DuringTurn { cancel, steer, subagents, defer }
 
-/// How a message arriving mid-turn is routed; `steerText` is set for steer.
+/// How a message arriving mid-turn is routed; `steerText` is set for steer,
+/// and is "on" or "off" for subagents (`/subagents on|off` without --save,
+/// applied from the turn's next model request).
 DuringTurn classifyDuringTurn(JSONValue msg, string active, out string steerText) pure
 {
     auto params = get(msg, "params");
@@ -158,7 +160,17 @@ DuringTurn classifyDuringTurn(JSONValue msg, string active, out string steerText
         auto trimmed = text.strip;
         if (!trimmed.length) return DuringTurn.defer;
         auto u = unescapePrompt(trimmed);
-        if (isCommand(trimmed)) return DuringTurn.defer;
+        if (isCommand(trimmed))
+        {
+            import nano.turn_commands : splitCmd, timing, Timing;
+            auto p = splitCmd(trimmed);
+            if (p[0] == "/subagents" && timing(trimmed) == Timing.nextStep)
+            {
+                steerText = p[1];
+                return DuringTurn.subagents;
+            }
+            return DuringTurn.defer;
+        }
         steerText = u !is null ? u : text;
         return DuringTurn.steer;
     }
@@ -200,6 +212,9 @@ struct Host
     string[] delegate() providerNames;
     /// The configured `model` and `system_prompt`, for `/settings`.
     string configModel, configSystemPrompt;
+    /// Write `subagents = on` to the user config (`/subagents on|off --save`);
+    /// returns where it saved or why it could not. Null: --save is refused.
+    string delegate(bool on) saveSubagents;
 }
 
 /// Input id for idempotent prompts: `messageId`, or `_meta.inputId`.
@@ -272,6 +287,14 @@ struct AcpRouter
                     st.steerMarks ~= st.items.length;
                     ctl.steer(Steer(steerText, get(msg, "id")));
                     return null;
+                case DuringTurn.subagents:
+                    ctl.requestSubagents(steerText == "on");
+                    auto sid = get(msg, "id");
+                    if (sid.type == JSONType.null_) return null;
+                    JSONValue b = ["stopReason": "end_turn"];
+                    b["queued"] = true;
+                    b["text"] = "Sub-agents " ~ steerText ~ " queued; applies from the agent's next model request";
+                    return rpcResult(sid, b).toString;
                 case DuringTurn.defer:
                     break;
                 }
@@ -702,6 +725,30 @@ final class AcpServer : AgentEvents
             if (warnings.length) body_["warning"] = warnings.join("\n");
             return rpcResult(id, body_);
         }
+        if (text == "/subagents" || text.startsWith("/subagents "))
+        {
+            import nano.subagent : parseToggle, statusText;
+            auto p = parseToggle(text["/subagents".length .. $]);
+            if (p.isErr) return rpcError(id, -32602, p.unwrapErr("isErr"));
+            auto t = p.unwrap("isOk");
+            JSONValue body_ = ["stopReason": "end_turn"];
+            if (!t.show)
+            {
+                if (!agent.subagentsEnabled) return rpcError(id, -32602, "sub-agents are not available in this session");
+                if (t.save && host.saveSubagents is null) return rpcError(id, -32602, "/subagents: --save is not available");
+                agent.control.takeSubagentsRequest(); // a direct switch supersedes a queued one
+                agent.subagentsOn = t.on;
+                if (t.save) body_["saved"] = host.saveSubagents(t.on);
+            }
+            auto model = agent.subagentModel.length ? agent.subagentModel
+                : agent.client.providerName ~ "/" ~ agent.client.modelName;
+            body_["subagents"] = agent.subagentsOffered;
+            JSONValue[] models;
+            foreach (c; agent.subagentCandidates) models ~= JSONValue(c.model);
+            body_["models"] = models;
+            body_["text"] = statusText(agent.subagentsOffered, agent.subagentCandidates, model, agent.subagentLimits);
+            return rpcResult(id, body_);
+        }
         if (text == "/thinking" || text.startsWith("/thinking "))
         {
             auto arg = text["/thinking".length .. $].strip;
@@ -914,6 +961,11 @@ unittest
     auto prompt = (string x) => parseJSON(`{"method":"session/prompt","params":{"prompt":[{"type":"text","text":` ~ JSONValue(x).toString ~ `}]}}`);
     assert(classifyDuringTurn(prompt("//x"), null, s) == DuringTurn.steer && s == "/x");
     assert(classifyDuringTurn(prompt("/plan"), null, s) == DuringTurn.defer);
+    // `/subagents on|off` applies from the next request; --save waits.
+    assert(classifyDuringTurn(prompt("/subagents off"), null, s) == DuringTurn.subagents && s == "off");
+    assert(classifyDuringTurn(prompt("/subagents on"), null, s) == DuringTurn.subagents && s == "on");
+    assert(classifyDuringTurn(prompt("/subagents off --save"), null, s) == DuringTurn.defer);
+    assert(classifyDuringTurn(prompt("/subagents"), null, s) == DuringTurn.defer);
     assert(classifyDuringTurn(parseJSON(`{"method":"session/cancel","params":{"sessionId":"other"}}`), "me", s) == DuringTurn.defer);
     // Requeued escaped steers are re-escaped.
     auto q = requeueSteers(null, [Steer("/x")], [0], null);
@@ -1150,4 +1202,38 @@ unittest
     assert(enforceSlashInvariant(t) is null && t == "/usr/lib is big");
     t = "hello world\n";
     assert(enforceSlashInvariant(t) is null && t == "hello world\n");
+}
+
+// `/subagents off|on` over ACP switches the agent tool for the next request.
+unittest
+{
+    import nano.providers.mock;
+    import nano.tools;
+    import nano.permissions : Policy;
+    import nano.subagent : SubClientFactory;
+    static final class NoClients : SubClientFactory
+    {
+        LLMClient make(string spec) const { assert(0, "no sub-agent runs here"); }
+    }
+    auto agent = new Agent(new MockClient([LLMResponse("ok")]), new ToolRegistry, Policy.init, null);
+    agent.subagentClients = new immutable NoClients;
+    string[] lines;
+    auto srv = new AcpServer(agent, Host((string cwd) => "sys", null, null, "test"), (string l) { lines ~= l; });
+    srv.receive(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}`);
+    srv.receive(`{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"prompt":[{"type":"text","text":"/subagents off"}]}}`);
+    srv.receive(`{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"prompt":[{"type":"text","text":"/tools"}]}}`);
+    srv.receive(`{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"prompt":[{"type":"text","text":"/subagents on --save"}]}}`);
+    srv.receive(`{"jsonrpc":"2.0","id":5,"method":"session/prompt","params":{"prompt":[{"type":"text","text":"/subagents on"}]}}`);
+    srv.close();
+    assert(srv.run());
+    JSONValue[long] byId;
+    foreach (l; lines)
+    {
+        auto m = parseJSON(l);
+        if ("id" in m) byId[m["id"].integer] = m;
+    }
+    assert(!byId[2]["result"]["subagents"].boolean, lines.format!"%s");
+    assert(!byId[3]["result"]["tools"].arrayNoRef.canFind!(t => t.str == "agent"));
+    assert(byId[4]["error"]["message"].str.canFind("--save"), "no host save: refused");
+    assert(byId[5]["result"]["subagents"].boolean && agent.offeredTools.canFind!(t => t.name == "agent"));
 }

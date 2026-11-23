@@ -570,3 +570,61 @@ unittest
         if (r.canFind!(p => p.callId == "q1" && p.done) && r.canFind!(p => p.callId == "q2" && !p.done)) together = true;
     assert(together, "the replacement was started after the report");
 }
+
+// `/subagents off` leaves the agent tool out of the next request (and an
+// agent call then is an unknown tool); with candidates, the offered tool
+// lists them and an omitted model runs on the first.
+unittest
+{
+    import nano.subagent : SubCandidate;
+    auto f = new Fixture([LLMResponse("", "", [ToolCall.fromRaw("c1", "agent", `{"task":"find the parser"}`)]),
+        LLMResponse("done")]);
+    f.agent.subagentCandidates = [SubCandidate("mock/search", "searches", SubLimits(3, 30, 1000))];
+    auto tool = f.agent.offeredTools;
+    size_t i;
+    while (tool[i].name != "agent") i++;
+    assert(tool[i].parameters["properties"]["model"]["enum"][0].str == "mock/search");
+    f.agent.subagentsOn = false;
+    assert(!f.agent.offeredTools.canFind!(t => t.name == "agent"));
+    assert(f.agent.run("go", new NullEvents) == "done");
+    assert(f.toolResult("c1").canFind("agent"), "an agent call while off is not run as a sub-agent");
+    f.agent.subagentsOn = true;
+    assert(f.agent.offeredTools.canFind!(t => t.name == "agent"));
+}
+
+// `/subagents off` queued mid-turn takes effect before the next model
+// request of the same turn.
+unittest
+{
+    auto f = new Fixture([LLMResponse("", "", [ToolCall.fromRaw("c1", "read_file", `{"path":"nope"}`)]),
+        LLMResponse("done")]);
+    f.agent.control.requestSubagents(false);
+    assert(f.agent.subagentsOn);
+    assert(f.agent.run("go", new NullEvents) == "done");
+    assert(!f.agent.subagentsOn && !f.agent.control.takeSubagentsRequest());
+}
+
+// `/subagents off` queued while a request is in flight applies to its
+// retry too: a stream-interruption retry no longer offers the agent tool.
+unittest
+{
+    import nano.http : StreamInterrupted;
+    auto f = new Fixture([]);
+    bool[] offered;
+    f.agent.client = new class MockClient
+    {
+        this() { super([]); }
+        override LLMResponse chat(const ref ChatRequest req, StreamSink sink)
+        {
+            offered ~= req.tools.canFind!(t => t.name == "agent");
+            if (offered.length == 1)
+            {
+                f.agent.control.requestSubagents(false);
+                throw new StreamInterrupted("dropped");
+            }
+            return LLMResponse("done");
+        }
+    };
+    assert(f.agent.run("go", new NullEvents) == "done");
+    assert(offered == [true, false], "the retry honours the toggle");
+}
