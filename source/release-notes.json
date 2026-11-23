@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.12.1", "date": "2026-11-23", "items": [
+      {"type":"perf","scope":"session","title":"resume heap no longer scales with the session log size","pr":269}
+    ]},
     {"version": "1.12.0", "date": "2026-11-23", "items": [
       {"type":"feat","scope":"subagents","title":"candidate sub-agent models in config, and /subagents on|off at runtime","pr":268}
     ]},
@@ -438,9 +441,6 @@
     ]},
     {"version": "0.19.2", "date": "2026-09-28", "items": [
       {"type":"fix","scope":"cli","title":"keep the status bar pinned on resize (revert #35)","pr":45}
-    ]},
-    {"version": "0.19.1", "date": "2026-09-28", "items": [
-      {"type":"fix","scope":"cli","title":"let the terminal reflow history on resize (drop the scroll region)","pr":35}
     ]}
   ]
 }
