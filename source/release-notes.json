@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.23.0", "date": "2026-11-24", "items": [
+      {"type":"feat","scope":"skills","title":"pick up added, removed and edited skills between turns","pr":320}
+    ]},
     {"version": "1.22.8", "date": "2026-11-24", "items": [
       {"type":"perf","scope":"frame","title":"reduce scrollback memory amplification and bound InputHistory","pr":321}
     ]},
@@ -438,9 +441,6 @@
     ]},
     {"version": "0.32.1", "date": "2026-10-02", "items": [
       {"type":"fix","scope":"","title":"update command in README","pr":89}
-    ]},
-    {"version": "0.32.0", "date": "2026-10-02", "items": [
-      {"type":"feat","scope":"","title":"cross-session memory (user + project scope)","pr":70}
     ]}
   ]
 }
