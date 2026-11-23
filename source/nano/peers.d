@@ -469,6 +469,7 @@ struct PeerListener
             });
             if (expired)
             {
+                purgeExpired(requests);
                 sendReply(conn, responseLine(id, Status.refused, "the target session did not answer in time"));
                 return;
             }
@@ -480,6 +481,25 @@ struct PeerListener
             }
         }
         sendReply(conn, responseLine(id, r.status, r.note));
+    }
+
+    /// Drop every expired request still waiting in `requests`: while the
+    /// consumer is stalled (e.g. a confirmation picker), each timed-out
+    /// send would otherwise keep its full message in the channel, growing
+    /// memory without bound.
+    package(nano) static void purgeExpired(Chan!PeerRequest requests)
+    {
+        requests.edit((ref PeerRequest[] a) {
+            size_t w;
+            foreach (ref q; a)
+            {
+                bool gone;
+                q.reply.update((ref ReplyCell c) { gone = c.expired; });
+                if (!gone) a[w++] = q;
+            }
+            foreach (ref q; a[w .. $]) q = PeerRequest.init;
+            a = a[0 .. w];
+        });
     }
 
     /// Wait up to 120 s for `cell` to resolve, in short slices so close()
@@ -777,6 +797,8 @@ struct PeerRouter
     /// needs confirmation is refused at routing time, before the sender's
     /// reply is resolved, so the sender reliably hears the refusal.
     private Shared!bool noConfirmChannel;
+    /// Serialises routing passes with `midTurn` changes.
+    private Shared!bool routeLock;
 
     // A waiting delivery: the message's strings are immutable (sendable).
     private struct WaitingItem
@@ -794,6 +816,7 @@ struct PeerRouter
             Shared!bool.make(true), Shared!bool.make(false));
         r.queuedBytes = Shared!size_t.make(0);
         r.noConfirmChannel = Shared!bool.make(false);
+        r.routeLock = Shared!bool.make(false);
         return r;
     }
 
@@ -825,6 +848,14 @@ struct PeerRouter
     /// becomes a steer (its `/queue` id reserved from `queue`); idle each
     /// waits for the prompt loop. Call at each turn boundary and prompt.
     void routePending(ref imported!"nano.queue".MessageQueue queue)
+    {
+        // Under the routing lock, so `midTurn(false)` can't slip between
+        // reading the flag and inserting a steer: a steer added after the
+        // turn's final drain would sit unseen until unrelated traffic.
+        routeLock.update((ref bool _) { routePendingLocked(queue); });
+    }
+
+    private void routePendingLocked(ref imported!"nano.queue".MessageQueue queue)
     {
         PeerRequest req;
         while (requests.tryTake(req))
@@ -884,7 +915,13 @@ struct PeerRouter
 
     /// Whether the agent is mid-turn (set at each turn boundary by the
     /// prompt loop): mid-turn deliveries steer, idle ones wait.
-    void midTurn(bool on) { midTurnFlag.update((ref bool b) { b = on; }); }
+    /// Set whether a turn is running. Waits for any in-flight routing pass,
+    /// so after `midTurn(false)` returns no steer can still be added.
+    void midTurn(bool on)
+    {
+        if (!routeLock) { if (midTurnFlag) midTurnFlag.update((ref bool b) { b = on; }); return; }
+        routeLock.update((ref bool _) { midTurnFlag.update((ref bool b) { b = on; }); });
+    }
     bool midTurn() { return midTurnFlag.get; }
 
     /// The next idle delivery the prompt loop must settle, if any.
@@ -1294,4 +1331,21 @@ unittest
     assert(!router.hasWaiting && q.get.status == Status.refused);
     assert(!control.hasSteers, "the unread peer steer was dropped");
     assert(w.get.status == Status.refused, "a waiting delivery is refused");
+}
+
+// Timed-out sends are removed from the request channel, not left to pile
+// up while the consumer is stalled.
+unittest
+{
+    auto requests = Chan!PeerRequest.make;
+    auto dead = Shared!ReplyCell.make;
+    dead.update((ref ReplyCell c) { c.expired = true; });
+    auto alive = Shared!ReplyCell.make;
+    requests.put(PeerRequest(PeerMessage("sess-a", null, "dead", "m", false), dead));
+    requests.put(PeerRequest(PeerMessage("sess-a", null, "alive", "m", false), alive));
+    requests.put(PeerRequest(PeerMessage("sess-a", null, "dead2", "m", false), dead));
+    PeerListener.purgeExpired(requests);
+    PeerRequest got;
+    assert(requests.tryTake(got) && got.pm.text == "alive");
+    assert(!requests.tryTake(got));
 }

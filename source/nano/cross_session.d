@@ -150,6 +150,51 @@ SessionInfo[] listSessions(ref Policy policy, string dir, string cwd, string fil
         }
         out_ ~= i;
     }
+    // A just-opened session listening for messages has no prompts yet, so
+    // the index omits it; list it too (after the same permission check) or
+    // `session_send` can't reach it until its user runs a turn.
+    foreach (i; listeningWithoutPrompts(dir, out_, &deniedPath))
+    {
+        if (filter.length)
+        {
+            auto f = filter.toLower;
+            if (!i.id.toLower.canFind(f) && !(i.cwd.length && i.cwd.toLower.canFind(f))) continue;
+        }
+        out_ ~= i;
+    }
+    return out_;
+}
+
+/// Live sessions with a peer socket and a log in `dir` that `known` doesn't
+/// already list (the index skips sessions without prompts).
+private SessionInfo[] listeningWithoutPrompts(string dir, const SessionInfo[] known,
+    scope bool delegate(string path) @safe denied) @safe
+{
+    import std.file : dirEntries, SpanMode, exists, FileException;
+    import std.path : baseName, buildPath, extension, stripExtension;
+    import nano.peers : peersDir;
+    import nano.session : logHeaderCwd;
+    SessionInfo[] out_;
+    auto pdir = peersDir();
+    if (!pdir.exists) return out_;
+    string[] socks;
+    try
+        foreach (e; dirEntries(pdir, "*.sock", SpanMode.shallow)) socks ~= e.name;
+    catch (FileException) return out_; // unreadable peers dir: nothing extra to list
+    foreach (sock; socks)
+    {
+        auto id = sock.baseName.stripExtension;
+        if (!id.length || known.canFind!((k, x) => k.id == x)(id)) continue;
+        auto path = buildPath(dir, id ~ ".jsonl");
+        if (!path.exists || denied(path) || !isLive(path) || !acceptsMessages(id)) continue;
+        SessionInfo i;
+        i.id = id;
+        i.path = path;
+        i.live = true;
+        i.messages = true;
+        i.cwd = logHeaderCwd(path);
+        out_ ~= i;
+    }
     return out_;
 }
 
