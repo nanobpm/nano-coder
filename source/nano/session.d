@@ -853,38 +853,77 @@ class SessionLog
     }
 }
 
+/// Folded tool outputs longer than this keep only their log reference in
+/// the replay stash (live compactions and resumes alike).
+enum size_t stashSlimBytes = 512;
+
 /// Recover `pinText` for a user message logged before it was recorded: a
 /// legacy prompt with hook context appended (`<input>\n\n<system-reminder>…`)
 /// gets the logged input it starts with (the longest such) as its user-typed
 /// part. A message that already has one, or is exactly an input, is left alone.
 void backfillPinText(ref Message m, const string[] inputs) pure
 {
-    import std.algorithm : canFind, startsWith;
+    InputKey[] keys;
+    foreach (i; inputs) keys ~= InputKey.of(i);
+    backfillPinText(m, keys);
+}
+
+/// A logged input's identity (length and hash): `restore` keeps these, not
+/// every input's text, to backfill `pinText` (issue #263).
+struct InputKey
+{
+    size_t length, hash;
+
+    /// The key of `text`.
+    static InputKey of(const(char)[] text) pure nothrow @nogc => InputKey(text.length, hashOf(text));
+
+    /// Whether `text` is (by length and hash) this input.
+    bool matches(const(char)[] text) const pure nothrow @nogc => text.length == length && hashOf(text) == hash;
+}
+
+/// `backfillPinText` over input keys: the user-typed part is the matching
+/// prefix of the message's own content.
+void backfillPinText(ref Message m, const InputKey[] inputs) pure
+{
+    import std.algorithm : any, canFind, startsWith;
     import std.string : stripLeft;
     if (m.role != Role.user || m.pinText.length || m.hookContext) return;
     enum wrapStart = "<system-reminder>";
-    if ((inputs.length && inputs[$ - 1] == m.content) || !m.content.canFind(wrapStart)) return;
-    if (inputs.canFind(m.content)) return;
-    string found;
-    foreach_reverse (input; inputs)
-        if (m.content.length > input.length && m.content.startsWith(input)
-            && m.content[input.length .. $].stripLeft.startsWith(wrapStart) && input.length > found.length)
-            found = input;
-    if (found.length) m.pinText = found;
+    if ((inputs.length && inputs[$ - 1].matches(m.content)) || !m.content.canFind(wrapStart)) return;
+    if (inputs.any!(k => k.matches(m.content))) return;
+    size_t found;
+    foreach_reverse (ref input; inputs)
+        if (m.content.length > input.length && input.length > found
+            && m.content[input.length .. $].stripLeft.startsWith(wrapStart) && input.matches(m.content[0 .. input.length]))
+            found = input.length;
+    if (found) m.pinText = m.content[0 .. found];
 }
 
-/// The same logged message: role, content, tool calls and results, thinking blocks.
-private bool sameContent(const ref Message a, const ref Message b)
+/// A digest of what makes two logged messages the same (role, content, tool
+/// calls and results, thinking blocks), so `restore` keeps one word per
+/// original for `backfillLogLines` instead of the decoded message (issue #263).
+private size_t contentDigest(const ref Message m)
 {
-    static string calls(const ref Message m)
+    size_t h = hashOf(m.role);
+    h = hashOf(m.content, h);
+    h = hashOf(m.toolCallId, h);
+    h = hashOf(m.toolName, h);
+    h = hashOf(m.isError, h);
+    if (m.toolCalls.length)
     {
+        // The calls as logged: their normalized record, not the raw fields.
         auto j = messageRecord(m);
-        auto c = "tool_calls" in j;
-        return c is null ? "" : c.toString;
+        h = hashOf(j["tool_calls"].toString, h);
     }
-    static string blocks(const ref Message m) { return JSONValue(m.thinkingBlocks.dup).toString; }
-    return a.role == b.role && a.content == b.content && a.toolCallId == b.toolCallId && a.toolName == b.toolName
-        && a.isError == b.isError && calls(a) == calls(b) && blocks(a) == blocks(b);
+    if (m.thinkingBlocks.length) h = hashOf(JSONValue(m.thinkingBlocks.dup).toString, h);
+    return h;
+}
+
+/// A direct message record `backfillLogLines` may match: its line and digest.
+private struct Original
+{
+    ulong logLine;
+    size_t digest;
 }
 
 /// Backfill stable `[#N]` IDs onto a `replace` record's retained messages
@@ -892,20 +931,36 @@ private bool sameContent(const ref Message a, const ref Message b)
 /// from before stable IDs stored retained messages without `log_line`. Each
 /// un-IDed non-system message takes the first unclaimed original with the
 /// same content past the summarized range (folded originals are not retained).
-private void backfillLogLines(Message[] messages, const Message[] originals, ulong summarizedEnd)
+private void backfillLogLines(Message[] messages, const Original[] originals, ulong summarizedEnd)
 {
-    auto claimed = new bool[originals.length];
+    bool[] claimed;
     foreach (ref m; messages)
     {
         if (m.logLine || m.role == Role.system) continue;
+        if (!claimed.length) claimed = new bool[originals.length];
+        immutable d = contentDigest(m);
         foreach (i, ref o; originals)
-            if (!claimed[i] && o.logLine > summarizedEnd && sameContent(o, m))
+            if (!claimed[i] && o.logLine > summarizedEnd && o.digest == d)
             {
                 m.logLine = o.logLine;
                 claimed[i] = true;
                 break;
             }
     }
+}
+
+/// The identity of a large tool result's content (issue #263): a folded
+/// stash entry whose content matches its direct record's can drop it and be
+/// read back from the log on replay.
+private struct ToolKey
+{
+    size_t length, hash;
+    string toolCallId;
+}
+
+private ToolKey toolKey(string toolCallId, const(char)[] content) pure nothrow
+{
+    return ToolKey(content.length, hashOf(content), toolCallId);
 }
 
 /// An input that was accepted but whose turn has not ended (Rust
@@ -958,6 +1013,12 @@ struct Restored
     /// replacement (Rust's `folded` stash): a replay shows these in place of
     /// the synthetic summary.
     Message[] replayStash;
+    /// Per `replayStash` entry: its content was dropped because the log's
+    /// direct record at its `logLine` holds the same text (issue #263), so a
+    /// replay reads it back from the log rather than the resumed session
+    /// holding every folded tool output. Shorter than `replayStash` when the
+    /// trailing entries keep their content.
+    bool[] replayStashSlim;
     /// Index, in the compacted conversation, of the restated in-flight input
     /// the latest compaction folded (its original is in `replayStash`).
     Option!size_t replayRestated;
@@ -1204,9 +1265,12 @@ private size_t skimCount(const(char)[] arr) pure nothrow @nogc
 }
 
 /// Stream the committed lines of a session log (a torn last line is
-/// dropped) to `dg` with their 1-based line numbers. A plain log is read
+/// dropped) to `dg` with their 1-based line numbers, so a reader holds one
+/// line rather than the whole log. `requireCommitted`: a log without a
+/// committed record throws (a resume needs its header). A plain log is read
 /// line by line rather than whole (issue #244); a compressed one is inflated.
-private void eachLogLine(string path, scope void delegate(const(char)[] line, ulong lineNo) @safe dg)
+void eachLogLine(string path, scope void delegate(const(char)[] line, ulong lineNo) @safe dg,
+    bool requireCommitted = true)
 {
     ulong lineNo;
     if (isCompressedLog(path))
@@ -1214,7 +1278,7 @@ private void eachLogLine(string path, scope void delegate(const(char)[] line, ul
         auto text = logText(path);
         auto committed = text.length;
         while (committed && text[committed - 1] != '\n') committed--;
-        if (!committed) throw new Exception("session log " ~ path ~ " has no committed records");
+        if (!committed && requireCommitted) throw new Exception("session log " ~ path ~ " has no committed records");
         foreach (line; text[0 .. committed].lineSplitter) dg(line, ++lineNo);
         return;
     }
@@ -1229,7 +1293,7 @@ private void eachLogLine(string path, scope void delegate(const(char)[] line, ul
         if (l.length && l[$ - 1] == '\r') l = l[0 .. $ - 1];
         dg(l, ++lineNo);
     }
-    if (!any) throw new Exception("session log " ~ path ~ " has no committed records");
+    if (!any && requireCommitted) throw new Exception("session log " ~ path ~ " has no committed records");
 }
 
 /// Pass 1 of `restore` (issue #244): the line of the latest `replace` that
@@ -1288,11 +1352,23 @@ private Restored restoreLog(string path, bool skipSuperseded)
     // The conversation length before `skipBefore`, without building it.
     size_t skimmedLen;
     string pendingId;
-    // Every logged input's text, to backfill `pinText` on legacy messages.
-    string[] inputs;
+    // Every logged input's key (not its text: issue #263), to backfill
+    // `pinText` on legacy messages.
+    InputKey[] inputs;
     Message[] rustStash;
-    // Every direct message record, with its line, for `backfillLogLines`.
-    Message[] originals;
+    // Per `rustStash` entry: its content was dropped (`Restored.replayStashSlim`).
+    bool[] stashSlim;
+    // Every direct message record's line and digest, for `backfillLogLines`
+    // (the decoded messages would hold the whole log until the end).
+    Original[] originals;
+    // The large direct tool results by line: a folded copy that matches
+    // drops its content (issue #263).
+    ToolKey[ulong] toolKeys;
+    void noteTool(ulong lineNo, ref const Message m)
+    {
+        if (m.role == Role.tool && m.content.length > stashSlimBytes && !m.attachments.length)
+            toolKeys[lineNo] = toolKey(m.toolCallId, m.content);
+    }
     // Plan replay is bounded by the latest full snapshot (issue #205): deltas
     // before it are already folded in, so applying them would redo merges the
     // snapshot supersedes. `planAt` replays only the suffix from `planFrom`.
@@ -1319,7 +1395,17 @@ private Restored restoreLog(string path, bool skipSuperseded)
             if (type == "message")
             {
                 skimmedLen++;
-                if (lineNo <= floorL) { index++; return; }
+                if (lineNo <= floorL)
+                {
+                    // Only a large tool result's key outlives the skim:
+                    // such a line is decoded below for `toolKeys`.
+                    auto data = skimField(line, "data");
+                    if (skimField(data, "role") != `"tool"` || skimField(data, "content").length <= stashSlimBytes)
+                    {
+                        index++;
+                        return;
+                    }
+                }
                 // An original past the latest summarized range: decoded
                 // below, for `backfillLogLines` only.
             }
@@ -1403,7 +1489,7 @@ private Restored restoreLog(string path, bool skipSuperseded)
         case "input":
             pendingId = data["id"].str;
             r.pendingInput = data["text"].str;
-            inputs ~= r.pendingInput;
+            inputs ~= InputKey.of(r.pendingInput);
             r.hasPending = true;
             r.pending = PendingInput(pendingId, r.pendingInput,
                 lineNo < skipBefore ? skimmedLen : r.conversation.length);
@@ -1411,14 +1497,16 @@ private Restored restoreLog(string path, bool skipSuperseded)
         case "message":
             if (lineNo < skipBefore)
             {
-                originals ~= messageFromRecord(data);
-                originals[$ - 1].logLine = lineNo;
+                auto o = messageFromRecord(data);
+                if (lineNo > floorL) originals ~= Original(lineNo, contentDigest(o));
+                noteTool(lineNo, o);
                 break;
             }
             r.conversation ~= messageFromRecord(data);
             r.conversation[$ - 1].logLine = lineNo;
             backfillPinText(r.conversation[$ - 1], inputs);
-            originals ~= r.conversation[$ - 1];
+            originals ~= Original(lineNo, contentDigest(r.conversation[$ - 1]));
+            noteTool(lineNo, r.conversation[$ - 1]);
             {
                 import nano.session_history : consumesHint;
                 if (r.historyAvailable && consumesHint(r.conversation[$ - 1])) r.historyHintConsumed = true;
@@ -1489,7 +1577,7 @@ private Restored restoreLog(string path, bool skipSuperseded)
                 }
             }
             {
-                static Message[] decode(const JSONValue v, const string[] inputs)
+                static Message[] decode(const JSONValue v, const InputKey[] inputs)
                 {
                     Message[] o;
                     if (v.type == JSONType.array)
@@ -1500,6 +1588,25 @@ private Restored restoreLog(string path, bool skipSuperseded)
                         }
                     return o;
                 }
+                auto pins = "pinned_requests" in data, pinBase = "pinned_base" in data;
+                // Folded turns whose large tool output matches its direct
+                // record drop it: a replay reads it back from the log, and the
+                // resumed session no longer holds every folded output (issue
+                // #263). Not for a Rust log, whose pinned block shares the stash.
+                bool[] slim(Message[] ms)
+                {
+                    auto o = new bool[ms.length];
+                    if (pins is null) return o;
+                    foreach (i, ref m; ms)
+                        if (m.role == Role.tool && m.content.length > stashSlimBytes && !m.attachments.length)
+                            if (auto k = m.logLine in toolKeys)
+                                if (*k == toolKey(m.toolCallId, m.content))
+                                {
+                                    m.content = null;
+                                    o[i] = true;
+                                }
+                    return o;
+                }
                 // Rust's cumulative stash of folded turns: full, or a delta on a base.
                 auto folded = "folded" in data, base = "folded_base" in data;
                 bool active;
@@ -1508,22 +1615,26 @@ private Restored restoreLog(string path, bool skipSuperseded)
                 {
                     auto b = toSize(foldedBaseN);
                     auto delta = decode(*folded, inputs);
-                    if ((b < rustStash.length ? b : rustStash.length) + delta.length > 0)
+                    auto keep = b < rustStash.length ? b : rustStash.length;
+                    if (keep + delta.length > 0)
                     {
-                        rustStash = rustStash[0 .. (b < rustStash.length ? b : rustStash.length)] ~ delta;
+                        auto flags = slim(delta); // before the copy: it drops content in place
+                        rustStash = rustStash[0 .. keep] ~ delta;
+                        stashSlim = stashSlim[0 .. keep] ~ flags;
                         active = true;
                     }
                 }
                 else if (folded !is null)
                 {
                     auto full = decode(*folded, inputs);
-                    if (full.length) { rustStash = full; active = true; }
+                    if (full.length) { rustStash = full; stashSlim = slim(full); active = true; }
                 }
-                if (!active) rustStash = null;
+                if (!active) { rustStash = null; stashSlim = null; }
                 // Shared, not copied (issue #244): neither is mutated in place
                 // (a later delta builds a new array), and an append to one
                 // never shows through the other's length.
                 r.replayStash = rustStash;
+                r.replayStashSlim = stashSlim;
                 r.replayRestated = Option!size_t.init;
                 if (auto at = "restated" in data)
                 {
@@ -1533,7 +1644,6 @@ private Restored restoreLog(string path, bool skipSuperseded)
                 // The pinned block: a full `pinned_requests` restatement, or a
                 // delta extending the first `pinned_base` of the stash so far
                 // (issue #205). With neither, a Rust log's folded stash is it.
-                auto pins = "pinned_requests" in data, pinBase = "pinned_base" in data;
                 ulong pinBaseN;
                 if (pins !is null && pinBase !is null && jsonUnsigned(*pinBase, pinBaseN))
                 {

@@ -3234,7 +3234,18 @@ int runMain(string[] args)
         writeln(stampBlock(console.stamp(), banner.join("\n")));
     }
     // The frame owns the screen: rebuild a resumed session's transcript on it.
-    if (gFrame && o.hasResume) replayTranscript(agent, console);
+    if (gFrame && o.hasResume)
+    {
+        replayTranscript(agent, console);
+        // The replay read the folded turns' outputs back from the log
+        // (issue #263): hand that transient heap back too.
+        releaseHeap();
+        {
+            import core.memory : GC;
+            import std.file : append;
+            append("/tmp/nano263-debug.txt", format("used=%s free=%s\n", GC.stats.usedSize, GC.stats.freeSize));
+        }
+    }
     import core.time : MonoTime, msecs;
     import nano.lineedit : DoublePress, interruptWindowMs;
     auto exitPress = DoublePress(interruptWindowMs); // idle Ctrl-C twice exits
@@ -3604,7 +3615,7 @@ int runMain(string[] args)
                     string[] loadNotes;
                     try loadNotes = loadSession(path);
                     catch (Exception e) { writeln(e.msg); continue; }
-                    if (gFrame) { gFrame.clear(); replayTranscript(agent, console); }
+                    if (gFrame) { gFrame.clear(); replayTranscript(agent, console); releaseHeap(); }
                     foreach (n; loadNotes) stdErr.writeln(n);
                     stdErr.flush();
                     writefln("Resumed session %s (resume later with nano-coder --resume %s)", id, id);

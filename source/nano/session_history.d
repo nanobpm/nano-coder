@@ -76,23 +76,23 @@ struct Entry
 }
 
 /// The log's message records with their IDs. Torn or unknown lines are skipped.
-Entry[] load(string path)
+/// `want`: decode only the lines it accepts (by ID), so a caller that needs a
+/// few messages of a long log holds only those; the log is streamed, never
+/// read whole (issue #263).
+Entry[] load(string path, scope bool delegate(ulong id) @safe want = null)
 {
-    import std.string : lineSplitter;
-    import nano.session : messageFromRecord, logText;
+    import nano.session : messageFromRecord, eachLogLine;
     Entry[] out_;
-    ulong n;
-    foreach (line; logText(path).lineSplitter)
-    {
-        ++n;
-        if (!line.canFind(`"message"`)) continue; // cheap pre-filter; any JSON spacing is valid
+    eachLogLine(path, (line, n) {
+        if (want !is null && !want(n)) return;
+        if (!line.canFind(`"message"`)) return; // cheap pre-filter; any JSON spacing is valid
         try
         {
             auto rec = parseJSON(line);
             if (rec["type"].str == "message") out_ ~= Entry(n, messageFromRecord(rec["data"]));
         }
         catch (Exception) {} // skip a torn or corrupt line, like the resume loader does
-    }
+    }, false);
     return out_;
 }
 
