@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.22.5", "date": "2026-11-24", "items": [
+      {"type":"perf","scope":"http","title":"stop buffering full SSE response bodies in http.perform","pr":314}
+    ]},
     {"version": "1.22.4", "date": "2026-11-23", "items": [
       {"type":"perf","scope":"session","title":"bound resume memory: stream log reads, smaller GC growth","pr":319}
     ]},
@@ -438,9 +441,6 @@
     ]},
     {"version": "0.30.0", "date": "2026-10-01", "items": [
       {"type":"feat","scope":"config","title":"per-provider and per-model temperature, with model default","pr":79}
-    ]},
-    {"version": "0.29.2", "date": "2026-10-01", "items": [
-      {"type":"fix","scope":"context","title":"reserve max_tokens within the context window","pr":81}
     ]}
   ]
 }
