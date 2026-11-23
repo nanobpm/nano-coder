@@ -3366,7 +3366,10 @@ int runMain(string[] args)
         {
             import std.algorithm : filter;
             import std.array : array;
-            foreach (t; late) if (t.fromPeer) peerRouter.requeueLate(t.text);
+            foreach (t; late)
+                if (t.fromPeer && !peerRouter.requeueLate(t.text))
+                    stdErr.writeln(console.dim(format("[peer message from %s dropped: inbox full]",
+                        escapeMarks(sanitizeBlock(PeerRouter.senderFromLabel(t.text))))));
             late = late.filter!(t => !t.fromPeer).array;
         }
         // A cancelled turn drops them (Rust: only a successful cancelled outcome).

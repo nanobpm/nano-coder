@@ -1057,7 +1057,10 @@ final class AcpServer : AgentEvents
             {
                 import std.algorithm : filter;
                 import std.array : array;
-                foreach (s; leftover) if (s.fromPeer) peerRouter.requeueLate(s.text);
+                foreach (s; leftover)
+                    if (s.fromPeer && !peerRouter.requeueLate(s.text))
+                        stdErr.writeln(format("peer message from %s dropped: inbox full",
+                            peers.PeerRouter.senderFromLabel(s.text)));
                 leftover = leftover.filter!(s => !s.fromPeer).array;
             }
             items = requeueSteers(items, leftover, marks, session);

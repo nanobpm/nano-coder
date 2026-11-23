@@ -797,7 +797,8 @@ struct PeerRouter
     /// Run a peer's steer that missed its turn as a later peer prompt, so
     /// it keeps its provenance (the loop guard) instead of becoming an
     /// ordinary prompt. Its sender was answered when it was steered.
-    void requeueLate(string labelled)
+    /// Returns false when the inbox is full and the message was dropped.
+    bool requeueLate(string labelled)
     {
         auto done = Shared!ReplyCell.make;
         answer(done, Status.queued, "queued");
@@ -812,8 +813,25 @@ struct PeerRouter
         queuedBytes.update((ref size_t q) {
             if (q + bytes <= 2 * maxQueuedBytes) { q += bytes; admitted = true; }
         });
-        if (!admitted) return;
+        if (!admitted) return false;
         waiting.put(WaitingItem(pm, labelled, false, done));
+        return true;
+    }
+
+    /// Extract the sender label from a labelled peer message (e.g.
+    /// `ab88e980` from `[from session ab88e980 · title] text`) for drop
+    /// notices; returns `"peer"` when the prefix is missing.
+    static string senderFromLabel(string labelled) pure nothrow
+    {
+        import std.string : indexOf;
+        enum prefix = "[from session ";
+        if (labelled.length > prefix.length && labelled[0 .. prefix.length] == prefix)
+        {
+            auto rest = labelled[prefix.length .. $];
+            auto close = rest.indexOf(']');
+            if (close > 0) return rest[0 .. close];
+        }
+        return "peer";
     }
 
     /// Every string a waiting item retains, so the byte cap can't be
@@ -1112,16 +1130,24 @@ unittest
     router.midTurn(false);
 
     // A late peer steer runs later as a (pre-answered) peer prompt.
-    router.requeueLate("[from session sess-a] later");
+    assert(router.requeueLate("[from session sess-a] later"));
     assert(router.takeWaiting(m) && m.labelled == "[from session sess-a] later" && !m.needsConfirm);
+    assert(PeerRouter.senderFromLabel("[from session sess-a · title] hi") == "sess-a · title");
+    assert(PeerRouter.senderFromLabel("[from session sess-a] hi") == "sess-a");
+    assert(PeerRouter.senderFromLabel("unlabelled") == "peer");
 
     // Late steers can't grow the inbox past its bound across turns.
     {
         auto quarter = "x".replicate(maxQueuedBytes / 4);
-        foreach (i; 0 .. 32) router.requeueLate(quarter);
+        size_t accepted, dropped;
+        foreach (i; 0 .. 32)
+        {
+            if (router.requeueLate(quarter)) accepted++;
+            else dropped++;
+        }
         size_t n;
         while (router.takeWaiting(m)) n++;
-        assert(n > 0 && n < 32);
+        assert(n == accepted && accepted > 0 && dropped > 0, "dropped late steers are reported to the caller");
     }
 
     // Leaving a session refuses its queued, waiting and steered messages.
