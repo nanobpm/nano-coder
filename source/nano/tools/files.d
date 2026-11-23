@@ -162,11 +162,13 @@ string readFileDigest(JSONValue args, scope void delegate(string path, ubyte[32]
     ubyte[4] utf8Carry;
     size_t utf8CarryLen;
 
-    auto emitLine = () {
+    auto emitLine = (bool terminated) {
         if (lineCount >= firstLine && lineCount < lastLine)
         {
             auto l = curLine.data;
-            if (!curTruncated && l.length && l[$ - 1] == '\r') l = l[0 .. $ - 1];
+            // Only a `\r` right before `\n` is a line ending; a literal
+            // trailing `\r` on an unterminated final line is content.
+            if (terminated && !curTruncated && l.length && l[$ - 1] == '\r') l = l[0 .. $ - 1];
             import std.format : formattedWrite;
             if (curTruncated)
                 formattedWrite(out_, "%6d\t%s [line truncated]\n", lineCount + 1, l[0 .. safeCut(l, maxLineChars)]);
@@ -253,7 +255,7 @@ string readFileDigest(JSONValue args, scope void delegate(string path, ubyte[32]
                 {
                     curTruncated = true;
                 }
-                emitLine();
+                emitLine(true);
                 st = i + 1;
             }
         }
@@ -283,7 +285,7 @@ string readFileDigest(JSONValue args, scope void delegate(string path, ubyte[32]
     if (anyBytes && !hadTrailingNewline)
     {
         if (!curTruncated && curLine.data.length > maxLineChars) curTruncated = true;
-        emitLine();
+        emitLine(false);
     }
 
     auto digest = sha.finish();
@@ -1883,6 +1885,15 @@ unittest
     bool threw;
     try readFile(j("path", p, "offset", 9), st); catch (ToolError) threw = true;
     assert(threw);
+}
+
+unittest // a literal trailing `\r` on an unterminated last line is content, not a line ending
+{
+    auto st = new ReadState;
+    auto p = tmpFile("cr-tail.txt", "a\r\nabc\r");
+    auto all = readFile(j("path", p), st);
+    assert(all.indexOf("     1\ta\n") >= 0, all);
+    assert(all.indexOf("     2\tabc\r\n") >= 0, all);
 }
 
 // rust: files.rs::write_creates_parents_and_edit_requires_unique_match
