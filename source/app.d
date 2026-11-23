@@ -364,6 +364,9 @@ struct MidTurn
     LiveView view;
     /// One element (a slice keeps `MidTurn` assignable).
     immutable(Config)[] cfg;
+    /// The sub-agent ids for `/subagents show|stop` completion: the source
+    /// is thread-local, so the key-reader thread sets its own from this.
+    NotNull!(shared Locked!(immutable(imported!"nano.commands".Suggestion)[])) subIds;
 }
 
 /// A `/command` typed during a turn: its output if it runs now, else null (held).
@@ -618,6 +621,9 @@ Isolated!LineEditor turnKeys(Isolated!LineEditor owned, ConsoleLink console, sha
     QuestionBroker questions, MessageQueue queue, MidTurn mid)
 {
     auto editor = owned.unwrap;
+    import nano.commands : subagentIdSource;
+    auto ids = mid.subIds;
+    subagentIdSource = () => atomicLoad(ids).get.dup;
     readTurnKeys(editor, console, done, held, questions, queue, mid);
     // Isolated: this thread got the editor isolated and kept no other reference.
     return Isolated!LineEditor.assumeIsolated(editor);
@@ -852,17 +858,35 @@ string saveSubagentsSetting(ref Config cfg, bool on)
     return "saved to " ~ cfg.path;
 }
 
-/// Run `/subagents [on|off] [--save]` on `agent`: show the state, or switch
-/// the `agent` tool for the session (and the user config with `--save`).
-string subagentsCommand(Agent agent, ref Config cfg, string arg)
+/// Run `/subagents` on `agent`: show the state and every sub-agent of the
+/// session, switch the `agent` tool (`on|off`, `--save` writes the user
+/// config), or stop sub-agents (`stop <id>|all`). `show <id>` returns its
+/// log path in `showLog` for the caller to render.
+string subagentsCommand(Agent agent, ref Config cfg, string arg, out string showLog)
 {
-    import nano.subagent : parseToggle, statusText;
-    import nano.result : unwrap, unwrapErr;
-    auto p = parseToggle(arg);
-    if (p.isErr) return p.unwrapErr("isErr");
-    auto t = p.unwrap("isOk");
+    import nano.subagent : parseCommand, SubToggle, SubShowCmd, SubStopCmd, SubCmdError;
+    string out_;
+    parseCommand(arg).match!(
+        (SubCmdError e) { out_ = e.message; },
+        (SubShowCmd s) {
+            agent.subagentLog(s.id).match!((string path) { showLog = path; }, (string why) { out_ = why; });
+        },
+        (SubStopCmd s) { out_ = agent.stopSubagentsByUser(s.id); },
+        (SubToggle t) { out_ = subagentsToggle(agent, cfg, t); });
+    return out_;
+}
+
+private string subagentsToggle(Agent agent, ref Config cfg, imported!"nano.subagent".SubToggle t)
+{
+    import nano.subagent : statusText, listingText;
     auto model = agent.subagentModel.length ? agent.subagentModel : agent.client.providerName ~ "/" ~ agent.client.modelName;
-    if (t.show) return statusText(agent.subagentsOffered, agent.subagentCandidates, model, agent.subagentLimits);
+    if (t.show)
+    {
+        size_t forgotten;
+        auto all = agent.subagentList(forgotten);
+        return statusText(agent.subagentsOffered, agent.subagentCandidates, model, agent.subagentLimits)
+            ~ "\n\n" ~ listingText(all, forgotten);
+    }
     if (!agent.subagentsEnabled) return "Sub-agents are not available in this session";
     agent.control.takeSubagentsRequest(); // a direct switch supersedes a queued one
     auto was = agent.subagentsOn;
@@ -871,6 +895,101 @@ string subagentsCommand(Agent agent, ref Config cfg, string arg)
     if (was != t.on) msg ~= " (the tool list changed, so the provider's prompt cache is rebuilt once)";
     if (t.save) msg ~= "; " ~ saveSubagentsSetting(cfg, t.on);
     return msg;
+}
+
+/// Replays shown so far by `/subagents show` (UI thread only).
+private size_t gReplaySeq;
+
+/// `/subagents show`: render a sub-agent's transcript on the frame as the
+/// main transcript replays (prompts, answers, tool calls with their folded
+/// output), streaming its log a message at a time rather than loading it.
+void showSubagentLog(string id, string path, Console console)
+{
+    import nano.subagent : eachLogMessage;
+    import std.exception : ErrnoException;
+    import std.file : FileException;
+    auto frame = gFrame;
+    if (frame) frame.hold(true);
+    scope (exit) if (frame) frame.hold(false);
+    auto after = console.afterStep;
+    console.afterStep = null;
+    scope (exit) console.afterStep = after;
+    const wasBatched = gStatusBatched;
+    gStatusBatched = true;
+    scope (exit) gStatusBatched = wasBatched;
+    scope (exit) console.replayTime = null;
+    // A replay runs no tools, so the child's `history_search`/`history_read`
+    // calls must not accumulate in the parent's status counters: keep them
+    // aside and put them back afterwards.
+    size_t savedSearches, savedReads;
+    if (gFrame) gStats.update((ref Stats s) {
+        savedSearches = s.historySearches;
+        savedReads = s.historyReads;
+    });
+    scope (exit) if (gFrame) gStats.update((ref Stats s) {
+        s.historySearches = savedSearches;
+        s.historyReads = savedReads;
+    });
+    writeln(console.bold(format("── %s transcript ──", id)));
+    // The calls of the latest assistant message waiting for their results,
+    // so each header shows directly above its own output.
+    ToolCall[] pending;
+    string pendingTime;
+    // A per-replay prefix on tool-call ids, so folds of two replays (or of
+    // children reusing ids) never share a key in the frame.
+    immutable prefix = format("replay%s:", ++gReplaySeq);
+    void flush()
+    {
+        console.replayTime = pendingTime;
+        foreach (c; pending) console.toolStart(c);
+        pending = null;
+    }
+    try eachLogMessage(path, (Message m) {
+        if (m.role != Role.tool) flush();
+        console.replayTime = m.timestamp;
+        final switch (m.role)
+        {
+            case Role.system: break;
+            case Role.user:
+            {
+                // As the main replay: model-only reminders were never typed,
+                // and a steer (e.g. a stop's cancellation) is not a prompt.
+                if (m.hookContext || m.continuation || m.timer || m.autoInitiated) break;
+                auto typed = m.pinText.length ? m.pinText : m.content;
+                if (!typed.strip.length) break;
+                if (m.steered) console.userMessage(sanitizeBlock(typed));
+                else writeln(stampBlock(console.stamp(), console.bold("› ") ~ escapeMarks(sanitizeBlock(typed))));
+                break;
+            }
+            case Role.assistant:
+                if (m.content.strip.length && !(console.quiet && m.toolCalls.length))
+                    writeln(stampBlock(console.stamp(), console.display(escapeMarks(sanitizeBlock(m.content))).stripRight));
+                pending = m.toolCalls.dup;
+                foreach (ref c; pending) c.id = prefix ~ c.id;
+                pendingTime = m.timestamp;
+                break;
+            case Role.tool:
+                foreach (k, c; pending)
+                {
+                    if (c.id != prefix ~ m.toolCallId) continue;
+                    console.replayTime = pendingTime;
+                    console.toolStart(c);
+                    console.replayTime = m.timestamp;
+                    console.toolEnd(c, toolResultDisplay(m.content, m.attachments), m.isError);
+                    pending = pending[0 .. k] ~ pending[k + 1 .. $];
+                    break;
+                }
+                break;
+        }
+        return true;
+    });
+    catch (ErrnoException e) writeln("Could not read the sub-agent log: ", e.msg);
+    catch (FileException e) writeln("Could not read the sub-agent log: ", e.msg);
+    flush();
+    writeln(console.bold(format("── end of %s ──", id)));
+    gStatusBatched = wasBatched;
+    updateStatus((ref Stats s) { s.activity = Activity.idle; s.tool = null; s.tokensPerSec = 0; });
+    stdOut.flush();
 }
 
 /// A frozen copy of `cfg`, for another thread.
@@ -3032,6 +3151,24 @@ int runMain(string[] args)
     auto recents = nano.recents.load(recentsPath);
     if (recents.canonicalize(cfg.providers, cfg.defaultProvider)) nano.recents.save(recentsPath, recents);
     string currentSpec() { return nano.recents.canonical(client.providerName ~ "/" ~ client.modelName, cfg.providers, cfg.defaultProvider); }
+    // `/subagents show|stop` completion reads a snapshot of the ids, taken
+    // on the agent's thread before each prompt and whenever a sub-agent
+    // changes: the key reader of a turn runs on
+    // its own thread and must not touch the agent.
+    import nano.commands : subagentIdSource, Suggestion;
+    auto subIds = notNull(new shared Locked!(immutable(Suggestion)[]));
+    void snapshotSubagentIds()
+    {
+        size_t forgotten;
+        immutable(Suggestion)[] ids;
+        foreach (ref i; agent.subagentSnapshot(forgotten))
+            ids ~= immutable Suggestion(i.id, i.state ~ " · " ~ i.task);
+        atomicLoad(subIds).update((ref immutable(Suggestion)[] v) { v = ids; });
+    }
+    // Refreshed as sub-agents launch, progress, end or are cancelled, so a
+    // turn's own sub-agents complete mid-turn too.
+    agent.onSubagentsChanged = () { snapshotSubagentIds(); };
+    subagentIdSource = () => atomicLoad(subIds).get.dup;
     modelSuggestionSource = () {
         string[] recent;
         synchronized recent = recents.models.dup;
@@ -3174,7 +3311,7 @@ int runMain(string[] args)
                     ~ "(/queue lists, edits, removes), Esc Esc or Ctrl-C to cancel]"));
             refreshView();
             heldLines = Chan!string.make;
-            auto mid = MidTurn(agent.control, view, [frozenConfig(cfg)]);
+            auto mid = MidTurn(agent.control, view, [frozenConfig(cfg)], subIds);
             // Isolated: `editor` is none until the join hands it back, and its
             // callbacks (built by `makeEditor`) reach only shared state.
             auto owned = Isolated!LineEditor.assumeIsolated(ed);
@@ -3464,6 +3601,7 @@ int runMain(string[] args)
         {
             auto ed = editor.unwrap("checked on the line above");
             refreshStatus();
+            snapshotSubagentIds();
             if (!quietPrompt) write("\n");
             quietPrompt = false;
             stdOut.flush();
@@ -3796,8 +3934,13 @@ int runMain(string[] args)
                     writeln(versionString);
                     continue;
                 case "/subagents":
-                    writeln(escapeMarks(sanitizeBlock(subagentsCommand(agent, cfg, arg))));
+                {
+                    string showLog;
+                    auto said = subagentsCommand(agent, cfg, arg, showLog);
+                    if (showLog.length) showSubagentLog(arg.strip["show".length .. $].strip, showLog, console);
+                    else writeln(escapeMarks(sanitizeBlock(said)));
                     continue;
+                }
                 case "/changes":
                 {
                     // No fetch here: it would block the prompt; notes the build
@@ -4038,7 +4181,8 @@ unittest
     import std.algorithm : canFind, startsWith;
     import nano.option : notNull;
     Config c;
-    auto ctx = MidTurn(notNull(new shared TurnControl), LiveView.make, [frozenConfig(c)]);
+    auto ctx = MidTurn(notNull(new shared TurnControl), LiveView.make, [frozenConfig(c)],
+        notNull(new shared Locked!(immutable(imported!"nano.commands".Suggestion)[])));
     foreach (sep; ["\t", "\n", "\x0b", "  ", " "])
     {
         auto note = midTurnCommand("/mode" ~ sep ~ "plan", ctx);
@@ -4060,7 +4204,8 @@ unittest
     import std.algorithm : canFind, startsWith;
     import nano.option : notNull;
     Config c;
-    auto ctx = MidTurn(notNull(new shared TurnControl), LiveView.make, [frozenConfig(c)]);
+    auto ctx = MidTurn(notNull(new shared TurnControl), LiveView.make, [frozenConfig(c)],
+        notNull(new shared Locked!(immutable(imported!"nano.commands".Suggestion)[])));
     foreach (cmd; ["/trajectory", "/trajectory --json", "/trajectory\t--json", "/trajectory\t"])
         assert(midTurnCommand(cmd, ctx).canFind("Session persistence is disabled"), cmd);
     assert(midTurnCommand("/trajectory\t--json", ctx) == midTurnCommand("/trajectory --json", ctx));
@@ -4126,4 +4271,36 @@ unittest
     assert(!s.captured.canFind("\x1b]8771;Zm9v"), s.captured);
     assert(!s.captured.canFind("\x07y"), s.captured);
     assert(!s.captured.canFind("\uE002"), s.captured);
+}
+
+// `/subagents show` replays a child's tools without counting its
+// `history_search`/`history_read` calls in the parent's status counters
+// (issue #267).
+unittest
+{
+    import std.file : tempDir, remove;
+    import std.path : buildPath;
+    import std.stdio : File;
+    import std.conv : to;
+    import nano.session : messageRecord;
+    auto p = buildPath(tempDir, "nano-replay-" ~ to!string(monoNow.ticks) ~ ".jsonl");
+    scope (exit) remove(p);
+    {
+        auto f = File(p, "wb");
+        auto hs = Message.assistant("", [ToolCall.fromRaw("c1", "history_search", `{"query":"q"}`)]);
+        auto hr = Message.assistant("", [ToolCall.fromRaw("c2", "history_read", `{"id":"1"}`)]);
+        auto hsResult = Message.toolResult("c1", "history_search", "a hit");
+        auto hrResult = Message.toolResult("c2", "history_read", "a line");
+        f.write(`{"type":"message","data":` ~ messageRecord(hs).jsonText ~ "}\n");
+        f.write(`{"type":"message","data":` ~ messageRecord(hsResult).jsonText ~ "}\n");
+        f.write(`{"type":"message","data":` ~ messageRecord(hr).jsonText ~ "}\n");
+        f.write(`{"type":"message","data":` ~ messageRecord(hrResult).jsonText ~ "}\n");
+    }
+    auto before = gStats.get;
+    scope (exit) gStats.update((ref Stats s) { s = before; });
+    gStats.update((ref Stats s) { s.historySearches = 4; s.historyReads = 2; });
+    showSubagentLog("sub-1", p, new Console(false));
+    auto after = gStats.get;
+    assert(after.historySearches == 4 && after.historyReads == 2,
+        format("replay counted the child's history calls: %ss %sr", after.historySearches, after.historyReads));
 }

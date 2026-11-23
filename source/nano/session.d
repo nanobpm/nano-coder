@@ -58,8 +58,11 @@ string logText(string path)
 
 // zlib's C API writes only within the caller's buffers (sizes tracked in
 // avail_in/avail_out); the stream struct is plain C data.
+/// A corrupt or truncated stream throws `FileException`, so readers that
+/// report unreadable files handle it too.
 private string gunzipLog(const(ubyte)[] bytes, string path) @trusted
 {
+    import std.file : FileException;
     import etc.c.zlib : z_stream, inflateInit2, inflate, inflateEnd, Z_FINISH, Z_NO_FLUSH, Z_STREAM_END, Z_OK, Z_BUF_ERROR;
     import core.stdc.string : strlen;
     // A gzip wrapper needs raw inflate with windowBits 31 (15 + the 16 that
@@ -90,10 +93,10 @@ private string gunzipLog(const(ubyte)[] bytes, string path) @trusted
         used += window - zs.avail_out;
         if (rc == Z_STREAM_END) break;
         if (rc != Z_OK && rc != Z_BUF_ERROR)
-            throw new Exception(format("gunzip %s: %s", path,
+            throw new FileException(path, format("gunzip: %s",
                 zs.msg !is null ? zs.msg[0 .. strlen(zs.msg)] : "corrupt stream"));
         if (rc == Z_BUF_ERROR && zs.avail_in == 0 && fed == bytes.length && zs.avail_out != 0)
-            throw new Exception("gunzip " ~ path ~ ": truncated stream");
+            throw new FileException(path, "gunzip: truncated stream");
     }
     import std.exception : assumeUnique;
     import std.string : assumeUTF;
@@ -346,6 +349,17 @@ size_t adoptPreviewSessions(string from, string to)
     }
     if (dirEntries(from, SpanMode.shallow).empty) collectException(rmdir(from));
     return moved;
+}
+
+unittest // a corrupt or truncated gzip log is a FileException, not a bare Exception
+{
+    import std.exception : assertThrown;
+    import std.file : FileException;
+    // A gzip header followed by garbage, and a header with no body.
+    immutable ubyte[] corrupt = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3, 0xff, 0xff, 0xff, 0xff];
+    immutable ubyte[] truncated = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
+    assertThrown!FileException(gunzipLog(corrupt, "x.jsonl.gz"));
+    assertThrown!FileException(gunzipLog(truncated, "x.jsonl.gz"));
 }
 
 unittest
@@ -1478,6 +1492,15 @@ private size_t skimCount(const(char)[] arr) pure nothrow @nogc
 void eachLogLine(string path, scope void delegate(const(char)[] line, ulong lineNo) @safe dg,
     bool requireCommitted = true)
 {
+    eachLogLineUntil(path, (const(char)[] line, ulong lineNo) { dg(line, lineNo); return true; },
+        requireCommitted);
+}
+
+/// `eachLogLine` whose `dg` returns false to stop reading: no further line
+/// is read from the file, so an early-stopping caller never scans to EOF.
+void eachLogLineUntil(string path, scope bool delegate(const(char)[] line, ulong lineNo) @safe dg,
+    bool requireCommitted = true)
+{
     ulong lineNo;
     if (isCompressedLog(path))
     {
@@ -1485,7 +1508,8 @@ void eachLogLine(string path, scope void delegate(const(char)[] line, ulong line
         auto committed = text.length;
         while (committed && text[committed - 1] != '\n') committed--;
         if (!committed && requireCommitted) throw new Exception("session log " ~ path ~ " has no committed records");
-        foreach (line; text[0 .. committed].lineSplitter) dg(line, ++lineNo);
+        foreach (line; text[0 .. committed].lineSplitter)
+            if (!dg(line, ++lineNo)) return;
         return;
     }
     import std.typecons : Yes;
@@ -1497,9 +1521,23 @@ void eachLogLine(string path, scope void delegate(const(char)[] line, ulong line
         any = true;
         auto l = line[0 .. $ - 1];
         if (l.length && l[$ - 1] == '\r') l = l[0 .. $ - 1];
-        dg(l, ++lineNo);
+        if (!dg(l, ++lineNo)) return;
     }
     if (!any && requireCommitted) throw new Exception("session log " ~ path ~ " has no committed records");
+}
+
+unittest // eachLogLineUntil stops reading at the first false
+{
+    import std.file : tempDir, remove;
+    import std.path : buildPath;
+    import std.conv : to;
+    import nano.clock : monoNow;
+    auto p = buildPath(tempDir, "nano-until-" ~ to!string(monoNow.ticks) ~ ".jsonl");
+    scope (exit) remove(p);
+    std.file.write(p, "a\nb\nc\nd\n");
+    ulong last;
+    eachLogLineUntil(p, (const(char)[] l, ulong n) { last = n; return n < 2; });
+    assert(last == 2);
 }
 
 /// Pass 1 of `restore` (issue #244): the line of the latest `replace` that
