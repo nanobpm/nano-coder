@@ -257,7 +257,7 @@ const(Message)[] rehydrateStash(const(Message)[] stash, Option!SessionLog[] logs
         // writer since, and the stale path would name a foreign file.
         try
             foreach (e; load(src.path, (id) => (id in lines) !is null))
-                if (e.message.role == Role.tool) at[e.id] = e.message;
+                if (e.message.role == Role.tool || e.message.role == Role.assistant) at[e.id] = e.message;
         catch (Exception) {} // an unreadable log: the entries replay empty
         byLog[src] = at;
     }
@@ -270,7 +270,13 @@ const(Message)[] rehydrateStash(const(Message)[] stash, Option!SessionLog[] logs
         Message x = deepCopy(m);
         auto src = logs[i].unwrap("isSome");
         if (auto r = x.logLine in byLog[src])
-            if (r.toolCallId == x.toolCallId) x.content = r.content;
+            if (r.role == x.role && r.toolCallId == x.toolCallId && (r.role == Role.tool || r.timestamp == x.timestamp))
+            {
+                x.content = r.content;
+                x.thinking = r.thinking;
+                x.thinkingBlocks = r.thinkingBlocks;
+                x.toolCalls = r.toolCalls;
+            }
         o ~= x;
     }
     return o;
@@ -2179,10 +2185,12 @@ class Agent
             srcs.length = stashBase;
             foreach (ref x; replayStash[stashBase .. $])
             {
-                bool slim = x.role == Role.tool && x.content.length > stashSlimBytes && !x.attachments.length
-                    && (log.isNone || (x.logLine > restoredLineFloor && x.logLine !in clippedLines));
+                // Without a log only a tool result is dropped (a reply's text
+                // is the transcript; it has nowhere to be read back from).
+                bool slim = stashSlimmable(x) && (log.isNone ? x.role == Role.tool
+                    : x.logLine > restoredLineFloor && x.logLine !in clippedLines);
                 srcs ~= slim ? log : Option!SessionLog.init;
-                if (slim) x.content = null;
+                if (slim) slimMessage(x);
             }
             replayStashLog = srcs;
             log.ifSome((SessionLog l) @safe {
