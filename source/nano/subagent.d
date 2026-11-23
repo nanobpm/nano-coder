@@ -377,6 +377,10 @@ private final class ChildEvents : imported!"nano.agent".AgentEvents
     ulong tokens;
     string limitHit;
     size_t gensSinceLimit;
+    /// Whether a fresh request has carried the report reminder since the limit.
+    bool reminderDelivered;
+    /// A report reminder is queued and not yet drained into a request.
+    bool reminderQueued;
     /// The parent's `agent_cancel` asked for a final report.
     bool wrappedUp;
     string[] filesRead;
@@ -425,6 +429,7 @@ private final class ChildEvents : imported!"nano.agent".AgentEvents
     {
         import nano.agent : wrapReminder;
         auto why = wrappedUp ? "The parent agent cancelled you" : format("You reached your %s", limitHit);
+        reminderQueued = true;
         foreach (a; agent) a.control.steer(wrapReminder(why ~ ". Stop investigating and call "
             ~ "report_outcome now with what you found so far."));
     }
@@ -483,9 +488,27 @@ private final class ChildEvents : imported!"nano.agent".AgentEvents
     void generationStart()
     {
         if (abort.aborted) throw new SubStop("stopped by the parent");
-        checkLimits();
+        if (limitHit is null)
+        {
+            // A limit (or the parent's cancel) first seen here arrived after
+            // this request's steers drained: the request lacks the report
+            // reminder, so it is not the grace call. Leave the reminder to
+            // the next fresh call (beforeFreshCall), which gets the grace
+            // (issue #322). Queue the reminder now too, so a tool-free
+            // answer to this request still leads to a reminded request.
+            checkLimits();
+            generations++;
+            return;
+        }
+        // A retry of a request that lacked the reminder (an interrupted
+        // stream or rejected output skips beforeFreshCall) is not the grace.
+        if (!reminderDelivered)
+        {
+            generations++;
+            return;
+        }
         // One call after the limit is the grace to write the report.
-        if (limitHit !is null && gensSinceLimit++ >= 1) throw new SubStop(limitHit);
+        if (gensSinceLimit++ >= 1) throw new SubStop(limitHit);
         generations++;
     }
 
@@ -508,7 +531,15 @@ private final class ChildEvents : imported!"nano.agent".AgentEvents
     {
         if (abort.aborted) throw new SubStop("stopped by the parent");
         checkLimits();
-        if (limitHit !is null && gensSinceLimit == 0) steerReportReminder();
+        if (limitHit !is null && gensSinceLimit == 0)
+        {
+            // A reminder queued by a late checkLimits is still pending; one
+            // copy per request is enough.
+            if (!reminderQueued) steerReportReminder();
+            // The steers drain after this, so the coming request carries it.
+            reminderQueued = false;
+            reminderDelivered = true;
+        }
     }
 
     /// A child's own progress is reported through its channel, not rendered.
@@ -538,6 +569,97 @@ unittest
     try st.generationStart();
     catch (SubStop) stopped = true;
     assert(stopped);
+}
+
+// The parent's cancel landing between a fresh call's steer drain and its
+// request (issue #322): that request carries no report reminder, so it is
+// not the grace call. The next fresh call gets the reminder and the grace;
+// only the call after that stops the child. Repeated to pin the ordering.
+unittest
+{
+    import std.algorithm : canFind;
+    foreach (n; 0 .. 200)
+    {
+        immutable spec = SubSpec(0, "c", "t", "m", "s", null, SubLimits.init);
+        auto ab = SubAbort.make;
+        auto st = new ChildEvents(spec, Chan!SubMsg.make, Chan!ToolReply.make, ab);
+        st.beforeFreshCall(); // steers drain here
+        ab.wrapUp(); // the cancel lands now
+        st.generationStart(); // this request has no reminder
+        assert(st.wrappedUp && st.limitHit !is null);
+        assert(st.gensSinceLimit == 0, "the reminder-less call is not the grace");
+        st.beforeFreshCall(); // queues the reminder for the grace call
+        st.generationStart(); // the grace call: the child can report
+        bool stopped;
+        try st.generationStart();
+        catch (SubStop) stopped = true;
+        assert(stopped, "only one final step");
+    }
+}
+
+// A retry (no beforeFreshCall) of the reminder-less request after the cancel
+// does not spend the grace either (issue #322).
+unittest
+{
+    immutable spec = SubSpec(0, "c", "t", "m", "s", null, SubLimits.init);
+    auto ab = SubAbort.make;
+    auto st = new ChildEvents(spec, Chan!SubMsg.make, Chan!ToolReply.make, ab);
+    st.beforeFreshCall();
+    ab.wrapUp();
+    st.generationStart(); // reminder-less request; stream interrupted
+    st.generationStart(); // its retry, still without the reminder
+    st.generationStart(); // another retry
+    assert(st.gensSinceLimit == 0, "retries without the reminder are not the grace");
+    st.beforeFreshCall();
+    st.generationStart(); // the grace call
+    bool stopped;
+    try st.generationStart();
+    catch (SubStop) stopped = true;
+    assert(stopped);
+}
+
+// End to end through a real Agent (issue #322): the cancel lands after the
+// first request's steers drained, and the
+// model answers that request without tools. The queued reminder keeps the
+// turn going, so a second request goes out carrying it.
+unittest
+{
+    import nano.agent : Agent;
+    import nano.tools : ToolRegistry;
+    import nano.permissions : Policy;
+    import nano.providers.mock : MockClient;
+    import nano.option : some;
+    import std.algorithm : any, count;
+    immutable spec = SubSpec(0, "c", "t", "m", "s", null, SubLimits.init);
+    auto ab = SubAbort.make;
+    auto st = new ChildEvents(spec, Chan!SubMsg.make, Chan!ToolReply.make, ab);
+    bool[] reminded;
+    size_t[] reminderCount;
+    auto client = new class MockClient
+    {
+        this() { super([]); }
+        override LLMResponse chat(const ref ChatRequest req, StreamSink sink)
+        {
+            reminded ~= req.messages.any!(m => m.content.canFind("call report_outcome now"));
+            reminderCount ~= req.messages.count!(m => m.content.canFind("call report_outcome now"));
+            if (reminded.length > 1) return LLMResponse("the report");
+            return LLMResponse("still looking");
+        }
+    };
+    auto agent = new Agent(client, new ToolRegistry, Policy.init, "s");
+    st.agent = some(agent);
+    agent.verifyBeforeComplete = false;
+    // The cancel lands after the first request's steers drained but before
+    // its generationStart, so the production late-detection path runs.
+    bool cancelled;
+    agent.onThresholdChecked = () {
+        if (!cancelled) { cancelled = true; ab.wrapUp(); }
+    };
+    agent.run("go", st);
+    assert(cancelled);
+    assert(reminded.length >= 2, "a tool-free reply must not end the turn before the reminder");
+    assert(!reminded[0] && reminded[1], "the next request carries the report reminder");
+    assert(reminderCount[1] == 1, "the reminded request carries exactly one reminder");
 }
 
 /// The text of the child's latest assistant reply, for a partial report.
