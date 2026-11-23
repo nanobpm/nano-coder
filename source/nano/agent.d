@@ -1678,8 +1678,10 @@ class Agent
             else
             {
                 auto outcome = p.thread.join().unwrap;
-                // A probe that finished late (collection was blocked) never publishes.
-                const late = p.expired || outcome.late || since(p.started) >= probeDeadline;
+                // Lateness is judged by when the probe finished (the worker
+                // flags it), not when it is collected: an on-time result
+                // collected after a long model call still publishes.
+                const late = p.expired || outcome.late;
                 if (!late)
                     published = probe.publishIfCurrent(p.generation, outcome.caps, configuredWindow == 0);
                 probing = false;

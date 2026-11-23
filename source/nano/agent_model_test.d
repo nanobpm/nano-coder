@@ -519,6 +519,28 @@ unittest
     assert(agent.capabilities.window == 0, "the fallback window stays");
 }
 
+// A probe that finished on time but is collected only after the deadline
+// (the agent was blocked in a model call) still publishes: lateness is the
+// probe's completion time, not the collection time (nano-coder#270).
+unittest
+{
+    import core.time : seconds, msecs;
+    import nano.clock : sleepFor;
+    auto p = Probes.make(true); // answers at once
+    auto agent = agentFor(new Interfering("first", []));
+    agent.probeDeadline = 50.msecs;
+    agent.probeClient = (string spec) => cast(LLMClient) p.client("probed", null, 4_096);
+    agent.onModelRequest = (string spec) {
+        agent.useClient(p.client("probed", null, 4_096), ConfiguredWindow.init);
+    };
+    agent.control.requestModel("mock/probed");
+    assert(agent.applyModelRequest());
+    p.done.await((ref const bool d) => d, (ref bool _) {});
+    sleepFor(100.msecs); // the worker has exited; collection comes past the deadline
+    assert(agent.settleProbes(5.seconds), "the on-time worker is joined");
+    assert(agent.capabilities.window == 4_096, "the on-time result is published");
+}
+
 /// Events that count summary starts and usage reports, to assert a
 /// threshold compaction in `prepareCall` notifies its consumers.
 class CountingEvents : NullEvents
