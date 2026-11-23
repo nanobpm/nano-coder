@@ -543,13 +543,16 @@ Summary[] list(string dir, bool strictIndex = false, scope bool delegate(string 
         {
             // The plain twin wins. An archive resume may publish it after the
             // iterator passed it: remember the title so the rewrite keeps it.
-            if (auto cached_ = id in index)
-                if (cached_.title !is null) skippedTitled[id] = *cached_;
+            auto cached_ = id in index;
+            if (cached_ is null) cached_ = id in denied;
+            if (cached_ !is null && cached_.title !is null) skippedTitled[id] = *cached_;
             continue;
         }
         auto size = e.size;
         Summary s;
         auto cached = id in index;
+        // A denied archive visited first moved the shared record to `denied`.
+        if (cached is null) cached = id in denied;
         immutable hit = cached !is null && (compressed
             ? cached.archiveBytes == size
             : cached.archiveBytes == 0 && cached.logBytes == size);
@@ -991,4 +994,24 @@ unittest
     auto shown = list(dir, false, (string p) => p == denied);
     assert(shown.length == 0, "the denied session is hidden");
     assert("denied" in titledIds(dir), "its title survives the rewrite");
+}
+
+// Issue #271 review: a denied archive visited before its allowed plain twin
+// must not strip the twin's title, whichever order the directory yields.
+unittest
+{
+    auto dir = testDir("denied-archive-twin");
+    scope (exit) rmdirRecurse(dir);
+    auto plain = writeLog(dir, "twin", ["Fix the deploy test please"]);
+    auto gone = writeLog(dir, "gone", ["Write the release notes now"]);
+    list(dir);
+    assert(setTitle(plain, "Keep me"));
+    auto archive = plain ~ ".gz";
+    std.file.write(archive, "not read: denied");
+    std.file.append(plain, ""); // unchanged size; the title must still come from the record
+    import std.file : remove;
+    remove(gone); // a stale index entry forces a rewrite
+    auto shown = list(dir, false, (string p) => p == archive);
+    assert(shown.length == 1 && shown[0].title == "Keep me", "the plain twin keeps its title");
+    assert("twin" in titledIds(dir), "its title survives the forced rewrite");
 }

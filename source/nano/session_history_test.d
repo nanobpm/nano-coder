@@ -234,3 +234,34 @@ unittest
     auto out_ = find(path, `{"pattern":"no method named"}`);
     assert(out_.startsWith("#2 tool bash"), out_);
 }
+
+// Issue #271 review: the `after` cutoff hides earlier tool messages from the
+// hits but not from the following assistant's adjacency note.
+unittest
+{
+    auto dir = fresh("after-cutoff");
+    scope (exit) rmdirRecurse(dir);
+    auto path = fixture(dir);
+    auto out_ = find(path, `{"pattern":"fixed","after":5}`);
+    assert(out_.startsWith("#6 assistant") && out_.canFind("[after tool output #5]"), out_);
+    auto log = new SessionLog(dir, "m", "/w", "cut");
+    foreach (m; [Message.user("go"), Message.toolResult("a", "bash", "one"), Message.toolResult("b", "bash", "two"),
+            Message.assistant("both said something")])
+        log.append(m);
+    out_ = find(log.path, `{"pattern":"something","after":3}`);
+    assert(out_.canFind("[after tool output #3–#4]"), out_);
+}
+
+// Issue #271 review: a missing log or a corrupt archive is an error, not an
+// empty (apparently complete) search.
+unittest
+{
+    import std.exception : assertThrown;
+    auto dir = fresh("errors");
+    scope (exit) rmdirRecurse(dir);
+    assertThrown(find(buildPath(dir, "missing.jsonl"), `{"pattern":"x"}`));
+    auto gz = buildPath(dir, "bad.jsonl.gz");
+    import std.file : write;
+    write(gz, "\x1f\x8b\x08\x00garbage");
+    assertThrown(find(gz, `{"pattern":"x"}`));
+}

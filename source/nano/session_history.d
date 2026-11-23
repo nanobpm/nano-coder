@@ -251,7 +251,11 @@ string search(string path, JSONValue args)
     size_t total;
     ulong omitFirst = ulong.max, omitLast;
     size_t[string] hidden;
-    ulong[] pendingTools; // tool ids since the last non-tool message
+    // The run of tool messages since the last non-tool message, as scalars
+    // so a long run costs nothing: first id, last id, count.
+    ulong runFirst, runLast;
+    size_t runLen;
+    void runAdd(ulong id) { if (!runLen) runFirst = id; runLast = id; ++runLen; }
     struct Kept { ulong id; string line; }
     Kept[] kept;
     ulong n;
@@ -262,15 +266,17 @@ string search(string path, JSONValue args)
         auto id = n;
         if (m.role == Role.system || (before && id >= before) || (after && id <= after))
         {
-            if (m.role != Role.tool) pendingTools = null;
+            // Excluded from hits, but adjacency still holds across the cutoff.
+            if (m.role == Role.tool) runAdd(id);
+            else runLen = 0;
             return;
         }
         auto text = searchable(m);
         if (role.length && role != roleName(m.role))
         {
             if (!matchAll(text, re).empty) hidden[roleName(m.role)]++;
-            if (m.role != Role.tool) pendingTools = null;
-            else pendingTools ~= id;
+            if (m.role == Role.tool) runAdd(id);
+            else runLen = 0;
             return;
         }
         size_t count, shownUntil;
@@ -288,18 +294,18 @@ string search(string path, JSONValue args)
         }
         // The tools just before it: the run tracked above (reset below for
         // this assistant message itself).
-        auto tools = pendingTools;
-        if (m.role == Role.tool) pendingTools ~= id;
-        else pendingTools = null;
+        immutable toolsLen = runLen, toolsFirst = runFirst, toolsLast = runLast;
+        if (m.role == Role.tool) runAdd(id);
+        else runLen = 0;
         if (!count) return;
         ++total;
         auto line = label(id, m);
         if (count > 1) line ~= format(" [%s matches]", count);
         if (m.role == Role.assistant)
         {
-            if (tools.length == 1) line ~= format(" [after tool output #%s]", tools[0]);
-            else if (tools.length > 1)
-                line ~= format(" [after tool output #%s–#%s]", tools[0], tools[$ - 1]);
+            if (toolsLen == 1) line ~= format(" [after tool output #%s]", toolsFirst);
+            else if (toolsLen > 1)
+                line ~= format(" [after tool output #%s–#%s]", toolsFirst, toolsLast);
         }
         line ~= ":";
         foreach (sp; spans) line ~= " " ~ snippet(text, sp[0], sp[1]);

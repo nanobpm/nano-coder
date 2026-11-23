@@ -274,13 +274,13 @@ private struct GunzipStream
     }
 }
 
-/// `streamLogLines`, skipping a torn or corrupt line like the resume loader
-/// does (one shared try/catch so every caller streams).
+/// `streamLogLines` for the history tools: a torn trailing line is dropped
+/// by the streamer and callers skip undecodable records themselves, but a
+/// missing or unreadable log or a corrupt/truncated archive throws, so a
+/// search never reports partial results as complete.
 void foreachLogLineSkippingTorn(string path, scope void delegate(const(char)[]) @safe sink)
 {
-    try
-        streamLogLines(path, sink);
-    catch (Exception) {} // a torn or corrupt line is skipped, like the resume loader does
+    streamLogLines(path, sink);
 }
 
 /// The working directory recorded in the log's header (null for older logs
