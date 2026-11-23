@@ -75,12 +75,14 @@ ToolDefinition definition(const(SubCandidate)[] candidates = null) pure
         ~ "across a codebase) and for independent investigations; several agent calls in one reply run in "
         ~ "parallel. Don't use it for a single lookup you can do with one grep or read_file. The sub-agent sees "
         ~ "nothing of this conversation: state the task completely (what to find, where to look, what to report). "
-        ~ "It cannot edit files. Its report cites file:line for its claims.";
+        ~ "It cannot edit files. Its report cites file:line for its claims. With background: true it runs while you "
+        ~ "carry on (into later turns too).";
     auto params = parseJSON(`{"type":"object","properties":{`
         ~ `"task":{"type":"string","description":"The complete, self-contained task and what the report should contain."},`
         ~ `"tools":{"type":"string","enum":["read-only"],"description":"The tool set (only \"read-only\" for now)."},`
         ~ `"model":{"type":"string","description":"provider/model to run it on (default: subagent_model, else your model)."},`
-        ~ `"timeout_s":{"type":"integer","description":"Wall-clock limit in seconds (default 600)."}`
+        ~ `"timeout_s":{"type":"integer","description":"Wall-clock limit in seconds (default 600)."},`
+        ~ `"background":{"type":"boolean","description":"Start it and return at once with a handle (e.g. sub-3); its result arrives later as a reminder (or from agent_wait). Watch it with agent_status/agent_read, stop it with agent_cancel."}`
         ~ `},"required":["task"]}`);
     if (candidates.length)
     {
@@ -189,6 +191,8 @@ struct SubArgs
     long timeoutSecs;
     /// The call gave `timeout_s` (it overrides a candidate's limit).
     bool timeoutSet;
+    /// `background: true`: return a handle at once (issue #266).
+    bool background;
 }
 
 /// Parse and check an `agent` call's arguments; throws a ToolError.
@@ -208,11 +212,18 @@ SubArgs parseArgs(JSONValue args, long defaultTimeout) pure
         if (auto t = "timeout_s" in args.objectNoRef)
             a.timeoutSet = t.type != JSONType.null_; // null means omitted, as in optInt
     if (a.timeoutSecs <= 0) throw new ToolError("agent: timeout_s must be a positive number of seconds");
+    if (args.type == JSONType.object)
+        if (auto b = "background" in args.objectNoRef)
+        {
+            if (b.type == JSONType.true_) a.background = true;
+            else if (b.type != JSONType.false_ && b.type != JSONType.null_)
+                throw new ToolError("agent: background must be true or false");
+        }
     return a;
 }
 
 /// What a sub-agent sends its parent.
-enum SubKind { tool, progress, done }
+enum SubKind { tool, progress, done, /** its log is open (`args`: the path) */ started }
 
 /// A message from a sub-agent's thread to its parent.
 struct SubMsg
@@ -222,7 +233,7 @@ struct SubMsg
     /// `tool`: the call to run for the child.
     string callId, name, args;
     /// `progress`: the child's counters so far.
-    size_t toolCalls;
+    size_t toolCalls, turns;
     ulong tokens;
 }
 
@@ -246,8 +257,13 @@ struct SubAbort
     /// The one cell all copies share; null only in `SubAbort.init`, which
     /// never aborts.
     private shared(bool)* flag;
+    /// Set by `agent_cancel`: report now, then stop (issue #266).
+    private shared(bool)* wrap;
 
-    static SubAbort make() { return SubAbort(new shared bool); }
+    static SubAbort make() { return SubAbort(new shared bool, new shared bool); }
+    /// Ask the child to stop investigating and report what it has.
+    void wrapUp() { if (wrap !is null) atomicStore(*wrap, true); }
+    bool wrapping() const nothrow @nogc { return wrap !is null && atomicLoad(*wrap); }
     void abort() { if (flag !is null) atomicStore(*flag, true); }
     bool aborted() const nothrow @nogc { return flag !is null && atomicLoad(*flag); }
     /// The cell the child's cancellation scope points at.
@@ -361,6 +377,8 @@ private final class ChildEvents : imported!"nano.agent".AgentEvents
     ulong tokens;
     string limitHit;
     size_t gensSinceLimit;
+    /// The parent's `agent_cancel` asked for a final report.
+    bool wrappedUp;
     string[] filesRead;
     Option!Agent agent;
 
@@ -381,6 +399,11 @@ private final class ChildEvents : imported!"nano.agent".AgentEvents
     /// The first limit breach's reason, or null.
     private string limitWhy()
     {
+        if (abort.wrapping)
+        {
+            wrappedUp = true;
+            return "cancel by the parent";
+        }
         if (generations >= spec.limits.turns) return format("turn limit (%s model calls)", spec.limits.turns);
         if (tokens >= spec.limits.tokens) return format("token limit (%s tokens)", spec.limits.tokens);
         if (since(start) >= timeout.seconds) return format("time limit (%ss)", timeout);
@@ -401,8 +424,9 @@ private final class ChildEvents : imported!"nano.agent".AgentEvents
     private void steerReportReminder()
     {
         import nano.agent : wrapReminder;
-        foreach (a; agent) a.control.steer(wrapReminder(format("You reached your %s. Stop investigating and call "
-            ~ "report_outcome now with what you found so far.", limitHit)));
+        auto why = wrappedUp ? "The parent agent cancelled you" : format("You reached your %s", limitHit);
+        foreach (a; agent) a.control.steer(wrapReminder(why ~ ". Stop investigating and call "
+            ~ "report_outcome now with what you found so far."));
     }
 
     void progress()
@@ -411,6 +435,7 @@ private final class ChildEvents : imported!"nano.agent".AgentEvents
         m.slot = spec.slot;
         m.kind = SubKind.progress;
         m.toolCalls = toolCalls;
+        m.turns = generations;
         m.tokens = tokens;
         up.put(m);
     }
@@ -599,6 +624,11 @@ SubResult runChild(immutable SubSpec spec, immutable(SubClientFactory) factory, 
             auto log = new SessionLog(spec.logDir, spec.model, spec.cwd, id);
             agent.log = some(log);
             res.logPath = log.path;
+            SubMsg m;
+            m.slot = spec.slot;
+            m.kind = SubKind.started;
+            m.args = log.path;
+            up.put(m);
         }
         string answer;
         try
@@ -657,6 +687,11 @@ SubResult runChild(immutable SubSpec spec, immutable(SubClientFactory) factory, 
             res.truncated = true;
             res.truncatedReason = st.limitHit;
         }
+        if (st.wrappedUp)
+        {
+            res.cancelled = res.truncated = true;
+            res.truncatedReason = "cancelled by the parent";
+        }
         foreach (l; agent.log) l.close();
     }
     catch (Exception e)
@@ -691,6 +726,26 @@ struct SubSlot
     /// The child's own read state: its read_file calls never authorize a
     /// later parent write (the parent model sees only the report).
     imported!"nano.option".Option!(imported!"nano.tools.files".ReadState) readState;
+    /// Started with `background: true` (issue #266): it outlives its reply
+    /// and its result is delivered later.
+    bool background;
+    /// Its result reached the parent model (a reminder or `agent_wait`).
+    bool delivered;
+    /// Its handle (`sub-N`) and log path once open.
+    string id, logPath;
+    size_t turns;
+    /// Its last few tool calls (name and argument summary).
+    string[] recent;
+    /// Why `agent_cancel` stopped it.
+    string cancelReason;
+
+    /// The state `agent_status` shows.
+    string state() pure const
+    {
+        if (!finished) return started ? "running" : "queued";
+        if (result.cancelled) return "cancelled";
+        return result.truncated ? "truncated" : "done";
+    }
 }
 
 /// An `agent` call's checks, made before its reply's sub-agents start.
@@ -710,6 +765,8 @@ struct SubGate
 struct SubProgress
 {
     string callId, task;
+    /// The session-unique handle (`sub-N`); call ids can repeat across replies.
+    string handle;
     size_t index, toolCalls;
     ulong tokens;
     Duration elapsed;
@@ -801,4 +858,160 @@ unittest
     r.filesRead = ["a.d"];
     auto t = r.toolText;
     assert(t.canFind("found it") && t.canFind("[truncated: time limit") && t.canFind("files read: a.d"), t);
+}
+
+// ---- background sub-agents (issue #266) ----
+
+/// The tools that watch and steer background sub-agents.
+enum string statusTool = "agent_status", readTool = "agent_read", cancelTool = "agent_cancel", waitTool = "agent_wait";
+
+/// Whether `name` is one of the background-control tools.
+bool isControlTool(string name) pure nothrow
+{
+    return name == statusTool || name == readTool || name == cancelTool || name == waitTool;
+}
+
+/// Most bytes one `agent_read` returns.
+enum size_t readCap = 16 * 1024;
+/// Seconds `agent_cancel` waits for the final report before cutting the
+/// sub-agent off.
+enum long cancelGraceSecs = 5;
+/// Most seconds one `agent_wait` blocks.
+enum long maxWaitSecs = 3600;
+/// Finished sub-agents kept for `agent_status` after their result was
+/// delivered (older ones are forgotten; their logs stay).
+enum size_t keepDelivered = 16;
+/// Recent tool calls `agent_status` shows per sub-agent.
+enum size_t recentCalls = 3;
+
+/// The background-control tools' definitions.
+ToolDefinition[] controlDefinitions() pure
+{
+    return [
+        ToolDefinition(statusTool, "Status of this session's sub-agents (one by id, or all): state (queued, running, done, "
+            ~ "cancelled, truncated), turns, tokens, elapsed time and the last few tool calls. Cheap: no transcript.",
+            parseJSON(`{"type":"object","properties":{"id":{"type":"string","description":"A handle such as sub-3; omit for all."}}}`)),
+        ToolDefinition(readTool, "Read a sub-agent's log (its messages and tool calls) from line `since`, at most 16 KB; "
+            ~ "the result ends with the `since` to continue from.",
+            parseJSON(`{"type":"object","properties":{"id":{"type":"string"},"since":{"type":"integer","description":"The log line to start at (default 0)."}},"required":["id"]}`)),
+        ToolDefinition(cancelTool, "Cancel a background sub-agent: it gets one short final step to report what it has "
+            ~ "(returned here, marked cancelled and partial); if it can't report within a few seconds it is cut off.",
+            parseJSON(`{"type":"object","properties":{"id":{"type":"string"},"reason":{"type":"string","description":"Why, for the log."}},"required":["id","reason"]}`)),
+        ToolDefinition(waitTool, "Wait until the given background sub-agents finish or timeout_s passes; returns their "
+            ~ "results (each delivered once), or their status for the ones still running.",
+            parseJSON(`{"type":"object","properties":{"ids":{"type":"array","items":{"type":"string"}},"timeout_s":{"type":"integer","description":"Seconds to wait at most."}},"required":["ids","timeout_s"]}`)),
+    ];
+}
+
+/// A short summary of a tool call's arguments for `agent_status`: the
+/// argument values, joined, at most `max` characters.
+string argSummary(string argsJson, size_t max = 60)
+{
+    import std.range : walkLength;
+    import std.utf : toUTF8;
+    import std.array : array;
+    string s;
+    try
+    {
+        auto j = parseJSON(argsJson);
+        if (j.type == JSONType.object)
+            foreach (k, v; j.objectNoRef)
+                s ~= (s.length ? ", " : "") ~ k ~ "=" ~ (v.type == JSONType.string ? v.str : v.toString);
+        else s = argsJson;
+    }
+    catch (JSONException) s = argsJson; // not JSON: show it raw
+    if (s.walkLength > max) s = toUTF8(s.array[0 .. max - 1]) ~ "…";
+    return s;
+}
+
+unittest
+{
+    assert(argSummary(`{"pattern":"parse"}`) == "pattern=parse");
+    import std.array : replicate;
+    import std.range : walkLength;
+    assert(argSummary(`{"p":"` ~ "x".replicate(100) ~ `"}`).walkLength == 60);
+    assert(argSummary("nope") == "nope");
+}
+
+/// What `agent_read` returns: log lines from `since`, capped at `cap`
+/// bytes, and the line to continue from. Streams the file in chunks and
+/// keeps only what it returns, so a large log is never loaded whole.
+string readLogTail(string path, size_t since, size_t cap = readCap)
+{
+    import std.array : appender;
+    import std.stdio : File;
+    import nano.safeio : ownText;
+    auto f = File(path, "rb");
+    auto out_ = appender!string;
+    ubyte[] line;
+    size_t lineNo, next = since;
+    bool full;
+    auto buf = new ubyte[64 * 1024];
+    // Appends a finished line (when in range) and says whether to stop.
+    bool finish()
+    {
+        scope (exit) { line = null; lineNo++; }
+        if (lineNo < since) return false;
+        auto text = ownText(line.dup);
+        if (out_.data.length + text.length + 1 > cap)
+        {
+            if (out_.data.length == 0)
+            {
+                // One line bigger than the cap: its head, and move past it.
+                size_t n = cap;
+                while (n > 0 && n < text.length && (text[n] & 0xC0) == 0x80) n--;
+                out_ ~= text[0 .. n] ~ "…[line cut at 16 KB]\n";
+                next = lineNo + 1;
+            }
+            full = true;
+            return true;
+        }
+        out_ ~= text ~ "\n";
+        next = lineNo + 1;
+        return false;
+    }
+    outer: for (;;)
+    {
+        auto got = f.rawRead(buf);
+        if (!got.length) break;
+        foreach (b; got)
+        {
+            if (b == '\n') { if (finish()) break outer; }
+            // Keep at most cap + 1 bytes of a line: anything longer is cut
+            // to its head in finish(), so a multi-MB line never sits whole
+            // in memory.
+            else if (lineNo >= since && line.length <= cap) line ~= b;
+        }
+    }
+    // A last line without a newline may still be being written: leave it.
+    auto body_ = out_.data.length ? out_.data : (since > lineNo ? "(no line " ~ format("%s", since) ~ " yet)\n" : "(nothing new)\n");
+    return body_ ~ format("[next since: %s%s]", next, full ? "; more follows" : "");
+}
+
+unittest
+{
+    import std.file : write, remove, tempDir;
+    import std.path : buildPath;
+    import std.array : replicate;
+    import std.algorithm : canFind;
+    auto p = buildPath(tempDir, "nano-readlog-test.jsonl");
+    scope (exit) remove(p);
+    write(p, "a\nb\nc\npartial");
+    auto t = readLogTail(p, 0);
+    assert(t.canFind("a\nb\nc\n") && t.canFind("[next since: 3]") && !t.canFind("partial"), t);
+    assert(readLogTail(p, 2).canFind("c\n[next since: 3]"));
+    assert(readLogTail(p, 3).canFind("(nothing new)"));
+    // The byte cap stops before a line that would cross it.
+    write(p, "x".replicate(10) ~ "\n" ~ "y".replicate(10) ~ "\nz\n");
+    auto c = readLogTail(p, 0, 15);
+    assert(c.canFind("xxxxxxxxxx\n[next since: 1; more follows]"), c);
+    // A single line over the cap is cut and skipped.
+    auto big = readLogTail(p, 1, 4);
+    assert(big.canFind("yyyy…[line cut") && big.canFind("[next since: 2; more follows]"), big);
+    // A line far larger than the cap and the read buffer is cut to its head.
+    write(p, "h".replicate(200_000) ~ "\nnext\n");
+    auto huge = readLogTail(p, 0, 8);
+    assert(huge.canFind("hhhhhhhh…[line cut") && !huge.canFind("hhhhhhhhh")
+        && huge.canFind("[next since: 1; more follows]"), huge);
+    assert(readLogTail(p, 1, 8).canFind("next\n[next since: 2]"));
 }

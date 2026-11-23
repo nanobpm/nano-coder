@@ -312,7 +312,9 @@ void readStdinLines(Chan!string inbox, bool color)
     for (;;)
     {
         auto line = input.next();
-        if (line is null) { inbox.close(); return; }
+        // An explicit null marks the end: `tryTake` can't tell a closed
+        // channel from an empty one, and the background poll uses it.
+        if (line is null) { inbox.put(null); inbox.close(); return; }
         auto text = line.strip;
         if (atomicLoad(gTurnRunning) && text.length
             && (!text.startsWith("/") || (!isCommand(text) && unescapePrompt(text) is null)))
@@ -1643,7 +1645,8 @@ class Console : AgentEvents
         // finished one collapses to its line in the transcript.
         foreach (ref p; all)
         {
-            string id = p.callId;
+            // The session-unique handle: provider call ids can repeat.
+            string id = p.handle.length ? p.handle : p.callId;
             if (p.done) subRows.remove(id);
             else subRows[id] = LiveSubagent(p, monoNow);
         }
@@ -2800,6 +2803,10 @@ int runMain(string[] args)
     Agent agent = new Agent(client, tools, policy, systemFor(cwd, o.plan));
     built = some(agent);
     mainAgent = some(agent);
+    // Exiting stops every sub-agent, background ones included; their logs
+    // stay. Installed before the `--acp` and `-p` returns: a child thread
+    // left waiting on its parent would otherwise hang process exit.
+    scope (exit) agent.stopSubagents();
     agent.memory = memory;
     agent.indexShown = indexShown;
     agent.instructions = instructions;
@@ -2821,6 +2828,9 @@ int runMain(string[] args)
     configureSubagents(agent, cfg, true);
     agent.planTools = cfg.planTools;
     agent.timerTools = !o.acp; // ACP has no idle loop to fire them
+    // Nor to serve background sub-agents between prompts (issue #266).
+    // Piped stdin blocks on its read, so nothing serves them there either.
+    agent.backgroundSubagents = !o.acp && isTerminal(0);
     agent.outcomeTool = cfg.outcomeTool;
     agent.remindersEnabled = cfg.reminders;
     agent.questions = questions;
@@ -3276,6 +3286,31 @@ int runMain(string[] args)
         return null;
     }
 
+    // The plain (no-editor) prompt's read: while background sub-agents run
+    // it polls, serving their tool calls and running a finished one's result
+    // as a turn, as the editor prompt does (issue #266).
+    string plainLine()
+    {
+        import nano.clock : sleepFor;
+        import core.time : msecs;
+        string l;
+        while (agent.subagentsActive || agent.backgroundResultsReady())
+        {
+            if (inbox.tryTake(l)) return l;
+            if (agent.backgroundResultsReady())
+            {
+                string notice;
+                auto text = agent.takeBackgroundResults(notice);
+                if (text is null) continue;
+                writeln(console.dim(notice));
+                agent.automaticInput = true;
+                return "\x00" ~ text;
+            }
+            sleepFor(20.msecs);
+        }
+        return takeLine(inbox);
+    }
+
     if (o.prompt.length)
     {
         bool ok = turn(o.prompt);
@@ -3404,7 +3439,9 @@ int runMain(string[] args)
             // Ready for input: tell Herdr, with the session to resume (re-read
             // each time so `/resume` and `/restart` are picked up).
             string resumeId = nano.herdr.active ? agent.log.match!(l => l.id, () => string.init) : null;
-            if (resumeId.length)
+            // Background sub-agents still running: the pane shows activity.
+            if (agent.subagentsActive) nano.herdr.report(nano.herdr.State.working);
+            else if (resumeId.length)
             {
                 auto resume = nano.herdr.resumeArgv(resumeId, agent.client.providerName ~ "/" ~ agent.client.modelName, herdrExtra);
                 if (resume !is null)
@@ -3446,13 +3483,33 @@ int runMain(string[] args)
                 return deliverDueTimer(agent.timers.anyDue(agent.timerNow()), ed.holdsTimer(monoNow), false,
                     exitPress.armed);
             }
+            // A finished background sub-agent's result runs as a turn, like a
+            // fired timer (issue #266); polling also serves their tool calls.
+            bool subNow() @safe
+            {
+                return deliverDueTimer(agent.backgroundResultsReady(), ed.holdsTimer(monoNow), false, exitPress.armed);
+            }
+            // Esc Esc at the idle prompt stops background sub-agents.
+            bool stopBackground;
+            ed.onIdleEscEsc = () @safe { if (agent.subagentsActive) stopBackground = true; };
             lapse = () @safe => exitPress.deadline.match!(d => monoMs() > d, () => false)
+                || stopBackground
                 || timerNow()
+                || subNow()
                 || idleNow()
                 || (updateHints && updateHints.tryTake(updateHint));
             auto r = ed.readLine(.stamp(false) ~ "› ", console.stamp() ~ glyphMark ~ " ", false, lapse);
             ed.restyle = null;
             syncMode(); // Shift-Tab at the prompt switched the mode
+            ed.onIdleEscEsc = null;
+            // Honour an idle Esc Esc whatever ended the read (a line typed
+            // before the lapse check keeps its text).
+            if (stopBackground)
+            {
+                agent.stopSubagents();
+                writeln(console.dim("[background sub-agents stopped]"));
+                if (r.outcome == Outcome.stopped) { quietPrompt = true; continue; }
+            }
             if (r.outcome == Outcome.eof) break;
             if (r.outcome == Outcome.stopped && timerNow())
             {
@@ -3460,6 +3517,15 @@ int runMain(string[] args)
                 hasParkedDraft = ed.parkDraft(parkedDraft);
                 string notice;
                 line = agent.takeFiredTimers(notice);
+                writeln(console.dim(notice));
+                agent.automaticInput = true;
+                line = "\x00" ~ line;
+            }
+            else if (r.outcome == Outcome.stopped && subNow())
+            {
+                hasParkedDraft = ed.parkDraft(parkedDraft);
+                string notice;
+                line = agent.takeBackgroundResults(notice);
                 writeln(console.dim(notice));
                 agent.automaticInput = true;
                 line = "\x00" ~ line;
@@ -3516,7 +3582,7 @@ int runMain(string[] args)
         else
         {
             if (interactive) { write("\n" ~ console.stamp() ~ console.bold("› ")); stdOut.flush(); }
-            line = inbox ? takeLine(inbox) : stdinLine();
+            line = inbox ? plainLine() : stdinLine();
             // Headless --wait-timers: input is done, but pending timers still
             // run, each as the next prompt, until none are left (#150).
             if (line is null && suppressEofForTimers(o.waitTimers, interactive))
@@ -3586,6 +3652,8 @@ int runMain(string[] args)
                             ~ "Use /restart for a fresh session.");
                         continue;
                     }
+                    // exec doesn't return, so the scope guard can't collect them.
+                    agent.stopSubagents();
                     auto exe = launchExe();
                     // Printed after the frame hands the terminal back, so it stays on screen.
                     if (gFrame) gFrame.suspend();
@@ -3725,6 +3793,7 @@ int runMain(string[] args)
                     catch (Exception) {} // an invalid ID or unreadable path is reported as "no saved session" just below
                     if (!ok) { writefln("No saved session %s: /resume without an ID lists them", JSONValue(id).jsonText); continue; }
                     string[] loadNotes;
+                    agent.stopSubagents(); // they belong to the session being left
                     try loadNotes = loadSession(path);
                     catch (Exception e) { writeln(e.msg); continue; }
                     if (gFrame) { gFrame.clear(); replayTranscript(agent, console); releaseHeap(); }

@@ -249,7 +249,7 @@ unittest
     assert(child.length && child.exists, "the child log is referenced: " ~ child);
     auto parentLog = f.agent.log.unwrap("set").path;
     import std.path : dirName, stripExtension;
-    assert(child.dirName == parentLog.stripExtension && child.canFind("sub-d1"));
+    assert(child.dirName == parentLog.stripExtension && child.canFind("sub-1"));
     assert(readText(parentLog).canFind(`"sub_log":`));
     auto text = readText(child);
     assert(text.canFind(`"is_error":true`) && text.canFind("forbidden-cmd"), text);
@@ -514,7 +514,7 @@ unittest
     // (The child log lives in the parent log's id-named subdirectory.)
     import std.path : stripExtension;
     auto childDir = agent.log.unwrap("set").path.stripExtension;
-    auto firstLog = buildPath(childDir, "sub-c.jsonl");
+    auto firstLog = buildPath(childDir, "sub-1.jsonl");
     assert(firstLog.exists, firstLog);
     write(firstLog ~ ".gz", gzipLog(readText(firstLog)));
     import std.file : remove;
@@ -530,7 +530,7 @@ unittest
     agent2.log = some(new SessionLog(agent.log.unwrap("set").path));
     agent2.run("go", new NullEvents);
     assert(!firstLog.exists, "the plain name stayed with the compressed log");
-    auto second = buildPath(childDir, "sub-c-2.jsonl");
+    auto second = buildPath(childDir, "sub-1-2.jsonl");
     assert(second.exists, "the reused id got a fresh filename: " ~ second);
     assert(readText(second).canFind("first child"), "the new child's transcript");
 }

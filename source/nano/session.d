@@ -770,6 +770,13 @@ class SessionLog
         write_(record("plan_delta", d));
     }
 
+    /// A background sub-agent event (issue #266): its result delivered,
+    /// cancelled or stopped with the session. Audit only: a resume ignores it.
+    void subagent(string id, string event, string text)
+    {
+        write_(record("subagent", JSONValue(["id": id, "event": event, "text": text, "recorded_at": nowStamp()])));
+    }
+
     /// The timers after a change; the latest record wins.
     void timers(JSONValue timers)
     {
