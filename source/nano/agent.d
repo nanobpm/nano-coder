@@ -1581,7 +1581,6 @@ class Agent
         Join!(Isolated!ProbeOutcome) thread;
         SubAbort abort;
         MonoTime started;
-        /// Past `probeDeadline`: cancelled, and its result never publishes.
     }
     /// What a probe thread returns: the capabilities, and whether it ran
     /// past its own deadline or was cancelled (then the result is dropped).
