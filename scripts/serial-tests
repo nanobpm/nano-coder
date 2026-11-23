@@ -24,3 +24,4 @@ nano.subagent_bg_test the cancel flag
 nano.session_resume_memory_test GC.stats is process-wide: other modules' allocations skew it
 nano.session flock probes: another module's fork briefly shares the log's locked description until exec
 nano.agent_cross_session_test the process working directory (the permission check reads it)
+nano.agent_peers_test environment variables (NANO_CODER_PEERS)
