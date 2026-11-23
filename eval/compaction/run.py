@@ -41,6 +41,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 sys.path.insert(0, str(HERE))
 import cases as synthetic  # noqa: E402
+import pathological  # noqa: E402
 
 # Denied unless --tools all: synthetic logs describe a project that doesn't
 # exist, so without history tools the agent would explore the real disk (and
@@ -443,6 +444,11 @@ def load_cases(args):
                     "cwd": spec.get("cwd"),
                 }
             out.append(case)
+    patho = [n for n in args.pathological.split(",") if n] if args.pathological else []
+    for name in patho:
+        if name not in pathological.CASES:
+            sys.exit(f"unknown pathological case {name!r}; choose from {', '.join(pathological.CASES)}")
+        out.append(pathological.build(name, 0))
     return out
 
 
@@ -684,8 +690,17 @@ def run_one(args, index, case, model, mode, repeat, work_root):
     if "error" not in result:
         if not turn_end:
             result["error"] = "no answer recorded (provider error?); see " + str(run_dir / "stderr.txt")
-        elif result.get("fallback") and "failed" in str(result["fallback"]):
+        elif result.get("fallback") and "failed" in str(result["fallback"]) and not case.get("pathological"):
             result["error"] = "compaction failed: " + str(result["fallback"])[:300]
+    if case.get("pathological"):
+        # Robustness, not recall: judged by invariants on what compaction
+        # wrote. A skipped or fallen-back compaction is the case's subject,
+        # so `check` decides whether it is a violation.
+        if str(result.get("error", "")).startswith("compaction "):
+            del result["error"]
+        result["pathological"] = True
+        result["violations"] = pathological.check(case, mode, records, len(case["records"]))
+        result["summary_sizes"] = pathological.summary_sizes(records[len(case["records"]):])
     result.update({
         "answer": answer,
         "passed": bool(turn_end) and matches_all(case["expect"], answer) and not matches_any(case["forbid"], answer),
@@ -811,7 +826,25 @@ def pct(n, d):
     return f"{100 * n / d:5.1f}%" if d else "    - "
 
 
+def robustness_report(results, out=sys.stdout):
+    """Pathological cases: invariant violations, not recall."""
+    if not results:
+        return
+    print("\nRobustness (pathological cases; invariants, not recall):", file=out)
+    for r in sorted(results, key=lambda r: (r["case"], r["model"], r["mode"])):
+        problems = ([r["error"]] if "error" in r else []) + r.get("violations", [])
+        sizes = r.get("summary_sizes") or []
+        shown = f" summary chars {sizes}" if len(sizes) > 1 else ""
+        print(f"  {r['case']:<32} {r['mode']:<14} {'OK' if not problems else 'VIOLATED'}{shown}", file=out)
+        for p in problems:
+            print(f"      - {p}", file=out)
+
+
 def report(results, out=sys.stdout):
+    robustness_report([r for r in results if r.get("pathological")], out)
+    results = [r for r in results if not r.get("pathological")]
+    if not results:
+        return
     groups = defaultdict(list)
     for r in results:
         groups[(r["model"], r["mode"])].append(r)
@@ -984,8 +1017,11 @@ def self_test_verdict(results):
     # long-log-error, working-command) are not pinned and always follow the
     # buried-case rule.
     user_detail_cases = {"user-constraint", "rejected-approach", "pinned-request"}
-    problems = []
+    problems = [f"pathological.check: {p}" for p in pathological.self_check()]
     for r in results:
+        if r.get("pathological"):
+            problems += [f"{r['case']} {r['mode']}: {p}" for p in ([r["error"]] if "error" in r else []) + r["violations"]]
+            continue
         base = r["case"].split("/")[0]
         mode = r["mode"]
         nopin = mode.endswith("-nopin")
@@ -1050,6 +1086,9 @@ def main():
     p.add_argument("--modes", default="standard,smart")
     p.add_argument("--synthetic", default=",".join(synthetic.CASES),
                    help="comma-separated built-in cases ('' for none): " + ", ".join(synthetic.CASES))
+    p.add_argument("--pathological", default="",
+                   help="comma-separated robustness cases, judged by invariants not recall "
+                        "(default none; --self-test runs all): " + ", ".join(pathological.CASES))
     p.add_argument("--cases", action="append", help="JSON case file (repeatable)")
     p.add_argument("--reuse-compaction", action="append", metavar="RESULTS",
                    help="answer only: reuse compacted logs from earlier smart runs where the detail was lost "
@@ -1086,6 +1125,8 @@ def main():
         base = Path(tempfile.mkdtemp(prefix="compaction-eval-fake-")) / "config.toml"
         base.write_text(f'[providers.fake]\nkind = "openai"\nbase_url = "{base_url}"\napi_key = "x"\nstream = false\ncontext_window = 128000\n')
         args.config, args.models = str(base), "fake/oracle"
+        if not args.pathological:
+            args.pathological = ",".join(pathological.CASES)
     if not args.models:
         p.error("--models is required (or use --self-test)")
     if args.reuse_compaction:

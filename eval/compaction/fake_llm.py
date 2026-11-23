@@ -25,12 +25,26 @@ SEARCHES = [("method", "no method named"), ("branch", "branch"), ("command", "--
 ACK_PROMPT = "Reply with a bare acknowledgement and nothing else."
 ACK_REPLY = "Acknowledged."
 
+# Markers a pathological case puts in its log to pick the summary's failure
+# mode (mirrors pathological.EMPTY_SUMMARY_MARKER / FAIL_SUMMARY_MARKER).
+EMPTY_SUMMARY_MARKER = "EVAL-SUMMARY-EMPTY"
+FAIL_SUMMARY_MARKER = "EVAL-SUMMARY-FAIL"
+
+
+class Fail(Exception):
+    """Answer the request with an HTTP error."""
+
 
 def reply(body):
     messages = body.get("messages", [])
     tools = {t["function"]["name"] for t in body.get("tools", [])}
     system = messages[0].get("content", "") if messages else ""
     if "compacting an AI agent's conversation" in system:
+        transcript = "\n".join(str(m.get("content") or "") for m in messages[1:])
+        if FAIL_SUMMARY_MARKER in transcript:
+            raise Fail("summary request failed (fake)")
+        if EMPTY_SUMMARY_MARKER in transcript:
+            return {"content": ""}
         return {"content": LOSSY_SUMMARY}
     last = messages[-1]
     question = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
@@ -61,7 +75,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
-        message = {"role": "assistant", "content": None, **reply(body)}
+        try:
+            message = {"role": "assistant", "content": None, **reply(body)}
+        except Fail as e:
+            payload = json.dumps({"error": {"message": str(e), "type": "invalid_request_error"}}).encode()
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         payload = json.dumps({
             "id": "fake", "object": "chat.completion", "model": body.get("model", "oracle"),
             "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if message.get("tool_calls") else "stop"}],

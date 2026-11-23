@@ -192,6 +192,52 @@ eval/compaction/run.py --models macbook/qwen3.8-neo-coder \
   config, the two are deep-merged (CLI fields win), so you can override one
   nested field without dropping the rest.
 
+## Pathological cases
+
+`--pathological a,b` adds robustness cases (`--self-test` runs all of them).
+They don't test recall. Each one compacts an awkward log, asks a trivial
+question, and checks what compaction wrote:
+
+- nano-coder still answers after compacting
+- every compaction leaves a non-empty summary
+- a failed or empty summary falls back to an honest "no summary is
+  available" note (pointing at the history tools in smart mode), never a
+  pretend summary
+- the kept messages never split a tool call from its result
+- the user's first request survives in the pinned block
+- repeated compactions don't ratchet the summary size upwards: after the
+  first fold, each summary may grow only by the pinned follow-up request
+
+| case | the log |
+| --- | --- |
+| `huge-tool-result` | one 2 MB tool result |
+| `many-tiny-turns` | 2,500 tiny turns |
+| `unicode-control` | emoji, RTL overrides, zero-width, NUL, ANSI, a run of CRs |
+| `null-content` | assistant messages with null or missing content |
+| `huge-tool-args` | a tool call with 1 MB of arguments |
+| `batch-tool-calls` | 200 parallel tool calls in one message |
+| `orphan-tool-result` | a tool result with no call |
+| `duplicates` | 500 identical exchanges |
+| `deep-nested-args` | deeply nested tool arguments |
+| `huge-single-turn` | one user turn whose tool work alone exceeds what compaction keeps |
+| `summary-ratchet` | eight compactions in a row |
+| `empty-summary` | the model returns an empty summary |
+| `failed-summary` | the summary request errors |
+
+Most are ported from the stress corpus of
+[pi-compaction-rank](https://github.com/a-canary/pi-compaction-rank)
+(`stress/corpus.ts`, MIT). The last three cover failure modes that corpus
+found in other compaction extensions. With the fake model, the last two are
+selected by markers in the log (`EVAL-SUMMARY-EMPTY`, `EVAL-SUMMARY-FAIL`).
+With a real model they still check the other invariants. The report lists
+them apart from the recall table, and the self-test also checks that
+`pathological.check` flags crafted violations of each invariant.
+
+For the cost side, `scripts/compaction-report.py` prints a compaction-cost
+baseline from your own session logs: per compaction, the context size before
+compacting, the summary request's input and output tokens, the summary size,
+the request time, and the share of all tokens spent on summaries.
+
 ## Self-test
 
 `--self-test` starts `fake_llm.py`, an OpenAI-compatible endpoint that plays
