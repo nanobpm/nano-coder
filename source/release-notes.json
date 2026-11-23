@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.18.0", "date": "2026-11-23", "items": [
+      {"type":"feat","scope":"agent","title":"session_settings tool to read and adjust the session's compaction","pr":294}
+    ]},
     {"version": "1.17.1", "date": "2026-11-23", "items": [
       {"type":"fix","scope":"probe","title":"bound background capability probes; cancel and join superseded ones","pr":286}
     ]},
@@ -438,9 +441,6 @@
     ]},
     {"version": "0.24.0", "date": "2026-09-30", "items": [
       {"type":"feat","scope":"session","title":"record thinking, token usage and request duration per assistant message","pr":58}
-    ]},
-    {"version": "0.23.0", "date": "2026-09-30", "items": [
-      {"type":"feat","scope":"tools","title":"guard stale edits, tolerate whitespace drift, show edited lines","pr":50}
     ]}
   ]
 }
