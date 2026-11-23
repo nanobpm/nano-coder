@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.22.6", "date": "2026-11-24", "items": [
+      {"type":"perf","scope":"tools","title":"stream read_file in chunks instead of reading whole files","pr":318}
+    ]},
     {"version": "1.22.5", "date": "2026-11-24", "items": [
       {"type":"perf","scope":"http","title":"stop buffering full SSE response bodies in http.perform","pr":314}
     ]},
@@ -438,9 +441,6 @@
     ]},
     {"version": "0.30.1", "date": "2026-10-01", "items": [
       {"type":"fix","scope":"compaction","title":"leave room for reasoning in the summary and flag cut-off summaries","pr":88}
-    ]},
-    {"version": "0.30.0", "date": "2026-10-01", "items": [
-      {"type":"feat","scope":"config","title":"per-provider and per-model temperature, with model default","pr":79}
     ]}
   ]
 }
