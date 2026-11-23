@@ -12,7 +12,7 @@ version (unittest):
 
 import nano.memory;
 import nano.memsecret;
-import std.algorithm : canFind, any;
+import std.algorithm : canFind, any, countUntil;
 import std.array : replicate, join;
 import std.conv : to;
 import std.format : format;
@@ -1153,7 +1153,7 @@ unittest // a failed registry write leaves the save and its supersession uncommi
 // ---------------------------------------------------------------------------
 // Entity recall (issue #280)
 
-unittest // entitiesFromCall: urls, ssh targets, gh -R, paths, tool name
+unittest // entitiesFromCall: urls, ssh targets, gh -R, repo name, tool name
 {
     // URLs resolve their host (port dropped).
     auto e = entitiesFromCall("bash", parseJSON(`{"command":"curl http://merlin.local:8080/api"}`), "");
@@ -1165,11 +1165,27 @@ unittest // entitiesFromCall: urls, ssh targets, gh -R, paths, tool name
     assert(e.canFind("tool:ssh"), e.join(",")); // first command word
     e = entitiesFromCall("bash", parseJSON(`{"command":"scp deploy@merlin.local:/var/log/x ."}`), "");
     assert(e.canFind("host:merlin.local"), e.join(","));
+    // ssh/scp options: `--flag=value`, and `-x value` / `--flag value` pairs.
+    e = entitiesFromCall("bash", parseJSON(`{"command":"ssh -p 2222 merlin"}`), "");
+    assert(e.canFind("host:merlin"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"ssh -i ~/.ssh/id_ed host.example.org"}`), "");
+    assert(e.canFind("host:host.example.org"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"ssh -o StrictHostKeyChecking=no -p 2222 deploy@merlin.local uptime"}`), "");
+    assert(e.canFind("host:merlin.local"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"ssh -J bastion -l admin merlin"}`), "");
+    assert(e.canFind("host:merlin"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"scp -P 22 f host.example.net:/x"}`), "");
+    assert(e.canFind("host:host.example.net"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"scp -i key f host.example.net:/x"}`), "");
+    assert(e.canFind("host:host.example.net"), e.join(","));
     // gh -R owner/repo and --repo.
     e = entitiesFromCall("bash", parseJSON(`{"command":"gh issue view 280 -R nanobpm/nano-coder"}`), "");
     assert(e.canFind("repo:nanobpm/nano-coder"), e.join(","));
     e = entitiesFromCall("bash", parseJSON(`{"command":"gh pr list --repo acme/widgets"}`), "");
     assert(e.canFind("repo:acme/widgets"), e.join(","));
+    // The working directory's repository, resolved once and passed in.
+    e = entitiesFromCall("read_file", parseJSON(`{"path":"source/app.d"}`), "nanobpm/nano-coder");
+    assert(e.canFind("repo:nanobpm/nano-coder"), e.join(","));
     // The tool name itself for a non-bash tool.
     e = entitiesFromCall("read_file", parseJSON(`{"path":"/x/y"}`), "");
     assert(e.canFind("tool:read_file"), e.join(","));
@@ -1180,7 +1196,12 @@ unittest // repoNameOf maps a project key to owner/repo
     assert(repoNameOf("github.com/nanobpm/nano-coder") == "nanobpm/nano-coder");
     assert(repoNameOf("git@github.com:nanobpm/nano-coder.git") == "nanobpm/nano-coder");
     assert(repoNameOf("https://github.com/acme/widgets.git") == "acme/widgets");
+    assert(repoNameOf("ssh://git@git.example.com/acme/widgets.git") == "acme/widgets");
     assert(repoNameOf("lonely") is null);
+    // A key that is a local checkout path (a repository with no remote) names
+    // no owner/repo — not two bogus path segments.
+    assert(repoNameOf("/Users/x/proj") is null);
+    assert(repoNameOf("/home/u/work/nano-coder") is null);
 }
 
 private Entry saveTagged(Store s, string text, string[] entities, string factKind = null, string kind = null)
@@ -1253,6 +1274,38 @@ unittest // entity recall: count cap and byte budget
     size_t bytes;
     foreach (n; notes) bytes += n.text.length;
     assert(bytes <= recallEntityByteBudget, "byte budget");
+}
+
+unittest // entity recall: a fact the cap crowded out fires despite the cooldown
+{
+    auto s = store(tmp("recall-entity-cooldown-exception"));
+    string[] ids;
+    foreach (i; 0 .. recallEntityMaxFacts + 1)
+        ids ~= saveTagged(s, format("merlin fact number %s", i), ["host:merlin"], "fact").id;
+    // Distinct last-used recency ranks the facts, so the cap picks the first
+    // N and crowds out exactly the oldest. Minutes, not days: the store's
+    // expiry would prune a day-old entry.
+    Entry[] bumped;
+    foreach (x; s.all())
+    {
+        auto e = x.e;
+        e.lastUsedTime = wallNow - minutes(cast(long) ids.countUntil(e.id));
+        e.lastUsed = stamp(e.lastUsedTime);
+        bumped ~= e;
+    }
+    writeAll(s.path(Scope.user), bumped, null);
+    Recall st;
+    bool[string] shown;
+    auto args = parseJSON(`{"command":"ssh merlin"}`);
+    // The cap admits the first N facts; the entity goes on cooldown.
+    auto first = recallEntities(s, "bash", args, "", st, shown, 10);
+    assert(first.length == recallEntityMaxFacts, first.length.to!string);
+    assert(!first.any!(n => n.id == ids[$ - 1]));
+    // The crowded-out fact was never chosen, so the cooldown does not quiet it.
+    auto second = recallEntities(s, "bash", args, "", st, shown, 10);
+    assert(second.length == 1 && second[0].id == ids[$ - 1], second.length.to!string);
+    // Now every fact of the entity was chosen: the cooldown quiets them all.
+    assert(!recallEntities(s, "bash", args, "", st, shown, 10).length);
 }
 
 unittest // entity recall: rules fire every call, superseded never, fallback for untagged

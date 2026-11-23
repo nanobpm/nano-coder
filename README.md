@@ -1393,8 +1393,8 @@ before they existed load unchanged.
 **Recall from tool calls.** After a tool runs, memories relevant to its arguments are attached
 to the result as a `<system-reminder>` note. With `memory_recall = "entity"` (the default) the
 call resolves to the entities it touches — hosts (URLs, `ssh`/`scp` targets), repos (`-R o/r`,
-the working directory's git remote), paths (mapped to the project) and the tool (the command
-name) — through the registry's aliases, following `reached_via` / `runs_on` / `part_of` one hop
+the working directory's git remote) and the tool (the command name) — through the registry's
+aliases, following `reached_via` / `runs_on` / `part_of` one hop
 (`merlin.local:8080` → `host:merlin` and the services on it). At most 3 facts within 1,500 bytes
 are recalled, ranked: rules first, then `fact_kind` weighted by context (`pitfall` and
 `procedure` for command execution, `decision` and `preference` when planning or editing), then

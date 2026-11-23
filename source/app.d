@@ -50,7 +50,7 @@ import nano.commands : helpText, isCommand, unescapePrompt;
 import core.thread : Thread;
 import nano.claude_hooks : HookManager, listingField, label, isProject;
 import nano.skills : Skills, skillsDefinition = definition;
-import nano.memory : MemoryStore = Store, MemoryMode, memorySessionTools = sessionTools, memoryDefaultDir = defaultDir, projectKey, Scope, parseRecallMode;
+import nano.memory : MemoryStore = Store, MemoryMode, memorySessionTools = sessionTools, memoryDefaultDir = defaultDir, projectKey, repoNameOf, Scope, parseRecallMode;
 import nano.control : TurnControl, FdLineReader;
 import nano.instructions : ProjectInstructions, InstructionOptions = Options, expandHome;
 import core.atomic : atomicLoad, atomicStore, cas;
@@ -2809,7 +2809,10 @@ int runMain(string[] args)
     scope (exit) agent.stopSubagents();
     agent.memory = memory;
     agent.memoryRecallMode = parseRecallMode(cfg.memoryRecall);
-    agent.recallCwd = cwd;
+    // Resolve the repo entity once: a `cwd` never changes during a session,
+    // and resolving per call would spawn git processes on the agent loop.
+    auto recallKey = projectKey(cwd);
+    agent.recallRepo = recallKey is null ? null : repoNameOf(recallKey);
     agent.indexShown = indexShown;
     agent.instructions = instructions;
     agent.sessionTitles = cfg.sessionTitles;

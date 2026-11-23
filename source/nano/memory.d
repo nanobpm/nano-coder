@@ -1746,10 +1746,11 @@ bool containsAnchor(string haystack, string anchor) pure
 // memory whose anchors happen to be substrings of the arguments.
 
 /// The entity ids (unresolved `type:name`s) a tool call touches: hosts from
-/// URLs and `ssh`/`scp` targets, repos from a `-R owner/repo` flag and the
-/// working directory's git remote, the project from repo-rooted paths, and
-/// the tool itself. Pure: `cwd` is the only outside input (one git call).
-string[] entitiesFromCall(string tool, const JSONValue args, string cwd)
+/// URLs and `ssh`/`scp` targets, repos from a `-R owner/repo` flag and
+/// `repoName` (the working directory's repository, resolved once by the
+/// caller — resolving it here would spawn git processes on every call), and
+/// the tool itself. Reads only its parameters and the module's match tables.
+string[] entitiesFromCall(string tool, const JSONValue args, string repoName)
 {
     bool[string] found;
     void add(string type, string name)
@@ -1768,24 +1769,9 @@ string[] entitiesFromCall(string tool, const JSONValue args, string cwd)
         // Repos: `-R owner/repo` (gh) and `--repo owner/repo`.
         foreach (m; t.matchAll(reRepoFlag)) add("repo", m[1]);
     }
-    // The working directory's repository, and paths inside it mapped to the
-    // project: a call that names repo files is about this repo.
-    string key;
-    if (cwd.length) key = projectKey(cwd);
-    if (key !is null && key.length)
-    {
-        if (auto name = repoNameOf(key)) add("repo", name);
-        bool touches;
-        foreach (line; haystack.splitLines)
-        {
-            auto t = line.strip;
-            if ((t.startsWith("/") || t.startsWith("~/")) && t.canFind('/')) { touches = true; break; }
-        }
-        if (touches)
-        {
-            if (auto name = repoNameOf(key)) add("repo", name);
-        }
-    }
+    // The working directory's repository, resolved once per session by the
+    // caller (a `cwd` never changes between calls).
+    add("repo", repoName);
     // The tool (command) itself: `bash`, `read_file`, `gh`, …
     add("tool", tool.strip.toLower);
     // Also the first word of a shell command (`ssh …` -> tool:ssh).
@@ -1805,10 +1791,14 @@ private Regex!char reUrlAuthority, reSshTarget, reScpTarget, reRepoFlag;
 static this()
 {
     reUrlAuthority = regex(`[a-z][a-z0-9+.-]*://(?:[^/@\s]+@)?([a-z0-9][a-z0-9.-]*)(?::\d+)?(?:[/?#\s]|$)`, "i");
-    // `ssh [user@]host`: the target is the first non-flag operand.
-    reSshTarget = regex(`(?:^|\s)ssh(?:\s+--?[a-z][a-z0-9-]*=[^\s]+)*\s+(?:[a-z0-9_.-]+@)?([a-z0-9][a-z0-9.-]*)(?:\s|$)`, "i");
-    // `scp`/`rsync`/`sftp` name a host as `host:path` (or `[user@]host:path`).
-    reScpTarget = regex(`(?:^|\s)(?:scp|sftp|rsync)(?:\s+--?[a-z][a-z0-9-]*=[^\s]+)*\s+(?:[a-z0-9_.-]+@)?([a-z0-9][a-z0-9.-]*):[\w./~-]+`, "i");
+    // `ssh [user@]host`: the target is the first non-option operand; options
+    // may be `--flag=value`, `--flag value` or `-x value` (`-p 2222`, `-i key`).
+    // A value never starts with `-x` (that is the next option).
+    reSshTarget = regex(`(?:^|\s)ssh(?:\s+--?[a-z][a-z0-9-]*(?:=[^\s]+|\s+[^\s-]\S*)?)*\s+(?:[a-z0-9_.-]+@)?([a-z0-9][a-z0-9.-]*)(?:\s|$)`, "i");
+    // `scp`/`rsync`/`sftp` name a host as `host:path` (or `[user@]host:path`);
+    // options come first, in the same `--flag=value` / `--flag value` forms,
+    // and plain operands (other files) may precede the remote one.
+    reScpTarget = regex(`(?:^|\s)(?:scp|sftp|rsync)(?:\s+--?[a-z][a-z0-9-]*(?:=[^\s]+|\s+[^\s-]\S*)?|\s+[^\s-]\S*)*?\s+(?:[a-z0-9_.-]+@)?([a-z0-9][a-z0-9.-]*):[\w./~-]+`, "i");
     reRepoFlag = regex(`(?:^|\s)(?:-R|--repo)[=\s]+([a-z0-9_.-]+/[a-z0-9_.-]+)(?:\s|$)`, "i");
 }
 
@@ -1824,8 +1814,11 @@ private string hostKey(string h) pure
 }
 
 /// The `owner/repo` a project key names: the last two path segments of a
-/// remote (`github.com/nanobpm/nano-coder` or `git@host:org/repo`), else null.
-package(nano) string repoNameOf(string key) pure
+/// remote URL (`https://github.com/nanobpm/nano-coder`, `git@host:org/repo`),
+/// else null. A key that is just a local checkout path (a repository with no
+/// origin remote) names no owner/repo, so it yields null rather than two
+/// bogus path segments.
+string repoNameOf(string key) pure
 {
     import std.array : split;
     auto s = key.strip;
@@ -1833,6 +1826,9 @@ package(nano) string repoNameOf(string key) pure
     // scp-style git@host:org/repo — the repo starts after the ':'.
     auto colon = s.indexOf(':');
     if (colon > 0 && !s[0 .. colon].canFind('/')) s = s[colon + 1 .. $];
+    // A key that is just a local checkout path (a repository with no remote)
+    // names no owner/repo — not two bogus path segments.
+    else if (s.startsWith("/") || s.startsWith("~/") || s.startsWith("./") || s.startsWith("../")) return null;
     string[] segs;
     foreach (p; s.split('/')) if (p.strip.length) segs ~= p.strip.toLower;
     if (segs.length >= 2) return segs[$ - 2] ~ "/" ~ segs[$ - 1];
@@ -1993,9 +1989,10 @@ RecallNote[] recall(Store store, string tool, const JSONValue args, ref Recall s
 /// the entities it touches, ranked and capped at `recallEntityMaxFacts` facts
 /// within `recallEntityByteBudget` bytes. Entries with no entities (not yet
 /// migrated) keep the anchor match, so nothing regresses before migration.
-/// `cwd` resolves the working directory's repository. Marks each returned
+/// `repoName` is the working directory's repository (`owner/repo`, empty:
+/// none), resolved once per session by the caller. Marks each returned
 /// memory seen and fired, and its entity recalled (cooldown).
-RecallNote[] recallEntities(Store store, string tool, const JSONValue args, string cwd,
+RecallNote[] recallEntities(Store store, string tool, const JSONValue args, string repoName,
     ref Recall state, const bool[string] shown, size_t budget)
 {
     if (budget == 0 || isMemoryTool(tool)) return null;
@@ -2003,7 +2000,7 @@ RecallNote[] recallEntities(Store store, string tool, const JSONValue args, stri
     if (!haystack.strip.length) return null;
     Store.Scoped[] all_ = store.allForRecall();
     EntityRecord[] records = store.allEntities();
-    auto resolved = resolveCallEntities(records, entitiesFromCall(tool, args, cwd));
+    auto resolved = resolveCallEntities(records, entitiesFromCall(tool, args, repoName));
     auto now = wallNow;
     // Age every entity cooldown by one call.
     foreach (k, ref v; state.entityCooldown) if (v > 0) v--;
@@ -2021,13 +2018,14 @@ RecallNote[] recallEntities(Store store, string tool, const JSONValue args, stri
             {
                 auto id = resolveEntity(records, en);
                 if (!resolved.canFind(id)) continue;
-                // Cooldown: an entity recalled in the last K calls stays quiet
-                // unless this fact of it was never chosen. A rule fires on
-                // every matching call regardless.
+                // Cooldown: an entity recalled in the last K calls stays
+                // quiet — unless this fact of it was never chosen (a fact
+                // the cap crowded out fires on a later call). A rule fires
+                // on every matching call regardless.
                 if (!x.e.isRule)
                 {
                     auto left = state.entityCooldown.get(id, 0);
-                    if (left > 0 && state.entityFired.get(id, null).length) break;
+                    if (left > 0 && state.entityFired.get(id, null).canFind(x.e.id)) break;
                 }
                 cands ~= Cand(x, id);
                 break;
