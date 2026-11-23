@@ -52,6 +52,7 @@ import nano.claude_hooks : HookManager, listingField, label, isProject;
 import nano.skills : Skills, skillsDefinition = definition;
 import nano.memory : MemoryStore = Store, MemoryMode, memorySessionTools = sessionTools, memoryDefaultDir = defaultDir, projectKey, Scope;
 import nano.control : TurnControl, FdLineReader;
+import nano.peers : PeerListener, PeerRouter, Inbound, ListenError, settle, confirmQuestion;
 import nano.instructions : ProjectInstructions, InstructionOptions = Options, expandHome;
 import core.atomic : atomicLoad, atomicStore, cas;
 
@@ -871,6 +872,77 @@ string subagentsCommand(Agent agent, ref Config cfg, string arg)
     if (was != t.on) msg ~= " (the tool list changed, so the provider's prompt cache is rebuilt once)";
     if (t.save) msg ~= "; " ~ saveSubagentsSetting(cfg, t.on);
     return msg;
+}
+
+/// Run `/messages [on|off|confirm on|off] [--save]` (issue #272): show the
+/// state, or switch inter-session messages (and confirmation) for this
+/// session; `--save` writes the user config.
+string messagesCommand(Agent agent, ref Config cfg, string arg, ref PeerRouter router,
+        bool listening, string delegate() @safe start, void delegate() @safe stop)
+{
+    import nano.settings : Changes, save;
+    import std.algorithm : endsWith;
+    import std.string : strip;
+    auto words = arg.strip;
+    bool saveIt;
+    if (words.endsWith("--save")) { saveIt = true; words = words[0 .. $ - "--save".length].strip; }
+
+    string stateText()
+    {
+        auto out_ = format("Messages %s: this session %s%s.", listening && agent.messagesOn ? "on" : "off",
+            listening && agent.messagesOn ? "listens for peer messages and offers session_send"
+                : "opens no socket and has no session_send",
+            router.confirm ? "; incoming messages wait for you to accept" : "; incoming messages are queued at once");
+        return out_;
+    }
+
+    string persist()
+    {
+        Changes ch;
+        ch.sessionMessages = true;
+        ch.sessionMessagesConfirm = true;
+        cfg.sessionMessages = agent.messagesOn;
+        cfg.sessionMessagesConfirm = router.confirm;
+        try
+        {
+            save(cfg, ch, null, cfg.path);
+            return "saved to " ~ cfg.path;
+        }
+        // save() throws only on an unwritable file or an unparseable existing
+        // config; both are reported, never swallowed.
+        catch (Exception e) return "could not save: " ~ e.msg;
+    }
+
+    if (!words.length) return stateText();
+    bool on;
+    bool confirmChange, confirmValue;
+    if (words == "on") on = true;
+    else if (words == "off") on = false;
+    else if (words == "confirm on") { confirmChange = true; confirmValue = true; }
+    else if (words == "confirm off") { confirmChange = true; confirmValue = false; }
+    else return "usage: /messages [on|off|confirm on|off] [--save]";
+
+    string out_;
+    if (confirmChange)
+    {
+        router.confirm(confirmValue);
+        out_ = format("Incoming messages %s for this session", confirmValue ? "wait for you to accept" : "are queued at once");
+    }
+    else if (on == agent.messagesOn && on == listening)
+        out_ = stateText();
+    else if (on)
+    {
+        if (auto failed = start()) out_ = "could not turn messages on: " ~ failed;
+        else out_ = "Messages on for this session (listening; session_send offered)";
+    }
+    else
+    {
+        stop();
+        agent.messagesOn = false;
+        out_ = "Messages off for this session (the socket is closed; session_send is gone from the next request)";
+    }
+    if (saveIt) out_ ~= "; " ~ persist();
+    return out_;
 }
 
 /// A frozen copy of `cfg`, for another thread.
@@ -2903,6 +2975,8 @@ int runMain(string[] args)
         host.configModel = cfg.model;
         host.configSystemPrompt = cfg.systemPrompt;
         host.saveSubagents = (bool on) => saveSubagentsSetting(cfg, on);
+        host.sessionMessages = cfg.sessionMessages;
+        host.sessionMessagesConfirm = cfg.sessionMessagesConfirm;
         host.sessionMeta = () {
             JSONValue meta = ["projectInstructions": JSONValue(instructions.match!(pi => pi.loadedPaths, () => string[].init)),
                 "skills": JSONValue(skills.names)];
@@ -3023,6 +3097,43 @@ int runMain(string[] args)
     Option!LineEditor editor;
     string[] held; // lines to run before reading the prompt again
     auto queue = MessageQueue.make; // Ctrl-Enter messages: one runs per following turn
+
+    // Inter-session messages (issue #272): with `session_messages` on this
+    // session listens on a registry socket; a delivery mid-turn joins the
+    // steers (visible in /queue), an idle one is confirmed (per
+    // `session_messages_confirm`) and starts a turn.
+    PeerRouter peerRouter;
+    // Zero or one listener (an Option can't hold a PeerListener: its NotNull
+    // has no default).
+    PeerListener[] peerListener;
+    void stopPeerListener()
+    {
+        foreach (ref l; peerListener) l.close();
+        peerListener = null;
+    }
+    scope (exit) stopPeerListener();
+    string startPeerListener()
+    {
+        import nano.peers : ensureDir, peersDir;
+        if (agent.log.isNone) return "this session isn't saved (--no-session), so it can't receive messages";
+        auto dir = peersDir();
+        if (!ensureDir(dir)) return "could not create the peers directory " ~ dir;
+        auto id = agent.log.unwrap("checked above").id;
+        try
+        {
+            peerListener = [PeerListener.listen(dir, id, peerRouter.requests)];
+            agent.messagesOn = true;
+            return null;
+        }
+        catch (ListenError e) return e.msg;
+    }
+    peerRouter = PeerRouter.make(agent.control.nonNull);
+    peerRouter.confirm(cfg.sessionMessagesConfirm);
+    if (cfg.sessionMessages)
+        if (auto failed = startPeerListener())
+            stdErr.writeln(console.red("[messages: " ~ failed ~ "]"));
+    // A peer delivery that starts a turn is flagged for the loop guard.
+    bool peerInput;
 
     // Recently used models lead the `/model` type-ahead (recents.rs).
     static import nano.recents;
@@ -3160,6 +3271,10 @@ int runMain(string[] args)
     /// over afterwards run as the next prompts.
     bool driven(scope bool delegate() @safe work) @safe
     {
+        // Peer messages accepted so far join this turn's steers (or wait for
+        // the prompt): route before the key reader starts and after it stops.
+        peerRouter.routePending(queue);
+        scope (exit) peerRouter.routePending(queue);
         // With the line editor, keys typed during the turn steer it (a
         // `/command` waits for the turn to end); Ctrl-C or Esc Esc cancels.
         auto turnDone = new shared(bool);
@@ -3218,11 +3333,13 @@ int runMain(string[] args)
         return ok;
     }
 
-    bool turn(string input) @safe
+    bool turn(string input, bool fromPeer = false) @safe
     {
         if (reloadInstructions())
             stdErr.writeln(console.dim("[instruction files changed: the system prompt now follows them]"));
         syncMode();
+        peerRouter.midTurn(true);
+        scope (exit) peerRouter.midTurn(false);
         nano.herdr.report(nano.herdr.State.working);
         nano.herdr.showTimer(!agent.timers.empty);
         // Follow timers set or cancelled during the turn too, not only the
@@ -3244,7 +3361,7 @@ int runMain(string[] args)
             console.finalAnswer = null;
             console.beginAnswerGuard();
             string response;
-            try response = agent.run(input, console);
+            try response = agent.run(input, console, true, null, fromPeer);
             catch (Exception e)
             {
                 console.endLine();
@@ -3449,17 +3566,52 @@ int runMain(string[] args)
     {
         string line;
         QueuedMessage next;
-        if (held.length)
+        // A peer message that arrived between turns: confirm it (per the
+        // setting), then run it as the next input, flagged for the loop
+        // guard. Mid-turn deliveries were steered by routePending instead.
+        peerRouter.routePending(queue);
+        Inbound inbound;
+        peerInput = false;
+        if (peerRouter.takeWaiting(inbound))
+        {
+            bool accepted = true;
+            if (inbound.needsConfirm)
+            {
+                import std.string : indexOf;
+                auto bracket = inbound.labelled.indexOf(']');
+                writeln(console.dim("Message " ~ (bracket > 0 ? inbound.labelled[0 .. bracket + 1] : inbound.labelled) ~ ":"));
+                writeln(inbound.pm.text);
+                import nano.question : Question, QuestionOption, Answered;
+                auto q = Question(confirmQuestion(inbound), null, [QuestionOption("Decline"), QuestionOption("Accept")]);
+                q.custom = false;
+                auto a = questions.ask([q]);
+                accepted = a.match!((Answered got) => got.answers.length && got.answers[0] == "Accept", _ => false);
+            }
+            settle(inbound, accepted);
+            if (accepted)
+            {
+                writeln(console.dim(format("[%s → starting a turn]", inbound.labelled)));
+                nano.herdr.report(nano.herdr.State.working, "message from a peer session");
+                line = inbound.labelled;
+                peerInput = true;
+            }
+            else
+            {
+                writeln(console.dim(format("[message %s declined]", inbound.labelled)));
+                continue;
+            }
+        }
+        if (line is null && held.length)
         {
             line = held[0];
             held = held[1 .. $];
         }
-        else if (queue.pop(next))
+        else if (line is null && queue.pop(next))
         {
             writeln(console.dim(format("↧ queued #%s: %s", next.id, next.text.strip)));
             line = next.text;
         }
-        else if (editor.isSome)
+        else if (line is null && editor.isSome)
         {
             auto ed = editor.unwrap("checked on the line above");
             refreshStatus();
@@ -3627,7 +3779,7 @@ int runMain(string[] args)
                 if (auto lit = unescapePrompt(line)) line = "\x00" ~ lit; // `//…`: a prompt starting with /
             }
         }
-        else
+        else if (line is null)
         {
             if (interactive) { write("\n" ~ console.stamp() ~ console.bold("› ")); stdOut.flush(); }
             line = inbox ? plainLine() : stdinLine();
@@ -3641,6 +3793,8 @@ int runMain(string[] args)
         if (literal) line = line[1 .. $];
         auto input = line.strip;
         if (!input.length) continue;
+        auto asPeer = peerInput;
+        peerInput = false;
         if (!literal && isCommand(input))
         {
             auto sp = input.indexOf(' ');
@@ -3797,6 +3951,13 @@ int runMain(string[] args)
                 case "/subagents":
                     writeln(escapeMarks(sanitizeBlock(subagentsCommand(agent, cfg, arg))));
                     continue;
+                case "/messages":
+                {
+                    auto reply = messagesCommand(agent, cfg, arg, peerRouter, peerListener.length != 0,
+                        &startPeerListener, &stopPeerListener);
+                    writeln(reply);
+                    continue;
+                }
                 case "/changes":
                 {
                     // No fetch here: it would block the prompt; notes the build
@@ -3922,7 +4083,7 @@ int runMain(string[] args)
                     continue;
             }
         }
-        turn(input);
+        turn(input, asPeer);
     }
     goodbye();
     return 0;

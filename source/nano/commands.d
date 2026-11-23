@@ -36,6 +36,7 @@ immutable Command[] commands = [
     Command("/tools", "", "List available tools"),
     Command("/skills", "", "List skills the agent can load"),
     Command("/subagents", "[on|off] [--save]", "Show sub-agent models, or switch the agent tool on/off"),
+    Command("/messages", "[on|off|confirm on|off] [--save]", "Show or switch inter-session messages (session_send) and confirmation"),
     Command("/model", "[provider/model]", "Show the model and pick a new one (or switch directly)"),
     Command("/mode", "[normal|plan|auto]", "Show or set the agent mode (Shift+Tab cycles)"),
     Command("/thinking", "[level|default|off|reset]", "Show or set the thinking level for this session"),
@@ -487,8 +488,8 @@ unittest // Tab completion
 // rust: commands.rs::slash_lists_everything_and_typing_narrows_it
 unittest // menu rows
 {
-    auto rows = menu("/m", 80, 10);
-    assert(rows.length == 3 && rows[0].canFind("\x1b[1m/m\x1b[0;36memory"), rows[0]);
+    auto rows = menu("/memo", 80, 10);
+    assert(rows.length == 1 && rows[0].canFind("\x1b[1m/memo\x1b[0;36m"), rows[0]);
     assert(menu("/help x", 80, 10) is null && menu("hi", 80, 10) is null && menu("/", 80, 0) is null);
     assert(menu("/zz", 80, 10)[0].canFind("no matching command"));
     auto few = menu("/", 80, 3);

@@ -48,6 +48,9 @@ struct SessionInfo
     string path;
     /// A process currently has the log open (it holds the log's flock).
     bool live;
+    /// The live session accepts inter-session messages (issue #272): it
+    /// listens on a registry socket (`session_messages` on).
+    bool messages;
 }
 
 /// What `Summary` names a session by (title, else first telling prompt).
@@ -70,6 +73,26 @@ private SessionInfo infoOf(Summary s, bool live) @safe
     i.path = s.path;
     i.live = live;
     return i;
+}
+
+/// Whether a live session accepts messages: its registry socket answers
+/// (issue #272). A stale socket (a dead session) is left for the next
+/// `session_send` to remove; here it just doesn't mark the session.
+private bool acceptsMessages(string id) @safe
+{
+    import std.file : exists;
+    import nano.peers : peersDir, socketPath;
+    import std.socket : Socket, UnixAddress, AddressFamily, SocketType, SocketException;
+    auto path = socketPath(peersDir(), id);
+    if (!path.exists) return false;
+    auto s = new Socket(AddressFamily.UNIX, SocketType.STREAM);
+    scope (exit) s.close();
+    try
+    {
+        s.connect(new UnixAddress(path));
+        return true;
+    }
+    catch (SocketException) return false; // stale or refusing: not reachable
 }
 
 /// Whether a process currently holds `path`'s session lock. Probed by opening
@@ -109,6 +132,7 @@ SessionInfo[] listSessions(ref Policy policy, string dir, string cwd, string fil
     foreach (s; list(dir, false, &deniedPath))
     {
         auto i = infoOf(s, isLive(s.path));
+        if (i.live) i.messages = acceptsMessages(i.id);
         if (!i.cwd.length) i.cwd = logHeaderCwd(s.path);
         if (filter.length)
         {
@@ -128,6 +152,7 @@ private string lineOf(const ref SessionInfo i) @safe
     auto out_ = format("%s  %s  %s  %s", i.id, label, i.cwd.length ? i.cwd : "(unknown cwd)",
         i.lastUsed.length >= 19 ? i.lastUsed[0 .. 19] : i.lastUsed);
     if (i.live) out_ ~= "  [live]";
+    if (i.messages) out_ ~= "  [messages]";
     return out_;
 }
 

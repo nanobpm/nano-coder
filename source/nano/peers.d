@@ -1,0 +1,796 @@
+/// Inter-session messages (issue #272, part of #264): a session that opts in
+/// (`session_messages = true`, or `/messages on`) listens on a Unix socket in
+/// the peer registry, and another session's `session_send` tool delivers a
+/// message into its steer/queue path.
+///
+/// Registry: `<peers dir>/<session-id>.sock`, one per listening session, in a
+/// directory created mode 0700. The peers dir is `NANO_CODER_PEERS`, else a
+/// `peers` folder next to the session logs. A stale socket (a session that
+/// died without `close`) is removed by whoever finds it: a refused `connect`
+/// means the file is unlinked and the sender reports `not running`.
+///
+/// Wire format: one JSON object per line, A2A-shaped so a later A2A bridge
+/// maps it directly:
+///
+///   - request:  `{"jsonrpc":"2.0","id":N,"method":"message/send","params":{
+///                 "message":{"role":"user","parts":[{"kind":"text","text":…}],
+///                 "messageId":…,"contextId":<sender session id>,
+///                 "metadata":{"nano":{"title":…,"confirm":bool}}}}`
+///   - response: `{"jsonrpc":"2.0","id":N,"result":{"status":"delivered"|
+///                 "queued"|"awaiting confirmation"|"refused"|"not running",
+///                 "message":…}}`
+///
+/// Trust: the receiver serves only a peer whose uid is its own
+/// (`socketPeerUid`), and the registry directory is 0700, so another user can
+/// neither plant a socket nor connect to one.
+///
+/// Delivery: the listener thread hands the labelled message to a shared
+/// `PeerInbox` the UI thread drains: mid-turn it is queued like a steer
+/// (visible, editable and withdrawable in `/queue`); idle it starts a turn.
+/// With confirmation on, the UI thread first asks the user to accept or
+/// decline and reports the outcome back through the inbox.
+///
+/// The loop guard (two agents must not ping-pong) lives with the sender: a
+/// turn started by a peer message marks the agent (`Agent.peerTurn`), and
+/// `session_send` then needs the user's approval whatever the confirm
+/// setting.
+module nano.peers;
+
+@safe:
+
+import std.algorithm : canFind, endsWith;
+import std.array : appender;
+import std.format : format;
+import std.json;
+import std.string : strip;
+import std.conv : octal;
+
+import nano.option : NotNull, nullable;
+import nano.result : Result, unwrap, unwrapErr;
+import nano.safeio : Chan, Locked, Shared, spawnDaemon, JoinHandle, jsonText;
+
+
+
+/// The tool `session_send` registers as (permission rules name it).
+enum sendTool = "session_send";
+
+/// The largest message accepted (the request line included): bigger sends
+/// are refused before they are read whole.
+enum size_t maxMessageBytes = 64 * 1024;
+
+/// The label a delivered message carries, e.g.
+/// `[from session ab88e980 · ts-performance-matrix] …`.
+string label(string senderId, string title) pure
+{
+    auto brief = senderId.length > 8 ? senderId[0 .. 8] : senderId;
+    return title.strip.length
+        ? format("[from session %s · %s]", brief, title.strip)
+        : format("[from session %s]", brief);
+}
+
+unittest
+{
+    assert(label("ab88e980-rest", "ts-performance-matrix") == "[from session ab88e980 · ts-performance-matrix]");
+    assert(label("ab88e980-rest", "  ") == "[from session ab88e980]");
+    assert(label("short", "t") == "[from session short · t]");
+}
+
+/// The peers directory: `NANO_CODER_PEERS`, else `peers` next to the
+/// session logs (`sessionDir`'s parent). Created mode 0700 by `ensureDir`.
+string peersDir()
+{
+    import std.process : environment;
+    import std.path : buildPath, dirName;
+    import nano.session : sessionDir;
+    if (auto x = environment.get("NANO_CODER_PEERS")) return x;
+    return buildPath(sessionDir().dirName, "peers");
+}
+
+/// Create the peers directory (and parents) mode 0700; tighten an existing
+/// one's mode. Returns false when it can't be made a private directory.
+bool ensureDir(string dir)
+{
+    import std.file : exists, isDir, mkdirRecurse, getAttributes;
+    import std.path : dirName;
+    import nano.safeio : mkdirMode;
+    import core.stdc.errno : errno, EEXIST;
+    if (dir.exists) return dir.isDir && tighten(dir);
+    auto parent = dir.dirName;
+    if (parent.length && parent != dir && !parent.exists) mkdirRecurse(parent);
+    if (mkdirMode(dir, octal!700) != 0 && errno != EEXIST) return false;
+    return tighten(dir);
+}
+
+private bool tighten(string dir)
+{
+    import std.file : getAttributes;
+    import nano.safeio : chmodPath;
+    if ((getAttributes(dir) & octal!777) == octal!700) return true;
+    return chmodPath(dir, octal!700) == 0;
+}
+
+unittest
+{
+    import std.file : tempDir, rmdirRecurse, exists, getAttributes, mkdirRecurse;
+    import std.path : buildPath;
+    auto root = buildPath(tempDir, "nano-d-peers-dir");
+    scope (exit) rmdirRecurse(root);
+    auto dir = buildPath(root, "a", "peers");
+    assert(ensureDir(dir));
+    assert(dir.exists);
+    assert((getAttributes(dir) & octal!777) == octal!700, "private to the user");
+    assert(ensureDir(dir), "idempotent");
+    // A permissive existing directory is tightened.
+    auto loose = buildPath(root, "loose");
+    mkdirRecurse(loose);
+    assert((getAttributes(loose) & octal!777) != octal!700);
+    assert(ensureDir(loose));
+    assert((getAttributes(loose) & octal!777) == octal!700);
+}
+
+/// One message as the wire carries it (already decoded).
+struct PeerMessage
+{
+    string senderId;
+    string senderTitle;
+    string text;
+    string messageId;
+    /// The sender asks the receiver to confirm even when its own
+    /// `session_messages_confirm` is off (the loop guard's approval).
+    bool confirm;
+
+}
+
+/// The `message/send` params, or the error the sender reads.
+Result!(PeerMessage, string) parseMessage(JSONValue params) pure
+{
+    alias R = Result!(PeerMessage, string);
+    if (params.type != JSONType.object) return R.err("params must be an object");
+    auto m = "message" in params.objectNoRef;
+    if (m is null || m.type != JSONType.object) return R.err("params.message must be an object");
+    PeerMessage pm;
+    if (auto v = "messageId" in m.objectNoRef)
+        if (v.type == JSONType.string) pm.messageId = v.str;
+    if (auto v = "contextId" in m.objectNoRef)
+        if (v.type == JSONType.string) pm.senderId = v.str;
+    if (!pm.senderId.length) return R.err("message.contextId (the sender's session id) is required");
+    if (auto v = "parts" in m.objectNoRef)
+        if (v.type == JSONType.array)
+            foreach (p; v.arrayNoRef)
+            {
+                if (p.type != JSONType.object) continue;
+                auto t = "text" in p.objectNoRef;
+                if (t !is null && t.type == JSONType.string)
+                    pm.text ~= (pm.text.length ? "\n" : "") ~ t.str;
+            }
+    if (!pm.text.strip.length) return R.err("message has no text part");
+    if (auto md = "metadata" in m.objectNoRef)
+        if (md.type == JSONType.object)
+            if (auto n = "nano" in md.objectNoRef)
+                if (n.type == JSONType.object)
+                {
+                    if (auto v = "title" in n.objectNoRef)
+                        if (v.type == JSONType.string) pm.senderTitle = v.str;
+                    if (auto v = "confirm" in n.objectNoRef)
+                        if (v.type == JSONType.true_ || v.type == JSONType.false_) pm.confirm = v.boolean;
+                }
+    return R.ok(pm);
+}
+
+/// The request line for `pm` (one JSON object, newline-terminated).
+string requestLine(PeerMessage pm, long id) pure
+{
+    JSONValue nano = ["title": JSONValue(pm.senderTitle), "confirm": JSONValue(pm.confirm)];
+    JSONValue part = ["kind": JSONValue("text"), "text": JSONValue(pm.text)];
+    JSONValue msg = [
+        "role": JSONValue("user"),
+        "parts": JSONValue([part]),
+        "messageId": JSONValue(pm.messageId.length ? pm.messageId : "msg-0"),
+        "contextId": JSONValue(pm.senderId),
+        "metadata": JSONValue(["nano": nano]),
+    ];
+    JSONValue req = [
+        "jsonrpc": JSONValue("2.0"),
+        "id": JSONValue(id),
+        "method": JSONValue("message/send"),
+        "params": JSONValue(["message": msg]),
+    ];
+    return req.jsonText(JSONOptions.doNotEscapeSlashes) ~ "\n";
+}
+
+unittest
+{
+    auto line = requestLine(PeerMessage("sess-sender", "a title", "hello there", "m-1", true), 7);
+    assert(line.endsWith("\n") && line.canFind(`"method":"message/send"`), line);
+    auto v = parseJSON(line);
+    auto pm = parseMessage(v["params"]).unwrap("valid request");
+    assert(pm.senderId == "sess-sender" && pm.senderTitle == "a title" && pm.text == "hello there" && pm.confirm);
+    assert(pm.messageId == "m-1");
+    // Two text parts join with a newline.
+    auto two = parseJSON(`{"message":{"role":"user","parts":[{"kind":"text","text":"a"},{"kind":"text","text":"b"}],"messageId":"m","contextId":"s"}}`);
+    assert(parseMessage(two).unwrap("two parts").text == "a\nb");
+    // No text, no contextId: refused.
+    assert(parseMessage(parseJSON(`{"message":{"role":"user","parts":[],"messageId":"m","contextId":"s"}}`)).isErr);
+    assert(parseMessage(parseJSON(`{"message":{"role":"user","parts":[{"kind":"text","text":"x"}],"messageId":"m"}}`)).isErr);
+}
+
+/// The delivery outcomes `session_send` reports (the response's `status`).
+enum Status : string
+{
+    delivered = "delivered",
+    queued = "queued",
+    awaiting = "awaiting confirmation",
+    refused = "refused",
+    notRunning = "not running",
+}
+
+/// The response line for one request.
+private string responseLine(JSONValue id, Status status, string message) pure
+{
+    JSONValue resp = [
+        "jsonrpc": JSONValue("2.0"),
+        "id": id,
+        "result": JSONValue(["status": JSONValue(status), "message": JSONValue(message)]),
+    ];
+    return resp.jsonText(JSONOptions.doNotEscapeSlashes) ~ "\n";
+}
+
+/// Binding the registry socket failed (another live session of the same id,
+/// or an unwritable directory).
+class ListenError : Exception
+{
+    this(string msg) pure @safe { super(msg); }
+}
+
+/// One accepted connection's parsed message, handed from the listener
+/// thread to the UI thread (which routes it and fills `reply`).
+struct PeerRequest
+{
+    PeerMessage pm;
+    /// The UI thread's answer: status and note for the sender (a handle:
+    /// default-constructible, always set before the request is put).
+    Shared!ReplyCell reply;
+}
+
+struct ReplyCell
+{
+    bool resolved;
+    Status status;
+    string note;
+}
+
+/// A listening session's end of the registry: the socket file it owns.
+/// `close` stops the listener and removes the socket (idempotent). A struct
+/// (one impl per listener), so no new reference type.
+struct PeerListener
+{
+    import std.socket : Socket;
+    import nano.option : NotNull, nullable;
+    private NotNull!Impl impl;
+
+    private static final class Impl
+    {
+        string path;
+        /// Set at listen() and never nulled (close() is idempotent via
+        /// `closed`); a bare reference because the impl is filled by field.
+        @nullable("set at listen(), never nulled")
+        Socket listener;
+        JoinHandle thread;
+        bool closed;
+    }
+
+    /// Listen on `<dir>/<id>.sock` (the directory must exist); accepted
+    /// messages go to `requests`, whose consumer must answer each promptly
+    /// (the sender blocks on the reply). Throws when the socket can't be
+    /// bound (another live session of the same id).
+    static PeerListener listen(string dir, string id, Chan!PeerRequest requests)
+    {
+        import std.socket : Socket, UnixAddress, SocketException, AddressFamily, SocketType;
+        import std.file : exists, remove;
+        auto path = socketPath(dir, id);
+        auto socket = new Socket(AddressFamily.UNIX, SocketType.STREAM);
+        try
+        {
+            // A stale socket from a dead session is replaced; a live one
+            // refuses the bind.
+            if (path.exists && !live(path)) remove(path);
+            socket.bind(new UnixAddress(path));
+            socket.listen(4);
+        }
+        catch (SocketException e)
+        {
+            socket.close();
+            throw new ListenError(format("cannot listen on %s: %s", path, e.msg));
+        }
+        auto impl = new Impl;
+        impl.path = path;
+        impl.listener = socket;
+        impl.thread = spawnDaemon(&serve, impl.listener.handle, requests);
+        return PeerListener(NotNull!Impl(impl));
+    }
+
+    /// The socket's path (for diagnostics).
+    string path() { return impl.path; }
+
+    /// Stop the listener thread and remove the socket file (idempotent).
+    void close()
+    {
+        import std.file : exists, remove;
+        import std.socket : SocketShutdown, SocketException;
+        if (impl.closed) return;
+        impl.closed = true;
+        auto l = impl.listener;
+        // Wake the accept loop, then join it before unlinking so no accepted
+        // connection is dropped mid-handshake.
+        try l.shutdown(SocketShutdown.BOTH);
+        catch (SocketException) {} // already closed: fine
+        l.close();
+        impl.thread.join();
+        if (impl.path.exists) removeIfThere(impl.path);
+    }
+
+    private static void serve(imported!"std.socket".socket_t handle_, Chan!PeerRequest requests)
+    {
+        import core.time : msecs;
+        import std.socket : Socket, SocketSet, SocketException, AddressFamily, SocketType;
+        import core.sys.posix.unistd : getuid;
+        import nano.safeio : socketPeerUid;
+        auto listener = new Socket(handle_, AddressFamily.UNIX);
+        auto set = new SocketSet;
+        for (;;)
+        {
+            set.reset();
+            set.add(listener);
+            int n;
+            try n = Socket.select(set, null, null, 100.msecs);
+            catch (SocketException) return; // closed by `close`
+            if (n <= 0) continue; // timeout: poll again (close wakes select)
+            Socket conn;
+            try conn = listener.accept();
+            catch (SocketException) return; // closed by `close`
+            scope (exit) conn.close();
+            // Same uid only: anything else is dropped unanswered.
+            if (socketPeerUid(conn.handle) != long(getuid())) continue;
+            handle(conn, requests);
+        }
+    }
+
+    /// One request/response exchange on an accepted connection: parse, hand
+    /// to the UI thread, wait for its answer (bounded, so a stuck consumer
+    /// never pins the listener), reply.
+    private static void handle(Socket conn, Chan!PeerRequest requests)
+    {
+        import nano.clock : monoNow, since, sleepFor;
+        import core.time : msecs, seconds;
+        auto line = readLine(conn);
+        if (line is null) return;
+        JSONValue id = JSONValue(0);
+        string reply;
+        JSONValue v;
+        try v = parseJSON(line);
+        catch (JSONException e)
+        {
+            reply = responseLine(id, Status.refused, "not JSON: " ~ e.msg);
+            sendReply(conn, reply);
+            return;
+        }
+        if (auto pid = "id" in v.objectNoRef) id = *pid;
+        auto method = "method" in v.objectNoRef;
+        auto params = "params" in v.objectNoRef;
+        if (v.type != JSONType.object || method is null || method.type != JSONType.string
+            || method.str != "message/send" || params is null)
+        {
+            sendReply(conn, responseLine(id, Status.refused, "expected a message/send request"));
+            return;
+        }
+        auto pm = parseMessage(*params);
+        if (pm.isErr)
+        {
+            sendReply(conn, responseLine(id, Status.refused, pm.unwrapErr("isErr")));
+            return;
+        }
+        auto cell = Shared!ReplyCell.make;
+        requests.put(PeerRequest(pm.unwrap("isOk"), cell));
+        // The UI thread answers within moments (mid-turn) or after the user
+        // decides (idle, confirm on): wait generously, but never forever —
+        // a wedged consumer must not pin the listener thread.
+        auto start = monoNow;
+        for (;;)
+        {
+            auto r = cell.get;
+            if (r.resolved)
+            {
+                sendReply(conn, responseLine(id, r.status, r.note));
+                return;
+            }
+            if (since(start) > 120.seconds)
+            {
+                sendReply(conn, responseLine(id, Status.refused, "the target session did not answer in time"));
+                return;
+            }
+            sleepFor(5.msecs);
+        }
+    }
+
+    private static void sendReply(Socket conn, string reply)
+    {
+        import std.string : representation;
+        import std.socket : SocketException;
+        try conn.send(reply.representation);
+        catch (SocketException) {} // the sender gave up waiting: nothing to do
+    }
+}
+
+/// Remove a socket file, ignoring a concurrent removal (a successor may
+/// have replaced it, or another cleaner got there first).
+private void removeIfThere(string path)
+{
+    import std.file : remove, FileException;
+    try remove(path);
+    catch (FileException) {} // already gone: fine
+}
+
+/// `<dir>/<id>.sock`; the id is validated (it names a file).
+string socketPath(string dir, string id)
+{
+    import std.path : buildPath;
+    import nano.session : validateId;
+    validateId(id);
+    return buildPath(dir, id ~ ".sock");
+}
+
+/// Read one newline-terminated line (bounded), or null on a clean close.
+private string readLine(imported!"std.socket".Socket conn)
+{
+    auto buf = appender!(char[]);
+    ubyte[1] b;
+    while (buf.data.length < maxMessageBytes + 1)
+    {
+        auto n = conn.receive(b[]);
+        if (n == 0) return buf.data.length ? buf.data.idup : null; // closed
+        if (n == conn.ERROR) return null; // interrupted or errored: treat as closed
+        if (b[0] == '\n') return buf.data.idup;
+        buf ~= char(b[0]);
+    }
+    return buf.data.idup; // overlong: the caller reports it
+}
+
+/// Whether a live session still answers the socket at `path`.
+private bool live(string path)
+{
+    import std.socket : Socket, UnixAddress, AddressFamily, SocketType, SocketException;
+    auto s = new Socket(AddressFamily.UNIX, SocketType.STREAM);
+    scope (exit) s.close();
+    try
+    {
+        s.connect(new UnixAddress(path));
+        return true;
+    }
+    catch (SocketException) return false; // refused or missing: stale
+}
+
+/// Deliver `pm` to the session listening at `<dir>/<to>.sock`; the outcome,
+/// with the receiver's note in `note`. A stale socket (connection refused)
+/// is removed, so a dead session reports `not running` and its file is gone.
+Status send(string dir, string to, PeerMessage pm, out string note)
+{
+    import std.socket : Socket, UnixAddress, AddressFamily, SocketType;
+    import std.file : exists, remove;
+    auto path = socketPath(dir, to);
+    if (!path.exists)
+    {
+        note = format("session %s is not listening (messages off, or not running)", to);
+        return Status.notRunning;
+    }
+    auto s = new Socket(AddressFamily.UNIX, SocketType.STREAM);
+    scope (exit) s.close();
+    import std.socket : SocketException;
+    try s.connect(new UnixAddress(path));
+    catch (SocketException)
+    {
+        // Stale: nobody is accepting. Remove it so the next listing is clean.
+        removeIfThere(path);
+        note = format("session %s is not running (removed a stale socket)", to);
+        return Status.notRunning;
+    }
+    string line;
+    try
+    {
+        import std.string : representation;
+        s.send(requestLine(pm, 1).representation);
+        line = readLine(s);
+    }
+    catch (SocketException e)
+    {
+        note = "delivery failed: " ~ e.msg;
+        return Status.refused;
+    }
+    if (line is null)
+    {
+        note = "the receiver closed without answering";
+        return Status.refused;
+    }
+    try
+    {
+        auto v = parseJSON(line);
+        auto r = "result" in v.objectNoRef;
+        if (r is null || r.type != JSONType.object)
+        {
+            note = "a malformed response from the receiver";
+            return Status.refused;
+        }
+        if (auto m = "message" in r.objectNoRef)
+            if (m.type == JSONType.string) note = m.str;
+        if (auto st = "status" in r.objectNoRef)
+            if (st.type == JSONType.string)
+                switch (st.str)
+                {
+                    case "delivered": return Status.delivered;
+                    case "queued": return Status.queued;
+                    case "awaiting confirmation": return Status.awaiting;
+                    case "refused": return Status.refused;
+                    default: return Status.notRunning;
+                }
+        note = note.length ? note : "a malformed response from the receiver";
+        return Status.refused;
+    }
+    catch (JSONException e)
+    {
+        note = "a malformed response from the receiver: " ~ e.msg;
+        return Status.refused;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The receiving session's side: shared state the UI thread drains.
+// ---------------------------------------------------------------------------
+
+/// One delivered message waiting for the UI thread (idle: confirm and/or
+/// start a turn).
+struct Inbound
+{
+    /// The wire message (its strings are immutable: sendable as-is).
+    PeerMessage pm;
+    /// The labelled text, ready to run as a prompt.
+    string labelled;
+    /// The receiver's confirm setting asks the user first.
+    bool needsConfirm;
+    /// The sender hears the outcome through this cell (the request's
+    /// reply; a handle, always set before the message can wait here).
+    Shared!ReplyCell outcome;
+}
+
+/// Resolve an inbound the user answered (or one that needs no answer):
+/// accepted messages report `delivered`, declined ones `refused`.
+void settle(ref Inbound m, bool accepted, string note = null)
+{
+    m.outcome.update((ref ReplyCell r) {
+        r.resolved = true;
+        r.status = accepted ? Status.delivered : Status.refused;
+        r.note = note.length ? note
+            : accepted ? "accepted by the target session's user" : "declined by the target session's user";
+    });
+}
+
+/// The question a confirm prompt asks.
+string confirmQuestion(const ref Inbound m) pure
+{
+    import nano.queue : preview;
+    return format("Accept a message %s? \"%s\"", label(m.pm.senderId, m.pm.senderTitle), preview(m.pm.text, 120));
+}
+
+/// The receiving session's router: the UI thread drains the listener's
+/// channel (`requests`), routes each message — mid-turn it joins the running
+/// turn's steers under a `/queue` id (answered `queued` at once); idle it
+/// waits in `waiting` for the prompt loop to confirm and/or start a turn —
+/// and answers the sender through the request's cell.
+struct PeerRouter
+{
+    import nano.control : TurnControl;
+    /// The listener hands accepted messages here.
+    Chan!PeerRequest requests;
+    /// The running turn's controls (steers), so a mid-turn delivery is
+    /// `/queue`-visible like a typed steer. Set by make() before any use; a
+    /// bare reference so the router stays default-constructible (the prompt
+    /// loop declares it before the agent exists).
+    @nullable("set by PeerRouter.make before any use")
+    private shared TurnControl control;
+    /// Idle deliveries the prompt loop hasn't settled yet (a channel: the
+    /// listener thread puts, the prompt loop takes).
+    private Chan!WaitingItem waiting;
+    /// The receiver's confirm setting (the prompt loop keeps it current).
+    private Shared!bool confirmSetting;
+    /// Whether the agent is mid-turn (set at each turn boundary).
+    private Shared!bool midTurnFlag;
+
+    // A waiting delivery: the message's strings are immutable (sendable).
+    private struct WaitingItem
+    {
+        PeerMessage pm;
+        string labelled;
+        bool needsConfirm;
+        Shared!ReplyCell outcome;
+    }
+
+    static PeerRouter make(shared TurnControl control)
+    {
+        import core.atomic : atomicLoad, atomicStore;
+        PeerRouter r;
+        atomicStore(r.control, atomicLoad(control));
+        r.requests = Chan!PeerRequest.make;
+        r.waiting = Chan!WaitingItem.make;
+        r.confirmSetting = Shared!bool.make(true);
+        r.midTurnFlag = Shared!bool.make(false);
+        return r;
+    }
+
+    bool opCast(B : bool)() pure const { return !!requests; }
+
+    /// The receiver's confirm setting, as routing applies it.
+    void confirm(bool on) { confirmSetting.update((ref bool b) { b = on; }); }
+    bool confirm() { return confirmSetting.get; }
+
+    /// Route every request the listener accepted so far. Mid-turn each
+    /// becomes a steer (its `/queue` id reserved from `queue`); idle each
+    /// waits for the prompt loop. Call at each turn boundary and prompt.
+    void routePending(ref imported!"nano.queue".MessageQueue queue)
+    {
+        PeerRequest req;
+        while (requests.tryTake(req))
+        {
+            auto labelled = label(req.pm.senderId, req.pm.senderTitle) ~ " " ~ req.pm.text;
+            auto confirm = this.confirm || req.pm.confirm;
+            if (midTurn)
+            {
+                auto id = queue.reserveId();
+                import core.atomic : atomicLoad;
+                atomicLoad(control).steerWithId(labelled, id);
+                answer(req.reply, Status.queued, "queued in the target session (visible and editable in /queue)");
+            }
+            else
+            {
+                waiting.put(WaitingItem(req.pm, labelled.idup, confirm, req.reply));
+                if (!confirm)
+                    answer(req.reply, Status.delivered, "starts a turn in the target session");
+                // With confirm on the prompt loop asks, then settles the
+                // inbound (which answers the request's cell).
+            }
+        }
+    }
+
+    /// Whether the agent is mid-turn (set at each turn boundary by the
+    /// prompt loop): mid-turn deliveries steer, idle ones wait.
+    void midTurn(bool on) { midTurnFlag.update((ref bool b) { b = on; }); }
+    bool midTurn() { return midTurnFlag.get; }
+
+    /// The next idle delivery the prompt loop must settle, if any.
+    bool takeWaiting(out Inbound first)
+    {
+        WaitingItem item;
+        if (!waiting.tryTake(item)) return false;
+        first = Inbound(item.pm, item.labelled, item.needsConfirm, item.outcome);
+        return true;
+    }
+
+    private static void answer(Shared!ReplyCell reply, Status status, string note)
+    {
+        reply.update((ref ReplyCell r) { r.resolved = true; r.status = status; r.note = note; });
+    }
+}
+
+/// The `session_send` tool definition (offered only with messages on).
+imported!"nano.llm".ToolDefinition sendDefinition() pure
+{
+    import nano.llm : ToolDefinition;
+    return ToolDefinition(sendTool,
+        "Send a message to another running nano-coder session on this machine (one that turned "
+        ~ "`session_messages` on; sessions_list marks it [messages]). `to` is an id, a unique id prefix or a "
+        ~ "title, resolved like the history tools' `session` argument. The message joins the target's input "
+        ~ "labelled with this session's id; the target may confirm it first. The result is one of: delivered, "
+        ~ "queued (the target is mid-turn; visible in its /queue), awaiting confirmation, refused (the target "
+        ~ "has messages off or declined), not running. A turn started by a peer message cannot send one without "
+        ~ "the user's approval, so two agents cannot ping-pong.",
+        parseJSON(`{"type":"object","properties":{"to":{"type":"string","description":"The target session: an id, a unique id prefix, or a title from sessions_list"},"text":{"type":"string","description":"The message text"},"confirm":{"type":"boolean","description":"Ask the target's user to accept even when their confirm setting is off (default false)"}},"required":["to","text"]}`));
+}
+
+// ---------------------------------------------------------------------------
+// Tests: two in-process sessions over real registry sockets.
+// ---------------------------------------------------------------------------
+
+// Two sessions: one listening, one sending. Delivery idle (confirm off) is
+// accepted and waits for the prompt loop; the wire is the A2A shape.
+unittest
+{
+    import std.file : exists, tempDir, mkdirRecurse, rmdirRecurse;
+    import std.path : buildPath;
+    import nano.control : TurnControl;
+    import nano.queue : MessageQueue;
+    import core.atomic : atomicLoad;
+    auto root = buildPath(tempDir, "nano-d-peers-send");
+    scope (exit) rmdirRecurse(root);
+    mkdirRecurse(root);
+    auto control = new shared TurnControl;
+    auto router = PeerRouter.make(atomicLoad(control));
+    auto listener = PeerListener.listen(root, "sess-target", router.requests);
+    scope (exit) listener.close();
+    assert(socketPath(root, "sess-target").exists, "the registry socket exists");
+
+    // Deliver: idle, confirm off → delivered at once, waiting for the loop.
+    string note;
+    auto status = send(root, "sess-target", PeerMessage("sess-sender", "a title", "hello there", "m-1", false), note);
+    assert(status == Status.delivered, note);
+    Inbound inbound;
+    assert(router.takeWaiting(inbound), "the message waits for the prompt loop");
+    assert(inbound.pm.senderId == "sess-sender" && inbound.pm.text == "hello there");
+    assert(inbound.labelled == "[from session sess-sen · a title] hello there", inbound.labelled);
+    assert(!inbound.needsConfirm, "confirm off: no ask");
+    settle(inbound, true);
+
+    // Confirm on: the sender hears awaiting-confirmation; accepting and
+    // declining both reach the sender.
+    router.confirm(true);
+    status = send(root, "sess-target", PeerMessage("sess-sender", null, "please review", "m-2", false), note);
+    assert(status == Status.awaiting, note);
+    assert(router.takeWaiting(inbound));
+    assert(inbound.needsConfirm);
+    settle(inbound, true); // accepted
+    status = send(root, "sess-target", PeerMessage("sess-sender", null, "and this?", "m-3", false), note);
+    assert(status == Status.awaiting, note);
+    assert(router.takeWaiting(inbound));
+    settle(inbound, false); // declined
+
+    // Mid-turn: the message joins the steers under a /queue id.
+    router.midTurn(true);
+    status = send(root, "sess-target", PeerMessage("sess-sender", null, "mid-turn note", "m-4", false), note);
+    assert(status == Status.queued, note);
+    auto queue = MessageQueue.make;
+    router.routePending(queue);
+    auto pending = control.pendingSteers;
+    assert(pending.length == 1 && pending[0].text == "[from session sess-sen] mid-turn note", pending[0].text);
+    assert(pending[0].id >= 0, "listed in /queue");
+    router.midTurn(false);
+
+    // Setting off: no listener → not running. A dead listener leaves a stale
+    // socket the next send removes.
+    listener.close();
+    assert(!socketPath(root, "sess-target").exists, "close removes the socket");
+    status = send(root, "sess-target", PeerMessage("sess-sender", null, "anyone?", "m-5", false), note);
+    assert(status == Status.notRunning, note);
+    // A stale socket (no listener behind it) is removed by the sender.
+    import std.socket : Socket, UnixAddress, AddressFamily, SocketType;
+    auto stale = new Socket(AddressFamily.UNIX, SocketType.STREAM);
+    stale.bind(new UnixAddress(socketPath(root, "sess-stale")));
+    stale.close(); // bound but nobody accepts: connect is refused
+    status = send(root, "sess-stale", PeerMessage("sess-sender", null, "hi", "m-6", false), note);
+    assert(status == Status.notRunning, note);
+    assert(!socketPath(root, "sess-stale").exists, "the stale socket is cleaned up: " ~ note);
+}
+
+// The same-uid check: a peer whose uid isn't the process's own is dropped.
+// (Can't fake a foreign uid in-process; assert the probe answers our own uid
+// and that the listener serves a same-uid peer — the drop path is the
+// comparison in serve().)
+unittest
+{
+    import std.socket : Socket, UnixAddress, AddressFamily, SocketType;
+    import core.sys.posix.unistd : getuid;
+    import nano.safeio : socketPeerUid;
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse;
+    import std.path : buildPath;
+    auto root = buildPath(tempDir, "nano-d-peers-uid");
+    scope (exit) rmdirRecurse(root);
+    mkdirRecurse(root);
+    auto server = new Socket(AddressFamily.UNIX, SocketType.STREAM);
+    server.bind(new UnixAddress(buildPath(root, "x.sock")));
+    server.listen(1);
+    scope (exit) server.close();
+    auto client = new Socket(AddressFamily.UNIX, SocketType.STREAM);
+    scope (exit) client.close();
+    client.connect(new UnixAddress(buildPath(root, "x.sock")));
+    auto conn = server.accept();
+    scope (exit) conn.close();
+    assert(socketPeerUid(conn.handle) == long(getuid()), "our own peer is recognized");
+}
+
+// The loop guard lives in the agent (peerTurn): covered by the agent-level
+// test in agent_peers_test.d.

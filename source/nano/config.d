@@ -471,6 +471,15 @@ struct Config
     /// `history_search`/`history_read`. Off, the tools behave as before and
     /// other sessions' logs are never opened.
     bool crossSessionHistory = true;
+    /// Send and receive messages between running sessions (issue #272):
+    /// this session listens on a registry socket, appears reachable in
+    /// `sessions_list`, and offers the `session_send` tool. Off (the
+    /// default), it opens no socket and has no `session_send`.
+    bool sessionMessages;
+    /// An incoming message waits for the user to accept it before it is
+    /// queued (`session_messages_confirm`, default true); off, it is queued
+    /// (or starts a turn) at once.
+    bool sessionMessagesConfirm = true;
     /// Session log directory (empty: the platform data folder).
     string sessionDir;
     /// Gzip session logs idle this many days at startup (0: never; issue #205).
@@ -560,6 +569,8 @@ struct Config
         if (auto v = "idle_compact" in doc) c.idleCompact = v.boolean;
         if (auto v = "persist_sessions" in doc) c.persistSessions = v.boolean;
         if (auto v = "cross_session_history" in doc) c.crossSessionHistory = v.boolean;
+        if (auto v = "session_messages" in doc) c.sessionMessages = v.boolean;
+        if (auto v = "session_messages_confirm" in doc) c.sessionMessagesConfirm = v.boolean;
         if (auto v = "session_dir" in doc) c.sessionDir = v.str;
         if (auto v = "session_compress_after_days" in doc) c.sessionCompressAfterDays = v.integer;
         if (auto v = "session_retention_days" in doc) c.sessionRetentionDays = v.integer;
