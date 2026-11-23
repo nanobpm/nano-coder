@@ -820,16 +820,24 @@ struct PeerRouter
 
     /// Extract the sender label from a labelled peer message (e.g.
     /// `ab88e980` from `[from session ab88e980 · title] text`) for drop
-    /// notices; returns `"peer"` when the prefix is missing.
-    static string senderFromLabel(string labelled) pure nothrow
+    /// notices; returns `"peer"` when the prefix is missing. Control
+    /// characters and terminal escape sequences are stripped so every
+    /// caller gets a terminal-safe single-line value.
+    static string senderFromLabel(string labelled) pure
     {
+        import std.encoding : sanitize;
         import std.string : indexOf;
+        import nano.trajectory : terminalSafe;
         enum prefix = "[from session ";
         if (labelled.length > prefix.length && labelled[0 .. prefix.length] == prefix)
         {
             auto rest = labelled[prefix.length .. $];
             auto close = rest.indexOf(']');
-            if (close > 0) return rest[0 .. close];
+            if (close > 0)
+            {
+                auto clean = terminalSafe(sanitize(rest[0 .. close])).strip;
+                return clean.length ? clean : "peer";
+            }
         }
         return "peer";
     }
@@ -1135,6 +1143,9 @@ unittest
     assert(PeerRouter.senderFromLabel("[from session sess-a · title] hi") == "sess-a · title");
     assert(PeerRouter.senderFromLabel("[from session sess-a] hi") == "sess-a");
     assert(PeerRouter.senderFromLabel("unlabelled") == "peer");
+    assert(PeerRouter.senderFromLabel("[from session sess-a · \x1b[31mevil\x1b[0m\nline] hi") == "sess-a · evilline");
+    assert(PeerRouter.senderFromLabel("[from session \x1b[2J] hi") == "peer");
+    assert(PeerRouter.senderFromLabel("[from session \xC3] hi").length > 0);
 
     // Late steers can't grow the inbox past its bound across turns.
     {
