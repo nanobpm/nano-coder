@@ -650,6 +650,41 @@ string[] relaunchArgv(const string[] argv, string session) pure
 }
 
 
+/// `argv` with the runtime-setting flags (`-m`/`--model`, `--verbosity`,
+/// `-v`/`--verbose`, `--plan`) replaced by the session's current values, so a
+/// `/relaunch` keeps a model, verbosity or mode switched mid-session instead
+/// of the stale startup flags overriding the session's settings (issue #297).
+string[] withCurrentSettings(const string[] argv, string model, string verbosity, bool plan) pure
+{
+    string[] out_;
+    for (size_t i = 0; i < argv.length; ++i)
+    {
+        auto a = argv[i];
+        if (a == "--model" || a == "-m" || a == "--verbosity")
+        {
+            if (i + 1 < argv.length) ++i;
+            continue;
+        }
+        if (a.startsWith("--model=") || a.startsWith("--verbosity=")
+            || a == "--verbose" || a == "-v" || a == "--plan")
+            continue;
+        out_ ~= a;
+    }
+    if (model.length) out_ ~= "--model=" ~ model;
+    if (verbosity.length) out_ ~= "--verbosity=" ~ verbosity;
+    if (plan) out_ ~= "--plan";
+    return out_;
+}
+
+unittest
+{
+    assert(withCurrentSettings(["-m", "a/x", "--plan", "-v", "--yolo"], "b/y", "normal", false)
+        == ["--yolo", "--model=b/y", "--verbosity=normal"]);
+    assert(withCurrentSettings(["--model=a/x", "--verbosity", "quiet"], "a/x", "verbose", true)
+        == ["--model=a/x", "--verbosity=verbose", "--plan"]);
+    assert(withCurrentSettings([], "", "", false) == []);
+}
+
 // rust: update.rs::detects_the_npm_channel_in_both_launcher_states
 // rust: update.rs::detects_the_npm_channel_through_the_global_bin_symlink
 // rust: update.rs::standalone_and_dev_builds_are_unmanaged

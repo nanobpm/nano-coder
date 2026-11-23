@@ -511,7 +511,10 @@ last value, then the config default. If the session's provider or model is no lo
 (the provider was removed or disabled), the resume falls back to the config default with a
 one-line notice instead of failing. The startup banner's `Model:` line shows the model the
 resumed session runs. `/relaunch` and the relaunch after `/update` keep the settings through the
-same path.
+same path: the relaunch passes the session's current model, verbosity and mode in place of the
+original `-m`, `--verbosity`/`-v` and `--plan` flags, so a switch made mid-session is not undone.
+An ACP `session/load` restores the same settings and re-renders the system prompt for the
+restored mode.
 
 The picker reads `.index.jsonl` in the session directory: one summary per session, updated at the
 end of each turn. It is only a cache. A session that is missing from it, or whose log changed

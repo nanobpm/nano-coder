@@ -1158,6 +1158,24 @@ unittest
     assert(!names.canFind("echo"), "no vestigial echo tool");
 }
 
+/// Whether a saved `provider/model` spec names a provider still in the
+/// config (issue #297): a resume falls back to the config model otherwise.
+/// A spec with no `/` has no provider prefix to check.
+bool savedProviderKnown(string spec, const ProviderConfig[string] providers) pure
+{
+    auto slash = spec.indexOf('/');
+    return slash < 0 || (spec[0 .. slash] in providers) !is null;
+}
+
+unittest
+{
+    ProviderConfig[string] ps;
+    ps["openai"] = ProviderConfig.init;
+    assert(savedProviderKnown("openai/gpt-4o", ps));
+    assert(!savedProviderKnown("removed/model", ps));
+    assert(savedProviderKnown("bare", ps));
+}
+
 void setVerbosity(Verbosity v)
 {
     atomicStore(gVerbosity, v);
@@ -3021,6 +3039,10 @@ int runMain(string[] args)
             return systemFor(dir, plan);
         };
         host.makeClient = (string s) => makeClient(resolve(cfg, s));
+        host.plan = plan;
+        host.modeSystemPrompt = (string dir, bool p) => systemFor(dir, p);
+        host.savedModelKnown = (string s) => savedProviderKnown(s, cfg.providers);
+        host.windowFor = (string s) => windowFor(cfg, resolve(cfg, s).config);
         host.sessionDir = o.noSession ? null : sessionDir;
         host.version_ = versionString;
         {
@@ -3349,6 +3371,7 @@ int runMain(string[] args)
             parseCompactionMode(cfg.compactionMode).match!((m) { agent.compactionMode = m; }, () {});
             agent.autoCompact = cfg.autoCompact;
             agent.autoCompactThreshold = cfg.autoCompactThreshold;
+            agent.control.mode = AgentMode.normal;
         }
 
         // The model: explicit flag > session's last record > session header >
@@ -3359,8 +3382,18 @@ int runMain(string[] args)
             : headerModel.length ? headerModel
             : cfg.model;
         auto current = client.providerName ~ "/" ~ client.modelName;
-        auto canonWanted = wanted.length ? nano.recents.canonical(wanted, cfg.providers, cfg.defaultProvider) : null;
+        bool fromFlag = explicitFlags && o.model.length;
         bool switchedModel;
+        // A saved spec is always `provider/model`; a provider since removed
+        // from the config must fall back, not be reparsed as a bare model on
+        // the default provider.
+        if (wanted.length && !fromFlag && wanted != cfg.model && !savedProviderKnown(wanted, cfg.providers))
+        {
+            notes ~= format("the session's model %s is not available (provider %s is not configured); using %s from the config",
+                wanted, wanted[0 .. wanted.indexOf('/')], cfg.model);
+            wanted = cfg.model;
+        }
+        auto canonWanted = wanted.length ? nano.recents.canonical(wanted, cfg.providers, cfg.defaultProvider) : null;
         if (wanted.length && canonWanted != current && wanted != current)
         {
             try
@@ -3370,11 +3403,26 @@ int runMain(string[] args)
             }
             catch (Exception e)
             {
-                auto fallback = current;
-                notes ~= format("the session's model %s is not available (%s); using %s from the config",
-                    wanted, e.msg, fallback);
                 // `switchModel` builds the new client before swapping, so a
-                // failure leaves the current client running.
+                // failure leaves the current client running. On an in-process
+                // `/resume` that client is the previous session's model, so
+                // fall back to the config default rather than keep it.
+                auto fallback = current;
+                if (wanted != cfg.model && cfg.model.length
+                    && nano.recents.canonical(cfg.model, cfg.providers, cfg.defaultProvider) != current)
+                {
+                    try
+                    {
+                        switchModel(cfg.model, false, false);
+                        switchedModel = true;
+                        fallback = cfg.model;
+                    }
+                    catch (Exception e2)
+                        notes ~= format("the config model %s is not available either (%s)", cfg.model, e2.msg);
+                }
+                else if (wanted != cfg.model) fallback = cfg.model;
+                notes ~= format("the session's model %s is not available (%s); using %s",
+                    wanted, e.msg, fallback);
             }
         }
         if (!explicitFlags && !switchedModel && st.contextWindow < 0)
@@ -4054,7 +4102,7 @@ int runMain(string[] args)
                     // At the idle prompt the queue is empty (queued messages
                     // run before it shows) and the draft was this command, so
                     // there is nothing to confirm discarding.
-                    import nano.update : launchExe, relaunchArgv;
+                    import nano.update : launchExe, relaunchArgv, withCurrentSettings;
                     import nano.safeio : execProgram;
                     auto id = agent.log.match!(l => l.id, () => string.init);
                     if (!id.length)
@@ -4072,7 +4120,9 @@ int runMain(string[] args)
                     stdOut.flush();
                     leaveKeyMode();
                     nano.herdr.release();
-                    auto err = execProgram(exe, [exe] ~ relaunchArgv(args[1 .. $], id));
+                    auto err = execProgram(exe, [exe] ~ relaunchArgv(withCurrentSettings(args[1 .. $],
+                        agent.client.providerName ~ "/" ~ agent.client.modelName, nano.ui.name(verbosity()),
+                        agent.control.mode == AgentMode.plan), id));
                     nano.herdr.reacquire();
                     enterKeyMode(0);
                     if (gFrame) gFrame.resume();

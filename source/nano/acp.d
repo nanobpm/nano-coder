@@ -210,6 +210,18 @@ struct Host
     JSONValue delegate() sessionMeta;
     /// Configured and preset provider names, for `/providers`.
     string[] delegate() providerNames;
+    /// The system prompt for `cwd` rendered for plan or normal mode, so a
+    /// loaded session's restored mode gets matching guidance (null: keep the
+    /// prompt `systemPrompt` rendered).
+    string delegate(string cwd, bool plan) modeSystemPrompt;
+    /// The mode `systemPrompt` renders for (the startup `--plan`).
+    bool plan;
+    /// Whether a saved `provider/model` names a provider still configured
+    /// (null: assume it does).
+    bool delegate(string spec) savedModelKnown;
+    /// The configured context window for a model spec's provider (null: the
+    /// startup window).
+    ConfiguredWindow delegate(string spec) windowFor;
     /// The configured `model` and `system_prompt`, for `/settings`.
     string configModel, configSystemPrompt;
     /// Write `subagents = on` to the user config (`/subagents on|off --save`);
@@ -883,6 +895,14 @@ final class AcpServer : AgentEvents
         agent.messages = sys.length ? [Message.system(sys)] : null;
         agent.loadRestored(restored, some(log)); // ACP has no channel for the dropped-state notes
         applyRestoredSettings(restored.settings, restored.model);
+        // `sys` was rendered for the startup mode; re-render it for the
+        // restored one so plan guidance matches plan-mode tool limits.
+        agent.promptPlan = host.plan;
+        if (host.modeSystemPrompt !is null)
+        {
+            auto dir = getcwd();
+            agent.syncModePrompt((bool plan) => host.modeSystemPrompt(dir, plan));
+        }
         sessionId = log.id;
         if (host.loadHooks !is null) agent.useHooks(host.loadHooks(getcwd()), true);
         replayHistory();
@@ -911,18 +931,39 @@ final class AcpServer : AgentEvents
         agent.autoCompact = defaultAutoCompact;
         agent.autoCompactThreshold = defaultAutoCompactThreshold;
         agent.setConfiguredWindow(defaultConfiguredWindow);
+        {
+            import nano.mode : AgentMode;
+            agent.control.mode = host.plan ? AgentMode.plan : AgentMode.normal;
+        }
 
         auto wanted = st.model.length ? st.model : headerModel;
-        if (wanted.length && host.makeClient !is null
-            && wanted != agent.client.providerName ~ "/" ~ agent.client.modelName)
+        auto current = agent.client.providerName ~ "/" ~ agent.client.modelName;
+        if (wanted.length && wanted != host.configModel && host.savedModelKnown !is null && !host.savedModelKnown(wanted))
+        {
+            stdErr.writeln("nano-coder: ACP session/load: the provider of ", wanted,
+                " is not configured; using ", host.configModel);
+            wanted = host.configModel;
+        }
+        bool tryModel(string spec)
         {
             import std.exception : collectException;
             auto e = collectException(() {
-                agent.client = host.makeClient(wanted);
-                agent.refreshCapabilities();
+                auto c = host.makeClient(spec);
+                // Through `useClient` so the previous client's learned
+                // window and max output are reset and the new model probed.
+                agent.useClient(c, host.windowFor !is null ? host.windowFor(spec) : defaultConfiguredWindow, false);
             }());
             if (e !is null)
-                stdErr.writeln("nano-coder: ACP session/load: could not restore model ", wanted, ": ", e.msg);
+                stdErr.writeln("nano-coder: ACP session/load: could not restore model ", spec, ": ", e.msg);
+            return e is null;
+        }
+        if (wanted.length && host.makeClient !is null && wanted != current)
+        {
+            // A failed restore falls back to the config model, not whatever
+            // an earlier session on this server switched to.
+            if (!tryModel(wanted) && wanted != host.configModel && host.configModel.length
+                && host.configModel != current)
+                tryModel(host.configModel);
         }
         if (st.mode.length)
         {
@@ -1419,4 +1460,32 @@ unittest
     assert(!agent3.subagentsOn);
     assert(!agent3.sessionThinking.isNull && agent3.sessionThinking.get == Thinking.of("high"));
     agent3.replaceLog(Option!SessionLog.init);
+
+    // A failed restore falls back to the config model, not the client an
+    // earlier session switched to; a removed provider is not reparsed; the
+    // restored window comes from the target provider, and the system prompt
+    // follows the restored mode.
+    auto agent4 = new Agent(new NamedMock("prev", "stale"), new ToolRegistry, Policy.init, null);
+    string[] lines4, built4;
+    Host host4;
+    host4.systemPrompt = (string cwd) => "sys-normal";
+    host4.modeSystemPrompt = (string cwd, bool plan) => plan ? "sys-plan" : "sys-normal";
+    host4.configModel = "cfg/default";
+    host4.savedModelKnown = (string spec) => !spec.startsWith("alt/");
+    host4.windowFor = (string spec) => ConfiguredWindow(1234, "test window");
+    host4.makeClient = (string spec) {
+        built4 ~= spec;
+        return new NamedMock("cfg", "default");
+    };
+    host4.sessionDir = dir;
+    host4.version_ = "test";
+    auto srv4 = new AcpServer(agent4, host4, (string l) { lines4 ~= l; });
+    srv4.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ sid ~ `"}}`);
+    srv4.close();
+    assert(srv4.run());
+    assert(built4 == ["cfg/default"], built4[0]);
+    assert(agent4.client.providerName == "cfg" && agent4.client.modelName == "default");
+    assert(agent4.configuredWindow == 1234);
+    assert(agent4.messages[0].content == "sys-normal");
+    agent4.replaceLog(Option!SessionLog.init);
 }
