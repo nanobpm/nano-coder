@@ -616,6 +616,10 @@ struct PeerRouter
     private Shared!bool midTurnFlag;
     /// Bytes held by `waiting` (bounded by `maxQueuedBytes`).
     private Shared!size_t queuedBytes;
+    /// Set when the host has no way to ask its user (ACP): a message that
+    /// needs confirmation is refused at routing time, before the sender's
+    /// reply is resolved, so the sender reliably hears the refusal.
+    private Shared!bool noConfirmChannel;
 
     // A waiting delivery: the message's strings are immutable (sendable).
     private struct WaitingItem
@@ -632,6 +636,7 @@ struct PeerRouter
         PeerRouter r = PeerRouter(Chan!PeerRequest.make, atomicLoad(control), Chan!WaitingItem.make,
             Shared!bool.make(true), Shared!bool.make(false));
         r.queuedBytes = Shared!size_t.make(0);
+        r.noConfirmChannel = Shared!bool.make(false);
         return r;
     }
 
@@ -652,6 +657,13 @@ struct PeerRouter
     void confirm(bool on) { confirmSetting.update((ref bool b) { b = on; }); }
     bool confirm() { return confirmSetting.get; }
 
+    /// The host can't ask its user to confirm (ACP): refuse such messages
+    /// in routing, with an explanatory note, instead of queueing them.
+    void confirmUnavailable(bool on) { noConfirmChannel.update((ref bool b) { b = on; }); }
+
+    /// Whether an idle delivery is waiting for `takeWaiting`.
+    bool hasWaiting() { return queuedBytes.get > 0; }
+
     /// Route every request the listener accepted so far. Mid-turn each
     /// becomes a steer (its `/queue` id reserved from `queue`); idle each
     /// waits for the prompt loop. Call at each turn boundary and prompt.
@@ -662,6 +674,12 @@ struct PeerRouter
         {
             auto labelled = label(req.pm.senderId, req.pm.senderTitle) ~ " " ~ req.pm.text;
             auto confirm = this.confirm || req.pm.confirm;
+            if (confirm && noConfirmChannel.get)
+            {
+                answer(req.reply, Status.refused,
+                    "the target session can't ask its user to confirm; re-send with confirm off");
+                continue;
+            }
             // Confirmation-requiring messages always wait for the user,
             // even mid-turn: steering them in would bypass the approval.
             if (midTurn && !confirm)
@@ -837,6 +855,17 @@ unittest
     assert(status == Status.awaiting, "explicit confirm waits mid-turn: " ~ note);
     assert(router.takeWaiting(inbound));
     settle(inbound, false);
+    // No confirm channel (ACP): a confirm message is refused in routing,
+    // so the sender hears the refusal itself, idle and mid-turn.
+    router.confirmUnavailable(true);
+    status = send(root, "sess-target", PeerMessage("sess-sender", null, "explicit", "m-4c", true), note);
+    assert(status == Status.refused && note.canFind("confirm"), note);
+    assert(!router.hasWaiting, "nothing waits for a confirm that can't happen");
+    router.midTurn(false);
+    status = send(root, "sess-target", PeerMessage("sess-sender", null, "explicit", "m-4d", true), note);
+    assert(status == Status.refused, note);
+    router.midTurn(true);
+    router.confirmUnavailable(false);
     status = send(root, "sess-target", PeerMessage("sess-sender", null, "mid-turn note", "m-4", false), note);
     assert(status == Status.queued, note);
     auto pending = control.pendingSteers;

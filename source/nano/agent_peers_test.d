@@ -91,7 +91,7 @@ unittest
 {
     auto mock = new MockClient([
         call("s1", sendTool, `{"to":"sess-target","text":"hello from the sender"}`), LLMResponse("sent")]);
-    auto t = TwoSessions.make("nano-d-agent-peers", mock);
+    auto t = TwoSessions.make("nd-ap", mock);
     scope (exit) t.cleanup();
     assert(t.agent.offeredTools.any!(d => d.name == sendTool), "the tool is offered with messages on");
 
@@ -119,7 +119,7 @@ unittest
         call("s1", sendTool, `{"to":"sess-target","text":"ping-pong?"}`),
         call("s2", sendTool, `{"to":"sess-target","text":"ping-pong?","confirm":true}`),
         LLMResponse("done")]);
-    auto t = TwoSessions.make("nano-d-agent-peers-guard", mock);
+    auto t = TwoSessions.make("nd-ap-guard", mock);
     scope (exit) t.cleanup();
 
     // A peer-started turn (fromPeer: the prompt loop's flag).
@@ -153,7 +153,7 @@ unittest
         ToolCall.fromRaw("s1", sendTool, `{"to":"sess-target","text":"hi"}`),
         ToolCall.fromRaw("s2", sendTool, `{"to":"sess-nope","text":"hi"}`)]);
     auto mock = new MockClient([both, LLMResponse("done")]);
-    auto t = TwoSessions.make("nano-d-agent-peers-off", mock);
+    auto t = TwoSessions.make("nd-ap-off", mock);
     scope (exit) t.cleanup();
     t.targetListener.close(); // the target turned messages off
 

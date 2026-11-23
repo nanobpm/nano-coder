@@ -20,7 +20,7 @@ import nano.clock : stdTimeNow;
 import nano.arith : saturatingSub;
 import nano.option : Option, some, none, match, ifSome, NotNull;
 
-import nano.safeio : spawnDaemon, stdErr, stdOut;
+import nano.safeio : spawnDaemon, stdErr, stdOut, Shared, JoinHandle;
 
 import std.json;
 import std.format : format;
@@ -259,7 +259,7 @@ struct AcpRouter
     private static struct State
     {
         immutable(string)[] items; /// queued messages, as JSON text
-        bool eof, turnActive, sawValid;
+        bool eof, turnActive, sawValid, poked;
         string sessionId;
         immutable(size_t)[] steerMarks; /// queue length when each steer arrived
     }
@@ -324,16 +324,32 @@ struct AcpRouter
     /// The next queued message (waits); false at end of input.
     bool pop(out JSONValue m)
     {
-        auto text = state.await!string((ref const State st) => st.items.length || st.eof, (ref State st) {
+        bool woken;
+        while (pop(m, woken)) if (!woken) return true;
+        return false;
+    }
+
+    /// As `pop`, but also returns (with `woken` set and no message) when
+    /// `wake` was called, so the caller can handle a peer delivery.
+    bool pop(out JSONValue m, out bool woken)
+    {
+        bool w;
+        auto text = state.await!string((ref const State st) => st.items.length || st.eof || st.poked, (ref State st) {
+            if (st.poked && !st.items.length && !st.eof) { st.poked = false; w = true; return ""; }
+            st.poked = false;
             if (!st.items.length) return string.init;
             auto t = st.items[0];
             st.items = st.items[1 .. $];
             return t;
         });
+        if (w) { woken = true; return true; }
         if (text is null) return false;
         m = parseJSON(text);
         return true;
     }
+
+    /// Wake a waiting `pop` (a peer delivery is ready).
+    void wake() { state.update((ref State st) { st.poked = true; }); }
 
     /// Whether any valid JSON-RPC request arrived.
     bool sawValid() { return state.get.sawValid; }
@@ -414,6 +430,7 @@ final class AcpServer : AgentEvents
         router = AcpRouter.make(agent.control.nonNull);
         peerRouter = peers.PeerRouter.make(agent.control.nonNull);
         peerRouter.confirm(host.sessionMessagesConfirm);
+        peerRouter.confirmUnavailable(true);
         peerQueue = MessageQueue.make;
         agent.messagesOn = host.sessionMessages;
         writeLine_ = writeLine !is null ? writeLine : (string l) => writeStdoutLine(l);
@@ -561,11 +578,11 @@ final class AcpServer : AgentEvents
         JSONValue msg;
         for (;;)
         {
-            // Peer messages the listener accepted: mid-turn they were
-            // steered; idle ones become a turn (shown to the client as user
-            // input with the label). ACP has no confirm channel, so a
-            // message under confirm is declined with a note.
-            peerRouter.routePending(peerQueue);
+            // Peer messages: the pump thread routes them (mid-turn ones
+            // steer the running turn) and wakes `pop` when an idle one
+            // waits; it becomes a turn (shown to the client as user input
+            // with the label). ACP has no confirm channel, so routing
+            // refuses messages under confirm before answering the sender.
             peers.Inbound inbound;
             if (peerRouter.takeWaiting(inbound))
             {
@@ -580,8 +597,9 @@ final class AcpServer : AgentEvents
                 runTurn(JSONValue.init, inbound.labelled, null, true);
                 continue;
             }
-            if (!router.pop(msg)) break;
-            handle(msg);
+            bool woken;
+            if (!router.pop(msg, woken)) break;
+            if (!woken) handle(msg);
         }
         return router.sawValid;
     }
@@ -855,13 +873,46 @@ final class AcpServer : AgentEvents
         auto dir = peers.peersDir();
         if (!peers.ensureDir(dir)) return;
         try peerListener = [peers.PeerListener.listen(dir, agent.log.unwrap("checked isSome").id, peerRouter.requests)];
-        catch (peers.ListenError) {} // a listener is best effort: the session runs without one
+        catch (peers.ListenError) { return; } // a listener is best effort: the session runs without one
+        auto halt = Shared!bool.make(false);
+        peerPump = [PeerPump(halt, spawnDaemon(&pumpPeers, peerRouter, peerQueue, router, halt))];
     }
 
     private void stopPeerListener()
     {
         foreach (ref l; peerListener) l.close();
         peerListener = null;
+        foreach (ref p; peerPump)
+        {
+            p.halt.update((ref bool b) { b = true; });
+            p.thread.join();
+        }
+        peerPump = null;
+    }
+
+    private static struct PeerPump
+    {
+        Shared!bool halt;
+        JoinHandle thread;
+    }
+    /// Routes peer messages while the main loop waits on stdin or runs a
+    /// turn (zero or one, alongside the listener).
+    private PeerPump[] peerPump;
+
+    /// Route peer requests every few ms (so mid-turn messages steer the
+    /// running turn) and wake the main loop's `pop` when an idle delivery
+    /// waits, so it doesn't sit until unrelated client traffic arrives.
+    private static void pumpPeers(peers.PeerRouter peerRouter, MessageQueue queue, AcpRouter router,
+        Shared!bool halt)
+    {
+        import core.time : msecs;
+        import nano.clock : sleepFor;
+        while (!halt.get)
+        {
+            peerRouter.routePending(queue);
+            if (peerRouter.hasWaiting) router.wake();
+            sleepFor(20.msecs);
+        }
     }
 
     private void newSession()
