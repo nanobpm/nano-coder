@@ -169,16 +169,22 @@ enum LockResult { acquired, contended, unsupported }
 /// a live process has the log open). The fd is closed before returning, so
 /// the probe never holds the lock itself. `unsupported` is any other failure
 /// (a missing file, ENOLCK, ...): the caller treats it as "not live".
+/// EINTR is retried: an interrupted attempt says nothing about the lock.
 LockResult tryLockFile(string path) @trusted nothrow
 {
     import core.sys.posix.fcntl : O_RDONLY;
     import core.sys.posix.unistd : close;
-    import core.stdc.errno : errno, EWOULDBLOCK, EAGAIN;
+    import core.stdc.errno : errno, EWOULDBLOCK, EAGAIN, EINTR;
     auto fd = openPath(path, O_RDONLY);
     if (fd < 0) return LockResult.unsupported;
     scope (exit) close(fd);
-    if (flockFd(fd, flockEx | flockNb) == 0) return LockResult.acquired;
-    return errno == EWOULDBLOCK || errno == EAGAIN ? LockResult.contended : LockResult.unsupported;
+    for (;;)
+    {
+        if (flockFd(fd, flockEx | flockNb) == 0) return LockResult.acquired;
+        immutable err = errno;
+        if (err == EINTR) continue;
+        return err == EWOULDBLOCK || err == EAGAIN ? LockResult.contended : LockResult.unsupported;
+    }
 }
 
 // flock(2) takes an fd and flags, touching no memory.

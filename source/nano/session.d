@@ -2017,11 +2017,19 @@ package enum LockResult { acquired, contended, unsupported }
 /// is any other flock failure (ENOLCK, EOPNOTSUPP, ...): writers carry on
 /// best-effort, but destructive maintenance must treat it as not held.
 /// The lock lives until `f` is closed; flock marks the open file description.
+/// EINTR is retried: a signal that interrupted the call (SIGCHLD from a
+/// spawned test or hook process) says nothing about the lock's state, and
+/// macOS returns it even for a non-blocking flock.
 private LockResult tryLock(ref File f) @trusted
 {
-    import core.stdc.errno : errno, EWOULDBLOCK, EAGAIN;
-    if (flock(fileno(f.getFP), LOCK_EX | LOCK_NB) == 0) return LockResult.acquired;
-    return errno == EWOULDBLOCK || errno == EAGAIN ? LockResult.contended : LockResult.unsupported;
+    import core.stdc.errno : errno, EWOULDBLOCK, EAGAIN, EINTR;
+    for (;;)
+    {
+        if (flock(fileno(f.getFP), LOCK_EX | LOCK_NB) == 0) return LockResult.acquired;
+        immutable err = errno;
+        if (err == EINTR) continue;
+        return err == EWOULDBLOCK || err == EAGAIN ? LockResult.contended : LockResult.unsupported;
+    }
 }
 
 /// A locked log handle shared by this thread's writers of one path.
@@ -3507,7 +3515,9 @@ unittest
             // The foreign file at the original path must not stay locked
             // by a leaked in-place-repair fd while this writer lives on.
             auto probe = File(p, "r+");
-            assert(tryLock(probe) == LockResult.acquired, "a leaked fd still locks the rewritten path");
+            immutable probeLock = tryLock(probe);
+            assert(probeLock == LockResult.acquired,
+                "a leaked fd still locks the rewritten path (probe: " ~ probeLock.to!string ~ ")");
             probe.close();
         }
         log.close();
@@ -3607,7 +3617,9 @@ unittest
     // must be free again.
     auto probe = openExistingForAppend(rec);
     scope (exit) probe.close();
-    assert(tryLock(probe) == LockResult.acquired, "no leaked fd still locks the recovery log");
+    immutable probeLock = tryLock(probe);
+    assert(probeLock == LockResult.acquired,
+        "no leaked fd still locks the recovery log (probe: " ~ probeLock.to!string ~ ")");
     restore(rec); // a resumable session: its header names the recovery id
 }
 
@@ -3647,7 +3659,9 @@ unittest
     assert(readText(first) == "", "the skipped name stays header-less for its lock holder");
     auto probe = openExistingForAppend(rec);
     scope (exit) probe.close();
-    assert(tryLock(probe) == LockResult.acquired, "the adopted recovery log is free after close");
+    immutable probeLock = tryLock(probe);
+    assert(probeLock == LockResult.acquired,
+        "the adopted recovery log is free after close (probe: " ~ probeLock.to!string ~ ")");
     assert(dirEntries(dir, "*.recovered-*.jsonl", SpanMode.shallow).array.length == 2,
         "no extra empty recovery files left behind");
     restore(rec);
