@@ -1051,8 +1051,46 @@ string firstLine(string text, size_t max = taskCols) pure
     import std.array : array;
     auto nl = text.indexOf('\n');
     if (nl >= 0) text = text[0 .. nl];
-    if (max && text.walkLength > max) text = toUTF8(text.array[0 .. max - 1]) ~ "…";
-    return text;
+    if (max && text.walkLength > max) return toUTF8(text.array[0 .. max - 1]) ~ "…";
+    // A copy: a slice would keep a long task body alive in the listing history.
+    return text.idup;
+}
+
+unittest // the first line is a copy, not a slice of the task
+{
+    import std.array : replicate;
+    auto task = "short\n" ~ "x".replicate(10_000);
+    auto line = firstLine(task);
+    assert(line == "short" && line.ptr != task.ptr);
+    auto plain = "only";
+    assert(firstLine(plain).ptr != plain.ptr);
+}
+
+/// The log at `path` as it is now: the session tidy-up of another process may
+/// have compressed a finished child's `.jsonl` to `.jsonl.gz` since. Null
+/// when neither exists.
+string currentLogPath(string path)
+{
+    import std.file : exists;
+    if (path.exists) return path;
+    if ((path ~ ".gz").exists) return path ~ ".gz";
+    return null;
+}
+
+unittest // a compressed child log is found by its original path
+{
+    import std.file : tempDir, write, remove, exists;
+    import std.path : buildPath;
+    import std.conv : to;
+    import std.process : thisProcessID;
+    auto p = buildPath(tempDir, "nano-curlog-" ~ thisProcessID.to!string ~ ".jsonl");
+    assert(currentLogPath(p) is null);
+    write(p ~ ".gz", "");
+    scope (exit) remove(p ~ ".gz");
+    assert(currentLogPath(p) == p ~ ".gz");
+    write(p, "");
+    scope (exit) remove(p);
+    assert(currentLogPath(p) == p);
 }
 
 /// The sub-agent table `/subagents` shows below the on/off state; `forgotten`

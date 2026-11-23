@@ -2498,7 +2498,10 @@ class Agent
             if (!i.logPath.length)
                 return R.err(format("%s has no log%s", id, i.state == "queued" ? " yet: it has not started"
                     : log.isNone ? ": this session keeps no logs" : " yet"));
-            return R.ok(i.logPath);
+            import nano.subagent : currentLogPath;
+            auto path = currentLogPath(i.logPath);
+            if (path is null) return R.err(format("%s's log %s is gone", id, i.logPath));
+            return R.ok(path);
         }
         return R.err(format("No sub-agent %s (/subagents lists them).", id));
     }

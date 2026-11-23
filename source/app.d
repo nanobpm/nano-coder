@@ -364,6 +364,9 @@ struct MidTurn
     LiveView view;
     /// One element (a slice keeps `MidTurn` assignable).
     immutable(Config)[] cfg;
+    /// The sub-agent ids for `/subagents show|stop` completion: the source
+    /// is thread-local, so the key-reader thread sets its own from this.
+    NotNull!(shared Locked!(immutable(imported!"nano.commands".Suggestion)[])) subIds;
 }
 
 /// A `/command` typed during a turn: its output if it runs now, else null (held).
@@ -618,6 +621,9 @@ Isolated!LineEditor turnKeys(Isolated!LineEditor owned, ConsoleLink console, sha
     QuestionBroker questions, MessageQueue queue, MidTurn mid)
 {
     auto editor = owned.unwrap;
+    import nano.commands : subagentIdSource;
+    auto ids = mid.subIds;
+    subagentIdSource = () => atomicLoad(ids).get.dup;
     readTurnKeys(editor, console, done, held, questions, queue, mid);
     // Isolated: this thread got the editor isolated and kept no other reference.
     return Isolated!LineEditor.assumeIsolated(editor);
@@ -3122,16 +3128,16 @@ int runMain(string[] args)
     // on this thread before each prompt: the key reader of a turn runs on
     // its own thread and must not touch the agent.
     import nano.commands : subagentIdSource, Suggestion;
-    auto subIds = new shared Locked!(immutable(Suggestion)[]);
+    auto subIds = notNull(new shared Locked!(immutable(Suggestion)[]));
     void snapshotSubagentIds()
     {
         size_t forgotten;
         immutable(Suggestion)[] ids;
         foreach (ref i; agent.subagentList(forgotten))
             ids ~= immutable Suggestion(i.id, i.state ~ " · " ~ i.task);
-        subIds.update((ref immutable(Suggestion)[] v) { v = ids; });
+        atomicLoad(subIds).update((ref immutable(Suggestion)[] v) { v = ids; });
     }
-    subagentIdSource = () => subIds.get.dup;
+    subagentIdSource = () => atomicLoad(subIds).get.dup;
     modelSuggestionSource = () {
         string[] recent;
         synchronized recent = recents.models.dup;
@@ -3274,7 +3280,7 @@ int runMain(string[] args)
                     ~ "(/queue lists, edits, removes), Esc Esc or Ctrl-C to cancel]"));
             refreshView();
             heldLines = Chan!string.make;
-            auto mid = MidTurn(agent.control, view, [frozenConfig(cfg)]);
+            auto mid = MidTurn(agent.control, view, [frozenConfig(cfg)], subIds);
             // Isolated: `editor` is none until the join hands it back, and its
             // callbacks (built by `makeEditor`) reach only shared state.
             auto owned = Isolated!LineEditor.assumeIsolated(ed);
@@ -4144,7 +4150,8 @@ unittest
     import std.algorithm : canFind, startsWith;
     import nano.option : notNull;
     Config c;
-    auto ctx = MidTurn(notNull(new shared TurnControl), LiveView.make, [frozenConfig(c)]);
+    auto ctx = MidTurn(notNull(new shared TurnControl), LiveView.make, [frozenConfig(c)],
+        notNull(new shared Locked!(immutable(imported!"nano.commands".Suggestion)[])));
     foreach (sep; ["\t", "\n", "\x0b", "  ", " "])
     {
         auto note = midTurnCommand("/mode" ~ sep ~ "plan", ctx);
@@ -4166,7 +4173,8 @@ unittest
     import std.algorithm : canFind, startsWith;
     import nano.option : notNull;
     Config c;
-    auto ctx = MidTurn(notNull(new shared TurnControl), LiveView.make, [frozenConfig(c)]);
+    auto ctx = MidTurn(notNull(new shared TurnControl), LiveView.make, [frozenConfig(c)],
+        notNull(new shared Locked!(immutable(imported!"nano.commands".Suggestion)[])));
     foreach (cmd; ["/trajectory", "/trajectory --json", "/trajectory\t--json", "/trajectory\t"])
         assert(midTurnCommand(cmd, ctx).canFind("Session persistence is disabled"), cmd);
     assert(midTurnCommand("/trajectory\t--json", ctx) == midTurnCommand("/trajectory --json", ctx));
