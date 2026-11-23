@@ -898,13 +898,31 @@ void backfillPinText(ref Message m, const InputKey[] inputs) pure
     // Each distinct prefix length is hashed once, however many inputs share it.
     size_t[size_t] prefixHash;
     foreach_reverse (ref input; inputs)
+        // A length inside a multi-byte character cannot be a typed prefix,
+        // and `stripLeft` would throw decoding the split character.
         if (m.content.length > input.length && input.length > found
+            && (m.content[input.length] & 0xC0) != 0x80
             && m.content[input.length .. $].stripLeft.startsWith(wrapStart))
         {
             auto h = prefixHash.require(input.length, hashOf(m.content[0 .. input.length]));
             if (h == input.hash) found = input.length;
         }
     if (found) m.pinText = m.content[0 .. found];
+}
+
+unittest
+{
+    // A candidate length that splits a UTF-8 character is skipped, not decoded.
+    Message m;
+    m.role = Role.user;
+    m.content = "\u00e9\n\n<system-reminder>x</system-reminder>";
+    backfillPinText(m, [InputKey.of("\u00e9"), InputKey.of("x")]);
+    assert(m.pinText == "\u00e9");
+    Message n;
+    n.role = Role.user;
+    n.content = "\u00e9\n\n<system-reminder>x</system-reminder>";
+    backfillPinText(n, [InputKey.of("x")]);
+    assert(n.pinText.length == 0);
 }
 
 /// A digest of what makes two logged messages the same (role, content, tool
