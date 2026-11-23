@@ -150,6 +150,9 @@ final class Skills
     /// removed) later without touching `ai.lock` still shows as a change.
     private string[] lockWatch;
     private string lockPrint;
+    /// Locked plugin skill folders (canonical, inside their checkout):
+    /// rescanned so an edit inside an installed checkout is a change.
+    private string[] lockDirs;
 
     static Skills discover(string cwd, const ref SkillsConfig config)
     {
@@ -260,8 +263,12 @@ final class Skills
         auto source = Source(Source.Kind.lock, locked.git, locked.commit);
         if (!isPlugin)
         {
-            if (within(checkout, buildPath(content, skillFile)) is null)
+            auto sf = within(checkout, buildPath(content, skillFile));
+            if (sf is null)
                 throw new Exception(format("no %s inside the checkout at the locked path", skillFile));
+            // The checkout's working tree may change without HEAD moving.
+            lockWatch ~= sf;
+            lockPrint ~= statLine(sf);
             Skill sk;
             if (!readSkill(content, name, source, sk)) throw new Exception(format("no %s in the locked path", skillFile));
             push(sk);
@@ -270,6 +277,13 @@ final class Skills
         auto skillsRel = pluginSkillsDir(content);
         auto skillsDir = within(checkout, buildPath(content, skillsRel));
         if (skillsDir is null || !skillsDir.isDir) return;
+        lockDirs ~= skillsDir;
+        {
+            import std.array : appender;
+            auto o = appender!string;
+            fingerprintScan(skillsDir, skillsDir, 0, o);
+            lockPrint ~= o[];
+        }
         auto dirs = listDir(skillsDir, SpanMode.shallow).map!(e => e.name).array.sort.array;
         foreach (d; dirs)
         {
@@ -285,9 +299,11 @@ final class Skills
     bool stale(string cwd, const ref SkillsConfig config, Locations locations) const
     {
         if (fingerprintIn(cwd, config, locations) != fingerprint) return true;
-        string now;
+        import std.array : appender;
+        auto now = appender!string;
         foreach (head; lockWatch) now ~= statLine(head);
-        return now != lockPrint;
+        foreach (d; lockDirs) fingerprintScan(d, d, 0, now);
+        return now[] != lockPrint;
     }
 
     bool empty() pure const { return skills.length == 0; }
@@ -429,43 +445,35 @@ private string statLine(string path)
     catch (FileException) return "?\0" ~ path ~ "\0"; // vanished mid-check: a change all the same
 }
 
-/// `scan`, recording what it looks at instead of collecting skills. One
-/// listing per folder: a plain (non-symlink) entry under a canonical folder
-/// is already canonical and is taken from the listing's own stat; only
-/// symlinks pay for a `realpath` containment check.
+/// `scan`, recording what it looks at instead of collecting skills. A
+/// skill folder is recognised from its `SKILL.md` without listing it; other
+/// folders are listed once, a plain (non-symlink) entry under a canonical
+/// folder is taken as canonical, and only symlinks pay for a `realpath`
+/// containment check.
 private void fingerprintScan(Out)(string root, string dir, size_t depth, ref Out o)
 {
+    // A skill folder first, as `scan` does: its siblings are never listed.
+    if (auto sf = within(root, buildPath(dir, skillFile)))
+    {
+        bool file;
+        try file = sf.isFile;
+        catch (FileException) {} // vanished mid-check: not a skill now
+        // The folder too: a symlinked SKILL.md's line names only its
+        // target, so renaming the folder would otherwise go unseen.
+        if (file) { o ~= "s\0" ~ dir ~ "\0" ~ statLine(sf); return; }
+    }
+    o ~= "d\0" ~ dir ~ "\0";
+    if (depth >= maxScanDepth) return;
     string[] dirs;
-    bool isSkill;
-    string skillLine;
     try
         foreach (DirEntry e; listDir(dir, SpanMode.shallow))
         {
-            auto base = e.name.baseName;
-            if (base == skillFile)
-            {
-                if (!e.isSymlink)
-                {
-                    if (e.isFile && !e.name.pathSplitter.canFind(".git"))
-                    {
-                        isSkill = true;
-                        skillLine = format("F\0%s\0%s\0%s\0", e.name, e.size, e.timeLastModified.stdTime);
-                    }
-                }
-                else if (auto sf = within(root, e.name))
-                    if (sf.isFile) { isSkill = true; skillLine = statLine(sf); }
-                continue;
-            }
-            if (base.startsWith(".")) continue;
+            // A directory named SKILL.md is searched like any other.
+            if (e.name.baseName.startsWith(".")) continue;
             if (!e.isSymlink) { if (e.isDir && !e.name.pathSplitter.canFind(".git")) dirs ~= e.name; }
             else if (auto rp = within(root, e.name)) if (rp.isDir) dirs ~= rp;
         }
     catch (FileException) { o ~= "?\0" ~ dir ~ "\0"; return; }
-    // The folder too: a symlinked SKILL.md's line names only its target,
-    // so renaming the folder would otherwise go unseen.
-    if (isSkill) { o ~= "s\0" ~ dir ~ "\0" ~ skillLine; return; }
-    o ~= "d\0" ~ dir ~ "\0";
-    if (depth >= maxScanDepth) return;
     dirs.sort();
     foreach (sub; dirs) fingerprintScan(root, sub, depth + 1, o);
 }
@@ -983,7 +991,13 @@ unittest // loads_ai_lock_skills_and_plugin_skills_by_fetching_into_the_cache
     assert(listDir(repo, SpanMode.shallow, true).length == 2);
     // Second run reads the cache; fetching is not needed.
     c.fetch = false;
-    assert(Skills.discoverIn(repo, c, locs(dir)).names == ["lint", "triage"]);
+    auto again = Skills.discoverIn(repo, c, locs(dir));
+    assert(again.names == ["lint", "triage"]);
+    assert(!again.stale(repo, c, locs(dir)));
+    // An edit or a new skill inside the cached plugin checkout is a change.
+    auto cached = buildPath(dir, "cache", storeKey(url, sha));
+    put(buildPath(cached, "plugin/bundled/extra/SKILL.md"), skillMd("extra", "Extra."));
+    assert(again.stale(repo, c, locs(dir)));
 }
 
 // rust: skills.rs::prefers_the_spm_store_and_guards_untrusted_lock_entries
@@ -1114,6 +1128,9 @@ unittest // sees_a_locked_checkout_installed_later_and_a_renamed_symlinked_skill
     assert(s.stale(repo, c, locs(dir)));
     auto fresh = Skills.discoverIn(repo, c, locs(dir));
     assert(fresh.names == ["fmt"] && !fresh.stale(repo, c, locs(dir)));
+    // Editing the installed checkout's SKILL.md (HEAD unchanged) is a change.
+    put(buildPath(store, "fmt/SKILL.md"), skillMd("fmt", "Format files, now with more words."));
+    assert(fresh.stale(repo, c, locs(dir)));
 
     // A symlinked SKILL.md inside the root: renaming its folder is a change.
     auto home = buildPath(dir, "home");
@@ -1124,6 +1141,25 @@ unittest // sees_a_locked_checkout_installed_later_and_a_renamed_symlinked_skill
     assert(!u.stale(repo, c, locs(dir)));
     rename(buildPath(home, ".agents/skills/a"), buildPath(home, ".agents/skills/b"));
     assert(u.stale(repo, c, locs(dir)));
+}
+
+unittest // fingerprints_a_directory_named_skill_md_and_ignores_skill_siblings
+{
+    auto dir = tmpRoot("nested");
+    auto repo = buildPath(dir, "repo");
+    mkdirRecurse(buildPath(repo, ".git"));
+    auto home = buildPath(dir, "home");
+    put(buildPath(home, ".agents/skills/SKILL.md/foo/SKILL.md"), skillMd("foo", "Foo."));
+    put(buildPath(home, ".agents/skills/web/SKILL.md"), skillMd("web", "Web."));
+    auto c = cfg();
+    auto s = Skills.discoverIn(repo, c, locs(dir));
+    assert(s.names.canFind("foo"), s.names.join(","));
+    // A supporting file beside a skill's SKILL.md is not part of the index.
+    put(buildPath(home, ".agents/skills/web/notes.txt"), "notes");
+    assert(!s.stale(repo, c, locs(dir)));
+    // Edits beneath a directory named SKILL.md are seen.
+    put(buildPath(home, ".agents/skills/SKILL.md/bar/SKILL.md"), skillMd("bar", "Bar."));
+    assert(s.stale(repo, c, locs(dir)));
 }
 
 unittest // the_no_change_check_on_50_skills_is_cheap

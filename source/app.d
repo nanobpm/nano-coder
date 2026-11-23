@@ -3050,9 +3050,10 @@ int runMain(string[] args)
         };
         host.beforePrompt = () {
             auto change = refreshSkills();
-            if (!change.length) return;
-            stdErr.writeln("nano-coder: skills: ", change);
+            if (!change.length) return null;
             agent.installSystem(systemFor(skillsDir, plan), indexShown);
+            // Published to the ACP client as a `_nano/notice`, not the model.
+            return "skills: " ~ change;
         };
         host.makeClient = (string s) => makeClient(resolve(cfg, s));
         host.sessionDir = o.noSession ? null : sessionDir;
