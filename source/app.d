@@ -65,7 +65,7 @@ enum string usage = `Usage: nano-coder [--model provider/model] [--config PATH] 
        nano-coder --list-sessions [--all] [--json]
        nano-coder --trajectory SESSION_ID [--json|--markdown]
        nano-coder --list-models PROVIDER[/model]
-       nano-coder --login github-copilot|muse
+       nano-coder --login github-copilot
        nano-coder --version
 
 Reads the Rust nano-coder's config (~/.config/nano-coder/config.toml).
@@ -198,12 +198,8 @@ int runLogin(string provider)
                 import nano.copilot : copilotLogin = login;
                 writeln("Saved GitHub Copilot credentials to ", copilotLogin(note, sleep));
                 return 0;
-            case "muse":
-                import nano.muse : museLogin = login;
-                writeln("Saved Muse Code credentials to ", museLogin(note, sleep));
-                return 0;
             default:
-                die(format("unknown provider %(%s%) for --login; supported: github-copilot, muse (other providers use API keys)", [provider]));
+                die(format("unknown provider %(%s%) for --login; supported: github-copilot (other providers use API keys)", [provider]));
         }
     }
     catch (Exception e) die(e.msg);

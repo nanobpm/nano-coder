@@ -189,7 +189,6 @@ source/
     │   ├── openai.d     # OpenAI Chat Completions (and compatible servers)
     │   ├── responses.d  # OpenAI Responses API
     │   ├── anthropic.d  # Anthropic Messages API
-    │   ├── muse.d       # UNOFFICIAL Meta Muse Code provider
     │   ├── mock.d       # Offline scripted client
     │   └── demo.d       # Offline demo model (`--model demo/demo`)
     ├── copilot.d    # UNOFFICIAL Copilot-subscription provider (login, tokens)
@@ -565,7 +564,7 @@ not on the next turn). The picker then shows `title · last prompt`. Titles live
 so older nano-coders can still read the logs. Deleting `index.jsonl` loses them; a new run then
 asks again on the session's next turn.
 
-Flags: `--login github-copilot|muse`, `--list-models PROVIDER`, `--trajectory SESSION_ID [--json|--markdown]`, `--acp`, `--model provider/model` (or `AGENTIC_HARNESS_MODEL`), `--resume [SESSION_ID|last]`, `--list-sessions [--all] [--json]`,
+Flags: `--login github-copilot`, `--list-models PROVIDER`, `--trajectory SESSION_ID [--json|--markdown]`, `--acp`, `--model provider/model` (or `AGENTIC_HARNESS_MODEL`), `--resume [SESSION_ID|last]`, `--list-sessions [--all] [--json]`,
 `--config PATH`, `--verbosity LEVEL` (`-v`), `--sandbox off|workspace|read-only` (or `NANO_CODER_SANDBOX`),
 `--allow RULE` and `--deny RULE` (repeatable; added to the config's rules), `--version` (`-V`).
 
@@ -749,7 +748,6 @@ Built-in presets:
 | `ollama` | openai | `http://localhost:11434/v1` | — |
 | `llamacpp` | openai | `http://localhost:8080/v1` | — |
 | `github-copilot` | github-copilot | from session token | `GITHUB_COPILOT_OAUTH_TOKEN` or `--login` (unofficial, see below) |
-| `muse` | muse | from minted key (`--login`); default Meta API endpoint (`META_API_KEY`) | `META_API_KEY` or `--login` (unofficial, see below) |
 | `mock` | mock | — | — |
 
 `kind = "openai"` means OpenAI Chat Completions, which also covers vLLM, LM Studio,
@@ -870,8 +868,6 @@ Endpoints that report levels:
 
 - **GitHub Copilot:** `/models` lists each model's levels, read with the same request as its
   context window.
-- **Meta Muse Code:** the model catalog (`/muse-code/models`) lists each model's
-  `reasoning_effort` tiers, read with the same request as its context window.
 - **Ollama:** a model with the `thinking` capability (`/api/show`) gets `off`, `low`,
   `medium` and `high`. Ollama refuses a level for a model without it, so none is sent then.
 - **llama.cpp:** the loaded model's chat template (`/props`) decides. A template with an
@@ -922,9 +918,7 @@ Whether a model can see images comes from, in order: a `vision = true|false` ove
 (global, `[providers.<name>]`, or `[providers.<name>.models."<model>"]`, like `thinking`);
 what the endpoint reports (GitHub Copilot `/models` `capabilities.supports.vision` and its
 `limits.vision`, Ollama `/api/show`'s `vision` capability, llama.cpp `/props`
-`modalities.vision`); a provider assumption (Meta Muse Code's catalog has no vision
-schema, so every visible, non-image-generation chat model is treated as vision-capable);
-and a built-in assumption for current Anthropic and OpenAI model
+`modalities.vision`); and a built-in assumption for current Anthropic and OpenAI model
 families. A model that can't see images gets the text error with a hint to switch models
 or set `vision = true`:
 
@@ -951,7 +945,7 @@ The old top-level `api_key` / `base_url` still work. They apply to `default_prov
 which becomes `openai` if it was `mock`.
 
 List a provider's models with `--list-models <provider>` (OpenAI-compatible endpoints,
-`github-copilot` and `muse`).
+and `github-copilot`).
 
 ### Local servers on another machine (macOS)
 
@@ -995,40 +989,6 @@ request. `GITHUB_COPILOT_DOMAIN` selects a GHE.com host.
 
 The sanctioned route is the [Copilot SDK](https://github.com/github/copilot-sdk), which
 drives the Copilot CLI's own agent loop rather than exposing the model.
-
-### Meta Muse Code (unofficial)
-
-The `muse` provider uses a Meta Muse Code subscription by authenticating **as the `muse` CLI
-does**: an RFC 8628 device-code login against `auth.meta.com` with Muse's public OAuth client
-id, a *mint* of that OAuth token for a short-lived Meta API key
-(`POST https://api.meta.ai/muse-code/key`), and model calls carrying Muse's client headers
-against the OpenAI-compatible Meta API at `https://api.meta.ai/v1`. Model calls use the
-OpenAI Responses API (`POST {base}/responses`). Like the Copilot provider this is **not a
-Meta-sanctioned integration**: it
-may breach Meta's terms or your organisation's policy, it can break without notice, and
-misuse could get an account flagged. It is never used unless you select it.
-
-The login only establishes *who you are*; your plan is checked at the mint, which returns the
-key plus your account state (`is_subs_active`, `subs_tier_name`, `require_payment`,
-`subs_usage`). So a subscription works through the same `--login muse`: the device flow
-completes, the mint confirms the plan, and calls are served against it. If the mint refuses —
-the account isn't enabled for the Model API, or no payment method/subscription is on it — the
-provider relays Meta's own message and the URL to fix it (`dev.meta.ai` to onboard,
-`accountscenter.meta.com/muse_code` to subscribe), and a lapsed subscription makes calls stop
-until you renew and log in again.
-
-```bash
-nano-coder --login muse                    # interactive; saves the OAuth token + minted key (0600)
-nano-coder --list-models muse
-nano-coder --model muse/muse-spark-1.3
-```
-
-Headless workers can't do the device flow; set `META_API_KEY` to a Meta API key instead. Note
-this is **a different credential lane from the subscription**: a raw key is metered/PAYG and
-carries no Muse Code plan, so it will not draw on a subscription (use `--login muse` for
-that). `META_API_KEY` takes priority over a stored login; the minted key and OAuth token live
-in `<data dir>/nano-coder/muse.json`. `MUSE_AUTH_BASE_URL` and `MUSE_MINT_BASE_URL` point the
-login and mint at other hosts.
 
 ### Retries
 
@@ -1129,7 +1089,6 @@ sets the window). The window a server has *loaded* is preferred over the model's
 | LM Studio | `/api/v0/models` `loaded_context_length` |
 | Ollama | `/api/ps` for a loaded model, else `num_ctx`; never the model maximum, since Ollama runs with a smaller default |
 | GitHub Copilot | `/models` `max_prompt_tokens` |
-| Meta Muse Code | `/muse-code/models` `context_limit` |
 
 Compaction asks the current model to summarize older messages, keeping the recent tail
 (up to 20k tokens, never starting at a tool result). Auto-compaction runs before a model

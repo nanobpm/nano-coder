@@ -93,7 +93,6 @@ Wire wireFor(ProviderKind kind, string model) pure
             case CopilotApi.messages: return Wire.anthropicMessages;
         }
     }
-    if (kind == ProviderKind.muse) return Wire.responses;
     return kind == ProviderKind.anthropic ? Wire.anthropicMessages : Wire.chatCompletions;
 }
 
@@ -1064,21 +1063,6 @@ unittest
     assert(!r.overridden && r.dropped && r.request == reqNone, "a dropped override is no override");
     r = rs(lv("high"), A, p, "claude-sonnet-4-5");
     assert(r.anthropic == AnthropicStyle.budget && r.overridden && !r.dropped && r.request == reqNone);
-}
-
-// rust: thinking.rs::muse_is_analysed_as_a_responses_wire
-unittest
-{
-    enum M = ProviderKind.muse;
-    enum lv3 = "thinking_levels = [\"low\", \"medium\", \"high\"]\n";
-    auto r = rs(lv("high"), M, prov(lv3), "muse-spark-1.3");
-    assert(r.wire == Wire.responses && r.request == reqEffort("high"));
-    r = rs(lv("high"), M, prov(lv3 ~ `extra_body = { reasoning = { summary = "auto" } }`), "muse-spark-1.3");
-    assert(!r.overridden && r.request == reqEffort("high"));
-    r = rs(lv("high"), M, prov(lv3 ~ `extra_body = { reasoning = { effort = "low" } }`), "muse-spark-1.3");
-    assert(r.overridden && r.extraBodyOverride == "reasoning" && r.request == reqNone);
-    r = rs(lv("high"), M, prov(lv3 ~ `extra_body = { reasoning_effort = "low" }`), "muse-spark-1.3");
-    assert(!r.overridden && r.request == reqEffort("high"), "a Chat Completions key isn't a Responses control");
 }
 
 // rust: thinking.rs::picks_the_request_form_for_the_api

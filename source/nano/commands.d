@@ -205,7 +205,6 @@ Suggestion[] modelSuggestions(const ref imported!"nano.config".Config cfg, strin
             case ProviderKind.openai: return "openai";
             case ProviderKind.anthropic: return "anthropic";
             case ProviderKind.githubCopilot: return "githubcopilot";
-            case ProviderKind.muse: return "muse";
             case ProviderKind.mock: return "mock";
         }
     }

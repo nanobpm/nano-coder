@@ -862,8 +862,8 @@ providers/mod.rs::finish_body_keeps_resolved_temperature	test
 providers/mod.rs::human_secs_drops_trailing_zero_but_keeps_fractions	na	D\'s offline notice shows elapsed time (formatElapsed, tested in http.d), not a fractional retry delay
 providers/mod.rs::invalid_env_values_fall_back_to_the_default	test
 providers/mod.rs::live_notice_width_preserves_narrow_terminals	test
-providers/mod.rs::muse_defaults_to_reasoning_replay	test
-providers/mod.rs::muse_endpoint_override_is_validated_when_present	test
+providers/mod.rs::muse_defaults_to_reasoning_replay	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+providers/mod.rs::muse_endpoint_override_is_validated_when_present	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
 providers/mod.rs::offline_budget_bounds_an_in_flight_resend	test
 providers/mod.rs::offline_budget_bounds_the_backoff_sleep	test
 providers/mod.rs::parses_events_split_across_chunks	test
@@ -876,34 +876,34 @@ providers/mod.rs::user_config_overrides_and_extends_presets	test
 providers/mod.rs::validate_spec_matches_resolve_for_the_buildable_cases	test
 providers/mod.rs::validate_spec_rejects_a_provider_without_a_model	test
 providers/mod.rs::validate_spec_rejects_an_empty_or_malformed_base_url	test
-providers/muse.rs::catalog_applies_configured_provider_headers	test
-providers/muse.rs::catalog_remints_on_a_401_with_a_non_json_body	test
-providers/muse.rs::catalog_remints_once_after_a_401	test
-providers/muse.rs::catalog_sends_api_version_header	test
-providers/muse.rs::freshness_tracks_renewal	test
-providers/muse.rs::lists_models_excludes_contributor_rows	test
-providers/muse.rs::lists_models_excludes_hidden_rows	test
-providers/muse.rs::lists_models_hiding_image_generation	test
-providers/muse.rs::mint_defaults_base_url_when_omitted	test
-providers/muse.rs::mint_refusal_never_leaks_the_api_key	test
-providers/muse.rs::mint_refusal_relays_the_payment_remediation_url	test
-providers/muse.rs::mint_refusal_surfaces_the_subscription_gate	test
-providers/muse.rs::mint_rejects_an_inactive_subscription_even_with_a_key	test
-providers/muse.rs::mint_sends_api_version_and_onboard_flag	test
-providers/muse.rs::mints_and_calls_the_responses_api	test
-providers/muse.rs::muse_vision_treats_chat_rows_as_image_capable	test
-providers/muse.rs::parses_stored_credentials	test
-providers/muse.rs::parses_the_catalog_envelope_tolerantly	test
-providers/muse.rs::persist_rotated_only_writes_for_the_same_login	test
-providers/muse.rs::reads_effort_variants_in_both_shapes	test
-providers/muse.rs::remint_refreshes_a_stale_oauth_token_first	test
-providers/muse.rs::remint_with_a_fresh_grant_skips_the_refresh	test
-providers/muse.rs::remints_once_after_a_401	test
-providers/muse.rs::reuses_a_stored_minted_key_without_minting_again	test
-providers/muse.rs::slow_down_never_reduces_the_poll_interval	test
-providers/muse.rs::stale_client_adopts_a_peers_renewed_grant	test
-providers/muse.rs::synthetic_grant_refresh_does_not_touch_the_saved_credentials	test
-providers/muse.rs::uses_a_literal_api_key_without_minting	test
+providers/muse.rs::catalog_applies_configured_provider_headers	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+providers/muse.rs::catalog_remints_on_a_401_with_a_non_json_body	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+providers/muse.rs::catalog_remints_once_after_a_401	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+providers/muse.rs::catalog_sends_api_version_header	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+providers/muse.rs::freshness_tracks_renewal	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+providers/muse.rs::lists_models_excludes_contributor_rows	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+providers/muse.rs::lists_models_excludes_hidden_rows	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+providers/muse.rs::lists_models_hiding_image_generation	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+providers/muse.rs::mint_defaults_base_url_when_omitted	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+providers/muse.rs::mint_refusal_never_leaks_the_api_key	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+providers/muse.rs::mint_refusal_relays_the_payment_remediation_url	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+providers/muse.rs::mint_refusal_surfaces_the_subscription_gate	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+providers/muse.rs::mint_rejects_an_inactive_subscription_even_with_a_key	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+providers/muse.rs::mint_sends_api_version_and_onboard_flag	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+providers/muse.rs::mints_and_calls_the_responses_api	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+providers/muse.rs::muse_vision_treats_chat_rows_as_image_capable	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+providers/muse.rs::parses_stored_credentials	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+providers/muse.rs::parses_the_catalog_envelope_tolerantly	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+providers/muse.rs::persist_rotated_only_writes_for_the_same_login	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+providers/muse.rs::reads_effort_variants_in_both_shapes	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+providers/muse.rs::remint_refreshes_a_stale_oauth_token_first	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+providers/muse.rs::remint_with_a_fresh_grant_skips_the_refresh	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+providers/muse.rs::remints_once_after_a_401	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+providers/muse.rs::reuses_a_stored_minted_key_without_minting_again	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+providers/muse.rs::slow_down_never_reduces_the_poll_interval	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+providers/muse.rs::stale_client_adopts_a_peers_renewed_grant	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+providers/muse.rs::synthetic_grant_refresh_does_not_touch_the_saved_credentials	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+providers/muse.rs::uses_a_literal_api_key_without_minting	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
 providers/openai.rs::asks_llama_cpp_for_its_loaded_context	test
 providers/openai.rs::combined_detection_probes_each_endpoint_once	test
 providers/openai.rs::detects_thinking_levels_on_ollama_and_llama_cpp	test
@@ -939,7 +939,7 @@ providers/openai_responses.rs::builds_input_instructions_tools_and_calls	test
 providers/openai_responses.rs::copilot_reasoning_model_replays_reasoning_by_default	test
 providers/openai_responses.rs::encodes_thinking_levels	test
 providers/openai_responses.rs::incomplete_status_resolves_to_nested_reason_not_bare_incomplete	test
-providers/openai_responses.rs::muse_reasoning_round_trips_and_suppresses_temperature	test
+providers/openai_responses.rs::muse_reasoning_round_trips_and_suppresses_temperature	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
 providers/openai_responses.rs::omits_temperature_for_reasoning_models_only	test
 providers/openai_responses.rs::parse_response_propagates_failed_status	test
 providers/openai_responses.rs::parses_copilot_aic_from_response_and_stream	test
@@ -1130,17 +1130,17 @@ settings.rs::applying_an_endpoint_never_introduces_a_variable_that_would_shadow_
 settings.rs::applying_an_endpoint_retargets_a_stale_plan_variable_behind_another_key_source	test
 settings.rs::applying_an_endpoint_retargets_the_api_key_variable_to_its_plan	test
 settings.rs::applying_an_endpoint_seeds_the_key_prompt_with_the_plan_variable	test
-settings.rs::derived_endpoint_source_distinguishes_muse_credential_lanes	test
+settings.rs::derived_endpoint_source_distinguishes_muse_credential_lanes	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
 settings.rs::edited_provider_resolution_detects_a_spec_that_newly_resolves_to_it	test
 settings.rs::edited_provider_resolution_uses_the_effective_provider_table	test
 settings.rs::editing_a_preset_stores_only_the_overrides	test
 settings.rs::editing_qwen_to_the_token_plan_stores_the_endpoint_and_key_variable	test
-settings.rs::key_status_keeps_the_env_var_hint_when_a_muse_login_is_absent	test
-settings.rs::key_status_recognises_a_stored_muse_login_with_an_empty_api_key_env	test
-settings.rs::key_status_recognises_a_stored_muse_login_with_an_unset_api_key_env	test
-settings.rs::key_status_recognises_a_stored_muse_login_without_api_key_env	test
+settings.rs::key_status_keeps_the_env_var_hint_when_a_muse_login_is_absent	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+settings.rs::key_status_recognises_a_stored_muse_login_with_an_empty_api_key_env	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+settings.rs::key_status_recognises_a_stored_muse_login_with_an_unset_api_key_env	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
+settings.rs::key_status_recognises_a_stored_muse_login_without_api_key_env	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
 settings.rs::key_status_reports_no_key_for_a_non_login_provider_without_credentials	test
-settings.rs::key_status_shows_the_muse_login_hint_when_no_env_var_and_not_logged_in	test
+settings.rs::key_status_shows_the_muse_login_hint_when_no_env_var_and_not_logged_in	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
 settings.rs::model_choice_maps_rows_to_steps	test
 settings.rs::model_spec_builds_provider_slash_model_or_goes_back	test
 settings.rs::provider_rows_list_recents_first_and_highlight_the_previous_model	test
@@ -1208,7 +1208,7 @@ temperature.rs::copilot_claude_uses_the_anthropic_range	test
 temperature.rs::fixed_by_clears_the_stale_range_warning	test
 temperature.rs::models_without_temperature_only_use_the_default	test
 temperature.rs::most_specific_setting_wins	test
-temperature.rs::muse_reasoning_models_ignore_a_configured_temperature	test
+temperature.rs::muse_reasoning_models_ignore_a_configured_temperature	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
 temperature.rs::parses_numbers_and_default	test
 temperature.rs::rejects_non_finite_values	test
 temperature.rs::user_model_settings_merge_over_presets	test
@@ -1235,7 +1235,7 @@ thinking.rs::gpt_5_family_reasoning_levels_split_by_variant	test
 thinking.rs::invalid_configured_level_names_are_dropped_with_a_warning	test
 thinking.rs::knows_model_families	test
 thinking.rs::most_specific_setting_wins	test
-thinking.rs::muse_is_analysed_as_a_responses_wire	test
+thinking.rs::muse_is_analysed_as_a_responses_wire	na	the Meta Muse Code provider was removed (https://github.com/nanobpm/nano-coder/issues/298)
 thinking.rs::off_aliases_in_configured_levels_are_rejected	test
 thinking.rs::parses_and_round_trips	test
 thinking.rs::picks_the_request_form_for_the_api	test
