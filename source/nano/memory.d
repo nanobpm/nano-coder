@@ -403,6 +403,22 @@ string resolveEntity(const EntityRecord[] records, string entity) pure
     return entity;
 }
 
+/// Every concatenation of an entity name with the other rendered fields, with
+/// and without a separating space: the split-field secret checks run over
+/// these so a credential divided between the text and an entity name (or the
+/// evidence, or valid_while) is still recognised.
+string[] entitiesJoined(string text, string evidence, string validWhile, const string[] entities) pure
+{
+    string[] fields = [text];
+    if (evidence !is null) fields ~= evidence;
+    if (validWhile !is null) fields ~= validWhile;
+    string[] r;
+    foreach (en; entities)
+        foreach (f; fields)
+            r ~= [f ~ en, f ~ " " ~ en];
+    return r;
+}
+
 /// Current entries that share an entity and fact kind with `e` (a missing
 /// kind counts as `fact`) and are near-duplicates (word similarity at least
 /// `nearDuplicateSimilarity`) or likely contradictions (overlapping anchors).
@@ -551,12 +567,22 @@ final class Store
     private static Entry[] keepUnexpired(Entry[] entries, SysTime cutoff)
     {
         bool[string] kept;
-        foreach (e; entries) if (!e.isSuperseded && e.lastUsedTime >= cutoff) kept[e.id] = true;
-        for (bool grew = true; grew;)
+        string[][string] predecessors;
+        foreach (e; entries)
         {
-            grew = false;
-            foreach (e; entries)
-                if (e.isSuperseded && e.id !in kept && e.supersededBy in kept) { kept[e.id] = true; grew = true; }
+            if (!e.isSuperseded && e.lastUsedTime >= cutoff) kept[e.id] = true;
+            if (e.isSuperseded) predecessors[e.supersededBy] ~= e.id;
+        }
+        // Walk each chain back from its surviving entries through the reverse
+        // map, instead of rescanning every entry until a fixpoint: a chain of
+        // n supersessions is one pass, not n.
+        string[] stack = kept.byKey.array;
+        while (stack.length)
+        {
+            auto id = stack[$ - 1];
+            stack = stack[0 .. $ - 1];
+            foreach (prev; predecessors.get(id, null))
+                if (prev !in kept) { kept[prev] = true; stack ~= prev; }
         }
         return entries.filter!(e => (e.id in kept) !is null).array;
     }
@@ -667,6 +693,18 @@ final class Store
             if (!uniq.canFind(id)) uniq ~= id;
         }
         e.entities = uniq;
+        // The prompt and search render text, evidence, valid_while and entity
+        // names in one line, so a credential split across any of them passes
+        // each field's own check: re-check the resolved names joined with the
+        // other fields before anything is written.
+        foreach (joined; entitiesJoined(text, evidence, validWhile, e.entities))
+            if (looksLikeSecret(joined) !is null)
+                throw new Exception("refusing to save: the text together with an entity name looks like a secret. "
+                    ~ "Never store keys, tokens or passwords, even split across fields.");
+        foreach (en; e.entities)
+            if (evidenceStatesLabelValue(text, en))
+                throw new Exception("refusing to save: the text together with an entity name looks like a secret. "
+                    ~ "Never store keys, tokens or passwords, even split across fields.");
         auto f = readScopeFile(s, true);
         foreach (id; sup)
             if (!f.entries.any!(x => x.id == id && !x.isSuperseded))
@@ -685,11 +723,15 @@ final class Store
         if (r.candidates.length) return r;
         foreach (ref x; f.entries) if (sup.canFind(x.id)) x.supersededBy = e.id;
         f.entries ~= e;
-        writeAll(p, f.entries, f.unknown);
         bool added;
         foreach (ne; e.entities)
             if (!reg.records.any!(rec => rec.id == ne)) { reg.records ~= EntityRecord(ne); added = true; }
+        // Persist the registry first: if the memory file were committed first,
+        // a registry-write failure would leave the save and the supersession
+        // applied while the tool reports failure, and a retried save then
+        // fails because the superseded ids are no longer current.
         if (added) writeRegistry(s, reg);
+        writeAll(p, f.entries, f.unknown);
         r.saved = true;
         r.entry = e;
         return r;
@@ -710,7 +752,9 @@ final class Store
         Registry r;
         auto p = registryPath(s);
         if (!p.exists) return r;
-        auto bytes = readBytes(p);
+        const(ubyte)[] bytes;
+        try bytes = readBytes(p);
+        catch (Exception e) throw new Exception(format("reading memory registry %s: %s", p, e.msg));
         size_t start = 0;
         foreach (i; 0 .. bytes.length + 1)
         {
@@ -792,6 +836,11 @@ final class Store
         string alsoRegister = null)
     {
         auto lock = FileLock(path(s));
+        // Release on a failed read or edit: the lock is a struct whose
+        // destructor only runs at finalization, so a throw here would
+        // otherwise hold it until then.
+        bool done;
+        scope (exit) if (!done) lock.release();
         auto reg = readRegistry(s);
         auto id = resolveEntity(reg.records, entity);
         auto i = reg.records.countUntil!(r => r.id == id);
@@ -803,6 +852,7 @@ final class Store
             if (!reg.records.any!(r => r.id == t)) reg.records ~= EntityRecord(t);
         }
         writeRegistry(s, reg);
+        done = true;
         return reg.records.filter!(r => r.id == id).front.describe;
     }
 
@@ -875,6 +925,11 @@ final class Store
             if (!hasPath(s)) continue;
             auto p = path(s);
             FileLock* lock = readOnly ? null : new FileLock(p);
+            // The lock is only released by the scope(exit) over `loaded` once
+            // it is appended there; a throw from either read below would
+            // otherwise leave it held until finalization.
+            bool released;
+            scope (exit) if (!released && lock) lock.release();
             auto f = readScopeFile(s, !readOnly);
             string entity = filter.entity is null ? null : resolveEntity(readRegistry(s).records, filter.entity);
             foreach (e; f.entries)
@@ -887,6 +942,7 @@ final class Store
                 if (!matchFirst(hay.to!dstring, rx).empty) hits ~= Hit(s, e);
             }
             loaded ~= Loaded(s, p, f, lock);
+            released = true;
         }
         if (!hits.length) return format("No memories match %s.", JSONValue(shownPattern).jsonText);
         import std.algorithm : SwapStrategy;

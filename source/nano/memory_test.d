@@ -1037,3 +1037,113 @@ unittest // a rejected relation leaves the registry unchanged even when an alias
     assert(fails(run(s, entityTool, parseJSON(`{"scope":"user","entity":"host:m","alias":"m.local","relation":"likes","target":"host:y"}`), null, false)));
     assert(!exists(s.registryPath(Scope.user)) || !readText(s.registryPath(Scope.user)).canFind("m.local"));
 }
+
+unittest // resolved entity names are checked for credentials split across the text
+{
+    auto s = store(tmp("facts-entity-split-secret"));
+    SaveOptions o;
+    o.entities = ["other:hunter2"];
+    // Neither field alone looks like a secret; joined they are label + value.
+    assert(fails(s.saveFact(Scope.user, "worker password:", null, null, null, null, false, o)));
+    assert(s.get(s.save(Scope.user, "worker password is in keepassxc", null, null).id).isSome);
+    // The alias resolves to the canonical id, so the join is checked against it too.
+    run(s, entityTool, parseJSON(`{"scope":"user","entity":"other:token-value","alias":"hunter3"}`), null, false);
+    SaveOptions aliased;
+    aliased.entities = ["other:hunter3"];
+    assert(fails(s.saveFact(Scope.user, "worker password:", null, null, null, null, false, aliased)));
+    // Ordinary entities still save.
+    SaveOptions ok;
+    ok.entities = ["host:merlin"];
+    assert(s.saveFact(Scope.user, "merlin has 64GB of memory", null, null, null, null, false, ok).saved);
+}
+
+unittest // a long supersession chain is expiry-filtered in one pass, oldest or newest first
+{
+    import std.format : format;
+    import std.range : iota, retro;
+    import std.algorithm : map;
+    import std.array : array;
+    auto dir = tmp("facts-chain-order");
+    foreach (oldestFirst; [true, false])
+    {
+        auto s = store(dir ~ (oldestFirst ? "-old" : "-new"), "github.com/nanobpm/nano-coder", 90);
+        Entry[] es;
+        foreach (i; 0 .. 64)
+        {
+            Entry e;
+            e.id = format("mem-chain-%04d", i);
+            e.text = "chain fact " ~ format("%04d", i);
+            e.created = e.lastUsed = stamp(wallNow);
+            e.lastUsedTime = wallNow;
+            if (i + 1 < 64) e.supersededBy = format("mem-chain-%04d", i + 1);
+            es ~= e;
+        }
+        // Only the head of the chain is current; every ancestor must survive.
+        auto ordered = oldestFirst ? es : es.retro.array;
+        writeAll(s.path(Scope.user), ordered, null);
+        auto kept = s.all();
+        assert(kept.length == 1 && kept[0].e.id == "mem-chain-0063");
+        foreach (i; 0 .. 64) assert(s.get(format("mem-chain-%04d", i)).isSome);
+        // Backdate the head: the whole chain expires with it.
+        Entry head;
+        foreach (x; s.get("mem-chain-0063")) head = x.e;
+        Entry[] rest;
+        foreach (i; 0 .. 63) foreach (x; s.get(format("mem-chain-%04d", i))) rest ~= x.e;
+        writeAll(s.path(Scope.user), rest ~ backdate(head, 95), null);
+        assert(s.get("mem-chain-0000").isNone);
+    }
+}
+
+unittest // an unreadable registry on a filtered writable search releases the scope lock
+{
+    import core.time : seconds;
+    auto s = store(tmp("facts-search-lock"));
+    auto rp = s.registryPath(Scope.user);
+    mkdirRecurse(rp); // a directory where the registry file belongs: reads fail
+    SearchFilter f;
+    f.entity = "host:merlin";
+    assert(fails(s.searchFiltered("worker", null, false, f)));
+    rmdirRecurse(rp);
+    // The lock was released: the next writable operation does not time out.
+    auto deadline = wallNow + seconds(2);
+    auto again = s.save(Scope.user, "the worker runs nwf", null, null);
+    assert(wallNow < deadline);
+    assert(again.id.length);
+    assert(s.search("worker", null).canFind("nwf"));
+}
+
+unittest // a failing registry edit releases the scope lock
+{
+    auto s = store(tmp("facts-edit-lock"));
+    auto rp = s.registryPath(Scope.user);
+    mkdirRecurse(rp); // a directory where the registry file belongs: reads fail
+    assert(fails(s.addAlias(Scope.user, "host:m", "m.local")));
+    rmdirRecurse(rp);
+    // The lock was released: the next registry edit does not time out.
+    assert(s.addAlias(Scope.user, "host:m", "m.local").canFind("m.local"));
+}
+
+unittest // a failed registry write leaves the save and its supersession uncommitted
+{
+    auto s = store(tmp("facts-registry-first"));
+    SaveOptions first;
+    first.entities = ["host:merlin"];
+    auto old = s.saveFact(Scope.user, "merlin has 32GB of memory", null, null, null, null, false, first).entry;
+    // Make the registry path unwritable: a directory sits where the file belongs.
+    auto rp = s.registryPath(Scope.user);
+    auto backup = readText(rp);
+    remove(rp);
+    mkdirRecurse(rp);
+    SaveOptions o;
+    o.entities = ["host:merlin"];
+    o.supersedes = [old.id];
+    o.distinct = true;
+    assert(fails(s.saveFact(Scope.user, "merlin has 64GB of memory", null, null, null, null, false, o)));
+    rmdirRecurse(rp);
+    write(rp, backup);
+    // Nothing was committed: the old entry is still current and the retry succeeds.
+    assert(s.all().any!(x => x.e.id == old.id));
+    auto retry = s.saveFact(Scope.user, "merlin has 64GB of memory", null, null, null, null, false, o);
+    assert(retry.saved);
+    assert(!s.all().any!(x => x.e.id == old.id));
+}
