@@ -483,9 +483,19 @@ private final class ChildEvents : imported!"nano.agent".AgentEvents
     void generationStart()
     {
         if (abort.aborted) throw new SubStop("stopped by the parent");
-        checkLimits();
+        if (limitHit is null)
+        {
+            // A limit (or the parent's cancel) first seen here arrived after
+            // this request's steers drained: the request lacks the report
+            // reminder, so it is not the grace call. Leave the reminder to
+            // the next fresh call (beforeFreshCall), which gets the grace
+            // (issue #322).
+            limitHit = limitWhy();
+            generations++;
+            return;
+        }
         // One call after the limit is the grace to write the report.
-        if (limitHit !is null && gensSinceLimit++ >= 1) throw new SubStop(limitHit);
+        if (gensSinceLimit++ >= 1) throw new SubStop(limitHit);
         generations++;
     }
 
@@ -538,6 +548,32 @@ unittest
     try st.generationStart();
     catch (SubStop) stopped = true;
     assert(stopped);
+}
+
+// The parent's cancel landing between a fresh call's steer drain and its
+// request (issue #322): that request carries no report reminder, so it is
+// not the grace call. The next fresh call gets the reminder and the grace;
+// only the call after that stops the child. Repeated to pin the ordering.
+unittest
+{
+    import std.algorithm : canFind;
+    foreach (n; 0 .. 200)
+    {
+        immutable spec = SubSpec(0, "c", "t", "m", "s", null, SubLimits.init);
+        auto ab = SubAbort.make;
+        auto st = new ChildEvents(spec, Chan!SubMsg.make, Chan!ToolReply.make, ab);
+        st.beforeFreshCall(); // steers drain here
+        ab.wrapUp(); // the cancel lands now
+        st.generationStart(); // this request has no reminder
+        assert(st.wrappedUp && st.limitHit !is null);
+        assert(st.gensSinceLimit == 0, "the reminder-less call is not the grace");
+        st.beforeFreshCall(); // queues the reminder for the grace call
+        st.generationStart(); // the grace call: the child can report
+        bool stopped;
+        try st.generationStart();
+        catch (SubStop) stopped = true;
+        assert(stopped, "only one final step");
+    }
 }
 
 /// The text of the child's latest assistant reply, for a partial report.
