@@ -180,6 +180,15 @@ version (Posix)
     private import std.socket : socket_t;
 }
 
+/// Duplicate a socket fd (`dup(2)`), returning `socket_t.init` on error.
+/// Used so a background thread can wrap its own `std.socket.Socket` without
+/// sharing the fd with another `Socket` whose GC finalizer would close it.
+socket_t dupSocket(socket_t fd) nothrow @nogc
+{
+    auto n = dupFd(fd);
+    return n < 0 ? socket_t.init : cast(socket_t) n;
+}
+
 /// The uid on the other end of a connected Unix-domain socket, or -1 when
 /// the platform can't say. The peer registry (issue #272) drops a peer whose
 /// uid is not the process's own, so a socket planted by another user is

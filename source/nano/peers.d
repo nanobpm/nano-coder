@@ -319,7 +319,20 @@ struct PeerListener
         impl.path = path;
         impl.listener = socket;
         impl.stop = Shared!bool.make;
-        impl.thread = spawnDaemon(&serve, impl.listener.handle, requests, impl.stop);
+        // Duplicate the fd for the listener thread so `serve` owns its own
+        // `Socket` (its GC finalizer cannot close `impl.listener`'s fd, and
+        // `close()` shutting down `impl.listener` still wakes `serve`'s
+        // select/accept on the shared open file description).
+        import nano.safeio : dupSocket;
+        import std.socket : socket_t;
+        auto serveFd = dupSocket(impl.listener.handle);
+        if (serveFd == socket_t.init)
+        {
+            socket.close();
+            removeIfThere(path);
+            throw new ListenError(format("cannot dup listener fd for %s", path));
+        }
+        impl.thread = spawnDaemon(&serve, serveFd, requests, impl.stop);
         return PeerListener(NotNull!Impl(impl));
     }
 
@@ -353,18 +366,28 @@ struct PeerListener
         import core.sys.posix.unistd : getuid;
         import nano.safeio : socketPeerUid;
         auto listener = new Socket(handle_, AddressFamily.UNIX);
+        scope (exit) listener.close();
         auto set = new SocketSet;
         while (!stop.get)
         {
+            import core.stdc.errno : errno, EINTR;
             set.reset();
             set.add(listener);
             int n;
             try n = Socket.select(set, null, null, 100.msecs);
-            catch (SocketException) return; // closed by `close`
+            catch (SocketException)
+            {
+                if (errno == EINTR) continue; // GC stop-the-world / signal
+                return; // closed by `close`
+            }
             if (n <= 0) continue; // timeout: poll again (close wakes select)
             Socket conn;
             try conn = listener.accept();
-            catch (SocketException) return; // closed by `close`
+            catch (SocketException)
+            {
+                if (errno == EINTR) continue;
+                return; // closed by `close`
+            }
             scope (exit) conn.close();
             // Same uid only: anything else is dropped unanswered.
             if (socketPeerUid(conn.handle) != long(getuid())) continue;
@@ -483,9 +506,29 @@ struct PeerListener
     {
         import std.string : representation;
         import std.socket : SocketException;
-        try conn.send(reply.representation);
+        try sendAll(conn, reply.representation);
         catch (SocketException) {} // the sender gave up waiting: nothing to do
     }
+}
+
+/// Write every byte of `data` to `conn`, retrying on `EINTR` (e.g. a GC
+/// stop-the-world signal) and short writes; returns false on error/closed.
+private bool sendAll(imported!"std.socket".Socket conn, const(ubyte)[] data)
+{
+    import core.stdc.errno : errno, EINTR;
+    size_t sent = 0;
+    while (sent < data.length)
+    {
+        auto n = conn.send(data[sent .. $]);
+        if (n == conn.ERROR)
+        {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (n <= 0) return false;
+        sent += size_t(n);
+    }
+    return true;
 }
 
 /// Remove a socket file, ignoring a concurrent removal (a successor may
@@ -509,6 +552,7 @@ string socketPath(string dir, string id)
 /// Read one newline-terminated line (bounded), or null on a clean close.
 private string readLine(imported!"std.socket".Socket conn, Duration total = 30.seconds)
 {
+    import core.stdc.errno : errno, EINTR;
     import nano.clock : monoNow, since;
     auto buf = appender!(char[]);
     ubyte[1] b;
@@ -520,7 +564,13 @@ private string readLine(imported!"std.socket".Socket conn, Duration total = 30.s
         if (since(start) > total) return null;
         auto n = conn.receive(b[]);
         if (n == 0) return buf.data.length ? buf.data.idup : null; // closed
-        if (n == conn.ERROR) return null; // interrupted or errored: treat as closed
+        if (n == conn.ERROR)
+        {
+            // A GC stop-the-world signal (SIGUSR1/SIGUSR2) or SIGCHLD can
+            // interrupt blocking recv() with EINTR while the peer is fine.
+            if (errno == EINTR) continue;
+            return null; // timed out or errored: treat as closed
+        }
         if (b[0] == '\n') return buf.data.idup;
         buf ~= char(b[0]);
     }
@@ -581,7 +631,11 @@ Status send(string dir, string to, PeerMessage pm, out string note)
     try
     {
         import std.string : representation;
-        s.send(requestLine(pm, 1).representation);
+        if (!sendAll(s, requestLine(pm, 1).representation))
+        {
+            note = "delivery failed: could not send request";
+            return Status.refused;
+        }
         line = readLine(s, 140.seconds);
     }
     catch (SocketException e)
