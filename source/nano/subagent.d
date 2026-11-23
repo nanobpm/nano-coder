@@ -379,6 +379,8 @@ private final class ChildEvents : imported!"nano.agent".AgentEvents
     size_t gensSinceLimit;
     /// Whether a fresh request has carried the report reminder since the limit.
     bool reminderDelivered;
+    /// A report reminder is queued and not yet drained into a request.
+    bool reminderQueued;
     /// The parent's `agent_cancel` asked for a final report.
     bool wrappedUp;
     string[] filesRead;
@@ -427,6 +429,7 @@ private final class ChildEvents : imported!"nano.agent".AgentEvents
     {
         import nano.agent : wrapReminder;
         auto why = wrappedUp ? "The parent agent cancelled you" : format("You reached your %s", limitHit);
+        reminderQueued = true;
         foreach (a; agent) a.control.steer(wrapReminder(why ~ ". Stop investigating and call "
             ~ "report_outcome now with what you found so far."));
     }
@@ -530,8 +533,11 @@ private final class ChildEvents : imported!"nano.agent".AgentEvents
         checkLimits();
         if (limitHit !is null && gensSinceLimit == 0)
         {
-            steerReportReminder();
+            // A reminder queued by a late checkLimits is still pending; one
+            // copy per request is enough.
+            if (!reminderQueued) steerReportReminder();
             // The steers drain after this, so the coming request carries it.
+            reminderQueued = false;
             reminderDelivered = true;
         }
     }
@@ -623,17 +629,19 @@ unittest
     import nano.permissions : Policy;
     import nano.providers.mock : MockClient;
     import nano.option : some;
-    import std.algorithm : any;
+    import std.algorithm : any, count;
     immutable spec = SubSpec(0, "c", "t", "m", "s", null, SubLimits.init);
     auto ab = SubAbort.make;
     auto st = new ChildEvents(spec, Chan!SubMsg.make, Chan!ToolReply.make, ab);
     bool[] reminded;
+    size_t[] reminderCount;
     auto client = new class MockClient
     {
         this() { super([]); }
         override LLMResponse chat(const ref ChatRequest req, StreamSink sink)
         {
             reminded ~= req.messages.any!(m => m.content.canFind("call report_outcome now"));
+            reminderCount ~= req.messages.count!(m => m.content.canFind("call report_outcome now"));
             if (reminded.length > 1) return LLMResponse("the report");
             return LLMResponse("still looking");
         }
@@ -651,6 +659,7 @@ unittest
     assert(cancelled);
     assert(reminded.length >= 2, "a tool-free reply must not end the turn before the reminder");
     assert(!reminded[0] && reminded[1], "the next request carries the report reminder");
+    assert(reminderCount[1] == 1, "the reminded request carries exactly one reminder");
 }
 
 /// The text of the child's latest assistant reply, for a partial report.
