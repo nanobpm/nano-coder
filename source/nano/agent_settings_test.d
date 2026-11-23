@@ -127,13 +127,24 @@ unittest
 // does not append a duplicate record.
 unittest
 {
+    import nano.session : SessionSettings, restore;
     auto agent = logged("model-record", new MockClient([]));
+    SessionSettings prior;
+    prior.contextWindow = 50_000;
+    agent.logSettings(prior);
     auto other = new MockClient([]);
     agent.useClient(other, ConfiguredWindow.init);
-    assert(records(agent).any!(r => r["type"].str == "settings" && r["data"]["model"].str == "mock/mock"));
+    assert(records(agent).any!(r => r["type"].str == "settings"
+        && "model" in r["data"] && r["data"]["model"].str == "mock/mock"
+        && "context_window" in r["data"] && r["data"]["context_window"].integer == 0));
     auto before = records(agent).length;
     agent.useClient(new MockClient([]), ConfiguredWindow.init, false);
     assert(records(agent).length == before, "restore switch does not write a duplicate settings record");
+    // Restoring the log sees the cleared override (`contextWindow == 0`), not the prior 50_000.
+    auto path = agent.log.unwrap("logged").path;
+    auto r = restore(path);
+    assert(r.settings.model == "mock/mock");
+    assert(r.settings.contextWindow == 0);
 }
 
 // issue #297: `/subagents off` mid-turn writes a `settings` record, so a

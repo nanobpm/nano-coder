@@ -1176,6 +1176,111 @@ unittest
     assert(savedProviderKnown("bare", ps));
 }
 
+/// The runtime settings `/restart` carries over into the new session's log
+/// (issue #297): the new session keeps the live verbosity, sub-agents switch
+/// and context settings, so seeding any value that differs from the config
+/// ensures a later flag-free resume restores them instead of reverting to
+/// config defaults. Returns `hasAny` = true when at least one field is set.
+SessionSettings retainedRestartSettings(const ref Config cfg, Verbosity liveVerbosity,
+    bool liveSubagents, imported!"nano.context".CompactionMode liveCompactionMode, bool liveAutoCompact,
+    double liveAutoCompactThreshold, size_t liveConfiguredWindow, string liveConfiguredWindowSource,
+    out bool hasAny) pure
+{
+    import nano.context : modeName;
+    import nano.ui : vname = name;
+    SessionSettings s;
+    if (liveVerbosity != cfg.verbosity) { s.verbosity = vname(liveVerbosity); hasAny = true; }
+    if (liveSubagents != cfg.subagents) { s.subagents = liveSubagents ? 1 : 0; hasAny = true; }
+    if (modeName(liveCompactionMode) != cfg.compactionMode) { s.compactionMode = modeName(liveCompactionMode); hasAny = true; }
+    if (liveAutoCompact != cfg.autoCompact) { s.autoCompact = liveAutoCompact ? 1 : 0; hasAny = true; }
+    if (liveAutoCompactThreshold != cfg.autoCompactThreshold) { s.autoCompactThreshold = liveAutoCompactThreshold; hasAny = true; }
+    if (liveConfiguredWindow > 0 && liveConfiguredWindowSource == "the session's settings")
+    {
+        import std.conv : to;
+        s.contextWindow = liveConfiguredWindow.to!long;
+        hasAny = true;
+    }
+    else if (liveConfiguredWindow > 0 && liveConfiguredWindowSource == "context_window in config"
+        && liveConfiguredWindow != (cfg.contextWindow > 0 ? toSize(cfg.contextWindow) : 0))
+    {
+        import std.conv : to;
+        s.contextWindow = liveConfiguredWindow.to!long;
+        hasAny = true;
+    }
+    return s;
+}
+
+unittest // retainedRestartSettings: records only live settings that diverge from config
+{
+    import nano.context : CompactionMode;
+    Config cfg;
+    cfg.verbosity = Verbosity.normal;
+    cfg.subagents = true;
+    cfg.compactionMode = "smart";
+    cfg.autoCompact = true;
+    cfg.autoCompactThreshold = 0.8;
+    bool hasAny;
+    const SessionSettings empty;
+    auto same = retainedRestartSettings(cfg, Verbosity.normal, true, CompactionMode.smart, true, 0.8, 0, "", hasAny);
+    assert(!hasAny && same == empty);
+
+    auto changed = retainedRestartSettings(cfg, Verbosity.verbose, false, CompactionMode.extract, false, 0.65,
+        50_000, "the session's settings", hasAny);
+    assert(hasAny);
+    assert(changed.verbosity == "verbose");
+    assert(changed.subagents == 0);
+    assert(changed.compactionMode == "extract");
+    assert(changed.autoCompact == 0);
+    assert(changed.autoCompactThreshold == 0.65);
+    assert(changed.contextWindow == 50_000);
+
+    // A `/settings` context_window edit (labelled "context_window in config") is also seeded.
+    auto dlgWin = retainedRestartSettings(cfg, Verbosity.normal, true, CompactionMode.smart, true, 0.8,
+        64_000, "context_window in config", hasAny);
+    assert(hasAny && dlgWin.contextWindow == 64_000);
+
+    // A config context_window that matches cfg.contextWindow is not redundantly recorded.
+    cfg.contextWindow = 64_000;
+    auto sameWin = retainedRestartSettings(cfg, Verbosity.normal, true, CompactionMode.smart, true, 0.8,
+        64_000, "context_window in config", hasAny);
+    assert(!hasAny && sameWin.contextWindow == -1);
+
+    // A provider/config window (not a session override) is not recorded.
+    auto provWin = retainedRestartSettings(cfg, Verbosity.normal, true, CompactionMode.smart, true, 0.8,
+        128_000, "provider context_window", hasAny);
+    assert(!hasAny && provWin.contextWindow == -1);
+}
+
+/// Pick the initial startup model candidate for `--resume` (issue #297):
+/// explicit `-m` wins, else a saved model whose provider is configured, else
+/// `cfg.model`. Sets `note` when a saved model's provider was removed from
+/// config.
+string startupResumeModel(string explicitModel, string savedModel, const ref Config cfg, out string note) pure
+{
+    if (explicitModel.length) return explicitModel;
+    if (!savedModel.length || savedModel == cfg.model) return cfg.model;
+    if (!savedProviderKnown(savedModel, cfg.providers))
+    {
+        note = format("the session's model %s is not available (provider %s is not configured); using %s from the config",
+            savedModel, savedModel[0 .. savedModel.indexOf('/')], cfg.model);
+        return cfg.model;
+    }
+    return savedModel;
+}
+
+unittest // startupResumeModel: explicit flag > configured saved model > config fallback
+{
+    import std.algorithm.searching : canFind;
+    Config cfg;
+    cfg.model = "disabled-a/model-a";
+    cfg.providers["b"] = ProviderConfig.init;
+    string note;
+    assert(startupResumeModel("b/explicit", "b/saved", cfg, note) == "b/explicit" && !note.length);
+    assert(startupResumeModel(null, "b/saved", cfg, note) == "b/saved" && !note.length);
+    assert(startupResumeModel(null, "gone/saved", cfg, note) == "disabled-a/model-a" && note.canFind("gone/saved"));
+    assert(startupResumeModel(null, null, cfg, note) == "disabled-a/model-a" && !note.length);
+}
+
 void setVerbosity(Verbosity v)
 {
     atomicStore(gVerbosity, v);
@@ -2783,7 +2888,23 @@ int runMain(string[] args)
         catch (Exception e) die(e.msg);
     }
 
-    auto spec = o.model.length ? o.model : cfg.model;
+    // On `--resume` without `-m`, peek the saved session's model before
+    // building the startup client (issue #297): a disabled or failing default
+    // provider must not block resuming a session whose own provider is usable.
+    auto cwd = getcwd();
+    string resumePath;
+    string startupSavedModel;
+    string startupModelFallbackNote;
+    if (o.hasResume && !o.acp)
+    {
+        try resumePath = findSession(sessionDir, o.resume, cwd);
+        catch (Exception e) die(e.msg);
+        if (!o.model.length)
+            startupSavedModel = logSavedModel(resumePath);
+    }
+    auto spec = o.hasResume && !o.acp
+        ? startupResumeModel(o.model, startupSavedModel, cfg, startupModelFallbackNote)
+        : (o.model.length ? o.model : cfg.model);
     ConfiguredWindow configuredWindow;
     LLMClient client = () {
         try
@@ -2792,7 +2913,25 @@ int runMain(string[] args)
             configuredWindow = windowFor(cfg, rp.config);
             return makeClient(rp);
         }
-        catch (Exception e) die(e.msg);
+        catch (Exception e)
+        {
+            // If the saved session's model failed at startup, fall back to the
+            // config default rather than failing the resume.
+            if (o.hasResume && !o.acp && !o.model.length && spec != cfg.model && cfg.model.length)
+            {
+                startupModelFallbackNote = format("the session's model %s is not available (%s); using %s",
+                    spec, e.msg, cfg.model);
+                spec = cfg.model;
+                try
+                {
+                    auto rp = resolve(cfg, spec);
+                    configuredWindow = windowFor(cfg, rp.config);
+                    return makeClient(rp);
+                }
+                catch (Exception e2) die(e2.msg);
+            }
+            die(e.msg);
+        }
     }();
 
     Policy policy;
@@ -2844,7 +2983,6 @@ int runMain(string[] args)
         return sources.length ? getcwd() ~ sources : null;
     });
 
-    auto cwd = getcwd();
     // Repository trust gates the repo's own skills, skill lock and hooks.
     bool trusted(string dir)
     {
@@ -3162,7 +3300,7 @@ int runMain(string[] args)
     try
     {
         if (o.hasResume)
-            foreach (n; loadSession(findSession(sessionDir, o.resume, cwd))) stdErr.writeln(n);
+            foreach (n; loadSession(resumePath.length ? resumePath : findSession(sessionDir, o.resume, cwd))) stdErr.writeln(n);
         else if (!o.noSession)
         {
             auto log = new SessionLog(sessionDir, spec, cwd);
@@ -3501,7 +3639,22 @@ int runMain(string[] args)
 
     // A `--resume`d session's runtime settings (issue #297) apply once the log
     // is adopted and `switchModel`/`syncMode` exist (declaration order).
-    if (o.hasResume) foreach (n; applyPendingSettings(true)) stdErr.writeln("nano-coder: " ~ n);
+    if (o.hasResume)
+    {
+        if (startupModelFallbackNote.length) stdErr.writeln("nano-coder: " ~ startupModelFallbackNote);
+        // If startup already fell back from `startupSavedModel` to `cfg.model`
+        // and emitted the notice, skip re-trying the same failed saved model.
+        if (startupModelFallbackNote.length && pendingSettings.set)
+        {
+            auto saved = pendingSettings.st.model.length ? pendingSettings.st.model : pendingSettings.headerModel;
+            if (saved == startupSavedModel)
+            {
+                pendingSettings.st.model = null;
+                pendingSettings.headerModel = null;
+            }
+        }
+        foreach (n; applyPendingSettings(true)) stdErr.writeln("nano-coder: " ~ n);
+    }
 
     // Explicit startup flags are recorded so a later flag-free resume keeps
     // them (issue #297): a fresh session's header holds only the model, and a
@@ -4096,6 +4249,16 @@ int runMain(string[] args)
                         () => systemFor(cwd, false));
                     catch (Exception e) { writeln(console.red("error: " ~ e.msg)); continue; }
                     auto log = agent.log;
+                    {
+                        // Seed the new log with live settings that `/restart`
+                        // retains (verbosity, sub-agents, context settings) so
+                        // a later flag-free resume restores them (issue #297).
+                        bool hasRetained;
+                        auto retained = retainedRestartSettings(cfg, verbosity, agent.subagentsOn,
+                            agent.compactionMode, agent.autoCompact, agent.autoCompactThreshold,
+                            agent.configuredWindow, agent.configuredWindowSource, hasRetained);
+                        if (hasRetained) logSessionSettings(retained);
+                    }
                     lastLoggedMode = agent.control.mode;
                     lastLoggedVerbosity = verbosity;
                     updateStatus((ref Stats s) { s.historySearches = s.historyReads = 0; });

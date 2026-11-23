@@ -3906,8 +3906,12 @@ class Agent
         if (logChange)
         {
             // A resume restores the session's last model (issue #297).
+            // Switching models resets the live context window to the new
+            // provider's configuration, so record `contextWindow = 0` to clear
+            // any earlier session override on resume too.
             SessionSettings s;
             s.model = c.providerName ~ "/" ~ c.modelName;
+            s.contextWindow = 0;
             logSettings(s);
         }
     }

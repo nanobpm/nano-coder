@@ -307,6 +307,61 @@ string logHeaderCwd(string path)
     return cwd;
 }
 
+/// The model a saved session will resume with: the latest `settings` record's
+/// `model` field, else the header's `model`, or null if unreadable (issue #297).
+/// Used at `--resume` startup to select the saved model before constructing the
+/// startup client, so a disabled or failing default provider does not block
+/// resuming a session whose own provider is usable.
+string logSavedModel(string path)
+{
+    string model;
+    try
+        streamLogLines(path, (line) {
+            // Fast path: skip lines that cannot be the header or a settings record.
+            if (!line.canFind(`"type":"session"`) && !line.canFind(`"type": "session"`)
+                && !line.canFind(`"type":"settings"`) && !line.canFind(`"type": "settings"`))
+                return;
+            JSONValue obj;
+            try obj = parseJSON(line);
+            catch (Exception) return; // a corrupt line does not block startup peeking
+            if (obj.type != JSONType.object) return;
+            auto t = "type" in obj, d = "data" in obj;
+            if (t is null || t.type != JSONType.string || d is null || d.type != JSONType.object) return;
+            if (t.str != "session" && t.str != "settings") return;
+            if (auto m = "model" in *d)
+                if (m.type == JSONType.string && m.str.length) model = m.str;
+        });
+    catch (Exception) {} // an unreadable or corrupt log falls back to config model
+    return model;
+}
+
+unittest // logSavedModel: header model, overridden by settings.model, corrupt lines ignored
+{
+    auto dir = buildPath(tempDir, "nano-coder-saved-model-test");
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) if (dir.exists) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "openai/gpt-4o", "/tmp");
+    auto p = log.path;
+    log.close();
+    assert(logSavedModel(p) == "openai/gpt-4o");
+
+    auto log2 = new SessionLog(p);
+    SessionSettings s1;
+    s1.verbosity = "verbose";
+    log2.settings(s1);
+    SessionSettings s2;
+    s2.model = "anthropic/claude-sonnet";
+    log2.settings(s2);
+    log2.close();
+    assert(logSavedModel(p) == "anthropic/claude-sonnet");
+
+    // Corrupt line and non-string model field are ignored.
+    std.file.append(p, "{not json\n");
+    std.file.append(p, `{"type":"settings","data":{"model":123}}` ~ "\n");
+    assert(logSavedModel(p) == "anthropic/claude-sonnet");
+    assert(logSavedModel(buildPath(dir, "missing.jsonl")) is null);
+}
+
 /// The session log directory: `NANO_CODER_SESSIONS`, else the configured
 /// `session_dir` (`~` expanded), else the platform data folder.
 string sessionDir(string configured = null)
