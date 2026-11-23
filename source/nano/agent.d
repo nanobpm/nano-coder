@@ -293,11 +293,11 @@ class Agent
     ref inout(Capabilities) capabilities() inout pure return { return probe.caps; }
     version (unittest)
     {
-        /// Test hook: runs in `prepareCall` after the first probe
-        /// collection, just before the first threshold check. A test that
-        /// needs a probe to land after the first check gates the probe and
-        /// opens the gate here — blocking inside a publication instead
-        /// deadlocks the agent thread against this hook.
+        /// Test hook: runs in `prepareCall` after the first
+        /// threshold-compaction block, just before `applyModelRequest`. A
+        /// test that needs a probe to land after the first check gates the
+        /// probe and opens the gate here — blocking inside a publication
+        /// instead deadlocks the agent thread against this hook.
         void delegate() onThresholdChecked;
     }
     private ProviderConfig noProvider;
@@ -871,13 +871,13 @@ class Agent
         // Publish finished probes first: one can lower the window, which
         // the threshold check below must see.
         collectProbes();
-        version (unittest) if (onThresholdChecked !is null) onThresholdChecked();
         if (overThreshold())
         {
             CompactReport rep;
             compact(rep, CompactTrigger.threshold, null, null, some(ev));
             if (control.isCancelled) return false;
         }
+        version (unittest) if (onThresholdChecked !is null) onThresholdChecked();
         // A switch (or a probe collected with it) can lower the window
         // again: recheck before the request goes out. Apply and collect
         // unconditionally first — a probe `applyModelRequest` publishes can

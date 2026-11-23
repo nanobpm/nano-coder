@@ -395,7 +395,7 @@ unittest
     // The probe's result must land after prepareCall's first threshold check
     // but before its apply: only the unconditional recheck can catch it.
     // Keep the probe gated until the first check has read the state (the
-    // hook at agent.d:874), then wait for the worker to finish there — never
+    // hook at agent.d:880), then wait for the worker to finish there — never
     // block inside the publish hook: a probe that completes before the first
     // collection publishes on the agent thread, and blocking there deadlocks
     // the test against the very check hook that would release it. Settle the
