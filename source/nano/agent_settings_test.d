@@ -123,13 +123,17 @@ unittest
 }
 
 // issue #297: a model switch writes a `settings` record with the new
-// provider/model, so a resume restores it.
+// provider/model, so a resume restores it; restoring with `logChange = false`
+// does not append a duplicate record.
 unittest
 {
     auto agent = logged("model-record", new MockClient([]));
     auto other = new MockClient([]);
     agent.useClient(other, ConfiguredWindow.init);
     assert(records(agent).any!(r => r["type"].str == "settings" && r["data"]["model"].str == "mock/mock"));
+    auto before = records(agent).length;
+    agent.useClient(new MockClient([]), ConfiguredWindow.init, false);
+    assert(records(agent).length == before, "restore switch does not write a duplicate settings record");
 }
 
 // issue #297: `/subagents off` mid-turn writes a `settings` record, so a
@@ -143,4 +147,39 @@ unittest
     assert(!agent.subagentsOn);
     assert(records(agent).any!(r => r["type"].str == "settings" && "subagents" in r["data"]
         && r["data"]["subagents"].boolean == false));
+}
+
+// issue #297: mid-turn `/thinking` writes a `settings` record distinguishing
+// `"default"` from `"reset"`, and both round-trip via `sessionSetting`.
+unittest
+{
+    import std.conv : to;
+    import nano.result : unwrap;
+    import nano.thinking : Thinking, sessionSetting, sessionSettingValue;
+    auto mock = new MockClient([LLMResponse("ok"), LLMResponse("ok"), LLMResponse("ok")]);
+    auto agent = logged("thinking-record", mock);
+    agent.control.requestThinking("high");
+    agent.run("go1", new NullEvents);
+    assert(!agent.sessionThinking.isNull && agent.sessionThinking.get == Thinking.of("high"));
+    agent.control.requestThinking("default");
+    agent.run("go2", new NullEvents);
+    assert(!agent.sessionThinking.isNull && agent.sessionThinking.get == Thinking.init);
+    agent.control.requestThinking("reset");
+    agent.run("go3", new NullEvents);
+    assert(agent.sessionThinking.isNull);
+    string[] loggedThinking;
+    foreach (r; records(agent))
+        if (r["type"].str == "settings" && "thinking" in r["data"])
+            loggedThinking ~= r["data"]["thinking"].str;
+    assert(loggedThinking == ["high", "default", "reset"], loggedThinking.to!string);
+    // Round-trip check via sessionSetting + sessionSettingValue.
+    foreach (v; ["high", "off", "default", "reset"])
+    {
+        auto parsed = sessionSetting(v);
+        assert(!parsed.isErr);
+        assert(sessionSettingValue(parsed.unwrap("isOk")) == v);
+    }
+    assert(sessionSetting("default").unwrap("ok").isNull == false);
+    assert(sessionSetting("reset").unwrap("ok").isNull == true);
+    assert(sessionSetting("bad level!").isErr);
 }

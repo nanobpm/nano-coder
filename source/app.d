@@ -3221,8 +3221,10 @@ int runMain(string[] args)
 
     /// Switch the model (history carries over); the "Model set to" text.
     /// `queued`: a `/model` from mid-turn, already taken off the queue; a
-    /// direct switch also drops one still queued.
-    string switchModel(string spec, bool queued = false)
+    /// direct switch also drops one still queued. `record`: false when
+    /// restoring a resumed session's own model (avoids appending a duplicate
+    /// `settings` record or rewriting recents).
+    string switchModel(string spec, bool queued = false, bool record = true)
     {
         auto previous = currentSpec();
         LLMClient build(string s, out ConfiguredWindow w)
@@ -3237,15 +3239,18 @@ int runMain(string[] args)
         {
             ConfiguredWindow w;
             auto c = build(spec, w);
-            agent.useClient(c, w);
+            agent.useClient(c, w, record);
         }
-        else agent.setModel(spec, &build);
+        else agent.setModel(spec, &build, record);
         client = agent.client;
-        synchronized
+        if (record)
         {
-            recents.record(previous);
-            recents.record(nano.recents.canonical(spec, cfg.providers, cfg.defaultProvider));
-            nano.recents.save(recentsPath, recents);
+            synchronized
+            {
+                recents.record(previous);
+                recents.record(nano.recents.canonical(spec, cfg.providers, cfg.defaultProvider));
+                nano.recents.save(recentsPath, recents);
+            }
         }
         auto text = format("Model set to %s (provider %s)", client.modelName, client.providerName);
         foreach (w; settingWarnings(agent)) text ~= "\nWarning: " ~ w;
@@ -3278,48 +3283,126 @@ int runMain(string[] args)
     }
     console.afterStep = &refreshView;
 
-    // The system prompt's plan section follows the mode; Shift-Tab mid-turn
-    // only switches the live mode, so the prompt catches up at the next turn.
+    // The system prompt's plan section follows the mode; Shift-Tab and
+    // mid-turn `/mode` or `/verbosity` change live state on the key-reader
+    // thread, so `syncMode` / `syncRuntimeSettings` catch the prompt and log up
+    // on the agent thread.
     agent.promptPlan = o.plan;
-    void syncMode() { agent.syncModePrompt((bool plan) => systemFor(cwd, plan)); }
+    AgentMode lastLoggedMode = agent.control.mode;
+    Verbosity lastLoggedVerbosity = verbosity;
+    void logModeIfChanged()
+    {
+        auto m = agent.control.mode;
+        if (m == lastLoggedMode) return;
+        lastLoggedMode = m;
+        SessionSettings s;
+        s.mode = m.name;
+        logSessionSettings(s);
+    }
+    void logVerbosityIfChanged()
+    {
+        auto v = verbosity;
+        if (v == lastLoggedVerbosity) return;
+        lastLoggedVerbosity = v;
+        SessionSettings s;
+        s.verbosity = nano.ui.name(v);
+        logSessionSettings(s);
+    }
+    void syncMode()
+    {
+        agent.syncModePrompt((bool plan) => systemFor(cwd, plan));
+        logModeIfChanged();
+    }
+    void syncRuntimeSettings()
+    {
+        syncMode();
+        logVerbosityIfChanged();
+    }
 
 
 
     /// Apply the runtime settings a resumed session logged (issue #297), so
     /// it carries on with the model, mode, verbosity, thinking level,
     /// sub-agents switch and context settings it stopped with. Precedence:
-    /// an explicit `-m`/`--model` or `--verbosity` on the resume command line
-    /// wins, then the session's last recorded value, then the config default
-    /// (already in effect). The header's model is the starting value for a
-    /// log with no settings records. A provider or model that is gone falls
-    /// back to the config default with a notice; the resume never fails.
-    void applyRestoredSettings(const SessionSettings st, string headerModel, ref string[] notes)
+    /// on startup `--resume` (`explicitFlags = true`), explicit `-m`/`--model`,
+    /// `--verbosity` and `--plan` flags win, then the session's last recorded
+    /// value, then the config default. On an in-session `/resume`
+    /// (`explicitFlags = false`), startup CLI flags do not override the
+    /// target session and settings the previous session modified are reset to
+    /// config defaults before applying `st`. The header's model is the starting
+    /// value for a log with no settings records. A provider or model that is
+    /// gone falls back to the config default with a notice; the resume never
+    /// fails.
+    void applyRestoredSettings(const SessionSettings st, string headerModel, bool explicitFlags, ref string[] notes)
     {
         import nano.context : parseCompactionMode;
-        import nano.thinking : Thinking;
+        import nano.thinking : sessionSetting;
         import std.math : isNaN;
 
-        // The model: explicit flag > session's last record > session header >
-        // what the session already runs (the config default).
-        auto wanted = o.model.length ? o.model : st.model.length ? st.model : headerModel;
-        if (wanted.length && wanted != client.providerName ~ "/" ~ client.modelName)
+        if (!explicitFlags)
         {
-            try switchModel(wanted);
+            // Switching sessions in-process (`/resume`): reset settings the
+            // session being left may have changed so they do not leak into a
+            // target session with no `settings` record for them.
+            setVerbosity(cfg.verbosity);
+            agent.subagentsOn = cfg.subagents;
+            parseCompactionMode(cfg.compactionMode).match!((m) { agent.compactionMode = m; }, () {});
+            agent.autoCompact = cfg.autoCompact;
+            agent.autoCompactThreshold = cfg.autoCompactThreshold;
+        }
+
+        // The model: explicit flag > session's last record > session header >
+        // config default. Canonicalize before comparing so a short alias that
+        // resolves to the already-active client does not rebuild it.
+        auto wanted = explicitFlags && o.model.length ? o.model
+            : st.model.length ? st.model
+            : headerModel.length ? headerModel
+            : cfg.model;
+        auto current = client.providerName ~ "/" ~ client.modelName;
+        auto canonWanted = wanted.length ? nano.recents.canonical(wanted, cfg.providers, cfg.defaultProvider) : null;
+        bool switchedModel;
+        if (wanted.length && canonWanted != current && wanted != current)
+        {
+            try
+            {
+                switchModel(wanted, false, false);
+                switchedModel = true;
+            }
             catch (Exception e)
             {
+                auto fallback = current;
                 notes ~= format("the session's model %s is not available (%s); using %s from the config",
-                    wanted, e.msg, spec);
+                    wanted, e.msg, fallback);
                 // `switchModel` builds the new client before swapping, so a
-                // failure leaves the config default running.
+                // failure leaves the current client running.
             }
         }
-        if (st.mode.length)
+        if (!explicitFlags && !switchedModel && st.contextWindow < 0)
+        {
+            // Reset any context-window override left by the previous session.
+            auto pc = client.providerName in cfg.providers;
+            agent.setConfiguredWindow(pc !is null ? windowFor(cfg, *pc)
+                : cfg.contextWindow > 0 ? ConfiguredWindow(toSize(cfg.contextWindow), "context_window in config")
+                : ConfiguredWindow.init);
+        }
+        if (explicitFlags && o.plan)
+        {
+            agent.control.mode = AgentMode.plan;
+            agent.syncModePrompt((bool plan) => systemFor(cwd, plan));
+            updateStatus((ref Stats s) { s.mode = AgentMode.plan; });
+        }
+        else if (st.mode.length)
             parseMode(st.mode).match!((m) {
                 agent.control.mode = m;
-                syncMode();
+                agent.syncModePrompt((bool plan) => systemFor(cwd, plan));
                 updateStatus((ref Stats s) { s.mode = m; });
             }, (e) { notes ~= "the saved mode: " ~ e; });
-        if (st.verbosity.length && !o.verbosity.length)
+        else
+        {
+            agent.syncModePrompt((bool plan) => systemFor(cwd, plan));
+            updateStatus((ref Stats s) { s.mode = agent.control.mode; });
+        }
+        if (st.verbosity.length && !(explicitFlags && o.verbosity.length))
         {
             import nano.ui : allVerbosities, vname = name;
             import std.algorithm.searching : find;
@@ -3329,11 +3412,9 @@ int runMain(string[] args)
         }
         if (st.thinking.length)
         {
-            // `sessionSetting` validated the level when it was logged.
-            Thinking t;
-            if (st.thinking == "off") t = Thinking.off;
-            else if (st.thinking != "default") t = Thinking.of(st.thinking);
-            agent.sessionThinking = t;
+            auto setting = sessionSetting(st.thinking);
+            if (setting.isErr) notes ~= "the saved thinking level is invalid: " ~ setting.unwrapErr("isErr");
+            else agent.sessionThinking = setting.unwrap("isOk");
         }
         if (st.subagents >= 0) agent.subagentsOn = st.subagents != 0;
         if (st.compactionMode.length)
@@ -3348,19 +3429,23 @@ int runMain(string[] args)
             else
             {
                 // The session cleared the override: re-resolve from the config.
-                auto rp = resolve(cfg, client.providerName ~ "/" ~ client.modelName);
-                agent.setConfiguredWindow(windowFor(cfg, rp.config));
+                auto pc = client.providerName in cfg.providers;
+                agent.setConfiguredWindow(pc !is null ? windowFor(cfg, *pc)
+                    : cfg.contextWindow > 0 ? ConfiguredWindow(toSize(cfg.contextWindow), "context_window in config")
+                    : ConfiguredWindow.init);
             }
         }
+        lastLoggedMode = agent.control.mode;
+        lastLoggedVerbosity = verbosity;
     }
 
     /// Apply the settings of the session just loaded, if any; the notes.
-    string[] applyPendingSettings()
+    string[] applyPendingSettings(bool explicitFlags)
     {
         string[] notes;
         if (pendingSettings.set)
         {
-            applyRestoredSettings(pendingSettings.st, pendingSettings.headerModel, notes);
+            applyRestoredSettings(pendingSettings.st, pendingSettings.headerModel, explicitFlags, notes);
             pendingSettings = PendingSettings.init;
         }
         return notes;
@@ -3368,7 +3453,7 @@ int runMain(string[] args)
 
     // A `--resume`d session's runtime settings (issue #297) apply once the log
     // is adopted and `switchModel`/`syncMode` exist (declaration order).
-    if (o.hasResume) foreach (n; applyPendingSettings()) stdErr.writeln("nano-coder: " ~ n);
+    if (o.hasResume) foreach (n; applyPendingSettings(true)) stdErr.writeln("nano-coder: " ~ n);
 
 
     // Re-read the instruction files (AGENTS.md, CLAUDE.md, rules, your own
@@ -3423,9 +3508,7 @@ int runMain(string[] args)
         };
         onVerbosity = (Verbosity v) {
             setVerbosity(v);
-            SessionSettings s;
-            s.verbosity = nano.ui.name(v);
-            logSessionSettings(s);
+            logVerbosityIfChanged();
         };
         h.logSettings = (const SessionSettings s) { logSessionSettings(s); };
         return h;
@@ -3512,6 +3595,7 @@ int runMain(string[] args)
         updateStatus((ref Stats s) { s.activity = Activity.thinking; s.tokensPerSec = 0; });
         scope (exit)
         {
+            syncRuntimeSettings();
             refreshStatus();
             updateStatus((ref Stats s) { s.activity = Activity.idle; s.tokensPerSec = 0; });
         }
@@ -3819,7 +3903,7 @@ int runMain(string[] args)
                 || (releaseNotice && releaseNotice.tryTake(fetchedNotice));
             auto r = ed.readLine(.stamp(false) ~ "› ", console.stamp() ~ glyphMark ~ " ", false, lapse);
             ed.restyle = null;
-            syncMode(); // Shift-Tab at the prompt switched the mode
+            syncRuntimeSettings(); // Shift-Tab at the prompt switched the mode
             ed.onIdleEscEsc = null;
             // Show a hint or notice the lapse already took before anything else:
             // the timer and idle branches below would otherwise drop it, and the
@@ -3952,6 +4036,8 @@ int runMain(string[] args)
                         () => systemFor(cwd, false));
                     catch (Exception e) { writeln(console.red("error: " ~ e.msg)); continue; }
                     auto log = agent.log;
+                    lastLoggedMode = agent.control.mode;
+                    lastLoggedVerbosity = verbosity;
                     updateStatus((ref Stats s) { s.historySearches = s.historyReads = 0; });
                     agent.useHooks(loadHooks(cwd), false);
                     if (gFrame) gFrame.clear();
@@ -4004,11 +4090,7 @@ int runMain(string[] args)
                         {
                             auto v = parseVerbosity(arg);
                             setVerbosity(v);
-                            {
-                                SessionSettings s;
-                                s.verbosity = nano.ui.name(v);
-                                logSessionSettings(s);
-                            }
+                            logVerbosityIfChanged();
                             writefln("Verbosity set to %s (%s); /settings saves it", nano.ui.name(v), nano.ui.describe(v));
                         }
                         catch (Exception e) writeln(e.msg);
@@ -4033,7 +4115,7 @@ int runMain(string[] args)
                     continue;
                 }
                 case "/thinking":
-                    import nano.thinking : Thinking, statusText, sessionSetting;
+                    import nano.thinking : statusText, sessionSetting, sessionSettingValue;
                     if (arg.length)
                     {
                         auto setting = sessionSetting(arg);
@@ -4041,9 +4123,8 @@ int runMain(string[] args)
                         agent.sessionThinking = setting.unwrap("isOk");
                         {
                             // A resume restores the session's thinking level (#297).
-                            auto t = agent.sessionThinking;
                             SessionSettings s;
-                            s.thinking = t.isNull ? "default" : t.get.kind == Thinking.Kind.off ? "off" : t.get.level;
+                            s.thinking = sessionSettingValue(agent.sessionThinking);
                             logSessionSettings(s);
                         }
                         auto r = agent.thinking();
@@ -4077,12 +4158,6 @@ int runMain(string[] args)
                     parseMode(arg).match!((m) {
                         agent.control.mode = m;
                         syncMode();
-                        {
-                            // A resume restores the session's mode (#297).
-                            SessionSettings s;
-                            s.mode = m.name;
-                            logSessionSettings(s);
-                        }
                         writefln("Mode set to %s (%s)", m.name, m.describe);
                     }, e => writeln(e));
                     continue;
@@ -4153,7 +4228,7 @@ int runMain(string[] args)
                     agent.stopSubagents(); // they belong to the session being left
                     try loadNotes = loadSession(path);
                     catch (Exception e) { writeln(e.msg); continue; }
-                    foreach (n; applyPendingSettings()) loadNotes ~= "nano-coder: " ~ n;
+                    foreach (n; applyPendingSettings(false)) loadNotes ~= "nano-coder: " ~ n;
                     if (gFrame) { gFrame.clear(); replayTranscript(agent, console); releaseHeap(); }
                     foreach (n; loadNotes) stdErr.writeln(n);
                     stdErr.flush();

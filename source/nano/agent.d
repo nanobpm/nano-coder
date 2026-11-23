@@ -929,9 +929,13 @@ class Agent
         }
         if (auto level = control.takeThinkingRequest())
         {
-            import nano.thinking : sessionSetting;
+            import nano.thinking : sessionSetting, sessionSettingValue;
             // Checked when it was typed, so this can't fail.
             sessionThinking = sessionSetting(level).unwrap("validated when typed");
+            // A resume restores the session's thinking level (#297).
+            SessionSettings ss;
+            ss.thinking = sessionSettingValue(sessionThinking);
+            logSettings(ss);
         }
         return true;
     }
@@ -3869,17 +3873,18 @@ class Agent
     /// A direct switch (at the prompt or from settings): it supersedes a
     /// `/model` still queued from the last turn, even when `build` fails, and
     /// a failed build changes nothing else.
-    void setModel(string spec, LLMClient delegate(string spec, out ConfiguredWindow window) @safe build)
+    void setModel(string spec, LLMClient delegate(string spec, out ConfiguredWindow window) @safe build,
+        bool logChange = true)
     {
         control.takeModelRequest();
         ConfiguredWindow window;
         auto c = build(spec, window);
-        useClient(c, window);
+        useClient(c, window, logChange);
     }
 
     /// Switch to a built client; history carries over, what was learned about
     /// the old model doesn't.
-    void useClient(LLMClient c, ConfiguredWindow window)
+    void useClient(LLMClient c, ConfiguredWindow window, bool logChange = true)
     {
         client = c;
         setConfiguredWindow(window);
@@ -3888,15 +3893,18 @@ class Agent
         // A mid-turn switch never waits on the endpoint.
         if (midTurnSwitch) startBackgroundProbe();
         else refreshCapabilities();
-        // A resume restores the session's last model (issue #297).
-        SessionSettings s;
-        s.model = c.providerName ~ "/" ~ c.modelName;
-        logSettings(s);
+        if (logChange)
+        {
+            // A resume restores the session's last model (issue #297).
+            SessionSettings s;
+            s.model = c.providerName ~ "/" ~ c.modelName;
+            logSettings(s);
+        }
     }
 
     /// Record a runtime settings change in the session log (issue #297): a
     /// resumed session restores the latest record of each field.
-    private void logSettings(const SessionSettings s)
+    void logSettings(const SessionSettings s)
     {
         log.ifSome((SessionLog l) { l.settings(s); });
     }

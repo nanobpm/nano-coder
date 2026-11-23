@@ -1231,7 +1231,7 @@ struct SessionSettings
     string mode;
     /// `/verbosity` name (empty: unchanged).
     string verbosity;
-    /// `/thinking`: "default", "off" or a level name (empty: unchanged).
+    /// `/thinking`: "reset" (clear override), "default", "off" or a level name (empty: unchanged).
     string thinking;
     /// `/subagents`: 1 on, 0 off, -1 unchanged.
     int subagents = -1;
@@ -1994,17 +1994,38 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
             break;
         case "settings":
             // The latest record of each field wins (issue #297); a field a
-            // record omits keeps its earlier value.
-            if (auto v = "model" in data) r.settings.model = v.str;
-            if (auto v = "mode" in data) r.settings.mode = v.str;
-            if (auto v = "verbosity" in data) r.settings.verbosity = v.str;
-            if (auto v = "thinking" in data) r.settings.thinking = v.str;
-            if (auto v = "subagents" in data) r.settings.subagents = v.boolean ? 1 : 0;
-            if (auto v = "compaction_mode" in data) r.settings.compactionMode = v.str;
-            if (auto v = "auto_compact" in data) r.settings.autoCompact = v.boolean ? 1 : 0;
+            // record omits keeps its earlier value. Hand-edited or corrupt
+            // fields with the wrong JSON type or out-of-range values are
+            // ignored instead of failing the resume.
+            if (auto v = "model" in data)
+                if (v.type == JSONType.string) r.settings.model = v.str;
+            if (auto v = "mode" in data)
+                if (v.type == JSONType.string) r.settings.mode = v.str;
+            if (auto v = "verbosity" in data)
+                if (v.type == JSONType.string) r.settings.verbosity = v.str;
+            if (auto v = "thinking" in data)
+                if (v.type == JSONType.string) r.settings.thinking = v.str;
+            if (auto v = "subagents" in data)
+                if (v.type == JSONType.true_ || v.type == JSONType.false_)
+                    r.settings.subagents = v.type == JSONType.true_ ? 1 : 0;
+            if (auto v = "compaction_mode" in data)
+                if (v.type == JSONType.string) r.settings.compactionMode = v.str;
+            if (auto v = "auto_compact" in data)
+                if (v.type == JSONType.true_ || v.type == JSONType.false_)
+                    r.settings.autoCompact = v.type == JSONType.true_ ? 1 : 0;
             if (auto v = "auto_compact_threshold" in data)
-                r.settings.autoCompactThreshold = v.type == JSONType.float_ ? v.floating : v.integer;
-            if (auto v = "context_window" in data) r.settings.contextWindow = v.integer;
+            {
+                double t = double.nan;
+                ulong n;
+                if (v.type == JSONType.float_) t = v.floating;
+                else if (jsonUnsigned(*v, n)) t = n;
+                if (t > 0.0 && t <= 1.0) r.settings.autoCompactThreshold = t;
+            }
+            if (auto v = "context_window" in data)
+            {
+                ulong n;
+                if (jsonUnsigned(*v, n) && n <= long.max) r.settings.contextWindow = n.to!long;
+            }
             break;
         default: // hooks, setting: audit only
             break;
@@ -2676,6 +2697,52 @@ unittest
     log.settings(s);
     auto r = restore(log.path);
     assert(r.settings.contextWindow == 0);
+}
+
+// issue #297: corrupt or hand-edited `settings` records with wrong JSON types
+// or out-of-range numeric values are ignored per-field instead of failing the
+// resume; uinteger context_window values still decode via jsonUnsigned.
+unittest
+{
+    auto dir = buildPath(tempDir, "nano-coder-session-settings-corrupt");
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/a", "/x");
+    auto sys = Message.system("sys");
+    log.append(sys);
+    SessionSettings good;
+    good.model = "mock/good";
+    good.mode = "plan";
+    good.verbosity = "verbose";
+    good.thinking = "high";
+    good.subagents = 1;
+    good.compactionMode = "smart";
+    good.autoCompact = 1;
+    good.autoCompactThreshold = 0.75;
+    good.contextWindow = 64_000;
+    log.settings(good);
+    log.close();
+    // Append a malformed settings record with wrong types and out-of-range numbers.
+    std.file.append(log.path, `{"type":"settings","data":{"model":123,"mode":true,"verbosity":[],`
+        ~ `"thinking":{},"subagents":"yes","compaction_mode":42,"auto_compact":"no",`
+        ~ `"auto_compact_threshold":"bad","context_window":"nope"}}` ~ "\n");
+    std.file.append(log.path, `{"type":"settings","data":{"auto_compact_threshold":-0.5,"context_window":-10}}` ~ "\n");
+    std.file.append(log.path, `{"type":"settings","data":{"auto_compact_threshold":1.5}}` ~ "\n");
+    auto r = restore(log.path);
+    assert(r.settings.model == "mock/good");
+    assert(r.settings.mode == "plan");
+    assert(r.settings.verbosity == "verbose");
+    assert(r.settings.thinking == "high");
+    assert(r.settings.subagents == 1);
+    assert(r.settings.compactionMode == "smart");
+    assert(r.settings.autoCompact == 1);
+    assert(imported!"std.math".isClose(r.settings.autoCompactThreshold, 0.75));
+    assert(r.settings.contextWindow == 64_000);
+    // A valid integer threshold (1) and large positive context_window still apply.
+    std.file.append(log.path, `{"type":"settings","data":{"auto_compact_threshold":1,"context_window":200000}}` ~ "\n");
+    auto r2 = restore(log.path);
+    assert(r2.settings.autoCompactThreshold == 1.0);
+    assert(r2.settings.contextWindow == 200_000);
 }
 
 // rust: session_index.rs::set_title_does_not_replace_an_existing_title

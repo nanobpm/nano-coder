@@ -527,6 +527,16 @@ Result!(Nullable!Thinking, string) sessionSetting(string arg) pure
     return Thinking.parse(arg).map!(t => Nullable!Thinking(t));
 }
 
+/// The `settings` record spelling of a session thinking override: `"reset"`
+/// clears the override (config applies), `"default"` pins the model's default,
+/// `"off"` disables thinking, and any other value is a level name. Round-trips
+/// through `sessionSetting`.
+string sessionSettingValue(T)(const T t) pure
+{
+    if (t.isNull) return "reset";
+    return t.get.configValue();
+}
+
 /// The level in `levels` nearest to `wanted`: the highest at or below it on
 /// ORDER, else the lowest above it. A name off the scale matches only itself.
 string nearest(const string[] levels, string wanted) pure

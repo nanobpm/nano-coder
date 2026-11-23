@@ -387,6 +387,14 @@ final class AcpServer : AgentEvents
     private string sessionId_;
     private size_t messageSeq;
     private bool releaseNoticeSent;
+    // Defaults captured at server construction so `session/load` resets
+    // runtime settings left by an earlier session before applying the loaded
+    // session's `settings` records.
+    private bool defaultSubagentsOn;
+    private imported!"nano.context".CompactionMode defaultCompactionMode;
+    private bool defaultAutoCompact;
+    private double defaultAutoCompactThreshold;
+    private ConfiguredWindow defaultConfiguredWindow;
 
     /// `writeLine` gets one JSON message per call (defaults to stdout).
     this(Agent agent, Host host, void delegate(string) @safe writeLine = null)
@@ -394,6 +402,11 @@ final class AcpServer : AgentEvents
         this.agent = agent;
         // The ACP orchestrator runs its own verification (Rust #158).
         agent.verifyBeforeComplete = false;
+        defaultSubagentsOn = agent.subagentsOn;
+        defaultCompactionMode = agent.compactionMode;
+        defaultAutoCompact = agent.autoCompact;
+        defaultAutoCompactThreshold = agent.autoCompactThreshold;
+        defaultConfiguredWindow = ConfiguredWindow(agent.configuredWindow, agent.configuredWindowSource);
         this.host = host;
         outLock = new Mutex;
         router = AcpRouter.make(agent.control.nonNull);
@@ -726,6 +739,12 @@ final class AcpServer : AgentEvents
             try agent.client = host.makeClient(text[7 .. $].strip);
             catch (Exception e) return rpcError(id, -32602, e.msg);
             agent.refreshCapabilities();
+            {
+                // A resume restores the session's model (#297).
+                SessionSettings ss;
+                ss.model = agent.client.providerName ~ "/" ~ agent.client.modelName;
+                agent.logSettings(ss);
+            }
             auto temp = agent.temperatureNow;
             auto th = agent.thinking();
             JSONValue body_ = ["stopReason": "end_turn", "provider": agent.client.providerName,
@@ -753,7 +772,15 @@ final class AcpServer : AgentEvents
                 if (!agent.subagentsEnabled) return rpcError(id, -32602, "sub-agents are not available in this session");
                 if (t.save && host.saveSubagents is null) return rpcError(id, -32602, "/subagents: --save is not available");
                 agent.control.takeSubagentsRequest(); // a direct switch supersedes a queued one
+                auto was = agent.subagentsOn;
                 agent.subagentsOn = t.on;
+                if (was != t.on)
+                {
+                    // A resume restores the session's sub-agents switch (#297).
+                    SessionSettings ss;
+                    ss.subagents = t.on ? 1 : 0;
+                    agent.logSettings(ss);
+                }
                 if (t.save) body_["saved"] = host.saveSubagents(t.on);
             }
             auto model = agent.subagentModel.length ? agent.subagentModel
@@ -770,9 +797,16 @@ final class AcpServer : AgentEvents
             auto arg = text["/thinking".length .. $].strip;
             if (arg.length)
             {
+                import nano.thinking : sessionSettingValue;
                 auto setting = sessionSetting(arg);
                 if (setting.isErr) return rpcError(id, -32602, setting.unwrapErr("isErr"));
                 agent.sessionThinking = setting.unwrap("isOk");
+                {
+                    // A resume restores the session's thinking level (#297).
+                    SessionSettings ss;
+                    ss.thinking = sessionSettingValue(agent.sessionThinking);
+                    agent.logSettings(ss);
+                }
             }
             auto th = agent.thinking();
             JSONValue body_ = ["stopReason": "end_turn"];
@@ -848,6 +882,7 @@ final class AcpServer : AgentEvents
         scope (failure) if (!agent.ownsLog(log)) agent.messages = prior;
         agent.messages = sys.length ? [Message.system(sys)] : null;
         agent.loadRestored(restored, some(log)); // ACP has no channel for the dropped-state notes
+        applyRestoredSettings(restored.settings, restored.model);
         sessionId = log.id;
         if (host.loadHooks !is null) agent.useHooks(host.loadHooks(getcwd()), true);
         replayHistory();
@@ -857,6 +892,55 @@ final class AcpServer : AgentEvents
         restored = Restored.init;
         prior = null;
         releaseHeap();
+    }
+
+    /// Apply the runtime settings a loaded session logged (issue #297): model,
+    /// mode, thinking, sub-agents and context settings. A model that is no
+    /// longer available keeps the current client rather than failing the load.
+    private void applyRestoredSettings(const SessionSettings st, string headerModel)
+    {
+        import nano.context : parseCompactionMode;
+        import nano.mode : parseMode;
+        import nano.arith : toSize;
+        import std.math : isNaN;
+
+        // Reset settings an earlier session on this server may have changed so
+        // they do not leak into a loaded session with no record for them.
+        agent.subagentsOn = defaultSubagentsOn;
+        agent.compactionMode = defaultCompactionMode;
+        agent.autoCompact = defaultAutoCompact;
+        agent.autoCompactThreshold = defaultAutoCompactThreshold;
+        agent.setConfiguredWindow(defaultConfiguredWindow);
+
+        auto wanted = st.model.length ? st.model : headerModel;
+        if (wanted.length && host.makeClient !is null
+            && wanted != agent.client.providerName ~ "/" ~ agent.client.modelName)
+        {
+            import std.exception : collectException;
+            auto e = collectException(() {
+                agent.client = host.makeClient(wanted);
+                agent.refreshCapabilities();
+            }());
+            if (e !is null)
+                stdErr.writeln("nano-coder: ACP session/load: could not restore model ", wanted, ": ", e.msg);
+        }
+        if (st.mode.length)
+        {
+            import nano.result : match;
+            parseMode(st.mode).match!((m) { agent.control.mode = m; }, (string) {});
+        }
+        if (st.thinking.length)
+        {
+            auto setting = sessionSetting(st.thinking);
+            if (!setting.isErr) agent.sessionThinking = setting.unwrap("isOk");
+        }
+        if (st.subagents >= 0) agent.subagentsOn = st.subagents != 0;
+        if (st.compactionMode.length)
+            parseCompactionMode(st.compactionMode).match!((m) { agent.compactionMode = m; }, () {});
+        if (st.autoCompact >= 0) agent.autoCompact = st.autoCompact != 0;
+        if (!st.autoCompactThreshold.isNaN) agent.autoCompactThreshold = st.autoCompactThreshold;
+        if (st.contextWindow > 0)
+            agent.setConfiguredWindow(ConfiguredWindow(toSize(st.contextWindow), "the session's settings"));
     }
 
     /// Replay the conversation as session/update notifications.
@@ -1252,4 +1336,87 @@ unittest
     assert(!byId[3]["result"]["tools"].arrayNoRef.canFind!(t => t.str == "agent"));
     assert(byId[4]["error"]["message"].str.canFind("--save"), "no host save: refused");
     assert(byId[5]["result"]["subagents"].boolean && agent.offeredTools.canFind!(t => t.name == "agent"));
+}
+
+// issue #297: ACP `/model`, `/subagents` and `/thinking` log `settings`
+// records, and `session/load` restores them (without failing when a model is
+// unavailable).
+unittest
+{
+    import std.file : exists, rmdirRecurse, tempDir;
+    import std.path : buildPath;
+    import nano.providers.mock;
+    import nano.tools;
+    import nano.permissions : Policy;
+    import nano.subagent : SubClientFactory;
+    import nano.thinking : Thinking;
+    static final class NoClients : SubClientFactory
+    {
+        LLMClient make(string spec) const { assert(0, "no sub-agent runs here"); }
+    }
+    static final class NamedMock : MockClient
+    {
+        string prov, mod;
+        this(string p, string m) pure { super([]); prov = p; mod = m; }
+        override string providerName() const pure { return prov; }
+        override string modelName() const pure { return mod; }
+    }
+    auto dir = buildPath(tempDir, "nano-acp-settings-restore");
+    if (exists(dir)) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+
+    auto agent1 = new Agent(new MockClient([]), new ToolRegistry, Policy.init, null);
+    agent1.subagentClients = new immutable NoClients;
+    string[] lines1;
+    Host host1;
+    host1.systemPrompt = (string cwd) => "sys";
+    host1.makeClient = (string spec) => new NamedMock("alt", spec);
+    host1.sessionDir = dir;
+    host1.version_ = "test";
+    auto srv1 = new AcpServer(agent1, host1, (string l) { lines1 ~= l; });
+    srv1.receive(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}`);
+    srv1.receive(`{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"prompt":[{"type":"text","text":"/model other"}]}}`);
+    srv1.receive(`{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"prompt":[{"type":"text","text":"/subagents off"}]}}`);
+    srv1.receive(`{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"prompt":[{"type":"text","text":"/thinking high"}]}}`);
+    srv1.close();
+    assert(srv1.run());
+    auto sid = parseJSON(lines1[0])["result"]["sessionId"].str;
+    agent1.replaceLog(Option!SessionLog.init);
+
+    auto agent2 = new Agent(new MockClient([]), new ToolRegistry, Policy.init, null);
+    agent2.subagentClients = new immutable NoClients;
+    string[] lines2;
+    Host host2;
+    host2.systemPrompt = (string cwd) => "sys";
+    host2.makeClient = (string spec) {
+        assert(spec == "alt/other", spec);
+        return new NamedMock("alt", "other");
+    };
+    host2.sessionDir = dir;
+    host2.version_ = "test";
+    auto srv2 = new AcpServer(agent2, host2, (string l) { lines2 ~= l; });
+    srv2.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ sid ~ `"}}`);
+    srv2.close();
+    assert(srv2.run());
+    assert(agent2.client.providerName == "alt" && agent2.client.modelName == "other");
+    assert(!agent2.subagentsOn);
+    assert(!agent2.sessionThinking.isNull && agent2.sessionThinking.get == Thinking.of("high"));
+    agent2.replaceLog(Option!SessionLog.init);
+
+    // An unavailable model during session/load falls back to the current client.
+    auto agent3 = new Agent(new MockClient([]), new ToolRegistry, Policy.init, null);
+    string[] lines3;
+    Host host3;
+    host3.systemPrompt = (string cwd) => "sys";
+    host3.makeClient = (string spec) { throw new Exception("gone: " ~ spec); };
+    host3.sessionDir = dir;
+    host3.version_ = "test";
+    auto srv3 = new AcpServer(agent3, host3, (string l) { lines3 ~= l; });
+    srv3.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ sid ~ `"}}`);
+    srv3.close();
+    assert(srv3.run());
+    assert(agent3.client.providerName == "mock" && agent3.client.modelName == "mock");
+    assert(!agent3.subagentsOn);
+    assert(!agent3.sessionThinking.isNull && agent3.sessionThinking.get == Thinking.of("high"));
+    agent3.replaceLog(Option!SessionLog.init);
 }
