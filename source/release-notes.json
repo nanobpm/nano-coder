@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.22.2", "date": "2026-11-23", "items": [
+      {"type":"perf","scope":"history","title":"skip non-message records by type without buffering them","pr":305}
+    ]},
     {"version": "1.22.1", "date": "2026-11-23", "items": [
       {"type":"fix","scope":"session","title":"drop legacy non-request pinned messages on resume and restate the stash","pr":302}
     ]},
@@ -438,9 +441,6 @@
     ]},
     {"version": "0.29.0", "date": "2026-10-01", "items": [
       {"type":"feat","scope":"status","title":"show home as ~ and elide the cwd's middle directories","pr":73}
-    ]},
-    {"version": "0.28.0", "date": "2026-10-01", "items": [
-      {"type":"feat","scope":"status","title":"label smart compaction as smart-compact in the status bar","pr":72}
     ]}
   ]
 }
