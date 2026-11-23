@@ -47,6 +47,14 @@ void main()
     scope (exit) rmdirRecurse(dir);
     auto store = new Store(buildPath(dir, "memory"), "github.com/nanobpm/nano-coder", 0);
 
+    // What the live session's memory index already renders in full: recall
+    // suppresses those (app.d indexShown), so the replay must too. Snapshotted
+    // BEFORE seeding: the measured facts below are the notes a live session's
+    // recall would still deliver — deliberately outside this index, or the
+    // replay would count nothing.
+    bool[string] shown;
+    store.indexWithRendered(true, shown);
+
     // Seed a noisy store: many memories mention merlin.local (the problem the
     // issue names — one hostname brings back every note that mentions it).
     // Entity-tagged facts about several hosts/repos, plus untagged legacy notes.
@@ -81,21 +89,27 @@ void main()
     bool[string] anchorDistinct, entityDistinct;
     // A note is relevant when one of its entry's tagged entities resolves to
     // an entity the call touched (untagged entries count as relevant by name).
+    // Resolution runs through the entry's own scope registry, as recall does.
+    auto byScope = store.entitiesByScope();
     bool relevant(Call c, string id)
     {
-        auto touched = resolveCallEntities(store.allEntities(), entitiesFromCall(c.tool, parseJSON(c.args), ""));
+        auto callEntities = entitiesFromCall(c.tool, parseJSON(c.args), "");
+        string[][Scope] resolvedIn;
+        foreach (s, recs; byScope) resolvedIn[s] = resolveCallEntities(recs, callEntities);
         foreach (x; store.all())
             if (x.e.id == id)
             {
                 if (!x.e.entities.length) return true; // legacy fallback: count as on-topic
+                auto records = byScope.get(x.s, null);
+                auto resolved = resolvedIn.get(x.s, null);
                 foreach (en; x.e.entities)
-                    if (touched.canFind(resolveEntity(store.allEntities(), en))) return true;
+                    if (resolved.canFind(resolveEntity(records, en))) return true;
                 return false;
             }
         return false;
     }
     {
-        Recall st; bool[string] shown;
+        Recall st;
         size_t turnNotes;
         foreach (i, c; sessionCalls)
         {
@@ -115,7 +129,7 @@ void main()
         }
     }
     {
-        Recall st; bool[string] shown;
+        Recall st;
         size_t turnNotes;
         foreach (i, c; sessionCalls)
         {

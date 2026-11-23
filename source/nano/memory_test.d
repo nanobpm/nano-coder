@@ -1206,11 +1206,19 @@ unittest // entitiesFromCall: urls, ssh targets, gh -R, repo name, tool name
     // A command after `&&` still counts.
     e = entitiesFromCall("bash", parseJSON(`{"command":"cd /x && ssh merlin df"}`), "");
     assert(e.canFind("host:merlin") && !e.canFind("host:df"), e.join(","));
-    // gh -R owner/repo and --repo.
+    // gh -R owner/repo and --repo, quoted or attached, case-preserved then
+    // lower-cased; a bare owner/repo operand is no selector.
     e = entitiesFromCall("bash", parseJSON(`{"command":"gh issue view 280 -R nanobpm/nano-coder"}`), "");
     assert(e.canFind("repo:nanobpm/nano-coder"), e.join(","));
     e = entitiesFromCall("bash", parseJSON(`{"command":"gh pr list --repo acme/widgets"}`), "");
     assert(e.canFind("repo:acme/widgets"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"gh -R \"Acme/Widgets\" pr list"}`), "");
+    assert(e.canFind("repo:acme/widgets"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"gh --repo=acme/widgets pr list"}`), "");
+    assert(e.canFind("repo:acme/widgets"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"scp -r acme/widgets merlin:/srv"}`), "");
+    assert(!e.canFind("repo:acme/widgets"), e.join(","));
+    assert(e.canFind("host:merlin"), e.join(","));
     // The working directory's repository, resolved once and passed in.
     e = entitiesFromCall("read_file", parseJSON(`{"path":"source/app.d"}`), "nanobpm/nano-coder");
     assert(e.canFind("repo:nanobpm/nano-coder"), e.join(","));
@@ -1426,6 +1434,17 @@ unittest // remoteHosts: quoted option values, shell operators, bare sftp, wrapp
     assert(remoteHosts(`sftp deploy@merlin.local`) == ["merlin.local"]);
     assert(remoteHosts(`sftp -P 22 merlin.local:/x`) == ["merlin.local"]);
     assert(remoteHosts(`sudo -E ssh merlin`) == ["merlin"]);
+    // Wrapper options take values by arity: `sudo -u deploy ssh …` and
+    // `env -u HOME ssh …` skip the value; attached (`-udeploy`, `-uHOME`,
+    // `--unset=HOME`) stay one word.
+    assert(remoteHosts(`sudo -u deploy ssh merlin`) == ["merlin"]);
+    assert(remoteHosts(`sudo -udeploy ssh merlin`) == ["merlin"]);
+    assert(remoteHosts(`env -u HOME ssh merlin`) == ["merlin"]);
+    assert(remoteHosts(`env -uHOME ssh merlin`) == ["merlin"]);
+    assert(remoteHosts(`env --unset=HOME ssh merlin`) == ["merlin"]);
+    assert(remoteHosts(`sudo --user deploy ssh merlin`) == ["merlin"]);
+    // sftp's -b takes the batch file; the destination follows.
+    assert(remoteHosts(`sftp -b batch.txt deploy@merlin.local`) == ["merlin.local"]);
     assert(remoteHosts(`bash -c "ssh merlin uptime"`) == ["merlin"]);
     assert(remoteHosts("echo ssh\nssh omarchy") == ["omarchy"]);
 }
@@ -1438,6 +1457,14 @@ unittest // every executable of a shell script becomes a tool entity
     assert(e.canFind("tool:gh"), e.to!string);
     e = entitiesFromCall("bash", parseJSON(`{"command":"FOO=1 env -i make test | tee log"}`), "");
     assert(e.canFind("tool:make") && e.canFind("tool:tee"), e.to!string);
+    // A nested `sh -c "…"` script's executables count too.
+    e = entitiesFromCall("bash", parseJSON(`{"command":"bash -c \"gh pr list\""}`), "");
+    assert(e.canFind("tool:gh"), e.to!string);
+    // Wrapper option values are not executables.
+    e = entitiesFromCall("bash", parseJSON(`{"command":"sudo -u deploy ssh merlin"}`), "");
+    assert(e.canFind("tool:ssh") && !e.canFind("tool:deploy"), e.to!string);
+    e = entitiesFromCall("bash", parseJSON(`{"command":"env -u HOME ssh merlin"}`), "");
+    assert(e.canFind("tool:ssh") && !e.canFind("tool:home"), e.to!string);
 }
 
 unittest // aliases resolve within their own scope

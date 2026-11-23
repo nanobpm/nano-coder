@@ -1764,12 +1764,13 @@ string[] entitiesFromCall(string tool, const JSONValue args, string repoName)
     auto haystack = argumentText(args);
     // Hosts: every URL's authority, and `ssh`/`scp` targets.
     foreach (m; haystack.matchAll(reUrlAuthority)) add("host", hostKey(m[1]));
-    foreach (line; haystack.splitLines)
-    {
-        auto t = line.strip;
-        // Repos: `-R owner/repo` (gh) and `--repo owner/repo`.
-        foreach (m; t.matchAll(reRepoFlag)) add("repo", m[1]);
-    }
+    // Repos: the value of gh's `-R owner/repo` / `--repo owner/repo`, parsed
+    // from the raw command's words — `argumentText` lower-cases (an
+    // `Acme/Widgets` selector must survive) and does not strip quotes, and a
+    // bare `owner/repo` operand (`scp -r acme/widgets merlin:/srv`) is an
+    // argument, not a selector. Any string field works: the gh invocation
+    // need not sit in a `command` field.
+    foreach (r; repoSelectors(args)) add("repo", r);
     // `ssh [user@]host` and `scp/rsync … host:path`, parsed from the raw
     // command: option letters are case-sensitive (`-J` takes a value, `-j`
     // doesn't), and `argumentText` lower-cases.
@@ -1790,12 +1791,68 @@ string[] entitiesFromCall(string tool, const JSONValue args, string repoName)
     return found.keys;
 }
 
-private Regex!char reUrlAuthority, reRepoFlag, reHostName;
+private Regex!char reUrlAuthority, reHostName, reRepoName;
 static this()
 {
     reUrlAuthority = regex("[a-z][a-z0-9+.-]*://(?:[^/@\\s]+@)?([a-z0-9][a-z0-9.-]*)(?::\\d+)?(?:[/?#\\s\"'`]|$)", "i");
     reHostName = regex(`^(?:[a-z0-9_.-]+@)?([a-z0-9][a-z0-9.-]*)$`, "i");
-    reRepoFlag = regex(`(?:^|\s)(?:-R|--repo)[=\s]+([a-z0-9_.-]+/[a-z0-9_.-]+)(?:\s|$)`, "i");
+    reRepoName = regex(`^([a-z0-9_.-]+/[a-z0-9_.-]+)$`, "i");
+}
+
+/// The `owner/repo` selectors gh's `-R` / `--repo` flags name anywhere in a
+/// call's arguments (`gh -R "acme/widgets" pr list`, `gh --repo=acme/widgets
+/// pr list`), parsed per simple command so quotes and case survive. A nested
+/// `sh -c "gh …"` script contributes its own selectors.
+private string[] repoSelectors(const JSONValue args)
+{
+    string[] scripts;
+    // Explicitly @safe: same LDC inference gap as argumentText's walk.
+    void walk(const JSONValue v) @safe
+    {
+        final switch (v.type)
+        {
+        case JSONType.string: scripts ~= v.str; break;
+        case JSONType.array: foreach (i; v.arrayNoRef) walk(i); break;
+        case JSONType.object: foreach (k; v.objectNoRef.keys) walk(v.objectNoRef[k]); break;
+        case JSONType.integer, JSONType.uinteger, JSONType.float_:
+        case JSONType.null_, JSONType.true_, JSONType.false_: break;
+        }
+    }
+    walk(args);
+    string[] repos;
+    foreach (script; scripts) repos ~= repoSelectorsIn(script);
+    return repos;
+}
+
+/// The selectors of one shell script (see `repoSelectors`).
+private string[] repoSelectorsIn(string script)
+{
+    string[] repos;
+    foreach (words; commandWords(script))
+    {
+        auto at = commandIndex(words);
+        if (at >= words.length) continue;
+        auto cmd = words[at];
+        if ((cmd == "sh" || cmd == "bash" || cmd == "zsh") && at + 2 < words.length && words[at + 1] == "-c")
+        {
+            repos ~= repoSelectorsIn(words[at + 2]);
+            continue;
+        }
+        if (cmd != "gh") continue;
+        auto rest = words[at + 1 .. $];
+        foreach (i, u; rest)
+        {
+            string v;
+            if (u == "-R" || u == "--repo")
+            {
+                if (i + 1 < rest.length) v = rest[i + 1];
+            }
+            else if (u.startsWith("--repo=")) v = u["--repo=".length .. $];
+            else if (u.startsWith("-R") && u.length > 2) v = u[2 .. $];
+            if (auto m = v.matchFirst(reRepoName)) repos ~= m[1].toLower;
+        }
+    }
+    return repos;
 }
 
 /// The remote hosts a shell script names through `ssh`, `scp`, `sftp` or
@@ -1822,9 +1879,9 @@ string[] remoteHosts(string script)
         bool isSsh = cmd == "ssh", isSftp = cmd == "sftp";
         if (!isSsh && !isSftp && cmd != "scp" && cmd != "rsync") continue;
         // Short options taking a value (OpenSSH ssh, scp, sftp; rsync's -e/-f).
-        // scp's -B/-R/-s are flags, but sftp's -B/-R/-s take a value.
+        // scp's -B/-R/-s are flags, but sftp's -b/-B/-R/-s take a value.
         string withArg = isSsh ? "BbcDEeFIiJLlmOoPpQRSWw" : cmd == "rsync" ? "efTM"
-            : cmd == "scp" ? "cDFiJloPSX" : "BcDFiJloPRSs";
+            : cmd == "scp" ? "cDFiJloPSX" : "bBcDFiJloPRSs";
         bool takesNext, opts = true;
         foreach (u; words[at + 1 .. $])
         {
@@ -1880,35 +1937,90 @@ private string[][] commandWords(string script)
 
 /// The index of the executable in a simple command's words: past variable
 /// assignments (`A=1 cmd`) and wrappers (`sudo`, `env`, `time`, `nohup`,
-/// `exec`, `command`) and their leading options. `words.length` if none.
+/// `exec`, `command`) and their options, each option consumed by its arity
+/// (`sudo -u deploy ssh …` skips `deploy`; `env -u HOME ssh …` skips `HOME`;
+/// attached values like `sudo -E -C4` and `env -uHOME` stay one word).
+/// `words.length` if none.
 private size_t commandIndex(const string[] words) pure
 {
     size_t i;
-    bool wrapped;
+    string wrapper;
     while (i < words.length)
     {
         auto w = words[i];
         if (w.canFind('=') && !w.startsWith("-") && !w.startsWith("=")) { i++; continue; }
-        if (wrapped && w.startsWith("-")) { i++; continue; }
+        if (wrapper.length && w.startsWith("-"))
+        {
+            i++;
+            // A value-taking wrapper option consumes the next word, unless
+            // the value is attached (`-uHOME`, `--unset=HOME`, `--`).
+            if (wrapperTakesValue(wrapper, w)) i++;
+            continue;
+        }
         if (w == "sudo" || w == "env" || w == "time" || w == "nohup" || w == "exec" || w == "command")
-        { wrapped = true; i++; continue; }
+        { wrapper = w; i++; continue; }
         return i;
     }
     return i;
 }
 
+/// Whether wrapper `cmd`'s option word `w` takes a value. Only the
+/// value-taking options of the wrappers `commandIndex` knows; a flag or an
+/// unknown option leaves the next word to be the executable.
+private bool wrapperTakesValue(string cmd, string w) pure
+{
+    if (w == "--") return false;
+    if (w.startsWith("--"))
+    {
+        auto name = w[2 .. $];
+        auto eq = name.indexOf('=');
+        if (eq >= 0) return false; // `--opt=value`: one word
+        switch (cmd)
+        {
+            case "sudo": return name == "user" || name == "group" || name == "chdir"
+                || name == "role" || name == "type" || name == "login-class";
+            case "env": return name == "unset" || name == "chdir";
+            case "time": return name == "output" || name == "format";
+            default: return false;
+        }
+    }
+    // A short-option cluster takes the next word when its last letter takes
+    // a value and nothing is attached (`sudo -Eu deploy`: attached to u).
+    foreach (ch; w[1 .. $])
+    {
+        auto takes = cmd == "sudo" ? "uUgGCDRrTth".canFind(ch)
+            : cmd == "env" ? ch == 'u' || ch == 'C'
+            : cmd == "time" ? ch == 'o' || ch == 'f'
+            : false;
+        if (takes) return w.length == 2; // attached value: one word
+    }
+    return false;
+}
+
 /// The executable names a shell script runs (`cd /x && sudo gh pr list` ->
-/// `cd`, `gh`): plausible bare names only, lower-cased.
+/// `cd`, `gh`), including the ones a nested `sh -c "…"` script runs:
+/// plausible bare names only, lower-cased.
 string[] commandNames(string script)
 {
     string[] names;
+    void add(string w)
+    {
+        if (w.length >= 2 && w.length <= 40 && !w.canFind('/') && !w.canFind('=') && !names.canFind(w.toLower))
+            names ~= w.toLower;
+    }
     foreach (words; commandWords(script))
     {
         auto at = commandIndex(words);
         if (at >= words.length) continue;
         auto w = words[at];
-        if (w.length >= 2 && w.length <= 40 && !w.canFind('/') && !w.canFind('=') && !names.canFind(w.toLower))
-            names ~= w.toLower;
+        // `bash -c "gh pr list"`: the nested script's executables count too.
+        if ((w == "sh" || w == "bash" || w == "zsh") && at + 2 < words.length && words[at + 1] == "-c")
+        {
+            add(w);
+            foreach (n; commandNames(words[at + 2])) add(n);
+            continue;
+        }
+        add(w);
     }
     return names;
 }
