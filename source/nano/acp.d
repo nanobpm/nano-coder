@@ -215,6 +215,9 @@ struct Host
     /// Write `subagents = on` to the user config (`/subagents on|off --save`);
     /// returns where it saved or why it could not. Null: --save is refused.
     string delegate(bool on) saveSubagents;
+    /// "Updated X → Y" and what changed (#282), sent once as an info notice
+    /// after the first session/new or session/load; null for none.
+    string releaseNotice;
 }
 
 /// Input id for idempotent prompts: `messageId`, or `_meta.inputId`.
@@ -383,6 +386,7 @@ final class AcpServer : AgentEvents
     private AcpRouter router;
     private string sessionId_;
     private size_t messageSeq;
+    private bool releaseNoticeSent;
 
     /// `writeLine` gets one JSON message per call (defaults to stdout).
     this(Agent agent, Host host, void delegate(string) @safe writeLine = null)
@@ -410,6 +414,16 @@ final class AcpServer : AgentEvents
     void heartbeat(string line)
     {
         update(JSONValue(["sessionUpdate": JSONValue("agent_thought_chunk"), "content": textBlock(line)]));
+    }
+
+    /// The release notice, once per process: a `_nano/notice` notification
+    /// (`level: "info"`), outside the model's context and the session log.
+    private void sendReleaseNotice()
+    {
+        if (releaseNoticeSent || !host.releaseNotice.length) return;
+        releaseNoticeSent = true;
+        notify("_nano/notice", JSONValue(["sessionId": JSONValue(sessionId), "level": JSONValue("info"),
+            "text": JSONValue(host.releaseNotice)]));
     }
 
     private void writeOut(string line)
@@ -585,6 +599,7 @@ final class AcpServer : AgentEvents
                 auto meta = sessionMeta();
                 if (!agent.plan.empty) meta["plan"] = agent.plan.toJSON;
                 reply(rpcResult(id, JSONValue(["sessionId": JSONValue(sessionId), "_meta": meta])));
+                sendReleaseNotice();
             }
             catch (Exception e) reply(rpcError(id, -32603, e.msg));
             return;
@@ -596,6 +611,7 @@ final class AcpServer : AgentEvents
             {
                 loadSession_(want);
                 reply(rpcResult(id, JSONValue(["sessionId": JSONValue(sessionId), "_meta": sessionMeta()])));
+                sendReleaseNotice();
             }
             catch (Exception e) reply(rpcError(id, -32603, e.msg));
             return;

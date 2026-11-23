@@ -49,6 +49,8 @@ struct Request
     string body_;
     Duration idleTimeout = 120.seconds;
     Duration connectTimeout = 30.seconds;
+    /// Abort the transfer (an exception) once the body would exceed this many bytes; 0: no limit.
+    size_t maxBytes;
 }
 
 /// Perform `req`; each received chunk goes to `onChunk` (when set) as it
@@ -97,6 +99,8 @@ int perform(const ref Request req, out string body_, out ResponseMeta meta,
         else if (k == "retry-after") meta.retryAfter = value.idup;
     };
     http.onReceive = (ubyte[] data) {
+        // Returning less than offered makes libcurl abort before more is buffered.
+        if (req.maxBytes && buf.length + data.length > req.maxBytes) return 0;
         buf ~= data;
         if (onChunk !is null) onChunk(asChars(data)); // unchecked: a chunk may end inside a character
         return data.length;

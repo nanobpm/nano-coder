@@ -42,6 +42,7 @@ immutable Command[] commands = [
     Command("/providers", "", "List configured providers"),
     Command("/session", "", "Show the session ID and log path"),
     Command("/version", "", "Show the nano-coder version"),
+    Command("/changes", "[version]", "Show what changed since the previous release (or since version)"),
     Command("/trajectory", "[--json|--markdown]", "Show this session's turn-by-turn trajectory in your pager (or export it)"),
     Command("/resume", "[ID|last]", "Switch to a saved session: pick one, or give its ID"),
     Command("/restart", "", "Start a fresh session (clean context) without exiting"),

@@ -22,3 +22,4 @@ nano.subagent_test the cancel flag
 nano.agent_parallel_test the cancel flag
 nano.subagent_bg_test the cancel flag
 nano.session_resume_memory_test GC.stats is process-wide: other modules' allocations skew it
+nano.session flock probes: another module's fork briefly shares the log's locked description until exec

@@ -2890,6 +2890,13 @@ int runMain(string[] args)
         host.makeClient = (string s) => makeClient(resolve(cfg, s));
         host.sessionDir = o.noSession ? null : sessionDir;
         host.version_ = versionString;
+        {
+            // The release notice, sent once (#282). No network here: notes
+            // the build lacks give a compare link.
+            import nano.release_notes : embedded, lastVersionPath, startupNotice;
+            import std.array : join;
+            host.releaseNotice = startupNotice(lastVersionPath(), packageVersion, cfg.showReleaseNotes, embedded()).join("\n");
+        }
         host.loadHooks = &loadHooks;
         host.providerNames = () => enabledProviderNames(cfg.providers);
         host.configModel = cfg.model;
@@ -3331,6 +3338,7 @@ int runMain(string[] args)
 
     bool interactive = isTerminal(0);
     Chan!string updateHints; // update hints for an idle prompt
+    Chan!string releaseNotice; // the fetched release notice, recorded once shown
     if (interactive && isTerminal(1) && environment.get("TERM", "") != "dumb"
         && environment.get("NANO_CODER_PLAIN_INPUT") is null && enterKeyMode(0))
     {
@@ -3389,6 +3397,27 @@ int runMain(string[] args)
         // The replay read the folded turns' outputs back from the log
         // (issue #263): hand that transient heap back too.
         releaseHeap();
+    }
+    // What changed since the version that ran last (#282): after the replay,
+    // so it is the last thing on screen. Notes the build lacks are fetched in
+    // the background and shown at the idle prompt, like an update hint.
+    if (interactive)
+    {
+        import nano.release_notes : embedded, lastVersionPath, needsFetch, runNotice, startupNotice;
+        // The record is updated only once the fetched notice is on screen, so
+        // quitting before it lands shows it again next start.
+        import std.array : join;
+        auto notesPath = lastVersionPath();
+        auto notes = embedded();
+        // Only the line editor's idle prompt drains the hints; without it, the
+        // synchronous path shows the compare link.
+        if (editor.isSome && needsFetch(notesPath, packageVersion, cfg.showReleaseNotes, notes))
+        {
+            releaseNotice = Chan!string.make;
+            spawnDaemon(&runNotice, notesPath, packageVersion, releaseNotice);
+        }
+        else if (auto lines = startupNotice(notesPath, packageVersion, cfg.showReleaseNotes, notes))
+            writeln(stampBlock(console.stamp(), lines.join("\n")));
     }
     import core.time : MonoTime, msecs;
     import nano.lineedit : DoublePress, interruptWindowMs;
@@ -3469,6 +3498,17 @@ int runMain(string[] args)
             string updateHint;
             if (updateHints && updateHints.tryTake(updateHint)) writeln(console.dim(updateHint));
             updateHint = null;
+            string fetchedNotice;
+            // Shows the fetched release notice, then records the version: once shown, it is done.
+            void showNotice() @safe
+            {
+                import nano.release_notes : lastVersionPath, writeLastVersion;
+                writeln(console.dim(fetchedNotice));
+                writeLastVersion(lastVersionPath(), packageVersion);
+                releaseNotice = Chan!string.init; // sent once
+                fetchedNotice = null;
+            }
+            if (releaseNotice && releaseNotice.tryTake(fetchedNotice)) showNotice();
             // An idle compaction is due once the prompt (and any draft) sat
             // untouched for the hold, unless the exit window is armed (#186).
             auto promptShown = monoNow;
@@ -3497,11 +3537,19 @@ int runMain(string[] args)
                 || timerNow()
                 || subNow()
                 || idleNow()
-                || (updateHints && updateHints.tryTake(updateHint));
+                || (updateHints && updateHints.tryTake(updateHint))
+                || (releaseNotice && releaseNotice.tryTake(fetchedNotice));
             auto r = ed.readLine(.stamp(false) ~ "› ", console.stamp() ~ glyphMark ~ " ", false, lapse);
             ed.restyle = null;
             syncMode(); // Shift-Tab at the prompt switched the mode
             ed.onIdleEscEsc = null;
+            // Show a hint or notice the lapse already took before anything else:
+            // the timer and idle branches below would otherwise drop it, and the
+            // channel can't deliver it again.
+            immutable shownHint = updateHint.length || fetchedNotice.length;
+            if (updateHint.length) writeln(console.dim(updateHint));
+            updateHint = null;
+            if (fetchedNotice.length) showNotice();
             // Honour an idle Esc Esc whatever ended the read (a line typed
             // before the lapse check keeps its text).
             if (stopBackground)
@@ -3553,9 +3601,8 @@ int runMain(string[] args)
                 else if (agent.control.nonNull.isCancelled) writeln(console.dim("[idle compaction cancelled]"));
                 continue;
             }
-            else if (r.outcome == Outcome.stopped && updateHint.length)
+            else if (r.outcome == Outcome.stopped && shownHint)
             {
-                writeln(console.dim(updateHint));
                 quietPrompt = true;
                 continue;
             }
@@ -3749,6 +3796,15 @@ int runMain(string[] args)
                 case "/subagents":
                     writeln(escapeMarks(sanitizeBlock(subagentsCommand(agent, cfg, arg))));
                     continue;
+                case "/changes":
+                {
+                    // No fetch here: it would block the prompt; notes the build
+                    // lacks give a compare link.
+                    import nano.release_notes : changesCommand, embedded;
+                    import std.array : join;
+                    writeln(changesCommand(arg, packageVersion, embedded()).join("\n"));
+                    continue;
+                }
                 case "/tools":
                     writeln(escapeMarks(toolsListing(agent)));
                     continue;

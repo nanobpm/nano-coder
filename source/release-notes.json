@@ -1,0 +1,446 @@
+{
+  "releases": [
+    {"version": "1.13.0", "date": "2026-11-23", "items": [
+      {"type":"feat","scope":"subagents","title":"background sub-agents the agent can check, read, cancel and wait on","pr":285}
+    ]},
+    {"version": "1.12.1", "date": "2026-11-23", "items": [
+      {"type":"perf","scope":"session","title":"resume heap no longer scales with the session log size","pr":269}
+    ]},
+    {"version": "1.12.0", "date": "2026-11-23", "items": [
+      {"type":"feat","scope":"subagents","title":"candidate sub-agent models in config, and /subagents on|off at runtime","pr":268}
+    ]},
+    {"version": "1.11.0", "date": "2026-11-23", "items": [
+      {"type":"feat","scope":"","title":"probe capabilities in the background with generations","pr":260}
+    ]},
+    {"version": "1.10.1", "date": "2026-11-23", "items": [
+      {"type":"fix","scope":"","title":"keep fold texts and folded tool outputs out of memory; Ctrl-O expands in batches","pr":251}
+    ]},
+    {"version": "1.10.0", "date": "2026-11-23", "items": [
+      {"type":"fix","scope":"ui","title":"merge reasoning streamed after answer text into one thinking block","pr":262},
+      {"type":"feat","scope":"agent","title":"read-only sub-agents via an agent tool","pr":236}
+    ]},
+    {"version": "1.9.2", "date": "2026-11-23", "items": [
+      {"type":"fix","scope":"attachment","title":"rotate EXIF-oriented pixels on the sips path","pr":261}
+    ]},
+    {"version": "1.9.1", "date": "2026-11-23", "items": [
+      {"type":"fix","scope":"parity","title":"default check-parity.py --ref to rust-final","pr":259}
+    ]},
+    {"version": "1.9.0", "date": "2026-11-23", "items": [
+      {"type":"feat","scope":"tools","title":"apply_patch — atomic multi-file, content-anchored patch tool","pr":235},
+      {"type":"perf","scope":"session","title":"skim superseded records on resume; keep the Rust folded stash once","pr":249}
+    ]},
+    {"version": "1.8.0", "date": "2026-11-23", "items": [
+      {"type":"feat","scope":"agent","title":"run a reply's read-only tool calls in parallel","pr":224},
+      {"type":"fix","scope":"session","title":"/relaunch log-lock inheritance and silent appends to a replaced log","pr":238}
+    ]},
+    {"version": "1.7.0", "date": "2026-11-23", "items": [
+      {"type":"feat","scope":"plan","title":"show plan item marks as symbols in the terminal","pr":245}
+    ]},
+    {"version": "1.6.6", "date": "2026-11-23", "items": [
+      {"type":"fix","scope":"session","title":"show the full nano-coder --resume command in session hints","pr":250},
+      {"type":"fix","scope":"frame","title":"render the resume replay in one frame","pr":247}
+    ]},
+    {"version": "1.6.5", "date": "2026-11-22", "items": [
+      {"type":"perf","scope":"gc","title":"use small fixed-size GC pools so a resume's freed heap returns to the OS","pr":243}
+    ]},
+    {"version": "1.6.4", "date": "2026-11-22", "items": [
+      {"type":"fix","scope":"session","title":"read pinned_base/folded_base/restated as uinteger on restore","pr":242}
+    ]},
+    {"version": "1.6.3", "date": "2026-11-22", "items": [
+      {"type":"fix","scope":"resume","title":"replay the loaded transcript on the frame after --resume, /resume and /relaunch","pr":218}
+    ]},
+    {"version": "1.6.2", "date": "2026-11-22", "items": [
+      {"type":"perf","scope":"session","title":"return the heap to the OS after a resume","pr":220}
+    ]},
+    {"version": "1.6.1", "date": "2026-11-22", "items": [
+      {"type":"fix","scope":"session","title":"bound session log growth — pinned/plan deltas, compression, retention","pr":210}
+    ]},
+    {"version": "1.6.0", "date": "2026-11-22", "items": [
+      {"type":"feat","scope":"update","title":"keep brew /update to nano-coder alone","pr":193}
+    ]},
+    {"version": "1.5.1", "date": "2026-11-22", "items": [
+      {"type":"fix","scope":"frame","title":"copy wrapped text without newlines and keep scrollback stable while output streams","pr":209}
+    ]},
+    {"version": "1.5.0", "date": "2026-11-22", "items": [
+      {"type":"feat","scope":"herdr","title":"show a timer icon in Herdr while a timer is set","pr":215}
+    ]},
+    {"version": "1.4.0", "date": "2026-11-21", "items": [
+      {"type":"feat","scope":"herdr","title":"show the model's short name next to the agent in Herdr","pr":213}
+    ]},
+    {"version": "1.3.0", "date": "2026-11-21", "items": [
+      {"type":"feat","scope":"compaction","title":"make smart compaction the default","pr":208}
+    ]},
+    {"version": "1.2.1", "date": "2026-11-20", "items": [
+      {"type":"fix","scope":"release","title":"scale unit-test time limits in release builds as ci.sh does","pr":202}
+    ]},
+    {"version": "1.2.0", "date": "2026-11-20", "items": [
+      {"type":"feat","scope":"","title":"pick up instruction file changes at the next turn without a restart","pr":201}
+    ]},
+    {"version": "1.1.0", "date": "2026-11-20", "items": [
+      {"type":"feat","scope":"bash","title":"emit a supervisor-visible heartbeat during long commands","pr":198}
+    ]},
+    {"version": "1.0.0", "date": "2026-11-19", "items": [
+      {"type":"feat","scope":"","title":"nano-coder 1.0, rewritten in d","pr":192,"breaking":true},
+      {"type":"fix","scope":"history","title":"read session log lines written with spaced json","pr":null},
+      {"type":"feat","scope":"","title":"replace the rust implementation with the d one","pr":null,"breaking":true},
+      {"type":"feat","scope":"d","title":"homebrew update channel (tap formula check, brew upgrade, opt relaunch)","pr":null},
+      {"type":"feat","scope":"d","title":"rename the binary to nano-coder and adopt preview sessions","pr":null},
+      {"type":"fix","scope":"d","title":"acp rejects unknown slash commands with a did-you-mean like rust","pr":null},
+      {"type":"fix","scope":"d","title":"string arguments report missing, null and wrong-type values like rust","pr":null},
+      {"type":"fix","scope":"d","title":"clear the stale output rate at each generation start; testable mode prompt and restart","pr":null},
+      {"type":"fix","scope":"d","title":"reject non-finite temperatures in config instead of treating them as default","pr":null},
+      {"type":"fix","scope":"d","title":"glob patterns starting with ./ or / match at the search root","pr":null},
+      {"type":"fix","scope":"d","title":"rebuild on provider edits the model now resolves to; clear stale save notices","pr":null},
+      {"type":"fix","scope":"d","title":"blank reasoning deltas no longer hide a reply's full reasoning","pr":null},
+      {"type":"fix","scope":"d","title":"key command reads stdout through a pipe so a setsid escapee fails closed","pr":null},
+      {"type":"fix","scope":"d","title":"/settings unsets a key inside an inline table; update checks tested against a fake registry","pr":null},
+      {"type":"fix","scope":"d","title":"offline wait stays within its budget; redirect loops fail at once; notice fits narrow rows","pr":null},
+      {"type":"fix","scope":"d","title":"spill markers carry a content digest; the repeat detector keys on it","pr":null},
+      {"type":"fix","scope":"d","title":"plan mode keeps the timer tools; /timers strips escapes from notes","pr":null},
+      {"type":"fix","scope":"d","title":"print what a cut-short answer stream missed","pr":null},
+      {"type":"fix","scope":"d","title":"keep the turn-cap note when reprinting a hidden answer; picker pause as a scope guard","pr":null},
+      {"type":"fix","scope":"d","title":"an armed exit window holds due timers; headless --wait-timers runs timers after eof","pr":null},
+      {"type":"fix","scope":"d","title":"reject --resume with --list-models; port cli conflict tests","pr":null},
+      {"type":"fix","scope":"d","title":"run app.d unittests under dub test; refuse /memory forget in plan mode","pr":null},
+      {"type":"fix","scope":"d","title":"strip whole escape sequences from terminal text; fit questions to the width","pr":null},
+      {"type":"fix","scope":"d","title":"per-segment quiet answer guard, one-line tool summaries; port ui.rs tests","pr":null},
+      {"type":"fix","scope":"d","title":"fresh esc pair per read, no command menu during a turn; port lineedit tests","pr":null},
+      {"type":"fix","scope":"d","title":"fit the plan header to the width; port frame.rs tests with a vt emulator","pr":null},
+      {"type":"fix","scope":"d","title":"show thinking-block text in history_read; port history and resume tests","pr":null},
+      {"type":"fix","scope":"d","title":"backfill log lines for messages a legacy replace retained","pr":null},
+      {"type":"fix","scope":"d","title":"bill auto-initiated copilot turns as agent, match models exactly","pr":null},
+      {"type":"fix","scope":"d","title":"trim post-thinking whitespace in streamed openai content","pr":null},
+      {"type":"fix","scope":"d","title":"retry a stream dropped before any visible output","pr":null},
+      {"type":"fix","scope":"d","title":"anthropic default max_tokens is 8192, as in Rust","pr":null},
+      {"type":"fix","scope":"d","title":"malformed tool arguments get Rust's stop-reason advice","pr":null},
+      {"type":"fix","scope":"d","title":"a failed repair on resume leaves the live session untouched","pr":null},
+      {"type":"fix","scope":"d","title":"replay over ACP keeps the image marker on tool results","pr":null},
+      {"type":"feat","scope":"d","title":"a responseRestarted event when a broken reply is resent","pr":null},
+      {"type":"fix","scope":"d","title":"retry a dropped summary stream; log the summary's usage","pr":null},
+      {"type":"fix","scope":"d","title":"roll timers and plan back when the session log fails","pr":null},
+      {"type":"fix","scope":"d","title":"the status line shows the thinking level the request sent","pr":null},
+      {"type":"fix","scope":"d","title":"the provider kind comes from the live client","pr":null},
+      {"type":"fix","scope":"d","title":"/tools lists the tools actually offered","pr":null},
+      {"type":"fix","scope":"d","title":"turn_end records count the turn's history calls","pr":null},
+      {"type":"fix","scope":"d","title":"one session loader for /resume and session/load","pr":null},
+      {"type":"fix","scope":"d","title":"a resumed ACP session replays the real turns, not the summary","pr":null},
+      {"type":"fix","scope":"d","title":"a steer on the turn's last call keeps the final answer","pr":null},
+      {"type":"fix","scope":"d","title":"log each reply's temperature and thinking level","pr":null},
+      {"type":"fix","scope":"d","title":"a queued /model applies before every model call; cancel stops compaction","pr":null},
+      {"type":"fix","scope":"d","title":"token estimate follows the image wire plan; window source names","pr":null},
+      {"type":"feat","scope":"d","title":"compile-time audit of class-typed fields, NotNull","pr":null},
+      {"type":"feat","scope":"d","title":"option type for absent values, null-check budgets, late steer fixes","pr":null},
+      {"type":"feat","scope":"d","title":"ratchet exhaustive switches, size arithmetic and swallowed catches","pr":null},
+      {"type":"feat","scope":"d","title":"compact at the idle prompt once past the threshold (port #186)","pr":null},
+      {"type":"feat","scope":"d","title":"harden repository trust like the rust gate (port #147 follow-ups)","pr":null},
+      {"type":"feat","scope":"d","title":"resume an interrupted turn and its cut-off continuation on redelivery (port #114)","pr":null},
+      {"type":"feat","scope":"d","title":"pin the user's requests verbatim across compactions (port #184)","pr":null},
+      {"type":"feat","scope":"d","title":"port edit_file matching pipeline and atomic writes","pr":null},
+      {"type":"feat","scope":"d","title":"background update check with /update and /relaunch","pr":null},
+      {"type":"feat","scope":"d","title":"expand/collapse the latest tool call/result or thought with Ctrl-O","pr":null},
+      {"type":"fix","scope":"d","title":"harden loop-detector shell and writer heuristics","pr":null},
+      {"type":"fix","scope":"d","title":"bound search walker and ignore-loading resource use","pr":null},
+      {"type":"feat","scope":"d","title":"verify evidence before accepting report_outcome(completed)","pr":null},
+      {"type":"fix","scope":"d","title":"pin error lines when clipping tool results for compaction","pr":null},
+      {"type":"feat","scope":"d","title":"render GitHub emoji shortcodes in markdown prose","pr":null},
+      {"type":"fix","scope":"d","title":"fire due timers after an AFK draft goes stale","pr":null},
+      {"type":"feat","scope":"d","title":"never prompt for unverifiable loops; allow under the sandbox, block without it","pr":null},
+      {"type":"feat","scope":"d","title":"report the turn's token usage on the ACP session/prompt result","pr":null},
+      {"type":"fix","scope":"d","title":"lower the default stream idle timeout below the worker idle-kill budget","pr":null},
+      {"type":"fix","scope":"d","title":"hide the mock provider by default","pr":null},
+      {"type":"fix","scope":"d","title":"send path-leading prompts to the model instead of rejecting them","pr":null},
+      {"type":"feat","scope":"d","title":"per-model hosts, curated model lists and disabled providers","pr":null},
+      {"type":"fix","scope":"d","title":"render multi-line and markdown questions above the picker","pr":null},
+      {"type":"feat","scope":"d","title":"recall relevant memories from tool calls","pr":null},
+      {"type":"feat","scope":"d","title":"unroll literal-list shell loops and ask instead of hard-blocking","pr":null},
+      {"type":"fix","scope":"d","title":"count wide emoji such as the timers ⏰ as two cells so the status line never wraps","pr":null},
+      {"type":"fix","scope":"trajectory","title":"open /trajectory in the pager even when it fits on screen","pr":null},
+      {"type":"fix","scope":"","title":"overlay the editor block cursor on the character under it","pr":null},
+      {"type":"feat","scope":"d","title":"keep fired timers pending until the agent marks them done","pr":null},
+      {"type":"feat","scope":"d","title":"add timers the agent sets to come back to work later in a session","pr":null},
+      {"type":"fix","scope":"d","title":"report a network wait on one line with an elapsed counter","pr":null},
+      {"type":"feat","scope":"d","title":"wait for the network instead of failing the turn","pr":null},
+      {"type":"feat","scope":"d","title":"ask before trusting a repository's skills and hooks; add --yolo","pr":null},
+      {"type":"feat","scope":"d","title":"add /version command","pr":null},
+      {"type":"fix","scope":"d","title":"bound api_key_command with a timeout, cancel and fail-closed wait","pr":null},
+      {"type":"fix","scope":"d","title":"continue replies cut off at the output-token limit","pr":null},
+      {"type":"fix","scope":"d","title":"repair interrupted tool calls and keep spills with the session","pr":null},
+      {"type":"feat","scope":"d","title":"show GitHub Copilot AI Credits in the status bar","pr":null},
+      {"type":"feat","scope":"d","title":"mark the D port with an nD badge in the status bar","pr":null},
+      {"type":"fix","scope":"d","title":"port missing Rust prompts and command feedback","pr":null},
+      {"type":"fix","scope":"d","title":"print Goodbye and the resume command on exit","pr":null},
+      {"type":"feat","scope":"d","title":"busy spinner and working time on the prompt line","pr":null},
+      {"type":"feat","scope":"d","title":"report state, resume command and release to Herdr (port of #142)","pr":null},
+      {"type":"feat","scope":"d","title":"list, edit and withdraw unread steers via /queue (port of #138)","pr":null},
+      {"type":"feat","scope":"d","title":"sendable-only threads (spawn, Isolated, Chan) with lint bans","pr":null},
+      {"type":"feat","scope":"d","title":"render markdown in assistant answers on the terminal","pr":null},
+      {"type":"perf","scope":"d","title":"export only main on macOS to cut dyld startup cost","pr":null},
+      {"type":"fix","scope":"d","title":"show the Ctrl-C exit hint at the idle prompt and require a second press","pr":null},
+      {"type":"fix","scope":"hooks","title":"skip npm audit in the commit-msg hook so commits don't hang","pr":null},
+      {"type":"fix","scope":"d","title":"ignore the [DONE] stream terminator for every provider","pr":null},
+      {"type":"feat","scope":"d","title":"npm packages, release and ci workflows, static phobos release build","pr":null},
+      {"type":"feat","scope":"d","title":"linux landlock sandbox backend via self re-exec helper","pr":null},
+      {"type":"feat","scope":"d","title":"window and output-cap detection, default max_tokens from published cap","pr":114},
+      {"type":"feat","scope":"d","title":"acp /compact /plan /providers, session _meta, plan seed, idempotent input ids","pr":null},
+      {"type":"feat","scope":"d","title":"frame renderer (default), live renderer switch from /settings","pr":null},
+      {"type":"feat","scope":"d","title":"/settings dialog, interactive /model picker, context_window key","pr":null},
+      {"type":"feat","scope":"d","title":"timestamps, rust banner and tool result lines","pr":null},
+      {"type":"feat","scope":"d","title":"/providers, /verbosity levels, /restart; align command table with rust","pr":null},
+      {"type":"feat","scope":"d","title":"pinned status line with context, activity and live rate","pr":null},
+      {"type":"feat","scope":"d","title":"recent models and /model, /mode, /thinking argument type-ahead","pr":null},
+      {"type":"feat","scope":"d","title":"run read-only commands and settings mid-turn (turn_commands)","pr":null},
+      {"type":"feat","scope":"d","title":"shift-tab mode cycle and ctrl-o thinking toggle with rust-style thinking block","pr":null},
+      {"type":"feat","scope":"d","title":"session trajectory ledger with --trajectory and /trajectory, rust-identical output","pr":null},
+      {"type":"feat","scope":"d","title":"fuzzy session picker for --resume and /resume, rust-identical session listing","pr":null},
+      {"type":"feat","scope":"d","title":"session summary index with titles cache and background session titles","pr":null},
+      {"type":"feat","scope":"d","title":"muse provider and login, qwen endpoints, mock kind, rust presets and defaults","pr":null},
+      {"type":"feat","scope":"d","title":"openai responses api, copilot routing and login, retry classification","pr":null},
+      {"type":"feat","scope":"d","title":"replay reasoning (anthropic signed thinking, reasoning_content, replay_reasoning)","pr":null},
+      {"type":"feat","scope":"d","title":"port image attachments for read_file with vision-aware requests","pr":null},
+      {"type":"feat","scope":"d","title":"port thinking, temperature and vision settings with capability detection","pr":null},
+      {"type":"feat","scope":"d","title":"port instruction files with imports, rules and nested attachment","pr":null},
+      {"type":"feat","scope":"d","title":"learn the provider output cap from capped-request errors","pr":null},
+      {"type":"feat","scope":"d","title":"port context accounting, auto/smart compaction and the history tools","pr":null},
+      {"type":"feat","scope":"d","title":"port system reminders and the repeated-call loop detector","pr":null},
+      {"type":"fix","scope":"d","title":"cap the command menu name column and update tests for /mode","pr":null},
+      {"type":"feat","scope":"d","title":"port the message queue (/queue, ctrl-enter)","pr":null},
+      {"type":"feat","scope":"d","title":"port agent modes, turn cap prompt and report_outcome","pr":null},
+      {"type":"feat","scope":"d","title":"port plan tools and question tool","pr":null},
+      {"type":"feat","scope":"d","title":"port line editor, input history and slash-command menu","pr":null},
+      {"type":"feat","scope":"d","title":"port macos seatbelt sandbox for bash, file tools and project hooks","pr":null},
+      {"type":"feat","scope":"d","title":"port claude-compatible command hooks","pr":null},
+      {"type":"feat","scope":"d","title":"port cross-session memory with secret filter and shared store","pr":null},
+      {"type":"feat","scope":"d","title":"port skills discovery, ai.lock and load_skill","pr":null},
+      {"type":"feat","scope":"d","title":"write and read rust-compatible session logs","pr":null},
+      {"type":"feat","scope":"d","title":"hide read-denied paths from grep and glob","pr":null},
+      {"type":"feat","scope":"d","title":"add the acp server (--acp)","pr":null},
+      {"type":"feat","scope":"d","title":"cancel and steer a running turn","pr":null},
+      {"type":"feat","scope":"d","title":"port the shell parser and full permission guards","pr":null},
+      {"type":"fix","scope":"d","title":"keep bounds checks in release, decode bash output lossily; add REVIEW.md","pr":null},
+      {"type":"feat","scope":"d","title":"port the nano-coder core to D","pr":null}
+    ]},
+    {"version": "0.69.0", "date": "2026-11-19", "items": [
+      {"type":"feat","scope":"update","title":"tell cargo installs how to switch to npm or homebrew","pr":191}
+    ]},
+    {"version": "0.68.0", "date": "2026-11-15", "items": [
+      {"type":"feat","scope":"","title":"install with Homebrew and update brew installs","pr":188}
+    ]},
+    {"version": "0.67.0", "date": "2026-11-14", "items": [
+      {"type":"feat","scope":"compaction","title":"compact at the idle prompt when already past the threshold (#182)","pr":186}
+    ]},
+    {"version": "0.66.0", "date": "2026-11-13", "items": [
+      {"type":"feat","scope":"compaction","title":"pin the user's requests instead of re-summarizing them","pr":184}
+    ]},
+    {"version": "0.65.0", "date": "2026-11-12", "items": [
+      {"type":"feat","scope":"eval","title":"noise band, baseline comparison and token cost for compaction eval","pr":183}
+    ]},
+    {"version": "0.64.0", "date": "2026-11-11", "items": [
+      {"type":"feat","scope":"markdown","title":"render GitHub emoji shortcodes like :seedling:","pr":181}
+    ]},
+    {"version": "0.63.2", "date": "2026-11-11", "items": [
+      {"type":"fix","scope":"timers","title":"fire due timers after an AFK draft goes stale","pr":178}
+    ]},
+    {"version": "0.63.1", "date": "2026-11-11", "items": [
+      {"type":"fix","scope":"providers","title":"lower default stream idle timeout below the worker idle-kill budget","pr":180}
+    ]},
+    {"version": "0.63.0", "date": "2026-11-10", "items": [
+      {"type":"feat","scope":"acp","title":"report the turn's token usage on the session/prompt result","pr":177}
+    ]},
+    {"version": "0.62.3", "date": "2026-11-06", "items": [
+      {"type":"fix","scope":"providers","title":"hide mock provider by default","pr":176}
+    ]},
+    {"version": "0.62.2", "date": "2026-11-05", "items": [
+      {"type":"fix","scope":"","title":"send path-leading prompts to the model instead of rejecting them","pr":175}
+    ]},
+    {"version": "0.62.1", "date": "2026-11-05", "items": [
+      {"type":"fix","scope":"update","title":"detect npm installs launched through the global bin symlink on macOS","pr":172}
+    ]},
+    {"version": "0.62.0", "date": "2026-11-05", "items": [
+      {"type":"feat","scope":"permissions","title":"never prompt for unverifiable loops; allow under the sandbox, block without it","pr":171}
+    ]},
+    {"version": "0.61.0", "date": "2026-11-05", "items": [
+      {"type":"feat","scope":"providers","title":"per-model hosts, curated model lists and disabled providers","pr":170}
+    ]},
+    {"version": "0.60.1", "date": "2026-11-05", "items": [
+      {"type":"fix","scope":"question","title":"render multi-line and markdown questions above the picker","pr":168}
+    ]},
+    {"version": "0.60.0", "date": "2026-11-04", "items": [
+      {"type":"feat","scope":"memory","title":"recall relevant memories from tool calls","pr":167}
+    ]},
+    {"version": "0.59.0", "date": "2026-11-04", "items": [
+      {"type":"feat","scope":"permissions","title":"unroll literal-list shell loops and ask instead of hard-blocking","pr":165}
+    ]},
+    {"version": "0.58.1", "date": "2026-11-03", "items": [
+      {"type":"fix","scope":"trajectory","title":"open /trajectory in the pager even when it fits on screen","pr":162}
+    ]},
+    {"version": "0.58.0", "date": "2026-10-29", "items": [
+      {"type":"feat","scope":"context","title":"pin error lines when clipping long tool results for compaction","pr":161}
+    ]},
+    {"version": "0.57.0", "date": "2026-10-29", "items": [
+      {"type":"feat","scope":"","title":"background update check with /update and /relaunch","pr":154}
+    ]},
+    {"version": "0.56.0", "date": "2026-10-29", "items": [
+      {"type":"feat","scope":"frame","title":"expand/collapse the latest tool call/result or thinking block with Ctrl-O","pr":156},
+      {"type":"feat","scope":"agent","title":"verify evidence before accepting report_outcome(completed)","pr":158}
+    ]},
+    {"version": "0.55.2", "date": "2026-10-29", "items": [
+      {"type":"fix","scope":"reminders","title":"harden loop-detector shell/writer heuristics","pr":159}
+    ]},
+    {"version": "0.55.1", "date": "2026-10-29", "items": [
+      {"type":"fix","scope":"search","title":"bound walker and ignore-loading resource use","pr":160}
+    ]},
+    {"version": "0.55.0", "date": "2026-10-28", "items": [
+      {"type":"feat","scope":"","title":"add /version command","pr":153}
+    ]},
+    {"version": "0.54.0", "date": "2026-10-27", "items": [
+      {"type":"feat","scope":"","title":"wait for network reconnection instead of failing the turn (Closes #148)","pr":149}
+    ]},
+    {"version": "0.53.0", "date": "2026-10-27", "items": [
+      {"type":"feat","scope":"trust","title":"ask \"Trust this repo?\" before loading skills and hooks; add --yolo","pr":147}
+    ]},
+    {"version": "0.52.0", "date": "2026-10-26", "items": [
+      {"type":"feat","scope":"timers","title":"session-scoped timers the agent sets to come back later","pr":151}
+    ]},
+    {"version": "0.51.1", "date": "2026-10-23", "items": [
+      {"type":"fix","scope":"commands","title":"release stats lock before printing slash command output","pr":143}
+    ]},
+    {"version": "0.51.0", "date": "2026-10-23", "items": [
+      {"type":"feat","scope":"herdr","title":"report state, resume command and release to Herdr","pr":142}
+    ]},
+    {"version": "0.50.0", "date": "2026-10-22", "items": [
+      {"type":"feat","scope":"queue","title":"list, edit and withdraw unread steers via /queue","pr":138}
+    ]},
+    {"version": "0.49.1", "date": "2026-10-22", "items": [
+      {"type":"fix","scope":"hooks","title":"skip npm audit in the commit-msg hook so commits don't hang","pr":137}
+    ]},
+    {"version": "0.49.0", "date": "2026-10-22", "items": [
+      {"type":"feat","scope":"ui","title":"render markdown in the terminal with pulldown-cmark","pr":132}
+    ]},
+    {"version": "0.48.0", "date": "2026-10-22", "items": [
+      {"type":"feat","scope":"ui","title":"render markdown tables in the terminal","pr":130}
+    ]},
+    {"version": "0.47.2", "date": "2026-10-21", "items": [
+      {"type":"fix","scope":"npm","title":"replace postinstall swap with lazy self-replacement in launcher","pr":128}
+    ]},
+    {"version": "0.47.1", "date": "2026-10-21", "items": [
+      {"type":"fix","scope":"permissions","title":"allow provably read-only shell loop bodies","pr":125}
+    ]},
+    {"version": "0.47.0", "date": "2026-10-20", "items": [
+      {"type":"feat","scope":"tools","title":"add structured read-only grep and glob tools, retire echo","pr":124}
+    ]},
+    {"version": "0.46.1", "date": "2026-10-15", "items": [
+      {"type":"fix","scope":"agent","title":"continue past output-limit cut-offs and default max_tokens to the model limit (#114)","pr":115}
+    ]},
+    {"version": "0.46.0", "date": "2026-10-15", "items": [
+      {"type":"feat","scope":"providers","title":"add an unofficial Meta Muse Code provider","pr":112}
+    ]},
+    {"version": "0.45.1", "date": "2026-10-13", "items": [
+      {"type":"fix","scope":"ui","title":"stop the working count while a picker waits for the user","pr":111}
+    ]},
+    {"version": "0.45.0", "date": "2026-10-12", "items": [
+      {"type":"feat","scope":"reminders","title":"detect repeated tool calls and stop runaway loops","pr":108}
+    ]},
+    {"version": "0.44.0", "date": "2026-10-12", "items": [
+      {"type":"feat","scope":"ui","title":"show whose turn it is on the prompt line (spinner / ready hint)","pr":110}
+    ]},
+    {"version": "0.43.0", "date": "2026-10-11", "items": [
+      {"type":"feat","scope":"commands","title":"apply /model <spec> typed mid-turn at the next model call","pr":107}
+    ]},
+    {"version": "0.42.0", "date": "2026-10-08", "items": [
+      {"type":"feat","scope":"commands","title":"run safe slash commands during a turn","pr":76}
+    ]},
+    {"version": "0.41.0", "date": "2026-10-07", "items": [
+      {"type":"feat","scope":"vision","title":"let agents view images via read_file attachments","pr":105}
+    ]},
+    {"version": "0.40.0", "date": "2026-10-07", "items": [
+      {"type":"feat","scope":"prompt","title":"clear the input on double Esc at the idle prompt","pr":103}
+    ]},
+    {"version": "0.39.0", "date": "2026-10-07", "items": [
+      {"type":"feat","scope":"commands","title":"never send /… input to the model","pr":75}
+    ]},
+    {"version": "0.38.0", "date": "2026-10-06", "items": [
+      {"type":"feat","scope":"instructions","title":"read Claude instruction files; prompt memory saving","pr":99}
+    ]},
+    {"version": "0.37.1", "date": "2026-10-06", "items": [
+      {"type":"fix","scope":"thinking","title":"apply /thinking typed mid-turn from the agent's next step (#78)","pr":101}
+    ]},
+    {"version": "0.37.0", "date": "2026-10-06", "items": [
+      {"type":"feat","scope":"providers","title":"expose all Qwen / Model Studio endpoint plans and regions","pr":102}
+    ]},
+    {"version": "0.36.0", "date": "2026-10-04", "items": [
+      {"type":"feat","scope":"config","title":"thinking level per provider and model, with /thinking","pr":91}
+    ]},
+    {"version": "0.35.0", "date": "2026-10-03", "items": [
+      {"type":"feat","scope":"hooks","title":"add Claude Code–compatible external user hooks (Phase 1)","pr":97}
+    ]},
+    {"version": "0.34.0", "date": "2026-10-02", "items": [
+      {"type":"feat","scope":"settings","title":"apply provider edits and renderer switches live","pr":77}
+    ]},
+    {"version": "0.33.0", "date": "2026-10-02", "items": [
+      {"type":"feat","scope":"sessions","title":"pick a session to resume, with project and last prompt","pr":84}
+    ]},
+    {"version": "0.32.1", "date": "2026-10-02", "items": [
+      {"type":"fix","scope":"","title":"update command in README","pr":89}
+    ]},
+    {"version": "0.32.0", "date": "2026-10-02", "items": [
+      {"type":"feat","scope":"","title":"cross-session memory (user + project scope)","pr":70}
+    ]},
+    {"version": "0.31.0", "date": "2026-10-01", "items": [
+      {"type":"feat","scope":"config","title":"move agentic-harness directories to nano-coder","pr":85}
+    ]},
+    {"version": "0.30.1", "date": "2026-10-01", "items": [
+      {"type":"fix","scope":"compaction","title":"leave room for reasoning in the summary and flag cut-off summaries","pr":88}
+    ]},
+    {"version": "0.30.0", "date": "2026-10-01", "items": [
+      {"type":"feat","scope":"config","title":"per-provider and per-model temperature, with model default","pr":79}
+    ]},
+    {"version": "0.29.2", "date": "2026-10-01", "items": [
+      {"type":"fix","scope":"context","title":"reserve max_tokens within the context window","pr":81}
+    ]},
+    {"version": "0.29.1", "date": "2026-10-01", "items": [
+      {"type":"fix","scope":"compact","title":"stream the summary request so idle-timeout proxies keep it alive","pr":82}
+    ]},
+    {"version": "0.29.0", "date": "2026-10-01", "items": [
+      {"type":"feat","scope":"status","title":"show home as ~ and elide the cwd's middle directories","pr":73}
+    ]},
+    {"version": "0.28.0", "date": "2026-10-01", "items": [
+      {"type":"feat","scope":"status","title":"label smart compaction as smart-compact in the status bar","pr":72}
+    ]},
+    {"version": "0.27.0", "date": "2026-10-01", "items": [
+      {"type":"feat","scope":"trajectory","title":"/trajectory view and --trajectory export","pr":63}
+    ]},
+    {"version": "0.26.0", "date": "2026-09-30", "items": [
+      {"type":"feat","scope":"cli","title":"list the last four models at the top of /model","pr":64}
+    ]},
+    {"version": "0.25.1", "date": "2026-09-30", "items": [
+      {"type":"fix","scope":"input","title":"handle Esc and Ctrl keys sent in kitty keyboard protocol form","pr":61}
+    ]},
+    {"version": "0.25.0", "date": "2026-09-30", "items": [
+      {"type":"feat","scope":"tui","title":"command menu in the frame renderer; make frame the default","pr":55}
+    ]},
+    {"version": "0.24.0", "date": "2026-09-30", "items": [
+      {"type":"feat","scope":"session","title":"record thinking, token usage and request duration per assistant message","pr":58}
+    ]},
+    {"version": "0.23.0", "date": "2026-09-30", "items": [
+      {"type":"feat","scope":"tools","title":"guard stale edits, tolerate whitespace drift, show edited lines","pr":50}
+    ]},
+    {"version": "0.22.1", "date": "2026-09-30", "items": [
+      {"type":"fix","scope":"cli","title":"stop wrapped input stacking copies of the prompt on redraw","pr":49}
+    ]},
+    {"version": "0.22.0", "date": "2026-09-30", "items": [
+      {"type":"feat","scope":"cli","title":"steer a running turn with Enter, queue with Ctrl-Enter","pr":53}
+    ]},
+    {"version": "0.21.2", "date": "2026-09-30", "items": [
+      {"type":"fix","scope":"cli","title":"make Ctrl-C exit visible and robust in the frame renderer","pr":54}
+    ]},
+    {"version": "0.21.1", "date": "2026-09-30", "items": [
+      {"type":"fix","scope":"providers","title":"surface malformed tool-call arguments instead of misreporting them","pr":51}
+    ]},
+    {"version": "0.21.0", "date": "2026-09-29", "items": [
+      {"type":"feat","scope":"cli","title":"recall input history with Up/Down at the prompt","pr":52}
+    ]},
+    {"version": "0.20.0", "date": "2026-09-29", "items": [
+      {"type":"feat","scope":"cli","title":"app-owned frame renderer behind renderer=\"frame\"","pr":48}
+    ]}
+  ]
+}

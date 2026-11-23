@@ -33,7 +33,8 @@ A scope is optional: `fix(sandbox): ...`.
 
 1. semantic-release reads the commits since the last `v*` tag. If none calls for a release,
    the workflow stops.
-2. Otherwise it sets `packageVersion` in `source/app.d` (`scripts/set-version.mjs`), commits `chore(release): X.Y.Z [skip ci]` to `main`, tags
+2. Otherwise it sets `packageVersion` in `source/app.d` (`scripts/set-version.mjs`), writes `source/release-notes.json`
+   (`scripts/release-notes.mjs`, below), commits `chore(release): X.Y.Z [skip ci]` to `main`, tags
    `vX.Y.Z`, and creates the GitHub release with generated notes. Released PRs and issues get
    a comment.
 3. From the tag, the workflow:
@@ -51,6 +52,22 @@ reports the next version, builds everything and runs `npm publish --dry-run`, bu
 tags and publishes nothing.
 
 Don't bump versions or push `v*` tags by hand: semantic-release owns both.
+
+## Release notes in the binary
+
+`source/release-notes.json` holds the user-facing changes of the last 100 releases and is
+compiled in (`import("release-notes.json")`, dub `stringImportPaths`), so nano-coder can
+show what changed after an update and on `/changes`. `node scripts/release-notes.mjs X.Y.Z`
+writes it from git: for each `v*` tag, plus X.Y.Z when it has no tag yet (its range ends at
+HEAD), the conventional-commit subjects since the previous version. It keeps `feat`, `fix`,
+`perf` and breaking changes (`type!:` or a `BREAKING CHANGE` footer), drops everything else,
+and takes the PR number from the subject's `(#N)`. The output is deterministic.
+
+semantic-release runs it in `prepareCmd` and commits the file with the release; a dry run of
+the release workflow runs it after `set-version.mjs`, so the dry-run binaries carry notes too.
+`scripts/ci.sh lint` runs the script's tests (`node --test scripts/release-notes.test.mjs`)
+and `release-notes.mjs --check`, which fails when the committed file differs from what git
+says for the tagged versions. Don't edit the file by hand; regenerate it with the script.
 
 ## Branch protection and the release app
 
