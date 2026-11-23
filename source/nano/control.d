@@ -24,6 +24,8 @@ import std.string : representation;
 
 import nano.option : NotNull;
 import core.atomic : atomicLoad, atomicStore;
+import core.time : MonoTime;
+import nano.clock : monoNow;
 
 /// The result recorded for tool calls skipped because of a cancel.
 enum string cancelledToolResult = "Error: the turn was cancelled before this tool call ran.";
@@ -47,6 +49,10 @@ private shared bool gCancel;
 /// only the pushing thread's blocking work sees the scope.
 private shared(bool)*[256] cancelScopes;
 private size_t cancelScopeDepth;
+/// This thread's cancellation deadline (`MonoTime.max`: none). Thread-local
+/// like the scope stack: a background probe sets one so its blocking calls
+/// bail on their own once it passes, whether or not the owner polls.
+private MonoTime cancelDeadline = MonoTime.max;
 
 /// Whether the running turn has been cancelled. Safe from any thread or a
 /// signal handler. Blocking tools and the HTTP client poll this.
@@ -57,6 +63,7 @@ bool cancelRequested() @safe nothrow @nogc
         auto scope_ = cancelScopes[cancelScopeDepth - 1];
         if (scope_ !is null && atomicLoad(*scope_)) return true;
     }
+    if (cancelDeadline != MonoTime.max && monoNow >= cancelDeadline) return true;
     return atomicLoad(gCancel);
 }
 
@@ -71,6 +78,19 @@ void pushCancelScope(shared(bool)* scope_) @safe nothrow @nogc
     cancelScopeDepth++;
 }
 
+/// Cancel this thread's blocking work once `monoNow` reaches `at`
+/// (`MonoTime.max` clears it). Thread-local, so it never affects the turn.
+void setCancelDeadline(MonoTime at) @safe nothrow @nogc
+{
+    cancelDeadline = at;
+}
+
+/// Whether this thread's cancellation deadline has passed.
+bool pastCancelDeadline() @safe nothrow @nogc
+{
+    return cancelDeadline != MonoTime.max && monoNow >= cancelDeadline;
+}
+
 /// Remove the scope `pushCancelScope` installed (LIFO, on this thread).
 void popCancelScope() @safe nothrow @nogc
 {
@@ -83,6 +103,23 @@ void popCancelScope() @safe nothrow @nogc
 class Cancelled : Exception
 {
     this() pure nothrow @safe { super(cancelledResponse); }
+}
+
+unittest
+{
+    // A thread deadline cancels this thread's blocking work once it passes.
+    import core.time : seconds;
+    import std.datetime.date : DateTime;
+    import std.datetime.systime : SysTime;
+    import std.datetime.timezone : UTC;
+    import nano.clock : FakeClock;
+    auto clock = FakeClock.install(SysTime(DateTime(2026, 1, 2, 3, 4, 5), UTC()));
+    setCancelDeadline(monoNow + 5.seconds);
+    assert(!cancelRequested && !pastCancelDeadline);
+    clock.advance(5.seconds);
+    assert(cancelRequested && pastCancelDeadline);
+    setCancelDeadline(MonoTime.max);
+    assert(!cancelRequested && !pastCancelDeadline);
 }
 
 unittest
