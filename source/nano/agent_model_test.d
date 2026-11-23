@@ -215,8 +215,12 @@ class Probing : Interfering, CapabilityProbe
     /// and skip the still-running worker).
     Shared!bool done;
     Shared!int probes, windowProbes;
-    this(string model, LLMResponse[] script, size_t window, Shared!bool gate, Shared!bool done, Shared!int probes, Shared!int windowProbes)
+    /// When set, the probe ignores cancellation (like an HTTP call stuck
+    /// in a read that never polls) and waits for the gate only.
+    Shared!bool deaf;
+    this(string model, LLMResponse[] script, size_t window, Shared!bool gate, Shared!bool done, Shared!int probes, Shared!int windowProbes, Shared!bool deaf)
     {
+        this.deaf = deaf;
         super(model, script);
         this.window = window;
         this.gate = gate;
@@ -235,7 +239,7 @@ class Probing : Interfering, CapabilityProbe
         // cap stands in for a real endpoint's timeout, so a probe a test
         // abandons without cancelling still lets its daemon thread exit.
         size_t polls;
-        while (!cancelRequested() && polls++ < 30_000)
+        while ((deaf.get || !cancelRequested()) && polls++ < 30_000)
         {
             bool open;
             gate.update((ref bool g) { open = g; });
@@ -258,13 +262,15 @@ struct Probes
     import nano.safeio : Shared;
     Shared!bool gate, done;
     Shared!int probes, windowProbes;
+    Shared!bool deaf;
     static Probes make(bool open)
     {
-        return Probes(Shared!bool.make(open), Shared!bool.make(false), Shared!int.make(0), Shared!int.make(0));
+        return Probes(Shared!bool.make(open), Shared!bool.make(false), Shared!int.make(0), Shared!int.make(0),
+            Shared!bool.make(false));
     }
     Probing client(string model, LLMResponse[] script, size_t window)
     {
-        return new Probing(model, script, window, gate, done, probes, windowProbes);
+        return new Probing(model, script, window, gate, done, probes, windowProbes, deaf);
     }
 }
 
@@ -358,6 +364,7 @@ unittest
     import core.time : seconds, msecs;
     import nano.safeio : Shared;
     auto p = Probes.make(false); // the endpoint never answers until released
+    p.deaf.update((ref bool d) { d = true; }); // and doesn't notice being cancelled
     auto agent = agentFor(new Interfering("first", []));
     agent.probeClient = (string spec) => cast(LLMClient) p.client("probed", null, 4_096);
     agent.onModelRequest = (string spec) {
@@ -405,9 +412,9 @@ unittest
     // The cancelled probe bails at its next poll (never awaiting the gate),
     // is joined, and the current generation's probe starts and publishes.
     p.done.await((ref const bool d) => d, (ref bool _) {}); // the cancelled probe bailed
-    assert(agent.settleProbes(5.seconds), "the cancelled probe was joined");
-    p.probes.await((ref const int n) => n == 2, (ref int _) {}); // the current probe ran
-    assert(agent.settleProbes(5.seconds), "the current probe published");
+    assert(agent.probesInFlight == 1, "the cancelled probe is tracked until joined");
+    p.gate.update((ref bool open) { open = true; }); // the current endpoint answers
+    assert(agent.settleProbes(5.seconds), "the cancelled probe was joined, the current one ran");
     assert(agent.probesInFlight == 0, "nothing finished is left un-joined");
     assert(p.probes.get == 2, "the cancelled probe and the current one");
     assert(agent.capabilities.window == 4_096 && agent.capabilities.windowSource == "probed",
@@ -443,7 +450,7 @@ unittest
     assert(source == "default" || source == "known for the model name", source);
     assert(agent.capabilities.window == 0, "the fallback window stays");
     p.gate.update((ref bool open) { open = true; }); // let the daemon exit
-    assert(!agent.settleProbes(50.msecs), "no probe is left to settle");
+    assert(agent.settleProbes(50.msecs), "no probe is left to settle");
     assert(agent.capabilities.window == 0, "the abandoned probe never publishes");
 }
 

@@ -25,12 +25,6 @@ struct ProbeState
     /// Monotonic model-change counter; a probe captures the generation it
     /// started under and is discarded once a later change bumps it.
     private ulong generation;
-    /// The newest generation a probe is wanted for. A switch that finds a
-    /// probe still running records its generation here without starting a
-    /// second thread; the running probe adopts it when it finishes, so rapid
-    /// switches cost one probe thread, not one per switch (nano-coder#270).
-    /// `ulong.max` is "no want recorded": generations count up from 1.
-    private ulong wanted_ = ulong.max;
 
     /// Invalidate any in-flight probe and clear every report (the previous
     /// model's reports must not leak onto the new one). Returns the new
@@ -44,24 +38,6 @@ struct ProbeState
 
     /// Whether `g` is still the live generation.
     bool isCurrent(ulong g) pure const { return generation == g; }
-
-    /// Record that the newest generation wants a probe even though one is
-    /// still running (see `wanted_`).
-    void wantNewest() pure { wanted_ = generation; }
-
-    /// The generation a probe that finishes now should run for next: the
-    /// recorded want, or the live generation when nothing was recorded.
-    ulong newestWanted() pure { return wanted_ == ulong.max ? generation : wanted_; }
-
-    /// Whether a switch recorded a want while a probe was still running (so
-    /// its finisher must start that probe). The want is cleared here: a
-    /// finisher that takes it owns starting the probe.
-    bool takeWant() pure
-    {
-        if (wanted_ == ulong.max) return false;
-        wanted_ = ulong.max;
-        return true;
-    }
 
     /// Publish a blocking probe's result: every report is replaced.
     void store(Capabilities c) pure { caps = c; }
@@ -101,25 +77,6 @@ private Capabilities windowOnly(size_t tokens, string source) pure
     c.window = tokens;
     c.windowSource = source;
     return c;
-}
-
-// A switch that finds a probe still running records its want instead of
-// starting a second thread; the finisher adopts the newest wanted generation.
-unittest
-{
-    ProbeState probe;
-    auto first = probe.beginDetect();
-    probe.wantNewest();
-    auto second = probe.beginDetect();
-    probe.wantNewest();
-    assert(probe.newestWanted == second);
-    assert(!probe.isCurrent(first) && probe.isCurrent(second));
-    // A recorded want is taken once: the finisher owns starting its probe.
-    assert(probe.takeWant() && !probe.takeWant());
-    // No recorded want: the live generation is what a finisher should probe.
-    ProbeState idle;
-    auto g = idle.beginDetect();
-    assert(idle.newestWanted == g && !idle.takeWant());
 }
 
 // rust: agent/probe.rs::a_stale_generation_publishes_nothing

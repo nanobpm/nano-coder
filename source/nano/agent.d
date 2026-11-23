@@ -1579,12 +1579,20 @@ class Agent
         SubAbort abort;
         MonoTime started;
     }
-    private PendingProbe[] pendingProbes;
+    /// The one probe thread (running, or finished and not yet joined). A
+    /// superseded probe stays here, cancelled, until it finishes and is
+    /// joined, so at most one probe thread is ever alive.
+    private PendingProbe pendingProbe;
+    /// Whether `pendingProbe` holds a thread not yet joined or dropped.
+    private bool probing;
+    /// A generation that wants a probe but couldn't start one because a
+    /// probe thread was still alive; started once that thread is gone.
+    private Option!ulong wantedProbe;
 
     /// How long a background probe may run before it is abandoned: past the
-    /// deadline its thread is cancelled (its HTTP calls bail at the next
-    /// poll) and dropped, and the fallback window stands. Bounds the life of
-    /// a probe against a hanging provider (nano-coder#270).
+    /// deadline it is cancelled (its HTTP calls bail at the next poll) and
+    /// dropped, and the fallback window stands. Bounds the life of a probe
+    /// against a hanging provider (nano-coder#270).
     Duration probeDeadline = 30.seconds;
 
     /// Probe the current client on a background thread (after a mid-turn
@@ -1593,24 +1601,18 @@ class Agent
     ///
     /// At most one probe thread runs at a time: a switch that finds one still
     /// running cancels it (it is stale by construction) and records the want
-    /// instead of spawning; `collectProbes` starts the recorded generation's
-    /// probe once the thread finishes and is joined. Rapid switches then cost
-    /// one thread, not one per switch.
+    /// instead of spawning; `collectProbes` starts the wanted generation's
+    /// probe once the thread is joined. Rapid switches cost one thread, not
+    /// one per switch.
     private void startBackgroundProbe()
     {
         auto generation = probe.beginDetect();
         if (probeClient is null) return;
-        reapProbes();
-        if (pendingProbes.length)
-        {
-            foreach (ref p; pendingProbes) p.abort.abort();
-            probe.wantNewest();
-            return;
-        }
-        spawnProbe(generation);
+        wantedProbe = some(generation);
+        collectProbes();
     }
 
-    /// Start the background probe for `generation` (one must not be running).
+    /// Start the background probe for `generation` (none may be alive).
     private void spawnProbe(ulong generation)
     {
         LLMClient c;
@@ -1619,15 +1621,15 @@ class Agent
         auto abort = SubAbort.make;
         // Isolated: `probeClient` builds a new client from a resolved
         // (deep-copied) config, and only the probe thread keeps it.
-        pendingProbes ~= PendingProbe(generation,
+        pendingProbe = PendingProbe(generation,
             spawnDaemon(&runProbe, Isolated!LLMClient.assumeIsolated(c), configuredWindow == 0, abort),
             abort, monoNow);
+        probing = true;
     }
 
     /// Runs on the probe thread: what `client` reports (nothing on failure).
     /// The abort cell is this thread's cancellation scope, so a superseded or
-    /// timed-out probe's HTTP calls bail at their next poll instead of
-    /// running to completion.
+    /// timed-out probe's HTTP calls bail at their next poll.
     private static Isolated!Capabilities runProbe(Isolated!LLMClient client, bool window, SubAbort abort)
     {
         pushCancelScope(abort.ptr);
@@ -1637,75 +1639,62 @@ class Agent
         return Isolated!Capabilities.assumeIsolated(caps);
     }
 
-    /// Join every finished probe, publishing a result whose generation is
-    /// still live and discarding a stale one; cancel and drop a still-running
-    /// probe a later switch superseded or that is past `probeDeadline`.
-    /// Whether one was published.
+    /// Join the probe thread if it finished, publishing its result when its
+    /// generation is still live (a stale one is discarded). A running probe
+    /// that is stale is cancelled; one past `probeDeadline` is cancelled and
+    /// dropped (abandoned to finish on its own). With no thread alive, the
+    /// wanted generation's probe starts. Whether a result was published.
     bool collectProbes()
     {
         bool published;
-        PendingProbe[] still;
-        foreach (ref p; pendingProbes)
+        if (probing)
         {
-            const current = probe.isCurrent(p.generation);
+            alias p = pendingProbe;
             if (p.thread.running)
             {
-                // A stale probe's result can never publish, and a probe past
-                // its deadline gives up: cancel both so their HTTP calls bail
-                // at the next poll, and drop them (a daemon thread is
-                // abandoned, never left un-joined once it finishes).
-                if (!current || since(p.started) >= probeDeadline) { p.abort.abort(); continue; }
-                still ~= p;
-                continue;
+                // Stale: its result can never publish, so stop its HTTP calls.
+                if (!probe.isCurrent(p.generation)) p.abort.abort();
+                // Past the deadline: cancel and abandon the daemon thread.
+                if (since(p.started) >= probeDeadline) { p.abort.abort(); probing = false; }
             }
-            auto result = p.thread.join();
-            published |= probe.publishIfCurrent(p.generation, result.unwrap, configuredWindow == 0);
+            else
+            {
+                auto result = p.thread.join();
+                published = probe.publishIfCurrent(p.generation, result.unwrap, configuredWindow == 0);
+                probing = false;
+            }
+            if (!probing) pendingProbe = PendingProbe.init;
         }
-        pendingProbes = still;
-        // A switch that found a probe running recorded its want instead of
-        // spawning: with the thread joined, the newest wanted generation's
-        // probe runs now.
-        if (!pendingProbes.length && probeClient !is null)
-        {
-            auto wanted = probe.newestWanted();
-            if (!probe.isCurrent(wanted)) spawnProbe(wanted);
-        }
+        const alive = probing;
+        if (!alive && probeClient !is null)
+            wantedProbe.ifSome((ref ulong g) {
+                if (probe.isCurrent(g)) spawnProbe(g);
+            });
+        if (!alive) wantedProbe = none;
         return published;
     }
 
-    /// Join and publish every finished probe without starting adoptees (the
-    /// superseding switch's own `startBackgroundProbe` spawns right after).
-    private void reapProbes()
-    {
-        PendingProbe[] still;
-        foreach (ref p; pendingProbes)
-        {
-            if (p.thread.running) { still ~= p; continue; }
-            auto result = p.thread.join();
-            probe.publishIfCurrent(p.generation, result.unwrap, configuredWindow == 0);
-        }
-        pendingProbes = still;
-    }
-
     /// Wait up to `max` for the live background probe (a superseded one is
-    /// never published), then publish; false if it still runs.
+    /// joined first, then the wanted one is started and waited for), then
+    /// publish; false if it still runs.
     bool settleProbes(Duration max)
     {
         import core.time : msecs;
         auto deadline = monoNow + max;
-        foreach (ref p; pendingProbes)
-            while (probe.isCurrent(p.generation) && p.thread.running)
-            {
-                if (monoNow >= deadline) { collectProbes(); return false; }
-                sleepFor(5.msecs);
-            }
-        collectProbes();
-        return true;
+        for (;;)
+        {
+            collectProbes();
+            if (!probing) return true;
+            if (monoNow >= deadline) return false;
+            sleepFor(5.msecs);
+        }
     }
 
-    /// Test-only: how many probe threads are tracked (at most one can still
-    /// be running; a finished one is joined at the next collect).
-    version (unittest) size_t probesInFlight() { return pendingProbes.length; }
+    /// Test-only: how many probe threads are tracked (at most one).
+    version (unittest) size_t probesInFlight()
+    {
+        return probing ? 1 : 0;
+    }
 
     /// The thinking level the current model is sent, and why. A fixed budget
     /// must stay below the output cap: one that can't fit sends no level.
