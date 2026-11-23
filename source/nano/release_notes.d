@@ -56,6 +56,8 @@ unittest
     assert(compareVersions("v1.2.3", "1.2.3") == 0);
     assert(compareVersions("1.0.0-rc.1", "1.0.0") == -1);
     assert(compareVersions("0.9.0", "0.10.0") == -1);
+    assert(compareVersions("1.0.0-rc.2", "1.0.0-rc.10") == -1);
+    assert(compareVersions("1.0.0-rc.2", "1.0.0-rc.1") == 1);
 }
 
 private string str(const JSONValue j, string key) pure

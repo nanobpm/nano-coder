@@ -341,7 +341,7 @@ void saveState(string path, const State s)
 /// compared in order, and a release beats a pre-release of the same numbers.
 bool isNewer(string candidate, string running) pure
 {
-    static void parse(string v, out ulong[] nums, out bool pre)
+    static void parse(string v, out ulong[] nums, out bool pre, out string preIds)
     {
         import std.algorithm : findSplit, splitter;
         import std.conv : to;
@@ -350,6 +350,7 @@ bool isNewer(string candidate, string running) pure
         auto core = v.findSplit("+")[0];
         auto parts = core.findSplit("-");
         pre = parts[2].length > 0 || parts[1].length > 0;
+        preIds = parts[2];
         foreach (p; parts[0].splitter('.'))
         {
             ulong n;
@@ -359,14 +360,44 @@ bool isNewer(string candidate, string running) pure
     }
     ulong[] c, r;
     bool cp, rp;
-    parse(candidate, c, cp);
-    parse(running, r, rp);
+    string cIds, rIds;
+    parse(candidate, c, cp, cIds);
+    parse(running, r, rp, rIds);
     foreach (i; 0 .. c.length > r.length ? c.length : r.length)
     {
         auto a = i < c.length ? c[i] : 0, b = i < r.length ? r[i] : 0;
         if (a != b) return a > b;
     }
-    return rp && !cp;
+    if (cp != rp) return rp;
+    return cp && comparePrerelease(cIds, rIds) > 0;
+}
+
+/// SemVer order of two prerelease suffixes (`rc.2` < `rc.10` < `rc.alpha`):
+/// `-1`, `0` or `1`. Numeric identifiers compare numerically and sort below
+/// alphanumeric ones; a shorter list of equal identifiers sorts first.
+int comparePrerelease(string a, string b) pure
+{
+    import std.algorithm : all, splitter;
+    import std.ascii : isDigit;
+    auto xs = a.splitter('.'), ys = b.splitter('.');
+    for (; !xs.empty && !ys.empty; xs.popFront, ys.popFront)
+    {
+        auto p = xs.front, q = ys.front;
+        if (p == q) continue;
+        immutable pn = p.length && p.all!isDigit, qn = q.length && q.all!isDigit;
+        if (pn && qn)
+        {
+            // Numeric without leading zeros: longer is larger, else lexical.
+            while (p.length > 1 && p[0] == '0') p = p[1 .. $];
+            while (q.length > 1 && q[0] == '0') q = q[1 .. $];
+            if (p.length != q.length) return p.length < q.length ? -1 : 1;
+            if (p != q) return p < q ? -1 : 1;
+            continue;
+        }
+        if (pn != qn) return pn ? -1 : 1;
+        return p < q ? -1 : 1;
+    }
+    return xs.empty == ys.empty ? 0 : xs.empty ? -1 : 1;
 }
 
 /// Records a check's result; the version to hint, if it's newer and not yet hinted.
@@ -650,6 +681,10 @@ unittest
     assert(!isNewer("0.1.0", "0.1.0") && !isNewer("0.1.0", "0.2.0"));
     assert(isNewer("0.2.0", "0.2.0-rc.1") && !isNewer("0.2.0-rc.1", "0.2.0"));
     assert(isNewer("0.2.1-rc.1", "0.2.0") && isNewer("1.0", "0.9.9") && !isNewer("1.0", "1.0.0"));
+    assert(isNewer("1.0.0-rc.2", "1.0.0-rc.1") && !isNewer("1.0.0-rc.1", "1.0.0-rc.2"));
+    assert(isNewer("1.0.0-rc.10", "1.0.0-rc.2") && !isNewer("1.0.0-rc.2", "1.0.0-rc.10"));
+    assert(!isNewer("1.0.0-rc.1", "1.0.0-rc.1") && isNewer("1.0.0-beta", "1.0.0-alpha.9"));
+    assert(isNewer("1.0.0-alpha.1", "1.0.0-alpha") && isNewer("1.0.0-alpha.beta", "1.0.0-alpha.1"));
 }
 
 // rust: update.rs::probe_hints_only_for_newer_unhinted_versions

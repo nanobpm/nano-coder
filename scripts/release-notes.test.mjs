@@ -126,9 +126,27 @@ test('--check accepts the generated file and ignores the unreleased tail, reject
     // An untagged entry that is not the newest is rejected.
     writeFileSync(out, formatNotes([full[1], full[0], full[2]]));
     assert.equal(main(['--check', '--repo', f.dir, '--out', out]), 1, 'untagged in the middle');
+    // --cap 1 with an untagged version: the tail fills the cap.
+    assert.equal(main(['1.0.2', '--repo', f.dir, '--out', out, '--cap', '1']), 0);
+    assert.equal(main(['--check', '--repo', f.dir, '--out', out, '--cap', '1']), 0, 'tail fills the cap');
+    // --cap 1 with only tagged versions still checks one release.
+    writeFileSync(out, formatNotes([full[1]]));
+    assert.equal(main(['--check', '--repo', f.dir, '--out', out, '--cap', '1']), 0, 'one tagged release');
+    writeFileSync(out, formatNotes([]));
+    assert.equal(main(['--check', '--repo', f.dir, '--out', out, '--cap', '1']), 1, 'tagged release missing');
   } finally {
     console.log = log;
     console.error = err;
     f.done();
   }
+});
+
+test('compareVersions orders prerelease identifiers by SemVer', () => {
+  assert.equal(compareVersions('1.0.0-rc.2', '1.0.0-rc.10'), -1);
+  assert.equal(compareVersions('1.0.0-rc.10', '1.0.0-rc.2'), 1);
+  assert.equal(compareVersions('1.0.0-alpha', '1.0.0-alpha.1'), -1);
+  assert.equal(compareVersions('1.0.0-alpha.1', '1.0.0-alpha.beta'), -1);
+  assert.equal(compareVersions('1.0.0-beta', '1.0.0-alpha'), 1);
+  assert.equal(compareVersions('1.0.0-rc.1', '1.0.0-rc.1'), 0);
+  assert.equal(compareVersions('1.0.0-rc.1', '1.0.0'), -1);
 });

@@ -39,7 +39,27 @@ export function compareVersions(a, b) {
   if (x.pre === y.pre) return 0;
   if (!x.pre) return 1;
   if (!y.pre) return -1;
-  return x.pre < y.pre ? -1 : 1;
+  return comparePre(x.pre, y.pre);
+}
+
+/** SemVer prerelease order: dot-separated, numeric ids numerically and below alphanumeric ones. */
+function comparePre(a, b) {
+  const xs = a.split('.');
+  const ys = b.split('.');
+  for (let i = 0; i < Math.min(xs.length, ys.length); i++) {
+    const p = xs[i], q = ys[i];
+    if (p === q) continue;
+    const pn = /^\d+$/.test(p), qn = /^\d+$/.test(q);
+    if (pn && qn) {
+      const d = BigInt(p) - BigInt(q);
+      if (d) return d < 0n ? -1 : 1;
+      continue;
+    }
+    if (pn) return -1;
+    if (qn) return 1;
+    return p < q ? -1 : 1;
+  }
+  return xs.length === ys.length ? 0 : xs.length < ys.length ? -1 : 1;
 }
 
 /**
@@ -165,8 +185,9 @@ function main(argv) {
       return 1;
     }
     // The window comes from the cap, not from what the file kept, so deleted
-    // releases are caught: the tail takes one of the cap's slots.
-    const want = formatNotes(buildNotes(repo, { cap: Math.max(1, cap - tail.length), taggedOnly: true }));
+    // releases are caught: the tail takes one of the cap's slots (with
+    // --cap 1 it takes the only one, leaving no tagged window).
+    const want = formatNotes(buildNotes(repo, { cap: cap - tail.length, taggedOnly: true }));
     const have = formatNotes(kept);
     if (want !== have) {
       console.error(`${out} is not what git says; regenerate it with scripts/release-notes.mjs <version>`);
