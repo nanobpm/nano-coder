@@ -1916,9 +1916,13 @@ string[] remoteHosts(string script)
     return hosts;
 }
 
-/// The words of each simple command in `script`, quotes removed. A script
-/// the shell parser rejects falls back to whitespace-split lines, so a
-/// half-typed command still yields its obvious names.
+/// The words of each simple command in `script`, quotes removed and shell
+/// control words dropped (`if ssh h; then gh …; fi` -> `ssh h`, `gh …`):
+/// an unquoted keyword is syntax, never the executable, and keeping it
+/// makes the keyword the command's name so the real executable's hosts,
+/// repos and tools are missed. A script the shell parser rejects falls
+/// back to whitespace-split lines, so a half-typed command still yields
+/// its obvious names.
 private string[][] commandWords(string script)
 {
     import nano.shell : parse, Simple;
@@ -1928,11 +1932,37 @@ private string[][] commandWords(string script)
     auto parsed = parse(script);
     if (parsed.isOk)
         foreach (simple; parsed.unwrap("isOk was checked"))
-            r ~= simple.words.map!(w => w.text).array;
+        {
+            string[] words;
+            foreach (w; simple.words)
+                if (w.quoted || !isControlWord(w.text)) words ~= w.text;
+            if (words.length) r ~= words;
+        }
     else
         foreach (line; script.splitLines)
             r ~= line.split.map!(w => w.strip(`"'`)).array;
     return r;
+}
+
+/// Whether an unquoted word is shell syntax around a simple command rather
+/// than its executable or an operand: compound-command keywords (`if …
+/// then … fi`, `while … do … done`, `case … esac`), the `[[`/`]]` test
+/// brackets, the `{`/`}` group braces and the `!` pipeline negation.
+/// Quoted occurrences never reach here (`commandWords` keeps them). A
+/// loop's `for name in words` header keeps its words: none is a host
+/// (`reHostName` rejects the shell metacharacters a glob carries), and
+/// `commandNames` needs no extra guard — the header yields no executable
+/// the header itself does not name.
+private bool isControlWord(string w) pure
+{
+    switch (w)
+    {
+        case "if", "then", "elif", "else", "fi", "while", "until", "for", "select",
+             "do", "done", "case", "esac", "in", "[[", "]]", "{", "}", "!":
+            return true;
+        default:
+            return false;
+    }
 }
 
 /// The index of the executable in a simple command's words: past variable

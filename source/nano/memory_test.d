@@ -1206,6 +1206,36 @@ unittest // entitiesFromCall: urls, ssh targets, gh -R, repo name, tool name
     // A command after `&&` still counts.
     e = entitiesFromCall("bash", parseJSON(`{"command":"cd /x && ssh merlin df"}`), "");
     assert(e.canFind("host:merlin") && !e.canFind("host:df"), e.join(","));
+    // Shell control words are syntax, not the executable: a conditional or
+    // loop still yields its commands' hosts, repos and tools.
+    e = entitiesFromCall("bash", parseJSON(`{"command":"if ssh merlin uptime; then gh -R acme/widgets pr list; fi"}`), "");
+    assert(e.canFind("host:merlin"), e.join(","));
+    assert(e.canFind("repo:acme/widgets"), e.join(","));
+    assert(e.canFind("tool:ssh") && e.canFind("tool:gh"), e.join(","));
+    assert(!e.canFind("tool:if") && !e.canFind("tool:then") && !e.canFind("tool:fi"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"if ssh merlin; then gh pr list; else ssh omarchy df; fi"}`), "");
+    assert(e.canFind("host:merlin") && e.canFind("host:omarchy"), e.join(","));
+    assert(!e.canFind("tool:else"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"while read -r h; do ssh \"$h\" uptime; done < hosts.txt"}`), "");
+    assert(e.canFind("tool:ssh") && e.canFind("tool:read"), e.join(","));
+    assert(!e.canFind("tool:while") && !e.canFind("tool:do") && !e.canFind("tool:done"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"for h in a b; do scp f merlin:/x; done"}`), "");
+    assert(e.canFind("host:merlin"), e.join(","));
+    assert(!e.canFind("tool:for") && !e.canFind("tool:in"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"until ssh merlin true; do sleep 1; done"}`), "");
+    assert(e.canFind("host:merlin") && !e.canFind("tool:until"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"case x in a) ssh merlin ;; esac"}`), "");
+    assert(e.canFind("host:merlin") && !e.canFind("tool:esac"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"! ssh merlin uptime"}`), "");
+    assert(e.canFind("host:merlin"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"{ ssh merlin; }"}`), "");
+    assert(e.canFind("host:merlin"), e.join(","));
+    e = entitiesFromCall("bash", parseJSON(`{"command":"if sudo ssh merlin; then echo ok; fi"}`), "");
+    assert(e.canFind("host:merlin") && e.canFind("tool:ssh"), e.join(","));
+    // A quoted keyword is a real word, not syntax: `"ssh"` here is the
+    // command, so `merlin` is its ssh target.
+    e = entitiesFromCall("bash", parseJSON(`{"command":"if \"ssh\" merlin; then echo quoted; fi"}`), "");
+    assert(e.canFind("host:merlin"), e.join(","));
     // gh -R owner/repo and --repo, quoted or attached, case-preserved then
     // lower-cased; a bare owner/repo operand is no selector.
     e = entitiesFromCall("bash", parseJSON(`{"command":"gh issue view 280 -R nanobpm/nano-coder"}`), "");
@@ -1453,6 +1483,19 @@ unittest // remoteHosts: quoted option values, shell operators, bare sftp, wrapp
     assert(remoteHosts(`env -iuHOME ssh merlin`) == ["merlin"]);
     assert(remoteHosts(`bash -c "ssh merlin uptime"`) == ["merlin"]);
     assert(remoteHosts("echo ssh\nssh omarchy") == ["omarchy"]);
+    // Control words are syntax: the conditional's and loop's commands yield
+    // their hosts, the keywords none.
+    assert(remoteHosts(`if ssh merlin uptime; then ssh omarchy df; fi`) == ["merlin", "omarchy"]);
+    assert(remoteHosts(`while read -r h; do ssh merlin; done`) == ["merlin"]);
+    assert(remoteHosts(`for h in a b; do scp f "$h":/x; done`) == []);
+    assert(remoteHosts(`until ssh merlin true; do sleep 1; done`) == ["merlin"]);
+    assert(remoteHosts(`case x in a) ssh merlin ;; esac`) == ["merlin"]);
+    assert(remoteHosts(`! ssh merlin uptime`) == ["merlin"]);
+    assert(remoteHosts(`{ ssh merlin; }`) == ["merlin"]);
+    assert(remoteHosts(`if sudo ssh merlin; then echo ok; fi`) == ["merlin"]);
+    // A quoted keyword is a real word: `"ssh"` runs a command named `ssh`,
+    // and `merlin` is its target.
+    assert(remoteHosts(`if "ssh" merlin; then echo quoted; fi`) == ["merlin"]);
 }
 
 unittest // every executable of a shell script becomes a tool entity
