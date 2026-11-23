@@ -437,3 +437,11 @@ unittest // an entry whose tag was dropped as invalid stays pending while its ba
     auto r2 = migrate(s, ask, v.ui, Options.init);
     assert(r2.untagged == 1 && calls == 2, r2.toString);
 }
+
+unittest // an empty reply shows nothing, so it marks no entry reviewed
+{
+    auto f = fixture("empty-reply");
+    auto u = new Script;
+    migrate(f.s, delegate string(string a, string b) => "{}", u.ui, Options.init);
+    assert(!Progress.load(f.s.root).has("user.jsonl", f.dupA));
+}

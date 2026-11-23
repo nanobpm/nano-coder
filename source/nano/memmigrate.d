@@ -220,7 +220,9 @@ Proposal[] parseProposals(string reply, const string[] batchIds, const string[] 
         }
         if (ents.length > maxAnchors) ents = ents[0 .. maxAnchors];
         string kind = str(t, "fact_kind");
-        if (kind !is null && !factKinds.canFind(kind)) kind = null;
+        if (kind !is null && !kind.length) kind = null;
+        // An unknown kind would be lost for good once the entities make the entry tagged.
+        if (kind !is null && !factKinds.canFind(kind)) { reject(); continue; }
         if (!ents.length && kind is null) { reject(); continue; }
         if (bad) invalid++;
         r ~= Proposal(TagProposal(id, ents, kind));
@@ -642,8 +644,17 @@ private Proposal[] edit(Proposal p, Ui ui)
         (TagProposal t) {
             auto ents = ui.input("Entities (comma-separated type:name)", t.entities.join(", "));
             if (ents is null) return Proposal[].init;
-            auto kind = ui.input("Fact kind (" ~ factKinds.join("/") ~ ")", t.factKind is null ? "" : t.factKind);
-            if (kind is null) return Proposal[].init;
+            string kind;
+            // An empty kind means none; a mistyped one is asked again rather than dropped.
+            for (auto initial = t.factKind is null ? "" : t.factKind;;)
+            {
+                kind = ui.input("Fact kind (" ~ factKinds.join("/") ~ ")", initial);
+                if (kind is null) return Proposal[].init;
+                kind = kind.strip;
+                if (!kind.length || factKinds.canFind(kind)) break;
+                ui.say("  unknown fact kind: " ~ kind);
+                initial = "";
+            }
             TagProposal o;
             o.id = t.id;
             foreach (raw; ents.split(","))
@@ -655,8 +666,7 @@ private Proposal[] edit(Proposal p, Ui ui)
                 if (error !is null) ui.say("  ignored: " ~ error);
                 else if (!o.entities.canFind(ne)) o.entities ~= ne;
             }
-            kind = kind.strip;
-            o.factKind = factKinds.canFind(kind) ? kind : null;
+            o.factKind = kind.length ? kind : null;
             if (!o.entities.length && o.factKind is null) return Proposal[].init;
             return [Proposal(o)];
         },
@@ -762,7 +772,11 @@ Report migrate(Store store, Ask ask, Ui ui, Options opts)
             if (!ps.length && bad) continue;
             // Entries of proposals skipped as stale stay pending so the next run offers them again.
             // So do entries whose proposal was dropped as invalid: nobody reviewed them.
-            foreach (id; ids) if (!staleIds.canFind(id) && !rejected.canFind(id)) progress.done[file][id] = true;
+            // Only entries some shown proposal covered were reviewed; ids the reply omitted stay pending.
+            string[] shown;
+            foreach (p; ps) foreach (id; touchedIds(p)) shown ~= id;
+            foreach (id; ids)
+                if (shown.canFind(id) && !staleIds.canFind(id) && !rejected.canFind(id)) progress.done[file][id] = true;
             progress.save(store.root);
         }
     }
@@ -865,4 +879,29 @@ unittest // a tag dropped as invalid is reported as rejected, not silently revie
     auto ps = parseProposals(`{"tags":[{"id":"a","fact_kind":"fact"},{"id":"b","fact_kind":"bogus"}]}`,
         ["a", "b"], ["a", "b"], bad, rejected);
     assert(ps.length == 1 && bad == 1 && rejected == ["b"]);
+}
+
+unittest // an invalid kind beside valid entities rejects the tag (it could never be repaired later)
+{
+    size_t bad;
+    string[] rejected;
+    auto ps = parseProposals(`{"tags":[{"id":"a","entities":["host:merlin"],"fact_kind":"bogus"}]}`,
+        ["a"], ["a"], bad, rejected);
+    assert(!ps.length && bad == 1 && rejected == ["a"]);
+}
+
+unittest // editing a tag reprompts for a mistyped kind; an empty kind means none
+{
+    string[] answers = ["host:merlin", "pitfal", "pitfall"];
+    string[] said;
+    Ui ui;
+    ui.input = (string prompt, string initial) { auto a = answers[0]; answers = answers[1 .. $]; return a; };
+    ui.say = (string l) { said ~= l; };
+    auto got = edit(Proposal(TagProposal("a", null, null)), ui);
+    assert(got.length == 1 && !answers.length && said.length == 1);
+    got[0].match!((TagProposal t) { assert(t.factKind == "pitfall" && t.entities == ["host:merlin"]); },
+        (_) { assert(0); });
+    answers = ["host:merlin", ""];
+    got = edit(Proposal(TagProposal("a", null, "fact")), ui);
+    got[0].match!((TagProposal t) { assert(t.factKind is null); }, (_) { assert(0); });
 }

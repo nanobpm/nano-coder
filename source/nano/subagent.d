@@ -566,6 +566,26 @@ unittest
     assert(stopped, "no more model calls after the grace call");
 }
 
+// A limit first seen during request setup, then a stream retry
+// (CallModel(false): no beforeFreshCall, no steer drain) of that request:
+// neither call carried the reminder, so the next fresh call is still the grace.
+unittest
+{
+    immutable spec = SubSpec(0, "c", "t", "m", "s", null, SubLimits.init);
+    auto ab = SubAbort.make;
+    auto st = new ChildEvents(spec, Chan!SubMsg.make, Chan!ToolReply.make, ab);
+    st.beforeFreshCall();
+    ab.wrapUp();
+    st.generationStart(); // interrupted
+    st.generationStart(); // its retry, still without the reminder
+    st.beforeFreshCall();
+    st.generationStart(); // the grace call
+    bool stopped;
+    try st.generationStart();
+    catch (SubStop) stopped = true;
+    assert(stopped, "no more model calls after the grace call");
+}
+
 // A compaction needed after the limit does not spend the reporting grace:
 // the summary call counts toward the budget, the following tool-enabled
 // call still runs, and only the one after that stops the child.

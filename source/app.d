@@ -1053,7 +1053,8 @@ import nano.ui : Verbosity, parseVerbosity, verbosityListing, providersListing;
 /// `/memory migrate` and `--memory-migrate` (issue #281): the model is the
 /// session's client; `ui` asks the user. Returns the report (or the error);
 /// `ok` is false when the migration failed, so the CLI can exit nonzero.
-string runMemoryMigrate(MemoryStore store, LLMClient client, nano.memmigrate.Ui ui, bool dryRun, out bool ok)
+string runMemoryMigrate(MemoryStore store, LLMClient client, nano.memmigrate.Ui ui, bool dryRun, out bool ok,
+    void delegate(scope void delegate() @safe) @safe aroundAsk = null)
 {
     nano.memmigrate.Options mo;
     mo.dryRun = dryRun;
@@ -1062,7 +1063,11 @@ string runMemoryMigrate(MemoryStore store, LLMClient client, nano.memmigrate.Ui 
         ChatRequest req;
         req.messages = [Message.system(system), Message.user(user)];
         req.maxTokens = 8_192;
-        return client.chat(req, (bool, string) {}).content;
+        string got;
+        void call() { got = client.chat(req, (bool, string) {}).content; }
+        if (aroundAsk is null) call();
+        else aroundAsk(&call);
+        return got;
     }
     try
     {
@@ -4142,7 +4147,28 @@ int runMain(string[] args)
                         bool migrated;
                         // A cancelled earlier turn leaves the flag set and the client polls it.
                         agent.control.startTurn();
-                        writeln(runMemoryMigrate(memory.unwrap("checked above"), agent.client, ui, dry, migrated));
+                        // Shift-Tab in the review prompts must not switch to Plan mode after the
+                        // writable check above: hold mode changes until the migration ends.
+                        void delegate(K) @safe savedAction;
+                        editor.ifSome((LineEditor e) {
+                            savedAction = e.onAction;
+                            e.onAction = (K) { writeln("Mode changes are held until /memory migrate ends."); };
+                        });
+                        scope (exit) editor.ifSome((LineEditor e) { e.onAction = savedAction; });
+                        // The model call runs with no key reader: give the terminal back its
+                        // signals so Ctrl-C reaches the SIGINT handler and cancels the request.
+                        void aroundAsk(scope void delegate() @safe call)
+                        {
+                            if (editor.isSome) leaveKeyMode();
+                            atomicStore(gTurnRunning, true);
+                            scope (exit)
+                            {
+                                atomicStore(gTurnRunning, false);
+                                if (editor.isSome) enterKeyMode(0);
+                            }
+                            call();
+                        }
+                        writeln(runMemoryMigrate(memory.unwrap("checked above"), agent.client, ui, dry, migrated, &aroundAsk));
                         // Applied batches (even before a later failure) change the memory index in the
                         // system prompt and which ids it shows in full: reinstall it.
                         if (!dry) agent.installSystem(systemFor(cwd, agent.promptPlan), indexShown);
