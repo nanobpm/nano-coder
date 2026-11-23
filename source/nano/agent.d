@@ -904,6 +904,9 @@ class Agent
             sm.steered = true;
             push(sm);
             ev.userMessage(s.text);
+            // A peer's steer makes the rest of this turn peer-driven: the
+            // loop guard must hold for whatever it asks for.
+            if (s.fromPeer) peerTurn = true;
             control.absorbed(s);
         }
         fireDueTimers(ev);
@@ -2321,7 +2324,7 @@ class Agent
         bool isTimer = timerTools && isTimerTool(call.name);
         bool isAgent = subagentsOffered && call.name == subToolName;
         bool isSubCtl = subagentsOffered && isSubControlTool(call.name);
-        bool isSend = messagesOn && call.name == peers.sendTool;
+        bool isSend = messagesOn && log.isSome && call.name == peers.sendTool;
         bool isSettings = settingsTools && call.name == settings.toolName;
         // An `agent` call was checked when its reply's sub-agents launched.
         if (isAgent)

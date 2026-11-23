@@ -201,6 +201,9 @@ struct Steer
     /// can list, edit or withdraw the steer before the agent reads it; -1
     /// for none (ACP and piped steers).
     long id = -1;
+    /// Sent by a peer session (issue #272): a turn that reads it, or runs
+    /// it later as a prompt, keeps the peer loop guard.
+    bool fromPeer;
 
     this(string text, JSONValue tag = JSONValue.init)
     {
@@ -288,11 +291,34 @@ final class TurnControl
 
     /// Queue a steer carrying a `/queue` id, so it can be edited or
     /// withdrawn until the agent reads it.
-    void steerWithId(string text, size_t id) shared
+    void steerWithId(string text, size_t id, bool fromPeer = false) shared
     {
         auto m = Steer(text);
         m.id = id;
+        m.fromPeer = fromPeer;
         steer(m);
+    }
+
+    /// Withdraw every unread peer steer (its session is being left, so it
+    /// must not reach the next one); returns how many.
+    size_t dropPeerSteers() shared
+    {
+        import std.algorithm : filter;
+        import std.array : array;
+        return state.update!size_t((ref State s) {
+            auto before = s.steers.length;
+            s.steers = s.steers.filter!(m => !m.fromPeer).array;
+            return before - s.steers.length;
+        });
+    }
+
+    /// Bytes held by unread steers, so a sender that can add them (a peer
+    /// session) is admitted against a budget that frees as they are read.
+    size_t pendingSteerBytes() shared
+    {
+        size_t n;
+        foreach (m; state.get.steers) n += m.text.length;
+        return n;
     }
 
     /// Id-carrying steers the agent has not read yet, oldest first.

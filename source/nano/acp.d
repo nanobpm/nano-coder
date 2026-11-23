@@ -890,6 +890,15 @@ final class AcpServer : AgentEvents
         peerPump = null;
     }
 
+    /// Before the session identity changes: stop intake (listener and
+    /// pump) and refuse what was addressed to the old session, so none of
+    /// it runs in the new one. `startPeerListener` rebinds afterwards.
+    private void leavePeerSession()
+    {
+        stopPeerListener();
+        peerRouter.discardAll();
+    }
+
     private static struct PeerPump
     {
         Shared!bool halt;
@@ -920,6 +929,7 @@ final class AcpServer : AgentEvents
         import std.file : getcwd;
         auto cwd = getcwd();
         auto sys = host.systemPrompt !is null ? host.systemPrompt(cwd) : null;
+        leavePeerSession();
         // `restart` (not a bare messages/log swap) so every piece of
         // session-local state is reset: replay/clipping provenance
         // (`restoredLineFloor`, `clippedLines`) left from a `session/load`
@@ -957,6 +967,10 @@ final class AcpServer : AgentEvents
         // adopted from a pre-turn snapshot and the turn re-run. The live
         // conversation is kept until the lock and restore succeed.
         auto log = new SessionLog(path);
+        // From here the identity may change: stop old-session intake (a
+        // failed load restarts the listener on the kept session).
+        leavePeerSession();
+        scope (failure) if (!agent.ownsLog(log)) startPeerListener();
         // Close on failure only until the agent adopts the log: after
         // `loadRestored` takes it (even if it throws later) it is the agent's
         // live writer, and a hook or replay failure must not close it.
@@ -1038,6 +1052,13 @@ final class AcpServer : AgentEvents
                 foreach (s; leftover)
                     if (s.tag.type != JSONType.null_) send(rpcResult(s.tag, JSONValue(["stopReason": "cancelled"])));
                 return false;
+            }
+            // A peer's late steer runs later as a peer prompt (loop guard kept).
+            {
+                import std.algorithm : filter;
+                import std.array : array;
+                foreach (s; leftover) if (s.fromPeer) peerRouter.requeueLate(s.text);
+                leftover = leftover.filter!(s => !s.fromPeer).array;
             }
             items = requeueSteers(items, leftover, marks, session);
             return true;

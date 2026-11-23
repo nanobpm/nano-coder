@@ -260,6 +260,12 @@ struct ReplyCell
     bool resolved;
     Status status;
     string note;
+    /// Routing took the request (it is about to be answered): a timeout
+    /// must wait for that answer rather than expire it.
+    bool claimed;
+    /// The listener gave up waiting and told the sender `refused`: routing
+    /// must drop the request, or a retry of the "failed" send runs twice.
+    bool expired;
 }
 
 /// A listening session's end of the registry: the socket file it owns.
@@ -418,8 +424,18 @@ struct PeerListener
         auto answered = cell.await((ref const ReplyCell c) => c.resolved, (ref ReplyCell c) { r = c; }, 120.seconds);
         if (!answered)
         {
-            sendReply(conn, responseLine(id, Status.refused, "the target session did not answer in time"));
-            return;
+            // Expire it atomically unless routing already claimed it (then
+            // its answer is moments away): an expired request never runs.
+            bool expired;
+            cell.update((ref ReplyCell c) {
+                if (!c.resolved && !c.claimed) { c.expired = true; expired = true; }
+            });
+            if (expired)
+            {
+                sendReply(conn, responseLine(id, Status.refused, "the target session did not answer in time"));
+                return;
+            }
+            cell.await((ref const ReplyCell c) => c.resolved, (ref ReplyCell c) { r = c; }, 120.seconds);
         }
         sendReply(conn, responseLine(id, r.status, r.note));
     }
@@ -496,10 +512,22 @@ Status send(string dir, string to, PeerMessage pm, out string note)
     }
     auto s = new Socket(AddressFamily.UNIX, SocketType.STREAM);
     scope (exit) s.close();
-    import std.socket : SocketException;
+    import std.socket : SocketException, SocketOption, SocketOptionLevel, wouldHaveBlocked;
+    import core.time : seconds;
+    // Bound the whole exchange: a full backlog would block connect, and a
+    // suspended receiver the reply read, pinning this tool call. The read
+    // outlasts the receiver's own 120 s answer deadline.
+    s.setOption(SocketOptionLevel.SOCKET, SocketOption.SNDTIMEO, 10.seconds);
+    s.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, 130.seconds);
     try s.connect(new UnixAddress(path));
     catch (SocketException)
     {
+        // A timeout is a busy receiver, not a dead one: keep its socket.
+        if (wouldHaveBlocked())
+        {
+            note = format("session %s did not accept the connection in time", to);
+            return Status.refused;
+        }
         // Stale: nobody is accepting. Remove it so the next listing is clean.
         removeIfThere(path);
         note = format("session %s is not running (removed a stale socket)", to);
@@ -672,6 +700,11 @@ struct PeerRouter
         PeerRequest req;
         while (requests.tryTake(req))
         {
+            // Claim it, unless the listener already timed it out (the
+            // sender was told `refused`, so it must not run).
+            bool live;
+            req.reply.update((ref ReplyCell c) { if (!c.expired) { c.claimed = true; live = true; } });
+            if (!live) continue;
             auto labelled = label(req.pm.senderId, req.pm.senderTitle) ~ " " ~ req.pm.text;
             auto confirm = this.confirm || req.pm.confirm;
             if (confirm && noConfirmChannel.get)
@@ -684,14 +717,21 @@ struct PeerRouter
             // even mid-turn: steering them in would bypass the approval.
             if (midTurn && !confirm)
             {
-                auto id = queue.reserveId();
                 import core.atomic : atomicLoad;
-                atomicLoad(control).steerWithId(labelled, id);
+                // Unread steers are bounded like the idle inbox; the budget
+                // frees as the turn reads them (or `/queue` withdraws them).
+                if (atomicLoad(control).pendingSteerBytes + labelled.length > maxQueuedBytes)
+                {
+                    answer(req.reply, Status.refused, "the target session's inbox is full; try again later");
+                    continue;
+                }
+                auto id = queue.reserveId();
+                atomicLoad(control).steerWithId(labelled, id, true);
                 answer(req.reply, Status.queued, "queued in the target session (visible and editable in /queue)");
             }
             else
             {
-                auto bytes = labelled.length + req.pm.text.length;
+                auto bytes = retainedBytes(req.pm, labelled);
                 bool admitted;
                 queuedBytes.update((ref size_t q) {
                     if (q + bytes <= maxQueuedBytes) { q += bytes; admitted = true; }
@@ -723,10 +763,51 @@ struct PeerRouter
     {
         WaitingItem item;
         if (!waiting.tryTake(item)) return false;
-        auto bytes = item.labelled.length + item.pm.text.length;
+        auto bytes = retainedBytes(item.pm, item.labelled);
         queuedBytes.update((ref size_t q) { import nano.arith : saturatingSub; q = saturatingSub(q, bytes); });
         first = Inbound(item.pm, item.labelled, item.needsConfirm, item.outcome);
         return true;
+    }
+
+    /// Refuse everything addressed to the session being left: accepted
+    /// requests not yet routed, idle deliveries and unread peer steers.
+    /// Call with the listener stopped, before the session id changes, so
+    /// none of it runs in the replacement session.
+    void discardAll()
+    {
+        enum note = "the target session switched to another session before running it";
+        PeerRequest req;
+        while (requests.tryTake(req))
+        {
+            bool live;
+            req.reply.update((ref ReplyCell c) { if (!c.expired) { c.claimed = true; live = true; } });
+            if (live) answer(req.reply, Status.refused, note);
+        }
+        Inbound m;
+        while (takeWaiting(m)) settle(m, false, note);
+        import core.atomic : atomicLoad;
+        atomicLoad(control).dropPeerSteers();
+    }
+
+    /// Run a peer's steer that missed its turn as a later peer prompt, so
+    /// it keeps its provenance (the loop guard) instead of becoming an
+    /// ordinary prompt. Its sender was answered when it was steered.
+    void requeueLate(string labelled)
+    {
+        auto done = Shared!ReplyCell.make;
+        answer(done, Status.queued, "queued");
+        PeerMessage pm;
+        pm.text = labelled;
+        // Already admitted against the steer budget: not refused here.
+        queuedBytes.update((ref size_t q) { q += retainedBytes(pm, labelled); });
+        waiting.put(WaitingItem(pm, labelled, false, done));
+    }
+
+    /// Every string a waiting item retains, so the byte cap can't be
+    /// dodged with a huge sender id, title or message id.
+    private static size_t retainedBytes(const ref PeerMessage pm, string labelled) pure nothrow @nogc
+    {
+        return labelled.length + pm.text.length + pm.senderId.length + pm.senderTitle.length + pm.messageId.length;
     }
 
     private static void answer(Shared!ReplyCell reply, Status status, string note)
@@ -959,3 +1040,75 @@ unittest
 
 // The loop guard lives in the agent (peerTurn): covered by the agent-level
 // test in agent_peers_test.d.
+
+// Review fixes: expired requests never run, every retained string counts
+// against the inbox cap, peer steers have a byte budget, late peer steers
+// keep their provenance, and a session switch refuses old deliveries.
+unittest
+{
+    import nano.control : TurnControl;
+    import nano.queue : MessageQueue;
+    import core.atomic : atomicLoad;
+    auto control = new shared TurnControl;
+    auto router = PeerRouter.make(atomicLoad(control));
+    router.confirm(false);
+    auto queue = MessageQueue.make;
+
+    // A request the listener timed out is dropped by routing.
+    auto expired = Shared!ReplyCell.make;
+    expired.update((ref ReplyCell c) { c.expired = true; });
+    router.requests.put(PeerRequest(PeerMessage("sess-a", null, "late", "m", false), expired));
+    router.routePending(queue);
+    assert(!router.hasWaiting, "an expired request never runs");
+    assert(!expired.get.resolved);
+
+    // A routed request is claimed, so a timeout can't expire it any more.
+    auto live = Shared!ReplyCell.make;
+    router.requests.put(PeerRequest(PeerMessage("sess-a", null, "hi", "m", false), live));
+    router.routePending(queue);
+    assert(live.get.claimed && live.get.resolved && router.hasWaiting);
+    Inbound m;
+    assert(router.takeWaiting(m));
+    assert(!router.hasWaiting, "the accounting returns to zero");
+
+    // A tiny body with a huge message id is charged for the id.
+    import std.array : replicate;
+    auto big = "x".replicate(maxQueuedBytes / 2 + 1);
+    auto c1 = Shared!ReplyCell.make, c2 = Shared!ReplyCell.make;
+    router.requests.put(PeerRequest(PeerMessage("sess-a", null, "a", big, false), c1));
+    router.requests.put(PeerRequest(PeerMessage("sess-a", null, "b", big, false), c2));
+    router.routePending(queue);
+    assert(c1.get.status == Status.delivered);
+    assert(c2.get.status == Status.refused, "the second big message id overflows the cap");
+    assert(router.takeWaiting(m));
+
+    // Mid-turn: peer steers are flagged and bounded by unread bytes.
+    router.midTurn(true);
+    auto s1 = Shared!ReplyCell.make, s2 = Shared!ReplyCell.make;
+    router.requests.put(PeerRequest(PeerMessage("sess-a", null, big, "m", false), s1));
+    router.requests.put(PeerRequest(PeerMessage("sess-a", null, big, "m", false), s2));
+    router.routePending(queue);
+    assert(s1.get.status == Status.queued);
+    assert(s2.get.status == Status.refused, "unread peer steers are capped");
+    auto steers = control.takePending;
+    assert(steers.length == 1 && steers[0].fromPeer, "a peer steer keeps its provenance");
+    auto s3 = Shared!ReplyCell.make;
+    router.requests.put(PeerRequest(PeerMessage("sess-a", null, big, "m", false), s3));
+    router.routePending(queue);
+    assert(s3.get.status == Status.queued, "the budget frees once steers are read");
+    router.midTurn(false);
+
+    // A late peer steer runs later as a (pre-answered) peer prompt.
+    router.requeueLate("[from session sess-a] later");
+    assert(router.takeWaiting(m) && m.labelled == "[from session sess-a] later" && !m.needsConfirm);
+
+    // Leaving a session refuses its queued, waiting and steered messages.
+    auto w = Shared!ReplyCell.make, q = Shared!ReplyCell.make;
+    router.requests.put(PeerRequest(PeerMessage("sess-a", null, "w", "m", false), w));
+    router.routePending(queue);
+    router.requests.put(PeerRequest(PeerMessage("sess-a", null, "q", "m", false), q));
+    router.discardAll();
+    assert(!router.hasWaiting && q.get.status == Status.refused);
+    assert(!control.hasSteers, "the unread peer steer was dropped");
+    assert(w.get.status == Status.refused, "a waiting delivery is refused");
+}

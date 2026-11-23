@@ -615,6 +615,19 @@ bool deliverIdleCompact(bool due, imported!"core.time".Duration quietFor, import
     assert(idleCompactHoldFor(c) == 7.seconds);
 }
 
+/// Route accepted peer requests every few ms while a turn runs (issue
+/// #272), until `halt`: mid-turn ones join the turn's steers.
+void pumpPeerRoutes(PeerRouter peerRouter, MessageQueue queue, Shared!bool halt)
+{
+    import core.time : msecs;
+    import nano.clock : sleepFor;
+    while (!halt.get)
+    {
+        peerRouter.routePending(queue);
+        sleepFor(20.msecs);
+    }
+}
+
 Isolated!LineEditor turnKeys(Isolated!LineEditor owned, ConsoleLink console, shared(bool)* done, Chan!string held,
     QuestionBroker questions, MessageQueue queue, MidTurn mid)
 {
@@ -3128,6 +3141,20 @@ int runMain(string[] args)
         }
         catch (ListenError e) return e.msg;
     }
+    // After a session switch (/restart, /resume): drop what was addressed
+    // to the old session and listen under the new id. Routing only runs on
+    // this thread, so nothing old was routed between the switch and here.
+    void rebindPeerListener()
+    {
+        if (!peerListener.length) return;
+        stopPeerListener();
+        peerRouter.discardAll();
+        if (auto failed = startPeerListener())
+        {
+            agent.messagesOn = false;
+            stdErr.writeln(console.red("[messages: " ~ failed ~ "]"));
+        }
+    }
     peerRouter = PeerRouter.make(agent.control.nonNull);
     peerRouter.confirm(cfg.sessionMessagesConfirm);
     if (cfg.sessionMessages)
@@ -3276,6 +3303,19 @@ int runMain(string[] args)
         // the prompt): route before the key reader starts and after it stops.
         peerRouter.routePending(queue);
         scope (exit) peerRouter.routePending(queue);
+        // Route during `work` too, so a busy session's peer steers reach
+        // this turn (and their senders hear back) instead of timing out.
+        auto pumpHalt = Shared!bool.make(false);
+        auto pump = spawnDaemon(&pumpPeerRoutes, peerRouter, queue, pumpHalt);
+        bool pumpRunning = true;
+        void stopPump()
+        {
+            if (!pumpRunning) return;
+            pumpRunning = false;
+            pumpHalt.update((ref bool b) { b = true; });
+            pump.join();
+        }
+        scope (exit) stopPump();
         // With the line editor, keys typed during the turn steer it (a
         // `/command` waits for the turn to end); Ctrl-C or Esc Esc cancels.
         auto turnDone = new shared(bool);
@@ -3312,6 +3352,10 @@ int runMain(string[] args)
         // Stop the key reader before taking the late steers: one typed between
         // the take and the stop would land in `control` and never run.
         stopKeys();
+        // The final routing pass comes before the take, so a peer steer
+        // routed now is collected below rather than stranded in `control`.
+        stopPump();
+        peerRouter.routePending(queue);
         // Steers that arrived after the agent's last step run as the next prompts.
         // One the user steered at the prompt keeps its `/queue` id.
         auto late = agent.control.takePending;
@@ -3320,6 +3364,13 @@ int runMain(string[] args)
         {
             foreach (t; late) stdErr.writeln(console.dim("[steer dropped: " ~ t.text ~ "]"));
             late = null;
+        }
+        // A peer's late steer runs later as a peer prompt (loop guard kept).
+        {
+            import std.algorithm : filter;
+            import std.array : array;
+            foreach (t; late) if (t.fromPeer) peerRouter.requeueLate(t.text);
+            late = late.filter!(t => !t.fromPeer).array;
         }
         if (inbox)
             foreach_reverse (t; late) inbox.put(t.text, true);
@@ -3420,9 +3471,13 @@ int runMain(string[] args)
         import nano.clock : sleepFor;
         import core.time : msecs;
         string l;
-        while (agent.subagentsActive || agent.backgroundResultsReady())
+        while (agent.subagentsActive || agent.backgroundResultsReady() || peerListener.length)
         {
             if (inbox.tryTake(l)) return l;
+            // A peer delivery wakes the prompt: an empty line just loops
+            // back to the top, which confirms and runs it (issue #272).
+            peerRouter.routePending(queue);
+            if (peerRouter.hasWaiting) return "";
             if (agent.backgroundResultsReady())
             {
                 string notice;
@@ -3588,8 +3643,16 @@ int runMain(string[] args)
                 import nano.question : Question, QuestionOption, Answered;
                 auto q = Question(confirmQuestion(inbound), null, [QuestionOption("Decline"), QuestionOption("Accept")]);
                 q.custom = false;
-                auto a = questions.ask([q]);
-                accepted = a.match!((Answered got) => got.answers.length && got.answers[0] == "Accept", _ => false);
+                // Ask through the editor this loop owns: the broker's other
+                // end (the turn key reader) is not running at the idle
+                // prompt, so `questions.ask` would block forever. No editor
+                // (plain input) means no way to ask: decline.
+                accepted = false;
+                foreach (ed; editor)
+                {
+                    auto a = askQuestions(ed, [q]);
+                    accepted = a.match!((Answered got) => got.answers.length && got.answers[0] == "Accept", _ => false);
+                }
             }
             settle(inbound, accepted);
             if (accepted)
@@ -3686,6 +3749,13 @@ int runMain(string[] args)
             {
                 return deliverDueTimer(agent.backgroundResultsReady(), ed.holdsTimer(monoNow), false, exitPress.armed);
             }
+            // A peer delivery wakes the prompt (issue #272): the loop top
+            // confirms and runs it, the draft parked meanwhile.
+            bool peerNow() @safe
+            {
+                peerRouter.routePending(queue);
+                return peerRouter.hasWaiting;
+            }
             // Esc Esc at the idle prompt stops background sub-agents.
             bool stopBackground;
             ed.onIdleEscEsc = () @safe { if (agent.subagentsActive) stopBackground = true; };
@@ -3693,6 +3763,7 @@ int runMain(string[] args)
                 || stopBackground
                 || timerNow()
                 || subNow()
+                || peerNow()
                 || idleNow()
                 || (updateHints && updateHints.tryTake(updateHint))
                 || (releaseNotice && releaseNotice.tryTake(fetchedNotice));
@@ -3734,6 +3805,11 @@ int runMain(string[] args)
                 writeln(console.dim(notice));
                 agent.automaticInput = true;
                 line = "\x00" ~ line;
+            }
+            else if (r.outcome == Outcome.stopped && peerRouter.hasWaiting)
+            {
+                hasParkedDraft = ed.parkDraft(parkedDraft);
+                continue;
             }
             else if (r.outcome == Outcome.stopped && idleNow())
             {
@@ -3835,6 +3911,7 @@ int runMain(string[] args)
                     auto log = agent.log;
                     updateStatus((ref Stats s) { s.historySearches = s.historyReads = 0; });
                     agent.useHooks(loadHooks(cwd), false);
+                    rebindPeerListener();
                     if (gFrame) gFrame.clear();
                     refreshStatus();
                     log.match!(l => writefln("Session: %s (resume with nano-coder --resume %s)", l.id, l.id),
@@ -4018,6 +4095,7 @@ int runMain(string[] args)
                     agent.stopSubagents(); // they belong to the session being left
                     try loadNotes = loadSession(path);
                     catch (Exception e) { writeln(e.msg); continue; }
+                    rebindPeerListener();
                     if (gFrame) { gFrame.clear(); replayTranscript(agent, console); releaseHeap(); }
                     foreach (n; loadNotes) stdErr.writeln(n);
                     stdErr.flush();
