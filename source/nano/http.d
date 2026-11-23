@@ -99,22 +99,35 @@ int perform(const ref Request req, out string body_, out ResponseMeta meta,
     // and on every chunk).
     http.onProgress = (size_t a, size_t b, size_t c, size_t d) => cancelRequested() ? 1 : 0;
     ubyte[] buf;
+    ushort statusCode;
     // Headers of the final response only (a redirect or 100 resets them).
-    http.onReceiveStatusLine = (HTTP.StatusLine) { meta = ResponseMeta.init; };
+    http.onReceiveStatusLine = (HTTP.StatusLine sl) {
+        meta = ResponseMeta.init;
+        statusCode = sl.code;
+        buf = null;
+    };
     http.onReceiveHeader = (in char[] key, in char[] value) {
         auto k = key.idup.toLower;
         if (k == "content-type") meta.contentType = value.idup;
         else if (k == "retry-after") meta.retryAfter = value.idup;
     };
     http.onReceive = (ubyte[] data) {
-        // Returning less than offered makes libcurl abort before more is buffered.
-        if (req.maxBytes && buf.length + data.length > req.maxBytes) return 0;
-        buf ~= data;
+        // A streamed 2xx SSE reply is consumed chunk-by-chunk by `onChunk`;
+        // buffering it in `buf` would retain the whole raw stream in GC memory
+        // only to discard it. Non-SSE replies and error bodies are still buffered.
+        immutable streamOnly = onChunk !is null && statusCode >= 200 && statusCode < 300
+            && meta.contentType.indexOf("event-stream") >= 0;
+        if (!streamOnly)
+        {
+            // Returning less than offered makes libcurl abort before more is buffered.
+            if (req.maxBytes && buf.length + data.length > req.maxBytes) return 0;
+            buf ~= data;
+        }
         if (onChunk !is null) onChunk(asChars(data)); // unchecked: a chunk may end inside a character
         return data.length;
     };
     http.perform();
-    body_ = lossyText(buf);
+    body_ = buf.length ? lossyText(buf) : null;
     return http.statusLine.code;
 }
 
@@ -470,19 +483,24 @@ private void pause(Duration d)
 /// Incremental server-sent-events parser: emits each event's joined `data:` lines.
 struct SseParser
 {
-    private string pending;
-    private string data;
+    import std.array : Appender;
+
+    private Appender!(char[]) pending;
+    private Appender!(char[]) data;
     private bool hasData;
 
     void feed(const(char)[] chunk, scope void delegate(string) @safe emit)
     {
-        pending ~= chunk;
+        if (chunk.length) pending.put(chunk);
+        auto buf = pending.data;
+        size_t pos;
         for (;;)
         {
-            auto nl = pending.indexOf('\n');
-            if (nl < 0) break;
-            auto line = pending[0 .. nl];
-            pending = pending[nl + 1 .. $];
+            auto rel = buf[pos .. $].indexOf('\n');
+            if (rel < 0) break;
+            auto nl = pos + rel;
+            auto line = buf[pos .. nl];
+            pos = nl + 1;
             if (line.length && line[$ - 1] == '\r') line = line[0 .. $ - 1];
             if (line.length == 0)
             {
@@ -493,15 +511,23 @@ struct SseParser
             {
                 auto v = line[5 .. $];
                 if (v.length && v[0] == ' ') v = v[1 .. $];
-                data = hasData ? data ~ "\n" ~ v : v;
+                if (hasData) data.put('\n');
+                data.put(v);
                 hasData = true;
             }
+        }
+        if (pos == buf.length) pending.clear();
+        else if (pos > 0)
+        {
+            auto rem = buf[pos .. $].dup;
+            pending.clear();
+            pending.put(rem);
         }
     }
 
     void finish(scope void delegate(string) @safe emit)
     {
-        if (pending.length) feed("\n", emit);
+        if (pending.data.length) feed("\n", emit);
         dispatch(emit);
     }
 
@@ -513,8 +539,8 @@ struct SseParser
         // byte of any multi-byte character, and invalid bytes become U+FFFD
         // instead of reaching the consumer as broken UTF-8.
         import std.string : representation;
-        auto d = lossyText(data.representation);
-        data = null;
+        auto d = lossyText(data.data.representation);
+        data.clear();
         hasData = false;
         emit(d);
     }
@@ -675,4 +701,61 @@ unittest
     auto h = seen[0].headers.toLower;
     assert(h.count("content-type:") == 1, seen[0].headers);
     assert(h.canFind("content-type: application/json"), seen[0].headers);
+}
+
+// Streamed 2xx SSE replies are delivered to `onChunk` without buffering the
+// whole raw stream in `body_`; non-SSE 2xx replies and error responses still
+// buffer `body_` (issue #308).
+unittest
+{
+    import nano.testserver : serve, Reply;
+    auto srv = serve([
+        Reply(200, "Content-Type: text/event-stream\r\n", "data: one\n\ndata: two\n\n"),
+        Reply(200, "Content-Type: application/json\r\n", `{"ok":true}`),
+        Reply(500, "Content-Type: text/event-stream\r\n", "data: err\n\n"),
+    ]);
+
+    // 1. 2xx text/event-stream with onChunk: chunks arrive, body_ stays empty.
+    {
+        Request req;
+        req.url = srv.url ~ "/sse";
+        req.body_ = "{}";
+        string body_;
+        ResponseMeta meta;
+        string[] events;
+        SseParser sse;
+        auto status = perform(req, body_, meta, (const(char)[] chunk) {
+            sse.feed(chunk, (string ev) { events ~= ev; });
+        });
+        sse.finish((string ev) { events ~= ev; });
+        assert(status == 200);
+        assert(events == ["one", "two"]);
+        assert(body_.length == 0, "expected SSE stream not to buffer body_: " ~ body_);
+    }
+
+    // 2. 2xx application/json with onEvent (postJson): still returns full JSON body.
+    {
+        RetryPolicy p;
+        p.maxRetries = 0;
+        string[] events;
+        auto res = postJson(srv.url ~ "/json", null, JSONValue(1), "probe", p, [], 5,
+            (string ev) { events ~= ev; });
+        assert(res == `{"ok":true}`, res);
+        assert(events.length == 0);
+    }
+
+    // 3. Non-2xx with event-stream content-type: still buffers error body for ApiError.
+    {
+        RetryPolicy p;
+        p.maxRetries = 0;
+        ApiError caught;
+        try postJson(srv.url ~ "/err", null, JSONValue(1), "probe", p, [], 5,
+            (string) {});
+        catch (ApiError e) caught = e;
+        assert(caught !is null);
+        assert(caught.status == 500);
+        assert(caught.body_ == "data: err\n\n", caught.body_);
+    }
+
+    srv.finish();
 }
