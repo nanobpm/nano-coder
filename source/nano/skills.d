@@ -142,6 +142,9 @@ final class Skills
     /// Problems found while loading (bad lock entries, failed fetches...).
     string[] warnings;
     private bool[string] seen;
+    /// What `fingerprintIn` saw just before this set was discovered: compared
+    /// with a fresh one at each turn boundary to tell whether to rediscover.
+    string fingerprint;
 
     static Skills discover(string cwd, const ref SkillsConfig config)
     {
@@ -151,6 +154,8 @@ final class Skills
     static Skills discoverIn(string cwd, const ref SkillsConfig config, Locations locations)
     {
         auto s = new Skills;
+        // Taken first, so an edit made during discovery shows as a change next time.
+        s.fingerprint = fingerprintIn(cwd, config, locations);
         auto c = canonical(cwd);
         if (c is null) c = cwd;
         auto root = gitRoot(c);
@@ -261,6 +266,13 @@ final class Skills
         }
     }
 
+    /// True when the skill files on disk no longer match what this set was
+    /// discovered from (stat only: reads no `SKILL.md`).
+    bool stale(string cwd, const ref SkillsConfig config, Locations locations) const
+    {
+        return fingerprintIn(cwd, config, locations) != fingerprint;
+    }
+
     bool empty() pure const { return skills.length == 0; }
 
     string[] names() pure const { return skills.map!(s => s.name.idup).array; }
@@ -332,6 +344,116 @@ ToolDefinition definition() pure
         parseJSON(`{"type":"object","properties":{"name":{"type":"string","description":"The skill's name, exactly as listed."}},"required":["name"]}`));
 }
 
+/// What changed between two skill sets, as `updated a; added b; removed c`
+/// (empty when names and descriptions are the same).
+string describeChanges(const Skills before, const Skills after) pure
+{
+    string[] updated, added, removed;
+    foreach (a; after.skills)
+    {
+        auto i = before.skills.countUntil!(b => b.name == a.name);
+        if (i < 0) added ~= a.name;
+        else if (before.skills[i].description != a.description || before.skills[i].dir != a.dir
+                || before.skills[i].source != a.source)
+            updated ~= a.name;
+    }
+    foreach (b; before.skills)
+        if (!after.skills.any!(a => a.name == b.name)) removed ~= b.name;
+    string[] parts;
+    if (updated.length) parts ~= "updated " ~ updated.join(", ");
+    if (added.length) parts ~= "added " ~ added.join(", ");
+    if (removed.length) parts ~= "removed " ~ removed.join(", ");
+    return parts.join("; ");
+}
+
+/// A stat-only signature of everything `Skills.discoverIn` would read: the
+/// directories it would scan (and their listings), each `SKILL.md`'s path,
+/// size and mtime, and `ai.lock`/`ai.json`. Same roots, depth cap and
+/// containment rules as discovery; no file contents are read. Locked
+/// checkouts are pinned by commit, so only `ai.lock` itself is watched.
+string fingerprintIn(string cwd, const ref SkillsConfig config, Locations locations)
+{
+    import std.array : appender;
+    auto o = appender!string;
+    auto c = canonical(cwd);
+    if (c is null) c = cwd;
+    auto root = gitRoot(c);
+    if (root is null) root = c;
+    auto confine = canonical(root);
+    void dirPrint(string dir, string limit)
+    {
+        o ~= "D\0" ~ dir ~ "\0";
+        auto r = canonical(dir);
+        if (r is null || (limit !is null && !startsWithPath(r, limit))) return;
+        fingerprintScan(r, r, 0, o);
+    }
+    foreach (dir; config.dirs) dirPrint(buildPath(root, dir), confine);
+    if (config.aiLock)
+        foreach (f; [lockFile, manifestFile]) o ~= statLine(buildPath(root, f));
+    foreach (dir; config.userDirs)
+    {
+        if (dir.startsWith("~/"))
+        {
+            if (locations.home.length) dirPrint(buildPath(locations.home, dir[2 .. $]), null);
+        }
+        else dirPrint(dir, null);
+    }
+    return o[];
+}
+
+private string statLine(string path)
+{
+    try
+    {
+        if (!path.exists || !path.isFile) return "-\0" ~ path ~ "\0";
+        return format("F\0%s\0%s\0%s\0", path, getSize(path), timeLastModified(path).stdTime);
+    }
+    catch (FileException) return "?\0" ~ path ~ "\0"; // vanished mid-check: a change all the same
+}
+
+/// `scan`, recording what it looks at instead of collecting skills. One
+/// listing per folder: a plain (non-symlink) entry under a canonical folder
+/// is already canonical and is taken from the listing's own stat; only
+/// symlinks pay for a `realpath` containment check.
+private void fingerprintScan(Out)(string root, string dir, size_t depth, ref Out o)
+{
+    string[] dirs;
+    bool isSkill;
+    string skillLine;
+    try
+        foreach (DirEntry e; listDir(dir, SpanMode.shallow))
+        {
+            auto base = e.name.baseName;
+            if (base == skillFile)
+            {
+                if (!e.isSymlink)
+                {
+                    if (e.isFile && !e.name.pathSplitter.canFind(".git"))
+                    {
+                        isSkill = true;
+                        skillLine = format("F\0%s\0%s\0%s\0", e.name, e.size, e.timeLastModified.stdTime);
+                    }
+                }
+                else if (auto sf = within(root, e.name))
+                    if (sf.isFile) { isSkill = true; skillLine = statLine(sf); }
+                continue;
+            }
+            if (base.startsWith(".")) continue;
+            if (!e.isSymlink) { if (e.isDir && !e.name.pathSplitter.canFind(".git")) dirs ~= e.name; }
+            else if (auto rp = within(root, e.name)) if (rp.isDir) dirs ~= rp;
+        }
+    catch (FileException) { o ~= "?\0" ~ dir ~ "\0"; return; }
+    if (isSkill) { o ~= skillLine; return; }
+    o ~= "d\0" ~ dir ~ "\0";
+    if (depth >= maxScanDepth) return;
+    dirs.sort();
+    foreach (sub; dirs) fingerprintScan(root, sub, depth + 1, o);
+}
+
+/// `SKILL.md` files read by discovery on this thread (tests check the
+/// no-change path reads none).
+package size_t skillFileReads;
+
 // ---- helpers ----
 
 /// The rp path of `p` (symlinks resolved), or null if it doesn't exist.
@@ -389,6 +511,7 @@ private void scan(string root, string dir, size_t depth, ref string[] out_)
 private bool readSkill(string dir, string nameOverride, Source source, out Skill sk)
 {
     string text;
+    skillFileReads++;
     try text = lossyUtf8(readBytes(buildPath(dir, skillFile)));
     catch (Exception) return false; // an unreadable SKILL.md is not a skill
     string[2][] fields;
@@ -906,4 +1029,61 @@ unittest // parses_git_hosts, store_key_matches_spm
     assert(gitHost("file:///tmp/x") == "file");
     auto z = "0".replicate(40);
     assert(storeKey("https://github.com/camunda/skills.git", z) == "skills-f3b38a5efdfe31f3@" ~ z);
+}
+
+unittest // picks_up_edited_added_and_removed_skills_with_a_stat_only_check
+{
+    auto dir = tmpRoot("refresh");
+    auto repo = buildPath(dir, "repo");
+    mkdirRecurse(buildPath(repo, ".git"));
+    auto home = buildPath(dir, "home");
+    put(buildPath(home, ".agents/skills/web/SKILL.md"), skillMd("web", "Over plain HTTP with curl."));
+    put(buildPath(home, ".agents/skills/old/SKILL.md"), skillMd("old", "Old one."));
+    auto c = cfg();
+    auto s = Skills.discoverIn(repo, c, locs(dir));
+    auto index = s.renderIndex;
+
+    // Untouched: no rediscovery, no SKILL.md read, the same index bytes.
+    auto reads = skillFileReads;
+    assert(!s.stale(repo, c, locs(dir)));
+    assert(skillFileReads == reads);
+    assert(Skills.discoverIn(repo, c, locs(dir)).renderIndex == index);
+
+    // Edit a description, add one, remove one.
+    put(buildPath(home, ".agents/skills/web/SKILL.md"), skillMd("web", "Over HTTP with d8ctl, the CLI."));
+    put(buildPath(home, ".agents/skills/foo/SKILL.md"), skillMd("foo", "Foo things."));
+    rmdirRecurse(buildPath(home, ".agents/skills/old"));
+    assert(s.stale(repo, c, locs(dir)));
+    auto fresh = Skills.discoverIn(repo, c, locs(dir));
+    assert(describeChanges(s, fresh) == "updated web; added foo; removed old", describeChanges(s, fresh));
+    assert(fresh.renderIndex.canFind("d8ctl") && !fresh.renderIndex.canFind("old"));
+    assert(!fresh.stale(repo, c, locs(dir)));
+    assert(describeChanges(fresh, fresh) == "");
+
+    // An untrusted repository keeps no repo skills, before or after a change.
+    auto untrusted = cfg();
+    untrusted.dirs = null;
+    untrusted.aiLock = false;
+    auto u = Skills.discoverIn(repo, untrusted, locs(dir));
+    put(buildPath(repo, ".agents/skills/evil/SKILL.md"), skillMd("evil", "Repo skill."));
+    assert(!u.stale(repo, untrusted, locs(dir)));
+    assert(!Skills.discoverIn(repo, untrusted, locs(dir)).names.canFind("evil"));
+    assert(s.stale(repo, c, locs(dir))); // trusted config does watch it
+}
+
+unittest // the_no_change_check_on_50_skills_is_cheap
+{
+    auto dir = tmpRoot("bench");
+    auto home = buildPath(dir, "home");
+    foreach (i; 0 .. 50)
+        put(buildPath(home, format(".agents/skills/s%02d/SKILL.md", i)), skillMd(format("s%02d", i), "A skill."));
+    auto c = cfg();
+    auto s = Skills.discoverIn(dir, c, locs(dir));
+    assert(s.skills.length == 50);
+    enum runs = 20;
+    auto t0 = monoNow;
+    foreach (_; 0 .. runs) assert(!s.stale(dir, c, locs(dir)));
+    auto per = (monoNow - t0) / runs;
+    debug (benchSkills) { import std.stdio : writeln; writeln("skills no-change check, 50 skills: ", per); }
+    assert(per.total!"msecs" < 50, per.toString);
 }

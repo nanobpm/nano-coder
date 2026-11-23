@@ -218,6 +218,9 @@ struct Host
     /// "Updated X → Y" and what changed (#282), sent once as an info notice
     /// after the first session/new or session/load; null for none.
     string releaseNotice;
+    /// Called before each prompt's turn: picks up between-turn changes
+    /// (edited skills) and rebuilds the system prompt if they changed it.
+    void delegate() beforePrompt;
 }
 
 /// Input id for idempotent prompts: `messageId`, or `_meta.inputId`.
@@ -640,6 +643,7 @@ final class AcpServer : AgentEvents
             // calls; release the previous turn's.
             subCalls = null;
             terminalCalls = null;
+            if (host.beforePrompt !is null) host.beforePrompt();
             runTurn(id, text, inputId(params));
             subCalls = null;
             terminalCalls = null;
