@@ -11,7 +11,9 @@ import nano.option : Option, some, none, match, ifSome, orElse, unwrap, NotNull;
 import nano.result : orThrow, toOption, match, unwrap;
 
 import nano.safeio : Chan, Isolated, Join, JoinHandle, spawn, spawnDaemon, stdErr, stdOut;
+import nano.subagent : SubAbort;
 import nano.probe : ProbeState;
+import core.time : seconds;
 
 import std.json;
 import std.format : format;
@@ -1567,52 +1569,122 @@ class Agent
     /// probe after a mid-turn switch (null: mid-turn switches don't probe).
     LLMClient delegate(string spec) probeClient;
 
-    /// A background probe: the generation it publishes under, and its thread.
+    /// A background probe: the generation it publishes under, its thread, the
+    /// abort flag its HTTP calls poll (set when a later switch supersedes it),
+    /// and when it started (for `probeDeadline`).
     private static struct PendingProbe
     {
         ulong generation;
         Join!(Isolated!Capabilities) thread;
+        SubAbort abort;
+        MonoTime started;
     }
     private PendingProbe[] pendingProbes;
+
+    /// How long a background probe may run before it is abandoned: past the
+    /// deadline its thread is cancelled (its HTTP calls bail at the next
+    /// poll) and dropped, and the fallback window stands. Bounds the life of
+    /// a probe against a hanging provider (nano-coder#270).
+    Duration probeDeadline = 30.seconds;
 
     /// Probe the current client on a background thread (after a mid-turn
     /// switch), so the next model call goes out at once, with the fallback
     /// window, until `collectProbes` publishes the result.
+    ///
+    /// At most one probe thread runs at a time: a switch that finds one still
+    /// running cancels it (it is stale by construction) and records the want
+    /// instead of spawning; `collectProbes` starts the recorded generation's
+    /// probe once the thread finishes and is joined. Rapid switches then cost
+    /// one thread, not one per switch.
     private void startBackgroundProbe()
     {
         auto generation = probe.beginDetect();
         if (probeClient is null) return;
+        reapProbes();
+        if (pendingProbes.length)
+        {
+            foreach (ref p; pendingProbes) p.abort.abort();
+            probe.wantNewest();
+            return;
+        }
+        spawnProbe(generation);
+    }
+
+    /// Start the background probe for `generation` (one must not be running).
+    private void spawnProbe(ulong generation)
+    {
         LLMClient c;
         try c = probeClient(client.providerName ~ "/" ~ client.modelName);
         catch (Exception) return; // the probe is optional: the fallbacks stand
+        auto abort = SubAbort.make;
         // Isolated: `probeClient` builds a new client from a resolved
         // (deep-copied) config, and only the probe thread keeps it.
         pendingProbes ~= PendingProbe(generation,
-            spawnDaemon(&runProbe, Isolated!LLMClient.assumeIsolated(c), configuredWindow == 0));
+            spawnDaemon(&runProbe, Isolated!LLMClient.assumeIsolated(c), configuredWindow == 0, abort),
+            abort, monoNow);
     }
 
     /// Runs on the probe thread: what `client` reports (nothing on failure).
-    private static Isolated!Capabilities runProbe(Isolated!LLMClient client, bool window)
+    /// The abort cell is this thread's cancellation scope, so a superseded or
+    /// timed-out probe's HTTP calls bail at their next poll instead of
+    /// running to completion.
+    private static Isolated!Capabilities runProbe(Isolated!LLMClient client, bool window, SubAbort abort)
     {
+        pushCancelScope(abort.ptr);
+        scope (exit) popCancelScope();
         auto caps = probeOf(client.unwrap, window);
         // Isolated: built on this thread, and only the result box keeps it.
         return Isolated!Capabilities.assumeIsolated(caps);
     }
 
-    /// Publish the background probes that finished; a result from a model
-    /// a later switch superseded is discarded. Whether one was published.
+    /// Join every finished probe, publishing a result whose generation is
+    /// still live and discarding a stale one; cancel and drop a still-running
+    /// probe a later switch superseded or that is past `probeDeadline`.
+    /// Whether one was published.
     bool collectProbes()
     {
         bool published;
         PendingProbe[] still;
         foreach (ref p; pendingProbes)
         {
-            if (p.thread.running) { if (probe.isCurrent(p.generation)) still ~= p; continue; }
+            const current = probe.isCurrent(p.generation);
+            if (p.thread.running)
+            {
+                // A stale probe's result can never publish, and a probe past
+                // its deadline gives up: cancel both so their HTTP calls bail
+                // at the next poll, and drop them (a daemon thread is
+                // abandoned, never left un-joined once it finishes).
+                if (!current || since(p.started) >= probeDeadline) { p.abort.abort(); continue; }
+                still ~= p;
+                continue;
+            }
             auto result = p.thread.join();
             published |= probe.publishIfCurrent(p.generation, result.unwrap, configuredWindow == 0);
         }
         pendingProbes = still;
+        // A switch that found a probe running recorded its want instead of
+        // spawning: with the thread joined, the newest wanted generation's
+        // probe runs now.
+        if (!pendingProbes.length && probeClient !is null)
+        {
+            auto wanted = probe.newestWanted();
+            if (!probe.isCurrent(wanted)) spawnProbe(wanted);
+        }
         return published;
+    }
+
+    /// Join and publish every finished probe without starting adoptees (the
+    /// superseding switch's own `startBackgroundProbe` spawns right after).
+    private void reapProbes()
+    {
+        PendingProbe[] still;
+        foreach (ref p; pendingProbes)
+        {
+            if (p.thread.running) { still ~= p; continue; }
+            auto result = p.thread.join();
+            probe.publishIfCurrent(p.generation, result.unwrap, configuredWindow == 0);
+        }
+        pendingProbes = still;
     }
 
     /// Wait up to `max` for the live background probe (a superseded one is
@@ -1630,6 +1702,10 @@ class Agent
         collectProbes();
         return true;
     }
+
+    /// Test-only: how many probe threads are tracked (at most one can still
+    /// be running; a finished one is joined at the next collect).
+    version (unittest) size_t probesInFlight() { return pendingProbes.length; }
 
     /// The thinking level the current model is sent, and why. A fixed budget
     /// must stay below the output cap: one that can't fit sends no level.

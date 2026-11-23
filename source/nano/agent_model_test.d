@@ -226,9 +226,23 @@ class Probing : Interfering, CapabilityProbe
     }
     Capabilities probeCapabilities(bool withWindow = true)
     {
-        gate.await((ref const bool open) => open, (ref bool _) {});
+        import nano.control : cancelRequested;
+        import core.time : msecs;
         probes.update((ref int n) { n++; });
         if (withWindow) windowProbes.update((ref int n) { n++; });
+        // Poll like the HTTP layer does: a cancelled probe (superseded or
+        // past its deadline) bails here instead of waiting for the gate. The
+        // cap stands in for a real endpoint's timeout, so a probe a test
+        // abandons without cancelling still lets its daemon thread exit.
+        size_t polls;
+        while (!cancelRequested() && polls++ < 30_000)
+        {
+            bool open;
+            gate.update((ref bool g) { open = g; });
+            if (open) break;
+            import nano.clock : sleepFor;
+            sleepFor(1.msecs);
+        }
         Capabilities c;
         c.maxOutput = 1_234;
         if (withWindow) { c.window = window; c.windowSource = model; }
@@ -321,15 +335,116 @@ unittest
     };
     agent.control.requestModel("mock/slow");
     assert(agent.applyModelRequest());
+    slow.probes.await((ref const int n) => n == 1, (ref int _) {}); // the slow probe is in flight
     agent.control.requestModel("mock/fast");
     assert(agent.applyModelRequest());
-    assert(agent.settleProbes(5.seconds), "the stale probe is not waited for");
+    // The slow probe is superseded: it is cancelled (it bails at its next
+    // poll, never awaiting the gate), joined, and the fast probe runs.
+    slow.done.await((ref const bool d) => d, (ref bool _) {}); // the cancelled probe bailed
+    assert(agent.settleProbes(5.seconds), "the cancelled stale probe is joined");
+    fast.probes.await((ref const int n) => n == 1, (ref int _) {}); // the fast probe started
+    assert(agent.settleProbes(5.seconds), "the fast probe publishes");
     assert(agent.capabilities.window == 4_096);
-    slow.gate.update((ref bool open) { open = true; });
-    slow.done.await((ref const bool d) => d, (ref bool _) {}); // the stale probe finished
     agent.collectProbes();
     assert(agent.capabilities.window == 4_096 && agent.capabilities.windowSource == "fast",
         "the stale probe did not overwrite the live model's window");
+}
+
+// Ten switches in a row against a probe that blocks: at most one probe
+// thread is alive at any time, and the last generation's probe runs once the
+// block is released (nano-coder#270).
+unittest
+{
+    import core.time : seconds, msecs;
+    import nano.safeio : Shared;
+    auto p = Probes.make(false); // the endpoint never answers until released
+    auto agent = agentFor(new Interfering("first", []));
+    agent.probeClient = (string spec) => cast(LLMClient) p.client("probed", null, 4_096);
+    agent.onModelRequest = (string spec) {
+        agent.useClient(p.client("probed", null, 4_096), ConfiguredWindow.init);
+    };
+    foreach (i; 0 .. 10)
+    {
+        agent.control.requestModel("mock/probed");
+        assert(agent.applyModelRequest());
+        assert(agent.probesInFlight <= 1, "at most one probe thread is alive");
+    }
+    p.probes.await((ref const int n) => n == 1, (ref int _) {}); // the one probe is in flight
+    assert(p.probes.get == 1, "nine superseded switches started no thread");
+    assert(!agent.settleProbes(50.msecs), "the blocked probe does not finish");
+    assert(agent.probesInFlight == 1, "the blocked probe is still within its deadline");
+    p.gate.update((ref bool open) { open = true; });
+    p.done.await((ref const bool d) => d, (ref bool _) {}); // the blocked probe finished
+    assert(agent.settleProbes(5.seconds), "the blocked probe is joined");
+    // Its stale result is discarded, and the last generation's probe starts.
+    p.probes.await((ref const int n) => n == 2, (ref int _) {}); // the last generation's probe ran
+    assert(agent.settleProbes(5.seconds), "the last generation's probe published");
+    assert(agent.probesInFlight == 0, "everything finished is joined");
+    assert(p.probes.get == 2, "one blocked probe, then one for the last generation");
+    assert(agent.capabilities.window == 4_096 && agent.capabilities.windowSource == "probed",
+        "the last generation's probe published");
+}
+
+// A superseded probe is cancelled and joined; the current one still
+// publishes (nano-coder#270).
+unittest
+{
+    import core.time : seconds;
+    import nano.safeio : Shared;
+    auto p = Probes.make(false);
+    auto agent = agentFor(new Interfering("first", []));
+    agent.probeClient = (string spec) => cast(LLMClient) p.client("probed", null, 4_096);
+    agent.onModelRequest = (string spec) {
+        agent.useClient(p.client("probed", null, 4_096), ConfiguredWindow.init);
+    };
+    agent.control.requestModel("mock/probed");
+    assert(agent.applyModelRequest());
+    p.probes.await((ref const int n) => n == 1, (ref int _) {}); // the first probe is in flight
+    agent.control.requestModel("mock/probed");
+    assert(agent.applyModelRequest()); // supersedes and cancels the first
+    // The cancelled probe bails at its next poll (never awaiting the gate),
+    // is joined, and the current generation's probe starts and publishes.
+    p.done.await((ref const bool d) => d, (ref bool _) {}); // the cancelled probe bailed
+    assert(agent.settleProbes(5.seconds), "the cancelled probe was joined");
+    p.probes.await((ref const int n) => n == 2, (ref int _) {}); // the current probe ran
+    assert(agent.settleProbes(5.seconds), "the current probe published");
+    assert(agent.probesInFlight == 0, "nothing finished is left un-joined");
+    assert(p.probes.get == 2, "the cancelled probe and the current one");
+    assert(agent.capabilities.window == 4_096 && agent.capabilities.windowSource == "probed",
+        "the current probe published");
+}
+
+// A probe past its deadline is abandoned (cancelled and dropped) and the
+// fallback window stays (nano-coder#270).
+unittest
+{
+    import core.time : seconds, msecs;
+    import std.datetime.date : DateTime;
+    import std.datetime.systime : SysTime;
+    import std.datetime.timezone : UTC;
+    import nano.clock : FakeClock;
+    import nano.safeio : Shared;
+    auto p = Probes.make(false); // the endpoint hangs
+    auto agent = agentFor(new Interfering("first", []));
+    agent.probeClient = (string spec) => cast(LLMClient) p.client("probed", null, 4_096);
+    agent.onModelRequest = (string spec) {
+        agent.useClient(p.client("probed", null, 4_096), ConfiguredWindow.init);
+    };
+    auto clock = FakeClock.install(SysTime(DateTime(2026, 1, 2, 3, 4, 5), UTC()));
+    agent.control.requestModel("mock/probed");
+    assert(agent.applyModelRequest());
+    p.probes.await((ref const int n) => n == 1, (ref int _) {}); // the probe is in flight
+    assert(agent.probesInFlight == 1, "the probe is tracked");
+    clock.advance(31.seconds); // past the 30 s probe deadline
+    assert(!agent.collectProbes(), "nothing publishes");
+    assert(agent.probesInFlight == 0, "the timed-out probe is dropped");
+    string source;
+    agent.contextWindow(source);
+    assert(source == "default" || source == "known for the model name", source);
+    assert(agent.capabilities.window == 0, "the fallback window stays");
+    p.gate.update((ref bool open) { open = true; }); // let the daemon exit
+    assert(!agent.settleProbes(50.msecs), "no probe is left to settle");
+    assert(agent.capabilities.window == 0, "the abandoned probe never publishes");
 }
 
 /// Events that count summary starts and usage reports, to assert a
