@@ -68,9 +68,13 @@ function git(repo, args) {
   return execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
 }
 
-/** The `vX.Y.Z` tags of `repo`, oldest version first (without the `v`). */
+/**
+ * The `vX.Y.Z` tags reachable from HEAD in `repo`, oldest version first
+ * (without the `v`). Tags on other branches (a release cut on main after
+ * this branch forked) are not part of this history, so they are ignored.
+ */
 export function releaseTags(repo) {
-  return git(repo, ['tag', '--list', 'v*'])
+  return git(repo, ['tag', '--merged', 'HEAD', '--list', 'v*'])
     .split('\n')
     .map((t) => t.trim())
     .filter((t) => VERSION_RE.test(t.slice(1)))

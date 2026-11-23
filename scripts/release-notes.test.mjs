@@ -81,6 +81,24 @@ test('buildNotes reads multiple versions, the unreleased tail and the cap', () =
   }
 });
 
+test('releaseTags ignores tags that are not ancestors of HEAD', () => {
+  const f = fixture();
+  try {
+    f.commit('feat: first (#1)');
+    f.git('tag', 'v0.1.0');
+    f.git('checkout', '-q', '-b', 'other');
+    f.commit('feat: elsewhere (#2)');
+    f.git('tag', 'v0.2.0');
+    f.git('checkout', '-q', 'main');
+    f.commit('fix: here (#3)');
+    const notes = buildNotes(f.dir, { version: '0.1.1' });
+    assert.deepEqual(notes.map((r) => r.version), ['0.1.1', '0.1.0']);
+    assert.deepEqual(notes[0].items, [{ type: 'fix', scope: '', title: 'here', pr: 3 }]);
+  } finally {
+    f.done();
+  }
+});
+
 test('--check accepts the generated file and ignores the unreleased tail, rejects a change', () => {
   const f = fixture();
   const log = console.log;
