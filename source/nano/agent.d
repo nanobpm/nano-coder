@@ -1575,9 +1575,18 @@ class Agent
     private static struct PendingProbe
     {
         ulong generation;
-        Join!(Isolated!Capabilities) thread;
+        Join!(Isolated!ProbeOutcome) thread;
         SubAbort abort;
         MonoTime started;
+        /// Past `probeDeadline`: cancelled, and its result never publishes.
+        bool expired;
+    }
+    /// What a probe thread returns: the capabilities, and whether it ran
+    /// past its own deadline or was cancelled (then the result is dropped).
+    private static struct ProbeOutcome
+    {
+        Capabilities caps;
+        bool late;
     }
     /// The one probe thread (running, or finished and not yet joined). A
     /// superseded probe stays here, cancelled, until it finishes and is
@@ -1622,28 +1631,37 @@ class Agent
         // Isolated: `probeClient` builds a new client from a resolved
         // (deep-copied) config, and only the probe thread keeps it.
         pendingProbe = PendingProbe(generation,
-            spawnDaemon(&runProbe, Isolated!LLMClient.assumeIsolated(c), configuredWindow == 0, abort),
+            spawnDaemon(&runProbe, Isolated!LLMClient.assumeIsolated(c), configuredWindow == 0, abort, probeDeadline),
             abort, monoNow);
         probing = true;
     }
 
     /// Runs on the probe thread: what `client` reports (nothing on failure).
-    /// The abort cell is this thread's cancellation scope, so a superseded or
-    /// timed-out probe's HTTP calls bail at their next poll.
-    private static Isolated!Capabilities runProbe(Isolated!LLMClient client, bool window, SubAbort abort)
+    /// The abort cell is this thread's cancellation scope, so a superseded
+    /// probe's HTTP calls bail at their next poll; the thread also sets its
+    /// own deadline, so a probe past `deadline` bails even while the agent
+    /// is blocked and not collecting. A late or cancelled result is flagged.
+    private static Isolated!ProbeOutcome runProbe(Isolated!LLMClient client, bool window, SubAbort abort,
+        Duration deadline)
     {
+        import nano.control : setCancelDeadline, pastCancelDeadline;
         pushCancelScope(abort.ptr);
         scope (exit) popCancelScope();
+        setCancelDeadline(monoNow + deadline);
+        scope (exit) setCancelDeadline(MonoTime.max);
         auto caps = probeOf(client.unwrap, window);
+        const late = abort.aborted || pastCancelDeadline();
         // Isolated: built on this thread, and only the result box keeps it.
-        return Isolated!Capabilities.assumeIsolated(caps);
+        return Isolated!ProbeOutcome.assumeIsolated(ProbeOutcome(caps, late));
     }
 
     /// Join the probe thread if it finished, publishing its result when its
-    /// generation is still live (a stale one is discarded). A running probe
-    /// that is stale is cancelled; one past `probeDeadline` is cancelled and
-    /// dropped (abandoned to finish on its own). With no thread alive, the
-    /// wanted generation's probe starts. Whether a result was published.
+    /// generation is still live and it beat `probeDeadline` (anything else is
+    /// discarded). A running probe that is stale or past the deadline is
+    /// cancelled but stays tracked until it exits and is joined, so a probe
+    /// that ignores cancellation still blocks new ones: at most one probe
+    /// thread is ever alive. With no thread alive, the wanted generation's
+    /// probe starts. Whether a result was published.
     bool collectProbes()
     {
         bool published;
@@ -1654,16 +1672,19 @@ class Agent
             {
                 // Stale: its result can never publish, so stop its HTTP calls.
                 if (!probe.isCurrent(p.generation)) p.abort.abort();
-                // Past the deadline: cancel and abandon the daemon thread.
-                if (since(p.started) >= probeDeadline) { p.abort.abort(); probing = false; }
+                // Past the deadline: cancel it; its result will be dropped.
+                if (since(p.started) >= probeDeadline) { p.abort.abort(); p.expired = true; }
             }
             else
             {
-                auto result = p.thread.join();
-                published = probe.publishIfCurrent(p.generation, result.unwrap, configuredWindow == 0);
+                auto outcome = p.thread.join().unwrap;
+                // A probe that finished late (collection was blocked) never publishes.
+                const late = p.expired || outcome.late || since(p.started) >= probeDeadline;
+                if (!late)
+                    published = probe.publishIfCurrent(p.generation, outcome.caps, configuredWindow == 0);
                 probing = false;
+                pendingProbe = PendingProbe.init;
             }
-            if (!probing) pendingProbe = PendingProbe.init;
         }
         const alive = probing;
         if (!alive && probeClient !is null)

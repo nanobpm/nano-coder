@@ -421,8 +421,10 @@ unittest
         "the current probe published");
 }
 
-// A probe past its deadline is abandoned (cancelled and dropped) and the
-// fallback window stays (nano-coder#270).
+// A probe past its deadline is cancelled, but a deaf one keeps its slot
+// until it exits and is joined: switches across repeated deadline intervals
+// start no second worker, and the expired result never publishes
+// (nano-coder#270).
 unittest
 {
     import core.time : seconds, msecs;
@@ -432,6 +434,7 @@ unittest
     import nano.clock : FakeClock;
     import nano.safeio : Shared;
     auto p = Probes.make(false); // the endpoint hangs
+    p.deaf.update((ref bool d) { d = true; }); // and ignores cancellation
     auto agent = agentFor(new Interfering("first", []));
     agent.probeClient = (string spec) => cast(LLMClient) p.client("probed", null, 4_096);
     agent.onModelRequest = (string spec) {
@@ -441,17 +444,79 @@ unittest
     agent.control.requestModel("mock/probed");
     assert(agent.applyModelRequest());
     p.probes.await((ref const int n) => n == 1, (ref int _) {}); // the probe is in flight
-    assert(agent.probesInFlight == 1, "the probe is tracked");
-    clock.advance(31.seconds); // past the 30 s probe deadline
-    assert(!agent.collectProbes(), "nothing publishes");
-    assert(agent.probesInFlight == 0, "the timed-out probe is dropped");
+    foreach (i; 0 .. 3)
+    {
+        clock.advance(31.seconds); // past the 30 s probe deadline
+        assert(!agent.collectProbes(), "nothing publishes");
+        assert(agent.probesInFlight == 1, "the deaf timed-out probe keeps its slot");
+        agent.control.requestModel("mock/probed");
+        assert(agent.applyModelRequest());
+        assert(!p.done.get, "the deaf worker is still alive");
+        assert(p.probes.get == 1, "no second worker started while one is alive");
+    }
     string source;
     agent.contextWindow(source);
     assert(source == "default" || source == "known for the model name", source);
     assert(agent.capabilities.window == 0, "the fallback window stays");
-    p.gate.update((ref bool open) { open = true; }); // let the daemon exit
-    assert(agent.settleProbes(50.msecs), "no probe is left to settle");
-    assert(agent.capabilities.window == 0, "the abandoned probe never publishes");
+    destroy(clock); // back to real time, so the settles below really wait
+    // Release the expired worker without collecting in between: it is joined,
+    // its result dropped, and the wanted generation's probe starts.
+    p.deaf.update((ref bool d) { d = false; });
+    p.gate.update((ref bool open) { open = true; });
+    p.done.await((ref const bool d) => d, (ref bool _) {});
+    assert(!agent.collectProbes(), "the expired result never publishes");
+    assert(agent.settleProbes(5.seconds), "the wanted probe ran");
+    assert(p.probes.get == 2, "one expired worker, then one for the live generation");
+    assert(agent.capabilities.windowSource == "probed", "the live generation's probe published");
+}
+
+// The worker enforces its own deadline: a probe that hangs while the agent
+// never collects bails on its own, and its late result is not published
+// (nano-coder#270).
+unittest
+{
+    import core.time : seconds, msecs;
+    import nano.safeio : Shared;
+    auto p = Probes.make(false); // the endpoint hangs; the probe polls cancellation
+    auto agent = agentFor(new Interfering("first", []));
+    agent.probeDeadline = 20.msecs;
+    agent.probeClient = (string spec) => cast(LLMClient) p.client("probed", null, 4_096);
+    agent.onModelRequest = (string spec) {
+        agent.useClient(p.client("probed", null, 4_096), ConfiguredWindow.init);
+    };
+    agent.control.requestModel("mock/probed");
+    assert(agent.applyModelRequest());
+    // No collection here (the agent is "blocked in a model call"): the
+    // worker's own deadline ends the probe.
+    p.done.await((ref const bool d) => d, (ref bool _) {});
+    assert(agent.settleProbes(5.seconds), "the finished worker is joined");
+    assert(agent.probesInFlight == 0, "nothing is left tracked");
+    assert(agent.capabilities.window == 0, "the fallback window stays");
+}
+
+// A deaf probe that finishes after its deadline, collected only afterwards,
+// is rejected too (nano-coder#270).
+unittest
+{
+    import core.time : seconds, msecs;
+    import nano.clock : sleepFor;
+    import nano.safeio : Shared;
+    auto p = Probes.make(false);
+    p.deaf.update((ref bool d) { d = true; });
+    auto agent = agentFor(new Interfering("first", []));
+    agent.probeDeadline = 10.msecs;
+    agent.probeClient = (string spec) => cast(LLMClient) p.client("probed", null, 4_096);
+    agent.onModelRequest = (string spec) {
+        agent.useClient(p.client("probed", null, 4_096), ConfiguredWindow.init);
+    };
+    agent.control.requestModel("mock/probed");
+    assert(agent.applyModelRequest());
+    p.probes.await((ref const int n) => n == 1, (ref int _) {});
+    sleepFor(20.msecs); // past the deadline, no collection
+    p.gate.update((ref bool open) { open = true; });
+    p.done.await((ref const bool d) => d, (ref bool _) {});
+    assert(agent.settleProbes(5.seconds), "the late worker is joined");
+    assert(agent.capabilities.window == 0, "the fallback window stays");
 }
 
 /// Events that count summary starts and usage reports, to assert a
