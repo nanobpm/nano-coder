@@ -65,6 +65,7 @@ static import nano.question;
 static import nano.queue;
 static import nano.qwen;
 static import nano.recents;
+static import nano.release_notes;
 static import nano.reminders;
 static import nano.resume;
 static import nano.retry;
@@ -155,6 +156,7 @@ private alias modules = imported!"std.meta".AliasSeq!(
     nano.queue,
     nano.qwen,
     nano.recents,
+    nano.release_notes,
     nano.reminders,
     nano.resume,
     nano.retry,

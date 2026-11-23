@@ -31,7 +31,7 @@ nano-coder --help
 - **Lifecycle Hooks**: an `AgentEvents` interface for observing agent behavior, plus
   Claude Code–compatible external user hooks loaded from `.claude/settings.json`
 - **Configuration**: TOML-based config file at `~/.config/nano-coder/config.toml`
-- **Commands**: `/help`, `/version`, `/compact`, `/context`, `/verbosity`, `/settings`, `/tools`, `/skills`, `/subagents`, `/queue`, `/restart`, `/update`, `/relaunch`, `/exit`
+- **Commands**: `/help`, `/version`, `/compact`, `/context`, `/verbosity`, `/settings`, `/tools`, `/skills`, `/subagents`, `/queue`, `/restart`, `/update`, `/relaunch`, `/changes`, `/exit`
 - **Streaming output**: answers stream in, thinking shows collapsed, tool calls show inline
 - **Status line** as the bottom row of the terminal, plus manual and automatic context compaction
 - **Task plans**: `plan_*` tools keep a plan with notes outside the conversation, so long tasks survive compaction, resume and a change of worker
@@ -630,6 +630,28 @@ session logs through `step` and checks that each turn asks for what the log show
 with the recorded answer. Point `NANO_REPLAY_DIR` at a sessions directory to replay all of its
 turns.
 
+## What Changed After an Update
+
+After an update (`/update` and `/relaunch`, `brew upgrade` or an npm update), the next
+interactive start shows **"Updated X → Y"** with the changes of every release in between,
+grouped as Features, Fixes and Performance, with each PR as a full link. It comes after
+a resumed session's transcript, so it is the last thing on screen, and is never written
+to the session log (a later resume doesn't show it again). At most 15 changes are listed,
+then "…and N more" with a compare link.
+
+- The version that ran last is kept in `<platform data dir>/nano-coder/last_version`. The
+  first run ever only records it; a downgrade records the running version and shows nothing.
+- The notes are compiled in. When they don't cover the range (a very old record, a local
+  build), the releases are fetched from the GitHub API in the background (short timeouts,
+  bounded size) and shown at the prompt; if that fails, a compare link
+  (`https://github.com/nanobpm/nano-coder/compare/vX...vY`) is shown instead.
+- Over ACP the notice is sent once, after the first `session/new` or `session/load`, as a
+  `_nano/notice` notification (`{"sessionId", "level": "info", "text"}`); it never fetches.
+  Headless prompts (`-p`, piped stdin) show nothing and leave the record alone.
+- `show_release_notes = false` turns the notice off (the record is still kept).
+- `/changes` shows the changes of this release again; `/changes 1.8.0` shows everything
+  since 1.8.0.
+
 ## Configuration
 
 Create `~/.config/nano-coder/config.toml` (every field is optional). Directories from before the rename (`agentic-harness`, for config and for data such as sessions) are moved to `nano-coder` at startup when the new ones don't exist yet. A symlink is left at the old path so an older nano-coder still finds them. If that compatibility symlink can't be created, a warning is printed and the link is retried on later starts; if the move itself fails, the old directory is used:
@@ -670,6 +692,7 @@ instruction_imports_outside_project = false   # let project @imports / rule link
 plan_tools = true                       # offer the plan_* tools (see Task Plans)
 outcome_tool = true                     # offer report_outcome (see Outcomes)
 reminders = true                        # append <system-reminder> notes to tool results
+show_release_notes = true               # after an update, show what changed (see What Changed)
 memory = "on"                           # on | read_only | off — cross-session memory (see Memory)
 # memory_dir = "/path/to/memory"        # default: <platform data dir>/nano-coder/memory
 memory_expiry_days = 90                 # expire memories unused this long (0 = never)

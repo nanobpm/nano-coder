@@ -449,6 +449,8 @@ struct Config
     bool autoCompact = true;
     /// Check for a newer release in the background (interactive sessions).
     bool checkUpdates = true;
+    /// After an update, show what changed since the version that ran last (#282).
+    bool showReleaseNotes = true;
     /// Instruction files (AGENTS.md and friends, the user's own, rules).
     bool projectInstructions = true;
     string[] projectInstructionFiles = ["AGENTS.md", "CLAUDE.md", ".claude/CLAUDE.md", ".github/copilot-instructions.md"];
@@ -539,6 +541,7 @@ struct Config
         if (auto v = "reminders" in doc) c.reminders = v.boolean;
         if (auto v = "auto_compact" in doc) c.autoCompact = v.boolean;
         if (auto v = "check_updates" in doc) c.checkUpdates = v.boolean;
+        if (auto v = "show_release_notes" in doc) c.showReleaseNotes = v.boolean;
         if (auto v = "project_instructions" in doc) c.projectInstructions = v.boolean;
         static string[] strs(JSONValue v) { string[] o; foreach (x; v.arrayNoRef) o ~= x.str; return o; }
         if (auto v = "project_instruction_files" in doc) c.projectInstructionFiles = strs(*v);

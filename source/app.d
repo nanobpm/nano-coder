@@ -2890,6 +2890,13 @@ int runMain(string[] args)
         host.makeClient = (string s) => makeClient(resolve(cfg, s));
         host.sessionDir = o.noSession ? null : sessionDir;
         host.version_ = versionString;
+        {
+            // The release notice, sent once (#282). No network here: notes
+            // the build lacks give a compare link.
+            import nano.release_notes : embedded, lastVersionPath, startupNotice;
+            import std.array : join;
+            host.releaseNotice = startupNotice(lastVersionPath(), packageVersion, cfg.showReleaseNotes, embedded()).join("\n");
+        }
         host.loadHooks = &loadHooks;
         host.providerNames = () => enabledProviderNames(cfg.providers);
         host.configModel = cfg.model;
@@ -3390,6 +3397,23 @@ int runMain(string[] args)
         // (issue #263): hand that transient heap back too.
         releaseHeap();
     }
+    // What changed since the version that ran last (#282): after the replay,
+    // so it is the last thing on screen. Notes the build lacks are fetched in
+    // the background and shown at the idle prompt, like an update hint.
+    if (interactive)
+    {
+        import nano.release_notes : embedded, lastVersionPath, needsFetch, runNotice, startupNotice;
+        import std.array : join;
+        auto notesPath = lastVersionPath();
+        auto notes = embedded();
+        if (needsFetch(notesPath, packageVersion, cfg.showReleaseNotes, notes))
+        {
+            if (!updateHints) updateHints = Chan!string.make;
+            spawnDaemon(&runNotice, notesPath, packageVersion, updateHints);
+        }
+        else if (auto lines = startupNotice(notesPath, packageVersion, cfg.showReleaseNotes, notes))
+            writeln(stampBlock(console.stamp(), lines.join("\n")));
+    }
     import core.time : MonoTime, msecs;
     import nano.lineedit : DoublePress, interruptWindowMs;
     auto exitPress = DoublePress(interruptWindowMs); // idle Ctrl-C twice exits
@@ -3749,6 +3773,13 @@ int runMain(string[] args)
                 case "/subagents":
                     writeln(escapeMarks(sanitizeBlock(subagentsCommand(agent, cfg, arg))));
                     continue;
+                case "/changes":
+                {
+                    import nano.release_notes : changesCommand, embedded, fetchUrl;
+                    import std.array : join;
+                    writeln(changesCommand(arg, packageVersion, embedded(), (string url) => fetchUrl(url)).join("\n"));
+                    continue;
+                }
                 case "/tools":
                     writeln(escapeMarks(toolsListing(agent)));
                     continue;

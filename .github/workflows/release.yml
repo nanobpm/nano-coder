@@ -109,9 +109,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          # Full history and tags: a dry run writes the release notes from git.
+          fetch-depth: 0
           ref: ${{ needs.release.outputs.released == 'true' && format('v{0}', needs.release.outputs.version) || github.sha }}
       # No-op for a release (the tag already has it); sets the dry-run version.
       - run: node scripts/set-version.mjs ${{ needs.release.outputs.version }}
+      # The dry run's notes for its version (a release's tag already has them).
+      - if: needs.release.outputs.released != 'true'
+        run: node scripts/release-notes.mjs ${{ needs.release.outputs.version }}
       - uses: dlang-community/setup-dlang@v2
         with:
           compiler: ldc-1.43.0

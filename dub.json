@@ -5,6 +5,9 @@
   "targetName": "nano-coder",
   "targetType": "executable",
   "mainSourceFile": "source/entry.d",
+  "stringImportPaths": [
+    "source"
+  ],
   "libs": [
     "curl"
   ],
