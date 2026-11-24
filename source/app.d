@@ -995,37 +995,51 @@ string messagesCommand(Agent agent, ref Config cfg, string arg, ref PeerRouter r
     else return "usage: /messages [on|off|confirm on|off] [--save]";
 
     // A resume restores the session's messaging state (issue #336).
-    void record(int on, int confirm)
+    // Writing the record can recover a replaced log under a new session ID;
+    // a bound listener then answers for the old ID, so it is rebound. Returns
+    // the rebind failure (messaging is then off), or null.
+    string record(int on, int confirm, bool bound)
     {
         SessionSettings s;
         s.messages = on;
         s.messagesConfirm = confirm;
-        agent.log.ifSome((SessionLog l) { l.settings(s); });
+        string before, after;
+        agent.log.ifSome((SessionLog l) { before = l.id; l.settings(s); after = l.id; });
         if (on >= 0) agent.messagesWanted = on != 0;
+        if (!bound || before == after) return null;
+        stop();
+        if (auto failed = start())
+        {
+            agent.messagesOn = false;
+            return failed;
+        }
+        return null;
     }
     string out_;
     if (confirmChange)
     {
-        if (router.confirm != confirmValue) record(-1, confirmValue ? 1 : 0);
+        string failed;
+        if (router.confirm != confirmValue)
+            failed = record(-1, confirmValue ? 1 : 0, listening && agent.messagesOn);
         router.confirm(confirmValue);
         out_ = format("Incoming messages %s for this session", confirmValue ? "wait for you to accept" : "are queued at once");
+        if (failed) out_ ~= "; the session ID changed and the listener could not rebind, so messages are off: " ~ failed;
     }
     else if (on && agent.messagesOn && listening)
         out_ = stateText();
     else if (on)
     {
         if (auto failed = start()) out_ = "could not turn messages on: " ~ failed;
+        else if (auto rebind = record(1, -1, true))
+            out_ = "could not turn messages on: the session ID changed and the listener could not rebind: " ~ rebind;
         else
-        {
-            record(1, -1);
             out_ = "Messages on for this session (listening; session_send offered)";
-        }
     }
     else
     {
         // Always record an explicit off: a resume whose listener failed
         // is live-off but still has an on record that would come back.
-        record(0, -1);
+        record(0, -1, false);
         if (listening) stop();
         agent.messagesOn = false;
         out_ = "Messages off for this session (the socket is closed; session_send is gone from the next request)";
@@ -1068,6 +1082,57 @@ unittest // `/messages off` after a failed resume-listen records off (issue #336
     // An on that fails keeps the off record and the off intent.
     messagesCommand(agent, cfg, "on", router, false, &failStart, &stop);
     assert(restore(log.path).settings.messages == 0 && !agent.messagesWanted);
+}
+
+unittest // a settings write that recovers the log under a new ID rebinds the listener (issue #336)
+{
+    import std.file : exists, remove, rmdirRecurse, tempDir, write;
+    import std.path : buildPath;
+    import nano.option : some;
+    import nano.permissions : Policy;
+    import nano.providers.mock : MockClient;
+    import nano.tools : ToolRegistry;
+    auto dir = buildPath(tempDir, "nano-coder-messages-rebind");
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "sys");
+    Config cfg;
+    auto router = PeerRouter.make(agent.control.nonNull);
+    string[] bound;
+    size_t stops;
+    bool fail;
+    SessionLog log;
+    string start()
+    {
+        if (fail) return "no socket";
+        bound ~= log.id;
+        agent.messagesOn = true;
+        return null;
+    }
+    void stop() { stops++; }
+    void replace()
+    {
+        remove(log.path);
+        write(log.path, "{\"type\":\"session\",\"data\":{}}\n");
+    }
+    log = new SessionLog(dir, "mock/a", "/x");
+    log.warn = (string) {};
+    agent.log = some(log);
+    auto sys = Message.system("sys");
+    log.append(sys);
+    // `/messages on`: the record write recovers the log under a new ID.
+    replace();
+    auto out_ = messagesCommand(agent, cfg, "on", router, false, &start, &stop);
+    assert(bound.length == 2 && bound[1] == log.id && bound[0] != log.id, out_);
+    assert(stops == 1 && agent.messagesOn, out_);
+    // A confirmation change while listening rebinds too; a failed rebind is messages off.
+    replace();
+    fail = true;
+    out_ = messagesCommand(agent, cfg, router.confirm ? "confirm off" : "confirm on", router, true, &start, &stop);
+    assert(stops == 2 && !agent.messagesOn, out_);
+    import std.algorithm : canFind;
+    assert(out_.canFind("could not rebind"), out_);
+    log.close();
 }
 
 /// Replays shown so far by `/subagents show` (UI thread only).
