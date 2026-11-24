@@ -2763,10 +2763,13 @@ class Agent
         import nano.handle : invalidHandle, claim;
         if (!handle.length)
         {
-            if (!name.length) return null;
-            releaseName();
-            name = null;
+            // Record the clear even with no live name: a handle refused on
+            // restore is still in the log, and a resume would bring it back.
+            // Persist first: a failed write leaves the handle (and its
+            // claim) in place, so a retry really retries.
             if (record) log.ifSome((SessionLog l) { l.name(null); });
+            if (name.length) releaseName();
+            name = null;
             return null;
         }
         if (auto why = invalidHandle(handle)) return why;
@@ -2775,10 +2778,20 @@ class Agent
         string refused;
         log.ifSome((SessionLog l) { refused = claim(peers.peersDir(), sessionDirOf(l), handle, l.id); });
         if (refused !is null) return refused;
-        if (name.length && name != handle) releaseName();
         immutable changed = name != handle;
+        if (record && changed)
+        {
+            // Persist before touching in-memory state or the old claim: a
+            // failed write must not leave `name` changed (a retry would then
+            // report success without recording it) nor hold the new claim.
+            import nano.handle : release;
+            log.ifSome((SessionLog l) {
+                scope (failure) release(peers.peersDir(), handle, l.id);
+                l.name(handle);
+            });
+        }
+        if (name.length && changed) releaseName();
         name = handle;
-        if (record && changed) log.ifSome((SessionLog l) { l.name(handle); });
         return null;
     }
 

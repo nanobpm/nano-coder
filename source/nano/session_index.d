@@ -601,7 +601,7 @@ Summary[] list(string dir, bool strictIndex = false, scope bool delegate(string 
             // iterator passed it: remember the title so the rewrite keeps it.
             auto cached_ = id in index;
             if (cached_ is null) cached_ = id in denied;
-            if (cached_ !is null && cached_.title !is null) skippedTitled[id] = *cached_;
+            if (cached_ !is null && (cached_.title !is null || cached_.name !is null)) skippedTitled[id] = *cached_;
             continue;
         }
         auto size = e.size;
@@ -623,7 +623,7 @@ Summary[] list(string dir, bool strictIndex = false, scope bool delegate(string 
                 // file still exists, or the rewrite below would drop the
                 // title and a later tidy pass could delete a named session.
                 // Zero prompts keeps it out of picker results.
-                if (cached !is null && cached.title !is null)
+                if (cached !is null && (cached.title !is null || cached.name !is null))
                 {
                     // Zero prompts keeps it out of picker results while the
                     // rewrite below keeps its title.
@@ -1120,4 +1120,39 @@ unittest
     log.name("again");
     log.close();
     assert(list(dir)[0].name == "again");
+}
+
+// Issue #300: a strict listing whose index update fails throws, so
+// retention (which then reads titles from that index) fails closed instead
+// of trusting a stale index that may lack a newer handle.
+unittest
+{
+    import std.conv : octal;
+    import std.file : setAttributes;
+    import std.exception : assertThrown, assertNotThrown;
+    auto dir = testDir("strict-index-write");
+    scope (exit) { setAttributes(indexPath(dir), octal!644); rmdirRecurse(dir); }
+    writeLog(dir, "first", ["A first prompt"]);
+    list(dir, true);
+    writeLog(dir, "second", ["A second prompt"]);
+    setAttributes(indexPath(dir), octal!444);
+    assertNotThrown(list(dir), "a plain listing treats the index as a cache");
+    assertThrown(list(dir, true), "strict: an index it couldn't update is an error");
+}
+
+// Issue #300 review: a handle-only session (no title) keeps its index entry
+// — and so its retention protection — when its log becomes unresumable.
+unittest
+{
+    import nano.session : SessionLog;
+    auto dir = testDir("named-truncated");
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/w", "s-handle");
+    log.input("i1", "A prompt worth keeping");
+    log.name("keep");
+    log.close();
+    list(dir);
+    std.file.write(log.path, ""); // truncated: not resumable
+    list(dir);
+    assert("s-handle" in titledIds(dir), "the cached handle survives the rewrite");
 }
