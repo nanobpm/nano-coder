@@ -439,14 +439,14 @@ struct SandboxConfig
         return p;
     }
 
-    /// `Read(...)` deny rules hiding the denied paths from `grep`/`glob`
-    /// walks (the policy's per-entry filter), so a search of `~` skips
-    /// `~/.ssh` the way the OS sandbox does.
-    string[] readDenyRules(string cwd) const
+    /// The literal denied paths hiding entries from `grep`/`glob` walks
+    /// (the policy's per-entry filter), so a search of `~` skips `~/.ssh`
+    /// the way the OS sandbox does. Literal paths, matched with
+    /// `withinDenied`: never rule text, which would strip trailing spaces
+    /// and read `*`/`[` as globs.
+    string[] readDeniedPaths(string cwd) const
     {
-        string[] rules;
-        foreach (d; readPlan(cwd).denied) rules ~= ["Read(" ~ d ~ ")", "Read(" ~ d ~ "/**)"];
-        return rules;
+        return readPlan(cwd).denied;
     }
 
     /// Why the sandbox would not let a command read `path`, or null (for the
@@ -733,7 +733,7 @@ bool within(string path, string root) pure nothrow
 
 /// `within` for denials: on macOS the default filesystem is case-insensitive,
 /// so `~/.SSH` names `~/.ssh`; compare case-insensitively there (fails closed).
-bool withinDenied(string path, string root) pure
+public bool withinDenied(string path, string root) pure
 {
     version (OSX)
     {
@@ -1154,8 +1154,8 @@ unittest
     assert(c.readRefusal(ws ~ "/private/x", ws) !is null);
     assert(c.readRefusal(ws ~ "/src.d", ws) is null);
     assert(c.readRefusal("/usr/bin/env", ws) is null);
-    auto rules = c.readDenyRules(ws);
-    assert(rules.canFind("Read(" ~ normalize(joinPath(home, ".ssh")) ~ "/**)"), rules.join(" "));
+    auto denied = c.readDeniedPaths(ws);
+    assert(denied.canFind(normalize(joinPath(home, ".ssh"))), denied.join(" "));
     SandboxConfig w = { mode: SandboxMode.workspace, toolCaches: false, readConfine: ReadConfine.workspace };
     assert(w.readRefusal(ws ~ "/a/b.txt", ws) is null);
     assert(w.readRefusal("/usr/lib", ws) is null);

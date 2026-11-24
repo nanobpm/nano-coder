@@ -1490,7 +1490,7 @@ unittest
         assert(p.readDenyScan(cwd, scan));
         assert(scan.forRoot(homeDir()).denied(joinPath(homeDir(), ".ssh/known_hosts")));
         assert(!scan.forRoot(cwd).denied(joinPath(cwd, "src/a.d")));
-        assert(p.readDenySources(cwd).canFind("Read(" ~ joinPath(homeDir(), ".ssh") ~ ")"));
+        assert(p.readDenySources(cwd).canFind(literalDenyMark ~ joinPath(homeDir(), ".ssh")));
     }
     // A cwd-relative deny_read follows the cwd of each search (ACP can change it).
     {
@@ -1500,7 +1500,7 @@ unittest
         ReadDenyScan scan;
         assert(q.readDenyScan(other, scan));
         assert(scan.forRoot(other).denied(joinPath(other, "private/x")));
-        assert(q.readDenySources(other).canFind("Read(" ~ joinPath(other, "private") ~ ")"));
+        assert(q.readDenySources(other).canFind(literalDenyMark ~ joinPath(other, "private")));
     }
     Policy w;
     w.sandbox.mode = SandboxMode.workspace;

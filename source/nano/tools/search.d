@@ -354,12 +354,10 @@ alias DenyRules = immutable(string)[] delegate() @safe;
 /// The deny check a worker rebuilds from `DenyRules` text for `root`.
 private Denied denyFrom(immutable(string)[] context, string root)
 {
-    import nano.permissions : Policy, parseRule, ReadDenyScan;
+    import nano.permissions : readDenyScanFrom, ReadDenyScan;
     if (!context.length) return null;
-    Policy p;
-    foreach (src; context[1 .. $]) p.deny ~= parseRule(src);
     ReadDenyScan scan;
-    if (!p.readDenyScan(context[0], scan)) return null;
+    if (!readDenyScanFrom(context[0], context[1 .. $], scan)) return null;
     auto forRoot = scan.forRoot(root);
     return (string path) @safe => forRoot.denied(path);
 }
@@ -737,4 +735,41 @@ unittest
     foreach (pattern; ["./*.rs", "/main.rs"])
         assert(run("glob", `{"pattern":"` ~ pattern ~ `"}`, root) == "main.rs", pattern ~ ": " ~ run("glob", `{"pattern":"` ~ pattern ~ `"}`, root));
     assert(run("glob", `{"pattern":"main.rs"}`, root) == "main.rs\nsub/main.rs");
+}
+
+// #333: denied paths are matched literally: a trailing space or a glob
+// metacharacter in a deny_read entry names exactly that file, on the agent's
+// thread and on a worker thread, and read_file agrees.
+unittest
+{
+    import nano.permissions : Policy, ReadDenyScan;
+    import nano.sandbox : SandboxMode;
+    import std.file : write;
+    import std.algorithm : canFind;
+    import std.json : JSONValue;
+    auto root = tmpRoot("nano-d-search-literal-deny");
+    foreach (f; ["secret ", "secret", "a*b", "aXb", "x[1]", "x1"]) write(buildPath(root, f), "needle\n");
+    Policy p;
+    p.sandbox.mode = SandboxMode.workspace;
+    p.sandbox.denyRead = ["secret ", "a*b", "x[1]"];
+    DenyScan inThread = (string r) @safe {
+        ReadDenyScan scan;
+        if (!p.readDenyScan(root, scan)) return Denied.init;
+        auto f = scan.forRoot(r);
+        return (string path) @safe => f.denied(path);
+    };
+    auto worker = denyFrom(root ~ p.readDenySources(root), root);
+    foreach (denied; [inThread(root), worker])
+    {
+        assert(denied !is null);
+        auto g = grep(parseJSON(`{"pattern":"needle","path":` ~ JSONValue(root).toString ~ `,"output_mode":"files"}`), (string) @safe => denied);
+        auto l = glob(parseJSON(`{"pattern":"*","path":` ~ JSONValue(root).toString ~ `}`), (string) @safe => denied);
+        foreach (out_; [g, l])
+        {
+            foreach (shown; ["/secret\n", "/aXb\n", "/x1\n"]) assert(out_.canFind(shown), out_);
+            foreach (hidden; ["/secret \n", "/a*b\n", "/x[1]\n"]) assert(!out_.canFind(hidden), out_);
+        }
+    }
+    foreach (f; ["secret ", "a*b", "x[1]"]) assert(p.sandbox.readRefusal(buildPath(root, f), root) !is null, f);
+    foreach (f; ["secret", "aXb", "x1"]) assert(p.sandbox.readRefusal(buildPath(root, f), root) is null, f);
 }
