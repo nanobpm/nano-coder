@@ -1622,12 +1622,12 @@ struct CompletedTurn
 /// the log is gone or holds no such record. Throws if the log is unreadable.
 Option!CompletedTurn findCompletedTurn(string path, string inputId)
 {
-    import std.algorithm.searching : canFind;
     Option!CompletedTurn found;
-    auto needle = `"input_id":` ~ JSONValue(inputId).jsonText;
     if (!path.exists) return found;
     eachLogLine(path, (const(char)[] line, ulong) {
-        if (!line.canFind(`"type":"turn_end"`) || !line.canFind(needle)) return;
+        // Decoded comparison: any spacing or escaping `restore` accepts.
+        if (skimType(line) != "turn_end") return;
+        if (skimString(skimField(line, "data"), "input_id") != inputId) return;
         auto rec = parseJSON(line);
         auto data = "data" in rec;
         if (data is null || data.type != JSONType.object) return;

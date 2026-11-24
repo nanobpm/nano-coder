@@ -78,3 +78,43 @@ unittest
     assert(pinned.pinStash.length < 1_000 && pinned.pinStash.length + pinned.pinGap.count == 2_001);
     assert(pinned.pinStash[0].content == "the goal");
 }
+
+// issue #312: empty responses still count against the cap, and a logless
+// agent never evicts (no log could replay an evicted response).
+unittest
+{
+    import std.array : replicate;
+    auto dir = buildPath(tempDir, "nano-d-loop-completed-empty");
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) if (dir.exists) rmdirRecurse(dir);
+    LLMResponse[] script;
+    foreach (i; 0 .. 200) script ~= LLMResponse("");
+    auto agent = agentFor(new MockClient(script));
+    agent.completedCap = 2_048;
+    agent.log = some(new SessionLog(dir, "mock/m", "/w"));
+    foreach (i; 0 .. 200) agent.run("go", new NullEvents, true, "id-" ~ i.to!string);
+    assert(agent.completedBytes <= 2_048 && agent.completedInputs.length < 50);
+
+    auto logless = agentFor(new MockClient([LLMResponse("x".replicate(3_000)), LLMResponse("y".replicate(3_000))]));
+    logless.completedCap = 2_048;
+    logless.run("go", new NullEvents, true, "a");
+    logless.run("go", new NullEvents, true, "b");
+    assert("a" in logless.completedInputs && "b" in logless.completedInputs);
+    assert(logless.run("go", new NullEvents, true, "a") == "x".replicate(3_000));
+}
+
+// issue #312: the log read-back matches decoded fields, whatever the spacing
+// or escaping of the record.
+unittest
+{
+    import std.file : write, remove;
+    import nano.session : findCompletedTurn;
+    auto p = buildPath(tempDir, "nano-find-completed.jsonl");
+    scope (exit) if (p.exists) remove(p);
+    write(p, `{"type" : "turn_end", "data" : {"input_id" : "a\/b", "response":"r1"}}` ~ "\n"
+        ~ `{"type":"turn_\u0065nd","data":{"input_id":"c/d","response":"r2","stop_reason":"max_tokens"}}` ~ "\n");
+    assert(findCompletedTurn(p, "a/b").unwrap("spaced, escaped slash").response == "r1");
+    auto t = findCompletedTurn(p, "c/d").unwrap("escaped type");
+    assert(t.response == "r2" && t.stopReason == "max_tokens");
+    assert(findCompletedTurn(p, "zz").isNone);
+}

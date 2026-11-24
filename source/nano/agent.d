@@ -674,21 +674,32 @@ class Agent
     /// Record `response` as input `id`'s, oldest-first for eviction.
     private void rememberCompleted(string id, string response)
     {
-        if (auto old = id in completedInputs) completedBytes = saturatingSub(completedBytes, old.length);
+        if (auto old = id in completedInputs) completedBytes = saturatingSub(completedBytes, completedCost(id, *old));
         else completedOrder ~= id;
         completedInputs[id] = response;
-        completedBytes += response.length;
+        completedBytes += completedCost(id, response);
+    }
+
+    /// What one completed entry counts against `completedCap`: its response,
+    /// its id (held as a key and in `completedOrder`) and a fixed charge for
+    /// the map/order metadata, so even empty responses are bounded.
+    private static size_t completedCost(string id, string response) pure nothrow @nogc
+    {
+        return response.length + 2 * id.length + 64;
     }
 
     /// Drop the oldest completed responses past `completedCap` (the
     /// newest is always kept); their ids stay redeliverable from the log.
     private void evictCompleted()
     {
+        // Without a session log an evicted response could not be read back,
+        // and a redelivered input would run (and repeat side effects) again.
+        if (log.isNone) return;
         size_t drop;
         while (completedBytes > completedCap && drop + 1 < completedOrder.length)
         {
             auto id = completedOrder[drop++];
-            if (auto r = id in completedInputs) completedBytes = saturatingSub(completedBytes, r.length);
+            if (auto r = id in completedInputs) completedBytes = saturatingSub(completedBytes, completedCost(id, *r));
             completedInputs.remove(id);
             completedStops.remove(id);
             completedOutcomes.remove(id);
@@ -3693,7 +3704,7 @@ class Agent
         // A hand-built `Restored` may lack the order: any order will do.
         completedOrder = r.completedOrder.length == r.completed.length ? r.completedOrder : r.completed.keys;
         completedBytes = 0;
-        foreach (v; completedInputs.byValue) completedBytes += v.length;
+        foreach (k, v; completedInputs) completedBytes += completedCost(k, v);
         evictCompleted();
         historyAvailable = r.historyAvailable;
         historyHintPending = r.historyAvailable && !r.historyHintConsumed;
