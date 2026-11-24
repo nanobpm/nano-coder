@@ -82,13 +82,15 @@ string header(const ref SummaryNode n)
 string render(const SummaryNode[] nodes, size_t maxBytes = size_t.max)
 {
     string[] heads, bodies;
-    size_t total, headBytes;
+    // Count exactly the bytes emitted: "\n\n" between parts, "\n" between
+    // a header and a nonempty body.
+    size_t total = nodes.length ? 2 * (nodes.length - 1) : 0, headBytes = total;
     foreach (ref n; nodes)
     {
         heads ~= header(n);
         bodies ~= escapeText(n.text.strip);
-        headBytes += heads[$ - 1].length + 3;
-        total += heads[$ - 1].length + 3 + bodies[$ - 1].length;
+        headBytes += heads[$ - 1].length + 1;
+        total += heads[$ - 1].length + (bodies[$ - 1].length ? 1 + bodies[$ - 1].length : 0);
     }
     if (total > maxBytes && nodes.length)
     {
@@ -195,8 +197,126 @@ const(char)[] summaryNodesJson(const(char)[] line)
         }
         ++i;
     }
-    // A torn record (unclosed containers) supplies nothing.
-    return depth == 0 && type == "replace" ? found : null;
+    // A torn record (unclosed containers) supplies nothing, and nor does a
+    // balanced but malformed one (bad values, separators, trailing input).
+    return depth == 0 && type == "replace" && found !is null && isValidJson(line) ? found : null;
+}
+
+/// Whether `s` is exactly one well-formed JSON value (RFC 8259), surrounding
+/// whitespace allowed. Validates without materialising anything, so a large
+/// record's messages cost one linear pass and no allocation.
+bool isValidJson(const(char)[] s) pure nothrow @nogc
+{
+    size_t i;
+    void ws() { while (i < s.length && isJsonSpace(s[i])) ++i; }
+    bool lit(string w)
+    {
+        if (s.length - i < w.length || s[i .. i + w.length] != w) return false;
+        i += w.length;
+        return true;
+    }
+    bool str()
+    {
+        if (i >= s.length || s[i] != '"') return false;
+        for (++i; i < s.length; ++i)
+        {
+            immutable c = s[i];
+            if (c == '"') { ++i; return true; }
+            if (c < 0x20) return false;
+            if (c != '\\') continue;
+            if (++i >= s.length) return false;
+            switch (s[i])
+            {
+                case '"': case '\\': case '/': case 'b': case 'f': case 'n': case 'r': case 't': break;
+                case 'u':
+                    if (s.length - i < 5) return false;
+                    foreach (h; s[i + 1 .. i + 5])
+                        if (!((h >= '0' && h <= '9') || ((h | 0x20) >= 'a' && (h | 0x20) <= 'f')))
+                            return false;
+                    i += 4;
+                    break;
+                default: return false;
+            }
+        }
+        return false;
+    }
+    bool digits()
+    {
+        immutable st = i;
+        while (i < s.length && s[i] >= '0' && s[i] <= '9') ++i;
+        return i > st;
+    }
+    bool num()
+    {
+        if (i < s.length && s[i] == '-') ++i;
+        if (i < s.length && s[i] == '0') ++i;
+        else if (!digits()) return false;
+        if (i < s.length && s[i] == '.') { ++i; if (!digits()) return false; }
+        if (i < s.length && (s[i] == 'e' || s[i] == 'E'))
+        {
+            ++i;
+            if (i < s.length && (s[i] == '+' || s[i] == '-')) ++i;
+            if (!digits()) return false;
+        }
+        return true;
+    }
+    // Iterative, so deep nesting cannot exhaust the stack: each open
+    // container's kind is one bit (1 = object), capped at `maxDepth`.
+    enum maxDepth = 4096;
+    ulong[maxDepth / 64] isObj;
+    size_t depth;
+    bool inObj() { return (isObj[(depth - 1) / 64] >> ((depth - 1) % 64)) & 1; }
+    ws();
+    for (;;)
+    {
+        // Expect a value.
+        if (i >= s.length) return false;
+        immutable c = s[i];
+        bool opened;
+        if (c == '{' || c == '[')
+        {
+            if (depth == maxDepth) return false;
+            immutable bit = 1UL << (depth % 64);
+            if (c == '{') isObj[depth / 64] |= bit; else isObj[depth / 64] &= ~bit;
+            ++depth; ++i; ws();
+            if (i < s.length && s[i] == (c == '{' ? '}' : ']')) { --depth; ++i; }
+            else opened = true;
+        }
+        else if (c == '"') { if (!str()) return false; }
+        else if (c == 't') { if (!lit("true")) return false; }
+        else if (c == 'f') { if (!lit("false")) return false; }
+        else if (c == 'n') { if (!lit("null")) return false; }
+        else if (!num()) return false;
+        if (opened && inObj())
+        {
+            // First member of a new object: key then colon.
+            if (!str()) return false;
+            ws();
+            if (i >= s.length || s[i] != ':') return false;
+            ++i; ws();
+            continue;
+        }
+        if (opened) continue; // first element of a new array
+        // After a value: close containers or move to the next member.
+        for (;;)
+        {
+            ws();
+            if (depth == 0) return i == s.length;
+            if (i >= s.length) return false;
+            immutable obj = inObj();
+            if (s[i] == (obj ? '}' : ']')) { --depth; ++i; continue; }
+            if (s[i] != ',') return false;
+            ++i; ws();
+            if (obj)
+            {
+                if (!str()) return false;
+                ws();
+                if (i >= s.length || s[i] != ':') return false;
+                ++i; ws();
+            }
+            break;
+        }
+    }
 }
 
 /// Whether `c` is JSON insignificant whitespace (RFC 8259: space, tab, LF, CR).
@@ -574,6 +694,11 @@ unittest // render enforces a hard byte cap, even on adversarial nodes (issue #3
     assert(h.startsWith(nodeOpen ~ "S2"), "the newest whole lines are kept");
     assert(render(ns[$ - 1 .. $], 1) == "");
     assert(render(ns) == render(ns, size_t.max));
+    // The exact rendered size fits without truncation (no phantom separators).
+    auto two = [SummaryNode(1, 0, 0, 0, null, "x".replicate(1000)), SummaryNode(2, 0, 0, 0, null, "tiny")];
+    auto full = render(two);
+    assert(render(two, full.length) == full);
+    assert(render(two, full.length - 1) != full);
 }
 
 unittest // summary_nodes extraction (issue #369)
@@ -609,6 +734,25 @@ unittest // summary_nodes extraction (issue #369)
     // Any JSON whitespace (CR, LF too) may surround a key's colon.
     assert(summaryNodesJson("{\"type\"\r:\"replace\",\"data\":{\"summary_nodes\":[{\"id\":7}]}}") == `[{"id":7}]`);
     assert(summaryNodesJson("{\"type\":\n\"replace\",\"data\"\r\n:\t{\"summary_nodes\"\n:\r[7]}}") == `[7]`);
+    // Balanced but malformed records supply nothing.
+    assert(summaryNodesJson(`{"type":"replace","data":{"summary_nodes":[{"id":99}],"messages":BROKEN}}`) is null);
+    assert(summaryNodesJson(`{"type":"replace","data":{"summary_nodes":[{"id":99}] "messages":[]}}`) is null);
+    assert(summaryNodesJson(`{"type":"replace","data":{"summary_nodes":[{"id":99}]}} trailing`) is null);
+    assert(summaryNodesJson(`{"type":"replace","data":{"summary_nodes":[{"id":99},]}}`) is null);
+    assert(summaryNodesJson(`{"type":"replace","data":{"summary_nodes":[{"id":99}],"m":"a` ~ "\x01" ~ `"}}`) is null);
+    assert(summaryNodesJson(`{"type":"replace","data":{"summary_nodes":[{"id":-1.5e+3}],"m":[true,false,null,{}]}}  `)
+        == `[{"id":-1.5e+3}]`);
+}
+
+unittest // isValidJson
+{
+    foreach (ok; [`0`, `"a\u00e9"`, `[]`, `{}`, ` [1, {"a": [null]}] `, `{"a":{"b":[]},"c":-0.1E2}`])
+        assert(isValidJson(ok), ok);
+    foreach (bad; [``, `[`, `[1,]`, `{"a"}`, `{"a":1,}`, `01`, `1.`, `tru`, `"\x"`, `[1 2]`, `{1:2}`, `[]]`, `{} {}`])
+        assert(!isValidJson(bad), bad);
+    char[] deep;
+    foreach (_; 0 .. 5000) deep ~= '[';
+    assert(!isValidJson(deep));
 }
 
 unittest // node names
