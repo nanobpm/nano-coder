@@ -1016,7 +1016,19 @@ final class AcpServer : AgentEvents
         stopPeerListener();
         if (!agent.messagesOn || host.sessionDir is null || agent.log.isNone) return;
         auto dir = peers.peersDir();
-        if (!peers.ensureDir(dir)) return;
+        string dirFailed;
+        {
+            import std.file : FileException;
+            try { if (!peers.ensureDir(dir)) dirFailed = "could not create the peers directory " ~ dir; }
+            catch (FileException e) dirFailed = "could not create the peers directory " ~ dir ~ ": " ~ e.msg;
+        }
+        if (dirFailed.length)
+        {
+            // As with a failed listen: messages off, the reason on stderr.
+            agent.messagesOn = false;
+            stdErr.writeln("nano-coder: ACP: messages are off: ", dirFailed);
+            return;
+        }
         try peerListener = [peers.PeerListener.listen(dir, agent.log.unwrap("checked isSome").id, peerRouter.requests)];
         catch (peers.ListenError e)
         {

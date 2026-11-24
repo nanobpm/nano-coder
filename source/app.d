@@ -3941,7 +3941,12 @@ int runMain(string[] args)
         import nano.peers : ensureDir, peersDir;
         if (agent.log.isNone) return "this session isn't saved (--no-session), so it can't receive messages";
         auto dir = peersDir();
-        if (!ensureDir(dir)) return "could not create the peers directory " ~ dir;
+        import std.file : FileException;
+        try
+        {
+            if (!ensureDir(dir)) return "could not create the peers directory " ~ dir;
+        }
+        catch (FileException e) return "could not create the peers directory " ~ dir ~ ": " ~ e.msg;
         auto id = agent.log.unwrap("checked above").id;
         try
         {
@@ -5228,6 +5233,13 @@ int runMain(string[] args)
                 {
                     auto reply = messagesCommand(agent, cfg, arg, peerRouter, peerListener.length != 0,
                         &startPeerListener, &stopPeerListener);
+                    // `--save` wrote both switches to the config: they are the
+                    // new defaults a later `/resume` falls back to.
+                    if (imported!"std.algorithm.searching".canFind(reply, "saved to "))
+                    {
+                        runtimeDefaults.sessionMessages = cfg.sessionMessages;
+                        runtimeDefaults.sessionMessagesConfirm = cfg.sessionMessagesConfirm;
+                    }
                     writeln(reply);
                     continue;
                 }
