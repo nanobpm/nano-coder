@@ -1592,16 +1592,18 @@ private size_t skimCount(const(char)[] arr) pure nothrow @nogc
 /// committed record throws (a resume needs its header). A plain log is read
 /// line by line rather than whole (issue #244); a compressed one is inflated.
 void eachLogLine(string path, scope void delegate(const(char)[] line, ulong lineNo) @safe dg,
-    bool requireCommitted = true)
+    bool requireCommitted = true, scope bool delegate(const(char)[] head) @safe keep = null)
 {
     eachLogLineUntil(path, (const(char)[] line, ulong lineNo) { dg(line, lineNo); return true; },
-        requireCommitted);
+        requireCommitted, keep);
 }
 
 /// `eachLogLine` whose `dg` returns false to stop reading: no further line
 /// is read from the file, so an early-stopping caller never scans to EOF.
+/// `keep`, if set, sees each line's first `lineHeadBytes`; a rejected line
+/// is skipped unbuffered (never assembled) but still counts for `lineNo`.
 void eachLogLineUntil(string path, scope bool delegate(const(char)[] line, ulong lineNo) @safe dg,
-    bool requireCommitted = true)
+    bool requireCommitted = true, scope bool delegate(const(char)[] head) @safe keep = null)
 {
     // One streaming reader for plain and compressed logs alike (64 KB reads,
     // a bounded inflate window): neither the file nor a decompressed copy is
@@ -1610,6 +1612,10 @@ void eachLogLineUntil(string path, scope bool delegate(const(char)[] line, ulong
     streamLogLinesUntil(path, (line) {
         if (line.length && line[$ - 1] == '\r') line = line[0 .. $ - 1];
         return dg(line, ++lineNo);
+    }, keep is null ? null : (const(char)[] head) {
+        if (keep(head)) return true;
+        ++lineNo;
+        return false;
     });
     if (!lineNo && requireCommitted) throw new Exception("session log " ~ path ~ " has no committed records");
 }
@@ -1651,8 +1657,39 @@ Option!CompletedTurn findCompletedTurn(string path, string inputId)
         if (auto st = "stop_reason" in *data) if (st.type == JSONType.string) t.stopReason = st.str;
         if (auto oc = "outcome" in *data) if (oc.type == JSONType.object) t.outcome = *oc;
         found = some(t);
-    }, false);
+    }, false, (const(char)[] head) {
+        // Skip, unbuffered, any record whose head already names another
+        // type (a multi-MB `replace` snapshot is never assembled). A head
+        // whose type isn't readable yet is kept; the full skim decides.
+        auto t = skimType(head);
+        return t is null || t == "turn_end";
+    });
     return found;
+}
+
+unittest // findCompletedTurn skips large non-turn_end records unassembled
+{
+    import core.memory : GC;
+    import std.array : replicate;
+    import std.file : tempDir, remove, write;
+    import std.path : buildPath;
+    auto big = `{"type":"replace","data":"` ~ "x".replicate(4_000_000) ~ `"}`;
+    auto text = big ~ "\n" ~ `{ "type" : "turn_end", "data":{"input_id":"in-1","response":"ok"}}` ~ "\n";
+    auto p = buildPath(tempDir, "nano-d-findturn-big.jsonl"), gz = p ~ ".gz";
+    write(p, text);
+    write(gz, gzipLog(text));
+    big = null;
+    text = null;
+    scope (exit) { remove(p); remove(gz); }
+    foreach (path; [p, gz])
+    {
+        auto before = GC.stats.allocatedInCurrentThread;
+        auto t = findCompletedTurn(path, "in-1");
+        auto used = GC.stats.allocatedInCurrentThread - before;
+        assert(t.isSome, path);
+        foreach (c; t) assert(c.response == "ok", path);
+        assert(used < 1_000_000, path);
+    }
 }
 
 unittest // eachLogLineUntil stops reading at the first false
