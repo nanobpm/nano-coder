@@ -27,8 +27,9 @@ import std.algorithm : sort, filter, map, min;
 import std.array : array;
 import std.math : isNaN;
 import nano.llm;
-import nano.option : Option, some, ifSome, match;
+import nano.option : Option, some, none, ifSome, match;
 import nano.plan : Plan;
+import nano.history : RecentInputs;
 
 /// The extension tidy-up compresses a session log to (`<id>.jsonl.gz`).
 enum string compressedExtension = ".jsonl.gz";
@@ -117,36 +118,81 @@ package uint zlibWindow(size_t remaining) pure nothrow @nogc @safe
 ubyte[] gzipLog(const(char)[] text) { return gzipLog(text.representation); }
 
 /// ditto, for raw bytes (a log read from disk, compressed unvalidated).
-ubyte[] gzipLog(const(ubyte)[] text) @trusted
+ubyte[] gzipLog(const(ubyte)[] text)
+{
+    import std.array : appender;
+    auto o = appender!(ubyte[]);
+    o.reserve(text.length / 4 + 256);
+    bool given;
+    gzipChunks(() { if (given) return (const(ubyte)[]).init; given = true; return text; },
+        (const(ubyte)[] c) { o ~= c; });
+    return o.data;
+}
+
+/// Compress the file at `src` into the new file `dst` (created exclusively
+/// with `mode`), 64 KiB at a time (issue #313: tidy-up compresses a huge log
+/// without holding it, a doubling buffer and a copy at once). Returns the
+/// compressed size.
+private ulong gzipFile(string src, string dst, uint mode)
+{
+    import std.stdio : File;
+    import nano.safeio : writeFd, closeFd;
+    auto f = File(src, "rb");
+    scope (exit) f.close();
+    auto fd = createPrivateFd(dst, mode);
+    scope (exit) closeFd(fd);
+    auto buf = new ubyte[](64 * 1024);
+    ulong written;
+    gzipChunks(() => f.rawRead(buf), (const(ubyte)[] c) {
+        writeAllFd(fd, c, dst);
+        written += c.length;
+    });
+    return written;
+}
+
+/// Deflate (gzip wrapper) every chunk `next` returns until it returns an
+/// empty one, handing each compressed chunk to `put` (valid only during the
+/// call). Input and output stay bounded to one chunk and a 64 KiB window.
+private void gzipChunks(scope const(ubyte)[] delegate() @safe next,
+    scope void delegate(const(ubyte)[]) @safe put) @trusted
 {
     import etc.c.zlib : z_stream, deflateInit2, deflate, deflateEnd, Z_FINISH, Z_NO_FLUSH, Z_STREAM_END, Z_BUF_ERROR;
     z_stream zs;
     if (deflateInit2(&zs, 6, 8 /* Z_DEFLATED */, 15 + 16 /* gzip wrapper */, 8, 0) != 0)
         throw new Exception("deflate init failed");
     scope (exit) deflateEnd(&zs);
-    auto out_ = new ubyte[](text.length / 4 + 256);
-    // Chunked like gunzipLog: a >4 GiB log must compress whole, never as
-    // its wrapped-length prefix (tidy-up deletes the original afterwards).
-    size_t fed, used;
+    auto out_ = new ubyte[](64 * 1024);
+    const(ubyte)[] chunk = next();
+    size_t fed;
+    bool last = chunk.length == 0;
     for (;;)
     {
-        if (zs.avail_in == 0 && fed < text.length)
+        // zlib counts in 32-bit uints: feed in windows of at most uint.max,
+        // so a >4 GiB chunk compresses whole, never its wrapped prefix.
+        if (zs.avail_in == 0 && !last)
         {
-            immutable n = zlibWindow(text.length - fed);
-            zs.next_in = text.ptr + fed;
-            zs.avail_in = n;
-            fed += n;
+            if (fed == chunk.length)
+            {
+                chunk = next();
+                fed = 0;
+                last = chunk.length == 0;
+            }
+            if (!last)
+            {
+                immutable n = zlibWindow(chunk.length - fed);
+                zs.next_in = chunk.ptr + fed;
+                zs.avail_in = n;
+                fed += n;
+            }
         }
-        if (used == out_.length) out_.length = out_.length * 2;
-        immutable window = zlibWindow(out_.length - used);
-        zs.next_out = out_.ptr + used;
-        zs.avail_out = window;
-        auto rc = deflate(&zs, fed < text.length ? Z_NO_FLUSH : Z_FINISH);
-        used += window - zs.avail_out;
+        zs.next_out = out_.ptr;
+        zs.avail_out = zlibWindow(out_.length);
+        auto rc = deflate(&zs, last ? Z_FINISH : Z_NO_FLUSH);
+        // No pointer into the caller's chunk outlives this iteration's use.
+        if (immutable got = out_.length - zs.avail_out) put(out_[0 .. got]);
         if (rc == Z_STREAM_END) break;
         if (rc != 0 && rc != Z_BUF_ERROR) throw new Exception("deflate failed compressing a session log");
     }
-    return out_[0 .. used].dup;
 }
 
 /// Feed every committed (newline-terminated) line of the log at `path` to
@@ -726,7 +772,7 @@ class SessionLog
             }
             auto tmp = format("%s.tmp-%s", plain, thisProcessID);
             scope (failure) if (tmp.exists) remove(tmp);
-            writePrivate(tmp, logText(path).representation, modeOf(path));
+            gunzipFile(path, tmp, modeOf(path)); // streamed: never the whole log in RAM (#313)
             publishOver(tmp, plain); // fsync the copy, link, sync the entry, unlink
             remove(path);
             archive.close();
@@ -824,6 +870,14 @@ class SessionLog
         f.write(line);
         f.flush();
         ++lines;
+    }
+
+    /// Recover now if the path no longer names the held file, so a reader
+    /// of `path` (the idempotency read-back, issue #312) sees this session's
+    /// records rather than a missing or foreign file.
+    void revalidate()
+    {
+        if (f.isOpen && !sameFile(f, path)) recoverReplaced();
     }
 
     /// Where the warning about a replaced log goes (tests capture it).
@@ -1415,6 +1469,10 @@ struct Restored
     /// `settings.model`, when set, supersedes `model`.
     SessionSettings settings;
     Message[] conversation;
+    /// The newest prompts typed in this session, oldest first (bounded by the
+    /// editor history's caps), for Up/Down recall after a resume. Prompts
+    /// sent by another session are not included.
+    string[] recentInputs;
     /// The text of an input whose turn never ended (a crash mid-turn).
     string pendingInput;
     /// That input in full, when `hasPending`.
@@ -1425,6 +1483,9 @@ struct Restored
     string[string] completed;
     string[string] completedStops;
     JSONValue[string] completedOutcomes;
+    /// The `completed` ids oldest first, so a bounded holder drops the
+    /// oldest responses first (issue #312).
+    string[] completedOrder;
     /// The latest plan record (`{goal, items}`), or null.
     JSONValue plan;
     /// The latest timers record (`{last_id, items}`), or null.
@@ -1706,16 +1767,18 @@ private size_t skimCount(const(char)[] arr) pure nothrow @nogc
 /// committed record throws (a resume needs its header). A plain log is read
 /// line by line rather than whole (issue #244); a compressed one is inflated.
 void eachLogLine(string path, scope void delegate(const(char)[] line, ulong lineNo) @safe dg,
-    bool requireCommitted = true)
+    bool requireCommitted = true, scope bool delegate(const(char)[] head) @safe keep = null)
 {
     eachLogLineUntil(path, (const(char)[] line, ulong lineNo) { dg(line, lineNo); return true; },
-        requireCommitted);
+        requireCommitted, keep);
 }
 
 /// `eachLogLine` whose `dg` returns false to stop reading: no further line
 /// is read from the file, so an early-stopping caller never scans to EOF.
+/// `keep`, if set, sees each line's first `lineHeadBytes`; a rejected line
+/// is skipped unbuffered (never assembled) but still counts for `lineNo`.
 void eachLogLineUntil(string path, scope bool delegate(const(char)[] line, ulong lineNo) @safe dg,
-    bool requireCommitted = true)
+    bool requireCommitted = true, scope bool delegate(const(char)[] head) @safe keep = null)
 {
     // One streaming reader for plain and compressed logs alike (64 KB reads,
     // a bounded inflate window): neither the file nor a decompressed copy is
@@ -1724,8 +1787,84 @@ void eachLogLineUntil(string path, scope bool delegate(const(char)[] line, ulong
     streamLogLinesUntil(path, (line) {
         if (line.length && line[$ - 1] == '\r') line = line[0 .. $ - 1];
         return dg(line, ++lineNo);
+    }, keep is null ? null : (const(char)[] head) {
+        if (keep(head)) return true;
+        ++lineNo;
+        return false;
     });
     if (!lineNo && requireCommitted) throw new Exception("session log " ~ path ~ " has no committed records");
+}
+
+/// A finished turn as its `turn_end` record holds it.
+struct CompletedTurn
+{
+    /// The final response.
+    string response;
+    /// The stop reason (`end_turn` when not recorded).
+    string stopReason = "end_turn";
+    /// The recorded outcome object, or null.
+    JSONValue outcome;
+}
+
+/// The last `turn_end` record for input `inputId` in the log at `path`, read
+/// back when a bounded in-memory record dropped it (issue #312); none when
+/// the log is gone or holds no such record. Throws if the log is unreadable.
+Option!CompletedTurn findCompletedTurn(string path, string inputId)
+{
+    Option!CompletedTurn found;
+    if (!path.exists) return found;
+    eachLogLine(path, (const(char)[] line, ulong) {
+        // Decoded comparison: any spacing or escaping `restore` accepts.
+        if (skimType(line) != "turn_end") return;
+        // The skim decodes each lone surrogate escape to U+FFFD, so a
+        // surrogate-pair id only prefilters here; parseJSON decides.
+        auto sid = skimString(skimField(line, "data"), "input_id");
+        if (sid is null) return;
+        import std.algorithm.searching : canFind;
+        if (sid != inputId && !sid.canFind("\uFFFD")) return;
+        auto rec = parseJSON(line);
+        auto data = "data" in rec;
+        if (data is null || data.type != JSONType.object) return;
+        auto id = "input_id" in *data;
+        if (id is null || id.type != JSONType.string || id.str != inputId) return;
+        CompletedTurn t;
+        if (auto resp = "response" in *data) if (resp.type == JSONType.string) t.response = resp.str;
+        if (auto st = "stop_reason" in *data) if (st.type == JSONType.string) t.stopReason = st.str;
+        if (auto oc = "outcome" in *data) if (oc.type == JSONType.object) t.outcome = *oc;
+        found = some(t);
+    }, false, (const(char)[] head) {
+        // Skip, unbuffered, any record whose head already names another
+        // type (a multi-MB `replace` snapshot is never assembled). A head
+        // whose type isn't readable yet is kept; the full skim decides.
+        auto t = skimType(head);
+        return t is null || t == "turn_end";
+    });
+    return found;
+}
+
+unittest // findCompletedTurn skips large non-turn_end records unassembled
+{
+    import core.memory : GC;
+    import std.array : replicate;
+    import std.file : tempDir, remove, write;
+    import std.path : buildPath;
+    auto big = `{"type":"replace","data":"` ~ "x".replicate(4_000_000) ~ `"}`;
+    auto text = big ~ "\n" ~ `{ "type" : "turn_end", "data":{"input_id":"in-1","response":"ok"}}` ~ "\n";
+    auto p = buildPath(tempDir, "nano-d-findturn-big.jsonl"), gz = p ~ ".gz";
+    write(p, text);
+    write(gz, gzipLog(text));
+    big = null;
+    text = null;
+    scope (exit) { remove(p); remove(gz); }
+    foreach (path; [p, gz])
+    {
+        auto before = GC.stats.allocatedInCurrentThread;
+        auto t = findCompletedTurn(path, "in-1");
+        auto used = GC.stats.allocatedInCurrentThread - before;
+        assert(t.isSome, path);
+        foreach (c; t) assert(c.response == "ok", path);
+        assert(used < 1_000_000, path);
+    }
 }
 
 unittest // eachLogLineUntil stops reading at the first false
@@ -1852,6 +1991,28 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
     // Every logged input's key (not its text: issue #263), to backfill
     // `pinText` on legacy messages.
     InputKey[] inputs;
+    // The newest typed prompts, for the editor's Up/Down history (bounded).
+    RecentInputs recentInputs;
+    // A typed input awaiting its user message (see the "input" case).
+    Option!string typedCandidate;
+    void flushTyped()
+    {
+        typedCandidate.ifSome((string t) { recentInputs.put(t); });
+        typedCandidate = none;
+    }
+    // A user message's effect on recall history: the typed input it
+    // answers is kept unless the message was automatic; a local steer is kept.
+    void noteUserMessage(bool isUser, bool autoInit, bool steered, bool fromPeer,
+        scope Option!string delegate() @safe content)
+    {
+        if (isUser && !typedCandidate.isNone)
+        {
+            if (!autoInit) flushTyped();
+            typedCandidate = none;
+        }
+        else if (isUser && steered && !fromPeer)
+            content().ifSome((string c) { flushTyped(); recentInputs.put(c); });
+    }
     Message[] rustStash;
     // Per `rustStash` entry: its content was dropped (`Restored.replayStashSlim`).
     bool[] stashSlim;
@@ -1897,6 +2058,26 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
                     // the skim: such a line is decoded below for `toolKeys`.
                     auto data = skimField(line, "data");
                     auto role = skimString(data, "role");
+                    // Recall history reads the user messages the skim
+                    // skips: the same rule as the full decode below.
+                    if (role == "user")
+                    {
+                        bool flag(string k) { return skimField(data, k) == "true"; }
+                        noteUserMessage(true, flag("auto_initiated"), flag("steered"),
+                            skimField(data, "from_session").length > 0, delegate Option!string() {
+                                // The full JSON decoder, not `unescapeKey`: it keeps
+                                // surrogate pairs, so recall matches the full decode.
+                                auto raw = skimField(data, "content");
+                                if (raw.length < 2 || raw[0] != '"') return Option!string.init;
+                                try
+                                {
+                                    auto v = parseJSON(raw);
+                                    if (v.type == JSONType.string) return some(v.str);
+                                }
+                                catch (JSONException) {} // malformed content: no recall entry, as the full decode
+                                return Option!string.init;
+                            });
+                    }
                     // Structured payloads (calls, reasoning items) are
                     // slimmable at any size (`slimPayload`), so mirror that.
                     if ((role != "tool" && role != "assistant")
@@ -2006,11 +2187,27 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
             pendingId = data["id"].str;
             r.pendingInput = data["text"].str;
             inputs ~= InputKey.of(r.pendingInput);
+            // Held until its message shows whether a timer or background
+            // result generated it (`auto_initiated`); a peer's is never kept.
+            flushTyped();
+            if ("from_session" !in data) typedCandidate = some(r.pendingInput);
             r.hasPending = true;
             r.pending = PendingInput(pendingId, r.pendingInput,
                 lineNo < skipBefore ? skimmedLen : r.conversation.length);
             break;
         case "message":
+            {
+                // The first message after an input is its user message: an
+                // automatic one is not something the user typed. A local
+                // steer (typed during a running turn) is.
+                auto role = "role" in data;
+                immutable isUser = role !is null && role.type == JSONType.string && role.str == "user";
+                bool flag(string k) { auto v = k in data; return v !is null && v.type == JSONType.true_; }
+                noteUserMessage(isUser, flag("auto_initiated"), flag("steered"), ("from_session" in data) !is null, delegate Option!string() {
+                    auto c = "content" in data;
+                    return c !is null && c.type == JSONType.string ? some(c.str) : Option!string.init;
+                });
+            }
             if (lineNo < skipBefore)
             {
                 auto o = messageFromRecord(data);
@@ -2033,6 +2230,7 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
             {
                 auto iid = data["input_id"].str;
                 auto resp = "response" in data;
+                if (iid !in r.completed) r.completedOrder ~= iid;
                 r.completed[iid] = resp !is null && resp.type == JSONType.string ? resp.str : "";
                 auto st = "stop_reason" in data;
                 if (st !is null && st.type == JSONType.string && st.str != "end_turn") r.completedStops[iid] = st.str;
@@ -2259,6 +2457,8 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
     });
     // Apply the deltas after the latest full snapshot, if any remain.
     if (planDeltas.length > planFrom) r.plan = planAt(planFrom);
+    flushTyped();
+    r.recentInputs = recentInputs.lines;
     return r;
 }
 
@@ -2602,17 +2802,56 @@ private uint modeOf(string path)
 /// (never wider than owner-only, whatever the umask), failing if it exists.
 private void writePrivate(string path, const(ubyte)[] data, uint mode)
 {
+    import nano.safeio : closeFd;
+    auto fd = createPrivateFd(path, mode);
+    scope (exit) closeFd(fd);
+    writeAllFd(fd, data, path);
+}
+
+/// A new file at `path` created exclusively, write-only, owner-only `mode`;
+/// the caller closes the descriptor.
+private int createPrivateFd(string path, uint mode)
+{
     import core.sys.posix.fcntl : O_WRONLY, O_CREAT, O_EXCL;
-    import nano.safeio : openPath, fchmodFd, writeFd, closeFd;
+    import nano.safeio : openPath, fchmodFd, closeFd;
     auto fd = openPath(path, O_WRONLY | O_CREAT | O_EXCL, mode & octal!600);
     if (fd < 0) throw new Exception("cannot create " ~ path);
-    scope (exit) closeFd(fd);
+    scope (failure) closeFd(fd);
     fchmodFd(fd, mode & octal!600);
+    return fd;
+}
+
+/// Write all of `data` to `fd` (named `path` in errors).
+private void writeAllFd(int fd, const(ubyte)[] data, string path)
+{
+    import nano.safeio : writeFd;
     while (data.length)
     {
         auto n = writeFd(fd, data);
         if (n <= 0) throw new Exception("cannot write " ~ path);
         data = data[n .. $];
+    }
+}
+
+/// Inflate the compressed log at `src` into the new file `dst` (created
+/// exclusively with `mode`) through `GunzipStream`, 64 KiB at a time (issue
+/// #313: reopening an archive never holds the whole log in RAM).
+private void gunzipFile(string src, string dst, uint mode)
+{
+    import std.stdio : File;
+    import nano.safeio : closeFd;
+    auto f = File(src, "rb");
+    scope (exit) f.close();
+    auto gz = GunzipStream(src);
+    scope (exit) gz.close();
+    auto fd = createPrivateFd(dst, mode);
+    scope (exit) closeFd(fd);
+    auto buf = new ubyte[](64 * 1024);
+    for (;;)
+    {
+        auto got = gz.read(f, buf);
+        if (!got.length) break;
+        writeAllFd(fd, got, dst);
     }
 }
 
@@ -2745,12 +2984,15 @@ private void tidyDir(string dir, SysTime now, long compressAfterDays, long reten
                 import std.file : setTimes;
                 auto gz = e.name ~ ".gz";
                 auto before = getSize(e.name);
-                auto packed = gzipLog(readBytes(e.name));
-                // Gzip can grow a short log: keep the original then.
-                if (packed.length >= before) continue;
                 auto tmp = format("%s.tmp-%s", gz, thisProcessID);
                 scope (failure) if (tmp.exists) remove(tmp);
-                writePrivate(tmp, packed, modeOf(e.name));
+                // Streamed (issue #313): the log is never held whole.
+                // Gzip can grow a short log: keep the original then.
+                if (gzipFile(e.name, tmp, modeOf(e.name)) >= before)
+                {
+                    remove(tmp);
+                    continue;
+                }
                 // Keep the last activity time: retention and the picker
                 // measure age from it, not from compression.
                 auto mtime = timeLastModified(e.name);
@@ -4411,4 +4653,124 @@ unittest
     // Inflated chunks are short-lived garbage; what's held at once (live
     // and not yet collected) stays well under the inflated size.
     assert(peak - before < o.data.length / 4, text("read held ", peak - before, " B for ", o.data.length, " B inflated"));
+}
+
+unittest // a resumed session's typed prompts come back for Up/Down recall; peer-sent ones don't
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse;
+    import std.path : buildPath;
+    auto dir = buildPath(tempDir, "nano-d-recent-inputs-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/w");
+    log.input("in-1", "fix the race");
+    log.turnEnd("in-1", "", "end_turn");
+    log.input("in-2", "from a peer", "sess-other");
+    log.turnEnd("in-2", "", "end_turn");
+    log.input("in-3", "now add a test");
+    auto um = Message.user("now add a test");
+    log.append(um);
+    auto steer = Message.user("also the docs"); // typed while the turn ran
+    steer.steered = true;
+    log.append(steer);
+    auto peerSteer = Message.user("peer steer");
+    peerSteer.steered = true;
+    peerSteer.fromSession = "sess-other";
+    log.append(peerSteer);
+    log.turnEnd("in-3", "", "end_turn");
+    log.input("in-4", "timer fired"); // a timer's turn: not typed
+    auto am = Message.auto_("timer fired");
+    log.append(am);
+    log.turnEnd("in-4", "", "end_turn");
+    log.input("in-5", "last one");
+    log.close();
+    assert(restore(log.path).recentInputs == ["fix the race", "now add a test", "also the docs", "last one"]);
+}
+
+unittest // compacted_log_recall_matches_full_decode: the skim keeps steers, drops automatic inputs
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, write;
+    import std.path : buildPath;
+    auto dir = buildPath(tempDir, "nano-d-skimrecall-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    static JSONValue rec(Message m) { return messageRecord(m); }
+    string line(string type, JSONValue data) { return JSONValue(["type": JSONValue(type), "data": data]).toString ~ "\n"; }
+    auto log = `{"type":"session","data":{"version":1,"id":"skimrecall","created_at":"x"}}` ~ "\n";
+    ulong lines = 1;
+    void add(string type, JSONValue data) { log ~= line(type, data); lines++; }
+    add("input", JSONValue(["id": "in-1", "text": "typed \"one\""]));
+    auto first = Message.user("typed \"one\"");
+    add("message", rec(first));
+    auto steer = Message.user("a steer \u00e9");
+    steer.steered = true;
+    add("message", rec(steer));
+    auto peerSteer = Message.user("peer steer");
+    peerSteer.steered = true;
+    peerSteer.fromSession = "sess-other";
+    add("message", rec(peerSteer));
+    import std.array : replace;
+    // A surrogate-pair escape must decode to the character, not U+FFFD.
+    auto rocket = Message.user("ROCKET");
+    rocket.steered = true;
+    log ~= line("message", rec(rocket)).replace("ROCKET", `go \ud83d\ude80`);
+    lines++;
+    add("turn_end", JSONValue(["input_id": "in-1", "response": "", "stop_reason": "end_turn"]));
+    add("input", JSONValue(["id": "in-2", "text": "timer fired"]));
+    add("message", rec(Message.auto_("timer fired")));
+    add("turn_end", JSONValue(["input_id": "in-2", "response": "", "stop_reason": "end_turn"]));
+    JSONValue full = ["messages": JSONValue([rec(Message.user("summary"))])];
+    full["folded"] = JSONValue([rec(first)]);
+    full["summarized"] = JSONValue([JSONValue(2), JSONValue(lines)]);
+    add("replace", full);
+    auto path = buildPath(dir, "skimrecall.jsonl");
+    write(path, log);
+    auto skimmed = restoreLog(path, true), fullR = restoreLog(path, false);
+    assert(fullR.recentInputs == ["typed \"one\"", "a steer \u00e9", "go \U0001F680"]);
+    assert(skimmed.recentInputs == fullR.recentInputs);
+}
+
+// Issue #313: compressing a log in tidy-up, reopening an archive and
+// streaming its lines keep GC allocation bounded, not proportional to the
+// log's uncompressed size.
+unittest
+{
+    import core.memory : GC;
+    import std.array : appender;
+    import std.conv : to;
+    import std.file : tempDir, remove, exists, getSize;
+    import nano.clock : monoNow;
+    auto base = buildPath(tempDir, "nano-gz-bound-" ~ to!string(monoNow.ticks));
+    auto plain = base ~ ".jsonl", gz = base ~ ".jsonl.gz", back = base ~ ".back";
+    scope (exit) foreach (p; [plain, gz, back]) if (p.exists) remove(p);
+    {
+        auto o = appender!string;
+        foreach (i; 0 .. 120_000)
+            o ~= `{"type":"text","data":{"text":"line ` ~ to!string(i) ~ ` of a long session log"}}` ~ "\n";
+        std.file.write(plain, o.data);
+    }
+    immutable size = getSize(plain);
+    assert(size > 6 << 20, "the log is large enough to show a leak");
+    enum bound = 2 << 20;
+    GC.collect();
+    auto before = GC.stats.allocatedInCurrentThread;
+    gzipFile(plain, gz, octal!600);
+    immutable zipped = GC.stats.allocatedInCurrentThread - before;
+    assert(zipped < bound, "gzipFile allocated " ~ to!string(zipped));
+    before = GC.stats.allocatedInCurrentThread;
+    gunzipFile(gz, back, octal!600);
+    immutable unzipped = GC.stats.allocatedInCurrentThread - before;
+    assert(unzipped < bound, "gunzipFile allocated " ~ to!string(unzipped));
+    assert(getSize(back) == size, "the round trip keeps every byte");
+    before = GC.stats.allocatedInCurrentThread;
+    ulong lines;
+    eachLogLineUntil(gz, (const(char)[] l, ulong n) { lines = n; return true; });
+    immutable streamed = GC.stats.allocatedInCurrentThread - before;
+    assert(lines == 120_000);
+    assert(streamed < bound, "eachLogLineUntil allocated " ~ to!string(streamed));
+    assert(gzipLog(readBytes(back)) .length > 0 && logText(gz).length == size, "gzipLog still compresses whole text");
+    // Byte-for-byte: same-length corruption, reordering or duplication of
+    // chunks must fail, since tidy-up deletes the original after compressing.
+    assert(std.file.read(back) == std.file.read(plain), "the round trip preserves the log exactly");
+    assert(logText(gz) == std.file.readText(plain), "the archive decompresses to the original");
 }

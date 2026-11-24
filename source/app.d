@@ -57,7 +57,7 @@ import nano.peers : PeerListener, PeerRouter, Inbound, ListenError, settle, conf
 import nano.instructions : ProjectInstructions, InstructionOptions = Options, expandHome;
 import core.atomic : atomicLoad, atomicStore, cas;
 
-enum string packageVersion = "1.25.0";
+enum string packageVersion = "1.25.4";
 enum string versionString = "nano-coder " ~ packageVersion;
 
 enum string usage = `Usage: nano-coder [--model provider/model] [--config PATH] [-p PROMPT]
@@ -3711,6 +3711,24 @@ int runMain(string[] args)
     }
     PendingSettings pendingSettings;
 
+    // The resumed session's prompts (bounded), until the editor is seeded
+    // with them: Up/Down recalls what was typed before the resume.
+    Option!(string[]) resumedInputs;
+    /// Replace the prompt editor's Up/Down history with the resumed
+    /// session's prompts (empty for a session without any), then drop the copy.
+    void seedInputHistory(Option!LineEditor ed)
+    {
+        resumedInputs.ifSome((string[] lines) {
+            // The log holds the prompt as sent: a `//…` line was unescaped to
+            // `/…`, so restore the escape or Up+Enter would run a command.
+            import std.algorithm : map;
+            import std.array : array;
+            import std.string : stripLeft;
+            auto typed = lines.map!(l => l.stripLeft.startsWith("/") ? "/" ~ l.stripLeft : l).array;
+            ed.ifSome((LineEditor e) { e.state.history.seed(typed); });
+        });
+        resumedInputs = none;
+    }
     /// Load a saved session into the agent: its conversation, plan and log.
     /// Load a saved session; returns its diagnostics so a frame caller can
     /// print them after clearing and replaying the transcript.
@@ -3757,6 +3775,7 @@ int runMain(string[] args)
             notes ~= format("%s timer%s still set (/timers lists them)", agent.timers.items.length,
                 agent.timers.items.length == 1 ? "" : "s");
         notes ~= format("resumed %s (%s messages)", restored.id, agent.messages.length - 1);
+        resumedInputs = some(restored.recentInputs);
         if (restored.pendingInput.length)
             notes ~= format("the last prompt never finished (the session was interrupted): %s",
                 oneLine(restored.pendingInput));
@@ -4515,6 +4534,7 @@ int runMain(string[] args)
             die("could not start the terminal renderer");
         }
         editor = some(makeEditor(console.link, agent.control.nonNull));
+        seedInputHistory(editor);
         questions.interactive = true;
         refreshStatus();
         // The background update check (Rust #154): interactive terminal
@@ -5122,6 +5142,7 @@ int runMain(string[] args)
                     try loadNotes = loadSession(path);
                     catch (Exception e) { writeln(e.msg); continue; }
                     foreach (n; applyPendingSettings(false)) loadNotes ~= "nano-coder: " ~ n;
+                    seedInputHistory(editor);
                     rebindPeerListener();
                     if (gFrame) { gFrame.clear(); replayTranscript(agent, console); releaseHeap(); }
                     foreach (n; loadNotes) stdErr.writeln(n);

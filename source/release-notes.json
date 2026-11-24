@@ -1,5 +1,18 @@
 {
   "releases": [
+    {"version": "1.25.4", "date": "2026-11-24", "items": [
+      {"type":"perf","scope":"session","title":"stream .jsonl.gz compression and archive reopen","pr":331}
+    ]},
+    {"version": "1.25.3", "date": "2026-11-24", "items": [
+      {"type":"fix","scope":"messages","title":"make peer sockets close-on-exec so /relaunch can listen again","pr":330},
+      {"type":"fix","scope":"frame","title":"reserve the render cache so the first render allocates a fixed amount","pr":329}
+    ]},
+    {"version": "1.25.2", "date": "2026-11-24", "items": [
+      {"type":"perf","scope":"agent","title":"bound pinStash and completed responses in memory","pr":324}
+    ]},
+    {"version": "1.25.1", "date": "2026-11-24", "items": [
+      {"type":"fix","scope":"resume","title":"recall the resumed session's prompts with Up/Down","pr":325}
+    ]},
     {"version": "1.25.0", "date": "2026-11-24", "items": [
       {"type":"feat","scope":"memory","title":"/memory migrate tags, merges and supersedes existing memories with user confirmation","pr":311}
     ]},
@@ -429,18 +442,6 @@
     ]},
     {"version": "0.38.0", "date": "2026-10-06", "items": [
       {"type":"feat","scope":"instructions","title":"read Claude instruction files; prompt memory saving","pr":99}
-    ]},
-    {"version": "0.37.1", "date": "2026-10-06", "items": [
-      {"type":"fix","scope":"thinking","title":"apply /thinking typed mid-turn from the agent's next step (#78)","pr":101}
-    ]},
-    {"version": "0.37.0", "date": "2026-10-06", "items": [
-      {"type":"feat","scope":"providers","title":"expose all Qwen / Model Studio endpoint plans and regions","pr":102}
-    ]},
-    {"version": "0.36.0", "date": "2026-10-04", "items": [
-      {"type":"feat","scope":"config","title":"thinking level per provider and model, with /thinking","pr":91}
-    ]},
-    {"version": "0.35.0", "date": "2026-10-03", "items": [
-      {"type":"feat","scope":"hooks","title":"add Claude Code–compatible external user hooks (Phase 1)","pr":97}
     ]}
   ]
 }

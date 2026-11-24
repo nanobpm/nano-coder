@@ -990,6 +990,91 @@ bool isUserRequest(const Message m) pure { return isUserRequest(m); }
 /// The user-typed text of a request: `pinText` when hook context was appended.
 private string requestText(const ref Message m) pure { return (m.pinText.length ? m.pinText : m.content).strip; }
 
+/// The requests `trimPinStash` dropped from the middle of a pin stash: how
+/// many, and the min/max log ID among them (0: none), which is all the
+/// pinned block's omission note ever shows of them.
+struct PinGap
+{
+    /// Requests dropped.
+    size_t count;
+    /// Lowest and highest log ID among them (0: none logged).
+    ulong lo, hi;
+}
+
+/// The window, in tokens, a trimmed pin stash still renders byte-identically
+/// for (a smaller window omits more): generous, so a later switch to a larger
+/// model loses nothing in practice (issue #312).
+enum size_t pinTrimWindowTokens = 1_000_000;
+/// Backstop on the raw bytes of the later requests a trimmed stash keeps:
+/// past it the oldest are dropped even if they could still render.
+enum size_t pinStashMaxBytes = 8 * 1024 * 1024;
+
+/// One pinned line: the first request (`first`) clipped to `budget` bytes,
+/// a later one flattened to a single line; smart mode prefixes its `#N`.
+private string renderPinned(bool first, const ref Message r, size_t budget, bool smart) pure
+{
+    auto label = smart && r.logLine ? format("#%s: ", r.logLine) : "";
+    budget = saturatingSub(budget, label.length);
+    auto text = requestText(r);
+    if (!first)
+    {
+        import std.array : split;
+        text = text.split.join(" ");
+    }
+    return label ~ clipBytes(text, budget);
+}
+
+/// The fewest bytes request `r` costs as a later pinned line, in either mode.
+private size_t pinnedLaterCost(const ref Message r) pure
+{
+    return min(renderPinned(false, r, pinnedLaterChars, false).length,
+        renderPinned(false, r, pinnedLaterChars, true).length) + 1;
+}
+
+/// How `trimPinStash` bounds a stash: drop `stash[1 .. keepFrom]`, whose
+/// requests `gap` (the old gap extended) then stands for.
+struct PinTrim
+{
+    /// The first later request kept.
+    size_t keepFrom;
+    /// The gap including the dropped requests.
+    PinGap gap;
+}
+
+/// Bound a pin stash of user requests (issue #312): keep the first request
+/// and the newest later ones whose pinned lines alone overflow the block's
+/// allowance at `max(windowTokens, pinTrimWindowTokens)`; the requests in
+/// between can never render, so they fold into the gap (count and log span).
+/// `pinnedUserRequests(trimmed, …, gap)` then renders exactly as for the
+/// untrimmed stash at any window up to that. None: nothing to drop.
+/// `floorTokens`: that minimum window (tests lower it).
+Option!PinTrim trimPinStash(const Message[] stash, PinGap gap, size_t windowTokens,
+    size_t floorTokens = pinTrimWindowTokens) pure
+{
+    import nano.option : some;
+    if (stash.length < 3) return Option!PinTrim.init;
+    auto allowance = max(max(windowTokens, floorTokens) / pinnedWindowShare, pinnedMinAllowanceTokens) * 4;
+    size_t cost, bytes;
+    size_t keepFrom = stash.length;
+    while (keepFrom > 1)
+    {
+        auto i = checkedSub(keepFrom, 1);
+        bytes += stash[i].content.length + stash[i].pinText.length;
+        // The newest request is always kept, whatever its size.
+        if (bytes > pinStashMaxBytes && i + 1 < stash.length) break;
+        keepFrom = i;
+        cost += pinnedLaterCost(stash[i]);
+        if (cost > allowance) break;
+    }
+    if (keepFrom <= 1) return Option!PinTrim.init;
+    foreach (ref m; stash[1 .. keepFrom])
+    {
+        gap.count++;
+        if (auto id = m.logLine) { gap.lo = gap.lo ? min(gap.lo, id) : id; gap.hi = max(gap.hi, id); }
+    }
+    return some(PinTrim(keepFrom, gap));
+}
+
 /// The pinned block of the user's requests, rebuilt from the original
 /// messages (`prior`: earlier compactions' requests; `new_`: the turns being
 /// folded), or null when there is nothing to pin. The first request keeps
@@ -997,7 +1082,11 @@ private string requestText(const ref Message m) pure { return (m.pinText.length 
 /// `#N`. The whole block fits an allowance of window/8 tokens (floored):
 /// the oldest later requests are dropped first, with an omission note naming
 /// them by one covering log span.
-string pinnedUserRequests(const Message[] prior, const Message[] new_, bool smart, size_t windowTokens) pure
+/// `gap`: the requests `trimPinStash` dropped from between `prior[0]` and
+/// `prior[1]`; they count in the omission note and its log span exactly as
+/// if they were still there, so a trimmed stash renders byte-identically.
+string pinnedUserRequests(const Message[] prior, const Message[] new_, bool smart, size_t windowTokens,
+    PinGap gap = PinGap.init) pure
 {
     const(Message)[] requests;
     foreach (ref m; prior) if (isUserRequest(m)) requests ~= m;
@@ -1009,16 +1098,7 @@ string pinnedUserRequests(const Message[] prior, const Message[] new_, bool smar
 
     string render(size_t index, const ref Message r, size_t firstBudget)
     {
-        auto budget = index == 0 ? firstBudget : pinnedLaterChars;
-        auto label = smart && r.logLine ? format("#%s: ", r.logLine) : "";
-        budget = saturatingSub(budget, label.length);
-        auto text = requestText(r);
-        if (index != 0)
-        {
-            import std.array : split;
-            text = text.split.join(" ");
-        }
-        return label ~ clipBytes(text, budget);
+        return renderPinned(index == 0, r, index == 0 ? firstBudget : pinnedLaterChars, smart);
     }
     auto n = requests.length;
     auto lines = new string[n];
@@ -1028,6 +1108,9 @@ string pinnedUserRequests(const Message[] prior, const Message[] new_, bool smar
     foreach_reverse (i; 0 .. n) suffix[i] = suffix[i + 1] + cost(lines[i]);
     // span[i]: min/max log ID over requests[1 .. i] (0: none).
     auto spanLo = new ulong[n + 1], spanHi = new ulong[n + 1];
+    // The trimmed gap sits right after the first request: every tail start
+    // omits it, so it seeds the span of the omitted later requests.
+    if (n > 1) { spanLo[1] = gap.lo; spanHi[1] = gap.hi; }
     foreach (i; 1 .. n)
     {
         spanLo[i + 1] = spanLo[i];
@@ -1041,7 +1124,7 @@ string pinnedUserRequests(const Message[] prior, const Message[] new_, bool smar
     string note(bool keepFirst, size_t tailStart)
     {
         auto t = max(tailStart, 1);
-        auto omitted = (t - 1) + (keepFirst ? 0 : 1);
+        auto omitted = (t - 1) + (n > 1 ? gap.count : 0) + (keepFirst ? 0 : 1);
         if (!omitted) return null;
         ulong lo = spanLo[t], hi = spanHi[t];
         if (!keepFirst)
@@ -1145,6 +1228,43 @@ unittest
     foreach (i; 0 .. 500) rs ~= req(format("request %s", i));
     auto small = pinnedUserRequests(null, rs, false, 8_000), large = pinnedUserRequests(null, rs, false, 200_000);
     assert(large.length > small.length && nchars_(large) <= 200_000 / pinnedWindowShare * 4);
+}
+
+// issue #312: a trimmed stash renders byte-identically, and stays bounded
+unittest
+{
+    import std.array : replicate;
+    import nano.option : unwrap;
+    Message[] stash = [req("the original goal " ~ "g".replicate(3_000), 2)];
+    enum floor = 8_000;
+    foreach (i; 0 .. 120)
+        stash ~= req(format("follow-up %s %s", i, "word ".replicate(i % 7 == 0 ? 400 : 10 + i % 50)), i % 11 ? 10 + i * 3 : 0);
+    Message[] new_ = [req("a newly folded ask", 90_000), req("and another", 90_010)];
+    auto t = trimPinStash(stash, PinGap.init, 4_000, floor).unwrap("a long stash is trimmed");
+    auto trimmed = stash[0] ~ stash[t.keepFrom .. $];
+    auto gap = t.gap;
+    assert(trimmed.length < stash.length && gap.count + trimmed.length == stash.length);
+    assert(trimmed[0].content == stash[0].content && trimmed[$ - 1].content == stash[$ - 1].content);
+    size_t later;
+    foreach (ref m; trimmed[1 .. $]) later += m.content.length;
+    assert(later <= pinStashMaxBytes);
+    foreach (window; [2_000UL, 4_800, floor])
+        foreach (smart; [false, true])
+            assert(pinnedUserRequests(trimmed, new_, smart, window, gap) == pinnedUserRequests(stash, new_, smart, window),
+                format("window %s smart %s", window, smart));
+    // Trimming again (a later compaction) folds into the same gap.
+    auto again = trimmed ~ new_;
+    auto full = stash ~ new_;
+    foreach (i; 0 .. 40) again ~= req(format("later ask %s", i), 95_000 + i);
+    full ~= again[$ - 40 .. $];
+    auto t2 = trimPinStash(again, gap, 4_000, floor).unwrap("longer again");
+    again = again[0] ~ again[t2.keepFrom .. $];
+    gap = t2.gap;
+    assert(gap.count + again.length == full.length);
+    foreach (smart; [false, true])
+        assert(pinnedUserRequests(again, null, smart, floor, gap) == pinnedUserRequests(full, null, smart, floor));
+    // A short stash is left alone.
+    assert(trimPinStash(stash[0 .. 3], PinGap.init, 8_000).isNone);
 }
 
 // rust: context.rs::pinned_requests_omission_note_names_ids_in_smart_mode

@@ -65,6 +65,10 @@ import nano.subagent : SubClientFactory, SubLimits, SubSlot, SubGate, SubMsg, Su
 import nano.safeio : Chan;
 import std.typecons : Rebindable;
 
+/// Bytes of recent final responses an agent keeps for idempotent
+/// redelivery (issue #312); older ones are read back from the session log.
+enum size_t completedMaxBytes = 1024 * 1024;
+
 /// What the loop reports as it works (the CLI renders these).
 interface AgentEvents
 {
@@ -291,6 +295,52 @@ private struct PatchEdit
     JSONValue args;
 }
 
+/// A fixed-size Bloom filter of evicted completed-input ids (issue #312):
+/// its memory is constant however many turns a session evicts. `mayContain`
+/// has no false negatives; a false positive is harmless (a log lookup).
+struct EvictedIds
+{
+    private enum words = 4_096; // 32 KiB, 262_144 bits
+    private ulong[] bits;
+
+    private static size_t[2] slots(string id) pure nothrow @nogc
+    {
+        immutable h = hashOf(id);
+        immutable g = hashOf(id, 0x9E37_79B9_7F4A_7C15UL) | 1;
+        return [h % (words * 64), (h + g) % (words * 64)];
+    }
+
+    /// Record `id` as evicted.
+    void add(string id) pure nothrow
+    {
+        if (bits.length == 0) bits = new ulong[words];
+        foreach (s; slots(id)) bits[s / 64] |= 1UL << (s % 64);
+    }
+
+    /// Whether `id` may have been evicted (never false for an added id).
+    bool mayContain(string id) const pure nothrow @nogc
+    {
+        if (bits.length == 0) return false;
+        foreach (s; slots(id)) if (!(bits[s / 64] & (1UL << (s % 64)))) return false;
+        return true;
+    }
+
+    /// The bytes the filter holds: constant once anything was added.
+    size_t byteSize() const pure nothrow @nogc => bits.length * ulong.sizeof;
+}
+
+unittest
+{
+    import std.conv : to;
+    EvictedIds e;
+    assert(!e.mayContain("x") && e.byteSize == 0);
+    foreach (i; 0 .. 20_000) e.add("in-" ~ i.to!string);
+    immutable size = e.byteSize;
+    foreach (i; 0 .. 20_000) assert(e.mayContain("in-" ~ i.to!string));
+    foreach (i; 20_000 .. 40_000) e.add("in-" ~ i.to!string);
+    assert(e.byteSize == size && size <= 32 * 1024);
+}
+
 class Agent
 {
     NotNull!LLMClient client;
@@ -335,6 +385,18 @@ class Agent
     string[string] completedInputs;
     string[string] completedStops;
     JSONValue[string] completedOutcomes;
+    /// The ids in `completedInputs`, oldest first, and the bytes their
+    /// responses hold: past `completedMaxBytes` the oldest are evicted
+    /// (issue #312).
+    string[] completedOrder;
+    size_t completedBytes;
+    /// The byte cap on `completedInputs` (tests lower it).
+    size_t completedCap = completedMaxBytes;
+    /// Ids evicted from `completedInputs`, as a fixed-size Bloom filter so
+    /// it never grows with the session: redelivering one reads its response
+    /// back from the session log's `turn_end` record. A false positive only
+    /// costs a log scan that finds nothing; the turn then runs normally.
+    EvictedIds completedEvicted;
     /// Claude Code-compatible user hooks (null = none).
     Option!HookManager hooks;
     /// Whether this agent continues a restored session (`SessionStart` source).
@@ -426,6 +488,13 @@ class Agent
     /// The restored `pinStash` dropped legacy non-request entries, so the
     /// next compaction writes it in full rather than as a delta (issue #301).
     bool pinStashRestate;
+    /// The requests `ctx.trimPinStash` dropped from between `pinStash[0]`
+    /// and `pinStash[1]` (issue #312): they still count in the on-disk
+    /// `pinned_base` and in the pinned block's omission note.
+    ctx.PinGap pinGap;
+    /// The smallest window a trimmed `pinStash` still renders exactly for
+    /// (`ctx.trimPinStash`; tests lower it).
+    size_t pinTrimFloor = ctx.pinTrimWindowTokens;
     /// The real turns folded by compactions since the last plain replacement:
     /// a replay (ACP session/load) shows them in place of the summary.
     Message[] replayStash;
@@ -534,6 +603,7 @@ class Agent
         peerTurn = fromPeer;
         inputSender = fromPeer ? peerSender : null;
         if (givenId.length)
+        {
             if (auto done = givenId in completedInputs)
             {
                 import std.stdio : stderr;
@@ -547,6 +617,24 @@ class Agent
                 foreach (o; recorded) lastOutcome = o;
                 return *done;
             }
+            else if (completedEvicted.mayContain(givenId))
+            {
+                Option!CompletedTurn found;
+                // Recover a removed or replaced log first: the lookup reads by path.
+                log.ifSome((SessionLog l) { l.revalidate(); found = findCompletedTurn(l.path, givenId); });
+                foreach (t; found)
+                {
+                    stdErr.writefln("[agent] input %s already processed; returning recorded response",
+                        JSONValue(givenId).jsonText);
+                    lastStop = stopReasonFrom(t.stopReason);
+                    auto recorded = t.outcome.type == JSONType.object ? Outcome.fromArgs(t.outcome).toOption
+                        : Option!Outcome.init;
+                    hasOutcome = recorded.isSome;
+                    foreach (o; recorded) lastOutcome = o;
+                    return t.response;
+                }
+            }
+        }
         // Every input carries an id; the log pairs it with a turn_end record,
         // so an input without one marks a turn a crash interrupted.
         auto inputId = givenId.length ? givenId
@@ -588,12 +676,65 @@ class Agent
             indexTurn(l, from);
         });
         hasPending = false;
-        completedInputs[inputId] = response;
+        rememberCompleted(inputId, response);
         if (lastStop != StopReason.endTurn) completedStops[inputId] = lastStop;
         else completedStops.remove(inputId);
         if (hasOutcome) completedOutcomes[inputId] = lastOutcome.toJSON;
         else completedOutcomes.remove(inputId);
+        evictCompleted();
         return response;
+    }
+
+    /// Bound `pinStash` for a `window`-token context (`ctx.trimPinStash`).
+    private void trimPins(size_t window)
+    {
+        foreach (t; ctx.trimPinStash(pinStash, pinGap, window, pinTrimFloor))
+        {
+            // A fresh array: a slice would keep the dropped requests reachable.
+            auto kept = new Message[](1 + checkedSub(pinStash.length, t.keepFrom));
+            kept[0] = pinStash[0];
+            kept[1 .. $] = pinStash[t.keepFrom .. $];
+            pinStash = kept;
+            pinGap = t.gap;
+        }
+    }
+
+    /// Record `response` as input `id`'s, oldest-first for eviction.
+    private void rememberCompleted(string id, string response)
+    {
+        if (auto old = id in completedInputs) completedBytes = saturatingSub(completedBytes, completedCost(id, *old));
+        else completedOrder ~= id;
+        completedInputs[id] = response;
+        completedBytes += completedCost(id, response);
+    }
+
+    /// What one completed entry counts against `completedCap`: its response,
+    /// its id (held as a key and in `completedOrder`) and a fixed charge for
+    /// the map/order metadata, so even empty responses are bounded.
+    private static size_t completedCost(string id, string response) pure nothrow @nogc
+    {
+        return response.length + 2 * id.length + 64;
+    }
+
+    /// Drop the oldest completed responses past `completedCap` (the
+    /// newest is always kept); their ids stay redeliverable from the log.
+    private void evictCompleted()
+    {
+        // Without a session log an evicted response could not be read back,
+        // and a redelivered input would run (and repeat side effects) again.
+        if (log.isNone) return;
+        size_t drop;
+        while (completedBytes > completedCap && drop + 1 < completedOrder.length)
+        {
+            auto id = completedOrder[drop++];
+            if (auto r = id in completedInputs) completedBytes = saturatingSub(completedBytes, completedCost(id, *r));
+            completedInputs.remove(id);
+            completedStops.remove(id);
+            completedOutcomes.remove(id);
+            completedEvicted.add(id);
+        }
+        // A fresh array: a front slice would keep growing its old block.
+        if (drop) completedOrder = completedOrder[drop .. $].dup;
     }
 
     /// Ask for session titles (`session_titles`): `titleClient` builds a client
@@ -2156,7 +2297,7 @@ class Agent
         if (planTools && !plan.empty) summary ~= "\n\n" ~ plan.contextNote();
         // Pin the user's own words, rebuilt from the originals every time.
         if (compactionPinRequests)
-            if (auto pinned = ctx.pinnedUserRequests(pinStash, summarized, smart, window))
+            if (auto pinned = ctx.pinnedUserRequests(pinStash, summarized, smart, window, pinGap))
                 summary ~= "\n\n" ~ pinned;
         // The requests this compaction adds to the pinned block (the stash so
         // far is their base): the log records only these, so a session holds
@@ -2191,7 +2332,7 @@ class Agent
                 calibLen = savedCalibLen;
             }
         // A full restatement (no base) after a restore dropped legacy entries.
-        auto pinnedBase = pinStashRestate ? Option!size_t.init : some(pinStash.length);
+        auto pinnedBase = pinStashRestate ? Option!size_t.init : some(pinStash.length + pinGap.count);
         Message[] pinnedNew = pinStashRestate ? pinStash.dup : null;
         foreach (ref x; summarized)
             if (ctx.isUserRequest(x)) { pinStash ~= x; pinnedNew ~= x; }
@@ -2288,6 +2429,8 @@ class Agent
         // so nothing past this point may roll it back.
         persisted = true;
         pinStashRestate = false;
+        // Bound the stash once the log holds it in full (issue #312).
+        trimPins(window);
         // The replacement drops recalled notes' full text from context, so
         // every memory may be recalled again (except those the retained
         // system message's index renders in full: `indexShown` is kept).
@@ -3734,6 +3877,12 @@ class Agent
         completedInputs = r.completed;
         completedStops = r.completedStops;
         completedOutcomes = r.completedOutcomes;
+        completedEvicted = EvictedIds.init;
+        // A hand-built `Restored` may lack the order: any order will do.
+        completedOrder = r.completedOrder.length == r.completed.length ? r.completedOrder : r.completed.keys;
+        completedBytes = 0;
+        foreach (k, v; completedInputs) completedBytes += completedCost(k, v);
+        evictCompleted();
         historyAvailable = r.historyAvailable;
         historyHintPending = r.historyAvailable && !r.historyHintConsumed;
         // Only user requests are pinned (`pinnedUserRequests` ignores the
@@ -3743,6 +3892,10 @@ class Agent
         pinStash = null;
         foreach (ref m; r.pinStash) if (ctx.isUserRequest(m)) pinStash ~= m;
         pinStashRestate = pinStash.length != r.pinStash.length;
+        pinGap = ctx.PinGap.init;
+        // A pending restatement writes the stash in full, so it is bounded
+        // only after that compaction (issue #312).
+        if (!pinStashRestate) trimPins(contextWindow);
         replayStash = r.replayStash;
         replayStashLog = null;
         stashRefLogs = null;
@@ -3860,6 +4013,9 @@ class Agent
         completedInputs = null;
         completedStops = null;
         completedOutcomes = null;
+        completedOrder = null;
+        completedBytes = 0;
+        completedEvicted = EvictedIds.init;
         control.mode = AgentMode.normal;
         sessionThinking.nullify();
         plan = Plan.init;
@@ -3874,6 +4030,7 @@ class Agent
         compactFloor = 0;
         resetIdleCompaction();
         pinStash = null;
+        pinGap = ctx.PinGap.init;
         pinStashRestate = false;
         replayStash = null;
         replayStashLog = null;
