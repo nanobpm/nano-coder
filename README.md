@@ -1761,7 +1761,12 @@ turn runs, `blocked` while a question or the turn limit waits for you, and `idle
 prompt. A saved session is reported with the command that resumes it
 (`nano-coder --resume <id> --model <provider/model>`, plus `--config` if given), so Herdr
 can reopen it after a restart (Herdr 0.9.2 or later). A session with a
-[handle](#session-handles) shows it as the pane's agent label and reports a `name` token. The pane is released on exit.
+[handle](#session-handles) shows it as the pane's agent label and reports a `name` token, re-sent each turn in case something else in the pane cleared it.
+The pane is released when you quit; `/relaunch` keeps it, and the relaunched process
+reports again. A nano-coder started from inside a session (the bash tool, a hook, a
+script) does not report to the parent's pane: the parent marks its pane with
+`NANO_CODER_HERDR_OWNER=<pid>`, which processes it starts inherit. The `herdr` CLI stays
+usable from the bash tool.
 Reports run in the background and failures are ignored; outside Herdr nothing is sent.
 
 While the agent has a timer set, nano-coder also reports a `timer` token showing ⏰.
