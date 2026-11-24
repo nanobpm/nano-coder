@@ -253,7 +253,7 @@ Result!(string, string) tomlSet(string doc, const string[] path, string key, str
                 if (!stmt[i]) continue;
                 auto k = lineKey(l);
                 if (k is null) continue;
-                auto h = tableAt(lines, i);
+                auto h = tableAt(lines, stmt, i);
                 if (!(h.length < path.length && equal(h, path[0 .. h.length]) && k == path[h.length])) continue;
                 auto col = l.indexOf('=') + 1;
                 while (col < l.length && l[col] == ' ') col++;
@@ -273,7 +273,7 @@ Result!(string, string) tomlSet(string doc, const string[] path, string key, str
             if (!stmt[i]) continue;
             auto k = lineKey(l);
             if (k is null) continue;
-            auto h = tableAt(lines, i);
+            auto h = tableAt(lines, stmt, i);
             if (h.length < path.length && equal(h, path[0 .. h.length]) && (k == path[h.length] || k == "\0" ~ path[h.length]))
                 return R.err(format("%s is written as an inline or dotted table; edit it by hand", path.join(".")));
         }
@@ -401,11 +401,13 @@ unittest
 }
 
 /// The header path in force at line `row`.
-private string[] tableAt(const string[] lines, size_t row) pure nothrow
+/// `stmt` is `statementRows(lines)`: rows inside a multi-line value are text.
+private string[] tableAt(const string[] lines, const bool[] stmt, size_t row) pure nothrow
 {
     string[] cur;
-    foreach (l; lines[0 .. row])
-        if (auto h = headerPath(l)) cur = h;
+    foreach (i, l; lines[0 .. row])
+        if (stmt[i])
+            if (auto h = headerPath(l)) cur = h;
     return cur;
 }
 
@@ -451,4 +453,11 @@ unittest
 {
     auto lines = ["files = [ # [", "  \"a\",", "]", "[[subagent_models]]", "model = \"m\""];
     assert(statementRows(lines) == [true, false, false, true, true]);
+}
+
+// A header-looking line inside a multi-line string doesn't move later root keys into that table.
+unittest
+{
+    auto doc = "system_prompt = \"\"\"\n[notes]\n\"\"\"\nnotes = { k = 1 }\n";
+    assert(tomlSet(doc, ["notes"], "k", "2").isErr);
 }
