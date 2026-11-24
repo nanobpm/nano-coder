@@ -299,7 +299,9 @@ Summary summarize(string path, ulong maxFileBytes, out bool partial, size_t maxL
     StreamOptions o;
     o.keep = (const(char)[] head) => first || mayBeInput(head);
     // An oversized first record is no header: stop there.
-    o.oversized = (size_t) { first = false; };
+    o.oversized = (size_t) {
+        if (first) throw new Exception(format("session log %s has an oversized header", path));
+    };
     o.maxFileBytes = maxFileBytes;
     o.maxLine = maxLine;
     auto st = streamLogLinesWith(path, (line) {
@@ -657,9 +659,14 @@ Summary[] list(string dir, bool strictIndex = false, scope bool delegate(string 
             {
                 // Spend the listing's read budget; once spent, read only
                 // each log's start (issue #289).
-                immutable allowance = readBudget > partialSummaryBytes ? readBudget : partialSummaryBytes;
-                s = summarize(e.name, allowance, partial);
+                // Strict callers (retention) read every log whole: a partial
+                // summary could miss the `name` record protecting it.
+                immutable allowance = strictIndex ? ulong.max
+                    : readBudget > partialSummaryBytes ? readBudget : partialSummaryBytes;
+                // Debit before the fallible read, so a log that throws late
+                // still spends its share of the budget.
                 readBudget = saturatingSub(readBudget, size < allowance ? size : allowance);
+                s = summarize(e.name, allowance, partial);
             }
             // One unreadable or truncated log must not hide every other
             // session (issue #300: it blocked unrelated resumes); strict
@@ -688,6 +695,23 @@ Summary[] list(string dir, bool strictIndex = false, scope bool delegate(string 
             // log has, make an index rewrite that still carries it a miss.
             if (partial)
             {
+                // Keep what the cache knew beyond the log's start (a name set
+                // later protects it from retention), and keep a valid session
+                // visible even when its first prompt lies past the prefix.
+                if (cached !is null)
+                {
+                    if (s.name is null) s.name = cached.name;
+                    if (s.prompts <= cached.prompts)
+                    {
+                        // A stale cache saw more of the log than the prefix did.
+                        s.prompts = cached.prompts;
+                        s.firstPrompt = cached.firstPrompt;
+                        s.firstTellingPrompt = cached.firstTellingPrompt;
+                        s.lastPrompt = cached.lastPrompt;
+                        s.contextPrompt = cached.contextPrompt;
+                    }
+                }
+                if (!s.prompts) s.prompts = 1;
                 s.logBytes = 0;
                 s.archiveBytes = 0;
             }
@@ -1295,4 +1319,35 @@ unittest
     assert(z.prompts == 2 && z.lastPrompt == "after the giant record");
     assert(z.logBytes == logText(gz).length, "an archive's offset is its inflated length");
     assert(allocated2 < cap * 3, format("summarizing an archive allocated %s bytes", allocated2));
+}
+
+// Issue #289 (PR review): strict listings (retention) ignore the read budget,
+// a partial summary keeps the cached handle and stays visible, and an
+// oversized first record aborts summarizing at once.
+unittest
+{
+    import std.array : replicate;
+    import std.file : append, write;
+    auto dir = testDir("budget-strict");
+    auto filler = `{"type":"tool_result","data":{"out":"` ~ "x".replicate(512 * 1024) ~ `"}}` ~ "\n";
+    auto p = writeLog(dir, "named", ["first prompt that is telling enough here"]);
+    append(p, filler);
+    append(p, `{"type":"name","data":{"name":"keep-me"}}` ~ "\n");
+    foreach (s; list(dir, true, null, 0)) assert(s.name == "keep-me" && s.logBytes > 0, "strict reads whole");
+    // Cached now; grow the log so the cache misses and the read is partial.
+    append(p, filler);
+    foreach (s; list(dir, false, null, 0))
+        assert(s.name == "keep-me" && s.prompts >= 1 && s.logBytes == 0, "the cached handle survives");
+    // A header-only partial summary (its first prompt past the prefix) is listed.
+    auto q = writeLog(dir, "late", []);
+    append(q, filler);
+    append(q, `{"type":"input","data":{"id":"in-1","text":"late prompt"}}` ~ "\n");
+    bool seen;
+    foreach (s; list(dir, false, null, 0)) if (s.id == "late") seen = s.prompts > 0;
+    assert(seen, "a valid session stays visible in a partial listing");
+    auto h = buildPath(dir, "big.jsonl");
+    write(h, `{"type":"session","data":{"pad":"` ~ "z".replicate(2048) ~ `"}}` ~ "\n" ~ filler);
+    import std.exception : assertThrown;
+    bool partial;
+    assertThrown(summarize(h, 0, partial, 1024), "an oversized header is no header");
 }

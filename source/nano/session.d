@@ -462,11 +462,24 @@ void foreachLogLineSkippingTorn(string path, scope void delegate(const(char)[]) 
 void foreachLogLineSkippingTorn(string path, scope void delegate(const(char)[]) @safe sink,
     scope bool delegate(const(char)[] head) @safe keep)
 {
+    foreachLogLineSkippingTorn(path, sink, keep, null);
+}
+
+/// `foreachLogLineSkippingTorn` with a `keep` filter that also tells
+/// `oversized` the bytes of each record above `maxRecordBytes` (issue #289),
+/// just before its empty placeholder line, so a history tool can say a
+/// result is incomplete instead of reporting a skipped record as absent.
+void foreachLogLineSkippingTorn(string path, scope void delegate(const(char)[]) @safe sink,
+    scope bool delegate(const(char)[] head) @safe keep, scope void delegate(size_t bytes) @safe oversized)
+{
     streamLogLinesUntil(path, (line) { sink(line); return true; }, (head) {
         if (keep(head)) return true;
         sink(null);
         return false;
-    }, (size_t) { sink(null); });
+    }, (size_t b) {
+        if (oversized !is null) oversized(b);
+        sink(null);
+    });
 }
 
 /// The working directory recorded in the log's header (null for older logs
@@ -481,11 +494,11 @@ string logHeaderCwd(string path)
     // never buffers a record of its body (issue #289).
     StreamOptions o;
     o.maxLine = maxHeaderBytes;
-    bool first = true;
-    o.oversized = (size_t) { first = false; };
+    // An oversized header: abort at once (the catch below returns no cwd),
+    // so not one byte of a denied session's body is buffered.
+    o.oversized = (size_t) { throw new Exception("oversized session header"); };
     try
         streamLogLinesWith(path, (line) {
-            if (!first) return false; // an oversized header: no cwd
             auto h = parseJSON(line);
             if (h["type"].str != "session") return false;
             auto d = h["data"].objectNoRef;

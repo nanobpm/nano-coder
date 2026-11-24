@@ -99,7 +99,7 @@ struct Entry
 /// read whole (issue #263).
 Entry[] load(string path, scope bool delegate(ulong id) @safe want = null)
 {
-    import nano.session : messageFromRecord, eachLogLine, maxRecordBytes;
+    import nano.session : messageFromRecord, eachLogLine;
     Entry[] out_;
     eachLogLine(path, (line, n) {
         if (want !is null && !want(n)) return;
@@ -112,7 +112,7 @@ Entry[] load(string path, scope bool delegate(ulong id) @safe want = null)
             if (recordMessage(parseJSON(line), m)) out_ ~= Entry(n, m);
         }
         catch (Exception) {} // skip a torn or corrupt line, like the resume loader does
-    }, false, null, maxRecordBytes); // a history view may skip a giant record (issue #289)
+    }, false); // lossless: replay rehydrates compacted payloads from here
     return out_;
 }
 
@@ -306,7 +306,7 @@ string search(string path, JSONValue args)
     // Stream the log (issue #271): only the `limit` newest/oldest hits are
     // retained, plus the run of tool messages before one assistant hit, so a
     // huge session's search stays bounded no matter its size.
-    import nano.session : foreachLogLineSkippingTorn;
+    import nano.session : foreachLogLineSkippingTorn, maxRecordBytes;
     import std.algorithm : min;
     string[] hits;
     size_t total;
@@ -320,6 +320,7 @@ string search(string path, JSONValue args)
     struct Kept { ulong id; string line; }
     Kept[] kept;
     ulong n;
+    size_t skippedBig; // records above the cap, unsearched (issue #289)
     foreachLogLineSkippingTorn(path, (const(char)[] logLine) {
         ++n;
         Message m;
@@ -392,7 +393,7 @@ string search(string path, JSONValue args)
                 kept = kept[$ - limit .. $].dup;
             }
         }
-    }, (head) => headMayBeMessage(head));
+    }, (head) => headMayBeMessage(head), (size_t) { ++skippedBig; });
     if (oldestFirst) foreach (ref k; kept) hits ~= k.line;
     else foreach_reverse (ref k; kept) hits ~= k.line;
     string hiddenNote;
@@ -404,6 +405,12 @@ string search(string path, JSONValue args)
         foreach (k; hidden.keys.sort) { counts ~= format("%s %s", hidden[k], k); sum += hidden[k]; }
         hiddenNote = format("[role=%s hid %s matching message(s): %s. Tool messages hold command output and errors; "
             ~ "search without role to include them]", role, sum, counts.join(", "));
+    }
+    if (skippedBig)
+    {
+        if (hiddenNote.length) hiddenNote ~= "\n";
+        hiddenNote ~= format("[incomplete: %s record(s) over %s bytes were too large to search]",
+            skippedBig, maxRecordBytes);
     }
     if (!hits.length)
     {
@@ -437,9 +444,11 @@ string read(string path, JSONValue args)
     // Stream the log (issue #271): only the target message is retained, so
     // reading one message from a huge session stays bounded.
     import nano.session : foreachLogLineSkippingTorn;
+    import nano.session : maxRecordBytes;
     Message found;
     bool have;
     ulong latest, n;
+    size_t bigBytes; // the target's size when it was skipped as oversized
     foreachLogLineSkippingTorn(path, (const(char)[] logLine) {
         ++n;
         // Only the asked-for line is decoded; the others just track the
@@ -453,7 +462,12 @@ string read(string path, JSONValue args)
             have = true;
         }
         latest = n;
-    }, (head) => headMayBeMessage(head));
+    }, (head) => headMayBeMessage(head), (size_t b) {
+        if (n + 1 == id) bigBytes = b;
+    });
+    if (!have && bigBytes)
+        throw new HistoryError(format("message #%s is a %s-byte record, too large to read (limit %s bytes)",
+            id, bigBytes, maxRecordBytes));
     if (!have)
         throw new HistoryError(format("no message #%s in this session (IDs are log lines; the latest is #%s)", id, latest));
     auto m = &found;
@@ -607,4 +621,29 @@ unittest
     immutable spent = GC.stats.allocatedInCurrentThread - before;
     assert(r.startsWith("#2 user") && !r.canFind("snapshot"), r);
     assert(spent < o.data.length / 4, text("search allocated ", spent, " B for a ", o.data.length, " B log"));
+}
+
+// Issue #289 (PR review): replay's `load` is lossless, while the history
+// tools say when a record above `maxRecordBytes` was skipped instead of
+// reporting it as absent.
+unittest
+{
+    import std.array : replicate;
+    import std.algorithm : canFind;
+    import std.file : write, remove, tempDir;
+    import std.path : buildPath;
+    import nano.session : maxRecordBytes;
+    auto p = buildPath(tempDir, "nano-d-history-oversized.jsonl");
+    scope (exit) remove(p);
+    write(p, `{"type":"session","data":{}}` ~ "\n"
+        ~ `{"type":"message","data":{"role":"user","content":"` ~ "q".replicate(maxRecordBytes) ~ `"}}` ~ "\n"
+        ~ `{"type":"message","data":{"role":"user","content":"after"}}` ~ "\n");
+    auto es = load(p);
+    assert(es.length == 2 && es[0].id == 2 && es[0].message.content.length == maxRecordBytes, "replay is lossless");
+    auto o = search(p, parseJSON(`{"pattern":"zzz"}`));
+    assert(o.canFind("too large to search"), o);
+    bool threw;
+    try read(p, parseJSON(`{"id":2}`));
+    catch (HistoryError e) threw = e.msg.canFind("too large to read");
+    assert(threw, "an oversized target is not reported missing");
 }
