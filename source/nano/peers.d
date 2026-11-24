@@ -1619,8 +1619,26 @@ unittest
     assert(c2.get.status == Status.refused, "the second big message id overflows the cap");
     assert(router.takeWaiting(m));
 
-    // Mid-turn: peer steers are flagged and bounded by unread bytes.
+    // Mid-turn: a late steer keeps its hop and thread through the requeue,
+    // so a hop-4 message can't be reset to hop 1 (issue #350).
     router.midTurn(true);
+    {
+        auto hc = Shared!ReplyCell.make;
+        auto hpm = PeerMessage("sess-h", null, "deep", "m", false);
+        hpm.hop = 4;
+        hpm.thread = "sess-x/msg-1";
+        router.requests.put(PeerRequest(hpm, hc));
+        router.routePending(queue);
+        assert(hc.get.status == Status.queued);
+        auto hs = control.takePending;
+        assert(hs.length == 1 && hs[0].hop == 4 && hs[0].thread == "sess-x/msg-1", "the steer carries hop and thread");
+        assert(router.requeueLate(hs[0].text, hs[0].sender, hs[0].hop, hs[0].thread));
+        Inbound hl;
+        assert(router.takeWaiting(hl));
+        assert(hl.pm.hop == 4 && hl.pm.thread == "sess-x/msg-1", "a requeued steer keeps hop and thread");
+    }
+
+    // Mid-turn: peer steers are flagged and bounded by unread bytes.
     auto s1 = Shared!ReplyCell.make, s2 = Shared!ReplyCell.make;
     router.requests.put(PeerRequest(PeerMessage("sess-a", null, big, "m", false), s1));
     router.requests.put(PeerRequest(PeerMessage("sess-a", null, big, "m", false), s2));
