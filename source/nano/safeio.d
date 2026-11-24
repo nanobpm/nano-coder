@@ -188,11 +188,40 @@ version (Posix)
 /// Duplicate a socket fd (`dup(2)`), returning `socket_t.init` on error.
 /// Used so a background thread can wrap its own `std.socket.Socket` without
 /// sharing the fd with another `Socket` whose GC finalizer would close it.
+/// The copy is close-on-exec atomically (F_DUPFD_CLOEXEC), so the orphan
+/// sweep (`closeOrphanedPeerFds`) never sees it without the flag.
 socket_t dupSocket(socket_t fd) nothrow @nogc
 {
-    auto n = dupFd(fd);
-    if (n >= 0) setCloexec(n);
+    version (linux) enum F_DUPFD_CLOEXEC = 1030;
+    else version (OSX) enum F_DUPFD_CLOEXEC = 67;
+    else version (FreeBSD) enum F_DUPFD_CLOEXEC = 17;
+    else static assert(0, "F_DUPFD_CLOEXEC unknown on this platform");
+    auto n = fcntlInt(fd, F_DUPFD_CLOEXEC, 0);
     return n < 0 ? socket_t.init : cast(socket_t) n;
+}
+
+/// Whether `fd` is a listening socket (SO_ACCEPTCONN). The orphan sweep
+/// closes only listeners: accepted connections report the listener's path
+/// from getsockname and may briefly lack close-on-exec.
+bool isListeningSocket(int fd) @trusted nothrow @nogc
+{
+    import core.sys.posix.sys.socket : getsockopt, SOL_SOCKET, socklen_t, sockaddr;
+    version (linux) enum SO_ACCEPTCONN = 30;
+    else version (OSX) enum SO_ACCEPTCONN = 0x0002;
+    else version (FreeBSD) enum SO_ACCEPTCONN = 0x0002;
+    else static assert(0, "SO_ACCEPTCONN unknown on this platform");
+    int v;
+    socklen_t n = int.sizeof;
+    // getsockopt writes at most `n` (= int.sizeof) bytes into the local `v`.
+    if (getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &v, &n) == 0) return v != 0;
+    // macOS rejects SO_ACCEPTCONN on Unix sockets (ENOPROTOOPT). A listener
+    // has no peer, an accepted connection does: getpeername tells them apart.
+    import core.sys.posix.sys.socket : getpeername, sockaddr_storage;
+    import core.stdc.errno : errno, ENOTCONN;
+    sockaddr_storage peer;
+    socklen_t pn = peer.sizeof;
+    // getpeername writes at most `pn` bytes into the local `peer`.
+    return getpeername(fd, cast(sockaddr*) &peer, &pn) != 0 && errno == ENOTCONN;
 }
 
 /// Mark `fd` close-on-exec, so a `/relaunch` exec doesn't inherit it.
@@ -326,7 +355,8 @@ private bool addFdFlag(int fd, int get, int set, int bit) nothrow @nogc
     return flags >= 0 && fcntlInt(fd, set, flags | bit) == 0;
 }
 
-/// `fcntl(2)` for the F_GETFD/F_SETFD/F_GETFL/F_SETFL commands only.
+/// `fcntl(2)` for the F_GETFD/F_SETFD/F_GETFL/F_SETFL/F_DUPFD_CLOEXEC
+/// commands only.
 private int fcntlInt(int fd, int cmd, int arg) @trusted nothrow @nogc
 {
     import core.sys.posix.fcntl : fcntl;

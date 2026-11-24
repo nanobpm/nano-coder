@@ -834,19 +834,22 @@ bool accepting(string dir, string id)
 }
 
 /// Close this process's inherited listeners in `dir`: Unix sockets bound to
-/// a path there whose fd lacks close-on-exec (every socket this build makes
+/// a path there, listening, whose fd lacks close-on-exec (every socket this build makes
 /// sets it, so such an fd came across an exec, orphaned). Returns how many
 /// were closed. Run at startup and before listening (issue #349).
 size_t closeOrphanedPeerFds(string dir)
 {
     import std.path : dirName, extension, absolutePath, buildNormalizedPath;
-    import nano.safeio : openFds, hasCloexec, unixSocketPathOf, closeFd;
+    import nano.safeio : openFds, hasCloexec, unixSocketPathOf, closeFd, isListeningSocket;
     if (!dir.length) return 0;
     immutable want = buildNormalizedPath(absolutePath(dir));
     size_t n;
     foreach (fd; openFds())
     {
         if (fd < 3 || hasCloexec(fd)) continue;
+        // Only listeners: an accepted connection of a live listener here
+        // names the same path and lacks the flag until serve() sets it.
+        if (!isListeningSocket(fd)) continue;
         auto p = unixSocketPathOf(fd);
         if (!p.length || p.extension != ".sock") continue;
         if (buildNormalizedPath(absolutePath(p.dirName)) != want) continue;
@@ -1981,6 +1984,37 @@ unittest
     settle(inbound, true);
     listener.close();
     assert(!path.exists && !pidPath(dir, "sess-self").exists, "close removes the socket and pid file");
+}
+
+@("issue #349: the orphan sweep spares accepted connections and dup'd sockets")
+unittest
+{
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir, exists;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    import std.socket : UnixAddress;
+    import nano.safeio : dupSocket, closeFd, unixSocketPathOf, hasCloexec, isListeningSocket;
+    auto dir = buildPath(tempDir, format("np349d%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto path = socketPath(dir, "sess-live");
+    auto l = unixSocket();
+    scope (exit) l.close();
+    l.bind(new UnixAddress(path));
+    l.listen(4);
+    auto c = unixSocket();
+    scope (exit) c.close();
+    c.connect(new UnixAddress(path));
+    auto conn = l.accept(); // not close-on-exec yet, like serve() before setCloexec
+    scope (exit) conn.close();
+    assert(!hasCloexec(cast(int) conn.handle) && unixSocketPathOf(cast(int) conn.handle) == path);
+    assert(!isListeningSocket(cast(int) conn.handle) && isListeningSocket(cast(int) l.handle));
+    immutable d = dupSocket(l.handle);
+    assert(cast(int) d >= 0 && hasCloexec(cast(int) d), "dupSocket is close-on-exec atomically");
+    scope (exit) closeFd(cast(int) d);
+    assert(closeOrphanedPeerFds(dir) == 0);
+    assert(unixSocketPathOf(cast(int) conn.handle) == path, "the accepted connection survives");
 }
 
 @("issue #349: a liveness probe of a full backlog never blocks")
