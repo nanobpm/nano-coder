@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.28.0", "date": "2026-11-24", "items": [
+      {"type":"feat","scope":"sessions","title":"/name — stable user-chosen session handles","pr":326}
+    ]},
     {"version": "1.27.0", "date": "2026-11-24", "items": [
       {"type":"feat","scope":"sandbox","title":"default to workspace sandbox for ACP/headless runs","pr":335}
     ]},
@@ -439,9 +442,6 @@
     ]},
     {"version": "0.42.0", "date": "2026-10-08", "items": [
       {"type":"feat","scope":"commands","title":"run safe slash commands during a turn","pr":76}
-    ]},
-    {"version": "0.41.0", "date": "2026-10-07", "items": [
-      {"type":"feat","scope":"vision","title":"let agents view images via read_file attachments","pr":105}
     ]}
   ]
 }
