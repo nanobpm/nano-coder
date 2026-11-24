@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.32.0", "date": "2026-11-24", "items": [
+      {"type":"feat","scope":"messages","title":"replace the peer-turn send block with a hop limit when confirmation is off","pr":359}
+    ]},
     {"version": "1.31.2", "date": "2026-11-24", "items": [
       {"type":"fix","scope":"plan","title":"stop restating a finished plan; bound plan notes and pending timers","pr":353}
     ]},
@@ -439,9 +442,6 @@
     ]},
     {"version": "0.47.2", "date": "2026-10-21", "items": [
       {"type":"fix","scope":"npm","title":"replace postinstall swap with lazy self-replacement in launcher","pr":128}
-    ]},
-    {"version": "0.47.1", "date": "2026-10-21", "items": [
-      {"type":"fix","scope":"permissions","title":"allow provably read-only shell loop bodies","pr":125}
     ]}
   ]
 }

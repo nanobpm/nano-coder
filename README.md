@@ -666,7 +666,10 @@ host doesn't fail a correct change: before failing a module, the runner times a 
 machine, at most 3x. `NANO_TEST_TIMES=N dub test` lists the
 N slowest modules. `NANO_TEST_JOBS=N` runs modules in parallel (`scripts/ci.sh` uses 4); modules
 that change process-wide state (the cancel flag, environment variables) are listed in
-`scripts/serial-tests` and run alone first.
+`scripts/serial-tests` and run alone first. A module still running at twice its most-scaled limit
+(at least 10 s) is treated as hung: the runner names it and exits failing instead of waiting
+forever. In tests, HTTP retries wait out an unreachable server for at most 10 s (in use the wait is
+unbounded until Ctrl-C).
 
 Functions are `pure` wherever they can be: the result depends only on the arguments, with no
 clock, environment, files or global state. Modules that start with `pure:` (parsing, markdown,
@@ -737,6 +740,8 @@ persist_sessions = true
 cross_session_history = true            # sessions_list + a session argument on the history tools: read other sessions' logs
 session_messages = false                # listen for messages from other sessions + offer session_send (see Inter-session messages)
 session_messages_confirm = true         # ask before an incoming session message is queued/run
+session_messages_max_hops = 4           # loop guard: refuse sends beyond this many hops in a message thread
+session_messages_max_per_hour = 10      # loop guard: max messages to one session per hour (0 = no cap)
 acp_session_messages = false            # let --acp sessions send/receive messages (ACP ignores session_messages)
 # session_dir = "/path/to/sessions"    # default: <platform data dir>/nano-coder/sessions
 session_compress_after_days = 14        # gzip logs idle this long at startup (0 = never)
@@ -1295,11 +1300,25 @@ The delivered message joins the target's input labelled with its origin, e.g.
 when the sender has a [handle](#session-handles)), and is logged like any input with
 the sender's full session id in the record (`from_session` on the input and message). Mid-turn it is steered into the running turn; idle it starts
 a turn. With `session_messages_confirm = true` (the default) the target first shows the
-message and waits for its user to accept or decline. A turn that was *started by* a peer
-message cannot itself call `session_send` without `confirm: true` (which asks the
-target's user whatever their confirm setting) — the loop guard, so two agents can't
-ping-pong. On the wire each message is one A2A-shaped JSON object per line (`role`,
-`parts` with `text`, `messageId`, `contextId` = the sender's session id), so a later A2A
+message and waits for its user to accept or decline; with it off, a message (including a
+reply from a turn a peer message started) is delivered at once. `confirm: true` on
+`session_send` asks the target's user whatever their confirm setting.
+
+**Loop guard.** The cost risk of two agents replying to each other is bounded two ways:
+
+- *Hop limit.* Every message carries a hop count and a thread id (the originating
+  message's context, kept by replies in both directions). A send from a turn you started
+  is hop 1; a send from a turn started by a hop-N message is hop N+1. Above
+  `session_messages_max_hops` (default 4) the send is refused with "thread hop limit
+  reached: stop, or ask your user". A message from an older nano-coder without a hop
+  counts as hop 1, and so does an interrupted peer turn after a resume.
+- *Per-pair rate cap.* One session sends another at most
+  `session_messages_max_per_hour` messages (default 10; 0 = no cap) in any hour, so loops
+  that keep starting fresh threads stop too.
+
+On the wire each message is one A2A-shaped JSON object per line (`role`,
+`parts` with `text`, `messageId`, `contextId` = the sender's session id, and
+`metadata.nano.hop` / `metadata.nano.thread`), so a later A2A
 bridge can map it directly. The receiver serves only a peer with its own uid
 (`SO_PEERCRED`/`getpeereid`) and drops any other, and the 0700 registry directory keeps
 other users from planting or reaching a socket. `/messages on|off` and `/messages confirm

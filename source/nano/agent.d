@@ -594,17 +594,21 @@ class Agent
     /// Pass `resetControl = false` when the caller already called
     /// `control.startTurn()`, so a cancel routed before `run` began is kept.
     string run(string input, AgentEvents ev, bool resetControl = true, string givenId = null,
-        bool fromPeer = false, string peerSender = null)
+        bool fromPeer = false, string peerSender = null, uint peerHop = 1, string peerThread = null)
     {
         import std.datetime.systime : Clock;
         import std.conv : to;
         // A harness-initiated input (a fired timer): never pinned as a request.
         bool automatic = automaticInput;
         automaticInput = false;
-        // The loop guard (issue #272): a peer-started turn can't send peer
-        // messages unapproved; any other input lifts the guard.
+        // The loop guard (issues #272, #350): a peer-started turn's sends
+        // count hops along the thread; any other input starts at hop 1.
         peerTurn = fromPeer;
         inputSender = fromPeer ? peerSender : null;
+        // Issue #350: the hop and thread of the peer message that started
+        // this turn; a reply from it is one hop further along the thread.
+        inputHop = fromPeer ? (peerHop ? peerHop : 1) : 0;
+        inputThread = fromPeer ? peerThread : null;
         if (givenId.length)
         {
             if (auto done = givenId in completedInputs)
@@ -653,6 +657,9 @@ class Agent
                 if (messages[i].fromSession.length)
                 {
                     peerTurn = true;
+                    // The hop isn't persisted: a resumed peer turn counts
+                    // as hop 1 (like a message from an older sender).
+                    if (!inputHop) inputHop = 1;
                     if (!inputSender.length && i == pending.position) inputSender = messages[i].fromSession;
                     break;
                 }
@@ -760,10 +767,36 @@ class Agent
     /// carries this intent over rather than the live state.
     bool messagesWanted;
     /// The current turn was started by a peer message (set by the prompt
-    /// loop via `run(..., fromPeer: true)`): the loop guard — `session_send`
-    /// now needs the user's approval whatever the confirm setting, so two
-    /// agents can't ping-pong. Cleared when the next turn starts.
+    /// loop via `run(..., fromPeer: true)`): the loop guard — its sends are
+    /// one hop further along the thread and stop at `maxHops`, so two agents
+    /// can't ping-pong forever. Cleared when the next turn starts.
     bool peerTurn;
+    /// The hop count (issue #350) of the peer message that started this
+    /// turn (the furthest one it read); 0 when no peer message did. A send
+    /// from this turn is hop `inputHop + 1`.
+    uint inputHop;
+    /// The thread (originating contextId) of that peer message, or null.
+    string inputThread;
+    /// The most hops a message thread may take (`session_messages_max_hops`,
+    /// issue #350): a send beyond it is refused, so agents replying to each
+    /// other stop instead of running up token cost.
+    uint maxHops = 4;
+    /// The most messages this session may send one target per hour
+    /// (`session_messages_max_per_hour`, issue #350; 0: no cap): the
+    /// backstop for loops that start fresh threads.
+    uint maxSendsPerHour = 10;
+    /// Recent send times (stdTime) per target id, for `maxSendsPerHour`;
+    /// pruned to the last hour on every send, so it stays bounded.
+    private long[][string] recentSends;
+
+    /// How many send times are recorded for the rate cap; tests check that
+    /// an uncapped agent (`maxSendsPerHour == 0`) records none.
+    package size_t recordedSendCount() const pure nothrow
+    {
+        size_t n;
+        foreach (v; recentSends) n += v.length;
+        return n;
+    }
     /// The full session id of the peer that started this turn (issue
     /// #272), persisted with its input; empty for any other input.
     string inputSender;
@@ -1098,7 +1131,17 @@ class Agent
             echoSender = null;
             // A peer's steer makes the rest of this turn peer-driven: the
             // loop guard must hold for whatever it asks for.
-            if (s.fromPeer) peerTurn = true;
+            if (s.fromPeer)
+            {
+                peerTurn = true;
+                // The furthest hop read this turn governs its replies.
+                auto h = s.hop ? s.hop : 1;
+                if (h > inputHop) { inputHop = h; inputThread = s.thread; }
+                else if (!inputThread.length) inputThread = s.thread;
+                // A legacy steer carries no thread: fall back to its sender,
+                // as an idle delivery does, so identity is timing-independent.
+                if (!inputThread.length) inputThread = s.sender;
+            }
             control.absorbed(s);
         }
         fireDueTimers(ev);
@@ -2695,13 +2738,14 @@ class Agent
         }
         if (!to.length) throw new hist.HistoryError("session_send: `to` must be a non-empty session handle, id, prefix or title");
         if (!text.strip.length) throw new hist.HistoryError("session_send: `text` must be a non-empty message");
-        // The loop guard: a turn started by a peer message can't send one
-        // unapproved, whatever the confirm setting — two agents must not
-        // ping-pong. The approval rides as `confirm` on the wire, so the
-        // target's user is asked even when their confirm setting is off.
-        if (peerTurn && !confirm)
-            throw new hist.HistoryError("this turn was started by a peer message: re-send with "
-                ~ "`confirm: true` so the target's user approves it (the loop guard), or ask your user first");
+        // The loop guard (issue #350): a send from a peer-started turn is one
+        // hop further along its thread; beyond `maxHops` it is refused. The
+        // target's own confirm setting still applies (and `confirm: true`
+        // still asks its user), so a plain reply needs no approval when the
+        // target has confirmation off.
+        auto hop = sendHop(peerTurn, inputHop);
+        if (auto why = hopRefusal(hop, maxHops))
+            throw new hist.HistoryError(why);
         auto cwd = getcwd();
         auto dir = sessionDirOf(ownLog);
         auto sessions = cross.listSessions(policy, dir, cwd);
@@ -2719,6 +2763,9 @@ class Agent
         // `session_send(...)` deny rule matches the call's JSON).
         if (auto denied = policy.checkIn(peers.sendTool, args, cwd))
             throw new hist.HistoryError(denied);
+        auto now = stdTimeNow;
+        if (auto why = rateRefusal(recentSends, ownLog.id, target.id, now, maxSendsPerHour))
+            throw new hist.HistoryError(why);
         peers.PeerMessage pm;
         pm.senderId = ownLog.id;
         pm.senderTitle = selfTitle(sessions, ownLog.id);
@@ -2726,12 +2773,67 @@ class Agent
         pm.text = text;
         pm.messageId = format("msg-%s", ++sendCounter);
         pm.confirm = confirm;
+        pm.hop = hop;
+        // A reply continues its thread; a user-started send opens one.
+        pm.thread = peerTurn && inputThread.length ? inputThread
+            : peerTurn && inputSender.length ? inputSender : format("%s/%s", ownLog.id, pm.messageId);
         string note;
         auto status = peers.send(peers.peersDir(), target.id, pm, note);
+        if (maxSendsPerHour && status != peers.Status.notRunning && status != peers.Status.refused)
+            recentSends[sendKey(ownLog.id, target.id)] ~= now; // keyed per sender/target pair
         return format("%s: %s", statusText(status), note.length ? note : defaultNote(status, target));
     }
 
     private uint sendCounter;
+
+    /// The hop of a send (issue #350): 1 from a user-started turn, one more
+    /// than the message that started a peer turn.
+    static uint sendHop(bool peerTurn, uint inputHop) pure nothrow @nogc
+    {
+        if (!peerTurn) return 1;
+        const h = inputHop ? inputHop : 1;
+        return h == uint.max ? uint.max : h + 1; // saturate: a wrapped hop would reset the thread
+    }
+
+    /// Why a send at `hop` is refused under `maxHops`, or null.
+    static string hopRefusal(uint hop, uint maxHops) pure
+    {
+        if (hop <= maxHops) return null;
+        return format("thread hop limit reached (hop %s > session_messages_max_hops %s): stop, or ask your user",
+            hop, maxHops);
+    }
+
+    /// Why one more send to `target` at `now` (stdTime) breaks the per-pair
+    /// cap of `perHour` sends an hour (0: no cap), or null. Prunes the
+    /// target's entries older than an hour, so the map stays bounded.
+    static string rateRefusal(ref long[][string] sent, string sender, string target, long now, uint perHour) pure
+    {
+        const key = sendKey(sender, target);
+        enum long hourTicks = 3600L * 10_000_000L;
+        if (auto times = key in sent)
+        {
+            import std.algorithm : filter;
+            import std.array : array;
+            *times = (*times).filter!(t => t + hourTicks > now).array;
+            if (!times.length) sent.remove(key);
+        }
+        // Drop other targets' stale entries too: a long session talks to many.
+        string[] stale;
+        foreach (k, v; sent)
+            if (!v.length || v[$ - 1] + hourTicks <= now) stale ~= k;
+        foreach (k; stale) sent.remove(k);
+        if (!perHour) return null;
+        auto times = key in sent;
+        if (times is null || times.length < perHour) return null;
+        return format("rate limit reached: %s messages to session %s in the last hour "
+            ~ "(session_messages_max_per_hour); stop, or ask your user", times.length, target);
+    }
+
+    /// The `recentSends` key of a sender/target pair; never shown to the model.
+    static string sendKey(string sender, string target) pure nothrow
+    {
+        return sender ~ "\x00" ~ target;
+    }
 
     private static string statusText(peers.Status s) pure
     {

@@ -1438,6 +1438,7 @@ unittest // sandbox_confines_file_tools (+ round12 #1: a symlink escaping lexica
     import std.process : thisProcessID;
     import std.format : format;
     // Outside the temp directories, which the sandbox always allows.
+    if (imported!"nano.sandbox".skipUnderTempRoot("permissions_test sandbox test")) return;
     auto cwd = canonicalize(getcwd) ~ format("/.dub/perm-sbx-%s", thisProcessID);
     mkdirRecurse(cwd);
     scope (exit) rmrf(cwd);
