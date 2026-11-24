@@ -77,7 +77,7 @@ private SessionInfo infoOf(Summary s, bool live) @safe
     SessionInfo i;
     i.id = s.id;
     i.cwd = s.cwd;
-    i.title = shortTitle(nameOf(s));
+    i.title = nameOf(s); // full: resolve() and filters match it; lineOf shortens
     i.name = s.name;
     i.createdAt = s.createdAt;
     i.lastUsed = stamp(s.lastUsed);
@@ -366,7 +366,7 @@ unittest
 /// One line of the `sessions_list` result.
 private string lineOf(const ref SessionInfo i) @safe
 {
-    auto label = i.title.length ? i.title : "(no title)";
+    auto label = i.title.length ? shortTitle(i.title) : "(no title)";
     auto out_ = format("%s  %s  %s  %s", i.id, label, i.cwd.length ? i.cwd : "(unknown cwd)",
         i.lastUsed.length >= 19 ? i.lastUsed[0 .. 19] : i.lastUsed);
     if (i.live) out_ ~= i.pid > 0 ? format("  [live pid %s]", i.pid) : "  [live]";
@@ -618,6 +618,18 @@ unittest
     assert(listSessions(noRules, dir, alpha, "done").length == 1);
     assert(listSessions(noRules, dir, alpha, alpha.toUpper).length == 1, "filter is case-insensitive");
     assert(!listSessions(noRules, dir, alpha, "nope").length);
+    {
+        // A long title stays whole for resolve() and filters; only the list shortens it.
+        import std.array : replicate;
+        auto longLog = new SessionLog(dir, "m", beta, "sess-long");
+        auto longTitle = "x".replicate(150) ~ " tailword";
+        longLog.input("in-3", longTitle);
+        longLog.close();
+        auto ss = listSessions(noRules, dir, alpha);
+        assert(resolve(longTitle, ss).id == "sess-long", "a >120-byte title resolves");
+        assert(listSessions(noRules, dir, alpha, "tailword").length == 1, "filter sees past the cap");
+        { import std.file : remove; import std.algorithm : filter; remove(ss.filter!(x => x.id == "sess-long").front.path); }
+    }
 
     // A deny rule hides a foreign session from the listing entirely, cached
     // title and all; an in-workspace session stays.
