@@ -1307,8 +1307,12 @@ gets a fourth cross-session tool:
   result is one of `delivered`, `queued` (the target is mid-turn; the message sits in its
   `/queue`, visible, editable and withdrawable like a typed steer), `awaiting
   confirmation` (the target's user is being asked), `refused` (the target has messages
-  off or declined), or `not running` (no live socket; a stale socket file from a dead
-  session is removed by the sender that finds it). The send goes through the sender's
+  off or declined, or is busy: its socket refused the connection but its process is still
+  running), or `not running` (no live socket; a stale socket file from a dead session is
+  removed by the sender that finds it). Each listener records its process next to its
+  socket (`<session-id>.pid`: pid and start time), so a socket is only removed once that
+  process is gone. A session closes any peer listener it inherited across a `/relaunch`
+  before listening, so `/messages on` can rebind. The send goes through the sender's
   permission policy as a `session_send(...)` rule.
 
 The delivered message joins the target's input labelled with its origin, e.g.
