@@ -112,6 +112,10 @@ sandbox mode is set explicitly (`--sandbox off` restores unsandboxed runs). At s
 the effective mode and its source go to stderr (`nano-coder: sandbox workspace
 (default-headless)`), and the `/settings` reply carries `sandbox` and `sandbox_source`.
 
+Inter-session messages are off in ACP mode whatever `session_messages` says; pass
+`--session-messages` (or set `acp_session_messages = true`) to make the session reachable
+(see [Inter-session messages](#inter-session-messages)).
+
 **Protocol methods supported:**
 - `initialize` → returns protocol version and capabilities (`loadSession` when persistence is on)
 - `session/new` → starts a fresh conversation (and session log), returns sessionId.
@@ -730,6 +734,7 @@ persist_sessions = true
 cross_session_history = true            # sessions_list + a session argument on the history tools: read other sessions' logs
 session_messages = false                # listen for messages from other sessions + offer session_send (see Inter-session messages)
 session_messages_confirm = true         # ask before an incoming session message is queued/run
+acp_session_messages = false            # let --acp sessions send/receive messages (ACP ignores session_messages)
 # session_dir = "/path/to/sessions"    # default: <platform data dir>/nano-coder/sessions
 session_compress_after_days = 14        # gzip logs idle this long at startup (0 = never)
 # session_retention_days = 0           # delete logs untouched this long (0 = keep; named sessions are kept)
@@ -1293,10 +1298,17 @@ on|off` switch the settings for the current session (`--save` writes them to the
 file); `/messages` alone shows the state. The state is restored on resume (`--resume`,
 `/resume`, `/relaunch`, ACP `session/load`): a session that had messages on listens again
 under its id; if the socket can't be opened the resume goes on with messages off and says why. With the Herdr integration active a received
-message shows as activity on the target's pane, and a session served over ACP can receive
-messages too (shown to the client as user input with the label; ACP has no question
-channel, so a message that would need confirmation is declined with a note asking the
-sender to re-send with confirm off).
+message shows as activity on the target's pane.
+
+A session served over ACP (`--acp`, typically an unattended worker) does **not** inherit
+`session_messages`: it joins the registry and offers `session_send` only when opted in for
+ACP, with `--session-messages` or `acp_session_messages = true` in the config (a session
+loaded with `session/load` that had messages on stays off without the opt-in). Opted in,
+it receives messages as user input with the label, sent to the client as a
+`user_message_chunk` whose `_meta.peer.fromSession` is the sender's session id so the
+client can tell them from its own input. ACP has no question channel, so a message that
+would need confirmation is declined with a note asking the sender to re-send with confirm
+off.
 
 ## Project Instructions
 
