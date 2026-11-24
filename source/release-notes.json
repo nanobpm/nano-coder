@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.30.2", "date": "2026-11-24", "items": [
+      {"type":"fix","scope":"peers","title":"move the peer listener to the recovered session id","pr":352}
+    ]},
     {"version": "1.30.1", "date": "2026-11-24", "items": [
       {"type":"fix","scope":"acp","title":"don't inherit session_messages in ACP sessions","pr":351}
     ]},
@@ -439,9 +442,6 @@
     ]},
     {"version": "0.46.0", "date": "2026-10-15", "items": [
       {"type":"feat","scope":"providers","title":"add an unofficial Meta Muse Code provider","pr":112}
-    ]},
-    {"version": "0.45.1", "date": "2026-10-13", "items": [
-      {"type":"fix","scope":"ui","title":"stop the working count while a picker waits for the user","pr":111}
     ]}
   ]
 }
