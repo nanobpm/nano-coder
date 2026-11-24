@@ -788,6 +788,15 @@ class Agent
     /// Recent send times (stdTime) per target id, for `maxSendsPerHour`;
     /// pruned to the last hour on every send, so it stays bounded.
     private long[][string] recentSends;
+
+    /// How many send times are recorded for the rate cap; tests check that
+    /// an uncapped agent (`maxSendsPerHour == 0`) records none.
+    package size_t recordedSendCount() const pure nothrow
+    {
+        size_t n;
+        foreach (v; recentSends) n += v.length;
+        return n;
+    }
     /// The full session id of the peer that started this turn (issue
     /// #272), persisted with its input; empty for any other input.
     string inputSender;

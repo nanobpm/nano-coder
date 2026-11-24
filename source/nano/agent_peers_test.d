@@ -292,3 +292,50 @@ unittest
     assert(t.targetRouter.takeWaiting(inbound) && inbound.pm.hop == 2);
     settle(inbound, true);
 }
+
+// A legacy steer from a peer with no thread (issue #350): the turn's reply
+// continues a thread named after the steer's sender, as an idle delivery does.
+unittest
+{
+    auto mock = new MockClient([call("s1", sendTool, `{"to":"sess-target","text":"reply"}`), LLMResponse("ok")]);
+    auto t = TwoSessions.make("nd-ap-ls", mock);
+    scope (exit) t.cleanup();
+    t.targetRouter.confirm(false);
+    t.agent.control.steerWithId("[from session legacy] hi", 1, true, "legacy-sender-id", 1, null);
+    t.agent.run("a normal turn", new NullEvents, false);
+    assert(lastToolResult(mock).canFind("delivered"), lastToolResult(mock));
+    Inbound got;
+    assert(t.targetRouter.takeWaiting(got), "the reply arrived");
+    assert(got.pm.thread == "legacy-sender-id", got.pm.thread);
+    assert(got.pm.hop == 2, "a reply to a peer steer is one hop further");
+    settle(got, true);
+}
+
+// Uncapped (`maxSendsPerHour == 0`): sends record no timestamps, so the map
+// can't grow over a long session.
+unittest
+{
+    auto mock = new MockClient([
+        call("s1", sendTool, `{"to":"sess-target","text":"one"}`),
+        call("s2", sendTool, `{"to":"sess-target","text":"two"}`), LLMResponse("ok")]);
+    auto t = TwoSessions.make("nd-ap-uc", mock);
+    scope (exit) t.cleanup();
+    t.targetRouter.confirm(false);
+    t.agent.maxSendsPerHour = 0;
+    t.agent.run("send twice", new NullEvents);
+    Inbound a, b;
+    assert(t.targetRouter.takeWaiting(a) && t.targetRouter.takeWaiting(b), "both sends arrived");
+    settle(a, true);
+    settle(b, true);
+    assert(t.agent.recordedSendCount == 0, "no timestamps recorded when uncapped");
+
+    // Capped: the same sends are recorded.
+    auto mock2 = new MockClient([call("s3", sendTool, `{"to":"sess-target","text":"three"}`), LLMResponse("ok")]);
+    t.agent.client = mock2;
+    t.agent.maxSendsPerHour = 10;
+    t.agent.run("send once", new NullEvents);
+    Inbound c;
+    assert(t.targetRouter.takeWaiting(c));
+    settle(c, true);
+    assert(t.agent.recordedSendCount == 1);
+}
