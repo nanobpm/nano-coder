@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.33.4", "date": "2026-11-24", "items": [
+      {"type":"fix","scope":"session","title":"keep a restored context-window override across /model switch","pr":364}
+    ]},
     {"version": "1.33.3", "date": "2026-11-24", "items": [
       {"type":"perf","scope":"sessions","title":"bound cold-index summarizing and per-record buffering","pr":367}
     ]},
@@ -439,9 +442,6 @@
     ]},
     {"version": "0.51.0", "date": "2026-10-23", "items": [
       {"type":"feat","scope":"herdr","title":"report state, resume command and release to Herdr","pr":142}
-    ]},
-    {"version": "0.50.0", "date": "2026-10-22", "items": [
-      {"type":"feat","scope":"queue","title":"list, edit and withdraw unread steers via /queue","pr":138}
     ]}
   ]
 }
