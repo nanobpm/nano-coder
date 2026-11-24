@@ -767,6 +767,10 @@ class Agent
     /// The full session id of the peer that started this turn (issue
     /// #272), persisted with its input; empty for any other input.
     string inputSender;
+    /// While the loop echoes a peer's mid-turn steer to the events
+    /// (`userMessage`), that peer's full session id; empty otherwise. Lets
+    /// the ACP server mark peer input for its client (issue #347).
+    string echoSender;
 
     private ulong logSize()
     {
@@ -1089,7 +1093,9 @@ class Agent
             sm.steered = true;
             sm.fromSession = s.sender;
             push(sm);
+            echoSender = s.fromPeer ? s.sender : null;
             ev.userMessage(s.text);
+            echoSender = null;
             // A peer's steer makes the rest of this turn peer-driven: the
             // loop guard must hold for whatever it asks for.
             if (s.fromPeer) peerTurn = true;

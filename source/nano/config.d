@@ -484,6 +484,11 @@ struct Config
     /// queued (`session_messages_confirm`, default true); off, it is queued
     /// (or starts a turn) at once.
     bool sessionMessagesConfirm = true;
+    /// Inter-session messages for `--acp` sessions (`acp_session_messages`,
+    /// default false; issue #347). ACP ignores `session_messages`: a worker
+    /// runs unattended, so it joins the registry only when opted in here or
+    /// with `--session-messages`.
+    bool acpSessionMessages;
     /// Session log directory (empty: the platform data folder).
     string sessionDir;
     /// Gzip session logs idle this many days at startup (0: never; issue #205).
@@ -574,6 +579,7 @@ struct Config
         if (auto v = "persist_sessions" in doc) c.persistSessions = v.boolean;
         if (auto v = "cross_session_history" in doc) c.crossSessionHistory = v.boolean;
         if (auto v = "session_messages" in doc) c.sessionMessages = v.boolean;
+        if (auto v = "acp_session_messages" in doc) c.acpSessionMessages = v.boolean;
         if (auto v = "session_messages_confirm" in doc) c.sessionMessagesConfirm = v.boolean;
         if (auto v = "session_dir" in doc) c.sessionDir = v.str;
         if (auto v = "session_compress_after_days" in doc) c.sessionCompressAfterDays = v.integer;
@@ -939,6 +945,22 @@ unittest
     auto c = Config.load(path);
     assert(!c.persistSessions && c.sessionDir == "~/logs" && !c.verifyBeforeComplete);
     assert(!c.idleCompact && c.idleCompactHoldSecs == 30);
+}
+
+// Issue #347: ACP sessions take messages only with `acp_session_messages`;
+// `session_messages` alone (the interactive key) leaves it off.
+unittest
+{
+    import std.file : write, tempDir, remove;
+    import nano.acp : acpSessionMessages;
+    assert(!Config.init.acpSessionMessages);
+    auto path = buildPath(tempDir, "nano-coder-acp-messages-test.toml");
+    scope (exit) remove(path);
+    write(path, "session_messages = true\n");
+    auto c = Config.load(path);
+    assert(c.sessionMessages && !acpSessionMessages(false, c.acpSessionMessages));
+    write(path, "session_messages = true\nacp_session_messages = true\n");
+    assert(acpSessionMessages(false, Config.load(path).acpSessionMessages));
 }
 
 /// A regional OpenRouter workspace (#169): US by default, one model on EU, a

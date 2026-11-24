@@ -57,13 +57,13 @@ import nano.peers : PeerListener, PeerRouter, Inbound, ListenError, settle, conf
 import nano.instructions : ProjectInstructions, InstructionOptions = Options, expandHome;
 import core.atomic : atomicLoad, atomicStore, cas;
 
-enum string packageVersion = "1.30.0";
+enum string packageVersion = "1.30.1";
 enum string versionString = "nano-coder " ~ packageVersion;
 
 enum string usage = `Usage: nano-coder [--model provider/model] [--config PATH] [-p PROMPT]
                     [--resume [SESSION|last]] [--name HANDLE] [--plan] [--sandbox off|workspace|read-only]
                     [--allow RULE]... [--deny RULE]...
-                    [--no-session] [--no-hooks] [--yolo] [--wait-timers] [--verbosity quiet|normal|verbose|debug] [--acp]
+                    [--no-session] [--no-hooks] [--yolo] [--wait-timers] [--verbosity quiet|normal|verbose|debug] [--acp [--session-messages]]
        nano-coder --list-sessions [--all] [--json]
        nano-coder --trajectory SESSION_ID [--json|--markdown]
        nano-coder --list-models PROVIDER[/model]
@@ -75,6 +75,8 @@ Reads the Rust nano-coder's config (~/.config/nano-coder/config.toml).
 -p runs one prompt and exits (--wait-timers: first wait for the timers the agent set,
 running each as it fires); with no -p, prompts are read from stdin (a REPL on a terminal).
 --acp serves the Agent Client Protocol (JSON-RPC 2.0, one message per line) on stdin/stdOut.
+--session-messages lets an --acp session send and receive inter-session messages (ACP ignores
+session_messages; acp_session_messages = true in the config does the same).
 REPL commands: /help lists them (/model, /mode, /verbosity, /providers, /restart, /resume, ...)
 Ctrl-C cancels a running turn; a line typed during a turn steers it.
 A repository's own skills and .claude/settings*.json hooks load only once you trust it: an
@@ -91,6 +93,8 @@ struct Options
     /// `--name`: the session's handle (issue #300).
     string name;
     bool waitTimers, yolo, markdown, plan, noSession, noHooks, verbose, hasResume, acp, listSessions, all, json;
+    /// `--session-messages`: an `--acp` session takes inter-session messages (issue #347).
+    bool sessionMessages;
     /// `--memory-migrate` and its `--dry-run`.
     bool memoryMigrate, dryRun;
     string[] allow, deny;
@@ -139,6 +143,7 @@ Options parseArgs(string[] args)
                 break;
             }
             case "--acp": o.acp = true; break;
+            case "--session-messages": o.sessionMessages = true; break;
             case "--list-sessions": o.listSessions = true; break;
             case "--all": o.all = true; break;
             case "--json": o.json = true; break;
@@ -177,6 +182,7 @@ Options parseArgs(string[] args)
     if (o.hasResume && o.listModels.length) fail("--resume and --list-models are mutually exclusive");
     if (o.name.length && (o.listSessions || o.trajectory !is null || o.listModels.length || o.login.length || o.memoryMigrate))
         fail("--name names an interactive, -p or --acp session");
+    if (o.sessionMessages && !o.acp) fail("--session-messages requires --acp (interactive sessions use session_messages or /messages)");
     return o;
 }
 
@@ -201,6 +207,8 @@ unittest
     assert(!ok("--resume", "--trajectory", "sess-1") && !ok("--trajectory", "sess-1", "--resume"));
     assert(!ok("--resume", "--list-models", "openai") && !ok("--list-models", "openai", "--resume=sess-1"));
     assert(ok("--acp", "--resume", "sess-1"));
+    assert(ok("--acp", "--session-messages") && !ok("--session-messages"));
+    assert(parseArgs(["nano-coder", "--acp", "--session-messages"]).sessionMessages);
     assert(parseArgs(["nano-coder", "--resume", "sess-1"]).resume == "sess-1");
     assert(ok("--memory-migrate") && ok("--memory-migrate", "--dry-run") && !ok("--dry-run"));
     assert(!ok("--memory-migrate", "-p", "hi") && !ok("--memory-migrate", "--acp"));
@@ -3796,7 +3804,7 @@ int runMain(string[] args)
 
     if (o.acp)
     {
-        import nano.acp : AcpServer, Host;
+        import nano.acp : AcpServer, Host, acpSessionMessages;
         Host host;
         bool plan = o.plan;
         host.systemPrompt = (string dir) {
@@ -3845,7 +3853,8 @@ int runMain(string[] args)
         host.sandboxMode = sandboxMode.mode.modeName;
         host.sandboxSource = sandboxMode.source.sourceName;
         host.saveSubagents = (bool on) => saveSubagentsSetting(cfg, on);
-        host.sessionMessages = cfg.sessionMessages;
+        // Issue #347: ACP never inherits `session_messages`; opt in for ACP.
+        host.sessionMessages = acpSessionMessages(o.sessionMessages, cfg.acpSessionMessages);
         host.sessionMessagesConfirm = cfg.sessionMessagesConfirm;
         host.sessionMeta = () {
             JSONValue meta = ["projectInstructions": JSONValue(instructions.match!(pi => pi.loadedPaths, () => string[].init)),

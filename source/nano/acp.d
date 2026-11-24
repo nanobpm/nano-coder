@@ -311,7 +311,9 @@ struct Host
     string releaseNotice;
     /// Inter-session messages (issue #272): this session listens and offers
     /// `session_send`; incoming messages are shown to the client as user
-    /// input with the label.
+    /// input with the label. ACP opt-in only (`--session-messages` or
+    /// `acp_session_messages`, issue #347), never the interactive
+    /// `session_messages`: see `acpSessionMessages`.
     bool sessionMessages;
     /// Ask the client before accepting an incoming message
     /// (`session_messages_confirm`, default true). ACP has no question
@@ -607,7 +609,15 @@ final class AcpServer : AgentEvents
 
     void userMessage(string t)
     {
-        update(JSONValue(["sessionUpdate": JSONValue("user_message_chunk"), "content": textBlock(t)]));
+        update(userChunk(t, agent.echoSender));
+    }
+
+    /// Echo input that came from another session (issue #347): a
+    /// `user_message_chunk` whose `_meta.peer.fromSession` names the sender,
+    /// so the client can tell it from its own user's input.
+    private void peerUserMessage(string t, string senderId)
+    {
+        update(peerUserChunk(t, senderId));
     }
 
     /// Nothing to retract over ACP: the client has the streamed chunks.
@@ -709,7 +719,7 @@ final class AcpServer : AgentEvents
                         "the ACP session can't ask its user to confirm; it accepts only sends without confirm, and only if its own session_messages_confirm is off");
                     continue;
                 }
-                userMessage(inbound.labelled);
+                peerUserMessage(inbound.labelled, inbound.pm.senderId);
                 peers.settle(inbound, true);
                 subCalls = null;
                 terminalCalls = null;
@@ -1371,7 +1381,9 @@ final class AcpServer : AgentEvents
         if (st.subagents >= 0) agent.subagentsOn = st.subagents != 0;
         // Inter-session messages (issue #336): `loadSession_` starts the
         // listener for the loaded id afterwards when they are on.
-        if (st.messages >= 0) agent.messagesOn = st.messages != 0;
+        // Only with the ACP opt-in (issue #347): a session saved with
+        // messages on (say, an interactive one) stays off here without it.
+        if (st.messages >= 0) agent.messagesOn = host.sessionMessages && st.messages != 0;
         if (st.messagesConfirm >= 0) peerRouter.confirm(st.messagesConfirm != 0);
         if (st.compactionMode.length)
             parseCompactionMode(st.compactionMode).match!((m) { agent.compactionMode = m; }, () {});
@@ -1407,7 +1419,8 @@ final class AcpServer : AgentEvents
             final switch (m.role)
             {
             case Role.system: break;
-            case Role.user: userMessage(m.content); break;
+            // The persisted sender keeps peer provenance across session/load.
+            case Role.user: update(userChunk(m.content, m.fromSession)); break;
             case Role.assistant:
                 assistantMessage(m.content, null);
                 foreach (c; m.toolCalls) toolStart(c);
@@ -2270,4 +2283,94 @@ unittest
     assert(agent.name == "perf");
     assert(agent.messages[0].content == "sys-plan", agent.messages[0].content);
     agent.log.ifSome((SessionLog l) { l.close(); });
+}
+
+/// The `user_message_chunk` update for input from another session (issue
+/// #347): the labelled text plus `_meta.peer.fromSession`, the sender's id.
+JSONValue peerUserChunk(string t, string senderId) pure
+{
+    auto u = JSONValue(["sessionUpdate": JSONValue("user_message_chunk"), "content": textBlock(t)]);
+    u["_meta"] = JSONValue(["peer": JSONValue(["fromSession": senderId])]);
+    return u;
+}
+
+/// The `user_message_chunk` update for user input: a peer chunk when
+/// `senderId` names another session, else a plain one. Live echoes and
+/// history replay share it so provenance looks the same both ways.
+JSONValue userChunk(string t, string senderId) pure
+{
+    if (senderId.length) return peerUserChunk(t, senderId);
+    return JSONValue(["sessionUpdate": JSONValue("user_message_chunk"), "content": textBlock(t)]);
+}
+
+/// Whether an ACP session takes inter-session messages (issue #347): only
+/// when opted in for ACP with `--session-messages` or `acp_session_messages`.
+/// The interactive `session_messages` doesn't apply: a worker runs
+/// unattended, so any local session could otherwise steer it.
+bool acpSessionMessages(bool flag, bool acpKey) pure nothrow @nogc
+{
+    return flag || acpKey;
+}
+
+unittest
+{
+    auto u = peerUserChunk("[from session s1] hi", "s1-full");
+    assert(u["sessionUpdate"].str == "user_message_chunk");
+    assert(u["_meta"]["peer"]["fromSession"].str == "s1-full");
+    auto r = userChunk("[from session s1] hi", "s1-full");
+    assert(r["_meta"]["peer"]["fromSession"].str == "s1-full", "a replayed peer input keeps its sender");
+    auto o = userChunk("hi", null);
+    assert(o["sessionUpdate"].str == "user_message_chunk" && o.toString().indexOf("_meta") < 0);
+    assert(!acpSessionMessages(false, false));
+    assert(acpSessionMessages(true, false) && acpSessionMessages(false, true));
+}
+
+// Issue #347: a config with `session_messages = true` doesn't make an ACP
+// session reachable (no socket, no `session_send`); the ACP opt-in does.
+unittest
+{
+    import nano.providers.mock;
+    import nano.tools;
+    import nano.permissions : Policy;
+    import nano.config : Config;
+    import nano.session : SessionLog;
+    import nano.option : ifSome;
+    import std.algorithm : any;
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, exists, dirEntries, SpanMode;
+    import std.path : buildPath;
+    import std.process : environment;
+    auto root = buildPath(tempDir, "nd-acp-347");
+    if (root.exists) rmdirRecurse(root);
+    mkdirRecurse(buildPath(root, "sessions"));
+    // A short registry path: a socket path over ~104 bytes can't be bound,
+    // and the macOS temp dir plus a generated session id exceeds it.
+    import std.conv : to;
+    import std.process : thisProcessID;
+    auto peersDir = "/tmp/nd347-" ~ thisProcessID.to!string;
+    if (peersDir.exists) rmdirRecurse(peersDir);
+    mkdirRecurse(peersDir);
+    environment["NANO_CODER_PEERS"] = peersDir;
+    scope (exit) { environment.remove("NANO_CODER_PEERS"); rmdirRecurse(root); rmdirRecurse(peersDir); }
+    Config cfg;
+    cfg.sessionMessages = true;
+    foreach (flag; [false, true])
+    {
+        auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, null);
+        auto host = Host((string cwd) => "sys", null, buildPath(root, "sessions"), "test");
+        host.sessionMessages = acpSessionMessages(flag, cfg.acpSessionMessages);
+        bool listening, replied;
+        auto srv = new AcpServer(agent, host, (string l) {
+            // The reply to session/new: the listener (if any) is up now.
+            if (!replied && l.canFind(`"id":1`))
+            {
+                replied = true;
+                listening = dirEntries(peersDir, "*.sock", SpanMode.shallow).any!(e => true);
+            }
+        });
+        srv.receive(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}`);
+        srv.close();
+        srv.run();
+        assert(replied && agent.messagesOn == flag && listening == flag, format!"%s %s %s %s"(flag, replied, agent.messagesOn, listening));
+        agent.log.ifSome((SessionLog l) { l.close(); });
+    }
 }

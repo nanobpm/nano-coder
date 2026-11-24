@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.30.1", "date": "2026-11-24", "items": [
+      {"type":"fix","scope":"acp","title":"don't inherit session_messages in ACP sessions","pr":351}
+    ]},
     {"version": "1.30.0", "date": "2026-11-24", "items": [
       {"type":"feat","scope":"messages","title":"restore inter-session messaging state on resume and /relaunch","pr":337}
     ]},
@@ -439,9 +442,6 @@
     ]},
     {"version": "0.45.1", "date": "2026-10-13", "items": [
       {"type":"fix","scope":"ui","title":"stop the working count while a picker waits for the user","pr":111}
-    ]},
-    {"version": "0.45.0", "date": "2026-10-12", "items": [
-      {"type":"feat","scope":"reminders","title":"detect repeated tool calls and stop runaway loops","pr":108}
     ]}
   ]
 }
