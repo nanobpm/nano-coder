@@ -168,7 +168,7 @@ bool dirHasSkill(string repoRoot, string dir)
 {
     auto repo = canonical(repoRoot);
     auto boundary = canonical(dir);
-    if (repo is null || boundary is null || !underPath(boundary, repo)) return false;
+    if (repo is null || boundary is null || !underPath(boundary, repo) || gitBelow(boundary, repo)) return false;
     size_t[string] visited;
     bool scan(string d, size_t depth)
     {

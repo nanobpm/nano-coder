@@ -192,7 +192,7 @@ final class Skills
         // a symlinked `SKILL.md` or skill folder can't pull in an outside file.
         auto root = canonical(dir);
         if (root is null) return;
-        if (confine !is null && !startsWithPath(root, confine)) return;
+        if (confine !is null && (!startsWithPath(root, confine) || gitBelow(root, confine))) return;
         string[] found;
         scan(root, root, 0, found);
         foreach (skillDir; found)
@@ -416,7 +416,7 @@ string fingerprintIn(string cwd, const ref SkillsConfig config, Locations locati
     {
         o ~= "D\0" ~ dir ~ "\0";
         auto r = canonical(dir);
-        if (r is null || (limit !is null && !startsWithPath(r, limit))) return;
+        if (r is null || (limit !is null && (!startsWithPath(r, limit) || gitBelow(r, limit)))) return;
         fingerprintScan(r, r, 0, o);
     }
     foreach (dir; config.dirs) dirPrint(buildPath(root, dir), confine);
@@ -536,6 +536,13 @@ private bool startsWithPath(string path, string root) pure
     return path == root || path.startsWith(root.endsWith("/") ? root : root ~ "/");
 }
 
+/// Whether `path` (under `root`) passes through a `.git` below `root`; a
+/// `.git` above `root` doesn't count (issue #374).
+private bool gitBelow(string path, string root) pure
+{
+    return path[root.length .. $].pathSplitter.canFind(".git");
+}
+
 /// `path` canonicalized, if it exists and stays inside `root` (already canonical) and outside `.git`.
 private string within(string root, string path)
 {
@@ -543,7 +550,7 @@ private string within(string root, string path)
     if (rp is null || !startsWithPath(rp, root)) return null;
     // Only `.git` below the root counts: the root itself may sit under some
     // other repository's `.git` (a worker's temp directory does, issue #374).
-    if (rp[root.length .. $].pathSplitter.canFind(".git")) return null;
+    if (gitBelow(rp, root)) return null;
     return rp;
 }
 
@@ -1282,4 +1289,22 @@ unittest
     assert(s.names == ["review"], s.names.join(","));
     assert(within(canonical(repo), buildPath(repo, ".git/skills/hidden/SKILL.md")) is null);
     assert(!s.stale(repo, c, Locations.init));
+}
+
+// A configured skills directory resolving into the repository's own `.git`
+// is not scanned, even though `.git` is above that directory.
+unittest
+{
+    import nano.trust : dirHasSkill;
+    auto dir = tmpRoot("into-git");
+    auto repo = buildPath(dir, "outer", ".git", "tmp", "repo");
+    mkdirRecurse(buildPath(repo, ".git"));
+    put(buildPath(repo, ".git/meta/hidden/SKILL.md"), skillMd("hidden", "Never found."));
+    mkdirRecurse(buildPath(repo, ".agents"));
+    symlink(buildPath(repo, ".git/meta"), buildPath(repo, ".agents/skills"));
+    auto c = cfg();
+    auto s = Skills.discoverIn(repo, c, Locations.init);
+    assert(s.names.length == 0, s.names.join(","));
+    assert(!s.stale(repo, c, Locations.init));
+    assert(!dirHasSkill(repo, buildPath(repo, ".agents/skills")));
 }
