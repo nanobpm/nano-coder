@@ -214,6 +214,8 @@ unittest
     // Hops: user turns send hop 1; a peer turn one more than its input
     // (an older sender's message without a hop counts as hop 1).
     assert(Agent.sendHop(false, 0) == 1 && Agent.sendHop(true, 1) == 2 && Agent.sendHop(true, 0) == 2);
+    // A hop at uint.max saturates instead of wrapping to 0 (which would pass the limit).
+    assert(Agent.sendHop(true, uint.max) == uint.max && Agent.hopRefusal(Agent.sendHop(true, uint.max), 4) !is null);
     assert(Agent.hopRefusal(4, 4) is null && Agent.hopRefusal(5, 4) !is null);
 }
 

@@ -2752,7 +2752,7 @@ class Agent
         if (auto denied = policy.checkIn(peers.sendTool, args, cwd))
             throw new hist.HistoryError(denied);
         auto now = stdTimeNow;
-        if (auto why = rateRefusal(recentSends, target.id, now, maxSendsPerHour))
+        if (auto why = rateRefusal(recentSends, ownLog.id ~ "\x00" ~ target.id, now, maxSendsPerHour))
             throw new hist.HistoryError(why);
         peers.PeerMessage pm;
         pm.senderId = ownLog.id;
@@ -2768,7 +2768,7 @@ class Agent
         string note;
         auto status = peers.send(peers.peersDir(), target.id, pm, note);
         if (status != peers.Status.notRunning && status != peers.Status.refused)
-            recentSends[target.id] ~= now;
+            recentSends[ownLog.id ~ "\x00" ~ target.id] ~= now; // keyed per sender/target pair
         return format("%s: %s", statusText(status), note.length ? note : defaultNote(status, target));
     }
 
@@ -2778,7 +2778,9 @@ class Agent
     /// than the message that started a peer turn.
     static uint sendHop(bool peerTurn, uint inputHop) pure nothrow @nogc
     {
-        return peerTurn ? (inputHop ? inputHop : 1) + 1 : 1;
+        if (!peerTurn) return 1;
+        const h = inputHop ? inputHop : 1;
+        return h == uint.max ? uint.max : h + 1; // saturate: a wrapped hop would reset the thread
     }
 
     /// Why a send at `hop` is refused under `maxHops`, or null.

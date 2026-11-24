@@ -994,7 +994,8 @@ struct PeerRouter
                 import core.atomic : atomicLoad;
                 // Unread steers are bounded like the idle inbox; the budget
                 // frees as the turn reads them (or `/queue` withdraws them).
-                if (atomicLoad(control).pendingSteerBytes + labelled.length + req.pm.senderId.length > maxQueuedBytes)
+                if (atomicLoad(control).pendingSteerBytes + labelled.length + req.pm.senderId.length
+                    + req.pm.thread.length > maxQueuedBytes)
                 {
                     answer(req.reply, Status.refused, "the target session's inbox is full; try again later");
                     continue;

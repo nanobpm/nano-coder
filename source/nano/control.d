@@ -327,7 +327,7 @@ final class TurnControl
     size_t pendingSteerBytes() shared
     {
         size_t n;
-        foreach (m; state.get.steers) n += m.text.length + m.sender.length;
+        foreach (m; state.get.steers) n += m.text.length + m.sender.length + m.thread.length;
         return n;
     }
 
