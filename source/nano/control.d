@@ -102,6 +102,9 @@ void popCancelScope() @safe nothrow @nogc
 /// Raised inside the agent when a cancel interrupts a model call.
 class Cancelled : Exception
 {
+    /// Usage the provider reported before the cancel (e.g. a usage chunk),
+    /// so it is still counted (issue #340). Zero when none arrived.
+    imported!"nano.llm".TokenUsage usage;
     this() pure nothrow @safe { super(cancelledResponse); }
 }
 

@@ -632,3 +632,31 @@ unittest
     assert(f.agent.run("go", new NullEvents) == "done");
     assert(offered == [true, false], "the retry honours the toggle");
 }
+
+// An aborted request counts the usage the provider reported before the drop
+// (issue #340); one without usage is left uncounted, not estimated.
+unittest
+{
+    import nano.http : StreamInterrupted;
+    auto f = new Fixture([]);
+    int n;
+    f.agent.client = new class MockClient
+    {
+        this() { super([]); }
+        override LLMResponse chat(const ref ChatRequest req, StreamSink sink)
+        {
+            n++;
+            if (n == 1)
+            {
+                auto e = new StreamInterrupted("dropped after usage");
+                e.usage = TokenUsage(40, 7);
+                throw e;
+            }
+            if (n == 2) throw new StreamInterrupted("dropped before usage");
+            return LLMResponse("done");
+        }
+    };
+    assert(f.agent.run("go", new NullEvents) == "done");
+    assert(f.agent.sessionInputTokens == 40, "the reported usage is counted");
+    assert(f.agent.uncountedRequests == 1, "only the request without usage is uncounted");
+}

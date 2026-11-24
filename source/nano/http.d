@@ -21,6 +21,9 @@ import nano.retry : ErrorInfo, RetryPolicy, retryDelay, retryableError = retryab
 /// be resumed, but the caller can discard the partial reply and ask again.
 class StreamInterrupted : Exception
 {
+    /// Usage the provider reported before the drop, so it is still counted
+    /// (issue #340). Zero when none arrived.
+    imported!"nano.llm".TokenUsage usage;
     this(string msg) pure { super(msg); }
 }
 
@@ -450,8 +453,12 @@ string postStream(S)(ref S st, string url, string[string] headers, JSONValue bod
         if (sink !is null) sink(thinking, text);
     };
     auto initial = local;
-    auto whole = postProvider(url, headers, body_, what, c, (string data) { local.event(data); }, () => shown,
+    string whole;
+    // An aborted stream keeps the usage it already reported (issue #340).
+    try whole = postProvider(url, headers, body_, what, c, (string data) { local.event(data); }, () => shown,
         () { local = initial; });
+    catch (StreamInterrupted dropped) { static if (__traits(hasMember, S, "r")) dropped.usage = local.r.usage; throw dropped; }
+    catch (imported!"nano.control".Cancelled stopped) { static if (__traits(hasMember, S, "r")) stopped.usage = local.r.usage; throw stopped; }
     st = local;
     return whole;
 }

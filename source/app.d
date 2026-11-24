@@ -4202,6 +4202,9 @@ int runMain(string[] args)
     {
         updateStatus((ref Stats s) { statusFromAgent(s, agent, cwdShown); });
     }
+    // A sub-agent's progress and completion fold its usage into the totals,
+    // so the status line's ↑↓/AIC move while a foreground agent runs (#340).
+    agent.onSubagentsChanged = () { snapshotSubagentIds(); refreshStatus(); };
 
     // Read-only commands typed mid-turn show this, rendered on the agent thread.
     auto view = LiveView.make;

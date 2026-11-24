@@ -1225,13 +1225,13 @@ class Agent
         catch (Cancelled e)
         {
             failure = e;
-            uncountedRequests++;
+            countAborted(e.usage, ev);
             return Event(CallFailed(Failure.cancelled, e.msg, req.maxTokens, true));
         }
         catch (StreamInterrupted e)
         {
             failure = e;
-            uncountedRequests++;
+            countAborted(e.usage, ev);
             return Event(CallFailed(Failure.interrupted, e.msg, req.maxTokens, control.isCancelled));
         }
         catch (Exception e) // classified by nano.turn.step: retried, compacted for, or re-raised
@@ -2319,9 +2319,14 @@ class Agent
                 }
                 break;
             }
-            catch (Cancelled) return false;
+            catch (Cancelled e)
+            {
+                countAborted(e.usage, ev);
+                return false;
+            }
             catch (StreamInterrupted e)
             {
+                countAborted(e.usage, ev);
                 // A dropped summary stream is asked again, as a turn's is,
                 // before history is dropped for want of a summary.
                 if (control.isCancelled) return false;
@@ -2510,6 +2515,20 @@ class Agent
         historyAvailable = historyHintPending = ctx.citesHistory(m);
         if (onCompacted !is null) onCompacted(report);
         return true;
+    }
+
+    /// Count an aborted request: the usage the provider reported before the
+    /// abort when there is any, else one more request left uncounted (no
+    /// estimate; issue #340).
+    private void countAborted(E)(TokenUsage u, E ev)
+    {
+        if (u.inputTokens > 0 || u.outputTokens > 0 || u.hasAic)
+        {
+            recordUsage(u);
+            static if (is(E : AgentEvents)) ev.usage(u);
+            else foreach (e; ev) e.usage(u);
+        }
+        else uncountedRequests++;
     }
 
     private void recordUsage(TokenUsage u) pure
