@@ -167,50 +167,63 @@ private string lineKey(string line) pure
 /// strings and arrays across `lines` from `row`; also the row it ends on.
 private size_t valueEnd(const string[] lines, size_t row, size_t col, out size_t endRow) pure
 {
-    endRow = row;
-    auto line = lines[row];
-    auto v = line[col .. $];
-    foreach (q; [`"""`, `'''`])
-        if (v.startsWith(q))
-        {
-            auto close = v[3 .. $].indexOf(q);
-            if (close >= 0) return col + 3 + close + 3;
-            foreach (r; row + 1 .. lines.length)
-            {
-                auto c = lines[r].indexOf(q);
-                if (c >= 0) { endRow = r; return c + 3; }
-            }
-            endRow = lines.length - 1;
-            return lines[$ - 1].length;
-        }
+    // One scanner for every depth: strings (basic, literal and their
+    // triple-quoted forms) are recognised wherever they start, and basic
+    // strings honour backslash escapes, as nano.toml's parser does.
+    enum S { none, basic, literal, mlBasic, mlLiteral }
+    S st;
     int depth;
-    bool inStr;
-    char quote;
     for (size_t r = row; r < lines.length; r++)
     {
         auto l = lines[r];
         for (size_t i = r == row ? col : 0; i < l.length; i++)
         {
             auto c = l[i];
-            if (inStr)
+            final switch (st)
             {
-                if (quote == '"' && c == '\\') { i++; continue; }
-                if (c == quote) inStr = false;
+            case S.basic:
+                if (c == '\\') i++;
+                else if (c == '"') st = S.none;
+                continue;
+            case S.literal:
+                if (c == '\'') st = S.none;
+                continue;
+            case S.mlBasic:
+                if (c == '\\') { i++; continue; }
+                goto case S.mlLiteral;
+            case S.mlLiteral:
+                auto q = st == S.mlBasic ? '"' : '\'';
+                if (c == q && l[i .. $].startsWith([q, q, q]))
+                {
+                    // A closing run may hold up to two extra quotes.
+                    i += 2;
+                    while (i + 1 < l.length && l[i + 1] == q) i++;
+                    st = S.none;
+                }
+                continue;
+            case S.none:
+                break;
+            }
+            if (c == '"' || c == '\'')
+            {
+                bool triple = l[i .. $].startsWith([c, c, c]);
+                st = c == '"' ? (triple ? S.mlBasic : S.basic) : (triple ? S.mlLiteral : S.literal);
+                if (triple) i += 2;
                 continue;
             }
-            if (c == '"' || c == '\'') { inStr = true; quote = c; continue; }
             if (c == '[' || c == '{') depth++;
             else if (c == ']' || c == '}') depth--;
             else if (c == '#')
             {
                 // A comment runs to the end of the line at any depth: its
                 // brackets and quotes are text, not structure.
-                if (depth == 0) { endRow = r; return i; }
+                if (depth <= 0) { endRow = r; return i; }
                 break;
             }
-            if (depth == 0 && i + 1 == l.length) { endRow = r; return l.length; }
         }
-        if (depth <= 0) { endRow = r; return l.length; }
+        // A single-line string can't span rows; a malformed one ends here.
+        if (st == S.basic || st == S.literal) st = S.none;
+        if (depth <= 0 && st == S.none) { endRow = r; return l.length; }
     }
     endRow = lines.length - 1;
     return lines[$ - 1].length;
@@ -460,4 +473,23 @@ unittest
 {
     auto doc = "system_prompt = \"\"\"\n[notes]\n\"\"\"\nnotes = { k = 1 }\n";
     assert(tomlSet(doc, ["notes"], "k", "2").isErr);
+}
+
+// Triple-quoted strings nest anywhere: removing a key keeps the following table.
+unittest
+{
+    auto doc = "subagent_models = [{ model = \"p/old\", use = '''For users' requests''' }]\n\n[providers.p]\nkind = \"openai\"\n";
+    assert(tomlSet(doc, [], "subagent_models", null).unwrap("valid") == "\n[providers.p]\nkind = \"openai\"\n");
+    auto ml = "a = [\"\"\"\n[x]\n\"\"\"]\n[y]\nk = 1";
+    assert(statementRows(ml.split("\n")) == [true, false, false, true, true]);
+}
+
+// An escaped triple quote doesn't end a multi-line basic string.
+unittest
+{
+    import std.array : replace;
+    auto doc = "system_prompt = \"\"\"\nsay \\\"\"\" then\n[[subagent_models]]\n\"\"\"\nx = 1\n";
+    assert(statementRows(doc.split("\n"))[0 .. 5] == [true, false, false, false, true]);
+    assert(tomlSet(doc, [], "x", "2").unwrap("valid") == doc.replace("x = 1", "x = 2"));
+    assert(tomlSet(doc, [], "system_prompt", `"s"`).unwrap("valid") == "system_prompt = \"s\"\nx = 1\n");
 }

@@ -153,6 +153,19 @@ unittest
 
 unittest
 {
+    // Esc at an existing candidate's Keep/Pick chooser cancels the edit.
+    auto f = new Fixture;
+    f.cfg.subagentModels = [SubagentModel("a/x", "old", 0, 0, 0)];
+    auto dir = scratch("candidate-esc");
+    auto h = host(f, buildPath(dir, "config.toml"));
+    // Sub-agents → Candidates(6) → a/x(0) → Edit(0) → Esc → Back(2) → Back(7) → Done
+    runSettings(new ScriptedUi(["9", "6", "0", "0", "esc", "2", "7", "12"]), h);
+    assert(f.cfg.subagentModels == [SubagentModel("a/x", "old", 0, 0, 0)] && f.reconfigured == 0);
+    rmdirRecurse(dir);
+}
+
+unittest
+{
     // Messages: on and confirm go through the command; a refused switch is not saved.
     auto dir = scratch("messages");
     auto path = buildPath(dir, "config.toml");

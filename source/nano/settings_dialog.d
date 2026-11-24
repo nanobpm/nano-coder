@@ -726,7 +726,10 @@ private bool editCandidate(SettingsUi ui, ref SettingsHost h, ref imported!"nano
 {
     import nano.config : specProblem;
     auto c = m;
-    if (isNew || ui.select("Model", ["Keep " ~ c.model, "Pick another model"], 0) == 1)
+    // Esc at the Keep/Pick chooser cancels the edit, like every other prompt here.
+    auto pick = isNew ? 1 : ui.select("Model", ["Keep " ~ c.model, "Pick another model"], 0);
+    if (pick < 0) return false;
+    if (pick == 1)
     {
         auto spec = pickModel(ui, h);
         if (spec is null) return false;
