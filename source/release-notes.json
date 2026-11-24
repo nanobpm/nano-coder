@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.31.0", "date": "2026-11-24", "items": [
+      {"type":"feat","scope":"sessions_list","title":"filters, a default limit and short titles for worker sessions","pr":354}
+    ]},
     {"version": "1.30.2", "date": "2026-11-24", "items": [
       {"type":"fix","scope":"peers","title":"move the peer listener to the recovered session id","pr":352}
     ]},
@@ -439,9 +442,6 @@
     ]},
     {"version": "0.46.1", "date": "2026-10-15", "items": [
       {"type":"fix","scope":"agent","title":"continue past output-limit cut-offs and default max_tokens to the model limit (#114)","pr":115}
-    ]},
-    {"version": "0.46.0", "date": "2026-10-15", "items": [
-      {"type":"feat","scope":"providers","title":"add an unofficial Meta Muse Code provider","pr":112}
     ]}
   ]
 }
