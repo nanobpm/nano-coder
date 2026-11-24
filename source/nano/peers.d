@@ -390,10 +390,17 @@ struct PeerListener
         // with nobody accepting: close them first so the bind below can
         // replace the socket (issue #349).
         closeOrphanedPeerFds(dir);
+        // Serialize owner inspection, claim and bind across processes
+        // (issue #370): without it, a second listener could see a claim in
+        // progress (an empty pid file) as stale, replace it, and both would
+        // proceed. Released when this function returns.
+        import nano.safeio : lockExclusive;
+        auto claimLock = lockExclusive(imported!"std.path".buildPath(dir, id ~ ".lock"));
         Socket socket;
         try socket = unixSocket();
         catch (SocketException e)
             throw new ListenError(format("cannot create a socket for %s: %s", path, e.msg));
+        bool claimed; // this call created the pid file, so its failure removes it
         try
         {
             // A stale socket from a dead session is replaced; a live one
@@ -418,11 +425,16 @@ struct PeerListener
             if (!path.exists)
             {
                 int other;
+                // A record already naming this process belongs to another
+                // listener here (a repeated `listen`): not ours to remove.
+                int self;
+                immutable already = ownerOf(dir, id, self) == Owner.self;
                 if (!claimOwner(dir, id, other))
                 {
                     socket.close();
                     throw new ListenError(format("cannot listen on %s: process %s still owns it", path, other));
                 }
+                claimed = !already;
             }
             socket.bind(new UnixAddress(path));
             socket.listen(listenBacklog);
@@ -430,14 +442,14 @@ struct PeerListener
         catch (SocketException e)
         {
             socket.close();
-            removeOwner(dir, id);
+            if (claimed) removeOwner(dir, id);
             throw new ListenError(format("cannot listen on %s: %s", path, e.msg));
         }
         catch (FileException e)
         {
             // An unremovable stale socket path: report it like a bind failure.
             socket.close();
-            removeOwner(dir, id);
+            if (claimed) removeOwner(dir, id);
             throw new ListenError(format("cannot replace stale socket %s: %s", path, e.msg));
         }
         registerOwnListener(path);
@@ -2370,4 +2382,29 @@ unittest
     assert(live(path), "cleanup keeps a permission-denied socket");
     assert(!connectable(path), "discovery rejects a permission-denied socket");
     assert(!accepting(dir, "sess-denied"));
+}
+
+@("issue #370: a repeated listen for a live id keeps the owner's pid file")
+unittest
+{
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir, exists;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    import nano.control : TurnControl;
+    import core.atomic : atomicLoad;
+    auto dir = buildPath(tempDir, format("np370c%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto router = PeerRouter.make(atomicLoad(new shared TurnControl));
+    router.confirm(false);
+    auto first = PeerListener.listen(dir, "sess-dup", router.requests);
+    scope (exit) first.close();
+    bool threw;
+    try PeerListener.listen(dir, "sess-dup", router.requests).close();
+    catch (ListenError) threw = true;
+    assert(threw, "the second bind must fail");
+    int pid;
+    assert(ownerOf(dir, "sess-dup", pid) == Owner.self && pid == thisProcessID,
+        "the failed listen must not remove the first listener's pid file");
 }
