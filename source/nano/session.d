@@ -2513,13 +2513,16 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
                 if (jsonUnsigned(*v, n) && n <= long.max)
                 {
                     r.settings.contextWindow = n.to!long;
-                    // The source travels with its window. Only a record
-                    // marked "user" is an explicit override; a legacy
-                    // unmarked (or unknown) one is treated as a provider
-                    // snapshot, so a resume never promotes it (issue #315).
+                    // The source travels with its window (issue #315). A
+                    // marked record says which it is; an unknown mark is a
+                    // provider snapshot. A legacy unmarked record is a
+                    // model-switch snapshot when it also carries a `model`
+                    // and a /settings Context edit (an override) when not.
                     auto src = "context_window_source" in data;
-                    r.settings.contextWindowFromProvider = !(src !is null && src.type == JSONType.string
-                        && src.str == "user");
+                    if (src !is null && src.type == JSONType.string)
+                        r.settings.contextWindowFromProvider = src.str != "user";
+                    else
+                        r.settings.contextWindowFromProvider = ("model" in data) !is null;
                 }
             }
             if (auto v = "session_messages" in data)
@@ -3227,13 +3230,18 @@ unittest
     explicitSame.contextWindow = 128_000;
     again.settings(explicitSame);
     assert(!restore(log.path).settings.contextWindowFromProvider);
-    // A legacy record with no source mark is provider-derived, not an override.
-    {
-        import std.file : append;
-        append(log.path, `{"type":"settings","data":{"context_window":90000}}` ~ "\n");
-    }
+    import std.file : append;
+    // A legacy unmarked model-switch snapshot is provider-derived.
+    append(log.path, `{"type":"settings","data":{"model":"p/m","context_window":90000}}` ~ "\n");
     assert(restore(log.path).settings.contextWindow == 90_000);
     assert(restore(log.path).settings.contextWindowFromProvider, "unmarked legacy snapshot promoted to an override");
+    // A legacy unmarked /settings Context edit (no model) is an override.
+    append(log.path, `{"type":"settings","data":{"context_window":50000,"auto_compact":true}}` ~ "\n");
+    assert(restore(log.path).settings.contextWindow == 50_000);
+    assert(!restore(log.path).settings.contextWindowFromProvider, "legacy explicit edit demoted to a snapshot");
+    // An unknown mark fails toward provider.
+    append(log.path, `{"type":"settings","data":{"context_window":60000,"context_window_source":"x"}}` ~ "\n");
+    assert(restore(log.path).settings.contextWindowFromProvider);
 }
 
 // issue #336: the messaging switch and its confirm setting round-trip; the
