@@ -3706,11 +3706,13 @@ int runMain(string[] args)
                     wanted, e.msg, fallback);
             }
         }
-        if (!explicitFlags && st.contextWindow < 0)
+        if (!explicitFlags)
         {
             // Reset any context-window override left by the previous session
             // (a switched model's client was built with the live `cfg`, which
-            // may hold an unsaved `/settings` edit).
+            // may hold an unsaved `/settings` edit). Always reset: a recorded
+            // window applies below only when its model is the live one, so a
+            // fallback must not keep the previous session's override.
             agent.setConfiguredWindow(runtimeDefaults.window(cfg.providers.get(client.providerName, ProviderConfig.init).contextWindow));
         }
         if (explicitFlags && o.plan)
