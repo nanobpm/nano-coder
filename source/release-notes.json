@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.28.1", "date": "2026-11-24", "items": [
+      {"type":"perf","scope":"build","title":"pass -lowmem to LDC to cut build peak memory","pr":343}
+    ]},
     {"version": "1.28.0", "date": "2026-11-24", "items": [
       {"type":"feat","scope":"sessions","title":"/name — stable user-chosen session handles","pr":326}
     ]},
@@ -439,9 +442,6 @@
     ]},
     {"version": "0.43.0", "date": "2026-10-11", "items": [
       {"type":"feat","scope":"commands","title":"apply /model <spec> typed mid-turn at the next model call","pr":107}
-    ]},
-    {"version": "0.42.0", "date": "2026-10-08", "items": [
-      {"type":"feat","scope":"commands","title":"run safe slash commands during a turn","pr":76}
     ]}
   ]
 }
