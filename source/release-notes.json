@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.33.1", "date": "2026-11-24", "items": [
+      {"type":"fix","scope":"messages","title":"don't delete a live session's socket; recover orphaned listeners","pr":355}
+    ]},
     {"version": "1.33.0", "date": "2026-11-24", "items": [
       {"type":"feat","scope":"compaction","title":"hierarchical summary DAG expandable via history_read","pr":366}
     ]},
@@ -439,9 +442,6 @@
     ]},
     {"version": "0.49.0", "date": "2026-10-22", "items": [
       {"type":"feat","scope":"ui","title":"render markdown in the terminal with pulldown-cmark","pr":132}
-    ]},
-    {"version": "0.48.0", "date": "2026-10-22", "items": [
-      {"type":"feat","scope":"ui","title":"render markdown tables in the terminal","pr":130}
     ]}
   ]
 }
