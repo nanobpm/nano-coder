@@ -291,13 +291,13 @@ string search(string path, JSONValue args)
     if (auto nv = "node" in args.objectNoRef)
     {
         // Only the node's range (issue #274), within any before/after given.
-        ulong ignoredLine;
-        auto node = findNode(path, nodeArg(*nv), ignoredLine);
-        if (node.first)
-        {
-            if (!after || node.first - 1 > after) after = node.first - 1;
-            if (!before || node.last + 1 < before) before = node.last + 1;
-        }
+        auto node = findNodeTree(path, nodeArg(*nv)).node;
+        // An unknown range must not widen to the whole session (issue #369).
+        if (!node.first)
+            throw new HistoryError(format("summary node %s has no recorded message range, so it cannot scope a "
+                ~ "search; history_read it, or search with before/after instead", nodeName(node.id)));
+        if (!after || node.first - 1 > after) after = node.first - 1;
+        if (!before || node.last + 1 < before) before = node.last + 1;
     }
     size_t limit = defaultLimit;
     if (auto l = "limit" in args.objectNoRef)
@@ -448,34 +448,60 @@ private uint nodeArg(const JSONValue v)
     throw new HistoryError(`node must be a summary node name such as "S3"`);
 }
 
-/// The summary nodes with the given IDs, from the `summary_nodes` of the
-/// log's `replace` records (issue #274). Streams the log; only the
-/// asked-for nodes are kept. An ID resolves to its latest record at or
-/// before log line `upTo` (0: anywhere), and `at` gets that record's line:
-/// node IDs from an older session can restart after a flat compaction, so
-/// a node's children are looked up as of the node's own record, never in
-/// a later node list.
-private SummaryNode[uint] findNodes(string path, const uint[] ids, ulong upTo, out ulong[uint] at)
+/// The summary nodes in one log line's `summary_nodes`, decoding only that
+/// array (issue #369), not the record's whole message list.
+private SummaryNode[] lineNodes(const(char)[] line)
+{
+    import nano.summary_dag : summaryNodesJson;
+    auto raw = summaryNodesJson(line);
+    if (raw is null) return null;
+    JSONValue ns;
+    try ns = parseJSON(raw);
+    catch (JSONException) return null; // a torn or foreign line holds no node
+    if (ns.type != JSONType.array) return null;
+    SummaryNode[] got;
+    foreach (j; ns.arrayNoRef)
+        foreach (n; fromJson(j)) got ~= n;
+    return got;
+}
+
+/// A node and its children, as `findNodeTree` resolves them.
+private struct NodeTree
+{
+    SummaryNode node;
+    /// The children found, keyed by ID; a missing one is not in the log.
+    SummaryNode[uint] kids;
+}
+
+/// Summary node `id` (its latest record) and its children as of that
+/// record, in one pass over the log (issue #369; #274 for the lookup
+/// rule): node IDs from an older session can restart after a flat
+/// compaction, so a node's children are looked up as of the node's own
+/// record, never in a later node list.
+private NodeTree findNodeTree(string path, uint id)
 {
     import nano.session : foreachLogLineSkippingTorn;
-    SummaryNode[uint] found;
-    ulong lineNo;
+    SummaryNode[uint] latest; // every node ID's latest record so far
+    NodeTree tree;
+    bool have;
     foreachLogLineSkippingTorn(path, (const(char)[] line) {
-        ++lineNo;
-        if (upTo && lineNo > upTo) return;
         if (line.indexOf(`"summary_nodes"`) < 0) return;
-        JSONValue rec;
-        try rec = parseJSON(line);
-        catch (JSONException) return; // a torn or foreign line holds no node
-        auto d = "data" in rec.objectNoRef;
-        if (d is null || d.type != JSONType.object) return;
-        auto ns = "summary_nodes" in d.objectNoRef;
-        if (ns is null || ns.type != JSONType.array) return;
-        foreach (j; ns.arrayNoRef)
-            foreach (n; fromJson(j))
-                if (ids.canFind(n.id)) { found[n.id] = n; at[n.id] = lineNo; }
+        auto ns = lineNodes(line);
+        foreach (ref n; ns) latest[n.id] = n;
+        foreach (ref n; ns)
+            if (n.id == id)
+            {
+                tree.node = n;
+                tree.kids = null;
+                foreach (c; n.children)
+                    if (auto k = c in latest) tree.kids[c] = *k;
+                have = true;
+            }
     });
-    return found;
+    if (!have)
+        throw new HistoryError(format("no summary node %s in this session (nodes are recorded by layered compaction)",
+            nodeName(id)));
+    return tree;
 }
 
 /// The largest summary-node ID any `replace` record in the log at `path`
@@ -488,27 +514,10 @@ uint maxNodeId(string path)
     uint high;
     foreachLogLineSkippingTorn(path, (const(char)[] line) {
         if (line.indexOf(`"summary_nodes"`) < 0) return;
-        JSONValue rec;
-        try rec = parseJSON(line);
-        catch (JSONException) return; // a torn or foreign line holds no node
-        auto d = "data" in rec.objectNoRef;
-        if (d is null || d.type != JSONType.object) return;
-        auto ns = "summary_nodes" in d.objectNoRef;
-        if (ns is null || ns.type != JSONType.array) return;
-        foreach (j; ns.arrayNoRef)
-            foreach (n; fromJson(j))
-                if (n.id > high) high = n.id;
+        foreach (ref n; lineNodes(line))
+            if (n.id > high) high = n.id;
     });
     return high;
-}
-
-private SummaryNode findNode(string path, uint id, out ulong line)
-{
-    ulong[uint] at;
-    auto got = findNodes(path, [id], 0, at);
-    if (auto n = id in got) { line = at[id]; return *n; }
-    throw new HistoryError(format("no summary node %s in this session (nodes are recorded by layered compaction)",
-        nodeName(id)));
 }
 
 /// `history_read` of a node: its prose, then its children's (a condensed
@@ -516,13 +525,12 @@ private SummaryNode findNode(string path, uint id, out ulong line)
 private string expandNode(string path, uint id, size_t limit = size_t.max)
 {
     import nano.session : foreachLogLineSkippingTorn;
-    ulong recordLine;
-    auto node = findNode(path, id, recordLine);
+    auto tree = findNodeTree(path, id);
+    auto node = tree.node;
     auto text = header(node) ~ "\n" ~ node.text ~ "\n";
     if (node.children.length)
     {
-        ulong[uint] kidAt;
-        auto kids = findNodes(path, node.children, recordLine, kidAt);
+        auto kids = tree.kids;
         text ~= format("\nIt condensed %s nodes; history_read one of them for more:\n", node.children.length);
         foreach (c; node.children)
             if (auto k = c in kids) text ~= "\n" ~ header(*k) ~ "\n" ~ k.text ~ "\n";
@@ -800,4 +808,23 @@ unittest
         ~ `{"type":"message","data":{"role":"assistant","content":"needle"}}` ~ "\n");
     auto o = search(p, parseJSON(`{"pattern":"needle"}`));
     assert(o.canFind("assistant") && !o.canFind("after tool output"), o);
+}
+
+unittest // history_search refuses a node with no recorded range (issue #369)
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, write;
+    import std.path : buildPath;
+    import std.exception : assertThrown;
+    auto dir = buildPath(tempDir, "nano-d-history-node-range-test");
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto path = buildPath(dir, "s.jsonl");
+    // A message whose text mentions the key must not be read as nodes.
+    write(path, `{"type":"header"}` ~ "\n"
+        ~ `{"type":"message","data":{"role":"user","content":"say \"summary_nodes\": [{\"id\":7}]"}}` ~ "\n"
+        ~ `{"type":"replace","data":{"messages":[],"summary_nodes":[{"id":1,"level":0,"text":"no range"},`
+        ~ `{"id":2,"level":0,"range":[2,2],"text":"ranged"}]}}` ~ "\n");
+    assertThrown!HistoryError(search(path, parseJSON(`{"pattern":"say","node":"S1"}`)));
+    search(path, parseJSON(`{"pattern":"say","node":"S2"}`));
+    assert(maxNodeId(path) == 2);
 }

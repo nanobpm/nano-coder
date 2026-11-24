@@ -2456,7 +2456,7 @@ class Agent
                 if (x.first && (!lo || x.first < lo)) lo = x.first;
                 if (x.last > hi) hi = x.last;
             }
-            summary = ctx.smartSummaryPrefix ~ "\n" ~ dag.render(nodes) ~ "\n\n" ~ dag.expandNote ~ "\n\n"
+            summary = ctx.smartSummaryPrefix ~ "\n" ~ dag.render(nodes, renderCapBytes(dagBudget)) ~ "\n\n" ~ dag.expandNote ~ "\n\n"
                 ~ ctx.smartSummaryNote(lo, hi);
         }
         if (planTools && !plan.empty) summary ~= "\n\n" ~ plan.contextNote();
@@ -2658,6 +2658,13 @@ class Agent
             else foreach (e; ev) e.usage(spent.usage);
         }
         uncountedRequests += spent.uncounted;
+    }
+
+    /// The hard cap on a rendered layered summary (issue #369): twice the
+    /// node-prose budget, so the bound holds whatever sizes nodes come in.
+    private static size_t renderCapBytes(size_t dagBudget) pure nothrow @nogc
+    {
+        return dagBudget > size_t.max / 2 ? size_t.max : dagBudget * 2;
     }
 
     /// The byte budget of a layered summary's node prose (issue #274): about

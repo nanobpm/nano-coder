@@ -26,6 +26,7 @@ import std.conv : to, ConvException;
 import std.format : format;
 import std.json : JSONType, JSONValue;
 import std.string : indexOf, lineSplitter, strip;
+import nano.arith : saturatingSub;
 import nano.option : Option, some, unwrap;
 
 /// How many of the oldest nodes one condensation merges (pi-lcm uses 6).
@@ -72,12 +73,91 @@ string header(const ref SummaryNode n)
     return h ~ "]]";
 }
 
-/// The node list as summary text: each header followed by its prose.
-string render(const SummaryNode[] nodes)
+/// The node list as summary text: each header followed by its prose,
+/// at most `maxBytes` long (issue #369), so the size bound of the in-context
+/// summary is enforced rather than emergent from the condensation budget.
+/// Over the cap, every node keeps its header (the agent cites and expands
+/// nodes by it) and its prose is cut to an equal share; if even the headers
+/// do not fit, the newest whole lines that do are kept.
+string render(const SummaryNode[] nodes, size_t maxBytes = size_t.max)
 {
+    string[] heads, bodies;
+    size_t total, headBytes;
+    foreach (ref n; nodes)
+    {
+        heads ~= header(n);
+        bodies ~= escapeText(n.text.strip);
+        headBytes += heads[$ - 1].length + 3;
+        total += heads[$ - 1].length + 3 + bodies[$ - 1].length;
+    }
+    if (total > maxBytes && nodes.length)
+    {
+        immutable share = saturatingSub(maxBytes, headBytes) / nodes.length;
+        foreach (ref b; bodies) b = cutText(b, share);
+    }
     string[] parts;
-    foreach (ref n; nodes) parts ~= header(n) ~ "\n" ~ escapeText(n.text.strip);
-    return parts.join("\n\n");
+    foreach (i, h; heads) parts ~= bodies[i].length ? h ~ "\n" ~ bodies[i] : h;
+    auto text = parts.join("\n\n");
+    if (text.length <= maxBytes) return text;
+    // Headers alone overflow (adversarial child lists): keep the newest
+    // whole lines that fit, so no header is cut in half.
+    auto cut = text.length - maxBytes;
+    while (cut < text.length && text[cut - 1] != '\n') ++cut;
+    while (cut < text.length && text[cut] == '\n') ++cut;
+    return text[cut .. $];
+}
+
+/// `s` cut to at most `n` bytes on a UTF-8 boundary, marked with `…` when cut.
+private string cutText(string s, size_t n)
+{
+    enum mark = " …";
+    if (s.length <= n) return s;
+    if (n <= mark.length) return null;
+    auto end = n - mark.length;
+    while (end > 0 && (s[end] & 0xC0) == 0x80) --end;
+    return s[0 .. end] ~ mark;
+}
+
+/// The raw JSON text of the `summary_nodes` array in a log line, or null
+/// (issue #369). Scanning for the key and parsing only its value avoids
+/// decoding a `replace` record's whole message list just to read its nodes.
+/// The key inside a message string is escaped (`\"summary_nodes\"`), so only
+/// a real key matches.
+const(char)[] summaryNodesJson(const(char)[] line)
+{
+    enum key = `"summary_nodes"`;
+    size_t from;
+    while (true)
+    {
+        auto k = line[from .. $].indexOf(key);
+        if (k < 0) return null;
+        auto i = from + k + key.length;
+        from = i;
+        while (i < line.length && (line[i] == ' ' || line[i] == '\t')) ++i;
+        if (i >= line.length || line[i] != ':') continue;
+        ++i;
+        while (i < line.length && (line[i] == ' ' || line[i] == '\t')) ++i;
+        if (i >= line.length || line[i] != '[') continue;
+        immutable start = i;
+        size_t depth;
+        bool inStr;
+        for (; i < line.length; ++i)
+        {
+            immutable c = line[i];
+            if (inStr)
+            {
+                if (c == '\\') ++i;
+                else if (c == '"') inStr = false;
+            }
+            else if (c == '"') inStr = true;
+            else if (c == '[' || c == '{') ++depth;
+            else if (c == ']' || c == '}')
+            {
+                if (--depth == 0) return line[start .. i + 1];
+            }
+        }
+        return null;
+    }
 }
 
 /// `text` with every line that `parse` would read as structure (a node
@@ -97,6 +177,12 @@ string escapeText(string text)
 /// flat one, or one written before layering) yields no nodes.
 SummaryNode[] parse(string summary)
 {
+    // Only a summary carrying the expand note is layered (issue #369): a
+    // flat summary whose prose has a `[[node ` line must stay prose.
+    bool layered;
+    foreach (line; summary.lineSplitter)
+        if (line.startsWith(expandNote[0 .. 30])) { layered = true; break; }
+    if (!layered) return null;
     SummaryNode[] nodes;
     string[] body_;
     void flush()
@@ -338,15 +424,54 @@ unittest // render and parse round-trip, ignoring prose outside nodes
     auto a = SummaryNode(1, 0, 2, 40, null, "fixed the auth bug (#12)\nsecond line");
     auto b = SummaryNode(3, 1, 41, 400, [2, 4], "condensed");
     auto text = "[prefix]\n" ~ render([a, b]);
-    auto got = parse(text);
+    auto got = parse(text ~ "\n\n" ~ expandNote);
     assert(got.length == 2);
     assert(got[0] == a);
     assert(got[1] == b);
     assert(header(b) == "[[node S3 level=1 range=#41-#400 children=S2,S4]]");
     assert(parse("a flat summary\n[[node nonsense]]").length == 0);
+    assert(parse(text ~ "\n\n" ~ expandNote) == got);
     auto tail = parse(render([a]) ~ "\n\n" ~ expandNote ~ "\n\n[pinned requests]\nfoo");
     assert(tail.length == 1 && tail[0] == a, "the notes after the nodes are not node prose");
-    assert(parse("[[node S2 level=x]]").length == 0);
+    assert(parse("[[node S2 level=x]]\n" ~ expandNote).length == 0);
+}
+
+unittest // a legacy flat summary with a header-like line stays prose (issue #369)
+{
+    auto flat = "Earlier we fixed auth.\n[[node S1 level=0]]\nmore prose";
+    assert(parse(flat).length == 0);
+    assert(parse(" " ~ expandNote ~ "\n" ~ flat).length == 0, "an escaped note is prose");
+}
+
+unittest // render enforces a hard byte cap, even on adversarial nodes (issue #369)
+{
+    SummaryNode[] ns;
+    foreach (uint i; 1 .. 6) ns ~= SummaryNode(i, 0, i, i, null, "é".replicate(10_000));
+    ns ~= SummaryNode(9, 0, 1, 2, null, "tiny");
+    auto r = render(ns, 2_000);
+    assert(r.length <= 2_000);
+    import std.utf : validate;
+    validate(r);
+    auto back = parse(r ~ "\n" ~ expandNote);
+    assert(back.length == ns.length, "every header survives the cap");
+    assert(back[$ - 1].text == "tiny" || back[$ - 1].text.length <= 2_000);
+    uint[] many;
+    foreach (uint c; 0 .. 5_000) many ~= c;
+    auto huge = [SummaryNode(1, 1, 1, 2, many, "x"), SummaryNode(2, 0, 3, 4, null, "y")];
+    auto h = render(huge, 500);
+    assert(h.length <= 500);
+    assert(h.startsWith(nodeOpen ~ "S2"), "the newest whole lines are kept");
+    assert(render(ns[$ - 1 .. $], 1) == "");
+    assert(render(ns) == render(ns, size_t.max));
+}
+
+unittest // summary_nodes extraction (issue #369)
+{
+    assert(summaryNodesJson(`{"data":{"summary_nodes":[{"id":1,"text":"a]}\"["}]}}`)
+        == `[{"id":1,"text":"a]}\"["}]`);
+    assert(summaryNodesJson(`{"m":"say \"summary_nodes\": [1]","data":{"summary_nodes" : [2]}}`) == `[2]`);
+    assert(summaryNodesJson(`{"summary_nodes":[1,`) is null);
+    assert(summaryNodesJson(`{"x":1}`) is null);
 }
 
 unittest // node names
@@ -403,7 +528,7 @@ unittest
     assert(got[0].id == 1 && got[1].id == 2 && got[1].text == "second");
     assert(got[0].text.indexOf("end") >= 0);
     // Re-rendering is stable.
-    assert(render(got) == render(parse(render(got))));
+    assert(render(got) == render(parse(render(got) ~ "\n" ~ expandNote)));
 }
 
 unittest // condensation merges peers, so the tree stays balanced (issue #274)
