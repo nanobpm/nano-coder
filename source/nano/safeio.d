@@ -191,7 +191,30 @@ version (Posix)
 socket_t dupSocket(socket_t fd) nothrow @nogc
 {
     auto n = dupFd(fd);
+    if (n >= 0) setCloexec(n);
     return n < 0 ? socket_t.init : cast(socket_t) n;
+}
+
+/// Mark `fd` close-on-exec, so a `/relaunch` exec doesn't inherit it.
+/// std.socket never sets the flag: an inherited peer listener keeps the
+/// relaunched session's socket path "live" with nobody accepting, and
+/// `/messages on` then fails with "Address already in use".
+/// Returns false if fcntl fails.
+bool setCloexec(int fd) nothrow @nogc
+{
+    import core.sys.posix.fcntl : F_GETFD, F_SETFD, FD_CLOEXEC;
+    return addFdFlag(fd, F_GETFD, F_SETFD, FD_CLOEXEC);
+}
+
+/// OR `bit` into the flags read with `get` and written with `set` (an
+/// F_GETFD/F_SETFD or F_GETFL/F_SETFL pair); false if fcntl fails.
+private bool addFdFlag(int fd, int get, int set, int bit) @trusted nothrow @nogc
+{
+    import core.sys.posix.fcntl : fcntl;
+    // fcntl is variadic (so @system); the get/set commands used here take
+    // and return plain ints and touch no memory of ours.
+    immutable flags = fcntl(fd, get);
+    return flags >= 0 && fcntl(fd, set, flags | bit) == 0;
 }
 
 /// The uid on the other end of a connected Unix-domain socket, or -1 when
@@ -561,10 +584,10 @@ DirEntry[] listDir(string dir, SpanMode mode, bool followSymlink = false) @trust
 }
 
 /// Make `fd` non-blocking (`fcntl(F_SETFL, … | O_NONBLOCK)`).
-void setNonBlocking(int fd) @trusted
+void setNonBlocking(int fd)
 {
-    import core.sys.posix.fcntl : fcntl, F_GETFL, F_SETFL, O_NONBLOCK;
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+    import core.sys.posix.fcntl : F_GETFL, F_SETFL, O_NONBLOCK;
+    addFdFlag(fd, F_GETFL, F_SETFL, O_NONBLOCK);
 }
 
 /// Ignore SIGPIPE, so a child that closes its stdin can't kill the process.

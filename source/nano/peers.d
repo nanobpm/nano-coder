@@ -293,6 +293,8 @@ struct PeerListener
         /// Set by close(): the listener thread stops waiting on an
         /// unanswered request and exits promptly instead of after 120 s.
         Shared!bool stop;
+        /// The listener thread's duplicate of the fd (owned by `serve`).
+        imported!"std.socket".socket_t serveFd = imported!"std.socket".socket_t.init;
     }
 
     /// Listen on `<dir>/<id>.sock` (the directory must exist); accepted
@@ -304,7 +306,7 @@ struct PeerListener
         import std.socket : Socket, UnixAddress, SocketException, AddressFamily, SocketType;
         import std.file : exists, remove;
         auto path = socketPath(dir, id);
-        auto socket = new Socket(AddressFamily.UNIX, SocketType.STREAM);
+        auto socket = unixSocket();
         try
         {
             // A stale socket from a dead session is replaced; a live one
@@ -335,6 +337,7 @@ struct PeerListener
             removeIfThere(path);
             throw new ListenError(format("cannot dup listener fd for %s", path));
         }
+        impl.serveFd = serveFd;
         impl.thread = spawnDaemon(&serve, serveFd, requests, impl.stop);
         return PeerListener(NotNull!Impl(impl));
     }
@@ -392,6 +395,8 @@ struct PeerListener
                 return; // closed by `close`
             }
             scope (exit) conn.close();
+            import nano.safeio : setCloexec;
+            setCloexec(conn.handle);
             // Same uid only: anything else is dropped unanswered.
             if (socketPeerUid(conn.handle) != long(getuid())) continue;
             // Bound framing I/O: a client that connects and never finishes
@@ -600,11 +605,23 @@ private string readLine(imported!"std.socket".Socket conn, Duration total = 30.s
     return buf.data.idup; // overlong: the caller reports it
 }
 
+/// A new Unix stream socket, close-on-exec: a `/relaunch` exec must not
+/// inherit a peer socket (an inherited listener keeps the session's path
+/// "live" with nobody accepting, so the relaunched session can't listen).
+package(nano) imported!"std.socket".Socket unixSocket()
+{
+    import std.socket : Socket, AddressFamily, SocketType;
+    import nano.safeio : setCloexec;
+    auto s = new Socket(AddressFamily.UNIX, SocketType.STREAM);
+    setCloexec(s.handle);
+    return s;
+}
+
 /// Whether a live session still answers the socket at `path`.
 private bool live(string path)
 {
-    import std.socket : Socket, UnixAddress, AddressFamily, SocketType, SocketException, SocketOSException;
-    auto s = new Socket(AddressFamily.UNIX, SocketType.STREAM);
+    import std.socket : UnixAddress, SocketException, SocketOSException;
+    auto s = unixSocket();
     scope (exit) s.close();
     try
     {
@@ -643,7 +660,7 @@ Status send(string dir, string to, PeerMessage pm, out string note)
         note = format("session %s is not listening (messages off, or not running)", to);
         return Status.notRunning;
     }
-    auto s = new Socket(AddressFamily.UNIX, SocketType.STREAM);
+    auto s = unixSocket();
     scope (exit) s.close();
     import std.socket : SocketException, SocketOSException, SocketOption, SocketOptionLevel, wouldHaveBlocked;
     import core.time : seconds;
@@ -1172,6 +1189,42 @@ unittest
     status = send(root, "sess-stale", PeerMessage("sess-sender", null, "hi", "m-6", false), note);
     assert(status == Status.notRunning, note);
     assert(!socketPath(root, "sess-stale").exists, "the stale socket is cleaned up: " ~ note);
+}
+
+@("a peer listener's fds are close-on-exec, so /relaunch can listen again")
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, exists;
+    import std.path : buildPath;
+    import std.process : spawnProcess, wait, Config, thisProcessID;
+    import nano.control : TurnControl;
+    import core.atomic : atomicLoad;
+    auto root = buildPath(tempDir, "nano-d-peers-cx");
+    if (root.exists) rmdirRecurse(root);
+    mkdirRecurse(root);
+    scope (exit) rmdirRecurse(root);
+    auto router = PeerRouter.make(atomicLoad(new shared TurnControl));
+    auto listener = PeerListener.listen(root, "sess-rl", router.requests);
+    scope (exit) listener.close();
+    immutable fd = cast(int) listener.impl.listener.handle, dup = cast(int) listener.impl.serveFd;
+    assert(dup >= 0);
+    // An exec'd image (what /relaunch runs) must see neither fd. Before the
+    // fix it inherited both, kept the path "live" with nobody accepting, and
+    // its `/messages on` failed with "Address already in use".
+    auto outPath = buildPath(root, "fds");
+    auto script = format("ls /dev/fd > %s 2>&1; test ! -e /dev/fd/%s && test ! -e /dev/fd/%s", outPath, fd, dup);
+    // inheritFDs: std.process closes nothing, so only FD_CLOEXEC can.
+    auto pid = spawnProcess(["/bin/sh", "-c", script], null, Config.inheritFDs);
+    import std.file : readText;
+    immutable rc = wait(pid);
+    assert(rc == 0, format("a peer listener fd survived exec: rc=%s fd=%s dup=%s child fds: %s", rc, fd, dup,
+        outPath.exists ? readText(outPath) : "(none)"));
+    // Sockets made for probing and sending are close-on-exec too.
+    auto s = unixSocket();
+    scope (exit) s.close();
+    auto pid2 = spawnProcess(["/bin/sh", "-c", format("test ! -e /dev/fd/%s", cast(int) s.handle)], null,
+        Config.inheritFDs);
+    assert(wait(pid2) == 0, "a peer client socket survived exec");
 }
 
 // A same-uid client that sends valid *non-object* JSON (`[]`, `5`, `"x"`)
