@@ -715,6 +715,22 @@ package(nano) imported!"std.socket".Socket unixSocket()
 /// counts as live, and the socket is closed at once.
 package(nano) bool live(string path)
 {
+    return probe(path, false);
+}
+
+/// Whether the socket at `path` positively accepts connections: a connect
+/// that succeeds or would block. Unlike `live`, any other error (EACCES, …)
+/// counts as not accepting, so discovery never advertises an unreachable
+/// socket.
+package(nano) bool connectable(string path)
+{
+    return probe(path, true);
+}
+
+/// Shared non-blocking connect probe; `strict` makes every error other than
+/// would-block count as unreachable, otherwise only stale errors do.
+private bool probe(string path, bool strict)
+{
     import std.socket : UnixAddress, SocketException, SocketOSException;
     import core.stdc.errno : EAGAIN, EINPROGRESS;
     auto s = unixSocket();
@@ -726,7 +742,8 @@ package(nano) bool live(string path)
         return true;
     }
     catch (SocketOSException e)
-        return e.errorCode == EAGAIN || e.errorCode == EINPROGRESS || !stale(e.errorCode);
+        return e.errorCode == EAGAIN || e.errorCode == EINPROGRESS
+            || (!strict && !stale(e.errorCode));
     catch (SocketException) return false; // no OS error code: treat as stale
 }
 
@@ -828,7 +845,7 @@ bool accepting(string dir, string id)
 {
     import std.file : exists;
     auto path = socketPath(dir, id);
-    if (!path.exists || !live(path)) return false;
+    if (!path.exists || !connectable(path)) return false;
     int pid;
     return ownerOf(dir, id, pid) != Owner.gone;
 }
@@ -2049,4 +2066,31 @@ unittest
     live(path);
     accepting(dir, "sess-full");
     assert(since(start) < 1.seconds, "the probe waited on accept");
+}
+
+// Discovery is strict: a permission-denied socket is kept by cleanup
+// (`live`) but never advertised as accepting messages (`connectable`).
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, exists, setAttributes;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    import std.socket : Socket, AddressFamily, SocketType, UnixAddress;
+    import std.conv : to;
+    import core.sys.posix.unistd : geteuid;
+    if (geteuid() == 0) return; // root bypasses the permission check
+    auto dir = buildPath(tempDir, "np349e" ~ thisProcessID.to!string);
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto path = socketPath(dir, "sess-denied");
+    auto s = new Socket(AddressFamily.UNIX, SocketType.STREAM);
+    scope (exit) s.close();
+    s.bind(new UnixAddress(path));
+    s.listen(4);
+    assert(connectable(path) && accepting(dir, "sess-denied"));
+    setAttributes(path, octal!0);
+    assert(live(path), "cleanup keeps a permission-denied socket");
+    assert(!connectable(path), "discovery rejects a permission-denied socket");
+    assert(!accepting(dir, "sess-denied"));
 }
