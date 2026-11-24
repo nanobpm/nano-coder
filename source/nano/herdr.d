@@ -803,10 +803,12 @@ unittest // a nested start() leaves reporting inactive and the environment untou
 {
     if (atomicLoad(gStarted)) return; // another test already started reporting
     string[string] env = ["HERDR_ENV": "1", "HERDR_BIN_PATH": "/bin/herdr", "HERDR_PANE_ID": "p1", ownerVar: "1"];
-    auto before = env.dup;
+    import std.process : environment;
+    immutable ownerBefore = environment.get(ownerVar, null);
     start((string k) => env.get(k, null));
+    scope (exit) atomicStore(gStarted, false); // undo the process-wide start latch for other tests
     assert(!active);
-    assert(env == before);
+    assert(environment.get(ownerVar, null) == ownerBefore); // a nested start claims nothing
 }
 
 unittest // a metadata clear from outside is repaired: refreshing re-sends name and model
