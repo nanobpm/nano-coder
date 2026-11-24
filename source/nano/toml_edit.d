@@ -80,13 +80,9 @@ string[] headerPath(string line) pure
             i++;
             // Decode with the loader's string rules (`\uXXXX`, `\n`, ...), so
             // the edit matches exactly the tables the loader sees.
-            import nano.toml : parseToml;
-            import std.json : JSONType;
-            auto decoded = parseToml("k = " ~ t[st .. i]);
-            if (decoded.isErr) return null;
-            auto v = decoded.unwrap("checked isErr above")["k"];
-            if (v.type != JSONType.string) return null;
-            seg = v.str;
+            bool ok;
+            seg = decodeQuoted(t[st .. i], ok);
+            if (!ok) return null;
         }
         else
         {
@@ -123,6 +119,21 @@ string[] arrayHeaderPath(string line) pure
         if (t[i] == ']') break;
     }
     return i + 1 < t.length && t[i + 1] == ']' ? segs : null;
+}
+
+/// Decodes one quoted TOML key segment (quotes included) with the loader's
+/// string rules, so edits match exactly the keys the loader sees; `ok` is
+/// false when the segment is malformed.
+private string decodeQuoted(string quoted, out bool ok) pure
+{
+    import nano.toml : parseToml;
+    import std.json : JSONType;
+    auto decoded = parseToml("k = " ~ quoted);
+    if (decoded.isErr) return null;
+    auto v = decoded.unwrap("checked isErr above")["k"];
+    if (v.type != JSONType.string) return null;
+    ok = true;
+    return v.str;
 }
 
 /// For each of `lines`, whether it starts a TOML statement (a header, key,
@@ -164,7 +175,9 @@ private ptrdiff_t keyEq(string line, out string first, out bool dotted) pure
             auto j = i + 1;
             for (; j < line.length && line[j] != q; j++) if (q == '"' && line[j] == '\\') j++;
             if (j >= line.length) return -1;
-            k = line[i + 1 .. j];
+            bool ok;
+            k = decodeQuoted(line[i .. j + 1], ok);
+            if (!ok) return -1;
             i = j + 1;
         }
         else
@@ -553,4 +566,16 @@ unittest
     assert(headerPath(`["a\"b"]`) == [`a"b`]);
     assert(headerPath(`['raw\u005F']`) == [`raw\u005F`]);
     assert(headerPath(`["bad\uZZZZ"]`) is null);
+}
+
+unittest
+{
+    // Quoted key segments decode escapes like headers do, so an escaped
+    // key is updated in place instead of duplicated.
+    assert(lineKey(`"mod\u0065l" = "a"`) == "model");
+    assert(lineKey(`"a\"b" = 1`) == `a"b`);
+    assert(lineKey(`'raw\u0065' = 1`) == `raw\u0065`);
+    assert(lineKey(`"bad\uZZZZ" = 1`) is null);
+    assert(tomlSet("\"mod\\u0065l\" = \"a\"\n", [], "model", `"b"`).unwrap("editable")
+        == "\"mod\\u0065l\" = \"b\"\n");
 }
