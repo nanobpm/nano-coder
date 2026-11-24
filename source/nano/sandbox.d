@@ -433,7 +433,27 @@ bool worktreeBackpointerWithin(string gitDir, string cwdReal) nothrow
 
 version (unittest)
 {
-    /// A fresh directory outside the temp roots (which are always writable).
+    /// Whether the checkout sits under a temp root the sandbox always
+    /// grants (/tmp, /var/tmp): directories `outsideDir` makes there aren't
+    /// outside the sandbox, so escape tests skip, saying why (#358).
+    public bool skipUnderTempRoot(string test)
+    {
+        import std.file : getcwd;
+        import nano.safeio : stdErr;
+        auto cwd = canonicalize(getcwd);
+        foreach (root; ["/tmp", "/var/tmp", tempDirectory()])
+        {
+            auto r = canonicalize(root);
+            if (r is null || cwd is null || !within(cwd, r)) continue;
+            stdErr.writefln("note: skipped %s: the checkout (%s) is under %s, which the sandbox always grants",
+                test, cwd, r);
+            return true;
+        }
+        return false;
+    }
+
+    /// A fresh directory outside the temp roots (which are always writable);
+    /// check `skipUnderTempRoot` first.
     string outsideDir()
     {
         import std.file : getcwd, mkdirRecurse;
@@ -520,6 +540,7 @@ unittest
 version (HasOsSandbox) unittest
 {
     import std.file : exists;
+    if (skipUnderTempRoot("sandbox escape test")) return;
     auto ws = outsideDir(), other = outsideDir();
     scope (exit) { rmTree(ws); rmTree(other); }
     SandboxConfig c;
@@ -539,6 +560,7 @@ version (HasOsSandbox) unittest
 version (HasOsSandbox) unittest // workspace mode confines writes
 {
     import std.file : write, exists;
+    if (skipUnderTempRoot("sandbox escape test")) return;
     auto ws = outsideDir(), other = outsideDir();
     scope (exit) { rmTree(ws); rmTree(other); }
     SandboxConfig c = { mode: SandboxMode.workspace, toolCaches: false };
@@ -563,6 +585,7 @@ version (HasOsSandbox) unittest // workspace mode confines writes
 version (HasOsSandbox) unittest // read-only mode blocks workspace writes
 {
     import std.file : exists;
+    if (skipUnderTempRoot("sandbox escape test")) return;
     auto ws = outsideDir();
     scope (exit) rmTree(ws);
     SandboxConfig c = { mode: SandboxMode.readOnly };
@@ -580,6 +603,7 @@ version (HasOsSandbox) unittest // an encoded write the static guard can't see i
 {
     import std.file : exists;
     import std.array : replace;
+    if (skipUnderTempRoot("sandbox escape test")) return;
     auto ws = outsideDir(), other = outsideDir();
     scope (exit) { rmTree(ws); rmTree(other); }
     SandboxConfig c = { mode: SandboxMode.workspace, toolCaches: false };
@@ -598,6 +622,7 @@ version (HasOsSandbox) unittest // an encoded write the static guard can't see i
 version (HasOsSandbox) unittest // extra writable paths
 {
     import std.file : exists;
+    if (skipUnderTempRoot("sandbox escape test")) return;
     auto ws = outsideDir(), extra = outsideDir();
     scope (exit) { rmTree(ws); rmTree(extra); }
     SandboxConfig c = { mode: SandboxMode.readOnly, writable: [extra] };
@@ -613,6 +638,7 @@ version (HasOsSandbox) unittest // extra writable paths
 unittest // device directories only in workspace mode, never /dev/shm or /dev/pts
 {
     import std.file : exists;
+    if (skipUnderTempRoot("sandbox escape test")) return;
     auto ws = outsideDir();
     scope (exit) rmTree(ws);
     SandboxConfig ro = { mode: SandboxMode.readOnly };
@@ -631,6 +657,7 @@ unittest // device directories only in workspace mode, never /dev/shm or /dev/pt
 unittest // a poisoned .git pointer to an external repo isn't granted
 {
     import std.file : write, mkdirRecurse;
+    if (skipUnderTempRoot("sandbox escape test")) return;
     auto ws = outsideDir(), outsider = outsideDir();
     scope (exit) { rmTree(ws); rmTree(outsider); }
     auto fake = outsider ~ "/.git";
@@ -645,6 +672,7 @@ unittest // a linked worktree's git dirs are granted
 {
     import std.file : write, mkdirRecurse;
     import std.process : execute, Config;
+    if (skipUnderTempRoot("sandbox escape test")) return;
     auto base = outsideDir();
     scope (exit) rmTree(base);
     auto main = base ~ "/main", wt = base ~ "/wt";
@@ -668,6 +696,7 @@ unittest // a linked worktree's git dirs are granted
 version (HasOsSandbox) unittest // the OS sandbox contains what the static guard can't see
 {
     import std.file : exists;
+    if (skipUnderTempRoot("sandbox escape test")) return;
     auto ws = outsideDir(), other = outsideDir();
     scope (exit) { rmTree(ws); rmTree(other); }
     SandboxConfig c = { mode: SandboxMode.workspace, toolCaches: false };
