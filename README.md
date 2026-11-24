@@ -344,6 +344,9 @@ phases). Disable them with `--no-hooks`, or granularly via the
   `read_file` (or written by these tools) in this process, and to be unchanged on disk since.
   Otherwise they ask the model to read it again, so an edit can't land on stale text.
 - `plan_add`, `plan_update`, `plan_show` - The agent's task plan (see [Task Plans](#task-plans)).
+- `timer_set`, `timer_list`, `timer_cancel`, `timer_done` - Timers the agent sets to come back
+  to something later in the session. A fired timer is restated until `timer_done`; at most 10
+  wait at once, and older ones are auto-closed (with a notice) beyond that.
 - `session_settings` - The agent reads or adjusts its own session's settings (see
   [Agent-adjusted compaction](#agent-adjusted-compaction)).
 - `report_outcome` - Report the task `completed`, `blocked` or `needs_input`, with a `summary`; ends
@@ -663,7 +666,10 @@ host doesn't fail a correct change: before failing a module, the runner times a 
 machine, at most 3x. `NANO_TEST_TIMES=N dub test` lists the
 N slowest modules. `NANO_TEST_JOBS=N` runs modules in parallel (`scripts/ci.sh` uses 4); modules
 that change process-wide state (the cancel flag, environment variables) are listed in
-`scripts/serial-tests` and run alone first.
+`scripts/serial-tests` and run alone first. A module still running at twice its most-scaled limit
+(at least 10 s) is treated as hung: the runner names it and exits failing instead of waiting
+forever. In tests, HTTP retries wait out an unreachable server for at most 10 s (in use the wait is
+unbounded until Ctrl-C).
 
 Functions are `pure` wherever they can be: the result depends only on the arguments, with no
 clock, environment, files or global state. Modules that start with `pure:` (parsing, markdown,
@@ -734,6 +740,8 @@ persist_sessions = true
 cross_session_history = true            # sessions_list + a session argument on the history tools: read other sessions' logs
 session_messages = false                # listen for messages from other sessions + offer session_send (see Inter-session messages)
 session_messages_confirm = true         # ask before an incoming session message is queued/run
+session_messages_max_hops = 4           # loop guard: refuse sends beyond this many hops in a message thread
+session_messages_max_per_hour = 10      # loop guard: max messages to one session per hour (0 = no cap)
 acp_session_messages = false            # let --acp sessions send/receive messages (ACP ignores session_messages)
 # session_dir = "/path/to/sessions"    # default: <platform data dir>/nano-coder/sessions
 session_compress_after_days = 14        # gzip logs idle this long at startup (0 = never)
@@ -750,6 +758,7 @@ subagent_max_tokens = 1000000
 auto_compact = true                     # summarize automatically when the context fills up
 auto_compact_threshold = 0.8            # fraction of the context window
 compaction_mode = "smart"               # smart | standard | extract (see Smart compaction)
+compaction_summary_dag = false          # layered, expandable summaries (see Smart compaction)
 # context_window = 128000               # override the window (providers can set it too)
 verbosity = "normal"                    # quiet | normal | verbose | debug (or --verbosity)
 timestamps = true                       # prefix CLI messages with the local time (HH:MM:SS)
@@ -1193,7 +1202,8 @@ session log, and falls back to a standard summary when `persist_sessions` is off
     three snippets (and a `[K matches]` count when more matched). Earlier history lookups
     are not searched.
   - `history_read(id, max_output_length?, session?)` - one message in full, bounded like other tool
-    output (the whole is spilled to a file when it is longer).
+    output (the whole is spilled to a file when it is longer). With `node` instead of `id` it expands
+    a layered summary node (see below).
   Before a smart compaction the tools are not offered, so they cost nothing.
 
 **Extract mode** (`compaction_mode = "extract"`, or `/compact --extract`) is smart
@@ -1204,6 +1214,19 @@ each with its `(#N)`, plus the pinned requests and the plan as usual. It says wh
 things are rather than what they mean, so the agent leans on the history tools. An
 earlier extract summary is merged rather than nested, so each section stays capped. See
 [#273](https://github.com/nanobpm/nano-coder/issues/273) for its measurement against smart.
+
+**Layered summaries** (`compaction_summary_dag = true`, issue
+[#274](https://github.com/nanobpm/nano-coder/issues/274)) stop smart and extract compaction from
+re-summarising the previous summary. Each compaction summarises only the new span into a
+*node*, shown under a header such as `[[node S7 level=1 range=#2-#300 children=S1,S2]]`, and
+carries the older nodes forward verbatim. When the nodes' text outgrows about a tenth of the
+context window, the oldest six are condensed into one node a level up: one extra model call
+(none in extract mode, which condenses in code), at most once per compaction. So the summary
+grows only logarithmically with session length, and early detail stays one lookup away:
+`history_read(node="S7")` expands a node to the nodes it condensed, or a level-0 node to a
+one-line digest of each original message it covers; `history_search(…, node="S7")` searches
+only that node's range. Each compaction's `replace` record lists the nodes it created under
+`summary_nodes`; older records are read as before.
 
 #### Agent-adjusted compaction
 
@@ -1296,11 +1319,25 @@ The delivered message joins the target's input labelled with its origin, e.g.
 when the sender has a [handle](#session-handles)), and is logged like any input with
 the sender's full session id in the record (`from_session` on the input and message). Mid-turn it is steered into the running turn; idle it starts
 a turn. With `session_messages_confirm = true` (the default) the target first shows the
-message and waits for its user to accept or decline. A turn that was *started by* a peer
-message cannot itself call `session_send` without `confirm: true` (which asks the
-target's user whatever their confirm setting) — the loop guard, so two agents can't
-ping-pong. On the wire each message is one A2A-shaped JSON object per line (`role`,
-`parts` with `text`, `messageId`, `contextId` = the sender's session id), so a later A2A
+message and waits for its user to accept or decline; with it off, a message (including a
+reply from a turn a peer message started) is delivered at once. `confirm: true` on
+`session_send` asks the target's user whatever their confirm setting.
+
+**Loop guard.** The cost risk of two agents replying to each other is bounded two ways:
+
+- *Hop limit.* Every message carries a hop count and a thread id (the originating
+  message's context, kept by replies in both directions). A send from a turn you started
+  is hop 1; a send from a turn started by a hop-N message is hop N+1. Above
+  `session_messages_max_hops` (default 4) the send is refused with "thread hop limit
+  reached: stop, or ask your user". A message from an older nano-coder without a hop
+  counts as hop 1, and so does an interrupted peer turn after a resume.
+- *Per-pair rate cap.* One session sends another at most
+  `session_messages_max_per_hour` messages (default 10; 0 = no cap) in any hour, so loops
+  that keep starting fresh threads stop too.
+
+On the wire each message is one A2A-shaped JSON object per line (`role`,
+`parts` with `text`, `messageId`, `contextId` = the sender's session id, and
+`metadata.nano.hop` / `metadata.nano.thread`), so a later A2A
 bridge can map it directly. The receiver serves only a peer with its own uid
 (`SO_PEERCRED`/`getpeereid`) and drops any other, and the 0700 registry directory keeps
 other users from planting or reaching a socket. `/messages on|off` and `/messages confirm
@@ -1443,9 +1480,16 @@ conversation be summarized without losing track.
 Each change returns a compact checklist ending with what is in progress or ready next. A bad
 call (unknown id, bad status) changes nothing.
 
+A finished plan (every item done or dropped) is history: `plan_add` then starts a new plan
+(ids from 1, new goal) and the finished one is kept in the session log as a `plan_archive`
+record. Each item keeps at most 4 KB of notes; older ones are replaced by
+"(older notes dropped)".
+
 The harness keeps the plan in front of the model:
-- **Compaction.** The summary message is followed by the full plan with notes (up to 8,000
-  characters; notes on finished items go first when it's too long).
+- **Compaction.** The summary message is followed by the plan with the notes of open items (up
+  to 8,000 characters); finished items show only a note count (`plan_show` has every note). A
+  finished plan is reduced to one line ("Previous plan '…' completed (N items)"), also when
+  carried over to a new session.
 - **Resume.** Every change is written to the session log, and `--resume` / `session/load`
   restore the latest plan.
 - **Another worker.** ACP `session/new` can be seeded with `_meta.plan` (see ACP above). The

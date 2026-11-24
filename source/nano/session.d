@@ -5,6 +5,7 @@ module nano.session;
 @safe:
 
 import std.conv : to;
+import nano.summary_dag : SummaryNode;
 
 import nano.safeio : jsonText, jsonPretty;
 import nano.clock : wallNow;
@@ -1106,6 +1107,15 @@ class SessionLog
         write_(record("plan", d));
     }
 
+    /// A finished plan replaced by a new one (issue #346): an audit record
+    /// so the history tools can still find it; resume ignores it.
+    void planArchive(JSONValue plan)
+    {
+        JSONValue d = ["recorded_at": nowStamp()];
+        d["plan"] = plan;
+        write_(record("plan_archive", d));
+    }
+
     /// A plan change as a delta against the plan the log so far restores to
     /// (issue #205: a full snapshot per `plan_update` rewrites every note on
     /// every change). `goal` when it changed, `upserts` the added/updated
@@ -1215,10 +1225,13 @@ class SessionLog
     /// `folded`: the real turns this compaction folded, extending the first
     /// `foldedBase` turns of the previous stash when that is set; `restated`:
     /// the index of the restated in-flight input in `messages`.
+    /// `summaryNodes`: the summary-DAG nodes this compaction created (issue
+    /// #274); `history_read` expands them. Older records have none.
     void replace(const Message[] messages, ulong first = 0, ulong last = 0, string mode = null, string model = null,
         const Message[] pinStash = null, scope const(PendingInput)* pending = null, const Message[] folded = null,
         Option!size_t foldedBase = Option!size_t.init, Option!size_t restated = Option!size_t.init,
-        Option!size_t pinnedBase = Option!size_t.init, string trigger = null)
+        Option!size_t pinnedBase = Option!size_t.init, string trigger = null,
+        const SummaryNode[] summaryNodes = null)
     {
         JSONValue[] ms;
         foreach (ref m; messages) ms ~= messageRecord(m);
@@ -1249,6 +1262,13 @@ class SessionLog
         if (first) d["summarized"] = JSONValue([JSONValue(first), JSONValue(last)]);
         if (mode !is null) d["mode"] = mode;
         if (model !is null) d["model"] = model;
+        if (summaryNodes.length)
+        {
+            import nano.summary_dag : toJson;
+            JSONValue[] ns;
+            foreach (ref n; summaryNodes) ns ~= toJson(n);
+            d["summary_nodes"] = ns;
+        }
         write_(record("replace", d));
     }
 }

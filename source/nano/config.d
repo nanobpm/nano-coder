@@ -466,6 +466,8 @@ struct Config
     string compactionMode = "smart";
     /// Pin the user's requests verbatim after each compaction summary.
     bool compactionPinRequests = true;
+    /// Layer smart/extract summaries into an expandable summary DAG (issue #274).
+    bool compactionSummaryDag;
     /// Compact at the idle prompt, once quiet for the hold (Rust #186).
     bool idleCompact = true;
     /// Persist conversations as JSONL session logs (false: like --no-session).
@@ -484,6 +486,12 @@ struct Config
     /// queued (`session_messages_confirm`, default true); off, it is queued
     /// (or starts a turn) at once.
     bool sessionMessagesConfirm = true;
+    /// The most hops a message thread between sessions may take
+    /// (`session_messages_max_hops`, default 4; issue #350).
+    uint sessionMessagesMaxHops = 4;
+    /// The most messages one session may send another per hour
+    /// (`session_messages_max_per_hour`, default 10, 0: no cap; issue #350).
+    uint sessionMessagesMaxPerHour = 10;
     /// Inter-session messages for `--acp` sessions (`acp_session_messages`,
     /// default false; issue #347). ACP ignores `session_messages`: a worker
     /// runs unattended, so it joins the registry only when opted in here or
@@ -575,12 +583,19 @@ struct Config
             c.autoCompactThreshold = v.type == JSONType.integer ? v.integer : v.floating;
         if (auto v = "compaction_mode" in doc) c.compactionMode = v.str;
         if (auto v = "compaction_pin_requests" in doc) c.compactionPinRequests = v.boolean;
+        if (auto v = "compaction_summary_dag" in doc) c.compactionSummaryDag = v.boolean;
         if (auto v = "idle_compact" in doc) c.idleCompact = v.boolean;
         if (auto v = "persist_sessions" in doc) c.persistSessions = v.boolean;
         if (auto v = "cross_session_history" in doc) c.crossSessionHistory = v.boolean;
         if (auto v = "session_messages" in doc) c.sessionMessages = v.boolean;
         if (auto v = "acp_session_messages" in doc) c.acpSessionMessages = v.boolean;
         if (auto v = "session_messages_confirm" in doc) c.sessionMessagesConfirm = v.boolean;
+        import std.algorithm : clamp;
+        import std.conv : to;
+        if (auto v = "session_messages_max_hops" in doc)
+            c.sessionMessagesMaxHops = clamp(v.integer, 1, 1000).to!uint;
+        if (auto v = "session_messages_max_per_hour" in doc)
+            c.sessionMessagesMaxPerHour = clamp(v.integer, 0, 100_000).to!uint;
         if (auto v = "session_dir" in doc) c.sessionDir = v.str;
         if (auto v = "session_compress_after_days" in doc) c.sessionCompressAfterDays = v.integer;
         if (auto v = "session_retention_days" in doc) c.sessionRetentionDays = v.integer;

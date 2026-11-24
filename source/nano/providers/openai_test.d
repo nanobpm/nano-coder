@@ -141,9 +141,12 @@ unittest
 unittest
 {
     string[] events;
-    foreach (piece; ["hel", "lo", " wor", "ld"]) events ~= `{"choices":[{"delta":{"content":"` ~ piece ~ `"}}]}`;
-    // 4 x 300 ms: the stream outlasts the 1 s idle timeout, no gap reaches it.
-    auto srv = serve([immutable Reply(200, streamHeaders, sse(events, true), 300)]);
+    foreach (piece; ["h", "e", "l", "l", "o", " ", "w", "o", "r", "l", "d"])
+        events ~= `{"choices":[{"delta":{"content":"` ~ piece ~ `"}}]}`;
+    // 12 x 100 ms (11 deltas and [DONE]): the stream outlasts the 1 s idle
+    // timeout, while each gap is a tenth of it, so a loaded host stalling a
+    // gap several-fold still can't trip it (issue #358).
+    auto srv = serve([immutable Reply(200, streamHeaders, sse(events, true), 100)]);
     auto c = against(srv.url, true, 1);
     auto req = hello("hi");
     auto r = c.chat(req, (bool t, string x) {});

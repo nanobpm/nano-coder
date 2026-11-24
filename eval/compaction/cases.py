@@ -187,6 +187,26 @@ def pinned_request(seed, filler_turns):
     ), [flag, rf"\b{count}\W+passes|passes\W+(?:exactly\W+)?{count}\b", phrase], []
 
 
+def deep_history(seed, filler_turns):
+    """A detail from the very first span, asked for after 22 compactions
+    (issue #274): flat summaries re-summarise their previous summary each
+    time, so the detail is a paraphrase of a paraphrase by the end; layered
+    summaries keep the first span's node (or a condensation citing it) and
+    the agent can expand it with history_read(node=...). Compare `smart`
+    with `smart-layered` (and `extract` with `extract-layered`)."""
+    rng = random.Random(seed)
+    port = rng.randint(20000, 29999)
+    method = f"drain_pool_v{rng.randint(10, 99)}_{rng.choice(['sync', 'fast', 'lazy'])}"
+    log = Log()
+    log.user("The pool service won't start. Find out why.")
+    log.bash("./pool serve", noise(rng, 60, f"fatal: {method} could not bind 0.0.0.0:{port}: address in use"), error=True)
+    log.answer(f"The pool service fails at startup in {method}: its port is taken. I'll look at what holds it.")
+    filler(log, rng, filler_turns)
+    return log.records, (
+        "At the very start of this session the pool service failed to start. Which function failed, and on which port?"
+    ), [method, str(port)], []
+
+
 CASES = {
     "buried-error": buried_error,
     "long-log-error": long_log_error,
@@ -195,6 +215,7 @@ CASES = {
     "rejected-approach": rejected_approach,
     "recent-control": recent_control,
     "pinned-request": pinned_request,
+    "deep-history": deep_history,
 }
 
 
@@ -204,6 +225,9 @@ def build(name, seed, filler_turns):
     # The pinned-request case is the issue-#66 scenario: compacted twice.
     if name == "pinned-request":
         case["compactions"] = 2
+    # The issue-#274 scenario: 20+ compactions, the detail in the first span.
+    if name == "deep-history":
+        case["compactions"] = 22
     return case
 
 

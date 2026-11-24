@@ -34,9 +34,11 @@
 /// decline and reports the outcome back through the inbox.
 ///
 /// The loop guard (two agents must not ping-pong) lives with the sender: a
-/// turn started by a peer message marks the agent (`Agent.peerTurn`), and
-/// `session_send` then needs the user's approval whatever the confirm
-/// setting.
+/// turn started by a peer message marks the agent (`Agent.peerTurn`), its
+/// sends carry `hop` (metadata `nano.hop`) one more than the message that
+/// started it, and beyond `session_messages_max_hops` they are refused; a
+/// per-pair hourly cap backs it up (issue #350). The target's confirm
+/// setting applies as for any send.
 module nano.peers;
 
 @safe:
@@ -153,10 +155,17 @@ struct PeerMessage
     string text;
     string messageId;
     /// The sender asks the receiver to confirm even when its own
-    /// `session_messages_confirm` is off (the loop guard's approval).
+    /// `session_messages_confirm` is off.
     bool confirm;
     /// The sender's handle (issue #300), or null.
     string senderName;
+    /// How many sends this thread has taken, this one included (issue #350):
+    /// 1 from a user-started turn, N+1 from a turn a hop-N message started.
+    /// A message without it (an older sender) counts as hop 1.
+    uint hop = 1;
+    /// The thread: the originating message's contextId, kept by replies in
+    /// both directions (null from an older sender).
+    string thread;
 }
 
 /// The `message/send` params, or the error the sender reads.
@@ -193,6 +202,14 @@ Result!(PeerMessage, string) parseMessage(JSONValue params) pure
                         if (v.type == JSONType.string) pm.senderName = v.str;
                     if (auto v = "confirm" in n.objectNoRef)
                         if (v.type == JSONType.true_ || v.type == JSONType.false_) pm.confirm = v.boolean;
+                    if (auto v = "hop" in n.objectNoRef)
+                        if (v.type == JSONType.integer && v.integer >= 1 && v.integer <= uint.max)
+                        {
+                            import std.conv : to;
+                            pm.hop = v.integer.to!uint;
+                        }
+                    if (auto v = "thread" in n.objectNoRef)
+                        if (v.type == JSONType.string) pm.thread = v.str;
                 }
     return R.ok(pm);
 }
@@ -202,6 +219,8 @@ string requestLine(PeerMessage pm, long id) pure
 {
     JSONValue nano = ["title": JSONValue(pm.senderTitle), "confirm": JSONValue(pm.confirm)];
     if (pm.senderName.length) nano["name"] = pm.senderName;
+    nano["hop"] = pm.hop ? pm.hop : 1;
+    if (pm.thread.length) nano["thread"] = pm.thread;
     JSONValue part = ["kind": JSONValue("text"), "text": JSONValue(pm.text)];
     JSONValue msg = [
         "role": JSONValue("user"),
@@ -236,6 +255,13 @@ unittest
     // No text, no contextId: refused.
     assert(parseMessage(parseJSON(`{"message":{"role":"user","parts":[],"messageId":"m","contextId":"s"}}`)).isErr);
     assert(parseMessage(parseJSON(`{"message":{"role":"user","parts":[{"kind":"text","text":"x"}],"messageId":"m"}}`)).isErr);
+    // Issue #350: hop and thread round-trip; a message without them is hop 1.
+    auto hopped = PeerMessage("s", "t", "x", "m");
+    hopped.hop = 3;
+    hopped.thread = "s/msg-1";
+    auto back = parseMessage(parseJSON(requestLine(hopped, 1))["params"]).unwrap("valid");
+    assert(back.hop == 3 && back.thread == "s/msg-1");
+    assert(pm.hop == 1 && two.parseMessage.unwrap("old").hop == 1);
 }
 
 /// The delivery outcomes `session_send` reports (the response's `status`).
@@ -1216,13 +1242,14 @@ struct PeerRouter
                 import core.atomic : atomicLoad;
                 // Unread steers are bounded like the idle inbox; the budget
                 // frees as the turn reads them (or `/queue` withdraws them).
-                if (atomicLoad(control).pendingSteerBytes + labelled.length + req.pm.senderId.length > maxQueuedBytes)
+                if (atomicLoad(control).pendingSteerBytes + labelled.length + req.pm.senderId.length
+                    + req.pm.thread.length > maxQueuedBytes)
                 {
                     answer(req.reply, Status.refused, "the target session's inbox is full; try again later");
                     continue;
                 }
                 auto id = queue.reserveId();
-                atomicLoad(control).steerWithId(labelled, id, true, req.pm.senderId);
+                atomicLoad(control).steerWithId(labelled, id, true, req.pm.senderId, req.pm.hop, req.pm.thread);
                 answer(req.reply, Status.queued, "queued in the target session (visible and editable in /queue)");
             }
             else
@@ -1295,13 +1322,15 @@ struct PeerRouter
     /// it keeps its provenance (the loop guard) instead of becoming an
     /// ordinary prompt. Its sender was answered when it was steered.
     /// Returns false when the inbox is full and the message was dropped.
-    bool requeueLate(string labelled, string sender = null)
+    bool requeueLate(string labelled, string sender = null, uint hop = 1, string thread = null)
     {
         auto done = Shared!ReplyCell.make;
         answer(done, Status.queued, "queued");
         PeerMessage pm;
         pm.text = labelled;
         pm.senderId = sender;
+        pm.hop = hop ? hop : 1;
+        pm.thread = thread;
         // Its steer budget was freed when the turn drained it, so admit it
         // against the inbox cap (with one steer budget of headroom, since its
         // sender was already told `queued`). Beyond that it is dropped: the
@@ -1344,7 +1373,7 @@ struct PeerRouter
     /// dodged with a huge sender id, title or message id.
     private static size_t retainedBytes(const ref PeerMessage pm, string labelled) pure nothrow @nogc
     {
-        return labelled.length + pm.text.length + pm.senderId.length + pm.senderTitle.length + pm.senderName.length + pm.messageId.length;
+        return labelled.length + pm.text.length + pm.senderId.length + pm.senderTitle.length + pm.senderName.length + pm.messageId.length + pm.thread.length;
     }
 
     private static void answer(Shared!ReplyCell reply, Status status, string note)
@@ -1363,8 +1392,10 @@ imported!"nano.llm".ToolDefinition sendDefinition() pure
         ~ "id prefix or a title, resolved like the history tools' `session` argument. The message joins the target's input "
         ~ "labelled with this session's handle or id; the target may confirm it first. The result is one of: delivered, "
         ~ "queued (the target is mid-turn; visible in its /queue), awaiting confirmation, refused (the target "
-        ~ "has messages off or declined), not running. A turn started by a peer message cannot send one without "
-        ~ "the user's approval, so two agents cannot ping-pong.",
+        ~ "has messages off or declined), not running. Whether the target's user confirms is the target's setting "
+        ~ "(or pass confirm: true). A reply from a turn a peer started is one hop further along its thread; past "
+        ~ "session_messages_max_hops, and past session_messages_max_per_hour sends to one target, the send is refused: "
+        ~ "then stop or ask your user.",
         parseJSON(`{"type":"object","properties":{"to":{"type":"string","description":"The target session: a handle, an id, a unique id prefix, or a title from sessions_list"},"text":{"type":"string","description":"The message text"},"confirm":{"type":"boolean","description":"Ask the target's user to accept even when their confirm setting is off (default false)"}},"required":["to","text"]}`));
 }
 
@@ -1836,8 +1867,26 @@ unittest
     assert(c2.get.status == Status.refused, "the second big message id overflows the cap");
     assert(router.takeWaiting(m));
 
-    // Mid-turn: peer steers are flagged and bounded by unread bytes.
+    // Mid-turn: a late steer keeps its hop and thread through the requeue,
+    // so a hop-4 message can't be reset to hop 1 (issue #350).
     router.midTurn(true);
+    {
+        auto hc = Shared!ReplyCell.make;
+        auto hpm = PeerMessage("sess-h", null, "deep", "m", false);
+        hpm.hop = 4;
+        hpm.thread = "sess-x/msg-1";
+        router.requests.put(PeerRequest(hpm, hc));
+        router.routePending(queue);
+        assert(hc.get.status == Status.queued);
+        auto hs = control.takePending;
+        assert(hs.length == 1 && hs[0].hop == 4 && hs[0].thread == "sess-x/msg-1", "the steer carries hop and thread");
+        assert(router.requeueLate(hs[0].text, hs[0].sender, hs[0].hop, hs[0].thread));
+        Inbound hl;
+        assert(router.takeWaiting(hl));
+        assert(hl.pm.hop == 4 && hl.pm.thread == "sess-x/msg-1", "a requeued steer keeps hop and thread");
+    }
+
+    // Mid-turn: peer steers are flagged and bounded by unread bytes.
     auto s1 = Shared!ReplyCell.make, s2 = Shared!ReplyCell.make;
     router.requests.put(PeerRequest(PeerMessage("sess-a", null, big, "m", false), s1));
     router.requests.put(PeerRequest(PeerMessage("sess-a", null, big, "m", false), s2));

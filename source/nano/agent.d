@@ -33,6 +33,7 @@ import nano.goal : Outcome, OutcomeStatus, verifyReminder, outcomeToolName = too
 import nano.reminders : Reminders, wrap;
 import mem = nano.memory;
 import ctx = nano.context;
+import dag = nano.summary_dag;
 import hist = nano.session_history;
 import cross = nano.cross_session;
 import peers = nano.peers;
@@ -54,7 +55,7 @@ import std.typecons : Nullable;
 import std.algorithm : min, max, clamp;
 import nano.plan : Plan, isPlanTool, planDefinitions = definitions;
 import settings = nano.session_settings;
-import nano.timers : Timers, TimerError, isTimerTool, timerDefinitions = definitions, firedMessage, firedNotice, pendingNudge, pendingNudgeEvery;
+import nano.timers : Timers, TimerError, isTimerTool, timerDefinitions = definitions, firedMessage, firedNotice, pendingNudge, pendingNudgeEvery, Timer, maxPending;
 import nano.permissions;
 import nano.session;
 import nano.control;
@@ -424,6 +425,19 @@ class Agent
     /// Pin the user's requests verbatim after each compaction summary
     /// (`compaction_pin_requests`, issue #66).
     bool compactionPinRequests = true;
+    /// Layer smart/extract summaries into a summary DAG instead of
+    /// re-summarising the previous summary (`compaction_summary_dag`, issue #274).
+    bool compactionSummaryDag;
+    /// The largest summary-node ID this agent has issued (issue #274): new
+    /// IDs stay above it, so a flat compaction that resets the node list
+    /// never reuses an ID an archived node's children still refer to.
+    private uint summaryNodeHigh;
+    /// Whether `summaryNodeHigh` has been seeded from the session log, so a
+    /// resumed session keeps issuing IDs above the ones it archived.
+    private bool summaryNodeSeeded;
+    /// The node-prose budget of a layered summary in bytes; 0 derives it
+    /// from the window (tests set it to force a condensation).
+    size_t summaryDagBudgetBytes;
     /// The accepted input whose turn has not ended (redelivering its id resumes it).
     bool hasPending;
     PendingInput pending;
@@ -594,17 +608,21 @@ class Agent
     /// Pass `resetControl = false` when the caller already called
     /// `control.startTurn()`, so a cancel routed before `run` began is kept.
     string run(string input, AgentEvents ev, bool resetControl = true, string givenId = null,
-        bool fromPeer = false, string peerSender = null)
+        bool fromPeer = false, string peerSender = null, uint peerHop = 1, string peerThread = null)
     {
         import std.datetime.systime : Clock;
         import std.conv : to;
         // A harness-initiated input (a fired timer): never pinned as a request.
         bool automatic = automaticInput;
         automaticInput = false;
-        // The loop guard (issue #272): a peer-started turn can't send peer
-        // messages unapproved; any other input lifts the guard.
+        // The loop guard (issues #272, #350): a peer-started turn's sends
+        // count hops along the thread; any other input starts at hop 1.
         peerTurn = fromPeer;
         inputSender = fromPeer ? peerSender : null;
+        // Issue #350: the hop and thread of the peer message that started
+        // this turn; a reply from it is one hop further along the thread.
+        inputHop = fromPeer ? (peerHop ? peerHop : 1) : 0;
+        inputThread = fromPeer ? peerThread : null;
         if (givenId.length)
         {
             if (auto done = givenId in completedInputs)
@@ -653,6 +671,9 @@ class Agent
                 if (messages[i].fromSession.length)
                 {
                     peerTurn = true;
+                    // The hop isn't persisted: a resumed peer turn counts
+                    // as hop 1 (like a message from an older sender).
+                    if (!inputHop) inputHop = 1;
                     if (!inputSender.length && i == pending.position) inputSender = messages[i].fromSession;
                     break;
                 }
@@ -760,10 +781,36 @@ class Agent
     /// carries this intent over rather than the live state.
     bool messagesWanted;
     /// The current turn was started by a peer message (set by the prompt
-    /// loop via `run(..., fromPeer: true)`): the loop guard — `session_send`
-    /// now needs the user's approval whatever the confirm setting, so two
-    /// agents can't ping-pong. Cleared when the next turn starts.
+    /// loop via `run(..., fromPeer: true)`): the loop guard — its sends are
+    /// one hop further along the thread and stop at `maxHops`, so two agents
+    /// can't ping-pong forever. Cleared when the next turn starts.
     bool peerTurn;
+    /// The hop count (issue #350) of the peer message that started this
+    /// turn (the furthest one it read); 0 when no peer message did. A send
+    /// from this turn is hop `inputHop + 1`.
+    uint inputHop;
+    /// The thread (originating contextId) of that peer message, or null.
+    string inputThread;
+    /// The most hops a message thread may take (`session_messages_max_hops`,
+    /// issue #350): a send beyond it is refused, so agents replying to each
+    /// other stop instead of running up token cost.
+    uint maxHops = 4;
+    /// The most messages this session may send one target per hour
+    /// (`session_messages_max_per_hour`, issue #350; 0: no cap): the
+    /// backstop for loops that start fresh threads.
+    uint maxSendsPerHour = 10;
+    /// Recent send times (stdTime) per target id, for `maxSendsPerHour`;
+    /// pruned to the last hour on every send, so it stays bounded.
+    private long[][string] recentSends;
+
+    /// How many send times are recorded for the rate cap; tests check that
+    /// an uncapped agent (`maxSendsPerHour == 0`) records none.
+    package size_t recordedSendCount() const pure nothrow
+    {
+        size_t n;
+        foreach (v; recentSends) n += v.length;
+        return n;
+    }
     /// The full session id of the peer that started this turn (issue
     /// #272), persisted with its input; empty for any other input.
     string inputSender;
@@ -1098,7 +1145,17 @@ class Agent
             echoSender = null;
             // A peer's steer makes the rest of this turn peer-driven: the
             // loop guard must hold for whatever it asks for.
-            if (s.fromPeer) peerTurn = true;
+            if (s.fromPeer)
+            {
+                peerTurn = true;
+                // The furthest hop read this turn governs its replies.
+                auto h = s.hop ? s.hop : 1;
+                if (h > inputHop) { inputHop = h; inputThread = s.thread; }
+                else if (!inputThread.length) inputThread = s.thread;
+                // A legacy steer carries no thread: fall back to its sender,
+                // as an idle delivery does, so identity is timing-independent.
+                if (!inputThread.length) inputThread = s.sender;
+            }
             control.absorbed(s);
         }
         fireDueTimers(ev);
@@ -2188,13 +2245,41 @@ class Agent
         auto summarized = messages[bodyStart .. split].dup;
         if (!summarized.length) return false;
         auto tokensBefore = estimateContextTokens();
+        // Layered (issue #274): the previous summary's nodes are carried
+        // forward verbatim and only the new span is summarized.
+        immutable layered = smart && compactionSummaryDag;
+        dag.SummaryNode[] nodes;
+        Message[] source = summarized;
+        bool inheritsFlat;
+        if (layered)
+        {
+            source = null;
+            foreach (ref x; summarized)
+            {
+                // A flat summary (from before layering, or a standard
+                // compaction in between) has no nodes: summarize it with
+                // the new span rather than drop its content.
+                auto parsed = ctx.isSummaryMessage(x) ? dag.parse(x.content) : null;
+                if (parsed.length) nodes ~= parsed;
+                else
+                {
+                    source ~= x;
+                    if (ctx.isSummaryMessage(x)) inheritsFlat = true;
+                }
+            }
+        }
+        string leafText;
         ulong first, last;
-        foreach (ref x; summarized)
+        foreach (ref x; source)
             if (x.logLine)
             {
                 if (!first || x.logLine < first) first = x.logLine;
                 if (x.logLine > last) last = x.logLine;
             }
+        // A folded flat summary covers everything before it, from the
+        // session's start: the new leaf's range must too, or expanding and
+        // searching it would miss the history its prose describes.
+        if (inheritsFlat && last) first = 1;
 
         long budget;
         // The output cap an output-cap rejection taught us (0: none yet).
@@ -2212,7 +2297,8 @@ class Agent
             // Built in code: no model call, so no usage, retry or fallback.
             import nano.extract : extractSummary;
             const swStart = monoNow;
-            summary = ctx.smartSummaryPrefix ~ "\n" ~ extractSummary(summarized) ~ "\n\n" ~ ctx.smartSummaryNote(first, last);
+            leafText = extractSummary(source);
+            summary = ctx.smartSummaryPrefix ~ "\n" ~ leafText ~ "\n\n" ~ ctx.smartSummaryNote(first, last);
             summaryMs = since(swStart).total!"msecs";
         }
         else for (;;)
@@ -2232,13 +2318,13 @@ class Agent
             if (learnedCap && learnedCap < budget) budget = learnedCap;
             auto inputWindow = saturatingSub(window, budget);
             auto chars = checkedMul(max(saturatingSub(inputWindow, 2_000), 2_000), 3);
-            auto request = "Conversation to summarize:\n\n" ~ ctx.renderTranscript(summarized, chars, smart);
+            auto request = "Conversation to summarize:\n\n" ~ ctx.renderTranscript(source, chars, smart);
             if (focus.strip.length) request ~= "\n\nWhen summarizing, focus on: " ~ focus.strip;
             ChatRequest req;
             auto system = ctx.summarySystemPrompt ~ (smart ? ctx.smartSummaryInstructions : "");
             // A repeated compaction folds the previous summary back in: warn
             // that it is lossy (issue #66).
-            if (summarized.canFind!((ref m) => ctx.isSummaryMessage(m)))
+            if (source.canFind!((ref m) => ctx.isSummaryMessage(m)))
                 system ~= compactionPinRequests ? ctx.earlierSummaryLossyInstructions : ctx.earlierSummaryLossyNoPinInstructions;
             req.messages = [Message.system(system), Message.user(request)];
             req.maxTokens = budget;
@@ -2261,6 +2347,7 @@ class Agent
                 if (body_.length)
                 {
                     if (truncated) body_ ~= ctx.summaryTruncatedNote;
+                    leafText = body_;
                     summary = smart ? ctx.smartSummaryPrefix ~ "\n" ~ body_ ~ "\n\n" ~ ctx.smartSummaryNote(first, last)
                         : ctx.summaryPrefix ~ "\n" ~ body_;
                 }
@@ -2306,6 +2393,58 @@ class Agent
             auto note = format("[%s earlier messages were removed to fit the context window; no summary is available]",
                 summarized.length);
             summary = smart && first ? ctx.smartSummaryPrefix ~ "\n" ~ note ~ "\n\n" ~ ctx.smartSummaryNote(first, last) : note;
+            leafText = note;
+        }
+        dag.SummaryNode[] newNodes;
+        if (layered)
+        {
+            if (!summaryNodeSeeded)
+            {
+                log.ifSome((SessionLog l) {
+                    // A deleted or replaced log path must be recovered first, or the
+                    // scan throws or reads a foreign file's node IDs.
+                    l.revalidate();
+                    immutable logged = hist.maxNodeId(l.path);
+                    if (logged > summaryNodeHigh) summaryNodeHigh = logged;
+                });
+                summaryNodeSeeded = true;
+            }
+            uint freshId()
+            {
+                auto id = dag.nextId(nodes);
+                if (id <= summaryNodeHigh) id = summaryNodeHigh + 1;
+                return id;
+            }
+            auto leaf = dag.SummaryNode(freshId(), 0, first, last, null, leafText);
+            nodes ~= leaf;
+            newNodes ~= leaf;
+            immutable dagBudget = summaryDagBudgetBytes ? summaryDagBudgetBytes : condenseBudgetBytes(window);
+            auto g = dag.condenseGroup(nodes, dagBudget);
+            if (g.count)
+            {
+                auto children = nodes[g.start .. g.start + g.count];
+                string text;
+                if (m == ctx.CompactionMode.extract) text = dag.deterministicText(children, dagBudget / 4);
+                else
+                {
+                    long ms;
+                    text = condenseByModel(children, dagBudget / 4, ev, summaryUsage, ms);
+                    // A cancel during condensation stops before anything is committed.
+                    if (control.isCancelled) return false;
+                    if (ms >= 0) summaryMs = (summaryMs < 0 ? 0 : summaryMs) + ms;
+                }
+                auto c = dag.condensed(children, freshId(), text);
+                nodes = nodes[0 .. g.start] ~ c ~ nodes[g.start + g.count .. $];
+                newNodes ~= c;
+            }
+            ulong lo = nodes[0].first, hi;
+            foreach (ref x; nodes)
+            {
+                if (x.first && (!lo || x.first < lo)) lo = x.first;
+                if (x.last > hi) hi = x.last;
+            }
+            summary = ctx.smartSummaryPrefix ~ "\n" ~ dag.render(nodes) ~ "\n\n" ~ dag.expandNote ~ "\n\n"
+                ~ ctx.smartSummaryNote(lo, hi);
         }
         if (planTools && !plan.empty) summary ~= "\n\n" ~ plan.contextNote();
         // Pin the user's own words, rebuilt from the originals every time.
@@ -2436,11 +2575,13 @@ class Agent
             import std.conv : to;
             l.replace(messages, first, last, ctx.modeName(m), client.providerName ~ "/" ~ client.modelName, pinnedNew,
                 hasPending ? &pending : null, folded, extendsStash ? some(stashBase) : Option!size_t.init, replayRestated,
-                pinnedBase, trigger.to!string);
+                pinnedBase, trigger.to!string, newNodes);
         });
         // The replace record is durable: the live state now matches the log,
         // so nothing past this point may roll it back.
         persisted = true;
+        foreach (ref nn; newNodes)
+            if (nn.id > summaryNodeHigh) summaryNodeHigh = nn.id;
         pinStashRestate = false;
         // Bound the stash once the log holds it in full (issue #312).
         trimPins(window);
@@ -2462,6 +2603,57 @@ class Agent
         historyAvailable = historyHintPending = ctx.citesHistory(m);
         if (onCompacted !is null) onCompacted(report);
         return true;
+    }
+
+    /// The byte budget of a layered summary's node prose (issue #274): about
+    /// a tenth of the window in tokens, at ~3 bytes per token.
+    private static size_t condenseBudgetBytes(size_t window) pure nothrow @nogc
+    {
+        auto b = window / 10 * 3;
+        return b < 4_000 ? 4_000 : b;
+    }
+
+    /// The one condensation call of a layered compaction (issue #274): the
+    /// model merges `children` into one summary. Any failure falls back to
+    /// the deterministic condensation, so a compaction never fails here (a
+    /// cancel returns at once; the caller checks it before committing). The
+    /// call's usage is added to `usage` and its duration set in `ms`, so the
+    /// persisted summary accounts for both requests.
+    private string condenseByModel(const dag.SummaryNode[] children, size_t maxBytes, Option!AgentEvents ev,
+        ref TokenUsage usage, out long ms)
+    {
+        ms = -1;
+        // A `/model` queued during the leaf summary applies first, as before
+        // every model call; a cancel pending now makes no call.
+        applyModelRequest();
+        if (control.isCancelled) return "";
+        ChatRequest req;
+        req.messages = [Message.system(dag.condenseSystemPrompt), Message.user(dag.condenseRequest(children))];
+        long cap = toLong(maxBytes / 3 < 256 ? 256 : maxBytes / 3);
+        immutable limit = effectiveMaxTokens();
+        if (limit > 0 && limit < cap) cap = limit;
+        req.maxTokens = cap;
+        req.temperature = temperatureFor(thinking().alwaysAnthropicThinking).effective;
+        import std.exception : collectException;
+        string t;
+        auto err = collectException(() {
+            foreach (e; ev) e.summaryStart();
+            const swStart = monoNow;
+            auto r = client.chat(req, (bool, string) {});
+            ms = since(swStart).total!"msecs";
+            recordUsage(r.usage);
+            usage.inputTokens += r.usage.inputTokens;
+            usage.outputTokens += r.usage.outputTokens;
+            usage.cachedInputTokens += r.usage.cachedInputTokens;
+            if (r.usage.hasAic) { usage.hasAic = true; usage.aic += r.usage.aic; }
+            foreach (e; ev) e.usage(r.usage);
+            // A truncated condensation would silently replace several summaries
+            // with an incomplete prefix: fall back to the deterministic text.
+            t = r.stopReason == "length" || r.stopReason == "max_tokens" ? "" : r.content.strip;
+        }());
+        if (control.isCancelled) return "";
+        if (err !is null) stdErr.writefln("[agent] condensing summaries failed (%s); condensing in code", err.msg);
+        return t.length ? t : dag.deterministicText(children, maxBytes);
     }
 
     private void recordUsage(TokenUsage u) pure
@@ -2695,13 +2887,14 @@ class Agent
         }
         if (!to.length) throw new hist.HistoryError("session_send: `to` must be a non-empty session handle, id, prefix or title");
         if (!text.strip.length) throw new hist.HistoryError("session_send: `text` must be a non-empty message");
-        // The loop guard: a turn started by a peer message can't send one
-        // unapproved, whatever the confirm setting — two agents must not
-        // ping-pong. The approval rides as `confirm` on the wire, so the
-        // target's user is asked even when their confirm setting is off.
-        if (peerTurn && !confirm)
-            throw new hist.HistoryError("this turn was started by a peer message: re-send with "
-                ~ "`confirm: true` so the target's user approves it (the loop guard), or ask your user first");
+        // The loop guard (issue #350): a send from a peer-started turn is one
+        // hop further along its thread; beyond `maxHops` it is refused. The
+        // target's own confirm setting still applies (and `confirm: true`
+        // still asks its user), so a plain reply needs no approval when the
+        // target has confirmation off.
+        auto hop = sendHop(peerTurn, inputHop);
+        if (auto why = hopRefusal(hop, maxHops))
+            throw new hist.HistoryError(why);
         auto cwd = getcwd();
         auto dir = sessionDirOf(ownLog);
         auto sessions = cross.listSessions(policy, dir, cwd);
@@ -2719,6 +2912,9 @@ class Agent
         // `session_send(...)` deny rule matches the call's JSON).
         if (auto denied = policy.checkIn(peers.sendTool, args, cwd))
             throw new hist.HistoryError(denied);
+        auto now = stdTimeNow;
+        if (auto why = rateRefusal(recentSends, ownLog.id, target.id, now, maxSendsPerHour))
+            throw new hist.HistoryError(why);
         peers.PeerMessage pm;
         pm.senderId = ownLog.id;
         pm.senderTitle = selfTitle(sessions, ownLog.id);
@@ -2726,12 +2922,67 @@ class Agent
         pm.text = text;
         pm.messageId = format("msg-%s", ++sendCounter);
         pm.confirm = confirm;
+        pm.hop = hop;
+        // A reply continues its thread; a user-started send opens one.
+        pm.thread = peerTurn && inputThread.length ? inputThread
+            : peerTurn && inputSender.length ? inputSender : format("%s/%s", ownLog.id, pm.messageId);
         string note;
         auto status = peers.send(peers.peersDir(), target.id, pm, note);
+        if (maxSendsPerHour && status != peers.Status.notRunning && status != peers.Status.refused)
+            recentSends[sendKey(ownLog.id, target.id)] ~= now; // keyed per sender/target pair
         return format("%s: %s", statusText(status), note.length ? note : defaultNote(status, target));
     }
 
     private uint sendCounter;
+
+    /// The hop of a send (issue #350): 1 from a user-started turn, one more
+    /// than the message that started a peer turn.
+    static uint sendHop(bool peerTurn, uint inputHop) pure nothrow @nogc
+    {
+        if (!peerTurn) return 1;
+        const h = inputHop ? inputHop : 1;
+        return h == uint.max ? uint.max : h + 1; // saturate: a wrapped hop would reset the thread
+    }
+
+    /// Why a send at `hop` is refused under `maxHops`, or null.
+    static string hopRefusal(uint hop, uint maxHops) pure
+    {
+        if (hop <= maxHops) return null;
+        return format("thread hop limit reached (hop %s > session_messages_max_hops %s): stop, or ask your user",
+            hop, maxHops);
+    }
+
+    /// Why one more send to `target` at `now` (stdTime) breaks the per-pair
+    /// cap of `perHour` sends an hour (0: no cap), or null. Prunes the
+    /// target's entries older than an hour, so the map stays bounded.
+    static string rateRefusal(ref long[][string] sent, string sender, string target, long now, uint perHour) pure
+    {
+        const key = sendKey(sender, target);
+        enum long hourTicks = 3600L * 10_000_000L;
+        if (auto times = key in sent)
+        {
+            import std.algorithm : filter;
+            import std.array : array;
+            *times = (*times).filter!(t => t + hourTicks > now).array;
+            if (!times.length) sent.remove(key);
+        }
+        // Drop other targets' stale entries too: a long session talks to many.
+        string[] stale;
+        foreach (k, v; sent)
+            if (!v.length || v[$ - 1] + hourTicks <= now) stale ~= k;
+        foreach (k; stale) sent.remove(k);
+        if (!perHour) return null;
+        auto times = key in sent;
+        if (times is null || times.length < perHour) return null;
+        return format("rate limit reached: %s messages to session %s in the last hour "
+            ~ "(session_messages_max_per_hour); stop, or ask your user", times.length, target);
+    }
+
+    /// The `recentSends` key of a sender/target pair; never shown to the model.
+    static string sendKey(string sender, string target) pure nothrow
+    {
+        return sender ~ "\x00" ~ target;
+    }
 
     private static string statusText(peers.Status s) pure
     {
@@ -4122,6 +4373,16 @@ class Agent
     {
         auto old = log;
         log = newLog;
+        // The node-ID high-water mark belongs to the log it was seeded
+        // from: a different session must be scanned afresh, or its archived
+        // IDs could be reissued (issue #274).
+        bool sameLog;
+        old.ifSome((SessionLog o) { newLog.ifSome((SessionLog n) { sameLog = n is o; }); });
+        if (!sameLog)
+        {
+            summaryNodeSeeded = false;
+            summaryNodeHigh = 0;
+        }
         old.ifSome((SessionLog o) {
             bool same;
             newLog.ifSome((SessionLog n) { same = n is o; });
@@ -4527,7 +4788,8 @@ class Agent
     {
         auto t = timerNow();
         auto before = Timers(timers.items.dup, timers.pending.dup, timers.lastId);
-        auto due = timers.takeDue(t);
+        Timer[] closed;
+        auto due = timers.takeDue(t, closed);
         if (!due.length) return null;
         {
             // Unrecorded, they stay due and fire on the next try.
@@ -4536,7 +4798,18 @@ class Agent
         }
         stepsSinceTimerNote = 0; // a fresh firing restarts the nudge interval
         notice = firedNotice(due);
-        return firedMessage(due, t);
+        import std.algorithm : map;
+        auto msg = firedMessage(due, t);
+        if (closed.length)
+        {
+            // Both the display and the model need it: earlier reminders still
+            // name the closed ids, and the model would keep chasing them.
+            auto why = format("\n(auto-closed fired timer%s %s: at most %s wait for timer_done)",
+                closed.length == 1 ? "" : "s", closed.map!(x => x.id.to!string).join(", "), maxPending);
+            notice ~= why;
+            msg ~= why;
+        }
+        return msg;
     }
 
     /// Mid-turn: due timers join the conversation before the next model call,
@@ -4580,7 +4853,7 @@ class Agent
             // As for timers: a change that cannot be recorded is rolled back
             // (the rollback itself lives in `planChanged`, which disarms it
             // once the change is persisted).
-            planChanged(before);
+            planChanged(before, o.restarted);
         }
         return o.text;
     }
@@ -4592,7 +4865,7 @@ class Agent
     private enum size_t planSnapshotEvery = 20;
     private size_t planDeltasSinceSnapshot;
 
-    private void planChanged(Plan before)
+    private void planChanged(Plan before, bool restarted = false)
     {
         import std.algorithm : canFind;
         // Only persistence may roll the plan back: once the change is
@@ -4601,7 +4874,11 @@ class Agent
         bool persisted;
         scope (failure) if (!persisted) plan = before;
         log.ifSome((SessionLog l) {
-            if (++planDeltasSinceSnapshot >= planSnapshotEvery || (before.items.length == 0 && plan.items.length > 1))
+            // Keep the finished plan findable by the history tools; a failed
+            // write rolls the restart back with the rest.
+            if (restarted) l.planArchive(before.toJSON);
+            if (++planDeltasSinceSnapshot >= planSnapshotEvery || restarted
+                || (before.items.length == 0 && plan.items.length > 1))
             {
                 l.plan(plan.toJSON);
                 planDeltasSinceSnapshot = 0;

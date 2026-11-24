@@ -47,7 +47,7 @@ import pathological  # noqa: E402
 # exist, so without history tools the agent would explore the real disk (and
 # a fork of a real log would find its answers there, not in the history).
 WORK_TOOLS = ("bash", "read_file", "write_file", "edit_file", "grep", "glob", "web_fetch", "load_skill")
-OVERRIDDEN = ("session_dir", "compaction_mode", "compaction_pin_requests", "auto_compact", "persist_sessions",
+OVERRIDDEN = ("session_dir", "compaction_mode", "compaction_pin_requests", "compaction_summary_dag", "auto_compact", "persist_sessions",
               "project_instructions", "model", "memory", "disable_hooks", "user_instruction_files")
 
 
@@ -238,7 +238,21 @@ def bracket_depth(text):
     return depth
 
 
-def config_text(base, session_dir, mode, extra_body=None, providers=(), pin=True):
+def split_mode(mode):
+    """A mode cell's parts: the bare compaction mode, whether the pinned block
+    is on (a `-nopin` suffix turns it off, issue #66) and whether summaries are
+    layered (a `-layered` suffix, issue #274). Suffixes combine in any order."""
+    pin, layered = True, False
+    while True:
+        if mode.endswith("-nopin"):
+            mode, pin = mode[:-len("-nopin")], False
+        elif mode.endswith("-layered"):
+            mode, layered = mode[:-len("-layered")], True
+        else:
+            return mode, pin, layered
+
+
+def config_text(base, session_dir, mode, extra_body=None, providers=(), pin=True, layered=False):
     """The user's config (for providers and keys) with eval overrides on top.
     Overridden top-level keys are removed from the base so TOML stays valid."""
     lines = []
@@ -263,6 +277,8 @@ def config_text(base, session_dir, mode, extra_body=None, providers=(), pin=True
         f'compaction_mode = "{mode}"',
         # The pinned-block A/B (issue #66): a `-nopin` mode suffix turns it off.
         f"compaction_pin_requests = {'true' if pin else 'false'}",
+        # Flat vs layered summaries (issue #274): a `-layered` mode suffix.
+        f"compaction_summary_dag = {'true' if layered else 'false'}",
         "auto_compact = false",
         "persist_sessions = true",
         "project_instructions = false",
@@ -593,8 +609,7 @@ def run_one(args, index, case, model, mode, repeat, work_root):
     # mode with the pinned-request block disabled, for the with/without-pin A/B
     # (issue #66). The reported `mode` keeps the suffix so the cells stay
     # distinct; the `/compact` command and config use the bare mode.
-    pin = not mode.endswith("-nopin")
-    compact_mode = mode[:-len("-nopin")] if not pin else mode
+    compact_mode, pin, layered = split_mode(mode)
     run_dir = work_root / f"{case['name'].replace('/', '_')}-{model.replace('/', '_').replace(':', '_')}-{mode}-r{repeat}-j{index}"
     session_dir, cwd = run_dir / "sessions", run_dir / "cwd"
     cwd.mkdir(parents=True, exist_ok=True)
@@ -603,7 +618,7 @@ def run_one(args, index, case, model, mode, repeat, work_root):
     session_id = f"eval-{uuid.uuid4().hex[:12]}"
     write_log(case["records"], session_dir, session_id)
     config = run_dir / "config.toml"
-    config.write_text(config_text(args.config, session_dir, compact_mode, args.extra_body, [provider_for(model, args.config)], pin))
+    config.write_text(config_text(args.config, session_dir, compact_mode, args.extra_body, [provider_for(model, args.config)], pin, layered))
     result = {"case": case["name"], "model": model, "mode": mode, "repeat": repeat, "tools": args.tools,
               "question": case["question"], "expect": case["expect"], "forbid": case["forbid"], "session": str(session_dir / f"{session_id}.jsonl")}
     started = time.monotonic()
@@ -1024,8 +1039,8 @@ def self_test_verdict(results):
             continue
         base = r["case"].split("/")[0]
         mode = r["mode"]
-        nopin = mode.endswith("-nopin")
-        bare_mode = mode[:-len("-nopin")] if nopin else mode
+        bare_mode, pin, _ = split_mode(mode)
+        nopin = not pin
         if "error" in r:
             problems.append(f"{r['case']} {mode}: {r['error']}")
         elif base == "recent-control":
@@ -1132,6 +1147,9 @@ def main():
         args.config, args.models = str(base), "fake/oracle"
         if not args.pathological:
             args.pathological = ",".join(pathological.CASES)
+        # Layered summaries (issue #274) must recover buried details too.
+        if args.modes == "standard,smart":
+            args.modes = "standard,smart,smart-layered"
     if not args.models:
         p.error("--models is required (or use --self-test)")
     if args.reuse_compaction:
