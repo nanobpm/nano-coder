@@ -3988,7 +3988,6 @@ int runMain(string[] args)
         view.set("log", agent.log.match!(l => l.path, () => string.init));
         refreshStatus();
     }
-    console.afterStep = &refreshView;
 
     // The system prompt's plan section follows the mode; Shift-Tab and
     // mid-turn `/mode` or `/verbosity` change live state on the key-reader
@@ -4027,6 +4026,15 @@ int runMain(string[] args)
         syncMode();
         logVerbosityIfChanged();
     }
+    // Log mid-turn `/mode` and `/verbosity` changes after every model call
+    // and tool too, so a turn cut short by a crash still resumes with them.
+    // The end-of-turn sync above stays for changes after the last step.
+    console.afterStep = ()
+    {
+        refreshView();
+        logModeIfChanged();
+        logVerbosityIfChanged();
+    };
 
 
 
