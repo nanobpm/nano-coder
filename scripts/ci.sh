@@ -65,10 +65,11 @@ lint() {
 
 # Unit tests run modules in parallel (scripts/serial-tests lists the ones that
 # run alone) and fail a module over its time limit (scripts/slow-tests); CI
-# machines get 3x the limits. The 10 slowest modules are listed.
+# machines get 3x the limits. The 10 slowest modules are listed. NANO_TEST_ONLY
+# is cleared so an exported filter cannot make CI pass on a subset.
 unit() {
     step "dub test"
-    NANO_TEST_JOBS=${NANO_TEST_JOBS:-4} NANO_TEST_TIMES=${NANO_TEST_TIMES:-10} \
+    NANO_TEST_ONLY= NANO_TEST_JOBS=${NANO_TEST_JOBS:-4} NANO_TEST_TIMES=${NANO_TEST_TIMES:-10} \
         NANO_TEST_BUDGET_SCALE=${NANO_TEST_BUDGET_SCALE:-${CI:+3}} dub test -q
     step "test watchdog names a hung module"
     # NANO_TEST_STUCK=1 adds a module that never returns; the watchdog must
