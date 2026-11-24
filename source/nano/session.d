@@ -1144,6 +1144,8 @@ class SessionLog
         if (s.autoCompact >= 0) d["auto_compact"] = s.autoCompact != 0;
         if (!s.autoCompactThreshold.isNaN) d["auto_compact_threshold"] = s.autoCompactThreshold;
         if (s.contextWindow >= 0) d["context_window"] = s.contextWindow;
+        if (s.messages >= 0) d["session_messages"] = s.messages != 0;
+        if (s.messagesConfirm >= 0) d["session_messages_confirm"] = s.messagesConfirm != 0;
         write_(record("settings", d));
     }
 
@@ -1472,6 +1474,10 @@ struct SessionSettings
     double autoCompactThreshold = double.nan;
     /// The context-window override in tokens; 0 clears it (-1: unchanged).
     long contextWindow = -1;
+    /// Inter-session messages (`/messages on|off`, issue #336): 1 on, 0 off, -1 unchanged.
+    int messages = -1;
+    /// `/messages confirm on|off` (issue #336): 1 on, 0 off, -1 unchanged.
+    int messagesConfirm = -1;
 
     /// Field-wise: the NaN "unchanged" threshold equals itself, which a
     /// struct's default bitwise equality rejects.
@@ -1482,7 +1488,8 @@ struct SessionSettings
             && subagents == o.subagents && compactionMode == o.compactionMode && autoCompact == o.autoCompact
             && (autoCompactThreshold == o.autoCompactThreshold
                 || (autoCompactThreshold.isNaN && o.autoCompactThreshold.isNaN))
-            && contextWindow == o.contextWindow;
+            && contextWindow == o.contextWindow && messages == o.messages
+            && messagesConfirm == o.messagesConfirm;
     }
 }
 
@@ -2479,6 +2486,12 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
                 ulong n;
                 if (jsonUnsigned(*v, n) && n <= long.max) r.settings.contextWindow = n.to!long;
             }
+            if (auto v = "session_messages" in data)
+                if (v.type == JSONType.true_ || v.type == JSONType.false_)
+                    r.settings.messages = v.type == JSONType.true_ ? 1 : 0;
+            if (auto v = "session_messages_confirm" in data)
+                if (v.type == JSONType.true_ || v.type == JSONType.false_)
+                    r.settings.messagesConfirm = v.type == JSONType.true_ ? 1 : 0;
             break;
         default: // hooks, setting: audit only
             break;
@@ -3180,6 +3193,38 @@ unittest
     auto more = Message.user("more");
     again.append(more);
     assert(restore(log.path).settings.model == "mock/c");
+}
+
+// issue #336: the messaging switch and its confirm setting round-trip; the
+// latest record wins and a record that omits them leaves them unchanged.
+unittest
+{
+    auto dir = buildPath(tempDir, "nano-coder-session-settings-messages");
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/a", "/x");
+    auto sys = Message.system("sys");
+    log.append(sys);
+    assert(restore(log.path).settings.messages == -1 && restore(log.path).settings.messagesConfirm == -1);
+    SessionSettings on;
+    on.messages = 1;
+    on.messagesConfirm = 0;
+    log.settings(on);
+    SessionSettings other;
+    other.verbosity = "quiet";
+    log.settings(other);
+    auto r = restore(log.path);
+    assert(r.settings.messages == 1 && r.settings.messagesConfirm == 0);
+    SessionSettings off;
+    off.messages = 0;
+    log.settings(off);
+    std.file.append(log.path, `{"type":"settings","data":{"session_messages":"yes","session_messages_confirm":1}}` ~ "\n");
+    r = restore(log.path);
+    assert(r.settings.messages == 0 && r.settings.messagesConfirm == 0, "wrong types are ignored");
+    SessionSettings conf;
+    conf.messagesConfirm = 1;
+    log.settings(conf);
+    assert(restore(log.path).settings.messagesConfirm == 1);
 }
 
 // issue #297: a settings record with a cleared context window (0) restores

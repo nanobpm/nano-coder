@@ -215,3 +215,18 @@ unittest
     assert(v["subagent_models"].arrayNoRef.length == 1 && v["tests"]["fast"].integer == 1);
     assert(v["system_prompt"].str.canFind("[[subagent_models]]"));
 }
+
+unittest
+{
+    // Choosing off while already off still runs `/messages off` (issue #336):
+    // after a failed resume-listen the log can hold an on record that only
+    // the command's off record overrides.
+    auto dir = scratch("messages-off");
+    auto f = new Fixture;
+    auto h = host(f, buildPath(dir, "config.toml"));
+    f.msgOn = false;
+    // Messages(10) → Enabled(0) → No(1) → Back(2) → Save → Done
+    runSettings(new ScriptedUi(["10", "0", "1", "2", "11", "12"]), h);
+    assert(f.msgCalls == ["off"], f.msgCalls.to!string);
+    rmdirRecurse(dir);
+}

@@ -781,8 +781,8 @@ private void editMessages(SettingsUi ui, ref SettingsHost h, ref Changes changes
         if (sel == 0)
         {
             bool want;
-            if (!askYesNo(ui, "Listen for messages from other sessions and offer session_send?", on, want) || want == on)
-                continue;
+            if (!askYesNo(ui, "Listen for messages from other sessions and offer session_send?", on, want) || (want && want == on))
+                continue; // an off is always applied: it must record off (issue #336)
             if (h.messagesCommand !is null) ui.say(h.messagesCommand(want ? "on" : "off"));
             auto now = stateOf(h.messagesOn, want);
             if (now != want) continue; // could not switch: nothing to save

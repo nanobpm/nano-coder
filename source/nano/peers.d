@@ -352,9 +352,12 @@ struct PeerListener
     static PeerListener listen(string dir, string id, Chan!PeerRequest requests)
     {
         import std.socket : Socket, UnixAddress, SocketException, AddressFamily, SocketType;
-        import std.file : exists, remove;
+        import std.file : exists, remove, FileException;
         auto path = socketPath(dir, id);
-        auto socket = unixSocket();
+        Socket socket;
+        try socket = unixSocket();
+        catch (SocketException e)
+            throw new ListenError(format("cannot create a socket for %s: %s", path, e.msg));
         try
         {
             // A stale socket from a dead session is replaced; a live one
@@ -367,6 +370,12 @@ struct PeerListener
         {
             socket.close();
             throw new ListenError(format("cannot listen on %s: %s", path, e.msg));
+        }
+        catch (FileException e)
+        {
+            // An unremovable stale socket path: report it like a bind failure.
+            socket.close();
+            throw new ListenError(format("cannot replace stale socket %s: %s", path, e.msg));
         }
         auto impl = new Impl;
         impl.path = path;
@@ -1115,6 +1124,63 @@ imported!"nano.llm".ToolDefinition sendDefinition() pure
 // Tests: two in-process sessions over real registry sockets.
 // ---------------------------------------------------------------------------
 
+/// The messaging state a resume brings a session to (issue #336): `listen`
+/// and `confirm` are 1 on, 0 off, -1 keep what is live.
+struct MessagesTarget
+{
+    int listen = -1; /// the listener (`/messages on|off`)
+    int confirm = -1; /// `/messages confirm on|off`
+}
+
+/// What a resumed session's `settings` records (`recordOn`, `recordConfirm`:
+/// 1, 0 or -1 for none) restore. With `reset` (an in-process `/resume`,
+/// `session/load`), a setting the log never recorded goes back to the config
+/// default (`defOn`, `defConfirm`) so the session being left does not leak
+/// into it; on a startup `--resume` the live (launch) state stays.
+MessagesTarget restoredMessages(int recordOn, int recordConfirm, bool reset, bool defOn, bool defConfirm)
+    pure nothrow @nogc
+{
+    MessagesTarget t;
+    t.listen = recordOn >= 0 ? recordOn : reset ? (defOn ? 1 : 0) : -1;
+    t.confirm = recordConfirm >= 0 ? recordConfirm : reset ? (defConfirm ? 1 : 0) : -1;
+    return t;
+}
+
+unittest // restoredMessages: the record wins; unrecorded settings reset only on reset
+{
+    assert(restoredMessages(1, 0, false, false, true) == MessagesTarget(1, 0));
+    assert(restoredMessages(0, -1, true, true, false) == MessagesTarget(0, 0));
+    assert(restoredMessages(-1, -1, false, true, true) == MessagesTarget(-1, -1));
+    assert(restoredMessages(-1, -1, true, true, false) == MessagesTarget(1, 0));
+}
+
+/// Bring the live messaging state to `t` after a resume (issue #336), once
+/// the session's log and id are set so `start` binds the resumed session's
+/// socket. `listening`: a listener is open; `messagesOn`: the agent's switch,
+/// updated. A listener that can't start leaves messages off and returns why
+/// (the caller reports it; the resume goes on); null otherwise.
+string applyMessagesTarget(MessagesTarget t, PeerRouter router, bool listening, ref bool messagesOn,
+    scope string delegate() @safe start, scope void delegate() @safe stop)
+{
+    if (t.confirm >= 0) router.confirm(t.confirm != 0);
+    if (t.listen < 0) return null;
+    if (t.listen == 0)
+    {
+        if (listening) stop();
+        messagesOn = false;
+        return null;
+    }
+    if (listening && messagesOn) return null;
+    if (listening) stop();
+    if (auto failed = start())
+    {
+        messagesOn = false;
+        return "messages are off: could not listen for peer messages (" ~ failed ~ ")";
+    }
+    messagesOn = true;
+    return null;
+}
+
 version (unittest):
 
 /// A stand-in for the prompt loop's routing pass: drains the listener's
@@ -1192,6 +1258,73 @@ unittest
     Inbound inbound;
     assert(router.takeWaiting(inbound));
     settle(inbound, true);
+}
+
+// issue #336: a resumed `/messages on` record starts the listener under the
+// resumed id and a send from another session reaches it; `off` closes it;
+// the confirm setting is applied; a failed listen is reported, not thrown.
+unittest
+{
+    import std.file : exists, tempDir, mkdirRecurse, rmdirRecurse;
+    import std.path : buildPath;
+    import nano.control : TurnControl;
+    import nano.session : SessionLog, SessionSettings, restore;
+    import nano.llm : Message;
+    import core.atomic : atomicLoad;
+    auto root = buildPath(tempDir, "nano-d-peers-restore");
+    if (root.exists) rmdirRecurse(root);
+    scope (exit) rmdirRecurse(root);
+    mkdirRecurse(root);
+    // A session that turned messages on with confirm off, then quit.
+    auto log = new SessionLog(buildPath(root, "sessions"), "mock/m", root, "sess-resumed");
+    auto sys = Message.system("sys");
+    log.append(sys);
+    SessionSettings on;
+    on.messages = 1;
+    log.settings(on);
+    SessionSettings conf;
+    conf.messagesConfirm = 0;
+    log.settings(conf);
+    log.close();
+    auto r = restore(log.path);
+
+    auto control = new shared TurnControl;
+    auto router = PeerRouter.make(atomicLoad(control));
+    router.confirm(true);
+    PeerListener[] listener;
+    scope (exit) foreach (ref l; listener) l.close();
+    string startOk()
+    {
+        listener = [PeerListener.listen(root, r.id, router.requests)];
+        return null;
+    }
+    void stop()
+    {
+        foreach (ref l; listener) l.close();
+        listener = null;
+    }
+    bool messagesOn;
+    auto t = restoredMessages(r.settings.messages, r.settings.messagesConfirm, false, false, true);
+    assert(applyMessagesTarget(t, router, false, messagesOn, &startOk, &stop) is null);
+    assert(messagesOn && listener.length == 1 && !router.confirm);
+
+    auto pump = TestPump.start(router);
+    string note;
+    auto status = send(root, "sess-resumed", PeerMessage("sess-sender", "t", "after resume", "m-1", false), note);
+    pump.stop();
+    assert(status == Status.delivered, note);
+    Inbound inbound;
+    assert(router.takeWaiting(inbound) && inbound.pm.text == "after resume");
+    settle(inbound, true);
+
+    // An `off` record closes it.
+    assert(applyMessagesTarget(MessagesTarget(0, 1), router, true, messagesOn, &startOk, &stop) is null);
+    assert(!messagesOn && listener.length == 0 && router.confirm);
+
+    // A listener that can't start: reported, messages stay off.
+    string startFails() { return "Address already in use"; }
+    auto failed = applyMessagesTarget(MessagesTarget(1, -1), router, false, messagesOn, &startFails, &stop);
+    assert(failed.canFind("Address already in use") && !messagesOn, failed);
 }
 
 // Two sessions: one listening, one sending. Delivery idle (confirm off) is
@@ -1507,4 +1640,16 @@ unittest
     PeerRequest got;
     assert(requests.tryTake(got) && got.pm.text == "alive");
     assert(!requests.tryTake(got));
+}
+
+unittest // listen: an unremovable stale path is a ListenError, not a FileException
+{
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir, exists;
+    import std.path : buildPath;
+    import std.exception : assertThrown;
+    import nano.safeio : Chan;
+    auto dir = buildPath(tempDir, "nano-peers-stale-" ~ imported!"std.conv".to!string(imported!"std.process".thisProcessID));
+    mkdirRecurse(buildPath(dir, "blocked.sock", "child"));
+    scope (exit) if (dir.exists) rmdirRecurse(dir);
+    assertThrown!ListenError(PeerListener.listen(dir, "blocked", Chan!PeerRequest.make));
 }

@@ -541,7 +541,8 @@ A resumed session carries on with the runtime settings it stopped with, not the 
 the model (`/model`), the mode (`/mode`), verbosity (`/verbosity`), the thinking level
 (`/thinking`), the sub-agents switch (`/subagents on|off`) and the context settings (compaction
 mode, auto-compact on/off and its threshold, and the context-window override, as changed in the
-`/settings` panel's Context section). Each change is logged when it happens and the latest value
+`/settings` panel's Context section) and inter-session messages (`/messages on|off` and
+`/messages confirm on|off`, or the `/settings` panel). Each change is logged when it happens and the latest value
 wins; a session logged before this feature starts from the model its header recorded. Precedence:
 an explicit `-m`/`--model`, `--verbosity` or `--plan` on the resume command line wins, then the session's
 last value, then the config default. Explicit startup flags are recorded too, so a later resume
@@ -1289,7 +1290,9 @@ bridge can map it directly. The receiver serves only a peer with its own uid
 (`SO_PEERCRED`/`getpeereid`) and drops any other, and the 0700 registry directory keeps
 other users from planting or reaching a socket. `/messages on|off` and `/messages confirm
 on|off` switch the settings for the current session (`--save` writes them to the config
-file); `/messages` alone shows the state. With the Herdr integration active a received
+file); `/messages` alone shows the state. The state is restored on resume (`--resume`,
+`/resume`, `/relaunch`, ACP `session/load`): a session that had messages on listens again
+under its id; if the socket can't be opened the resume goes on with messages off and says why. With the Herdr integration active a received
 message shows as activity on the target's pane, and a session served over ACP can receive
 messages too (shown to the client as user input with the label; ACP has no question
 channel, so a message that would need confirmation is declined with a note asking the

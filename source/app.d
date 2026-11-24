@@ -994,27 +994,145 @@ string messagesCommand(Agent agent, ref Config cfg, string arg, ref PeerRouter r
     else if (words == "confirm off") { confirmChange = true; confirmValue = false; }
     else return "usage: /messages [on|off|confirm on|off] [--save]";
 
+    // A resume restores the session's messaging state (issue #336).
+    // Writing the record can recover a replaced log under a new session ID;
+    // a bound listener then answers for the old ID, so it is rebound. Returns
+    // the rebind failure (messaging is then off), or null.
+    string record(int on, int confirm, bool bound)
+    {
+        SessionSettings s;
+        s.messages = on;
+        s.messagesConfirm = confirm;
+        string before, after;
+        agent.log.ifSome((SessionLog l) { before = l.id; l.settings(s); after = l.id; });
+        if (on >= 0) agent.messagesWanted = on != 0;
+        if (!bound || before == after) return null;
+        stop();
+        if (auto failed = start())
+        {
+            agent.messagesOn = false;
+            return failed;
+        }
+        return null;
+    }
     string out_;
     if (confirmChange)
     {
+        string failed;
+        if (router.confirm != confirmValue)
+            failed = record(-1, confirmValue ? 1 : 0, listening && agent.messagesOn);
         router.confirm(confirmValue);
         out_ = format("Incoming messages %s for this session", confirmValue ? "wait for you to accept" : "are queued at once");
+        if (failed) out_ ~= "; the session ID changed and the listener could not rebind, so messages are off: " ~ failed;
     }
-    else if (on == agent.messagesOn && on == listening)
+    else if (on && agent.messagesOn && listening)
         out_ = stateText();
     else if (on)
     {
         if (auto failed = start()) out_ = "could not turn messages on: " ~ failed;
-        else out_ = "Messages on for this session (listening; session_send offered)";
+        else if (auto rebind = record(1, -1, true))
+            out_ = "could not turn messages on: the session ID changed and the listener could not rebind: " ~ rebind;
+        else
+            out_ = "Messages on for this session (listening; session_send offered)";
     }
     else
     {
-        stop();
+        // Always record an explicit off: a resume whose listener failed
+        // is live-off but still has an on record that would come back.
+        record(0, -1, false);
+        if (listening) stop();
         agent.messagesOn = false;
         out_ = "Messages off for this session (the socket is closed; session_send is gone from the next request)";
     }
     if (saveIt) out_ ~= "; " ~ persist();
     return out_;
+}
+
+unittest // `/messages off` after a failed resume-listen records off (issue #336)
+{
+    import std.file : exists, rmdirRecurse, tempDir;
+    import std.path : buildPath;
+    import nano.option : some;
+    import nano.permissions : Policy;
+    import nano.providers.mock : MockClient;
+    import nano.session : restore;
+    import nano.tools : ToolRegistry;
+    auto dir = buildPath(tempDir, "nano-coder-messages-off-record");
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/a", "/x");
+    auto sys = Message.system("sys");
+    log.append(sys);
+    SessionSettings rec;
+    rec.messages = 1;
+    log.settings(rec);
+    auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "sys");
+    agent.log = some(log);
+    // The resume restored the on record but the listener failed to start.
+    agent.messagesWanted = true;
+    agent.messagesOn = false;
+    Config cfg;
+    auto router = PeerRouter.make(agent.control.nonNull);
+    size_t stops;
+    string failStart() { return "Address already in use"; }
+    void stop() { stops++; }
+    messagesCommand(agent, cfg, "off", router, false, &failStart, &stop);
+    assert(restore(log.path).settings.messages == 0);
+    assert(!agent.messagesWanted && !agent.messagesOn && stops == 0);
+    // An on that fails keeps the off record and the off intent.
+    messagesCommand(agent, cfg, "on", router, false, &failStart, &stop);
+    assert(restore(log.path).settings.messages == 0 && !agent.messagesWanted);
+}
+
+unittest // a settings write that recovers the log under a new ID rebinds the listener (issue #336)
+{
+    import std.file : exists, remove, rmdirRecurse, tempDir, write;
+    import std.path : buildPath;
+    import nano.option : some;
+    import nano.permissions : Policy;
+    import nano.providers.mock : MockClient;
+    import nano.tools : ToolRegistry;
+    auto dir = buildPath(tempDir, "nano-coder-messages-rebind");
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "sys");
+    Config cfg;
+    auto router = PeerRouter.make(agent.control.nonNull);
+    string[] bound;
+    size_t stops;
+    bool fail;
+    SessionLog log;
+    string start()
+    {
+        if (fail) return "no socket";
+        bound ~= log.id;
+        agent.messagesOn = true;
+        return null;
+    }
+    void stop() { stops++; }
+    void replace()
+    {
+        remove(log.path);
+        write(log.path, "{\"type\":\"session\",\"data\":{}}\n");
+    }
+    log = new SessionLog(dir, "mock/a", "/x");
+    log.warn = (string) {};
+    agent.log = some(log);
+    auto sys = Message.system("sys");
+    log.append(sys);
+    // `/messages on`: the record write recovers the log under a new ID.
+    replace();
+    auto out_ = messagesCommand(agent, cfg, "on", router, false, &start, &stop);
+    assert(bound.length == 2 && bound[1] == log.id && bound[0] != log.id, out_);
+    assert(stops == 1 && agent.messagesOn, out_);
+    // A confirmation change while listening rebinds too; a failed rebind is messages off.
+    replace();
+    fail = true;
+    out_ = messagesCommand(agent, cfg, router.confirm ? "confirm off" : "confirm on", router, true, &start, &stop);
+    assert(stops == 2 && !agent.messagesOn, out_);
+    import std.algorithm : canFind;
+    assert(out_.canFind("could not rebind"), out_);
+    log.close();
 }
 
 /// Replays shown so far by `/subagents show` (UI thread only).
@@ -1373,12 +1491,14 @@ struct RuntimeDefaults
     bool autoCompact; /// `auto_compact`
     double autoCompactThreshold; /// `auto_compact_threshold`
     long contextWindow; /// top-level `context_window` (0: none)
+    bool sessionMessages; /// `session_messages`
+    bool sessionMessagesConfirm = true; /// `session_messages_confirm`
 
     /// The defaults `c` holds.
     static RuntimeDefaults of(const ref Config c) pure nothrow @nogc
     {
         return RuntimeDefaults(c.verbosity, c.subagents, c.compactionMode, c.autoCompact,
-            c.autoCompactThreshold, c.contextWindow);
+            c.autoCompactThreshold, c.contextWindow, c.sessionMessages, c.sessionMessagesConfirm);
     }
 
     /// These defaults with only the fields a save wrote (`ch`) taken from
@@ -1389,6 +1509,8 @@ struct RuntimeDefaults
         RuntimeDefaults r = this;
         if (ch.verbosity) r.verbosity = c.verbosity;
         if (ch.subagents) r.subagents = c.subagents;
+        if (ch.sessionMessages) r.sessionMessages = c.sessionMessages;
+        if (ch.sessionMessagesConfirm) r.sessionMessagesConfirm = c.sessionMessagesConfirm;
         if (ch.compaction)
         {
             r.compactionMode = c.compactionMode;
@@ -3923,7 +4045,12 @@ int runMain(string[] args)
         import nano.peers : ensureDir, peersDir;
         if (agent.log.isNone) return "this session isn't saved (--no-session), so it can't receive messages";
         auto dir = peersDir();
-        if (!ensureDir(dir)) return "could not create the peers directory " ~ dir;
+        import std.file : FileException;
+        try
+        {
+            if (!ensureDir(dir)) return "could not create the peers directory " ~ dir;
+        }
+        catch (FileException e) return "could not create the peers directory " ~ dir ~ ": " ~ e.msg;
         auto id = agent.log.unwrap("checked above").id;
         try
         {
@@ -3950,6 +4077,7 @@ int runMain(string[] args)
     }
     peerRouter = PeerRouter.make(agent.control.nonNull);
     peerRouter.confirm(cfg.sessionMessagesConfirm);
+    agent.messagesWanted = cfg.sessionMessages;
     if (cfg.sessionMessages)
         if (auto failed = startPeerListener())
             stdErr.writeln(console.red("[messages: " ~ failed ~ "]"));
@@ -4251,6 +4379,20 @@ int runMain(string[] args)
                 // provider's own window, not the top-level `context_window`.
                 agent.restoreConfiguredWindow(providerWindow(cfg.providers.get(client.providerName, ProviderConfig.init).contextWindow));
             }
+        }
+        // Inter-session messages (issue #336): the session's log and id are
+        // set by now, so a listener binds the resumed session's socket. A
+        // listener that can't start is reported; the resume goes on.
+        {
+            import nano.peers : applyMessagesTarget, restoredMessages;
+            auto target = restoredMessages(st.messages, st.messagesConfirm, !explicitFlags,
+                runtimeDefaults.sessionMessages, runtimeDefaults.sessionMessagesConfirm);
+            bool on = agent.messagesOn;
+            if (auto failed = applyMessagesTarget(target, peerRouter, peerListener.length != 0, on,
+                    &startPeerListener, &stopPeerListener))
+                notes ~= failed;
+            agent.messagesOn = on;
+            if (target.listen >= 0) agent.messagesWanted = target.listen != 0;
         }
         // The warnings `/model` and `/thinking` show for the restored values.
         foreach (w; agent.restoreWarnings(switchedModel, st.thinking.length > 0)) notes ~= "warning: " ~ w;
@@ -5025,6 +5167,19 @@ int runMain(string[] args)
                         auto retained = retainedRestartSettings(runtimeDefaults, verbosity, agent.subagentsOn,
                             agent.compactionMode, agent.autoCompact, agent.autoCompactThreshold,
                             agent.configuredWindow, agent.configuredWindowSource, hasRetained);
+                        // `/restart` keeps the messaging state too (issue #336).
+                        // The recorded intent, not the live state: a failed
+                        // listener does not turn an on record off.
+                        if (agent.messagesWanted != runtimeDefaults.sessionMessages)
+                        {
+                            retained.messages = agent.messagesWanted ? 1 : 0;
+                            hasRetained = true;
+                        }
+                        if (peerRouter.confirm != runtimeDefaults.sessionMessagesConfirm)
+                        {
+                            retained.messagesConfirm = peerRouter.confirm ? 1 : 0;
+                            hasRetained = true;
+                        }
                         if (hasRetained) logSessionSettings(retained);
                     }
                     lastLoggedMode = agent.control.mode;
@@ -5186,6 +5341,13 @@ int runMain(string[] args)
                 {
                     auto reply = messagesCommand(agent, cfg, arg, peerRouter, peerListener.length != 0,
                         &startPeerListener, &stopPeerListener);
+                    // `--save` wrote both switches to the config: they are the
+                    // new defaults a later `/resume` falls back to.
+                    if (imported!"std.algorithm.searching".canFind(reply, "saved to "))
+                    {
+                        runtimeDefaults.sessionMessages = cfg.sessionMessages;
+                        runtimeDefaults.sessionMessagesConfirm = cfg.sessionMessagesConfirm;
+                    }
                     writeln(reply);
                     continue;
                 }
@@ -5251,9 +5413,11 @@ int runMain(string[] args)
                     agent.stopSubagents(); // they belong to the session being left
                     try loadNotes = loadSession(path);
                     catch (Exception e) { writeln(e.msg); continue; }
+                    // Rebind first: the restored messaging state (issue
+                    // #336) then starts or stops the resumed id's listener.
+                    rebindPeerListener();
                     foreach (n; applyPendingSettings(false)) loadNotes ~= "nano-coder: " ~ n;
                     seedInputHistory(editor);
-                    rebindPeerListener();
                     if (gFrame) { gFrame.clear(); replayTranscript(agent, console); releaseHeap(); }
                     foreach (n; loadNotes) stdErr.writeln(n);
                     stdErr.flush();
