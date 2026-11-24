@@ -1626,6 +1626,46 @@ unittest // a restored window survives a model switch; a fallback drops it (issu
     assert(cfg.contextWindow == 128_000 && windowFor(cfg, p).tokens == 128_000);
 }
 
+/// The live configured window a restored record `recorded` (>= 0) sets on
+/// resume (issue #315): only a user override (not `fromProvider`) is kept;
+/// 0 ("from provider/model") and a provider-derived or legacy unmarked
+/// snapshot are dropped for the live provider's own window
+/// (`liveProviderWindow`, 0: none, so the window is probed or taken from the
+/// model catalogue), so a stale snapshot never outlives its provider.
+ConfiguredWindow resumedLiveWindow(long recorded, bool fromProvider, long liveProviderWindow) pure
+{
+    if (recorded > 0 && !fromProvider)
+        return ConfiguredWindow(toSize(recorded), "the session's settings");
+    return providerWindow(liveProviderWindow);
+}
+
+unittest // resume then provider switch: only a marked user override survives (issue #315)
+{
+    import nano.session : SessionSettings;
+    Config cfg;
+    ProviderConfig big, small;
+    big.contextWindow = 128_000;
+    small.contextWindow = 32_000;
+    // (1) a legacy unmarked snapshot (read back as provider-derived) from the
+    // old 128k provider: the switch to the 32k provider gets 32k.
+    SessionSettings legacy; // as `restore` yields an unmarked record
+    legacy.contextWindow = 128_000;
+    legacy.contextWindowFromProvider = true;
+    cfg.contextWindow = resumedContextWindow(0, 0, false, true, legacy.contextWindow, legacy.contextWindowFromProvider);
+    assert(windowFor(cfg, small).tokens == 32_000);
+    // The resumed live window is the current provider's, not the snapshot.
+    assert(resumedLiveWindow(legacy.contextWindow, true, 32_000).tokens == 32_000);
+    assert(resumedLiveWindow(legacy.contextWindow, true, 0).tokens == 0, "no provider window: probe");
+    // (2) a marked user override survives the switch.
+    cfg.contextWindow = resumedContextWindow(0, 0, false, true, 100_000, false);
+    assert(windowFor(cfg, small).tokens == 100_000);
+    assert(resumedLiveWindow(100_000, false, 32_000).tokens == 100_000);
+    // (3) a marked provider-derived snapshot behaves like (1).
+    cfg.contextWindow = resumedContextWindow(0, 0, false, true, 128_000, true);
+    assert(windowFor(cfg, small).tokens == 32_000 && windowFor(cfg, big).tokens == 128_000);
+    assert(resumedLiveWindow(128_000, true, 32_000).source == "provider context_window");
+}
+
 unittest // context_window 0 restores the provider's window, ignoring the top-level one
 {
     assert(providerWindow(32_000).tokens == 32_000);
@@ -4450,16 +4490,11 @@ int runMain(string[] args)
             // window from `cfg`; issue #315). 0 clears the top-level window.
             cfg.contextWindow = resumedContextWindow(cfg.contextWindow, runtimeDefaults.contextWindow, false, true, st.contextWindow,
                 st.contextWindowFromProvider);
-            if (st.contextWindow > 0)
-                // Keep a provider snapshot's source, so re-recording it (e.g.
-                // `--resume -m <same model>`) keeps the provider mark.
-                agent.setConfiguredWindow(ConfiguredWindow(toSize(st.contextWindow),
-                    st.contextWindowFromProvider ? "provider context_window" : "the session's settings"));
-            else
             {
-                // 0 is "from provider/model" (as `/settings` offers it): the
-                // provider's own window, not the top-level `context_window`.
-                agent.restoreConfiguredWindow(providerWindow(cfg.providers.get(client.providerName, ProviderConfig.init).contextWindow));
+                const w = resumedLiveWindow(st.contextWindow, st.contextWindowFromProvider,
+                    cfg.providers.get(client.providerName, ProviderConfig.init).contextWindow);
+                if (w.source == "the session's settings") agent.setConfiguredWindow(w);
+                else agent.restoreConfiguredWindow(w);
             }
         }
         // Inter-session messages (issue #336): the session's log and id are

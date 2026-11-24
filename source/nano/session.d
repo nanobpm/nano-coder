@@ -1164,7 +1164,7 @@ class SessionLog
         if (s.autoCompact >= 0) d["auto_compact"] = s.autoCompact != 0;
         if (!s.autoCompactThreshold.isNaN) d["auto_compact_threshold"] = s.autoCompactThreshold;
         if (s.contextWindow >= 0) d["context_window"] = s.contextWindow;
-        if (s.contextWindow > 0 && s.contextWindowFromProvider) d["context_window_source"] = "provider";
+        if (s.contextWindow > 0) d["context_window_source"] = s.contextWindowFromProvider ? "provider" : "user";
         if (s.messages >= 0) d["session_messages"] = s.messages != 0;
         if (s.messagesConfirm >= 0) d["session_messages_confirm"] = s.messagesConfirm != 0;
         write_(record("settings", d));
@@ -2513,11 +2513,13 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
                 if (jsonUnsigned(*v, n) && n <= long.max)
                 {
                     r.settings.contextWindow = n.to!long;
-                    // The source travels with its window: a record without
-                    // it is an explicit override.
+                    // The source travels with its window. Only a record
+                    // marked "user" is an explicit override; a legacy
+                    // unmarked (or unknown) one is treated as a provider
+                    // snapshot, so a resume never promotes it (issue #315).
                     auto src = "context_window_source" in data;
-                    r.settings.contextWindowFromProvider = src !is null && src.type == JSONType.string
-                        && src.str == "provider";
+                    r.settings.contextWindowFromProvider = !(src !is null && src.type == JSONType.string
+                        && src.str == "user");
                 }
             }
             if (auto v = "session_messages" in data)
@@ -3213,7 +3215,8 @@ unittest
     auto more = Message.user("more");
     again.append(more);
     assert(restore(log.path).settings.model == "mock/c");
-    assert(!restore(log.path).settings.contextWindowFromProvider, "no source: an explicit override");
+    assert(!restore(log.path).settings.contextWindowFromProvider, "written without the provider mark: a user override");
+    assert(imported!"std.algorithm".canFind(readText(log.path), `"context_window_source":"user"`));
     // A provider snapshot keeps its source; a later override drops it.
     SessionSettings snap;
     snap.contextWindow = 128_000;
@@ -3224,6 +3227,13 @@ unittest
     explicitSame.contextWindow = 128_000;
     again.settings(explicitSame);
     assert(!restore(log.path).settings.contextWindowFromProvider);
+    // A legacy record with no source mark is provider-derived, not an override.
+    {
+        import std.file : append;
+        append(log.path, `{"type":"settings","data":{"context_window":90000}}` ~ "\n");
+    }
+    assert(restore(log.path).settings.contextWindow == 90_000);
+    assert(restore(log.path).settings.contextWindowFromProvider, "unmarked legacy snapshot promoted to an override");
 }
 
 // issue #336: the messaging switch and its confirm setting round-trip; the
