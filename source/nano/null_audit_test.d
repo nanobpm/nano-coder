@@ -28,6 +28,7 @@ static import nano.emoji_table;
 static import nano.frame;
 static import nano.frameui;
 static import nano.extract;
+static import nano.summary_dag;
 static import nano.goal;
 static import nano.session_settings;
 static import nano.guard;
@@ -124,6 +125,7 @@ private alias modules = imported!"std.meta".AliasSeq!(
     nano.frame,
     nano.frameui,
     nano.extract,
+    nano.summary_dag,
     nano.goal,
     nano.session_settings,
     nano.guard,

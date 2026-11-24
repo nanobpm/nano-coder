@@ -3781,6 +3781,7 @@ int runMain(string[] args)
     agent.idleCompact = cfg.idleCompact;
     agent.verifyBeforeComplete = cfg.verifyBeforeComplete;
     agent.compactionPinRequests = cfg.compactionPinRequests;
+    agent.compactionSummaryDag = cfg.compactionSummaryDag;
     agent.autoCompactThreshold = cfg.autoCompactThreshold;
     {
         import nano.context : parseCompactionMode;

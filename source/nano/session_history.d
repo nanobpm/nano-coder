@@ -14,6 +14,7 @@ import std.format : format;
 import std.json;
 import std.string : strip, indexOf;
 import nano.llm : Message, Role, ToolDefinition;
+import nano.summary_dag : SummaryNode, fromJson, header, nodeName, parseNodeName;
 
 enum searchTool = "history_search";
 enum readTool = "history_read";
@@ -67,10 +68,11 @@ ToolDefinition[] definitions(bool crossSession = true) pure
             ~ "phrase, an identifier, a flag) over common words, and use order=oldest for things from early on. "
             ~ "An assistant message that follows tool output is often a paraphrase: read the output it names. "
             ~ "Results are history, not the current state of files.",
-            parseJSON(`{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression (case-insensitive); plain text works too"},"role":{"type":"string","enum":["user","assistant","tool"],"description":"Only messages with this role. Command output and errors are in tool messages; omit role to search everything"},"before":{"type":"integer","description":"Only messages with an ID below this"},"after":{"type":"integer","description":"Only messages with an ID above this"},"order":{"type":"string","enum":["newest","oldest"],"description":"Result order (default newest first)"},"limit":{"type":"integer","description":"Maximum messages returned (default 20, max 100)"}` ~ (crossSession ? sessionProp : "") ~ `},"required":["pattern"]}`)),
+            parseJSON(`{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression (case-insensitive); plain text works too"},"role":{"type":"string","enum":["user","assistant","tool"],"description":"Only messages with this role. Command output and errors are in tool messages; omit role to search everything"},"before":{"type":"integer","description":"Only messages with an ID below this"},"after":{"type":"integer","description":"Only messages with an ID above this"},"order":{"type":"string","enum":["newest","oldest"],"description":"Result order (default newest first)"},"limit":{"type":"integer","description":"Maximum messages returned (default 20, max 100)"},"node":{"type":"string","description":"Only messages in this summary node's range (e.g. \"S3\")"}` ~ (crossSession ? sessionProp : "") ~ `},"required":["pattern"]}`)),
         ToolDefinition(readTool,
-            "Read one original message of this session in full by its ID (#N from a summary or history_search).",
-            parseJSON(`{"type":"object","properties":{"id":{"type":"integer","description":"Message ID (the N in #N)"},"max_output_length":{"type":"integer","description":"Maximum characters to return (default 40000)"}` ~ (crossSession ? sessionProp : "") ~ `},"required":["id"]}`)),
+            "Read one original message of this session in full by its ID (#N from a summary or history_search). "
+            ~ "With node=\"S3\" it instead expands that summary node one level down: the nodes it condensed, or its original messages.",
+            parseJSON(`{"type":"object","properties":{"id":{"type":"integer","description":"Message ID (the N in #N)"},"node":{"type":"string","description":"A summary node name such as \"S3\" to expand instead of a message"},"max_output_length":{"type":"integer","description":"Maximum characters to return (default 40000)"}` ~ (crossSession ? sessionProp : "") ~ `},"required":[]}`)),
     ];
 }
 
@@ -286,6 +288,16 @@ string search(string path, JSONValue args)
     string role;
     if (auto r = "role" in args.objectNoRef) if (r.type == JSONType.string) role = r.str;
     auto before = idArg(args, "before", false), after = idArg(args, "after", false);
+    if (auto nv = "node" in args.objectNoRef)
+    {
+        // Only the node's range (issue #274), within any before/after given.
+        auto node = findNode(path, nodeArg(*nv));
+        if (node.first)
+        {
+            if (!after || node.first - 1 > after) after = node.first - 1;
+            if (!before || node.last + 1 < before) before = node.last + 1;
+        }
+    }
     size_t limit = defaultLimit;
     if (auto l = "limit" in args.objectNoRef)
     {
@@ -419,11 +431,79 @@ string search(string path, JSONValue args)
     return out_;
 }
 
+/// The node ID in a tool argument (`"S7"`), or a HistoryError.
+private uint nodeArg(const JSONValue v)
+{
+    if (v.type == JSONType.string)
+        foreach (id; parseNodeName(v.str)) return id;
+    throw new HistoryError(`node must be a summary node name such as "S3"`);
+}
+
+/// The summary nodes with the given IDs, from the `summary_nodes` of the
+/// log's `replace` records (issue #274). Streams the log; only the
+/// asked-for nodes are kept.
+private SummaryNode[uint] findNodes(string path, const uint[] ids)
+{
+    import nano.session : foreachLogLineSkippingTorn;
+    SummaryNode[uint] found;
+    foreachLogLineSkippingTorn(path, (const(char)[] line) {
+        if (found.length == ids.length || line.indexOf(`"summary_nodes"`) < 0) return;
+        JSONValue rec;
+        try rec = parseJSON(line);
+        catch (JSONException) return; // a torn or foreign line holds no node
+        auto d = "data" in rec.objectNoRef;
+        if (d is null || d.type != JSONType.object) return;
+        auto ns = "summary_nodes" in d.objectNoRef;
+        if (ns is null || ns.type != JSONType.array) return;
+        foreach (j; ns.arrayNoRef)
+            foreach (n; fromJson(j))
+                if (ids.canFind(n.id)) found[n.id] = n;
+    });
+    return found;
+}
+
+private SummaryNode findNode(string path, uint id)
+{
+    auto got = findNodes(path, [id]);
+    if (auto n = id in got) return *n;
+    throw new HistoryError(format("no summary node %s in this session (nodes are recorded by layered compaction)",
+        nodeName(id)));
+}
+
+/// `history_read` of a node: its prose, then its children's (a condensed
+/// node) or a one-line digest of each original message it covers (level 0).
+private string expandNode(string path, uint id)
+{
+    import nano.session : foreachLogLineSkippingTorn;
+    auto node = findNode(path, id);
+    auto text = header(node) ~ "\n" ~ node.text ~ "\n";
+    if (node.children.length)
+    {
+        auto kids = findNodes(path, node.children);
+        text ~= format("\nIt condensed %s nodes; history_read one of them for more:\n", node.children.length);
+        foreach (c; node.children)
+            if (auto k = c in kids) text ~= "\n" ~ header(*k) ~ "\n" ~ k.text ~ "\n";
+            else text ~= "\n" ~ nodeName(c) ~ ": not found in the log\n";
+        return text;
+    }
+    if (!node.first) return text ~ "\n(the node's message range is unknown)";
+    text ~= format("\nOriginal messages #%s-#%s (history_read an ID for the whole message):\n", node.first, node.last);
+    ulong n;
+    foreachLogLineSkippingTorn(path, (const(char)[] logLine) {
+        ++n;
+        if (n < node.first || n > node.last || !logLine.length) return;
+        Message m;
+        if (!messageLine(logLine, m) || m.role == Role.system) return;
+        auto body_ = searchable(m);
+        text ~= label(n, m) ~ ": " ~ snippet(body_, 0, 0) ~ "\n";
+    }, (head) => headMayBeMessage(head));
+    return text;
+}
+
 /// `history_read`: one message in full, bounded (the whole is spilled to a file).
 string read(string path, JSONValue args)
 {
     import nano.tools : truncateOutput, defaultMaxOutput, maxOutputLimit;
-    auto id = idArg(args, "id", true);
     size_t limit = defaultMaxOutput;
     if (auto l = "max_output_length" in args.objectNoRef)
     {
@@ -434,6 +514,15 @@ string read(string path, JSONValue args)
         if (n <= 0) throw new HistoryError("max_output_length must be a positive integer");
         limit = min(toSize(n), maxOutputLimit);
     }
+    // A summary node (`S7`, issue #274) expands to the next level down.
+    if (auto v = args.type == JSONType.object ? "node" in args.objectNoRef : null)
+        if (v.type != JSONType.null_)
+            return truncateOutput(expandNode(path, nodeArg(*v)), limit, "history-node");
+    // A node name passed as the id is expanded too.
+    if (auto v = args.type == JSONType.object ? "id" in args.objectNoRef : null)
+        if (v.type == JSONType.string && parseNodeName(v.str).isSome)
+            return truncateOutput(expandNode(path, nodeArg(*v)), limit, "history-node");
+    auto id = idArg(args, "id", true);
     // Stream the log (issue #271): only the target message is retained, so
     // reading one message from a huge session stays bounded.
     import nano.session : foreachLogLineSkippingTorn;

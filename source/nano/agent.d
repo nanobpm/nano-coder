@@ -33,6 +33,7 @@ import nano.goal : Outcome, OutcomeStatus, verifyReminder, outcomeToolName = too
 import nano.reminders : Reminders, wrap;
 import mem = nano.memory;
 import ctx = nano.context;
+import dag = nano.summary_dag;
 import hist = nano.session_history;
 import cross = nano.cross_session;
 import peers = nano.peers;
@@ -424,6 +425,12 @@ class Agent
     /// Pin the user's requests verbatim after each compaction summary
     /// (`compaction_pin_requests`, issue #66).
     bool compactionPinRequests = true;
+    /// Layer smart/extract summaries into a summary DAG instead of
+    /// re-summarising the previous summary (`compaction_summary_dag`, issue #274).
+    bool compactionSummaryDag;
+    /// The node-prose budget of a layered summary in bytes; 0 derives it
+    /// from the window (tests set it to force a condensation).
+    size_t summaryDagBudgetBytes;
     /// The accepted input whose turn has not ended (redelivering its id resumes it).
     bool hasPending;
     PendingInput pending;
@@ -2188,8 +2195,21 @@ class Agent
         auto summarized = messages[bodyStart .. split].dup;
         if (!summarized.length) return false;
         auto tokensBefore = estimateContextTokens();
+        // Layered (issue #274): the previous summary's nodes are carried
+        // forward verbatim and only the new span is summarized.
+        immutable layered = smart && compactionSummaryDag;
+        dag.SummaryNode[] nodes;
+        Message[] source = summarized;
+        if (layered)
+        {
+            source = null;
+            foreach (ref x; summarized)
+                if (ctx.isSummaryMessage(x)) nodes ~= dag.parse(x.content);
+                else source ~= x;
+        }
+        string leafText;
         ulong first, last;
-        foreach (ref x; summarized)
+        foreach (ref x; source)
             if (x.logLine)
             {
                 if (!first || x.logLine < first) first = x.logLine;
@@ -2212,7 +2232,8 @@ class Agent
             // Built in code: no model call, so no usage, retry or fallback.
             import nano.extract : extractSummary;
             const swStart = monoNow;
-            summary = ctx.smartSummaryPrefix ~ "\n" ~ extractSummary(summarized) ~ "\n\n" ~ ctx.smartSummaryNote(first, last);
+            leafText = extractSummary(source);
+            summary = ctx.smartSummaryPrefix ~ "\n" ~ leafText ~ "\n\n" ~ ctx.smartSummaryNote(first, last);
             summaryMs = since(swStart).total!"msecs";
         }
         else for (;;)
@@ -2232,13 +2253,13 @@ class Agent
             if (learnedCap && learnedCap < budget) budget = learnedCap;
             auto inputWindow = saturatingSub(window, budget);
             auto chars = checkedMul(max(saturatingSub(inputWindow, 2_000), 2_000), 3);
-            auto request = "Conversation to summarize:\n\n" ~ ctx.renderTranscript(summarized, chars, smart);
+            auto request = "Conversation to summarize:\n\n" ~ ctx.renderTranscript(source, chars, smart);
             if (focus.strip.length) request ~= "\n\nWhen summarizing, focus on: " ~ focus.strip;
             ChatRequest req;
             auto system = ctx.summarySystemPrompt ~ (smart ? ctx.smartSummaryInstructions : "");
             // A repeated compaction folds the previous summary back in: warn
             // that it is lossy (issue #66).
-            if (summarized.canFind!((ref m) => ctx.isSummaryMessage(m)))
+            if (source.canFind!((ref m) => ctx.isSummaryMessage(m)))
                 system ~= compactionPinRequests ? ctx.earlierSummaryLossyInstructions : ctx.earlierSummaryLossyNoPinInstructions;
             req.messages = [Message.system(system), Message.user(request)];
             req.maxTokens = budget;
@@ -2261,6 +2282,7 @@ class Agent
                 if (body_.length)
                 {
                     if (truncated) body_ ~= ctx.summaryTruncatedNote;
+                    leafText = body_;
                     summary = smart ? ctx.smartSummaryPrefix ~ "\n" ~ body_ ~ "\n\n" ~ ctx.smartSummaryNote(first, last)
                         : ctx.summaryPrefix ~ "\n" ~ body_;
                 }
@@ -2306,6 +2328,32 @@ class Agent
             auto note = format("[%s earlier messages were removed to fit the context window; no summary is available]",
                 summarized.length);
             summary = smart && first ? ctx.smartSummaryPrefix ~ "\n" ~ note ~ "\n\n" ~ ctx.smartSummaryNote(first, last) : note;
+            leafText = note;
+        }
+        dag.SummaryNode[] newNodes;
+        if (layered)
+        {
+            auto leaf = dag.SummaryNode(dag.nextId(nodes), 0, first, last, null, leafText);
+            nodes ~= leaf;
+            newNodes ~= leaf;
+            immutable dagBudget = summaryDagBudgetBytes ? summaryDagBudgetBytes : condenseBudgetBytes(window);
+            if (auto k = dag.condenseCount(nodes, dagBudget))
+            {
+                auto children = nodes[0 .. k];
+                auto text = m == ctx.CompactionMode.extract ? dag.deterministicText(children, dagBudget / 4)
+                    : condenseByModel(children, dagBudget / 4, ev);
+                auto c = dag.condensed(children, dag.nextId(nodes), text);
+                nodes = c ~ nodes[k .. $];
+                newNodes ~= c;
+            }
+            ulong lo = nodes[0].first, hi;
+            foreach (ref x; nodes)
+            {
+                if (x.first && (!lo || x.first < lo)) lo = x.first;
+                if (x.last > hi) hi = x.last;
+            }
+            summary = ctx.smartSummaryPrefix ~ "\n" ~ dag.render(nodes) ~ "\n\n" ~ dag.expandNote ~ "\n\n"
+                ~ ctx.smartSummaryNote(lo, hi);
         }
         if (planTools && !plan.empty) summary ~= "\n\n" ~ plan.contextNote();
         // Pin the user's own words, rebuilt from the originals every time.
@@ -2436,7 +2484,7 @@ class Agent
             import std.conv : to;
             l.replace(messages, first, last, ctx.modeName(m), client.providerName ~ "/" ~ client.modelName, pinnedNew,
                 hasPending ? &pending : null, folded, extendsStash ? some(stashBase) : Option!size_t.init, replayRestated,
-                pinnedBase, trigger.to!string);
+                pinnedBase, trigger.to!string, newNodes);
         });
         // The replace record is durable: the live state now matches the log,
         // so nothing past this point may roll it back.
@@ -2462,6 +2510,36 @@ class Agent
         historyAvailable = historyHintPending = ctx.citesHistory(m);
         if (onCompacted !is null) onCompacted(report);
         return true;
+    }
+
+    /// The byte budget of a layered summary's node prose (issue #274): about
+    /// a tenth of the window in tokens, at ~3 bytes per token.
+    private static size_t condenseBudgetBytes(size_t window) pure nothrow @nogc
+    {
+        auto b = window / 10 * 3;
+        return b < 4_000 ? 4_000 : b;
+    }
+
+    /// The one condensation call of a layered compaction (issue #274): the
+    /// model merges `children` into one summary. Any failure falls back to
+    /// the deterministic condensation, so a compaction never fails here.
+    private string condenseByModel(const dag.SummaryNode[] children, size_t maxBytes, Option!AgentEvents ev)
+    {
+        ChatRequest req;
+        req.messages = [Message.system(dag.condenseSystemPrompt), Message.user(dag.condenseRequest(children))];
+        req.maxTokens = toLong(maxBytes / 3 < 256 ? 256 : maxBytes / 3);
+        req.temperature = temperatureFor(thinking().alwaysAnthropicThinking).effective;
+        import std.exception : collectException;
+        string t;
+        auto err = collectException(() {
+            foreach (e; ev) e.summaryStart();
+            auto r = client.chat(req, (bool, string) {});
+            recordUsage(r.usage);
+            foreach (e; ev) e.usage(r.usage);
+            t = r.content.strip;
+        }());
+        if (err !is null) stdErr.writefln("[agent] condensing summaries failed (%s); condensing in code", err.msg);
+        return t.length ? t : dag.deterministicText(children, maxBytes);
     }
 
     private void recordUsage(TokenUsage u) pure

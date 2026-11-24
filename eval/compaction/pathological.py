@@ -241,7 +241,7 @@ def check(case, mode, records, seeded):
         # that is only a problem when the case needs every one.
         if want > 1 or not replaces:
             problems.append(f"{len(replaces)} of {want} compactions happened")
-    sizes = []
+    sizes, leaves = [], []
     for k, data in enumerate(replaces, 1):
         messages = data.get("messages") or []
         summary = _summary_of(messages)
@@ -249,6 +249,11 @@ def check(case, mode, records, seeded):
             problems.append(f"compaction {k} wrote an empty summary")
             continue
         sizes.append(len(summary))
+        # A layered summary (issue #274) grows by its new node until the
+        # nodes are condensed: that growth is the design, not a ratchet.
+        blocks = summary.split("[[node ")
+        leaves.append(len("[[node ") + len(blocks[-1].split("\n\n[The summary above is layered")[0])
+                      if "-layered" in mode and len(blocks) > 1 else 0)
         if case.get("expect_fallback") and mode.startswith("extract"):
             # Extract makes no model call, so a failing model can't fail it:
             # it must write its normal summary.
@@ -273,7 +278,8 @@ def check(case, mode, records, seeded):
         # summary being folded in and restated: a ratchet. The first step is
         # exempt, as the first summary is folded in once.
         step = len(case.get("between", ACK_PROMPT)) + 32
-        grown = [(k + 1, b - a) for k, (a, b) in enumerate(zip(sizes[1:], sizes[2:]), 2) if b - a > step]
+        grown = [(k + 1, b - a) for k, (a, b) in enumerate(zip(sizes[1:], sizes[2:]), 2)
+                 if b - a > step + (leaves[k] if k < len(leaves) else 0)]
         if grown:
             problems.append(f"summary ratchets upwards across compactions: sizes {sizes}, "
                             f"(compaction, growth) beyond {step} chars: {grown}")
