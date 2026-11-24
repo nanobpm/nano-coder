@@ -1236,7 +1236,9 @@ context window, the oldest six are condensed into one node a level up: one extra
 grows only logarithmically with session length, and early detail stays one lookup away:
 `history_read(node="S7")` expands a node to the nodes it condensed, or a level-0 node to a
 one-line digest of each original message it covers; `history_search(…, node="S7")` searches
-only that node's range. Each compaction's `replace` record lists the nodes it created under
+only that node's range (a node with no recorded range is an error rather than a whole-session
+search). The rendered node list is capped at twice that budget in bytes: over it, each node
+keeps its header and its prose is cut to an equal share. Each compaction's `replace` record lists the nodes it created under
 `summary_nodes`; older records are read as before.
 
 #### Agent-adjusted compaction
