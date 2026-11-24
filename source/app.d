@@ -1584,16 +1584,34 @@ ConfiguredWindow providerWindow(long providerWindow) pure
         : ConfiguredWindow.init;
 }
 
-unittest // a restored window held in the live config survives a model switch (issue #315)
+/// The live `context_window` after `--resume` (issue #315): the recorded
+/// window when it applies to the live model (0 clears the top-level one),
+/// else the configured default when the resume resets runtime settings,
+/// else unchanged. Held in `cfg` so a later `/model` switch keeps it.
+long resumedContextWindow(long current, long configured, bool reset, bool recordedApplies, long recorded)
+    pure nothrow @nogc
+{
+    if (recordedApplies && recorded >= 0) return recorded;
+    return reset ? configured : current;
+}
+
+unittest // a restored window survives a model switch; a fallback drops it (issue #315)
 {
     Config cfg;
-    cfg.contextWindow = 100_000;
     ProviderConfig p;
     p.contextWindow = 32_000;
-    cfg.contextWindow = 50_000; // restored override
+    cfg.contextWindow = 100_000; // previous session's unsaved override
+    // Recorded override applies: a later windowFor (as `/model` does) keeps it.
+    cfg.contextWindow = resumedContextWindow(cfg.contextWindow, 0, true, true, 50_000);
     assert(windowFor(cfg, p).tokens == 50_000);
-    cfg.contextWindow = 0; // restored "from provider/model"
+    // Recorded "from provider/model" (0): the provider's window.
+    cfg.contextWindow = resumedContextWindow(100_000, 0, true, true, 0);
     assert(windowFor(cfg, p).tokens == 32_000 && windowFor(cfg, p).source == "provider context_window");
+    // Fallback model: the recorded window does not apply; back to the default.
+    cfg.contextWindow = resumedContextWindow(100_000, 64_000, true, false, 50_000);
+    assert(windowFor(cfg, p).tokens == 64_000);
+    // Explicit flags (no reset) and nothing recorded: unchanged.
+    assert(resumedContextWindow(100_000, 64_000, false, false, -1) == 100_000);
 }
 
 unittest // context_window 0 restores the provider's window, ignoring the top-level one
@@ -4363,7 +4381,7 @@ int runMain(string[] args)
             agent.setConfiguredWindow(runtimeDefaults.window(cfg.providers.get(client.providerName, ProviderConfig.init).contextWindow));
             // The live config too: a later `/model` builds its window from
             // it, so the previous session's override must not come back.
-            cfg.contextWindow = runtimeDefaults.contextWindow;
+            cfg.contextWindow = resumedContextWindow(cfg.contextWindow, runtimeDefaults.contextWindow, true, false, -1);
         }
         if (explicitFlags && o.plan)
         {
@@ -4416,7 +4434,7 @@ int runMain(string[] args)
             // Held in the live config like an unsaved `/settings` edit, so
             // a later `/model` switch keeps it (`switchModel` builds the
             // window from `cfg`; issue #315). 0 clears the top-level window.
-            cfg.contextWindow = st.contextWindow;
+            cfg.contextWindow = resumedContextWindow(cfg.contextWindow, runtimeDefaults.contextWindow, false, true, st.contextWindow);
             if (st.contextWindow > 0)
                 agent.setConfiguredWindow(ConfiguredWindow(toSize(st.contextWindow), "the session's settings"));
             else
