@@ -1588,15 +1588,15 @@ ConfiguredWindow providerWindow(long providerWindow) pure
 /// window when it applies to the live model (0 clears the top-level one),
 /// else the configured default when the resume resets runtime settings,
 /// else unchanged. Held in `cfg` so a later `/model` switch keeps it.
-/// A recorded window equal to the live provider's own `context_window`
-/// (`liveProviderWindow`) is a snapshot `useClient` took of that provider's
-/// limit, not an explicit override: it clears the top-level window so the
-/// next provider's limit applies, like 0.
+/// A recorded window marked `recordedFromProvider` is a snapshot `useClient`
+/// took of the provider's limit, not an explicit override: it clears the
+/// top-level window so the next provider's limit applies, like 0. The mark,
+/// not numeric equality, decides: an explicit override may equal the limit.
 long resumedContextWindow(long current, long configured, bool reset, bool recordedApplies, long recorded,
-    long liveProviderWindow = 0) pure nothrow @nogc
+    bool recordedFromProvider = false) pure nothrow @nogc
 {
     if (recordedApplies && recorded >= 0)
-        return liveProviderWindow > 0 && recorded == liveProviderWindow ? 0 : recorded;
+        return recordedFromProvider ? 0 : recorded;
     return reset ? configured : current;
 }
 
@@ -1617,12 +1617,13 @@ unittest // a restored window survives a model switch; a fallback drops it (issu
     assert(windowFor(cfg, p).tokens == 64_000);
     // Explicit flags (no reset) and nothing recorded: unchanged.
     assert(resumedContextWindow(100_000, 64_000, false, false, -1) == 100_000);
-    // A provider-window snapshot (recorded == the live provider's window) is
-    // not an override: a later switch to a 32k provider gets 32k, not 128k.
-    cfg.contextWindow = resumedContextWindow(0, 0, false, true, 128_000, 128_000);
+    // A provider-window snapshot is not an override: a later switch to a
+    // 32k provider gets 32k, not 128k.
+    cfg.contextWindow = resumedContextWindow(0, 0, false, true, 128_000, true);
     assert(cfg.contextWindow == 0 && windowFor(cfg, p).tokens == 32_000);
-    // A recorded window that differs from the provider's is an override.
-    assert(resumedContextWindow(0, 0, false, true, 50_000, 128_000) == 50_000);
+    // An explicit override equal to the provider's limit stays an override.
+    cfg.contextWindow = resumedContextWindow(0, 0, false, true, 128_000, false);
+    assert(cfg.contextWindow == 128_000 && windowFor(cfg, p).tokens == 128_000);
 }
 
 unittest // context_window 0 restores the provider's window, ignoring the top-level one
@@ -4448,7 +4449,7 @@ int runMain(string[] args)
             // a later `/model` switch keeps it (`switchModel` builds the
             // window from `cfg`; issue #315). 0 clears the top-level window.
             cfg.contextWindow = resumedContextWindow(cfg.contextWindow, runtimeDefaults.contextWindow, false, true, st.contextWindow,
-                cfg.providers.get(agent.client.providerName, ProviderConfig.init).contextWindow);
+                st.contextWindowFromProvider);
             if (st.contextWindow > 0)
                 agent.setConfiguredWindow(ConfiguredWindow(toSize(st.contextWindow), "the session's settings"));
             else
@@ -4517,6 +4518,7 @@ int runMain(string[] args)
             import std.conv : to;
             explicitSettings.model = currentSpec();
             explicitSettings.contextWindow = agent.configuredWindow.to!long;
+            explicitSettings.contextWindowFromProvider = agent.configuredWindowSource == "provider context_window";
         }
         if (o.plan) explicitSettings.mode = agent.control.mode.name;
         if (o.verbosity.length) explicitSettings.verbosity = nano.ui.name(verbosity);

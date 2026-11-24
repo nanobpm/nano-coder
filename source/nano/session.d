@@ -1164,6 +1164,7 @@ class SessionLog
         if (s.autoCompact >= 0) d["auto_compact"] = s.autoCompact != 0;
         if (!s.autoCompactThreshold.isNaN) d["auto_compact_threshold"] = s.autoCompactThreshold;
         if (s.contextWindow >= 0) d["context_window"] = s.contextWindow;
+        if (s.contextWindow > 0 && s.contextWindowFromProvider) d["context_window_source"] = "provider";
         if (s.messages >= 0) d["session_messages"] = s.messages != 0;
         if (s.messagesConfirm >= 0) d["session_messages_confirm"] = s.messagesConfirm != 0;
         write_(record("settings", d));
@@ -1494,6 +1495,10 @@ struct SessionSettings
     double autoCompactThreshold = double.nan;
     /// The context-window override in tokens; 0 clears it (-1: unchanged).
     long contextWindow = -1;
+    /// `contextWindow` is a snapshot of the provider's own `context_window`
+    /// (a model switch records it), not an explicit override: a resume must
+    /// not carry it to another provider (issue #315).
+    bool contextWindowFromProvider;
     /// Inter-session messages (`/messages on|off`, issue #336): 1 on, 0 off, -1 unchanged.
     int messages = -1;
     /// `/messages confirm on|off` (issue #336): 1 on, 0 off, -1 unchanged.
@@ -1508,7 +1513,8 @@ struct SessionSettings
             && subagents == o.subagents && compactionMode == o.compactionMode && autoCompact == o.autoCompact
             && (autoCompactThreshold == o.autoCompactThreshold
                 || (autoCompactThreshold.isNaN && o.autoCompactThreshold.isNaN))
-            && contextWindow == o.contextWindow && messages == o.messages
+            && contextWindow == o.contextWindow && contextWindowFromProvider == o.contextWindowFromProvider
+            && messages == o.messages
             && messagesConfirm == o.messagesConfirm;
     }
 }
@@ -2504,7 +2510,15 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
             if (auto v = "context_window" in data)
             {
                 ulong n;
-                if (jsonUnsigned(*v, n) && n <= long.max) r.settings.contextWindow = n.to!long;
+                if (jsonUnsigned(*v, n) && n <= long.max)
+                {
+                    r.settings.contextWindow = n.to!long;
+                    // The source travels with its window: a record without
+                    // it is an explicit override.
+                    auto src = "context_window_source" in data;
+                    r.settings.contextWindowFromProvider = src !is null && src.type == JSONType.string
+                        && src.str == "provider";
+                }
             }
             if (auto v = "session_messages" in data)
                 if (v.type == JSONType.true_ || v.type == JSONType.false_)
@@ -3199,6 +3213,17 @@ unittest
     auto more = Message.user("more");
     again.append(more);
     assert(restore(log.path).settings.model == "mock/c");
+    assert(!restore(log.path).settings.contextWindowFromProvider, "no source: an explicit override");
+    // A provider snapshot keeps its source; a later override drops it.
+    SessionSettings snap;
+    snap.contextWindow = 128_000;
+    snap.contextWindowFromProvider = true;
+    again.settings(snap);
+    assert(restore(log.path).settings.contextWindowFromProvider);
+    SessionSettings explicitSame;
+    explicitSame.contextWindow = 128_000;
+    again.settings(explicitSame);
+    assert(!restore(log.path).settings.contextWindowFromProvider);
 }
 
 // issue #336: the messaging switch and its confirm setting round-trip; the
