@@ -209,39 +209,107 @@ void streamLogLines(string path, scope void delegate(const(char)[] line) @safe s
     streamLogLinesUntil(path, (line) { sink(line); return true; });
 }
 
+/// The most bytes one log record (line) may take before the streamers skip
+/// it unbuffered (issue #289): one giant tool output must not spike the heap
+/// of a reader that only wanted, say, a session's prompts. A skipped record
+/// is reported to the `oversized` hook so callers can say so.
+enum size_t maxRecordBytes = 16 * 1024 * 1024;
+
+/// The cap on a log header line read for a permission or summary check.
+enum size_t maxHeaderBytes = 1024 * 1024;
+
+/// Options for `streamLogLinesWith`: hooks and caps beyond the plain sink.
+struct StreamOptions
+{
+    /// Sees each line's first `lineHeadBytes`; a rejected line is skipped
+    /// unbuffered (null keeps every line).
+    bool delegate(const(char)[] head) @safe keep;
+    /// Called for each line skipped for exceeding `maxLine`, with the bytes
+    /// buffered when it was dropped (a lower bound of its size).
+    void delegate(size_t bytes) @safe oversized;
+    /// Per-line buffering cap in bytes.
+    size_t maxLine = maxRecordBytes;
+    /// Stop (as if `sink` returned false) once this many bytes of the file
+    /// have been read; 0 is no limit. The read that crosses it still counts.
+    ulong maxFileBytes;
+}
+
+/// What a `streamLogLinesWith` pass did.
+struct StreamStats
+{
+    /// Bytes read from the file (compressed bytes for an archive).
+    ulong fileBytes;
+    /// Bytes of log text seen (inflated bytes for an archive).
+    ulong textBytes;
+    /// Lines skipped for exceeding the per-line cap.
+    size_t oversized;
+    /// True when `maxFileBytes` stopped the pass before the end of the log.
+    bool truncated;
+}
+
 /// `streamLogLines` whose `sink` returns false to stop reading: nothing
 /// past that line is read or inflated (issue #271: the permission-header
-/// probe must not scan a denied session's whole log).
+/// probe must not scan a denied session's whole log). A line longer than
+/// `maxRecordBytes` is skipped unbuffered (issue #289).
 void streamLogLinesUntil(string path, scope bool delegate(const(char)[] line) @safe sink,
-    scope bool delegate(const(char)[] head) @safe keep = null)
+    scope bool delegate(const(char)[] head) @safe keep = null,
+    scope void delegate(size_t bytes) @safe oversized = null)
+{
+    StreamOptions o;
+    o.keep = keep;
+    o.oversized = oversized;
+    streamLogLinesWith(path, sink, o);
+}
+
+/// `streamLogLinesUntil` with explicit options; returns what it read.
+StreamStats streamLogLinesWith(string path, scope bool delegate(const(char)[] line) @safe sink,
+    scope StreamOptions o)
 {
     import std.stdio : File;
     auto f = File(path, "rb");
     scope (exit) f.close();
     ubyte[] carry;
     bool skipping;
+    StreamStats st;
+    bool budgetLeft()
+    {
+        if (o.maxFileBytes && st.fileBytes >= o.maxFileBytes)
+        {
+            st.truncated = true;
+            return false;
+        }
+        return true;
+    }
+    auto buf = new ubyte[](64 * 1024);
     if (isCompressedLog(path))
     {
         auto gz = GunzipStream(path);
+        gz.limit = o.maxFileBytes;
         scope (exit) gz.close();
-        auto buf = new ubyte[](64 * 1024);
         for (;;)
         {
+            if (!budgetLeft()) break;
             auto got = gz.read(f, buf);
+            st.fileBytes = gz.consumed;
+            if (gz.limitHit) st.truncated = true;
             if (!got.length) break;
-            if (!feedChunk(carry, skipping, got, sink, keep)) return;
+            st.textBytes += got.length;
+            if (!feedChunk(carry, skipping, st.oversized, got, sink, o.keep, o.oversized, o.maxLine)) break;
         }
     }
     else
     {
-        auto buf = new ubyte[](64 * 1024);
         for (;;)
         {
+            if (!budgetLeft()) break;
             auto got = f.rawRead(buf);
+            st.fileBytes += got.length;
             if (!got.length) break;
-            if (!feedChunk(carry, skipping, got, sink, keep)) return;
+            st.textBytes += got.length;
+            if (!feedChunk(carry, skipping, st.oversized, got, sink, o.keep, o.oversized, o.maxLine)) break;
         }
     }
+    return st;
 }
 
 /// The bytes of a line's start that a `keep` predicate sees.
@@ -251,22 +319,50 @@ enum size_t lineHeadBytes = 64;
 /// partial line over to the next chunk (a torn tail is dropped). `keep`, if
 /// set, sees each line's first `lineHeadBytes` (or the whole of a shorter
 /// line): a line it rejects is skipped unbuffered, so a multi-megabyte
-/// record the caller doesn't want is never assembled (issue #234).
-private bool feedChunk(ref ubyte[] carry, ref bool skipping, const(ubyte)[] chunk,
-    scope bool delegate(const(char)[]) @safe sink, scope bool delegate(const(char)[]) @safe keep)
+/// record the caller doesn't want is never assembled (issue #234). A line
+/// whose bytes pass `maxLine` (0: no cap) is dropped and skipped likewise,
+/// reported to `oversized` and counted (issue #289), so the carry never
+/// holds more than one capped record.
+private bool feedChunk(ref ubyte[] carry, ref bool skipping, ref size_t dropped, const(ubyte)[] chunk,
+    scope bool delegate(const(char)[]) @safe sink, scope bool delegate(const(char)[]) @safe keep,
+    scope void delegate(size_t) @safe oversized, size_t maxLine)
 {
     import nano.safeio : asChars;
+    void drop(size_t bytes)
+    {
+        ++dropped;
+        if (oversized !is null) oversized(bytes);
+        carry = null;
+    }
     size_t start;
     foreach (i, b; chunk)
         if (b == '\n')
         {
             if (skipping) skipping = false;
+            else if (maxLine && carry.length + (i - start) > maxLine) drop(carry.length + (i - start));
             else if (!emitLine(carry, chunk[start .. i], sink, keep)) return false;
             carry = null;
             start = i + 1;
         }
     if (start < chunk.length && !skipping)
     {
+        immutable rest = chunk.length - start;
+        if (maxLine && carry.length + rest > maxLine)
+        {
+            drop(carry.length + rest);
+            skipping = true;
+            return true;
+        }
+        // Grow by doubling, never past the cap: a capped record then costs
+        // at most twice the cap in allocations, however the heap is laid out.
+        immutable want = carry.length + rest;
+        if (carry.capacity < want)
+        {
+            size_t cap = carry.length ? carry.length * 2 : rest;
+            if (cap < want) cap = want;
+            if (maxLine && cap > maxLine) cap = maxLine;
+            carry.reserve(cap);
+        }
         carry ~= chunk[start .. $];
         if (keep !is null && carry.length >= lineHeadBytes && !keep(asChars(carry[0 .. lineHeadBytes])))
         {
@@ -305,6 +401,13 @@ private struct GunzipStream
     private ubyte[] inBuf;
     private string path;
     private bool ended;
+    /// Compressed bytes read from the file so far.
+    ulong consumed;
+    /// Cap on compressed bytes read (0: none), checked before every
+    /// underlying read so one `read` call cannot overrun it.
+    ulong limit;
+    /// Set when `read` stopped because `limit` was reached, not at EOF.
+    bool limitHit;
 
     /// A reader over the log at `path`.
     this(string path) { this.path = path; }
@@ -321,8 +424,14 @@ private struct GunzipStream
         {
             if (zs.availIn == 0)
             {
-                auto got = f.rawRead(inBuf);
-                if (!got.length) throw new Exception("gunzip " ~ path ~ ": truncated stream");
+                if (limit && consumed >= limit)
+                {
+                    limitHit = true;
+                    return null;
+                }
+                auto got = f.rawRead(inBuf[0 .. limit ? min(inBuf.length, limit - consumed) : $]);
+                consumed += got.length;
+                if (!got.length) throw new FileException(path, "gunzip: truncated stream");
                 zs.feed(got);
             }
             auto rc = zs.inflateInto(buf);
@@ -333,11 +442,11 @@ private struct GunzipStream
                 return used ? buf[0 .. used] : null;
             }
             if (rc == InflateStream.Rc.error)
-                throw new Exception("gunzip " ~ path ~ ": " ~ zs.errorMessage);
+                throw new FileException(path, "gunzip: " ~ zs.errorMessage);
             if (used) return buf[0 .. used];
             // Z_BUF_ERROR with no output means zlib can make no progress: with
             // input still buffered that is a stuck stream, not a read more.
-            if (zs.availIn) throw new Exception("gunzip " ~ path ~ ": corrupt stream (no progress)");
+            if (zs.availIn) throw new FileException(path, "gunzip: corrupt stream (no progress)");
             // else zlib wants more input; loop to read it.
         }
     }
@@ -355,7 +464,9 @@ private struct GunzipStream
 /// search never reports partial results as complete.
 void foreachLogLineSkippingTorn(string path, scope void delegate(const(char)[]) @safe sink)
 {
-    streamLogLines(path, sink);
+    // An oversized record (issue #289) is reported as an empty line so line
+    // counts stay aligned with the log.
+    streamLogLinesUntil(path, (line) { sink(line); return true; }, null, (size_t) { sink(null); });
 }
 
 /// `foreachLogLineSkippingTorn` that skips, unbuffered, each line whose
@@ -364,10 +475,23 @@ void foreachLogLineSkippingTorn(string path, scope void delegate(const(char)[]) 
 void foreachLogLineSkippingTorn(string path, scope void delegate(const(char)[]) @safe sink,
     scope bool delegate(const(char)[] head) @safe keep)
 {
+    foreachLogLineSkippingTorn(path, sink, keep, null);
+}
+
+/// `foreachLogLineSkippingTorn` with a `keep` filter that also tells
+/// `oversized` the bytes of each record above `maxRecordBytes` (issue #289),
+/// just before its empty placeholder line, so a history tool can say a
+/// result is incomplete instead of reporting a skipped record as absent.
+void foreachLogLineSkippingTorn(string path, scope void delegate(const(char)[]) @safe sink,
+    scope bool delegate(const(char)[] head) @safe keep, scope void delegate(size_t bytes) @safe oversized)
+{
     streamLogLinesUntil(path, (line) { sink(line); return true; }, (head) {
         if (keep(head)) return true;
         sink(null);
         return false;
+    }, (size_t b) {
+        if (oversized !is null) oversized(b);
+        sink(null);
     });
 }
 
@@ -378,15 +502,23 @@ void foreachLogLineSkippingTorn(string path, scope void delegate(const(char)[]) 
 string logHeaderCwd(string path)
 {
     string cwd;
+    // The header is small: cap its buffering well below `maxRecordBytes` and
+    // stop after the first line, so a permission check on a denied session
+    // never buffers a record of its body (issue #289).
+    StreamOptions o;
+    o.maxLine = maxHeaderBytes;
+    // An oversized header: abort at once (the catch below returns no cwd),
+    // so not one byte of a denied session's body is buffered.
+    o.oversized = (size_t) { throw new Exception("oversized session header"); };
     try
-        streamLogLinesUntil(path, (line) {
+        streamLogLinesWith(path, (line) {
             auto h = parseJSON(line);
             if (h["type"].str != "session") return false;
             auto d = h["data"].objectNoRef;
             if (auto c = "cwd" in d)
                 if (c.type == JSONType.string) cwd = c.str;
             return false; // the header is the first line: stop reading
-        });
+        }, o);
     catch (Exception) {} // an unreadable or corrupt header is no cwd, as documented
     return cwd;
 }
@@ -503,6 +635,34 @@ unittest // a corrupt or truncated gzip log is a FileException, not a bare Excep
     immutable ubyte[] truncated = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
     assertThrown!FileException(gunzipLog(corrupt, "x.jsonl.gz"));
     assertThrown!FileException(gunzipLog(truncated, "x.jsonl.gz"));
+}
+
+unittest // the streaming reader also fails with FileException and honours its byte limit
+{
+    import std.exception : assertThrown;
+    import std.file : FileException, write, remove;
+    import std.stdio : File;
+    auto p = buildPath(tempDir, "nano-coder-gzstream-test.jsonl.gz");
+    scope (exit) if (p.exists) remove(p);
+    immutable ubyte[] corrupt = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3, 0xff, 0xff, 0xff, 0xff];
+    immutable ubyte[] truncated = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
+    auto buf = new ubyte[](4096);
+    foreach (bytes; [corrupt, truncated])
+    {
+        write(p, bytes);
+        auto f = File(p, "rb");
+        auto gz = GunzipStream(p);
+        scope (exit) { gz.close(); f.close(); }
+        assertThrown!FileException(gz.read(f, buf));
+    }
+    // A limit below the header stops before any output, without reading past it.
+    write(p, gzipLog("hello\n"));
+    auto f = File(p, "rb");
+    auto gz = GunzipStream(p);
+    scope (exit) { gz.close(); f.close(); }
+    gz.limit = 4;
+    assert(gz.read(f, buf) is null);
+    assert(gz.limitHit && gz.consumed == 4);
 }
 
 unittest
@@ -1828,14 +1988,17 @@ private size_t skimCount(const(char)[] arr) pure nothrow @nogc
 
 /// Stream the committed lines of a session log (a torn last line is
 /// dropped) to `dg` with their 1-based line numbers, so a reader holds one
-/// line rather than the whole log. `requireCommitted`: a log without a
+/// line rather than the whole log. `maxLine` caps a record's bytes (0, the
+/// default: no cap, so restore never silently drops a record); an over-cap
+/// record is skipped but still counts for `lineNo`. `requireCommitted`: a log without a
 /// committed record throws (a resume needs its header). A plain log is read
 /// line by line rather than whole (issue #244); a compressed one is inflated.
 void eachLogLine(string path, scope void delegate(const(char)[] line, ulong lineNo) @safe dg,
-    bool requireCommitted = true, scope bool delegate(const(char)[] head) @safe keep = null)
+    bool requireCommitted = true, scope bool delegate(const(char)[] head) @safe keep = null,
+    size_t maxLine = 0)
 {
     eachLogLineUntil(path, (const(char)[] line, ulong lineNo) { dg(line, lineNo); return true; },
-        requireCommitted, keep);
+        requireCommitted, keep, maxLine);
 }
 
 /// `eachLogLine` whose `dg` returns false to stop reading: no further line
@@ -1843,20 +2006,25 @@ void eachLogLine(string path, scope void delegate(const(char)[] line, ulong line
 /// `keep`, if set, sees each line's first `lineHeadBytes`; a rejected line
 /// is skipped unbuffered (never assembled) but still counts for `lineNo`.
 void eachLogLineUntil(string path, scope bool delegate(const(char)[] line, ulong lineNo) @safe dg,
-    bool requireCommitted = true, scope bool delegate(const(char)[] head) @safe keep = null)
+    bool requireCommitted = true, scope bool delegate(const(char)[] head) @safe keep = null,
+    size_t maxLine = 0)
 {
     // One streaming reader for plain and compressed logs alike (64 KB reads,
     // a bounded inflate window): neither the file nor a decompressed copy is
     // ever held whole.
     ulong lineNo;
-    streamLogLinesUntil(path, (line) {
-        if (line.length && line[$ - 1] == '\r') line = line[0 .. $ - 1];
-        return dg(line, ++lineNo);
-    }, keep is null ? null : (const(char)[] head) {
+    StreamOptions o;
+    o.maxLine = maxLine;
+    o.keep = keep is null ? null : (const(char)[] head) {
         if (keep(head)) return true;
         ++lineNo;
         return false;
-    });
+    };
+    o.oversized = (size_t) { ++lineNo; }; // an oversized record (issue #289) still counts as a line
+    streamLogLinesWith(path, (line) {
+        if (line.length && line[$ - 1] == '\r') line = line[0 .. $ - 1];
+        return dg(line, ++lineNo);
+    }, o);
     if (!lineNo && requireCommitted) throw new Exception("session log " ~ path ~ " has no committed records");
 }
 
@@ -4867,4 +5035,53 @@ unittest
     // chunks must fail, since tidy-up deletes the original after compressing.
     assert(std.file.read(back) == std.file.read(plain), "the round trip preserves the log exactly");
     assert(logText(gz) == std.file.readText(plain), "the archive decompresses to the original");
+}
+
+// Issue #289: a line above the per-line cap is skipped unbuffered and
+// reported, the streamers keep line numbers aligned, and a header-only read
+// never buffers a body record.
+unittest
+{
+    import core.memory : GC;
+    import std.array : replicate;
+    import std.file : write, remove, tempDir;
+    import std.path : buildPath;
+    auto p = buildPath(tempDir, "nano-oversized.jsonl");
+    scope (exit) remove(p);
+    write(p, `{"type":"session","data":{"cwd":"/w"}}` ~ "\n" ~ "z".replicate(300_000) ~ "\n" ~ "tail\n");
+    StreamOptions o;
+    o.maxLine = 100_000;
+    size_t dropped, dropBytes;
+    o.oversized = (size_t n) { ++dropped; dropBytes = n; };
+    string[] seen;
+    auto st = streamLogLinesWith(p, (line) { seen ~= line.idup; return true; }, o);
+    assert(seen.length == 2 && seen[1] == "tail" && dropped == 1 && st.oversized == 1, format("%s", seen.length));
+    assert(dropBytes > 100_000 && st.textBytes == getSize(p) && !st.truncated);
+    // Buffering stops at the cap: a reader holding the record whole would
+    // allocate at least its 4 MiB; a capped one at most twice the cap.
+    write(p, `{"type":"session","data":{"cwd":"/w"}}` ~ "\n" ~ "z".replicate(4_000_000) ~ "\n" ~ "tail\n");
+    StreamOptions small;
+    small.maxLine = 500_000;
+    immutable before = GC.stats().allocatedInCurrentThread;
+    streamLogLinesWith(p, (line) => true, small);
+    assert(GC.stats().allocatedInCurrentThread - before < 1_500_000, "the giant record was not buffered whole");
+    // The default cap: a 16 MiB+ record is skipped; line numbers stay aligned.
+    write(p, `{"type":"session","data":{"cwd":"/w"}}` ~ "\n" ~ "z".replicate(maxRecordBytes + 1) ~ "\n" ~ "tail\n");
+    ulong[] nos;
+    eachLogLine(p, (const(char)[] l, ulong n) { nos ~= n; }, true, null, maxRecordBytes);
+    assert(nos == [1, 3], format("%s", nos));
+    // Restore's reader is uncapped by default: an over-cap record is kept,
+    // never silently dropped from a resumed conversation.
+    size_t[] lens;
+    eachLogLine(p, (const(char)[] l, ulong n) { lens ~= l.length; });
+    assert(lens.length == 3 && lens[1] == maxRecordBytes + 1, format("%s", lens));
+    size_t lines;
+    foreachLogLineSkippingTorn(p, (const(char)[]) { ++lines; });
+    assert(lines == 3);
+    assert(logHeaderCwd(p) == "/w");
+    // A file budget stops the pass early.
+    StreamOptions b;
+    b.maxFileBytes = 1;
+    auto bs = streamLogLinesWith(p, (line) => true, b);
+    assert(bs.truncated && bs.fileBytes == 64 * 1024);
 }

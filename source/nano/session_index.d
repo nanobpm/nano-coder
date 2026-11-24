@@ -16,7 +16,8 @@ import std.utf : UTFException;
 
 import nano.safeio : lossyText, utf8View;
 
-import nano.arith : toSize, toLong;
+import nano.arith : saturatingSub, toSize, toLong;
+import nano.session : maxRecordBytes;
 
 import std.string : representation;
 import nano.clock : wallNow;
@@ -257,7 +258,19 @@ private void foldName(ref Summary s, const(char)[] line) pure
 /// record that isn't a matching header of this format version.
 Summary summarize(string path)
 {
-    import nano.session : isCompressedLog, logIdOf, logText, streamLogLinesUntil;
+    bool partial;
+    return summarize(path, 0, partial);
+}
+
+/// `summarize` reading at most about `maxFileBytes` of the file (0: no
+/// limit). Plain and compressed logs alike are streamed, a record that isn't
+/// an input is skipped by its head without being assembled, and one above
+/// `maxRecordBytes` is skipped unbuffered (issue #289). `partial` is set when
+/// the limit stopped the read early (`maxLine` is the per-record cap): the summary then covers only the log's
+/// start (header, first prompts) and must not be cached as the whole log's.
+Summary summarize(string path, ulong maxFileBytes, out bool partial, size_t maxLine = maxRecordBytes)
+{
+    import nano.session : StreamOptions, isCompressedLog, logIdOf, streamLogLinesWith;
     Summary s;
     s.path = path;
     s.lastUsed = timeLastModified(path);
@@ -281,22 +294,17 @@ Summary summarize(string path)
         }
         catch (Exception) {} // skip a corrupt line; a missing header is reported just below
     }
-    if (isCompressedLog(path))
-    {
-        // An archive: summarized once and cached by its size.
-        auto text = logText(path);
-        s.logBytes = text.length;
-        auto lines = committedLines(text.representation);
-        if (lines.length) header(lines[0]);
-        if (!ok) throw new Exception(format("session log %s has no resumable header", path));
-        foreach (line; lines[1 .. $]) foldLine(s, line);
-        return s;
-    }
-    // A live log is streamed, and a record that isn't an input is skipped by
-    // its head without being read whole: a long session's log can run to
-    // hundreds of MB, and summarizing it after a turn once held all of it.
-    s.logBytes = getSize(path);
-    streamLogLinesUntil(path, (line) {
+    // A long session's log can run to hundreds of MB (and an archive inflates
+    // to more): stream it, never hold it whole.
+    StreamOptions o;
+    o.keep = (const(char)[] head) => first || mayBeInput(head);
+    // An oversized first record is no header: stop there.
+    o.oversized = (size_t) {
+        if (first) throw new Exception(format("session log %s has an oversized header", path));
+    };
+    o.maxFileBytes = maxFileBytes;
+    o.maxLine = maxLine;
+    auto st = streamLogLinesWith(path, (line) {
         if (first)
         {
             first = false;
@@ -305,10 +313,26 @@ Summary summarize(string path)
         }
         foldLine(s, line);
         return true;
-    }, (head) => first || mayBeInput(head));
+    }, o);
     if (!ok) throw new Exception(format("session log %s has no resumable header", path));
+    partial = st.truncated;
+    // The offset is the text bytes streamed (an archive's inflated length).
+    // Stamp the bytes actually streamed, not the size now: a record another
+    // session appended after EOF must not be marked as already summarized.
+    s.logBytes = st.textBytes;
     return s;
 }
+
+/// The most log bytes one `list` call reads to summarize sessions the index
+/// lacks or holds stale (issue #289): a fresh or deleted index over hundreds
+/// of multi-hundred-MB logs must not read them all in one listing. Past it,
+/// logs are summarized from their first `partialSummaryBytes` only, shown,
+/// and left uncached so a later listing (or the session's own turn) finishes.
+enum ulong listingReadBudget = 256UL * 1024 * 1024;
+
+/// The bytes read from a log once a listing's budget is spent: enough for
+/// the header and the first prompts.
+enum ulong partialSummaryBytes = 256 * 1024;
 
 /// A streamed line's head: false only for a record known not to be an input
 /// (its `{"type":"<type>"` prefix names another type).
@@ -569,8 +593,10 @@ bool[string] titledIds(string dir)
 /// denies is neither summarized nor reported from cached metadata, so its
 /// title or first request can't leak); a skipped log's cached record is
 /// still carried into any index rewrite, so hiding it never erases its title
-/// (which protects the log from retention).
-Summary[] list(string dir, bool strictIndex = false, scope bool delegate(string path) @safe skip = null)
+/// (which protects the log from retention). `readBudget` caps the log bytes
+/// read to summarize (see `listingReadBudget`).
+Summary[] list(string dir, bool strictIndex = false, scope bool delegate(string path) @safe skip = null,
+    ulong readBudget = listingReadBudget)
 {
     if (!dir.exists) return null;
     auto indexLen = sizeOr0(indexPath(dir));
@@ -629,7 +655,20 @@ Summary[] list(string dir, bool strictIndex = false, scope bool delegate(string 
                     index.remove(id);
                 }
             }
-            try s = summarize(e.name);
+            bool partial;
+            try
+            {
+                // Spend the listing's read budget; once spent, read only
+                // each log's start (issue #289).
+                // Strict callers (retention) read every log whole: a partial
+                // summary could miss the `name` record protecting it.
+                immutable allowance = strictIndex ? ulong.max
+                    : readBudget > partialSummaryBytes ? readBudget : partialSummaryBytes;
+                // Debit before the fallible read, so a log that throws late
+                // still spends its share of the budget.
+                readBudget = saturatingSub(readBudget, size < allowance ? size : allowance);
+                s = summarize(e.name, allowance, partial);
+            }
             // One unreadable or truncated log must not hide every other
             // session (issue #300: it blocked unrelated resumes); strict
             // callers (retention) still fail rather than act on a partial view.
@@ -652,7 +691,32 @@ Summary[] list(string dir, bool strictIndex = false, scope bool delegate(string 
                 if (s.title is null) s.title = cached.title;
             }
             s.archiveBytes = compressed ? size : 0;
-            updates ~= s;
+            // A partial summary covers only the log's start: show it, but
+            // don't cache it as the whole log's. Zero sizes, which no real
+            // log has, make an index rewrite that still carries it a miss.
+            if (partial)
+            {
+                // Keep what the cache knew beyond the log's start (a name set
+                // later protects it from retention), and keep a valid session
+                // visible even when its first prompt lies past the prefix.
+                if (cached !is null)
+                {
+                    if (s.name is null) s.name = cached.name;
+                    if (s.prompts <= cached.prompts)
+                    {
+                        // A stale cache saw more of the log than the prefix did.
+                        s.prompts = cached.prompts;
+                        s.firstPrompt = cached.firstPrompt;
+                        s.firstTellingPrompt = cached.firstTellingPrompt;
+                        s.lastPrompt = cached.lastPrompt;
+                        s.contextPrompt = cached.contextPrompt;
+                    }
+                }
+                if (!s.prompts) s.prompts = 1;
+                s.logBytes = 0;
+                s.archiveBytes = 0;
+            }
+            else updates ~= s;
         }
         if (cached !is null) index.remove(id);
         s.path = e.name;
@@ -1193,4 +1257,98 @@ unittest
     setAttributes(log.path, octal!0);
     list(dir);
     assert("s-locked" in titledIds(dir), "the cached handle survives an unreadable log");
+}
+
+// Issue #289: a cold index over many large logs reads at most the listing's
+// budget (plus each log's start), lists every session, and caches only the
+// fully read ones, so the next listing finishes the rest.
+unittest
+{
+    import core.memory : GC;
+    import std.array : replicate;
+    import std.file : append;
+    auto dir = testDir("cold-budget");
+    enum logs = 8;
+    auto filler = `{"type":"tool_result","data":{"out":"` ~ "x".replicate(512 * 1024) ~ `"}}` ~ "\n";
+    foreach (i; 0 .. logs)
+    {
+        auto p = writeLog(dir, format("big%s", i), ["first prompt that is telling enough here"]);
+        foreach (_; 0 .. 2) append(p, filler); // ~1 MiB of non-input records
+        append(p, `{"type":"input","data":{"id":"in-9","text":"the last prompt after the filler"}}` ~ "\n");
+    }
+    immutable before = GC.stats().allocatedInCurrentThread;
+    auto l = list(dir, false, null, 2 * 1024 * 1024);
+    immutable allocated = GC.stats().allocatedInCurrentThread - before;
+    assert(l.length == logs, "every session is listed, budget or not");
+    size_t full;
+    foreach (s; l)
+        if (s.lastPrompt == "the last prompt after the filler") ++full;
+        else assert(s.lastPrompt == "first prompt that is telling enough here" && s.logBytes == 0);
+    assert(full >= 1 && full <= 3, format("only the budget's worth is read whole: %s", full));
+    assert(allocated < 4 * 1024 * 1024, format("a listing allocated %s bytes", allocated));
+    // The partial summaries weren't cached: a listing with room finishes them.
+    auto again = list(dir);
+    assert(again.length == logs);
+    foreach (s; again) assert(s.lastPrompt == "the last prompt after the filler" && s.logBytes > 0);
+}
+
+// Issue #289: a record above the per-record cap is skipped unbuffered by
+// summarizing, plain or compressed, and the prompts around it still count.
+unittest
+{
+    import core.memory : GC;
+    import std.array : replace, replicate;
+    import std.file : append, write;
+    import nano.session : gzipLog, logText;
+    // A small cap keeps the test fast; the default is `maxRecordBytes`.
+    enum size_t cap = 1024 * 1024;
+    auto dir = testDir("oversized");
+    auto p = writeLog(dir, "huge", ["first prompt that is telling enough here"]);
+    append(p, `{"type":"input","data":{"id":"in-x","text":"` ~ "y".replicate(4 * cap) ~ `"}}` ~ "\n");
+    append(p, `{"type":"input","data":{"id":"in-9","text":"after the giant record"}}` ~ "\n");
+    immutable before = GC.stats().allocatedInCurrentThread;
+    bool partial;
+    auto s = summarize(p, 0, partial, cap);
+    immutable allocated = GC.stats().allocatedInCurrentThread - before;
+    assert(s.prompts == 2 && s.lastPrompt == "after the giant record", format("%s", s.prompts));
+    assert(allocated < cap * 3, format("summarizing allocated %s bytes", allocated));
+    auto gz = buildPath(dir, "zipped.jsonl.gz");
+    write(gz, gzipLog(logText(p).replace(`"id":"huge"`, `"id":"zipped"`)));
+    immutable before2 = GC.stats().allocatedInCurrentThread;
+    auto z = summarize(gz, 0, partial, cap);
+    immutable allocated2 = GC.stats().allocatedInCurrentThread - before2;
+    assert(z.prompts == 2 && z.lastPrompt == "after the giant record");
+    assert(z.logBytes == logText(gz).length, "an archive's offset is its inflated length");
+    assert(allocated2 < cap * 3, format("summarizing an archive allocated %s bytes", allocated2));
+}
+
+// Issue #289 (PR review): strict listings (retention) ignore the read budget,
+// a partial summary keeps the cached handle and stays visible, and an
+// oversized first record aborts summarizing at once.
+unittest
+{
+    import std.array : replicate;
+    import std.file : append, write;
+    auto dir = testDir("budget-strict");
+    auto filler = `{"type":"tool_result","data":{"out":"` ~ "x".replicate(512 * 1024) ~ `"}}` ~ "\n";
+    auto p = writeLog(dir, "named", ["first prompt that is telling enough here"]);
+    append(p, filler);
+    append(p, `{"type":"name","data":{"name":"keep-me"}}` ~ "\n");
+    foreach (s; list(dir, true, null, 0)) assert(s.name == "keep-me" && s.logBytes > 0, "strict reads whole");
+    // Cached now; grow the log so the cache misses and the read is partial.
+    append(p, filler);
+    foreach (s; list(dir, false, null, 0))
+        assert(s.name == "keep-me" && s.prompts >= 1 && s.logBytes == 0, "the cached handle survives");
+    // A header-only partial summary (its first prompt past the prefix) is listed.
+    auto q = writeLog(dir, "late", []);
+    append(q, filler);
+    append(q, `{"type":"input","data":{"id":"in-1","text":"late prompt"}}` ~ "\n");
+    bool seen;
+    foreach (s; list(dir, false, null, 0)) if (s.id == "late") seen = s.prompts > 0;
+    assert(seen, "a valid session stays visible in a partial listing");
+    auto h = buildPath(dir, "big.jsonl");
+    write(h, `{"type":"session","data":{"pad":"` ~ "z".replicate(2048) ~ `"}}` ~ "\n" ~ filler);
+    import std.exception : assertThrown;
+    bool partial;
+    assertThrown(summarize(h, 0, partial, 1024), "an oversized header is no header");
 }
