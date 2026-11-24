@@ -510,6 +510,8 @@ dub build -b release   # ./nano-coder
 ./nano-coder
 ```
 
+The build passes `-lowmem` to LDC (GC during compilation), which roughly halves its peak memory so it fits on small machines and alongside other builds.
+
 Then, for example:
 
 ```bash

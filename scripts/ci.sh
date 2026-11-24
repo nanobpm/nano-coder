@@ -26,7 +26,7 @@ typecheck() {
     for build in "" "-unittest"; do
         step "typecheck ${build:-release} ${1:-}"
         # shellcheck disable=SC2086 # word splitting is intended
-        ldc2 -o- -w -allinst -preview=dip1000 -preview=nosharedaccess -Isource -Jsource ${1:-} $build $files
+        ldc2 -o- -w -lowmem -allinst -preview=dip1000 -preview=nosharedaccess -Isource -Jsource ${1:-} $build $files
     done
 }
 
