@@ -469,3 +469,70 @@ unittest
     assert(failed.retried.usage.inputTokens == 10 && isClose(failed.retried.usage.aic, 0.25));
     assert(failed.next !is null, "the original error stays chained");
 }
+
+// The final parse runs after the stream retries: a malformed or error reply
+// there still carries the dropped attempts' spending, the usage-reporting
+// one and the uncounted one (issue #340). Each provider funnels its final
+// parse through `finishCounted`, so these cover the class.
+void assertRetriedKept(SpendingException failed, long input, double aic)
+{
+    import std.math : isClose;
+    assert(failed !is null, "the final parse error carries the retried spending");
+    assert(failed.retried.usage.inputTokens == input && isClose(failed.retried.usage.aic, aic), "first attempt usage");
+    assert(failed.retried.uncounted == 1, "the usage-free dropped attempt is still one request");
+}
+
+immutable dropSpent = immutable Reply(200, cutHeaders, sse([spentEvent]) ~ `data: {"choices":[{"delta":{"content":"pa`);
+immutable dropBare = immutable Reply(200, cutHeaders, `data: {"choices":[{"delta":{"content":"pa`);
+
+// (a) Chat completions: the retry returns a non-SSE malformed body.
+unittest
+{
+    auto srv = serve([dropSpent, dropBare, immutable Reply(200, "content-type: text/html\r\n", "<html>proxy</html>")]);
+    auto req = hello();
+    SpendingException failed;
+    try against(srv.url).chat(req, (bool t, string x) {});
+    catch (SpendingException e) failed = e;
+    srv.finish();
+    assertRetriedKept(failed, 10, 0.25);
+}
+
+// (b) Chat completions: the retry returns a 200 error object.
+unittest
+{
+    auto srv = serve([dropSpent, dropBare,
+        immutable Reply(200, "content-type: application/json\r\n", `{"error":{"message":"boom"}}`)]);
+    auto req = hello();
+    SpendingException failed;
+    try against(srv.url).chat(req, (bool t, string x) {});
+    catch (SpendingException e) failed = e;
+    srv.finish();
+    assertRetriedKept(failed, 10, 0.25);
+    assert(failed.msg.canFind("boom"), failed.msg);
+}
+
+// (c) The Anthropic route: the retry returns a 200 error object.
+unittest
+{
+    import nano.providers.anthropic : AnthropicClient;
+    enum spent = `{"type":"message_start","message":{"usage":{"input_tokens":10}}}`;
+    enum delta = `{"type":"message_delta","delta":{},"usage":{"output_tokens":1},"copilot_usage":{"total_nano_aiu":250000000}}`;
+    auto srv = serve([immutable Reply(200, cutHeaders, sse([spent, delta]) ~ `data: {"type":"cont`),
+        immutable Reply(200, cutHeaders, `data: {"type":"cont`),
+        immutable Reply(200, "content-type: application/json\r\n", `{"type":"error","error":{"type":"overloaded_error","message":"busy"}}`)]);
+    ResolvedProvider p;
+    p.name = "test";
+    p.model = "some-model";
+    p.apiKey = "sk-test";
+    p.config.baseUrl = srv.url;
+    p.config.stream = true;
+    p.config.retryInitialBackoffMs = 1;
+    p.config.timeoutSecs = 10;
+    p.config.maxRetries = 5;
+    auto req = hello();
+    SpendingException failed;
+    try new AnthropicClient(p).chat(req, (bool t, string x) {});
+    catch (SpendingException e) failed = e;
+    srv.finish();
+    assertRetriedKept(failed, 10, 0.25);
+}

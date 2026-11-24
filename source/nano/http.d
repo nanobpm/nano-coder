@@ -574,6 +574,50 @@ imported!"nano.llm".LLMResponse withRetried(imported!"nano.llm".LLMResponse r, i
     return r;
 }
 
+/// Run `parse` (the reply's final parse: the whole body or the stream's
+/// finish) and attach `spent`, the retried attempts' spending, to its result.
+/// A failure keeps that spending too: a SpendingException gets it added, and
+/// any other exception is wrapped in a RequestException carrying it, so no
+/// provider can lose retried usage on a malformed final reply (issue #340).
+imported!"nano.llm".LLMResponse finishCounted(imported!"nano.llm".RetrySpend spent,
+        scope imported!"nano.llm".LLMResponse delegate() @safe parse)
+{
+    import nano.llm : LLMResponse, RetrySpend, SpendingException;
+    LLMResponse r;
+    try r = parse();
+    catch (SpendingException failed)
+    {
+        failed.retried = addSpend(failed.retried, spent);
+        throw failed;
+    }
+    catch (Exception other)
+    {
+        // Nothing retried means nothing to carry: pass the error through as is.
+        if (spent == RetrySpend.init) throw other;
+        auto wrapped = new RequestException(other.msg, other);
+        wrapped.retried = spent;
+        throw wrapped;
+    }
+    return withRetried(r, spent);
+}
+
+unittest
+{
+    import nano.llm : LLMResponse, RetrySpend, SpendingException, TokenUsage;
+    import std.exception : assertThrown, collectException;
+    TokenUsage u = { inputTokens: 5 };
+    RetrySpend spent = { usage: u, uncounted: 1 };
+    assert(finishCounted(spent, () => LLMResponse.init).retried == spent);
+    auto e = collectException!SpendingException(finishCounted(spent, () { throw new Exception("bad"); return LLMResponse.init; }));
+    assert(e !is null && e.msg == "bad" && e.retried == spent && e.next !is null);
+    auto r = new RequestException("x");
+    r.retried = spent;
+    auto e2 = collectException!SpendingException(finishCounted(spent, () { throw r; return LLMResponse.init; }));
+    assert(e2 is r && e2.retried.uncounted == 2 && e2.retried.usage.inputTokens == 10, "merged, not overwritten");
+    auto plain = collectException(finishCounted(RetrySpend.init, () { throw new Exception("p"); return LLMResponse.init; }));
+    assert(cast(SpendingException) plain is null && plain.msg == "p");
+}
+
 /// Whether a request reported any usage worth counting.
 bool hasUsage(imported!"nano.llm".TokenUsage u) pure nothrow @nogc @safe
 {

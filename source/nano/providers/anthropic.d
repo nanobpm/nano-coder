@@ -162,8 +162,9 @@ class AnthropicClient : LLMClient, KindedClient
         st.sink = sink;
         RetrySpend spent;
         auto whole = postStream(st, spent, url, headers(), requestBody(req, true), what, p.config);
-        if (whole !is null) return withRetried(reportWhole(parseWhole(parseJSON(whole)), sink), spent);
-        return withRetried(st.finish(), spent);
+        return finishCounted(spent, () => whole !is null
+            ? reportWhole(parseWhole(parseJSON(whole)), sink)
+            : st.finish());
     }
 
     static LLMResponse parseWhole(JSONValue j) pure

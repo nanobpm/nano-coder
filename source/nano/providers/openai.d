@@ -181,8 +181,9 @@ class OpenAIClient : LLMClient, CapabilityProbe, KindedClient
         st.replay = p.replayReasoning;
         RetrySpend spent;
         auto whole = postStream(st, spent, url, headers(req), requestBody(req, true), what, p.config);
-        if (whole !is null) return withRetried(reportWhole(parseWhole(parseJSON(whole), p.replayReasoning), sink), spent);
-        return withRetried(st.finish(), spent);
+        return finishCounted(spent, () => whole !is null
+            ? reportWhole(parseWhole(parseJSON(whole), p.replayReasoning), sink)
+            : st.finish());
     }
 
     static LLMResponse parseWhole(JSONValue j, bool replay = false)
@@ -537,8 +538,9 @@ class CopilotClient : OpenAIClient
             st.replay = p.replayReasoning;
             RetrySpend spent;
         auto whole = postStream(st, spent, url, h, body_, what, p.config);
-            if (whole !is null) return withRetried(reportWhole(parseResponses(parseJSON(whole), p.replayReasoning), sink), spent);
-            return withRetried(st.finish(), spent);
+            return finishCounted(spent, () => whole !is null
+                ? reportWhole(parseResponses(parseJSON(whole), p.replayReasoning), sink)
+                : st.finish());
         }
         import nano.providers.anthropic : AnthropicClient, AnthropicStream;
         h["anthropic-version"] = "2023-06-01";
@@ -549,8 +551,9 @@ class CopilotClient : OpenAIClient
         st.sink = sink;
         RetrySpend spent;
         auto whole = postStream(st, spent, url, h, body_, what, p.config);
-        if (whole !is null) return withRetried(reportWhole(AnthropicClient.parseWhole(parseJSON(whole)), sink), spent);
-        return withRetried(st.finish(), spent);
+        return finishCounted(spent, () => whole !is null
+            ? reportWhole(AnthropicClient.parseWhole(parseJSON(whole)), sink)
+            : st.finish());
     }
 }
 
