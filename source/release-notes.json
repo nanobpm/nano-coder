@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.27.0", "date": "2026-11-24", "items": [
+      {"type":"feat","scope":"sandbox","title":"default to workspace sandbox for ACP/headless runs","pr":335}
+    ]},
     {"version": "1.26.1", "date": "2026-11-24", "items": [
       {"type":"fix","scope":"session","title":"resume restores the session's model and runtime settings","pr":303}
     ]},
@@ -439,9 +442,6 @@
     ]},
     {"version": "0.41.0", "date": "2026-10-07", "items": [
       {"type":"feat","scope":"vision","title":"let agents view images via read_file attachments","pr":105}
-    ]},
-    {"version": "0.40.0", "date": "2026-10-07", "items": [
-      {"type":"feat","scope":"prompt","title":"clear the input on double Esc at the idle prompt","pr":103}
     ]}
   ]
 }
