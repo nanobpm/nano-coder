@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.30.0", "date": "2026-11-24", "items": [
+      {"type":"feat","scope":"messages","title":"restore inter-session messaging state on resume and /relaunch","pr":337}
+    ]},
     {"version": "1.29.0", "date": "2026-11-24", "items": [
       {"type":"feat","scope":"acp","title":"report AI Credits in PromptResponse usage","pr":345}
     ]},
@@ -439,9 +442,6 @@
     ]},
     {"version": "0.45.0", "date": "2026-10-12", "items": [
       {"type":"feat","scope":"reminders","title":"detect repeated tool calls and stop runaway loops","pr":108}
-    ]},
-    {"version": "0.44.0", "date": "2026-10-12", "items": [
-      {"type":"feat","scope":"ui","title":"show whose turn it is on the prompt line (spinner / ready hint)","pr":110}
     ]}
   ]
 }
