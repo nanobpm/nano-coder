@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.33.5", "date": "2026-11-24", "items": [
+      {"type":"fix","scope":"messages","title":"write the owner pid file before bind","pr":373}
+    ]},
     {"version": "1.33.4", "date": "2026-11-24", "items": [
       {"type":"fix","scope":"session","title":"keep a restored context-window override across /model switch","pr":364}
     ]},
@@ -439,9 +442,6 @@
     ]},
     {"version": "0.51.1", "date": "2026-10-23", "items": [
       {"type":"fix","scope":"commands","title":"release stats lock before printing slash command output","pr":143}
-    ]},
-    {"version": "0.51.0", "date": "2026-10-23", "items": [
-      {"type":"feat","scope":"herdr","title":"report state, resume command and release to Herdr","pr":142}
     ]}
   ]
 }
