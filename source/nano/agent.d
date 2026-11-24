@@ -2204,8 +2204,14 @@ class Agent
         {
             source = null;
             foreach (ref x; summarized)
-                if (ctx.isSummaryMessage(x)) nodes ~= dag.parse(x.content);
+            {
+                // A flat summary (from before layering, or a standard
+                // compaction in between) has no nodes: summarize it with
+                // the new span rather than drop its content.
+                auto parsed = ctx.isSummaryMessage(x) ? dag.parse(x.content) : null;
+                if (parsed.length) nodes ~= parsed;
                 else source ~= x;
+            }
         }
         string leafText;
         ulong first, last;

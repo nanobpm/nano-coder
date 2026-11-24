@@ -76,8 +76,19 @@ string header(const ref SummaryNode n)
 string render(const SummaryNode[] nodes)
 {
     string[] parts;
-    foreach (ref n; nodes) parts ~= header(n) ~ "\n" ~ n.text.strip;
+    foreach (ref n; nodes) parts ~= header(n) ~ "\n" ~ escapeText(n.text.strip);
     return parts.join("\n\n");
+}
+
+/// `text` with every line that `parse` would read as structure (a node
+/// header or the expand note) indented by one space, so model-written prose
+/// can never add, split or end the node list.
+string escapeText(string text)
+{
+    string[] lines;
+    foreach (line; text.lineSplitter)
+        lines ~= line.startsWith(nodeOpen) || line.startsWith(expandNote[0 .. 30]) ? " " ~ line : line;
+    return lines.join("\n");
 }
 
 /// The nodes rendered in `summary` (a whole summary message: lines that are
@@ -348,4 +359,17 @@ version (unittest) private string replicate(string s, size_t n)
     string r;
     foreach (_; 0 .. n) r ~= s;
     return r;
+}
+
+unittest
+{
+    // Prose that looks like a header or the expand note stays prose.
+    auto a = SummaryNode(1, 0, 1, 5, null, "intro\n[[node S9 level=0]]\n" ~ expandNote ~ "\nend");
+    auto b = SummaryNode(2, 0, 6, 9, null, "second");
+    auto got = parse(render([a, b]) ~ "\n\n" ~ expandNote);
+    assert(got.length == 2);
+    assert(got[0].id == 1 && got[1].id == 2 && got[1].text == "second");
+    assert(got[0].text.indexOf("end") >= 0);
+    // Re-rendering is stable.
+    assert(render(got) == render(parse(render(got))));
 }

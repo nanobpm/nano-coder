@@ -447,7 +447,9 @@ private SummaryNode[uint] findNodes(string path, const uint[] ids)
     import nano.session : foreachLogLineSkippingTorn;
     SummaryNode[uint] found;
     foreachLogLineSkippingTorn(path, (const(char)[] line) {
-        if (found.length == ids.length || line.indexOf(`"summary_nodes"`) < 0) return;
+        // No early exit: node IDs restart after the node list is reset (a
+        // flat compaction in between), so the latest record of an ID wins.
+        if (line.indexOf(`"summary_nodes"`) < 0) return;
         JSONValue rec;
         try rec = parseJSON(line);
         catch (JSONException) return; // a torn or foreign line holds no node

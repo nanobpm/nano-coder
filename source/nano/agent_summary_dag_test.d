@@ -159,3 +159,33 @@ unittest
     assert(!agent.messages[1].content.canFind("[[node "));
     assert(("summary_nodes" in replaces(agent)[0]["data"].objectNoRef) is null);
 }
+
+// Flat, then layered: the flat summary's content goes to the summarizer
+// instead of being dropped, and a reused node ID reads back the live node.
+unittest
+{
+    auto mock = new MockClient([LLMResponse("a0"), LLMResponse("FLATSUM"), LLMResponse("a1"), LLMResponse("LEAF1"),
+        LLMResponse("a2"), LLMResponse("FLAT2"), LLMResponse("a3"), LLMResponse("fresh-marker")]);
+    auto agent = logged("flat-then-layered", mock);
+    agent.compactionSummaryDag = false;
+    agent.run("first", new NullEvents);
+    assert(compactAs(agent, ctx.CompactionMode.smart));
+    assert(!agent.messages[1].content.canFind("[[node "));
+    agent.compactionSummaryDag = true;
+    agent.run("second", new NullEvents);
+    auto before = mock.seen.length;
+    assert(compactAs(agent, ctx.CompactionMode.smart));
+    assert(mock.seen[before][1].content.canFind("FLATSUM"), "the flat summary is summarized, not dropped");
+    assert(dag.parse(agent.messages[1].content).length == 1);
+    // Reset the node list with a flat compaction, then layer again: S1 repeats.
+    agent.compactionSummaryDag = false;
+    agent.run("third", new NullEvents);
+    assert(compactAs(agent, ctx.CompactionMode.smart));
+    agent.compactionSummaryDag = true;
+    agent.run("fourth", new NullEvents);
+    assert(compactAs(agent, ctx.CompactionMode.smart));
+    auto live = dag.parse(agent.messages[1].content);
+    assert(live.length == 1 && live[0].id == 1);
+    auto got = hist.read(agent.log.unwrap("logged").path, parseJSON(`{"node":"S1"}`));
+    assert(got.canFind("fresh-marker") && !got.canFind("LEAF1"), got);
+}
