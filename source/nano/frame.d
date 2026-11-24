@@ -1584,6 +1584,11 @@ struct Transcript
     string[] render(size_t width) pure
     {
         if (width != cacheWidth) { cache = null; cacheWidth = width; }
+        // Reserve once: growing element by element from empty re-copies the
+        // array a varying number of times (whether it extends in place
+        // depends on what other threads hold in the shared GC heap), so the
+        // first render's allocation varied between runs (#310's 2 MiB check).
+        cache.reserve(lines.length);
         while (cache.length < lines.length) cache ~= wrapAnsi(lines[cache.length], width);
         size_t total;
         foreach (w; cache) total += w.length;
