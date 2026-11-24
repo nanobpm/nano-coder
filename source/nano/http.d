@@ -166,8 +166,18 @@ string postJson(string url, string[string] headers, JSONValue body_, string what
     req.idleTimeout = (timeoutSecs > 0 ? timeoutSecs : defaultTimeoutSecs()).seconds;
     auto offline = OfflineWait(what, policy);
     scope (failure) offline.abandon();
+    // A dropped stream's accumulator is reset only when the next attempt is
+    // sent, not before the backoff: a cancel during the wait then reports the
+    // dropped attempt as the final one, and one during the next transfer
+    // counts both (issue #340).
+    bool resetDue;
     for (long attempt = 0;; attempt++)
     {
+        if (resetDue)
+        {
+            resetDue = false;
+            reset();
+        }
         bool received;
         SseParser sse;
         string text;
@@ -198,7 +208,7 @@ string postJson(string url, string[string] headers, JSONValue body_, string what
                 // accumulator is reset and the request retried like any other.
                 auto lost = new StreamInterrupted(format("%s: connection lost mid-reply (%s)", what, curlReason(e.msg)));
                 if (shown is null || reset is null || shown() || attempt >= policy.maxRetries) throw lost;
-                reset();
+                resetDue = true;
                 failure = lost;
             }
             else
@@ -475,67 +485,43 @@ string postStream(S)(ref S st, out imported!"nano.llm".RetrySpend spent, string 
         local = initial;
     }
     // An aborted stream keeps the usage it already reported (issue #340).
-    try whole = postProvider(url, headers, body_, what, c, (string data) { ledger.answered(); local.event(data); },
+    try whole = postProvider(url, headers, body_, what, c, (string data) { local.event(data); },
         () => shown, &restart);
     catch (StreamInterrupted dropped)
     {
-        dropped.usage = ledger.last(usageNow());
+        dropped.usage = usageNow();
         dropped.retried = ledger.retried;
         throw dropped;
     }
     catch (imported!"nano.control".Cancelled stopped)
     {
-        stopped.usage = ledger.last(usageNow());
+        stopped.usage = usageNow();
         stopped.retried = ledger.retried;
         throw stopped;
     }
     catch (imported!"nano.llm".SpendingException failed)
     {
-        // A dropped attempt the failure ended is still spent (issue #340).
-        ledger.answered();
         failed.retried = ledger.retried;
         throw failed;
     }
-    ledger.answered();
     spent = ledger.retried;
     st = local;
     return whole;
 }
 
-/// What a stream request's dropped attempts cost. The attempt a restart drops
-/// is folded into `retried` only once another attempt answers: a cancel or
-/// failure before then (e.g. during the retry backoff) reports it as the
-/// final attempt instead, so it is counted exactly once (issue #340).
+/// What a stream request's dropped attempts cost. An attempt is folded in when
+/// the next one is sent (`postJson` resets the stream only then), so a cancel
+/// during the retry backoff reports the dropped attempt as the final one and a
+/// cancel during the next transfer counts both, each exactly once (issue #340).
 struct RetryLedger
 {
     /// The spending of attempts dropped and followed by another attempt.
     imported!"nano.llm".RetrySpend retried;
-    private imported!"nano.llm".TokenUsage dropped;
-    private bool pending;
 
-    /// An attempt that reported `u` was dropped; another will be made.
+    /// An attempt that reported `u` was dropped and the next one is being sent.
     void restart(imported!"nano.llm".TokenUsage u) pure nothrow @nogc
     {
-        answered();
-        dropped = u;
-        pending = true;
-    }
-
-    /// Another attempt answered (an event, a reply or an error), so the
-    /// dropped one is settled as retried.
-    void answered() pure nothrow @nogc
-    {
-        if (!pending) return;
-        retried = addRetry(retried, dropped);
-        pending = false;
-    }
-
-    /// The final attempt's usage when the request stops now, given what
-    /// the current attempt reported: the dropped attempt's while no other
-    /// has answered.
-    imported!"nano.llm".TokenUsage last(imported!"nano.llm".TokenUsage current) const pure nothrow @nogc
-    {
-        return pending ? dropped : current;
+        retried = addRetry(retried, u);
     }
 }
 
@@ -543,20 +529,11 @@ unittest
 {
     import nano.llm : RetrySpend, TokenUsage;
     TokenUsage u = { inputTokens: 7 };
-    // Cancelled during the backoff after a drop: one attempt, counted once.
     RetryLedger a;
+    assert(a.retried == RetrySpend.init);
     a.restart(TokenUsage.init);
-    assert(a.retried == RetrySpend.init && !hasUsage(a.last(TokenUsage.init)),
-        "the dropped attempt is the final one, not also a retried one");
     a.restart(u);
-    assert(a.retried.uncounted == 1 && a.last(TokenUsage.init) == u);
-    // The retry answered: the dropped attempt is retried spending.
-    RetryLedger b;
-    b.restart(u);
-    b.answered();
-    assert(b.retried.usage == u && b.retried.uncounted == 0 && b.last(TokenUsage.init) == TokenUsage.init);
-    b.answered();
-    assert(b.retried.usage == u, "settled once");
+    assert(a.retried.uncounted == 1 && a.retried.usage == u);
 }
 
 /// The sum of two retried-attempt spendings.
@@ -948,4 +925,30 @@ unittest
     assert(threw, "expected the capped stream to abort");
     assert(forwarded <= 5);
     srv.finish();
+}
+
+// A dropped stream's accumulator is reset when the next attempt is sent, after
+// the backoff, so a cancel during the wait still sees the dropped attempt as
+// the final one and a cancel during the next transfer counts both (issue #340).
+unittest
+{
+    import nano.testserver : serve, Reply;
+    import nano.clock : FakeClock;
+    import std.datetime.systime : SysTime;
+    auto clock = FakeClock.install(SysTime(0));
+    auto srv = serve([
+        Reply(200, "Content-Type: text/event-stream\r\nx-truncate: 1\r\n", "data: usage\n\n"),
+        Reply(200, "Content-Type: text/event-stream\r\n", "data: done\n\n"),
+    ]);
+    RetryPolicy p;
+    p.maxRetries = 1;
+    p.initialBackoff = 2.seconds;
+    auto start = monoNow;
+    string[] seen;
+    Duration resetAt = Duration.max;
+    postJson(srv.url ~ "/sse", null, JSONValue(1), "probe", p, [], 5, (string ev) { seen ~= ev; },
+        () => false, () { resetAt = monoNow - start; seen ~= "reset"; });
+    srv.finish();
+    assert(seen == ["usage", "reset", "done"], imported!"std.conv".text(seen));
+    assert(resetAt >= 1.seconds, "reset before the backoff: " ~ resetAt.toString);
 }
