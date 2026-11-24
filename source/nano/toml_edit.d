@@ -58,7 +58,7 @@ string tomlKey(string k) pure
 
 /// The dotted segments of a header like `[providers."my x".models]`, or null
 /// when `line` is not a plain table header (`[[array]]` tables too are null).
-string[] headerPath(string line) pure nothrow
+string[] headerPath(string line) pure
 {
     auto t = line.strip;
     if (!t.startsWith("[") || t.startsWith("[[")) return null;
@@ -72,14 +72,21 @@ string[] headerPath(string line) pure nothrow
         if (t[i] == '"' || t[i] == '\'')
         {
             auto q = t[i];
+            auto st = i;
             i++;
             while (i < t.length && t[i] != q)
-            {
-                if (q == '"' && t[i] == '\\' && i + 1 < t.length) { seg ~= t[i + 1]; i += 2; continue; }
-                seg ~= t[i++];
-            }
+                i += q == '"' && t[i] == '\\' && i + 1 < t.length ? 2 : 1;
             if (i >= t.length) return null;
             i++;
+            // Decode with the loader's string rules (`\uXXXX`, `\n`, ...), so
+            // the edit matches exactly the tables the loader sees.
+            import nano.toml : parseToml;
+            import std.json : JSONType;
+            auto decoded = parseToml("k = " ~ t[st .. i]);
+            if (decoded.isErr) return null;
+            auto v = decoded.unwrap("checked isErr above")["k"];
+            if (v.type != JSONType.string) return null;
+            seg = v.str;
         }
         else
         {
@@ -99,7 +106,7 @@ string[] headerPath(string line) pure nothrow
 
 /// The dotted segments of an array-of-tables header like
 /// `[["subagent_models"]]`, or null when `line` is not one.
-string[] arrayHeaderPath(string line) pure nothrow
+string[] arrayHeaderPath(string line) pure
 {
     auto t = line.strip;
     if (!t.startsWith("[[")) return null;
@@ -415,7 +422,7 @@ unittest
 
 /// The header path in force at line `row`.
 /// `stmt` is `statementRows(lines)`: rows inside a multi-line value are text.
-private string[] tableAt(const string[] lines, const bool[] stmt, size_t row) pure nothrow
+private string[] tableAt(const string[] lines, const bool[] stmt, size_t row) pure
 {
     string[] cur;
     foreach (i, l; lines[0 .. row])
@@ -492,4 +499,14 @@ unittest
     assert(statementRows(doc.split("\n"))[0 .. 5] == [true, false, false, false, true]);
     assert(tomlSet(doc, [], "x", "2").unwrap("valid") == doc.replace("x = 1", "x = 2"));
     assert(tomlSet(doc, [], "system_prompt", `"s"`).unwrap("valid") == "system_prompt = \"s\"\nx = 1\n");
+}
+
+unittest
+{
+    // Quoted header segments decode TOML escapes like the loader does.
+    assert(headerPath(`["subagent\u005Fmodels"]`) == ["subagent_models"]);
+    assert(arrayHeaderPath(`[["subagent\u005Fmodels"]]`) == ["subagent_models"]);
+    assert(headerPath(`["a\"b"]`) == [`a"b`]);
+    assert(headerPath(`['raw\u005F']`) == [`raw\u005F`]);
+    assert(headerPath(`["bad\uZZZZ"]`) is null);
 }
