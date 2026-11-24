@@ -283,6 +283,15 @@ struct RetrySpend
     size_t uncounted;
 }
 
+/// A failed model request that still carries what its retried stream
+/// attempts cost (issue #340), so every failure path can count it.
+class SpendingException : Exception
+{
+    /// Spending of stream attempts dropped and retried before the failure.
+    RetrySpend retried;
+    this(string msg) pure nothrow @safe { super(msg); }
+}
+
 struct LLMResponse
 {
     string content;

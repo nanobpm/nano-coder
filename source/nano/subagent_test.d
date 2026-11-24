@@ -693,3 +693,35 @@ unittest
     assert(f.agent.uncountedRequests == 4, "the usage-free final drop and both retries' usage-free attempts");
     assert(f.agent.lastUsage.inputTokens == 20, "only the successful attempt sizes the context");
 }
+
+// A request whose retried stream attempts end in an HTTP error (or any other
+// failure) still counts their spending, as a drop or cancel does (issue #340).
+unittest
+{
+    import nano.http : ApiError, RequestException;
+    import nano.llm : RetrySpend;
+    auto f = new Fixture([]);
+    int n;
+    f.agent.client = new class MockClient
+    {
+        this() { super([]); }
+        override LLMResponse chat(const ref ChatRequest req, StreamSink sink)
+        {
+            n++;
+            if (n == 1)
+            {
+                auto e = new ApiError(400, `{"error":{"message":"bad request"}}`, "chat");
+                e.retried = RetrySpend(TokenUsage(30, 0), 1);
+                throw e;
+            }
+            auto e = new RequestException("chat: network unavailable");
+            e.retried = RetrySpend(TokenUsage(4, 0), 2);
+            throw e;
+        }
+    };
+    import std.exception : collectException;
+    assert(collectException(f.agent.run("go", new NullEvents)) !is null);
+    assert(collectException(f.agent.run("again", new NullEvents)) !is null);
+    assert(f.agent.sessionInputTokens == 34, "both failures' retried usage is counted once");
+    assert(f.agent.uncountedRequests >= 3, "their usage-free retried attempts are counted");
+}

@@ -1221,18 +1221,16 @@ class Agent
         auto tr = temperatureFor(th.anthropicThinkingOn);
         req.temperature = tr.effective;
         ev.generationStart();
-        try r = client.chat(req, (bool t, string s) { ev.text(t, s); });
+        try r = chatCounted(req, (bool t, string s) { ev.text(t, s); }, ev);
         catch (Cancelled e)
         {
             failure = e;
-            countRetried(e.retried, ev);
             countAborted(e.usage, ev);
             return Event(CallFailed(Failure.cancelled, e.msg, req.maxTokens, true));
         }
         catch (StreamInterrupted e)
         {
             failure = e;
-            countRetried(e.retried, ev);
             countAborted(e.usage, ev);
             return Event(CallFailed(Failure.interrupted, e.msg, req.maxTokens, control.isCancelled));
         }
@@ -2303,7 +2301,7 @@ class Agent
                 // counts it (its turn cap and token cap), so emit the same
                 // events a turn's call does.
                 foreach (e; ev) e.summaryStart();
-                auto r = client.chat(req, (bool, string) {});
+                auto r = chatCounted(req, (bool, string) {}, ev);
                 summaryMs = since(swStart).total!"msecs";
                 countRetried(r.retried, ev);
                 summaryUsage = r.usage;
@@ -2326,13 +2324,11 @@ class Agent
             }
             catch (Cancelled e)
             {
-                countRetried(e.retried, ev);
                 countAborted(e.usage, ev);
                 return false;
             }
             catch (StreamInterrupted e)
             {
-                countRetried(e.retried, ev);
                 countAborted(e.usage, ev);
                 // A dropped summary stream is asked again, as a turn's is,
                 // before history is dropped for want of a summary.
@@ -2536,6 +2532,20 @@ class Agent
             else foreach (e; ev) e.usage(u);
         }
         else uncountedRequests++;
+    }
+
+    /// `client.chat`, first counting what retried stream attempts cost when
+    /// the request fails, whatever the failure (issue #340); the failure is
+    /// rethrown unchanged otherwise, for the caller to classify.
+    private LLMResponse chatCounted(E)(ref ChatRequest req, StreamSink sink, E ev)
+    {
+        try return client.chat(req, sink);
+        catch (SpendingException e)
+        {
+            countRetried(e.retried, ev);
+            e.retried = RetrySpend.init;
+            throw e;
+        }
     }
 
     /// Count the stream attempts dropped and retried before a request's

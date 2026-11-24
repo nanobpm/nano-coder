@@ -501,7 +501,18 @@ class CopilotClient : OpenAIClient
         {
             if (e.status != 401) throw e;
             forceRefresh = true;
-            return route(req, sink);
+            // The first route's retried attempts were spent too (issue #340).
+            try
+            {
+                auto r = route(req, sink);
+                r.retried = addSpend(e.retried, r.retried);
+                return r;
+            }
+            catch (SpendingException again)
+            {
+                again.retried = addSpend(e.retried, again.retried);
+                throw again;
+            }
         }
     }
 
