@@ -1811,8 +1811,17 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
                         bool flag(string k) { return skimField(data, k) == "true"; }
                         noteUserMessage(true, flag("auto_initiated"), flag("steered"),
                             skimField(data, "from_session").length > 0, delegate Option!string() {
-                                auto c = skimString(data, "content");
-                                return c is null ? Option!string.init : some(c.idup);
+                                // The full JSON decoder, not `unescapeKey`: it keeps
+                                // surrogate pairs, so recall matches the full decode.
+                                auto raw = skimField(data, "content");
+                                if (raw.length < 2 || raw[0] != '"') return Option!string.init;
+                                try
+                                {
+                                    auto v = parseJSON(raw);
+                                    if (v.type == JSONType.string) return some(v.str);
+                                }
+                                catch (JSONException) {} // malformed content: no recall entry, as the full decode
+                                return Option!string.init;
                             });
                     }
                     // Structured payloads (calls, reasoning items) are
@@ -4255,6 +4264,12 @@ unittest // compacted_log_recall_matches_full_decode: the skim keeps steers, dro
     peerSteer.steered = true;
     peerSteer.fromSession = "sess-other";
     add("message", rec(peerSteer));
+    import std.array : replace;
+    // A surrogate-pair escape must decode to the character, not U+FFFD.
+    auto rocket = Message.user("ROCKET");
+    rocket.steered = true;
+    log ~= line("message", rec(rocket)).replace("ROCKET", `go \ud83d\ude80`);
+    lines++;
     add("turn_end", JSONValue(["input_id": "in-1", "response": "", "stop_reason": "end_turn"]));
     add("input", JSONValue(["id": "in-2", "text": "timer fired"]));
     add("message", rec(Message.auto_("timer fired")));
@@ -4266,6 +4281,6 @@ unittest // compacted_log_recall_matches_full_decode: the skim keeps steers, dro
     auto path = buildPath(dir, "skimrecall.jsonl");
     write(path, log);
     auto skimmed = restoreLog(path, true), fullR = restoreLog(path, false);
-    assert(fullR.recentInputs == ["typed \"one\"", "a steer \u00e9"]);
+    assert(fullR.recentInputs == ["typed \"one\"", "a steer \u00e9", "go \U0001F680"]);
     assert(skimmed.recentInputs == fullR.recentInputs);
 }
