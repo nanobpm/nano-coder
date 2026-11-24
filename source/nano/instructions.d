@@ -42,18 +42,7 @@ immutable string[] defaultUserRulesDirs = ["~/.claude/rules"];
 /// Project rules directory, relative to the git root.
 enum projectRulesDir = ".claude/rules";
 
-/// The nearest ancestor (or `start`) holding `.git`, or null.
-string gitRoot(string start)
-{
-    import std.file : exists;
-    for (auto d = start;;)
-    {
-        if (exists(buildPath(d, ".git"))) return d;
-        auto up = d.dirName;
-        if (up == d) return null;
-        d = up;
-    }
-}
+public import nano.gitroot : gitRoot;
 
 /// Expand a leading `~` (alone or `~/…`) to the home directory.
 string expandHome(string path)

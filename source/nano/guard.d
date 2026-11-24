@@ -424,14 +424,25 @@ struct Guard
         if (!inWorkspace && componentCount(p) <= 2) return "a top-level system directory";
         if (!inWorkspace && systemDirs.any!(d => startsWithPath(p, d))) return "a system directory";
         if (!inWorkspace && varRoots.canFind(p)) return "a system directory";
-        if (components(p).canFind(".git")) return "a git repository's .git directory";
+        if (inGitDir(p)) return "a git repository's .git directory";
         return null;
+    }
+
+    /// Whether `p` passes through a `.git` directory. Inside the workspace only
+    /// the part below the working directory counts: a workspace that itself
+    /// sits under some `.git` (a worker's temp directory does, issue #374)
+    /// still guards its own repositories' `.git`, but is not wholly off limits.
+    bool inGitDir(string p) pure
+    {
+        auto parts = components(p);
+        if (!samePath(cwd, "/") && startsWithPath(p, cwd)) parts = parts[components(cwd).length .. $];
+        return parts.canFind(".git");
     }
 
     /// Like `danger`, but only catastrophic roots outside the workspace.
     string catastrophicRoot(string p) pure
     {
-        if (components(p).canFind(".git")) return "a git repository's .git directory";
+        if (inGitDir(p)) return "a git repository's .git directory";
         if (!samePath(cwd, "/") && startsWithPath(p, cwd)) return null;
         if (samePath(p, "/")) return "the filesystem root";
         if (home !is null)
@@ -638,4 +649,18 @@ private string envGet(string name)
 {
     import std.process : environment;
     return environment.get(name);
+}
+
+// issue #374: a workspace that sits under some `.git` (a worker's temp
+// directory does) is not wholly off limits, but `.git` below it still is,
+// and any `.git` outside it too.
+unittest
+{
+    Guard g;
+    g.cwd = "/w/.git/tmp/ws";
+    assert(g.danger("/w/.git/tmp/ws/build", true) is null);
+    assert(g.danger("/w/.git/tmp/ws/repo/.git", true) == "a git repository's .git directory");
+    assert(g.catastrophicRoot("/w/.git/tmp/ws/.git/refs") == "a git repository's .git directory");
+    assert(g.catastrophicRoot("/w/.git/objects") == "a git repository's .git directory");
+    assert(g.catastrophicRoot("/w/.git/tmp/ws/build") is null);
 }

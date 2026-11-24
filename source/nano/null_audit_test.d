@@ -26,6 +26,7 @@ static import nano.copilot;
 static import nano.emoji;
 static import nano.emoji_table;
 static import nano.frame;
+static import nano.gitroot;
 static import nano.frameui;
 static import nano.extract;
 static import nano.summary_dag;
@@ -123,6 +124,7 @@ private alias modules = imported!"std.meta".AliasSeq!(
     nano.emoji,
     nano.emoji_table,
     nano.frame,
+    nano.gitroot,
     nano.frameui,
     nano.extract,
     nano.summary_dag,

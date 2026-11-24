@@ -88,8 +88,41 @@ unit() {
         || { echo "the watchdog did not name the stuck module:"; printf '%s\n' "$out" | tail -20; exit 1; }
 }
 
+# The modules that read the user's home, config and repositories, run the way
+# a Nano Workforce worker runs them (issue #374): a populated HOME (user
+# instructions, skills, Claude settings, nano-coder config, trusted projects)
+# and a TMPDIR inside a git checkout's .git. They must pass regardless.
+hostile_home() {
+    step "unit tests with a populated HOME and TMPDIR inside a git checkout"
+    # Not under a temp root nor this checkout's .git: the workspace sandbox
+    # always grants both, so a fake HOME there would be writable.
+    work=${XDG_CACHE_HOME:-$HOME/.cache}/nano-coder-hostile.$$
+    mkdir -p "$(dirname "$work")"
+    rm -rf "$work"
+    fake=$work/home
+    mkdir -p "$fake/.agents/skills/intruder" "$fake/.claude/skills/intruder2" "$fake/.claude/rules" \
+        "$fake/.config/nano-coder" "$work/checkout/.git/tmp"
+    printf 'INTRUDER user instructions\n' > "$fake/.agents/AGENTS.md"
+    printf 'INTRUDER claude instructions\n' > "$fake/.claude/CLAUDE.md"
+    printf 'INTRUDER rule\n' > "$fake/.claude/rules/r.md"
+    printf -- '---\nname: intruder\ndescription: Intrudes.\n---\nx\n' > "$fake/.agents/skills/intruder/SKILL.md"
+    printf -- '---\nname: intruder2\ndescription: Intrudes.\n---\nx\n' > "$fake/.claude/skills/intruder2/SKILL.md"
+    printf '{"permissions":{"deny":["Bash(*)"]},"hooks":{}}\n' > "$fake/.claude/settings.json"
+    printf 'bash_timeout_secs = 1\n[permissions]\ndeny = ["bash"]\n' > "$fake/.config/nano-coder/config.toml"
+    printf '/\n%s\n' "$work" > "$fake/.config/nano-coder/trusted-projects"
+    printf 'INTRUDER checkout instructions\n' > "$work/checkout/AGENTS.md"
+    status=0
+    HOME=$fake XDG_CONFIG_HOME=$fake/.config TMPDIR=$work/checkout/.git/tmp NANO_TEST_JOBS=4 \
+        NANO_TEST_BUDGET_SCALE=${NANO_TEST_BUDGET_SCALE:-${CI:+3}} \
+        NANO_TEST_ONLY=nano.instructions,nano.permissions_test,nano.skills,nano.system_prompt,nano.tools.search,nano.trust,nano.agent_bound_test,nano.gitroot \
+        ./nano-coder-test-application || status=$?
+    rm -rf "$work"
+    [ "$status" -eq 0 ] || exit "$status"
+}
+
 test_() {
     unit
+    hostile_home
     typecheck
     # The other OS too, so a macOS-only or Linux-only symbol fails on either.
     case "$(uname -s)" in
@@ -114,6 +147,7 @@ quick() {
     ./scripts/check-safe.sh
     typecheck
     unit
+    hostile_home
 }
 
 case "${1:-all}" in

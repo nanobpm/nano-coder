@@ -1044,6 +1044,10 @@ class SessionLog
 
     /// Where the warning about a replaced log goes (tests capture it).
     void delegate(string) warn;
+    /// Whether `turnEnd` fsyncs the log, so a finished turn survives a crash.
+    /// Tests that write many turns turn it off: a thousand fsyncs on a loaded
+    /// disk outlast the per-module time limit (issue #374).
+    bool syncTurns = true;
     /// Called after a recovery moved this session to a new id (oldId, newId),
     /// so the owner can move state keyed on the id (the handle claim). Runs
     /// on the append path: whatever it throws is swallowed.
@@ -1368,6 +1372,7 @@ class SessionLog
         d["recorded_at"] = nowStamp();
         if (stopReason.length && stopReason != "end_turn") d["stop_reason"] = stopReason;
         write_(record("turn_end", d));
+        if (!syncTurns) return;
         import core.sys.posix.unistd : fsync;
         fsync(fileno(f.getFP));
     }

@@ -664,7 +664,11 @@ short one rather than waiting out the production value. The test runner
 host doesn't fail a correct change: before failing a module, the runner times a fixed calibration
 (CPU, short sleeps, process spawns) and scales the limits by how much slower it ran than on an idle
 machine, at most 3x. `NANO_TEST_TIMES=N dub test` lists the
-N slowest modules. `NANO_TEST_JOBS=N` runs modules in parallel (`scripts/ci.sh` uses 4); modules
+N slowest modules. `NANO_TEST_ONLY=nano.skills,nano.trust` runs only the named modules. The
+runner gives each run its own TMPDIR and makes it a git ceiling directory, so a host whose temp
+directory sits inside a git checkout (a Nano Workforce worker's does) cannot leak that checkout into
+the tests; `scripts/ci.sh` reruns the modules that read the home directory and repositories with a
+populated fake HOME and such a TMPDIR. `NANO_TEST_JOBS=N` runs modules in parallel (`scripts/ci.sh` uses 4); modules
 that change process-wide state (the cancel flag, environment variables) are listed in
 `scripts/serial-tests` and run alone first. A module still running at twice its most-scaled limit
 (at least 10 s) is treated as hung: the runner names it and exits failing instead of waiting
@@ -1368,7 +1372,8 @@ and `~/.agents/AGENTS.md`) is loaded first, under a "Your instructions" heading,
 the rules in `user_rules_dirs` (default `~/.claude/rules`).
 
 **The repository's files.** When a session starts, the harness looks in every directory from
-the git root (the nearest ancestor containing `.git`) down to the working directory. Outside
+the git root (the nearest ancestor containing `.git`, not climbing into a directory listed in
+`GIT_CEILING_DIRECTORIES`, as git itself does) down to the working directory. Outside
 a repository only the working directory is checked. In each directory:
 
 - the first file found from `project_instruction_files` is used, so `AGENTS.md` wins over

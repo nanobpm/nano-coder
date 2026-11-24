@@ -223,7 +223,7 @@ else
     if [ -s "$cache/$key" ]; then
         then_=$(measure_cached "$cache/$key") || exit 1
     else
-        tree=$(mktemp -d)
+        tree=$(mktemp -d "${TMPDIR:-/tmp}/nano-ratchet.XXXXXX")
         rmdir "$tree"
         # Remove the worktree however we leave, interrupts included.
         drop_tree() { git worktree remove --force "$tree" >/dev/null 2>&1; rm -rf "$tree"; git worktree prune >/dev/null 2>&1; }
