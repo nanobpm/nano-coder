@@ -216,6 +216,10 @@ unittest
     assert(f.agent.run("go", new NullEvents, false) == cancelledResponse);
     h.join();
     assert(f.toolResult("h1").canFind("[truncated: cancelled"));
+    // Each child's in-flight request was interrupted with no usage: left out
+    // of the totals, but counted and reported (issue #340).
+    assert(f.agent.uncountedRequests == 2 && f.agent.sessionInputTokens == 0);
+    assert(f.toolResult("h1").canFind("1 interrupted request not counted"), f.toolResult("h1"));
     f.agent.control.startTurn();
 }
 
@@ -627,4 +631,97 @@ unittest
     };
     assert(f.agent.run("go", new NullEvents) == "done");
     assert(offered == [true, false], "the retry honours the toggle");
+}
+
+// An aborted request counts the usage the provider reported before the drop
+// (issue #340); one without usage is left uncounted, not estimated.
+unittest
+{
+    import nano.http : StreamInterrupted;
+    auto f = new Fixture([]);
+    int n;
+    f.agent.client = new class MockClient
+    {
+        this() { super([]); }
+        override LLMResponse chat(const ref ChatRequest req, StreamSink sink)
+        {
+            n++;
+            if (n == 1)
+            {
+                auto e = new StreamInterrupted("dropped after usage");
+                e.usage = TokenUsage(40, 7);
+                throw e;
+            }
+            if (n == 2) throw new StreamInterrupted("dropped before usage");
+            return LLMResponse("done");
+        }
+    };
+    assert(f.agent.run("go", new NullEvents) == "done");
+    assert(f.agent.sessionInputTokens == 40, "the reported usage is counted");
+    assert(f.agent.uncountedRequests == 1, "only the request without usage is uncounted");
+}
+
+// Stream attempts retried inside a request add to the session totals and
+// count their usage-free attempts, but only the final attempt sizes the
+// context; a later usage-free drop is not hidden by earlier usage (issue #340).
+unittest
+{
+    import nano.http : StreamInterrupted;
+    import nano.llm : RetrySpend;
+    auto f = new Fixture([]);
+    int n;
+    f.agent.client = new class MockClient
+    {
+        this() { super([]); }
+        override LLMResponse chat(const ref ChatRequest req, StreamSink sink)
+        {
+            n++;
+            if (n == 1)
+            {
+                auto e = new StreamInterrupted("dropped");
+                e.retried = RetrySpend(TokenUsage(30, 0), 1);
+                throw e;
+            }
+            auto r = LLMResponse("done");
+            r.usage = TokenUsage(20, 5);
+            r.retried = RetrySpend(TokenUsage(20, 0), 2);
+            return r;
+        }
+    };
+    assert(f.agent.run("go", new NullEvents) == "done");
+    assert(f.agent.sessionInputTokens == 70 && f.agent.sessionOutputTokens == 5);
+    assert(f.agent.uncountedRequests == 4, "the usage-free final drop and both retries' usage-free attempts");
+    assert(f.agent.lastUsage.inputTokens == 20, "only the successful attempt sizes the context");
+}
+
+// A request whose retried stream attempts end in an HTTP error (or any other
+// failure) still counts their spending, as a drop or cancel does (issue #340).
+unittest
+{
+    import nano.http : ApiError, RequestException;
+    import nano.llm : RetrySpend;
+    auto f = new Fixture([]);
+    int n;
+    f.agent.client = new class MockClient
+    {
+        this() { super([]); }
+        override LLMResponse chat(const ref ChatRequest req, StreamSink sink)
+        {
+            n++;
+            if (n == 1)
+            {
+                auto e = new ApiError(400, `{"error":{"message":"bad request"}}`, "chat");
+                e.retried = RetrySpend(TokenUsage(30, 0), 1);
+                throw e;
+            }
+            auto e = new RequestException("chat: network unavailable");
+            e.retried = RetrySpend(TokenUsage(4, 0), 2);
+            throw e;
+        }
+    };
+    import std.exception : collectException;
+    assert(collectException(f.agent.run("go", new NullEvents)) !is null);
+    assert(collectException(f.agent.run("again", new NullEvents)) !is null);
+    assert(f.agent.sessionInputTokens == 34, "both failures' retried usage is counted once");
+    assert(f.agent.uncountedRequests >= 3, "their usage-free retried attempts are counted");
 }

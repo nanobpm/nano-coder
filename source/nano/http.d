@@ -19,12 +19,24 @@ import nano.retry : ErrorInfo, RetryPolicy, retryDelay, retryableError = retryab
 
 /// A streamed reply that broke after some events arrived. The request can't
 /// be resumed, but the caller can discard the partial reply and ask again.
-class StreamInterrupted : Exception
+class StreamInterrupted : imported!"nano.llm".SpendingException
 {
+    /// Usage the provider reported before the drop, so it is still counted
+    /// (issue #340). Zero when none arrived.
+    imported!"nano.llm".TokenUsage usage;
     this(string msg) pure { super(msg); }
 }
 
-class ApiError : Exception
+/// A request that failed for a reason other than an HTTP error or a drop
+/// (invalid JSON, a redirect loop, a network outage past its budget).
+class RequestException : imported!"nano.llm".SpendingException
+{
+    this(string msg) pure nothrow @safe { super(msg); }
+    /// `cause`'s message, chained to it, so its spending can be attached.
+    this(string msg, Throwable cause) pure nothrow @safe { super(msg); next = cause; }
+}
+
+class ApiError : imported!"nano.llm".SpendingException
 {
     int status;
     string body_;
@@ -156,8 +168,18 @@ string postJson(string url, string[string] headers, JSONValue body_, string what
     req.idleTimeout = (timeoutSecs > 0 ? timeoutSecs : defaultTimeoutSecs()).seconds;
     auto offline = OfflineWait(what, policy);
     scope (failure) offline.abandon();
+    // A dropped stream's accumulator is reset only when the next attempt is
+    // sent, not before the backoff: a cancel during the wait then reports the
+    // dropped attempt as the final one, and one during the next transfer
+    // counts both (issue #340).
+    bool resetDue;
     for (long attempt = 0;; attempt++)
     {
+        if (resetDue)
+        {
+            resetDue = false;
+            reset();
+        }
         bool received;
         SseParser sse;
         string text;
@@ -188,7 +210,7 @@ string postJson(string url, string[string] headers, JSONValue body_, string what
                 // accumulator is reset and the request retried like any other.
                 auto lost = new StreamInterrupted(format("%s: connection lost mid-reply (%s)", what, curlReason(e.msg)));
                 if (shown is null || reset is null || shown() || attempt >= policy.maxRetries) throw lost;
-                reset();
+                resetDue = true;
                 failure = lost;
             }
             else
@@ -215,7 +237,7 @@ string postJson(string url, string[string] headers, JSONValue body_, string what
                 // An error inside a 2xx JSON body.
                 JSONValue j;
                 try j = parseJSON(text);
-                catch (Exception) throw new Exception(format("%s: invalid JSON response: %s", what,
+                catch (Exception) throw new RequestException(format("%s: invalid JSON response: %s", what,
                     text.length > 500 ? text[0 .. 500] : text));
                 auto e = j.type == JSONType.object ? "error" in j.objectNoRef : null;
                 if (e is null || e.type == JSONType.null_) return text;
@@ -328,7 +350,7 @@ private struct OfflineWait
         import std.uni : toLower;
         auto now = monoNow;
         reason = curlReason(e.msg);
-        if (reason.toLower.indexOf("redirect") >= 0) throw new Exception(format("%s: %s", what, reason));
+        if (reason.toLower.indexOf("redirect") >= 0) throw new RequestException(format("%s: %s", what, reason));
         if (failures == 0)
         {
             since = now;
@@ -336,7 +358,7 @@ private struct OfflineWait
             if (!live) stdErr.writefln("[%s] network unavailable (%s); waiting to reconnect (Ctrl-C to stop)", what, reason);
         }
         auto spent = () => failures > 0 && remaining() == Duration.zero;
-        auto outOfBudget = () => new Exception(format("%s: network unavailable (%s)", what, reason));
+        auto outOfBudget = () => new RequestException(format("%s: network unavailable (%s)", what, reason));
         if (spent()) throw outOfBudget();
         auto backoff = policy.backoff(failures++);
         auto pauseFor = min(backoff, remaining());
@@ -437,10 +459,12 @@ string postProvider(string url, string[string] headers, JSONValue body_, string 
 
 /// Stream a provider request into `st` (an accumulator with a `sink` and an
 /// `event(data)` method). A drop before any visible output (non-empty text or
-/// thinking reached the sink) restarts from a fresh copy of `st` as given.
+/// thinking reached the sink) restarts from a fresh copy of `st` as given;
+/// what those dropped attempts cost goes to `spent`, apart from the final
+/// attempt's usage (also on a thrown StreamInterrupted or Cancelled).
 /// Returns the whole body when the reply wasn't an event stream, else null.
-string postStream(S)(ref S st, string url, string[string] headers, JSONValue body_, string what,
-        const ref imported!"nano.config".ProviderConfig c)
+string postStream(S)(ref S st, out imported!"nano.llm".RetrySpend spent, string url, string[string] headers,
+        JSONValue body_, string what, const ref imported!"nano.config".ProviderConfig c)
 {
     auto sink = st.sink;
     bool shown;
@@ -450,10 +474,186 @@ string postStream(S)(ref S st, string url, string[string] headers, JSONValue bod
         if (sink !is null) sink(thinking, text);
     };
     auto initial = local;
-    auto whole = postProvider(url, headers, body_, what, c, (string data) { local.event(data); }, () => shown,
-        () { local = initial; });
+    string whole;
+    RetryLedger ledger;
+    imported!"nano.llm".TokenUsage usageNow()
+    {
+        static if (__traits(hasMember, S, "r")) return local.r.usage;
+        else return imported!"nano.llm".TokenUsage.init;
+    }
+    void restart()
+    {
+        ledger.restart(usageNow());
+        local = initial;
+    }
+    // An aborted stream keeps the usage it already reported (issue #340).
+    try whole = postProvider(url, headers, body_, what, c, (string data) { local.event(data); },
+        () => shown, &restart);
+    catch (StreamInterrupted dropped)
+    {
+        dropped.usage = usageNow();
+        dropped.retried = ledger.retried;
+        throw dropped;
+    }
+    catch (imported!"nano.control".Cancelled stopped)
+    {
+        stopped.usage = usageNow();
+        stopped.retried = ledger.retried;
+        throw stopped;
+    }
+    catch (imported!"nano.llm".SpendingException failed)
+    {
+        failed.retried = ledger.retried;
+        throw failed;
+    }
+    catch (Exception other)
+    {
+        // Any other failure (a provider error event, malformed JSON from the
+        // parser) after a retried drop would lose the dropped attempts'
+        // spending: wrap it so it carries them. Without retries it passes as is.
+        if (ledger.retried == imported!"nano.llm".RetrySpend.init) throw other;
+        auto wrapped = new RequestException(other.msg, other);
+        wrapped.retried = ledger.retried;
+        throw wrapped;
+    }
+    spent = ledger.retried;
     st = local;
     return whole;
+}
+
+/// What a stream request's dropped attempts cost. An attempt is folded in when
+/// the next one is sent (`postJson` resets the stream only then), so a cancel
+/// during the retry backoff reports the dropped attempt as the final one and a
+/// cancel during the next transfer counts both, each exactly once (issue #340).
+struct RetryLedger
+{
+    /// The spending of attempts dropped and followed by another attempt.
+    imported!"nano.llm".RetrySpend retried;
+
+    /// An attempt that reported `u` was dropped and the next one is being sent.
+    void restart(imported!"nano.llm".TokenUsage u) pure nothrow @nogc
+    {
+        retried = addRetry(retried, u);
+    }
+}
+
+unittest
+{
+    import nano.llm : RetrySpend, TokenUsage;
+    TokenUsage u = { inputTokens: 7 };
+    RetryLedger a;
+    assert(a.retried == RetrySpend.init);
+    a.restart(TokenUsage.init);
+    a.restart(u);
+    assert(a.retried.uncounted == 1 && a.retried.usage == u);
+}
+
+/// The sum of two retried-attempt spendings.
+imported!"nano.llm".RetrySpend addSpend(imported!"nano.llm".RetrySpend a, imported!"nano.llm".RetrySpend b)
+    pure nothrow @nogc @safe
+{
+    a.usage = addUsage(a.usage, b.usage);
+    a.uncounted += b.uncounted;
+    return a;
+}
+
+/// `spent` plus one retried attempt that reported `u` (or nothing).
+imported!"nano.llm".RetrySpend addRetry(imported!"nano.llm".RetrySpend spent, imported!"nano.llm".TokenUsage u)
+    pure nothrow @nogc @safe
+{
+    if (hasUsage(u)) spent.usage = addUsage(spent.usage, u);
+    else spent.uncounted++;
+    return spent;
+}
+
+/// `r` carrying the spending of the attempts retried before it.
+imported!"nano.llm".LLMResponse withRetried(imported!"nano.llm".LLMResponse r, imported!"nano.llm".RetrySpend spent)
+    pure nothrow @safe
+{
+    r.retried = spent;
+    return r;
+}
+
+/// Run `parse` (the reply's final parse: the whole body or the stream's
+/// finish) and attach `spent`, the retried attempts' spending, to its result.
+/// A failure keeps that spending too: a SpendingException gets it added, and
+/// any other exception is wrapped in a RequestException carrying it, so no
+/// provider can lose retried usage on a malformed final reply (issue #340).
+imported!"nano.llm".LLMResponse finishCounted(imported!"nano.llm".RetrySpend spent,
+        scope imported!"nano.llm".LLMResponse delegate() @safe parse)
+{
+    import nano.llm : LLMResponse, RetrySpend, SpendingException;
+    LLMResponse r;
+    try r = parse();
+    catch (SpendingException failed)
+    {
+        failed.retried = addSpend(failed.retried, spent);
+        throw failed;
+    }
+    catch (Exception other)
+    {
+        // Nothing retried means nothing to carry: pass the error through as is.
+        if (spent == RetrySpend.init) throw other;
+        auto wrapped = new RequestException(other.msg, other);
+        wrapped.retried = spent;
+        throw wrapped;
+    }
+    return withRetried(r, spent);
+}
+
+unittest
+{
+    import nano.llm : LLMResponse, RetrySpend, SpendingException, TokenUsage;
+    import std.exception : assertThrown, collectException;
+    TokenUsage u = { inputTokens: 5 };
+    RetrySpend spent = { usage: u, uncounted: 1 };
+    assert(finishCounted(spent, () => LLMResponse.init).retried == spent);
+    auto e = collectException!SpendingException(finishCounted(spent, () { throw new Exception("bad"); return LLMResponse.init; }));
+    assert(e !is null && e.msg == "bad" && e.retried == spent && e.next !is null);
+    auto r = new RequestException("x");
+    r.retried = spent;
+    auto e2 = collectException!SpendingException(finishCounted(spent, () { throw r; return LLMResponse.init; }));
+    assert(e2 is r && e2.retried.uncounted == 2 && e2.retried.usage.inputTokens == 10, "merged, not overwritten");
+    auto plain = collectException(finishCounted(RetrySpend.init, () { throw new Exception("p"); return LLMResponse.init; }));
+    assert(cast(SpendingException) plain is null && plain.msg == "p");
+}
+
+/// Whether a request reported any usage worth counting.
+bool hasUsage(imported!"nano.llm".TokenUsage u) pure nothrow @nogc @safe
+{
+    return u.inputTokens > 0 || u.outputTokens > 0 || u.hasAic;
+}
+
+unittest
+{
+    import nano.llm : RetrySpend, TokenUsage;
+    TokenUsage some_ = { inputTokens: 20 };
+    auto s = addRetry(addRetry(RetrySpend.init, some_), TokenUsage.init);
+    assert(s.usage.inputTokens == 20 && s.uncounted == 1, "a usage-free retry is counted, not hidden");
+    assert(!hasUsage(TokenUsage.init) && hasUsage(some_));
+}
+
+/// The sum of two requests' usage: a retried attempt's tokens and credits
+/// are added to the attempt that replaced it.
+imported!"nano.llm".TokenUsage addUsage(imported!"nano.llm".TokenUsage a, imported!"nano.llm".TokenUsage b) pure nothrow @nogc @safe
+{
+    a.inputTokens += b.inputTokens;
+    a.outputTokens += b.outputTokens;
+    a.cachedInputTokens += b.cachedInputTokens;
+    a.aic += b.aic;
+    a.hasAic = a.hasAic || b.hasAic;
+    return a;
+}
+
+unittest
+{
+    import nano.llm : TokenUsage;
+    TokenUsage dropped = { inputTokens: 100 };
+    TokenUsage done = { inputTokens: 100, outputTokens: 7, cachedInputTokens: 3, hasAic: true, aic: 0.5 };
+    auto sum = addUsage(dropped, done);
+    assert(sum.inputTokens == 200 && sum.outputTokens == 7 && sum.cachedInputTokens == 3);
+    assert(sum.hasAic && sum.aic == 0.5);
+    assert(addUsage(TokenUsage.init, TokenUsage.init) == TokenUsage.init);
 }
 
 /// The `data: [DONE]` end-of-stream marker (not a JSON event).
@@ -781,4 +981,30 @@ unittest
     assert(threw, "expected the capped stream to abort");
     assert(forwarded <= 5);
     srv.finish();
+}
+
+// A dropped stream's accumulator is reset when the next attempt is sent, after
+// the backoff, so a cancel during the wait still sees the dropped attempt as
+// the final one and a cancel during the next transfer counts both (issue #340).
+unittest
+{
+    import nano.testserver : serve, Reply;
+    import nano.clock : FakeClock;
+    import std.datetime.systime : SysTime;
+    auto clock = FakeClock.install(SysTime(0));
+    auto srv = serve([
+        Reply(200, "Content-Type: text/event-stream\r\nx-truncate: 1\r\n", "data: usage\n\n"),
+        Reply(200, "Content-Type: text/event-stream\r\n", "data: done\n\n"),
+    ]);
+    RetryPolicy p;
+    p.maxRetries = 1;
+    p.initialBackoff = 2.seconds;
+    auto start = monoNow;
+    string[] seen;
+    Duration resetAt = Duration.max;
+    postJson(srv.url ~ "/sse", null, JSONValue(1), "probe", p, [], 5, (string ev) { seen ~= ev; },
+        () => false, () { resetAt = monoNow - start; seen ~= "reset"; });
+    srv.finish();
+    assert(seen == ["usage", "reset", "done"], imported!"std.conv".text(seen));
+    assert(resetAt >= 1.seconds, "reset before the backoff: " ~ resetAt.toString);
 }

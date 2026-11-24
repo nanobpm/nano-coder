@@ -21,7 +21,7 @@ import std.string : strip, stripLeft;
 import std.array : join;
 import std.conv : to;
 import nano.llm;
-import nano.http : StreamInterrupted;
+import nano.http : StreamInterrupted, hasUsage;
 import core.thread : Thread;
 import core.time : Duration;
 static import nano.session_index;
@@ -577,6 +577,9 @@ class Agent
     /// How many model calls (sub-agents included) reported AI Credits this
     /// session, so a turn reporting zero credits is told apart from one reporting none.
     ulong aicReports;
+    /// Model requests interrupted (cancelled or a broken stream) before the
+    /// provider reported usage: left out of the totals, never estimated.
+    size_t uncountedRequests;
     /// Called after every compaction with its report (the UI prints it).
     void delegate(const ref CompactReport) onCompacted;
     /// Usage-anchored estimate: messages[0 .. calibLen] cost `calibTokens`.
@@ -1232,15 +1235,17 @@ class Agent
         auto tr = temperatureFor(th.anthropicThinkingOn);
         req.temperature = tr.effective;
         ev.generationStart();
-        try r = client.chat(req, (bool t, string s) { ev.text(t, s); });
+        try r = chatCounted(req, (bool t, string s) { ev.text(t, s); }, ev);
         catch (Cancelled e)
         {
             failure = e;
+            countAborted(e.usage, ev);
             return Event(CallFailed(Failure.cancelled, e.msg, req.maxTokens, true));
         }
         catch (StreamInterrupted e)
         {
             failure = e;
+            countAborted(e.usage, ev);
             return Event(CallFailed(Failure.interrupted, e.msg, req.maxTokens, control.isCancelled));
         }
         catch (Exception e) // classified by nano.turn.step: retried, compacted for, or re-raised
@@ -1248,6 +1253,8 @@ class Agent
             failure = e;
             return Event(CallFailed(Failure.error, e.msg, req.maxTokens, control.isCancelled));
         }
+        // Retried attempts add to the totals but not to the calibration below.
+        countRetried(r.retried, ev);
         lastUsage = r.usage;
         recordUsage(r.usage);
         if (r.usage.inputTokens > 0)
@@ -2337,8 +2344,9 @@ class Agent
                 // counts it (its turn cap and token cap), so emit the same
                 // events a turn's call does.
                 foreach (e; ev) e.summaryStart();
-                auto r = client.chat(req, (bool, string) {});
+                auto r = chatCounted(req, (bool, string) {}, ev);
                 summaryMs = since(swStart).total!"msecs";
+                countRetried(r.retried, ev);
                 summaryUsage = r.usage;
                 recordUsage(r.usage);
                 foreach (e; ev) e.usage(r.usage);
@@ -2358,9 +2366,14 @@ class Agent
                 }
                 break;
             }
-            catch (Cancelled) return false;
+            catch (Cancelled e)
+            {
+                countAborted(e.usage, ev);
+                return false;
+            }
             catch (StreamInterrupted e)
             {
+                countAborted(e.usage, ev);
                 // A dropped summary stream is asked again, as a turn's is,
                 // before history is dropped for want of a summary.
                 if (control.isCancelled) return false;
@@ -2605,6 +2618,48 @@ class Agent
         return true;
     }
 
+    /// Count an aborted request: the usage the provider reported before the
+    /// abort when there is any, else one more request left uncounted (no
+    /// estimate; issue #340).
+    private void countAborted(E)(TokenUsage u, E ev)
+    {
+        if (hasUsage(u))
+        {
+            recordUsage(u);
+            static if (is(E : AgentEvents)) ev.usage(u);
+            else foreach (e; ev) e.usage(u);
+        }
+        else uncountedRequests++;
+    }
+
+    /// `client.chat`, first counting what retried stream attempts cost when
+    /// the request fails, whatever the failure (issue #340); the failure is
+    /// rethrown unchanged otherwise, for the caller to classify.
+    private LLMResponse chatCounted(E)(ref ChatRequest req, StreamSink sink, E ev)
+    {
+        try return client.chat(req, sink);
+        catch (SpendingException e)
+        {
+            countRetried(e.retried, ev);
+            e.retried = RetrySpend.init;
+            throw e;
+        }
+    }
+
+    /// Count the stream attempts dropped and retried before a request's
+    /// final attempt: their reported usage, plus one uncounted request per
+    /// attempt that reported none (issue #340).
+    private void countRetried(E)(RetrySpend spent, E ev)
+    {
+        if (hasUsage(spent.usage))
+        {
+            recordUsage(spent.usage);
+            static if (is(E : AgentEvents)) ev.usage(spent.usage);
+            else foreach (e; ev) e.usage(spent.usage);
+        }
+        uncountedRequests += spent.uncounted;
+    }
+
     /// The byte budget of a layered summary's node prose (issue #274): about
     /// a tenth of the window in tokens, at ~3 bytes per token.
     private static size_t condenseBudgetBytes(size_t window) pure nothrow @nogc
@@ -2639,8 +2694,16 @@ class Agent
         auto err = collectException(() {
             foreach (e; ev) e.summaryStart();
             const swStart = monoNow;
-            auto r = client.chat(req, (bool, string) {});
+            // Count retried stream attempts too, on success and on failure
+            // (issue #340), as the leaf summary request does.
+            LLMResponse r;
+            // An aborted attempt counts its reported usage, or one uncounted
+            // request, before the fallback, as the leaf summary's does.
+            try r = chatCounted(req, (bool, string) {}, ev);
+            catch (Cancelled e) { countAborted(e.usage, ev); throw e; }
+            catch (StreamInterrupted e) { countAborted(e.usage, ev); throw e; }
             ms = since(swStart).total!"msecs";
+            countRetried(r.retried, ev);
             recordUsage(r.usage);
             usage.inputTokens += r.usage.inputTokens;
             usage.outputTokens += r.usage.outputTokens;
@@ -2676,6 +2739,7 @@ class Agent
         hasSessionAic = false;
         sessionAic = 0;
         aicReports = 0;
+        uncountedRequests = 0;
         compactions = 0;
     }
 
@@ -3640,6 +3704,11 @@ class Agent
                 subSlots[i].toolCalls = m.toolCalls;
                 subSlots[i].turns = m.turns;
                 subSlots[i].tokens = m.tokens;
+                // A running child's usage counts as it is spent (issue
+                // #340): fold in what this snapshot adds to the last one.
+                size_t lost;
+                recordUsage(subSlots[i].fold.advance(m.spent, m.aicReports, m.uncounted, lost));
+                uncountedRequests += lost;
                 reportSubagents();
                 break;
             case SubKind.done:
@@ -3650,7 +3719,11 @@ class Agent
                 if (subSlots[i].result.logPath.length) subSlots[i].logPath = subSlots[i].result.logPath;
                 subRunning--;
                 // Usage rolls up into this session's totals (status line, /cost).
-                recordUsage(subSlots[i].result.usage);
+                // Only what the progress snapshots didn't already add.
+                size_t lost;
+                recordUsage(subSlots[i].fold.advance(subSlots[i].result.usage, subSlots[i].result.aicReports,
+                    subSlots[i].result.uncountedRequests, lost));
+                uncountedRequests += lost;
                 // Start the replacements first, so the one report shows
                 // them running (a child sends no progress during its first
                 // model request).

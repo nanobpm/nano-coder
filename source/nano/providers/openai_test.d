@@ -16,7 +16,7 @@ import nano.testserver;
 
 private:
 
-OpenAIClient against(string url, bool stream = true, long timeoutSecs = 10)
+OpenAIClient against(string url, bool stream = true, long timeoutSecs = 10, long maxRetries = 5)
 {
     ResolvedProvider p;
     p.name = "test";
@@ -26,6 +26,7 @@ OpenAIClient against(string url, bool stream = true, long timeoutSecs = 10)
     p.config.stream = stream;
     p.config.retryInitialBackoffMs = 1;
     p.config.timeoutSecs = timeoutSecs;
+    p.config.maxRetries = maxRetries;
     return new OpenAIClient(p);
 }
 
@@ -391,4 +392,147 @@ unittest
 
     r = probeWith("hosted", [ok(`{"data":[{"id":"qwen3:8b","owned_by":"system"}]}`)]);
     assert(r.caps.thinking.isNull && r.paths == ["/v1/models"], "unknown servers get no extra probes");
+}
+
+// Stream attempts dropped before any output and retried: their reported
+// tokens and credits, and one request each, add up with the final attempt's
+// so the totals equal the sum over every attempt (issue #340).
+enum spentEvent = `{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":1},"copilot_usage":{"total_nano_aiu":250000000}}`;
+
+/// The totals over a request's attempts: tokens, credits, and requests
+/// (each attempt reporting usage plus each one left uncounted).
+struct Totals { long input, output; double aic; size_t requests; }
+
+Totals totals(TokenUsage final_, bool finalCounted, RetrySpend retried) pure
+{
+    import nano.http : addUsage;
+    auto u = addUsage(final_, retried.usage);
+    return Totals(u.inputTokens, u.outputTokens, u.aic, retried.uncounted + (finalCounted ? 1 : 0));
+}
+
+// A retry that fails then succeeds.
+unittest
+{
+    import std.math : isClose;
+    auto srv = serve([immutable Reply(200, cutHeaders, sse([spentEvent]) ~ `data: {"choices":[{"delta":{"content":"pa`),
+        immutable Reply(200, cutHeaders, `data: {"choices":[{"delta":{"content":"pa`),
+        immutable Reply(200, streamHeaders, sse([`{"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}`,
+            `{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3},"copilot_usage":{"total_nano_aiu":500000000}}`], true))]);
+    auto req = hello();
+    auto r = against(srv.url).chat(req, (bool t, string x) {});
+    auto seen = srv.finish();
+    assert(r.content == "done" && seen.length == 3);
+    assert(r.usage.inputTokens == 12, "only the final attempt sizes the context");
+    auto t = totals(r.usage, true, r.retried);
+    assert(t.input == 22 && t.output == 4 && isClose(t.aic, 0.75), "tokens and credits of every attempt");
+    // The first attempt reported usage; the second none; the final its own.
+    assert(r.retried.uncounted == 1 && t.requests + 1 == seen.length, "every attempt is one request");
+}
+
+// A retry that fails on every attempt.
+unittest
+{
+    import std.math : isClose;
+    import nano.http : StreamInterrupted;
+    auto srv = serve([immutable Reply(200, cutHeaders, sse([spentEvent]) ~ `data: {"choices":[{"delta":{"content":"pa`),
+        immutable Reply(200, cutHeaders, `data: {"choices":[{"delta":{"content":"pa`),
+        immutable Reply(200, cutHeaders, sse([`{"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":2},`
+            ~ `"copilot_usage":{"total_nano_aiu":125000000}}`]) ~ `data: {"choices":[{"delta":{"content":"pa`)]);
+    auto c = against(srv.url, true, 10, 2);
+    auto req = hello();
+    StreamInterrupted dropped;
+    try c.chat(req, (bool t, string x) {});
+    catch (StreamInterrupted e) dropped = e;
+    auto seen = srv.finish();
+    assert(dropped !is null && seen.length == 3, "three attempts, all dropped");
+    assert(dropped.usage.inputTokens == 11, "the final attempt's own usage");
+    auto t = totals(dropped.usage, true, dropped.retried);
+    assert(t.input == 21 && t.output == 3 && isClose(t.aic, 0.375), "tokens and credits of every attempt");
+    // The first attempt reported usage; the second none; the final its own.
+    assert(dropped.retried.uncounted == 1 && t.requests + 1 == seen.length, "every attempt is one request");
+}
+
+// A retry whose next attempt fails in the parser (malformed JSON) still
+// carries the dropped attempt's spending (issue #340).
+unittest
+{
+    import std.math : isClose;
+    import nano.llm : SpendingException;
+    auto srv = serve([immutable Reply(200, cutHeaders, sse([spentEvent]) ~ `data: {"choices":[{"delta":{"content":"pa`),
+        immutable Reply(200, streamHeaders, "data: {not json\n\n")]);
+    auto req = hello();
+    SpendingException failed;
+    try against(srv.url).chat(req, (bool t, string x) {});
+    catch (SpendingException e) failed = e;
+    srv.finish();
+    assert(failed !is null, "the parser error carries the retried spending");
+    assert(failed.retried.usage.inputTokens == 10 && isClose(failed.retried.usage.aic, 0.25));
+    assert(failed.next !is null, "the original error stays chained");
+}
+
+// The final parse runs after the stream retries: a malformed or error reply
+// there still carries the dropped attempts' spending, the usage-reporting
+// one and the uncounted one (issue #340). Each provider funnels its final
+// parse through `finishCounted`, so these cover the class.
+void assertRetriedKept(SpendingException failed, long input, double aic)
+{
+    import std.math : isClose;
+    assert(failed !is null, "the final parse error carries the retried spending");
+    assert(failed.retried.usage.inputTokens == input && isClose(failed.retried.usage.aic, aic), "first attempt usage");
+    assert(failed.retried.uncounted == 1, "the usage-free dropped attempt is still one request");
+}
+
+immutable dropSpent = immutable Reply(200, cutHeaders, sse([spentEvent]) ~ `data: {"choices":[{"delta":{"content":"pa`);
+immutable dropBare = immutable Reply(200, cutHeaders, `data: {"choices":[{"delta":{"content":"pa`);
+
+// (a) Chat completions: the retry returns a non-SSE malformed body.
+unittest
+{
+    auto srv = serve([dropSpent, dropBare, immutable Reply(200, "content-type: text/html\r\n", "<html>proxy</html>")]);
+    auto req = hello();
+    SpendingException failed;
+    try against(srv.url).chat(req, (bool t, string x) {});
+    catch (SpendingException e) failed = e;
+    srv.finish();
+    assertRetriedKept(failed, 10, 0.25);
+}
+
+// (b) Chat completions: the retry returns a 200 error object.
+unittest
+{
+    auto srv = serve([dropSpent, dropBare,
+        immutable Reply(200, "content-type: application/json\r\n", `{"error":{"message":"boom"}}`)]);
+    auto req = hello();
+    SpendingException failed;
+    try against(srv.url).chat(req, (bool t, string x) {});
+    catch (SpendingException e) failed = e;
+    srv.finish();
+    assertRetriedKept(failed, 10, 0.25);
+    assert(failed.msg.canFind("boom"), failed.msg);
+}
+
+// (c) The Anthropic route: the retry returns a 200 error object.
+unittest
+{
+    import nano.providers.anthropic : AnthropicClient;
+    enum spent = `{"type":"message_start","message":{"usage":{"input_tokens":10}}}`;
+    enum delta = `{"type":"message_delta","delta":{},"usage":{"output_tokens":1},"copilot_usage":{"total_nano_aiu":250000000}}`;
+    auto srv = serve([immutable Reply(200, cutHeaders, sse([spent, delta]) ~ `data: {"type":"cont`),
+        immutable Reply(200, cutHeaders, `data: {"type":"cont`),
+        immutable Reply(200, "content-type: application/json\r\n", `{"type":"error","error":{"type":"overloaded_error","message":"busy"}}`)]);
+    ResolvedProvider p;
+    p.name = "test";
+    p.model = "some-model";
+    p.apiKey = "sk-test";
+    p.config.baseUrl = srv.url;
+    p.config.stream = true;
+    p.config.retryInitialBackoffMs = 1;
+    p.config.timeoutSecs = 10;
+    p.config.maxRetries = 5;
+    auto req = hello();
+    SpendingException failed;
+    try new AnthropicClient(p).chat(req, (bool t, string x) {});
+    catch (SpendingException e) failed = e;
+    srv.finish();
+    assertRetriedKept(failed, 10, 0.25);
 }
