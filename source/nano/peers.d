@@ -2144,7 +2144,7 @@ unittest
     if (isListeningSocket(fd))
     {
         assert(closeOrphanedPeerFds(dir) == 1, "unguarded, the sweep closes it");
-        conn = unixSocket(); // fd is closed; don't close its number again
+        conn.release(); // the sweep closed the fd: drop the handle so neither scope(exit) nor the GC finalizer closes its number again
     }
 }
 
