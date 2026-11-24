@@ -3807,7 +3807,15 @@ int runMain(string[] args)
     // resumed one's last record would otherwise win over `-m`.
     {
         SessionSettings explicitSettings;
-        if (o.hasResume && o.model.length) explicitSettings.model = currentSpec();
+        if (o.hasResume && o.model.length)
+        {
+            // Record the override's live window too (0: none), as `useClient`
+            // does for a switch, so a later flag-free resume doesn't pair the
+            // previous model's window with this model.
+            import std.conv : to;
+            explicitSettings.model = currentSpec();
+            explicitSettings.contextWindow = agent.configuredWindow.to!long;
+        }
         if (o.plan) explicitSettings.mode = agent.control.mode.name;
         if (o.verbosity.length) explicitSettings.verbosity = nano.ui.name(verbosity);
         if (explicitSettings.model.length || explicitSettings.mode.length || explicitSettings.verbosity.length)
