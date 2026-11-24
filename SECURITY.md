@@ -80,9 +80,15 @@ it even though the static guard cannot see through them.
 
 ## Posture and recommendation
 
-The OS sandbox is **off by default**. Running with the sandbox off is a
+The OS sandbox defaults to **`workspace` for headless runs** (`--acp`, `-p`,
+piped stdin), where nobody approves commands, and stays **off by default for
+interactive terminal runs**. Explicit settings (`--sandbox`,
+`NANO_CODER_SANDBOX`, `[sandbox] mode`) always win, including an explicit `off`.
+If a headless run's sandbox cannot be applied, nano-coder exits at startup
+rather than running unsandboxed. Running with the sandbox off is a
 **documented, user-accepted best-effort posture**: only the advisory static
-guard is active, with the known limitations above.
+guard is active, with the known limitations above. The effective mode and its
+source are printed to stderr in ACP mode and shown in `/settings`.
 
 **For untrusted or prompt-injectable model use, enable the sandbox**
 (`workspace` or `read-only` mode, and `network = false` where possible). That is

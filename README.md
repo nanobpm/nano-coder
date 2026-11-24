@@ -107,6 +107,11 @@ nano-coder --acp
 
 Speaks the Agent Communication Protocol (ACP) over stdio using newline-delimited JSON-RPC 2.0 messages. Compatible with c8ctl-nano's `spawnCaptureAcp` executor.
 
+Shell commands run in the `workspace` [OS sandbox](#permissions-and-sandbox) unless a
+sandbox mode is set explicitly (`--sandbox off` restores unsandboxed runs). At startup
+the effective mode and its source go to stderr (`nano-coder: sandbox workspace
+(default-headless)`), and the `/settings` reply carries `sandbox` and `sandbox_source`.
+
 **Protocol methods supported:**
 - `initialize` → returns protocol version and capabilities (`loadSession` when persistence is on)
 - `session/new` → starts a fresh conversation (and session log), returns sessionId.
@@ -400,7 +405,7 @@ Add an allow rule for anything legitimate they block, e.g.
 nothing inspects that. The boundary is the OS sandbox, plus credentials: don't give the agent
 production database URLs or broadly scoped tokens.
 
-**Sandbox** (`--sandbox workspace`, off by default) runs each shell command under Seatbelt
+**Sandbox** (`--sandbox workspace`; on by default for headless runs, off interactively) runs each shell command under Seatbelt
 (`sandbox-exec`) on macOS or Landlock on Linux (6.2+). Commands can read everywhere, but
 write only to:
 
@@ -414,6 +419,19 @@ outbound connections (macOS: except to localhost; Linux: all TCP, which needs Li
 If the sandbox is enabled but cannot be applied, commands fail instead of running
 unsandboxed. When a sandboxed command fails with a permission error, the result tells the
 model where it may write.
+
+**Default mode.** The mode comes from, in order: `--sandbox`, `NANO_CODER_SANDBOX`, the
+config's `[sandbox] mode`, and otherwise a default that depends on how nano-coder runs.
+Headless runs (`--acp`, `-p`, piped stdin), where no one approves commands, default to
+`workspace`; interactive terminal runs default to `off`. An explicit `off` at any level
+restores unsandboxed behaviour. `/settings` shows the effective mode and its source
+(`flag --sandbox`, `env NANO_CODER_SANDBOX`, `config`, `default-headless` or `default`).
+A headless run whose sandbox can't be applied (e.g. Linux older than 6.2) exits at
+startup with the opt-out spelled out rather than running unsandboxed.
+
+**Breaking change for fleet operators:** headless workers that write outside the
+workspace (other repositories, `~/.config/...`) now need `[sandbox] writable` grants or an
+explicit opt-out (`--sandbox off`, `NANO_CODER_SANDBOX=off` or `[sandbox] mode = "off"`).
 
 ## Commands
 
@@ -729,7 +747,7 @@ deny = []                               # e.g. ["Bash(git push:*)", "Edit(**/.en
 protected_branches = ["main", "master", "trunk", "develop"]
 
 [sandbox]
-mode = "off"                            # off | workspace | read-only (or --sandbox)
+# mode = "workspace"                    # off | workspace | read-only (or --sandbox); unset: workspace headless, off interactive
 writable = []                           # extra writable paths, e.g. ["~/.local/state/myapp"]
 network = true                          # false blocks outbound connections
 tool_caches = true                      # workspace mode: allow ~/.cargo/registry, ~/.npm, ~/.cache, ...

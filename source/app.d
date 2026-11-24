@@ -2945,20 +2945,26 @@ int runMain(string[] args)
         foreach (r; o.deny) policy.deny ~= parseRule(r);
     }
     catch (Exception e) die(e.msg);
+    // Headless runs (ACP, -p, piped stdin) have nobody approving commands, so
+    // they default to the workspace sandbox; explicit settings win (#118).
+    immutable headless = o.acp || o.prompt.length > 0 || !isTerminal(0);
+    import nano.sandbox : ResolvedMode, SandboxSource, modeName, parseSandboxMode = parseMode, resolveMode, sourceName, unavailableReason;
+    ResolvedMode sandboxMode;
     {
-        import nano.sandbox : parseMode;
         auto env = environment.get("NANO_CODER_SANDBOX");
-        try
-        {
-            if (env.length) cfg.sandbox.mode = parseMode(env);
-        }
-        catch (Exception e) die("NANO_CODER_SANDBOX: " ~ e.msg);
-        try
-        {
-            if (o.sandbox.length) cfg.sandbox.mode = parseMode(o.sandbox);
-        }
+        try parseSandboxMode(o.sandbox.length ? o.sandbox : "off");
         catch (Exception e) die(e.msg);
+        try sandboxMode = resolveMode(o.sandbox, env, cfg.sandbox.modeSet, cfg.sandbox.mode, headless);
+        catch (Exception e) die("NANO_CODER_SANDBOX: " ~ e.msg);
+        cfg.sandbox.mode = sandboxMode.mode;
     }
+    immutable sandboxSummary = format("%s (%s)", sandboxMode.mode.modeName, sandboxMode.source.sourceName);
+    if (o.acp) stdErr.writeln("nano-coder: sandbox ", sandboxSummary);
+    if (headless && cfg.sandbox.active)
+        if (auto why = unavailableReason(cfg.sandbox.network))
+            die(format("the %s sandbox (%s) can't be applied: %s. To run unsandboxed, opt out explicitly with "
+                ~ "--sandbox off, NANO_CODER_SANDBOX=off or [sandbox] mode = \"off\" in the config",
+                sandboxMode.mode.modeName, sandboxMode.source.sourceName, why));
     policy.sandbox = cfg.sandbox;
 
     auto tools = new ToolRegistry;
@@ -3248,6 +3254,8 @@ int runMain(string[] args)
         host.providerNames = () => enabledProviderNames(cfg.providers);
         host.configModel = cfg.model;
         host.configSystemPrompt = cfg.systemPrompt;
+        host.sandboxMode = sandboxMode.mode.modeName;
+        host.sandboxSource = sandboxMode.source.sourceName;
         host.saveSubagents = (bool on) => saveSubagentsSetting(cfg, on);
         host.sessionMessages = cfg.sessionMessages;
         host.sessionMessagesConfirm = cfg.sessionMessagesConfirm;
@@ -3569,6 +3577,7 @@ int runMain(string[] args)
     {
         auto h = SettingsHost(&cfg, notNull(agent));
         h.configPath = cfgPath;
+        h.sandboxSummary = sandboxSummary;
         h.recents = () => recents.models;
         h.switchModel = (string spec) {
             try { switchModel(spec); return string.init; }
