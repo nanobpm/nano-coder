@@ -2948,7 +2948,7 @@ int runMain(string[] args)
     // Headless runs (ACP, -p, piped stdin) have nobody approving commands, so
     // they default to the workspace sandbox; explicit settings win (#118).
     immutable headless = o.acp || o.prompt.length > 0 || !isTerminal(0);
-    import nano.sandbox : ResolvedMode, SandboxSource, modeName, parseSandboxMode = parseMode, resolveMode, sourceName, unavailableReason;
+    import nano.sandbox : ResolvedMode, SandboxSource, modeName, parseSandboxMode = parseMode, resolveMode, sourceName, applyFailure;
     ResolvedMode sandboxMode;
     {
         auto env = environment.get("NANO_CODER_SANDBOX");
@@ -2961,7 +2961,7 @@ int runMain(string[] args)
     immutable sandboxSummary = format("%s (%s)", sandboxMode.mode.modeName, sandboxMode.source.sourceName);
     if (o.acp) stdErr.writeln("nano-coder: sandbox ", sandboxSummary);
     if (headless && cfg.sandbox.active)
-        if (auto why = unavailableReason(cfg.sandbox.network))
+        if (auto why = applyFailure(cfg.sandbox, getcwd()))
             die(format("the %s sandbox (%s) can't be applied: %s. To run unsandboxed, opt out explicitly with "
                 ~ "--sandbox off, NANO_CODER_SANDBOX=off or [sandbox] mode = \"off\" in the config",
                 sandboxMode.mode.modeName, sandboxMode.source.sourceName, why));

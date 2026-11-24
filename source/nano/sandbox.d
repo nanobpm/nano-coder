@@ -110,6 +110,37 @@ string unavailableReason(bool network)
         return "sandbox unavailable on this platform";
 }
 
+/// Why a probe of the sandbox launcher failed, or null when it succeeded:
+/// a non-zero exit, with the launcher's first output line for the reason.
+string probeFailure(int status, string output) pure
+{
+    import std.string : lineSplitter, strip;
+    if (status == 0) return null;
+    foreach (line; output.lineSplitter)
+        if (line.strip.length) return format("sandbox probe failed (exit %s): %s", status, line.strip);
+    return format("sandbox probe failed (exit %s)", status);
+}
+
+unittest
+{
+    assert(probeFailure(0, "anything") is null);
+    assert(probeFailure(71, "\nsandbox-exec: sandbox_apply: Operation not permitted\n")
+        == "sandbox probe failed (exit 71): sandbox-exec: sandbox_apply: Operation not permitted");
+    assert(probeFailure(1, "") == "sandbox probe failed (exit 1)");
+}
+
+/// Why `c` can't actually be applied in `cwd`, or null when it can: checks the
+/// backend, then runs a harmless command through the real launcher, since an
+/// already-sandboxed process has the backend yet can't apply it (#118).
+string applyFailure(const SandboxConfig c, string cwd)
+{
+    if (auto why = unavailableReason(c.network)) return why;
+    import std.process : execute, Config;
+    // command() only throws when the backend is missing, ruled out above.
+    auto r = execute(c.command("/bin/sh", "exit 0", cwd), null, Config.none, 4096, cwd);
+    return probeFailure(r.status, r.output);
+}
+
 /// Cache directories under `$HOME` that build tools write to.
 immutable string[] toolCacheDirs = [
     ".cargo/registry", ".cargo/git", ".cargo/.package-cache", ".cargo/.package-cache-mutate",
