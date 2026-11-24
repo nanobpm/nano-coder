@@ -352,9 +352,12 @@ struct PeerListener
     static PeerListener listen(string dir, string id, Chan!PeerRequest requests)
     {
         import std.socket : Socket, UnixAddress, SocketException, AddressFamily, SocketType;
-        import std.file : exists, remove;
+        import std.file : exists, remove, FileException;
         auto path = socketPath(dir, id);
-        auto socket = unixSocket();
+        Socket socket;
+        try socket = unixSocket();
+        catch (SocketException e)
+            throw new ListenError(format("cannot create a socket for %s: %s", path, e.msg));
         try
         {
             // A stale socket from a dead session is replaced; a live one
@@ -367,6 +370,12 @@ struct PeerListener
         {
             socket.close();
             throw new ListenError(format("cannot listen on %s: %s", path, e.msg));
+        }
+        catch (FileException e)
+        {
+            // An unremovable stale socket path: report it like a bind failure.
+            socket.close();
+            throw new ListenError(format("cannot replace stale socket %s: %s", path, e.msg));
         }
         auto impl = new Impl;
         impl.path = path;
@@ -1631,4 +1640,16 @@ unittest
     PeerRequest got;
     assert(requests.tryTake(got) && got.pm.text == "alive");
     assert(!requests.tryTake(got));
+}
+
+unittest // listen: an unremovable stale path is a ListenError, not a FileException
+{
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir, exists;
+    import std.path : buildPath;
+    import std.exception : assertThrown;
+    import nano.safeio : Chan;
+    auto dir = buildPath(tempDir, "nano-peers-stale-" ~ imported!"std.conv".to!string(imported!"std.process".thisProcessID));
+    mkdirRecurse(buildPath(dir, "blocked.sock", "child"));
+    scope (exit) if (dir.exists) rmdirRecurse(dir);
+    assertThrown!ListenError(PeerListener.listen(dir, "blocked", Chan!PeerRequest.make));
 }
