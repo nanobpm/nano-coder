@@ -398,6 +398,7 @@ struct PeerListener
             throw new ListenError(format("cannot replace stale socket %s: %s", path, e.msg));
         }
         writeOwner(dir, id);
+        registerOwnListener(path);
         auto impl = new Impl;
         impl.path = path;
         impl.dir = dir;
@@ -414,6 +415,7 @@ struct PeerListener
         if (serveFd == socket_t.init)
         {
             socket.close();
+            unregisterOwnListener(path);
             removeIfThere(path);
             removeOwner(dir, id);
             throw new ListenError(format("cannot dup listener fd for %s", path));
@@ -443,6 +445,7 @@ struct PeerListener
         catch (SocketException) {} // already closed: fine
         impl.thread.join();
         l.close();
+        unregisterOwnListener(impl.path);
         if (impl.path.exists) removeIfThere(impl.path);
         removeOwner(impl.dir, impl.id);
     }
@@ -850,6 +853,58 @@ bool accepting(string dir, string id)
     return ownerOf(dir, id, pid) != Owner.gone;
 }
 
+/// Socket paths of this process's live `PeerListener`s, one per line. The
+/// orphan sweep skips fds bound to them: a live listener's accepted
+/// connection names the listener's path and lacks close-on-exec until
+/// `serve` sets it, and on macOS (no SO_ACCEPTCONN for Unix sockets) one
+/// whose client already hung up looks like a listener. Closing it would
+/// leave `serve`'s `Socket` to close the fd number again later, after
+/// another thread reused it.
+private shared Locked!string ownListenerPathsCell;
+private shared bool ownListenerPathsMade;
+
+/// The `ownListenerPathsCell`, made on first use (a module constructor here
+/// would form a constructor cycle with nano.landlock).
+private shared(Locked!string) ownListenerPaths()
+{
+    import core.atomic : atomicLoad, atomicStore, cas;
+    if (cas(&ownListenerPathsMade, false, true))
+        atomicStore(ownListenerPathsCell, new shared Locked!string);
+    // Another thread won the race: its store lands at once.
+    while (atomicLoad(ownListenerPathsCell) is null) {}
+    return atomicLoad(ownListenerPathsCell);
+}
+
+private string normalizedSocketPath(string p)
+{
+    import std.path : absolutePath, buildNormalizedPath;
+    return buildNormalizedPath(absolutePath(p));
+}
+
+private void registerOwnListener(string path)
+{
+    immutable line = normalizedSocketPath(path) ~ "\n";
+    ownListenerPaths.update((ref string all) { all ~= line; });
+}
+
+private void unregisterOwnListener(string path)
+{
+    immutable line = normalizedSocketPath(path) ~ "\n";
+    ownListenerPaths.update((ref string all) {
+        import std.string : indexOf;
+        immutable i = all.indexOf(line);
+        if (i >= 0) all = all[0 .. i] ~ all[i + line.length .. $];
+    });
+}
+
+private bool isOwnListenerPath(string path)
+{
+    import std.string : lineSplitter;
+    import std.algorithm : canFind;
+    immutable want = normalizedSocketPath(path);
+    return ownListenerPaths.get.lineSplitter.canFind(want);
+}
+
 /// Close this process's inherited listeners in `dir`: Unix sockets bound to
 /// a path there, listening, whose fd lacks close-on-exec (every socket this build makes
 /// sets it, so such an fd came across an exec, orphaned). Returns how many
@@ -870,6 +925,7 @@ size_t closeOrphanedPeerFds(string dir)
         auto p = unixSocketPathOf(fd);
         if (!p.length || p.extension != ".sock") continue;
         if (buildNormalizedPath(absolutePath(p.dirName)) != want) continue;
+        if (isOwnListenerPath(p)) continue; // a live listener's connection
         if (closeFd(fd) == 0) n++;
     }
     return n;
@@ -2032,6 +2088,27 @@ unittest
     scope (exit) closeFd(cast(int) d);
     assert(closeOrphanedPeerFds(dir) == 0);
     assert(unixSocketPathOf(cast(int) conn.handle) == path, "the accepted connection survives");
+}
+
+@("issue #349: the orphan sweep spares a live listener's hung-up connections")
+unittest
+{
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir, exists;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    import nano.control : TurnControl;
+    import core.atomic : atomicLoad;
+    auto dir = buildPath(tempDir, format("np349f%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto router = PeerRouter.make(atomicLoad(new shared TurnControl));
+    auto listener = PeerListener.listen(dir, "sess-own", router.requests);
+    scope (exit) listener.close();
+    assert(isOwnListenerPath(socketPath(dir, "sess-own")));
+    assert(closeOrphanedPeerFds(dir) == 0, "a live listener is not an orphan");
+    listener.close();
+    assert(!isOwnListenerPath(socketPath(dir, "sess-own")), "close unregisters the path");
 }
 
 @("issue #349: a liveness probe of a full backlog never blocks")
