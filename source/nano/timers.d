@@ -224,6 +224,8 @@ struct Timers
                     else r.pending ~= t;
                 }
         r.items.sort!((a, b) => a.dueAt < b.dueAt);
+        // A log from before the cap may hold more: keep the newest.
+        if (r.pending.length > maxPending) r.pending = r.pending[$ - maxPending .. $].dup;
         return r;
     }
 }
@@ -507,4 +509,12 @@ unittest // fired-not-done timers are capped; the oldest are auto-closed
     assert(t.pending.length == maxPending);
     assert(closed.map!(x => x.id).array == [1u, 2, 3]);
     assert(t.pending[0].id == 4);
+}
+
+unittest // restore_caps_pending
+{
+    Timers t;
+    foreach (i; 0 .. maxPending + 5) t.pending ~= Timer(i + 1, 0, 0, "n");
+    auto back = Timers.fromJSON(parseJSON(t.toJSON.toString));
+    assert(back.pending.length == maxPending && back.pending[0].id == 6);
 }

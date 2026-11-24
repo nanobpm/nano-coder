@@ -4579,9 +4579,6 @@ class Agent
             // As for timers: a change that cannot be recorded is rolled back
             // (the rollback itself lives in `planChanged`, which disarms it
             // once the change is persisted).
-            if (o.restarted)
-                // Keep the finished plan findable by the history tools.
-                log.ifSome((SessionLog l) { l.planArchive(before.toJSON); });
             planChanged(before, o.restarted);
         }
         return o.text;
@@ -4603,6 +4600,9 @@ class Agent
         bool persisted;
         scope (failure) if (!persisted) plan = before;
         log.ifSome((SessionLog l) {
+            // Keep the finished plan findable by the history tools; a failed
+            // write rolls the restart back with the rest.
+            if (restarted) l.planArchive(before.toJSON);
             if (++planDeltasSinceSnapshot >= planSnapshotEvery || restarted
                 || (before.items.length == 0 && plan.items.length > 1))
             {

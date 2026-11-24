@@ -248,7 +248,6 @@ struct Plan
         bool restart = finished;
         auto plan = restart ? Plan.init : dup();
         string[] summary;
-        if (restart) summary ~= format!"started a new plan (the previous one, %s items, is finished)"(items.length);
         if (auto g = field(args, "goal"))
             if (g.type == JSONType.string && g.str.strip.length)
             {
@@ -266,6 +265,8 @@ struct Plan
         }
         if (!list.length && !summary.length)
             return R.err("plan_add needs `items` (a list of step titles or {title, after} objects) or a `goal`");
+        // Only real work restarts a finished plan; the notice is not work.
+        if (restart) summary = format!"started a new plan (the previous one, %s items, is finished)"(items.length) ~ summary;
         uint firstId = (plan.items.length ? plan.items.map!(i => i.id).maxElement : 0) + 1;
         if (list.length > maxItems || plan.items.length + list.length > maxItems)
             return R.err(format!"a plan holds at most %s items; drop or merge some first"(maxItems));
@@ -494,8 +495,10 @@ struct Plan
                         foreach (x; n.arrayNoRef)
                         {
                             if (x.type != JSONType.string) return R.err(shape);
-                            p.notes ~= x.str;
+                            p.notes ~= x.str == droppedNotesMarker ? x.str : clip(x.str, maxNoteChars);
                         }
+                // Logs written before the cap (or edited by hand) obey it too.
+                p.notes = capNotes(p.notes);
                 if (auto a = field(it, "after"))
                 {
                     auto ids = idsOf(*a);
@@ -855,4 +858,22 @@ unittest // issue #346: per-item notes are capped in bytes, newest kept
     assert(notes.map!(n => n.length).sum <= maxNotesBytes, notes.length.to!string);
     assert(notes[0] == droppedNotesMarker);
     assert(notes[$ - 1].startsWith("19") && notes.length > 2);
+}
+
+unittest // finished_plan_ignores_an_empty_add_and_caps_loaded_notes
+{
+    auto p = Plan.fromJSON(parseJSON(`{"items":[{"id":1,"title":"a","status":"done"}]}`)).unwrap("valid");
+    assert(p.apply("plan_add", parseJSON(`{}`)).isErr);
+    assert(p.apply("plan_add", parseJSON(`{"items":[]}`)).isErr);
+    assert(p.items.length == 1, "an empty call keeps the finished plan");
+    import std.array : replicate;
+    import std.algorithm : sum;
+    JSONValue[] notes;
+    foreach (i; 0 .. 20) notes ~= JSONValue("n".replicate(900));
+    notes ~= JSONValue("x".replicate(100_000));
+    auto j = parseJSON(`{"items":[{"id":1,"title":"a","status":"pending"}]}`);
+    j["items"][0]["notes"] = JSONValue(notes);
+    auto q = Plan.fromJSON(j).unwrap("valid");
+    assert(q.items[0].notes.map!(n => n.length).sum <= maxNotesBytes);
+    assert(q.items[0].notes[0] == droppedNotesMarker);
 }

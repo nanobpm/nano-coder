@@ -107,8 +107,8 @@ Entry[] load(string path, scope bool delegate(ulong id) @safe want = null)
         if (!mayBeMessage(line)) return;
         try
         {
-            auto rec = parseJSON(line);
-            if (rec["type"].str == "message") out_ ~= Entry(n, messageFromRecord(rec["data"]));
+            Message m;
+            if (recordMessage(parseJSON(line), m)) out_ ~= Entry(n, m);
         }
         catch (Exception) {} // skip a torn or corrupt line, like the resume loader does
     }, false);
@@ -134,8 +134,8 @@ unittest // escaped_type_reaches_the_decoder
 /// back to the substring check and reaches the decoder.
 bool mayBeMessage(const(char)[] line) pure @safe
 {
-    if (auto t = writtenType(line)) return t == "message";
-    return line.canFind(`"message"`) || line.canFind(`\u`);
+    if (auto t = writtenType(line)) return t == "message" || t == "plan_archive";
+    return line.canFind(`"message"`) || line.canFind(`"plan_archive"`) || line.canFind(`\u`);
 }
 
 /// The type a line's `{"type":"<type>"` prefix names, or null when the line
@@ -154,7 +154,33 @@ private const(char)[] writtenType(const(char)[] line) pure @safe
 bool headMayBeMessage(const(char)[] head) pure @safe
 {
     auto t = writtenType(head);
-    return t is null || t == "message";
+    return t is null || t == "message" || t == "plan_archive";
+}
+
+/// The message a decoded record shows the history tools, if any: a
+/// `message` record as is, and a `plan_archive` (a finished plan replaced by
+/// a new one, issue #346) as its full checklist with notes, so details that
+/// only lived in the plan stay searchable. Throws on a malformed record.
+private bool recordMessage(const JSONValue rec, out Message m)
+{
+    import nano.session : messageFromRecord;
+    import nano.plan : Plan;
+    import nano.result : match;
+    immutable type = rec["type"].str;
+    if (type == "message") { m = messageFromRecord(rec["data"]); return true; }
+    if (type != "plan_archive") return false;
+    return Plan.fromJSON(rec["data"]["plan"]).match!(
+        (p) { m = Message.auto_("[Archived plan]\n" ~ p.render(true, size_t.max)); return true; },
+        (e) => false);
+}
+
+unittest // plan_archive_is_searchable
+{
+    Message m;
+    auto rec = parseJSON(`{"type":"plan_archive","data":{"plan":{"goal":"g","items":[{"id":1,"title":"t","status":"done","notes":["needle note"]}]}}}`);
+    assert(recordMessage(rec, m) && m.content.canFind("needle note"));
+    assert(mayBeMessage(`{"type":"plan_archive","data":{}}`) && headMayBeMessage(`{"type":"plan_archive"`));
+    assert(!recordMessage(parseJSON(`{"type":"plan","data":{}}`), m));
 }
 
 unittest
@@ -171,15 +197,8 @@ unittest
 /// not a decodable message record.
 private bool messageLine(const(char)[] line, out Message m)
 {
-    import nano.session : messageFromRecord;
     if (!mayBeMessage(line)) return false;
-    try
-    {
-        auto rec = parseJSON(line);
-        if (rec["type"].str != "message") return false;
-        m = messageFromRecord(rec["data"]);
-        return true;
-    }
+    try return recordMessage(parseJSON(line), m);
     catch (Exception) return false; // a corrupt record is skipped alone; later records stay readable
 }
 
