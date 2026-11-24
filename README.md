@@ -1141,7 +1141,12 @@ In an interactive terminal the bottom row shows the provider/model, the working 
 a fill bar, message count, session input/output tokens, the auto-compaction threshold and
 count (labelled `smart-compact` when compactions are smart, else `auto-compact`), the active mode when it is `plan` or `auto` (the default `normal` is not shown, to
 save space), and what the agent is doing. With a GitHub Copilot model it also shows the session's
-AI Credits (`0.4 AIC`), summed from the `total_nano_aiu` each response reports. The frame
+AI Credits (`0.4 AIC`), summed from the `total_nano_aiu` each response reports. Token and
+AIC totals include sub-agents as they run: each model call a running or background sub-agent
+makes (compactions included) moves them, and its final usage is counted once when it finishes.
+A request interrupted before the provider reported its usage (a cancel, a dropped stream) is
+left out rather than estimated; a sub-agent's result says how many (`N interrupted requests
+not counted`). The frame
 renderer draws the bar as the frame's final row; it follows resizes, and is off when stdin/stdout isn't a TTY or `AGENTIC_NO_STATUS` is set. The conversation is kept
 directly above the status line (empty space collects at the top), so shrinking the window
 drops empty rows rather than pushing the conversation out of view.

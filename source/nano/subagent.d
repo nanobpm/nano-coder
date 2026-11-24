@@ -235,6 +235,87 @@ struct SubMsg
     /// `progress`: the child's counters so far.
     size_t toolCalls, turns;
     ulong tokens;
+    /// `progress`: the child's cumulative usage so far (tokens and AI
+    /// Credits), so the parent's totals move per request (issue #340).
+    TokenUsage spent;
+    /// `progress`: the child's model requests interrupted without usage.
+    size_t uncounted;
+}
+
+/// What `now` adds to a running sub-agent's usage the parent already counted
+/// (`seen`): the parent folds each progress snapshot in as this delta, and the
+/// final usage too, so every token and credit is counted exactly once.
+TokenUsage usageDelta(TokenUsage seen, TokenUsage now) pure nothrow @nogc
+{
+    import nano.arith : saturatingSub;
+    TokenUsage d;
+    d.inputTokens = saturatingSub(now.inputTokens, seen.inputTokens);
+    d.outputTokens = saturatingSub(now.outputTokens, seen.outputTokens);
+    d.hasAic = now.hasAic;
+    import std.algorithm.comparison : max;
+    d.aic = max(0.0, now.aic - seen.aic);
+    return d;
+}
+
+/// A running sub-agent's usage as the parent has counted it (issue #340):
+/// each progress snapshot and the final result are cumulative, so the parent
+/// adds only what is new, and the totals move per request without double
+/// counting at `done`.
+struct UsageFold
+{
+    TokenUsage counted;
+    size_t uncounted;
+
+    /// Advance to the cumulative `now`; returns what to add to the totals
+    /// (and, in `newUncounted`, the newly interrupted requests).
+    TokenUsage advance(TokenUsage now, size_t uncountedNow, out size_t newUncounted) pure nothrow @nogc
+    {
+        import nano.arith : saturatingSub;
+        auto d = usageDelta(counted, now);
+        if (now.inputTokens > counted.inputTokens) counted.inputTokens = now.inputTokens;
+        if (now.outputTokens > counted.outputTokens) counted.outputTokens = now.outputTokens;
+        if (now.aic > counted.aic) counted.aic = now.aic;
+        counted.hasAic = counted.hasAic || now.hasAic;
+        newUncounted = saturatingSub(uncountedNow, uncounted);
+        if (uncountedNow > uncounted) uncounted = uncountedNow;
+        return d;
+    }
+}
+
+unittest
+{
+    import std.math : isClose;
+    // A fake sub-agent: parent spent 1000 in / 0.1 AIC; progress 1, 2, then
+    // done (also replayed, as a late duplicate) — status = parent + latest.
+    TokenUsage parent;
+    parent.inputTokens = 1000; parent.hasAic = true; parent.aic = 0.1;
+    void add(ref TokenUsage t, TokenUsage d) { t.inputTokens += d.inputTokens; t.outputTokens += d.outputTokens; t.aic += d.aic; }
+    UsageFold f;
+    size_t nu, lost;
+    TokenUsage p1, p2, fin;
+    p1.inputTokens = 200; p1.outputTokens = 20; p1.hasAic = true; p1.aic = 0.02;
+    p2 = p1; p2.inputTokens = 500; p2.outputTokens = 50; p2.aic = 0.05;
+    fin = p2; fin.inputTokens = 700; fin.aic = 0.07;
+    add(parent, f.advance(p1, 0, nu));
+    assert(parent.inputTokens == 1200 && parent.outputTokens == 20 && isClose(parent.aic, 0.12));
+    add(parent, f.advance(p2, 0, nu));
+    assert(parent.inputTokens == 1500 && parent.outputTokens == 50 && isClose(parent.aic, 0.15));
+    add(parent, f.advance(fin, 1, nu));
+    lost += nu;
+    assert(parent.inputTokens == 1700 && isClose(parent.aic, 0.17) && lost == 1);
+    add(parent, f.advance(fin, 1, nu));
+    lost += nu;
+    assert(parent.inputTokens == 1700 && isClose(parent.aic, 0.17) && lost == 1, "done counts exactly once");
+}
+
+unittest
+{
+    TokenUsage a, b;
+    a.inputTokens = 100; a.outputTokens = 10; a.hasAic = true; a.aic = 0.5;
+    b = a; b.inputTokens = 250; b.aic = 0.75;
+    auto d = usageDelta(a, b);
+    assert(d.inputTokens == 150 && d.outputTokens == 0 && d.hasAic && d.aic == 0.25);
+    assert(usageDelta(b, a).inputTokens == 0 && usageDelta(b, a).aic == 0);
 }
 
 /// The parent's answer to a forwarded tool call.
@@ -293,6 +374,9 @@ struct SubResult
     ulong inputTokens, outputTokens;
     bool hasAic;
     double aic = 0;
+    /// Model requests interrupted before the provider reported their usage:
+    /// not counted (never estimated), but reported.
+    size_t uncountedRequests;
     size_t turns, toolCalls;
     long durationMs;
     /// The child's session log (null when the parent has none).
@@ -310,6 +394,8 @@ struct SubResult
         if (truncated) s ~= format("\n\n[truncated: %s; the report above is partial]", truncatedReason);
         s ~= format("\n\n[sub-agent: %s turns, %s tool calls, %s tokens, %.1fs", turns, toolCalls,
             inputTokens + outputTokens, durationMs / 1000.0);
+        if (uncountedRequests)
+            s ~= format("; %s interrupted request%s not counted", uncountedRequests, uncountedRequests == 1 ? "" : "s");
         if (filesRead.length)
         {
             auto shown = filesRead.length > 20 ? filesRead[0 .. 20] : filesRead;
@@ -375,6 +461,8 @@ private final class ChildEvents : imported!"nano.agent".AgentEvents
     MonoTime start;
     size_t generations, toolCalls;
     ulong tokens;
+    /// Cumulative usage of every model call (turns and compactions).
+    TokenUsage spent;
     string limitHit;
     size_t gensSinceLimit;
     /// Whether a fresh request has carried the report reminder since the limit.
@@ -442,6 +530,8 @@ private final class ChildEvents : imported!"nano.agent".AgentEvents
         m.toolCalls = toolCalls;
         m.turns = generations;
         m.tokens = tokens;
+        m.spent = spent;
+        foreach (a; agent) m.uncounted = a.uncountedRequests;
         up.put(m);
     }
 
@@ -480,6 +570,13 @@ private final class ChildEvents : imported!"nano.agent".AgentEvents
     {
         import nano.arith : toSize;
         tokens += toSize(u.inputTokens < 0 ? 0 : u.inputTokens) + toSize(u.outputTokens < 0 ? 0 : u.outputTokens);
+        spent.inputTokens += u.inputTokens < 0 ? 0 : u.inputTokens;
+        spent.outputTokens += u.outputTokens < 0 ? 0 : u.outputTokens;
+        if (u.hasAic)
+        {
+            spent.hasAic = true;
+            spent.aic += u.aic;
+        }
         progress();
     }
     void userMessage(string text) {}
@@ -845,6 +942,7 @@ SubResult runChild(immutable SubSpec spec, immutable(SubClientFactory) factory, 
         res.outputTokens = agent.sessionOutputTokens;
         res.hasAic = agent.hasSessionAic;
         res.aic = agent.sessionAic;
+        res.uncountedRequests = agent.uncountedRequests;
         if (st.limitHit !is null && !res.truncated)
         {
             res.truncated = true;
@@ -866,6 +964,9 @@ SubResult runChild(immutable SubSpec spec, immutable(SubClientFactory) factory, 
         {
             res.inputTokens = a.sessionInputTokens;
             res.outputTokens = a.sessionOutputTokens;
+            res.hasAic = a.hasSessionAic;
+            res.aic = a.sessionAic;
+            res.uncountedRequests = a.uncountedRequests;
         }
     }
     return res;
@@ -885,6 +986,8 @@ struct SubSlot
     MonoTime start;
     size_t toolCalls;
     ulong tokens;
+    /// What of its usage the parent's totals already hold.
+    UsageFold fold;
     bool reportedDone;
     /// The child's own read state: its read_file calls never authorize a
     /// later parent write (the parent model sees only the report).

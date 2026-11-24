@@ -563,6 +563,9 @@ class Agent
     /// How many model calls (sub-agents included) reported AI Credits this
     /// session, so a turn reporting zero credits is told apart from one reporting none.
     ulong aicReports;
+    /// Model requests interrupted (cancelled or a broken stream) before the
+    /// provider reported usage: left out of the totals, never estimated.
+    size_t uncountedRequests;
     /// Called after every compaction with its report (the UI prints it).
     void delegate(const ref CompactReport) onCompacted;
     /// Usage-anchored estimate: messages[0 .. calibLen] cost `calibTokens`.
@@ -1222,11 +1225,13 @@ class Agent
         catch (Cancelled e)
         {
             failure = e;
+            uncountedRequests++;
             return Event(CallFailed(Failure.cancelled, e.msg, req.maxTokens, true));
         }
         catch (StreamInterrupted e)
         {
             failure = e;
+            uncountedRequests++;
             return Event(CallFailed(Failure.interrupted, e.msg, req.maxTokens, control.isCancelled));
         }
         catch (Exception e) // classified by nano.turn.step: retried, compacted for, or re-raised
@@ -2527,6 +2532,7 @@ class Agent
         hasSessionAic = false;
         sessionAic = 0;
         aicReports = 0;
+        uncountedRequests = 0;
         compactions = 0;
     }
 
@@ -3491,6 +3497,11 @@ class Agent
                 subSlots[i].toolCalls = m.toolCalls;
                 subSlots[i].turns = m.turns;
                 subSlots[i].tokens = m.tokens;
+                // A running child's usage counts as it is spent (issue
+                // #340): fold in what this snapshot adds to the last one.
+                size_t lost;
+                recordUsage(subSlots[i].fold.advance(m.spent, m.uncounted, lost));
+                uncountedRequests += lost;
                 reportSubagents();
                 break;
             case SubKind.done:
@@ -3501,7 +3512,10 @@ class Agent
                 if (subSlots[i].result.logPath.length) subSlots[i].logPath = subSlots[i].result.logPath;
                 subRunning--;
                 // Usage rolls up into this session's totals (status line, /cost).
-                recordUsage(subSlots[i].result.usage);
+                // Only what the progress snapshots didn't already add.
+                size_t lost;
+                recordUsage(subSlots[i].fold.advance(subSlots[i].result.usage, subSlots[i].result.uncountedRequests, lost));
+                uncountedRequests += lost;
                 // Start the replacements first, so the one report shows
                 // them running (a child sends no progress during its first
                 // model request).

@@ -216,6 +216,10 @@ unittest
     assert(f.agent.run("go", new NullEvents, false) == cancelledResponse);
     h.join();
     assert(f.toolResult("h1").canFind("[truncated: cancelled"));
+    // Each child's in-flight request was interrupted with no usage: left out
+    // of the totals, but counted and reported (issue #340).
+    assert(f.agent.uncountedRequests == 2 && f.agent.sessionInputTokens == 0);
+    assert(f.toolResult("h1").canFind("1 interrupted request not counted"), f.toolResult("h1"));
     f.agent.control.startTurn();
 }
 
