@@ -615,25 +615,33 @@ Summary[] list(string dir, bool strictIndex = false, scope bool delegate(string 
         if (hit) s = *cached;
         else
         {
-            try s = summarize(e.name);
-            // One unreadable or truncated log must not hide every other
-            // session (issue #300: it blocked unrelated resumes); strict
-            // callers (retention) still fail rather than act on a partial view.
-            catch (FileException err) { if (strictIndex) throw err; else continue; }
-            catch (Exception)
+            // Not resumable (e.g. truncated) or unreadable: keep a titled
+            // entry whose file still exists, or the rewrite below would drop
+            // the title and a later tidy pass could delete a named session.
+            // Zero prompts keeps it out of picker results.
+            void keepCached()
             {
-                // Not resumable (e.g. truncated): keep a titled entry whose
-                // file still exists, or the rewrite below would drop the
-                // title and a later tidy pass could delete a named session.
-                // Zero prompts keeps it out of picker results.
                 if (cached !is null && (cached.title !is null || cached.name !is null))
                 {
-                    // Zero prompts keeps it out of picker results while the
-                    // rewrite below keeps its title.
                     current[id] = *cached;
                     current[id].prompts = 0;
                     index.remove(id);
                 }
+            }
+            try s = summarize(e.name);
+            // One unreadable or truncated log must not hide every other
+            // session (issue #300: it blocked unrelated resumes); strict
+            // callers (retention) still fail rather than act on a partial view.
+            catch (FileException err)
+            {
+                if (strictIndex) throw err;
+                keepCached();
+                continue;
+            }
+            catch (Exception)
+            {
+                // Not resumable: skipping is the point; keepCached saves its handle.
+                keepCached();
                 continue;
             }
             if (cached !is null)
@@ -1158,4 +1166,24 @@ unittest
     std.file.write(log.path, ""); // truncated: not resumable
     list(dir);
     assert("s-handle" in titledIds(dir), "the cached handle survives the rewrite");
+}
+
+// Issue #300 review: a resized log that is temporarily unreadable keeps its
+// cached handle through a non-strict rewrite, so it isn't lost for good.
+unittest
+{
+    import std.conv : octal;
+    import std.file : setAttributes;
+    import nano.session : SessionLog;
+    auto dir = testDir("named-unreadable");
+    auto log = new SessionLog(dir, "mock/m", "/w", "s-locked");
+    scope (exit) { setAttributes(log.path, octal!644); rmdirRecurse(dir); }
+    log.input("i1", "A prompt worth keeping");
+    log.name("keep");
+    log.close();
+    list(dir);
+    std.file.append(log.path, "\n"); // resized: the cache misses
+    setAttributes(log.path, octal!0);
+    list(dir);
+    assert("s-locked" in titledIds(dir), "the cached handle survives an unreadable log");
 }
