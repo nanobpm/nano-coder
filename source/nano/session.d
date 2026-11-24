@@ -208,39 +208,105 @@ void streamLogLines(string path, scope void delegate(const(char)[] line) @safe s
     streamLogLinesUntil(path, (line) { sink(line); return true; });
 }
 
+/// The most bytes one log record (line) may take before the streamers skip
+/// it unbuffered (issue #289): one giant tool output must not spike the heap
+/// of a reader that only wanted, say, a session's prompts. A skipped record
+/// is reported to the `oversized` hook so callers can say so.
+enum size_t maxRecordBytes = 16 * 1024 * 1024;
+
+/// The cap on a log header line read for a permission or summary check.
+enum size_t maxHeaderBytes = 1024 * 1024;
+
+/// Options for `streamLogLinesWith`: hooks and caps beyond the plain sink.
+struct StreamOptions
+{
+    /// Sees each line's first `lineHeadBytes`; a rejected line is skipped
+    /// unbuffered (null keeps every line).
+    bool delegate(const(char)[] head) @safe keep;
+    /// Called for each line skipped for exceeding `maxLine`, with the bytes
+    /// buffered when it was dropped (a lower bound of its size).
+    void delegate(size_t bytes) @safe oversized;
+    /// Per-line buffering cap in bytes.
+    size_t maxLine = maxRecordBytes;
+    /// Stop (as if `sink` returned false) once this many bytes of the file
+    /// have been read; 0 is no limit. The read that crosses it still counts.
+    ulong maxFileBytes;
+}
+
+/// What a `streamLogLinesWith` pass did.
+struct StreamStats
+{
+    /// Bytes read from the file (compressed bytes for an archive).
+    ulong fileBytes;
+    /// Bytes of log text seen (inflated bytes for an archive).
+    ulong textBytes;
+    /// Lines skipped for exceeding the per-line cap.
+    size_t oversized;
+    /// True when `maxFileBytes` stopped the pass before the end of the log.
+    bool truncated;
+}
+
 /// `streamLogLines` whose `sink` returns false to stop reading: nothing
 /// past that line is read or inflated (issue #271: the permission-header
-/// probe must not scan a denied session's whole log).
+/// probe must not scan a denied session's whole log). A line longer than
+/// `maxRecordBytes` is skipped unbuffered (issue #289).
 void streamLogLinesUntil(string path, scope bool delegate(const(char)[] line) @safe sink,
-    scope bool delegate(const(char)[] head) @safe keep = null)
+    scope bool delegate(const(char)[] head) @safe keep = null,
+    scope void delegate(size_t bytes) @safe oversized = null)
+{
+    StreamOptions o;
+    o.keep = keep;
+    o.oversized = oversized;
+    streamLogLinesWith(path, sink, o);
+}
+
+/// `streamLogLinesUntil` with explicit options; returns what it read.
+StreamStats streamLogLinesWith(string path, scope bool delegate(const(char)[] line) @safe sink,
+    scope StreamOptions o)
 {
     import std.stdio : File;
     auto f = File(path, "rb");
     scope (exit) f.close();
     ubyte[] carry;
     bool skipping;
+    StreamStats st;
+    bool budgetLeft()
+    {
+        if (o.maxFileBytes && st.fileBytes >= o.maxFileBytes)
+        {
+            st.truncated = true;
+            return false;
+        }
+        return true;
+    }
+    auto buf = new ubyte[](64 * 1024);
     if (isCompressedLog(path))
     {
         auto gz = GunzipStream(path);
         scope (exit) gz.close();
-        auto buf = new ubyte[](64 * 1024);
         for (;;)
         {
+            if (!budgetLeft()) break;
             auto got = gz.read(f, buf);
+            st.fileBytes = gz.consumed;
             if (!got.length) break;
-            if (!feedChunk(carry, skipping, got, sink, keep)) return;
+            st.textBytes += got.length;
+            if (!feedChunk(carry, skipping, st.oversized, got, sink, o.keep, o.oversized, o.maxLine)) break;
         }
     }
     else
     {
-        auto buf = new ubyte[](64 * 1024);
         for (;;)
         {
+            if (!budgetLeft()) break;
             auto got = f.rawRead(buf);
+            st.fileBytes += got.length;
             if (!got.length) break;
-            if (!feedChunk(carry, skipping, got, sink, keep)) return;
+            st.textBytes += got.length;
+            if (!feedChunk(carry, skipping, st.oversized, got, sink, o.keep, o.oversized, o.maxLine)) break;
         }
     }
+    return st;
 }
 
 /// The bytes of a line's start that a `keep` predicate sees.
@@ -250,22 +316,50 @@ enum size_t lineHeadBytes = 64;
 /// partial line over to the next chunk (a torn tail is dropped). `keep`, if
 /// set, sees each line's first `lineHeadBytes` (or the whole of a shorter
 /// line): a line it rejects is skipped unbuffered, so a multi-megabyte
-/// record the caller doesn't want is never assembled (issue #234).
-private bool feedChunk(ref ubyte[] carry, ref bool skipping, const(ubyte)[] chunk,
-    scope bool delegate(const(char)[]) @safe sink, scope bool delegate(const(char)[]) @safe keep)
+/// record the caller doesn't want is never assembled (issue #234). A line
+/// whose bytes pass `maxLine` (0: no cap) is dropped and skipped likewise,
+/// reported to `oversized` and counted (issue #289), so the carry never
+/// holds more than one capped record.
+private bool feedChunk(ref ubyte[] carry, ref bool skipping, ref size_t dropped, const(ubyte)[] chunk,
+    scope bool delegate(const(char)[]) @safe sink, scope bool delegate(const(char)[]) @safe keep,
+    scope void delegate(size_t) @safe oversized, size_t maxLine)
 {
     import nano.safeio : asChars;
+    void drop(size_t bytes)
+    {
+        ++dropped;
+        if (oversized !is null) oversized(bytes);
+        carry = null;
+    }
     size_t start;
     foreach (i, b; chunk)
         if (b == '\n')
         {
             if (skipping) skipping = false;
+            else if (maxLine && carry.length + (i - start) > maxLine) drop(carry.length + (i - start));
             else if (!emitLine(carry, chunk[start .. i], sink, keep)) return false;
             carry = null;
             start = i + 1;
         }
     if (start < chunk.length && !skipping)
     {
+        immutable rest = chunk.length - start;
+        if (maxLine && carry.length + rest > maxLine)
+        {
+            drop(carry.length + rest);
+            skipping = true;
+            return true;
+        }
+        // Grow by doubling, never past the cap: a capped record then costs
+        // at most twice the cap in allocations, however the heap is laid out.
+        immutable want = carry.length + rest;
+        if (carry.capacity < want)
+        {
+            size_t cap = carry.length ? carry.length * 2 : rest;
+            if (cap < want) cap = want;
+            if (maxLine && cap > maxLine) cap = maxLine;
+            carry.reserve(cap);
+        }
         carry ~= chunk[start .. $];
         if (keep !is null && carry.length >= lineHeadBytes && !keep(asChars(carry[0 .. lineHeadBytes])))
         {
@@ -304,6 +398,8 @@ private struct GunzipStream
     private ubyte[] inBuf;
     private string path;
     private bool ended;
+    /// Compressed bytes read from the file so far.
+    ulong consumed;
 
     /// A reader over the log at `path`.
     this(string path) { this.path = path; }
@@ -321,6 +417,7 @@ private struct GunzipStream
             if (zs.availIn == 0)
             {
                 auto got = f.rawRead(inBuf);
+                consumed += got.length;
                 if (!got.length) throw new Exception("gunzip " ~ path ~ ": truncated stream");
                 zs.feed(got);
             }
@@ -354,7 +451,9 @@ private struct GunzipStream
 /// search never reports partial results as complete.
 void foreachLogLineSkippingTorn(string path, scope void delegate(const(char)[]) @safe sink)
 {
-    streamLogLines(path, sink);
+    // An oversized record (issue #289) is reported as an empty line so line
+    // counts stay aligned with the log.
+    streamLogLinesUntil(path, (line) { sink(line); return true; }, null, (size_t) { sink(null); });
 }
 
 /// `foreachLogLineSkippingTorn` that skips, unbuffered, each line whose
@@ -367,7 +466,7 @@ void foreachLogLineSkippingTorn(string path, scope void delegate(const(char)[]) 
         if (keep(head)) return true;
         sink(null);
         return false;
-    });
+    }, (size_t) { sink(null); });
 }
 
 /// The working directory recorded in the log's header (null for older logs
@@ -377,15 +476,23 @@ void foreachLogLineSkippingTorn(string path, scope void delegate(const(char)[]) 
 string logHeaderCwd(string path)
 {
     string cwd;
+    // The header is small: cap its buffering well below `maxRecordBytes` and
+    // stop after the first line, so a permission check on a denied session
+    // never buffers a record of its body (issue #289).
+    StreamOptions o;
+    o.maxLine = maxHeaderBytes;
+    bool first = true;
+    o.oversized = (size_t) { first = false; };
     try
-        streamLogLinesUntil(path, (line) {
+        streamLogLinesWith(path, (line) {
+            if (!first) return false; // an oversized header: no cwd
             auto h = parseJSON(line);
             if (h["type"].str != "session") return false;
             auto d = h["data"].objectNoRef;
             if (auto c = "cwd" in d)
                 if (c.type == JSONType.string) cwd = c.str;
             return false; // the header is the first line: stop reading
-        });
+        }, o);
     catch (Exception) {} // an unreadable or corrupt header is no cwd, as documented
     return cwd;
 }
@@ -1845,7 +1952,7 @@ void eachLogLineUntil(string path, scope bool delegate(const(char)[] line, ulong
         if (keep(head)) return true;
         ++lineNo;
         return false;
-    });
+    }, (size_t) { ++lineNo; }); // an oversized record (issue #289) still counts as a line
     if (!lineNo && requireCommitted) throw new Exception("session log " ~ path ~ " has no committed records");
 }
 
@@ -4856,4 +4963,48 @@ unittest
     // chunks must fail, since tidy-up deletes the original after compressing.
     assert(std.file.read(back) == std.file.read(plain), "the round trip preserves the log exactly");
     assert(logText(gz) == std.file.readText(plain), "the archive decompresses to the original");
+}
+
+// Issue #289: a line above the per-line cap is skipped unbuffered and
+// reported, the streamers keep line numbers aligned, and a header-only read
+// never buffers a body record.
+unittest
+{
+    import core.memory : GC;
+    import std.array : replicate;
+    import std.file : write, remove, tempDir;
+    import std.path : buildPath;
+    auto p = buildPath(tempDir, "nano-oversized.jsonl");
+    scope (exit) remove(p);
+    write(p, `{"type":"session","data":{"cwd":"/w"}}` ~ "\n" ~ "z".replicate(300_000) ~ "\n" ~ "tail\n");
+    StreamOptions o;
+    o.maxLine = 100_000;
+    size_t dropped, dropBytes;
+    o.oversized = (size_t n) { ++dropped; dropBytes = n; };
+    string[] seen;
+    auto st = streamLogLinesWith(p, (line) { seen ~= line.idup; return true; }, o);
+    assert(seen.length == 2 && seen[1] == "tail" && dropped == 1 && st.oversized == 1, format("%s", seen.length));
+    assert(dropBytes > 100_000 && st.textBytes == getSize(p) && !st.truncated);
+    // Buffering stops at the cap: a reader holding the record whole would
+    // allocate at least its 4 MiB; a capped one at most twice the cap.
+    write(p, `{"type":"session","data":{"cwd":"/w"}}` ~ "\n" ~ "z".replicate(4_000_000) ~ "\n" ~ "tail\n");
+    StreamOptions small;
+    small.maxLine = 500_000;
+    immutable before = GC.stats().allocatedInCurrentThread;
+    streamLogLinesWith(p, (line) => true, small);
+    assert(GC.stats().allocatedInCurrentThread - before < 1_500_000, "the giant record was not buffered whole");
+    // The default cap: a 16 MiB+ record is skipped; line numbers stay aligned.
+    write(p, `{"type":"session","data":{"cwd":"/w"}}` ~ "\n" ~ "z".replicate(maxRecordBytes + 1) ~ "\n" ~ "tail\n");
+    ulong[] nos;
+    eachLogLine(p, (const(char)[] l, ulong n) { nos ~= n; });
+    assert(nos == [1, 3], format("%s", nos));
+    size_t lines;
+    foreachLogLineSkippingTorn(p, (const(char)[]) { ++lines; });
+    assert(lines == 3);
+    assert(logHeaderCwd(p) == "/w");
+    // A file budget stops the pass early.
+    StreamOptions b;
+    b.maxFileBytes = 1;
+    auto bs = streamLogLinesWith(p, (line) => true, b);
+    assert(bs.truncated && bs.fileBytes == 64 * 1024);
 }
