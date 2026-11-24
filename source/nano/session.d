@@ -11,6 +11,7 @@ import nano.clock : wallNow;
 
 import nano.safeio : readBytes, jsonUnsigned;
 import nano.arith : toSize;
+import nano.loghandles : Held, openHere, shareHandle;
 import std.string : representation;
 
 import std.json;
@@ -2653,20 +2654,6 @@ private LockResult tryLock(ref File f) @trusted
         if (err == EINTR) continue;
         return err == EWOULDBLOCK || err == EAGAIN ? LockResult.contended : LockResult.unsupported;
     }
-}
-
-/// A locked log handle shared by this thread's writers of one path.
-private struct Held { File file; size_t refs; }
-
-/// Logs this thread holds open and locked, so an in-process reopen shares
-/// the locked handle instead of opening an unlocked second description.
-private Held*[string] openHere;
-
-private Held* shareHandle(string path, File f)
-{
-    auto h = new Held(f, 1);
-    openHere[path] = h;
-    return h;
 }
 
 /// Every byte `f` holds, read from its start (the position is left at EOF).
