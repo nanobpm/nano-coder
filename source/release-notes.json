@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.25.1", "date": "2026-11-24", "items": [
+      {"type":"fix","scope":"resume","title":"recall the resumed session's prompts with Up/Down","pr":325}
+    ]},
     {"version": "1.25.0", "date": "2026-11-24", "items": [
       {"type":"feat","scope":"memory","title":"/memory migrate tags, merges and supersedes existing memories with user confirmation","pr":311}
     ]},
@@ -438,9 +441,6 @@
     ]},
     {"version": "0.36.0", "date": "2026-10-04", "items": [
       {"type":"feat","scope":"config","title":"thinking level per provider and model, with /thinking","pr":91}
-    ]},
-    {"version": "0.35.0", "date": "2026-10-03", "items": [
-      {"type":"feat","scope":"hooks","title":"add Claude Code–compatible external user hooks (Phase 1)","pr":97}
     ]}
   ]
 }
