@@ -434,7 +434,12 @@ model where it may write and what it may not read.
 - `workspace`: only the workspace (and its git dirs), system and toolchain directories
   (`/usr`, `/etc`, `/opt`, `~/.cargo`, `~/.rustup`, mise/nvm/volta/dub installs,
   `~/.gitconfig`, ...), package caches, temp dirs, `writable` and `readable` paths; the
-  secrets above stay denied inside them.
+  secrets above stay denied inside them. The system directories are `/usr`, `/bin`,
+  `/sbin`, `/lib*`, `/etc`, `/opt`, `/nix`, `/snap`, `/proc`, `/sys`, `/dev`, `/run`,
+  `/tmp`, `/System`, `/Library`, `/Applications`, `/Developer`, and only these parts of
+  `/var` and `/private`: `/var/{lib,cache,tmp,run,db,select,folders}`,
+  `/private/{etc,tmp}` and `/private/var/{db,select,folders}`. A system directory that
+  contains your home (e.g. `/var/home` on Fedora Silverblue) is never granted.
 - `off`: reads everywhere (the behaviour before read confinement).
 
 `cat ~/.ssh/id_ed25519` or `ls ~/.config/gh` then fail with a permission error, and the

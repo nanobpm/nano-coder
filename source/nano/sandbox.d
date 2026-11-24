@@ -209,9 +209,24 @@ immutable string[] defaultDenyRead = [
 immutable string[] systemDenyRead = ["/etc/shadow", "/etc/gshadow", "/etc/sudoers", "/etc/master.passwd"];
 
 /// System and toolchain directories `read_confine = "workspace"` still reads.
+/// `/var` and `/private` are granted only in parts: homes live under
+/// `/var/home` on ostree/bootc distros, and a whole-`/var` grant would make
+/// the home readable. macOS needs `/private/var/db` (timezone),
+/// `/private/var/select` (`sh`) and `/private/var/folders` (per-user temp).
 immutable string[] systemReadDirs = ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc", "/opt",
-    "/nix", "/snap", "/proc", "/sys", "/dev", "/run", "/var", "/private", "/System", "/Library", "/Applications",
-    "/Developer", "/Library/Developer", "/tmp"];
+    "/nix", "/snap", "/proc", "/sys", "/dev", "/run", "/var/lib", "/var/cache", "/var/tmp", "/var/run", "/var/db",
+    "/var/select", "/var/folders", "/private/etc", "/private/tmp", "/private/var/db", "/private/var/select",
+    "/private/var/folders", "/System", "/Library", "/Applications", "/Developer", "/Library/Developer", "/tmp"];
+
+/// `roots` without any root that contains one of `homes` (as given and
+/// canonical), so a system grant can never re-open the home directory.
+string[] withoutHomeAncestors(const string[] roots, const string[] homes) pure nothrow
+{
+    string[] result;
+    foreach (r; roots)
+        if (!homes.any!(h => h.length && within(h, r))) result ~= r;
+    return result;
+}
 
 /// Toolchain installs and config under `$HOME` that `read_confine =
 /// "workspace"` still reads (on top of `toolCacheDirs`).
@@ -425,7 +440,11 @@ struct SandboxConfig
         foreach (d; denyRead) addTo(p.denied, expand(d), true);
         if (readConfine == ReadConfine.workspace)
         {
-            foreach (d; systemReadDirs) addTo(p.readable, d);
+            string[] sys;
+            foreach (d; systemReadDirs) addTo(sys, d);
+            string[] homes = home.length ? [normalize(home)] : null;
+            if (home.length) if (auto hc = canonicalize(home)) homes ~= hc;
+            p.readable ~= withoutHomeAncestors(sys, homes);
             if (home.length)
             {
                 foreach (d; homeReadDirs) addTo(p.readable, joinPath(home, d));
@@ -1167,6 +1186,29 @@ unittest
     mkdirRecurse(ws ~ "/private");
     symlink(ws ~ "/private", ws ~ "/link");
     assert(c.readRefusal(ws ~ "/link/key", ws) !is null);
+}
+
+// issue #333: system read grants never contain the home, e.g. /var/home/u
+unittest
+{
+    string[] sys;
+    foreach (d; systemReadDirs) sys ~= d;
+    foreach (r; sys) assert(r != "/var" && r != "/private" && r != "/", r);
+    auto kept = withoutHomeAncestors(sys ~ ["/var", "/var/home"], ["/var/home/u"]);
+    foreach (r; kept) assert(!within("/var/home/u", r), r);
+    assert(kept.canFind("/var/lib") && kept.canFind("/usr"));
+    // macOS: timezone, sh and the per-user temp dir stay readable.
+    foreach (d; ["/private/var/db", "/private/var/select", "/private/var/folders", "/private/tmp", "/private/etc"])
+        assert(sys.canFind(d), d);
+    SandboxConfig w = { mode: SandboxMode.workspace, toolCaches: false, readConfine: ReadConfine.workspace };
+    auto ws = outsideDir();
+    scope (exit) rmTree(ws);
+    auto home = homeDir();
+    auto plan = w.readPlan(ws);
+    foreach (r; plan.readable)
+        if (!within(ws, r) && !within(canonicalize(ws), r))
+            assert(!within(normalize(home), r) || within(r, normalize(home)), "grants an ancestor of HOME: " ~ r);
+    version (OSX) assert(plan.readable.canFind("/private/var/db"), plan.readable.join(" "));
 }
 
 // issue #333: the generated Seatbelt read rules
