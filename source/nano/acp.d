@@ -1014,11 +1014,18 @@ final class AcpServer : AgentEvents
     private void startPeerListener()
     {
         stopPeerListener();
-        if (!host.sessionMessages || host.sessionDir is null || agent.log.isNone) return;
+        if (!agent.messagesOn || host.sessionDir is null || agent.log.isNone) return;
         auto dir = peers.peersDir();
         if (!peers.ensureDir(dir)) return;
         try peerListener = [peers.PeerListener.listen(dir, agent.log.unwrap("checked isSome").id, peerRouter.requests)];
-        catch (peers.ListenError) { return; } // a listener is best effort: the session runs without one
+        catch (peers.ListenError e)
+        {
+            // A listener is best effort: the session runs without one, with
+            // messages off (issue #336), and the reason goes to stderr.
+            agent.messagesOn = false;
+            stdErr.writeln("nano-coder: ACP: messages are off: could not listen for peer messages (", e.msg, ")");
+            return;
+        }
         auto halt = Shared!bool.make(false);
         peerPump = [PeerPump(halt, spawnDaemon(&pumpPeers, peerRouter, peerQueue, router, halt))];
     }
@@ -1183,6 +1190,8 @@ final class AcpServer : AgentEvents
     {
         import nano.mode : AgentMode;
         agent.subagentsOn = defaultSubagentsOn;
+        agent.messagesOn = host.sessionMessages;
+        peerRouter.confirm(host.sessionMessagesConfirm);
         agent.compactionMode = defaultCompactionMode;
         agent.autoCompact = defaultAutoCompact;
         agent.autoCompactThreshold = defaultAutoCompactThreshold;
@@ -1272,6 +1281,10 @@ final class AcpServer : AgentEvents
         foreach (w; agent.restoreWarnings(switched, st.thinking.length > 0))
             stdErr.writeln("nano-coder: ACP session/load: warning: ", w);
         if (st.subagents >= 0) agent.subagentsOn = st.subagents != 0;
+        // Inter-session messages (issue #336): `loadSession_` starts the
+        // listener for the loaded id afterwards when they are on.
+        if (st.messages >= 0) agent.messagesOn = st.messages != 0;
+        if (st.messagesConfirm >= 0) peerRouter.confirm(st.messagesConfirm != 0);
         if (st.compactionMode.length)
             parseCompactionMode(st.compactionMode).match!((m) { agent.compactionMode = m; }, () {});
         if (st.autoCompact >= 0) agent.autoCompact = st.autoCompact != 0;

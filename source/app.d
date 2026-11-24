@@ -994,9 +994,18 @@ string messagesCommand(Agent agent, ref Config cfg, string arg, ref PeerRouter r
     else if (words == "confirm off") { confirmChange = true; confirmValue = false; }
     else return "usage: /messages [on|off|confirm on|off] [--save]";
 
+    // A resume restores the session's messaging state (issue #336).
+    void record(int on, int confirm)
+    {
+        SessionSettings s;
+        s.messages = on;
+        s.messagesConfirm = confirm;
+        agent.log.ifSome((SessionLog l) { l.settings(s); });
+    }
     string out_;
     if (confirmChange)
     {
+        if (router.confirm != confirmValue) record(-1, confirmValue ? 1 : 0);
         router.confirm(confirmValue);
         out_ = format("Incoming messages %s for this session", confirmValue ? "wait for you to accept" : "are queued at once");
     }
@@ -1005,10 +1014,15 @@ string messagesCommand(Agent agent, ref Config cfg, string arg, ref PeerRouter r
     else if (on)
     {
         if (auto failed = start()) out_ = "could not turn messages on: " ~ failed;
-        else out_ = "Messages on for this session (listening; session_send offered)";
+        else
+        {
+            record(1, -1);
+            out_ = "Messages on for this session (listening; session_send offered)";
+        }
     }
     else
     {
+        if (agent.messagesOn || listening) record(0, -1);
         stop();
         agent.messagesOn = false;
         out_ = "Messages off for this session (the socket is closed; session_send is gone from the next request)";
@@ -1373,12 +1387,14 @@ struct RuntimeDefaults
     bool autoCompact; /// `auto_compact`
     double autoCompactThreshold; /// `auto_compact_threshold`
     long contextWindow; /// top-level `context_window` (0: none)
+    bool sessionMessages; /// `session_messages`
+    bool sessionMessagesConfirm = true; /// `session_messages_confirm`
 
     /// The defaults `c` holds.
     static RuntimeDefaults of(const ref Config c) pure nothrow @nogc
     {
         return RuntimeDefaults(c.verbosity, c.subagents, c.compactionMode, c.autoCompact,
-            c.autoCompactThreshold, c.contextWindow);
+            c.autoCompactThreshold, c.contextWindow, c.sessionMessages, c.sessionMessagesConfirm);
     }
 
     /// These defaults with only the fields a save wrote (`ch`) taken from
@@ -1389,6 +1405,8 @@ struct RuntimeDefaults
         RuntimeDefaults r = this;
         if (ch.verbosity) r.verbosity = c.verbosity;
         if (ch.subagents) r.subagents = c.subagents;
+        if (ch.sessionMessages) r.sessionMessages = c.sessionMessages;
+        if (ch.sessionMessagesConfirm) r.sessionMessagesConfirm = c.sessionMessagesConfirm;
         if (ch.compaction)
         {
             r.compactionMode = c.compactionMode;
@@ -4252,6 +4270,19 @@ int runMain(string[] args)
                 agent.restoreConfiguredWindow(providerWindow(cfg.providers.get(client.providerName, ProviderConfig.init).contextWindow));
             }
         }
+        // Inter-session messages (issue #336): the session's log and id are
+        // set by now, so a listener binds the resumed session's socket. A
+        // listener that can't start is reported; the resume goes on.
+        {
+            import nano.peers : applyMessagesTarget, restoredMessages;
+            auto target = restoredMessages(st.messages, st.messagesConfirm, !explicitFlags,
+                runtimeDefaults.sessionMessages, runtimeDefaults.sessionMessagesConfirm);
+            bool on = agent.messagesOn;
+            if (auto failed = applyMessagesTarget(target, peerRouter, peerListener.length != 0, on,
+                    &startPeerListener, &stopPeerListener))
+                notes ~= failed;
+            agent.messagesOn = on;
+        }
         // The warnings `/model` and `/thinking` show for the restored values.
         foreach (w; agent.restoreWarnings(switchedModel, st.thinking.length > 0)) notes ~= "warning: " ~ w;
         lastLoggedMode = agent.control.mode;
@@ -5025,6 +5056,17 @@ int runMain(string[] args)
                         auto retained = retainedRestartSettings(runtimeDefaults, verbosity, agent.subagentsOn,
                             agent.compactionMode, agent.autoCompact, agent.autoCompactThreshold,
                             agent.configuredWindow, agent.configuredWindowSource, hasRetained);
+                        // `/restart` keeps the messaging state too (issue #336).
+                        if (agent.messagesOn != runtimeDefaults.sessionMessages)
+                        {
+                            retained.messages = agent.messagesOn ? 1 : 0;
+                            hasRetained = true;
+                        }
+                        if (peerRouter.confirm != runtimeDefaults.sessionMessagesConfirm)
+                        {
+                            retained.messagesConfirm = peerRouter.confirm ? 1 : 0;
+                            hasRetained = true;
+                        }
                         if (hasRetained) logSessionSettings(retained);
                     }
                     lastLoggedMode = agent.control.mode;
@@ -5251,9 +5293,11 @@ int runMain(string[] args)
                     agent.stopSubagents(); // they belong to the session being left
                     try loadNotes = loadSession(path);
                     catch (Exception e) { writeln(e.msg); continue; }
+                    // Rebind first: the restored messaging state (issue
+                    // #336) then starts or stops the resumed id's listener.
+                    rebindPeerListener();
                     foreach (n; applyPendingSettings(false)) loadNotes ~= "nano-coder: " ~ n;
                     seedInputHistory(editor);
-                    rebindPeerListener();
                     if (gFrame) { gFrame.clear(); replayTranscript(agent, console); releaseHeap(); }
                     foreach (n; loadNotes) stdErr.writeln(n);
                     stdErr.flush();
