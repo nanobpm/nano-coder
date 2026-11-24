@@ -127,6 +127,7 @@ private string cutText(string s, size_t n)
 const(char)[] summaryNodesJson(const(char)[] line)
 {
     size_t depth, i;
+    char[] closers; // the closer each open container expects, innermost last
     const(char)[] key1, type, found; // key1: the top-level key being read
     bool okData; // the depth-2 container is the value of top-level "data"
     while (i < line.length)
@@ -141,12 +142,12 @@ const(char)[] summaryNodesJson(const(char)[] line)
             const(char)[] str = line[s .. i];
             ++i;
             auto j = i;
-            while (j < line.length && (line[j] == ' ' || line[j] == '\t')) ++j;
+            while (j < line.length && isJsonSpace(line[j])) ++j;
             if (j < line.length && line[j] == ':')
             {
                 // A key: note its value where it matters.
                 ++j;
-                while (j < line.length && (line[j] == ' ' || line[j] == '\t')) ++j;
+                while (j < line.length && isJsonSpace(line[j])) ++j;
                 if (depth <= 2)
                 {
                     auto k = unescapeJsonKey(str);
@@ -182,17 +183,26 @@ const(char)[] summaryNodesJson(const(char)[] line)
         if (c == '{' || c == '[')
         {
             ++depth;
+            closers ~= c == '{' ? '}' : ']';
             if (depth == 2) okData = c == '{' && key1 == "data";
         }
         else if (c == '}' || c == ']')
         {
-            if (depth == 0) return null;
+            // A mismatched closer makes the record invalid JSON.
+            if (depth == 0 || closers[$ - 1] != c) return null;
             --depth;
+            closers = closers[0 .. $ - 1];
         }
         ++i;
     }
     // A torn record (unclosed containers) supplies nothing.
     return depth == 0 && type == "replace" ? found : null;
+}
+
+/// Whether `c` is JSON insignificant whitespace (RFC 8259: space, tab, LF, CR).
+private bool isJsonSpace(char c) pure nothrow @nogc
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
 }
 
 /// The raw JSON key text `key` with its escapes decoded (a fresh copy only
@@ -592,6 +602,13 @@ unittest // summary_nodes extraction (issue #369)
     assert(summaryNodesJson(`{"data":{"summary_nodes":[4]},"type":"replace"}`) == `[4]`);
     assert(summaryNodesJson(`{"summary_nodes":[5],"type":"replace"}`) is null);
     assert(summaryNodesJson(`{"x":1}`) is null);
+    // Mismatched closers are invalid JSON, at every level.
+    assert(summaryNodesJson(`{"type":"replace","data":{"summary_nodes":[{"id":99}]}]`) is null);
+    assert(summaryNodesJson(`{"type":"replace","data":{"summary_nodes":[{"id":99}]]}`) is null);
+    assert(summaryNodesJson(`{"type":"replace","data":{"summary_nodes":[{"id":99]}}}`) is null);
+    // Any JSON whitespace (CR, LF too) may surround a key's colon.
+    assert(summaryNodesJson("{\"type\"\r:\"replace\",\"data\":{\"summary_nodes\":[{\"id\":7}]}}") == `[{"id":7}]`);
+    assert(summaryNodesJson("{\"type\":\n\"replace\",\"data\"\r\n:\t{\"summary_nodes\"\n:\r[7]}}") == `[7]`);
 }
 
 unittest // node names
