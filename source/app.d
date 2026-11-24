@@ -3547,12 +3547,21 @@ int runMain(string[] args)
     }
     immutable sandboxSummary = format("%s (%s)", sandboxMode.mode.modeName, sandboxMode.source.sourceName);
     if (o.acp) stdErr.writeln("nano-coder: sandbox ", sandboxSummary);
+    // The selected config (any of --config, NANO_CODER_CONFIG, XDG_CONFIG_HOME)
+    // and the saved Copilot token hold credentials wherever they live, so
+    // commands and file tools may not read them (#333).
+    {
+        import std.path : absolutePath;
+        cfg.sandbox.denyRead ~= [absolutePath(cfgPath), absolutePath(imported!"nano.copilot".credentialsPath())];
+    }
     if (headless && cfg.sandbox.active)
         if (auto why = applyFailure(cfg.sandbox, getcwd()))
             die(format("the %s sandbox (%s) can't be applied: %s. To run unsandboxed, opt out explicitly with "
                 ~ "--sandbox off, NANO_CODER_SANDBOX=off or [sandbox] mode = \"off\" in the config",
                 sandboxMode.mode.modeName, sandboxMode.source.sourceName, why));
     policy.sandbox = cfg.sandbox;
+    // Search walks hide what the sandbox won't let commands read (#333):
+    // Policy.readDenyScan/readDenySources add its rules for the current cwd.
 
     auto tools = new ToolRegistry;
     auto readState = new ReadState;
@@ -3574,8 +3583,9 @@ int runMain(string[] args)
         return (string path) @safe => forRoot.denied(path);
     }, () @safe {
         // The same rules as text, for a search on a worker thread (#222).
-        auto sources = built.match!(a => a.policy.readDenySources, () => policy.readDenySources);
-        return sources.length ? getcwd() ~ sources : null;
+        auto cwd = getcwd();
+        auto sources = built.match!(a => a.policy.readDenySources(cwd), () => policy.readDenySources(cwd));
+        return sources.length ? cwd ~ sources : null;
     });
 
     // Repository trust gates the repo's own skills, skill lock and hooks.

@@ -31,7 +31,7 @@ import nano.result : orThrow, toOption;
 import nano.cmdexpand;
 import nano.guard;
 import nano.paths;
-import nano.sandbox : SandboxConfig, modeName;
+import nano.sandbox : SandboxConfig, modeName, withinDenied;
 
 enum string blockAdvice = "Do not try to get around this with a different command or a script. "
     ~ "If the action is really needed, stop and tell the user what you want to run and why, so they can run it "
@@ -326,6 +326,8 @@ struct Policy
                 auto path = stringArg(args, "path");
                 if (path is null) return null;
                 auto joined = joinPath(cwd, expandTilde(path));
+                // Every file tool reads what it touches (edits show a diff).
+                if (auto why = sandbox.readRefusal(joined, cwd)) return why;
                 auto absolute = normalize(joined);
                 auto resolved = resolveSymlinks(joined);
                 foreach (rule; deny)
@@ -369,6 +371,7 @@ struct Policy
             case "grep", "glob":
                 auto root = stringArg(args, "path");
                 if (root is null) root = ".";
+                if (auto why = sandbox.readRefusal(joinPath(cwd, expandTilde(root)), cwd)) return why;
                 if (auto rule = readDenyRule(expandTilde(root), cwd))
                     return format("rule `%s` denies %s on %s", rule, tool, root);
                 auto text = args.jsonText;
@@ -399,19 +402,26 @@ struct Policy
     {
         foreach (ref r; deny)
             if (r.subject == Subject.path && r.appliesTo("read_file")) scan.rules ~= r;
-        if (!scan.rules.length) return false;
+        // The sandbox's denied paths for *this* cwd (#333): generated per
+        // search, so a cwd change (ACP) can't leave them aimed at the old one.
+        scan.literal = sandbox.readDeniedPaths(cwd);
+        if (!scan.rules.length && !scan.literal.length) return false;
         scan.cwdNormalized = scan.rootNormalized = normalize(cwd);
         scan.cwdResolved = scan.rootResolved = resolveSymlinks(cwd);
         return true;
     }
 
     /// The sources of the rules `readDenyScan` uses, so another thread can
-    /// rebuild the scan with `parseRule` (a `Policy` isn't sendable).
-    immutable(string)[] readDenySources() const
+    /// rebuild the scan with `readDenyScanFrom` (a `Policy` isn't sendable),
+    /// including the sandbox's denied paths for `cwd`. A denied path is
+    /// carried literally, prefixed with `literalDenyMark` (a NUL, which no
+    /// path or rule contains), so it is never re-parsed as rule text.
+    immutable(string)[] readDenySources(string cwd) const
     {
         immutable(string)[] r;
         foreach (ref r_; deny)
             if (r_.subject == Subject.path && r_.appliesTo("read_file")) r ~= r_.source;
+        foreach (d; sandbox.readDeniedPaths(cwd)) r ~= literalDenyMark ~ d;
         return r;
     }
 
@@ -563,6 +573,23 @@ unittest
     assert(p.check("apply_patch", pt("*** Delete File: /x/ok\n")) is null);
 }
 
+/// Marks a literal denied path in `Policy.readDenySources`.
+enum string literalDenyMark = "\0";
+
+/// Rebuilds, on any thread, the scan `Policy.readDenyScan` makes, from the
+/// text of `Policy.readDenySources`. False when nothing is denied.
+bool readDenyScanFrom(string cwd, const(string)[] sources, out ReadDenyScan scan)
+{
+    Policy p;
+    string[] literal;
+    foreach (src; sources)
+        if (src.startsWith(literalDenyMark)) literal ~= src[literalDenyMark.length .. $];
+        else p.deny ~= parseRule(src);
+    p.readDenyScan(cwd, scan);
+    scan.literal ~= literal;
+    return scan.rules.length || scan.literal.length;
+}
+
 /// Read-deny rules prepared for judging many walked paths (`Policy.readDenyScan`).
 /// Walked paths never pass through a symlink (the walker doesn't follow
 /// them), so only the search root and working directory need resolving: a
@@ -570,6 +597,8 @@ unittest
 struct ReadDenyScan
 {
     private const(Rule)[] rules;
+    // The sandbox's denied paths, matched literally with `withinDenied`.
+    private const(string)[] literal;
     private string cwdNormalized, cwdResolved, rootNormalized, rootResolved;
 
     /// The scan for a walk under `root` (which may be a symlink).
@@ -577,6 +606,7 @@ struct ReadDenyScan
     {
         ReadDenyScan s;
         s.rules = rules;
+        s.literal = literal;
         s.cwdNormalized = cwdNormalized;
         s.cwdResolved = cwdResolved;
         s.rootNormalized = normalize(joinPath(cwdNormalized, root));
@@ -594,6 +624,9 @@ struct ReadDenyScan
             auto rest = fromComponents(components(absolute)[components(rootNormalized).length .. $]);
             candidates ~= normalize(joinPath(rootResolved, rest));
         }
+        foreach (d; literal)
+            foreach (base; candidates)
+                if (withinDenied(base, d)) return true;
         bool matches(const ref Rule r, string c)
         {
             if (r.matches(c)) return true;
