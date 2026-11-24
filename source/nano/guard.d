@@ -441,18 +441,17 @@ struct Guard
     }
 
     /// Whether the working directory is itself git metadata: a `.git`
-    /// directory, or one of git's own subdirectories (objects, refs, ...)
-    /// below it. Such a cwd gets no exemption from the `.git` guard; only a
-    /// scratch directory under `.git` (like a worker's `.git/tmp`) does.
+    /// directory, or anything below it other than a scratch directory
+    /// (`.git/tmp`, `.git/nano-tmp`: worker workspaces and test temp dirs). The check is an allowlist so any
+    /// unknown git state dir (rebase-merge, sequencer, ...) stays guarded.
     bool cwdIsGitMetadata() pure
     {
-        static immutable metadata = ["objects", "refs", "hooks", "info", "logs", "worktrees",
-            "modules", "lfs", "rr-cache", "branches", "refs.d", "reftable"];
+        static immutable scratchDirs = ["tmp", "nano-tmp"];
         auto parts = components(cwd);
         foreach_reverse (i, part; parts)
         {
             if (part != ".git") continue;
-            return i + 1 == parts.length || metadata.canFind(parts[i + 1]);
+            return i + 1 == parts.length || !scratchDirs.canFind(parts[i + 1]);
         }
         return false;
     }
@@ -688,6 +687,13 @@ unittest
     g.cwd = "/repo/.git/refs";
     assert(g.danger("/repo/.git/refs/heads", true) == "a git repository's .git directory");
     assert(g.catastrophicRoot("/repo/.git/refs/heads") == "a git repository's .git directory");
+    foreach (dir; ["rebase-merge", "rebase-apply", "sequencer", "svn", "subtree-cache"])
+    {
+        g.cwd = "/repo/.git/" ~ dir;
+        assert(g.catastrophicRoot("/repo/.git/" ~ dir ~ "/x") == "a git repository's .git directory");
+    }
+    g.cwd = "/w/.git/nano-tmp/ws";
+    assert(g.catastrophicRoot("/w/.git/nano-tmp/ws/build") is null);
     g.cwd = "/repo/.git/objects/ab";
     assert(g.catastrophicRoot("/repo/.git/objects/ab/cd") == "a git repository's .git directory");
 }
