@@ -335,3 +335,26 @@ unittest
     auto b = parseJSON(log[0].body_);
     assert(log[0].path == "/responses" && "input" in b && "messages" !in b && b["stream"].boolean);
 }
+
+// A 401 after a dropped, retried stream attempt, then a token re-exchange
+// that fails with a non-spending error (malformed JSON): the thrown error
+// still carries the first route's retried spending (issue #371).
+unittest
+{
+    import std.math : isClose;
+    enum spent = `data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":1},`
+        ~ `"copilot_usage":{"total_nano_aiu":250000000}}` ~ "\n\n";
+    auto api = serve([immutable Reply(200, "content-type: text/event-stream\r\nx-truncate: 1\r\n",
+            spent ~ `data: {"choices":[{"delta":{"content":"pa`),
+        immutable Reply(401, "", `{"error":{"message":"token expired"}}`)]);
+    auto auth = serve([ok(tokenBody(api.url, "sess-1")), ok("{not json")]);
+    auto req = ask(Message.user("hello"));
+    SpendingException failed;
+    try client(auth.url, "gpt-4.1").chat(req, (bool, string) {});
+    catch (SpendingException e) failed = e;
+    auth.finish();
+    api.finish();
+    assert(failed !is null, "the exchange failure carries the first route's spending");
+    assert(failed.retried.usage.inputTokens == 10 && isClose(failed.retried.usage.aic, 0.25), "first attempt usage");
+    assert(failed.next !is null, "the exchange error stays chained");
+}

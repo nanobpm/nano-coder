@@ -10,6 +10,7 @@ import nano.status : Stats;
 void statusFromAgent(ref Stats s, Agent agent, string cwdShown)
 {
     import nano.context : CompactionMode, citesHistory;
+    agent.collectTitleSpend(); // a finished title request's usage (issue #371)
     s.provider = agent.client.providerName;
     s.model = agent.client.modelName;
     s.cwd = cwdShown;

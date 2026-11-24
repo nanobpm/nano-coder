@@ -628,7 +628,8 @@ any run.
 
 **Titles.** With `session_titles = true`, once a session has a prompt that says something (not
 just "hi"), nano-coder asks the model for a title of at most six words in the background. It uses
-`title_model` (a cheap one is enough) or the session's model. The request is a few hundred tokens,
+`title_model` (a cheap one is enough) or the session's model. The request is a few hundred tokens
+(counted in the status line's token and AI Credit totals once it finishes),
 tried at most once per session per run (so a failed or deleted title is retried after a restart,
 not on the next turn). The picker then shows `title · last prompt`. Titles live only in the index,
 so older nano-coders can still read the logs. Deleting `index.jsonl` loses them; a new run then
@@ -1662,6 +1663,8 @@ facts. Set `memory_recall = "anchor"` to compare or roll back to the pre-entity 
   proposals to `<memory dir>/migrate-dry-run-<timestamp>.json` and changes nothing; it also
   works when memory is read-only. Applying needs memory `on` and, in the REPL, an interactive
   terminal outside Plan mode.
+- The report ends with the model usage of the run (`Model usage: N input, M output tokens`, plus
+  AI Credits when the provider reports them), retried and failed requests included.
 
 **Prompt.** A capped, dated index (most-recently-used first, ~4 KB with the guidance) is
 appended to the system prompt at session start, framed as "notes from earlier sessions; may be
