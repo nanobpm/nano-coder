@@ -609,8 +609,7 @@ final class AcpServer : AgentEvents
 
     void userMessage(string t)
     {
-        if (agent.echoSender.length) peerUserMessage(t, agent.echoSender);
-        else update(JSONValue(["sessionUpdate": JSONValue("user_message_chunk"), "content": textBlock(t)]));
+        update(userChunk(t, agent.echoSender));
     }
 
     /// Echo input that came from another session (issue #347): a
@@ -1409,7 +1408,8 @@ final class AcpServer : AgentEvents
             final switch (m.role)
             {
             case Role.system: break;
-            case Role.user: userMessage(m.content); break;
+            // The persisted sender keeps peer provenance across session/load.
+            case Role.user: update(userChunk(m.content, m.fromSession)); break;
             case Role.assistant:
                 assistantMessage(m.content, null);
                 foreach (c; m.toolCalls) toolStart(c);
@@ -2283,6 +2283,15 @@ JSONValue peerUserChunk(string t, string senderId) pure
     return u;
 }
 
+/// The `user_message_chunk` update for user input: a peer chunk when
+/// `senderId` names another session, else a plain one. Live echoes and
+/// history replay share it so provenance looks the same both ways.
+JSONValue userChunk(string t, string senderId) pure
+{
+    if (senderId.length) return peerUserChunk(t, senderId);
+    return JSONValue(["sessionUpdate": JSONValue("user_message_chunk"), "content": textBlock(t)]);
+}
+
 /// Whether an ACP session takes inter-session messages (issue #347): only
 /// when opted in for ACP with `--session-messages` or `acp_session_messages`.
 /// The interactive `session_messages` doesn't apply: a worker runs
@@ -2297,6 +2306,10 @@ unittest
     auto u = peerUserChunk("[from session s1] hi", "s1-full");
     assert(u["sessionUpdate"].str == "user_message_chunk");
     assert(u["_meta"]["peer"]["fromSession"].str == "s1-full");
+    auto r = userChunk("[from session s1] hi", "s1-full");
+    assert(r["_meta"]["peer"]["fromSession"].str == "s1-full", "a replayed peer input keeps its sender");
+    auto o = userChunk("hi", null);
+    assert(o["sessionUpdate"].str == "user_message_chunk" && o.toString().indexOf("_meta") < 0);
     assert(!acpSessionMessages(false, false));
     assert(acpSessionMessages(true, false) && acpSessionMessages(false, true));
 }
