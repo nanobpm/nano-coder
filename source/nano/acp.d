@@ -2124,3 +2124,43 @@ unittest
     assert(byId[3]["error"]["message"].str.canFind("can't record the handle"), byId[3].toString);
     assert(byId[4]["result"]["name"].str == "other", byId[4].toString);
 }
+
+// Issue #300: a rename re-renders the system prompt for the session's
+// current mode (plan), not the startup one.
+unittest
+{
+    import nano.providers.mock;
+    import nano.tools;
+    import nano.permissions : Policy;
+    import nano.session : SessionLog;
+    import nano.option : ifSome;
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, exists;
+    import std.path : buildPath;
+    import std.process : environment;
+    auto root = buildPath(tempDir, "nd-acp-name-plan");
+    if (root.exists) rmdirRecurse(root);
+    mkdirRecurse(buildPath(root, "sessions"));
+    mkdirRecurse(buildPath(root, "peers"));
+    environment["NANO_CODER_PEERS"] = buildPath(root, "peers");
+    scope (exit) { environment.remove("NANO_CODER_PEERS"); rmdirRecurse(root); }
+    auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, null);
+    scope (exit) agent.releaseName();
+    auto host = Host((string cwd) => "sys-normal", null, buildPath(root, "sessions"), "test");
+    // The session enters plan mode once session/new has built its final
+    // prompt (as a mode switch mid-session would), before the rename.
+    import nano.mode : AgentMode;
+    int built;
+    host.systemPrompt = (string cwd) {
+        scope (exit) if (++built == 2) agent.control.mode = AgentMode.plan;
+        return "sys-normal";
+    };
+    host.modeSystemPrompt = (string cwd, bool plan) => plan ? "sys-plan" : "sys-normal";
+    auto srv = new AcpServer(agent, host, (string l) {});
+    srv.receive(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}`);
+    srv.receive(`{"jsonrpc":"2.0","id":3,"method":"session/set_name","params":{"name":"perf"}}`);
+    srv.close();
+    srv.run();
+    assert(agent.name == "perf");
+    assert(agent.messages[0].content == "sys-plan", agent.messages[0].content);
+    agent.log.ifSome((SessionLog l) { l.close(); });
+}

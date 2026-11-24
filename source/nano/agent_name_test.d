@@ -328,3 +328,43 @@ unittest
     closeLog(a);
     closeLog(b);
 }
+
+// The write of the name record itself recovers the log to a new id: the
+// claim moves to that id and the old id holds nothing.
+unittest
+{
+    import std.file : write, remove;
+    import nano.handle : runningHolder, handlePath;
+    import std.file : readText;
+    import std.algorithm : startsWith;
+    auto d = Dirs.make("nd-name-recover-on-set");
+    scope (exit) d.cleanup();
+    auto a = d.agent("s-a");
+    a.log.ifSome((SessionLog l) {
+        l.warn = (string m) {};
+        remove(l.path);
+        write(l.path, "{\"type\":\"session\",\"data\":{\"id\":\"other\"}}\n");
+    });
+    assert(a.setName("perf") is null);
+    string id;
+    a.log.ifSome((SessionLog l) { id = l.id; });
+    assert(id == "s-a.recovered-1", id);
+    assert(readText(handlePath(d.peers, "perf")).startsWith(id ~ "\n"), "the claim names the recovered id");
+    assert(runningHolder(d.peers, d.sessions, "perf") == id);
+    closeLog(a);
+}
+
+// `--clear` with no live name (a handle refused on restore) still writes
+// the clearing record, so a resume doesn't bring the handle back.
+unittest
+{
+    auto d = Dirs.make("nd-name-clear-refused");
+    scope (exit) d.cleanup();
+    auto a = d.agent("s-a");
+    auto path = buildPath(d.sessions, "s-a.jsonl");
+    a.log.ifSome((SessionLog l) { l.name("perf"); });
+    assert(a.name is null);
+    assert(a.setName(null) is null);
+    closeLog(a);
+    assert(restore(path).name is null, "the clearing record wins on resume");
+}

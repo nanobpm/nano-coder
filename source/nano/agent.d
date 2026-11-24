@@ -2797,7 +2797,9 @@ class Agent
                 catch (Exception e)
                 {
                     // Recoverable (a full disk, say): report it, don't end the session.
-                    release(peers.peersDir(), handle, l.id);
+                    // Release the id the claim was taken under: a write that
+                    // recovered the log before throwing has a new `l.id`.
+                    release(peers.peersDir(), handle, claimedId);
                     failed = "can't record the handle: " ~ e.msg;
                 }
             });
@@ -2811,7 +2813,18 @@ class Agent
                 moved = claim(peers.peersDir(), sessionDirOf(l), handle, l.id);
                 release(peers.peersDir(), handle, claimedId);
             });
-            if (moved !is null) return "can't keep the handle after the log moved: " ~ moved;
+            if (moved !is null)
+            {
+                // The name record is already in the log: write a clearing
+                // record so a resume doesn't bring back a handle the user
+                // was told wasn't set (or the previous one, now released).
+                string rollback;
+                log.ifSome((SessionLog l) {
+                    try l.name(name.length ? name : null);
+                    catch (Exception e) rollback = " (and the log still names it: " ~ e.msg ~ ")";
+                });
+                return "can't keep the handle after the log moved: " ~ moved ~ rollback;
+            }
         }
         if (name.length && changed) releaseName();
         name = handle;
