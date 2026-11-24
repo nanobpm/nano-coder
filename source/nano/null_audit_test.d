@@ -32,6 +32,7 @@ static import nano.goal;
 static import nano.session_settings;
 static import nano.guard;
 static import nano.herdr;
+static import nano.handle;
 static import nano.history;
 static import nano.http;
 static import nano.instruction_state;
@@ -126,6 +127,7 @@ private alias modules = imported!"std.meta".AliasSeq!(
     nano.session_settings,
     nano.guard,
     nano.herdr,
+    nano.handle,
     nano.history,
     nano.http,
     nano.instruction_state,

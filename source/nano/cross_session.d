@@ -20,7 +20,7 @@ module nano.cross_session;
 @safe:
 
 import std.algorithm : canFind, startsWith, map;
-import std.array : array, join;
+import std.array : array, join, replace;
 import std.format : format;
 import std.json;
 import std.string : toLower, strip;
@@ -31,6 +31,7 @@ import nano.permissions : Policy;
 import nano.safeio : jsonText;
 import nano.session_history : HistoryError;
 import nano.session_index : Summary, list;
+import nano.option : Option, some, unwrap;
 
 /// One session as `sessions_list` reports it.
 struct SessionInfo
@@ -51,6 +52,9 @@ struct SessionInfo
     /// The live session accepts inter-session messages (issue #272): it
     /// listens on a registry socket (`session_messages` on).
     bool messages;
+    /// The session's user-chosen handle (issue #300), or null. A running
+    /// session's comes from the registry, a stopped one's from the index.
+    string name;
 }
 
 /// What `Summary` names a session by (title, else first telling prompt).
@@ -68,6 +72,7 @@ private SessionInfo infoOf(Summary s, bool live) @safe
     i.id = s.id;
     i.cwd = s.cwd;
     i.title = nameOf(s);
+    i.name = s.name;
     i.createdAt = s.createdAt;
     i.lastUsed = stamp(s.lastUsed);
     i.path = s.path;
@@ -129,7 +134,15 @@ private bool isLive(string path) @safe
 SessionInfo[] listSessions(ref Policy policy, string dir, string cwd, string filter = null) @safe
 {
     import nano.session : logHeaderCwd;
+    import nano.handle : runningHandles;
+    import nano.peers : peersDir;
     SessionInfo[] out_;
+    auto handles = runningHandles(peersDir(), dir);
+    bool matches(const ref SessionInfo i, string f)
+    {
+        return i.id.toLower.canFind(f) || i.title.toLower.canFind(f) || (i.name.length && i.name.canFind(f))
+            || (i.cwd.length && i.cwd.toLower.canFind(f));
+    }
     // Deny before the index opens or reports a log (issue #271): the header's
     // cwd decides whether the policy judges the log a foreign read.
     bool deniedPath(string path)
@@ -141,14 +154,15 @@ SessionInfo[] listSessions(ref Policy policy, string dir, string cwd, string fil
     foreach (s; list(dir, false, &deniedPath))
     {
         auto i = infoOf(s, isLive(s.path));
-        if (i.live) i.messages = acceptsMessages(i.id);
-        if (!i.cwd.length) i.cwd = logHeaderCwd(s.path);
-        if (filter.length)
+        if (i.live)
         {
-            auto f = filter.toLower;
-            if (!i.id.toLower.canFind(f) && !i.title.toLower.canFind(f)
-                && !(i.cwd.length && i.cwd.toLower.canFind(f))) continue;
+            i.messages = acceptsMessages(i.id);
+            // The registry is current for a running session (the index
+            // catches up after its next turn).
+            i.name = handles.get(i.id, null);
         }
+        if (!i.cwd.length) i.cwd = logHeaderCwd(s.path);
+        if (filter.length && !matches(i, filter.toLower)) continue;
         out_ ~= i;
     }
     // A just-opened session listening for messages has no prompts yet, so
@@ -156,11 +170,8 @@ SessionInfo[] listSessions(ref Policy policy, string dir, string cwd, string fil
     // `session_send` can't reach it until its user runs a turn.
     foreach (i; listeningWithoutPrompts(dir, out_, &deniedPath))
     {
-        if (filter.length)
-        {
-            auto f = filter.toLower;
-            if (!i.id.toLower.canFind(f) && !(i.cwd.length && i.cwd.toLower.canFind(f))) continue;
-        }
+        i.name = handles.get(i.id, null);
+        if (filter.length && !matches(i, filter.toLower)) continue;
         out_ ~= i;
     }
     return out_;
@@ -207,6 +218,7 @@ private string lineOf(const ref SessionInfo i) @safe
         i.lastUsed.length >= 19 ? i.lastUsed[0 .. 19] : i.lastUsed);
     if (i.live) out_ ~= "  [live]";
     if (i.messages) out_ ~= "  [messages]";
+    if (i.name.length) out_ ~= "  [name: " ~ i.name ~ "]";
     return out_;
 }
 
@@ -228,7 +240,8 @@ string listResult(ref Policy policy, string dir, string cwd, JSONValue args) @sa
     return truncateOutputBytes(sessions.map!lineOf.array.join("\n"), defaultMaxOutput, "sessions-list");
 }
 
-/// `needle` as one session: an exact id, a unique id prefix, or a title match
+/// `needle` as one session: an exact id, a handle (issue #300), a unique id
+/// prefix, or a title match
 /// (case-insensitive; every exact-title match beats any substring match, so
 /// two sessions sharing a title report ambiguity instead of silently picking
 /// one). An ambiguous match throws a HistoryError listing the candidates.
@@ -239,7 +252,24 @@ SessionInfo resolve(string needle, SessionInfo[] sessions, scope const(SessionIn
     if (!needle.length)
     {
         if (fallback !is null) return *fallback;
-        throw new HistoryError("no current session to read; pass a session id, prefix or title");
+        throw new HistoryError("no current session to read; pass a session handle, id, prefix or title");
+    }
+    // An exact id wins, as in `resolveResumeId`: a handle claimed before
+    // handles were refused from looking like ids must not shadow that session.
+    foreach (i; sessions)
+        if (i.id == needle) return i;
+    // Then a handle: a running holder beats stopped sessions that once had
+    // it, then the newest (`sessions` is newest first).
+    {
+        Option!SessionInfo stopped;
+        immutable lowered = needle.toLower; // handles are always lowercase
+        foreach (i; sessions)
+            if (i.name.length && i.name == lowered)
+            {
+                if (i.live) return i;
+                if (stopped.isNone) stopped = some(i);
+            }
+        if (stopped.isSome) return stopped.unwrap("checked just above");
     }
     SessionInfo[] candidates;
     foreach (i; sessions)
@@ -262,6 +292,41 @@ SessionInfo resolve(string needle, SessionInfo[] sessions, scope const(SessionIn
         JSONValue(needle).jsonText, candidates.map!lineOf.array.join("\n")));
 }
 
+/// The session id `--resume <arg>` / `/resume <arg>` names (issue #300): an
+/// exact id first, then a handle (a running holder, else the newest that had
+/// it), a unique id prefix, then a title, as `resolve`. An argument
+/// that matches nothing listed but names a log file is returned as is (a
+/// session without prompts isn't indexed); otherwise throws with the reason.
+string resolveResumeId(string dir, string arg) @safe
+{
+    import std.file : exists;
+    import std.path : buildPath;
+    import nano.handle : runningHandles;
+    import nano.peers : peersDir;
+    import nano.handle : plausibleId;
+    // An exact log id wins first (as in `resolve`) and needs no listing, so
+    // an unrelated corrupt log can't block it.
+    if (plausibleId(arg) && (buildPath(dir, arg ~ ".jsonl").exists || buildPath(dir, arg ~ ".jsonl.gz").exists))
+        return arg;
+    auto handles = runningHandles(peersDir(), dir);
+    // A running holder of the handle wins, even one not listed (no prompt yet).
+    foreach (id, h; handles)
+        if (h.toLower == arg.toLower && buildPath(dir, id ~ ".jsonl").exists) return id;
+    SessionInfo[] infos;
+    foreach (s; list(dir))
+    {
+        auto i = infoOf(s, isLive(s.path));
+        if (i.live) i.name = handles.get(i.id, null); // a live session holds only its registry claim
+        infos ~= i;
+    }
+    try return resolve(arg, infos).id;
+    catch (HistoryError e)
+    {
+        if (plausibleId(arg) && (buildPath(dir, arg ~ ".jsonl").exists || buildPath(dir, arg ~ ".jsonl.gz").exists)) return arg;
+        throw new Exception(e.msg.replace("sessions_list shows", "--list-sessions shows"));
+    }
+}
+
 /// The `session` argument of a history call: absent (read the caller's own
 /// log) or a non-empty string.
 string sessionArg(JSONValue args) pure @safe
@@ -270,7 +335,7 @@ string sessionArg(JSONValue args) pure @safe
     auto v = "session" in args.objectNoRef;
     if (v is null || v.type == JSONType.null_) return null;
     if (v.type != JSONType.string || !v.str.strip.length)
-        throw new HistoryError("session must be a non-empty string (an id, unique id prefix or title)");
+        throw new HistoryError("session must be a non-empty string (a handle, id, unique id prefix or title)");
     return v.str.strip;
 }
 
@@ -427,4 +492,39 @@ unittest
     assert(confirmQuestion(done).canFind("sess-done") && confirmQuestion(done).canFind(beta));
 
     liveLog.close();
+}
+
+// Issue #300: a handle resolves first — before ids, prefixes and a colliding
+// title — and a running holder beats a stopped one, then the newest wins.
+unittest
+{
+    SessionInfo mk(string id, string title, string name, bool live)
+    {
+        SessionInfo i;
+        i.id = id;
+        i.title = title;
+        i.name = name;
+        i.live = live;
+        return i;
+    }
+    // Newest first, as `listSessions` returns them.
+    auto sessions = [
+        mk("sess-3", "perf", null, false),       // a title that collides with the handle
+        mk("sess-2", "older run", "perf", false), // a stopped session that had the handle
+        mk("sess-1", "matrix", "perf", true),     // the running holder
+    ];
+    assert(resolve("perf", sessions).id == "sess-1", "the running holder wins");
+    assert(resolve("Perf", sessions).id == "sess-1", "a handle matches whatever the case");
+    sessions[2].live = false;
+    assert(resolve("perf", sessions).id == "sess-2", "with none running, the newest holder wins");
+    assert(resolve("sess-3", sessions).id == "sess-3", "an id still resolves");
+    assert(resolve("matrix", sessions).id == "sess-1", "a title still resolves");
+    // A legacy ID-shaped handle never shadows the session with that exact id.
+    sessions[1].name = "sess-3";
+    assert(resolve("sess-3", sessions).id == "sess-3", "an exact id beats a legacy handle");
+    sessions[1].name = sessions[2].name = null;
+    assert(resolve("perf", sessions).id == "sess-3", "without a holder the title matches");
+    // sessions_list shows the handle.
+    auto named = mk("sess-9", "t", "nano-engine", true);
+    assert(lineOf(named).canFind("[name: nano-engine]"), lineOf(named));
 }

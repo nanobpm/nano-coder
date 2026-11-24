@@ -882,6 +882,24 @@ class SessionLog
 
     /// Where the warning about a replaced log goes (tests capture it).
     void delegate(string) warn;
+    /// Called after a recovery moved this session to a new id (oldId, newId),
+    /// so the owner can move state keyed on the id (the handle claim). Runs
+    /// on the append path: whatever it throws is swallowed.
+    void delegate(string oldId, string newId) onIdChange;
+
+    /// Show `msg` to the user: through `warn` when set, else on stderr.
+    void report(string msg)
+    {
+        if (warn) warn(msg);
+        else
+        {
+            import nano.safeio : stdErr;
+            import std.exception : collectException;
+            // Best-effort diagnostic: a closed or unwritable stderr must not
+            // abort the caller's pending write after a successful recovery.
+            if (collectException(stdErr.writeln("\n", msg)) !is null) {}
+        }
+    }
 
     /// The path no longer names the file this writer holds open (something
     /// moved, deleted or rewrote the live log). Appending on would write into
@@ -1033,14 +1051,12 @@ class SessionLog
             buildPath(path.dirName, id ~ ".attachments"));
         auto msg = "WARNING: session log " ~ old ~ " no longer names the file this session was writing: "
             ~ how ~ ". Nothing was lost.";
-        if (warn) warn(msg);
-        else
+        report(msg);
+        if (id != oldId && onIdChange)
         {
-            import nano.safeio : stdErr;
             import std.exception : collectException;
-            // Best-effort diagnostic: a closed or unwritable stderr must not
-            // abort the caller's pending write after a successful recovery.
-            if (collectException(stdErr.writeln("\n", msg)) !is null) {}
+            // The recovery already succeeded: a failing hook must not fail the write.
+            if (auto e = collectException(onIdChange(oldId, id))) report("WARNING: " ~ e.msg);
         }
     }
 
@@ -1129,6 +1145,15 @@ class SessionLog
         if (!s.autoCompactThreshold.isNaN) d["auto_compact_threshold"] = s.autoCompactThreshold;
         if (s.contextWindow >= 0) d["context_window"] = s.contextWindow;
         write_(record("settings", d));
+    }
+
+    /// The session's handle after `/name` (issue #300); null records a
+    /// cleared handle. The latest record wins.
+    void name(string handle)
+    {
+        JSONValue d = ["recorded_at": nowStamp()];
+        d["name"] = handle.length ? JSONValue(handle) : JSONValue(null);
+        write_(record("name", d));
     }
 
     /// The timers after a change; the latest record wins.
@@ -1490,6 +1515,8 @@ struct Restored
     JSONValue plan;
     /// The latest timers record (`{last_id, items}`), or null.
     JSONValue timers;
+    /// The session's handle (issue #300) as of the latest `name` record.
+    string name;
     /// The memory-recall state (`{seen, fired}`) as of the latest recall
     /// record, reset by a later replace; null when the session never had one.
     JSONValue recall;
@@ -2412,6 +2439,9 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
         case "timers":
             r.timers = data["timers"];
             break;
+        case "name":
+            if (auto n = "name" in data) r.name = n.type == JSONType.string ? n.str : null;
+            break;
         case "recall":
             r.recall = data["recall"];
             break;
@@ -2918,7 +2948,7 @@ private enum LOCK_EX = 2, LOCK_NB = 4, LOCK_UN = 8;
 /// unwritable entry is skipped.
 TidyResult tidySessions(string dir, long compressAfterDays, long retentionDays)
 {
-    import nano.session_index : titledIds, indexFile;
+    import nano.session_index : titledIds, indexFile, list;
     TidyResult result;
     if (!dir.exists || (compressAfterDays <= 0 && retentionDays <= 0)) return result;
     auto stampPath = buildPath(dir, tidyStampFile);
@@ -2929,7 +2959,9 @@ TidyResult tidySessions(string dir, long compressAfterDays, long retentionDays)
     // Without the titles, any deletion could hit a named session: fail
     // closed and only compress this pass.
     bool mayDelete = retentionDays > 0;
-    try named = titledIds(dir);
+    // Refresh the index first: a handle recorded after a session's last
+    // indexing (issue #300) is only in its log until a listing re-reads it.
+    try { list(dir, true); named = titledIds(dir); }
     catch (Exception) mayDelete = false; // unknown titles: compress only, delete nothing
     tidyDir(dir, now, compressAfterDays, retentionDays, mayDelete, named, result);
     // Sub-agent logs sit one level down (<session>/sub-<call>.jsonl): the

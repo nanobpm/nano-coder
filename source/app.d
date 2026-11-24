@@ -61,7 +61,7 @@ enum string packageVersion = "1.27.0";
 enum string versionString = "nano-coder " ~ packageVersion;
 
 enum string usage = `Usage: nano-coder [--model provider/model] [--config PATH] [-p PROMPT]
-                    [--resume [SESSION_ID|last]] [--plan] [--sandbox off|workspace|read-only]
+                    [--resume [SESSION|last]] [--name HANDLE] [--plan] [--sandbox off|workspace|read-only]
                     [--allow RULE]... [--deny RULE]...
                     [--no-session] [--no-hooks] [--yolo] [--wait-timers] [--verbosity quiet|normal|verbose|debug] [--acp]
        nano-coder --list-sessions [--all] [--json]
@@ -80,12 +80,16 @@ Ctrl-C cancels a running turn; a line typed during a turn steers it.
 A repository's own skills and .claude/settings*.json hooks load only once you trust it: an
 interactive start asks "Trust this repo?" and remembers a yes; -p and piped runs skip them.
 --yolo trusts the repository without asking (as --acp does).
+--name names the session with a handle other sessions reach it by (as /name does); --resume
+takes a handle, an id, a unique id prefix or a title.
 --memory-migrate tags, merges and supersedes the saved memories with the model's help, asking
 before each change (as /memory migrate does); --dry-run writes the proposals to a file instead.`;
 
 struct Options
 {
     string model, configPath, prompt, resume, listModels, sandbox, login, trajectory, verbosity;
+    /// `--name`: the session's handle (issue #300).
+    string name;
     bool waitTimers, yolo, markdown, plan, noSession, noHooks, verbose, hasResume, acp, listSessions, all, json;
     /// `--memory-migrate` and its `--dry-run`.
     bool memoryMigrate, dryRun;
@@ -127,6 +131,13 @@ Options parseArgs(string[] args)
             case "--memory-migrate": o.memoryMigrate = true; break;
             case "--dry-run": o.dryRun = true; break;
             case "--sandbox": o.sandbox = value(); break;
+            case "--name":
+            {
+                import nano.handle : invalidHandle;
+                o.name = value();
+                if (auto why = invalidHandle(o.name)) fail("--name " ~ o.name ~ ": " ~ why);
+                break;
+            }
             case "--acp": o.acp = true; break;
             case "--list-sessions": o.listSessions = true; break;
             case "--all": o.all = true; break;
@@ -164,6 +175,8 @@ Options parseArgs(string[] args)
         fail("--memory-migrate can't be combined with --resume, --acp, --list-models, --login, --list-sessions, --trajectory or -p");
     if (o.hasResume && o.login.length) fail("--resume and --login are mutually exclusive");
     if (o.hasResume && o.listModels.length) fail("--resume and --list-models are mutually exclusive");
+    if (o.name.length && (o.listSessions || o.trajectory !is null || o.listModels.length || o.login.length || o.memoryMigrate))
+        fail("--name names an interactive, -p or --acp session");
     return o;
 }
 
@@ -195,6 +208,11 @@ unittest
     assert(bare.hasResume && bare.resume == "");
     assert(parseArgs(["nano-coder", "--resume=-sess"]).resume == "-sess");
     assert(!ok("--resume", "-sess"), "a dash-prefixed id needs the attached form");
+    // `--name` (issue #300): a valid handle, for a session-running mode.
+    assert(parseArgs(["nano-coder", "--name", "perf-matrix"]).name == "perf-matrix");
+    assert(ok("--resume", "sess-1", "--name", "perf") && ok("--acp", "--name=perf"));
+    assert(!ok("--name", "Perf") && !ok("--name", "sess-1") && !ok("--name"));
+    assert(!ok("--list-sessions", "--name", "perf"));
 }
 
 /// `--login PROVIDER`: interactive device-flow sign-in.
@@ -2531,6 +2549,7 @@ string indent(string s) pure
 
 alias planNote = planPromptNote;
 import nano.system_prompt : buildSystemPrompt;
+static import nano.handle;
 
 
 /// Warnings for the current model's temperature and thinking settings.
@@ -2584,9 +2603,33 @@ unittest
     assert(listed.canFind("here"));
 }
 
+/// `/name [HANDLE|--clear]` (issue #300): show, set or clear this
+/// session's handle; the reply the user sees.
+string nameCommand(Agent agent, string arg)
+{
+    import std.string : strip;
+    import nano.handle : describe;
+    arg = arg.strip;
+    if (!arg.length) return describe(agent.name);
+    if (arg == "--clear")
+    {
+        // Clear even with no live name: a handle refused on restore is
+        // still in the log, and only the clearing record stops a resume
+        // from bringing it back.
+        auto old = agent.name;
+        if (auto why = agent.setName(null)) return "Can't clear the handle: " ~ why;
+        return old.length ? format("Handle %s removed", old) : "This session has no handle";
+    }
+    if (auto why = agent.setName(arg)) return format("Can't name this session %s: %s", arg, why);
+    return format("This session is now %s: session_send to \"%s\" reaches it, nano-coder --resume=%s resumes it",
+        arg, arg, arg);
+}
+
 string sessionText(Agent agent) pure
 {
-    return agent.log.match!(l => format("session %s\nlog: %s", l.id, l.path), () => "not recording (--no-session)");
+    auto handle = agent.name.length ? "\nhandle: " ~ agent.name : "";
+    return agent.log.match!(l => format("session %s%s\nlog: %s", l.id, handle, l.path),
+        () => "not recording (--no-session)" ~ handle);
 }
 
 /// `/timers`: the agent's active timers.
@@ -3260,12 +3303,15 @@ int runMain(string[] args)
     if (!cfg.persistSessions) o.noSession = true;
     if (o.trajectory !is null) return printTrajectory(sessionDir, o.trajectory, o.json, o.markdown);
     if (o.listSessions) return printSessions(sessionDir, o.all, o.json);
-    if (o.hasResume && (o.resume == "" || o.resume == "last"))
+    if (o.hasResume)
     {
         import nano.resume : pickOutcome, Pick, printList, resumeLast = last;
+        import nano.cross_session : resolveResumeId;
         try
         {
             if (o.resume == "last") o.resume = resumeLast(sessionDir, getcwd());
+            // A handle, id, unique id prefix or title (issue #300).
+            else if (o.resume != "") o.resume = resolveResumeId(sessionDir, o.resume);
             else if (o.acp) die("--resume needs a session ID with --acp");
             else if (isTerminal(0) && isTerminal(2))
             {
@@ -3533,7 +3579,8 @@ int runMain(string[] args)
             foreach (a; built) a.instructions = instructions;
         }
         return buildSystemPrompt(cfg, dir, wallNow.toISOExtString[0 .. 10], plan, skills, index,
-            instructions.match!(pi => pi.render, () => string.init));
+            instructions.match!(pi => pi.render, () => string.init),
+            built.match!(a => a.name, () => string.init));
     }
     auto questions = QuestionBroker.make;
     tools.register(questionDefinition, (JSONValue a) => questions.run(a));
@@ -3689,6 +3736,8 @@ int runMain(string[] args)
             if (skills.warnings.length) meta["skillWarnings"] = skills.warnings;
             return meta;
         };
+        host.name = o.name;
+        scope (exit) agent.releaseName();
         auto server = new AcpServer(agent, host);
         // The bash heartbeat keeps a supervising worker (c8ctl-nano) from
         // idle-killing a healthy long command: a `session/update` note on the
@@ -3794,6 +3843,8 @@ int runMain(string[] args)
         // life of the process.
         restored = Restored.init;
         releaseHeap();
+        // The resumed session's handle (issue #300) is in its system prompt.
+        agent.installSystem(systemFor(cwd, agent.promptPlan), indexShown);
         return notes;
     }
 
@@ -3811,6 +3862,16 @@ int runMain(string[] args)
         }
     }
     catch (Exception e) die(e.msg);
+    // `--name` (issue #300) names the new session, or renames the resumed one.
+    if (o.name.length)
+    {
+        string why;
+        try why = agent.setName(o.name);
+        catch (Exception e) why = e.msg;
+        if (why !is null) die("--name " ~ o.name ~ ": " ~ why);
+    }
+    scope (exit) agent.releaseName();
+    if (agent.name.length) agent.installSystem(systemFor(cwd, agent.promptPlan), indexShown);
     agent.useHooks(loadHooks(cwd), o.hasResume);
 
     auto console = new Console(isTerminal(1) && environment.get("NO_COLOR") is null, isTerminal(1));
@@ -4589,7 +4650,7 @@ int runMain(string[] args)
             "nano-coder v" ~ packageVersion,
             format("Model: %s (provider: %s)", client.modelName, client.providerName),
         ];
-        agent.log.ifSome((SessionLog l) { banner ~= format("Session: %s (resume with nano-coder --resume %s)", l.id, l.id); });
+        agent.log.ifSome((SessionLog l) { banner ~= nano.handle.sessionLine(sessionDir, l.id, agent.name); });
         foreach (pi; instructions)
         {
             foreach (f; pi.loadedPaths) banner ~= "Instructions: " ~ f;
@@ -4652,7 +4713,7 @@ int runMain(string[] args)
     void goodbye()
     {
         writeln("\nGoodbye!");
-        agent.log.ifSome((SessionLog l) { writefln("Session: %s (resume with nano-coder --resume %s)", l.id, l.id); });
+        agent.log.ifSome((SessionLog l) { writeln(nano.handle.sessionLine(sessionDir, l.id, agent.name)); });
         stdOut.flush();
     }
     for (;;)
@@ -4742,6 +4803,7 @@ int runMain(string[] args)
                 else nano.herdr.report(nano.herdr.State.idle);
             }
             else nano.herdr.report(nano.herdr.State.idle);
+            nano.herdr.showName(agent.name);
             nano.herdr.showModel(agent.client.modelName);
             nano.herdr.showTimer(!agent.timers.empty);
             // The prompt's stamp is redrawn with the submission time (Rust's restamp).
@@ -4970,6 +5032,9 @@ int runMain(string[] args)
                     updateStatus((ref Stats s) { s.historySearches = s.historyReads = 0; });
                     agent.useHooks(loadHooks(cwd), false);
                     rebindPeerListener();
+                    // A new session has no handle (issue #300): drop it from the prompt.
+                    agent.installSystem(systemFor(cwd, agent.promptPlan), indexShown);
+                    nano.herdr.showName(null);
                     if (gFrame) gFrame.clear();
                     refreshStatus();
                     log.match!(l => writefln("Session: %s (resume with nano-coder --resume %s)", l.id, l.id),
@@ -5106,6 +5171,17 @@ int runMain(string[] args)
                     else writeln(escapeMarks(sanitizeBlock(said)));
                     continue;
                 }
+                case "/name":
+                {
+                    // A backstop: a failed rename is reported, never ends the session.
+                    try writeln(nameCommand(agent, arg));
+                    catch (Exception e) stdErr.writeln(console.red("error: can't change the handle: " ~ e.msg));
+                    // The handle is in the system prompt, the status bar and Herdr's pane label.
+                    agent.installSystem(systemFor(cwd, agent.promptPlan), indexShown);
+                    nano.herdr.showName(agent.name);
+                    refreshStatus();
+                    continue;
+                }
                 case "/messages":
                 {
                     auto reply = messagesCommand(agent, cfg, arg, peerRouter, peerListener.length != 0,
@@ -5154,6 +5230,12 @@ int runMain(string[] args)
                             }
                         }
                         else if (arg == "last") id = resumeLast(sessionDir, cwd, current);
+                        else
+                        {
+                            // A handle, id, unique id prefix or title (issue #300).
+                            import nano.cross_session : resolveResumeId;
+                            id = resolveResumeId(sessionDir, arg);
+                        }
                     }
                     catch (Exception e) { writeln(e.msg); continue; }
                     if (id == current) { writefln("Already in session %s", id); continue; }
@@ -5175,7 +5257,10 @@ int runMain(string[] args)
                     if (gFrame) { gFrame.clear(); replayTranscript(agent, console); releaseHeap(); }
                     foreach (n; loadNotes) stdErr.writeln(n);
                     stdErr.flush();
-                    writefln("Resumed session %s (resume later with nano-coder --resume %s)", id, id);
+                    nano.herdr.showName(agent.name);
+                    refreshStatus();
+                    writefln("Resumed session %s%s (resume later with nano-coder --resume=%s)", id,
+                        agent.name.length ? " · " ~ agent.name : "", nano.handle.resumeArg(sessionDir, id, agent.name));
                     continue;
                 }
                 case "/trajectory":

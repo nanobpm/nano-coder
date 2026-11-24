@@ -27,6 +27,7 @@ void statusFromAgent(ref Stats s, Agent agent, string cwdShown)
     s.nextTimer = s.timers ? imported!"nano.timers".clock(agent.timers.nextDue) : null;
     s.mode = agent.control.mode;
     s.thinking = agent.shownThinking;
+    s.name = agent.name;
     s.sessionInputTokens = agent.sessionInputTokens;
     s.sessionOutputTokens = agent.sessionOutputTokens;
     s.hasAic = agent.hasSessionAic;

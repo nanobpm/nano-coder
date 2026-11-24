@@ -122,6 +122,9 @@ the effective mode and its source go to stderr (`nano-coder: sandbox workspace
   process; a `sessionId` other than the active one is rejected (use `session/load` to switch). An optional `messageId`
   (or `_meta.inputId`) makes it idempotent: redelivering an ID that already completed
   returns the recorded response without calling the model again
+- `session/set_name` → `{ "name": "perf" }` sets the active session's [handle](#session-handles)
+  (`null` or `""` clears it); the result is `{ "sessionId", "name" }`, and an invalid or
+  taken handle is an error. `--name` names every new or loaded session.
 - `session/cancel` → cancels the current turn (normally sent as a notification, which
   gets no reply). The running model call is abandoned, a running bash command is
   killed, remaining tool calls are recorded as cancelled, and the turn's
@@ -490,9 +493,10 @@ argument: a type-ahead list narrows as you type and Tab completes it.
   - **auto** - no turn cap (headless runs still get the 300-call safety cap); a `question` left unanswered for 15s is answered with "the user is away from the keyboard, make the best decision you can"
 - `/thinking [level|default|off|reset]` - Show the thinking level in use and the levels the current model takes, or set one for this session (`reset` goes back to the configured level). See [Thinking](#thinking)
 - `/providers` - List providers, endpoints and whether their API key is available
-- `/session` - Show the session ID and log path
+- `/session` - Show the session ID, its handle (if any) and log path
+- `/name [HANDLE|--clear]` - Show, set or clear this session's handle: a stable name other sessions use to reach it (see [Session handles](#session-handles))
 - `/trajectory` - Show this session's trajectory turn by turn: user input, thinking, answers, tool calls and results, tokens and timings. Each message row is labelled with its `#N` session-log ID, the same ID `history_read` and smart-compaction summaries use (compaction and crash-recovered input rows have no `#N`, as they aren't cited that way). It opens in your pager (`$PAGER`, default `less`), even when it would fit on the screen, so you dismiss it with `q` and it doesn't stay in the transcript or your scrollback — but only at an idle prompt on a terminal: invoked mid-turn (while a turn runs) or with piped output it prints inline instead. `/trajectory --json` or `/trajectory --markdown` prints an export instead; `nano-coder --trajectory SESSION_ID [--json|--markdown]` does the same for any saved session
-- `/resume [ID|last]` - Switch to a saved session without restarting: the same picker as `--resume` (leaving out the session in use), or the session with that ID, or `last` (the most recent other session in this directory). Run it at the prompt, not during a turn
+- `/resume [SESSION|last]` - Switch to a saved session without restarting: the same picker as `--resume` (leaving out the session in use), or the session with that handle, ID, unique ID prefix or title, or `last` (the most recent other session in this directory). Run it at the prompt, not during a turn
 - `/restart` - Start a fresh session (clean context) without exiting
 - `/exit` - Exit the agent (prints the session's `--resume` command first, when session persistence is enabled)
 
@@ -609,7 +613,7 @@ not on the next turn). The picker then shows `title · last prompt`. Titles live
 so older nano-coders can still read the logs. Deleting `index.jsonl` loses them; a new run then
 asks again on the session's next turn.
 
-Flags: `--login github-copilot`, `--list-models PROVIDER`, `--trajectory SESSION_ID [--json|--markdown]`, `--acp`, `--model provider/model` (or `AGENTIC_HARNESS_MODEL`), `--resume [SESSION_ID|last]`, `--list-sessions [--all] [--json]`,
+Flags: `--login github-copilot`, `--list-models PROVIDER`, `--trajectory SESSION_ID [--json|--markdown]`, `--acp`, `--model provider/model` (or `AGENTIC_HARNESS_MODEL`), `--resume [SESSION|last]` (a handle, ID, unique ID prefix or title), `--name HANDLE`, `--list-sessions [--all] [--json]`,
 `--config PATH`, `--verbosity LEVEL` (`-v`), `--sandbox off|workspace|read-only` (or `NANO_CODER_SANDBOX`),
 `--allow RULE` and `--deny RULE` (repeatable; added to the config's rules), `--version` (`-V`).
 
@@ -1220,7 +1224,8 @@ take an optional `session` argument:
   session open (probed with the session log's own lock). `filter` keeps sessions whose id,
   title or directory contains it (case-insensitive), and the listing is capped in bytes like
   any tool output.
-- `session` - an id, a unique id prefix, or a title from `sessions_list`. An ambiguous match
+- `session` - a handle, an id, a unique id prefix, or a title from `sessions_list` (see
+  [Session handles](#session-handles) for the order). An ambiguous match
   is an error listing the candidates; without the argument the tools read the current
   session, as before.
 
@@ -1253,8 +1258,8 @@ directory created mode 0700; `NANO_CODER_PEERS` overrides the directory) and the
 gets a fourth cross-session tool:
 
 - `session_send(to, text, confirm?)` - deliver a message to another running session.
-  `to` resolves like the history tools' `session` argument (an id, a unique id prefix,
-  or a title from `sessions_list`, which marks reachable sessions `[messages]`). The
+  `to` resolves like the history tools' `session` argument (a handle, an id, a unique id
+  prefix, or a title from `sessions_list`, which marks reachable sessions `[messages]`). The
   result is one of `delivered`, `queued` (the target is mid-turn; the message sits in its
   `/queue`, visible, editable and withdrawable like a typed steer), `awaiting
   confirmation` (the target's user is being asked), `refused` (the target has messages
@@ -1263,7 +1268,8 @@ gets a fourth cross-session tool:
   permission policy as a `session_send(...)` rule.
 
 The delivered message joins the target's input labelled with its origin, e.g.
-`[from session 1234abcd · ts-performance-matrix] …`, and is logged like any input with
+`[from session 1234abcd · ts-performance-matrix] …` (or `[from perf · ts-performance-matrix] …`
+when the sender has a [handle](#session-handles)), and is logged like any input with
 the sender's full session id in the record (`from_session` on the input and message). Mid-turn it is steered into the running turn; idle it starts
 a turn. With `session_messages_confirm = true` (the default) the target first shows the
 message and waits for its user to accept or decline. A turn that was *started by* a peer
@@ -1600,6 +1606,46 @@ reminders off).
 Set `memory = "on"` (full), `"read_only"` (index and `memory_search` only), or `"off"`.
 Headless/ACP runs downgrade `on` to `read_only` by default, since no human vets a save live.
 
+#### Session handles
+
+Session ids and model-written titles change or collide, so a session can take a stable,
+user-chosen **handle**: `/name perf` at the prompt, or `nano-coder --name perf` at launch
+(with `--resume`, `--name` renames the resumed session). `/name` alone shows it and
+`/name --clear` removes it. A handle is lowercase letters, digits and `-`, at most 32
+characters, and can't start with `sess-` (so it never looks like an id). A handle needs
+a saved session: with `--no-session` or `persist_sessions = false` it is refused.
+
+- **Stored with the session.** The handle is a `name` record in the session log (the last
+  one wins) and is kept in the session index, so it survives `/resume`, `/relaunch` and
+  `/update`; ACP clients set it with `session/set_name` (`{"name": "perf"}`, `null`
+  clears) and see it as `name` in the `_meta` of `session/new` and `session/load`
+  (a `--name` another running session holds fails either request). A named
+  session is kept by `session_retention_days`, like a titled one.
+- **Unique among running sessions.** Setting a handle a running session holds is refused,
+  naming that session; a stopped session's handle can be reused. Running holders are
+  recorded in the peer registry (`<peers dir>/<handle>.name`, with the holder's session
+  directory, so sessions with different `session_dir`s still can't share a handle).
+- **Resolution order.** `session_send`'s `to`, the history tools' `session`, `--resume` and
+  `/resume` try, in order: an exact session id, a handle (a running holder first, then
+  the newest stopped one), a unique id prefix, then a title. A handle always beats a title
+  that happens to be the same word, and a handle can't look like a session id (`sess-…`
+  is refused), so an id and a handle never compete.
+- **Visible.** The status bar shows `@perf`, `/session` and the exit message show it (the
+  exit message suggests `--resume=perf` when no other saved session used the handle), a
+  sent message is labelled `[from perf · …]`, `sessions_list` marks it `[name: perf]`, the
+  system prompt tells the agent its own handle, and a Herdr pane label shows it.
+
+Two agents that talk by name, in two terminals (both with `session_messages = true`):
+
+```
+nano-coder --name nano-engine     # works on the engine
+nano-coder --name perf            # runs the benchmarks
+```
+
+In `perf`: *"send the regression numbers to nano-engine"* — the agent calls
+`session_send(to: "nano-engine", …)`, and `nano-engine` sees `[from perf · …] …`. Both
+keep the names across restarts: `nano-coder --resume perf`.
+
 ## Sessions
 
 When `persist_sessions` is on, each conversation is written to `<session_dir>/<id>.jsonl`.
@@ -1626,7 +1672,7 @@ Record times and each message's `timestamp` are RFC 3339 with the local UTC offs
   place (`<id>.jsonl.gz`); `--resume`, the picker, `--list-sessions`, `--trajectory` and
   the history tools read them transparently, and resuming one decompresses it back.
   `session_retention_days` (default 0 = keep forever) deletes logs untouched that long,
-  except named sessions. The tidy-up runs at most once a day and never touches a log a
+  except named sessions (a title or a handle). The tidy-up runs at most once a day and never touches a log a
   running session holds open.
 
 ## Herdr
@@ -1636,7 +1682,8 @@ Run inside a [Herdr](https://herdr.dev) pane (`HERDR_ENV=1`, `HERDR_PANE_ID` and
 turn runs, `blocked` while a question or the turn limit waits for you, and `idle` at the
 prompt. A saved session is reported with the command that resumes it
 (`nano-coder --resume <id> --model <provider/model>`, plus `--config` if given), so Herdr
-can reopen it after a restart (Herdr 0.9.2 or later). The pane is released on exit.
+can reopen it after a restart (Herdr 0.9.2 or later). A session with a
+[handle](#session-handles) shows it as the pane's agent label and reports a `name` token. The pane is released on exit.
 Reports run in the background and failures are ignored; outside Herdr nothing is sent.
 
 While the agent has a timer set, nano-coder also reports a `timer` token showing ⏰.

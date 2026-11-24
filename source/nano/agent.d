@@ -2678,7 +2678,7 @@ class Agent
             if (auto v = "confirm" in args.objectNoRef)
                 if (v.type == JSONType.true_ || v.type == JSONType.false_) confirm = v.boolean;
         }
-        if (!to.length) throw new hist.HistoryError("session_send: `to` must be a non-empty session id, prefix or title");
+        if (!to.length) throw new hist.HistoryError("session_send: `to` must be a non-empty session handle, id, prefix or title");
         if (!text.strip.length) throw new hist.HistoryError("session_send: `text` must be a non-empty message");
         // The loop guard: a turn started by a peer message can't send one
         // unapproved, whatever the confirm setting — two agents must not
@@ -2707,6 +2707,7 @@ class Agent
         peers.PeerMessage pm;
         pm.senderId = ownLog.id;
         pm.senderTitle = selfTitle(sessions, ownLog.id);
+        pm.senderName = name;
         pm.text = text;
         pm.messageId = format("msg-%s", ++sendCounter);
         pm.confirm = confirm;
@@ -2747,6 +2748,121 @@ class Agent
             case peers.Status.refused: return format("session %s refused the message", target.id);
             case peers.Status.notRunning: return format("session %s is not running (or has messages off)", target.id);
         }
+    }
+
+    /// This session's user-chosen handle (issue #300), or null. Set with
+    /// `setName`, restored from the log by `loadRestored`.
+    string name;
+
+    /// Set this session's handle to `handle` (null or empty clears it):
+    /// validated, claimed in the peers registry (refused while another
+    /// running session holds it) and, when `record`, written to the session
+    /// log so a resume restores it. Returns null on success, else why not.
+    string setName(string handle, bool record = true)
+    {
+        import nano.handle : invalidHandle, claim;
+        if (!handle.length)
+        {
+            // Record the clear even with no live name: a handle refused on
+            // restore is still in the log, and a resume would bring it back.
+            // Persist first: a failed write leaves the handle (and its
+            // claim) in place, so a retry really retries.
+            string failed;
+            if (record) log.ifSome((SessionLog l) {
+                try l.name(null);
+                catch (Exception e) failed = "can't record the handle: " ~ e.msg;
+            });
+            if (failed !is null) return failed;
+            if (name.length) releaseName();
+            name = null;
+            return null;
+        }
+        if (auto why = invalidHandle(handle)) return why;
+        // Without a log the handle can be neither claimed nor resumed.
+        if (log.isNone) return "sessions are not saved (--no-session or persist_sessions = false)";
+        string refused;
+        string claimedId;
+        log.ifSome((SessionLog l) { claimedId = l.id; refused = claim(peers.peersDir(), sessionDirOf(l), handle, l.id); });
+        if (refused !is null) return refused;
+        immutable changed = name != handle;
+        if (record && changed)
+        {
+            // Persist before touching in-memory state or the old claim: a
+            // failed write must not leave `name` changed (a retry would then
+            // report success without recording it) nor hold the new claim.
+            import nano.handle : release;
+            string failed;
+            log.ifSome((SessionLog l) {
+                try l.name(handle);
+                catch (Exception e)
+                {
+                    // Recoverable (a full disk, say): report it, don't end the session.
+                    // Release the id the claim was taken under: a write that
+                    // recovered the log before throwing has a new `l.id`.
+                    release(peers.peersDir(), handle, claimedId);
+                    failed = "can't record the handle: " ~ e.msg;
+                }
+            });
+            if (failed !is null) return failed;
+            // The write may have recovered the log to a new id (no hook
+            // moves this not-yet-live claim): move the claim to the final
+            // id, or discovery misses it and another session can take it.
+            string moved;
+            log.ifSome((SessionLog l) {
+                if (l.id == claimedId) return;
+                moved = claim(peers.peersDir(), sessionDirOf(l), handle, l.id);
+                release(peers.peersDir(), handle, claimedId);
+            });
+            if (moved !is null)
+            {
+                // The name record is already in the log: write a clearing
+                // record so a resume doesn't bring back a handle the user
+                // was told wasn't set (or the previous one, now released).
+                string rollback;
+                log.ifSome((SessionLog l) {
+                    try l.name(name.length ? name : null);
+                    catch (Exception e) rollback = " (and the log still names it: " ~ e.msg ~ ")";
+                });
+                return "can't keep the handle after the log moved: " ~ moved ~ rollback;
+            }
+        }
+        if (name.length && changed) releaseName();
+        name = handle;
+        log.ifSome((SessionLog l) { l.onIdChange = &moveNameClaim; });
+        return null;
+    }
+
+    /// The log moved to a recovery id: move the handle's claim with it, or
+    /// the old (now unlocked) id reads as stopped and another session could
+    /// take the handle. Never throws: it runs on the log's append path.
+    private void moveNameClaim(string oldId, string newId) nothrow
+    {
+        import nano.handle : claim, release;
+        if (!name.length) return;
+        string refused;
+        try
+        {
+            log.ifSome((SessionLog l) { refused = claim(peers.peersDir(), sessionDirOf(l), name, newId); });
+            release(peers.peersDir(), name, oldId);
+        }
+        catch (Exception e) refused = e.msg;
+        if (refused is null) return;
+        immutable lost = name;
+        name = null;
+        try log.ifSome((SessionLog l) {
+            l.report("WARNING: this session lost its handle " ~ lost ~ " when its log moved to " ~ newId
+                ~ ": " ~ refused ~ " (set it again with /name)");
+        });
+        catch (Exception) {} // best-effort diagnostic: the handle is already dropped
+    }
+
+    /// Drop this session's registry claim on its handle (it keeps the name
+    /// in memory): before the session is left or the process exits.
+    void releaseName()
+    {
+        import nano.handle : release;
+        if (!name.length) return;
+        log.ifSome((SessionLog l) { release(peers.peersDir(), name, l.id); });
     }
 
     /// The directory a session log lives in (where its sibling sessions are).
@@ -3871,7 +3987,13 @@ class Agent
         messages = messages.length && messages[0].role == Role.system ? messages[0 .. 1].dup : null;
         foreach (ref m; r.conversation)
             if (m.role != Role.system) messages ~= m;
+        releaseName();
         replaceLog(newLog);
+        name = null;
+        if (r.name.length)
+        {
+            if (auto why = setName(r.name, false)) dropped ~= "the handle " ~ r.name ~ ": " ~ why;
+        }
         control.mode = AgentMode.normal;
         sessionThinking.nullify();
         completedInputs = r.completed;
@@ -4006,6 +4128,8 @@ class Agent
         // system message at all: some providers reject an empty one.
         messages = system.length ? [Message.system(system)] : null;
         promptPlan = false; // the caller renders `system` for normal mode
+        releaseName();
+        name = null;
         replaceLog(newLog);
         if (messages.length) log.ifSome((SessionLog l) { l.append(messages[0]); });
         // A new session must not answer a prompt from the previous session's
