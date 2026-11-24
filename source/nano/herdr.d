@@ -327,15 +327,24 @@ void start(scope string delegate(string) @safe get)
     import std.process : environment, thisProcessID;
     if (!cas(&gStarted, false, true)) return;
     bool found;
-    auto pane = Pane.fromEnv(get, thisProcessID, found);
+    auto pane = claim(get, (string k, string v) { environment[k] = v; }, thisProcessID, found);
     if (!found) return;
-    // Children inherit the claim; the herdr CLI variables stay usable.
-    environment[ownerVar] = thisProcessID.to!string;
     Reporter r;
     r.pane = pane;
     atomicStore(gReporter, new shared Locked!Reporter(r));
     atomicStore(gActive, true);
     spawnDaemon(&worker, pane.bin, pane.id);
+}
+
+/// Find this process's pane (as `Pane.fromEnv` for `pid`) and, if found, mark
+/// it claimed by `pid` through `set`, so every child inherits the claim. Only
+/// `ownerVar` is set: the herdr CLI variables stay usable in children.
+private Pane claim(scope string delegate(string) @safe get, scope void delegate(string, string) @safe set,
+    long pid, out bool found)
+{
+    auto pane = Pane.fromEnv(get, pid, found);
+    if (found) set(ownerVar, pid.to!string);
+    return pane;
 }
 
 /// Whether nano-coder is running inside a Herdr pane.
@@ -768,6 +777,36 @@ unittest // a pane claimed by another nano-coder is not reported to; the owner i
     assert(!found);
     Pane.fromEnv(env(nested), 7, found);
     assert(found);
+}
+
+unittest // startup claims the pane for its pid; a child inheriting that environment is nested and claims nothing
+{
+    string[string] env = ["HERDR_ENV": "1", "HERDR_BIN_PATH": "/bin/herdr", "HERDR_PANE_ID": "p1"];
+    auto get = (string k) => env.get(k, null);
+    auto set = (string k, string v) { env[k] = v; };
+    bool found;
+    auto pane = claim(get, set, 42, found);
+    assert(found && pane == Pane("/bin/herdr", "p1"));
+    assert(env[ownerVar] == "42");
+    auto before = env.dup;
+    // The nested child (pid 43) sees the inherited marker: no pane, nothing changed.
+    claim(get, set, 43, found);
+    assert(!found);
+    assert(env == before);
+    assert(env["HERDR_PANE_ID"] == "p1" && env["HERDR_BIN_PATH"] == "/bin/herdr" && env["HERDR_ENV"] == "1");
+    // The owner itself after a /relaunch exec keeps its pane.
+    claim(get, set, 42, found);
+    assert(found);
+}
+
+unittest // a nested start() leaves reporting inactive and the environment untouched
+{
+    if (atomicLoad(gStarted)) return; // another test already started reporting
+    string[string] env = ["HERDR_ENV": "1", "HERDR_BIN_PATH": "/bin/herdr", "HERDR_PANE_ID": "p1", ownerVar: "1"];
+    auto before = env.dup;
+    start((string k) => env.get(k, null));
+    assert(!active);
+    assert(env == before);
 }
 
 unittest // a metadata clear from outside is repaired: refreshing re-sends name and model
