@@ -3589,6 +3589,17 @@ int runMain(string[] args)
             try { switchModel(spec); return ""; }
             catch (Exception e) return e.msg;
         };
+        // The same paths as `/subagents on|off` and `/messages ...`, so the
+        // dialog never duplicates their state changes.
+        h.subagentsCommand = (string arg) {
+            string showLog;
+            return subagentsCommand(agent, cfg, arg, showLog);
+        };
+        h.reconfigureSubagents = () { configureSubagents(agent, cfg, false); };
+        h.messagesCommand = (string arg) => messagesCommand(agent, cfg, arg, peerRouter, peerListener.length != 0,
+            &startPeerListener, &stopPeerListener);
+        h.messagesOn = () => agent.messagesOn && peerListener.length != 0;
+        h.messagesConfirm = () => peerRouter.confirm;
         onVerbosity = (Verbosity v) { setVerbosity(v); };
         return h;
     }
