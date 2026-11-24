@@ -140,8 +140,10 @@ Rule[] ruleSet(ulong fs, const string[] roots, bool confineReads, const string[]
     auto granted = fs & ~(makeChar | makeBlock | readFile | readDir);
     Rule[] rules;
     foreach (root; roots)
-        rules ~= Rule(root, (isDirectory(root) ? granted : granted & (writeFile | truncate | ioctlDev))
-            | (confineReads ? (isDirectory(root) ? readFile | readDir : readFile) : 0));
+        // No read rights here: a writable root may contain a denied path
+        // (e.g. cwd = $HOME), so the caller passes write roots through the
+        // read splitting (`landlockReadRoots`) and they arrive in `reads`.
+        rules ~= Rule(root, isDirectory(root) ? granted : granted & (writeFile | truncate | ioctlDev));
     if (confineReads)
         foreach (r; reads) rules ~= Rule(r, isDirectory(r) ? readFile | readDir : readFile);
     return rules;
@@ -230,7 +232,7 @@ unittest // issue #333: the helper argv carries the read set, or "-" when reads 
         == ["/x", execFlag, "0", "1", "/w", "2", "/usr", "/home/u/a"]);
 }
 
-unittest // issue #333: the Landlock rule set grants reads only on the read roots
+unittest // issue #333: the Landlock rule set grants reads only on the read roots, never on write roots
 {
     auto fs = writeFile | truncate | makeDir | makeChar;
     bool dir(string p) { return p != "/w/file" && p != "/r/file"; }
@@ -238,8 +240,8 @@ unittest // issue #333: the Landlock rule set grants reads only on the read root
     assert(off.length == 1 && off[0].access == (writeFile | truncate | makeDir));
     auto on = ruleSet(fs | readFile | readDir, ["/w", "/w/file"], true, ["/usr", "/r/file"], &dir);
     assert(on.length == 4);
-    assert(on[0] == Rule("/w", writeFile | truncate | makeDir | readFile | readDir));
-    assert(on[1] == Rule("/w/file", writeFile | truncate | readFile));
+    assert(on[0] == Rule("/w", writeFile | truncate | makeDir));
+    assert(on[1] == Rule("/w/file", writeFile | truncate));
     assert(on[2] == Rule("/usr", readFile | readDir));
     assert(on[3] == Rule("/r/file", readFile));
     foreach (r; on) assert(!(r.access & makeChar), r.path);

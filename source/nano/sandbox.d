@@ -503,7 +503,7 @@ struct SandboxConfig
             if (auto e = check(network)) throw new Exception(e);
             auto plan = readPlan(cwd);
             auto reads = plan.confine == ReadConfine.off ? null
-                : landlockReadRoots(plan, (string d) => listDir(d), (string d) => isDir(d));
+                : landlockReadRoots(plan, (string d) => listDir(d), (string d) => isDir(d), writableRoots(cwd));
             return argv(network, writableRoots(cwd), plan.confine != ReadConfine.off, reads, shell, script);
         }
         else
@@ -579,9 +579,11 @@ string seatbeltReadRules(const ReadPlan plan, string home) pure
 /// is removed by splitting each readable root that contains one into its
 /// children (from `list`) until no granted root contains a denied path; the
 /// denied paths and their ancestors are then simply not granted. `secrets`
-/// mode starts from `/`, `workspace` mode from `plan.readable`.
+/// mode starts from `/`, `workspace` mode from `plan.readable` plus the
+/// writable `roots` (which get no read rights of their own, so a write root
+/// containing a denied path, e.g. cwd = $HOME, is split the same way).
 string[] landlockReadRoots(const ReadPlan plan, scope string[] delegate(string) @safe list,
-    scope bool delegate(string) @safe isDirectory)
+    scope bool delegate(string) @safe isDirectory, const string[] roots = null)
 {
     string[] result;
     void grant(string root, size_t depth)
@@ -600,7 +602,10 @@ string[] landlockReadRoots(const ReadPlan plan, scope string[] delegate(string) 
     {
         case ReadConfine.off: return null;
         case ReadConfine.secrets: grant("/", 0); break;
-        case ReadConfine.workspace: foreach (r; plan.readable) grant(r, 0); break;
+        case ReadConfine.workspace:
+            foreach (r; plan.readable) grant(r, 0);
+            foreach (r; roots) grant(r, 0);
+            break;
     }
     return result;
 }
@@ -1100,6 +1105,15 @@ unittest
     ReadPlan w = { confine: ReadConfine.workspace, denied: ["/home/u/.ssh"], readable: ["/usr", "/home/u/src", "/home/u"] };
     assert(landlockReadRoots(w, &list, &dir) == ["/usr", "/home/u/src", "/home/u/.config", "/home/u/.netrc"]);
     assert(landlockReadRoots(ReadPlan.init, &list, &dir) is null);
+    // A writable root containing a denied path (cwd = $HOME, writable ~/.config)
+    // is split too, in both modes, so writing there doesn't re-expose secrets.
+    ReadPlan w2 = { confine: ReadConfine.workspace, denied: ["/home/u/.ssh", "/home/u/.config/gh"], readable: ["/usr"] };
+    auto wr = landlockReadRoots(w2, &list, &dir, ["/home/u", "/home/u/.config"]);
+    assert(wr == ["/usr", "/home/u/.config/git", "/home/u/src", "/home/u/.netrc"], wr.join(" "));
+    foreach (r; wr)
+        foreach (d; w2.denied) assert(!within(d, r) && !within(r, d), r ~ " exposes " ~ d);
+    ReadPlan s2 = { confine: ReadConfine.secrets, denied: ["/home/u/.ssh"] };
+    foreach (r; landlockReadRoots(s2, &list, &dir, ["/home/u"])) assert(!within("/home/u/.ssh", r), r);
 }
 
 // issue #333: sandboxed commands can't read denied paths; normal work still runs
