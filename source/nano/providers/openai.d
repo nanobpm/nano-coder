@@ -179,9 +179,10 @@ class OpenAIClient : LLMClient, CapabilityProbe, KindedClient
         StreamState st;
         st.sink = sink;
         st.replay = p.replayReasoning;
-        auto whole = postStream(st, url, headers(req), requestBody(req, true), what, p.config);
-        if (whole !is null) return reportWhole(parseWhole(parseJSON(whole), p.replayReasoning), sink);
-        return st.finish();
+        RetrySpend spent;
+        auto whole = postStream(st, spent, url, headers(req), requestBody(req, true), what, p.config);
+        if (whole !is null) return withRetried(reportWhole(parseWhole(parseJSON(whole), p.replayReasoning), sink), spent);
+        return withRetried(st.finish(), spent);
     }
 
     static LLMResponse parseWhole(JSONValue j, bool replay = false)
@@ -523,9 +524,10 @@ class CopilotClient : OpenAIClient
             ResponsesStream st;
             st.sink = sink;
             st.replay = p.replayReasoning;
-            auto whole = postStream(st, url, h, body_, what, p.config);
-            if (whole !is null) return reportWhole(parseResponses(parseJSON(whole), p.replayReasoning), sink);
-            return st.finish();
+            RetrySpend spent;
+        auto whole = postStream(st, spent, url, h, body_, what, p.config);
+            if (whole !is null) return withRetried(reportWhole(parseResponses(parseJSON(whole), p.replayReasoning), sink), spent);
+            return withRetried(st.finish(), spent);
         }
         import nano.providers.anthropic : AnthropicClient, AnthropicStream;
         h["anthropic-version"] = "2023-06-01";
@@ -534,9 +536,10 @@ class CopilotClient : OpenAIClient
             return reportWhole(AnthropicClient.parseWhole(parseJSON(postProvider(url, h, body_, what, p.config))), sink);
         AnthropicStream st;
         st.sink = sink;
-        auto whole = postStream(st, url, h, body_, what, p.config);
-        if (whole !is null) return reportWhole(AnthropicClient.parseWhole(parseJSON(whole)), sink);
-        return st.finish();
+        RetrySpend spent;
+        auto whole = postStream(st, spent, url, h, body_, what, p.config);
+        if (whole !is null) return withRetried(reportWhole(AnthropicClient.parseWhole(parseJSON(whole)), sink), spent);
+        return withRetried(st.finish(), spent);
     }
 }
 

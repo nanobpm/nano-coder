@@ -105,6 +105,8 @@ class Cancelled : Exception
     /// Usage the provider reported before the cancel (e.g. a usage chunk),
     /// so it is still counted (issue #340). Zero when none arrived.
     imported!"nano.llm".TokenUsage usage;
+    /// Spending of earlier attempts retried before output (issue #340).
+    imported!"nano.llm".RetrySpend retried;
     this() pure nothrow @safe { super(cancelledResponse); }
 }
 

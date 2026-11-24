@@ -660,3 +660,36 @@ unittest
     assert(f.agent.sessionInputTokens == 40, "the reported usage is counted");
     assert(f.agent.uncountedRequests == 1, "only the request without usage is uncounted");
 }
+
+// Stream attempts retried inside a request add to the session totals and
+// count their usage-free attempts, but only the final attempt sizes the
+// context; a later usage-free drop is not hidden by earlier usage (issue #340).
+unittest
+{
+    import nano.http : StreamInterrupted;
+    import nano.llm : RetrySpend;
+    auto f = new Fixture([]);
+    int n;
+    f.agent.client = new class MockClient
+    {
+        this() { super([]); }
+        override LLMResponse chat(const ref ChatRequest req, StreamSink sink)
+        {
+            n++;
+            if (n == 1)
+            {
+                auto e = new StreamInterrupted("dropped");
+                e.retried = RetrySpend(TokenUsage(30, 0), 1);
+                throw e;
+            }
+            auto r = LLMResponse("done");
+            r.usage = TokenUsage(20, 5);
+            r.retried = RetrySpend(TokenUsage(20, 0), 2);
+            return r;
+        }
+    };
+    assert(f.agent.run("go", new NullEvents) == "done");
+    assert(f.agent.sessionInputTokens == 70 && f.agent.sessionOutputTokens == 5);
+    assert(f.agent.uncountedRequests == 4, "the usage-free final drop and both retries' usage-free attempts");
+    assert(f.agent.lastUsage.inputTokens == 20, "only the successful attempt sizes the context");
+}

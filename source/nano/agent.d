@@ -21,7 +21,7 @@ import std.string : strip, stripLeft;
 import std.array : join;
 import std.conv : to;
 import nano.llm;
-import nano.http : StreamInterrupted;
+import nano.http : StreamInterrupted, hasUsage;
 import core.thread : Thread;
 import core.time : Duration;
 static import nano.session_index;
@@ -1225,12 +1225,14 @@ class Agent
         catch (Cancelled e)
         {
             failure = e;
+            countRetried(e.retried, ev);
             countAborted(e.usage, ev);
             return Event(CallFailed(Failure.cancelled, e.msg, req.maxTokens, true));
         }
         catch (StreamInterrupted e)
         {
             failure = e;
+            countRetried(e.retried, ev);
             countAborted(e.usage, ev);
             return Event(CallFailed(Failure.interrupted, e.msg, req.maxTokens, control.isCancelled));
         }
@@ -1239,6 +1241,8 @@ class Agent
             failure = e;
             return Event(CallFailed(Failure.error, e.msg, req.maxTokens, control.isCancelled));
         }
+        // Retried attempts add to the totals but not to the calibration below.
+        countRetried(r.retried, ev);
         lastUsage = r.usage;
         recordUsage(r.usage);
         if (r.usage.inputTokens > 0)
@@ -2301,6 +2305,7 @@ class Agent
                 foreach (e; ev) e.summaryStart();
                 auto r = client.chat(req, (bool, string) {});
                 summaryMs = since(swStart).total!"msecs";
+                countRetried(r.retried, ev);
                 summaryUsage = r.usage;
                 recordUsage(r.usage);
                 foreach (e; ev) e.usage(r.usage);
@@ -2321,11 +2326,13 @@ class Agent
             }
             catch (Cancelled e)
             {
+                countRetried(e.retried, ev);
                 countAborted(e.usage, ev);
                 return false;
             }
             catch (StreamInterrupted e)
             {
+                countRetried(e.retried, ev);
                 countAborted(e.usage, ev);
                 // A dropped summary stream is asked again, as a turn's is,
                 // before history is dropped for want of a summary.
@@ -2522,13 +2529,27 @@ class Agent
     /// estimate; issue #340).
     private void countAborted(E)(TokenUsage u, E ev)
     {
-        if (u.inputTokens > 0 || u.outputTokens > 0 || u.hasAic)
+        if (hasUsage(u))
         {
             recordUsage(u);
             static if (is(E : AgentEvents)) ev.usage(u);
             else foreach (e; ev) e.usage(u);
         }
         else uncountedRequests++;
+    }
+
+    /// Count the stream attempts dropped and retried before a request's
+    /// final attempt: their reported usage, plus one uncounted request per
+    /// attempt that reported none (issue #340).
+    private void countRetried(E)(RetrySpend spent, E ev)
+    {
+        if (hasUsage(spent.usage))
+        {
+            recordUsage(spent.usage);
+            static if (is(E : AgentEvents)) ev.usage(spent.usage);
+            else foreach (e; ev) e.usage(spent.usage);
+        }
+        uncountedRequests += spent.uncounted;
     }
 
     private void recordUsage(TokenUsage u) pure

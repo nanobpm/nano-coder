@@ -24,6 +24,8 @@ class StreamInterrupted : Exception
     /// Usage the provider reported before the drop, so it is still counted
     /// (issue #340). Zero when none arrived.
     imported!"nano.llm".TokenUsage usage;
+    /// Spending of earlier attempts retried before output (issue #340).
+    imported!"nano.llm".RetrySpend retried;
     this(string msg) pure { super(msg); }
 }
 
@@ -440,10 +442,12 @@ string postProvider(string url, string[string] headers, JSONValue body_, string 
 
 /// Stream a provider request into `st` (an accumulator with a `sink` and an
 /// `event(data)` method). A drop before any visible output (non-empty text or
-/// thinking reached the sink) restarts from a fresh copy of `st` as given.
+/// thinking reached the sink) restarts from a fresh copy of `st` as given;
+/// what those dropped attempts cost goes to `spent`, apart from the final
+/// attempt's usage (also on a thrown StreamInterrupted or Cancelled).
 /// Returns the whole body when the reply wasn't an event stream, else null.
-string postStream(S)(ref S st, string url, string[string] headers, JSONValue body_, string what,
-        const ref imported!"nano.config".ProviderConfig c)
+string postStream(S)(ref S st, out imported!"nano.llm".RetrySpend spent, string url, string[string] headers,
+        JSONValue body_, string what, const ref imported!"nano.config".ProviderConfig c)
 {
     auto sink = st.sink;
     bool shown;
@@ -454,22 +458,63 @@ string postStream(S)(ref S st, string url, string[string] headers, JSONValue bod
     };
     auto initial = local;
     string whole;
-    // Usage reported by attempts dropped and retried before visible output
-    // (e.g. Anthropic's message_start input tokens) is still billed.
-    imported!"nano.llm".TokenUsage retried;
+    imported!"nano.llm".RetrySpend retried;
     void restart()
     {
-        static if (__traits(hasMember, S, "r")) retried = addUsage(retried, local.r.usage);
+        static if (__traits(hasMember, S, "r")) retried = addRetry(retried, local.r.usage);
+        else retried.uncounted++;
         local = initial;
     }
     // An aborted stream keeps the usage it already reported (issue #340).
     try whole = postProvider(url, headers, body_, what, c, (string data) { local.event(data); }, () => shown,
         &restart);
-    catch (StreamInterrupted dropped) { static if (__traits(hasMember, S, "r")) dropped.usage = addUsage(retried, local.r.usage); throw dropped; }
-    catch (imported!"nano.control".Cancelled stopped) { static if (__traits(hasMember, S, "r")) stopped.usage = addUsage(retried, local.r.usage); throw stopped; }
-    static if (__traits(hasMember, S, "r")) local.r.usage = addUsage(retried, local.r.usage);
+    catch (StreamInterrupted dropped)
+    {
+        static if (__traits(hasMember, S, "r")) dropped.usage = local.r.usage;
+        dropped.retried = retried;
+        throw dropped;
+    }
+    catch (imported!"nano.control".Cancelled stopped)
+    {
+        static if (__traits(hasMember, S, "r")) stopped.usage = local.r.usage;
+        stopped.retried = retried;
+        throw stopped;
+    }
+    spent = retried;
     st = local;
     return whole;
+}
+
+/// `spent` plus one retried attempt that reported `u` (or nothing).
+imported!"nano.llm".RetrySpend addRetry(imported!"nano.llm".RetrySpend spent, imported!"nano.llm".TokenUsage u)
+    pure nothrow @nogc @safe
+{
+    if (hasUsage(u)) spent.usage = addUsage(spent.usage, u);
+    else spent.uncounted++;
+    return spent;
+}
+
+/// `r` carrying the spending of the attempts retried before it.
+imported!"nano.llm".LLMResponse withRetried(imported!"nano.llm".LLMResponse r, imported!"nano.llm".RetrySpend spent)
+    pure nothrow @safe
+{
+    r.retried = spent;
+    return r;
+}
+
+/// Whether a request reported any usage worth counting.
+bool hasUsage(imported!"nano.llm".TokenUsage u) pure nothrow @nogc @safe
+{
+    return u.inputTokens > 0 || u.outputTokens > 0 || u.hasAic;
+}
+
+unittest
+{
+    import nano.llm : RetrySpend, TokenUsage;
+    TokenUsage some_ = { inputTokens: 20 };
+    auto s = addRetry(addRetry(RetrySpend.init, some_), TokenUsage.init);
+    assert(s.usage.inputTokens == 20 && s.uncounted == 1, "a usage-free retry is counted, not hidden");
+    assert(!hasUsage(TokenUsage.init) && hasUsage(some_));
 }
 
 /// The sum of two requests' usage: a retried attempt's tokens and credits

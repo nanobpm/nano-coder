@@ -160,9 +160,10 @@ class AnthropicClient : LLMClient, KindedClient
         }
         AnthropicStream st;
         st.sink = sink;
-        auto whole = postStream(st, url, headers(), requestBody(req, true), what, p.config);
-        if (whole !is null) return reportWhole(parseWhole(parseJSON(whole)), sink);
-        return st.finish();
+        RetrySpend spent;
+        auto whole = postStream(st, spent, url, headers(), requestBody(req, true), what, p.config);
+        if (whole !is null) return withRetried(reportWhole(parseWhole(parseJSON(whole)), sink), spent);
+        return withRetried(st.finish(), spent);
     }
 
     static LLMResponse parseWhole(JSONValue j) pure
