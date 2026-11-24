@@ -12,9 +12,18 @@ import std.string : toLower;
 import nano.config : ResolvedProvider;
 import nano.llm;
 import nano.providers.openai;
+import nano.clock : FakeClock;
 import nano.testserver;
 
 private:
+
+/// Fake time for one test: retry backoffs and offline waits advance it
+/// instead of sleeping, so the module finishes well under 1 s (issue #379).
+FakeClock fakeTime()
+{
+    import std.datetime.systime : SysTime;
+    return FakeClock.install(SysTime(0));
+}
 
 OpenAIClient against(string url, bool stream = true, long timeoutSecs = 10, long maxRetries = 5)
 {
@@ -50,6 +59,7 @@ enum cutHeaders = "content-type: text/event-stream\r\nx-truncate: 1\r\n";
 // rust: providers/openai.rs::does_not_retry_auth_errors
 unittest
 {
+    auto clock = fakeTime();
     auto srv = serve([immutable Reply(401, "",
         `{"error":{"message":"bad key","type":"invalid_request_error","code":"invalid_api_key"}}`)]);
     auto req = hello();
@@ -63,6 +73,7 @@ unittest
 // rust: providers/openai.rs::does_not_retry_mid_stream_disconnect_after_partial_output
 unittest
 {
+    auto clock = fakeTime();
     auto srv = serve([immutable Reply(200, cutHeaders,
         sse([`{"choices":[{"delta":{"role":"assistant","content":"hello"}}]}`])
         ~ `data: {"choices":[{"delta":{"content":" wor`)]);
@@ -78,6 +89,7 @@ unittest
 // rust: providers/openai.rs::retries_after_metadata_only_event_and_resets_accumulator
 unittest
 {
+    auto clock = fakeTime();
     enum call = `{"choices":[{"delta":{"role":"assistant","tool_calls":[`
         ~ `{"index":0,"id":"c1","type":"function","function":{"name":"get_time","arguments":"{}"}}]}}]}`;
     auto srv = serve([immutable Reply(200, cutHeaders, sse([call]) ~ `data: {"choices":[{"delta":{"content":" wor`),
@@ -93,6 +105,7 @@ unittest
 // rust: providers/openai.rs::retries_mid_stream_disconnect_before_any_output
 unittest
 {
+    auto clock = fakeTime();
     auto srv = serve([immutable Reply(200, cutHeaders, `data: {"choices":[{"delta":{"content":"par`),
         immutable Reply(200, streamHeaders, sse([`{"choices":[{"delta":{"role":"assistant","content":"hello"}}]}`,
             `{"choices":[{"delta":{"content":" world"},"finish_reason":"stop"}]}`], true))]);
@@ -106,6 +119,7 @@ unittest
 // rust: providers/openai.rs::retries_rate_limits_then_succeeds
 unittest
 {
+    auto clock = fakeTime();
     auto srv = serve([immutable Reply(429, "retry-after: 0\r\n", `{"error":{"message":"slow down","code":"rate_limit_exceeded"}}`),
         immutable Reply(503, "", "upstream"),
         immutable Reply(200, "", `{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}]}`)]);
@@ -120,6 +134,7 @@ unittest
 // rust: providers/openai.rs::retries_truncated_success_bodies
 unittest
 {
+    auto clock = fakeTime();
     auto srv = serve([immutable Reply(200, "x-truncate: 1\r\n", `{"choices":[{"mess`),
         immutable Reply(200, "", `{"choices":[{"message":{"content":"whole"}}]}`)]);
     auto req = hello();
@@ -130,6 +145,7 @@ unittest
 // rust: providers/openai.rs::stream_falls_back_to_json_and_splits_think_tags
 unittest
 {
+    auto clock = fakeTime();
     auto srv = serve([immutable Reply(200, "",
         `{"choices":[{"message":{"content":"<think>hmm</think>\nhi"},"finish_reason":"stop"}]}`)]);
     auto req = hello();
@@ -139,18 +155,18 @@ unittest
 }
 
 // rust: providers/openai.rs::slow_but_steady_stream_survives_beyond_idle_timeout
+// The idle decision is tested without real waits next to `idleLimit` in
+// nano.http; this smoke test checks a dripped stream with gaps far below the
+// idle timeout arrives whole (issue #379).
 unittest
 {
+    auto clock = fakeTime();
     string[] events;
     foreach (piece; ["h", "e", "l", "l", "o", " ", "w", "o", "r", "l", "d"])
         events ~= `{"choices":[{"delta":{"content":"` ~ piece ~ `"}}]}`;
-    // 12 x 100 ms (11 deltas and [DONE]): the stream outlasts the 1 s idle
-    // timeout, while each gap is a tenth of it, so a loaded host stalling a
-    // gap several-fold still can't trip it (issue #358).
-    auto srv = serve([immutable Reply(200, streamHeaders, sse(events, true), 100)]);
-    auto c = against(srv.url, true, 1);
+    auto srv = serve([immutable Reply(200, streamHeaders, sse(events, true), 2)]);
     auto req = hello("hi");
-    auto r = c.chat(req, (bool t, string x) {});
+    auto r = against(srv.url).chat(req, (bool t, string x) {});
     srv.finish();
     assert(r.content == "hello world");
 }
@@ -158,6 +174,7 @@ unittest
 // rust: providers/openai.rs::streamed_leading_whitespace_after_thinking_is_trimmed
 unittest
 {
+    auto clock = fakeTime();
     auto srv = serve([immutable Reply(200, streamHeaders, sse([
         `{"choices":[{"delta":{"role":"assistant","reasoning_content":"ponder"}}]}`,
         `{"choices":[{"delta":{"content":"\n\nanswer"}}]}`,
@@ -171,6 +188,7 @@ unittest
 // rust: providers/openai.rs::streamed_leading_whitespace_is_preserved_without_thinking
 unittest
 {
+    auto clock = fakeTime();
     auto srv = serve([immutable Reply(200, streamHeaders, sse([
         `{"choices":[{"delta":{"role":"assistant","content":" world"}}]}`,
         `{"choices":[{"delta":{"content":" again"}}]}`,
@@ -185,6 +203,7 @@ unittest
 // rust: providers/openai.rs::streams_reasoning_text_and_tool_calls
 unittest
 {
+    auto clock = fakeTime();
     auto srv = serve([immutable Reply(200, streamHeaders, sse([
         `{"choices":[{"delta":{"role":"assistant","reasoning_content":"Let me "}}]}`,
         `{"choices":[{"delta":{"reasoning_content":"check."}}]}`,
@@ -209,6 +228,7 @@ unittest
 // rust: providers/openai.rs::trajectory_data_is_never_sent
 unittest
 {
+    auto clock = fakeTime();
     auto logged = Message.assistant("answer");
     logged.thinking = "private reasoning";
     logged.usage.inputTokens = 10;
@@ -256,6 +276,7 @@ string freshDir(string name)
 // rust: providers/openai.rs::tool_result_image_goes_in_a_followup_user_message
 unittest
 {
+    auto clock = fakeTime();
     import std.base64 : Base64;
     import std.file : rmdirRecurse;
     import nano.vision : Vision;
@@ -281,6 +302,7 @@ unittest
 // rust: providers/openai.rs::tool_without_its_own_image_does_not_claim_one_follows
 unittest
 {
+    auto clock = fakeTime();
     import std.file : rmdirRecurse;
     import nano.vision : Vision;
     auto dir = freshDir("nano-openai-claim");
@@ -327,6 +349,7 @@ immutable(Reply) ok(string body_) { return immutable Reply(200, "", body_); }
 // rust: providers/openai.rs::asks_llama_cpp_for_its_loaded_context
 unittest
 {
+    auto clock = fakeTime();
     auto r = probeWith("local", [ok(`{"data":[{"id":"qwen3:8b","owned_by":"llamacpp","meta":{"n_ctx_train":262144}}]}`),
         ok(`{"default_generation_settings":{"n_ctx":65536}}`)]);
     assert(r.caps.window == 65536 && r.caps.windowSource == "llama.cpp /props n_ctx", r.caps.windowSource);
@@ -336,6 +359,7 @@ unittest
 // rust: providers/openai.rs::recognizes_llama_cpp_by_provider_name
 unittest
 {
+    auto clock = fakeTime();
     auto r = probeWith("llamacpp", [ok(`{"data":[{"id":"qwen3:8b"}]}`), ok(`{"default_generation_settings":{"n_ctx":65536}}`)]);
     assert(r.caps.window == 65536 && r.caps.windowSource == "llama.cpp /props n_ctx");
     assert(r.paths == ["/v1/models", "/props?model=qwen3%3A8b"]);
@@ -344,6 +368,7 @@ unittest
 // rust: providers/openai.rs::recognizes_lm_studio_by_provider_name
 unittest
 {
+    auto clock = fakeTime();
     auto r = probeWith("lmstudio", [ok(`{"data":[{"id":"qwen3:8b"}]}`),
         ok(`{"data":[{"id":"qwen3:8b","loaded_context_length":12288}]}`)]);
     assert(r.caps.window == 12288 && r.caps.windowSource == "LM Studio loaded_context_length");
@@ -353,6 +378,7 @@ unittest
 // rust: providers/openai.rs::reports_nothing_when_the_endpoint_does_not_say
 unittest
 {
+    auto clock = fakeTime();
     auto r = probeWith("hosted", [ok(`{"data":[{"id":"qwen3:8b","owned_by":"system"},{"id":"b"}]}`)]);
     assert(r.caps.window == 0 && r.caps.thinking.isNull);
     assert(r.paths == ["/v1/models"], "unknown servers get no extra probes");
@@ -363,6 +389,7 @@ unittest
 // rust: providers/openai.rs::output_cap_survives_absent_window_on_generic_server
 unittest
 {
+    auto clock = fakeTime();
     auto r = probeWith("hosted", [ok(`{"data":[{"id":"qwen3:8b","max_completion_tokens":8000}]}`)]);
     assert(r.caps.window == 0, "no window field means no detected window");
     assert(r.caps.maxOutput == 8000, "the published output cap survives the absent window");
@@ -375,6 +402,7 @@ unittest
 // rust: providers/openai.rs::thinking_and_vision_probe_shares_one_fetch
 unittest
 {
+    auto clock = fakeTime();
     import nano.thinking : Format;
     auto r = probeWith("box", [ok(`{"data":[{"id":"qwen3:8b","owned_by":"llamacpp"}]}`),
         ok(`{"default_generation_settings":{"n_ctx":65536},"modalities":{"vision":true},"chat_template":"{% if enable_thinking %}"}`)]);
@@ -413,6 +441,7 @@ Totals totals(TokenUsage final_, bool finalCounted, RetrySpend retried) pure
 // A retry that fails then succeeds.
 unittest
 {
+    auto clock = fakeTime();
     import std.math : isClose;
     auto srv = serve([immutable Reply(200, cutHeaders, sse([spentEvent]) ~ `data: {"choices":[{"delta":{"content":"pa`),
         immutable Reply(200, cutHeaders, `data: {"choices":[{"delta":{"content":"pa`),
@@ -432,6 +461,7 @@ unittest
 // A retry that fails on every attempt.
 unittest
 {
+    auto clock = fakeTime();
     import std.math : isClose;
     import nano.http : StreamInterrupted;
     auto srv = serve([immutable Reply(200, cutHeaders, sse([spentEvent]) ~ `data: {"choices":[{"delta":{"content":"pa`),
@@ -456,6 +486,7 @@ unittest
 // carries the dropped attempt's spending (issue #340).
 unittest
 {
+    auto clock = fakeTime();
     import std.math : isClose;
     import nano.llm : SpendingException;
     auto srv = serve([immutable Reply(200, cutHeaders, sse([spentEvent]) ~ `data: {"choices":[{"delta":{"content":"pa`),
@@ -488,6 +519,7 @@ immutable dropBare = immutable Reply(200, cutHeaders, `data: {"choices":[{"delta
 // (a) Chat completions: the retry returns a non-SSE malformed body.
 unittest
 {
+    auto clock = fakeTime();
     auto srv = serve([dropSpent, dropBare, immutable Reply(200, "content-type: text/html\r\n", "<html>proxy</html>")]);
     auto req = hello();
     SpendingException failed;
@@ -500,6 +532,7 @@ unittest
 // (b) Chat completions: the retry returns a 200 error object.
 unittest
 {
+    auto clock = fakeTime();
     auto srv = serve([dropSpent, dropBare,
         immutable Reply(200, "content-type: application/json\r\n", `{"error":{"message":"boom"}}`)]);
     auto req = hello();
@@ -514,6 +547,7 @@ unittest
 // (c) The Anthropic route: the retry returns a 200 error object.
 unittest
 {
+    auto clock = fakeTime();
     import nano.providers.anthropic : AnthropicClient;
     enum spent = `{"type":"message_start","message":{"usage":{"input_tokens":10}}}`;
     enum delta = `{"type":"message_delta","delta":{},"usage":{"output_tokens":1},"copilot_usage":{"total_nano_aiu":250000000}}`;

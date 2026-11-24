@@ -73,6 +73,34 @@ struct ResponseMeta
     string contentType, retryAfter;
 }
 
+/// libcurl's low-speed limit, used as an idle timeout: the transfer fails once
+/// it stays below `bytesPerSecond` for `seconds`. There is deliberately no
+/// total-time cap, so a slow but steady stream outlives `idleTimeout`.
+struct IdleLimit
+{
+    long bytesPerSecond; /// the floor; 1 byte/s means "any data at all"
+    long seconds; /// how long the transfer may stay below the floor
+}
+
+/// The idle limit `perform` gives libcurl for `idleTimeout` (at least 1 s:
+/// libcurl treats 0 as "no limit").
+IdleLimit idleLimit(Duration idleTimeout) pure nothrow @nogc
+{
+    const secs = idleTimeout.total!"seconds";
+    return IdleLimit(1, secs > 0 ? secs : 1);
+}
+
+// rust: providers/openai.rs::slow_but_steady_stream_survives_beyond_idle_timeout
+// The idle timeout is a 1 byte/s floor over the window, never a total cap, so
+// a stream that keeps delivering survives however long it runs (issue #379:
+// decided here with no real waits).
+unittest
+{
+    assert(idleLimit(1.seconds) == IdleLimit(1, 1));
+    assert(idleLimit(120.seconds) == IdleLimit(1, 120));
+    assert(idleLimit(Duration.zero) == IdleLimit(1, 1) && idleLimit(500.msecs) == IdleLimit(1, 1));
+}
+
 int perform(const ref Request req, out string body_, scope void delegate(const(char)[]) @safe onChunk = null)
 {
     ResponseMeta meta;
@@ -97,11 +125,10 @@ int perform(const ref Request req, out string body_, out ResponseMeta meta,
         else http.addRequestHeader(k, v);
     }
     http.connectTimeout = req.connectTimeout;
-    // libcurl's low-speed limit acts as an idle timeout: fail after `idleTimeout`
-    // seconds below 1 byte/s, without capping a slow but steady stream.
     import etc.c.curl : CurlOption;
-    http.handle.set(CurlOption.low_speed_limit, 1);
-    http.handle.set(CurlOption.low_speed_time, req.idleTimeout.total!"seconds");
+    const idle = idleLimit(req.idleTimeout);
+    http.handle.set(CurlOption.low_speed_limit, idle.bytesPerSecond);
+    http.handle.set(CurlOption.low_speed_time, idle.seconds);
     if (req.method != "GET")
     {
         const(void)[] payload = req.body_;
