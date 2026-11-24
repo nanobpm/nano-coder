@@ -1,6 +1,7 @@
 {
   "releases": [
     {"version": "1.33.5", "date": "2026-11-24", "items": [
+      {"type":"fix","scope":"status","title":"count running sub-agents' tokens and AIC in the status line","pr":344},
       {"type":"fix","scope":"messages","title":"write the owner pid file before bind","pr":373}
     ]},
     {"version": "1.33.4", "date": "2026-11-24", "items": [
