@@ -669,7 +669,8 @@ that change process-wide state (the cancel flag, environment variables) are list
 `scripts/serial-tests` and run alone first. A module still running at twice its most-scaled limit
 (at least 10 s) is treated as hung: the runner names it and exits failing instead of waiting
 forever. In tests, HTTP retries wait out an unreachable server for at most 10 s (in use the wait is
-unbounded until Ctrl-C).
+unbounded until Ctrl-C). `NANO_TEST_STUCK=1` adds a module that never returns, to check the
+watchdog (`ci.sh` does).
 
 Functions are `pure` wherever they can be: the result depends only on the arguments, with no
 clock, environment, files or global state. Modules that start with `pure:` (parsing, markdown,
@@ -758,6 +759,7 @@ subagent_max_tokens = 1000000
 auto_compact = true                     # summarize automatically when the context fills up
 auto_compact_threshold = 0.8            # fraction of the context window
 compaction_mode = "smart"               # smart | standard | extract (see Smart compaction)
+compaction_summary_dag = false          # layered, expandable summaries (see Smart compaction)
 # context_window = 128000               # override the window (providers can set it too)
 verbosity = "normal"                    # quiet | normal | verbose | debug (or --verbosity)
 timestamps = true                       # prefix CLI messages with the local time (HH:MM:SS)
@@ -1206,7 +1208,8 @@ session log, and falls back to a standard summary when `persist_sessions` is off
     three snippets (and a `[K matches]` count when more matched). Earlier history lookups
     are not searched.
   - `history_read(id, max_output_length?, session?)` - one message in full, bounded like other tool
-    output (the whole is spilled to a file when it is longer).
+    output (the whole is spilled to a file when it is longer). With `node` instead of `id` it expands
+    a layered summary node (see below).
   Before a smart compaction the tools are not offered, so they cost nothing.
 
 **Extract mode** (`compaction_mode = "extract"`, or `/compact --extract`) is smart
@@ -1217,6 +1220,19 @@ each with its `(#N)`, plus the pinned requests and the plan as usual. It says wh
 things are rather than what they mean, so the agent leans on the history tools. An
 earlier extract summary is merged rather than nested, so each section stays capped. See
 [#273](https://github.com/nanobpm/nano-coder/issues/273) for its measurement against smart.
+
+**Layered summaries** (`compaction_summary_dag = true`, issue
+[#274](https://github.com/nanobpm/nano-coder/issues/274)) stop smart and extract compaction from
+re-summarising the previous summary. Each compaction summarises only the new span into a
+*node*, shown under a header such as `[[node S7 level=1 range=#2-#300 children=S1,S2]]`, and
+carries the older nodes forward verbatim. When the nodes' text outgrows about a tenth of the
+context window, the oldest six are condensed into one node a level up: one extra model call
+(none in extract mode, which condenses in code), at most once per compaction. So the summary
+grows only logarithmically with session length, and early detail stays one lookup away:
+`history_read(node="S7")` expands a node to the nodes it condensed, or a level-0 node to a
+one-line digest of each original message it covers; `history_search(…, node="S7")` searches
+only that node's range. Each compaction's `replace` record lists the nodes it created under
+`summary_nodes`; older records are read as before.
 
 #### Agent-adjusted compaction
 
@@ -1296,8 +1312,12 @@ gets a fourth cross-session tool:
   result is one of `delivered`, `queued` (the target is mid-turn; the message sits in its
   `/queue`, visible, editable and withdrawable like a typed steer), `awaiting
   confirmation` (the target's user is being asked), `refused` (the target has messages
-  off or declined), or `not running` (no live socket; a stale socket file from a dead
-  session is removed by the sender that finds it). The send goes through the sender's
+  off or declined, or is busy: its socket refused the connection but its process is still
+  running), or `not running` (no live socket; a stale socket file from a dead session is
+  removed by the sender that finds it). Each listener records its process next to its
+  socket (`<session-id>.pid`: pid and start time), so a socket is only removed once that
+  process is gone. A session closes any peer listener it inherited across a `/relaunch`
+  before listening, so `/messages on` can rebind. The send goes through the sender's
   permission policy as a `session_send(...)` rule.
 
 The delivered message joins the target's input labelled with its origin, e.g.
@@ -1746,7 +1766,12 @@ turn runs, `blocked` while a question or the turn limit waits for you, and `idle
 prompt. A saved session is reported with the command that resumes it
 (`nano-coder --resume <id> --model <provider/model>`, plus `--config` if given), so Herdr
 can reopen it after a restart (Herdr 0.9.2 or later). A session with a
-[handle](#session-handles) shows it as the pane's agent label and reports a `name` token. The pane is released on exit.
+[handle](#session-handles) shows it as the pane's agent label and reports a `name` token, re-sent each turn in case something else in the pane cleared it.
+The pane is released when you quit; `/relaunch` keeps it, and the relaunched process
+reports again. A nano-coder started from inside a session (the bash tool, a hook, a
+script) does not report to the parent's pane: the parent marks its pane with
+`NANO_CODER_HERDR_OWNER=<pid>`, which processes it starts inherit. The `herdr` CLI stays
+usable from the bash tool.
 Reports run in the background and failures are ignored; outside Herdr nothing is sent.
 
 While the agent has a timer set, nano-coder also reports a `timer` token showing ⏰.

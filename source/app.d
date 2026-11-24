@@ -57,7 +57,7 @@ import nano.peers : PeerListener, PeerRouter, Inbound, ListenError, settle, conf
 import nano.instructions : ProjectInstructions, InstructionOptions = Options, expandHome;
 import core.atomic : atomicLoad, atomicStore, cas;
 
-enum string packageVersion = "1.32.0";
+enum string packageVersion = "1.33.4";
 enum string versionString = "nano-coder " ~ packageVersion;
 
 enum string usage = `Usage: nano-coder [--model provider/model] [--config PATH] [-p PROMPT]
@@ -1582,6 +1582,88 @@ ConfiguredWindow providerWindow(long providerWindow) pure
 {
     return providerWindow > 0 ? ConfiguredWindow(toSize(providerWindow), "provider context_window")
         : ConfiguredWindow.init;
+}
+
+/// The live `context_window` after `--resume` (issue #315): the recorded
+/// window when it applies to the live model (0 clears the top-level one),
+/// else the configured default when the resume resets runtime settings,
+/// else unchanged. Held in `cfg` so a later `/model` switch keeps it.
+/// A recorded window marked `recordedFromProvider` is a snapshot `useClient`
+/// took of the provider's limit, not an explicit override: it clears the
+/// top-level window so the next provider's limit applies, like 0. The mark,
+/// not numeric equality, decides: an explicit override may equal the limit.
+long resumedContextWindow(long current, long configured, bool reset, bool recordedApplies, long recorded,
+    bool recordedFromProvider = false) pure nothrow @nogc
+{
+    if (recordedApplies && recorded >= 0)
+        return recordedFromProvider ? 0 : recorded;
+    return reset ? configured : current;
+}
+
+unittest // a restored window survives a model switch; a fallback drops it (issue #315)
+{
+    Config cfg;
+    ProviderConfig p;
+    p.contextWindow = 32_000;
+    cfg.contextWindow = 100_000; // previous session's unsaved override
+    // Recorded override applies: a later windowFor (as `/model` does) keeps it.
+    cfg.contextWindow = resumedContextWindow(cfg.contextWindow, 0, true, true, 50_000);
+    assert(windowFor(cfg, p).tokens == 50_000);
+    // Recorded "from provider/model" (0): the provider's window.
+    cfg.contextWindow = resumedContextWindow(100_000, 0, true, true, 0);
+    assert(windowFor(cfg, p).tokens == 32_000 && windowFor(cfg, p).source == "provider context_window");
+    // Fallback model: the recorded window does not apply; back to the default.
+    cfg.contextWindow = resumedContextWindow(100_000, 64_000, true, false, 50_000);
+    assert(windowFor(cfg, p).tokens == 64_000);
+    // Explicit flags (no reset) and nothing recorded: unchanged.
+    assert(resumedContextWindow(100_000, 64_000, false, false, -1) == 100_000);
+    // A provider-window snapshot is not an override: a later switch to a
+    // 32k provider gets 32k, not 128k.
+    cfg.contextWindow = resumedContextWindow(0, 0, false, true, 128_000, true);
+    assert(cfg.contextWindow == 0 && windowFor(cfg, p).tokens == 32_000);
+    // An explicit override equal to the provider's limit stays an override.
+    cfg.contextWindow = resumedContextWindow(0, 0, false, true, 128_000, false);
+    assert(cfg.contextWindow == 128_000 && windowFor(cfg, p).tokens == 128_000);
+}
+
+/// The live configured window a restored record `recorded` (>= 0) sets on
+/// resume (issue #315): only a user override (not `fromProvider`) is kept;
+/// 0 ("from provider/model") and a provider-derived or legacy unmarked
+/// snapshot are dropped for the live provider's own window
+/// (`liveProviderWindow`, 0: none, so the window is probed or taken from the
+/// model catalogue), so a stale snapshot never outlives its provider.
+ConfiguredWindow resumedLiveWindow(long recorded, bool fromProvider, long liveProviderWindow) pure
+{
+    if (recorded > 0 && !fromProvider)
+        return ConfiguredWindow(toSize(recorded), "the session's settings");
+    return providerWindow(liveProviderWindow);
+}
+
+unittest // resume then provider switch: only a marked user override survives (issue #315)
+{
+    import nano.session : SessionSettings;
+    Config cfg;
+    ProviderConfig big, small;
+    big.contextWindow = 128_000;
+    small.contextWindow = 32_000;
+    // (1) a legacy unmarked snapshot (read back as provider-derived) from the
+    // old 128k provider: the switch to the 32k provider gets 32k.
+    SessionSettings legacy; // as `restore` yields an unmarked record
+    legacy.contextWindow = 128_000;
+    legacy.contextWindowFromProvider = true;
+    cfg.contextWindow = resumedContextWindow(0, 0, false, true, legacy.contextWindow, legacy.contextWindowFromProvider);
+    assert(windowFor(cfg, small).tokens == 32_000);
+    // The resumed live window is the current provider's, not the snapshot.
+    assert(resumedLiveWindow(legacy.contextWindow, true, 32_000).tokens == 32_000);
+    assert(resumedLiveWindow(legacy.contextWindow, true, 0).tokens == 0, "no provider window: the window is probed");
+    // (2) a marked user override survives the switch.
+    cfg.contextWindow = resumedContextWindow(0, 0, false, true, 100_000, false);
+    assert(windowFor(cfg, small).tokens == 100_000);
+    assert(resumedLiveWindow(100_000, false, 32_000).tokens == 100_000);
+    // (3) a marked provider-derived snapshot behaves like (1).
+    cfg.contextWindow = resumedContextWindow(0, 0, false, true, 128_000, true);
+    assert(windowFor(cfg, small).tokens == 32_000 && windowFor(cfg, big).tokens == 128_000);
+    assert(resumedLiveWindow(128_000, true, 32_000).source == "provider context_window");
 }
 
 unittest // context_window 0 restores the provider's window, ignoring the top-level one
@@ -3783,6 +3865,7 @@ int runMain(string[] args)
     agent.idleCompact = cfg.idleCompact;
     agent.verifyBeforeComplete = cfg.verifyBeforeComplete;
     agent.compactionPinRequests = cfg.compactionPinRequests;
+    agent.compactionSummaryDag = cfg.compactionSummaryDag;
     agent.autoCompactThreshold = cfg.autoCompactThreshold;
     {
         import nano.context : parseCompactionMode;
@@ -4047,6 +4130,12 @@ int runMain(string[] args)
     // Zero or one listener (an Option can't hold a PeerListener: its NotNull
     // has no default).
     PeerListener[] peerListener;
+    // Close peer listeners inherited across a `/relaunch` exec (issue #349):
+    // an orphan keeps this session's socket "live" with nobody accepting.
+    {
+        import nano.peers : closeOrphanedPeerFds, peersDir;
+        closeOrphanedPeerFds(peersDir());
+    }
     void stopPeerListener()
     {
         foreach (ref l; peerListener) l.close();
@@ -4355,7 +4444,12 @@ int runMain(string[] args)
             // may hold an unsaved `/settings` edit). Always reset: a recorded
             // window applies below only when its model is the live one, so a
             // fallback must not keep the previous session's override.
-            agent.setConfiguredWindow(runtimeDefaults.window(cfg.providers.get(client.providerName, ProviderConfig.init).contextWindow));
+            // Restore, not set: clearing a carried-over positive window must
+            // re-probe the endpoint, whose window detection it suppressed.
+            agent.restoreConfiguredWindow(runtimeDefaults.window(cfg.providers.get(client.providerName, ProviderConfig.init).contextWindow));
+            // The live config too: a later `/model` builds its window from
+            // it, so the previous session's override must not come back.
+            cfg.contextWindow = resumedContextWindow(cfg.contextWindow, runtimeDefaults.contextWindow, true, false, -1);
         }
         if (explicitFlags && o.plan)
         {
@@ -4405,13 +4499,16 @@ int runMain(string[] args)
             windowOwner.length ? nano.recents.canonical(windowOwner, cfg.providers, cfg.defaultProvider) : null,
             agent.client.providerName ~ "/" ~ agent.client.modelName))
         {
-            if (st.contextWindow > 0)
-                agent.setConfiguredWindow(ConfiguredWindow(toSize(st.contextWindow), "the session's settings"));
-            else
+            // Held in the live config like an unsaved `/settings` edit, so
+            // a later `/model` switch keeps it (`switchModel` builds the
+            // window from `cfg`; issue #315). 0 clears the top-level window.
+            cfg.contextWindow = resumedContextWindow(cfg.contextWindow, runtimeDefaults.contextWindow, false, true, st.contextWindow,
+                st.contextWindowFromProvider);
             {
-                // 0 is "from provider/model" (as `/settings` offers it): the
-                // provider's own window, not the top-level `context_window`.
-                agent.restoreConfiguredWindow(providerWindow(cfg.providers.get(client.providerName, ProviderConfig.init).contextWindow));
+                const w = resumedLiveWindow(st.contextWindow, st.contextWindowFromProvider,
+                    cfg.providers.get(client.providerName, ProviderConfig.init).contextWindow);
+                if (w.source == "the session's settings") agent.setConfiguredWindow(w);
+                else agent.restoreConfiguredWindow(w);
             }
         }
         // Inter-session messages (issue #336): the session's log and id are
@@ -4473,6 +4570,7 @@ int runMain(string[] args)
             import std.conv : to;
             explicitSettings.model = currentSpec();
             explicitSettings.contextWindow = agent.configuredWindow.to!long;
+            explicitSettings.contextWindowFromProvider = agent.configuredWindowSource == "provider context_window";
         }
         if (o.plan) explicitSettings.mode = agent.control.mode.name;
         if (o.verbosity.length) explicitSettings.verbosity = nano.ui.name(verbosity);
@@ -4982,6 +5080,8 @@ int runMain(string[] args)
                 else nano.herdr.report(nano.herdr.State.idle);
             }
             else nano.herdr.report(nano.herdr.State.idle);
+            // Re-sent every turn: a process in the pane may have cleared it.
+            nano.herdr.refreshMetadata();
             nano.herdr.showName(agent.name);
             nano.herdr.showModel(agent.client.modelName);
             nano.herdr.showTimer(!agent.timers.empty);
@@ -5262,11 +5362,11 @@ int runMain(string[] args)
                     writefln("\nRelaunching into session %s (resume later with nano-coder --resume %s)", id, id);
                     stdOut.flush();
                     leaveKeyMode();
-                    nano.herdr.release();
+                    // No Herdr release: the same pane goes on with the same
+                    // session, and the exec'd process reports at its first idle.
                     auto err = execProgram(exe, [exe] ~ relaunchArgv(withCurrentSettings(args[1 .. $],
                         agent.client.providerName ~ "/" ~ agent.client.modelName, nano.ui.name(verbosity()),
                         agent.control.mode == AgentMode.plan), id));
-                    nano.herdr.reacquire();
                     enterKeyMode(0);
                     if (gFrame) gFrame.resume();
                     writefln("Relaunch failed: could not exec %s: %s", exe, err);

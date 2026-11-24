@@ -1,5 +1,20 @@
 {
   "releases": [
+    {"version": "1.33.4", "date": "2026-11-24", "items": [
+      {"type":"fix","scope":"session","title":"keep a restored context-window override across /model switch","pr":364}
+    ]},
+    {"version": "1.33.3", "date": "2026-11-24", "items": [
+      {"type":"perf","scope":"sessions","title":"bound cold-index summarizing and per-record buffering","pr":367}
+    ]},
+    {"version": "1.33.2", "date": "2026-11-24", "items": [
+      {"type":"fix","scope":"herdr","title":"nested nano-coder runs no longer release the session's pane","pr":368}
+    ]},
+    {"version": "1.33.1", "date": "2026-11-24", "items": [
+      {"type":"fix","scope":"messages","title":"don't delete a live session's socket; recover orphaned listeners","pr":355}
+    ]},
+    {"version": "1.33.0", "date": "2026-11-24", "items": [
+      {"type":"feat","scope":"compaction","title":"hierarchical summary DAG expandable via history_read","pr":366}
+    ]},
     {"version": "1.32.0", "date": "2026-11-24", "items": [
       {"type":"feat","scope":"messages","title":"replace the peer-turn send block with a hop limit when confirmation is off","pr":359}
     ]},
@@ -427,21 +442,6 @@
     ]},
     {"version": "0.51.0", "date": "2026-10-23", "items": [
       {"type":"feat","scope":"herdr","title":"report state, resume command and release to Herdr","pr":142}
-    ]},
-    {"version": "0.50.0", "date": "2026-10-22", "items": [
-      {"type":"feat","scope":"queue","title":"list, edit and withdraw unread steers via /queue","pr":138}
-    ]},
-    {"version": "0.49.1", "date": "2026-10-22", "items": [
-      {"type":"fix","scope":"hooks","title":"skip npm audit in the commit-msg hook so commits don't hang","pr":137}
-    ]},
-    {"version": "0.49.0", "date": "2026-10-22", "items": [
-      {"type":"feat","scope":"ui","title":"render markdown in the terminal with pulldown-cmark","pr":132}
-    ]},
-    {"version": "0.48.0", "date": "2026-10-22", "items": [
-      {"type":"feat","scope":"ui","title":"render markdown tables in the terminal","pr":130}
-    ]},
-    {"version": "0.47.2", "date": "2026-10-21", "items": [
-      {"type":"fix","scope":"npm","title":"replace postinstall swap with lazy self-replacement in launcher","pr":128}
     ]}
   ]
 }

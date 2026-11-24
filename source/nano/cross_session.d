@@ -90,33 +90,13 @@ private SessionInfo infoOf(Summary s, bool live) @safe
     return i;
 }
 
-/// Whether a live session accepts messages: its registry socket answers
-/// (issue #272). A stale socket (a dead session) is left for the next
-/// `session_send` to remove; here it just doesn't mark the session.
+/// Whether a live session accepts messages: its registry socket answers a
+/// non-blocking probe and its recorded owner process still runs (issues #272,
+/// #349). A stale socket is left for the next `session_send` to remove.
 private bool acceptsMessages(string id) @safe
 {
-    import std.file : exists;
-    import nano.peers : peersDir, socketPath;
-    import std.socket : Socket, UnixAddress, AddressFamily, SocketType, SocketException, SocketOSException;
-    auto path = socketPath(peersDir(), id);
-    if (!path.exists) return false;
-    import nano.peers : unixSocket;
-    auto s = unixSocket();
-    scope (exit) s.close();
-    // Non-blocking: a listener whose backlog is full (busy routing) must not
-    // stall discovery; a would-block connect means a live listener.
-    s.blocking = false;
-    try
-    {
-        s.connect(new UnixAddress(path));
-        return true;
-    }
-    catch (SocketOSException e)
-    {
-        import core.stdc.errno : EAGAIN, EINPROGRESS;
-        return e.errorCode == EAGAIN || e.errorCode == EINPROGRESS; // else stale: not reachable
-    }
-    catch (SocketException) return false; // stale or refusing: not reachable
+    import nano.peers : peersDir, accepting;
+    return accepting(peersDir(), id);
 }
 
 /// Whether a process currently holds `path`'s session lock. Probed by opening

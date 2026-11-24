@@ -360,6 +360,15 @@ unittest
     assert(results.tryTake(m) && m.passed && m.name == "nano.blocked");
 }
 
+unittest // the test-only switch: a module that hangs, for the watchdog to catch
+{
+    import std.process : environment;
+    if (environment.get("NANO_TEST_STUCK") != "1") return;
+    import core.time : hours;
+    import nano.clock : sleepFor;
+    while (true) sleepFor(1.hours);
+}
+
 /// Default per-module unit-test time limit (scripts/slow-tests lists more).
 enum defaultBudgetMs = 1000;
 

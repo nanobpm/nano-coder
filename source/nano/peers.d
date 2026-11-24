@@ -7,7 +7,10 @@
 /// directory created mode 0700. The peers dir is `NANO_CODER_PEERS`, else a
 /// `peers` folder next to the session logs. A stale socket (a session that
 /// died without `close`) is removed by whoever finds it: a refused `connect`
-/// means the file is unlinked and the sender reports `not running`.
+/// whose owner process is gone means the file is unlinked and the sender
+/// reports `not running`. Each listener records its owner in
+/// `<session-id>.pid` (pid and process start time); while that process runs,
+/// a refusing socket is kept and reported busy (issue #349).
 ///
 /// Wire format: one JSON object per line, A2A-shaped so a later A2A bridge
 /// maps it directly:
@@ -358,6 +361,8 @@ struct PeerListener
     private static final class Impl
     {
         string path;
+        /// The registry directory and session id (for the pid file).
+        string dir, id;
         /// Set at listen() and never nulled (close() is idempotent via
         /// `closed`); a bare reference because the impl is filled by field.
         @nullable("set at listen(), never nulled")
@@ -380,6 +385,11 @@ struct PeerListener
         import std.socket : Socket, UnixAddress, SocketException, AddressFamily, SocketType;
         import std.file : exists, remove, FileException;
         auto path = socketPath(dir, id);
+        // Listeners this process inherited across exec (a `/relaunch` from a
+        // build without close-on-exec, or any fd leak) keep a path "live"
+        // with nobody accepting: close them first so the bind below can
+        // replace the socket (issue #349).
+        closeOrphanedPeerFds(dir);
         Socket socket;
         try socket = unixSocket();
         catch (SocketException e)
@@ -387,10 +397,20 @@ struct PeerListener
         try
         {
             // A stale socket from a dead session is replaced; a live one
-            // refuses the bind.
-            if (path.exists && !live(path)) remove(path);
+            // refuses the bind. A socket that refuses connections while its
+            // owner still runs (a full backlog) is not stale: leave it.
+            if (path.exists && !live(path))
+            {
+                int pid;
+                if (ownerOf(dir, id, pid) == Owner.alive)
+                {
+                    socket.close();
+                    throw new ListenError(format("cannot listen on %s: process %s still owns it", path, pid));
+                }
+                remove(path);
+            }
             socket.bind(new UnixAddress(path));
-            socket.listen(4);
+            socket.listen(listenBacklog);
         }
         catch (SocketException e)
         {
@@ -403,8 +423,12 @@ struct PeerListener
             socket.close();
             throw new ListenError(format("cannot replace stale socket %s: %s", path, e.msg));
         }
+        writeOwner(dir, id);
+        registerOwnListener(path);
         auto impl = new Impl;
         impl.path = path;
+        impl.dir = dir;
+        impl.id = id;
         impl.listener = socket;
         impl.stop = Shared!bool.make;
         // Duplicate the fd for the listener thread so `serve` owns its own
@@ -417,7 +441,9 @@ struct PeerListener
         if (serveFd == socket_t.init)
         {
             socket.close();
+            unregisterOwnListener(path);
             removeIfThere(path);
+            removeOwner(dir, id);
             throw new ListenError(format("cannot dup listener fd for %s", path));
         }
         impl.serveFd = serveFd;
@@ -445,7 +471,9 @@ struct PeerListener
         catch (SocketException) {} // already closed: fine
         impl.thread.join();
         l.close();
+        unregisterOwnListener(impl.path);
         if (impl.path.exists) removeIfThere(impl.path);
+        removeOwner(impl.dir, impl.id);
     }
 
     private static void serve(imported!"std.socket".socket_t handle_, Chan!PeerRequest requests, Shared!bool stop)
@@ -711,19 +739,222 @@ package(nano) imported!"std.socket".Socket unixSocket()
     return s;
 }
 
-/// Whether a live session still answers the socket at `path`.
-private bool live(string path)
+/// Whether a live session still answers the socket at `path`. The probe
+/// never waits: a non-blocking connect that would block (a full backlog)
+/// counts as live, and the socket is closed at once.
+package(nano) bool live(string path)
+{
+    return probe(path, false);
+}
+
+/// Whether the socket at `path` positively accepts connections: a connect
+/// that succeeds or would block. Unlike `live`, any other error (EACCES, …)
+/// counts as not accepting, so discovery never advertises an unreachable
+/// socket.
+package(nano) bool connectable(string path)
+{
+    return probe(path, true);
+}
+
+/// Shared non-blocking connect probe; `strict` makes every error other than
+/// would-block count as unreachable, otherwise only stale errors do.
+private bool probe(string path, bool strict)
 {
     import std.socket : UnixAddress, SocketException, SocketOSException;
+    import core.stdc.errno : EAGAIN, EINPROGRESS;
     auto s = unixSocket();
     scope (exit) s.close();
+    s.blocking = false;
     try
     {
         s.connect(new UnixAddress(path));
         return true;
     }
-    catch (SocketOSException e) return !stale(e.errorCode);
+    catch (SocketOSException e)
+        return e.errorCode == EAGAIN || e.errorCode == EINPROGRESS
+            || (!strict && !stale(e.errorCode));
     catch (SocketException) return false; // no OS error code: treat as stale
+}
+
+/// The backlog of a peer listener: generous, so a burst of senders (or
+/// probes) is queued rather than refused (on macOS a full backlog refuses,
+/// which a sender could mistake for a dead session).
+private enum listenBacklog = 64;
+
+/// `<dir>/<id>.pid`: the listener's owner record, `<pid> <start time>`,
+/// written next to its socket so others can tell a busy session from a dead
+/// one before removing the socket (issue #349).
+string pidPath(string dir, string id)
+{
+    import std.path : buildPath;
+    import nano.session : validateId;
+    validateId(id);
+    return buildPath(dir, id ~ ".pid");
+}
+
+/// Who owns a registry socket, from its pid file.
+enum Owner
+{
+    unknown, /// no (readable) pid file: an older build, or none written
+    self,    /// this very process
+    alive,   /// another running process
+    gone,    /// the process has exited (or its pid was reused)
+}
+
+/// Parse a pid file's `<pid> <start time>`; false when malformed.
+bool parseOwner(string text, out int pid, out long start) pure
+{
+    import std.string : strip, split;
+    import std.conv : to, ConvException;
+    auto f = text.strip.split;
+    if (f.length != 2) return false;
+    try
+    {
+        pid = f[0].to!int;
+        start = f[1].to!long;
+    }
+    catch (ConvException) return false; // malformed: no owner
+    return pid > 0;
+}
+
+unittest
+{
+    int pid;
+    long start;
+    assert(parseOwner("123 456\n", pid, start) && pid == 123 && start == 456);
+    assert(parseOwner("7 0", pid, start) && pid == 7 && start == 0);
+    assert(!parseOwner("", pid, start));
+    assert(!parseOwner("x 1", pid, start));
+    assert(!parseOwner("0 1", pid, start));
+    assert(!parseOwner("1 2 3", pid, start));
+}
+
+/// Who owns `<dir>/<id>.sock`, per its pid file; `pid` is the recorded pid.
+Owner ownerOf(string dir, string id, out int pid)
+{
+    import std.file : readText, FileException;
+    import std.process : thisProcessID;
+    import nano.safeio : processExists, processStartTime;
+    string text;
+    try text = readText(pidPath(dir, id));
+    catch (FileException) return Owner.unknown; // none: an older listener
+    catch (imported!"std.utf".UTFException) return Owner.unknown; // garbage: no owner
+    long start;
+    if (!parseOwner(text, pid, start)) return Owner.unknown;
+    if (!processExists(pid)) return Owner.gone;
+    immutable now = processStartTime(pid);
+    // A different start time means the pid was reused by another process.
+    if (start != 0 && now != 0 && now != start) return Owner.gone;
+    return pid == thisProcessID ? Owner.self : Owner.alive;
+}
+
+/// Record this process as the owner of `<dir>/<id>.sock` (best effort: a
+/// missing pid file only makes others fall back to the connect probe).
+private void writeOwner(string dir, string id)
+{
+    import std.file : write, FileException;
+    import std.process : thisProcessID;
+    import nano.safeio : processStartTime;
+    immutable pid = thisProcessID;
+    try write(pidPath(dir, id), format("%s %s\n", pid, processStartTime(pid)));
+    catch (FileException) {} // best effort: senders fall back to the probe
+}
+
+/// Remove `<dir>/<id>.pid` if it names this process (a successor may own
+/// it now).
+private void removeOwner(string dir, string id)
+{
+    int pid;
+    if (ownerOf(dir, id, pid) == Owner.self) removeIfThere(pidPath(dir, id));
+}
+
+/// Whether session `id` accepts messages: its socket answers a probe and its
+/// owner process (when recorded) is still running. Used by `sessions_list`.
+bool accepting(string dir, string id)
+{
+    import std.file : exists;
+    auto path = socketPath(dir, id);
+    if (!path.exists || !connectable(path)) return false;
+    int pid;
+    return ownerOf(dir, id, pid) != Owner.gone;
+}
+
+/// Socket paths of this process's live `PeerListener`s, one per line. The
+/// orphan sweep skips fds bound to them: a live listener's accepted
+/// connection names the listener's path and lacks close-on-exec until
+/// `serve` sets it, and on macOS (no SO_ACCEPTCONN for Unix sockets) one
+/// whose client already hung up looks like a listener. Closing it would
+/// leave `serve`'s `Socket` to close the fd number again later, after
+/// another thread reused it.
+private shared Locked!string ownListenerPathsCell;
+private shared bool ownListenerPathsMade;
+
+/// The `ownListenerPathsCell`, made on first use (a module constructor here
+/// would form a constructor cycle with nano.landlock).
+private shared(Locked!string) ownListenerPaths()
+{
+    import core.atomic : atomicLoad, atomicStore, cas;
+    if (cas(&ownListenerPathsMade, false, true))
+        atomicStore(ownListenerPathsCell, new shared Locked!string);
+    // Another thread won the race: its store lands at once.
+    while (atomicLoad(ownListenerPathsCell) is null) {}
+    return atomicLoad(ownListenerPathsCell);
+}
+
+private string normalizedSocketPath(string p)
+{
+    import std.path : absolutePath, buildNormalizedPath;
+    return buildNormalizedPath(absolutePath(p));
+}
+
+private void registerOwnListener(string path)
+{
+    immutable line = normalizedSocketPath(path) ~ "\n";
+    ownListenerPaths.update((ref string all) { all ~= line; });
+}
+
+private void unregisterOwnListener(string path)
+{
+    immutable line = normalizedSocketPath(path) ~ "\n";
+    ownListenerPaths.update((ref string all) {
+        import std.string : indexOf;
+        immutable i = all.indexOf(line);
+        if (i >= 0) all = all[0 .. i] ~ all[i + line.length .. $];
+    });
+}
+
+private bool isOwnListenerPath(string path)
+{
+    import std.string : lineSplitter;
+    import std.algorithm : canFind;
+    immutable want = normalizedSocketPath(path);
+    return ownListenerPaths.get.lineSplitter.canFind(want);
+}
+
+/// Close this process's inherited listeners in `dir`: Unix sockets bound to
+/// a path there, listening, whose fd lacks close-on-exec (every socket this build makes
+/// sets it, so such an fd came across an exec, orphaned). Returns how many
+/// were closed. Run at startup and before listening (issue #349).
+size_t closeOrphanedPeerFds(string dir)
+{
+    import std.path : dirName, extension, absolutePath, buildNormalizedPath;
+    import nano.safeio : openFds, hasCloexec, unixSocketPathOf, closeFd, isListeningSocket;
+    if (!dir.length) return 0;
+    immutable want = buildNormalizedPath(absolutePath(dir));
+    size_t n;
+    foreach (fd; openFds())
+    {
+        if (fd < 3 || hasCloexec(fd)) continue;
+        // Only listeners: an accepted connection of a live listener here
+        // names the same path and lacks the flag until serve() sets it.
+        if (!isListeningSocket(fd)) continue;
+        auto p = unixSocketPathOf(fd);
+        if (!p.length || p.extension != ".sock") continue;
+        if (buildNormalizedPath(absolutePath(p.dirName)) != want) continue;
+        if (isOwnListenerPath(p)) continue; // a live listener's connection
+        if (closeFd(fd) == 0) n++;
+    }
+    return n;
 }
 
 /// Whether the last socket error proves nobody listens (refused or no
@@ -742,8 +973,10 @@ unittest
 }
 
 /// Deliver `pm` to the session listening at `<dir>/<to>.sock`; the outcome,
-/// with the receiver's note in `note`. A stale socket (connection refused)
-/// is removed, so a dead session reports `not running` and its file is gone.
+/// with the receiver's note in `note`. A stale socket (connection refused
+/// and its owner process gone, per `<to>.pid`) is removed, so a dead session
+/// reports `not running` and its file is gone; a refusing socket whose owner
+/// still runs is kept and reported busy (issue #349).
 Status send(string dir, string to, PeerMessage pm, out string note)
 {
     import std.socket : Socket, UnixAddress, AddressFamily, SocketType;
@@ -781,6 +1014,21 @@ Status send(string dir, string to, PeerMessage pm, out string note)
         {
             note = format("session %s could not be reached; try again", to);
             return Status.refused;
+        }
+        // Refused is not proof the session is dead (a full backlog refuses
+        // on macOS): while its owner process runs, keep the socket.
+        int pid;
+        final switch (ownerOf(dir, to, pid))
+        {
+            case Owner.alive:
+            case Owner.self:
+                note = format("session %s is busy or unreachable (its process %s is running); try again", to, pid);
+                return Status.refused;
+            case Owner.gone:
+                removeIfThere(pidPath(dir, to));
+                break;
+            case Owner.unknown:
+                break; // an older listener without a pid file: refused means stale
         }
         // Stale: nobody is accepting. Remove it so the next listing is clean.
         removeIfThere(path);
@@ -1770,4 +2018,248 @@ unittest
     // No listener open: nothing to move.
     PeerListener[] none;
     assert(moveListener(none, root, "x", router.requests) is null && none.length == 0);
+}
+
+@("issue #349: a refused socket is kept while its owner runs, removed once it's gone")
+unittest
+{
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir, exists, write;
+    import std.path : buildPath;
+    import std.process : spawnProcess, wait, thisProcessID;
+    import std.socket : Socket, UnixAddress, AddressFamily, SocketType;
+    import core.sys.posix.unistd : getppid;
+    import nano.safeio : processStartTime;
+    auto dir = buildPath(tempDir, format("np349a%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    void refusing(string id)
+    {
+        auto s = new Socket(AddressFamily.UNIX, SocketType.STREAM);
+        s.bind(new UnixAddress(socketPath(dir, id)));
+        s.close(); // bound, nobody listening: connect is refused
+    }
+    string note;
+    // Refused, but the owner (our parent: certainly running) is alive.
+    refusing("sess-busy");
+    immutable ppid = getppid();
+    write(pidPath(dir, "sess-busy"), format("%s %s\n", ppid, processStartTime(ppid)));
+    auto st = send(dir, "sess-busy", PeerMessage("sess-sender", null, "hi", "m", false), note);
+    assert(st == Status.refused, note);
+    assert(socketPath(dir, "sess-busy").exists && pidPath(dir, "sess-busy").exists, "a live owner's socket is kept");
+    assert(note.canFind("busy or unreachable"), note);
+    assert(!accepting(dir, "sess-busy"), "a refusing socket isn't listed as accepting");
+    // The owner has exited: the socket and its pid file are removed.
+    refusing("sess-dead");
+    auto child = spawnProcess(["/bin/sh", "-c", "exit 0"]);
+    immutable deadPid = child.processID;
+    wait(child);
+    write(pidPath(dir, "sess-dead"), format("%s 1\n", deadPid));
+    st = send(dir, "sess-dead", PeerMessage("sess-sender", null, "hi", "m", false), note);
+    assert(st == Status.notRunning, note);
+    assert(!socketPath(dir, "sess-dead").exists && !pidPath(dir, "sess-dead").exists, note);
+    // A reused pid (alive, but a different start time) counts as gone.
+    refusing("sess-reused");
+    write(pidPath(dir, "sess-reused"), format("%s %s\n", ppid, processStartTime(ppid) + 1));
+    int pid;
+    // On the supported platforms the lookup must work, or this check (and
+    // pid-reuse detection itself) would silently pass on a zero start time.
+    version (OSX) enum known = true;
+    else version (linux) enum known = true;
+    else enum known = false;
+    static if (known) assert(processStartTime(ppid) != 0, "start time lookup failed");
+    if (processStartTime(ppid) != 0) assert(ownerOf(dir, "sess-reused", pid) == Owner.gone);
+}
+
+@("issue #349: listen closes this process's orphaned listener and rebinds")
+unittest
+{
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir, exists, readText;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    import std.socket : Socket, UnixAddress, AddressFamily, SocketType;
+    import nano.safeio : dupFd, closeFd, unixSocketPathOf, hasCloexec;
+    import nano.control : TurnControl;
+    import core.atomic : atomicLoad;
+    auto dir = buildPath(tempDir, format("np349b%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto path = socketPath(dir, "sess-self");
+    // An orphan like one inherited across exec: listening, not close-on-exec,
+    // and owned by no `Socket` (a raw fd nobody in this image knows about).
+    auto s = new Socket(AddressFamily.UNIX, SocketType.STREAM);
+    s.bind(new UnixAddress(path));
+    s.listen(4);
+    immutable orphan = dupFd(cast(int) s.handle);
+    s.close();
+    assert(orphan >= 0 && !hasCloexec(orphan) && unixSocketPathOf(orphan) == path);
+    assert(live(path), "the orphan answers probes");
+    auto router = PeerRouter.make(atomicLoad(new shared TurnControl));
+    router.confirm(false);
+    auto listener = PeerListener.listen(dir, "sess-self", router.requests);
+    scope (exit) listener.close();
+    // The orphan fd is gone (or reused by a close-on-exec socket of ours).
+    assert(unixSocketPathOf(orphan) != path || hasCloexec(orphan), "the orphan was closed");
+    int pid;
+    assert(ownerOf(dir, "sess-self", pid) == Owner.self && pid == thisProcessID);
+    auto pump = TestPump.start(router);
+    scope (exit) pump.stop();
+    string note;
+    assert(send(dir, "sess-self", PeerMessage("sess-sender", null, "hello", "m", false), note) == Status.delivered, note);
+    Inbound inbound;
+    assert(router.takeWaiting(inbound));
+    settle(inbound, true);
+    listener.close();
+    assert(!path.exists && !pidPath(dir, "sess-self").exists, "close removes the socket and pid file");
+}
+
+@("issue #349: the orphan sweep spares accepted connections and dup'd sockets")
+unittest
+{
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir, exists;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    import std.socket : UnixAddress;
+    import nano.safeio : dupSocket, closeFd, unixSocketPathOf, hasCloexec, isListeningSocket;
+    auto dir = buildPath(tempDir, format("np349d%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto path = socketPath(dir, "sess-live");
+    auto l = unixSocket();
+    scope (exit) l.close();
+    l.bind(new UnixAddress(path));
+    l.listen(4);
+    auto c = unixSocket();
+    scope (exit) c.close();
+    c.connect(new UnixAddress(path));
+    auto conn = l.accept(); // not close-on-exec yet, like serve() before setCloexec
+    scope (exit) conn.close();
+    assert(!hasCloexec(cast(int) conn.handle) && unixSocketPathOf(cast(int) conn.handle) == path);
+    assert(!isListeningSocket(cast(int) conn.handle) && isListeningSocket(cast(int) l.handle));
+    immutable d = dupSocket(l.handle);
+    assert(cast(int) d >= 0 && hasCloexec(cast(int) d), "dupSocket is close-on-exec atomically");
+    scope (exit) closeFd(cast(int) d);
+    assert(closeOrphanedPeerFds(dir) == 0);
+    assert(unixSocketPathOf(cast(int) conn.handle) == path, "the accepted connection survives");
+}
+
+@("issue #349: the orphan sweep spares a live listener's hung-up connections")
+unittest
+{
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir, exists;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    import nano.control : TurnControl;
+    import core.atomic : atomicLoad;
+    auto dir = buildPath(tempDir, format("np349f%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto router = PeerRouter.make(atomicLoad(new shared TurnControl));
+    auto listener = PeerListener.listen(dir, "sess-own", router.requests);
+    scope (exit) listener.close();
+    assert(isOwnListenerPath(socketPath(dir, "sess-own")));
+    assert(closeOrphanedPeerFds(dir) == 0, "a live listener is not an orphan");
+    listener.close();
+    assert(!isOwnListenerPath(socketPath(dir, "sess-own")), "close unregisters the path");
+}
+
+@("issue #349: the orphan sweep spares a registered listener's disconnected accepted fd")
+unittest
+{
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir, exists;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    import std.socket : UnixAddress;
+    import nano.safeio : unixSocketPathOf, hasCloexec, isListeningSocket;
+    auto dir = buildPath(tempDir, format("np349g%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto path = socketPath(dir, "sess-gone");
+    auto l = unixSocket();
+    scope (exit) l.close();
+    l.bind(new UnixAddress(path));
+    l.listen(4);
+    auto c = unixSocket();
+    c.connect(new UnixAddress(path));
+    auto conn = l.accept(); // not close-on-exec yet, like serve() before setCloexec
+    scope (exit) conn.close();
+    c.close(); // the client hangs up: on macOS the fd now reads as a listener
+    immutable fd = cast(int) conn.handle;
+    assert(!hasCloexec(fd) && unixSocketPathOf(fd) == path);
+    registerOwnListener(path);
+    assert(closeOrphanedPeerFds(dir) == 0, "a registered listener's connection is not an orphan");
+    assert(unixSocketPathOf(fd) == path && !hasCloexec(fd), "the accepted fd stays open");
+    unregisterOwnListener(path);
+    // Red without the guard: where the hung-up fd reads as listening, an
+    // unregistered path lets the sweep take it.
+    if (isListeningSocket(fd))
+    {
+        assert(closeOrphanedPeerFds(dir) == 1, "unguarded, the sweep closes it");
+        conn.release(); // the sweep closed the fd: drop the handle so neither scope(exit) nor the GC finalizer closes its number again
+    }
+}
+
+@("issue #349: a liveness probe of a full backlog never blocks")
+unittest
+{
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir, exists;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    import std.socket : Socket, UnixAddress, AddressFamily, SocketType;
+    import nano.clock : monoNow, since;
+    auto dir = buildPath(tempDir, format("np349c%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto path = socketPath(dir, "sess-full");
+    auto l = unixSocket();
+    scope (exit) l.close();
+    l.bind(new UnixAddress(path));
+    l.listen(1); // never accepted
+    Socket[] clients;
+    scope (exit) foreach (c; clients) c.close();
+    // Fill the backlog with non-blocking connects nobody accepts.
+    foreach (i; 0 .. 8)
+    {
+        auto c = unixSocket();
+        c.blocking = false;
+        try c.connect(new UnixAddress(path));
+        catch (imported!"std.socket".SocketException) {} // full: expected
+        clients ~= c;
+    }
+    auto start = monoNow;
+    live(path);
+    accepting(dir, "sess-full");
+    assert(since(start) < 1.seconds, "the probe waited on accept");
+}
+
+// Discovery is strict: a permission-denied socket is kept by cleanup
+// (`live`) but never advertised as accepting messages (`connectable`).
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, exists, setAttributes;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    import std.socket : Socket, AddressFamily, SocketType, UnixAddress;
+    import std.conv : to;
+    import core.sys.posix.unistd : geteuid;
+    if (geteuid() == 0) return; // root bypasses the permission check
+    auto dir = buildPath(tempDir, "np349e" ~ thisProcessID.to!string);
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto path = socketPath(dir, "sess-denied");
+    auto s = new Socket(AddressFamily.UNIX, SocketType.STREAM);
+    scope (exit) s.close();
+    s.bind(new UnixAddress(path));
+    s.listen(4);
+    assert(connectable(path) && accepting(dir, "sess-denied"));
+    setAttributes(path, octal!0);
+    assert(live(path), "cleanup keeps a permission-denied socket");
+    assert(!connectable(path), "discovery rejects a permission-denied socket");
+    assert(!accepting(dir, "sess-denied"));
 }
