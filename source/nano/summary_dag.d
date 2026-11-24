@@ -118,46 +118,90 @@ private string cutText(string s, size_t n)
     return s[0 .. end] ~ mark;
 }
 
-/// The raw JSON text of the `summary_nodes` array in a log line, or null
-/// (issue #369). Scanning for the key and parsing only its value avoids
-/// decoding a `replace` record's whole message list just to read its nodes.
-/// The key inside a message string is escaped (`\"summary_nodes\"`), so only
-/// a real key matches.
+/// The raw JSON text of a `replace` record's `summary_nodes` array, or
+/// null (issue #369). Scanning the line and parsing only that value avoids
+/// decoding the record's whole message list just to read its nodes. Only
+/// the direct `data.summary_nodes` field of a record whose `type` is
+/// `replace` counts: the same key nested deeper (a tool call's arguments,
+/// a message string) is not a node list.
 const(char)[] summaryNodesJson(const(char)[] line)
 {
-    enum key = `"summary_nodes"`;
-    size_t from;
-    while (true)
+    size_t depth, i;
+    const(char)[] key1, type, found; // key1: the top-level key being read
+    bool okData; // the depth-2 container is the value of top-level "data"
+    while (i < line.length)
     {
-        auto k = line[from .. $].indexOf(key);
-        if (k < 0) return null;
-        auto i = from + k + key.length;
-        from = i;
-        while (i < line.length && (line[i] == ' ' || line[i] == '\t')) ++i;
-        if (i >= line.length || line[i] != ':') continue;
-        ++i;
-        while (i < line.length && (line[i] == ' ' || line[i] == '\t')) ++i;
-        if (i >= line.length || line[i] != '[') continue;
-        immutable start = i;
-        size_t depth;
-        bool inStr;
-        for (; i < line.length; ++i)
+        immutable c = line[i];
+        if (c == '"')
         {
-            immutable c = line[i];
-            if (inStr)
+            immutable s = i + 1;
+            for (++i; i < line.length && line[i] != '"'; ++i)
+                if (line[i] == '\\') ++i;
+            if (i >= line.length) return null;
+            auto str = line[s .. i];
+            ++i;
+            auto j = i;
+            while (j < line.length && (line[j] == ' ' || line[j] == '\t')) ++j;
+            if (j < line.length && line[j] == ':')
             {
-                if (c == '\\') ++i;
-                else if (c == '"') inStr = false;
+                // A key: note its value where it matters.
+                ++j;
+                while (j < line.length && (line[j] == ' ' || line[j] == '\t')) ++j;
+                if (depth == 1)
+                {
+                    key1 = str;
+                    if (str == "type" && j < line.length && line[j] == '"')
+                    {
+                        auto e = j + 1;
+                        while (e < line.length && line[e] != '"' && line[e] != '\\') ++e;
+                        type = line[j + 1 .. e];
+                    }
+                }
+                else if (depth == 2 && okData && str == "summary_nodes" && found is null
+                    && j < line.length && line[j] == '[')
+                {
+                    auto end = closing(line, j);
+                    if (end == 0) return null;
+                    found = line[j .. end + 1];
+                }
+                i = j;
             }
-            else if (c == '"') inStr = true;
-            else if (c == '[' || c == '{') ++depth;
-            else if (c == ']' || c == '}')
-            {
-                if (--depth == 0) return line[start .. i + 1];
-            }
+            continue;
         }
-        return null;
+        if (c == '{' || c == '[')
+        {
+            ++depth;
+            if (depth == 2) okData = c == '{' && key1 == "data";
+        }
+        else if (c == '}' || c == ']')
+        {
+            if (depth == 0) return null;
+            --depth;
+        }
+        ++i;
     }
+    return type == "replace" ? found : null;
+}
+
+/// The index of the bracket closing the array or object at `line[start]`,
+/// or 0 if the line ends first.
+private size_t closing(const(char)[] line, size_t start)
+{
+    size_t depth;
+    bool inStr;
+    for (auto i = start; i < line.length; ++i)
+    {
+        immutable c = line[i];
+        if (inStr)
+        {
+            if (c == '\\') ++i;
+            else if (c == '"') inStr = false;
+        }
+        else if (c == '"') inStr = true;
+        else if (c == '[' || c == '{') ++depth;
+        else if ((c == ']' || c == '}') && --depth == 0) return i;
+    }
+    return 0;
 }
 
 /// `text` with every line that `parse` would read as structure (a node
@@ -467,10 +511,21 @@ unittest // render enforces a hard byte cap, even on adversarial nodes (issue #3
 
 unittest // summary_nodes extraction (issue #369)
 {
-    assert(summaryNodesJson(`{"data":{"summary_nodes":[{"id":1,"text":"a]}\"["}]}}`)
+    assert(summaryNodesJson(`{"type":"replace","data":{"summary_nodes":[{"id":1,"text":"a]}\"["}]}}`)
         == `[{"id":1,"text":"a]}\"["}]`);
-    assert(summaryNodesJson(`{"m":"say \"summary_nodes\": [1]","data":{"summary_nodes" : [2]}}`) == `[2]`);
-    assert(summaryNodesJson(`{"summary_nodes":[1,`) is null);
+    assert(summaryNodesJson(`{"type":"replace","m":"say \"summary_nodes\": [1]","data":{"summary_nodes" : [2]}}`)
+        == `[2]`);
+    assert(summaryNodesJson(`{"type":"replace","data":{"summary_nodes":[1,`) is null);
+    // The key nested deeper than data.summary_nodes is tool data, not nodes:
+    // alone it yields nothing, and it never hides the real array.
+    enum call = `{"tool_calls":[{"arguments":{"summary_nodes":[9]}}]}`;
+    assert(summaryNodesJson(`{"type":"replace","data":{"messages":[` ~ call ~ `]}}`) is null);
+    assert(summaryNodesJson(`{"type":"replace","data":{"messages":[` ~ call ~ `],"summary_nodes":[3]}}`) == `[3]`);
+    assert(summaryNodesJson(`{"type":"message","data":{"role":"assistant","args":{"summary_nodes":[9]}}}`) is null);
+    // Only a replace record holds nodes, wherever its type key sits.
+    assert(summaryNodesJson(`{"type":"message","data":{"summary_nodes":[9]}}`) is null);
+    assert(summaryNodesJson(`{"data":{"summary_nodes":[4]},"type":"replace"}`) == `[4]`);
+    assert(summaryNodesJson(`{"summary_nodes":[5],"type":"replace"}`) is null);
     assert(summaryNodesJson(`{"x":1}`) is null);
 }
 

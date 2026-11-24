@@ -291,7 +291,7 @@ string search(string path, JSONValue args)
     if (auto nv = "node" in args.objectNoRef)
     {
         // Only the node's range (issue #274), within any before/after given.
-        auto node = findNodeTree(path, nodeArg(*nv)).node;
+        auto node = findNodeTree(path, nodeArg(*nv), false).node;
         // An unknown range must not widen to the whole session (issue #369).
         if (!node.first)
             throw new HistoryError(format("summary node %s has no recorded message range, so it cannot scope a "
@@ -474,33 +474,41 @@ private struct NodeTree
 }
 
 /// Summary node `id` (its latest record) and its children as of that
-/// record, in one pass over the log (issue #369; #274 for the lookup
-/// rule): node IDs from an older session can restart after a flat
-/// compaction, so a node's children are looked up as of the node's own
-/// record, never in a later node list.
-private NodeTree findNodeTree(string path, uint id)
+/// record (issue #369; #274 for the lookup rule): node IDs from an older
+/// session can restart after a flat compaction, so a node's children are
+/// looked up as of the node's own record, never in a later node list.
+/// Two passes keep memory to the node and its children, not every archived
+/// node: the first finds the node's latest record, the second each child's
+/// latest record at or before it. `withKids` false skips the second pass
+/// (a range-only lookup needs no child prose).
+private NodeTree findNodeTree(string path, uint id, bool withKids = true)
 {
     import nano.session : foreachLogLineSkippingTorn;
-    SummaryNode[uint] latest; // every node ID's latest record so far
     NodeTree tree;
-    bool have;
+    size_t rec, at; // node-bearing records seen; the 1-based one holding the node
     foreachLogLineSkippingTorn(path, (const(char)[] line) {
         if (line.indexOf(`"summary_nodes"`) < 0) return;
         auto ns = lineNodes(line);
-        foreach (ref n; ns) latest[n.id] = n;
+        if (!ns.length) return;
+        ++rec;
         foreach (ref n; ns)
-            if (n.id == id)
-            {
-                tree.node = n;
-                tree.kids = null;
-                foreach (c; n.children)
-                    if (auto k = c in latest) tree.kids[c] = *k;
-                have = true;
-            }
+            if (n.id == id) { tree.node = n; at = rec; }
     });
-    if (!have)
+    if (!at)
         throw new HistoryError(format("no summary node %s in this session (nodes are recorded by layered compaction)",
             nodeName(id)));
+    if (!withKids || !tree.node.children.length) return tree;
+    bool[uint] wanted;
+    foreach (c; tree.node.children) wanted[c] = true;
+    rec = 0;
+    foreachLogLineSkippingTorn(path, (const(char)[] line) {
+        if (rec >= at || line.indexOf(`"summary_nodes"`) < 0) return;
+        auto ns = lineNodes(line);
+        if (!ns.length) return;
+        ++rec;
+        foreach (ref n; ns)
+            if (n.id in wanted) tree.kids[n.id] = n;
+    });
     return tree;
 }
 
