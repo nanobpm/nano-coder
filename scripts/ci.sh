@@ -76,7 +76,7 @@ unit() {
     # perl's alarm survives exec: a parent-side deadline (SIGALRM kills the
     # runner) so a broken watchdog fails this check instead of hanging CI.
     status=0
-    out=$(NANO_TEST_STUCK=1 NANO_TEST_JOBS=4 NANO_TEST_BUDGET_SCALE=0.3 \
+    out=$(NANO_TEST_ONLY= NANO_TEST_STUCK=1 NANO_TEST_JOBS=4 NANO_TEST_BUDGET_SCALE=0.3 \
         perl -e 'alarm shift; exec @ARGV or die "exec: $!"' 300 ./nano-coder-test-application 2>&1) || status=$?
     if [ "$status" -eq 0 ]; then
         echo "the stuck test module passed"; exit 1
@@ -95,8 +95,9 @@ unit() {
 hostile_home() {
     step "unit tests with a populated HOME and TMPDIR inside a git checkout"
     # Not under a temp root nor this checkout's .git: the workspace sandbox
-    # always grants both, so a fake HOME there would be writable.
-    work=${XDG_CACHE_HOME:-$HOME/.cache}/nano-coder-hostile.$$
+    # always grants both, so a fake HOME there would be writable. Under the
+    # real HOME, not XDG_CACHE_HOME: that may point at a temp root.
+    work=$HOME/.cache/nano-coder-hostile.$$
     mkdir -p "$(dirname "$work")"
     rm -rf "$work"
     fake=$work/home
