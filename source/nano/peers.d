@@ -349,6 +349,10 @@ struct ReplyCell
     bool expired;
 }
 
+/// The peers-dir file whose flock serializes every listener's owner claim
+/// (issue #370); one fixed name, so the directory never grows per session.
+enum claimLockName = ".claim.lock";
+
 /// A listening session's end of the registry: the socket file it owns.
 /// `close` stops the listener and removes the socket (idempotent). A struct
 /// (one impl per listener), so no new reference type.
@@ -393,9 +397,15 @@ struct PeerListener
         // Serialize owner inspection, claim and bind across processes
         // (issue #370): without it, a second listener could see a claim in
         // progress (an empty pid file) as stale, replace it, and both would
-        // proceed. Released when this function returns.
+        // proceed. Released when this function returns. One lock file for
+        // the whole directory, not one per id, so sessions leave no file
+        // behind (removing a flock file races a waiter holding its inode).
+        // Fail closed: an unheld lock would bring the race back.
         import nano.safeio : lockExclusive;
-        auto claimLock = lockExclusive(imported!"std.path".buildPath(dir, id ~ ".lock"));
+        immutable lockPath = imported!"std.path".buildPath(dir, claimLockName);
+        auto claimLock = lockExclusive(lockPath);
+        if (!claimLock.held)
+            throw new ListenError(format("cannot lock %s to claim %s", lockPath, path));
         Socket socket;
         try socket = unixSocket();
         catch (SocketException e)
@@ -2407,4 +2417,39 @@ unittest
     int pid;
     assert(ownerOf(dir, "sess-dup", pid) == Owner.self && pid == thisProcessID,
         "the failed listen must not remove the first listener's pid file");
+}
+
+@("issue #370: listen/close leaves no per-id lock file, only the shared claim lock")
+unittest
+{
+    import std.file : exists, dirEntries, SpanMode, mkdirRecurse, rmdirRecurse, tempDir;
+    import std.path : buildPath, baseName;
+    import std.process : thisProcessID;
+    import std.conv : to;
+    auto dir = buildPath(tempDir, "nano-peers-lock-" ~ thisProcessID.to!string);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    foreach (i; 0 .. 3)
+    {
+        auto l = PeerListener.listen(dir, "s" ~ i.to!string, Chan!PeerRequest.make);
+        l.close();
+    }
+    string[] left;
+    foreach (e; dirEntries(dir, SpanMode.shallow)) left ~= e.name.baseName;
+    assert(left == [claimLockName], left.to!string);
+}
+
+@("issue #370: listen fails closed when the claim lock can't be taken")
+unittest
+{
+    import std.exception : assertThrown;
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    import std.conv : to;
+    auto dir = buildPath(tempDir, "nano-peers-nolock-" ~ thisProcessID.to!string);
+    // A directory where the lock file should be: open(2) fails.
+    mkdirRecurse(buildPath(dir, claimLockName));
+    scope (exit) rmdirRecurse(dir);
+    assertThrown!ListenError(PeerListener.listen(dir, "x", Chan!PeerRequest.make));
 }
