@@ -4532,10 +4532,17 @@ class Agent
         stepsSinceTimerNote = 0; // a fresh firing restarts the nudge interval
         notice = firedNotice(due);
         import std.algorithm : map;
+        auto msg = firedMessage(due, t);
         if (closed.length)
-            notice ~= format("\n(auto-closed fired timer%s %s: at most %s wait for timer_done)",
+        {
+            // Both the display and the model need it: earlier reminders still
+            // name the closed ids, and the model would keep chasing them.
+            auto why = format("\n(auto-closed fired timer%s %s: at most %s wait for timer_done)",
                 closed.length == 1 ? "" : "s", closed.map!(x => x.id.to!string).join(", "), maxPending);
-        return firedMessage(due, t);
+            notice ~= why;
+            msg ~= why;
+        }
+        return msg;
     }
 
     /// Mid-turn: due timers join the conversation before the next model call,
