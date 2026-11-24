@@ -57,7 +57,7 @@ import nano.peers : PeerListener, PeerRouter, Inbound, ListenError, settle, conf
 import nano.instructions : ProjectInstructions, InstructionOptions = Options, expandHome;
 import core.atomic : atomicLoad, atomicStore, cas;
 
-enum string packageVersion = "1.25.4";
+enum string packageVersion = "1.26.0";
 enum string versionString = "nano-coder " ~ packageVersion;
 
 enum string usage = `Usage: nano-coder [--model provider/model] [--config PATH] [-p PROMPT]
@@ -4284,6 +4284,17 @@ int runMain(string[] args)
         };
         h.logSettings = (const SessionSettings s) { logSessionSettings(s); };
         h.onSaved = (const ref imported!"nano.settings".Changes saved) { runtimeDefaults = runtimeDefaults.refreshed(cfg, saved); };
+        // The same paths as `/subagents on|off` and `/messages ...`, so the
+        // dialog never duplicates their state changes.
+        h.subagentsCommand = (string arg) {
+            string showLog;
+            return subagentsCommand(agent, cfg, arg, showLog);
+        };
+        h.reconfigureSubagents = () { configureSubagents(agent, cfg, false); };
+        h.messagesCommand = (string arg) => messagesCommand(agent, cfg, arg, peerRouter, peerListener.length != 0,
+            &startPeerListener, &stopPeerListener);
+        h.messagesOn = () => agent.messagesOn && peerListener.length != 0;
+        h.messagesConfirm = () => peerRouter.confirm;
         return h;
     }
 
