@@ -1292,26 +1292,65 @@ import nano.ui : Verbosity, parseVerbosity, verbosityListing, providersListing;
 string runMemoryMigrate(MemoryStore store, LLMClient client, nano.memmigrate.Ui ui, bool dryRun, out bool ok,
     void delegate(scope void delegate() @safe) @safe aroundAsk = null)
 {
+    import nano.http : addUsage, hasUsage;
     nano.memmigrate.Options mo;
     mo.dryRun = dryRun;
+    // Every model call's usage, retried attempts and failures included
+    // (issue #371): there is no status line, so the report prints it.
+    RetrySpend spent;
+    void count(RetrySpend s)
+    {
+        spent.usage = addUsage(spent.usage, s.usage);
+        spent.uncounted += s.uncounted;
+    }
     string ask(string system, string user)
     {
         ChatRequest req;
         req.messages = [Message.system(system), Message.user(user)];
         req.maxTokens = 8_192;
         string got;
-        void call() { got = client.chat(req, (bool, string) {}).content; }
+        void call()
+        {
+            LLMResponse r;
+            try r = client.chat(req, (bool, string) {});
+            catch (SpendingException e) { count(e.retried); throw e; }
+            count(r.retried);
+            if (hasUsage(r.usage)) count(RetrySpend(r.usage, 0));
+            else count(RetrySpend(TokenUsage.init, 1));
+            got = r.content;
+        }
         if (aroundAsk is null) call();
         else aroundAsk(&call);
         return got;
     }
+    string report;
     try
     {
-        auto r = nano.memmigrate.migrate(store, &ask, ui, mo).toString;
+        report = nano.memmigrate.migrate(store, &ask, ui, mo).toString;
         ok = true;
-        return r;
     }
-    catch (Exception e) return "memory migrate failed (applied batches are kept; run it again to resume): " ~ e.msg;
+    catch (Exception e) report = "memory migrate failed (applied batches are kept; run it again to resume): " ~ e.msg;
+    return report ~ "\n" ~ migrateUsageLine(spent);
+}
+
+/// The model usage line `memory migrate` ends its report with (issue #371).
+string migrateUsageLine(RetrySpend s) pure
+{
+    auto line = format("Model usage: %s input, %s output tokens", s.usage.inputTokens, s.usage.outputTokens);
+    if (s.usage.hasAic) line ~= format(", %.2f AI Credits", s.usage.aic);
+    if (s.uncounted) line ~= format(" (%s request(s) reported no usage)", s.uncounted);
+    return line;
+}
+
+unittest
+{
+    TokenUsage u;
+    u.inputTokens = 10;
+    u.outputTokens = 2;
+    assert(migrateUsageLine(RetrySpend(u, 0)) == "Model usage: 10 input, 2 output tokens");
+    u.hasAic = true;
+    u.aic = 0.5;
+    assert(migrateUsageLine(RetrySpend(u, 1)) == "Model usage: 10 input, 2 output tokens, 0.50 AI Credits (1 request(s) reported no usage)");
 }
 
 /// The migration review on plain stdin: numbered menus, typed answers.

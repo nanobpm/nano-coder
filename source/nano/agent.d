@@ -21,7 +21,7 @@ import std.string : strip, stripLeft;
 import std.array : join;
 import std.conv : to;
 import nano.llm;
-import nano.http : StreamInterrupted, hasUsage;
+import nano.http : StreamInterrupted, hasUsage, addUsage;
 import core.thread : Thread;
 import core.time : Duration;
 static import nano.session_index;
@@ -616,6 +616,7 @@ class Agent
         import std.datetime.systime : Clock;
         import std.conv : to;
         // A harness-initiated input (a fired timer): never pinned as a request.
+        collectTitleSpend();
         bool automatic = automaticInput;
         automaticInput = false;
         // The loop guard (issues #272, #350): a peer-started turn's sends
@@ -856,14 +857,18 @@ class Agent
         LLMClient c;
         try c = titleClient(spec);
         catch (Exception) return; // a title is optional
+        if (!titleSpend) titleSpend = Chan!RetrySpend.make();
         // Isolated: `titleClient` builds a new client from a resolved
         // (deep-copied) config, and only the title thread keeps it.
-        titleThreads ~= spawnDaemon(&fetchTitle, Isolated!LLMClient.assumeIsolated(c), source, logPath);
+        titleThreads ~= spawnDaemon(&fetchTitle, Isolated!LLMClient.assumeIsolated(c), source, logPath, titleSpend);
     }
 
     /// Ask `client` for a title for `source` and store it in the session at
-    /// `path`. Runs on its own thread (`spawn`).
-    private static void fetchTitle(Isolated!LLMClient client, string source, string path)
+    /// `path`. Runs on its own thread (`spawn`). What the request cost (its
+    /// usage, retried attempts included, even when it fails) goes to `spend`
+    /// for the agent to count (issue #371); `uncounted` counts each attempt
+    /// that reported no usage.
+    private static void fetchTitle(Isolated!LLMClient client, string source, string path, Chan!RetrySpend spend)
     {
         import nano.session_index : cleanTitle, setTitle;
         try
@@ -872,10 +877,38 @@ class Agent
             ChatRequest req;
             req.messages = [Message.system(titlePrompt), Message.user(source)];
             req.maxTokens = 400; // room for reasoning models that think first
-            auto title = cleanTitle(c.chat(req, null).content);
+            LLMResponse r;
+            try r = c.chat(req, null);
+            catch (SpendingException e)
+            {
+                spend.put(e.retried);
+                return; // a title is optional
+            }
+            RetrySpend total = r.retried;
+            if (hasUsage(r.usage)) total.usage = addUsage(total.usage, r.usage);
+            else total.uncounted++;
+            spend.put(total);
+            auto title = cleanTitle(r.content);
             if (title !is null) setTitle(path, title); // false: another process won
         }
         catch (Exception) {} // a title is optional
+    }
+
+    /// What finished title requests cost, sent by their threads (issue #371).
+    private Chan!RetrySpend titleSpend;
+
+    /// Count what finished title requests cost into the session totals
+    /// (issue #371). Called before a turn, when titles settle and when the
+    /// status line is built.
+    void collectTitleSpend()
+    {
+        if (!titleSpend) return;
+        RetrySpend s;
+        while (titleSpend.tryTake(s))
+        {
+            if (hasUsage(s.usage)) recordUsage(s.usage);
+            uncountedRequests += s.uncounted;
+        }
     }
 
     /// Title requests in flight (tests join them).
@@ -886,6 +919,7 @@ class Agent
     {
         import core.time : MonoTime, msecs;
         auto deadline = monoNow + max;
+        scope (exit) collectTitleSpend();
         foreach (t; titleThreads)
             while (t.running)
             {
@@ -6436,4 +6470,59 @@ unittest
     assert(agent.control.takeModelRequest() is null);
     assert(agent.control.takeThinkingRequest() is null);
     assert(agent.control.takeSubagentsRequest() == 0);
+}
+
+// A title request's usage, its retried attempts included, adds to the
+// session totals; a title request that fails with a SpendingException still
+// counts its retried attempts (issue #371).
+unittest
+{
+    import std.file : tempDir, exists, rmdirRecurse;
+    import std.path : buildPath;
+    import core.time : seconds;
+    import nano.session : SessionLog;
+    import nano.providers.mock : MockClient;
+    static class FailingTitler : MockClient
+    {
+        this() pure { super([]); }
+        override LLMResponse chat(const ref ChatRequest req, StreamSink sink)
+        {
+            auto e = new SpendingException("titler dropped");
+            e.retried.usage.inputTokens = 7;
+            e.retried.usage.outputTokens = 1;
+            e.retried.uncounted = 2;
+            throw e;
+        }
+    }
+    foreach (failing; [false, true])
+    {
+        auto dir = buildPath(tempDir, "nano-d-agent-title-usage");
+        if (dir.exists) rmdirRecurse(dir);
+        auto agent = new Agent(new MockClient([LLMResponse("a")]), new ToolRegistry, Policy.init, null);
+        agent.log = some(new SessionLog(dir, "mock/m", "/w"));
+        agent.sessionTitles = true;
+        agent.titleClient = (string spec) {
+            if (failing) return cast(LLMClient) new FailingTitler;
+            auto r = LLMResponse("Deploy test fix");
+            r.usage.inputTokens = 100;
+            r.usage.outputTokens = 5;
+            r.retried.usage.inputTokens = 40;
+            r.retried.uncounted = 1;
+            return cast(LLMClient) new MockClient([r]);
+        };
+        agent.run("Fix the flaky deploy test in CI", new NullEvents);
+        immutable before = agent.sessionInputTokens, uncountedBefore = agent.uncountedRequests;
+        assert(agent.settleTitles(5.seconds));
+        if (failing)
+        {
+            assert(agent.sessionInputTokens == before + 7 && agent.uncountedRequests == uncountedBefore + 2,
+                "a failed title request still counts its retried attempts");
+        }
+        else
+        {
+            assert(agent.sessionInputTokens == before + 140 && agent.uncountedRequests == uncountedBefore + 1,
+                "the title request and its retried attempt count");
+        }
+        rmdirRecurse(dir);
+    }
 }
