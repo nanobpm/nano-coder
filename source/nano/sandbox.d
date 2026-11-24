@@ -51,6 +51,96 @@ SandboxMode parseMode(string s) pure
     }
 }
 
+/// Where the effective sandbox mode came from, for startup diagnostics and
+/// `/settings` (issue #118).
+enum SandboxSource { interactiveDefault, headlessDefault, config, env, flag }
+
+/// The source's name as shown to users.
+string sourceName(SandboxSource s) pure nothrow
+{
+    final switch (s)
+    {
+        case SandboxSource.interactiveDefault: return "default";
+        case SandboxSource.headlessDefault: return "default-headless";
+        case SandboxSource.config: return "config";
+        case SandboxSource.env: return "env NANO_CODER_SANDBOX";
+        case SandboxSource.flag: return "flag --sandbox";
+    }
+}
+
+/// The effective sandbox mode and where it was set.
+struct ResolvedMode
+{
+    /// The mode commands run under.
+    SandboxMode mode;
+    /// Which setting decided it.
+    SandboxSource source;
+}
+
+/// Resolve the sandbox mode: `--sandbox` flag > `NANO_CODER_SANDBOX` > the
+/// config's `[sandbox] mode` > a default that depends on how nano-coder runs:
+/// `workspace` for headless runs (ACP, `-p`, piped stdin), where nobody
+/// approves commands, and `off` interactively. An explicit `off` at any level
+/// wins. Empty `flag`/`env` mean unset; throws on an unknown mode name.
+ResolvedMode resolveMode(string flag, string env, bool configSet, SandboxMode configMode, bool headless) pure
+{
+    if (flag.length) return ResolvedMode(parseMode(flag), SandboxSource.flag);
+    if (env.length) return ResolvedMode(parseMode(env), SandboxSource.env);
+    if (configSet) return ResolvedMode(configMode, SandboxSource.config);
+    return headless ? ResolvedMode(SandboxMode.workspace, SandboxSource.headlessDefault)
+        : ResolvedMode(SandboxMode.off, SandboxSource.interactiveDefault);
+}
+
+/// Why the OS sandbox can't be applied on this machine, or null when it can.
+/// Checked at startup by headless runs so a sandboxed worker fails loudly
+/// instead of failing every command.
+string unavailableReason(bool network)
+{
+    version (OSX)
+    {
+        import std.file : exists;
+        return exists("/usr/bin/sandbox-exec") ? null : "sandbox unavailable: /usr/bin/sandbox-exec not found";
+    }
+    else version (linux)
+    {
+        import nano.landlock : check;
+        return check(network);
+    }
+    else
+        return "sandbox unavailable on this platform";
+}
+
+/// Why a probe of the sandbox launcher failed, or null when it succeeded:
+/// a non-zero exit, with the launcher's first output line for the reason.
+string probeFailure(int status, string output) pure
+{
+    import std.string : lineSplitter, strip;
+    if (status == 0) return null;
+    foreach (line; output.lineSplitter)
+        if (line.strip.length) return format("sandbox probe failed (exit %s): %s", status, line.strip);
+    return format("sandbox probe failed (exit %s)", status);
+}
+
+unittest
+{
+    assert(probeFailure(0, "anything") is null);
+    assert(probeFailure(71, "\nsandbox-exec: sandbox_apply: Operation not permitted\n")
+        == "sandbox probe failed (exit 71): sandbox-exec: sandbox_apply: Operation not permitted");
+    assert(probeFailure(1, "") == "sandbox probe failed (exit 1)");
+}
+
+/// Why `c` can't actually be applied in `cwd`, or null when it can: checks the
+/// backend, then runs a harmless command through the real launcher, since an
+/// already-sandboxed process has the backend yet can't apply it (#118).
+string applyFailure(const SandboxConfig c, string cwd)
+{
+    if (auto why = unavailableReason(c.network)) return why;
+    import std.process : execute, Config;
+    // command() only throws when the backend is missing, ruled out above.
+    auto r = execute(c.command("/bin/sh", "exit 0", cwd), null, Config.none, 4096, cwd);
+    return probeFailure(r.status, r.output);
+}
+
 /// Cache directories under `$HOME` that build tools write to.
 immutable string[] toolCacheDirs = [
     ".cargo/registry", ".cargo/git", ".cargo/.package-cache", ".cargo/.package-cache-mutate",
@@ -77,13 +167,16 @@ struct SandboxConfig
     bool network = true;
     /// In workspace mode, also allow writes to package-manager caches.
     bool toolCaches = true;
+    /// Whether the config file named a `mode` (so an explicit `off` can be
+    /// told apart from no setting at all; issue #118).
+    bool modeSet;
 
     /// From the `[sandbox]` table; throws on a bad mode or type.
     static SandboxConfig fromJSON(JSONValue v) pure
     {
         SandboxConfig c;
         if (v.type != JSONType.object) return c;
-        if (auto x = "mode" in v) c.mode = parseMode(x.str);
+        if (auto x = "mode" in v) { c.mode = parseMode(x.str); c.modeSet = true; }
         if (auto x = "writable" in v) foreach (w; x.arrayNoRef) c.writable ~= w.str;
         if (auto x = "network" in v) c.network = x.boolean;
         if (auto x = "tool_caches" in v) c.toolCaches = x.boolean;
@@ -390,6 +483,56 @@ unittest
     import nano.result : unwrap;
     auto c = SandboxConfig.fromJSON(parseToml("mode = \"read-only\"\nnetwork = false").unwrap("valid TOML"));
     assert(c.mode == SandboxMode.readOnly && !c.network && c.toolCaches);
+}
+
+// issue #118: precedence flag > env > config > mode-dependent default
+unittest
+{
+    alias W = SandboxMode.workspace, O = SandboxMode.off, R = SandboxMode.readOnly;
+    alias S = SandboxSource;
+    // Nothing set: headless defaults to workspace, interactive stays off.
+    assert(resolveMode("", "", false, O, true) == ResolvedMode(W, S.headlessDefault));
+    assert(resolveMode("", "", false, O, false) == ResolvedMode(O, S.interactiveDefault));
+    // Explicit off at each level is respected in headless mode.
+    assert(resolveMode("off", "", false, O, true) == ResolvedMode(O, S.flag));
+    assert(resolveMode("", "off", false, O, true) == ResolvedMode(O, S.env));
+    assert(resolveMode("", "", true, O, true) == ResolvedMode(O, S.config));
+    // Higher levels win over lower ones.
+    assert(resolveMode("off", "read-only", true, W, true) == ResolvedMode(O, S.flag));
+    assert(resolveMode("read-only", "off", true, O, false) == ResolvedMode(R, S.flag));
+    assert(resolveMode("", "off", true, R, true) == ResolvedMode(O, S.env));
+    assert(resolveMode("", "workspace", true, O, false) == ResolvedMode(W, S.env));
+    assert(resolveMode("", "", true, R, false) == ResolvedMode(R, S.config));
+    import std.exception : assertThrown;
+    assertThrown(resolveMode("bogus", "", false, O, true));
+    // The config file distinguishes an explicit off from no setting.
+    import nano.toml : parseToml;
+    import nano.result : unwrap;
+    auto off = SandboxConfig.fromJSON(parseToml("mode = \"off\"").unwrap("valid TOML"));
+    assert(off.modeSet && off.mode == O);
+    assert(resolveMode("", "", off.modeSet, off.mode, true) == ResolvedMode(O, S.config));
+    auto none = SandboxConfig.fromJSON(parseToml("network = true").unwrap("valid TOML"));
+    assert(!none.modeSet);
+    assert(resolveMode("", "", none.modeSet, none.mode, true).mode == W);
+}
+
+// issue #118: a headless run with no sandbox configuration confines shell writes
+version (HasOsSandbox) unittest
+{
+    import std.file : exists;
+    auto ws = outsideDir(), other = outsideDir();
+    scope (exit) { rmTree(ws); rmTree(other); }
+    SandboxConfig c;
+    c.mode = resolveMode("", "", c.modeSet, c.mode, true).mode;
+    c.toolCaches = false;
+    assert(c.active);
+    auto target = other ~ "/escape.txt";
+    bool ok; string text;
+    if (run(c, ws, format(`echo x > %s 2>/dev/null; echo done`, target), ok, text))
+    {
+        assert(text.canFind("done"), text);
+        assert(!exists(target), "headless default sandbox let a write escape the workspace: " ~ text);
+    }
 }
 
 // rust: sandbox.rs::workspace_mode_confines_writes

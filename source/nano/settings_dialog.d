@@ -47,6 +47,8 @@ struct SettingsHost
     Config* cfg;
     NotNull!Agent agent;
     string configPath;
+    /// The effective sandbox mode and its source, shown read-only (#118).
+    string sandboxSummary;
     string[] delegate() @safe recents;
     /// Switches the session's model (recording it in recents); an error or null.
     string delegate(string spec) @safe switchModel;
@@ -162,6 +164,7 @@ string[] runSettings(SettingsUi ui, ref SettingsHost h)
     for (;;)
     {
         ui.say(format("\nSettings (%s):", h.configPath));
+        if (h.sandboxSummary.length) ui.say("Sandbox: " ~ h.sandboxSummary ~ " (set with --sandbox, NANO_CODER_SANDBOX or [sandbox])");
         auto items = [
             format("Model            %s (provider %s)", cfg.model, a.client.providerName),
             "Add or edit a provider",

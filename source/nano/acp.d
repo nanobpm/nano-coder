@@ -234,6 +234,8 @@ struct Host
     ConfiguredWindow delegate(string spec) providerWindowFor;
     /// The configured `model` and `system_prompt`, for `/settings`.
     string configModel, configSystemPrompt;
+    /// The effective sandbox mode and its source, for `/settings` (#118).
+    string sandboxMode, sandboxSource;
     /// Write `subagents = on` to the user config (`/subagents on|off --save`);
     /// returns where it saved or why it could not (starting "could not").
     /// Null: --save is refused.
@@ -827,6 +829,8 @@ final class AcpServer : AgentEvents
             import std.math : isNaN;
             JSONValue s = ["provider": agent.client.providerName, "provider_model": agent.client.modelName];
             s["model"] = host.configModel;
+            s["sandbox"] = host.sandboxMode;
+            s["sandbox_source"] = host.sandboxSource;
             auto temp = agent.temperatureNow;
             s["temperature"] = isNaN(temp.effective) ? JSONValue(null) : JSONValue(temp.effective);
             s["temperature_source"] = label(temp.source);
