@@ -124,12 +124,37 @@ string enforceSlashInvariant(ref string text) pure
 /// between the turn's start and end (input, output), summed over its model
 /// calls. A null JSON value when the provider reported nothing (the field is
 /// optional in ACP). Counters reset mid-turn by /clear never go negative.
-JSONValue turnUsage(const ulong[2] before, const ulong[2] after) pure
+///
+/// Extension: when a provider reported AI Credits during the turn (the
+/// session's count of credit reports changed, so a reported zero still
+/// counts), the credits used are added as `usage._meta.aic` so
+/// standard ACP clients ignore them. Sub-agent credits are included, as
+/// finished sub-agents roll their usage into the session counters.
+JSONValue turnUsage(const ulong[2] before, const ulong[2] after, const AicTotal aicBefore = AicTotal.init,
+    const AicTotal aicAfter = AicTotal.init) pure
 {
     auto input = saturatingSub(after[0], before[0]);
     auto output = saturatingSub(after[1], before[1]);
-    if (input == 0 && output == 0) return JSONValue(null);
-    return JSONValue(["inputTokens": input, "outputTokens": output, "totalTokens": input + output]);
+    immutable credits = aicAfter.reports != aicBefore.reports;
+    if (input == 0 && output == 0 && !credits) return JSONValue(null);
+    auto usage = JSONValue(["inputTokens": input, "outputTokens": output, "totalTokens": input + output]);
+    if (credits)
+    {
+        // A /clear mid-turn resets the session total: count what follows it.
+        immutable delta = aicAfter.reports > aicBefore.reports && aicAfter.aic >= aicBefore.aic
+            ? aicAfter.aic - aicBefore.aic : aicAfter.aic;
+        usage["_meta"] = JSONValue(["aic": delta]);
+    }
+    return usage;
+}
+
+/// A session's AI Credits total and how many model calls reported credits.
+struct AicTotal
+{
+    /// The number of credit reports so far.
+    ulong reports;
+    /// The credits used.
+    double aic = 0;
 }
 
 // rust: acp.rs::turn_usage_is_the_delta_of_the_session_counters
@@ -138,6 +163,46 @@ unittest
     assert(turnUsage([1_000, 50], [13_087, 54]) == JSONValue(["inputTokens": 12_087UL, "outputTokens": 4UL, "totalTokens": 12_091UL]));
     assert(turnUsage([10, 5], [10, 5]).type == JSONType.null_, "nothing reported, no usage field");
     assert(turnUsage([10, 5], [3, 7]) == JSONValue(["inputTokens": 0UL, "outputTokens": 2UL, "totalTokens": 2UL]));
+}
+
+// AI Credits: the turn's delta under `_meta.aic`, omitted when none reported.
+unittest
+{
+    import std.math : isClose;
+    // No provider reported credits: no `_meta`.
+    assert("_meta" !in turnUsage([0, 0], [10, 2], AicTotal(), AicTotal()));
+    // First credits this session.
+    auto u = turnUsage([0, 0], [10, 2], AicTotal(), AicTotal(1, 0.25));
+    assert(u["inputTokens"].get!ulong == 10 && isClose(u["_meta"]["aic"].get!double, 0.25));
+    // The delta over an earlier total.
+    u = turnUsage([10, 2], [30, 4], AicTotal(1, 0.25), AicTotal(2, 0.75));
+    assert(isClose(u["_meta"]["aic"].get!double, 0.5));
+    // No credit report this turn (the session total is sticky): omitted.
+    assert("_meta" !in turnUsage([10, 2], [30, 4], AicTotal(1, 0.25), AicTotal(1, 0.25)));
+    // An explicit zero report: included as 0.
+    u = turnUsage([10, 2], [30, 4], AicTotal(1, 0.25), AicTotal(2, 0.25));
+    assert(u["_meta"]["aic"].get!double == 0);
+    // Credits with no tokens: usage still carries the three counts (ACP requires them).
+    u = turnUsage([10, 2], [10, 2], AicTotal(1, 0.25), AicTotal(2, 0.5));
+    assert(u["totalTokens"].get!ulong == 0 && isClose(u["_meta"]["aic"].get!double, 0.25));
+    // Reset mid-turn by /clear: counts what follows.
+    u = turnUsage([10, 2], [5, 1], AicTotal(3, 0.75), AicTotal(1, 0.1));
+    assert(isClose(u["_meta"]["aic"].get!double, 0.1));
+}
+
+// A turn whose credits come only from a sub-agent: its usage rolls into the
+// parent's session counters, so the turn's usage reports it.
+unittest
+{
+    import std.math : isClose;
+    import nano.subagent : SubResult;
+    SubResult r;
+    r.hasAic = true;
+    r.aic = 0.4;
+    auto tu = r.usage;
+    auto u = turnUsage([100, 10], [400, 40], AicTotal(),
+        AicTotal(tu.hasAic ? 1 : 0, tu.aic));
+    assert(u["totalTokens"].get!ulong == 330 && isClose(u["_meta"]["aic"].get!double, 0.4));
 }
 
 /// Whether `msg` is a JSON-RPC 2.0 request or notification.
@@ -1325,6 +1390,7 @@ final class AcpServer : AgentEvents
         peerRouter.midTurn(true);
         scope (exit) peerRouter.midTurn(false);
         immutable ulong[2] tokensBefore = [agent.sessionInputTokens, agent.sessionOutputTokens];
+        immutable aicBefore = AicTotal(agent.aicReports, agent.sessionAic);
         string response;
         try response = agent.run(text, this, false, givenId, fromPeer, peerSender);
         catch (Exception e)
@@ -1342,7 +1408,8 @@ final class AcpServer : AgentEvents
                 auto reply = JSONValue(["stopReason": stop, "response": response]);
                 // Extension: the model's explicit completed/blocked report.
                 if (agent.hasOutcome && stop == "end_turn") reply["_meta"] = JSONValue(["outcome": agent.lastOutcome.toJSON]);
-                auto usage = turnUsage(tokensBefore, [agent.sessionInputTokens, agent.sessionOutputTokens]);
+                auto usage = turnUsage(tokensBefore, [agent.sessionInputTokens, agent.sessionOutputTokens],
+                    aicBefore, AicTotal(agent.aicReports, agent.sessionAic));
                 if (usage.type != JSONType.null_) reply["usage"] = usage;
                 send(rpcResult(id, reply));
             }

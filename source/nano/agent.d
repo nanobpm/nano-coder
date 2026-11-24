@@ -560,6 +560,9 @@ class Agent
     /// AI Credits used this session; `hasSessionAic` once a provider reported any.
     bool hasSessionAic;
     double sessionAic = 0;
+    /// How many model calls (sub-agents included) reported AI Credits this
+    /// session, so a turn reporting zero credits is told apart from one reporting none.
+    ulong aicReports;
     /// Called after every compaction with its report (the UI prints it).
     void delegate(const ref CompactReport) onCompacted;
     /// Usage-anchored estimate: messages[0 .. calibLen] cost `calibTokens`.
@@ -2459,6 +2462,7 @@ class Agent
         {
             hasSessionAic = true;
             sessionAic += u.aic;
+            aicReports++;
         }
     }
 
@@ -2469,6 +2473,7 @@ class Agent
         sessionInputTokens = sessionOutputTokens = 0;
         hasSessionAic = false;
         sessionAic = 0;
+        aicReports = 0;
         compactions = 0;
     }
 

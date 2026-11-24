@@ -130,6 +130,12 @@ the effective mode and its source go to stderr (`nano-coder: sandbox workspace
   killed, remaining tool calls are recorded as cancelled, and the turn's
   `session/prompt` resolves with `stopReason: "cancelled"`
 
+**Usage.** A `session/prompt` result carries `usage` (`inputTokens`, `outputTokens`,
+`totalTokens`) for the turn, including finished sub-agents, when the provider reported
+tokens. When a provider reported AI Credits during the turn, `usage._meta.aic` holds the
+credits the turn used (sub-agents included); it is omitted otherwise, and standard ACP
+clients ignore it.
+
 **Steering.** A `session/prompt` for the active session that arrives while a turn is
 running is a steer, not a queued prompt. It is added as a user message before the next
 model call (echoed as a `user_message_chunk`) and answered when the turn ends with
