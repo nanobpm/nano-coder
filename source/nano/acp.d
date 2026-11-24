@@ -808,8 +808,24 @@ final class AcpServer : AgentEvents
     {
         import std.file : getcwd;
         if (auto why = agent.setName(handle)) return why;
-        if (host.systemPrompt !is null) agent.installSystem(host.systemPrompt(getcwd()), agent.indexShown);
+        reinstallPrompt();
         return null;
+    }
+
+    /// Re-render the system prompt (handle included) for the session's
+    /// current mode, not the startup one.
+    private void reinstallPrompt()
+    {
+        import std.file : getcwd;
+        import nano.mode : AgentMode;
+        if (host.modeSystemPrompt !is null)
+        {
+            immutable plan = agent.control.mode == AgentMode.plan;
+            agent.installSystem(host.modeSystemPrompt(getcwd(), plan), agent.indexShown);
+            agent.promptPlan = plan;
+        }
+        else if (host.systemPrompt !is null)
+            agent.installSystem(host.systemPrompt(getcwd()), agent.indexShown);
     }
 
     /// Slash commands available over ACP; JSONValue.init when `text` isn't one.
@@ -1139,8 +1155,7 @@ final class AcpServer : AgentEvents
         // still carry the previous session's handle.
         string refused;
         if (host.name.length) refused = renameSession(host.name);
-        if ((!host.name.length || refused !is null) && host.systemPrompt !is null)
-            agent.installSystem(host.systemPrompt(getcwd()), agent.indexShown);
+        if (!host.name.length || refused !is null) reinstallPrompt();
         startPeerListener();
         if (host.loadHooks !is null) agent.useHooks(host.loadHooks(getcwd()), true);
         replayHistory();

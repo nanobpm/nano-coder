@@ -2781,7 +2781,8 @@ class Agent
         // Without a log the handle can be neither claimed nor resumed.
         if (log.isNone) return "sessions are not saved (--no-session or persist_sessions = false)";
         string refused;
-        log.ifSome((SessionLog l) { refused = claim(peers.peersDir(), sessionDirOf(l), handle, l.id); });
+        string claimedId;
+        log.ifSome((SessionLog l) { claimedId = l.id; refused = claim(peers.peersDir(), sessionDirOf(l), handle, l.id); });
         if (refused !is null) return refused;
         immutable changed = name != handle;
         if (record && changed)
@@ -2801,6 +2802,16 @@ class Agent
                 }
             });
             if (failed !is null) return failed;
+            // The write may have recovered the log to a new id (no hook
+            // moves this not-yet-live claim): move the claim to the final
+            // id, or discovery misses it and another session can take it.
+            string moved;
+            log.ifSome((SessionLog l) {
+                if (l.id == claimedId) return;
+                moved = claim(peers.peersDir(), sessionDirOf(l), handle, l.id);
+                release(peers.peersDir(), handle, claimedId);
+            });
+            if (moved !is null) return "can't keep the handle after the log moved: " ~ moved;
         }
         if (name.length && changed) releaseName();
         name = handle;

@@ -2613,10 +2613,12 @@ string nameCommand(Agent agent, string arg)
     if (!arg.length) return describe(agent.name);
     if (arg == "--clear")
     {
-        if (!agent.name.length) return "This session has no handle";
+        // Clear even with no live name: a handle refused on restore is
+        // still in the log, and only the clearing record stops a resume
+        // from bringing it back.
         auto old = agent.name;
         if (auto why = agent.setName(null)) return "Can't clear the handle: " ~ why;
-        return format("Handle %s removed", old);
+        return old.length ? format("Handle %s removed", old) : "This session has no handle";
     }
     if (auto why = agent.setName(arg)) return format("Can't name this session %s: %s", arg, why);
     return format("This session is now %s: session_send to \"%s\" reaches it, nano-coder --resume=%s resumes it",
