@@ -4451,7 +4451,10 @@ int runMain(string[] args)
             cfg.contextWindow = resumedContextWindow(cfg.contextWindow, runtimeDefaults.contextWindow, false, true, st.contextWindow,
                 st.contextWindowFromProvider);
             if (st.contextWindow > 0)
-                agent.setConfiguredWindow(ConfiguredWindow(toSize(st.contextWindow), "the session's settings"));
+                // Keep a provider snapshot's source, so re-recording it (e.g.
+                // `--resume -m <same model>`) keeps the provider mark.
+                agent.setConfiguredWindow(ConfiguredWindow(toSize(st.contextWindow),
+                    st.contextWindowFromProvider ? "provider context_window" : "the session's settings"));
             else
             {
                 // 0 is "from provider/model" (as `/settings` offers it): the
