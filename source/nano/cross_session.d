@@ -45,6 +45,9 @@ struct SessionInfo
     string createdAt;
     /// When the log was last written (RFC 3339).
     string lastUsed;
+    /// `lastUsed` as absolute hnsecs (`SysTime.stdTime`): the sort key, since
+    /// local-time strings misorder across a DST fallback.
+    long lastUsedTime;
     /// The log file `history_search`/`history_read` stream.
     string path;
     /// A process currently has the log open (it holds the log's flock).
@@ -81,6 +84,7 @@ private SessionInfo infoOf(Summary s, bool live) @safe
     i.name = s.name;
     i.createdAt = s.createdAt;
     i.lastUsed = stamp(s.lastUsed);
+    i.lastUsedTime = s.lastUsed.stdTime;
     i.path = s.path;
     i.live = live;
     return i;
@@ -146,7 +150,8 @@ SessionInfo[] listSessions(ref Policy policy, string dir, string cwd, string fil
     auto handles = runningHandles(peersDir(), dir);
     bool matches(const ref SessionInfo i, string f)
     {
-        return i.id.toLower.canFind(f) || i.title.toLower.canFind(f) || (i.name.length && i.name.canFind(f))
+        return i.id.toLower.canFind(f) || i.title.toLower.canFind(f)
+            || (i.title.length && shortTitle(i.title).toLower.canFind(f)) || (i.name.length && i.name.canFind(f))
             || (i.cwd.length && i.cwd.toLower.canFind(f));
     }
     // Deny before the index opens or reports a log (issue #271): the header's
@@ -213,6 +218,17 @@ private SessionInfo[] listeningWithoutPrompts(string dir, const SessionInfo[] kn
         i.live = true;
         i.messages = true;
         i.cwd = logHeaderCwd(path);
+        // Its activity is the log's mtime, as the index uses for others, so
+        // a just-opened listener sorts by when it was last written.
+        try
+        {
+            import std.file : timeLastModified;
+            import nano.session : stamp;
+            auto t = timeLastModified(path);
+            i.lastUsed = stamp(t);
+            i.lastUsedTime = t.stdTime;
+        }
+        catch (FileException) {} // vanished since the probe: sorts last
         out_ ~= i;
     }
     return out_;
@@ -424,23 +440,28 @@ SessionInfo[] selectSessions(SessionInfo[] sessions, bool live, bool messages) p
 {
     import std.algorithm : filter, sort, SwapStrategy;
     auto out_ = sessions.filter!(i => (!live || i.live) && (!messages || i.messages)).array;
-    out_.sort!((a, b) => a.live != b.live ? a.live : a.lastUsed > b.lastUsed, SwapStrategy.stable);
+    out_.sort!((a, b) => a.live != b.live ? a.live : a.lastUsedTime > b.lastUsedTime, SwapStrategy.stable);
     return out_;
 }
 
 unittest
 {
-    SessionInfo s(string id, bool live, bool msgs, string used)
+    SessionInfo s(string id, bool live, bool msgs, long used)
     {
         SessionInfo i;
-        i.id = id; i.live = live; i.messages = msgs; i.lastUsed = used;
+        i.id = id; i.live = live; i.messages = msgs; i.lastUsedTime = used;
         return i;
     }
-    auto all = [s("a", false, false, "2026-01-03"), s("b", true, false, "2026-01-01"),
-        s("c", true, true, "2026-01-02"), s("d", false, false, "2026-01-04")];
+    auto all = [s("a", false, false, 3), s("b", true, false, 1),
+        s("c", true, true, 2), s("d", false, false, 4)];
     assert(selectSessions(all, false, false).map!(i => i.id).array == ["c", "b", "d", "a"]);
     assert(selectSessions(all, true, false).map!(i => i.id).array == ["c", "b"]);
     assert(selectSessions(all, false, true).map!(i => i.id).array == ["c"]);
+    // DST fallback: the absolute time orders, not the local-time string.
+    auto later = s("later", false, false, 20), earlier = s("earlier", false, false, 10);
+    later.lastUsed = "2026-11-01T01:15:00-05:00";
+    earlier.lastUsed = "2026-11-01T01:45:00-04:00";
+    assert(selectSessions([earlier, later], false, false).map!(i => i.id).array == ["later", "earlier"]);
 }
 
 /// `needle` as one session: an exact id, a handle (issue #300), a unique id
@@ -478,14 +499,16 @@ SessionInfo resolve(string needle, SessionInfo[] sessions, scope const(SessionIn
     foreach (i; sessions)
     {
         if (i.id == needle) return i;
-        if (i.id.startsWith(needle) || (i.title.length && i.title.toLower.canFind(needle.toLower)))
+        if (i.id.startsWith(needle) || (i.title.length && (i.title.toLower.canFind(needle.toLower)
+                || shortTitle(i.title).toLower.canFind(needle.toLower))))
             candidates ~= i;
     }
     // Case-insensitive exact titles beat the other substring matches; several
     // sessions may share one title (identical first-request fallbacks too).
     SessionInfo[] exact;
     foreach (ref c; candidates)
-        if (c.title.toLower == needle.toLower) exact ~= c;
+        if (c.title.toLower == needle.toLower
+            || (c.title.length && shortTitle(c.title).toLower == needle.toLower)) exact ~= c;
     if (exact.length) candidates = exact;
     if (candidates.length == 1) return candidates[0];
     if (!candidates.length)
@@ -628,6 +651,9 @@ unittest
         auto ss = listSessions(noRules, dir, alpha);
         assert(resolve(longTitle, ss).id == "sess-long", "a >120-byte title resolves");
         assert(listSessions(noRules, dir, alpha, "tailword").length == 1, "filter sees past the cap");
+        auto shown = shortTitle(longTitle);
+        assert(resolve(shown, ss).id == "sess-long", "the displayed short title resolves");
+        assert(listSessions(noRules, dir, alpha, shown).length == 1, "filter matches the displayed title");
         { import std.file : remove; import std.algorithm : filter; remove(ss.filter!(x => x.id == "sess-long").front.path); }
     }
 

@@ -97,7 +97,8 @@ unittest
     auto agent = compacted(root, workspace, mock);
 
     agent.run("list the sessions", new NullEvents);
-    assert(lastToolResult(mock).canFind("sess-other") && lastToolResult(mock).canFind("[live]"), lastToolResult(mock));
+    assert(lastToolResult(mock).canFind("sess-other") && (lastToolResult(mock).canFind("[live]")
+        || lastToolResult(mock).canFind("[live pid ")), lastToolResult(mock));
 
     agent.run("search the other session", new NullEvents);
     assert(lastToolResult(mock).canFind("error[E0308]") && lastToolResult(mock).canFind("#6 tool bash"), lastToolResult(mock));
