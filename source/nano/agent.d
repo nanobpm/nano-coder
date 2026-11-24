@@ -469,6 +469,17 @@ class Agent
         configuredWindow = w.tokens;
         if (w.source.length) configuredWindowSource = w.source;
     }
+
+    /// Apply a configured window restored from a session record (issue
+    /// #297). Clearing a positive window re-probes the endpoint: the probe
+    /// made under the old window skipped window detection, so without it the
+    /// session would fall back to a model-name estimate.
+    void restoreConfiguredWindow(ConfiguredWindow w)
+    {
+        const cleared = configuredWindow > 0 && w.tokens == 0;
+        setConfiguredWindow(w);
+        if (cleared) refreshCapabilities();
+    }
     /// Learned from a context-overflow error (0: none).
     size_t learnedWindow;
     /// Compactions this session.

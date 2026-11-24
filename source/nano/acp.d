@@ -1202,8 +1202,8 @@ final class AcpServer : AgentEvents
             import std.exception : collectException;
             ConfiguredWindow w;
             auto spec = agent.client.providerName ~ "/" ~ agent.client.modelName;
-            if (host.providerWindowFor is null) agent.setConfiguredWindow(defaultConfiguredWindow);
-            else if (collectException(w = host.providerWindowFor(spec)) is null) agent.setConfiguredWindow(w);
+            if (host.providerWindowFor is null) agent.restoreConfiguredWindow(defaultConfiguredWindow);
+            else if (collectException(w = host.providerWindowFor(spec)) is null) agent.restoreConfiguredWindow(w);
         }
     }
 

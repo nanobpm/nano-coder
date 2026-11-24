@@ -1363,6 +1363,24 @@ struct RuntimeDefaults
             c.autoCompactThreshold, c.contextWindow);
     }
 
+    /// These defaults with only the fields a save wrote (`ch`) taken from
+    /// `c`: unsaved edits left in `c` by an earlier visit stay out, so a
+    /// resume or `/restart` still treats them as session-only overrides.
+    RuntimeDefaults refreshed(const ref Config c, const ref imported!"nano.settings".Changes ch) const pure nothrow @nogc
+    {
+        RuntimeDefaults r = this;
+        if (ch.verbosity) r.verbosity = c.verbosity;
+        if (ch.subagents) r.subagents = c.subagents;
+        if (ch.compaction)
+        {
+            r.compactionMode = c.compactionMode;
+            r.autoCompact = c.autoCompact;
+            r.autoCompactThreshold = c.autoCompactThreshold;
+            r.contextWindow = c.contextWindow;
+        }
+        return r;
+    }
+
     /// The configured window under these defaults for a provider whose own
     /// `context_window` is `providerWindow` (0: none), as `windowFor`
     /// resolves it.
@@ -1372,6 +1390,40 @@ struct RuntimeDefaults
         if (providerWindow > 0) return ConfiguredWindow(toSize(providerWindow), "provider context_window");
         return ConfiguredWindow.init;
     }
+}
+
+unittest // RuntimeDefaults.refreshed: only fields the save wrote become defaults
+{
+    import nano.settings : Changes;
+    Config cfg;
+    cfg.verbosity = Verbosity.normal;
+    cfg.contextWindow = 100_000;
+    cfg.compactionMode = "smart";
+    auto d = RuntimeDefaults.of(cfg);
+    // An unsaved Context edit, then a verbosity-only save.
+    cfg.contextWindow = 0;
+    cfg.compactionMode = "extract";
+    cfg.verbosity = Verbosity.verbose;
+    Changes ch;
+    ch.verbosity = true;
+    auto r = d.refreshed(cfg, ch);
+    assert(r.verbosity == Verbosity.verbose);
+    assert(r.contextWindow == 100_000 && r.compactionMode == "smart", "unsaved Context edits stay out");
+    ch.compaction = true;
+    r = d.refreshed(cfg, ch);
+    assert(r.contextWindow == 0 && r.compactionMode == "extract");
+}
+
+unittest // retainedRestartSettings: a cleared window over a saved one is recorded whatever its source label
+{
+    import nano.context : CompactionMode;
+    Config cfg;
+    cfg.contextWindow = 100_000;
+    auto d = RuntimeDefaults.of(cfg);
+    bool hasAny;
+    auto s = retainedRestartSettings(d, d.verbosity, d.subagents, CompactionMode.smart, d.autoCompact,
+        d.autoCompactThreshold, 0, "context_window in config", hasAny);
+    assert(hasAny && s.contextWindow == 0);
 }
 
 /// The configured window a session record of `context_window = 0` restores
@@ -1470,8 +1522,9 @@ SessionSettings retainedRestartSettings(const ref RuntimeDefaults d, Verbosity l
         s.contextWindow = liveConfiguredWindow.to!long;
         hasAny = true;
     }
-    else if (d.contextWindow > 0 && liveConfiguredWindowSource != "context_window in config"
-        && liveConfiguredWindowSource != "the session's settings")
+    else if (d.contextWindow > 0 && (liveConfiguredWindow == 0
+        || (liveConfiguredWindowSource != "context_window in config"
+            && liveConfiguredWindowSource != "the session's settings")))
     {
         // `/settings` set 0 ("from provider/model") over a saved top-level
         // window: record 0 so a resume uses the provider's window too.
@@ -4073,7 +4126,7 @@ int runMain(string[] args)
             {
                 // 0 is "from provider/model" (as `/settings` offers it): the
                 // provider's own window, not the top-level `context_window`.
-                agent.setConfiguredWindow(providerWindow(cfg.providers.get(client.providerName, ProviderConfig.init).contextWindow));
+                agent.restoreConfiguredWindow(providerWindow(cfg.providers.get(client.providerName, ProviderConfig.init).contextWindow));
             }
         }
         // The warnings `/model` and `/thinking` show for the restored values.
@@ -4184,7 +4237,7 @@ int runMain(string[] args)
             logVerbosityIfChanged();
         };
         h.logSettings = (const SessionSettings s) { logSessionSettings(s); };
-        h.onSaved = () { runtimeDefaults = RuntimeDefaults.of(cfg); };
+        h.onSaved = (const ref imported!"nano.settings".Changes saved) { runtimeDefaults = runtimeDefaults.refreshed(cfg, saved); };
         return h;
     }
 
