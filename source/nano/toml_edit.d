@@ -201,7 +201,13 @@ private size_t valueEnd(const string[] lines, size_t row, size_t col, out size_t
             if (c == '"' || c == '\'') { inStr = true; quote = c; continue; }
             if (c == '[' || c == '{') depth++;
             else if (c == ']' || c == '}') depth--;
-            else if (c == '#' && depth == 0) { endRow = r; return i; }
+            else if (c == '#')
+            {
+                // A comment runs to the end of the line at any depth: its
+                // brackets and quotes are text, not structure.
+                if (depth == 0) { endRow = r; return i; }
+                break;
+            }
             if (depth == 0 && i + 1 == l.length) { endRow = r; return l.length; }
         }
         if (depth <= 0) { endRow = r; return l.length; }
@@ -226,8 +232,11 @@ Result!(string, string) tomlSet(string doc, const string[] path, string key, str
     size_t end = lines.length;
     string[] current;
     bool inside = !path.length;
+    // Rows inside a multi-line string or array are text, never a header or key.
+    auto stmt = statementRows(lines);
     foreach (i, l; lines)
     {
+        if (!stmt[i]) continue;
         auto h = headerPath(l);
         if (h is null && !l.strip.startsWith("[[")) continue;
         if (inside) { end = i; break; }
@@ -241,6 +250,7 @@ Result!(string, string) tomlSet(string doc, const string[] path, string key, str
             // inside it, keeping the rest of the line.
             foreach (i, l; lines)
             {
+                if (!stmt[i]) continue;
                 auto k = lineKey(l);
                 if (k is null) continue;
                 auto h = tableAt(lines, i);
@@ -260,6 +270,7 @@ Result!(string, string) tomlSet(string doc, const string[] path, string key, str
         // redefinition: refuse rather than corrupt the file.
         foreach (i, l; lines)
         {
+            if (!stmt[i]) continue;
             auto k = lineKey(l);
             if (k is null) continue;
             auto h = tableAt(lines, i);
@@ -276,6 +287,7 @@ Result!(string, string) tomlSet(string doc, const string[] path, string key, str
     }
     foreach (i; toSize(start) .. end)
     {
+        if (!stmt[i]) continue;
         auto k = lineKey(lines[i]);
         if (k == "\0" ~ key)
             return R.err(format("%s is written as a dotted key; edit it by hand", key));
@@ -300,7 +312,7 @@ Result!(string, string) tomlSet(string doc, const string[] path, string key, str
     // Insert after the table's last key line (before trailing blanks/comments).
     size_t at = start;
     foreach (i; toSize(start) .. end)
-        if (lineKey(lines[i]) !is null) { size_t er; valueEnd(lines, i, lines[i].indexOf('=') + 1, er); at = er + 1; }
+        if (stmt[i] && lineKey(lines[i]) !is null) { size_t er; valueEnd(lines, i, lines[i].indexOf('=') + 1, er); at = er + 1; }
     auto res = lines[0 .. at] ~ [tomlKey(key) ~ " = " ~ value] ~ lines[at .. $];
     return R.ok(res.join("\n") ~ "\n");
 }
@@ -424,4 +436,19 @@ unittest
     assert(tomlSet("a.b = 1\n", ["c"], "k", "1").unwrap("editable") == "a.b = 1\n\n[c]\nk = 1\n");
     assert(tomlSet("[providers]\nx = { kind = \"openai\" }\n", ["providers", "x"], "kind", `"a"`).isErr);
     assert(tomlSet("[providers]\n", ["providers", "x"], "kind", `"a"`).unwrap("editable") == "[providers]\n\n[providers.x]\nkind = \"a\"\n");
+}
+
+// A root-key removal leaves a key-looking line inside a multi-line string alone.
+unittest
+{
+    auto doc = "system_prompt = \"\"\"\nsubagent_models = [{ model = \"x\" }]\n\"\"\"\nsubagent_models = []\n";
+    assert(tomlSet(doc, [], "subagent_models", null).unwrap("valid")
+        == "system_prompt = \"\"\"\nsubagent_models = [{ model = \"x\" }]\n\"\"\"\n");
+}
+
+// A bracket in a comment inside a multi-line array doesn't swallow later headers.
+unittest
+{
+    auto lines = ["files = [ # [", "  \"a\",", "]", "[[subagent_models]]", "model = \"m\""];
+    assert(statementRows(lines) == [true, false, false, true, true]);
 }

@@ -647,3 +647,21 @@ unittest
     c.subagentModel = "b/y";
     assert(applyChanges("", c, ch, null).canFind(`subagent_model = "b/y"`));
 }
+
+// Saving candidate edits keeps a multi-line prompt's key-looking text, and a
+// commented multi-line array doesn't hide the candidate tables after it.
+unittest
+{
+    import std.algorithm : canFind, count;
+    import nano.config : SubagentModel;
+    auto doc = "system_prompt = \"\"\"\nsubagent_models = [{ model = \"x\" }]\n\"\"\"\n"
+        ~ "files = [ # [\n  \"a\",\n]\n\n[[subagent_models]]\nmodel = \"old\"\n";
+    Config c;
+    c.subagentModels = [SubagentModel("new/m", "", 0, 0, 0)];
+    Changes ch;
+    ch.subagentModels = true;
+    auto text = applyChanges(doc, c, ch, null);
+    assert(text.canFind("\"\"\"\nsubagent_models = [{ model = \"x\" }]\n\"\"\""), text);
+    assert(!text.canFind("\"old\""), text);
+    assert(text.count("[[subagent_models]]") == 1, text);
+}
