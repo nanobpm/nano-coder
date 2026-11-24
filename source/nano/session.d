@@ -11,6 +11,7 @@ import nano.clock : wallNow;
 
 import nano.safeio : readBytes, jsonUnsigned;
 import nano.arith : toSize;
+import nano.loghandles : Held, openHere, shareHandle;
 import std.string : representation;
 
 import std.json;
@@ -886,6 +887,10 @@ class SessionLog
     /// so the owner can move state keyed on the id (the handle claim). Runs
     /// on the append path: whatever it throws is swallowed.
     void delegate(string oldId, string newId) onIdChange;
+    /// Like `onIdChange`, for the peer listener (issue #338): it moves the
+    /// session's socket to the new id. A separate slot so the handle claim
+    /// and the listener don't overwrite each other's hook.
+    void delegate(string oldId, string newId) onIdChangeListener;
 
     /// Show `msg` to the user: through `warn` when set, else on stderr.
     void report(string msg)
@@ -1057,6 +1062,12 @@ class SessionLog
             import std.exception : collectException;
             // The recovery already succeeded: a failing hook must not fail the write.
             if (auto e = collectException(onIdChange(oldId, id))) report("WARNING: " ~ e.msg);
+        }
+        if (id != oldId && onIdChangeListener)
+        {
+            import std.exception : collectException;
+            // As above: the recovery succeeded whatever the hook does.
+            if (auto e = collectException(onIdChangeListener(oldId, id))) report("WARNING: " ~ e.msg);
         }
     }
 
@@ -2643,20 +2654,6 @@ private LockResult tryLock(ref File f) @trusted
         if (err == EINTR) continue;
         return err == EWOULDBLOCK || err == EAGAIN ? LockResult.contended : LockResult.unsupported;
     }
-}
-
-/// A locked log handle shared by this thread's writers of one path.
-private struct Held { File file; size_t refs; }
-
-/// Logs this thread holds open and locked, so an in-process reopen shares
-/// the locked handle instead of opening an unlocked second description.
-private Held*[string] openHere;
-
-private Held* shareHandle(string path, File f)
-{
-    auto h = new Held(f, 1);
-    openHere[path] = h;
-    return h;
 }
 
 /// Every byte `f` holds, read from its start (the position is left at EOF).

@@ -41,6 +41,7 @@ static import nano.keycmd;
 static import nano.landlock;
 static import nano.lineedit;
 static import nano.llm;
+static import nano.loghandles;
 static import nano.markdown;
 static import nano.mdblock;
 static import nano.mdinline;
@@ -136,6 +137,7 @@ private alias modules = imported!"std.meta".AliasSeq!(
     nano.landlock,
     nano.lineedit,
     nano.llm,
+    nano.loghandles,
     nano.markdown,
     nano.mdblock,
     nano.mdinline,
