@@ -30,6 +30,10 @@ private enum maxResumeArgs = 64, maxResumeBytes = 8 * 1024;
 
 enum State { idle, working, blocked }
 
+/// Set to the pid of the nano-coder reporting to the Herdr pane; inherited by
+/// every process it starts, so a nested nano-coder leaves the pane alone.
+enum ownerVar = "NANO_CODER_HERDR_OWNER";
+
 /// The pane this process reports to, from Herdr's environment.
 struct Pane
 {
@@ -37,8 +41,20 @@ struct Pane
 
     static Pane fromEnv(scope string delegate(string) @safe get, out bool found)
     {
+        return fromEnv(get, 0, found);
+    }
+
+    /// ditto, for process `pid`: a pane already claimed by another
+    /// nano-coder process (`ownerVar` set to a different pid) is not this
+    /// process's, so a nested nano-coder (started from the bash tool, a hook
+    /// or a script) doesn't report to, and release, its parent's pane. The
+    /// same pid is the process itself after a `/relaunch` exec.
+    static Pane fromEnv(scope string delegate(string) @safe get, long pid, out bool found)
+    {
         found = false;
         if (get("HERDR_ENV") != "1") return Pane.init;
+        auto owner = get(ownerVar);
+        if (pid != 0 && owner.length && owner != pid.to!string) return Pane.init;
         auto bin = get("HERDR_BIN_PATH"), id = get("HERDR_PANE_ID");
         if (!bin.length || !id.length) return Pane.init;
         found = true;
@@ -308,10 +324,13 @@ void start()
 void start(scope string delegate(string) @safe get)
 {
     import nano.safeio : spawnDaemon;
+    import std.process : environment, thisProcessID;
     if (!cas(&gStarted, false, true)) return;
     bool found;
-    auto pane = Pane.fromEnv(get, found);
+    auto pane = Pane.fromEnv(get, thisProcessID, found);
     if (!found) return;
+    // Children inherit the claim; the herdr CLI variables stay usable.
+    environment[ownerVar] = thisProcessID.to!string;
     Reporter r;
     r.pane = pane;
     atomicStore(gReporter, new shared Locked!Reporter(r));
@@ -385,6 +404,20 @@ void showName(string handle)
         r.curName = handle;
         queueModel(r, metaKey(r.curName, r.curModel));
     });
+}
+
+/// Forget what metadata (name, model, timer) was sent, so the next
+/// `showName`/`showModel`/`showTimer` re-sends it. Called once per turn:
+/// something else (another process in the pane) may have cleared it.
+void refreshMetadata()
+{
+    if (!active) return;
+    atomicLoad(gReporter).update((ref Reporter r) { forgetMetadata(r); });
+}
+
+private void forgetMetadata(ref Reporter r)
+{
+    r.hasLastModel = r.hasLastTimer = false;
 }
 
 /// ditto, for callers that only track the model.
@@ -720,4 +753,35 @@ unittest // release clears a model whose pending clear was never sent
     bool shown;
     beginRelease(r, shown);
     assert(shown);
+}
+
+unittest // a pane claimed by another nano-coder is not reported to; the owner itself (after exec) is
+{
+    auto full = ["HERDR_ENV": "1", "HERDR_BIN_PATH": "/bin/herdr", "HERDR_PANE_ID": "p1"];
+    string delegate(string) @safe env(string[string] m) { return (string k) => m.get(k, null); }
+    bool found;
+    Pane.fromEnv(env(full), 42, found);
+    assert(found);
+    auto nested = full.dup;
+    nested[ownerVar] = "7";
+    Pane.fromEnv(env(nested), 42, found);
+    assert(!found);
+    Pane.fromEnv(env(nested), 7, found);
+    assert(found);
+}
+
+unittest // a metadata clear from outside is repaired: refreshing re-sends name and model
+{
+    Reporter r;
+    queueModel(r, metaKey("probe", "gpt-5"));
+    string m;
+    assert(takeModel(r, m) && m == metaKey("probe", "gpt-5"));
+    r.modelInFlight = false;
+    queueModel(r, metaKey("probe", "gpt-5"));
+    assert(!r.hasPendingModel);
+    forgetMetadata(r);
+    queueModel(r, metaKey("probe", "gpt-5"));
+    assert(takeModel(r, m) && m == metaKey("probe", "gpt-5"));
+    queueTimer(r, false);
+    assert(r.hasPendingTimer);
 }

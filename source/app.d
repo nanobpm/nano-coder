@@ -4972,6 +4972,8 @@ int runMain(string[] args)
                 else nano.herdr.report(nano.herdr.State.idle);
             }
             else nano.herdr.report(nano.herdr.State.idle);
+            // Re-sent every turn: a process in the pane may have cleared it.
+            nano.herdr.refreshMetadata();
             nano.herdr.showName(agent.name);
             nano.herdr.showModel(agent.client.modelName);
             nano.herdr.showTimer(!agent.timers.empty);
@@ -5248,11 +5250,11 @@ int runMain(string[] args)
                     writefln("\nRelaunching into session %s (resume later with nano-coder --resume %s)", id, id);
                     stdOut.flush();
                     leaveKeyMode();
-                    nano.herdr.release();
+                    // No Herdr release: the same pane goes on with the same
+                    // session, and the exec'd process reports at its first idle.
                     auto err = execProgram(exe, [exe] ~ relaunchArgv(withCurrentSettings(args[1 .. $],
                         agent.client.providerName ~ "/" ~ agent.client.modelName, nano.ui.name(verbosity()),
                         agent.control.mode == AgentMode.plan), id));
-                    nano.herdr.reacquire();
                     enterKeyMode(0);
                     if (gFrame) gFrame.resume();
                     writefln("Relaunch failed: could not exec %s: %s", exe, err);
