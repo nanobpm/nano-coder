@@ -1608,9 +1608,10 @@ a saved session: with `--no-session` or `persist_sessions = false` it is refused
   recorded in the peer registry (`<peers dir>/<handle>.name`, with the holder's session
   directory, so sessions with different `session_dir`s still can't share a handle).
 - **Resolution order.** `session_send`'s `to`, the history tools' `session`, `--resume` and
-  `/resume` try, in order: a handle (a running holder first, then the newest stopped one),
-  an exact id, a unique id prefix, then a title. A handle always beats a title that
-  happens to be the same word.
+  `/resume` try, in order: an exact session id, a handle (a running holder first, then
+  the newest stopped one), a unique id prefix, then a title. A handle always beats a title
+  that happens to be the same word, and a handle can't look like a session id (`sess-…`
+  is refused), so an id and a handle never compete.
 - **Visible.** The status bar shows `@perf`, `/session` and the exit message show it (the
   exit message suggests `--resume=perf` when no other saved session used the handle), a
   sent message is labelled `[from perf · …]`, `sessions_list` marks it `[name: perf]`, the

@@ -240,7 +240,7 @@ string listResult(ref Policy policy, string dir, string cwd, JSONValue args) @sa
     return truncateOutputBytes(sessions.map!lineOf.array.join("\n"), defaultMaxOutput, "sessions-list");
 }
 
-/// `needle` as one session: a handle (issue #300), an exact id, a unique id
+/// `needle` as one session: an exact id, a handle (issue #300), a unique id
 /// prefix, or a title match
 /// (case-insensitive; every exact-title match beats any substring match, so
 /// two sessions sharing a title report ambiguity instead of silently picking
@@ -254,8 +254,12 @@ SessionInfo resolve(string needle, SessionInfo[] sessions, scope const(SessionIn
         if (fallback !is null) return *fallback;
         throw new HistoryError("no current session to read; pass a session handle, id, prefix or title");
     }
-    // A handle is tried first: a running holder beats stopped sessions that
-    // once had it, then the newest (`sessions` is newest first).
+    // An exact id wins, as in `resolveResumeId`: a handle claimed before
+    // handles were refused from looking like ids must not shadow that session.
+    foreach (i; sessions)
+        if (i.id == needle) return i;
+    // Then a handle: a running holder beats stopped sessions that once had
+    // it, then the newest (`sessions` is newest first).
     {
         Option!SessionInfo stopped;
         immutable lowered = needle.toLower; // handles are always lowercase
@@ -288,9 +292,9 @@ SessionInfo resolve(string needle, SessionInfo[] sessions, scope const(SessionIn
         JSONValue(needle).jsonText, candidates.map!lineOf.array.join("\n")));
 }
 
-/// The session id `--resume <arg>` / `/resume <arg>` names (issue #300): a
-/// handle first (a running holder, else the newest that had it), then an
-/// exact id, a unique id prefix, then a title, as `resolve`. An argument
+/// The session id `--resume <arg>` / `/resume <arg>` names (issue #300): an
+/// exact id first, then a handle (a running holder, else the newest that had
+/// it), a unique id prefix, then a title, as `resolve`. An argument
 /// that matches nothing listed but names a log file is returned as is (a
 /// session without prompts isn't indexed); otherwise throws with the reason.
 string resolveResumeId(string dir, string arg) @safe
@@ -300,13 +304,14 @@ string resolveResumeId(string dir, string arg) @safe
     import nano.handle : runningHandles;
     import nano.peers : peersDir;
     import nano.handle : plausibleId;
+    // An exact log id wins first (as in `resolve`) and needs no listing, so
+    // an unrelated corrupt log can't block it.
+    if (plausibleId(arg) && (buildPath(dir, arg ~ ".jsonl").exists || buildPath(dir, arg ~ ".jsonl.gz").exists))
+        return arg;
     auto handles = runningHandles(peersDir(), dir);
     // A running holder of the handle wins, even one not listed (no prompt yet).
     foreach (id, h; handles)
         if (h.toLower == arg.toLower && buildPath(dir, id ~ ".jsonl").exists) return id;
-    // An exact log id needs no listing, so an unrelated corrupt log can't block it.
-    if (plausibleId(arg) && (buildPath(dir, arg ~ ".jsonl").exists || buildPath(dir, arg ~ ".jsonl.gz").exists))
-        return arg;
     SessionInfo[] infos;
     foreach (s; list(dir))
     {
@@ -514,6 +519,9 @@ unittest
     assert(resolve("perf", sessions).id == "sess-2", "with none running, the newest holder wins");
     assert(resolve("sess-3", sessions).id == "sess-3", "an id still resolves");
     assert(resolve("matrix", sessions).id == "sess-1", "a title still resolves");
+    // A legacy ID-shaped handle never shadows the session with that exact id.
+    sessions[1].name = "sess-3";
+    assert(resolve("sess-3", sessions).id == "sess-3", "an exact id beats a legacy handle");
     sessions[1].name = sessions[2].name = null;
     assert(resolve("perf", sessions).id == "sess-3", "without a holder the title matches");
     // sessions_list shows the handle.

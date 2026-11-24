@@ -76,6 +76,7 @@ unittest
     auto a = d.agent("s-a");
     assert(a.setName("Perf Matrix") !is null, "an invalid handle is refused");
     assert(a.setName("sess-123") !is null, "a handle can't look like a session id");
+    assert(a.setName("sess-20261124T000000-abcdef12") !is null, "a full session id is refused as a handle");
     assert(a.name is null);
     assert(a.setName("perf") is null);
     assert(a.name == "perf" && handlePath(d.peers, "perf").exists);
@@ -269,4 +270,30 @@ unittest
     write(buildPath(d.sessions, "sess-broken.jsonl.gz"), "not gzip at all");
     assert(cross.resolveResumeId(d.sessions, "sess-good") == "sess-good");
     assert(cross.resolveResumeId(d.sessions, "keeper") == "sess-good");
+}
+
+// A legacy handle shaped like another session's id (claimed before such
+// handles were refused): resume and the history tools both pick the session
+// with that exact id.
+unittest
+{
+    import std.file : write;
+    auto d = Dirs.make("nd-name-idshaped");
+    scope (exit) d.cleanup();
+    auto target = d.agent("sess-target");
+    target.setName("tgt");
+    closeLog(target);
+    auto other = d.agent("sess-other");
+    // Forge the legacy claim directly: setName now refuses it.
+    import nano.handle : handlePath;
+    write(handlePath(d.peers, "sess-target"), "sess-other");
+    assert(cross.resolveResumeId(d.sessions, "sess-target") == "sess-target");
+    cross.SessionInfo t, o;
+    t.id = "sess-target";
+    o.id = "sess-other";
+    o.name = "sess-target";
+    o.live = true;
+    auto infos = [o, t];
+    assert(cross.resolve("sess-target", infos).id == "sess-target");
+    closeLog(other);
 }
