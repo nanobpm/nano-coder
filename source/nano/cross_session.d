@@ -19,7 +19,7 @@ module nano.cross_session;
 
 @safe:
 
-import std.algorithm : canFind, startsWith, map;
+import std.algorithm : canFind, startsWith, endsWith, map;
 import std.array : array, join, replace;
 import std.format : format;
 import std.json;
@@ -45,6 +45,9 @@ struct SessionInfo
     string createdAt;
     /// When the log was last written (RFC 3339).
     string lastUsed;
+    /// `lastUsed` as absolute hnsecs (`SysTime.stdTime`): the sort key, since
+    /// local-time strings misorder across a DST fallback.
+    long lastUsedTime;
     /// The log file `history_search`/`history_read` stream.
     string path;
     /// A process currently has the log open (it holds the log's flock).
@@ -55,6 +58,12 @@ struct SessionInfo
     /// The session's user-chosen handle (issue #300), or null. A running
     /// session's comes from the registry, a stopped one's from the index.
     string name;
+    /// The process holding a live session's log (0 when unknown or not live;
+    /// found through `/proc/locks`, so Linux only).
+    int pid;
+    /// That process's current working directory (null when unknown); it can
+    /// differ from `cwd`, where the session started.
+    string processCwd;
 }
 
 /// What `Summary` names a session by (title, else first telling prompt).
@@ -71,10 +80,11 @@ private SessionInfo infoOf(Summary s, bool live) @safe
     SessionInfo i;
     i.id = s.id;
     i.cwd = s.cwd;
-    i.title = nameOf(s);
+    i.title = nameOf(s); // full: resolve() and filters match it; lineOf shortens
     i.name = s.name;
     i.createdAt = s.createdAt;
     i.lastUsed = stamp(s.lastUsed);
+    i.lastUsedTime = s.lastUsed.stdTime;
     i.path = s.path;
     i.live = live;
     return i;
@@ -138,9 +148,18 @@ SessionInfo[] listSessions(ref Policy policy, string dir, string cwd, string fil
     import nano.peers : peersDir;
     SessionInfo[] out_;
     auto handles = runningHandles(peersDir(), dir);
+    // /proc/locks is read and indexed once per discovery, not per live session.
+    bool locksRead;
+    int[string] locks;
+    void probe(ref SessionInfo i)
+    {
+        if (!locksRead) { locks = readLockIndex(); locksRead = true; }
+        probeProcess(i, locks);
+    }
     bool matches(const ref SessionInfo i, string f)
     {
-        return i.id.toLower.canFind(f) || i.title.toLower.canFind(f) || (i.name.length && i.name.canFind(f))
+        return i.id.toLower.canFind(f) || i.title.toLower.canFind(f)
+            || (i.title.length && shortTitle(i.title).toLower.canFind(f)) || (i.name.length && i.name.canFind(f))
             || (i.cwd.length && i.cwd.toLower.canFind(f));
     }
     // Deny before the index opens or reports a log (issue #271): the header's
@@ -160,6 +179,7 @@ SessionInfo[] listSessions(ref Policy policy, string dir, string cwd, string fil
             // The registry is current for a running session (the index
             // catches up after its next turn).
             i.name = handles.get(i.id, null);
+            probe(i);
         }
         if (!i.cwd.length) i.cwd = logHeaderCwd(s.path);
         if (filter.length && !matches(i, filter.toLower)) continue;
@@ -171,6 +191,7 @@ SessionInfo[] listSessions(ref Policy policy, string dir, string cwd, string fil
     foreach (i; listeningWithoutPrompts(dir, out_, &deniedPath))
     {
         i.name = handles.get(i.id, null);
+        probe(i);
         if (filter.length && !matches(i, filter.toLower)) continue;
         out_ ~= i;
     }
@@ -205,39 +226,303 @@ private SessionInfo[] listeningWithoutPrompts(string dir, const SessionInfo[] kn
         i.live = true;
         i.messages = true;
         i.cwd = logHeaderCwd(path);
+        // Its activity is the log's mtime, as the index uses for others, so
+        // a just-opened listener sorts by when it was last written.
+        try
+        {
+            import std.file : timeLastModified;
+            import nano.session : stamp;
+            auto t = timeLastModified(path);
+            i.lastUsed = stamp(t);
+            i.lastUsedTime = t.stdTime;
+        }
+        catch (FileException) {} // vanished since the probe: sorts last
         out_ ~= i;
     }
     return out_;
 }
 
+/// Longest title `sessions_list` shows, in bytes (issue #348): worker
+/// sessions are otherwise titled with a whole job payload.
+enum maxTitleBytes = 120;
+
+/// Default and largest `limit` of `sessions_list` (issue #348).
+enum defaultListLimit = 50;
+/// ditto
+enum maxListLimit = 500;
+
+/// A short title for `title` (issue #348): an ACP job payload (`{"jobKey":…,
+/// "jobType":…,"processInstanceKey":…}` first input) becomes
+/// `jobType · pik N`; anything else is capped at `maxTitleBytes` on a
+/// character boundary with a trailing `…`.
+string shortTitle(string title) pure @safe
+{
+    auto t = title.strip;
+    if (t.startsWith("{"))
+    {
+        auto jt = jsonStringField(t, "jobType");
+        if (jt.length)
+        {
+            auto pik = jsonScalarField(t, "processInstanceKey");
+            return capTitle(pik.length ? jt ~ " · pik " ~ pik : jt);
+        }
+    }
+    return capTitle(t);
+}
+
+private string capTitle(string t) pure @safe
+{
+    import std.utf : stride, UTFException;
+    import std.string : indexOf;
+    auto nl = t.indexOf('\n');
+    if (nl >= 0) t = t[0 .. nl].strip ~ " …";
+    if (t.length <= maxTitleBytes) return t;
+    size_t end = 0;
+    try
+        while (end < t.length)
+        {
+            immutable n = stride(t, end);
+            if (end + n > maxTitleBytes - 3) break; // room for "…"
+            end += n;
+        }
+    catch (UTFException) {} // invalid UTF-8: cut at the last good boundary
+    return t[0 .. end] ~ "…";
+}
+
+/// The string value of `"key":"…"` in raw JSON text (no unescaping; job
+/// types and keys are plain), or null. Raw text is scanned because the
+/// payload is often followed by prose or truncated.
+private string jsonStringField(string text, string key) pure @safe
+{
+    import std.string : indexOf;
+    auto at = text.indexOf(`"` ~ key ~ `"`);
+    if (at < 0) return null;
+    auto rest = text[at + key.length + 2 .. $].stripLeftColon;
+    if (!rest.startsWith(`"`)) return null;
+    auto close = rest[1 .. $].indexOf('"');
+    return close < 0 ? null : rest[1 .. 1 + close];
+}
+
+/// `"key":` followed by a number or a quoted string, as text, or null.
+private string jsonScalarField(string text, string key) pure @safe
+{
+    import std.string : indexOf;
+    auto s = jsonStringField(text, key);
+    if (s.length) return s;
+    auto at = text.indexOf(`"` ~ key ~ `"`);
+    if (at < 0) return null;
+    auto rest = text[at + key.length + 2 .. $].stripLeftColon;
+    size_t n;
+    while (n < rest.length && rest[n] >= '0' && rest[n] <= '9') n++;
+    return rest[0 .. n];
+}
+
+private string stripLeftColon(string s) pure @safe
+{
+    import std.string : stripLeft;
+    s = s.stripLeft;
+    if (s.startsWith(":")) s = s[1 .. $];
+    return s.stripLeft;
+}
+
+unittest
+{
+    assert(shortTitle(`{"jobKey":"1","jobType":"senior:pr-review","processInstanceKey":"289676","prompt":"long…"}`)
+        == "senior:pr-review · pik 289676");
+    assert(shortTitle(`{"jobType": "x", "processInstanceKey": 42}`) == "x · pik 42");
+    assert(shortTitle(`{"jobType":"only"}`) == "only");
+    assert(shortTitle(`{"a":1}`) == `{"a":1}`);
+    assert(shortTitle("fix the parser") == "fix the parser");
+    assert(shortTitle("first line\nsecond") == "first line …");
+    import std.array : replicate;
+    auto capped = shortTitle("é".replicate(200));
+    assert(capped.length <= maxTitleBytes && capped.endsWith("…"));
+    import std.utf : validate;
+    validate(capped);
+    assert(shortTitle("a".replicate(maxTitleBytes)) == "a".replicate(maxTitleBytes));
+}
+
+/// `/proc/locks` indexed by `lockIndex`; empty where `/proc` is absent
+/// (macOS), unreadable or malformed, so pids stay unknown (best effort).
+private int[string] readLockIndex() @safe
+{
+    import std.file : readText, FileException;
+    import std.conv : ConvException;
+    try return lockIndex(readText("/proc/locks"));
+    catch (FileException) {} // no /proc: leave pids unknown
+    catch (ConvException) {} // malformed /proc/locks line: leave pids unknown
+    return null;
+}
+
+/// Fill a live session's `pid` and `processCwd` from the `/proc/locks`
+/// index (the process holding the log's flock) and `/proc/<pid>/cwd`. Best
+/// effort: leaves them unset where `/proc` is absent or unreadable.
+private void probeProcess(ref SessionInfo i, const int[string] locks) @safe
+{
+    import std.file : DirEntry, readLink, FileException;
+    try
+    {
+        auto st = DirEntry(i.path).statBuf;
+        i.pid = locks.get(lockKey(st.st_dev, st.st_ino), 0);
+        if (i.pid > 0) i.processCwd = readLink(format("/proc/%s/cwd", i.pid));
+    }
+    catch (FileException) {} // the log or process just went away: leave unknown
+}
+
+/// The `lockIndex` key for the file `dev`:`ino`.
+private string lockKey(ulong dev, ulong ino) pure @safe
+{
+    immutable major = ((dev >> 8) & 0xfff) | ((dev >> 32) & ~0xfffUL);
+    immutable minor = (dev & 0xff) | ((dev >> 12) & ~0xffUL);
+    return format("%x:%x:%s", major, minor, ino);
+}
+
+/// FLOCK holders in `/proc/locks` text, keyed by `lockKey`, so one read
+/// serves every live session's lookup.
+int[string] lockIndex(string locks) pure @safe
+{
+    import std.string : lineSplitter, split;
+    int[string] out_;
+    foreach (line; locks.lineSplitter)
+    {
+        auto f = line.split;
+        // "1: FLOCK ADVISORY WRITE 1234 08:02:5678 0 EOF"; blocked waiters ("->") shift by one.
+        if (f.length < 6 || f[1] != "FLOCK") continue;
+        auto parts = f[5].split(":");
+        if (parts.length != 3) continue;
+        auto key = format("%x:%x:%s", parts[0].to!ulong(16), parts[1].to!ulong(16), parts[2].to!ulong);
+        if (key !in out_) out_[key] = f[4].to!int;
+    }
+    return out_;
+}
+
+/// The pid holding a FLOCK on the file `dev`:`ino` per `/proc/locks` text, or 0.
+int lockHolder(string locks, ulong dev, ulong ino) pure @safe
+{
+    return lockIndex(locks).get(lockKey(dev, ino), 0);
+}
+
+unittest
+{
+    auto locks = "1: POSIX  ADVISORY  WRITE 99 08:02:77 0 EOF\n2: FLOCK  ADVISORY  WRITE 4321 fd:01:77 0 EOF\n";
+    immutable dev = (0xfdUL << 8) | 0x01;
+    assert(lockHolder(locks, dev, 77) == 4321);
+    assert(lockHolder(locks, dev, 78) == 0);
+    assert(lockHolder(locks, (8UL << 8) | 2, 77) == 0, "POSIX locks are not session locks");
+}
+
 /// One line of the `sessions_list` result.
 private string lineOf(const ref SessionInfo i) @safe
 {
-    auto label = i.title.length ? i.title : "(no title)";
+    auto label = i.title.length ? shortTitle(i.title) : "(no title)";
     auto out_ = format("%s  %s  %s  %s", i.id, label, i.cwd.length ? i.cwd : "(unknown cwd)",
         i.lastUsed.length >= 19 ? i.lastUsed[0 .. 19] : i.lastUsed);
-    if (i.live) out_ ~= "  [live]";
+    if (i.live) out_ ~= i.pid > 0 ? format("  [live pid %s]", i.pid) : "  [live]";
+    if (i.processCwd.length && i.processCwd != i.cwd) out_ ~= "  [now in " ~ i.processCwd ~ "]";
     if (i.messages) out_ ~= "  [messages]";
     if (i.name.length) out_ ~= "  [name: " ~ i.name ~ "]";
     return out_;
 }
 
 /// The `sessions_list` tool result: one `#id title cwd last-activity [live]`
-/// line per session, newest first, capped like other tool output (the
-/// remainder is spilled to a file).
+/// line per session, live ones first, then newest first. `live`/`messages`
+/// keep only open / `session_send`-reachable sessions; `limit` (default
+/// `defaultListLimit`) caps the lines and says how many more matched. The
+/// text is also capped in bytes like other tool output.
 string listResult(ref Policy policy, string dir, string cwd, JSONValue args) @safe
 {
     import nano.tools : truncateOutputBytes, defaultMaxOutput;
     string filter;
+    bool onlyLive, onlyMessages;
+    long limit = defaultListLimit;
     if (args.type == JSONType.object)
-        if (auto f = "filter" in args.objectNoRef)
+    {
+        auto o = args.objectNoRef;
+        if (auto f = "filter" in o)
             if (f.type == JSONType.string) filter = f.str;
-    auto sessions = listSessions(policy, dir, cwd, filter);
+        if (auto f = "live" in o) onlyLive = f.type == JSONType.true_;
+        if (auto f = "messages" in o) onlyMessages = f.type == JSONType.true_;
+        if (auto f = "limit" in o)
+        {
+            if (f.type == JSONType.integer) limit = f.integer;
+            else if (f.type == JSONType.uinteger) limit = f.uinteger > maxListLimit ? maxListLimit : f.uinteger.to!long;
+        }
+    }
+    if (limit < 1) limit = 1;
+    if (limit > maxListLimit) limit = maxListLimit;
+    auto sessions = selectSessions(listSessions(policy, dir, cwd, filter), onlyLive, onlyMessages);
     if (!sessions.length)
+    {
+        string what = onlyMessages ? "reachable " : onlyLive ? "live " : "";
         return filter.length
-            ? format("No sessions match %s.", JSONValue(filter).jsonText)
-            : "No saved sessions.";
-    return truncateOutputBytes(sessions.map!lineOf.array.join("\n"), defaultMaxOutput, "sessions-list");
+            ? format("No %ssessions match %s.", what, JSONValue(filter).jsonText)
+            : what.length ? format("No %ssessions.", what) : "No saved sessions.";
+    }
+    return truncateOutputBytes(limitedLines(sessions, limit), defaultMaxOutput, "sessions-list");
+}
+
+/// The first `limit` (clamped to 1..`maxListLimit`) of `sessions` as lines,
+/// plus a note saying how many more matched.
+string limitedLines(SessionInfo[] sessions, long limit) @safe
+{
+    if (limit < 1) limit = 1;
+    if (limit > maxListLimit) limit = maxListLimit;
+    auto shown = sessions.length > limit ? sessions[0 .. limit.to!size_t] : sessions;
+    auto text = shown.map!lineOf.array.join("\n");
+    if (sessions.length > shown.length)
+        text ~= format("\n(%s more not shown; raise limit or narrow with filter/live/messages)",
+            sessions.length - shown.length);
+    return text;
+}
+
+unittest
+{
+    import std.algorithm : count;
+    SessionInfo[] many;
+    foreach (n; 0 .. 600)
+    {
+        SessionInfo i;
+        i.id = format("s%s", n);
+        many ~= i;
+    }
+    size_t rows(string t) { return t.count('\n') + 1 - (t.canFind("more not shown") ? 1 : 0); }
+    auto def = limitedLines(many, defaultListLimit);
+    assert(rows(def) == defaultListLimit && def.canFind("(550 more not shown"));
+    assert(rows(limitedLines(many, 3)) == 3 && limitedLines(many, 3).canFind("(597 more not shown"));
+    assert(rows(limitedLines(many, 0)) == 1 && limitedLines(many, -5).canFind("(599 more not shown"));
+    assert(rows(limitedLines(many, 10_000)) == maxListLimit && limitedLines(many, 10_000).canFind("(100 more"));
+    auto few = limitedLines(many[0 .. 2], defaultListLimit);
+    assert(rows(few) == 2 && !few.canFind("more not shown"));
+}
+
+/// `sessions` filtered by `live`/`messages` and ordered live first, then by
+/// last activity (newest first); stable, so ties keep the index order.
+SessionInfo[] selectSessions(SessionInfo[] sessions, bool live, bool messages) pure @safe
+{
+    import std.algorithm : filter, sort, SwapStrategy;
+    auto out_ = sessions.filter!(i => (!live || i.live) && (!messages || i.messages)).array;
+    out_.sort!((a, b) => a.live != b.live ? a.live : a.lastUsedTime > b.lastUsedTime, SwapStrategy.stable);
+    return out_;
+}
+
+unittest
+{
+    SessionInfo s(string id, bool live, bool msgs, long used)
+    {
+        SessionInfo i;
+        i.id = id; i.live = live; i.messages = msgs; i.lastUsedTime = used;
+        return i;
+    }
+    auto all = [s("a", false, false, 3), s("b", true, false, 1),
+        s("c", true, true, 2), s("d", false, false, 4)];
+    assert(selectSessions(all, false, false).map!(i => i.id).array == ["c", "b", "d", "a"]);
+    assert(selectSessions(all, true, false).map!(i => i.id).array == ["c", "b"]);
+    assert(selectSessions(all, false, true).map!(i => i.id).array == ["c"]);
+    // DST fallback: the absolute time orders, not the local-time string.
+    auto later = s("later", false, false, 20), earlier = s("earlier", false, false, 10);
+    later.lastUsed = "2026-11-01T01:15:00-05:00";
+    earlier.lastUsed = "2026-11-01T01:45:00-04:00";
+    assert(selectSessions([earlier, later], false, false).map!(i => i.id).array == ["later", "earlier"]);
 }
 
 /// `needle` as one session: an exact id, a handle (issue #300), a unique id
@@ -275,14 +560,16 @@ SessionInfo resolve(string needle, SessionInfo[] sessions, scope const(SessionIn
     foreach (i; sessions)
     {
         if (i.id == needle) return i;
-        if (i.id.startsWith(needle) || (i.title.length && i.title.toLower.canFind(needle.toLower)))
+        if (i.id.startsWith(needle) || (i.title.length && (i.title.toLower.canFind(needle.toLower)
+                || shortTitle(i.title).toLower.canFind(needle.toLower))))
             candidates ~= i;
     }
     // Case-insensitive exact titles beat the other substring matches; several
     // sessions may share one title (identical first-request fallbacks too).
     SessionInfo[] exact;
     foreach (ref c; candidates)
-        if (c.title.toLower == needle.toLower) exact ~= c;
+        if (c.title.toLower == needle.toLower
+            || (c.title.length && shortTitle(c.title).toLower == needle.toLower)) exact ~= c;
     if (exact.length) candidates = exact;
     if (candidates.length == 1) return candidates[0];
     if (!candidates.length)
@@ -415,6 +702,21 @@ unittest
     assert(listSessions(noRules, dir, alpha, "done").length == 1);
     assert(listSessions(noRules, dir, alpha, alpha.toUpper).length == 1, "filter is case-insensitive");
     assert(!listSessions(noRules, dir, alpha, "nope").length);
+    {
+        // A long title stays whole for resolve() and filters; only the list shortens it.
+        import std.array : replicate;
+        auto longLog = new SessionLog(dir, "m", beta, "sess-long");
+        auto longTitle = "x".replicate(150) ~ " tailword";
+        longLog.input("in-3", longTitle);
+        longLog.close();
+        auto ss = listSessions(noRules, dir, alpha);
+        assert(resolve(longTitle, ss).id == "sess-long", "a >120-byte title resolves");
+        assert(listSessions(noRules, dir, alpha, "tailword").length == 1, "filter sees past the cap");
+        auto shown = shortTitle(longTitle);
+        assert(resolve(shown, ss).id == "sess-long", "the displayed short title resolves");
+        assert(listSessions(noRules, dir, alpha, shown).length == 1, "filter matches the displayed title");
+        { import std.file : remove; import std.algorithm : filter; remove(ss.filter!(x => x.id == "sess-long").front.path); }
+    }
 
     // A deny rule hides a foreign session from the listing entirely, cached
     // title and all; an in-workspace session stays.
