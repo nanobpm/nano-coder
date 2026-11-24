@@ -3287,7 +3287,13 @@ int runMain(string[] args)
     void seedInputHistory(Option!LineEditor ed)
     {
         resumedInputs.ifSome((string[] lines) {
-            ed.ifSome((LineEditor e) { e.state.history.seed(lines); });
+            // The log holds the prompt as sent: a `//…` line was unescaped to
+            // `/…`, so restore the escape or Up+Enter would run a command.
+            import std.algorithm : map;
+            import std.array : array;
+            import std.string : stripLeft;
+            auto typed = lines.map!(l => l.stripLeft.startsWith("/") ? "/" ~ l.stripLeft : l).array;
+            ed.ifSome((LineEditor e) { e.state.history.seed(typed); });
         });
         resumedInputs = none;
     }

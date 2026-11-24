@@ -1746,6 +1746,19 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
         typedCandidate.ifSome((string t) { recentInputs.put(t); });
         typedCandidate = none;
     }
+    // A user message's effect on recall history: the typed input it
+    // answers is kept unless the message was automatic; a local steer is kept.
+    void noteUserMessage(bool isUser, bool autoInit, bool steered, bool fromPeer,
+        scope Option!string delegate() @safe content)
+    {
+        if (isUser && !typedCandidate.isNone)
+        {
+            if (!autoInit) flushTyped();
+            typedCandidate = none;
+        }
+        else if (isUser && steered && !fromPeer)
+            content().ifSome((string c) { flushTyped(); recentInputs.put(c); });
+    }
     Message[] rustStash;
     // Per `rustStash` entry: its content was dropped (`Restored.replayStashSlim`).
     bool[] stashSlim;
@@ -1791,6 +1804,17 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
                     // the skim: such a line is decoded below for `toolKeys`.
                     auto data = skimField(line, "data");
                     auto role = skimString(data, "role");
+                    // Recall history reads the user messages the skim
+                    // skips: the same rule as the full decode below.
+                    if (role == "user")
+                    {
+                        bool flag(string k) { return skimField(data, k) == "true"; }
+                        noteUserMessage(true, flag("auto_initiated"), flag("steered"),
+                            skimField(data, "from_session").length > 0, delegate Option!string() {
+                                auto c = skimString(data, "content");
+                                return c is null ? Option!string.init : some(c.idup);
+                            });
+                    }
                     // Structured payloads (calls, reasoning items) are
                     // slimmable at any size (`slimPayload`), so mirror that.
                     if ((role != "tool" && role != "assistant")
@@ -1916,16 +1940,10 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
                 auto role = "role" in data;
                 immutable isUser = role !is null && role.type == JSONType.string && role.str == "user";
                 bool flag(string k) { auto v = k in data; return v !is null && v.type == JSONType.true_; }
-                if (isUser && !typedCandidate.isNone)
-                {
-                    if (!flag("auto_initiated")) flushTyped();
-                    typedCandidate = none;
-                }
-                else if (isUser && flag("steered") && "from_session" !in data)
-                {
+                noteUserMessage(isUser, flag("auto_initiated"), flag("steered"), ("from_session" in data) !is null, delegate Option!string() {
                     auto c = "content" in data;
-                    if (c !is null && c.type == JSONType.string) { flushTyped(); recentInputs.put(c.str); }
-                }
+                    return c !is null && c.type == JSONType.string ? some(c.str) : Option!string.init;
+                });
             }
             if (lineNo < skipBefore)
             {
@@ -4213,4 +4231,41 @@ unittest // a resumed session's typed prompts come back for Up/Down recall; peer
     log.input("in-5", "last one");
     log.close();
     assert(restore(log.path).recentInputs == ["fix the race", "now add a test", "also the docs", "last one"]);
+}
+
+unittest // compacted_log_recall_matches_full_decode: the skim keeps steers, drops automatic inputs
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, write;
+    import std.path : buildPath;
+    auto dir = buildPath(tempDir, "nano-d-skimrecall-" ~ newSessionId);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    static JSONValue rec(Message m) { return messageRecord(m); }
+    string line(string type, JSONValue data) { return JSONValue(["type": JSONValue(type), "data": data]).toString ~ "\n"; }
+    auto log = `{"type":"session","data":{"version":1,"id":"skimrecall","created_at":"x"}}` ~ "\n";
+    ulong lines = 1;
+    void add(string type, JSONValue data) { log ~= line(type, data); lines++; }
+    add("input", JSONValue(["id": "in-1", "text": "typed \"one\""]));
+    auto first = Message.user("typed \"one\"");
+    add("message", rec(first));
+    auto steer = Message.user("a steer \u00e9");
+    steer.steered = true;
+    add("message", rec(steer));
+    auto peerSteer = Message.user("peer steer");
+    peerSteer.steered = true;
+    peerSteer.fromSession = "sess-other";
+    add("message", rec(peerSteer));
+    add("turn_end", JSONValue(["input_id": "in-1", "response": "", "stop_reason": "end_turn"]));
+    add("input", JSONValue(["id": "in-2", "text": "timer fired"]));
+    add("message", rec(Message.auto_("timer fired")));
+    add("turn_end", JSONValue(["input_id": "in-2", "response": "", "stop_reason": "end_turn"]));
+    JSONValue full = ["messages": JSONValue([rec(Message.user("summary"))])];
+    full["folded"] = JSONValue([rec(first)]);
+    full["summarized"] = JSONValue([JSONValue(2), JSONValue(lines)]);
+    add("replace", full);
+    auto path = buildPath(dir, "skimrecall.jsonl");
+    write(path, log);
+    auto skimmed = restoreLog(path, true), fullR = restoreLog(path, false);
+    assert(fullR.recentInputs == ["typed \"one\"", "a steer \u00e9"]);
+    assert(skimmed.recentInputs == fullR.recentInputs);
 }
