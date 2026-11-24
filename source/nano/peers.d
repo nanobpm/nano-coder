@@ -1144,8 +1144,10 @@ imported!"nano.llm".ToolDefinition sendDefinition() pure
         ~ "id prefix or a title, resolved like the history tools' `session` argument. The message joins the target's input "
         ~ "labelled with this session's handle or id; the target may confirm it first. The result is one of: delivered, "
         ~ "queued (the target is mid-turn; visible in its /queue), awaiting confirmation, refused (the target "
-        ~ "has messages off or declined), not running. A turn started by a peer message cannot send one without "
-        ~ "the user's approval, so two agents cannot ping-pong.",
+        ~ "has messages off or declined), not running. Whether the target's user confirms is the target's setting "
+        ~ "(or pass confirm: true). A reply from a turn a peer started is one hop further along its thread; past "
+        ~ "session_messages_max_hops, and past session_messages_max_per_hour sends to one target, the send is refused: "
+        ~ "then stop or ask your user.",
         parseJSON(`{"type":"object","properties":{"to":{"type":"string","description":"The target session: a handle, an id, a unique id prefix, or a title from sessions_list"},"text":{"type":"string","description":"The message text"},"confirm":{"type":"boolean","description":"Ask the target's user to accept even when their confirm setting is off (default false)"}},"required":["to","text"]}`));
 }
 

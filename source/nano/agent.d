@@ -1129,6 +1129,9 @@ class Agent
                 auto h = s.hop ? s.hop : 1;
                 if (h > inputHop) { inputHop = h; inputThread = s.thread; }
                 else if (!inputThread.length) inputThread = s.thread;
+                // A legacy steer carries no thread: fall back to its sender,
+                // as an idle delivery does, so identity is timing-independent.
+                if (!inputThread.length) inputThread = s.sender;
             }
             control.absorbed(s);
         }
@@ -2767,7 +2770,7 @@ class Agent
             : peerTurn && inputSender.length ? inputSender : format("%s/%s", ownLog.id, pm.messageId);
         string note;
         auto status = peers.send(peers.peersDir(), target.id, pm, note);
-        if (status != peers.Status.notRunning && status != peers.Status.refused)
+        if (maxSendsPerHour && status != peers.Status.notRunning && status != peers.Status.refused)
             recentSends[sendKey(ownLog.id, target.id)] ~= now; // keyed per sender/target pair
         return format("%s: %s", statusText(status), note.length ? note : defaultNote(status, target));
     }
