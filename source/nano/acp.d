@@ -702,6 +702,8 @@ final class AcpServer : AgentEvents
     bool run()
     {
         scope (exit) stopPeerListener();
+        // Close peer listeners inherited across exec (issue #349).
+        peers.closeOrphanedPeerFds(peers.peersDir());
         JSONValue msg;
         for (;;)
         {

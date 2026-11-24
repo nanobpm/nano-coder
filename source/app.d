@@ -4045,6 +4045,12 @@ int runMain(string[] args)
     // Zero or one listener (an Option can't hold a PeerListener: its NotNull
     // has no default).
     PeerListener[] peerListener;
+    // Close peer listeners inherited across a `/relaunch` exec (issue #349):
+    // an orphan keeps this session's socket "live" with nobody accepting.
+    {
+        import nano.peers : closeOrphanedPeerFds, peersDir;
+        closeOrphanedPeerFds(peersDir());
+    }
     void stopPeerListener()
     {
         foreach (ref l; peerListener) l.close();

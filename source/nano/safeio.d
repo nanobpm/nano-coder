@@ -206,15 +206,133 @@ bool setCloexec(int fd) nothrow @nogc
     return addFdFlag(fd, F_GETFD, F_SETFD, FD_CLOEXEC);
 }
 
+/// Whether `fd` has FD_CLOEXEC set (false if fcntl fails). An fd without it
+/// that names a peer socket was inherited across exec (issue #349).
+bool hasCloexec(int fd) nothrow @nogc
+{
+    import core.sys.posix.fcntl : F_GETFD, FD_CLOEXEC;
+    immutable flags = fcntlInt(fd, F_GETFD, 0);
+    return flags >= 0 && (flags & FD_CLOEXEC) != 0;
+}
+
+/// The filesystem path `fd` is bound to when it is a Unix-domain socket
+/// (`getsockname(2)`), or null (not a socket, unbound, or an error). Lets a
+/// session find a peer listener it inherited but no longer knows about.
+string unixSocketPathOf(int fd) @trusted nothrow
+{
+    import core.sys.posix.sys.socket : getsockname, sockaddr, socklen_t, AF_UNIX;
+    import core.sys.posix.sys.un : sockaddr_un;
+    sockaddr_un a;
+    socklen_t n = sockaddr_un.sizeof;
+    // getsockname writes at most `n` bytes into `a` (its size handed over).
+    if (getsockname(fd, cast(sockaddr*) &a, &n) != 0 || a.sun_family != AF_UNIX) return null;
+    immutable off = sockaddr_un.sun_path.offsetof;
+    if (n <= off) return null;
+    size_t len = n - off;
+    if (len > a.sun_path.length) len = a.sun_path.length;
+    size_t end;
+    while (end < len && a.sun_path[end] != 0) end++;
+    if (end == 0) return null;
+    // sun_path holds bytes of the bound path; idup copies them out.
+    return (cast(const(char)[]) cast(const(ubyte)[]) a.sun_path[0 .. end]).idup;
+}
+
+/// The fds this process has open (from /dev/fd), or empty if unlisted.
+int[] openFds()
+{
+    import std.file : dirEntries, SpanMode, FileException;
+    import std.path : baseName;
+    import std.conv : to;
+    import std.algorithm : all;
+    import std.ascii : isDigit;
+    int[] fds;
+    try
+        foreach (e; dirEntries("/dev/fd", SpanMode.shallow, false))
+        {
+            auto n = e.name.baseName;
+            if (n.length && n.length < 9 && n.all!isDigit) fds ~= n.to!int;
+        }
+    catch (FileException) {} // no /dev/fd listing: nothing to report
+    return fds;
+}
+
+/// Whether process `pid` exists (`kill(pid, 0)`: success or EPERM).
+bool processExists(int pid)
+{
+    import core.stdc.errno : errno, EPERM;
+    if (pid <= 0) return false;
+    return killPid(pid, 0) == 0 || errno == EPERM;
+}
+
+/// When process `pid` started, in seconds since the epoch on macOS or clock
+/// ticks since boot on Linux; 0 when unknown. Paired with the pid, it tells
+/// a live owner from an unrelated process that reused the pid (issue #349).
+long processStartTime(int pid) @trusted
+{
+    if (pid <= 0) return 0;
+    version (OSX)
+    {
+        // proc_pidinfo(PROC_PIDTBSDINFO) fills a 136-byte proc_bsdinfo whose
+        // pbi_start_tvsec is the u64 at offset 120; it writes at most the
+        // buffer size passed.
+        ubyte[136] buf;
+        if (procPidinfo(pid, 3, 0, buf.ptr, cast(int) buf.length) != cast(int) buf.length) return 0;
+        ulong v;
+        foreach_reverse (i; 0 .. 8) v = (v << 8) | buf[120 + i];
+        return cast(long) v;
+    }
+    else version (linux)
+    {
+        import std.file : read, FileException;
+        import std.format : format;
+        const(ubyte)[] s;
+        try s = cast(const(ubyte)[]) read(format("/proc/%d/stat", pid));
+        catch (FileException) return 0; // gone or unreadable: unknown
+        // The command name (field 2) may hold spaces or any bytes: count
+        // fields from the last ')'.
+        size_t i = s.length;
+        while (i > 0 && s[i - 1] != ')') i--;
+        if (i == 0) return 0;
+        int field = 2;
+        bool inField;
+        long v;
+        foreach (c; s[i .. $])
+        {
+            if (c == ' ' || c == '\n') { inField = false; continue; }
+            if (!inField) { inField = true; field++; }
+            if (field == 22)
+            {
+                if (c < '0' || c > '9') return 0;
+                v = v * 10 + (c - '0');
+            }
+            else if (field > 22) break;
+        }
+        return field >= 22 ? v : 0;
+    }
+    else return 0;
+}
+
+version (OSX)
+{
+    // proc_pidinfo writes at most `size` bytes at `buffer`.
+    private extern (C) pragma(mangle, "proc_pidinfo") int procPidinfo(int, int, ulong, void*, int) nothrow @nogc @system;
+}
+
 /// OR `bit` into the flags read with `get` and written with `set` (an
 /// F_GETFD/F_SETFD or F_GETFL/F_SETFL pair); false if fcntl fails.
-private bool addFdFlag(int fd, int get, int set, int bit) @trusted nothrow @nogc
+private bool addFdFlag(int fd, int get, int set, int bit) nothrow @nogc
+{
+    immutable flags = fcntlInt(fd, get, 0);
+    return flags >= 0 && fcntlInt(fd, set, flags | bit) == 0;
+}
+
+/// `fcntl(2)` for the F_GETFD/F_SETFD/F_GETFL/F_SETFL commands only.
+private int fcntlInt(int fd, int cmd, int arg) @trusted nothrow @nogc
 {
     import core.sys.posix.fcntl : fcntl;
-    // fcntl is variadic (so @system); the get/set commands used here take
-    // and return plain ints and touch no memory of ours.
-    immutable flags = fcntl(fd, get);
-    return flags >= 0 && fcntl(fd, set, flags | bit) == 0;
+    // fcntl is variadic (so @system); the get/set flag commands callers pass
+    // take and return plain ints and touch no memory of ours.
+    return fcntl(fd, cmd, arg);
 }
 
 /// The uid on the other end of a connected Unix-domain socket, or -1 when
