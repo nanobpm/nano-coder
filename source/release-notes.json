@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.26.1", "date": "2026-11-24", "items": [
+      {"type":"fix","scope":"session","title":"resume restores the session's model and runtime settings","pr":303}
+    ]},
     {"version": "1.26.0", "date": "2026-11-24", "items": [
       {"type":"feat","scope":"settings","title":"configure sub-agents and inter-session messages in /settings","pr":328}
     ]},
@@ -439,9 +442,6 @@
     ]},
     {"version": "0.40.0", "date": "2026-10-07", "items": [
       {"type":"feat","scope":"prompt","title":"clear the input on double Esc at the idle prompt","pr":103}
-    ]},
-    {"version": "0.39.0", "date": "2026-10-07", "items": [
-      {"type":"feat","scope":"commands","title":"never send /… input to the model","pr":75}
     ]}
   ]
 }
