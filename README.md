@@ -669,7 +669,8 @@ that change process-wide state (the cancel flag, environment variables) are list
 `scripts/serial-tests` and run alone first. A module still running at twice its most-scaled limit
 (at least 10 s) is treated as hung: the runner names it and exits failing instead of waiting
 forever. In tests, HTTP retries wait out an unreachable server for at most 10 s (in use the wait is
-unbounded until Ctrl-C).
+unbounded until Ctrl-C). `NANO_TEST_STUCK=1` adds a module that never returns, to check the
+watchdog (`ci.sh` does).
 
 Functions are `pure` wherever they can be: the result depends only on the arguments, with no
 clock, environment, files or global state. Modules that start with `pure:` (parsing, markdown,

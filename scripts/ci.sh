@@ -70,6 +70,22 @@ unit() {
     step "dub test"
     NANO_TEST_JOBS=${NANO_TEST_JOBS:-4} NANO_TEST_TIMES=${NANO_TEST_TIMES:-10} \
         NANO_TEST_BUDGET_SCALE=${NANO_TEST_BUDGET_SCALE:-${CI:+3}} dub test -q
+    step "test watchdog names a hung module"
+    # NANO_TEST_STUCK=1 adds a module that never returns; the watchdog must
+    # name it and fail the run within its hard limit (seconds, not hours).
+    # perl's alarm survives exec: a parent-side deadline (SIGALRM kills the
+    # runner) so a broken watchdog fails this check instead of hanging CI.
+    status=0
+    out=$(NANO_TEST_STUCK=1 NANO_TEST_JOBS=4 NANO_TEST_BUDGET_SCALE=0.3 \
+        perl -e 'alarm shift; exec @ARGV or die "exec: $!"' 300 ./nano-coder-test-application 2>&1) || status=$?
+    if [ "$status" -eq 0 ]; then
+        echo "the stuck test module passed"; exit 1
+    fi
+    if [ "$status" -eq 142 ]; then
+        echo "the watchdog did not end the run within 300s:"; printf '%s\n' "$out" | tail -20; exit 1
+    fi
+    printf '%s\n' "$out" | grep -q "1 module FAILED unittests: nano.testenv_test (hung past" \
+        || { echo "the watchdog did not name the stuck module:"; printf '%s\n' "$out" | tail -20; exit 1; }
 }
 
 test_() {
