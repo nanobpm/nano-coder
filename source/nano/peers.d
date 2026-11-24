@@ -439,10 +439,13 @@ struct PeerListener
                 // listener here (a repeated `listen`): not ours to remove.
                 int self;
                 immutable already = ownerOf(dir, id, self) == Owner.self;
-                if (!claimOwner(dir, id, other))
+                string error;
+                if (!claimOwner(dir, id, other, error))
                 {
                     socket.close();
-                    throw new ListenError(format("cannot listen on %s: process %s still owns it", path, other));
+                    throw new ListenError(error.length
+                        ? format("cannot listen on %s: %s", path, error)
+                        : format("cannot listen on %s: process %s still owns it", path, other));
                 }
                 claimed = !already;
             }
@@ -900,21 +903,27 @@ private void writeOwner(string dir, string id)
 
 /// Create `<dir>/<id>.pid` naming this process, exclusively. An existing
 /// file naming a dead process (or nobody) is replaced; one naming this
-/// process is kept. Returns false, with `other` set, when another live
-/// process owns it: two listeners racing for one id must not both write it
-/// (issue #370), or the loser would delete the winner's record on failure.
-private bool claimOwner(string dir, string id, out int other)
+/// process is kept. Returns false when the claim fails: `other` is set when
+/// another live process owns it (two listeners racing for one id must not
+/// both write it, issue #370), else `error` says why the record could not be
+/// written. Fails closed on I/O errors: without a readable owner record a
+/// sender probing before `listen` would delete the fresh socket. A partly
+/// written file is removed.
+private bool claimOwner(string dir, string id, out int other, out string error)
 {
     import std.stdio : File;
     import std.exception : ErrnoException;
     import std.process : thisProcessID;
     import nano.safeio : processStartTime;
     immutable pid = thisProcessID;
+    immutable path = pidPath(dir, id);
     foreach (attempt; 0 .. 2)
     {
+        bool created;
         try
         {
-            auto f = File(pidPath(dir, id), "wx");
+            auto f = File(path, "wx");
+            created = true;
             f.writef("%s %s\n", pid, processStartTime(pid));
             f.close();
             return true;
@@ -922,7 +931,12 @@ private bool claimOwner(string dir, string id, out int other)
         catch (ErrnoException e)
         {
             import core.stdc.errno : EEXIST;
-            if (e.errno != EEXIST) return true; // best effort: senders fall back to the probe
+            if (created || e.errno != EEXIST)
+            {
+                if (created) removeIfThere(path);
+                error = format("cannot write %s: %s", path, e.msg);
+                return false;
+            }
         }
         final switch (ownerOf(dir, id, other))
         {
@@ -930,11 +944,12 @@ private bool claimOwner(string dir, string id, out int other)
             case Owner.alive: return false;
             case Owner.gone:
             case Owner.unknown:
-                removeIfThere(pidPath(dir, id));
+                removeIfThere(path);
                 break;
         }
     }
-    return true; // lost a replace race twice: best effort, as above
+    error = format("cannot claim %s: replaced concurrently", path);
+    return false;
 }
 
 /// Remove `<dir>/<id>.pid` if it names this process (a successor may own
@@ -2186,19 +2201,24 @@ unittest
     mkdirRecurse(dir);
     scope (exit) rmdirRecurse(dir);
     int pid;
+    string error;
     // A fresh claim names this process.
-    assert(claimOwner(dir, "sess-a", pid));
+    assert(claimOwner(dir, "sess-a", pid, error));
     assert(ownerOf(dir, "sess-a", pid) == Owner.self && pid == thisProcessID);
     // A stale (garbage) pid file is replaced.
     write(pidPath(dir, "sess-b"), "garbage");
-    assert(claimOwner(dir, "sess-b", pid));
+    assert(claimOwner(dir, "sess-b", pid, error));
     assert(ownerOf(dir, "sess-b", pid) == Owner.self);
     // A live other owner (pid 1, start time unknown) is not overwritten,
     // and the loser's cleanup leaves the winner's file alone.
     write(pidPath(dir, "sess-c"), "1 0\n");
-    assert(!claimOwner(dir, "sess-c", pid) && pid == 1);
+    assert(!claimOwner(dir, "sess-c", pid, error) && pid == 1 && !error.length);
     removeOwner(dir, "sess-c");
     assert(pidPath(dir, "sess-c").exists && ownerOf(dir, "sess-c", pid) == Owner.alive);
+    // An I/O error (here: a missing directory) fails the claim, closed,
+    // instead of letting listen bind without an owner record.
+    assert(!claimOwner(buildPath(dir, "missing"), "sess-d", pid, error));
+    assert(error.length && pid == 0);
 }
 
 @("issue #349: listen closes this process's orphaned listener and rebinds")
