@@ -2013,6 +2013,12 @@ unittest
     refusing("sess-reused");
     write(pidPath(dir, "sess-reused"), format("%s %s\n", ppid, processStartTime(ppid) + 1));
     int pid;
+    // On the supported platforms the lookup must work, or this check (and
+    // pid-reuse detection itself) would silently pass on a zero start time.
+    version (OSX) enum known = true;
+    else version (linux) enum known = true;
+    else enum known = false;
+    static if (known) assert(processStartTime(ppid) != 0, "start time lookup failed");
     if (processStartTime(ppid) != 0) assert(ownerOf(dir, "sess-reused", pid) == Owner.gone);
 }
 
