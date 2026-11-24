@@ -2678,7 +2678,7 @@ class Agent
             if (auto v = "confirm" in args.objectNoRef)
                 if (v.type == JSONType.true_ || v.type == JSONType.false_) confirm = v.boolean;
         }
-        if (!to.length) throw new hist.HistoryError("session_send: `to` must be a non-empty session id, prefix or title");
+        if (!to.length) throw new hist.HistoryError("session_send: `to` must be a non-empty session handle, id, prefix or title");
         if (!text.strip.length) throw new hist.HistoryError("session_send: `text` must be a non-empty message");
         // The loop guard: a turn started by a peer message can't send one
         // unapproved, whatever the confirm setting — two agents must not
@@ -2707,6 +2707,7 @@ class Agent
         peers.PeerMessage pm;
         pm.senderId = ownLog.id;
         pm.senderTitle = selfTitle(sessions, ownLog.id);
+        pm.senderName = name;
         pm.text = text;
         pm.messageId = format("msg-%s", ++sendCounter);
         pm.confirm = confirm;
@@ -2747,6 +2748,45 @@ class Agent
             case peers.Status.refused: return format("session %s refused the message", target.id);
             case peers.Status.notRunning: return format("session %s is not running (or has messages off)", target.id);
         }
+    }
+
+    /// This session's user-chosen handle (issue #300), or null. Set with
+    /// `setName`, restored from the log by `loadRestored`.
+    string name;
+
+    /// Set this session's handle to `handle` (null or empty clears it):
+    /// validated, claimed in the peers registry (refused while another
+    /// running session holds it) and, when `record`, written to the session
+    /// log so a resume restores it. Returns null on success, else why not.
+    string setName(string handle, bool record = true)
+    {
+        import nano.handle : invalidHandle, claim;
+        if (!handle.length)
+        {
+            if (!name.length) return null;
+            releaseName();
+            name = null;
+            if (record) log.ifSome((SessionLog l) { l.name(null); });
+            return null;
+        }
+        if (auto why = invalidHandle(handle)) return why;
+        string refused;
+        log.ifSome((SessionLog l) { refused = claim(peers.peersDir(), sessionDirOf(l), handle, l.id); });
+        if (refused !is null) return refused;
+        if (name.length && name != handle) releaseName();
+        immutable changed = name != handle;
+        name = handle;
+        if (record && changed) log.ifSome((SessionLog l) { l.name(handle); });
+        return null;
+    }
+
+    /// Drop this session's registry claim on its handle (it keeps the name
+    /// in memory): before the session is left or the process exits.
+    void releaseName()
+    {
+        import nano.handle : release;
+        if (!name.length) return;
+        log.ifSome((SessionLog l) { release(peers.peersDir(), name, l.id); });
     }
 
     /// The directory a session log lives in (where its sibling sessions are).
@@ -3871,7 +3911,13 @@ class Agent
         messages = messages.length && messages[0].role == Role.system ? messages[0 .. 1].dup : null;
         foreach (ref m; r.conversation)
             if (m.role != Role.system) messages ~= m;
+        releaseName();
         replaceLog(newLog);
+        name = null;
+        if (r.name.length)
+        {
+            if (auto why = setName(r.name, false)) dropped ~= "the handle " ~ r.name ~ ": " ~ why;
+        }
         control.mode = AgentMode.normal;
         sessionThinking.nullify();
         completedInputs = r.completed;
@@ -4006,6 +4052,8 @@ class Agent
         // system message at all: some providers reject an empty one.
         messages = system.length ? [Message.system(system)] : null;
         promptPlan = false; // the caller renders `system` for normal mode
+        releaseName();
+        name = null;
         replaceLog(newLog);
         if (messages.length) log.ifSome((SessionLog l) { l.append(messages[0]); });
         // A new session must not answer a prompt from the previous session's

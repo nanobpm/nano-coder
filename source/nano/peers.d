@@ -63,9 +63,14 @@ enum size_t maxMessageBytes = 64 * 1024;
 enum size_t maxQueuedBytes = 1024 * 1024;
 
 /// The label a delivered message carries, e.g.
-/// `[from session ab88e980 · ts-performance-matrix] …`.
-string label(string senderId, string title) pure
+/// `[from session ab88e980 · ts-performance-matrix] …`, or with the sender's
+/// handle (issue #300) `[from perf-matrix · ts-performance-matrix] …`.
+string label(string senderId, string title, string name = null) pure
 {
+    if (name.strip.length)
+        return title.strip.length
+            ? format("[from %s · %s]", name.strip, title.strip)
+            : format("[from %s]", name.strip);
     // Generated ids are `sess-<timestamp>-<random>`: their prefix is shared
     // by every session, so a short label must keep the distinguishing tail.
     auto brief = senderId.length > 8 ? senderId[$ - 8 .. $] : senderId;
@@ -80,6 +85,8 @@ unittest
     assert(label("rest-ab88e980", "  ") == "[from session ab88e980]");
     assert(label("sess-20261124T101010-1234abcd", "") != label("sess-20261124T101010-9876fedc", ""));
     assert(label("short", "t") == "[from session short · t]");
+    assert(label("rest-ab88e980", "matrix", "perf") == "[from perf · matrix]");
+    assert(label("rest-ab88e980", "", "perf") == "[from perf]");
 }
 
 /// The peers directory: `NANO_CODER_PEERS`, else `peers` next to the
@@ -145,7 +152,8 @@ struct PeerMessage
     /// The sender asks the receiver to confirm even when its own
     /// `session_messages_confirm` is off (the loop guard's approval).
     bool confirm;
-
+    /// The sender's handle (issue #300), or null.
+    string senderName;
 }
 
 /// The `message/send` params, or the error the sender reads.
@@ -178,6 +186,8 @@ Result!(PeerMessage, string) parseMessage(JSONValue params) pure
                 {
                     if (auto v = "title" in n.objectNoRef)
                         if (v.type == JSONType.string) pm.senderTitle = v.str;
+                    if (auto v = "name" in n.objectNoRef)
+                        if (v.type == JSONType.string) pm.senderName = v.str;
                     if (auto v = "confirm" in n.objectNoRef)
                         if (v.type == JSONType.true_ || v.type == JSONType.false_) pm.confirm = v.boolean;
                 }
@@ -188,6 +198,7 @@ Result!(PeerMessage, string) parseMessage(JSONValue params) pure
 string requestLine(PeerMessage pm, long id) pure
 {
     JSONValue nano = ["title": JSONValue(pm.senderTitle), "confirm": JSONValue(pm.confirm)];
+    if (pm.senderName.length) nano["name"] = pm.senderName;
     JSONValue part = ["kind": JSONValue("text"), "text": JSONValue(pm.text)];
     JSONValue msg = [
         "role": JSONValue("user"),
@@ -212,6 +223,9 @@ unittest
     auto v = parseJSON(line);
     auto pm = parseMessage(v["params"]).unwrap("valid request");
     assert(pm.senderId == "sess-sender" && pm.senderTitle == "a title" && pm.text == "hello there" && pm.confirm);
+    assert(pm.senderName is null);
+    auto named = parseMessage(parseJSON(requestLine(PeerMessage("s", "t", "x", "m", false, "perf"), 1))["params"]);
+    assert(named.unwrap("valid").senderName == "perf");
     assert(pm.messageId == "m-1");
     // Two text parts join with a newline.
     auto two = parseJSON(`{"message":{"role":"user","parts":[{"kind":"text","text":"a"},{"kind":"text","text":"b"}],"messageId":"m","contextId":"s"}}`);
@@ -785,7 +799,7 @@ void settle(ref Inbound m, bool accepted, string note = null)
 string confirmQuestion(const ref Inbound m) pure
 {
     import nano.queue : preview;
-    return format("Accept a message %s? \"%s\"", label(m.pm.senderId, m.pm.senderTitle), preview(m.pm.text, 120));
+    return format("Accept a message %s? \"%s\"", label(m.pm.senderId, m.pm.senderTitle, m.pm.senderName), preview(m.pm.text, 120));
 }
 
 /// The receiving session's router: the UI thread drains the listener's
@@ -885,7 +899,7 @@ struct PeerRouter
             bool live;
             req.reply.update((ref ReplyCell c) { if (!c.expired) { c.claimed = true; live = true; } });
             if (!live) continue;
-            auto labelled = label(req.pm.senderId, req.pm.senderTitle) ~ " " ~ req.pm.text;
+            auto labelled = label(req.pm.senderId, req.pm.senderTitle, req.pm.senderName) ~ " " ~ req.pm.text;
             auto confirm = this.confirm || req.pm.confirm;
             if (confirm && noConfirmChannel.get)
             {
@@ -1028,7 +1042,7 @@ struct PeerRouter
     /// dodged with a huge sender id, title or message id.
     private static size_t retainedBytes(const ref PeerMessage pm, string labelled) pure nothrow @nogc
     {
-        return labelled.length + pm.text.length + pm.senderId.length + pm.senderTitle.length + pm.messageId.length;
+        return labelled.length + pm.text.length + pm.senderId.length + pm.senderTitle.length + pm.senderName.length + pm.messageId.length;
     }
 
     private static void answer(Shared!ReplyCell reply, Status status, string note)
@@ -1043,13 +1057,13 @@ imported!"nano.llm".ToolDefinition sendDefinition() pure
     import nano.llm : ToolDefinition;
     return ToolDefinition(sendTool,
         "Send a message to another running nano-coder session on this machine (one that turned "
-        ~ "`session_messages` on; sessions_list marks it [messages]). `to` is an id, a unique id prefix or a "
-        ~ "title, resolved like the history tools' `session` argument. The message joins the target's input "
-        ~ "labelled with this session's id; the target may confirm it first. The result is one of: delivered, "
+        ~ "`session_messages` on; sessions_list marks it [messages]). `to` is a handle (a name the user set with /name), an id, a unique "
+        ~ "id prefix or a title, resolved like the history tools' `session` argument. The message joins the target's input "
+        ~ "labelled with this session's handle or id; the target may confirm it first. The result is one of: delivered, "
         ~ "queued (the target is mid-turn; visible in its /queue), awaiting confirmation, refused (the target "
         ~ "has messages off or declined), not running. A turn started by a peer message cannot send one without "
         ~ "the user's approval, so two agents cannot ping-pong.",
-        parseJSON(`{"type":"object","properties":{"to":{"type":"string","description":"The target session: an id, a unique id prefix, or a title from sessions_list"},"text":{"type":"string","description":"The message text"},"confirm":{"type":"boolean","description":"Ask the target's user to accept even when their confirm setting is off (default false)"}},"required":["to","text"]}`));
+        parseJSON(`{"type":"object","properties":{"to":{"type":"string","description":"The target session: a handle, an id, a unique id prefix, or a title from sessions_list"},"text":{"type":"string","description":"The message text"},"confirm":{"type":"boolean","description":"Ask the target's user to accept even when their confirm setting is off (default false)"}},"required":["to","text"]}`));
 }
 
 // ---------------------------------------------------------------------------

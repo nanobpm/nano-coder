@@ -30,6 +30,7 @@ struct Stats
     string nextTimer;
     AgentMode mode;
     string thinking; /// the level sent (null: the model decides)
+    string name; /// the session's handle (issue #300), null when unset
     ulong sessionInputTokens, sessionOutputTokens;
     bool hasAic;
     double aic = 0;
@@ -221,6 +222,9 @@ string render(const ref Stats stats, size_t cols) pure
     // The mode only gets a segment when it is not the default.
     if (stats.mode == AgentMode.plan) segments ~= Segment(" plan ", "\x1b[1;38;5;221m", 10);
     else if (stats.mode == AgentMode.auto_) segments ~= Segment(" auto ", "\x1b[1;38;5;114m", 10);
+    // The handle (issue #300) is how other sessions address this one: kept
+    // as long as the model is.
+    if (stats.name.length) segments ~= Segment(" @" ~ stats.name ~ " ", "\x1b[1;38;5;159m", 9);
     if (stats.thinking.length) segments ~= Segment(" think " ~ stats.thinking ~ " ", "\x1b[38;5;147m", 4);
     if (stats.sessionInputTokens + stats.sessionOutputTokens > 0)
         segments ~= Segment(format(" ↑%s ↓%s ", formatTokens(toSize(max(0L, stats.sessionInputTokens))),
@@ -409,6 +413,12 @@ unittest
     assert(cellWidth(line) == 70 && line.canFind("…") && line.canFind("openai/gpt-4o"));
     line = visible(render(s, 20));
     assert(cellWidth(line) == 20 && line.canFind("openai/gpt-4o"));
+    {
+        auto named = s;
+        named.name = "perf-matrix";
+        assert(visible(render(named, 200)).canFind(" @perf-matrix "), "the handle shows in the status bar");
+        assert(!visible(render(s, 200)).canFind("@"));
+    }
     s.mode = AgentMode.plan;
     s.activity = Activity.tool;
     s.tool = "bash";

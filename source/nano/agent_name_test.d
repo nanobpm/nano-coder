@@ -1,0 +1,196 @@
+/// Session handles at the agent level (issue #300): `/name`'s validation,
+/// persistence across a resume and `--clear`; uniqueness among running
+/// sessions; `session_send` and the history tools resolving a handle (a
+/// handle beats a colliding title); and the resume hint naming the handle.
+module nano.agent_name_test;
+@safe:
+
+version (unittest):
+
+import std.algorithm : canFind;
+import std.file : tempDir, mkdirRecurse, rmdirRecurse, exists;
+import std.path : buildPath;
+import nano.agent;
+import nano.handle : handlePath, sessionLine, resumeArg;
+import nano.llm;
+import nano.option : some;
+import nano.peers;
+import nano.permissions : Policy;
+import nano.providers.mock : MockClient;
+import nano.session : SessionLog, restore;
+import nano.tools : ToolRegistry;
+static import cross = nano.cross_session;
+
+private:
+
+/// A sessions dir and a peers dir under a fresh root; NANO_CODER_PEERS
+/// points at the latter for the test's life.
+struct Dirs
+{
+    string root, sessions, peers;
+
+    static Dirs make(string name)
+    {
+        import std.process : environment;
+        Dirs d;
+        d.root = buildPath(tempDir, name);
+        if (d.root.exists) rmdirRecurse(d.root);
+        d.sessions = buildPath(d.root, "sessions");
+        d.peers = buildPath(d.root, "peers");
+        mkdirRecurse(d.sessions);
+        mkdirRecurse(d.peers);
+        environment["NANO_CODER_PEERS"] = d.peers;
+        return d;
+    }
+
+    void cleanup()
+    {
+        import std.process : environment;
+        environment.remove("NANO_CODER_PEERS");
+        rmdirRecurse(root);
+    }
+
+    /// An agent recording to a new log `id` (with one prompt, so the index lists it).
+    Agent agent(string id, MockClient mock = null)
+    {
+        auto a = new Agent(mock is null ? new MockClient([]) : mock, new ToolRegistry, Policy.init, "sys");
+        auto log = new SessionLog(sessions, "mock/m", root, id);
+        log.input("in-" ~ id, "the first prompt of " ~ id);
+        a.log = some(log);
+        return a;
+    }
+}
+
+void closeLog(Agent a)
+{
+    import nano.option : ifSome;
+    a.log.ifSome((SessionLog l) { l.close(); });
+}
+
+// `/name`: validation, the registry claim, persistence across a resume, and
+// `--clear` (a cleared handle stays cleared after a resume).
+unittest
+{
+    auto d = Dirs.make("nd-name-persist");
+    scope (exit) d.cleanup();
+    auto a = d.agent("s-a");
+    assert(a.setName("Perf Matrix") !is null, "an invalid handle is refused");
+    assert(a.setName("sess-123") !is null, "a handle can't look like a session id");
+    assert(a.name is null);
+    assert(a.setName("perf") is null);
+    assert(a.name == "perf" && handlePath(d.peers, "perf").exists);
+    auto path = buildPath(d.sessions, "s-a.jsonl");
+    a.releaseName();
+    closeLog(a);
+    assert(!handlePath(d.peers, "perf").exists, "releasing drops the claim");
+
+    // A resume restores the handle (and claims it again).
+    auto r = restore(path);
+    assert(r.name == "perf");
+    auto b = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "sys");
+    b.loadRestored(r, some(new SessionLog(path)));
+    assert(b.name == "perf" && handlePath(d.peers, "perf").exists);
+
+    // `--clear` survives a resume too.
+    assert(b.setName(null) is null && b.name is null);
+    assert(!handlePath(d.peers, "perf").exists);
+    closeLog(b);
+    assert(restore(path).name is null);
+}
+
+// Uniqueness: a running session's handle is refused (naming the holder); a
+// stopped session's handle is reusable; resolution prefers the running one.
+unittest
+{
+    auto d = Dirs.make("nd-name-unique");
+    scope (exit) d.cleanup();
+    auto a = d.agent("s-a");
+    auto b = d.agent("s-b");
+    assert(a.setName("perf") is null);
+    auto refused = b.setName("perf");
+    assert(refused !is null && refused.canFind("s-a"), refused);
+    assert(b.name is null);
+    // `a` stops (its log closes without releasing): its claim is stale.
+    closeLog(a);
+    assert(b.setName("perf") is null, "a stopped session's handle is reusable");
+    // Both logs say "perf" now; the running one wins, then the newest.
+    auto sessions = cross.listSessions(b.policy, d.sessions, d.root);
+    assert(cross.resolve("perf", sessions).id == "s-b");
+    // The resume hint falls back to the id: the handle isn't unique on disk.
+    assert(resumeArg(d.sessions, "s-b", "perf") == "s-b");
+    assert(sessionLine(d.sessions, "s-b", "perf").canFind("perf · s-b"));
+    closeLog(b);
+}
+
+// The resume hint names the handle when it is unique on disk, and `--resume`
+// resolves it (handle first, then id, prefix, title).
+unittest
+{
+    auto d = Dirs.make("nd-name-resume");
+    scope (exit) d.cleanup();
+    auto a = d.agent("s-only");
+    assert(a.setName("nano-engine") is null);
+    closeLog(a);
+    assert(sessionLine(d.sessions, "s-only", "nano-engine").canFind("--resume nano-engine"),
+        sessionLine(d.sessions, "s-only", "nano-engine"));
+    assert(sessionLine(d.sessions, "s-only", null).canFind("--resume s-only"));
+    assert(cross.resolveResumeId(d.sessions, "nano-engine") == "s-only");
+    assert(cross.resolveResumeId(d.sessions, "s-on") == "s-only", "a unique id prefix");
+    assert(cross.resolveResumeId(d.sessions, "s-only") == "s-only");
+    import std.exception : assertThrown;
+    assertThrown(cross.resolveResumeId(d.sessions, "nobody"));
+}
+
+// `session_send` resolves a handle — beating a session whose title is the
+// same word — and the delivered label names the sender by its handle.
+unittest
+{
+    import core.atomic : atomicLoad;
+    import nano.control : TurnControl;
+    import nano.handle : claim;
+    auto d = Dirs.make("nd-name-send");
+    scope (exit) d.cleanup();
+    // A session titled "nano-engine" (its first prompt), stopped.
+    {
+        auto decoy = new SessionLog(d.sessions, "mock/m", d.root, "sess-decoy");
+        decoy.input("in-1", "nano-engine");
+        decoy.close();
+    }
+    // The target: running (its log open), listening, holding the handle.
+    auto targetLog = new SessionLog(d.sessions, "mock/m", d.root, "sess-target");
+    targetLog.input("in-1", "work on the engine scheduler");
+    scope (exit) targetLog.close();
+    assert(claim(d.peers, d.sessions, "nano-engine", "sess-target") is null);
+    auto control = new shared TurnControl;
+    auto router = PeerRouter.make(atomicLoad(control));
+    auto listener = PeerListener.listen(d.peers, "sess-target", router.requests);
+    scope (exit) listener.close();
+    auto pump = TestPump.start(router);
+    scope (exit) pump.stop();
+
+    auto mock = new MockClient([
+        LLMResponse("", "", [ToolCall.fromRaw("s1", sendTool, `{"to":"nano-engine","text":"here is the diagnostic"}`)]),
+        LLMResponse("sent")]);
+    auto sender = d.agent("sess-sender", mock);
+    scope (exit) closeLog(sender);
+    sender.messagesOn = true;
+    assert(sender.setName("perf-matrix") is null);
+    sender.run("hand this to nano-engine", new NullEvents);
+    string result;
+    foreach_reverse (m; mock.seen[$ - 1])
+        if (m.role == Role.tool) { result = m.content; break; }
+    assert(result.canFind("delivered") || result.canFind("awaiting confirmation"), result);
+    Inbound inbound;
+    assert(router.takeWaiting(inbound), "the handle's holder got it, not the title match");
+    assert(inbound.labelled.canFind("[from perf-matrix"), inbound.labelled);
+    settle(inbound, true);
+
+    // The history tools' `session` argument resolves the handle the same way.
+    auto sessions = cross.listSessions(sender.policy, d.sessions, d.root);
+    assert(cross.resolve("nano-engine", sessions).id == "sess-target");
+    // sessions_list shows it.
+    import std.json : parseJSON;
+    assert(cross.listResult(sender.policy, d.sessions, d.root, parseJSON(`{}`)).canFind("[name: nano-engine]"));
+    assert(cross.listResult(sender.policy, d.sessions, d.root, parseJSON(`{"filter":"nano-engine"}`))
+        .canFind("sess-target"));
+}

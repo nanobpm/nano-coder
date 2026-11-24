@@ -11,18 +11,33 @@ import nano.skills : Skills;
 /// The prompt for `cwd` on the date `today` (YYYY-MM-DD); `instructions` and
 /// `memoryIndex` are pre-rendered.
 string buildSystemPrompt(const ref Config c, string cwd, string today, bool plan, const Skills skills,
-    string memoryIndex = null, string instructions = null) pure
+    string memoryIndex = null, string instructions = null, string handle = null) pure
 {
     auto base = c.systemPrompt.length ? c.systemPrompt : "You are a helpful assistant with access to tools.";
     version (OSX) enum os = "macOS";
     else version (linux) enum os = "Linux";
     else enum os = "unknown";
     auto s = format("%s\n\nWorking directory: %s\nPlatform: %s\nToday's date: %s", base, cwd, os, today);
+    // The session's own handle (issue #300), so the agent can introduce
+    // itself and other sessions can be told how to reach it.
+    if (handle.length)
+        s ~= format("\nSession handle: %s (other sessions reach this one with session_send to \"%s\")", handle, handle);
     s ~= instructions;
     s ~= skills.renderIndex;
     s ~= memoryIndex;
     if (plan) s ~= planPromptNote;
     return s;
+}
+
+unittest // the session's handle (issue #300) is in the prompt when set
+{
+    import std.algorithm : canFind;
+    import nano.config : Config;
+    import nano.skills : Skills;
+    Config c;
+    auto named = buildSystemPrompt(c, "/w", "2026-01-02", false, new Skills, null, null, "perf-matrix");
+    assert(named.canFind("Session handle: perf-matrix"), named);
+    assert(!buildSystemPrompt(c, "/w", "2026-01-02", false, new Skills).canFind("Session handle"));
 }
 
 // rust: agent.rs::indexes_skills_in_the_system_prompt_and_loads_them_on_request

@@ -1,7 +1,8 @@
 /// Agent Client Protocol server (`--acp`): JSON-RPC 2.0, one message per
 /// line on stdin and stdout. Port of src/acp.rs.
 ///
-/// Methods: `initialize`, `session/new`, `session/load`, `session/prompt`
+/// Methods: `initialize`, `session/new`, `session/load`, `session/prompt`,
+/// `session/set_name` (issue #300: `{name}` sets the handle, null clears it)
 /// and `session/cancel`. Over ACP, prompts can run the slash commands
 /// `/tools`, `/settings` and `/model <spec>`; any other `/…` prompt is
 /// rejected rather than sent to the model, and `//…` sends a prompt that
@@ -254,6 +255,8 @@ struct Host
     /// Returns a notice for the client (sent as `_nano/notice`, outside the
     /// model's context), or null when nothing changed.
     string delegate() beforePrompt;
+    /// `--name` (issue #300): the handle a new or loaded session takes.
+    string name;
 }
 
 /// Input id for idempotent prompts: `messageId`, or `_meta.inputId`.
@@ -731,6 +734,29 @@ final class AcpServer : AgentEvents
             }
             catch (Exception e) reply(rpcError(id, -32603, e.msg));
             return;
+        case "session/set_name":
+        {
+            // Issue #300: set (a string) or clear (null or "") the active
+            // session's handle, as `/name` does in the REPL.
+            if (sessionId is null) { reply(rpcError(id, -32602, "no active session; call session/new or session/load first")); return; }
+            auto requested = getStr(params, "sessionId");
+            if (requested !is null && requested != sessionId)
+            {
+                reply(rpcError(id, -32602, format("session %s is not active (active: %s)", debugQuote(requested), sessionId)));
+                return;
+            }
+            string handle;
+            if (params.type == JSONType.object)
+                if (auto n = "name" in params.objectNoRef)
+                {
+                    if (n.type == JSONType.string) handle = n.str;
+                    else if (n.type != JSONType.null_) { reply(rpcError(id, -32602, "params.name must be a string or null")); return; }
+                }
+            if (auto why = renameSession(handle)) { reply(rpcError(id, -32602, why)); return; }
+            reply(rpcResult(id, JSONValue(["sessionId": JSONValue(sessionId),
+                "name": agent.name.length ? JSONValue(agent.name) : JSONValue(null)])));
+            return;
+        }
         case "session/cancel":
             // Nothing is running; a notification gets no reply.
             reply(rpcResult(id, JSONValue(string[string].init)));
@@ -768,7 +794,20 @@ final class AcpServer : AgentEvents
 
     private JSONValue sessionMeta()
     {
-        return host.sessionMeta !is null ? host.sessionMeta() : JSONValue(string[string].init);
+        auto meta = host.sessionMeta !is null ? host.sessionMeta() : JSONValue(string[string].init);
+        // The session's handle (issue #300), when it has one.
+        if (agent.name.length) meta["name"] = agent.name;
+        return meta;
+    }
+
+    /// Set (empty: clear) the active session's handle and put it in the
+    /// system prompt; null on success, else why not.
+    private string renameSession(string handle)
+    {
+        import std.file : getcwd;
+        if (auto why = agent.setName(handle)) return why;
+        if (host.systemPrompt !is null) agent.installSystem(host.systemPrompt(getcwd()), agent.indexShown);
+        return null;
     }
 
     /// Slash commands available over ACP; JSONValue.init when `text` isn't one.
@@ -1050,6 +1089,8 @@ final class AcpServer : AgentEvents
             agent.log.ifSome((SessionLog l) { l.settings(s); });
         }
         if (host.loadHooks !is null) agent.useHooks(host.loadHooks(cwd), false);
+        if (host.name.length)
+            if (auto why = renameSession(host.name)) throw new Exception("--name " ~ host.name ~ ": " ~ why);
         startPeerListener();
     }
 
@@ -1087,6 +1128,10 @@ final class AcpServer : AgentEvents
             agent.syncModePrompt((bool plan) => host.modeSystemPrompt(dir, plan));
         }
         sessionId = log.id;
+        // The restored handle (issue #300), or `--name`'s, goes in the prompt.
+        if (host.name.length) renameSession(host.name); // refused: the restored handle stays
+        else if (agent.name.length && host.systemPrompt !is null)
+            agent.installSystem(host.systemPrompt(getcwd()), agent.indexShown);
         startPeerListener();
         if (host.loadHooks !is null) agent.useHooks(host.loadHooks(getcwd()), true);
         replayHistory();
@@ -1958,4 +2003,50 @@ unittest
         assert(agentL.control.mode == AgentMode.plan);
         agentL.replaceLog(Option!SessionLog.init);
     }
+}
+
+// Issue #300: `session/set_name` sets, refuses and clears the handle; the
+// session's `_meta` carries it, and `Host.name` names a new session.
+unittest
+{
+    import nano.providers.mock;
+    import nano.tools;
+    import nano.permissions : Policy;
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, exists;
+    import std.path : buildPath;
+    import std.process : environment;
+    auto root = buildPath(tempDir, "nd-acp-name");
+    if (root.exists) rmdirRecurse(root);
+    mkdirRecurse(buildPath(root, "sessions"));
+    mkdirRecurse(buildPath(root, "peers"));
+    environment["NANO_CODER_PEERS"] = buildPath(root, "peers");
+    scope (exit) { environment.remove("NANO_CODER_PEERS"); rmdirRecurse(root); }
+    auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, null);
+    scope (exit) agent.releaseName();
+    string[] lines;
+    auto host = Host((string cwd) => "sys", null, buildPath(root, "sessions"), "test");
+    host.name = "first";
+    auto srv = new AcpServer(agent, host, (string l) { lines ~= l; });
+    srv.receive(`{"jsonrpc":"2.0","id":1,"method":"session/set_name","params":{"name":"perf"}}`);
+    srv.receive(`{"jsonrpc":"2.0","id":2,"method":"session/new","params":{}}`);
+    srv.receive(`{"jsonrpc":"2.0","id":3,"method":"session/set_name","params":{"name":"perf"}}`);
+    srv.receive(`{"jsonrpc":"2.0","id":4,"method":"session/set_name","params":{"name":"Not Valid"}}`);
+    srv.receive(`{"jsonrpc":"2.0","id":5,"method":"session/set_name","params":{"name":"again"}}`);
+    srv.receive(`{"jsonrpc":"2.0","id":6,"method":"session/set_name","params":{"name":null}}`);
+    srv.close();
+    srv.run();
+    JSONValue[long] byId;
+    foreach (l; lines)
+    {
+        auto m = parseJSON(l);
+        if (auto id = "id" in m) byId[id.integer] = m;
+    }
+    assert(byId[1]["error"]["message"].str.canFind("no active session"), byId[1].toString);
+    assert(byId[2]["result"]["_meta"]["name"].str == "first", byId[2].toString);
+    assert(byId[3]["result"]["name"].str == "perf", byId[3].toString);
+    assert("error" in byId[4], byId[4].toString);
+    assert(byId[5]["result"]["name"].str == "again", byId[5].toString);
+    assert(byId[6]["result"]["name"].type == JSONType.null_, byId[6].toString);
+    assert(agent.name is null);
+    agent.log.ifSome((SessionLog l) { l.close(); });
 }

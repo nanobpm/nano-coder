@@ -120,15 +120,47 @@ string shortModel(string model) pure
 /// `nano-coder · <model>`, plus a `model` token. An empty model clears both.
 /// Metadata changes only what Herdr shows; state and session restore are
 /// unaffected, and a Herdr without `report-metadata` just fails the call.
-string[] metadataArgs(string pane, string model) pure
+string[] metadataArgs(string pane, string model, string name = null) pure
 {
     import std.uni : isControl;
     import std.algorithm : filter;
     import std.conv : text;
     string[] args = ["pane", "report-metadata", pane, "--source", source, "--agent", agent];
     string clean = model.filter!(c => !isControl(c)).text;
-    if (!clean.length) return args ~ ["--clear-display-agent", "--clear-token", "model"];
-    return args ~ ["--display-agent", agent ~ " · " ~ clean, "--token", "model=" ~ clean];
+    string handle = name.filter!(c => !isControl(c)).text;
+    // The session's handle (issue #300) names the pane in place of the
+    // generic agent name, so two named sessions are told apart at a glance.
+    auto who = handle.length ? handle : agent;
+    string[] tokens = handle.length ? ["--token", "name=" ~ handle] : ["--clear-token", "name"];
+    if (!clean.length && !handle.length) return args ~ ["--clear-display-agent", "--clear-token", "model", "--clear-token", "name"];
+    if (!clean.length) return args ~ ["--display-agent", who, "--clear-token", "model"] ~ tokens;
+    return args ~ ["--display-agent", who ~ " · " ~ clean, "--token", "model=" ~ clean] ~ tokens;
+}
+
+/// The pending metadata key for a handle and a model: one string, so the
+/// reporter's repeat check and release logic treat both as one display.
+/// Control characters are filtered from both on send, so `\n` separates.
+private string metaKey(string name, string model) pure
+{
+    return name.length ? name ~ "\n" ~ model : model;
+}
+
+/// `metadataArgs` for a `metaKey`.
+private string[] metadataFor(string pane, string key) pure
+{
+    import std.string : indexOf;
+    auto nl = key.indexOf('\n');
+    return nl < 0 ? metadataArgs(pane, key) : metadataArgs(pane, key[nl + 1 .. $], key[0 .. nl]);
+}
+
+unittest // a handle names the pane and rides as a token
+{
+    auto a = metadataArgs("p", "gpt-5", "perf");
+    assert(a[$ - 6 .. $] == ["--display-agent", "perf · gpt-5", "--token", "model=gpt-5", "--token", "name=perf"], a[$ - 6 .. $].to!string);
+    assert(metadataFor("p", metaKey("perf", "gpt-5")) == a);
+    assert(metadataFor("p", metaKey(null, "gpt-5")) == metadataArgs("p", "gpt-5"));
+    auto n = metadataArgs("p", null, "perf");
+    assert(n[$ - 6 .. $] == ["--display-agent", "perf", "--clear-token", "model", "--token", "name=perf"], n.to!string);
 }
 
 /// The icon the `timer` token shows while a timer is set.
@@ -178,6 +210,8 @@ private struct Reporter
     /// Whether `lastModel` holds a reported name, so a first empty name
     /// (a clear) is still sent rather than mistaken for a repeat.
     bool hasLastModel;
+    /// The current handle and short model name, combined by `metaKey`.
+    string curName, curModel;
     /// Whether a timer is set, when that changed since the last report.
     bool hasPendingTimer, pendingTimer, lastTimer;
     /// Whether `lastTimer` holds a reported state, so a first `false` is
@@ -336,7 +370,21 @@ void showModel(string model)
 {
     if (!active) return;
     auto name = shortModel(model);
-    atomicLoad(gReporter).update((ref Reporter r) { queueModel(r, name); });
+    atomicLoad(gReporter).update((ref Reporter r) {
+        r.curModel = name;
+        queueModel(r, metaKey(r.curName, r.curModel));
+    });
+}
+
+/// Show the session's handle (issue #300; empty clears it) as the pane's
+/// agent name in Herdr, alongside the model, in the background.
+void showName(string handle)
+{
+    if (!active) return;
+    atomicLoad(gReporter).update((ref Reporter r) {
+        r.curName = handle;
+        queueModel(r, metaKey(r.curName, r.curModel));
+    });
 }
 
 /// ditto, for callers that only track the model.
@@ -411,7 +459,7 @@ private void worker(string bin, string pane)
             hasModel = takeModel(r, model);
             hasTimer = takeTimer(r, timerOn);
         });
-        if (hasModel) run(bin, metadataArgs(pane, model));
+        if (hasModel) run(bin, metadataFor(pane, model));
         if (hasTimer) run(bin, timerArgs(pane, timerOn));
         if (hasModel || hasTimer) atomicLoad(gReporter).update((ref Reporter r) { r.modelInFlight = false; });
     }
@@ -537,9 +585,9 @@ unittest // the model shows by its short name, and an empty one clears it
     assert(shortModel("openrouter/moonshotai/kimi-k2") == "kimi-k2");
     assert(shortModel("gpt-5") == "gpt-5");
     assert(metadataArgs("p1", "gpt-5") == ["pane", "report-metadata", "p1", "--source", "nano-coder", "--agent",
-        "nano-coder", "--display-agent", "nano-coder · gpt-5", "--token", "model=gpt-5"]);
-    assert(metadataArgs("p1", "gpt\x1b-5")[$ - 1] == "model=gpt-5");
-    assert(metadataArgs("p1", null)[$ - 3 .. $] == ["--clear-display-agent", "--clear-token", "model"]);
+        "nano-coder", "--display-agent", "nano-coder · gpt-5", "--token", "model=gpt-5", "--clear-token", "name"]);
+    assert(metadataArgs("p1", "gpt\x1b-5")[$ - 3] == "model=gpt-5");
+    assert(metadataArgs("p1", null)[$ - 5 .. $] == ["--clear-display-agent", "--clear-token", "model", "--clear-token", "name"]);
 }
 
 unittest // a model taken before release is waited for and cleared; none is sent after

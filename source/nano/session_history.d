@@ -58,7 +58,7 @@ ToolDefinition[] definitions(bool crossSession = true) pure
 {
     // Without cross-session history the schemas keep their previous shape
     // (issue #271): no `session` property is advertised at all.
-    immutable sessionProp = `,"session":{"type":"string","description":"Read another session: its id, a unique id prefix, or a title from sessions_list. Omit for this session."}`;
+    immutable sessionProp = `,"session":{"type":"string","description":"Read another session: its handle, id, a unique id prefix, or a title from sessions_list. Omit for this session."}`;
     return [
         ToolDefinition(searchTool,
             "Search the original messages of this session, including those folded into a compaction summary. "
@@ -83,7 +83,7 @@ ToolDefinition sessionsDefinition() pure
         ~ "last activity, and whether a process currently has the session open ([live]). Pass an id, a unique id "
         ~ "prefix or a title as the `session` argument of history_search/history_read to read that session's "
         ~ "history. Reading a session from another working directory may be blocked by the permission policy.",
-        parseJSON(`{"type":"object","properties":{"filter":{"type":"string","description":"Only sessions whose id, title or working directory contains this (case-insensitive)"}}}`));
+        parseJSON(`{"type":"object","properties":{"filter":{"type":"string","description":"Only sessions whose id, handle, title or working directory contains this (case-insensitive)"}}}`));
 }
 
 struct Entry

@@ -59,6 +59,8 @@ struct Summary
     string contextPrompt;
     /// A few-word title from the model (`session_titles = true`); kept only here.
     string title;
+    /// The user-chosen handle (issue #300) as of the log's latest `name` record.
+    string name;
     /// Size of the log this summary was made from.
     ulong logBytes;
     /// On-disk size of a compressed log (`<id>.jsonl.gz`) this summary was
@@ -87,6 +89,7 @@ struct Summary
         opt("last_prompt", lastPrompt);
         opt("context_prompt", contextPrompt);
         opt("title", title);
+        opt("name", name);
         f ~= ["log_bytes", logBytes.to!string];
         if (archiveBytes) f ~= ["archive_bytes", archiveBytes.to!string];
         return f;
@@ -132,6 +135,7 @@ struct Summary
         s.lastPrompt = opt("last_prompt");
         s.contextPrompt = opt("context_prompt");
         s.title = opt("title");
+        s.name = opt("name");
         s.logBytes = j["log_bytes"].integer.to!ulong;
         if (auto a = "archive_bytes" in j)
             if (a.type == JSONType.integer && a.integer > 0) s.archiveBytes = a.integer.to!ulong;
@@ -224,8 +228,28 @@ private void foldInputsSince(string path, ulong from, ref Summary s)
 {
     import nano.safeio : readFrom;
     auto tail = readFrom(path, from);
-    foreach (line; committedLines(tail))
-        if (auto t = inputText(line)) foldInput(s, t);
+    foreach (line; committedLines(tail)) foldLine(s, line);
+}
+
+/// Fold one committed log line into `s`: an input's text or a handle.
+private void foldLine(ref Summary s, const(char)[] line) pure
+{
+    if (auto t = inputText(line)) foldInput(s, t);
+    else foldName(s, line);
+}
+
+/// A `name` record (issue #300) sets the handle; a null name clears it.
+private void foldName(ref Summary s, const(char)[] line) pure
+{
+    if (!line.canFind(`"name"`)) return;
+    try
+    {
+        auto rec = parseJSON(line);
+        if (rec["type"].str != "name") return;
+        auto n = rec["data"]["name"];
+        s.name = n.type == JSONType.string ? n.str : null;
+    }
+    catch (JSONException) {} // a corrupt line names nothing
 }
 
 /// Summarize the session log at `path`. Only the header and input records are
@@ -265,8 +289,7 @@ Summary summarize(string path)
         auto lines = committedLines(text.representation);
         if (lines.length) header(lines[0]);
         if (!ok) throw new Exception(format("session log %s has no resumable header", path));
-        foreach (line; lines[1 .. $])
-            if (auto t = inputText(line)) foldInput(s, t);
+        foreach (line; lines[1 .. $]) foldLine(s, line);
         return s;
     }
     // A live log is streamed, and a record that isn't an input is skipped by
@@ -280,7 +303,7 @@ Summary summarize(string path)
             header(line);
             return ok;
         }
-        if (auto t = inputText(line)) foldInput(s, t);
+        foldLine(s, line);
         return true;
     }, (head) => first || mayBeInput(head));
     if (!ok) throw new Exception(format("session log %s has no resumable header", path));
@@ -295,7 +318,7 @@ private bool mayBeInput(const(char)[] head) pure @safe
     if (!head.startsWith(prefix)) return true;
     auto rest = head[prefix.length .. $];
     immutable q = rest.indexOf('"');
-    return q <= 0 || rest[0 .. q].canFind('\\') || rest[0 .. q] == "input";
+    return q <= 0 || rest[0 .. q].canFind('\\') || rest[0 .. q] == "input" || rest[0 .. q] == "name";
 }
 
 private string indexPath(string dir) pure
@@ -531,7 +554,8 @@ bool[string] titledIds(string dir)
     bool[string] named;
     if (!dir.exists) return named;
     size_t lines;
-    foreach (id, s; load(dir, lines, true)) if (s.title !is null) named[id] = true;
+    // A handle (issue #300) protects a session as a title does.
+    foreach (id, s; load(dir, lines, true)) if (s.title !is null || s.name !is null) named[id] = true;
     return named;
 }
 
@@ -1070,4 +1094,30 @@ unittest
     immutable spent = GC.stats.allocatedInCurrentThread - before;
     assert(s.prompts == 2 && s.logBytes == getSize(p), text(s.prompts, " ", s.logBytes));
     assert(spent < big.length / 4, text("summarize allocated ", spent, " B for a ", big.length, " B record"));
+}
+
+// Issue #300: the latest `name` record in the log is the summary's handle; a
+// null name clears it; it round-trips through the index line.
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, exists;
+    import std.path : buildPath;
+    import nano.session : SessionLog;
+    auto dir = buildPath(tempDir, "nano-index-name");
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/m", "/w", "s-named");
+    log.input("i1", "Fix the parser's error recovery");
+    log.name("perf");
+    assert(summarize(log.path).name == "perf");
+    log.name("perf-2");
+    auto s = summarize(log.path);
+    assert(s.name == "perf-2");
+    assert(Summary.fromJson(s.toJson).name == "perf-2");
+    log.name(null);
+    assert(summarize(log.path).name is null, "a cleared handle");
+    log.name("again");
+    log.close();
+    assert(list(dir)[0].name == "again");
 }

@@ -1131,6 +1131,15 @@ class SessionLog
         write_(record("settings", d));
     }
 
+    /// The session's handle after `/name` (issue #300); null records a
+    /// cleared handle. The latest record wins.
+    void name(string handle)
+    {
+        JSONValue d = ["recorded_at": nowStamp()];
+        d["name"] = handle.length ? JSONValue(handle) : JSONValue(null);
+        write_(record("name", d));
+    }
+
     /// The timers after a change; the latest record wins.
     void timers(JSONValue timers)
     {
@@ -1490,6 +1499,8 @@ struct Restored
     JSONValue plan;
     /// The latest timers record (`{last_id, items}`), or null.
     JSONValue timers;
+    /// The session's handle (issue #300) as of the latest `name` record.
+    string name;
     /// The memory-recall state (`{seen, fired}`) as of the latest recall
     /// record, reset by a later replace; null when the session never had one.
     JSONValue recall;
@@ -2411,6 +2422,9 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
             break;
         case "timers":
             r.timers = data["timers"];
+            break;
+        case "name":
+            if (auto n = "name" in data) r.name = n.type == JSONType.string ? n.str : null;
             break;
         case "recall":
             r.recall = data["recall"];
