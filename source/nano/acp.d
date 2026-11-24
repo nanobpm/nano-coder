@@ -1397,9 +1397,12 @@ final class AcpServer : AgentEvents
         const windowApplies = !windowOwner.length || windowOwner == liveModel
             || (host.canonicalModel !is null && host.canonicalModel(windowOwner) == liveModel);
         if (!windowApplies) {}
-        else if (st.contextWindow > 0)
+        else if (st.contextWindow > 0 && !st.contextWindowFromProvider)
+            // Only a user override (marked, or a legacy record without a
+            // model) is pinned; a provider-derived snapshot is re-read from
+            // the live provider below, as interactive resume does (issue #315).
             agent.setConfiguredWindow(ConfiguredWindow(toSize(st.contextWindow), "the session's settings"));
-        else if (st.contextWindow == 0)
+        else if (st.contextWindow >= 0)
         {
             // 0 is "from provider/model": the provider's own window. A
             // provider since removed from config keeps the current one.
@@ -2126,6 +2129,36 @@ unittest
         assert(srvB.run());
         assert(agentB.configuredWindow == 4_343, "a bare header model lost its window");
         agentB.replaceLog(Option!SessionLog.init);
+    }
+
+    // A provider-derived snapshot (128k) is not pinned: the load takes the
+    // live provider's window (32k, lowered in config since); a user-marked
+    // record of the same size is an override (issue #315).
+    foreach (fromProvider; [true, false])
+    {
+        auto lp = new SessionLog(dir, "hdr/one", "/");
+        SessionSettings ws;
+        ws.model = "hdr/one";
+        ws.contextWindow = 128_000;
+        ws.contextWindowFromProvider = fromProvider;
+        lp.settings(ws);
+        auto sidP = lp.id;
+        lp.close();
+        Host hostP = host3;
+        hostP.makeClient = (string spec) => new NamedMock("hdr", "one");
+        hostP.providerWindowFor = (string spec) => ConfiguredWindow(32_000, "provider context_window");
+        auto agentP = new Agent(new NamedMock("hdr", "one"), new ToolRegistry, Policy.init, null);
+        auto srvP = new AcpServer(agentP, hostP, (string l) {});
+        srvP.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ sidP ~ `"}}`);
+        srvP.close();
+        assert(srvP.run());
+        if (fromProvider)
+            assert(agentP.configuredWindow == 32_000 && agentP.configuredWindowSource == "provider context_window",
+                "a provider snapshot restores the live provider window");
+        else
+            assert(agentP.configuredWindow == 128_000 && agentP.configuredWindowSource == "the session's settings",
+                "a user-marked window restores as an override");
+        agentP.replaceLog(Option!SessionLog.init);
     }
 
     // A `session/new` under startup `--plan` records plan mode, so a

@@ -2518,6 +2518,10 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
                     // provider snapshot. A legacy unmarked record is a
                     // model-switch snapshot when it also carries a `model`
                     // and a /settings Context edit (an override) when not.
+                    // Accepted trade-off: a legacy /settings-only override
+                    // followed by a model switch reads back as that switch's
+                    // provider snapshot, so the override is dropped on resume
+                    // (the safe direction: never pin a stale window).
                     auto src = "context_window_source" in data;
                     if (src !is null && src.type == JSONType.string)
                         r.settings.contextWindowFromProvider = src.str != "user";

@@ -1655,7 +1655,7 @@ unittest // resume then provider switch: only a marked user override survives (i
     assert(windowFor(cfg, small).tokens == 32_000);
     // The resumed live window is the current provider's, not the snapshot.
     assert(resumedLiveWindow(legacy.contextWindow, true, 32_000).tokens == 32_000);
-    assert(resumedLiveWindow(legacy.contextWindow, true, 0).tokens == 0, "no provider window: probe");
+    assert(resumedLiveWindow(legacy.contextWindow, true, 0).tokens == 0, "no provider window: the window is probed");
     // (2) a marked user override survives the switch.
     cfg.contextWindow = resumedContextWindow(0, 0, false, true, 100_000, false);
     assert(windowFor(cfg, small).tokens == 100_000);
