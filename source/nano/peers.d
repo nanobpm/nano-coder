@@ -409,21 +409,28 @@ struct PeerListener
                 }
                 remove(path);
             }
+            // Record the owner BEFORE bind (issue #370): between bind and
+            // listen the socket refuses connections, and a peer probing then
+            // must see a live owner, not a missing or stale pid file, or it
+            // deletes our fresh socket. Only written once the path is free,
+            // so a live owner's pid file is never overwritten.
+            if (!path.exists) writeOwner(dir, id);
             socket.bind(new UnixAddress(path));
             socket.listen(listenBacklog);
         }
         catch (SocketException e)
         {
             socket.close();
+            removeOwner(dir, id);
             throw new ListenError(format("cannot listen on %s: %s", path, e.msg));
         }
         catch (FileException e)
         {
             // An unremovable stale socket path: report it like a bind failure.
             socket.close();
+            removeOwner(dir, id);
             throw new ListenError(format("cannot replace stale socket %s: %s", path, e.msg));
         }
-        writeOwner(dir, id);
         registerOwnListener(path);
         auto impl = new Impl;
         impl.path = path;
@@ -1028,7 +1035,10 @@ Status send(string dir, string to, PeerMessage pm, out string note)
                 removeIfThere(pidPath(dir, to));
                 break;
             case Owner.unknown:
-                break; // an older listener without a pid file: refused means stale
+                // No pid file: an older build that never writes one. Current
+                // listeners write it before bind (issue #370), so a refused
+                // socket without one is not a listener mid-startup: stale.
+                break;
         }
         // Stale: nobody is accepting. Remove it so the next listing is clean.
         removeIfThere(path);
@@ -2069,6 +2079,30 @@ unittest
     else enum known = false;
     static if (known) assert(processStartTime(ppid) != 0, "start time lookup failed");
     if (processStartTime(ppid) != 0) assert(ownerOf(dir, "sess-reused", pid) == Owner.gone);
+}
+
+@("issue #370: a refusing socket whose pid file names a live process is kept")
+unittest
+{
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir, exists, write;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    import std.socket : Socket, UnixAddress, AddressFamily, SocketType;
+    import nano.safeio : processStartTime;
+    auto dir = buildPath(tempDir, format("np370%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto path = socketPath(dir, "sess-mid");
+    // A listener caught between bind and listen: the socket exists and
+    // refuses, and its pid file (written before bind) names a live process.
+    auto s = new Socket(AddressFamily.UNIX, SocketType.STREAM);
+    scope (exit) s.close();
+    s.bind(new UnixAddress(path));
+    write(pidPath(dir, "sess-mid"), format("%s %s\n", thisProcessID, processStartTime(thisProcessID)));
+    string note;
+    assert(send(dir, "sess-mid", PeerMessage("sess-sender", null, "hi", "m", false), note) == Status.refused, note);
+    assert(path.exists && pidPath(dir, "sess-mid").exists, "the fresh socket must not be deleted");
 }
 
 @("issue #349: listen closes this process's orphaned listener and rebinds")
