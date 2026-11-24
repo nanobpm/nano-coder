@@ -73,6 +73,67 @@ struct ResponseMeta
     string contentType, retryAfter;
 }
 
+/// libcurl's low-speed limit, used as an idle timeout: the transfer fails once
+/// it stays below `bytesPerSecond` for `seconds`. There is deliberately no
+/// total-time cap, so a slow but steady stream outlives `idleTimeout`.
+struct IdleLimit
+{
+    long bytesPerSecond; /// the floor; 1 byte/s means "any data at all"
+    long seconds; /// how long the transfer may stay below the floor
+}
+
+/// The idle limit `perform` gives libcurl for `idleTimeout` (at least 1 s:
+/// libcurl treats 0 as "no limit").
+IdleLimit idleLimit(Duration idleTimeout) pure nothrow @nogc
+{
+    const secs = idleTimeout.total!"seconds";
+    return IdleLimit(1, secs > 0 ? secs : 1);
+}
+
+// rust: providers/openai.rs::slow_but_steady_stream_survives_beyond_idle_timeout
+// The idle timeout is a 1 byte/s floor over the window, never a total cap, so
+// a stream that keeps delivering survives however long it runs (issue #379:
+// decided here with no real waits).
+unittest
+{
+    assert(idleLimit(1.seconds) == IdleLimit(1, 1));
+    assert(idleLimit(120.seconds) == IdleLimit(1, 120));
+    assert(idleLimit(Duration.zero) == IdleLimit(1, 1) && idleLimit(500.msecs) == IdleLimit(1, 1));
+}
+
+/// One libcurl option `perform` sets for its timeouts.
+struct TimeoutOption
+{
+    import etc.c.curl : CurlOption;
+    CurlOption option; /// the libcurl option
+    long value; /// its value
+}
+
+/// Every timeout option `perform` applies for `idleTimeout`: the low-speed
+/// idle limit, and an explicit 0 total timeout so no total-time cap ever ends
+/// a stream that keeps delivering data.
+TimeoutOption[3] timeoutOptions(Duration idleTimeout) pure nothrow @nogc
+{
+    import etc.c.curl : CurlOption;
+    const idle = idleLimit(idleTimeout);
+    return [TimeoutOption(CurlOption.low_speed_limit, idle.bytesPerSecond),
+        TimeoutOption(CurlOption.low_speed_time, idle.seconds),
+        TimeoutOption(CurlOption.timeout_ms, 0)];
+}
+
+// The options perform applies: a 1 byte/s floor over the idle window and no
+// total-time cap (timeout_ms 0 = none), so an active stream outlives it.
+unittest
+{
+    import etc.c.curl : CurlOption;
+    const opts = timeoutOptions(30.seconds);
+    assert(opts[0] == TimeoutOption(CurlOption.low_speed_limit, 1));
+    assert(opts[1] == TimeoutOption(CurlOption.low_speed_time, 30));
+    assert(opts[2] == TimeoutOption(CurlOption.timeout_ms, 0));
+    foreach (o; opts)
+        assert(o.option != CurlOption.timeout || o.value == 0);
+}
+
 int perform(const ref Request req, out string body_, scope void delegate(const(char)[]) @safe onChunk = null)
 {
     ResponseMeta meta;
@@ -97,11 +158,8 @@ int perform(const ref Request req, out string body_, out ResponseMeta meta,
         else http.addRequestHeader(k, v);
     }
     http.connectTimeout = req.connectTimeout;
-    // libcurl's low-speed limit acts as an idle timeout: fail after `idleTimeout`
-    // seconds below 1 byte/s, without capping a slow but steady stream.
-    import etc.c.curl : CurlOption;
-    http.handle.set(CurlOption.low_speed_limit, 1);
-    http.handle.set(CurlOption.low_speed_time, req.idleTimeout.total!"seconds");
+    foreach (o; timeoutOptions(req.idleTimeout))
+        http.handle.set(o.option, o.value);
     if (req.method != "GET")
     {
         const(void)[] payload = req.body_;
