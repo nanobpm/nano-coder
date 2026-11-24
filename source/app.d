@@ -1001,6 +1001,7 @@ string messagesCommand(Agent agent, ref Config cfg, string arg, ref PeerRouter r
         s.messages = on;
         s.messagesConfirm = confirm;
         agent.log.ifSome((SessionLog l) { l.settings(s); });
+        if (on >= 0) agent.messagesWanted = on != 0;
     }
     string out_;
     if (confirmChange)
@@ -1009,7 +1010,7 @@ string messagesCommand(Agent agent, ref Config cfg, string arg, ref PeerRouter r
         router.confirm(confirmValue);
         out_ = format("Incoming messages %s for this session", confirmValue ? "wait for you to accept" : "are queued at once");
     }
-    else if (on == agent.messagesOn && on == listening)
+    else if (on && agent.messagesOn && listening)
         out_ = stateText();
     else if (on)
     {
@@ -1022,13 +1023,51 @@ string messagesCommand(Agent agent, ref Config cfg, string arg, ref PeerRouter r
     }
     else
     {
-        if (agent.messagesOn || listening) record(0, -1);
-        stop();
+        // Always record an explicit off: a resume whose listener failed
+        // is live-off but still has an on record that would come back.
+        record(0, -1);
+        if (listening) stop();
         agent.messagesOn = false;
         out_ = "Messages off for this session (the socket is closed; session_send is gone from the next request)";
     }
     if (saveIt) out_ ~= "; " ~ persist();
     return out_;
+}
+
+unittest // `/messages off` after a failed resume-listen records off (issue #336)
+{
+    import std.file : exists, rmdirRecurse, tempDir;
+    import std.path : buildPath;
+    import nano.option : some;
+    import nano.permissions : Policy;
+    import nano.providers.mock : MockClient;
+    import nano.session : restore;
+    import nano.tools : ToolRegistry;
+    auto dir = buildPath(tempDir, "nano-coder-messages-off-record");
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/a", "/x");
+    auto sys = Message.system("sys");
+    log.append(sys);
+    SessionSettings rec;
+    rec.messages = 1;
+    log.settings(rec);
+    auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "sys");
+    agent.log = some(log);
+    // The resume restored the on record but the listener failed to start.
+    agent.messagesWanted = true;
+    agent.messagesOn = false;
+    Config cfg;
+    auto router = PeerRouter.make(agent.control.nonNull);
+    size_t stops;
+    string failStart() { return "Address already in use"; }
+    void stop() { stops++; }
+    messagesCommand(agent, cfg, "off", router, false, &failStart, &stop);
+    assert(restore(log.path).settings.messages == 0);
+    assert(!agent.messagesWanted && !agent.messagesOn && stops == 0);
+    // An on that fails keeps the off record and the off intent.
+    messagesCommand(agent, cfg, "on", router, false, &failStart, &stop);
+    assert(restore(log.path).settings.messages == 0 && !agent.messagesWanted);
 }
 
 /// Replays shown so far by `/subagents show` (UI thread only).
@@ -3973,6 +4012,7 @@ int runMain(string[] args)
     }
     peerRouter = PeerRouter.make(agent.control.nonNull);
     peerRouter.confirm(cfg.sessionMessagesConfirm);
+    agent.messagesWanted = cfg.sessionMessages;
     if (cfg.sessionMessages)
         if (auto failed = startPeerListener())
             stdErr.writeln(console.red("[messages: " ~ failed ~ "]"));
@@ -4287,6 +4327,7 @@ int runMain(string[] args)
                     &startPeerListener, &stopPeerListener))
                 notes ~= failed;
             agent.messagesOn = on;
+            if (target.listen >= 0) agent.messagesWanted = target.listen != 0;
         }
         // The warnings `/model` and `/thinking` show for the restored values.
         foreach (w; agent.restoreWarnings(switchedModel, st.thinking.length > 0)) notes ~= "warning: " ~ w;
@@ -5062,9 +5103,11 @@ int runMain(string[] args)
                             agent.compactionMode, agent.autoCompact, agent.autoCompactThreshold,
                             agent.configuredWindow, agent.configuredWindowSource, hasRetained);
                         // `/restart` keeps the messaging state too (issue #336).
-                        if (agent.messagesOn != runtimeDefaults.sessionMessages)
+                        // The recorded intent, not the live state: a failed
+                        // listener does not turn an on record off.
+                        if (agent.messagesWanted != runtimeDefaults.sessionMessages)
                         {
-                            retained.messages = agent.messagesOn ? 1 : 0;
+                            retained.messages = agent.messagesWanted ? 1 : 0;
                             hasRetained = true;
                         }
                         if (peerRouter.confirm != runtimeDefaults.sessionMessagesConfirm)

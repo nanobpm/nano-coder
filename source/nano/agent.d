@@ -752,6 +752,10 @@ class Agent
     /// offer the `session_send` tool. The listener side lives in the prompt
     /// loop (app.d / acp.d); the agent only sends.
     bool messagesOn;
+    /// The messaging state the session log records as wanted (issue #336):
+    /// differs from `messagesOn` when a listener failed to start. `/restart`
+    /// carries this intent over rather than the live state.
+    bool messagesWanted;
     /// The current turn was started by a peer message (set by the prompt
     /// loop via `run(..., fromPeer: true)`): the loop guard — `session_send`
     /// now needs the user's approval whatever the confirm setting, so two
