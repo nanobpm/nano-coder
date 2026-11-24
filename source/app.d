@@ -3734,6 +3734,8 @@ int runMain(string[] args)
     agent.instructions = instructions;
     agent.sessionTitles = cfg.sessionTitles;
     agent.crossSessionHistory = cfg.crossSessionHistory;
+    agent.maxHops = cfg.sessionMessagesMaxHops;
+    agent.maxSendsPerHour = cfg.sessionMessagesMaxPerHour;
     agent.titleModel = cfg.titleModel;
     agent.titleClient = (string spec) => makeClient(resolve(cfg, spec));
     // The provider the last switch resolved: a background probe builds its
@@ -4111,6 +4113,8 @@ int runMain(string[] args)
     // A peer delivery that starts a turn is flagged for the loop guard.
     bool peerInput;
     string peerSender; // its full sender session id
+    uint peerHop = 1; // its hop (issue #350)
+    string peerThread; // its thread
 
     // Recently used models lead the `/model` type-ahead (recents.rs).
     static import nano.recents;
@@ -4620,7 +4624,7 @@ int runMain(string[] args)
             import std.algorithm : filter;
             import std.array : array;
             foreach (t; late)
-                if (t.fromPeer && !peerRouter.requeueLate(t.text, t.sender))
+                if (t.fromPeer && !peerRouter.requeueLate(t.text, t.sender, t.hop, t.thread))
                     stdErr.writeln(console.dim(format("[peer message from %s dropped: inbox full]",
                         escapeMarks(sanitizeBlock(PeerRouter.senderFromLabel(t.text))))));
             late = late.filter!(t => !t.fromPeer).array;
@@ -4644,7 +4648,8 @@ int runMain(string[] args)
         return ok;
     }
 
-    bool turn(string input, bool fromPeer = false, string peerSender = null) @safe
+    bool turn(string input, bool fromPeer = false, string peerSender = null, uint peerHop = 1,
+        string peerThread = null) @safe
     {
         auto skillChange = refreshSkills();
         if (skillChange.length)
@@ -4679,7 +4684,7 @@ int runMain(string[] args)
             console.finalAnswer = null;
             console.beginAnswerGuard();
             string response;
-            try response = agent.run(input, console, true, null, fromPeer, peerSender);
+            try response = agent.run(input, console, true, null, fromPeer, peerSender, peerHop, peerThread);
             catch (Exception e)
             {
                 console.endLine();
@@ -4934,6 +4939,8 @@ int runMain(string[] args)
                 line = inbound.labelled;
                 peerInput = true;
                 peerSender = inbound.pm.senderId;
+                peerHop = inbound.pm.hop;
+                peerThread = inbound.pm.thread;
             }
             else
             {
@@ -5150,6 +5157,10 @@ int runMain(string[] args)
         if (!input.length) continue;
         auto asPeer = peerInput;
         auto asPeerSender = peerSender;
+        auto asPeerHop = peerHop;
+        auto asPeerThread = peerThread;
+        peerHop = 1;
+        peerThread = null;
         peerInput = false;
         peerSender = null;
         if (!literal && isCommand(input))
@@ -5563,7 +5574,7 @@ int runMain(string[] args)
                     continue;
             }
         }
-        turn(input, asPeer, asPeerSender);
+        turn(input, asPeer, asPeerSender, asPeerHop, asPeerThread);
     }
     goodbye();
     return 0;

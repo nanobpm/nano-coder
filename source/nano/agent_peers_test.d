@@ -1,6 +1,6 @@
 /// Inter-session messages at the agent level (issue #272): the `session_send`
-/// tool (offered only with `session_messages` on), the loop guard (a
-/// peer-started turn can't send unapproved), and delivery into a second
+/// tool (offered only with `session_messages` on), the loop guard (hop
+/// limit and per-pair rate cap, issue #350), and delivery into a second
 /// in-process session's router.
 module nano.agent_peers_test;
 @safe:
@@ -113,43 +113,129 @@ unittest
     assert(!t.agent.offeredTools.any!(d => d.name == sendTool), "no session_send with the setting off");
 }
 
-// The loop guard: a turn started by a peer message can't send without
-// `confirm: true`; with it, the send goes through (marked for approval).
+// The loop guard (issue #350): a peer-started turn's plain reply to a
+// confirm-off target is delivered as hop 2; a confirm-on target still asks
+// its user; `confirm: true` still asks whatever the target's setting.
 unittest
 {
     auto mock = new MockClient([
-        call("s1", sendTool, `{"to":"sess-target","text":"ping-pong?"}`),
-        call("s2", sendTool, `{"to":"sess-target","text":"ping-pong?","confirm":true}`),
+        call("s1", sendTool, `{"to":"sess-target","text":"the answer"}`),
+        call("s2", sendTool, `{"to":"sess-target","text":"are you sure?","confirm":true}`),
         LLMResponse("done")]);
     auto t = TwoSessions.make("nd-ap-guard", mock);
     scope (exit) t.cleanup();
+    t.targetRouter.confirm(false);
 
-    // A peer-started turn (fromPeer: the prompt loop's flag).
-    t.agent.run("[from session abcd1234] talk to the target", new NullEvents, true, null, true, "abcd1234-full-id");
+    // A peer-started turn (fromPeer: the prompt loop's flag), hop 1.
+    t.agent.run("[from session abcd1234] talk to the target", new NullEvents, true, null, true,
+        "abcd1234-full-id", 1, "abcd1234-full-id/msg-1");
     {
         import std.algorithm.searching : any;
         assert(t.agent.messages.any!(m => m.role == Role.user && m.fromSession == "abcd1234-full-id"),
             "a peer input keeps its full sender id");
     }
-    // The final request carries both tool results: the refused plain send
-    // and the confirm-marked one that went through.
     string[] toolTexts;
     foreach (m; mock.seen[$ - 1])
         if (m.role == Role.tool) toolTexts ~= m.content;
     assert(toolTexts.length == 2, mock.seen[$ - 1].length.stringof);
-    assert(toolTexts[0].canFind("loop guard") || toolTexts[0].canFind("started by a peer message"), toolTexts[0]);
-    // With confirm the send is allowed; the wire asks the target to confirm.
+    assert(toolTexts[0].canFind("delivered"), toolTexts[0]);
     assert(toolTexts[1].canFind("delivered") || toolTexts[1].canFind("awaiting confirmation"), toolTexts[1]);
-    Inbound inbound;
-    assert(t.targetRouter.takeWaiting(inbound), "the confirm-marked message arrived");
-    assert(inbound.needsConfirm, "the target's user is asked even with their confirm off");
+    Inbound plain, asked;
+    assert(t.targetRouter.takeWaiting(plain), "the plain reply arrived");
+    assert(!plain.needsConfirm && plain.pm.hop == 2, "a reply is hop 2, unconfirmed");
+    assert(plain.pm.thread == "abcd1234-full-id/msg-1", plain.pm.thread);
+    assert(t.targetRouter.takeWaiting(asked), "the confirm-marked message arrived");
+    assert(asked.needsConfirm, "the target's user is asked even with their confirm off");
+    settle(plain, true);
+    settle(asked, true);
 
-    // The next plain turn lifts the guard.
-    auto mock2 = new MockClient([call("s3", sendTool, `{"to":"sess-target","text":"free to send"}`), LLMResponse("ok")]);
+    // A confirm-on target still asks its user for a peer turn's reply.
+    t.targetRouter.confirm(true);
+    auto mock2 = new MockClient([call("s3", sendTool, `{"to":"sess-target","text":"again"}`), LLMResponse("ok")]);
     t.agent.client = mock2;
+    t.agent.run("[from session abcd1234] more", new NullEvents, true, null, true, "abcd1234-full-id", 1);
+    assert(lastToolResult(mock2).canFind("awaiting confirmation"), lastToolResult(mock2));
+    Inbound third;
+    assert(t.targetRouter.takeWaiting(third) && third.needsConfirm);
+    settle(third, false);
+
+    // A user-started turn sends hop 1 and opens its own thread.
+    t.targetRouter.confirm(false);
+    auto mock3 = new MockClient([call("s4", sendTool, `{"to":"sess-target","text":"fresh"}`), LLMResponse("ok")]);
+    t.agent.client = mock3;
     t.agent.run("a normal turn", new NullEvents);
-    assert(lastToolResult(mock2).canFind("delivered") || lastToolResult(mock2).canFind("awaiting confirmation"),
-        lastToolResult(mock2));
+    assert(lastToolResult(mock3).canFind("delivered"), lastToolResult(mock3));
+    Inbound fresh;
+    assert(t.targetRouter.takeWaiting(fresh) && fresh.pm.hop == 1 && fresh.pm.thread.canFind("sess-sender/"),
+        fresh.pm.thread);
+    settle(fresh, true);
+}
+
+// The hop limit (issue #350): a turn started by a hop-4 message can't send
+// hop 5 (default limit 4); nothing reaches the target.
+unittest
+{
+    auto mock = new MockClient([call("s1", sendTool, `{"to":"sess-target","text":"hop five"}`), LLMResponse("done")]);
+    auto t = TwoSessions.make("nd-ap-hops", mock);
+    scope (exit) t.cleanup();
+    t.targetRouter.confirm(false);
+    t.agent.run("[from session abcd1234] reply", new NullEvents, true, null, true, "abcd1234-full-id", 4, "th");
+    auto result = lastToolResult(mock);
+    assert(result.canFind("thread hop limit reached") && result.canFind("ask your user"), result);
+    Inbound none_;
+    assert(!t.targetRouter.takeWaiting(none_), "a refused send never reaches the target");
+}
+
+// The per-pair rate cap (issue #350): the 11th send to one target within an
+// hour is refused; an hour later it goes through. Times are fake stdTime.
+unittest
+{
+    enum long minute = 60L * 10_000_000L;
+    long[][string] sent;
+    long now = 1_000_000 * minute;
+    foreach (i; 0 .. 10)
+    {
+        assert(Agent.rateRefusal(sent, "b", now, 10) is null);
+        sent["b"] ~= now;
+        now += minute;
+    }
+    auto why = Agent.rateRefusal(sent, "b", now, 10);
+    assert(why.canFind("rate limit reached") && why.canFind("10 messages"), why);
+    // Another target is capped separately; 0 means no cap.
+    assert(Agent.rateRefusal(sent, "c", now, 10) is null);
+    assert(Agent.rateRefusal(sent, "b", now, 0) is null);
+    // An hour after the first send, its slot frees.
+    now = 1_000_000 * minute + 60 * minute;
+    assert(Agent.rateRefusal(sent, "b", now, 10) is null);
+    assert(sent["b"].length == 9);
+    // Stale targets are pruned: the map stays bounded.
+    assert(Agent.rateRefusal(sent, "z", now + 120 * minute, 10) is null);
+    assert(sent.length == 0);
+    // Hops: user turns send hop 1; a peer turn one more than its input
+    // (an older sender's message without a hop counts as hop 1).
+    assert(Agent.sendHop(false, 0) == 1 && Agent.sendHop(true, 1) == 2 && Agent.sendHop(true, 0) == 2);
+    assert(Agent.hopRefusal(4, 4) is null && Agent.hopRefusal(5, 4) !is null);
+}
+
+// The rate cap in the tool: with a cap of 1 the second send to the same
+// target is refused.
+unittest
+{
+    auto both = LLMResponse("", "", [
+        ToolCall.fromRaw("s1", sendTool, `{"to":"sess-target","text":"one"}`),
+        ToolCall.fromRaw("s2", sendTool, `{"to":"sess-target","text":"two"}`)]);
+    auto mock = new MockClient([both, LLMResponse("done")]);
+    auto t = TwoSessions.make("nd-ap-rate", mock);
+    scope (exit) t.cleanup();
+    t.targetRouter.confirm(false);
+    t.agent.maxSendsPerHour = 1;
+    t.agent.run("send twice", new NullEvents);
+    string[] toolTexts;
+    foreach (m; mock.seen[$ - 1])
+        if (m.role == Role.tool) toolTexts ~= m.content;
+    assert(toolTexts.length == 2);
+    assert(toolTexts[0].canFind("delivered"), toolTexts[0]);
+    assert(toolTexts[1].canFind("rate limit reached"), toolTexts[1]);
 }
 
 // A target with messages off (no listener) reports `not running`; an unknown
@@ -178,7 +264,7 @@ import std.conv : to;
 
 // Resuming an interrupted peer-input turn (its id redelivered with no
 // sender) re-arms the loop guard and restores the full sender id from the
-// persisted message.
+// persisted message; the hop isn't persisted, so its reply is hop 2.
 unittest
 {
     import nano.session : PendingInput;
@@ -195,5 +281,8 @@ unittest
     assert(t.agent.peerTurn, "the resumed peer turn keeps the loop guard");
     assert(t.agent.inputSender == "abcd1234-full-id", t.agent.inputSender);
     auto result = lastToolResult(mock);
-    assert(result.canFind("loop guard") || result.canFind("started by a peer message"), result);
+    assert(result.canFind("delivered") || result.canFind("awaiting confirmation"), result);
+    Inbound inbound;
+    assert(t.targetRouter.takeWaiting(inbound) && inbound.pm.hop == 2);
+    settle(inbound, true);
 }
