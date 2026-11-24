@@ -1534,6 +1534,23 @@ SessionSettings retainedRestartSettings(const ref RuntimeDefaults d, Verbosity l
     return s;
 }
 
+/// Whether a restored `context_window` record applies to the live model
+/// (issue #297): it belongs to `owner` (the record's model, else the header's,
+/// `canonOwner` its canonical form), so a fallback or `-m` override to
+/// another model must not take it. No owner (an old log) applies.
+bool recordedWindowApplies(string owner, string canonOwner, string live) pure nothrow @nogc
+{
+    return !owner.length || owner == live || canonOwner == live;
+}
+
+unittest // a window recorded by a `/settings` edit belongs to the header model, not a `-m` override
+{
+    assert(recordedWindowApplies("a/one", "a/one", "a/one"));
+    assert(!recordedWindowApplies("a/one", "a/one", "b/two"), "model A's window applied to B");
+    assert(recordedWindowApplies("one", "a/one", "a/one"), "a bare header alias matches canonically");
+    assert(recordedWindowApplies(null, null, "b/two"), "an old log with no model keeps the window");
+}
+
 unittest // retainedRestartSettings: records only live settings that diverge from config
 {
     import nano.context : CompactionMode;
@@ -3624,7 +3641,9 @@ int runMain(string[] args)
         host.beforePrompt = () {
             auto change = refreshSkills();
             if (!change.length) return null;
-            agent.installSystem(systemFor(skillsDir, plan), indexShown);
+            // The live mode, not the startup `--plan`: a loaded session may
+            // have restored another one.
+            agent.installSystem(systemFor(skillsDir, agent.control.mode == AgentMode.plan), indexShown);
             // Published to the ACP client as a `_nano/notice`, not the model.
             return "skills: " ~ change;
         };
@@ -3962,19 +3981,21 @@ int runMain(string[] args)
     {
         auto m = agent.control.mode;
         if (m == lastLoggedMode) return;
-        lastLoggedMode = m;
         SessionSettings s;
         s.mode = m.name;
         logSessionSettings(s);
+        // Only after the write: a failed one is retried on the next sync.
+        lastLoggedMode = m;
     }
     void logVerbosityIfChanged()
     {
         auto v = verbosity;
         if (v == lastLoggedVerbosity) return;
-        lastLoggedVerbosity = v;
         SessionSettings s;
         s.verbosity = nano.ui.name(v);
         logSessionSettings(s);
+        // Only after the write: a failed one is retried on the next sync.
+        lastLoggedVerbosity = v;
     }
     void syncMode()
     {
@@ -4117,8 +4138,13 @@ int runMain(string[] args)
         // A window recorded with a model (a switch records the window it made
         // live) belongs to that model: it does not apply to a fallback or a
         // `-m` override.
-        if (st.contextWindow >= 0 && (!st.model.length
-            || agent.client.providerName ~ "/" ~ agent.client.modelName == st.model))
+        // A window recorded without a model belongs to the header's model
+        // (a `/settings` edit with no `/model` switch), so `--resume -m B`
+        // must not apply model A's window to B.
+        const windowOwner = st.model.length ? st.model : headerModel;
+        if (st.contextWindow >= 0 && recordedWindowApplies(windowOwner,
+            windowOwner.length ? nano.recents.canonical(windowOwner, cfg.providers, cfg.defaultProvider) : null,
+            agent.client.providerName ~ "/" ~ agent.client.modelName))
         {
             if (st.contextWindow > 0)
                 agent.setConfiguredWindow(ConfiguredWindow(toSize(st.contextWindow), "the session's settings"));

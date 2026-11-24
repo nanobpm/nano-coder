@@ -1037,6 +1037,15 @@ final class AcpServer : AgentEvents
         // `session/load` restored (issue #297): its log has no record of
         // them, so a later load would not reproduce them.
         resetToStartupDefaults(true);
+        // Record a startup `--plan` in the new log, as CLI startup does, so a
+        // flag-free process loading it keeps plan mode's restrictions.
+        if (host.plan)
+        {
+            SessionSettings s;
+            import nano.mode : AgentMode, mname = name;
+            s.mode = mname(AgentMode.plan);
+            agent.log.ifSome((SessionLog l) { l.settings(s); });
+        }
         if (host.loadHooks !is null) agent.useHooks(host.loadHooks(cwd), false);
         startPeerListener();
     }
@@ -1190,8 +1199,10 @@ final class AcpServer : AgentEvents
         if (!st.autoCompactThreshold.isNaN) agent.autoCompactThreshold = st.autoCompactThreshold;
         // A window recorded with a model (a switch records the window it made
         // live) belongs to that model: it does not apply to a fallback.
-        const windowApplies = !st.model.length
-            || agent.client.providerName ~ "/" ~ agent.client.modelName == st.model;
+        // One recorded without a model belongs to the header's model.
+        const windowOwner = st.model.length ? st.model : headerModel;
+        const windowApplies = !windowOwner.length
+            || agent.client.providerName ~ "/" ~ agent.client.modelName == windowOwner;
         if (!windowApplies) {}
         else if (st.contextWindow > 0)
             agent.setConfiguredWindow(ConfiguredWindow(toSize(st.contextWindow), "the session's settings"));
@@ -1879,4 +1890,47 @@ unittest
     assert(srv9.run());
     assert(agent9.configuredWindow == 3_333);
     agent9.replaceLog(Option!SessionLog.init);
+
+    // A window recorded without a model (a `/settings` edit) belongs to the
+    // header's model: a load that falls back to another model drops it.
+    {
+        auto la = new SessionLog(dir, "hdr/one", "/");
+        SessionSettings ws;
+        ws.contextWindow = 4_242;
+        la.settings(ws);
+        auto sidA = la.id;
+        la.close();
+        Host hostW = host3; // makeClient throws: stays on mock/mock
+        hostW.windowFor = (string spec) => ConfiguredWindow(777, "fallback provider");
+        auto agentW = new Agent(new MockClient([]), new ToolRegistry, Policy.init, null);
+        auto srvW = new AcpServer(agentW, hostW, (string l) {});
+        srvW.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ sidA ~ `"}}`);
+        srvW.close();
+        assert(srvW.run());
+        assert(agentW.configuredWindow != 4_242, "model hdr/one's window applied to mock/mock");
+        agentW.replaceLog(Option!SessionLog.init);
+    }
+
+    // A `session/new` under startup `--plan` records plan mode, so a
+    // flag-free server loading it restores plan mode.
+    {
+        import nano.mode : AgentMode;
+        Host hostP = host2;
+        hostP.plan = true;
+        auto agentP = new Agent(new MockClient([]), new ToolRegistry, Policy.init, null);
+        string[] linesP;
+        auto srvP = new AcpServer(agentP, hostP, (string l) { linesP ~= l; });
+        srvP.receive(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}`);
+        srvP.close();
+        assert(srvP.run());
+        auto sidP = parseJSON(linesP[0])["result"]["sessionId"].str;
+        agentP.replaceLog(Option!SessionLog.init);
+        auto agentL = new Agent(new MockClient([]), new ToolRegistry, Policy.init, null);
+        auto srvL = new AcpServer(agentL, host3, (string l) {});
+        srvL.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ sidP ~ `"}}`);
+        srvL.close();
+        assert(srvL.run());
+        assert(agentL.control.mode == AgentMode.plan);
+        agentL.replaceLog(Option!SessionLog.init);
+    }
 }
