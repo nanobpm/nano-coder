@@ -30,12 +30,13 @@ immutable Command[] commands = [
     Command("/verbosity", "[quiet|normal|verbose|debug]", "Show or set output detail"),
     Command("/plan", "", "Show the agent's task plan with notes"),
     Command("/timers", "", "List the timers the agent set for itself"),
-    Command("/memory", "[forget ID]", "List cross-session memories (or forget one by id)"),
+    Command("/memory", "[forget ID|entities|migrate [--dry-run]]", "List cross-session memories (forget one, view entities, or migrate: tag, merge and supersede with confirmation)"),
     Command("/hooks", "", "List loaded user hooks (.claude/settings.json and friends)"),
     Command("/queue", "[list|add text|remove N...|edit N text|clear]", "Show or edit the queued messages"),
     Command("/tools", "", "List available tools"),
     Command("/skills", "", "List skills the agent can load"),
     Command("/subagents", "[on|off] [--save] | show <id> | stop <id>|all", "List sub-agents, show or stop one, or switch the agent tool on/off"),
+    Command("/messages", "[on|off|confirm on|off] [--save]", "Show or switch inter-session messages (session_send) and confirmation"),
     Command("/model", "[provider/model]", "Show the model and pick a new one (or switch directly)"),
     Command("/mode", "[normal|plan|auto]", "Show or set the agent mode (Shift+Tab cycles)"),
     Command("/thinking", "[level|default|off|reset]", "Show or set the thinking level for this session"),
@@ -515,14 +516,14 @@ unittest // Tab completion
 // rust: commands.rs::slash_lists_everything_and_typing_narrows_it
 unittest // menu rows
 {
-    auto rows = menu("/m", 80, 10);
-    assert(rows.length == 3 && rows[0].canFind("\x1b[1m/m\x1b[0;36memory"), rows[0]);
+    auto rows = menu("/memo", 80, 10);
+    assert(rows.length == 1 && rows[0].canFind("\x1b[1m/memo\x1b[0;36m"), rows[0]);
     assert(menu("/help x", 80, 10) is null && menu("hi", 80, 10) is null && menu("/", 80, 0) is null);
     assert(menu("/zz", 80, 10)[0].canFind("no matching command"));
     auto few = menu("/", 80, 3);
     assert(few.length == 3 && few[2].canFind("more"));
     foreach (r; menu("/", 20, 20)) assert(r.count <= 19 + 30, r);
-    assert(helpText().canFind("/memory [forget ID]"));
+    assert(helpText().canFind("/memory [forget ID|entities|migrate [--dry-run]]"));
     assert(helpText().canFind("/version")); // rust: commands.rs::help_lists_version
 }
 

@@ -15,7 +15,12 @@ import std.stdio : File;
 /// spread over those large pools, so almost none of the freed heap goes back
 /// (a 59 MB log kept ~330 MB resident with 38 MB live). Small fixed-size pools
 /// let far more of them empty out and be released: 336 -> 237 MB there.
-extern (C) __gshared string[] rt_options = ["gcopt=maxPoolSize:4 incPoolSize:0 initReserve:0"];
+/// `heapSizeFactor` (default 2) is how far the heap may outgrow the live
+/// set before a collection: a resume's replay decodes thousands of folded
+/// messages of short-lived garbage, and at 2 the heap doubled into pools the
+/// few survivors then pinned. Resuming an 82 MB log settled at 139 MB at the
+/// default, 91 MB at 1.25 (1.1: 82 MB, for ~8% more CPU on the resume).
+extern (C) __gshared string[] rt_options = ["gcopt=maxPoolSize:4 incPoolSize:0 initReserve:0 heapSizeFactor:1.25"];
 
 /// `std.stdio.stdout`. Phobos marks it @system only because the `File` is a
 /// `__gshared` global; every `File` operation locks the stream itself.
@@ -159,6 +164,72 @@ int fchmodFd(int fd, uint mode) @trusted
     import core.sys.posix.sys.stat : fchmod;
     import core.sys.posix.sys.types : mode_t;
     return fchmod(fd, cast(mode_t) mode);
+}
+
+/// `mkdir(2)` with an explicit mode (subject to the umask); returns 0 or -1
+/// (errno set). Used where the mode is part of the contract — the peer
+/// registry's 0700 directory (issue #272) — since `std.file.mkdir` always
+/// passes 0777.
+int mkdirMode(string path, uint mode) @trusted nothrow
+{
+    import core.sys.posix.sys.stat : mkdir;
+    import std.string : toStringz;
+    import core.sys.posix.sys.types : mode_t;
+    return mkdir(path.toStringz, cast(mode_t) mode);
+}
+
+version (Posix)
+{
+    private import core.sys.posix.sys.socket : socklen_t, SOL_SOCKET;
+    private import core.sys.posix.sys.types : uid_t, gid_t;
+    private import std.socket : socket_t;
+}
+
+/// Duplicate a socket fd (`dup(2)`), returning `socket_t.init` on error.
+/// Used so a background thread can wrap its own `std.socket.Socket` without
+/// sharing the fd with another `Socket` whose GC finalizer would close it.
+socket_t dupSocket(socket_t fd) nothrow @nogc
+{
+    auto n = dupFd(fd);
+    return n < 0 ? socket_t.init : cast(socket_t) n;
+}
+
+/// The uid on the other end of a connected Unix-domain socket, or -1 when
+/// the platform can't say. The peer registry (issue #272) drops a peer whose
+/// uid is not the process's own, so a socket planted by another user is
+/// never served (an unknown uid fails closed).
+long socketPeerUid(socket_t fd) @trusted nothrow @nogc
+{
+    version (linux)
+    {
+        // SO_PEERCRED fills a ucred: the call writes only within `c` (its
+        // size handed over through `n`).
+        UCred c;
+        socklen_t n = UCred.sizeof;
+        if (getsockopt(fd, SOL_SOCKET, socPeercred, &c, &n) != 0) return -1;
+        return c.uid;
+    }
+    else version (OSX)
+    {
+        uid_t uid;
+        gid_t gid;
+        if (getpeereid(fd, &uid, &gid) != 0) return -1;
+        return uid;
+    }
+    else return -1; // unsupported platform: fail closed
+}
+
+version (linux)
+{
+    private enum socPeercred = 17; // SO_PEERCRED on Linux
+    private struct UCred { int pid; uint uid; uint gid; }
+    // getsockopt writes at most *optlen bytes at optval; here exactly the
+    // UCred the length says.
+    private extern (C) int getsockopt(socket_t, int, int, void*, socklen_t*) nothrow @nogc @system;
+}
+else version (OSX)
+{
+    private extern (C) int getpeereid(socket_t, uid_t*, gid_t*) nothrow @nogc @system;
 }
 
 /// How a non-blocking lock attempt ended.
@@ -588,6 +659,7 @@ unittest
 /// not hold unshared mutable references, so neither a copy out of `get` nor
 /// anything `update` stores can alias the locked value from another thread.
 import std.traits : hasUnsharedAliasing;
+import core.time : Duration;
 final class Locked(T) if (!hasUnsharedAliasing!T)
 {
     import core.sync.mutex : Mutex;
@@ -637,6 +709,28 @@ final class Locked(T) if (!hasUnsharedAliasing!T)
         scope (exit) self.changed.notifyAll();
         return f(self.value);
     }
+
+    /// `await` with a bound: false when `timeout` lapses before `ready`
+    /// holds (nothing run); true after running `f` under the lock.
+    /// `@trusted`: as for `update`.
+    bool await(R = void)(scope bool delegate(ref const T) @safe ready, scope R delegate(ref T) @safe f,
+        Duration timeout) shared @trusted
+    {
+        import core.time : MonoTime;
+        auto self = cast() this;
+        self.mutex.lock();
+        scope (exit) self.mutex.unlock();
+        auto deadline = MonoTime.currTime + timeout;
+        while (!ready(self.value))
+        {
+            auto left = deadline - MonoTime.currTime;
+            if (left <= Duration.zero) return false;
+            self.changed.wait(left);
+        }
+        scope (exit) self.changed.notifyAll();
+        f(self.value);
+        return true;
+    }
 }
 
 /// A copyable, sendable handle to a `shared Locked!T` (like Rust's
@@ -657,6 +751,12 @@ struct Shared(T)
     R await(R = void)(scope bool delegate(ref const T) @safe ready, scope R delegate(ref T) @safe f)
     {
         return atomicLoad(impl).await!R(ready, f);
+    }
+    /// ditto
+    bool await(R = void)(scope bool delegate(ref const T) @safe ready, scope R delegate(ref T) @safe f,
+        Duration timeout)
+    {
+        return atomicLoad(impl).await!R(ready, f, timeout);
     }
 }
 

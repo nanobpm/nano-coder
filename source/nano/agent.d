@@ -35,6 +35,7 @@ import mem = nano.memory;
 import ctx = nano.context;
 import hist = nano.session_history;
 import cross = nano.cross_session;
+import peers = nano.peers;
 import nano.instructions : ProjectInstructions;
 import nano.thinking : Thinking, ThinkingResolved = Resolved, resolveThinking = resolve, Request, cappedBudget, Reported, ThinkingSource = Source;
 import temp = nano.temperature;
@@ -257,7 +258,7 @@ const(Message)[] rehydrateStash(const(Message)[] stash, Option!SessionLog[] logs
         // writer since, and the stale path would name a foreign file.
         try
             foreach (e; load(src.path, (id) => (id in lines) !is null))
-                if (e.message.role == Role.tool) at[e.id] = e.message;
+                if (e.message.role == Role.tool || e.message.role == Role.assistant) at[e.id] = e.message;
         catch (Exception) {} // an unreadable log: the entries replay empty
         byLog[src] = at;
     }
@@ -270,7 +271,13 @@ const(Message)[] rehydrateStash(const(Message)[] stash, Option!SessionLog[] logs
         Message x = deepCopy(m);
         auto src = logs[i].unwrap("isSome");
         if (auto r = x.logLine in byLog[src])
-            if (r.toolCallId == x.toolCallId) x.content = r.content;
+            if (r.role == x.role && r.toolCallId == x.toolCallId && (r.role == Role.tool || r.timestamp == x.timestamp))
+            {
+                x.content = r.content;
+                x.thinking = r.thinking;
+                x.thinkingBlocks = r.thinkingBlocks;
+                x.toolCalls = r.toolCalls;
+            }
         o ~= x;
     }
     return o;
@@ -416,6 +423,9 @@ class Agent
     /// compaction rebuilds the pinned block from originals (Rust's
     /// `pre_compaction_transcript`, trimmed to requests).
     Message[] pinStash;
+    /// The restored `pinStash` dropped legacy non-request entries, so the
+    /// next compaction writes it in full rather than as a delta (issue #301).
+    bool pinStashRestate;
     /// The real turns folded by compactions since the last plain replacement:
     /// a replay (ACP session/load) shows them in place of the summary.
     Message[] replayStash;
@@ -500,13 +510,18 @@ class Agent
     /// too late for this turn stay in `control` for the caller to queue.
     /// Pass `resetControl = false` when the caller already called
     /// `control.startTurn()`, so a cancel routed before `run` began is kept.
-    string run(string input, AgentEvents ev, bool resetControl = true, string givenId = null)
+    string run(string input, AgentEvents ev, bool resetControl = true, string givenId = null,
+        bool fromPeer = false, string peerSender = null)
     {
         import std.datetime.systime : Clock;
         import std.conv : to;
         // A harness-initiated input (a fired timer): never pinned as a request.
         bool automatic = automaticInput;
         automaticInput = false;
+        // The loop guard (issue #272): a peer-started turn can't send peer
+        // messages unapproved; any other input lifts the guard.
+        peerTurn = fromPeer;
+        inputSender = fromPeer ? peerSender : null;
         if (givenId.length)
             if (auto done = givenId in completedInputs)
             {
@@ -529,7 +544,17 @@ class Agent
         // Redelivering the id of an interrupted turn resumes it (its input
         // was logged already).
         bool resuming = hasPending && givenId.length && pending.id == givenId;
-        if (!resuming) log.ifSome((SessionLog l) { l.input(inputId, input); });
+        // A resumed turn keeps its persisted provenance: a peer input or an
+        // absorbed peer steer re-arms the loop guard whatever the caller says.
+        if (resuming)
+            foreach (i; pending.position .. messages.length)
+                if (messages[i].fromSession.length)
+                {
+                    peerTurn = true;
+                    if (!inputSender.length && i == pending.position) inputSender = messages[i].fromSession;
+                    break;
+                }
+        if (!resuming) log.ifSome((SessionLog l) { l.input(inputId, input, inputSender); });
         turnHistoryCalls = 0;
         turnSerial++;
         scope (exit) requestThinking = Option!string.init;
@@ -571,6 +596,18 @@ class Agent
     /// `sessions_list` and honor the `session` argument of the history tools.
     /// Off, the history tools behave as before and no other log is opened.
     bool crossSessionHistory = true;
+    /// Send messages to other sessions (`session_messages`, issue #272):
+    /// offer the `session_send` tool. The listener side lives in the prompt
+    /// loop (app.d / acp.d); the agent only sends.
+    bool messagesOn;
+    /// The current turn was started by a peer message (set by the prompt
+    /// loop via `run(..., fromPeer: true)`): the loop guard — `session_send`
+    /// now needs the user's approval whatever the confirm setting, so two
+    /// agents can't ping-pong. Cleared when the next turn starts.
+    bool peerTurn;
+    /// The full session id of the peer that started this turn (issue
+    /// #272), persisted with its input; empty for any other input.
+    string inputSender;
 
     private ulong logSize()
     {
@@ -726,7 +763,9 @@ class Agent
             {
                 hasPending = true;
                 pending = PendingInput(inputId, typed, messages.length);
-                push(Message.user(input));
+                auto bm = Message.user(input);
+                bm.fromSession = inputSender;
+                push(bm);
                 auto reason = o.blockReason.strip.length ? o.blockReason : "Your message was blocked by a UserPromptSubmit hook.";
                 push(Message.assistant(reason, null));
                 ev.text(false, reason);
@@ -749,6 +788,7 @@ class Agent
             auto um = Message.user(input);
             um.pinText = pinText;
             um.autoInitiated = automatic;
+            um.fromSession = inputSender;
             hasPending = true;
             pending = PendingInput(inputId, typed, messages.length);
             push(um);
@@ -888,8 +928,12 @@ class Agent
         {
             auto sm = Message.user(s.text);
             sm.steered = true;
+            sm.fromSession = s.sender;
             push(sm);
             ev.userMessage(s.text);
+            // A peer's steer makes the rest of this turn peer-driven: the
+            // loop guard must hold for whatever it asks for.
+            if (s.fromPeer) peerTurn = true;
             control.absorbed(s);
         }
         fireDueTimers(ev);
@@ -2135,8 +2179,9 @@ class Agent
                 pending = savedPending;
                 calibLen = savedCalibLen;
             }
-        size_t pinnedBase = pinStash.length;
-        Message[] pinnedNew;
+        // A full restatement (no base) after a restore dropped legacy entries.
+        auto pinnedBase = pinStashRestate ? Option!size_t.init : some(pinStash.length);
+        Message[] pinnedNew = pinStashRestate ? pinStash.dup : null;
         foreach (ref x; summarized)
             if (ctx.isUserRequest(x)) { pinStash ~= x; pinnedNew ~= x; }
 
@@ -2200,10 +2245,12 @@ class Agent
             srcs.length = stashBase;
             foreach (ref x; replayStash[stashBase .. $])
             {
-                bool slim = x.role == Role.tool && x.content.length > stashSlimBytes && !x.attachments.length
-                    && (log.isNone || (x.logLine > restoredLineFloor && x.logLine !in clippedLines));
+                // Without a log only a tool result is dropped (a reply's text
+                // is the transcript; it has nowhere to be read back from).
+                bool slim = stashSlimmable(x) && (log.isNone ? x.role == Role.tool
+                    : x.logLine > restoredLineFloor && x.logLine !in clippedLines);
                 srcs ~= slim ? log : Option!SessionLog.init;
-                if (slim) x.content = null;
+                if (slim) slimMessage(x);
             }
             replayStashLog = srcs;
             log.ifSome((SessionLog l) @safe {
@@ -2224,11 +2271,12 @@ class Agent
             import std.conv : to;
             l.replace(messages, first, last, ctx.modeName(m), client.providerName ~ "/" ~ client.modelName, pinnedNew,
                 hasPending ? &pending : null, folded, extendsStash ? some(stashBase) : Option!size_t.init, replayRestated,
-                some(pinnedBase), trigger.to!string);
+                pinnedBase, trigger.to!string);
         });
         // The replace record is durable: the live state now matches the log,
         // so nothing past this point may roll it back.
         persisted = true;
+        pinStashRestate = false;
         // The replacement drops recalled notes' full text from context, so
         // every memory may be recalled again (except those the retained
         // system message's index renders in full: `indexShown` is kept).
@@ -2328,10 +2376,12 @@ class Agent
         if (auto e = call.rawArgumentsError(stopReason)) { refused = e; return false; }
         bool isPlan = planTools && isPlanTool(call.name);
         bool isOutcome = outcomeTool && call.name == outcomeToolName;
-        bool isHistory = historyEnabled && hist.isHistoryTool(call.name);
+        bool isHistory = (historyEnabled && hist.isHistoryTool(call.name))
+            || (sessionsOffered && call.name == hist.sessionsTool);
         bool isTimer = timerTools && isTimerTool(call.name);
         bool isAgent = subagentsOffered && call.name == subToolName;
         bool isSubCtl = subagentsOffered && isSubControlTool(call.name);
+        bool isSend = messagesOn && log.isSome && call.name == peers.sendTool;
         bool isSettings = settingsTools && call.name == settings.toolName;
         // An `agent` call was checked when its reply's sub-agents launched.
         if (isAgent)
@@ -2342,7 +2392,7 @@ class Agent
                 context ~= gate.context;
                 return true;
             }
-        if (!isPlan && !isOutcome && !isHistory && !isTimer && !isAgent && !isSubCtl && !isSettings && !tools.has(call.name))
+        if (!isPlan && !isOutcome && !isHistory && !isTimer && !isAgent && !isSubCtl && !isSend && !isSettings && !tools.has(call.name))
         {
             refused = format("Tool '%s' not found. Available: %s", call.name, toolNames());
             return false;
@@ -2391,13 +2441,16 @@ class Agent
         isError = true;
         bool isPlan = planTools && isPlanTool(call.name);
         bool isOutcome = outcomeTool && call.name == outcomeToolName;
-        bool isHistory = historyEnabled && hist.isHistoryTool(call.name);
+        bool isHistory = (historyEnabled && hist.isHistoryTool(call.name))
+            || (sessionsOffered && call.name == hist.sessionsTool);
         bool isTimer = timerTools && isTimerTool(call.name);
         bool isAgent = subagentsOffered && call.name == subToolName;
+        bool isSend = messagesOn && call.name == peers.sendTool;
         string out_;
         try
         {
-            if (isAgent) out_ = runSubagent(call, call.id in subGates);
+            if (isSend) out_ = runSessionSend(args);
+            else if (isAgent) out_ = runSubagent(call, call.id in subGates);
             else if (subagentsOffered && isSubControlTool(call.name)) out_ = runSubControl(call.name, args);
             else if (settingsTools && call.name == settings.toolName) out_ = runSessionSettings(args);
             else if (isOutcome)
@@ -2451,6 +2504,95 @@ class Agent
         catch (QuestionError e) out_ = e.msg;
         catch (Exception e) out_ = format("%s failed: %s", call.name, e.msg);
         return out_;
+    }
+
+    /// The `session_send` handler (issue #272): resolve the target like the
+    /// history tools' `session` argument, apply the loop guard and the
+    /// sender's permission policy, and deliver through the registry socket.
+    private string runSessionSend(JSONValue args)
+    {
+        import std.file : getcwd;
+        auto ownLog = log.unwrap("session_send is offered only with a session log");
+        string to, text;
+        bool confirm;
+        if (args.type == JSONType.object)
+        {
+            if (auto v = "to" in args.objectNoRef)
+                if (v.type == JSONType.string) to = v.str.strip;
+            if (auto v = "text" in args.objectNoRef)
+                if (v.type == JSONType.string) text = v.str;
+            if (auto v = "confirm" in args.objectNoRef)
+                if (v.type == JSONType.true_ || v.type == JSONType.false_) confirm = v.boolean;
+        }
+        if (!to.length) throw new hist.HistoryError("session_send: `to` must be a non-empty session id, prefix or title");
+        if (!text.strip.length) throw new hist.HistoryError("session_send: `text` must be a non-empty message");
+        // The loop guard: a turn started by a peer message can't send one
+        // unapproved, whatever the confirm setting — two agents must not
+        // ping-pong. The approval rides as `confirm` on the wire, so the
+        // target's user is asked even when their confirm setting is off.
+        if (peerTurn && !confirm)
+            throw new hist.HistoryError("this turn was started by a peer message: re-send with "
+                ~ "`confirm: true` so the target's user approves it (the loop guard), or ask your user first");
+        auto cwd = getcwd();
+        auto dir = sessionDirOf(ownLog);
+        auto sessions = cross.listSessions(policy, dir, cwd);
+        cross.SessionInfo self;
+        self.id = ownLog.id;
+        self.path = ownLog.path;
+        self.live = true;
+        self.cwd = cwd;
+        auto target = cross.resolve(to, sessions, &self);
+        if (target.id == ownLog.id)
+            throw new hist.HistoryError("session_send: the target is this session; just answer directly");
+        if (auto denied = cross.readDenied(policy, target, cwd))
+            throw new hist.HistoryError(denied);
+        // The sender's permission policy judges the send itself (a
+        // `session_send(...)` deny rule matches the call's JSON).
+        if (auto denied = policy.checkIn(peers.sendTool, args, cwd))
+            throw new hist.HistoryError(denied);
+        peers.PeerMessage pm;
+        pm.senderId = ownLog.id;
+        pm.senderTitle = selfTitle(sessions, ownLog.id);
+        pm.text = text;
+        pm.messageId = format("msg-%s", ++sendCounter);
+        pm.confirm = confirm;
+        string note;
+        auto status = peers.send(peers.peersDir(), target.id, pm, note);
+        return format("%s: %s", statusText(status), note.length ? note : defaultNote(status, target));
+    }
+
+    private uint sendCounter;
+
+    private static string statusText(peers.Status s) pure
+    {
+        final switch (s)
+        {
+            case peers.Status.delivered: return "delivered";
+            case peers.Status.queued: return "queued";
+            case peers.Status.awaiting: return "awaiting confirmation";
+            case peers.Status.refused: return "refused";
+            case peers.Status.notRunning: return "not running";
+        }
+    }
+
+    private static string selfTitle(cross.SessionInfo[] sessions, string id)
+    {
+        foreach (i; sessions)
+            if (i.id == id) return i.title;
+        return null;
+    }
+
+    private static string defaultNote(peers.Status status, const ref cross.SessionInfo target) pure
+    {
+        import peers = nano.peers;
+        final switch (status)
+        {
+            case peers.Status.delivered: return format("delivered to session %s", target.id);
+            case peers.Status.queued: return format("queued in session %s (mid-turn; visible in its /queue)", target.id);
+            case peers.Status.awaiting: return format("waiting for session %s's user to accept", target.id);
+            case peers.Status.refused: return format("session %s refused the message", target.id);
+            case peers.Status.notRunning: return format("session %s is not running (or has messages off)", target.id);
+        }
     }
 
     /// The directory a session log lives in (where its sibling sessions are).
@@ -3512,6 +3654,12 @@ class Agent
     /// Append the "look in history" hint to the next failed tool result.
     bool historyHintPending;
     bool historyEnabled() pure const { return log.isSome && historyAvailable; }
+    /// `sessions_list` is offered with history, and also whenever messaging
+    /// is on so `session_send` targets can be discovered before history is.
+    bool sessionsOffered() pure const
+    {
+        return log.isSome && crossSessionHistory && (historyAvailable || messagesOn);
+    }
 
     /// The messages a replay shows (Rust `replay_history`): the stashed
     /// pre-compaction turns, then the conversation without its synthetic
@@ -3577,7 +3725,13 @@ class Agent
         completedOutcomes = r.completedOutcomes;
         historyAvailable = r.historyAvailable;
         historyHintPending = r.historyAvailable && !r.historyHintConsumed;
-        pinStash = r.pinStash;
+        // Only user requests are pinned (`pinnedUserRequests` ignores the
+        // rest). An older log's stash also holds folded tool and assistant
+        // turns (issue #301); drop them, and have the next compaction restate
+        // the stash in full, because its `pinned_base` would count them.
+        pinStash = null;
+        foreach (ref m; r.pinStash) if (ctx.isUserRequest(m)) pinStash ~= m;
+        pinStashRestate = pinStash.length != r.pinStash.length;
         replayStash = r.replayStash;
         replayStashLog = null;
         stashRefLogs = null;
@@ -3709,6 +3863,7 @@ class Agent
         compactFloor = 0;
         resetIdleCompaction();
         pinStash = null;
+        pinStashRestate = false;
         replayStash = null;
         replayStashLog = null;
         stashRefLogs = null;
@@ -3831,7 +3986,8 @@ class Agent
     {
         auto all = tools.definitions ~ (planTools ? planDefinitions() : null)
             ~ (outcomeTool ? [outcomeDefinition()] : null) ~ (historyEnabled ? hist.definitions(crossSessionHistory) : null)
-            ~ (historyEnabled && crossSessionHistory ? [hist.sessionsDefinition()] : null)
+            ~ (sessionsOffered ? [hist.sessionsDefinition()] : null)
+            ~ (messagesOn && log.isSome ? [peers.sendDefinition()] : null)
             ~ (timerTools ? timerDefinitions() : null) ~ (settingsTools ? [settings.definition()] : null)
             ~ (subagentsOffered ? [subDefinition(subagentCandidates)] ~ subControlDefinitions() : null);
         if (control.mode != AgentMode.plan) return all;

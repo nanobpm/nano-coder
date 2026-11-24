@@ -143,6 +143,10 @@ struct Message
     /// User role: a steer typed mid-turn (`steered`); the turn goes on, so
     /// it supersedes the answer before it in quiet replay.
     bool steered;
+    /// User role: the full session id of the peer that sent this input
+    /// or steer (`from_session`, issue #272); the visible label carries
+    /// only a prefix, so this keeps the origin unambiguous.
+    string fromSession;
     /// User role: entirely harness hook context (`hook_context`), never pinned.
     bool hookContext;
     /// User role: the user-typed text when hook context was appended to

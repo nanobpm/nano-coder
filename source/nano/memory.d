@@ -43,7 +43,7 @@ enum forgetTool = "memory_forget";
 enum entityTool = "memory_entity";
 enum verifyTool = "memory_verify";
 enum maxTextChars = 800;
-private enum maxEvidenceChars = 400;
+enum maxEvidenceChars = 400;
 /// Budget for the memory section of the system prompt.
 enum indexChars = 4_000;
 enum defaultExpiryDays = 90;
@@ -272,19 +272,31 @@ string parseFactKind(string text) pure
 /// empty name or a line break is an error.
 string normalizeEntity(string raw) pure
 {
+    string error;
+    auto r = normalizeEntityOr(raw, error);
+    if (error !is null) throw new Exception(error);
+    return r;
+}
+
+/// `normalizeEntity` without throwing: the id, or null with `error` set.
+string normalizeEntityOr(string raw, out string error) pure
+{
     import std.uni : uniToLower = toLower;
     auto t = raw.strip;
     auto colon = t.indexOf(':');
     if (colon <= 0)
-        throw new Exception(format("entity %s must be `type:name` (type one of %s)", JSONValue(t).jsonText, entityTypes.join(", ")));
+    {
+        error = format("entity %s must be `type:name` (type one of %s)", JSONValue(t).jsonText, entityTypes.join(", "));
+        return null;
+    }
     auto type = t[0 .. colon].strip.uniToLower;
     auto name_ = t[colon + 1 .. $].strip.uniToLower;
     if (!entityTypes.canFind(type))
-        throw new Exception(format("unknown entity type %s; use one of %s", JSONValue(type).jsonText, entityTypes.join(", ")));
-    if (!name_.length) throw new Exception(format("entity %s has no name", JSONValue(t).jsonText));
-    if (name_.byDchar.any!isLineBreak || name_.length > maxAnchorChars)
-        throw new Exception(format("entity name %s must be a single line of at most %s bytes", JSONValue(name_).jsonText, maxAnchorChars));
-    return type ~ ":" ~ name_;
+        error = format("unknown entity type %s; use one of %s", JSONValue(type).jsonText, entityTypes.join(", "));
+    else if (!name_.length) error = format("entity %s has no name", JSONValue(t).jsonText);
+    else if (name_.byDchar.any!isLineBreak || name_.length > maxAnchorChars)
+        error = format("entity name %s must be a single line of at most %s bytes", JSONValue(name_).jsonText, maxAnchorChars);
+    return error is null ? type ~ ":" ~ name_ : null;
 }
 
 /// The lower-cased words (letters and digits) of `text`, in order.
@@ -404,7 +416,8 @@ struct EntityRecord
     }
 }
 
-private bool tryParseJson(string text, out JSONValue j)
+/// Parse `text` as JSON; false (instead of throwing) when it is not.
+bool tryParseJson(string text, out JSONValue j)
 {
     try j = parseJSON(text);
     catch (Exception) return false; // a non-JSON line is skipped (kept verbatim by the caller)
@@ -1050,6 +1063,33 @@ final class Store
         throw new Exception(format("no memory %s; list the ids with /memory", scrubControl(id)));
     }
 
+    /// Whether `s` has a file here (the project scope needs a git repository).
+    bool hasScope(Scope s) pure const { return hasPath(s); }
+
+    /// Every entry of one scope, superseded ones included (unlocked: never
+    /// writes); empty when the scope has no file. `/memory migrate` reads it.
+    Entry[] scopeEntries(Scope s) { return hasPath(s) ? readScopeFile(s, false).entries : null; }
+
+    /// A locked read-modify-write of one scope's entries (`/memory migrate`):
+    /// `edit` changes them in place, then entities they name that the
+    /// registry lacks are registered and the file is rewritten. Unknown lines
+    /// are kept verbatim.
+    void editEntries(Scope s, void delegate(ref Entry[] entries, const EntityRecord[] records) @safe edit)
+    {
+        auto p = path(s);
+        auto lock = FileLock(p);
+        auto f = readScopeFile(s, true);
+        auto reg = readRegistry(s);
+        edit(f.entries, reg.records);
+        bool added;
+        foreach (e; f.entries)
+            foreach (ne; e.entities)
+                if (!reg.records.any!(rec => rec.id == ne)) { reg.records ~= EntityRecord(ne); added = true; }
+        // Registry first, as in saveFact: a failed registry write leaves the entries untouched.
+        if (added) writeRegistry(s, reg);
+        writeAll(p, f.entries, f.unknown);
+    }
+
     struct Scoped { Scope s; Entry e; }
 
     /// Every current (not superseded) entry, most recently used first (unlocked: filters expired, never writes).
@@ -1478,7 +1518,8 @@ void writeAll(string p, const Entry[] entries, const(ubyte[])[] unknown)
 }
 
 /// Atomically replace `p` with `data` (owner-only temp file, then rename).
-private void writeBody(string p, const(ubyte)[] data)
+/// Also used by `/memory migrate` for its progress, dry-run and backup files.
+void writeBody(string p, const(ubyte)[] data)
 {
     import core.sys.posix.fcntl : O_WRONLY, O_CREAT, O_EXCL;
     import core.sys.posix.unistd : close, getpid;
@@ -1570,7 +1611,7 @@ enum recallEntityByteBudget = 1_500;
 /// A recalled entity's other facts stay quiet for this many tool calls (the
 /// issue's K), unless the call would recall a fact of it not chosen before.
 enum recallEntityCooldownCalls = 8;
-private enum maxAnchors = 12;
+enum maxAnchors = 12;
 private enum maxAnchorChars = 120;
 private enum minAnchorChars = 3;
 /// Append-only `fired`/`used` event log beside the scope files.
@@ -2405,9 +2446,8 @@ size_t[2][string] recallStats(Store store)
     foreach (line; text.splitLines)
     {
         JSONValue v;
-        try v = parseJSON(line);
-        catch (Exception) continue; // skip a torn or corrupt log line
-        if (v.type != JSONType.object) continue;
+        // A torn or corrupt log line is skipped.
+        if (!tryParseJson(line, v) || v.type != JSONType.object) continue;
         auto id = "id" in v, event = "event" in v;
         if (id is null || event is null || id.type != JSONType.string || event.type != JSONType.string) continue;
         auto slot = id.str in stats;

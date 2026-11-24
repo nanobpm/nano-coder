@@ -95,13 +95,20 @@ string[] textLines(string s) pure
 
 string readFile(JSONValue args, ReadState state)
 {
-    return readFile(args, (string path, const(ubyte)[] data) => state.record(path, data));
+    return readFileDigest(args, (string path, ubyte[32] digest) => state.recordDigest(path, digest));
 }
 
-/// `read_file` reporting what it showed to `seen` instead of a `ReadState`,
-/// so it can run on a worker thread (issue #222): it touches nothing else.
-string readFile(JSONValue args, scope void delegate(string path, const(ubyte)[] data) @safe seen)
+/// `read_file` reporting the file's SHA-256 digest to `seen` instead of a
+/// `ReadState`, so it can run on a worker thread (issue #222) while streaming
+/// large files without holding their full contents in memory (issue #309).
+string readFileDigest(JSONValue args, scope void delegate(string path, ubyte[32] digest) @safe seen)
 {
+    import std.array : Appender;
+    import std.digest.sha : SHA256;
+    import std.stdio : File;
+    import std.utf : validate, UTFException;
+    import nano.safeio : asChars;
+
     auto path = resolvePath(requireString(args, "path", "read_file"));
     auto offset = optInt(args, "offset", 1);
     auto limit = optInt(args, "limit", defaultReadLimit);
@@ -109,16 +116,20 @@ string readFile(JSONValue args, scope void delegate(string path, const(ubyte)[] 
     if (limit < 1) throw new ToolError("read_file: limit must be 1 or more");
     if (!path.exists) throw new ToolError(format("read_file: %s does not exist", path));
     if (path.isDir) throw new ToolError(format("read_file: %s is a directory; use glob or bash ls", path));
-    auto data = readBytes(path);
-    import std.path : extension;
-    import std.uni : toLower;
-    // An image returns its metadata only, as `{"image": {...}}`; the agent
-    // re-reads it by path, fits it to the model and attaches it (or reports
-    // that the model can't view images). Text output never starts with `{`.
+
+    // Sniff the first 8 KiB for image headers or NUL bytes before streaming
+    // the rest of the file. Images are read whole (for dimensions); text files
+    // are streamed in 64 KiB chunks so memory stays bounded to the requested
+    // line window instead of scaling with total file size.
+    auto f = File(path, "rb");
+    auto chunkBuf = new ubyte[64 * 1024];
+    auto firstChunk = f.rawRead(chunkBuf);
     import nano.attachment : sniff, dimensions, mediaType, extension_ = extension;
-    auto fmt = sniff(data);
+    auto fmt = sniff(firstChunk);
     if (!fmt.isNull)
     {
+        f.close();
+        auto data = readBytes(path);
         uint[2] dims;
         try dims = dimensions(data);
         catch (Exception e) throw new ToolError(format("read_file: %s: read image dimensions: %s", path, e.msg));
@@ -128,38 +139,177 @@ string readFile(JSONValue args, scope void delegate(string path, const(ubyte)[] 
         img["bytes"] = data.length;
         return JSONValue(["image": img]).jsonText;
     }
-    if (looksBinary(data)) throw new ToolError(format("read_file: %s looks like a binary file (%s bytes)", path, data.length));
-    import std.utf : validate, UTFException;
-    auto text = ownText(data);
-    try validate(text);
-    catch (UTFException) throw new ToolError(format("read_file: %s is not valid UTF-8 text", path));
-    auto lines = textLines(text);
-    if (lines.length == 0)
+    if (looksBinary(firstChunk))
     {
-        seen(path, data);
+        auto sz = getSize(path);
+        throw new ToolError(format("read_file: %s looks like a binary file (%s bytes)", path, sz));
+    }
+
+    // Stream chunks: hash raw bytes for ReadState freshness, validate UTF-8
+    // across chunk boundaries, count total lines, and format only lines in
+    // [firstLine, lastLine) (each capped at `maxLineChars` bytes).
+    immutable size_t firstLine = toSize(offset - 1);
+    immutable size_t limitLines = toSize(limit);
+    immutable size_t lastLine = firstLine <= size_t.max - limitLines ? firstLine + limitLines : size_t.max;
+
+    SHA256 sha;
+    sha.start();
+    Appender!string out_;
+    Appender!(char[]) curLine;
+    bool curTruncated;
+    size_t lineCount;
+    bool anyBytes;
+    ubyte[4] utf8Carry;
+    size_t utf8CarryLen;
+
+    auto emitLine = (bool terminated) {
+        if (lineCount >= firstLine && lineCount < lastLine)
+        {
+            auto l = curLine.data;
+            // Only a `\r` right before `\n` is a line ending; a literal
+            // trailing `\r` on an unterminated final line is content.
+            if (terminated && !curTruncated && l.length && l[$ - 1] == '\r') l = l[0 .. $ - 1];
+            import std.format : formattedWrite;
+            if (curTruncated)
+                formattedWrite(out_, "%6d\t%s [line truncated]\n", lineCount + 1, l[0 .. safeCut(l, maxLineChars)]);
+            else
+                formattedWrite(out_, "%6d\t%s\n", lineCount + 1, l);
+        }
+        curLine.clear();
+        curTruncated = false;
+        lineCount++;
+    };
+
+    auto pushLinePart = (const(char)[] part) {
+        if (lineCount < firstLine || lineCount >= lastLine || curTruncated || !part.length) return;
+        // Keep up to `maxLineChars + 1` bytes so a trailing `\r` right at
+        // `maxLineChars` is stripped cleanly before deciding truncation.
+        immutable cap = maxLineChars + 1;
+        if (curLine.data.length + part.length <= cap)
+        {
+            curLine.put(part);
+        }
+        else
+        {
+            auto room = saturatingSub(cap, curLine.data.length);
+            if (room) curLine.put(part[0 .. room]);
+            curTruncated = true;
+        }
+    };
+
+    auto processChunk = (const(ubyte)[] got) {
+        if (!got.length) return;
+        anyBytes = true;
+        sha.put(got);
+
+        // Validate UTF-8 across chunk boundaries (at most 3 trailing bytes
+        // carried to the next chunk if an incomplete sequence ends the chunk).
+        ubyte[64 * 1024 + 4] combined;
+        const(ubyte)[] data;
+        if (utf8CarryLen)
+        {
+            combined[0 .. utf8CarryLen] = utf8Carry[0 .. utf8CarryLen];
+            combined[utf8CarryLen .. utf8CarryLen + got.length] = got[];
+            data = combined[0 .. utf8CarryLen + got.length];
+            utf8CarryLen = 0;
+        }
+        else data = got;
+
+        // Peel off an incomplete trailing multi-byte UTF-8 sequence (1..3 bytes).
+        size_t validEnd = data.length;
+        size_t back = 1;
+        while (back <= 3 && back <= data.length && (data[$ - back] & 0xC0) == 0x80) back++;
+        if (back <= 4 && back <= data.length)
+        {
+            auto lead = data[$ - back];
+            size_t seqLen = (lead & 0x80) == 0 ? 1
+                : (lead & 0xE0) == 0xC0 ? 2
+                : (lead & 0xF0) == 0xE0 ? 3
+                : (lead & 0xF8) == 0xF0 ? 4 : 1;
+            if (seqLen > back)
+            {
+                validEnd = data.length - back;
+                utf8CarryLen = back;
+                utf8Carry[0 .. back] = data[validEnd .. $];
+            }
+        }
+
+        auto slice = asChars(data[0 .. validEnd]);
+        try validate(slice);
+        catch (UTFException) throw new ToolError(format("read_file: %s is not valid UTF-8 text", path));
+
+        size_t st;
+        foreach (i, char c; slice)
+        {
+            if (c == '\n')
+            {
+                pushLinePart(slice[st .. i]);
+                // If the line filled to `maxLineChars + 1` and its last byte
+                // wasn't `\r`, it truly exceeded `maxLineChars`; if it was
+                // exactly `maxLineChars` + `\r`, drop `\r` and don't truncate.
+                if (curTruncated && curLine.data.length == maxLineChars + 1)
+                {
+                    // already truncated by extra bytes beyond maxLineChars+1
+                }
+                else if (!curTruncated && curLine.data.length > maxLineChars && curLine.data[$ - 1] != '\r')
+                {
+                    curTruncated = true;
+                }
+                emitLine(true);
+                st = i + 1;
+            }
+        }
+        if (st < slice.length)
+        {
+            pushLinePart(slice[st .. $]);
+            if (!curTruncated && curLine.data.length > maxLineChars)
+            {
+                // Could still be maxLineChars + '\r' followed by '\n' in next chunk;
+                // only mark truncated once we have > maxLineChars bytes not ending in '\r'
+                // (or on EOF).
+                if (curLine.data.length > maxLineChars + 1 || curLine.data[$ - 1] != '\r')
+                    curTruncated = true;
+            }
+        }
+    };
+
+    bool hadTrailingNewline = true;
+    while (firstChunk.length)
+    {
+        hadTrailingNewline = firstChunk[$ - 1] == '\n';
+        processChunk(firstChunk);
+        firstChunk = f.rawRead(chunkBuf);
+    }
+    if (utf8CarryLen)
+        throw new ToolError(format("read_file: %s is not valid UTF-8 text", path));
+    if (anyBytes && !hadTrailingNewline)
+    {
+        if (!curTruncated && curLine.data.length > maxLineChars) curTruncated = true;
+        emitLine(false);
+    }
+
+    auto digest = sha.finish();
+    if (lineCount == 0)
+    {
+        seen(path, digest);
         return "(empty file)";
     }
-    if (offset > lines.length)
-        throw new ToolError(format("read_file: offset %s is past the end of %s (%s lines)", offset, path, lines.length));
+    if (offset > lineCount)
+        throw new ToolError(format("read_file: offset %s is past the end of %s (%s lines)", offset, path, lineCount));
     // Record only once the read has succeeded, so a failed out-of-range read
     // can't authorize a later edit the model never saw.
-    seen(path, data);
-    auto first = toSize(offset - 1);
-    auto last = min(lines.length, first + toSize(limit));
-    string out_;
-    foreach (n; first .. last)
+    seen(path, digest);
+    auto last = min(lineCount, lastLine);
+    if (last < lineCount)
     {
-        auto line = lines[n];
-        if (line.length > maxLineChars) line = line[0 .. safeCut(line, maxLineChars)] ~ " [line truncated]";
-        out_ ~= format("%6d\t%s\n", n + 1, line);
+        import std.format : formattedWrite;
+        formattedWrite(out_, "\n(%s more lines; use offset=%s to continue)", lineCount - last, last + 1);
     }
-    if (last < lines.length)
-        out_ ~= format("\n(%s more lines; use offset=%s to continue)", lines.length - last, last + 1);
-    return out_;
+    return out_.data;
 }
 
 /// A byte index ≤ `at` that does not split a UTF-8 sequence.
-private size_t safeCut(string s, size_t at) pure
+private size_t safeCut(const(char)[] s, size_t at) pure
 {
     if (at >= s.length) return s.length;
     while (at > 0 && (s[at] & 0xC0) == 0x80) at--;
@@ -1608,8 +1758,8 @@ Concurrency readConcurrency(ReadState state)
     {
         import std.string : representation;
         immutable(ubyte)[] receipt;
-        auto text = readFile(parseJSON(argsJson), (string path, const(ubyte)[] data) {
-            receipt = sha256Of(data).idup ~ path.representation;
+        auto text = readFileDigest(parseJSON(argsJson), (string path, ubyte[32] digest) {
+            receipt = digest.idup ~ path.representation;
         });
         return JobResult(text, false, false, receipt);
     }
@@ -1735,6 +1885,15 @@ unittest
     bool threw;
     try readFile(j("path", p, "offset", 9), st); catch (ToolError) threw = true;
     assert(threw);
+}
+
+unittest // a literal trailing `\r` on an unterminated last line is content, not a line ending
+{
+    auto st = new ReadState;
+    auto p = tmpFile("cr-tail.txt", "a\r\nabc\r");
+    auto all = readFile(j("path", p), st);
+    assert(all.indexOf("     1\ta\n") >= 0, all);
+    assert(all.indexOf("     2\tabc\r\n") >= 0, all);
 }
 
 // rust: files.rs::write_creates_parents_and_edit_requires_unique_match
@@ -2732,4 +2891,90 @@ unittest // review round 9: snapshot-gated commit, normalized repeats, symlink r
     assert(!b.exists, e);
     assert(c.exists && readText(c) == "y\n", e);
     remove(c);
+}
+
+// Streaming read_file handles multi-byte UTF-8 across 64 KiB chunk boundaries,
+// CRLF lines right at maxLineChars, and keeps GC allocation bounded on a large
+// file while still recording the full-file SHA-256 in ReadState (issue #309).
+unittest
+{
+    import core.memory : GC;
+    import std.stdio : File;
+    import std.array : replicate;
+
+    // 1. Multi-byte UTF-8 crossing a 64 KiB chunk boundary + CRLF right at maxLineChars.
+    {
+        auto p = tmpFile("stream-utf8.txt", null);
+        scope (exit) if (p.exists) remove(p);
+        size_t pad;
+        {
+            auto f = File(p, "wb");
+            // Line 1: exactly maxLineChars 'a's + "\r\n" -> must NOT be truncated.
+            f.rawWrite("a".replicate(maxLineChars) ~ "\r\n");
+            // Fill to 64 KiB - 1 so a 3-byte '€' crosses the chunk boundary.
+            size_t written = maxLineChars + 2;
+            string filler = "b".replicate(100) ~ "\n";
+            while (written + filler.length < 64 * 1024 - 1)
+            {
+                f.rawWrite(filler);
+                written += filler.length;
+            }
+            pad = (64 * 1024 - 1) - written;
+            if (pad > 0) f.rawWrite("c".replicate(pad));
+            f.rawWrite("€end\n");
+        }
+        auto st = new ReadState;
+        auto head = readFile(j("path", p, "offset", 1, "limit", 1), st);
+        assert(head.indexOf("[line truncated]") < 0, "CRLF line at maxLineChars must not be truncated");
+        assert(head.indexOf("     1\t" ~ "a".replicate(maxLineChars) ~ "\n") == 0);
+        // Freshness check confirms ReadState received the exact full-file SHA-256.
+        st.checkFresh(p, readBytes(p), "edit_file");
+        // The line holding the split '€' must come out whole, with no carried byte lost or doubled.
+        size_t lastLine = readBytes(p).count('\n');
+        auto tail = readFile(j("path", p, "offset", lastLine, "limit", 1), st);
+        assert(tail.indexOf(format("%6d\t%s€end\n", lastLine, "c".replicate(pad))) == 0, tail);
+    }
+
+    // 2. Memory bound: reading 10 lines from a 16 MiB file must stay well under 4 MiB GC allocated.
+    {
+        auto p = tmpFile("stream-big.txt", null);
+        scope (exit) if (p.exists) remove(p);
+        enum size_t linesPerBlock = 1024;
+        enum size_t blocks = 256; // 256 * 64 KiB = 16 MiB, 262,144 lines
+        {
+            auto f = File(p, "wb");
+            string line = "x".replicate(63) ~ "\n"; // 64 bytes per line
+            foreach (_; 0 .. blocks)
+                foreach (__; 0 .. linesPerBlock)
+                    f.rawWrite(line);
+        }
+        auto st = new ReadState;
+        GC.collect();
+        auto before = GC.stats.allocatedInCurrentThread;
+        auto got = readFile(j("path", p, "offset", 10, "limit", 5), st);
+        auto allocated = GC.stats.allocatedInCurrentThread - before;
+        assert(got.indexOf("    10\t") == 0, got);
+        assert(got.indexOf("(262130 more lines; use offset=15 to continue)") > 0, got);
+        assert(allocated < 4 * 1024 * 1024, format("expected < 4 MiB allocated, got %s bytes", allocated));
+    }
+
+    // 3. Memory bound for one oversized line: an 8 MiB single line is truncated, not buffered whole.
+    {
+        auto p = tmpFile("stream-longline.txt", null);
+        scope (exit) if (p.exists) remove(p);
+        {
+            auto f = File(p, "wb");
+            string block = "z".replicate(64 * 1024);
+            foreach (_; 0 .. 128)
+                f.rawWrite(block);
+            f.rawWrite("\n");
+        }
+        auto st = new ReadState;
+        GC.collect();
+        auto before = GC.stats.allocatedInCurrentThread;
+        auto got = readFile(j("path", p, "offset", 1, "limit", 1), st);
+        auto allocated = GC.stats.allocatedInCurrentThread - before;
+        assert(got == "     1\t" ~ "z".replicate(maxLineChars) ~ " [line truncated]\n", got[0 .. min(got.length, 200)]);
+        assert(allocated < 4 * 1024 * 1024, format("expected < 4 MiB allocated, got %s bytes", allocated));
+    }
 }

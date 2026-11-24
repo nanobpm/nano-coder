@@ -48,6 +48,9 @@ Timing timing(string cmd) pure nothrow
     // `/thinking LEVEL` applies from the agent's next step; bare `/thinking`
     // lists the levels of the model in use, after the turn.
     if (name == "/thinking") return arg.length ? Timing.nextStep : Timing.afterTurn;
+    // `/messages` opens/closes the registry socket and edits the config:
+    // it waits for the turn (the prompt loop owns both).
+    if (name == "/messages") return Timing.afterTurn;
     // `/subagents on|off` changes the next request's tools; `--save` writes
     // the config, so it waits for the turn.
     if (name == "/subagents" && (arg == "on" || arg == "off")) return Timing.nextStep;

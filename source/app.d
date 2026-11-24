@@ -24,6 +24,7 @@ import std.process : environment;
 import core.stdc.stdlib : exit;
 import nano.config;
 import nano.llm;
+static import nano.memmigrate;
 import nano.agent;
 import nano.providers;
 import nano.tools;
@@ -49,13 +50,14 @@ import nano.settings_dialog : SettingsUi, SettingsHost, runSettings, pickModel, 
 import nano.commands : helpText, isCommand, unescapePrompt;
 import core.thread : Thread;
 import nano.claude_hooks : HookManager, listingField, label, isProject;
-import nano.skills : Skills, skillsDefinition = definition;
+import nano.skills : Skills, SkillsConfig, skillsDefinition = definition;
 import nano.memory : MemoryStore = Store, MemoryMode, memorySessionTools = sessionTools, memoryDefaultDir = defaultDir, projectKey, repoNameOf, Scope, parseRecallMode;
 import nano.control : TurnControl, FdLineReader;
+import nano.peers : PeerListener, PeerRouter, Inbound, ListenError, settle, confirmQuestion;
 import nano.instructions : ProjectInstructions, InstructionOptions = Options, expandHome;
 import core.atomic : atomicLoad, atomicStore, cas;
 
-enum string packageVersion = "1.22.0";
+enum string packageVersion = "1.25.0";
 enum string versionString = "nano-coder " ~ packageVersion;
 
 enum string usage = `Usage: nano-coder [--model provider/model] [--config PATH] [-p PROMPT]
@@ -65,6 +67,7 @@ enum string usage = `Usage: nano-coder [--model provider/model] [--config PATH] 
        nano-coder --list-sessions [--all] [--json]
        nano-coder --trajectory SESSION_ID [--json|--markdown]
        nano-coder --list-models PROVIDER[/model]
+       nano-coder --memory-migrate [--dry-run]
        nano-coder --login github-copilot
        nano-coder --version
 
@@ -76,12 +79,16 @@ REPL commands: /help lists them (/model, /mode, /verbosity, /providers, /restart
 Ctrl-C cancels a running turn; a line typed during a turn steers it.
 A repository's own skills and .claude/settings*.json hooks load only once you trust it: an
 interactive start asks "Trust this repo?" and remembers a yes; -p and piped runs skip them.
---yolo trusts the repository without asking (as --acp does).`;
+--yolo trusts the repository without asking (as --acp does).
+--memory-migrate tags, merges and supersedes the saved memories with the model's help, asking
+before each change (as /memory migrate does); --dry-run writes the proposals to a file instead.`;
 
 struct Options
 {
     string model, configPath, prompt, resume, listModels, sandbox, login, trajectory, verbosity;
     bool waitTimers, yolo, markdown, plan, noSession, noHooks, verbose, hasResume, acp, listSessions, all, json;
+    /// `--memory-migrate` and its `--dry-run`.
+    bool memoryMigrate, dryRun;
     string[] allow, deny;
 }
 
@@ -117,6 +124,8 @@ Options parseArgs(string[] args)
             case "--allow": o.allow ~= value(); break;
             case "--deny": o.deny ~= value(); break;
             case "--plan": o.plan = true; break;
+            case "--memory-migrate": o.memoryMigrate = true; break;
+            case "--dry-run": o.dryRun = true; break;
             case "--sandbox": o.sandbox = value(); break;
             case "--acp": o.acp = true; break;
             case "--list-sessions": o.listSessions = true; break;
@@ -149,6 +158,10 @@ Options parseArgs(string[] args)
     if (o.hasResume && o.trajectory !is null) fail("--resume and --trajectory are mutually exclusive");
     if (o.listSessions && (o.hasResume || o.acp || o.listModels.length || o.prompt.length || o.login.length))
         fail("--list-sessions can't be combined with --resume, --acp, --list-models, --login or -p");
+    if (o.dryRun && !o.memoryMigrate) fail("--dry-run requires --memory-migrate");
+    if (o.memoryMigrate && (o.hasResume || o.acp || o.listModels.length || o.prompt.length || o.login.length
+            || o.listSessions || o.trajectory !is null))
+        fail("--memory-migrate can't be combined with --resume, --acp, --list-models, --login, --list-sessions, --trajectory or -p");
     if (o.hasResume && o.login.length) fail("--resume and --login are mutually exclusive");
     if (o.hasResume && o.listModels.length) fail("--resume and --list-models are mutually exclusive");
     return o;
@@ -176,6 +189,8 @@ unittest
     assert(!ok("--resume", "--list-models", "openai") && !ok("--list-models", "openai", "--resume=sess-1"));
     assert(ok("--acp", "--resume", "sess-1"));
     assert(parseArgs(["nano-coder", "--resume", "sess-1"]).resume == "sess-1");
+    assert(ok("--memory-migrate") && ok("--memory-migrate", "--dry-run") && !ok("--dry-run"));
+    assert(!ok("--memory-migrate", "-p", "hi") && !ok("--memory-migrate", "--acp"));
     auto bare = parseArgs(["nano-coder", "--resume"]);
     assert(bare.hasResume && bare.resume == "");
     assert(parseArgs(["nano-coder", "--resume=-sess"]).resume == "-sess");
@@ -613,6 +628,19 @@ bool deliverIdleCompact(bool due, imported!"core.time".Duration quietFor, import
     assert(idleCompactHoldFor(c) == 7.seconds);
 }
 
+/// Route accepted peer requests every few ms while a turn runs (issue
+/// #272), until `halt`: mid-turn ones join the turn's steers.
+void pumpPeerRoutes(PeerRouter peerRouter, MessageQueue queue, Shared!bool halt)
+{
+    import core.time : msecs;
+    import nano.clock : sleepFor;
+    while (!halt.get)
+    {
+        peerRouter.routePending(queue);
+        sleepFor(20.msecs);
+    }
+}
+
 Isolated!LineEditor turnKeys(Isolated!LineEditor owned, ConsoleLink console, shared(bool)* done, Chan!string held,
     QuestionBroker questions, MessageQueue queue, MidTurn mid)
 {
@@ -900,6 +928,77 @@ private string subagentsToggle(Agent agent, ref Config cfg, imported!"nano.subag
     return msg;
 }
 
+/// Run `/messages [on|off|confirm on|off] [--save]` (issue #272): show the
+/// state, or switch inter-session messages (and confirmation) for this
+/// session; `--save` writes the user config.
+string messagesCommand(Agent agent, ref Config cfg, string arg, ref PeerRouter router,
+        bool listening, string delegate() @safe start, void delegate() @safe stop)
+{
+    import nano.settings : Changes, save;
+    import std.algorithm : endsWith;
+    import std.string : strip;
+    auto words = arg.strip;
+    bool saveIt;
+    if (words.endsWith("--save")) { saveIt = true; words = words[0 .. $ - "--save".length].strip; }
+
+    string stateText()
+    {
+        auto out_ = format("Messages %s: this session %s%s.", listening && agent.messagesOn ? "on" : "off",
+            listening && agent.messagesOn ? "listens for peer messages and offers session_send"
+                : "opens no socket and has no session_send",
+            router.confirm ? "; incoming messages wait for you to accept" : "; incoming messages are queued at once");
+        return out_;
+    }
+
+    string persist()
+    {
+        Changes ch;
+        ch.sessionMessages = true;
+        ch.sessionMessagesConfirm = true;
+        cfg.sessionMessages = agent.messagesOn;
+        cfg.sessionMessagesConfirm = router.confirm;
+        try
+        {
+            save(cfg, ch, null, cfg.path);
+            return "saved to " ~ cfg.path;
+        }
+        // save() throws only on an unwritable file or an unparseable existing
+        // config; both are reported, never swallowed.
+        catch (Exception e) return "could not save: " ~ e.msg;
+    }
+
+    if (!words.length) return stateText();
+    bool on;
+    bool confirmChange, confirmValue;
+    if (words == "on") on = true;
+    else if (words == "off") on = false;
+    else if (words == "confirm on") { confirmChange = true; confirmValue = true; }
+    else if (words == "confirm off") { confirmChange = true; confirmValue = false; }
+    else return "usage: /messages [on|off|confirm on|off] [--save]";
+
+    string out_;
+    if (confirmChange)
+    {
+        router.confirm(confirmValue);
+        out_ = format("Incoming messages %s for this session", confirmValue ? "wait for you to accept" : "are queued at once");
+    }
+    else if (on == agent.messagesOn && on == listening)
+        out_ = stateText();
+    else if (on)
+    {
+        if (auto failed = start()) out_ = "could not turn messages on: " ~ failed;
+        else out_ = "Messages on for this session (listening; session_send offered)";
+    }
+    else
+    {
+        stop();
+        agent.messagesOn = false;
+        out_ = "Messages off for this session (the socket is closed; session_send is gone from the next request)";
+    }
+    if (saveIt) out_ ~= "; " ~ persist();
+    return out_;
+}
+
 /// Replays shown so far by `/subagents show` (UI thread only).
 private size_t gReplaySeq;
 
@@ -1042,6 +1141,73 @@ Answer askQuestions(LineEditor editor, const Question[] qs, bool delegate() @saf
 
 // The output detail level (ui.rs's global verbosity), read live by Console.
 import nano.ui : Verbosity, parseVerbosity, verbosityListing, providersListing;
+
+/// `/memory migrate` and `--memory-migrate` (issue #281): the model is the
+/// session's client; `ui` asks the user. Returns the report (or the error);
+/// `ok` is false when the migration failed, so the CLI can exit nonzero.
+string runMemoryMigrate(MemoryStore store, LLMClient client, nano.memmigrate.Ui ui, bool dryRun, out bool ok,
+    void delegate(scope void delegate() @safe) @safe aroundAsk = null)
+{
+    nano.memmigrate.Options mo;
+    mo.dryRun = dryRun;
+    string ask(string system, string user)
+    {
+        ChatRequest req;
+        req.messages = [Message.system(system), Message.user(user)];
+        req.maxTokens = 8_192;
+        string got;
+        void call() { got = client.chat(req, (bool, string) {}).content; }
+        if (aroundAsk is null) call();
+        else aroundAsk(&call);
+        return got;
+    }
+    try
+    {
+        auto r = nano.memmigrate.migrate(store, &ask, ui, mo).toString;
+        ok = true;
+        return r;
+    }
+    catch (Exception e) return "memory migrate failed (applied batches are kept; run it again to resume): " ~ e.msg;
+}
+
+/// The migration review on plain stdin: numbered menus, typed answers.
+nano.memmigrate.Ui plainMigrateUi()
+{
+    nano.memmigrate.Ui ui;
+    ui.select = (string prompt, const string[] labels) {
+        foreach (i, l; labels) stdErr.writefln("  %s) %s", i + 1, l);
+        stdErr.write(format("%s [1-%s]: ", prompt, labels.length));
+        stdErr.flush();
+        auto line = stdinLine();
+        if (line is null) return ptrdiff_t(-1);
+        size_t n;
+        foreach (c; line.strip) { if (c < '0' || c > '9' || n > labels.length) return ptrdiff_t(-1); n = n * 10 + (c - '0'); }
+        return n >= 1 && n <= labels.length ? ptrdiff_t(n - 1) : ptrdiff_t(-1);
+    };
+    ui.input = (string prompt, string initial) {
+        // Enter keeps the suggestion; "-" clears the field explicitly.
+        stdErr.write(prompt ~ (initial.length ? " [" ~ initial ~ "] (Enter keeps it, - clears)" : " (- for empty)") ~ ": ");
+        stdErr.flush();
+        auto line = stdinLine();
+        if (line is null) return string.init;
+        auto v = line.strip;
+        if (v == "-") return "";
+        return v.length ? v : initial;
+    };
+    ui.say = (string line) { writeln(line); stdOut.flush(); };
+    return ui;
+}
+
+/// The migration review on the line editor (menus and pre-filled inputs).
+nano.memmigrate.Ui editorMigrateUi(LineEditor e)
+{
+    auto eu = new EditorUi(e);
+    nano.memmigrate.Ui ui;
+    ui.select = (string prompt, const string[] labels) => eu.select(prompt, labels, 0);
+    ui.input = (string prompt, string initial) => eu.input(prompt, initial);
+    ui.say = (string line) => eu.say(line);
+    return ui;
+}
 
 /// The `/settings` prompts on the line editor.
 final class EditorUi : SettingsUi
@@ -2091,7 +2257,7 @@ class Console : AgentEvents
     {
         if (quiet) return;
         endLine();
-        writeln(stampBlock(stamp(), dim("↪ " ~ escapeMarks(text))));
+        writeln(stampBlock(stamp(), dim("↪ " ~ escapeMarks(sanitizeBlock(text)))));
     }
     /// Close the abandoned partial so the resent reply starts a fresh segment
     /// instead of joining the stale prefix.
@@ -2958,6 +3124,39 @@ int appMain(string[] args)
     return rc;
 }
 
+/// Forget a `--resume`d session's model that startup already found
+/// unavailable (and fell back from), so it is not retried; the window
+/// recorded with it is dropped too, since it belongs to that model and must
+/// not be applied to the fallback (the config/learned window applies).
+void dropFallenBackModel(ref SessionSettings st, ref string headerModel, string startupSavedModel) pure nothrow
+{
+    auto saved = st.model.length ? st.model : headerModel;
+    if (saved != startupSavedModel) return;
+    st.model = null;
+    headerModel = null;
+    st.contextWindow = -1;
+}
+
+unittest
+{
+    // Startup fell back from an unavailable model: its recorded window is
+    // not applied to the fallback.
+    SessionSettings st;
+    st.model = "gone/big";
+    st.contextWindow = 1_000_000;
+    string header = "gone/big";
+    dropFallenBackModel(st, header, "gone/big");
+    assert(!st.model.length && !header.length && st.contextWindow == -1);
+
+    // A different saved model is left alone, window included.
+    SessionSettings other;
+    other.model = "ok/m";
+    other.contextWindow = 5000;
+    string h2;
+    dropFallenBackModel(other, h2, "gone/big");
+    assert(other.model == "ok/m" && other.contextWindow == 5000);
+}
+
 int runMain(string[] args)
 {
     Options o;
@@ -3155,18 +3354,47 @@ int runMain(string[] args)
     // Off is an empty set (as in Rust), not null.
     // NANO_CODER_NO_SKILLS turns skills off for one run (as in Rust).
     bool skillsOn = cfg.skills.enabled && environment.get("NANO_CODER_NO_SKILLS") is null;
+    SkillsConfig skillsConfigFor(string dir)
+    {
+        auto sc = cfg.skills;
+        if (!trusted(dir)) { sc.dirs = null; sc.aiLock = false; }
+        return sc;
+    }
     Skills discoverSkills(string dir)
     {
         if (!skillsOn) return new Skills;
-        auto sc = cfg.skills;
-        if (!trusted(dir)) { sc.dirs = null; sc.aiLock = false; }
+        auto sc = skillsConfigFor(dir);
         auto s = Skills.discover(dir, sc);
-        foreach (w; s.warnings) stdErr.writeln("nano-coder: skills: ", w);
+        foreach (w; s.warnings) stdErr.writeln("nano-coder: skills: ", escapeMarks(sanitizeBlock(w)));
         return s;
     }
     Skills skills = discoverSkills(cwd);
-    if (skillsOn && (o.acp || !skills.empty))
+    string skillsDir = cwd;
+    bool skillToolOn;
+    void registerSkillTool()
+    {
+        if (skillToolOn) return;
+        skillToolOn = true;
         tools.register(skillsDefinition, (JSONValue a) => skills.load(a));
+    }
+    if (skillsOn && (o.acp || !skills.empty)) registerSkillTool();
+    // Between turns: a stat-only check of the skill files; on a change,
+    // rediscover and say what changed (empty: nothing did). The caller
+    // rebuilds the system prompt, so an unchanged set keeps it byte-identical.
+    string refreshSkills()
+    {
+        import nano.skills : describeChanges, Locations;
+        if (!skillsOn) return null;
+        auto sc = skillsConfigFor(skillsDir);
+        if (!skills.stale(skillsDir, sc, Locations.fromEnv)) return null;
+        auto fresh = discoverSkills(skillsDir);
+        // Skill names come from SKILL.md files: strip control sequences and
+        // frame markers before any caller prints them.
+        auto change = escapeMarks(sanitizeBlock(describeChanges(skills, fresh)));
+        skills = fresh;
+        if (!skills.empty) registerSkillTool();
+        return change;
+    }
     // Memory: read-only when no human vets saves live (ACP, -p, piped stdio) and in plan mode.
     Option!MemoryStore memory;
     bool memoryWritable = cfg.memory == MemoryMode.on && !o.acp && !o.prompt.length && isTerminal(0) && isTerminal(1);
@@ -3174,6 +3402,19 @@ int runMain(string[] args)
     {
         auto dir = cfg.memoryDir.length ? cfg.memoryDir : memoryDefaultDir();
         if (dir.length) memory = some(new MemoryStore(dir, projectKey(cwd), cfg.memoryExpiryDays < 0 ? 0 : cfg.memoryExpiryDays));
+    }
+    if (o.memoryMigrate)
+    {
+        if (memory.isNone) { stdErr.writeln("nano-coder: memory is off"); exitProcess(1); }
+        if (!o.dryRun && cfg.memory != MemoryMode.on)
+        {
+            stdErr.writeln("nano-coder: memory is read-only in the config; --memory-migrate --dry-run only proposes");
+            exitProcess(1);
+        }
+        bool ok;
+        writeln(runMemoryMigrate(memory.unwrap("checked above"), client, plainMigrateUi(), o.dryRun, ok));
+        stdOut.flush();
+        exitProcess(ok ? 0 : 1);
     }
     // A helper, not a foreach-body delegate: D closures share the loop variable.
     ToolHandler asToolError(string delegate(JSONValue) @safe handler)
@@ -3314,12 +3555,25 @@ int runMain(string[] args)
         Host host;
         bool plan = o.plan;
         host.systemPrompt = (string dir) {
-            if (dir != cwd) skills = discoverSkills(dir);
+            if (dir != skillsDir) { skills = discoverSkills(dir); skillsDir = dir; }
+            else
+            {
+                // Same directory: the session's metadata must not be stale.
+                auto change = refreshSkills();
+                if (change.length) stdErr.writeln("nano-coder: skills: ", change);
+            }
             // A session in another directory recalls that directory's repo
             // facts; still resolved once per session, not per tool call.
             auto key = projectKey(dir);
             agent.recallRepo = key is null ? null : repoNameOf(key);
             return systemFor(dir, plan);
+        };
+        host.beforePrompt = () {
+            auto change = refreshSkills();
+            if (!change.length) return null;
+            agent.installSystem(systemFor(skillsDir, plan), indexShown);
+            // Published to the ACP client as a `_nano/notice`, not the model.
+            return "skills: " ~ change;
         };
         host.makeClient = (string s) => makeClient(resolve(cfg, s));
         host.plan = plan;
@@ -3341,6 +3595,8 @@ int runMain(string[] args)
         host.configModel = cfg.model;
         host.configSystemPrompt = cfg.systemPrompt;
         host.saveSubagents = (bool on) => saveSubagentsSetting(cfg, on);
+        host.sessionMessages = cfg.sessionMessages;
+        host.sessionMessagesConfirm = cfg.sessionMessagesConfirm;
         host.sessionMeta = () {
             JSONValue meta = ["projectInstructions": JSONValue(instructions.match!(pi => pi.loadedPaths, () => string[].init)),
                 "skills": JSONValue(skills.names)];
@@ -3486,6 +3742,59 @@ int runMain(string[] args)
     Option!LineEditor editor;
     string[] held; // lines to run before reading the prompt again
     auto queue = MessageQueue.make; // Ctrl-Enter messages: one runs per following turn
+
+    // Inter-session messages (issue #272): with `session_messages` on this
+    // session listens on a registry socket; a delivery mid-turn joins the
+    // steers (visible in /queue), an idle one is confirmed (per
+    // `session_messages_confirm`) and starts a turn.
+    PeerRouter peerRouter;
+    // Zero or one listener (an Option can't hold a PeerListener: its NotNull
+    // has no default).
+    PeerListener[] peerListener;
+    void stopPeerListener()
+    {
+        foreach (ref l; peerListener) l.close();
+        peerListener = null;
+    }
+    scope (exit) stopPeerListener();
+    string startPeerListener()
+    {
+        import nano.peers : ensureDir, peersDir;
+        if (agent.log.isNone) return "this session isn't saved (--no-session), so it can't receive messages";
+        auto dir = peersDir();
+        if (!ensureDir(dir)) return "could not create the peers directory " ~ dir;
+        auto id = agent.log.unwrap("checked above").id;
+        try
+        {
+            peerListener = [PeerListener.listen(dir, id, peerRouter.requests)];
+            agent.messagesOn = true;
+            return null;
+        }
+        catch (ListenError e) return e.msg;
+    }
+    // After a session switch (/restart, /resume): drop what was addressed
+    // to the old session and listen under the new id. Routing only runs on
+    // this thread, so nothing old was routed between the switch and here.
+    void rebindPeerListener()
+    {
+        // Old-session deliveries go even when messages are off already.
+        peerRouter.discardAll();
+        if (!peerListener.length) return;
+        stopPeerListener();
+        if (auto failed = startPeerListener())
+        {
+            agent.messagesOn = false;
+            stdErr.writeln(console.red("[messages: " ~ failed ~ "]"));
+        }
+    }
+    peerRouter = PeerRouter.make(agent.control.nonNull);
+    peerRouter.confirm(cfg.sessionMessagesConfirm);
+    if (cfg.sessionMessages)
+        if (auto failed = startPeerListener())
+            stdErr.writeln(console.red("[messages: " ~ failed ~ "]"));
+    // A peer delivery that starts a turn is flagged for the loop guard.
+    bool peerInput;
+    string peerSender; // its full sender session id
 
     // Recently used models lead the `/model` type-ahead (recents.rs).
     static import nano.recents;
@@ -3794,12 +4103,7 @@ int runMain(string[] args)
         // and emitted the notice, skip re-trying the same failed saved model.
         if (startupModelFallbackNote.length && pendingSettings.set)
         {
-            auto saved = pendingSettings.st.model.length ? pendingSettings.st.model : pendingSettings.headerModel;
-            if (saved == startupSavedModel)
-            {
-                pendingSettings.st.model = null;
-                pendingSettings.headerModel = null;
-            }
+            dropFallenBackModel(pendingSettings.st, pendingSettings.headerModel, startupSavedModel);
         }
         foreach (n; applyPendingSettings(true)) stdErr.writeln("nano-coder: " ~ n);
     }
@@ -3889,6 +4193,27 @@ int runMain(string[] args)
     /// over afterwards run as the next prompts.
     bool driven(scope bool delegate() @safe work) @safe
     {
+        // Peer messages accepted so far join this turn's steers (or wait for
+        // the prompt): route before the key reader starts and after it stops.
+        // No pass on exit: the turn is still mid-turn there, so a peer
+        // request would be steered into `control` with nobody to collect it.
+        // The explicit pass before the late take and the idle prompt cover it.
+        peerRouter.routePending(queue);
+        // Route during `work` too, so a busy session's peer steers reach
+        // this turn (and their senders hear back) instead of timing out.
+        auto pumpHalt = Shared!bool.make(false);
+        // No listener, nothing to route: skip the polling thread.
+        bool pumpRunning = peerListener.length != 0;
+        typeof(spawnDaemon(&pumpPeerRoutes, peerRouter, queue, pumpHalt)) pump;
+        if (pumpRunning) pump = spawnDaemon(&pumpPeerRoutes, peerRouter, queue, pumpHalt);
+        void stopPump()
+        {
+            if (!pumpRunning) return;
+            pumpRunning = false;
+            pumpHalt.update((ref bool b) { b = true; });
+            pump.join();
+        }
+        scope (exit) stopPump();
         // With the line editor, keys typed during the turn steer it (a
         // `/command` waits for the turn to end); Ctrl-C or Esc Esc cancels.
         auto turnDone = new shared(bool);
@@ -3925,9 +4250,24 @@ int runMain(string[] args)
         // Stop the key reader before taking the late steers: one typed between
         // the take and the stop would land in `control` and never run.
         stopKeys();
+        // The final routing pass comes before the take, so a peer steer
+        // routed now is collected below rather than stranded in `control`.
+        stopPump();
+        peerRouter.routePending(queue);
         // Steers that arrived after the agent's last step run as the next prompts.
         // One the user steered at the prompt keeps its `/queue` id.
         auto late = agent.control.takePending;
+        // Before the cancel drop: its sender was told `queued`, so a
+        // peer's late steer runs later as a peer prompt (loop guard kept).
+        {
+            import std.algorithm : filter;
+            import std.array : array;
+            foreach (t; late)
+                if (t.fromPeer && !peerRouter.requeueLate(t.text, t.sender))
+                    stdErr.writeln(console.dim(format("[peer message from %s dropped: inbox full]",
+                        escapeMarks(sanitizeBlock(PeerRouter.senderFromLabel(t.text))))));
+            late = late.filter!(t => !t.fromPeer).array;
+        }
         // A cancelled turn drops them (Rust: only a successful cancelled outcome).
         if (ok && agent.control.nonNull.isCancelled)
         {
@@ -3947,11 +4287,19 @@ int runMain(string[] args)
         return ok;
     }
 
-    bool turn(string input) @safe
+    bool turn(string input, bool fromPeer = false, string peerSender = null) @safe
     {
+        auto skillChange = refreshSkills();
+        if (skillChange.length)
+        {
+            stdErr.writeln(console.dim("skills: " ~ skillChange));
+            agent.installSystem(systemFor(cwd, agent.promptPlan), indexShown);
+        }
         if (reloadInstructions())
             stdErr.writeln(console.dim("[instruction files changed: the system prompt now follows them]"));
         syncMode();
+        peerRouter.midTurn(true);
+        scope (exit) peerRouter.midTurn(false);
         nano.herdr.report(nano.herdr.State.working);
         nano.herdr.showTimer(!agent.timers.empty);
         // Follow timers set or cancelled during the turn too, not only the
@@ -3974,7 +4322,7 @@ int runMain(string[] args)
             console.finalAnswer = null;
             console.beginAnswerGuard();
             string response;
-            try response = agent.run(input, console);
+            try response = agent.run(input, console, true, null, fromPeer, peerSender);
             catch (Exception e)
             {
                 console.endLine();
@@ -4032,9 +4380,13 @@ int runMain(string[] args)
         import nano.clock : sleepFor;
         import core.time : msecs;
         string l;
-        while (agent.subagentsActive || agent.backgroundResultsReady())
+        while (agent.subagentsActive || agent.backgroundResultsReady() || peerListener.length)
         {
             if (inbox.tryTake(l)) return l;
+            // A peer delivery wakes the prompt: an empty line just loops
+            // back to the top, which confirms and runs it (issue #272).
+            peerRouter.routePending(queue);
+            if (peerRouter.hasWaiting) return "";
             if (agent.backgroundResultsReady())
             {
                 string notice;
@@ -4179,17 +4531,69 @@ int runMain(string[] args)
     {
         string line;
         QueuedMessage next;
-        if (held.length)
+        // A peer message that arrived between turns: confirm it (per the
+        // setting), then run it as the next input, flagged for the loop
+        // guard. Mid-turn deliveries were steered by routePending instead.
+        peerRouter.routePending(queue);
+        Inbound inbound;
+        peerInput = false;
+        // Lines the user typed during the last turn (`/messages off`,
+        // `/quit`, …) run first: a steady peer stream must not starve them.
+        if (!held.length && peerRouter.takeWaiting(inbound))
+        {
+            bool accepted = true;
+            if (inbound.needsConfirm)
+            {
+                import std.string : indexOf;
+                // Peer text is untrusted: strip terminal escapes and frame
+                // marks from every display copy (the model input is unchanged).
+                auto shownLabel = escapeMarks(sanitizeBlock(inbound.labelled));
+                auto bracket = shownLabel.indexOf(']');
+                writeln(console.dim("Message " ~ (bracket > 0 ? shownLabel[0 .. bracket + 1] : shownLabel) ~ ":"));
+                writeln(escapeMarks(sanitizeBlock(inbound.pm.text)));
+                import nano.question : Question, QuestionOption, Answered;
+                auto q = Question(confirmQuestion(inbound), null, [QuestionOption("Decline"), QuestionOption("Accept")]);
+                q.custom = false;
+                // Ask through the editor this loop owns: the broker's other
+                // end (the turn key reader) is not running at the idle
+                // prompt, so `questions.ask` would block forever. No editor
+                // (plain input) means no way to ask: decline.
+                accepted = false;
+                foreach (ed; editor)
+                {
+                    // Keep routing while the picker waits, so later senders hear
+                    // their status now rather than timing out (they queue
+                    // behind this one; the picker stays open).
+                    auto a = askQuestions(ed, [q], () @safe { peerRouter.routePending(queue); return false; });
+                    accepted = a.match!((Answered got) => got.answers.length && got.answers[0] == "Accept", _ => false);
+                }
+            }
+            settle(inbound, accepted);
+            if (accepted)
+            {
+                writeln(console.dim(format("[%s → starting a turn]", escapeMarks(sanitizeBlock(inbound.labelled)))));
+                nano.herdr.report(nano.herdr.State.working, "message from a peer session");
+                line = inbound.labelled;
+                peerInput = true;
+                peerSender = inbound.pm.senderId;
+            }
+            else
+            {
+                writeln(console.dim(format("[message %s declined]", escapeMarks(sanitizeBlock(inbound.labelled)))));
+                continue;
+            }
+        }
+        if (line is null && held.length)
         {
             line = held[0];
             held = held[1 .. $];
         }
-        else if (queue.pop(next))
+        else if (line is null && queue.pop(next))
         {
             writeln(console.dim(format("↧ queued #%s: %s", next.id, next.text.strip)));
             line = next.text;
         }
-        else if (editor.isSome)
+        else if (line is null && editor.isSome)
         {
             auto ed = editor.unwrap("checked on the line above");
             refreshStatus();
@@ -4261,6 +4665,13 @@ int runMain(string[] args)
             {
                 return deliverDueTimer(agent.backgroundResultsReady(), ed.holdsTimer(monoNow), false, exitPress.armed);
             }
+            // A peer delivery wakes the prompt (issue #272): the loop top
+            // confirms and runs it, the draft parked meanwhile.
+            bool peerNow() @safe
+            {
+                peerRouter.routePending(queue);
+                return peerRouter.hasWaiting;
+            }
             // Esc Esc at the idle prompt stops background sub-agents.
             bool stopBackground;
             ed.onIdleEscEsc = () @safe { if (agent.subagentsActive) stopBackground = true; };
@@ -4268,6 +4679,7 @@ int runMain(string[] args)
                 || stopBackground
                 || timerNow()
                 || subNow()
+                || peerNow()
                 || idleNow()
                 || (updateHints && updateHints.tryTake(updateHint))
                 || (releaseNotice && releaseNotice.tryTake(fetchedNotice));
@@ -4309,6 +4721,11 @@ int runMain(string[] args)
                 writeln(console.dim(notice));
                 agent.automaticInput = true;
                 line = "\x00" ~ line;
+            }
+            else if (r.outcome == Outcome.stopped && peerRouter.hasWaiting)
+            {
+                hasParkedDraft = ed.parkDraft(parkedDraft);
+                continue;
             }
             else if (r.outcome == Outcome.stopped && idleNow())
             {
@@ -4358,7 +4775,7 @@ int runMain(string[] args)
                 if (auto lit = unescapePrompt(line)) line = "\x00" ~ lit; // `//…`: a prompt starting with /
             }
         }
-        else
+        else if (line is null)
         {
             if (interactive) { write("\n" ~ console.stamp() ~ console.bold("› ")); stdOut.flush(); }
             line = inbox ? plainLine() : stdinLine();
@@ -4372,6 +4789,10 @@ int runMain(string[] args)
         if (literal) line = line[1 .. $];
         auto input = line.strip;
         if (!input.length) continue;
+        auto asPeer = peerInput;
+        auto asPeerSender = peerSender;
+        peerInput = false;
+        peerSender = null;
         if (!literal && isCommand(input))
         {
             auto sp = input.indexOf(' ');
@@ -4420,6 +4841,7 @@ int runMain(string[] args)
                     lastLoggedVerbosity = verbosity;
                     updateStatus((ref Stats s) { s.historySearches = s.historyReads = 0; });
                     agent.useHooks(loadHooks(cwd), false);
+                    rebindPeerListener();
                     if (gFrame) gFrame.clear();
                     refreshStatus();
                     log.match!(l => writefln("Session: %s (resume with nano-coder --resume %s)", l.id, l.id),
@@ -4556,6 +4978,13 @@ int runMain(string[] args)
                     else writeln(escapeMarks(sanitizeBlock(said)));
                     continue;
                 }
+                case "/messages":
+                {
+                    auto reply = messagesCommand(agent, cfg, arg, peerRouter, peerListener.length != 0,
+                        &startPeerListener, &stopPeerListener);
+                    writeln(reply);
+                    continue;
+                }
                 case "/changes":
                 {
                     // No fetch here: it would block the prompt; notes the build
@@ -4613,6 +5042,7 @@ int runMain(string[] args)
                     try loadNotes = loadSession(path);
                     catch (Exception e) { writeln(e.msg); continue; }
                     foreach (n; applyPendingSettings(false)) loadNotes ~= "nano-coder: " ~ n;
+                    rebindPeerListener();
                     if (gFrame) { gFrame.clear(); replayTranscript(agent, console); releaseHeap(); }
                     foreach (n; loadNotes) stdErr.writeln(n);
                     stdErr.flush();
@@ -4645,6 +5075,52 @@ int runMain(string[] args)
                     continue;
                 case "/memory":
                     if (memory.isNone) { writeln("memory is off"); continue; }
+                    if (arg == "migrate" || arg.startsWith("migrate "))
+                    {
+                        auto rest = arg["migrate".length .. $].strip;
+                        if (rest.length && rest != "--dry-run")
+                        {
+                            writeln("Usage: /memory migrate [--dry-run]");
+                            continue;
+                        }
+                        bool dry = rest.length > 0;
+                        if (!dry && (!memoryWritable || agent.control.mode == AgentMode.plan))
+                        {
+                            writeln("Memory is read-only here; /memory migrate --dry-run only proposes changes.");
+                            continue;
+                        }
+                        if (!dry && editor.isNone) { writeln("/memory migrate needs an interactive terminal"); continue; }
+                        auto ui = editor.match!(e => editorMigrateUi(e), () => plainMigrateUi());
+                        bool migrated;
+                        // A cancelled earlier turn leaves the flag set and the client polls it.
+                        agent.control.startTurn();
+                        // Shift-Tab in the review prompts must not switch to Plan mode after the
+                        // writable check above: hold mode changes until the migration ends.
+                        void delegate(K) @safe savedAction;
+                        editor.ifSome((LineEditor e) {
+                            savedAction = e.onAction;
+                            e.onAction = (K) { writeln("Mode changes are held until /memory migrate ends."); };
+                        });
+                        scope (exit) editor.ifSome((LineEditor e) { e.onAction = savedAction; });
+                        // The model call runs with no key reader: give the terminal back its
+                        // signals so Ctrl-C reaches the SIGINT handler and cancels the request.
+                        void aroundAsk(scope void delegate() @safe call)
+                        {
+                            if (editor.isSome) leaveKeyMode();
+                            atomicStore(gTurnRunning, true);
+                            scope (exit)
+                            {
+                                atomicStore(gTurnRunning, false);
+                                if (editor.isSome) enterKeyMode(0);
+                            }
+                            call();
+                        }
+                        writeln(runMemoryMigrate(memory.unwrap("checked above"), agent.client, ui, dry, migrated, &aroundAsk));
+                        // Applied batches (even before a later failure) change the memory index in the
+                        // system prompt and which ids it shows in full: reinstall it.
+                        if (!dry) agent.installSystem(systemFor(cwd, agent.promptPlan), indexShown);
+                        continue;
+                    }
                     {
                         import nano.memory : memoryCommand;
                         auto store = memory.unwrap("checked on the line above");
@@ -4682,7 +5158,7 @@ int runMain(string[] args)
                     continue;
             }
         }
-        turn(input);
+        turn(input, asPeer, asPeerSender);
     }
     goodbye();
     return 0;

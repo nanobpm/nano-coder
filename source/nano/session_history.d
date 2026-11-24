@@ -104,7 +104,7 @@ Entry[] load(string path, scope bool delegate(ulong id) @safe want = null)
         if (want !is null && !want(n)) return;
         // Cheap pre-filter; any JSON spacing is valid, and a line with a
         // `\u` escape may spell the type escaped, so it reaches the decoder.
-        if (!line.canFind(`"message"`) && !line.canFind(`\u`)) return;
+        if (!mayBeMessage(line)) return;
         try
         {
             auto rec = parseJSON(line);
@@ -126,12 +126,53 @@ unittest // escaped_type_reaches_the_decoder
     assert(es.length == 1 && es[0].message.content == "out");
 }
 
+/// Whether `line` may be a message record, without decoding it. A record
+/// as nano writes it starts `{"type":"<type>",`, so its type is read from
+/// that prefix: a compaction snapshot (`replace`, whose embedded `"messages"`
+/// would pass a substring check) is skipped without parsing its megabytes
+/// (issue #234). Any other spelling (other spacing, an escaped type) falls
+/// back to the substring check and reaches the decoder.
+bool mayBeMessage(const(char)[] line) pure @safe
+{
+    if (auto t = writtenType(line)) return t == "message";
+    return line.canFind(`"message"`) || line.canFind(`\u`);
+}
+
+/// The type a line's `{"type":"<type>"` prefix names, or null when the line
+/// is not spelled that way (or the type is escaped). Needs only the line's
+/// first bytes, so a streamed line can be judged before it is buffered.
+private const(char)[] writtenType(const(char)[] line) pure @safe
+{
+    enum prefix = `{"type":"`;
+    if (!line.startsWith(prefix)) return null;
+    auto rest = line[prefix.length .. $];
+    immutable q = rest.indexOf('"');
+    return q > 0 && !rest[0 .. q].canFind('\\') ? rest[0 .. q] : null;
+}
+
+/// A streamed line's head: false only for a line known not to be a message.
+bool headMayBeMessage(const(char)[] head) pure @safe
+{
+    auto t = writtenType(head);
+    return t is null || t == "message";
+}
+
+unittest
+{
+    assert(mayBeMessage(`{"type":"message","data":{}}`));
+    assert(!mayBeMessage(`{"type":"replace","data":{"messages":[{"type":"message"}]}}`));
+    assert(!mayBeMessage(`{"type":"plan","data":{}}`));
+    assert(mayBeMessage(`{"type":"mess\u0061ge","data":{}}`), "an escaped type reaches the decoder");
+    assert(mayBeMessage(`{ "type" : "message", "data":{}}`), "other spacing reaches the decoder");
+    assert(!mayBeMessage(`{ "type" : "plan", "data":{}}`));
+}
+
 /// One message record parsed from a streamed line, or none when the line is
 /// not a decodable message record.
 private bool messageLine(const(char)[] line, out Message m)
 {
     import nano.session : messageFromRecord;
-    if (!line.canFind(`"message"`)) return false; // cheap pre-filter; any JSON spacing is valid
+    if (!mayBeMessage(line)) return false;
     try
     {
         auto rec = parseJSON(line);
@@ -262,7 +303,7 @@ string search(string path, JSONValue args)
     foreachLogLineSkippingTorn(path, (const(char)[] logLine) {
         ++n;
         Message m;
-        if (!messageLine(logLine, m)) return;
+        if (!logLine.length || !messageLine(logLine, m)) return; // empty: a record skipped by type, unread
         auto id = n;
         if (m.role == Role.system || (before && id >= before) || (after && id <= after))
         {
@@ -331,7 +372,7 @@ string search(string path, JSONValue args)
                 kept = kept[$ - limit .. $].dup;
             }
         }
-    });
+    }, (head) => headMayBeMessage(head));
     if (oldestFirst) foreach (ref k; kept) hits ~= k.line;
     else foreach_reverse (ref k; kept) hits ~= k.line;
     string hiddenNote;
@@ -381,11 +422,18 @@ string read(string path, JSONValue args)
     ulong latest, n;
     foreachLogLineSkippingTorn(path, (const(char)[] logLine) {
         ++n;
-        Message m;
-        if (!messageLine(logLine, m)) return;
+        // Only the asked-for line is decoded; the others just track the
+        // latest ID for the error (issue #234).
+        if (!logLine.length || !mayBeMessage(logLine)) return;
+        if (n == id)
+        {
+            Message m;
+            if (!messageLine(logLine, m)) return;
+            found = m;
+            have = true;
+        }
         latest = n;
-        if (n == id) { found = m; have = true; }
-    });
+    }, (head) => headMayBeMessage(head));
     if (!have)
         throw new HistoryError(format("no message #%s in this session (IDs are log lines; the latest is #%s)", id, latest));
     auto m = &found;
@@ -510,4 +558,33 @@ unittest
         ~ `{"type":"message","data":{"role":"user","content":"after"}}` ~ "\n");
     auto es = load(p);
     assert(es.length == 1 && es[0].id == 3, "the record after a corrupt one is still loaded");
+}
+
+// A search never parses a compaction snapshot (issue #234): a `replace`
+// record's embedded messages match the query but are not hits (they are the
+// same conversation as the message records, restated), and its megabytes are
+// skipped by type rather than decoded, so a search allocates far less than
+// the snapshot's size.
+unittest
+{
+    import core.memory : GC;
+    import std.array : appender;
+    import std.conv : text;
+    import std.file : write, remove, tempDir;
+    import std.path : buildPath;
+    auto p = buildPath(tempDir, "nano-d-history-replace-skip.jsonl");
+    auto o = appender!string;
+    o.put(`{"type":"session","data":{"version":1,"id":"s","created_at":"x"}}` ~ "\n");
+    o.put(`{"type":"message","data":{"role":"user","content":"find needle here"}}` ~ "\n");
+    o.put(`{"type":"replace","data":{"messages":[`);
+    foreach (i; 0 .. 20_000)
+        o.put(text(i ? "," : "", `{"role":"tool","tool_call_id":"c`, i, `","content":"needle in snapshot `, i, `"}`));
+    o.put(`]}}` ~ "\n");
+    write(p, o.data);
+    scope (exit) remove(p);
+    immutable before = GC.stats.allocatedInCurrentThread;
+    auto r = search(p, parseJSON(`{"pattern":"needle"}`));
+    immutable spent = GC.stats.allocatedInCurrentThread - before;
+    assert(r.startsWith("#2 user") && !r.canFind("snapshot"), r);
+    assert(spent < o.data.length / 4, text("search allocated ", spent, " B for a ", o.data.length, " B log"));
 }

@@ -249,15 +249,365 @@ enum size_t maxOutputLimit = 1_000_000;
 /// full text is saved and its path noted, so nothing is lost.
 string truncateOutput(string text, size_t limit, string label)
 {
-    import std.utf : toUTF32, toUTF8;
     if (text.length <= limit) return text;
-    auto chars = text.toUTF32;
-    if (chars.length <= limit) return text;
+    // Walk code points in place without allocating a 4x UTF-32 copy.
+    auto headTarget = limit * 2 / 3;
+    auto tailTarget = limit - headTarget;
+    size_t count;
+    size_t headByte;
+    bool headFound;
+    for (size_t i = 0; i < text.length;)
+    {
+        if (!headFound && count == headTarget)
+        {
+            headByte = i;
+            headFound = true;
+        }
+        ubyte b = text[i];
+        size_t step = (b & 0x80) == 0 ? 1
+            : (b & 0xE0) == 0xC0 ? 2
+            : (b & 0xF0) == 0xE0 ? 3
+            : (b & 0xF8) == 0xF0 ? 4 : 1;
+        i += step <= text.length - i ? step : text.length - i;
+        count++;
+    }
+    if (count <= limit) return text;
+    size_t tailByte = text.length;
+    size_t tailCount;
+    while (tailByte > 0 && tailCount < tailTarget)
+    {
+        tailByte--;
+        if ((text[tailByte] & 0xC0) != 0x80) tailCount++;
+    }
     auto spill = spillFile(text, label);
-    auto head = limit * 2 / 3;
-    auto tail = limit - head;
     return format("%s\n\n[... %s characters omitted (sha256:%s); full output saved to %s ...]\n\n%s",
-            chars[0 .. head].toUTF8, chars.length - limit, contentDigest(text), spill, chars[$ - tail .. $].toUTF8);
+            text[0 .. headByte], count - limit, contentDigest(text), spill, text[tailByte .. $]);
+}
+
+/// Stream-truncate a file on disk (raw bytes, lossy UTF-8 decoded on the fly)
+/// to `limit` characters without loading the whole file into memory. When the
+/// file exceeds `limit` characters, its UTF-8-sanitized full text is streamed
+/// to a spill file and the head/tail marker is returned. Also sets `denied` if
+/// `checkDenied` is true and any denial phrase appears in the output.
+string truncateFile(string path, size_t limit, string label, out bool denied, bool checkDenied = false)
+{
+    import std.file : getSize;
+    import std.stdio : File;
+    import std.digest.sha : SHA256, toHexString;
+    import std.ascii : LetterCase;
+    import std.array : Appender;
+    import std.string : representation;
+    import nano.safeio : asChars;
+    import nano.sandbox : looksDenied;
+    import nano.arith : saturatingSub;
+
+    denied = false;
+    auto rawSize = getSize(path);
+    if (rawSize == 0) return null;
+    // Fast path for small files: at most `limit` bytes can never exceed `limit`
+    // UTF-8 code points (even if every byte is invalid -> 1 U+FFFD each).
+    if (rawSize <= limit)
+    {
+        // Cap at the sampled size: a background child may still be appending.
+        auto buf = new ubyte[rawSize];
+        auto text = lossyUtf8(File(path, "rb").rawRead(buf));
+        if (checkDenied) denied = looksDenied(text);
+        return text;
+    }
+
+    auto headTarget = limit * 2 / 3;
+    auto tailTarget = limit - headTarget;
+
+    // Stream the file in 64 KiB chunks, lossy-decoding UTF-8 across chunk
+    // boundaries, hashing the decoded UTF-8, capturing head + rolling tail,
+    // and writing the sanitized full output to a spill file once we know it
+    // exceeds `limit` characters.
+    // Allocated only when spilling actually starts: a file over `limit` bytes
+    // may still fit `limit` characters and then needs no spill directory.
+    string spillPath;
+    File spillF;
+    bool spilling;
+    scope (failure)
+    {
+        if (spilling)
+        {
+            import std.file : exists, remove;
+            spillF.close();
+            if (spillPath.length && spillPath.exists) remove(spillPath);
+        }
+    }
+
+    Appender!(char[]) headBuf;
+    // Rolling double-buffer of decoded UTF-8 bytes for the tail. Reused via
+    // `.clear()` so streaming a multi-MB file does zero per-chunk heap copies.
+    Appender!(char[]) smallBuf; // holds decoded text while totalChars <= limit
+    Appender!(char[]) tailPrev;
+    Appender!(char[]) tailCur;
+    size_t tailCurChars;
+    size_t headChars;
+    size_t totalChars;
+    SHA256 sha;
+    sha.start();
+
+    // Small overlap for sandbox denial phrase matching across chunk boundaries
+    // (longest phrase in looksDenied is 23 bytes).
+    enum size_t deniedOverlap = 32;
+    char[deniedOverlap * 2] deniedJoin; // carry + piece prefix, fixed: no per-chunk GC copy
+    size_t deniedCarryLen;
+
+    static const(char)[] lastNChars(const(char)[] s, size_t n) pure nothrow @nogc
+    {
+        size_t pos = s.length;
+        size_t seen;
+        while (pos > 0 && seen < n)
+        {
+            pos--;
+            if ((s[pos] & 0xC0) != 0x80) seen++;
+        }
+        return s[pos .. $];
+    }
+
+    auto startSpilling = () {
+        if (spilling) return;
+        spillPath = nextSpillPath(label);
+        spillF = File(spillPath, "wb");
+        spilling = true;
+        if (smallBuf.data.length) spillF.rawWrite(smallBuf.data);
+        // Seed rolling tail from what we already decoded.
+        if (tailTarget > 0)
+        {
+            auto seed = totalChars > tailTarget ? lastNChars(smallBuf.data, tailTarget) : smallBuf.data;
+            tailCur.put(seed);
+            tailCurChars = totalChars > tailTarget ? tailTarget : totalChars;
+        }
+        smallBuf.clear();
+    };
+
+    auto pushDecoded = (const(char)[] piece, size_t nChars) {
+        if (!piece.length) return;
+        sha.put(piece.representation);
+        if (checkDenied && !denied)
+        {
+            // Scan the piece in place, plus a fixed-size join of the carried
+            // tail and the piece's head for phrases straddling the boundary.
+            auto pre = piece.length > deniedOverlap ? piece[0 .. deniedOverlap] : piece;
+            deniedJoin[deniedCarryLen .. deniedCarryLen + pre.length] = pre[];
+            auto joined = deniedJoin[0 .. deniedCarryLen + pre.length];
+            if (looksDenied(piece) || looksDenied(joined)) denied = true;
+            else
+            {
+                const(char)[] keep = piece.length >= deniedOverlap
+                    ? piece[$ - deniedOverlap .. $]
+                    : joined[saturatingSub(joined.length, deniedOverlap) .. $];
+                char[deniedOverlap] tmp;
+                tmp[0 .. keep.length] = keep[];
+                deniedJoin[0 .. keep.length] = tmp[0 .. keep.length];
+                deniedCarryLen = keep.length;
+            }
+        }
+        if (headChars < headTarget)
+        {
+            auto need = headTarget - headChars;
+            if (nChars <= need)
+            {
+                headBuf.put(piece);
+                headChars += nChars;
+            }
+            else
+            {
+                size_t cut;
+                size_t taken;
+                while (cut < piece.length && taken < need)
+                {
+                    ubyte b = piece[cut];
+                    size_t step = (b & 0x80) == 0 ? 1
+                        : (b & 0xE0) == 0xC0 ? 2
+                        : (b & 0xF0) == 0xE0 ? 3
+                        : (b & 0xF8) == 0xF0 ? 4 : 1;
+                    cut += step <= piece.length - cut ? step : piece.length - cut;
+                    taken++;
+                }
+                headBuf.put(piece[0 .. cut]);
+                headChars += taken;
+            }
+        }
+        totalChars += nChars;
+        if (!spilling)
+        {
+            smallBuf.put(piece);
+            if (totalChars > limit) startSpilling();
+        }
+        else
+        {
+            spillF.rawWrite(piece);
+            if (tailTarget > 0)
+            {
+                if (nChars >= tailTarget)
+                {
+                    // This chunk alone has enough trailing characters: keep
+                    // only its last `tailTarget` chars and drop older tail.
+                    tailPrev.clear();
+                    tailCur.clear();
+                    tailCur.put(lastNChars(piece, tailTarget));
+                    tailCurChars = tailTarget;
+                }
+                else
+                {
+                    tailCur.put(piece);
+                    tailCurChars += nChars;
+                    if (tailCurChars >= tailTarget)
+                    {
+                        import std.algorithm.mutation : swap;
+                        swap(tailPrev, tailCur);
+                        tailCur.clear();
+                        tailCurChars = 0;
+                    }
+                }
+            }
+        }
+    };
+
+    auto src = File(path, "rb");
+    ubyte[64 * 1024] chunkBuf;
+    ubyte[4] carry;
+    size_t carryLen;
+    Appender!(char[]) decoded;
+
+    // Read only the `rawSize` bytes sampled above: background children left by
+    // the command may keep appending, and a live EOF could then never come.
+    ulong remaining = rawSize;
+    for (;;)
+    {
+        if (remaining == 0) break;
+        auto want = remaining < chunkBuf.length ? remaining : chunkBuf.length;
+        auto got = src.rawRead(chunkBuf[0 .. want]);
+        if (!got.length) break;
+        remaining -= got.length;
+
+        // Decode `carry[0 .. carryLen]` + `got`, leaving an incomplete
+        // trailing multi-byte UTF-8 sequence (at most 3 bytes) in `carry` for
+        // the next chunk.
+        decoded.clear();
+        size_t chars;
+
+        // Combine small carry with the start of `got` so boundary sequences
+        // decode seamlessly.
+        ubyte[64 * 1024 + 4] combined;
+        const(ubyte)[] data;
+        if (carryLen)
+        {
+            combined[0 .. carryLen] = carry[0 .. carryLen];
+            combined[carryLen .. carryLen + got.length] = got[];
+            data = combined[0 .. carryLen + got.length];
+            carryLen = 0;
+        }
+        else data = got;
+
+        size_t i;
+        while (i < data.length)
+        {
+            auto b = data[i];
+            if (b < 0x80)
+            {
+                // Fast ASCII run.
+                size_t j = i + 1;
+                while (j < data.length && data[j] < 0x80) j++;
+                decoded.put(asChars(data[i .. j]));
+                chars += j - i;
+                i = j;
+                continue;
+            }
+            size_t need = (b & 0xE0) == 0xC0 ? 2
+                : (b & 0xF0) == 0xE0 ? 3
+                : (b & 0xF8) == 0xF0 ? 4 : 0;
+            if (need == 0)
+            {
+                decoded.put("\uFFFD");
+                chars++;
+                i++;
+                continue;
+            }
+            if (data.length - i < need)
+            {
+                // Could be a valid sequence split across chunks; hold it.
+                carryLen = data.length - i;
+                carry[0 .. carryLen] = data[i .. $];
+                break;
+            }
+            if (validUtf8Seq(data[i .. i + need]))
+            {
+                decoded.put(asChars(data[i .. i + need]));
+                chars++;
+                i += need;
+            }
+            else
+            {
+                decoded.put("\uFFFD");
+                chars++;
+                i++;
+            }
+        }
+        pushDecoded(decoded.data, chars);
+    }
+    if (carryLen)
+    {
+        // Any bytes left in `carry` at EOF are an incomplete UTF-8 sequence:
+        // lossyUtf8 replaces each invalid byte with U+FFFD.
+        auto tail = lossyUtf8(carry[0 .. carryLen].dup);
+        size_t chars;
+        for (size_t i = 0; i < tail.length;)
+        {
+            ubyte b = tail[i];
+            size_t step = (b & 0x80) == 0 ? 1
+                : (b & 0xE0) == 0xC0 ? 2
+                : (b & 0xF0) == 0xE0 ? 3
+                : (b & 0xF8) == 0xF0 ? 4 : 1;
+            i += step <= tail.length - i ? step : tail.length - i;
+            chars++;
+        }
+        pushDecoded(tail, chars);
+    }
+
+    if (!spilling) return smallBuf.data.idup;
+
+    spillF.close();
+    recordSpill(spillPath);
+
+    // Extract exact `tailTarget` trailing code points from `tailPrev ~ tailCur`.
+    string tailStr;
+    if (tailTarget > 0)
+    {
+        auto joined = tailPrev.data.length ? (tailPrev.data ~ tailCur.data) : tailCur.data;
+        tailStr = lastNChars(joined, tailTarget).idup;
+    }
+
+    auto digest = toHexString!(LetterCase.lower)(sha.finish()[0 .. 8]).idup;
+    return format("%s\n\n[... %s characters omitted (sha256:%s); full output saved to %s ...]\n\n%s",
+            headBuf.data, totalChars - limit, digest, spillPath, tailStr);
+}
+
+private bool validUtf8Seq(const(ubyte)[] seq) pure nothrow @nogc
+{
+    if (seq.length == 2)
+        return seq[0] >= 0xC2 && seq[0] <= 0xDF && (seq[1] & 0xC0) == 0x80;
+    if (seq.length == 3)
+    {
+        auto b0 = seq[0], b1 = seq[1], b2 = seq[2];
+        if ((b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80) return false;
+        if (b0 == 0xE0 && b1 < 0xA0) return false; // overlong
+        if (b0 == 0xED && b1 >= 0xA0) return false; // UTF-16 surrogate
+        return true;
+    }
+    if (seq.length == 4)
+    {
+        auto b0 = seq[0], b1 = seq[1], b2 = seq[2], b3 = seq[3];
+        if ((b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 || (b3 & 0xC0) != 0x80) return false;
+        if (b0 == 0xF0 && b1 < 0x90) return false; // overlong
+        if (b0 == 0xF4 && b1 >= 0x90) return false; // > U+10FFFF
+        if (b0 > 0xF4) return false;
+        return true;
+    }
+    return false;
 }
 
 /// Keep the head and tail of `text` within `limit` UTF-8 bytes, marker
@@ -360,12 +710,11 @@ string spillDirFor(string logPath) pure
     return logPath.stripExtension ~ ".spill";
 }
 
-private string spillFile(string text, string label)
+private string nextSpillPath(string label)
 {
-    import std.file : write, mkdirRecurse, tempDir, exists;
+    import std.file : mkdirRecurse, tempDir, exists;
     import std.path : buildPath;
     import std.process : thisProcessID;
-    import std.datetime.systime : Clock;
     static size_t counter;
     auto dir = spillDir_.length ? spillDir_ : buildPath(tempDir, format("nano-coder-%s", thisProcessID));
     mkdirRecurse(dir);
@@ -373,9 +722,21 @@ private string spillFile(string text, string label)
     auto stem = buildPath(dir, format("%s-%s-%s", label, stdTimeNow, ++counter));
     auto path = stem ~ ".txt";
     for (size_t n = 2; path.exists; n++) path = format("%s-%s.txt", stem, n);
-    write(path, text);
+    return path;
+}
+
+private void recordSpill(string path)
+{
     if (spilled_.length > 10_000) spilled_ = null; // bounded: the oldest calls are long out of the repeat window
     spilled_[path] = true;
+}
+
+private string spillFile(string text, string label)
+{
+    import std.file : write;
+    auto path = nextSpillPath(label);
+    write(path, text);
+    recordSpill(path);
     return path;
 }
 
@@ -417,6 +778,153 @@ unittest
     bool threw;
     try requireString(args, "missing", "t"); catch (ToolError) threw = true;
     assert(threw);
+}
+
+// Stream truncation of a large file matches `truncateOutput` byte-for-byte
+// (head, tail, omitted count, sha256 digest, spill contents, and denial check)
+// while keeping GC heap bounded well below the file size (issue #307).
+unittest
+{
+    import core.memory : GC;
+    import std.algorithm : canFind, startsWith, endsWith;
+    import std.file : tempDir, write, remove, exists, readText;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    import std.regex : matchFirst;
+    import std.stdio : File;
+
+    // 1. Equivalence on multi-byte + invalid UTF-8 crossing chunk boundaries,
+    //    plus sandbox denial phrase straddling a 64 KiB boundary.
+    {
+        auto p = buildPath(tempDir, format("nano-d-trunc-eq-%s.bin", thisProcessID));
+        scope (exit) if (p.exists) remove(p);
+        ubyte[] raw;
+        raw.length = 64 * 1024 - 1;
+        raw[] = 'a';
+        raw ~= [0xE2, 0x82, 0xAC]; // '€' split across 64 KiB chunk boundary
+        raw ~= [0xFF, 0xFE];       // invalid bytes -> U+FFFD each
+        raw ~= cast(const(ubyte)[]) "Operation not permitted";
+        foreach (_; 0 .. 100) raw ~= cast(const(ubyte)[]) "héllo😀";
+        write(p, raw);
+
+        auto expectedText = lossyUtf8(raw);
+        auto expected = truncateOutput(expectedText, 50, "eq-ref");
+        auto refPath = expected.matchFirst(`full output saved to (.*\.txt) \.\.\.\]`);
+        scope (exit) if (refPath && refPath[1].exists) remove(refPath[1]);
+
+        bool denied;
+        auto got = truncateFile(p, 50, "eq-stream", denied, true);
+        auto gotPath = got.matchFirst(`full output saved to (.*\.txt) \.\.\.\]`);
+        scope (exit) if (gotPath && gotPath[1].exists) remove(gotPath[1]);
+
+        assert(denied, "expected denial phrase to be detected while streaming");
+        assert(gotPath && isSpill(gotPath[1]));
+        assert(readText(gotPath[1]) == expectedText, "spill content mismatch");
+        // Compare markers ignoring only the spill file path.
+        assert(got.startsWith(expected[0 .. 33]), "head mismatch");
+        assert(got.canFind("(sha256:" ~ contentDigest(expectedText) ~ ")"), "digest mismatch: " ~ got);
+        assert(got.endsWith(expected[$ - 20 .. $]), "tail mismatch");
+    }
+
+    // 1b. Complete-result equivalence (spill paths normalised only): a denial
+    //     phrase straddling a chunk boundary, and tails longer than one 64 KiB
+    //     chunk so the rolling-tail buffers rotate, ending both exactly on a
+    //     chunk boundary and with a partially filled current buffer.
+    {
+        import std.regex : replaceAll, regex;
+        auto spillRe = regex(`full output saved to (.*\.txt) \.\.\.\]`);
+        string norm(string s) { return s.replaceAll(spillRe, "full output saved to SPILL ...]"); }
+        void check(const(ubyte)[] raw, size_t limit, bool wantDenied, string label)
+        {
+            auto p = buildPath(tempDir, format("nano-d-trunc-full-%s.bin", thisProcessID));
+            scope (exit) if (p.exists) remove(p);
+            write(p, raw);
+            auto expected = truncateOutput(lossyUtf8(raw), limit, "full-ref");
+            auto em = expected.matchFirst(spillRe);
+            scope (exit) if (em && em[1].exists) remove(em[1]);
+            bool denied;
+            auto got = truncateFile(p, limit, "full-stream", denied, true);
+            auto gm = got.matchFirst(spillRe);
+            scope (exit) if (gm && gm[1].exists) remove(gm[1]);
+            assert(norm(got) == norm(expected), label ~ ": output mismatch");
+            assert(denied == wantDenied, label ~ ": denial mismatch");
+        }
+        enum chunk = 64 * 1024;
+        enum phrase = "Operation not permitted";
+        // Phrase split across the first chunk boundary.
+        {
+            ubyte[] raw;
+            raw.length = chunk - 10;
+            raw[] = 'a';
+            raw ~= cast(const(ubyte)[]) phrase;
+            raw ~= new ubyte[](chunk)[] = 'b';
+            check(raw, 50, true, "denial across boundary");
+        }
+        // Without the phrase, no denial (guards against a fail-open matcher).
+        {
+            auto raw = new ubyte[](3 * chunk);
+            raw[] = 'c';
+            check(raw, 50, false, "no denial");
+        }
+        // Tail larger than a chunk; file ends on a chunk boundary and mid-chunk.
+        foreach (extra; [0, 12_345])
+        {
+            auto raw = new ubyte[](8 * chunk + extra);
+            foreach (i, ref b; raw) b = cast(ubyte)('a' + (i * 7 + i / 977) % 26);
+            raw[5 * chunk + 3 .. 5 * chunk + 5] = [0xC3, 0xA9]; // multi-byte in tail
+            check(raw, 3 * chunk, false, format("rotation extra=%s", extra));
+            check(raw, 2 * chunk + 1, false, format("rotation odd extra=%s", extra));
+        }
+    }
+
+    // 2. Memory bound: streaming a 16 MiB file must not grow GC heap by ~16 MiB.
+    {
+        auto p = buildPath(tempDir, format("nano-d-trunc-mem-%s.bin", thisProcessID));
+        scope (exit) if (p.exists) remove(p);
+        {
+            auto f = File(p, "wb");
+            ubyte[64 * 1024] block;
+            block[] = 'z';
+            block[0] = 'H';
+            block[$ - 1] = '\n';
+            foreach (_; 0 .. 256) f.rawWrite(block[]); // 16 MiB
+        }
+        // Both with and without sandbox-denial scanning (the sandboxed-failure path).
+        foreach (checkDenied; [false, true])
+        {
+            GC.collect();
+            auto before = GC.stats.allocatedInCurrentThread;
+            bool denied;
+            auto got = truncateFile(p, 1000, "mem-stream", denied, checkDenied);
+            auto allocated = GC.stats.allocatedInCurrentThread - before;
+            auto m = got.matchFirst(`full output saved to (.*\.txt) \.\.\.\]`);
+            scope (exit) if (m && m[1].exists) remove(m[1]);
+            assert(m && got.startsWith("H") && got.endsWith("z\n"));
+            assert(got.canFind("16776216 characters omitted"), got);
+            assert(!denied);
+            // Streaming 16 MiB should allocate well under 4 MiB total on the GC heap
+            // (old path allocated > 96 MiB: readBytes + lossyUtf8 + 4x toUTF32).
+            assert(allocated < 4 * 1024 * 1024, format("expected < 4 MiB allocated (checkDenied=%s), got %s bytes",
+                checkDenied, allocated));
+        }
+    }
+
+    // 3. Over `limit` bytes but within `limit` characters: no spill is needed,
+    //    so an unusable spill directory must not matter.
+    {
+        auto p = buildPath(tempDir, format("nano-d-trunc-nospill-%s.bin", thisProcessID));
+        auto blocker = buildPath(tempDir, format("nano-d-trunc-blocker-%s", thisProcessID));
+        scope (exit) { if (p.exists) remove(p); if (blocker.exists) remove(blocker); }
+        string text;
+        foreach (_; 0 .. 30_000) text ~= "é";
+        write(p, text);
+        write(blocker, "not a dir");
+        auto saved = spillDir_;
+        setSpillDir(buildPath(blocker, "sub"));
+        scope (exit) setSpillDir(saved);
+        bool denied;
+        assert(truncateFile(p, 40_000, "nospill", denied) == text);
+    }
 }
 
 // rust: output.rs::spill_never_overwrites_an_existing_file

@@ -334,7 +334,7 @@ phases). Disable them with `--no-hooks`, or granularly via the
   Interactive sessions only; in auto mode an unanswered question is resolved after 15s with the
   away message. Headless (ACP) sessions get an error instead.
 - `load_skill` - Return a skill's instructions and list its other files; `name`. Offered only
-  when skills were found (see [Skills](#skills)).
+  once skills are found (at start, or when one is added mid-session; see [Skills](#skills)).
 - `memory_save`, `memory_search`, `memory_forget`, `memory_verify`, `memory_entity` - Cross-session memory: facts the model saves
   in one session and finds in later ones (see [Memory](#memory)). Offered when `memory` is on;
   read-only runs (headless/ACP) offer `memory_search` only.
@@ -454,8 +454,9 @@ argument: a type-ahead list narrows as you type and Tab completes it.
 - `/subagents` also lists every sub-agent of the session (the last 200; older ones are counted): its id, model, state (queued, running, done, cancelled, truncated), the first line of its task, turns, tokens and elapsed time
 - `/subagents show <id>` - Render a sub-agent's transcript (prompt, answers, tool calls with folded output) from its log, read a message at a time, so even a long log shows without being loaded whole
 - `/subagents stop <id>` / `/subagents stop all` - Stop running or queued sub-agents as the agent's `agent_cancel` does: each gets a few seconds to report what it has (marked cancelled; one that can't is cut off), and the agent receives that as the sub-agent's result. Typed during a turn, it runs when the turn ends. Tab completes `show`/`stop` and the sub-agent ids. `show` and `stop` are terminal-only (not over ACP)
+- `/messages [on|off|confirm on|off] [--save]` - Without an argument, show whether this session sends and receives inter-session messages (see [Inter-session messages](#inter-session-messages)). `on` opens the registry socket and offers `session_send` from the next request; `off` closes it. `confirm on|off` switches whether an incoming message waits for you to accept it. `--save` writes `session_messages` / `session_messages_confirm` to the config file
 - `/plan` - Show the agent's task plan with all notes
-- `/memory [entities] [forget ID]` - List cross-session memories with their ids, each entity's facts, or delete one by id (see [Memory](#memory))
+- `/memory [entities] [forget ID] [migrate [--dry-run]]` - List cross-session memories with their ids, each entity's facts, delete one by id, or tag, merge and supersede existing memories with your confirmation (see [Memory](#memory))
 - `/hooks` - List the loaded external user hooks (from `.claude/settings.json` and friends), the files they came from, and any skipped entries (see [Lifecycle Hooks](#lifecycle-hooks))
 - `/queue [list|add text|remove N...|edit N text|clear]` - Show or edit the queued messages and unread steers. Works while a turn runs, so a queued message or steer can be removed or rewritten before it is sent.
 - `/model [provider/model]` - Show the current model and pick a new one. The list starts with the last four models you used (the current one marked; the previous one highlighted, so `/model` then Enter switches back), then the providers: pick a provider to scroll its model list (Esc steps back). With an argument, switches directly (conversation is kept). Typing `/model ` shows a type-ahead of the current model, recently used models, and each configured provider's default model; Tab completes (a bare provider name completes to its default model). Recently used models are kept in `~/.local/share/nano-coder/recent-models.json`
@@ -690,6 +691,8 @@ bash_timeout_secs = 600
 # bash_heartbeat_secs = 60               # supervisor-visible "still running" note interval (or NANO_CODER_BASH_HEARTBEAT_SECS)
 persist_sessions = true
 cross_session_history = true            # sessions_list + a session argument on the history tools: read other sessions' logs
+session_messages = false                # listen for messages from other sessions + offer session_send (see Inter-session messages)
+session_messages_confirm = true         # ask before an incoming session message is queued/run
 # session_dir = "/path/to/sessions"    # default: <platform data dir>/nano-coder/sessions
 session_compress_after_days = 14        # gzip logs idle this long at startup (0 = never)
 # session_retention_days = 0           # delete logs untouched this long (0 = keep; named sessions are kept)
@@ -1049,7 +1052,7 @@ adds it to the message queue (one queued message runs per following turn; `/queu
 edits and removes them), and Esc Esc or Ctrl-C cancels the turn. The prompt supports
 editing: Left/Right move the cursor, Home/End (or Ctrl-A/Ctrl-E) jump to the start/end,
 Alt/Option-Left/Right (or Alt-B/Alt-F) move by word, and Up/Down recall submitted lines from
-the session's input history (Down past the newest restores what you were typing). The mouse is never captured, so the
+the session's input history (Down past the newest restores what you were typing; history keeps up to 200 entries and 512 KiB, and a single prompt over 512 KiB is not recalled). The mouse is never captured, so the
 terminal keeps its native behaviour — the wheel scrolls the scrollback and drag selects text. Backspace and Delete remove the character before/under the cursor, Ctrl-U clears the
 input, Ctrl-W deletes the word before the cursor, and Esc Esc (twice within a second)
 clears the whole input at the prompt. At the prompt between turns,
@@ -1217,6 +1220,43 @@ compactions, turns after the first compaction, turns that used the history tools
 reported outcomes. `eval/compaction/` has a harness that compares the two modes across
 providers and models on synthetic or forked real sessions (see its README). See [#29](https://github.com/nanobpm/nano-coder/issues/29) for the design.
 
+#### Inter-session messages
+
+Cross-session history lets an agent *read* another session's log; inter-session messages
+let it *talk* to a running one. With `session_messages = true` (default `false`) a session
+listens on a Unix socket in a peer registry (`<data dir>/peers/<session-id>.sock`, the
+directory created mode 0700; `NANO_CODER_PEERS` overrides the directory) and the agent
+gets a fourth cross-session tool:
+
+- `session_send(to, text, confirm?)` - deliver a message to another running session.
+  `to` resolves like the history tools' `session` argument (an id, a unique id prefix,
+  or a title from `sessions_list`, which marks reachable sessions `[messages]`). The
+  result is one of `delivered`, `queued` (the target is mid-turn; the message sits in its
+  `/queue`, visible, editable and withdrawable like a typed steer), `awaiting
+  confirmation` (the target's user is being asked), `refused` (the target has messages
+  off or declined), or `not running` (no live socket; a stale socket file from a dead
+  session is removed by the sender that finds it). The send goes through the sender's
+  permission policy as a `session_send(...)` rule.
+
+The delivered message joins the target's input labelled with its origin, e.g.
+`[from session 1234abcd · ts-performance-matrix] …`, and is logged like any input with
+the sender's full session id in the record (`from_session` on the input and message). Mid-turn it is steered into the running turn; idle it starts
+a turn. With `session_messages_confirm = true` (the default) the target first shows the
+message and waits for its user to accept or decline. A turn that was *started by* a peer
+message cannot itself call `session_send` without `confirm: true` (which asks the
+target's user whatever their confirm setting) — the loop guard, so two agents can't
+ping-pong. On the wire each message is one A2A-shaped JSON object per line (`role`,
+`parts` with `text`, `messageId`, `contextId` = the sender's session id), so a later A2A
+bridge can map it directly. The receiver serves only a peer with its own uid
+(`SO_PEERCRED`/`getpeereid`) and drops any other, and the 0700 registry directory keeps
+other users from planting or reaching a socket. `/messages on|off` and `/messages confirm
+on|off` switch the settings for the current session (`--save` writes them to the config
+file); `/messages` alone shows the state. With the Herdr integration active a received
+message shows as activity on the target's pane, and a session served over ACP can receive
+messages too (shown to the client as user input with the label; ACP has no question
+channel, so a message that would need confirmation is declined with a note asking the
+sender to re-send with confirm off).
+
 ## Project Instructions
 
 nano-coder reads the instruction files you already have for other tools, including Claude
@@ -1315,7 +1355,13 @@ inside the checkout. Fetches are limited to `skills.allowed_hosts` (`"file"` all
 An `ai.json` without an `ai.lock` is skipped with a warning, because unpinned references are
 never resolved.
 
-Skills are found again when a session starts or is resumed. Problems are listed at startup
+Skills are found when a session starts or is resumed, and edits take effect on the next turn
+without a restart: before each turn (each prompt over ACP) nano-coder stats the skill folders
+and each `SKILL.md` (size and mtime; nothing is read unless something changed). When a skill
+was added, removed or edited, it finds them again, rebuilds the skills index in the system
+prompt and shows one dim line such as `skills: updated web; added foo; removed bar`. An
+unchanged set leaves the system prompt byte-identical, so the provider's prompt cache holds.
+`/skills` lists the current set. Problems are listed at startup
 and by `/skills` (and returned as `_meta.skillWarnings` over ACP); they never stop a session.
 To turn skills off, set `skills.enabled = false` or set `NANO_CODER_NO_SKILLS`.
 
@@ -1469,6 +1515,33 @@ recalled (unless a different fact would be chosen). Memories with no entities ye
 anchor-substring recall, so nothing regresses before they are migrated. The note names the
 entity that triggered it (`📌 host:merlin — …`), and `/memory entities` lists each entity's
 facts. Set `memory_recall = "anchor"` to compare or roll back to the pre-entity substring match.
+
+**Migrating existing memories.** Memories saved before entities existed have no entities or
+`fact_kind`, and may include duplicates and facts a later note contradicts. `/memory migrate`
+(or `nano-coder --memory-migrate` from a shell) tidies them with the model's help:
+
+- Untagged entries not reviewed before are sent to the session's model in batches of at most
+  12 KB, each with a capped (6 KB) digest of the already-tagged entries. The model proposes,
+  per entry, entities and a `fact_kind`, and across the batch and the tagged set, duplicates to
+  merge and stale entries to supersede (naming the newer entry and why). Invalid proposals
+  (unknown ids, bad entity types) are dropped and counted.
+- Each batch's proposals are listed for review: **Accept all**, **Review each** (accept, skip
+  or edit each item: a tag's entities and kind, a merge's text), **Skip this batch**, or
+  **Stop** (resume later). Nothing changes without a confirmation.
+- A merge keeps the chosen entry with the better text and the union of the anchors, evidence
+  and entities; the duplicates and superseded entries stay on disk marked replaced
+  (`superseded_by`), so they are never recalled or listed but remain readable by id.
+- Before the first applied change, the memory files are copied to
+  `<memory dir>/backups/migrate-<timestamp>/` and the path is printed. To undo, copy the files
+  from there back into the memory directory.
+- Progress is recorded in `<memory dir>/migrate-progress.json` after each batch, so an
+  interrupted or stopped migration resumes where it left off, and a re-run only looks at
+  entries that are still untagged and were saved since (skipped batches are not offered again;
+  delete the progress file to review everything once more).
+- `--dry-run` (`/memory migrate --dry-run`, `nano-coder --memory-migrate --dry-run`) writes the
+  proposals to `<memory dir>/migrate-dry-run-<timestamp>.json` and changes nothing; it also
+  works when memory is read-only. Applying needs memory `on` and, in the REPL, an interactive
+  terminal outside Plan mode.
 
 **Prompt.** A capped, dated index (most-recently-used first, ~4 KB with the guidance) is
 appended to the system prompt at session start, framed as "notes from earlier sessions; may be

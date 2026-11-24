@@ -20,7 +20,7 @@ import nano.clock : stdTimeNow;
 import nano.arith : saturatingSub;
 import nano.option : Option, some, none, match, ifSome, NotNull;
 
-import nano.safeio : spawnDaemon, stdErr, stdOut;
+import nano.safeio : spawnDaemon, stdErr, stdOut, Shared, JoinHandle;
 
 import std.json;
 import std.format : format;
@@ -40,7 +40,10 @@ enum int protocolVersion = 1;
 import nano.paths : debugQuote;
 import nano.commands : isCommand;
 import nano.thinking : wireValue, sessionSetting, label;
-import nano.result : orThrow, unwrap, unwrapErr;
+import nano.result : orThrow, unwrapErr, resultUnwrap = unwrap;
+import nano.option : unwrap;
+import peers = nano.peers;
+import nano.queue : MessageQueue;
 import nano.temperature : label;
 import std.array : join;
 
@@ -235,6 +238,19 @@ struct Host
     /// "Updated X → Y" and what changed (#282), sent once as an info notice
     /// after the first session/new or session/load; null for none.
     string releaseNotice;
+    /// Inter-session messages (issue #272): this session listens and offers
+    /// `session_send`; incoming messages are shown to the client as user
+    /// input with the label.
+    bool sessionMessages;
+    /// Ask the client before accepting an incoming message
+    /// (`session_messages_confirm`, default true). ACP has no question
+    /// channel, so a message under confirm is declined with a note.
+    bool sessionMessagesConfirm = true;
+    /// Called before each prompt's turn: picks up between-turn changes
+    /// (edited skills) and rebuilds the system prompt if they changed it.
+    /// Returns a notice for the client (sent as `_nano/notice`, outside the
+    /// model's context), or null when nothing changed.
+    string delegate() beforePrompt;
 }
 
 /// Input id for idempotent prompts: `messageId`, or `_meta.inputId`.
@@ -265,7 +281,7 @@ struct AcpRouter
     private static struct State
     {
         immutable(string)[] items; /// queued messages, as JSON text
-        bool eof, turnActive, sawValid;
+        bool eof, turnActive, sawValid, poked;
         string sessionId;
         immutable(size_t)[] steerMarks; /// queue length when each steer arrived
     }
@@ -330,16 +346,32 @@ struct AcpRouter
     /// The next queued message (waits); false at end of input.
     bool pop(out JSONValue m)
     {
-        auto text = state.await!string((ref const State st) => st.items.length || st.eof, (ref State st) {
+        bool woken;
+        while (pop(m, woken)) if (!woken) return true;
+        return false;
+    }
+
+    /// As `pop`, but also returns (with `woken` set and no message) when
+    /// `wake` was called, so the caller can handle a peer delivery.
+    bool pop(out JSONValue m, out bool woken)
+    {
+        bool w;
+        auto text = state.await!string((ref const State st) => st.items.length || st.eof || st.poked, (ref State st) {
+            if (st.poked && !st.items.length && !st.eof) { st.poked = false; w = true; return ""; }
+            st.poked = false;
             if (!st.items.length) return string.init;
             auto t = st.items[0];
             st.items = st.items[1 .. $];
             return t;
         });
+        if (w) { woken = true; return true; }
         if (text is null) return false;
         m = parseJSON(text);
         return true;
     }
+
+    /// Wake a waiting `pop` (a peer delivery is ready).
+    void wake() { state.update((ref State st) { st.poked = true; }); }
 
     /// Whether any valid JSON-RPC request arrived.
     bool sawValid() { return state.get.sawValid; }
@@ -412,6 +444,10 @@ final class AcpServer : AgentEvents
     private bool defaultAutoCompact;
     private double defaultAutoCompactThreshold;
     private ConfiguredWindow defaultConfiguredWindow;
+    /// Inter-session messages (issue #272): the router draining the
+    /// listener, and the listener itself (zero or one).
+    private peers.PeerRouter peerRouter;
+    private peers.PeerListener[] peerListener;
 
     /// `writeLine` gets one JSON message per call (defaults to stdout).
     this(Agent agent, Host host, void delegate(string) @safe writeLine = null)
@@ -427,6 +463,11 @@ final class AcpServer : AgentEvents
         this.host = host;
         outLock = new Mutex;
         router = AcpRouter.make(agent.control.nonNull);
+        peerRouter = peers.PeerRouter.make(agent.control.nonNull);
+        peerRouter.confirm(host.sessionMessagesConfirm);
+        peerRouter.confirmUnavailable(true);
+        peerQueue = MessageQueue.make;
+        agent.messagesOn = host.sessionMessages;
         writeLine_ = writeLine !is null ? writeLine : (string l) => writeStdoutLine(l);
         agent.onPlanChanged = () {
             JSONValue u = ["sessionUpdate": "plan"];
@@ -454,6 +495,15 @@ final class AcpServer : AgentEvents
         releaseNoticeSent = true;
         notify("_nano/notice", JSONValue(["sessionId": JSONValue(sessionId), "level": JSONValue("info"),
             "text": JSONValue(host.releaseNotice)]));
+    }
+
+    /// An info `_nano/notice` for between-turn changes (e.g. skills
+    /// refreshed); nothing for empty text.
+    private void sendNotice(string text)
+    {
+        if (!text.length) return;
+        notify("_nano/notice", JSONValue(["sessionId": JSONValue(sessionId), "level": JSONValue("info"),
+            "text": JSONValue(text)]));
     }
 
     private void writeOut(string line)
@@ -568,10 +618,43 @@ final class AcpServer : AgentEvents
     /// Run until input ends. Returns whether any valid JSON-RPC request arrived.
     bool run()
     {
+        scope (exit) stopPeerListener();
         JSONValue msg;
-        while (router.pop(msg)) handle(msg);
+        for (;;)
+        {
+            // Peer messages: the pump thread routes them (mid-turn ones
+            // steer the running turn) and wakes `pop` when an idle one
+            // waits; it becomes a turn (shown to the client as user input
+            // with the label). ACP has no confirm channel, so routing
+            // refuses messages under confirm before answering the sender.
+            peers.Inbound inbound;
+            if (peerRouter.takeWaiting(inbound))
+            {
+                if (inbound.needsConfirm)
+                {
+                    peers.settle(inbound, false,
+                        "the ACP session can't ask its user to confirm; it accepts only sends without confirm, and only if its own session_messages_confirm is off");
+                    continue;
+                }
+                userMessage(inbound.labelled);
+                peers.settle(inbound, true);
+                subCalls = null;
+                terminalCalls = null;
+                runTurn(JSONValue.init, inbound.labelled, null, true, inbound.pm.senderId);
+                subCalls = null;
+                terminalCalls = null;
+                continue;
+            }
+            bool woken;
+            if (!router.pop(msg, woken)) break;
+            if (!woken) handle(msg);
+        }
         return router.sawValid;
     }
+
+    /// The queue mid-turn peer deliveries take their `/queue` ids from (ACP
+    /// has no interactive queue; ids are only for the wire note).
+    private MessageQueue peerQueue;
 
     /// Serve stdin on a reader thread until it ends.
     bool serveStdio()
@@ -670,6 +753,7 @@ final class AcpServer : AgentEvents
             // calls; release the previous turn's.
             subCalls = null;
             terminalCalls = null;
+            if (host.beforePrompt !is null) sendNotice(host.beforePrompt());
             runTurn(id, text, inputId(params));
             subCalls = null;
             terminalCalls = null;
@@ -786,7 +870,7 @@ final class AcpServer : AgentEvents
             import nano.subagent : parseToggle, statusText;
             auto p = parseToggle(text["/subagents".length .. $]);
             if (p.isErr) return rpcError(id, -32602, p.unwrapErr("isErr"));
-            auto t = p.unwrap("isOk");
+            auto t = resultUnwrap(p, "isOk");
             JSONValue body_ = ["stopReason": "end_turn"];
             if (!t.show)
             {
@@ -828,7 +912,7 @@ final class AcpServer : AgentEvents
                 import nano.thinking : sessionSettingValue;
                 auto setting = sessionSetting(arg);
                 if (setting.isErr) return rpcError(id, -32602, setting.unwrapErr("isErr"));
-                agent.sessionThinking = setting.unwrap("isOk");
+                agent.sessionThinking = resultUnwrap(setting, "isOk");
                 {
                     // A resume restores the session's thinking level (#297).
                     SessionSettings ss;
@@ -860,11 +944,73 @@ final class AcpServer : AgentEvents
         return null;
     }
 
+    /// (Re)start the registry listener for the current session id (issue
+    /// #272): only with `session_messages` on and a session log (its id
+    /// names the socket).
+    private void startPeerListener()
+    {
+        stopPeerListener();
+        if (!host.sessionMessages || host.sessionDir is null || agent.log.isNone) return;
+        auto dir = peers.peersDir();
+        if (!peers.ensureDir(dir)) return;
+        try peerListener = [peers.PeerListener.listen(dir, agent.log.unwrap("checked isSome").id, peerRouter.requests)];
+        catch (peers.ListenError) { return; } // a listener is best effort: the session runs without one
+        auto halt = Shared!bool.make(false);
+        peerPump = [PeerPump(halt, spawnDaemon(&pumpPeers, peerRouter, peerQueue, router, halt))];
+    }
+
+    private void stopPeerListener()
+    {
+        foreach (ref l; peerListener) l.close();
+        peerListener = null;
+        foreach (ref p; peerPump)
+        {
+            p.halt.update((ref bool b) { b = true; });
+            p.thread.join();
+        }
+        peerPump = null;
+    }
+
+    /// Before the session identity changes: stop intake (listener and
+    /// pump) and refuse what was addressed to the old session, so none of
+    /// it runs in the new one. `startPeerListener` rebinds afterwards.
+    private void leavePeerSession()
+    {
+        stopPeerListener();
+        peerRouter.discardAll();
+    }
+
+    private static struct PeerPump
+    {
+        Shared!bool halt;
+        JoinHandle thread;
+    }
+    /// Routes peer messages while the main loop waits on stdin or runs a
+    /// turn (zero or one, alongside the listener).
+    private PeerPump[] peerPump;
+
+    /// Route peer requests every few ms (so mid-turn messages steer the
+    /// running turn) and wake the main loop's `pop` when an idle delivery
+    /// waits, so it doesn't sit until unrelated client traffic arrives.
+    private static void pumpPeers(peers.PeerRouter peerRouter, MessageQueue queue, AcpRouter router,
+        Shared!bool halt)
+    {
+        import core.time : msecs;
+        import nano.clock : sleepFor;
+        while (!halt.get)
+        {
+            peerRouter.routePending(queue);
+            if (peerRouter.hasWaiting) router.wake();
+            sleepFor(20.msecs);
+        }
+    }
+
     private void newSession()
     {
         import std.file : getcwd;
         auto cwd = getcwd();
         auto sys = host.systemPrompt !is null ? host.systemPrompt(cwd) : null;
+        leavePeerSession();
         // `restart` (not a bare messages/log swap) so every piece of
         // session-local state is reset: replay/clipping provenance
         // (`restoredLineFloor`, `clippedLines`) left from a `session/load`
@@ -892,6 +1038,7 @@ final class AcpServer : AgentEvents
         // them, so a later load would not reproduce them.
         resetToStartupDefaults(true);
         if (host.loadHooks !is null) agent.useHooks(host.loadHooks(cwd), false);
+        startPeerListener();
     }
 
     private void loadSession_(string want)
@@ -905,6 +1052,10 @@ final class AcpServer : AgentEvents
         // adopted from a pre-turn snapshot and the turn re-run. The live
         // conversation is kept until the lock and restore succeed.
         auto log = new SessionLog(path);
+        // From here the identity may change: stop old-session intake (a
+        // failed load restarts the listener on the kept session).
+        leavePeerSession();
+        scope (failure) if (!agent.ownsLog(log)) startPeerListener();
         // Close on failure only until the agent adopts the log: after
         // `loadRestored` takes it (even if it throws later) it is the agent's
         // live writer, and a hook or replay failure must not close it.
@@ -924,6 +1075,7 @@ final class AcpServer : AgentEvents
             agent.syncModePrompt((bool plan) => host.modeSystemPrompt(dir, plan));
         }
         sessionId = log.id;
+        startPeerListener();
         if (host.loadHooks !is null) agent.useHooks(host.loadHooks(getcwd()), true);
         replayHistory();
         // As on the CLI resume: drop the full-log parse and the replaced
@@ -1075,17 +1227,23 @@ final class AcpServer : AgentEvents
     }
 
     /// Run one prompt turn; the reader thread routes cancels and steers meanwhile.
-    private void runTurn(JSONValue id, string text, string givenId = null)
+    private void runTurn(JSONValue id, string text, string givenId = null, bool fromPeer = false,
+        string peerSender = null)
     {
         router.startTurn();
+        peerRouter.midTurn(true);
+        scope (exit) peerRouter.midTurn(false);
         immutable ulong[2] tokensBefore = [agent.sessionInputTokens, agent.sessionOutputTokens];
         string response;
-        try response = agent.run(text, this, false, givenId);
+        try response = agent.run(text, this, false, givenId, fromPeer, peerSender);
         catch (Exception e)
         {
             response = "Error: " ~ e.msg;
             agent.lastStop = StopReason.endTurn;
         }
+        // Stop steering peers into this turn before endTurn collects the
+        // leftover steers: a later peer message queues for the next turn.
+        peerRouter.midTurn(false);
         router.endTurn((ref JSONValue[] items, const(size_t)[] marks, string session) {
             string stop = agent.lastStop;
             if (id.type != JSONType.null_)
@@ -1108,6 +1266,13 @@ final class AcpServer : AgentEvents
             // Steers that arrived too late: dropped on cancel, else queued as
             // prompts at the position each one arrived.
             auto leftover = agent.control.takePending;
+            // A peer's late steer runs later as a peer prompt (loop guard
+            // kept), even on cancel: its sender was told it was queued.
+            leftover = requeuePeerSteers(leftover, (string text, string sender) {
+                if (peerRouter.requeueLate(text, sender)) return;
+                stdErr.writeln(format("peer message from %s dropped: inbox full",
+                    peers.PeerRouter.senderFromLabel(text)));
+            });
             if (agent.lastStop == StopReason.cancelled)
             {
                 foreach (s; leftover)
@@ -1118,6 +1283,30 @@ final class AcpServer : AgentEvents
             return true;
         });
     }
+}
+
+/// Hand every peer steer in `leftover` to `requeue` (its sender was told it
+/// was queued, so it runs later even when the turn was cancelled) and
+/// return the rest, which the caller answers or requeues as prompts.
+Steer[] requeuePeerSteers(Steer[] leftover, scope void delegate(string text, string sender) @safe requeue)
+{
+    Steer[] rest;
+    foreach (s; leftover)
+        if (s.fromPeer) requeue(s.text, s.sender);
+        else rest ~= s;
+    return rest;
+}
+
+unittest
+{
+    auto peer = Steer("[from session abcd1234] hi");
+    peer.fromPeer = true;
+    peer.sender = "abcd1234-full";
+    auto plain = Steer("user steer");
+    string[] got;
+    auto rest = requeuePeerSteers([plain, peer], (string t, string s) { got ~= s ~ "|" ~ t; });
+    assert(got == ["abcd1234-full|[from session abcd1234] hi"], got[0]);
+    assert(rest.length == 1 && rest[0].text == "user steer" && !rest[0].fromPeer);
 }
 
 /// Insert steers that missed their turn into `deferred` as prompts, each at
