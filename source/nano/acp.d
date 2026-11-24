@@ -746,12 +746,10 @@ final class AcpServer : AgentEvents
                 return;
             }
             string handle;
-            if (params.type == JSONType.object)
-                if (auto n = "name" in params.objectNoRef)
-                {
-                    if (n.type == JSONType.string) handle = n.str;
-                    else if (n.type != JSONType.null_) { reply(rpcError(id, -32602, "params.name must be a string or null")); return; }
-                }
+            auto n = params.type == JSONType.object ? "name" in params.objectNoRef : null;
+            if (n is null) { reply(rpcError(id, -32602, "params.name is required: a string, or null to clear")); return; }
+            if (n.type == JSONType.string) handle = n.str;
+            else if (n.type != JSONType.null_) { reply(rpcError(id, -32602, "params.name must be a string or null")); return; }
             if (auto why = renameSession(handle)) { reply(rpcError(id, -32602, why)); return; }
             reply(rpcResult(id, JSONValue(["sessionId": JSONValue(sessionId),
                 "name": agent.name.length ? JSONValue(agent.name) : JSONValue(null)])));
@@ -2033,6 +2031,7 @@ unittest
     srv.receive(`{"jsonrpc":"2.0","id":4,"method":"session/set_name","params":{"name":"Not Valid"}}`);
     srv.receive(`{"jsonrpc":"2.0","id":5,"method":"session/set_name","params":{"name":"again"}}`);
     srv.receive(`{"jsonrpc":"2.0","id":6,"method":"session/set_name","params":{"name":null}}`);
+    srv.receive(`{"jsonrpc":"2.0","id":7,"method":"session/set_name","params":{"handle":"x"}}`);
     srv.close();
     srv.run();
     JSONValue[long] byId;
@@ -2047,6 +2046,7 @@ unittest
     assert("error" in byId[4], byId[4].toString);
     assert(byId[5]["result"]["name"].str == "again", byId[5].toString);
     assert(byId[6]["result"]["name"].type == JSONType.null_, byId[6].toString);
+    assert(byId[7]["error"]["message"].str.canFind("required"), byId[7].toString);
     assert(agent.name is null);
     agent.log.ifSome((SessionLog l) { l.close(); });
 }

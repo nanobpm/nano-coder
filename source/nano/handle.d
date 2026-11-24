@@ -116,11 +116,17 @@ string claim(string dir, string sessionDir, string handle, string id)
     import std.file : write, rename, FileException;
     import std.process : thisProcessID;
     import nano.peers : ensureDir;
+    import nano.safeio : lockExclusive;
     if (auto why = invalidHandle(handle)) return why;
+    if (!ensureDir(dir)) return format("can't create the registry directory %s", dir);
+    // Serialize check-then-write across processes: two sessions claiming the
+    // same handle at once would otherwise both see no running holder. The
+    // lock is released when `guard` closes (also if the process dies).
+    auto guard = lockExclusive(handlePath(dir, handle) ~ ".lock");
+    if (!guard.held) return format("can't lock the handle registry for %s", handle);
     auto holder = runningHolder(dir, sessionDir, handle);
     if (holder.length && holder != id)
         return format("the handle %s is held by running session %s", handle, holder);
-    if (!ensureDir(dir)) return format("can't create the registry directory %s", dir);
     auto p = handlePath(dir, handle);
     auto tmp = format("%s.tmp-%s", p, thisProcessID);
     try
@@ -230,5 +236,14 @@ unittest
     release(peers, "perf", "s-live");
     assert(!handlePath(peers, "perf").exists);
     assert(claim(peers, sessions, "Bad", "s-live") !is null);
+    // The claim lock file is reusable once released, and the check under it still refuses.
+    {
+        import nano.safeio : lockExclusive;
+        auto held = lockExclusive(handlePath(peers, "race") ~ ".lock");
+        assert(held.held);
+        held.release();
+        assert(claim(peers, sessions, "race", "s-live") is null);
+        assert(claim(peers, sessions, "race", "s-other") !is null, "the running holder wins");
+    }
     assert(describe("perf").canFind("perf") && describe(null).canFind("/name"));
 }

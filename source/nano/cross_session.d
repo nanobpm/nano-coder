@@ -258,8 +258,9 @@ SessionInfo resolve(string needle, SessionInfo[] sessions, scope const(SessionIn
     // once had it, then the newest (`sessions` is newest first).
     {
         Option!SessionInfo stopped;
+        immutable lowered = needle.toLower; // handles are always lowercase
         foreach (i; sessions)
-            if (i.name.length && i.name == needle)
+            if (i.name.length && i.name == lowered)
             {
                 if (i.live) return i;
                 if (stopped.isNone) stopped = some(i);
@@ -502,6 +503,7 @@ unittest
         mk("sess-1", "matrix", "perf", true),     // the running holder
     ];
     assert(resolve("perf", sessions).id == "sess-1", "the running holder wins");
+    assert(resolve("Perf", sessions).id == "sess-1", "a handle matches whatever the case");
     sessions[2].live = false;
     assert(resolve("perf", sessions).id == "sess-2", "with none running, the newest holder wins");
     assert(resolve("sess-3", sessions).id == "sess-3", "an id still resolves");

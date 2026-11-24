@@ -281,6 +281,46 @@ LockResult tryLockFile(string path) @trusted nothrow
     }
 }
 
+/// An exclusive flock held on a file until `release` (or process exit):
+/// serializes a check-then-write across processes (issue #300's handle
+/// claims). Not copyable, so the fd has one owner.
+struct ExclusiveLock
+{
+    private int fd = -1;
+    @disable this(this);
+
+    /// Whether the lock is held.
+    bool held() const pure nothrow @nogc => fd >= 0;
+
+    /// Unlock and close (closing drops the flock).
+    void release() @trusted nothrow
+    {
+        import core.sys.posix.unistd : close;
+        // close(2) on an fd this struct alone owns touches no D memory.
+        if (fd >= 0) close(fd);
+        fd = -1;
+    }
+
+    ~this() nothrow { release(); }
+}
+
+/// Create (mode 0600) or open `path` and block until an exclusive flock is
+/// held on it; `held` is false if the file can't be opened or locked.
+/// EINTR is retried.
+ExclusiveLock lockExclusive(string path) @trusted nothrow
+{
+    import core.sys.posix.fcntl : O_RDWR, O_CREAT;
+    import std.conv : octal;
+    import core.stdc.errno : errno, EINTR;
+    ExclusiveLock l;
+    auto fd = openPath(path, O_RDWR | O_CREAT, octal!600);
+    if (fd < 0) return l;
+    l.fd = fd;
+    while (flockFd(fd, flockEx) != 0)
+        if (errno != EINTR) { l.release(); break; }
+    return l;
+}
+
 // flock(2) takes an fd and flags, touching no memory.
 private extern (C) pragma(mangle, "flock") int flockFd(int, int) nothrow @nogc @system;
 private enum flockEx = 2, flockNb = 4;
