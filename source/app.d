@@ -1584,6 +1584,18 @@ ConfiguredWindow providerWindow(long providerWindow) pure
         : ConfiguredWindow.init;
 }
 
+unittest // a restored window held in the live config survives a model switch (issue #315)
+{
+    Config cfg;
+    cfg.contextWindow = 100_000;
+    ProviderConfig p;
+    p.contextWindow = 32_000;
+    cfg.contextWindow = 50_000; // restored override
+    assert(windowFor(cfg, p).tokens == 50_000);
+    cfg.contextWindow = 0; // restored "from provider/model"
+    assert(windowFor(cfg, p).tokens == 32_000 && windowFor(cfg, p).source == "provider context_window");
+}
+
 unittest // context_window 0 restores the provider's window, ignoring the top-level one
 {
     assert(providerWindow(32_000).tokens == 32_000);
@@ -4349,6 +4361,9 @@ int runMain(string[] args)
             // window applies below only when its model is the live one, so a
             // fallback must not keep the previous session's override.
             agent.setConfiguredWindow(runtimeDefaults.window(cfg.providers.get(client.providerName, ProviderConfig.init).contextWindow));
+            // The live config too: a later `/model` builds its window from
+            // it, so the previous session's override must not come back.
+            cfg.contextWindow = runtimeDefaults.contextWindow;
         }
         if (explicitFlags && o.plan)
         {
@@ -4398,6 +4413,10 @@ int runMain(string[] args)
             windowOwner.length ? nano.recents.canonical(windowOwner, cfg.providers, cfg.defaultProvider) : null,
             agent.client.providerName ~ "/" ~ agent.client.modelName))
         {
+            // Held in the live config like an unsaved `/settings` edit, so
+            // a later `/model` switch keeps it (`switchModel` builds the
+            // window from `cfg`; issue #315). 0 clears the top-level window.
+            cfg.contextWindow = st.contextWindow;
             if (st.contextWindow > 0)
                 agent.setConfiguredWindow(ConfiguredWindow(toSize(st.contextWindow), "the session's settings"));
             else
