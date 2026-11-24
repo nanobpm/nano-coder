@@ -99,7 +99,7 @@ struct Entry
 /// read whole (issue #263).
 Entry[] load(string path, scope bool delegate(ulong id) @safe want = null)
 {
-    import nano.session : messageFromRecord, eachLogLine;
+    import nano.session : messageFromRecord, eachLogLine, maxRecordBytes;
     Entry[] out_;
     eachLogLine(path, (line, n) {
         if (want !is null && !want(n)) return;
@@ -112,7 +112,7 @@ Entry[] load(string path, scope bool delegate(ulong id) @safe want = null)
             if (recordMessage(parseJSON(line), m)) out_ ~= Entry(n, m);
         }
         catch (Exception) {} // skip a torn or corrupt line, like the resume loader does
-    }, false);
+    }, false, null, maxRecordBytes); // a history view may skip a giant record (issue #289)
     return out_;
 }
 

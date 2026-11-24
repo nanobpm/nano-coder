@@ -1924,14 +1924,17 @@ private size_t skimCount(const(char)[] arr) pure nothrow @nogc
 
 /// Stream the committed lines of a session log (a torn last line is
 /// dropped) to `dg` with their 1-based line numbers, so a reader holds one
-/// line rather than the whole log. `requireCommitted`: a log without a
+/// line rather than the whole log. `maxLine` caps a record's bytes (0, the
+/// default: no cap, so restore never silently drops a record); an over-cap
+/// record is skipped but still counts for `lineNo`. `requireCommitted`: a log without a
 /// committed record throws (a resume needs its header). A plain log is read
 /// line by line rather than whole (issue #244); a compressed one is inflated.
 void eachLogLine(string path, scope void delegate(const(char)[] line, ulong lineNo) @safe dg,
-    bool requireCommitted = true, scope bool delegate(const(char)[] head) @safe keep = null)
+    bool requireCommitted = true, scope bool delegate(const(char)[] head) @safe keep = null,
+    size_t maxLine = 0)
 {
     eachLogLineUntil(path, (const(char)[] line, ulong lineNo) { dg(line, lineNo); return true; },
-        requireCommitted, keep);
+        requireCommitted, keep, maxLine);
 }
 
 /// `eachLogLine` whose `dg` returns false to stop reading: no further line
@@ -1939,20 +1942,25 @@ void eachLogLine(string path, scope void delegate(const(char)[] line, ulong line
 /// `keep`, if set, sees each line's first `lineHeadBytes`; a rejected line
 /// is skipped unbuffered (never assembled) but still counts for `lineNo`.
 void eachLogLineUntil(string path, scope bool delegate(const(char)[] line, ulong lineNo) @safe dg,
-    bool requireCommitted = true, scope bool delegate(const(char)[] head) @safe keep = null)
+    bool requireCommitted = true, scope bool delegate(const(char)[] head) @safe keep = null,
+    size_t maxLine = 0)
 {
     // One streaming reader for plain and compressed logs alike (64 KB reads,
     // a bounded inflate window): neither the file nor a decompressed copy is
     // ever held whole.
     ulong lineNo;
-    streamLogLinesUntil(path, (line) {
-        if (line.length && line[$ - 1] == '\r') line = line[0 .. $ - 1];
-        return dg(line, ++lineNo);
-    }, keep is null ? null : (const(char)[] head) {
+    StreamOptions o;
+    o.maxLine = maxLine;
+    o.keep = keep is null ? null : (const(char)[] head) {
         if (keep(head)) return true;
         ++lineNo;
         return false;
-    }, (size_t) { ++lineNo; }); // an oversized record (issue #289) still counts as a line
+    };
+    o.oversized = (size_t) { ++lineNo; }; // an oversized record (issue #289) still counts as a line
+    streamLogLinesWith(path, (line) {
+        if (line.length && line[$ - 1] == '\r') line = line[0 .. $ - 1];
+        return dg(line, ++lineNo);
+    }, o);
     if (!lineNo && requireCommitted) throw new Exception("session log " ~ path ~ " has no committed records");
 }
 
@@ -4996,8 +5004,13 @@ unittest
     // The default cap: a 16 MiB+ record is skipped; line numbers stay aligned.
     write(p, `{"type":"session","data":{"cwd":"/w"}}` ~ "\n" ~ "z".replicate(maxRecordBytes + 1) ~ "\n" ~ "tail\n");
     ulong[] nos;
-    eachLogLine(p, (const(char)[] l, ulong n) { nos ~= n; });
+    eachLogLine(p, (const(char)[] l, ulong n) { nos ~= n; }, true, null, maxRecordBytes);
     assert(nos == [1, 3], format("%s", nos));
+    // Restore's reader is uncapped by default: an over-cap record is kept,
+    // never silently dropped from a resumed conversation.
+    size_t[] lens;
+    eachLogLine(p, (const(char)[] l, ulong n) { lens ~= l.length; });
+    assert(lens.length == 3 && lens[1] == maxRecordBytes + 1, format("%s", lens));
     size_t lines;
     foreachLogLineSkippingTorn(p, (const(char)[]) { ++lines; });
     assert(lines == 3);
