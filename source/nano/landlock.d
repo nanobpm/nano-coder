@@ -31,6 +31,7 @@ enum uint createRulesetVersion = 1, rulePathBeneath = 1;
 enum int prSetNoNewPrivs = 38;
 enum int oPath = 0x200000, oCloexec = 0x80000;
 
+enum ulong readFile = 1UL << 2, readDir = 1UL << 3;
 enum ulong writeFile = 1UL << 1, removeDir = 1UL << 4, removeFile = 1UL << 5, makeChar = 1UL << 6,
     makeDir = 1UL << 7, makeReg = 1UL << 8, makeSock = 1UL << 9, makeFifo = 1UL << 10, makeBlock = 1UL << 11,
     makeSym = 1UL << 12, refer = 1UL << 13, truncate = 1UL << 14, ioctlDev = 1UL << 15;
@@ -102,16 +103,53 @@ string check(bool network)
     return rights(network, v, fs, net);
 }
 
-/// The argv that runs `shell -c script` confined to `roots`.
-string[] argv(bool network, const string[] roots, string shell, string script)
+/// The argv that runs `shell -c script` writing only to `roots` and, when
+/// `confineReads`, reading only `reads` (issue #333).
+string[] argv(bool network, const string[] roots, bool confineReads, const string[] reads, string shell,
+    string script)
 {
     import std.file : thisExePath;
-    import std.conv : to;
-    return [thisExePath, execFlag, network ? "1" : "0", roots.length.to!string] ~ roots.dup ~ [shell, "-c", script];
+    return helperArgs(thisExePath, network, roots, confineReads, reads) ~ [shell, "-c", script];
 }
 
-/// Restrict this process to `roots` (call it single-threaded, before exec).
-string restrict(bool network, const string[] roots) @trusted
+/// The helper's argv prefix: [exe, execFlag, network, n, roots..., m|"-", reads...].
+string[] helperArgs(string exe, bool network, const string[] roots, bool confineReads, const string[] reads) pure
+{
+    import std.conv : to;
+    return [exe, execFlag, network ? "1" : "0", roots.length.to!string] ~ roots.dup
+        ~ [confineReads ? reads.length.to!string : "-"] ~ reads.dup;
+}
+
+/// A rule the helper adds: a path and the rights granted beneath it.
+struct Rule
+{
+    /// The path (directory or file).
+    string path;
+    /// Granted access rights.
+    ulong access;
+}
+
+/// The Landlock rules for `roots` (writable) and `reads` (readable), given
+/// the handled `fs` rights; files get only file rights. Pure so the rule set
+/// is unit-tested without a Landlock kernel.
+Rule[] ruleSet(ulong fs, const string[] roots, bool confineReads, const string[] reads,
+    scope bool delegate(string) @safe isDirectory) pure
+{
+    // Device-node creation is handled but granted nowhere, so mknod fails
+    // closed everywhere (a node in the workspace could reach a raw device).
+    auto granted = fs & ~(makeChar | makeBlock | readFile | readDir);
+    Rule[] rules;
+    foreach (root; roots)
+        rules ~= Rule(root, (isDirectory(root) ? granted : granted & (writeFile | truncate | ioctlDev))
+            | (confineReads ? (isDirectory(root) ? readFile | readDir : readFile) : 0));
+    if (confineReads)
+        foreach (r; reads) rules ~= Rule(r, isDirectory(r) ? readFile | readDir : readFile);
+    return rules;
+}
+
+/// Restrict this process to writing `roots` and, when `confineReads`,
+/// reading `reads` (call it single-threaded, before exec).
+string restrict(bool network, const string[] roots, bool confineReads, const string[] reads) @trusted
 {
     import core.sys.posix.fcntl : open;
     import core.sys.posix.unistd : close;
@@ -120,29 +158,27 @@ string restrict(bool network, const string[] roots) @trusted
     long v;
     ulong fs, net;
     if (auto e = rights(network, v, fs, net)) return e;
+    if (confineReads) fs |= readFile | readDir;
     auto attr = RulesetAttr(fs, net);
     auto size = v >= 4 ? RulesetAttr.sizeof : ulong.sizeof;
     auto fd = syscall(sysCreateRuleset, &attr, size, 0u).to!int;
     if (fd < 0) return "sandbox unavailable: landlock_create_ruleset: " ~ lastError();
     scope (exit) close(fd);
-    // Device-node creation is handled but granted nowhere, so mknod fails
-    // closed everywhere (a node in the workspace could reach a raw device).
-    auto granted = fs & ~(makeChar | makeBlock);
-    foreach (root; roots)
+    foreach (r; ruleSet(fs, roots, confineReads, reads, (string p) => isDir(p)))
     {
-        auto parent = open(root.toStringz, oPath | oCloexec);
+        auto parent = open(r.path.toStringz, oPath | oCloexec);
         if (parent < 0) continue;
         scope (exit) close(parent);
-        auto rule = PathBeneathAttr(isDir(root) ? granted : granted & (writeFile | truncate | ioctlDev), parent);
+        auto rule = PathBeneathAttr(r.access, parent);
         if (syscall(sysAddRule, fd, rulePathBeneath, &rule, 0u) < 0)
-            return format("sandbox: landlock_add_rule %s: %s", root, lastError());
+            return format("sandbox: landlock_add_rule %s: %s", r.path, lastError());
     }
     if (prctl(prSetNoNewPrivs, 1, 0, 0, 0) != 0) return "sandbox: prctl(PR_SET_NO_NEW_PRIVS): " ~ lastError();
     if (syscall(sysRestrictSelf, fd, 0u) != 0) return "sandbox: landlock_restrict_self: " ~ lastError();
     return null;
 }
 
-/// The helper: `args` = [exe, execFlag, network, n, roots..., shell, "-c", script].
+/// The helper: `args` = [exe, execFlag, network, n, roots..., m|"-", reads..., shell, "-c", script].
 /// Only returns on failure (exit status 126, like a shell's "cannot execute").
 int helperMain(string[] args) @trusted
 {
@@ -156,9 +192,12 @@ int helperMain(string[] args) @trusted
         auto network = args[2] == "1";
         auto n = args[3].to!size_t;
         auto roots = args[4 .. 4 + n];
-        auto rest = args[4 + n .. $];
+        auto confineReads = args[4 + n] != "-";
+        auto m = confineReads ? args[4 + n].to!size_t : 0;
+        auto reads = args[5 + n .. 5 + n + m];
+        auto rest = args[5 + n + m .. $];
         if (rest.length < 1) { fail("sandbox: no command"); return 126; }
-        if (auto e = restrict(network, roots)) { fail(e); return 126; }
+        if (auto e = restrict(network, roots, confineReads, reads)) { fail(e); return 126; }
         const(char)*[] cargs;
         foreach (a; rest) cargs ~= a.toStringz;
         cargs ~= null;
@@ -182,4 +221,26 @@ shared static this() @trusted
         stderr.flush();
         exit(rc);
     }
+}
+
+unittest // issue #333: the helper argv carries the read set, or "-" when reads aren't confined
+{
+    assert(helperArgs("/x", true, ["/w"], false, null) == ["/x", execFlag, "1", "1", "/w", "-"]);
+    assert(helperArgs("/x", false, ["/w"], true, ["/usr", "/home/u/a"])
+        == ["/x", execFlag, "0", "1", "/w", "2", "/usr", "/home/u/a"]);
+}
+
+unittest // issue #333: the Landlock rule set grants reads only on the read roots
+{
+    auto fs = writeFile | truncate | makeDir | makeChar;
+    bool dir(string p) { return p != "/w/file" && p != "/r/file"; }
+    auto off = ruleSet(fs, ["/w"], false, null, &dir);
+    assert(off.length == 1 && off[0].access == (writeFile | truncate | makeDir));
+    auto on = ruleSet(fs | readFile | readDir, ["/w", "/w/file"], true, ["/usr", "/r/file"], &dir);
+    assert(on.length == 4);
+    assert(on[0] == Rule("/w", writeFile | truncate | makeDir | readFile | readDir));
+    assert(on[1] == Rule("/w/file", writeFile | truncate | readFile));
+    assert(on[2] == Rule("/usr", readFile | readDir));
+    assert(on[3] == Rule("/r/file", readFile));
+    foreach (r; on) assert(!(r.access & makeChar), r.path);
 }

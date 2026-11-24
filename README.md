@@ -406,8 +406,7 @@ nothing inspects that. The boundary is the OS sandbox, plus credentials: don't g
 production database URLs or broadly scoped tokens.
 
 **Sandbox** (`--sandbox workspace`; on by default for headless runs, off interactively) runs each shell command under Seatbelt
-(`sandbox-exec`) on macOS or Landlock on Linux (6.2+). Commands can read everywhere, but
-write only to:
+(`sandbox-exec`) on macOS or Landlock on Linux (6.2+). Commands write only to:
 
 - `workspace`: the working directory, its git directories (including a worktree's shared
   one), temp directories, package-manager caches (`~/.cargo/registry`, `~/.npm`, `~/.cache`,
@@ -418,7 +417,33 @@ write only to:
 outbound connections (macOS: except to localhost; Linux: all TCP, which needs Linux 6.7+).
 If the sandbox is enabled but cannot be applied, commands fail instead of running
 unsandboxed. When a sandboxed command fails with a permission error, the result tells the
-model where it may write.
+model where it may write and what it may not read.
+
+**Read confinement** (`[sandbox] read_confine`) keeps sandboxed commands and the
+`read_file`, `grep` and `glob` tools away from credentials:
+
+- `secrets` (the default whenever the sandbox is on): everything is readable except
+  credentials and home secrets — `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure`,
+  `~/.config/gcloud`, `~/.config/gh`, `~/.netrc`, `~/.git-credentials`,
+  `~/.docker/config.json`, `~/.kube`, `~/.password-store`, `~/.pypirc`, cargo credentials,
+  keyrings and `~/Library/Keychains`, browser profiles and cookies, shell/REPL history,
+  nano-coder's own config directory (`~/.config/nano-coder`: API keys and
+  `api_key_command`), and `/etc/shadow`-style system files — plus every `deny_read` path.
+- `workspace`: only the workspace (and its git dirs), system and toolchain directories
+  (`/usr`, `/etc`, `/opt`, `~/.cargo`, `~/.rustup`, mise/nvm/volta/dub installs,
+  `~/.gitconfig`, ...), package caches, temp dirs, `writable` and `readable` paths; the
+  secrets above stay denied inside them.
+- `off`: reads everywhere (the behaviour before read confinement).
+
+`cat ~/.ssh/id_ed25519` or `ls ~/.config/gh` then fail with a permission error, and the
+file tools refuse those paths with "outside what the … sandbox may read" (`grep`/`glob`
+walks skip them). Builds, `git` (including worktrees) and `gh` with `GH_TOKEN` in the
+environment keep working. On macOS the Seatbelt profile denies the paths. Landlock on
+Linux can only allow, so `deny_read` is implemented by leaving the denied paths out of
+the read rules: the readable set is split around them, which also means a directory that
+*contains* a denied path (e.g. `$HOME` itself) can't be listed, though its other entries
+can be read. Only tool-spawned commands, project hooks and file tools are confined; the
+nano-coder process itself still reads its config and API keys.
 
 **Default mode.** The mode comes from, in order: `--sandbox`, `NANO_CODER_SANDBOX`, the
 config's `[sandbox] mode`, and otherwise a default that depends on how nano-coder runs.
@@ -768,6 +793,9 @@ protected_branches = ["main", "master", "trunk", "develop"]
 writable = []                           # extra writable paths, e.g. ["~/.local/state/myapp"]
 network = true                          # false blocks outbound connections
 tool_caches = true                      # workspace mode: allow ~/.cargo/registry, ~/.npm, ~/.cache, ...
+read_confine = "secrets"                # secrets | workspace | off: what sandboxed commands and file tools may read
+deny_read = []                          # extra never-readable paths, e.g. ["~/.config/acme"]
+readable = []                           # read_confine = "workspace": extra readable paths, e.g. ["~/src/shared"]
 ```
 
 The default model is `gpt-4o-mini` on the `mock` provider, so the harness still works offline.

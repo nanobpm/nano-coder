@@ -70,6 +70,15 @@ a command can actually *do* regardless of how the command is spelled:
 
 - writes are limited to the workspace (plus temp dirs, git dirs, and explicitly
   granted `writable` paths); `read-only` mode allows writes only to temp dirs;
+- reads are confined (`read_confine`): by default credentials and home secrets
+  (`~/.ssh`, `~/.aws`, `~/.config/gh`, keychains, browser profiles, shell history,
+  nano-coder's own config with its API keys, plus `deny_read`) are unreadable;
+  `read_confine = "workspace"` allows reads only of the workspace, system and
+  toolchain directories, caches and `readable` paths. Seatbelt denies the paths;
+  Landlock (allow-list only) omits them from the read rules. `read_file`, `grep`
+  and `glob` refuse the same paths. The nano-coder process itself is **not**
+  confined — it needs its API key — only the commands, hooks and file tools it
+  runs for the model;
 - `network = false` blocks outbound connections;
 - it **fails closed**: if the sandbox is enabled but cannot be applied, the
   command does not run.
@@ -103,4 +112,6 @@ the boundary rather than the parser's completeness:
 
 - a command the static guard cannot see through (an encoded write escaping the
   workspace) is still contained by the OS sandbox (write-root boundary);
+- a sandboxed command cannot read a denied path, and the generated Seatbelt
+  rules and Landlock read roots never cover a denied path (read boundary);
 - uninspectable / run-time-computed input still fails closed in the static guard.

@@ -326,6 +326,8 @@ struct Policy
                 auto path = stringArg(args, "path");
                 if (path is null) return null;
                 auto joined = joinPath(cwd, expandTilde(path));
+                // Every file tool reads what it touches (edits show a diff).
+                if (auto why = sandbox.readRefusal(joined, cwd)) return why;
                 auto absolute = normalize(joined);
                 auto resolved = resolveSymlinks(joined);
                 foreach (rule; deny)
@@ -369,6 +371,7 @@ struct Policy
             case "grep", "glob":
                 auto root = stringArg(args, "path");
                 if (root is null) root = ".";
+                if (auto why = sandbox.readRefusal(joinPath(cwd, expandTilde(root)), cwd)) return why;
                 if (auto rule = readDenyRule(expandTilde(root), cwd))
                     return format("rule `%s` denies %s on %s", rule, tool, root);
                 auto text = args.jsonText;

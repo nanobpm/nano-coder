@@ -265,7 +265,7 @@ class HookManager
         import nano.skills : gitRoot;
         auto root = gitRoot(cwd);
         auto m = new HookManager(null, root.length ? root : cwd);
-        m.sandbox = SandboxConfig(opts.sandbox.mode, opts.sandbox.writable.dup, opts.sandbox.network, opts.sandbox.toolCaches);
+        m.sandbox = opts.sandbox.dup;
         if (opts.disableHooks) return m;
         if (opts.nanoHooks.type == JSONType.object) m.ingestGroups(opts.nanoHooks, Source.userNano);
         if (opts.claudeUserHooks)

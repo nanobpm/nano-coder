@@ -1456,6 +1456,45 @@ unittest // sandbox_confines_file_tools (+ round12 #1: a symlink escaping lexica
     assert(ro.checkIn("edit_file", parseJSON(`{"path":"src/new.rs"}`), cwd).isErr);
 }
 
+// issue #333: the file tools refuse what the sandbox won't let commands read
+unittest
+{
+    import nano.sandbox : SandboxConfig, SandboxMode, ReadConfine;
+    import nano.paths : canonicalize;
+    import std.file : getcwd;
+    import std.process : thisProcessID;
+    import std.format : format;
+    auto cwd = canonicalize(getcwd) ~ format("/.dub/perm-read-%s", thisProcessID);
+    mkdirRecurse(cwd);
+    scope (exit) rmrf(cwd);
+    auto key = joinPath(homeDir(), ".ssh/id_ed25519");
+    Policy off;
+    assert(off.checkIn("read_file", JSONValue(["path": key]), cwd).isOk, "no sandbox: reads are not confined");
+    Policy p;
+    p.sandbox.mode = SandboxMode.workspace;
+    foreach (tool; ["read_file", "grep", "glob"])
+    {
+        auto err = p.checkIn(tool, JSONValue(["path": "~/.ssh"]), cwd);
+        assert(err.canFind("outside what the workspace sandbox may read"), tool ~ ": " ~ err);
+    }
+    assert(p.checkIn("read_file", JSONValue(["path": key]), cwd).isErr);
+    assert(p.checkIn("read_file", JSONValue(["path": joinPath(homeDir(), ".config/gh/hosts.yml")]), cwd).isErr);
+    assert(p.checkIn("read_file", parseJSON(`{"path":"src/a.d"}`), cwd).isOk);
+    assert(p.checkIn("grep", parseJSON(`{"pattern":"x"}`), cwd).isOk);
+    // A symlink in the workspace can't reach a denied directory.
+    symlink(joinPath(homeDir(), ".aws"), joinPath(cwd, "aws-link"));
+    assert(p.checkIn("read_file", parseJSON(`{"path":"aws-link/credentials"}`), cwd).isErr);
+    // Search walks hide the denied paths through Read(...) rules.
+    foreach (r; p.sandbox.readDenyRules(cwd)) p.deny ~= parseRule(r);
+    assert(p.readDenied(joinPath(homeDir(), ".ssh/known_hosts"), cwd));
+    assert(!p.readDenied(joinPath(cwd, "src/a.d"), cwd));
+    Policy w;
+    w.sandbox.mode = SandboxMode.workspace;
+    w.sandbox.readConfine = ReadConfine.workspace;
+    assert(w.checkIn("read_file", JSONValue(["path": joinPath(homeDir(), "Documents/notes.txt")]), cwd).isErr);
+    assert(w.checkIn("read_file", parseJSON(`{"path":"src/a.d"}`), cwd).isOk);
+}
+
 // Issue #164 (loop permissions): ported from Rust PR #165.
 
 // rust: permissions.rs::literal_loop_lists_are_unrolled_and_checked_as_standalone_commands

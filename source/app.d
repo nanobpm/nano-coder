@@ -3375,6 +3375,9 @@ int runMain(string[] args)
                 ~ "--sandbox off, NANO_CODER_SANDBOX=off or [sandbox] mode = \"off\" in the config",
                 sandboxMode.mode.modeName, sandboxMode.source.sourceName, why));
     policy.sandbox = cfg.sandbox;
+    // Search walks hide what the sandbox won't let commands read (#333).
+    foreach (r; cfg.sandbox.readDenyRules(getcwd()))
+        policy.deny ~= imported!"nano.permissions".parseRule(r);
 
     auto tools = new ToolRegistry;
     auto readState = new ReadState;
