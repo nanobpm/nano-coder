@@ -405,8 +405,13 @@ struct PeerListener
             try conn = listener.accept();
             catch (SocketException)
             {
-                if (errno == EINTR) continue;
-                return; // closed by `close`
+                import core.stdc.errno : EBADF, ENOTSOCK;
+                // `close` sets `stop` before shutting the socket down. Any
+                // other failure is the one pending connection's: a peer that
+                // connected and left at once (a liveness probe) fails accept
+                // with ECONNABORTED, or EINVAL on macOS. Serving goes on.
+                if (stop.get || errno == EBADF || errno == ENOTSOCK) return;
+                continue;
             }
             scope (exit) conn.close();
             import nano.safeio : setCloexec;
@@ -1110,6 +1115,43 @@ package(nano) struct TestPump
         }
         router.routePending(queue);
     }
+}
+
+// A peer that connects and leaves before the accept (a liveness probe, as
+// `sessions_list` makes) must not stop the listener: on macOS its accept
+// fails with EINVAL, which once ended the serve loop for good.
+unittest
+{
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse;
+    import std.path : buildPath;
+    import std.socket : Socket, UnixAddress, AddressFamily, SocketType;
+    import nano.control : TurnControl;
+    import core.atomic : atomicLoad;
+    import core.time : msecs;
+    import nano.clock : sleepFor;
+    auto root = buildPath(tempDir, "nano-d-peers-probe");
+    scope (exit) rmdirRecurse(root);
+    mkdirRecurse(root);
+    auto control = new shared TurnControl;
+    auto router = PeerRouter.make(atomicLoad(control));
+    router.confirm(false);
+    auto listener = PeerListener.listen(root, "sess-target", router.requests);
+    scope (exit) listener.close();
+    auto pump = TestPump.start(router);
+    scope (exit) pump.stop();
+    foreach (_; 0 .. 3)
+    {
+        auto probe = new Socket(AddressFamily.UNIX, SocketType.STREAM);
+        probe.connect(new UnixAddress(socketPath(root, "sess-target")));
+        probe.close();
+    }
+    sleepFor(150.msecs); // the listener's select wakes and meets the aborted connections
+    string note;
+    auto status = send(root, "sess-target", PeerMessage("sess-sender", null, "after the probes", "m-1", false), note);
+    assert(status == Status.delivered, note);
+    Inbound inbound;
+    assert(router.takeWaiting(inbound));
+    settle(inbound, true);
 }
 
 // Two sessions: one listening, one sending. Delivery idle (confirm off) is

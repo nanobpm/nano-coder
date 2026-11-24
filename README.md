@@ -1594,22 +1594,25 @@ Session ids and model-written titles change or collide, so a session can take a 
 user-chosen **handle**: `/name perf` at the prompt, or `nano-coder --name perf` at launch
 (with `--resume`, `--name` renames the resumed session). `/name` alone shows it and
 `/name --clear` removes it. A handle is lowercase letters, digits and `-`, at most 32
-characters, and can't start with `sess-` (so it never looks like an id).
+characters, and can't start with `sess-` (so it never looks like an id). A handle needs
+a saved session: with `--no-session` or `persist_sessions = false` it is refused.
 
 - **Stored with the session.** The handle is a `name` record in the session log (the last
   one wins) and is kept in the session index, so it survives `/resume`, `/relaunch` and
   `/update`; ACP clients set it with `session/set_name` (`{"name": "perf"}`, `null`
-  clears) and see it as `name` in the `_meta` of `session/new` and `session/load`. A named
+  clears) and see it as `name` in the `_meta` of `session/new` and `session/load`
+  (a `--name` another running session holds fails either request). A named
   session is kept by `session_retention_days`, like a titled one.
 - **Unique among running sessions.** Setting a handle a running session holds is refused,
   naming that session; a stopped session's handle can be reused. Running holders are
-  recorded in the peer registry (`<peers dir>/<handle>.name`).
+  recorded in the peer registry (`<peers dir>/<handle>.name`, with the holder's session
+  directory, so sessions with different `session_dir`s still can't share a handle).
 - **Resolution order.** `session_send`'s `to`, the history tools' `session`, `--resume` and
   `/resume` try, in order: a handle (a running holder first, then the newest stopped one),
   an exact id, a unique id prefix, then a title. A handle always beats a title that
   happens to be the same word.
 - **Visible.** The status bar shows `@perf`, `/session` and the exit message show it (the
-  exit message suggests `--resume perf` when no other saved session used the handle), a
+  exit message suggests `--resume=perf` when no other saved session used the handle), a
   sent message is labelled `[from perf · …]`, `sessions_list` marks it `[name: perf]`, the
   system prompt tells the agent its own handle, and a Herdr pane label shows it.
 

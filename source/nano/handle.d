@@ -89,24 +89,51 @@ unittest
     assert(!plausibleId("") && !plausibleId(".x") && !plausibleId("../etc") && !plausibleId("a b"));
 }
 
+/// A registry entry: the holder's session id and the session directory its
+/// log lives in (sessions with different `session_dir`s share the registry).
+private struct Entry
+{
+    string id;
+    string sessionDir; /// null in an entry written without one
+}
+
+/// The entry recorded for `handle` (`Entry.init` when none).
+private Entry recordedEntry(string dir, string handle)
+{
+    import std.file : exists, readText, FileException;
+    import std.string : lineSplitter;
+    import std.array : array;
+    auto p = handlePath(dir, handle);
+    if (!p.exists) return Entry.init;
+    import std.utf : UTFException;
+    string text;
+    try text = readText(p);
+    catch (FileException) return Entry.init; // unreadable (or removed meanwhile): no holder
+    catch (UTFException) return Entry.init; // not text: no holder
+    auto lines = text.lineSplitter.array;
+    if (!lines.length) return Entry.init;
+    return Entry(lines[0].strip, lines.length > 1 ? lines[1].strip : null);
+}
+
 /// The session id recorded for `handle`, or null.
 private string recorded(string dir, string handle)
 {
-    import std.file : exists, readText, FileException;
-    auto p = handlePath(dir, handle);
-    if (!p.exists) return null;
-    import std.utf : UTFException;
-    try return readText(p).strip;
-    catch (FileException) return null; // unreadable (or removed meanwhile): no holder
-    catch (UTFException) return null; // not text: no holder
+    return recordedEntry(dir, handle).id;
+}
+
+/// Whether `e`'s session is running: checked in the directory it recorded,
+/// else in `sessionDir`.
+private bool entryRunning(const Entry e, string sessionDir)
+{
+    return e.id.length && sessionRunning(e.sessionDir.length ? e.sessionDir : sessionDir, e.id);
 }
 
 /// The id of the running session that holds `handle`, or null.
 string runningHolder(string dir, string sessionDir, string handle)
 {
     if (invalidHandle(handle) !is null) return null;
-    auto id = recorded(dir, handle);
-    return id.length && sessionRunning(sessionDir, id) ? id : null;
+    auto e = recordedEntry(dir, handle);
+    return entryRunning(e, sessionDir) ? e.id : null;
 }
 
 /// Claim `handle` for session `id`: null on success, else why it was
@@ -131,7 +158,8 @@ string claim(string dir, string sessionDir, string handle, string id)
     auto tmp = format("%s.tmp-%s", p, thisProcessID);
     try
     {
-        write(tmp, id ~ "\n");
+        import std.path : absolutePath;
+        write(tmp, id ~ "\n" ~ absolutePath(sessionDir) ~ "\n");
         rename(tmp, p);
     }
     catch (FileException e) return format("can't record the handle: %s", e.msg);
@@ -163,8 +191,8 @@ string[string] runningHandles(string dir, string sessionDir)
     {
         auto handle = f.baseName.stripExtension;
         if (invalidHandle(handle) !is null) continue;
-        auto id = recorded(dir, handle);
-        if (id.length && sessionRunning(sessionDir, id)) byId[id] = handle;
+        auto e = recordedEntry(dir, handle);
+        if (entryRunning(e, sessionDir)) byId[e.id] = handle;
     }
     return byId;
 }
@@ -188,8 +216,8 @@ string resumeArg(string sessionDir, string id, string handle)
 string sessionLine(string sessionDir, string id, string handle)
 {
     return handle.length
-        ? format("Session: %s · %s (resume with nano-coder --resume %s)", handle, id, resumeArg(sessionDir, id, handle))
-        : format("Session: %s (resume with nano-coder --resume %s)", id, id);
+        ? format("Session: %s · %s (resume with nano-coder --resume=%s)", handle, id, resumeArg(sessionDir, id, handle))
+        : format("Session: %s (resume with nano-coder --resume=%s)", id, id);
 }
 
 /// The `/name` reply when showing the current handle.
@@ -215,7 +243,9 @@ unittest
     import std.file : write;
     write(buildPath(sessions, "s-old.jsonl"), "{}\n");
     assert(claim(peers, sessions, "perf", "s-old") is null);
-    assert(readText(handlePath(peers, "perf")).strip == "s-old");
+    assert(recorded(peers, "perf") == "s-old");
+    import std.path : absolutePath;
+    assert(recordedEntry(peers, "perf").sessionDir == absolutePath(sessions), "the holder's directory is recorded");
     assert(runningHolder(peers, sessions, "perf") is null, "a stopped holder is not running");
     // A stopped holder's handle is reusable by a running session (its open
     // log holds the writer's lock).

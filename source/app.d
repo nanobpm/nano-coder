@@ -2619,7 +2619,7 @@ string nameCommand(Agent agent, string arg)
         return format("Handle %s removed", old);
     }
     if (auto why = agent.setName(arg)) return format("Can't name this session %s: %s", arg, why);
-    return format("This session is now %s: session_send to \"%s\" reaches it, nano-coder --resume %s resumes it",
+    return format("This session is now %s: session_send to \"%s\" reaches it, nano-coder --resume=%s resumes it",
         arg, arg, arg);
 }
 
@@ -5241,7 +5241,7 @@ int runMain(string[] args)
                     stdErr.flush();
                     nano.herdr.showName(agent.name);
                     refreshStatus();
-                    writefln("Resumed session %s%s (resume later with nano-coder --resume %s)", id,
+                    writefln("Resumed session %s%s (resume later with nano-coder --resume=%s)", id,
                         agent.name.length ? " · " ~ agent.name : "", nano.handle.resumeArg(sessionDir, id, agent.name));
                     continue;
                 }

@@ -2932,7 +2932,7 @@ private enum LOCK_EX = 2, LOCK_NB = 4, LOCK_UN = 8;
 /// unwritable entry is skipped.
 TidyResult tidySessions(string dir, long compressAfterDays, long retentionDays)
 {
-    import nano.session_index : titledIds, indexFile;
+    import nano.session_index : titledIds, indexFile, list;
     TidyResult result;
     if (!dir.exists || (compressAfterDays <= 0 && retentionDays <= 0)) return result;
     auto stampPath = buildPath(dir, tidyStampFile);
@@ -2943,7 +2943,9 @@ TidyResult tidySessions(string dir, long compressAfterDays, long retentionDays)
     // Without the titles, any deletion could hit a named session: fail
     // closed and only compress this pass.
     bool mayDelete = retentionDays > 0;
-    try named = titledIds(dir);
+    // Refresh the index first: a handle recorded after a session's last
+    // indexing (issue #300) is only in its log until a listing re-reads it.
+    try { list(dir, true); named = titledIds(dir); }
     catch (Exception) mayDelete = false; // unknown titles: compress only, delete nothing
     tidyDir(dir, now, compressAfterDays, retentionDays, mayDelete, named, result);
     // Sub-agent logs sit one level down (<session>/sub-<call>.jsonl): the

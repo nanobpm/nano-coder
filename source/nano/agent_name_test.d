@@ -131,9 +131,9 @@ unittest
     auto a = d.agent("s-only");
     assert(a.setName("nano-engine") is null);
     closeLog(a);
-    assert(sessionLine(d.sessions, "s-only", "nano-engine").canFind("--resume nano-engine"),
+    assert(sessionLine(d.sessions, "s-only", "nano-engine").canFind("--resume=nano-engine"),
         sessionLine(d.sessions, "s-only", "nano-engine"));
-    assert(sessionLine(d.sessions, "s-only", null).canFind("--resume s-only"));
+    assert(sessionLine(d.sessions, "s-only", null).canFind("--resume=s-only"));
     assert(cross.resolveResumeId(d.sessions, "nano-engine") == "s-only");
     assert(cross.resolveResumeId(d.sessions, "s-on") == "s-only", "a unique id prefix");
     assert(cross.resolveResumeId(d.sessions, "s-only") == "s-only");
@@ -148,7 +148,7 @@ unittest
     import core.atomic : atomicLoad;
     import nano.control : TurnControl;
     import nano.handle : claim;
-    auto d = Dirs.make("nd-name-send");
+    auto d = Dirs.make("nd-ns");
     scope (exit) d.cleanup();
     // A session titled "nano-engine" (its first prompt), stopped.
     {
@@ -193,4 +193,42 @@ unittest
     assert(cross.listResult(sender.policy, d.sessions, d.root, parseJSON(`{}`)).canFind("[name: nano-engine]"));
     assert(cross.listResult(sender.policy, d.sessions, d.root, parseJSON(`{"filter":"nano-engine"}`))
         .canFind("sess-target"));
+}
+
+// Without a session log a handle can be neither claimed nor resumed: refused.
+unittest
+{
+    auto d = Dirs.make("nd-name-nolog");
+    scope (exit) d.cleanup();
+    auto a = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "sys");
+    assert(a.setName("perf") !is null, "no log: refused");
+    assert(!a.name.length);
+    assert(a.setName(null) is null, "clearing nothing is fine");
+}
+
+// A holder whose log lives in another session directory still blocks the
+// claim: the registry records the holder's directory.
+unittest
+{
+    import nano.handle : claim;
+    auto d = Dirs.make("nd-name-otherdir");
+    scope (exit) d.cleanup();
+    auto a = d.agent("s-a");
+    assert(a.setName("perf") is null);
+    auto other = buildPath(d.root, "other");
+    mkdirRecurse(other);
+    assert(claim(d.peers, other, "perf", "s-b") !is null, "held by s-a in another dir");
+}
+
+// A running holder without a prompt yet (so unlisted) resumes by handle,
+// matched case-insensitively.
+unittest
+{
+    auto d = Dirs.make("nd-name-promptless");
+    scope (exit) d.cleanup();
+    auto a = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "sys");
+    a.log = some(new SessionLog(d.sessions, "mock/m", d.root, "s-bare"));
+    assert(a.setName("perf") is null);
+    assert(cross.resolveResumeId(d.sessions, "PERF") == "s-bare");
+    closeLog(a);
 }

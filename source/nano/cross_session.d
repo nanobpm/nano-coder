@@ -305,9 +305,12 @@ string resolveResumeId(string dir, string arg) @safe
     foreach (s; list(dir))
     {
         auto i = infoOf(s, isLive(s.path));
-        if (i.live) i.name = handles.get(i.id, i.name);
+        if (i.live) i.name = handles.get(i.id, null); // a live session holds only its registry claim
         infos ~= i;
     }
+    // A running holder of the handle wins, even one not listed (no prompt yet).
+    foreach (id, h; handles)
+        if (h.toLower == arg.toLower && buildPath(dir, id ~ ".jsonl").exists) return id;
     try return resolve(arg, infos).id;
     catch (HistoryError e)
     {

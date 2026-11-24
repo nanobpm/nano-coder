@@ -2770,6 +2770,8 @@ class Agent
             return null;
         }
         if (auto why = invalidHandle(handle)) return why;
+        // Without a log the handle can be neither claimed nor resumed.
+        if (log.isNone) return "sessions are not saved (--no-session or persist_sessions = false)";
         string refused;
         log.ifSome((SessionLog l) { refused = claim(peers.peersDir(), sessionDirOf(l), handle, l.id); });
         if (refused !is null) return refused;

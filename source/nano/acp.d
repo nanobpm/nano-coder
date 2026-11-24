@@ -1088,7 +1088,11 @@ final class AcpServer : AgentEvents
         }
         if (host.loadHooks !is null) agent.useHooks(host.loadHooks(cwd), false);
         if (host.name.length)
+        {
             if (auto why = renameSession(host.name)) throw new Exception("--name " ~ host.name ~ ": " ~ why);
+        }
+        else if (host.systemPrompt !is null) // drop the left session's handle from the prompt
+            agent.installSystem(host.systemPrompt(cwd), agent.indexShown);
         startPeerListener();
     }
 
@@ -1127,8 +1131,11 @@ final class AcpServer : AgentEvents
         }
         sessionId = log.id;
         // The restored handle (issue #300), or `--name`'s, goes in the prompt.
-        if (host.name.length) renameSession(host.name); // refused: the restored handle stays
-        else if (agent.name.length && host.systemPrompt !is null)
+        // Always re-render: the prompt was built before the load and may
+        // still carry the previous session's handle.
+        string refused;
+        if (host.name.length) refused = renameSession(host.name);
+        if ((!host.name.length || refused !is null) && host.systemPrompt !is null)
             agent.installSystem(host.systemPrompt(getcwd()), agent.indexShown);
         startPeerListener();
         if (host.loadHooks !is null) agent.useHooks(host.loadHooks(getcwd()), true);
@@ -1139,6 +1146,9 @@ final class AcpServer : AgentEvents
         restored = Restored.init;
         prior = null;
         releaseHeap();
+        // The session is loaded, but the client asked for a handle it didn't
+        // get: tell it rather than report success under another identity.
+        if (refused !is null) throw new Exception("--name " ~ host.name ~ ": " ~ refused);
     }
 
     /// Reset the runtime settings a session can change (issue #297) to the
