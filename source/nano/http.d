@@ -101,6 +101,39 @@ unittest
     assert(idleLimit(Duration.zero) == IdleLimit(1, 1) && idleLimit(500.msecs) == IdleLimit(1, 1));
 }
 
+/// One libcurl option `perform` sets for its timeouts.
+struct TimeoutOption
+{
+    import etc.c.curl : CurlOption;
+    CurlOption option; /// the libcurl option
+    long value; /// its value
+}
+
+/// Every timeout option `perform` applies for `idleTimeout`: the low-speed
+/// idle limit, and an explicit 0 total timeout so no total-time cap ever ends
+/// a stream that keeps delivering data.
+TimeoutOption[3] timeoutOptions(Duration idleTimeout) pure nothrow @nogc
+{
+    import etc.c.curl : CurlOption;
+    const idle = idleLimit(idleTimeout);
+    return [TimeoutOption(CurlOption.low_speed_limit, idle.bytesPerSecond),
+        TimeoutOption(CurlOption.low_speed_time, idle.seconds),
+        TimeoutOption(CurlOption.timeout_ms, 0)];
+}
+
+// The options perform applies: a 1 byte/s floor over the idle window and no
+// total-time cap (timeout_ms 0 = none), so an active stream outlives it.
+unittest
+{
+    import etc.c.curl : CurlOption;
+    const opts = timeoutOptions(30.seconds);
+    assert(opts[0] == TimeoutOption(CurlOption.low_speed_limit, 1));
+    assert(opts[1] == TimeoutOption(CurlOption.low_speed_time, 30));
+    assert(opts[2] == TimeoutOption(CurlOption.timeout_ms, 0));
+    foreach (o; opts)
+        assert(o.option != CurlOption.timeout || o.value == 0);
+}
+
 int perform(const ref Request req, out string body_, scope void delegate(const(char)[]) @safe onChunk = null)
 {
     ResponseMeta meta;
@@ -125,10 +158,8 @@ int perform(const ref Request req, out string body_, out ResponseMeta meta,
         else http.addRequestHeader(k, v);
     }
     http.connectTimeout = req.connectTimeout;
-    import etc.c.curl : CurlOption;
-    const idle = idleLimit(req.idleTimeout);
-    http.handle.set(CurlOption.low_speed_limit, idle.bytesPerSecond);
-    http.handle.set(CurlOption.low_speed_time, idle.seconds);
+    foreach (o; timeoutOptions(req.idleTimeout))
+        http.handle.set(o.option, o.value);
     if (req.method != "GET")
     {
         const(void)[] payload = req.body_;
