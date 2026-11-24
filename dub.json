@@ -42,7 +42,8 @@
     "-preview=nosharedaccess"
   ],
   "dflags-ldc": [
-    "-fno-delete-null-pointer-checks"
+    "-fno-delete-null-pointer-checks",
+    "-lowmem"
   ],
   "preBuildCommands": [
     "\"$PACKAGE_DIR/scripts/check-safe.sh\""
