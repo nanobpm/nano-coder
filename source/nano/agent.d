@@ -2358,6 +2358,9 @@ class Agent
             if (!summaryNodeSeeded)
             {
                 log.ifSome((SessionLog l) {
+                    // A deleted or replaced log path must be recovered first, or the
+                    // scan throws or reads a foreign file's node IDs.
+                    l.revalidate();
                     immutable logged = hist.maxNodeId(l.path);
                     if (logged > summaryNodeHigh) summaryNodeHigh = logged;
                 });
@@ -2601,7 +2604,9 @@ class Agent
             usage.cachedInputTokens += r.usage.cachedInputTokens;
             if (r.usage.hasAic) { usage.hasAic = true; usage.aic += r.usage.aic; }
             foreach (e; ev) e.usage(r.usage);
-            t = r.content.strip;
+            // A truncated condensation would silently replace several summaries
+            // with an incomplete prefix: fall back to the deterministic text.
+            t = r.stopReason == "length" || r.stopReason == "max_tokens" ? "" : r.content.strip;
         }());
         if (control.isCancelled) return "";
         if (err !is null) stdErr.writefln("[agent] condensing summaries failed (%s); condensing in code", err.msg);

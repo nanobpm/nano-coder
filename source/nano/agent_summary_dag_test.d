@@ -269,3 +269,50 @@ unittest
     auto small = hist.read(path, parseJSON(`{"node":"S1","max_output_length":300}`));
     assert(!small.canFind("question number 39"), small);
 }
+
+// A truncated condensation (stop reason length / max_tokens) is not persisted
+// as an incomplete prefix: the deterministic text is used instead.
+unittest
+{
+    foreach (stop; ["length", "max_tokens"])
+    {
+        LLMResponse[] replies;
+        foreach (i; 0 .. 8)
+        {
+            replies ~= LLMResponse("answer " ~ i.to!string);
+            replies ~= LLMResponse("SUMMARY " ~ i.to!string ~ ": work done in this span with many words");
+            auto cut = LLMResponse("TRUNCATED-PREFIX");
+            cut.stopReason = stop;
+            replies ~= cut;
+        }
+        auto mock = new MockClient(replies);
+        auto agent = logged("truncated-" ~ stop, mock);
+        agent.summaryDagBudgetBytes = 100;
+        size_t condensations;
+        foreach (i; 0 .. 5)
+        {
+            auto before = mock.seen.length;
+            agent.run("step " ~ i.to!string, new NullEvents);
+            assert(compactAs(agent, ctx.CompactionMode.smart));
+            foreach (req; mock.seen[before .. $])
+                if (req[0].content == dag.condenseSystemPrompt) ++condensations;
+        }
+        assert(condensations >= 1, "a condensation call was made");
+        foreach (r; replaces(agent))
+            foreach (n; r["data"]["summary_nodes"].arrayNoRef)
+                assert(!n.toString.canFind("TRUNCATED-PREFIX"), n.toString);
+    }
+}
+
+// A log deleted before the first layered compaction is recovered (revalidated)
+// before its node IDs are scanned, rather than throwing.
+unittest
+{
+    import std.file : remove;
+    auto mock = new MockClient([LLMResponse("a"), LLMResponse("SUMMARY")]);
+    auto agent = logged("revalidate", mock);
+    agent.run("ping", new NullEvents);
+    remove(agent.log.unwrap("logged").path);
+    assert(compactAs(agent, ctx.CompactionMode.smart));
+    assert(dag.parse(agent.messages[1].content).length == 1);
+}
