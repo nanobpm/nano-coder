@@ -2767,7 +2767,12 @@ class Agent
             // restore is still in the log, and a resume would bring it back.
             // Persist first: a failed write leaves the handle (and its
             // claim) in place, so a retry really retries.
-            if (record) log.ifSome((SessionLog l) { l.name(null); });
+            string failed;
+            if (record) log.ifSome((SessionLog l) {
+                try l.name(null);
+                catch (Exception e) failed = "can't record the handle: " ~ e.msg;
+            });
+            if (failed !is null) return failed;
             if (name.length) releaseName();
             name = null;
             return null;
@@ -2785,10 +2790,17 @@ class Agent
             // failed write must not leave `name` changed (a retry would then
             // report success without recording it) nor hold the new claim.
             import nano.handle : release;
+            string failed;
             log.ifSome((SessionLog l) {
-                scope (failure) release(peers.peersDir(), handle, l.id);
-                l.name(handle);
+                try l.name(handle);
+                catch (Exception e)
+                {
+                    // Recoverable (a full disk, say): report it, don't end the session.
+                    release(peers.peersDir(), handle, l.id);
+                    failed = "can't record the handle: " ~ e.msg;
+                }
             });
+            if (failed !is null) return failed;
         }
         if (name.length && changed) releaseName();
         name = handle;

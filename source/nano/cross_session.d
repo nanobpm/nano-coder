@@ -301,6 +301,12 @@ string resolveResumeId(string dir, string arg) @safe
     import nano.peers : peersDir;
     import nano.handle : plausibleId;
     auto handles = runningHandles(peersDir(), dir);
+    // A running holder of the handle wins, even one not listed (no prompt yet).
+    foreach (id, h; handles)
+        if (h.toLower == arg.toLower && buildPath(dir, id ~ ".jsonl").exists) return id;
+    // An exact log id needs no listing, so an unrelated corrupt log can't block it.
+    if (plausibleId(arg) && (buildPath(dir, arg ~ ".jsonl").exists || buildPath(dir, arg ~ ".jsonl.gz").exists))
+        return arg;
     SessionInfo[] infos;
     foreach (s; list(dir))
     {
@@ -308,9 +314,6 @@ string resolveResumeId(string dir, string arg) @safe
         if (i.live) i.name = handles.get(i.id, null); // a live session holds only its registry claim
         infos ~= i;
     }
-    // A running holder of the handle wins, even one not listed (no prompt yet).
-    foreach (id, h; handles)
-        if (h.toLower == arg.toLower && buildPath(dir, id ~ ".jsonl").exists) return id;
     try return resolve(arg, infos).id;
     catch (HistoryError e)
     {

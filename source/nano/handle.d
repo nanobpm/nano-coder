@@ -170,7 +170,12 @@ string claim(string dir, string sessionDir, string handle, string id)
 void release(string dir, string handle, string id)
 {
     import std.file : remove, FileException;
+    import nano.safeio : lockExclusive;
     if (!handle.length || invalidHandle(handle) !is null) return;
+    // The same lock as `claim`: otherwise a claim another session takes
+    // between the read and the remove would be deleted.
+    auto guard = lockExclusive(handlePath(dir, handle) ~ ".lock");
+    if (!guard.held) return; // can't lock: leave the claim (a stale one is taken over once its holder stops)
     if (recorded(dir, handle) != id) return;
     try remove(handlePath(dir, handle));
     catch (FileException) {} // already gone (a concurrent release): nothing to drop

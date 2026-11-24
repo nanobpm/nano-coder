@@ -232,3 +232,41 @@ unittest
     assert(cross.resolveResumeId(d.sessions, "PERF") == "s-bare");
     closeLog(a);
 }
+
+// A failed log write on rename (set or clear) is reported, not thrown: the
+// session goes on, the name is unchanged and the new claim is rolled back.
+unittest
+{
+    import nano.handle : runningHolder;
+    auto d = Dirs.make("nd-name-writefail");
+    scope (exit) d.cleanup();
+    auto a = d.agent("s-wf");
+    scope (exit) closeLog(a);
+    assert(a.setName("first") is null);
+    a.log.ifSome((SessionLog l) { l.failNextWrite = true; });
+    auto why = a.setName("second");
+    assert(why !is null && why.canFind("can't record the handle"), why);
+    assert(a.name == "first");
+    assert(runningHolder(d.peers, d.sessions, "second") is null, "the new claim is rolled back");
+    assert(runningHolder(d.peers, d.sessions, "first") == "s-wf", "the old claim is kept");
+    a.log.ifSome((SessionLog l) { l.failNextWrite = true; });
+    why = a.setName(null);
+    assert(why !is null && why.canFind("can't record the handle"), why);
+    assert(a.name == "first" && runningHolder(d.peers, d.sessions, "first") == "s-wf");
+    assert(a.setName("second") is null && a.name == "second", "a retry really retries");
+}
+
+// One corrupt, unrelated log in the sessions dir doesn't block a resume by
+// exact id or by handle.
+unittest
+{
+    import std.file : write;
+    auto d = Dirs.make("nd-name-corrupt");
+    scope (exit) d.cleanup();
+    auto a = d.agent("sess-good");
+    assert(a.setName("keeper") is null);
+    closeLog(a);
+    write(buildPath(d.sessions, "sess-broken.jsonl.gz"), "not gzip at all");
+    assert(cross.resolveResumeId(d.sessions, "sess-good") == "sess-good");
+    assert(cross.resolveResumeId(d.sessions, "keeper") == "sess-good");
+}

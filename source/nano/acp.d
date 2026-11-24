@@ -750,7 +750,11 @@ final class AcpServer : AgentEvents
             if (n is null) { reply(rpcError(id, -32602, "params.name is required: a string, or null to clear")); return; }
             if (n.type == JSONType.string) handle = n.str;
             else if (n.type != JSONType.null_) { reply(rpcError(id, -32602, "params.name must be a string or null")); return; }
-            if (auto why = renameSession(handle)) { reply(rpcError(id, -32602, why)); return; }
+            string why;
+            // A backstop: a failed rename is an error reply, never a dead server.
+            try why = renameSession(handle);
+            catch (Exception e) { reply(rpcError(id, -32603, e.msg)); return; }
+            if (why !is null) { reply(rpcError(id, -32602, why)); return; }
             reply(rpcResult(id, JSONValue(["sessionId": JSONValue(sessionId),
                 "name": agent.name.length ? JSONValue(agent.name) : JSONValue(null)])));
             return;
@@ -2059,4 +2063,49 @@ unittest
     assert(byId[7]["error"]["message"].str.canFind("required"), byId[7].toString);
     assert(agent.name is null);
     agent.log.ifSome((SessionLog l) { l.close(); });
+}
+
+// Issue #300: a failed log write on `session/set_name` is an error reply;
+// the server keeps serving and the handle is unchanged.
+unittest
+{
+    import nano.providers.mock;
+    import nano.tools;
+    import nano.permissions : Policy;
+    import nano.session : SessionLog;
+    import nano.option : ifSome;
+    import std.file : tempDir, mkdirRecurse, rmdirRecurse, exists;
+    import std.path : buildPath;
+    import std.process : environment;
+    auto root = buildPath(tempDir, "nd-acp-name-fail");
+    if (root.exists) rmdirRecurse(root);
+    mkdirRecurse(buildPath(root, "sessions"));
+    mkdirRecurse(buildPath(root, "peers"));
+    environment["NANO_CODER_PEERS"] = buildPath(root, "peers");
+    scope (exit) { environment.remove("NANO_CODER_PEERS"); rmdirRecurse(root); }
+    auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, null);
+    scope (exit) agent.releaseName();
+    string[] lines;
+    bool armed;
+    // Right after the first rename succeeds, arm the next log write to fail.
+    auto host = Host((string cwd) {
+        if (agent.name == "perf" && !armed) { armed = true; agent.log.ifSome((SessionLog l) { l.failNextWrite = true; }); }
+        return "sys";
+    }, null, buildPath(root, "sessions"), "test");
+    auto srv = new AcpServer(agent, host, (string l) { lines ~= l; });
+    srv.receive(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}`);
+    srv.receive(`{"jsonrpc":"2.0","id":2,"method":"session/set_name","params":{"name":"perf"}}`);
+    srv.receive(`{"jsonrpc":"2.0","id":3,"method":"session/set_name","params":{"name":"other"}}`);
+    srv.receive(`{"jsonrpc":"2.0","id":4,"method":"session/set_name","params":{"name":"other"}}`);
+    srv.close();
+    srv.run();
+    JSONValue[long] byId;
+    foreach (l; lines)
+    {
+        auto m = parseJSON(l);
+        if (auto id = "id" in m) byId[id.integer] = m;
+    }
+    assert(byId[2]["result"]["name"].str == "perf", byId[2].toString);
+    assert(byId[3]["error"]["message"].str.canFind("can't record the handle"), byId[3].toString);
+    assert(byId[4]["result"]["name"].str == "other", byId[4].toString);
 }

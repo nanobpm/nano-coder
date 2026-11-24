@@ -616,7 +616,10 @@ Summary[] list(string dir, bool strictIndex = false, scope bool delegate(string 
         else
         {
             try s = summarize(e.name);
-            catch (FileException err) throw err;
+            // One unreadable or truncated log must not hide every other
+            // session (issue #300: it blocked unrelated resumes); strict
+            // callers (retention) still fail rather than act on a partial view.
+            catch (FileException err) { if (strictIndex) throw err; else continue; }
             catch (Exception)
             {
                 // Not resumable (e.g. truncated): keep a titled entry whose

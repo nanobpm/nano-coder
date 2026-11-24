@@ -3854,7 +3854,12 @@ int runMain(string[] args)
     catch (Exception e) die(e.msg);
     // `--name` (issue #300) names the new session, or renames the resumed one.
     if (o.name.length)
-        if (auto why = agent.setName(o.name)) die("--name " ~ o.name ~ ": " ~ why);
+    {
+        string why;
+        try why = agent.setName(o.name);
+        catch (Exception e) why = e.msg;
+        if (why !is null) die("--name " ~ o.name ~ ": " ~ why);
+    }
     scope (exit) agent.releaseName();
     if (agent.name.length) agent.installSystem(systemFor(cwd, agent.promptPlan), indexShown);
     agent.useHooks(loadHooks(cwd), o.hasResume);
@@ -5157,7 +5162,9 @@ int runMain(string[] args)
                 }
                 case "/name":
                 {
-                    writeln(nameCommand(agent, arg));
+                    // A backstop: a failed rename is reported, never ends the session.
+                    try writeln(nameCommand(agent, arg));
+                    catch (Exception e) stdErr.writeln(console.red("error: can't change the handle: " ~ e.msg));
                     // The handle is in the system prompt, the status bar and Herdr's pane label.
                     agent.installSystem(systemFor(cwd, agent.promptPlan), indexShown);
                     nano.herdr.showName(agent.name);
