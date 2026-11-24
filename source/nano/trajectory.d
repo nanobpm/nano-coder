@@ -18,7 +18,7 @@ import std.json;
 import std.string : lineSplitter;
 import std.typecons : Nullable;
 
-enum Kind { user, think, assistant, tool, toolCall, compact }
+enum Kind { user, think, assistant, tool, toolCall, compact, subagent }
 
 /// One ledger row. Optional fields use `null` strings or `-1`.
 struct Row
@@ -65,6 +65,8 @@ struct Row
                 : format("TOOL %s (%s)", name, status);
         case Kind.toolCall: return "CALL " ~ name;
         case Kind.compact: return compactMode !is null ? "COMPACT (" ~ compactMode ~ ")" : "COMPACT";
+        case Kind.subagent: return compactModel !is null ? format("SUB-AGENT %s (%s)", name, compactModel)
+            : "SUB-AGENT " ~ name;
         }
     }
 
@@ -73,6 +75,7 @@ struct Row
     {
         string[] bits;
         if (hasUsage && totalTokens > 0) bits ~= formatTokens(totalTokens) ~ " tok";
+        if (kind == Kind.subagent && aic !is null) bits ~= aic ~ " AIC";
         if (kind != Kind.tool && durationMs >= 0) bits ~= formatDuration(durationMs);
         if (temperature !is null) bits ~= "temp " ~ temperature;
         if (thinkingLevel !is null) bits ~= "thinking " ~ thinkingLevel;
@@ -195,10 +198,36 @@ struct Trajectory
                 current.rows ~= r;
                 prevTs = null;
                 break;
+            case "subagent_usage":
+                current.rows ~= subagentUsageRow(data, lines[i], i < raws.length ? raws[i] : null);
+                break;
             default: // plan, hooks: not ledger rows
             }
         }
         flush(current);
+        return t;
+    }
+
+    /// Every request's usage in the session, sub-agents included (issue
+    /// #341): main-agent rows plus one `subagent_usage` row per finished
+    /// sub-agent. Rows expanded from a child log are not counted again.
+    Totals totals() pure const
+    {
+        Totals t;
+        foreach (ref turn; turns)
+            foreach (ref r; turn.rows)
+            {
+                if (!r.hasUsage) continue;
+                auto into = r.kind == Kind.subagent ? &t.subagents : &t.main;
+                into.inputTokens += r.promptTokens;
+                into.outputTokens += r.completionTokens;
+                if (r.aic !is null)
+                {
+                    into.hasAic = true;
+                    into.aic += r.aic.to!double;
+                }
+                if (r.kind == Kind.subagent) t.subagentCount++;
+            }
         return t;
     }
 
@@ -241,6 +270,8 @@ struct Trajectory
             }
             o ~= sanitizeTerminal("  ↳ " ~ turn.summary);
         }
+        auto tl = totals.line;
+        if (tl !is null) o ~= ["", tl];
         return o.join("\n");
     }
 
@@ -270,6 +301,15 @@ struct Trajectory
             ts.items ~= tj;
         }
         root.add("turns", ts);
+        auto tot = totals;
+        if (tot.subagentCount)
+        {
+            J tj = J.obj;
+            tj.add("main", usageJson(tot.main));
+            tj.add("subagents", usageJson(tot.subagents));
+            tj.add("subagent_count", J.raw(tot.subagentCount.to!string));
+            root.add("totals", tj);
+        }
         return root.pretty(0);
     }
 
@@ -304,8 +344,42 @@ struct Trajectory
                 if (resp.length) o ~= ["", "**Response**", "", "> " ~ quoteLines(sanitizeMarkdown(resp))];
             }
         }
+        auto tl = totals.line;
+        if (tl !is null) o ~= ["", "_" ~ tl ~ "_"];
         o ~= "";
         return o.join("\n");
+    }
+}
+
+/// Summed usage of one side (main agent or sub-agents).
+struct UsageSum
+{
+    long inputTokens, outputTokens;
+    bool hasAic;
+    double aic = 0;
+}
+
+/// Session usage totals, split into the main agent and its sub-agents.
+struct Totals
+{
+    UsageSum main, subagents;
+    size_t subagentCount;
+
+    /// `Total: …` (null when nothing was spent).
+    string line() pure const
+    {
+        auto all = main.inputTokens + main.outputTokens + subagents.inputTokens + subagents.outputTokens;
+        if (all <= 0 && !main.hasAic && !subagents.hasAic) return null;
+        string s = format("Total: %s tok", formatTokens(all));
+        if (main.hasAic || subagents.hasAic) s ~= format(", %s AIC", serdeFloat(main.aic + subagents.aic));
+        if (subagentCount)
+        {
+            s ~= format(" (sub-agents ×%s: %s tok", subagentCount,
+                formatTokens(subagents.inputTokens + subagents.outputTokens));
+            if (subagents.hasAic) s ~= format(", %s AIC", serdeFloat(subagents.aic));
+            s ~= ")";
+        }
+        return s;
     }
 }
 
@@ -383,6 +457,34 @@ string str(const JSONValue j, string key, string dflt) pure
     if (j.type != JSONType.object) return dflt;
     if (auto v = key in j) if (v.type == JSONType.string) return v.str;
     return dflt;
+}
+
+/// A `subagent_usage` record's row (issue #341). The child log is kept in
+/// `text` only, not `subLog`, so `load` does not expand it a second time.
+Row subagentUsageRow(const JSONValue d, ulong line, string rawLine)
+{
+    Row r;
+    r.id = line;
+    r.kind = Kind.subagent;
+    r.name = str(d, "id", "");
+    r.compactModel = str(d, "model", null);
+    auto log = str(d, "log", "");
+    r.text = log.length ? "log: " ~ log : "";
+    r.timestamp = str(d, "recorded_at", null);
+    if (d.type != JSONType.object) return r;
+    long n(string k) { long x; if (auto p = k in d) if (jsonSigned(*p, x)) return x; return 0; }
+    r.hasUsage = true;
+    r.promptTokens = n("input_tokens");
+    r.completionTokens = n("output_tokens");
+    r.totalTokens = r.promptTokens + r.completionTokens;
+    if (auto a = "aic" in d)
+        if (a.type == JSONType.float_ || a.type == JSONType.integer || a.type == JSONType.uinteger)
+        {
+            auto lit = rawNumber(rawLine, "aic");
+            r.aic = serdeFloat(lit !is null ? strtodOf(lit)
+                : a.type == JSONType.float_ ? a.floating : jsonWholeAsDouble(*a));
+        }
+    return r;
 }
 
 void appendMessageRows(ref Turn turn, const JSONValue m, ulong line, ref string prevTs, string rawLine = null)
@@ -555,6 +657,7 @@ string bullet(const ref Row r) pure
     case Kind.toolCall: return "→";
     case Kind.think: return "·";
     case Kind.compact: return "↺";
+    case Kind.subagent: return "⇣";
     case Kind.user, Kind.assistant: return "▸";
     }
 }
@@ -900,6 +1003,15 @@ struct J
     }
 }
 
+J usageJson(const ref UsageSum u) pure
+{
+    J j = J.obj;
+    j.add("input_tokens", J.raw(u.inputTokens.to!string));
+    j.add("output_tokens", J.raw(u.outputTokens.to!string));
+    if (u.hasAic) j.add("aic", J.raw(serdeFloat(u.aic)));
+    return j;
+}
+
 J rowJson(const ref Row r) pure
 {
     J j = J.obj;
@@ -925,6 +1037,11 @@ J rowJson(const ref Row r) pure
     case Kind.compact:
         j.add("kind", J.s("compact"));
         if (r.compactMode !is null) j.add("mode", J.s(r.compactMode));
+        if (r.compactModel !is null) j.add("model", J.s(r.compactModel));
+        break;
+    case Kind.subagent:
+        j.add("kind", J.s("subagent"));
+        j.add("name", J.s(r.name));
         if (r.compactModel !is null) j.add("model", J.s(r.compactModel));
         break;
     }
@@ -1148,4 +1265,36 @@ unittest
         assert(r.durationMs == 42);
     }
     assert(seen);
+}
+
+// Issue #341: a `subagent_usage` record is one row, counted once in the
+// totals (beside the main agent's own usage), in every output format; a
+// log without it has no sub-agent totals.
+unittest
+{
+    auto recs = [
+        `{"type":"session","data":{"id":"s1","version":1}}`,
+        `{"type":"input","data":{"id":"i1","text":"go"}}`,
+        `{"type":"message","data":{"role":"assistant","content":"ok","usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,"aic":0.25}}}`,
+        `{"type":"subagent_usage","data":{"version":1,"id":"sub-1","log":"/l/c.jsonl","model":"mock/b","input_tokens":1000,"output_tokens":200,"aic":1.5}}`,
+        `{"type":"turn_end","data":{"input_id":"i1","response":"ok"}}`,
+    ];
+    JSONValue[] parsed;
+    ulong[] lines;
+    foreach (i, l; recs) { parsed ~= parseJSON(l); lines ~= i + 1; }
+    auto t = Trajectory.fromRecords(parsed, lines, recs);
+    auto tot = t.totals;
+    assert(tot.subagentCount == 1);
+    assert(tot.main.inputTokens == 100 && tot.main.outputTokens == 20 && tot.main.aic == 0.25);
+    assert(tot.subagents.inputTokens == 1000 && tot.subagents.outputTokens == 200 && tot.subagents.aic == 1.5);
+    auto plain = t.toPlain;
+    assert(plain.canFind("SUB-AGENT sub-1 (mock/b)"), plain);
+    assert(plain.canFind("Total: 1.3k tok, 1.75 AIC (sub-agents ×1: 1.2k tok, 1.5 AIC)"), plain);
+    assert(t.toMarkdown.canFind("SUB-AGENT sub-1"));
+    auto j = parseJSON(t.toJson);
+    assert(j["totals"]["subagents"]["input_tokens"].integer == 1000);
+    assert(j["turns"][0]["rows"][2]["kind"].str == "subagent");
+    // An old log without the record: no sub-agent totals, JSON unchanged.
+    auto old = Trajectory.fromRecords(parsed[0 .. 3] ~ parsed[4], [1UL, 2, 3, 5], recs[0 .. 3] ~ recs[4]);
+    assert(old.totals.subagentCount == 0 && "totals" !in parseJSON(old.toJson));
 }
