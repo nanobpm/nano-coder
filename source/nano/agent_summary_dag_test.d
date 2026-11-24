@@ -316,3 +316,48 @@ unittest
     assert(compactAs(agent, ctx.CompactionMode.smart));
     assert(dag.parse(agent.messages[1].content).length == 1);
 }
+
+// The condensation call counts its retried stream attempts, whether it
+// succeeds or fails into the deterministic fallback (issue #340).
+unittest
+{
+    import nano.http : RequestException;
+    foreach (fail; [false, true])
+    {
+        LLMResponse[] replies;
+        foreach (i; 0 .. 8)
+        {
+            replies ~= LLMResponse("answer " ~ i.to!string);
+            replies ~= LLMResponse("SUMMARY " ~ i.to!string ~ ": work done in this span with many words");
+            replies ~= LLMResponse("CONDENSED " ~ i.to!string);
+        }
+        size_t condensations;
+        auto mock = new class MockClient
+        {
+            this() { super(replies); }
+            override LLMResponse chat(const ref ChatRequest req, StreamSink sink)
+            {
+                auto r = super.chat(req, sink);
+                if (req.messages[0].content != dag.condenseSystemPrompt) return r;
+                ++condensations;
+                if (fail)
+                {
+                    auto e = new RequestException("condense: network unavailable");
+                    e.retried = RetrySpend(TokenUsage(0, 0), 3);
+                    throw e;
+                }
+                r.retried = RetrySpend(TokenUsage(0, 0), 3);
+                return r;
+            }
+        };
+        auto agent = logged(fail ? "condense-retried-fail" : "condense-retried", mock);
+        agent.summaryDagBudgetBytes = 100;
+        foreach (i; 0 .. 5)
+        {
+            agent.run("step " ~ i.to!string, new NullEvents);
+            assert(compactAs(agent, ctx.CompactionMode.smart));
+        }
+        assert(condensations >= 1, "a condensation call was made");
+        assert(agent.uncountedRequests == 3 * condensations, agent.uncountedRequests.to!string);
+    }
+}

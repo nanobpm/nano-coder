@@ -2694,8 +2694,11 @@ class Agent
         auto err = collectException(() {
             foreach (e; ev) e.summaryStart();
             const swStart = monoNow;
-            auto r = client.chat(req, (bool, string) {});
+            // Count retried stream attempts too, on success and on failure
+            // (issue #340), as the leaf summary request does.
+            auto r = chatCounted(req, (bool, string) {}, ev);
             ms = since(swStart).total!"msecs";
+            countRetried(r.retried, ev);
             recordUsage(r.usage);
             usage.inputTokens += r.usage.inputTokens;
             usage.outputTokens += r.usage.outputTokens;
