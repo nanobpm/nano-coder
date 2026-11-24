@@ -76,7 +76,15 @@ a command can actually *do* regardless of how the command is spelled:
   `read_confine = "workspace"` allows reads only of the workspace, system and
   toolchain directories, caches and `readable` paths. Seatbelt denies the paths;
   Landlock (allow-list only) omits them from the read rules. `read_file`, `grep`
-  and `glob` refuse the same paths. The nano-coder process itself is **not**
+  and `glob` refuse the same paths. A denied path (and every directory above
+  it) also can't be renamed, unlinked or hard-linked by a sandboxed command, so
+  it can't be moved out from under the deny. **Read confinement applies only
+  when the sandbox is on**: with `mode = "off"` nothing is confined. It is
+  path-based, so a hard link to a secret that already exists elsewhere, outside
+  the denied paths, is readable through that other name. The file tools check
+  a path (with symlinks resolved) and then open it by name, so a symlink swapped
+  in between the check and the open is a known race (TOCTOU); the OS sandbox,
+  which checks at access time, has no such gap. The nano-coder process itself is **not**
   confined — it needs its API key — only the commands, hooks and file tools it
   runs for the model;
 - `network = false` blocks outbound connections;
@@ -112,6 +120,8 @@ the boundary rather than the parser's completeness:
 
 - a command the static guard cannot see through (an encoded write escaping the
   workspace) is still contained by the OS sandbox (write-root boundary);
-- a sandboxed command cannot read a denied path, and the generated Seatbelt
-  rules and Landlock read roots never cover a denied path (read boundary);
+- with the sandbox on, a sandboxed command cannot read a denied path by its
+  name or rename/link it to another name, and the generated Seatbelt rules and
+  Landlock read roots never cover a denied path (read boundary; a hard link
+  made before the run, outside the denied paths, is not covered);
 - uninspectable / run-time-computed input still fails closed in the static guard.

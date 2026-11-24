@@ -449,7 +449,15 @@ the read rules: the readable set is split around them, which also means a direct
 can be read. Because the split is fixed when the command starts, a file or directory a
 command *creates* directly in such a directory is writable but not readable until the
 next command; keep `deny_read` paths out of the workspace root (or put build output in a
-subdirectory) if a build needs to read back what it wrote there. A symlink found while
+subdirectory) if a build needs to read back what it wrote there. So that a denied path
+can't be renamed or hard-linked out of the deny (`mv private pub && cat pub/key`), it
+and the directories above it can't be renamed, removed or linked by sandboxed commands:
+Seatbelt denies writes to their entries; Landlock grants a write root that holds a
+denied path (and each directory between them) without remove/rename rights, so in that
+directory files can be created and edited but not deleted or renamed. A hard link to a
+secret made beforehand somewhere else is not covered (the deny is path-based), and the
+file tools check a path before opening it, so a symlink swapped in between is a known
+race. Read confinement only applies while the sandbox is on. A symlink found while
 splitting is followed only when its target lies in an approved read root. Only tool-spawned commands, project hooks and file tools are confined; the
 nano-coder process itself still reads its config and API keys.
 

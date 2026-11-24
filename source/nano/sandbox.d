@@ -24,7 +24,7 @@ import std.format : format;
 import std.json;
 import std.string : startsWith, endsWith, replace, strip, splitLines;
 
-import nano.paths : canonicalize, homeDir, isDir, joinPath, normalize;
+import nano.paths : canonicalize, homeDir, isDir, isSymlink, joinPath, normalize;
 
 version (OSX) version = HasOsSandbox;
 version (linux) version = HasOsSandbox;
@@ -515,7 +515,12 @@ struct SandboxConfig
             auto reads = plan.confine == ReadConfine.off ? null
                 : landlockReadRoots(plan, (string d) => listDir(d), (string d) => isDir(d), writableRoots(cwd),
                     (string d) => canonicalize(d));
-            return argv(network, writableRoots(cwd), plan.confine != ReadConfine.off, reads, shell, script);
+            // A write root holding a denied path is split too, so the denied
+            // path can't be renamed or linked out from under the read rules.
+            auto writes = plan.confine == ReadConfine.off ? writableRoots(cwd)
+                : landlockWriteRoots(writableRoots(cwd), plan.denied, (string d) => listDir(d),
+                    (string d) => isDir(d), (string d) => isSymlink(d));
+            return argv(network, writes, plan.confine != ReadConfine.off, reads, shell, script);
         }
         else
             throw new Exception("sandbox unavailable on this platform");
@@ -540,7 +545,9 @@ struct SandboxConfig
 /// rules; later rules win). `workspace` mode denies every read, re-allows
 /// `/` itself and the readable roots (and metadata
 /// of their ancestors, for `getcwd`/`realpath`); every mode then denies the
-/// secret paths. `subpath` covers a path itself, so files work too.
+/// secret paths. `subpath` covers a path itself, so files work too. Writes
+/// to the denied paths and their ancestors' entries are denied as well, so a
+/// command can't rename or link a secret out from under the read deny.
 string seatbeltReadRules(const ReadPlan plan) pure
 {
     import std.array : appender;
@@ -578,6 +585,20 @@ string seatbeltReadRules(const ReadPlan plan) pure
     {
         o ~= "(deny file-read*";
         foreach (d; plan.denied) o ~= " (subpath " ~ quote(d) ~ ")";
+        o ~= ")
+";
+        // A read deny is path-based: renaming or hard-linking a denied path
+        // (or a directory above it) to another name would move the secret out
+        // from under it. Deny writes to the denied paths themselves and to
+        // their ancestors' own entries (`literal`: files can still be created
+        // in those directories), so rename, unlink and link are refused.
+        o ~= "(deny file-write*";
+        foreach (d; plan.denied) o ~= " (subpath " ~ quote(d) ~ ")";
+        string[] above;
+        foreach (d; plan.denied)
+            for (auto a = parentOf(d); a !is null && a != "/"; a = parentOf(a))
+                if (!above.canFind(a)) above ~= a;
+        foreach (a; above) o ~= " (literal " ~ quote(a) ~ ")";
         o ~= ")
 ";
     }
@@ -632,6 +653,40 @@ string[] landlockReadRoots(const ReadPlan plan, scope string[] delegate(string) 
             foreach (r; roots) grant(r, 0);
             break;
     }
+    return result;
+}
+
+/// Marks a Landlock write root that holds a denied path: it keeps its create
+/// and write rights but not REMOVE_*/REFER, so nothing in it (the denied
+/// path or a directory above it) can be renamed, unlinked or linked away.
+enum guardedRoot = "!";
+
+/// The Landlock write roots for `roots`, split around `denied` (issue #333).
+/// Read denial is path-based, so a writable root holding a denied path would
+/// let a command `mv private pub` and read `pub/key`. Such a root (and every
+/// directory between it and the denied path) is granted guarded
+/// (`guardedRoot` prefix, see `nano.landlock.ruleSet`); its other children
+/// keep full rights. The denied path itself gets no rule. Symlinks met while
+/// splitting are skipped: a rule follows links, so `ws/l -> /etc` would grant
+/// `/etc`. Fails closed: an unlistable directory grants none of its children.
+string[] landlockWriteRoots(const string[] roots, const string[] denied, scope string[] delegate(string) @safe list,
+    scope bool delegate(string) @safe isDirectory, scope bool delegate(string) @safe isLink)
+{
+    string[] result;
+    void add(string r) { if (!result.canFind(r)) result ~= r; }
+    void split(string root, size_t depth)
+    {
+        if (denied.any!(d => withinDenied(root, d))) return;
+        if (!denied.any!(d => withinDenied(d, root) && d != root)) { add(root); return; }
+        add(guardedRoot ~ root);
+        if (depth > 64 || !isDirectory(root)) return;
+        foreach (child; list(root))
+        {
+            auto c = joinPath(root, child);
+            if (!isLink(c)) split(c, depth + 1);
+        }
+    }
+    foreach (r; roots) split(r, 0);
     return result;
 }
 
@@ -1114,7 +1169,8 @@ unittest
 unittest
 {
     ReadPlan secrets = { confine: ReadConfine.secrets, denied: ["/h/.ssh", "/h/.netrc"] };
-    assert(seatbeltReadRules(secrets) == "(deny file-read* (subpath \"/h/.ssh\") (subpath \"/h/.netrc\"))\n");
+    assert(seatbeltReadRules(secrets) == "(deny file-read* (subpath \"/h/.ssh\") (subpath \"/h/.netrc\"))\n"
+        ~ "(deny file-write* (subpath \"/h/.ssh\") (subpath \"/h/.netrc\") (literal \"/h\"))\n", seatbeltReadRules(secrets));
     assert(seatbeltReadRules(ReadPlan.init) is null);
     ReadPlan ws = { confine: ReadConfine.workspace, denied: ["/Users/u/.ssh"], readable: ["/usr", "/Users/u/src/p"] };
     auto r = seatbeltReadRules(ws);
@@ -1123,7 +1179,14 @@ unittest
     assert(r == "(deny file-read* (subpath \"/\"))\n(allow file-read* (literal \"/\"))\n"
         ~ "(allow file-read-metadata (literal \"/Users/u/src\") (literal \"/Users/u\") (literal \"/Users\"))\n"
         ~ "(allow file-read* (subpath \"/usr\") (subpath \"/Users/u/src/p\"))\n"
-        ~ "(deny file-read* (subpath \"/Users/u/.ssh\"))\n", r);
+        ~ "(deny file-read* (subpath \"/Users/u/.ssh\"))\n"
+        ~ "(deny file-write* (subpath \"/Users/u/.ssh\") (literal \"/Users/u\") (literal \"/Users\"))\n", r);
+    // Both the lexical and the canonical form of a denied path are guarded
+    // against rename/link (the plan lists both).
+    ReadPlan both = { confine: ReadConfine.secrets, denied: ["/tmp/w/private", "/private/tmp/w/private"] };
+    auto b = seatbeltReadRules(both);
+    assert(b.canFind(`(deny file-write* (subpath "/tmp/w/private") (subpath "/private/tmp/w/private")`), b);
+    assert(b.canFind(`(literal "/tmp/w")`) && b.canFind(`(literal "/private/tmp/w")`), b);
     // The full profile appends the read rules after the write rules.
     SandboxConfig c = { mode: SandboxMode.workspace };
     auto p = c.profile(["/w"], secrets);
@@ -1241,5 +1304,50 @@ version (HasOsSandbox) unittest
     {
         assert(text.canFind("workspace-data") && text.canFind("shell-ok"), text);
         assert(!text.canFind("SIBLING"), "read_confine = workspace let a command read a sibling directory: " ~ text);
+    }
+}
+
+// issue #333 review: a write root holding a denied path is split so the denied
+// path (or a directory above it) can't be renamed or linked out of the deny
+unittest
+{
+    string[][string] tree = [
+        "/w": ["a.txt", ".sbt", "src", "lnk"],
+        "/w/.sbt": ["private", "other"],
+    ];
+    string[] list(string d) { return d in tree ? tree[d] : null; }
+    bool dir(string d) { return (d in tree) !is null || d == "/w/src" || d == "/w/.sbt/private"; }
+    bool link(string d) { return d == "/w/lnk"; }
+    auto r = landlockWriteRoots(["/w", "/tmp"], ["/w/.sbt/private"], &list, &dir, &link);
+    assert(r == ["!/w", "/w/a.txt", "!/w/.sbt", "/w/.sbt/other", "/w/src", "/tmp"], r.join(" "));
+    // No root covering the denied path keeps REMOVE/REFER; the denied path gets no rule.
+    foreach (x; r)
+        if (!x.startsWith(guardedRoot)) assert(!within("/w/.sbt/private", x), x);
+    // A symlink met while splitting is never granted (a rule would follow it).
+    assert(!r.canFind("/w/lnk"));
+    // A root without a denied path is untouched; a root inside one gets nothing.
+    assert(landlockWriteRoots(["/w/src"], ["/w/.sbt/private"], &list, &dir, &link) == ["/w/src"]);
+    assert(landlockWriteRoots(["/w/.sbt/private"], ["/w/.sbt/private"], &list, &dir, &link).length == 0);
+}
+
+// issue #333 review: a denied path inside the workspace can't be renamed,
+// hard-linked or have a parent renamed out of the deny and then read
+version (HasOsSandbox) unittest
+{
+    import std.file : write, mkdirRecurse, exists;
+    auto ws = outsideDir();
+    scope (exit) rmTree(ws);
+    mkdirRecurse(ws ~ "/.sbt/private");
+    write(ws ~ "/.sbt/private/key", "PRIVATE");
+    write(ws ~ "/plain.txt", "x");
+    SandboxConfig c = { mode: SandboxMode.workspace, toolCaches: false, denyRead: [".sbt/private"] };
+    bool ok; string text;
+    if (run(c, ws, `mv .sbt/private .sbt/pub; cat .sbt/pub/key; ln .sbt/private/key hl; cat hl;
+        mv .sbt/private/key k2; cat k2; mv .sbt moved; cat moved/private/key; cat .sbt/private/key;
+        echo new > fresh.txt && echo created; echo edit >> plain.txt && echo edited; true`, ok, text))
+    {
+        assert(!text.canFind("PRIVATE"), "a denied path was moved or linked out of the deny: " ~ text);
+        assert(exists(ws ~ "/.sbt/private/key"), text);
+        assert(text.canFind("created") && text.canFind("edited"), "ordinary workspace writes stopped working: " ~ text);
     }
 }
