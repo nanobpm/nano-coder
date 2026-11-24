@@ -171,3 +171,34 @@ unittest
     assert(g.msgCalls == ["on", "confirm off"] && !exists(buildPath(dir, "other.toml")));
     rmdirRecurse(dir);
 }
+
+unittest
+{
+    // Esc at each on/off prompt leaves the setting alone (it is not "No").
+    auto f = new Fixture;
+    auto h = host(f, buildPath(scratch("esc"), "config.toml"));
+    f.agent.subagentsOn = true;
+    f.msgOn = true;
+    // Sub-agents → Enabled → Esc → Back; Messages → Enabled → Esc → Confirm → Esc → Back; Done
+    runSettings(new ScriptedUi(["9", "0", "esc", "7", "10", "0", "esc", "1", "esc", "2", "12"]), h);
+    assert(f.subCalls.length == 0 && f.msgCalls.length == 0, f.msgCalls.to!string);
+    assert(f.agent.subagentsOn && f.msgOn && f.msgConfirm);
+}
+
+unittest
+{
+    // Header-like lines inside multi-line values are text, not tables, and
+    // quoted `[["subagent_models"]]` headers are the same table.
+    import nano.settings : replaceSubagentModels;
+    auto doc = "system_prompt = \"\"\"\nhi\n[[subagent_models]]\n\"\"\"\n\n[[subagent_models]]\nmodel = \"a/x\"\n"
+        ~ "use = '''\n[tests]\n'''\n\n[tests]\nfast = 1\n\n[[\"subagent_models\"]]\nmodel = \"b/y\"\n\n"
+        ~ "[[ 'subagent_models' ]]\nmodel = \"c/z\"\n";
+    auto res = replaceSubagentModels(doc, [SubagentModel("d/w", "", 0, 0, 0)]);
+    assert(res == "system_prompt = \"\"\"\nhi\n[[subagent_models]]\n\"\"\"\n\n\n[tests]\nfast = 1\n\n"
+        ~ "[[subagent_models]]\nmodel = \"d/w\"\n", res);
+    import nano.toml : parseToml;
+    import nano.result : unwrap;
+    auto v = parseToml(res).unwrap("valid TOML");
+    assert(v["subagent_models"].arrayNoRef.length == 1 && v["tests"]["fast"].integer == 1);
+    assert(v["system_prompt"].str.canFind("[[subagent_models]]"));
+}

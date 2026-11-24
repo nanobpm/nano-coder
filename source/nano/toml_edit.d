@@ -97,6 +97,52 @@ string[] headerPath(string line) pure nothrow
     }
 }
 
+/// The dotted segments of an array-of-tables header like
+/// `[["subagent_models"]]`, or null when `line` is not one.
+string[] arrayHeaderPath(string line) pure nothrow
+{
+    auto t = line.strip;
+    if (!t.startsWith("[[")) return null;
+    auto segs = headerPath(t[1 .. $]);
+    if (segs is null) return null;
+    // The inner header must be closed by `]]`, not a lone `]`.
+    size_t i = 2, depth;
+    bool inStr;
+    char q;
+    for (; i < t.length; i++)
+    {
+        if (inStr) { if (q == '"' && t[i] == '\\') { i++; continue; } if (t[i] == q) inStr = false; continue; }
+        if (t[i] == '"' || t[i] == '\'') { inStr = true; q = t[i]; continue; }
+        if (t[i] == ']') break;
+    }
+    return i + 1 < t.length && t[i + 1] == ']' ? segs : null;
+}
+
+/// For each of `lines`, whether it starts a TOML statement (a header, key,
+/// comment or blank line) rather than continuing a multi-line string or
+/// array begun above, where a `[header]`-looking line is just text.
+bool[] statementRows(const string[] lines) pure
+{
+    auto res = new bool[lines.length];
+    for (size_t i = 0; i < lines.length;)
+    {
+        res[i] = true;
+        auto l = lines[i];
+        if (lineKey(l) is null) { i++; continue; }
+        auto t = l.stripLeft;
+        size_t col = l.length - t.length;
+        if (t[0] == '"' || t[0] == '\'')
+            col += 1 + t[1 .. $].indexOf(t[0]) + 1;
+        col += l[col .. $].indexOf('=') + 1;
+        while (col < l.length && (l[col] == ' ' || l[col] == '\t')) col++;
+        if (col >= l.length) { i++; continue; }
+        size_t endRow;
+        valueEnd(lines, i, col, endRow);
+        i = endRow + 1 > i ? endRow + 1 : i + 1;
+    }
+    return res;
+}
+
 /// The key a `key = value` line sets (unquoted), or null.
 private string lineKey(string line) pure
 {

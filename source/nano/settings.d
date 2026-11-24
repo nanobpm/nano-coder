@@ -362,25 +362,26 @@ string applyChanges(string doc, const ref Config c, const ref Changes ch, const 
 /// that table and are kept.
 string replaceSubagentModels(string doc, const imported!"nano.config".SubagentModel[] models) pure
 {
-    import std.algorithm : startsWith, filter;
-    import std.array : array, join;
-    import std.ascii : isWhite;
+    import std.algorithm : startsWith;
+    import std.array : join;
     import std.string : splitLines, stripLeft, strip;
-    bool isOurs(string line)
-    {
-        auto t = line.filter!(ch => !isWhite(ch)).array;
-        return t.startsWith("[[subagent_models]]");
-    }
+    import nano.toml_edit : arrayHeaderPath, statementRows;
     auto lines = doc.splitLines;
+    // Only statement rows can be headers: a `[x]` line inside a multi-line
+    // string or array is part of a value.
+    auto stmt = statementRows(lines);
+    bool isOurs(size_t i) { return stmt[i] && arrayHeaderPath(lines[i]) == ["subagent_models"]; }
+    bool isHeader(size_t i) { return stmt[i] && lines[i].stripLeft.startsWith("["); }
     string[] kept;
     for (size_t i = 0; i < lines.length;)
     {
-        if (!isOurs(lines[i])) { kept ~= lines[i++]; continue; }
+        if (!isOurs(i)) { kept ~= lines[i++]; continue; }
         auto end = i + 1;
-        while (end < lines.length && !lines[end].stripLeft.startsWith("[")) end++;
+        while (end < lines.length && !isHeader(end)) end++;
         auto keepFrom = end;
         if (end < lines.length)
-            while (keepFrom > i + 1 && (!lines[keepFrom - 1].strip.length || lines[keepFrom - 1].stripLeft.startsWith("#")))
+            while (keepFrom > i + 1 && stmt[keepFrom - 1]
+                && (!lines[keepFrom - 1].strip.length || lines[keepFrom - 1].stripLeft.startsWith("#")))
                 keepFrom--;
         kept ~= lines[keepFrom .. end];
         i = end;

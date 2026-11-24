@@ -31,6 +31,16 @@ bool confirm(SettingsUi ui, string prompt, bool dflt)
     return ui.select(prompt, ["Yes", "No"], dflt ? 0 : 1) == 0;
 }
 
+/// Asks yes or no; false when cancelled (Esc), so a caller that changes a
+/// setting can leave it alone rather than read Esc as "No".
+private bool askYesNo(SettingsUi ui, string prompt, bool dflt, out bool answer)
+{
+    auto sel = ui.select(prompt, ["Yes", "No"], dflt ? 0 : 1);
+    if (sel < 0) return false;
+    answer = sel == 0;
+    return true;
+}
+
 /// What the dialog asks of the app.
 struct SettingsHost
 {
@@ -273,7 +283,8 @@ private bool editContext(SettingsUi ui, ref SettingsHost h)
     import nano.context : CompactionMode;
     auto cfg = h.cfg;
     auto a = h.agent;
-    bool auto_ = confirm(ui, "Auto-compact when the context fills up?", cfg.autoCompact);
+    bool auto_;
+    if (!askYesNo(ui, "Auto-compact when the context fills up?", cfg.autoCompact, auto_)) return false;
     double threshold = cfg.autoCompactThreshold;
     if (auto_)
     {
@@ -638,8 +649,8 @@ private void editSubagents(SettingsUi ui, ref SettingsHost h, ref Changes change
         switch (sel)
         {
             case 0:
-                bool on = confirm(ui, "Offer sub-agents (the agent tool)?", a.subagentsOn);
-                if (on == a.subagentsOn) break;
+                bool on;
+                if (!askYesNo(ui, "Offer sub-agents (the agent tool)?", a.subagentsOn, on) || on == a.subagentsOn) break;
                 if (h.subagentsCommand !is null) ui.say(h.subagentsCommand(on ? "on" : "off"));
                 if (a.subagentsOn != on) break; // not available in this session: nothing changed
                 cfg.subagents = on;
@@ -743,8 +754,9 @@ private void editMessages(SettingsUi ui, ref SettingsHost h, ref Changes changes
         if (sel < 0 || sel == 2) return;
         if (sel == 0)
         {
-            bool want = confirm(ui, "Listen for messages from other sessions and offer session_send?", on);
-            if (want == on) continue;
+            bool want;
+            if (!askYesNo(ui, "Listen for messages from other sessions and offer session_send?", on, want) || want == on)
+                continue;
             if (h.messagesCommand !is null) ui.say(h.messagesCommand(want ? "on" : "off"));
             auto now = stateOf(h.messagesOn, want);
             if (now != want) continue; // could not switch: nothing to save
@@ -753,8 +765,8 @@ private void editMessages(SettingsUi ui, ref SettingsHost h, ref Changes changes
         }
         else
         {
-            bool want = confirm(ui, "Ask before accepting an incoming message?", conf);
-            if (want == conf) continue;
+            bool want;
+            if (!askYesNo(ui, "Ask before accepting an incoming message?", conf, want) || want == conf) continue;
             if (h.messagesCommand !is null) ui.say(h.messagesCommand(want ? "confirm on" : "confirm off"));
             auto now = stateOf(h.messagesConfirm, want);
             if (now != want) continue; // could not switch: nothing to save
