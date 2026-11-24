@@ -49,6 +49,20 @@ struct SettingsHost
     string delegate(string provider) @safe refreshClient;
     /// Where `/providers` key status reads stored logins (tests).
     string dataDir;
+    /// Runs `/subagents <arg>` (`on`/`off`) and returns its reply, so the
+    /// dialog switches the `agent` tool the same way the command does.
+    string delegate(string arg) @safe subagentsCommand;
+    /// Re-applies the `subagent_*` settings of `cfg` to the session after
+    /// the dialog changed the model, limits or candidates.
+    void delegate() @safe reconfigureSubagents;
+    /// Runs `/messages <arg>` (`on`, `off`, `confirm on`, `confirm off`)
+    /// and returns its reply, so the registry socket opens or closes as
+    /// with the command.
+    string delegate(string arg) @safe messagesCommand;
+    /// Whether this session has inter-session messages on (listening).
+    bool delegate() @safe messagesOn;
+    /// Whether incoming messages wait for confirmation.
+    bool delegate() @safe messagesConfirm;
 }
 
 /// The bare `/model` picker: a recent model or a provider, then its model.
@@ -142,11 +156,14 @@ string[] runSettings(SettingsUi ui, ref SettingsHost h)
             format("Context          %s window, auto-compact %s, %s compaction", formatTokens(a.contextWindow),
                 cfg.autoCompact ? format("at %.0f%%", cfg.autoCompactThreshold * 100) : "off", cfg.compactionMode),
             format("Verbosity        %s (%s)", cfg.verbosity.vname, cfg.verbosity.vdescribe),
+            format("Sub-agents       %s", subagentsSummary(a.subagentsOn, cfg.subagentModel, cfg.subagentModels.length)),
+            format("Session messages %s", messagesSummary(stateOf(h.messagesOn, cfg.sessionMessages),
+                stateOf(h.messagesConfirm, cfg.sessionMessagesConfirm))),
             format("Save to config file%s", changes.any ? " (unsaved changes)" : ""),
             "Done",
         ];
         auto sel = ui.select("Select setting", items, 0);
-        if (sel < 0 || sel == 10)
+        if (sel < 0 || sel == 12)
         {
             if (changes.any && confirm(ui, format("Save changes to %s?", h.configPath), true))
                 saveAndReport(ui, h, changes, notices);
@@ -199,7 +216,9 @@ string[] runSettings(SettingsUi ui, ref SettingsHost h)
                 if (onVerbosity !is null) onVerbosity(allVerbosities[i]);
                 changes.verbosity = true;
                 break;
-            case 9: saveAndReport(ui, h, changes, notices); break;
+            case 9: editSubagents(ui, h, changes); break;
+            case 10: editMessages(ui, h, changes); break;
+            case 11: saveAndReport(ui, h, changes, notices); break;
             default: break;
         }
     }
@@ -550,5 +569,195 @@ private string kindLabelOf(ProviderKind k) pure nothrow
         case ProviderKind.anthropic: return "anthropic";
         case ProviderKind.githubCopilot: return "githubcopilot";
         case ProviderKind.mock: return "mock";
+    }
+}
+
+/// The `Sub-agents` row: on/off, the default model and the candidate count.
+string subagentsSummary(bool on, string model, size_t candidates) pure
+{
+    return format("%s, model %s, %s candidate model%s", on ? "on" : "off",
+        model.length ? model : "same as session", candidates, candidates == 1 ? "" : "s");
+}
+
+/// The `Session messages` row: on/off and whether incoming ones are confirmed.
+string messagesSummary(bool on, bool confirm_) pure
+{
+    return format("%s, confirm %s", on ? "on" : "off", confirm_ ? "on" : "off");
+}
+
+private bool stateOf(bool delegate() @safe get, bool fallback)
+{
+    return get !is null ? get() : fallback;
+}
+
+/// A sub-agent candidate's row: its model, what it is for and its own limits.
+string candidateLabel(const ref imported!"nano.config".SubagentModel m) pure
+{
+    import nano.trajectory : terminalSafe;
+    string[] lim;
+    if (m.timeoutSecs > 0) lim ~= format("timeout %ss", m.timeoutSecs);
+    if (m.maxTurns > 0) lim ~= format("%s turns", m.maxTurns);
+    if (m.maxTokens > 0) lim ~= format("%s tokens", m.maxTokens);
+    import std.array : join;
+    return format("%s — %s%s", m.model, m.use.length ? terminalSafe(m.use) : "(no use given)",
+        lim.length ? " (" ~ lim.join(", ") ~ ")" : "");
+}
+
+/// Asks for a whole number of at least `min` until one is given; false on Esc.
+private bool askCount(SettingsUi ui, string prompt, long min, ref long value)
+{
+    for (;;)
+    {
+        auto t = ui.input(prompt, format("%s", value));
+        if (t is null) return false;
+        long v;
+        if (parseCount(t, v) && v >= min) { value = v; return true; }
+        ui.say(format("enter a whole number of at least %s", min));
+    }
+}
+
+private void editSubagents(SettingsUi ui, ref SettingsHost h, ref Changes changes)
+{
+    auto cfg = h.cfg;
+    auto a = h.agent;
+    void reconfigure() { if (h.reconfigureSubagents !is null) h.reconfigureSubagents(); }
+    for (;;)
+    {
+        auto items = [
+            format("Enabled          %s", a.subagentsOn ? "on" : "off"),
+            format("Default model    %s", cfg.subagentModel.length ? cfg.subagentModel : "same as session"),
+            format("Max concurrent   %s", cfg.subagentMaxConcurrency),
+            format("Timeout          %ss", cfg.subagentTimeoutSecs),
+            format("Max turns        %s", cfg.subagentMaxTurns),
+            format("Max tokens       %s", cfg.subagentMaxTokens),
+            format("Candidate models %s", cfg.subagentModels.length),
+            "Back",
+        ];
+        auto sel = ui.select("Sub-agents", items, 0);
+        if (sel < 0 || sel == 7) return;
+        switch (sel)
+        {
+            case 0:
+                bool on = confirm(ui, "Offer sub-agents (the agent tool)?", a.subagentsOn);
+                if (on == a.subagentsOn) break;
+                if (h.subagentsCommand !is null) ui.say(h.subagentsCommand(on ? "on" : "off"));
+                if (a.subagentsOn != on) break; // not available in this session: nothing changed
+                cfg.subagents = on;
+                changes.subagents = true;
+                break;
+            case 1:
+                auto m = ui.select("Model sub-agents run on", ["Same as the session's model", "Pick a model"],
+                    cfg.subagentModel.length ? 1 : 0);
+                if (m < 0) break;
+                string spec;
+                if (m == 1)
+                {
+                    spec = pickModel(ui, h);
+                    if (spec is null) break;
+                }
+                cfg.subagentModel = spec;
+                changes.subagentModel = true;
+                reconfigure();
+                break;
+            case 2: .. case 5:
+                static immutable prompts = ["Sub-agents running at once", "Sub-agent timeout in seconds",
+                    "Sub-agent turn cap (LLM calls)", "Sub-agent token cap"];
+                long*[4] fields = [&cfg.subagentMaxConcurrency, &cfg.subagentTimeoutSecs, &cfg.subagentMaxTurns,
+                    &cfg.subagentMaxTokens];
+                long v = *fields[sel - 2];
+                if (!askCount(ui, prompts[sel - 2], 1, v)) break;
+                *fields[sel - 2] = v;
+                changes.subagentLimits = true;
+                reconfigure();
+                break;
+            case 6:
+                if (editCandidates(ui, h)) { changes.subagentModels = true; reconfigure(); }
+                break;
+            default: break;
+        }
+    }
+}
+
+/// The `[[subagent_models]]` list: add, edit or remove; true when it changed.
+private bool editCandidates(SettingsUi ui, ref SettingsHost h)
+{
+    import std.algorithm : remove;
+    auto cfg = h.cfg;
+    bool changed;
+    for (;;)
+    {
+        string[] labels;
+        foreach (ref m; cfg.subagentModels) labels ~= candidateLabel(m);
+        labels ~= ["Add a candidate model", "Back"];
+        auto sel = ui.select("Candidate models the agent tool may pick", labels, 0);
+        if (sel < 0 || sel == labels.length - 1) return changed;
+        if (sel == labels.length - 2)
+        {
+            imported!"nano.config".SubagentModel m;
+            if (editCandidate(ui, h, m, true)) { cfg.subagentModels ~= m; changed = true; }
+            continue;
+        }
+        auto act = ui.select(cfg.subagentModels[sel].model, ["Edit", "Remove", "Back"], 0);
+        if (act == 0)
+        {
+            auto m = cfg.subagentModels[sel];
+            if (editCandidate(ui, h, m, false)) { cfg.subagentModels[sel] = m; changed = true; }
+        }
+        else if (act == 1)
+        {
+            cfg.subagentModels = cfg.subagentModels.dup.remove(sel);
+            changed = true;
+        }
+    }
+}
+
+private bool editCandidate(SettingsUi ui, ref SettingsHost h, ref imported!"nano.config".SubagentModel m, bool isNew)
+{
+    import nano.config : specProblem;
+    auto c = m;
+    if (isNew || ui.select("Model", ["Keep " ~ c.model, "Pick another model"], 0) == 1)
+    {
+        auto spec = pickModel(ui, h);
+        if (spec is null) return false;
+        c.model = spec;
+    }
+    auto u = ui.input("Use for (what the agent picks this model for)", c.use);
+    if (u is null) return false;
+    c.use = u.strip;
+    if (!askCount(ui, "Timeout in seconds (0 = the sub-agent default)", 0, c.timeoutSecs)) return false;
+    if (!askCount(ui, "Turn cap (0 = the sub-agent default)", 0, c.maxTurns)) return false;
+    if (!askCount(ui, "Token cap (0 = the sub-agent default)", 0, c.maxTokens)) return false;
+    if (auto why = specProblem(*h.cfg, c.model)) ui.say("Warning: the agent tool won't offer it: " ~ why);
+    m = c;
+    return true;
+}
+
+private void editMessages(SettingsUi ui, ref SettingsHost h, ref Changes changes)
+{
+    auto cfg = h.cfg;
+    for (;;)
+    {
+        bool on = stateOf(h.messagesOn, cfg.sessionMessages), conf = stateOf(h.messagesConfirm, cfg.sessionMessagesConfirm);
+        auto sel = ui.select("Session messages", [format("Enabled          %s", on ? "on" : "off"),
+            format("Confirm incoming %s", conf ? "on" : "off"), "Back"], 0);
+        if (sel < 0 || sel == 2) return;
+        if (sel == 0)
+        {
+            bool want = confirm(ui, "Listen for messages from other sessions and offer session_send?", on);
+            if (want == on) continue;
+            if (h.messagesCommand !is null) ui.say(h.messagesCommand(want ? "on" : "off"));
+            auto now = stateOf(h.messagesOn, want);
+            if (now != want) continue; // could not switch: nothing to save
+            cfg.sessionMessages = now;
+            changes.sessionMessages = true;
+        }
+        else
+        {
+            bool want = confirm(ui, "Ask before accepting an incoming message?", conf);
+            if (want == conf) continue;
+            if (h.messagesCommand !is null) ui.say(h.messagesCommand(want ? "confirm on" : "confirm off"));
+            cfg.sessionMessagesConfirm = stateOf(h.messagesConfirm, want);
+            changes.sessionMessagesConfirm = true;
+        }
     }
 }

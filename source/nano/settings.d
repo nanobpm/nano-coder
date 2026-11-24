@@ -19,7 +19,7 @@ import nano.result : toOption, unwrap;
 struct Changes
 {
     bool model, temperature, thinking, maxTokens, maxIterations, systemPrompt, compaction, verbosity, subagents,
-        sessionMessages, sessionMessagesConfirm;
+        sessionMessages, sessionMessagesConfirm, subagentModel, subagentLimits, subagentModels;
     bool[string] providerTemperatures, providerThinking, providers;
     /// "provider\0model" pairs.
     bool[string] modelTemperatures, modelThinking;
@@ -28,6 +28,7 @@ struct Changes
     {
         return model || temperature || thinking || maxTokens || maxIterations || systemPrompt || compaction
             || verbosity || subagents || sessionMessages || sessionMessagesConfirm
+            || subagentModel || subagentLimits || subagentModels
             || providerTemperatures.length || providerThinking.length || providers.length
             || modelTemperatures.length || modelThinking.length;
     }
@@ -312,6 +313,19 @@ string applyChanges(string doc, const ref Config c, const ref Changes ch, const 
     if (ch.systemPrompt) doc = tomlSet(doc, [], "system_prompt", tomlString(c.systemPrompt));
     if (ch.verbosity) doc = tomlSet(doc, [], "verbosity", tomlString(c.verbosity.vname));
     if (ch.subagents) doc = tomlSet(doc, [], "subagents", c.subagents ? "true" : "false");
+    if (ch.subagentModel) doc = tomlSet(doc, [], "subagent_model", c.subagentModel.length ? tomlString(c.subagentModel) : null);
+    if (ch.subagentLimits)
+    {
+        doc = tomlSet(doc, [], "subagent_max_concurrency", format("%s", c.subagentMaxConcurrency));
+        doc = tomlSet(doc, [], "subagent_timeout_secs", format("%s", c.subagentTimeoutSecs));
+        doc = tomlSet(doc, [], "subagent_max_turns", format("%s", c.subagentMaxTurns));
+        doc = tomlSet(doc, [], "subagent_max_tokens", format("%s", c.subagentMaxTokens));
+    }
+    if (ch.subagentModels)
+    {
+        doc = tomlSet(doc, [], "subagent_models", null);
+        doc = replaceSubagentModels(doc, c.subagentModels);
+    }
     if (ch.sessionMessages) doc = tomlSet(doc, [], "session_messages", c.sessionMessages ? "true" : "false");
     if (ch.sessionMessagesConfirm)
         doc = tomlSet(doc, [], "session_messages_confirm", c.sessionMessagesConfirm ? "true" : "false");
@@ -340,6 +354,47 @@ string applyChanges(string doc, const ref Config c, const ref Changes ch, const 
             doc ~= "\n[providers." ~ tomlKey(name) ~ "]\n"; // an entry with nothing but defaults still marks it as the user's
     }
     return doc;
+}
+
+/// `doc` with every `[[subagent_models]]` table replaced by `models`,
+/// appended at the end. Other keys, tables and comments stay; comment and
+/// blank lines just before the table that follows a removed one belong to
+/// that table and are kept.
+string replaceSubagentModels(string doc, const imported!"nano.config".SubagentModel[] models) pure
+{
+    import std.algorithm : startsWith, filter;
+    import std.array : array, join;
+    import std.ascii : isWhite;
+    import std.string : splitLines, stripLeft, strip;
+    bool isOurs(string line)
+    {
+        auto t = line.filter!(ch => !isWhite(ch)).array;
+        return t.startsWith("[[subagent_models]]");
+    }
+    auto lines = doc.splitLines;
+    string[] kept;
+    for (size_t i = 0; i < lines.length;)
+    {
+        if (!isOurs(lines[i])) { kept ~= lines[i++]; continue; }
+        auto end = i + 1;
+        while (end < lines.length && !lines[end].stripLeft.startsWith("[")) end++;
+        auto keepFrom = end;
+        if (end < lines.length)
+            while (keepFrom > i + 1 && (!lines[keepFrom - 1].strip.length || lines[keepFrom - 1].stripLeft.startsWith("#")))
+                keepFrom--;
+        kept ~= lines[keepFrom .. end];
+        i = end;
+    }
+    while (kept.length && !kept[$ - 1].strip.length) kept = kept[0 .. $ - 1];
+    foreach (ref m; models)
+    {
+        kept ~= ["", "[[subagent_models]]", "model = " ~ tomlString(m.model)];
+        if (m.use.length) kept ~= "use = " ~ tomlString(m.use);
+        if (m.timeoutSecs > 0) kept ~= format("timeout_secs = %s", m.timeoutSecs);
+        if (m.maxTurns > 0) kept ~= format("max_turns = %s", m.maxTurns);
+        if (m.maxTokens > 0) kept ~= format("max_tokens = %s", m.maxTokens);
+    }
+    return kept.length ? kept.join("\n") ~ "\n" : "";
 }
 
 /// Writes the changes into `path` atomically (0600 when a key is stored).

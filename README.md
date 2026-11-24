@@ -445,6 +445,12 @@ argument: a type-ahead list narrows as you type and Tab completes it.
   - **Turn cap** (`max_iterations`): LLM calls per input (0 = unbounded); a positive cap makes normal mode ask before stopping. In a headless (non-interactive) session an unbounded cap falls back to a 300-call safety net
   - **Context**: auto-compaction on/off, threshold, compaction mode, context-window override
   - **Verbosity**
+  - **Sub-agents**: on/off (as `/subagents on|off`, from the next request), the default
+    model (`subagent_model`, or the session's), max concurrent, timeout, max turns and
+    max tokens, and the candidate models (`[[subagent_models]]`): add, edit or remove
+    one, each with its "use for" text and optional timeout, turns and tokens (0 = default)
+  - **Session messages**: on/off (as `/messages on|off`) and confirm incoming on/off
+    (as `/messages confirm on|off`)
   - **Save to config file**: writes only the keys you changed into the config file
     (`--config` or `~/.config/nano-coder/config.toml`), keeping comments and
     other settings. Leaving with unsaved changes asks whether to save
