@@ -161,7 +161,8 @@ unittest
 }
 
 // Flat, then layered: the flat summary's content goes to the summarizer
-// instead of being dropped, and a reused node ID reads back the live node.
+// instead of being dropped (and the leaf's range covers it), and node IDs
+// stay unique across a flat reset, so each reads back its own node.
 unittest
 {
     auto mock = new MockClient([LLMResponse("a0"), LLMResponse("FLATSUM"), LLMResponse("a1"), LLMResponse("LEAF1"),
@@ -176,8 +177,9 @@ unittest
     auto before = mock.seen.length;
     assert(compactAs(agent, ctx.CompactionMode.smart));
     assert(mock.seen[before][1].content.canFind("FLATSUM"), "the flat summary is summarized, not dropped");
-    assert(dag.parse(agent.messages[1].content).length == 1);
-    // Reset the node list with a flat compaction, then layer again: S1 repeats.
+    auto first = dag.parse(agent.messages[1].content);
+    assert(first.length == 1 && first[0].first == 1, "the leaf covers the folded flat summary's history");
+    // Reset the node list with a flat compaction, then layer again.
     agent.compactionSummaryDag = false;
     agent.run("third", new NullEvents);
     assert(compactAs(agent, ctx.CompactionMode.smart));
@@ -185,7 +187,9 @@ unittest
     agent.run("fourth", new NullEvents);
     assert(compactAs(agent, ctx.CompactionMode.smart));
     auto live = dag.parse(agent.messages[1].content);
-    assert(live.length == 1 && live[0].id == 1);
-    auto got = hist.read(agent.log.unwrap("logged").path, parseJSON(`{"node":"S1"}`));
+    assert(live.length == 1 && live[0].id == 2, "a new ID after the reset");
+    auto path = agent.log.unwrap("logged").path;
+    auto got = hist.read(path, parseJSON(`{"node":"S2"}`));
     assert(got.canFind("fresh-marker") && !got.canFind("LEAF1"), got);
+    assert(hist.read(path, parseJSON(`{"node":"S1"}`)).canFind("LEAF1"), "the archived node is intact");
 }

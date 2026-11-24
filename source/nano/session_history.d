@@ -291,7 +291,8 @@ string search(string path, JSONValue args)
     if (auto nv = "node" in args.objectNoRef)
     {
         // Only the node's range (issue #274), within any before/after given.
-        auto node = findNode(path, nodeArg(*nv));
+        ulong ignoredLine;
+        auto node = findNode(path, nodeArg(*nv), ignoredLine);
         if (node.first)
         {
             if (!after || node.first - 1 > after) after = node.first - 1;
@@ -441,14 +442,19 @@ private uint nodeArg(const JSONValue v)
 
 /// The summary nodes with the given IDs, from the `summary_nodes` of the
 /// log's `replace` records (issue #274). Streams the log; only the
-/// asked-for nodes are kept.
-private SummaryNode[uint] findNodes(string path, const uint[] ids)
+/// asked-for nodes are kept. An ID resolves to its latest record at or
+/// before log line `upTo` (0: anywhere), and `at` gets that record's line:
+/// node IDs from an older session can restart after a flat compaction, so
+/// a node's children are looked up as of the node's own record, never in
+/// a later node list.
+private SummaryNode[uint] findNodes(string path, const uint[] ids, ulong upTo, out ulong[uint] at)
 {
     import nano.session : foreachLogLineSkippingTorn;
     SummaryNode[uint] found;
+    ulong lineNo;
     foreachLogLineSkippingTorn(path, (const(char)[] line) {
-        // No early exit: node IDs restart after the node list is reset (a
-        // flat compaction in between), so the latest record of an ID wins.
+        ++lineNo;
+        if (upTo && lineNo > upTo) return;
         if (line.indexOf(`"summary_nodes"`) < 0) return;
         JSONValue rec;
         try rec = parseJSON(line);
@@ -459,15 +465,16 @@ private SummaryNode[uint] findNodes(string path, const uint[] ids)
         if (ns is null || ns.type != JSONType.array) return;
         foreach (j; ns.arrayNoRef)
             foreach (n; fromJson(j))
-                if (ids.canFind(n.id)) found[n.id] = n;
+                if (ids.canFind(n.id)) { found[n.id] = n; at[n.id] = lineNo; }
     });
     return found;
 }
 
-private SummaryNode findNode(string path, uint id)
+private SummaryNode findNode(string path, uint id, out ulong line)
 {
-    auto got = findNodes(path, [id]);
-    if (auto n = id in got) return *n;
+    ulong[uint] at;
+    auto got = findNodes(path, [id], 0, at);
+    if (auto n = id in got) { line = at[id]; return *n; }
     throw new HistoryError(format("no summary node %s in this session (nodes are recorded by layered compaction)",
         nodeName(id)));
 }
@@ -477,11 +484,13 @@ private SummaryNode findNode(string path, uint id)
 private string expandNode(string path, uint id)
 {
     import nano.session : foreachLogLineSkippingTorn;
-    auto node = findNode(path, id);
+    ulong recordLine;
+    auto node = findNode(path, id, recordLine);
     auto text = header(node) ~ "\n" ~ node.text ~ "\n";
     if (node.children.length)
     {
-        auto kids = findNodes(path, node.children);
+        ulong[uint] kidAt;
+        auto kids = findNodes(path, node.children, recordLine, kidAt);
         text ~= format("\nIt condensed %s nodes; history_read one of them for more:\n", node.children.length);
         foreach (c; node.children)
             if (auto k = c in kids) text ~= "\n" ~ header(*k) ~ "\n" ~ k.text ~ "\n";

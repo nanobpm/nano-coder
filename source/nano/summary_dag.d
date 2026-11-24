@@ -190,14 +190,45 @@ size_t textBytes(const SummaryNode[] nodes) nothrow @nogc
     return t;
 }
 
-/// How many of the oldest nodes to condense, or 0 when the node text fits
-/// `budgetBytes` (or there are fewer than two nodes to merge). The newest
-/// node, just written, is never condensed in the same compaction.
-size_t condenseCount(const SummaryNode[] nodes, size_t budgetBytes) nothrow @nogc
+/// A run of consecutive nodes to condense into one: `nodes[start .. start + count]`.
+struct CondenseGroup
 {
-    if (nodes.length < 3 || textBytes(nodes) <= budgetBytes) return 0;
-    auto k = nodes.length - 1;
-    return k < condenseFanIn ? k : condenseFanIn;
+    size_t start; /// index of the first node to merge
+    size_t count; /// how many to merge (0: none)
+}
+
+/// Which nodes to condense, or a group with `count` 0 when the node text
+/// fits `budgetBytes` (or there are fewer than two nodes to merge). The
+/// newest node, just written, is never condensed in the same compaction.
+/// The group is the oldest run of at least two consecutive nodes at the
+/// lowest level present, capped at `condenseFanIn`: merging peers keeps the
+/// tree balanced (depth grows with the log of the leaf count) instead of
+/// folding each condensed node into the next one in a linear chain.
+CondenseGroup condenseGroup(const SummaryNode[] nodes, size_t budgetBytes) nothrow @nogc
+{
+    if (nodes.length < 3 || textBytes(nodes) <= budgetBytes) return CondenseGroup.init;
+    auto old = nodes[0 .. $ - 1];
+    // Visit each level present, lowest first, for a run of two or more peers.
+    long level = -1;
+    for (;;)
+    {
+        long next = long.max;
+        foreach (ref n; old)
+            if (n.level > level && n.level < next) next = n.level;
+        if (next == long.max) break;
+        level = next;
+        for (size_t i = 0; i < old.length;)
+        {
+            if (old[i].level != level) { i++; continue; }
+            size_t j = i;
+            while (j < old.length && old[j].level == level && j - i < condenseFanIn) j++;
+            if (j - i >= 2) return CondenseGroup(i, j - i);
+            i = j;
+        }
+    }
+    // No two peers are adjacent: merge the oldest nodes, as before.
+    auto k = old.length;
+    return CondenseGroup(0, k < condenseFanIn ? k : condenseFanIn);
 }
 
 /// A condensed node over `children` with `text` (the caller writes it, by
@@ -330,10 +361,10 @@ unittest // condensation picks the oldest nodes, never the newest
 {
     SummaryNode[] ns;
     foreach (uint i; 1 .. 4) ns ~= SummaryNode(i, 0, i * 10, i * 10 + 9, null, "x".replicate(100));
-    assert(condenseCount(ns, 1_000) == 0, "fits the budget");
-    assert(condenseCount(ns, 100) == 2, "all but the newest");
+    assert(condenseGroup(ns, 1_000).count == 0, "fits the budget");
+    assert(condenseGroup(ns, 100) == CondenseGroup(0, 2), "all but the newest");
     foreach (uint i; 4 .. 12) ns ~= SummaryNode(i, 0, i * 10, i * 10 + 9, null, "x".replicate(100));
-    assert(condenseCount(ns, 100) == condenseFanIn);
+    assert(condenseGroup(ns, 100) == CondenseGroup(0, condenseFanIn));
     auto c = condensed(ns[0 .. 6], nextId(ns), deterministicText(ns[0 .. 6], 600));
     assert(c.id == 12 && c.level == 1 && c.first == 10 && c.last == 69);
     assert(c.children == [1, 2, 3, 4, 5, 6]);
@@ -372,4 +403,20 @@ unittest
     assert(got[0].text.indexOf("end") >= 0);
     // Re-rendering is stable.
     assert(render(got) == render(parse(render(got))));
+}
+
+unittest // condensation merges peers, so the tree stays balanced (issue #274)
+{
+    SummaryNode n(uint id, uint level) { return SummaryNode(id, level, 0, 0, null, "xxxxxxxxxxxxxxxxxxxx"); }
+    // The newest leaf is excluded, so no two peers are adjacent: fall back
+    // to merging the oldest.
+    assert(condenseGroup([n(7, 1), n(8, 0), n(9, 0)], 10) == CondenseGroup(0, 2));
+    // Leaves after a condensed node are merged among themselves.
+    assert(condenseGroup([n(7, 1), n(8, 0), n(9, 0), n(10, 0)], 10) == CondenseGroup(1, 2));
+    // Two level-1 nodes and no leaf run: the level-1 peers merge.
+    assert(condenseGroup([n(7, 1), n(8, 1), n(9, 0)], 10) == CondenseGroup(0, 2));
+    // A long leaf run is capped at the fan-in.
+    SummaryNode[] many = [n(1, 2)];
+    foreach (uint i; 2 .. 12) many ~= n(i, 0);
+    assert(condenseGroup(many, 10) == CondenseGroup(1, condenseFanIn));
 }

@@ -23,6 +23,7 @@ summary behaviour a case selects with a marker in its log.
 """
 import json
 import random
+import re
 
 from cases import Log, noise
 
@@ -251,9 +252,12 @@ def check(case, mode, records, seeded):
         sizes.append(len(summary))
         # A layered summary (issue #274) grows by its new node until the
         # nodes are condensed: that growth is the design, not a ratchet.
-        blocks = summary.split("[[node ")
-        leaves.append(len("[[node ") + len(blocks[-1].split("\n\n[The summary above is layered")[0])
-                      if "-layered" in mode and len(blocks) > 1 else 0)
+        # Only the node list counts: the expand note after it mentions
+        # `[[node S<n> …]]` too, and a pinned request could, so cut the
+        # footer first and split only at node-header lines.
+        nodes_text = summary.split("\n\n[The summary above is layered")[0]
+        blocks = re.split(r"(?m)^(?=\[\[node S\d+)", nodes_text)
+        leaves.append(len(blocks[-1]) if "-layered" in mode and len(blocks) > 1 else 0)
         if case.get("expect_fallback") and mode.startswith("extract"):
             # Extract makes no model call, so a failing model can't fail it:
             # it must write its normal summary.

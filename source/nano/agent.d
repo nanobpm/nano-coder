@@ -428,6 +428,10 @@ class Agent
     /// Layer smart/extract summaries into a summary DAG instead of
     /// re-summarising the previous summary (`compaction_summary_dag`, issue #274).
     bool compactionSummaryDag;
+    /// The largest summary-node ID this agent has issued (issue #274): new
+    /// IDs stay above it, so a flat compaction that resets the node list
+    /// never reuses an ID an archived node's children still refer to.
+    private uint summaryNodeHigh;
     /// The node-prose budget of a layered summary in bytes; 0 derives it
     /// from the window (tests set it to force a condensation).
     size_t summaryDagBudgetBytes;
@@ -2200,6 +2204,7 @@ class Agent
         immutable layered = smart && compactionSummaryDag;
         dag.SummaryNode[] nodes;
         Message[] source = summarized;
+        bool inheritsFlat;
         if (layered)
         {
             source = null;
@@ -2210,7 +2215,11 @@ class Agent
                 // the new span rather than drop its content.
                 auto parsed = ctx.isSummaryMessage(x) ? dag.parse(x.content) : null;
                 if (parsed.length) nodes ~= parsed;
-                else source ~= x;
+                else
+                {
+                    source ~= x;
+                    if (ctx.isSummaryMessage(x)) inheritsFlat = true;
+                }
             }
         }
         string leafText;
@@ -2221,6 +2230,10 @@ class Agent
                 if (!first || x.logLine < first) first = x.logLine;
                 if (x.logLine > last) last = x.logLine;
             }
+        // A folded flat summary covers everything before it, from the
+        // session's start: the new leaf's range must too, or expanding and
+        // searching it would miss the history its prose describes.
+        if (inheritsFlat && last) first = 1;
 
         long budget;
         // The output cap an output-cap rejection taught us (0: none yet).
@@ -2339,17 +2352,32 @@ class Agent
         dag.SummaryNode[] newNodes;
         if (layered)
         {
-            auto leaf = dag.SummaryNode(dag.nextId(nodes), 0, first, last, null, leafText);
+            uint freshId()
+            {
+                auto id = dag.nextId(nodes);
+                if (id <= summaryNodeHigh) id = summaryNodeHigh + 1;
+                return id;
+            }
+            auto leaf = dag.SummaryNode(freshId(), 0, first, last, null, leafText);
             nodes ~= leaf;
             newNodes ~= leaf;
             immutable dagBudget = summaryDagBudgetBytes ? summaryDagBudgetBytes : condenseBudgetBytes(window);
-            if (auto k = dag.condenseCount(nodes, dagBudget))
+            auto g = dag.condenseGroup(nodes, dagBudget);
+            if (g.count)
             {
-                auto children = nodes[0 .. k];
-                auto text = m == ctx.CompactionMode.extract ? dag.deterministicText(children, dagBudget / 4)
-                    : condenseByModel(children, dagBudget / 4, ev);
-                auto c = dag.condensed(children, dag.nextId(nodes), text);
-                nodes = c ~ nodes[k .. $];
+                auto children = nodes[g.start .. g.start + g.count];
+                string text;
+                if (m == ctx.CompactionMode.extract) text = dag.deterministicText(children, dagBudget / 4);
+                else
+                {
+                    long ms;
+                    text = condenseByModel(children, dagBudget / 4, ev, summaryUsage, ms);
+                    // A cancel during condensation stops before anything is committed.
+                    if (control.isCancelled) return false;
+                    if (ms >= 0) summaryMs = (summaryMs < 0 ? 0 : summaryMs) + ms;
+                }
+                auto c = dag.condensed(children, freshId(), text);
+                nodes = nodes[0 .. g.start] ~ c ~ nodes[g.start + g.count .. $];
                 newNodes ~= c;
             }
             ulong lo = nodes[0].first, hi;
@@ -2495,6 +2523,8 @@ class Agent
         // The replace record is durable: the live state now matches the log,
         // so nothing past this point may roll it back.
         persisted = true;
+        foreach (ref nn; newNodes)
+            if (nn.id > summaryNodeHigh) summaryNodeHigh = nn.id;
         pinStashRestate = false;
         // Bound the stash once the log holds it in full (issue #312).
         trimPins(window);
@@ -2528,22 +2558,41 @@ class Agent
 
     /// The one condensation call of a layered compaction (issue #274): the
     /// model merges `children` into one summary. Any failure falls back to
-    /// the deterministic condensation, so a compaction never fails here.
-    private string condenseByModel(const dag.SummaryNode[] children, size_t maxBytes, Option!AgentEvents ev)
+    /// the deterministic condensation, so a compaction never fails here (a
+    /// cancel returns at once; the caller checks it before committing). The
+    /// call's usage is added to `usage` and its duration set in `ms`, so the
+    /// persisted summary accounts for both requests.
+    private string condenseByModel(const dag.SummaryNode[] children, size_t maxBytes, Option!AgentEvents ev,
+        ref TokenUsage usage, out long ms)
     {
+        ms = -1;
+        // A `/model` queued during the leaf summary applies first, as before
+        // every model call; a cancel pending now makes no call.
+        applyModelRequest();
+        if (control.isCancelled) return "";
         ChatRequest req;
         req.messages = [Message.system(dag.condenseSystemPrompt), Message.user(dag.condenseRequest(children))];
-        req.maxTokens = toLong(maxBytes / 3 < 256 ? 256 : maxBytes / 3);
+        long cap = toLong(maxBytes / 3 < 256 ? 256 : maxBytes / 3);
+        immutable limit = effectiveMaxTokens();
+        if (limit > 0 && limit < cap) cap = limit;
+        req.maxTokens = cap;
         req.temperature = temperatureFor(thinking().alwaysAnthropicThinking).effective;
         import std.exception : collectException;
         string t;
         auto err = collectException(() {
             foreach (e; ev) e.summaryStart();
+            const swStart = monoNow;
             auto r = client.chat(req, (bool, string) {});
+            ms = since(swStart).total!"msecs";
             recordUsage(r.usage);
+            usage.inputTokens += r.usage.inputTokens;
+            usage.outputTokens += r.usage.outputTokens;
+            usage.cachedInputTokens += r.usage.cachedInputTokens;
+            if (r.usage.hasAic) { usage.hasAic = true; usage.aic += r.usage.aic; }
             foreach (e; ev) e.usage(r.usage);
             t = r.content.strip;
         }());
+        if (control.isCancelled) return "";
         if (err !is null) stdErr.writefln("[agent] condensing summaries failed (%s); condensing in code", err.msg);
         return t.length ? t : dag.deterministicText(children, maxBytes);
     }
