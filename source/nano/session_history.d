@@ -393,7 +393,8 @@ string search(string path, JSONValue args)
                 kept = kept[$ - limit .. $].dup;
             }
         }
-    }, (head) => headMayBeMessage(head), (size_t) { ++skippedBig; });
+    // An oversized record's role is unknown: it breaks any tool-output run.
+    }, (head) => headMayBeMessage(head), (size_t) { ++skippedBig; runLen = 0; });
     if (oldestFirst) foreach (ref k; kept) hits ~= k.line;
     else foreach_reverse (ref k; kept) hits ~= k.line;
     string hiddenNote;
@@ -646,4 +647,23 @@ unittest
     try read(p, parseJSON(`{"id":2}`));
     catch (HistoryError e) threw = e.msg.canFind("too large to read");
     assert(threw, "an oversized target is not reported missing");
+}
+
+// Issue #289 (PR review): an oversized record's role is unknown, so it ends
+// a tool-output run; the next assistant hit is not labelled as following it.
+unittest
+{
+    import std.array : replicate;
+    import std.algorithm : canFind;
+    import std.file : write, remove, tempDir;
+    import std.path : buildPath;
+    import nano.session : maxRecordBytes;
+    auto p = buildPath(tempDir, "nano-d-history-oversized-run.jsonl");
+    scope (exit) remove(p);
+    write(p, `{"type":"session","data":{}}` ~ "\n"
+        ~ `{"type":"message","data":{"role":"tool","tool_call_id":"c","content":"out"}}` ~ "\n"
+        ~ `{"type":"message","data":{"role":"user","content":"` ~ "q".replicate(maxRecordBytes) ~ `"}}` ~ "\n"
+        ~ `{"type":"message","data":{"role":"assistant","content":"needle"}}` ~ "\n");
+    auto o = search(p, parseJSON(`{"pattern":"needle"}`));
+    assert(o.canFind("assistant") && !o.canFind("after tool output"), o);
 }

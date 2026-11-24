@@ -316,9 +316,10 @@ Summary summarize(string path, ulong maxFileBytes, out bool partial, size_t maxL
     }, o);
     if (!ok) throw new Exception(format("session log %s has no resumable header", path));
     partial = st.truncated;
-    // A plain log's offset is its size on disk; an archive's is its inflated
-    // length (the bytes `update` would append after).
-    s.logBytes = isCompressedLog(path) ? st.textBytes : getSize(path);
+    // The offset is the text bytes streamed (an archive's inflated length).
+    // Stamp the bytes actually streamed, not the size now: a record another
+    // session appended after EOF must not be marked as already summarized.
+    s.logBytes = st.textBytes;
     return s;
 }
 
