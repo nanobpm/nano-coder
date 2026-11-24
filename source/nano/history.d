@@ -124,6 +124,9 @@ struct RecentInputs
     void put(string line) pure
     {
         if (!line.strip.length || line.length + string.sizeof > InputHistory.maxBytes) return;
+        // An adjacent repeat is one entry, as in `InputHistory.record`, so
+        // it never pushes distinct older prompts out of the caps.
+        if (buf.length && buf[$ - 1] == line) return;
         buf ~= line;
         bytes += line.length + string.sizeof;
         if (buf.length >= 2 * InputHistory.maxEntries || bytes > 2 * InputHistory.maxBytes) trim();
@@ -162,6 +165,10 @@ unittest // a resumed session's prompts seed Up/Down recall, newest first
     r.put("last");
     auto kept = r.lines;
     assert(kept.length == InputHistory.maxEntries && kept[$ - 1] == "last", "newest kept within the entry cap");
+    RecentInputs rep;
+    rep.put("distinct");
+    foreach (i; 0 .. 500) rep.put("same");
+    assert(rep.lines == ["distinct", "same"], "adjacent repeats do not evict older prompts");
     InputHistory h;
     h.record("from the old process");
     h.seed(["first", "second", "second"]);
@@ -172,9 +179,10 @@ unittest // a resumed session's prompts seed Up/Down recall, newest first
 unittest // the byte cap bounds the kept prompts, not just their count
 {
     import std.array : replicate;
+    import std.conv : to;
     RecentInputs r;
     auto big = "x".replicate(100 * 1024);
-    foreach (i; 0 .. 50) r.put(big);
+    foreach (i; 0 .. 50) r.put(big ~ i.to!string);
     r.put("x".replicate(InputHistory.maxBytes)); // over the whole budget: skipped
     size_t total;
     foreach (l; r.lines) total += l.length + string.sizeof;

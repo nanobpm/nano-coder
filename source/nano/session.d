@@ -26,7 +26,7 @@ import std.process : environment, thisProcessID;
 import std.algorithm : sort, filter, map, min;
 import std.array : array;
 import nano.llm;
-import nano.option : Option, some, ifSome, match;
+import nano.option : Option, some, none, ifSome, match;
 import nano.plan : Plan;
 import nano.history : RecentInputs;
 
@@ -1739,6 +1739,13 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
     InputKey[] inputs;
     // The newest typed prompts, for the editor's Up/Down history (bounded).
     RecentInputs recentInputs;
+    // A typed input awaiting its user message (see the "input" case).
+    Option!string typedCandidate;
+    void flushTyped()
+    {
+        typedCandidate.ifSome((string t) { recentInputs.put(t); });
+        typedCandidate = none;
+    }
     Message[] rustStash;
     // Per `rustStash` entry: its content was dropped (`Restored.replayStashSlim`).
     bool[] stashSlim;
@@ -1893,12 +1900,33 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
             pendingId = data["id"].str;
             r.pendingInput = data["text"].str;
             inputs ~= InputKey.of(r.pendingInput);
-            if ("from_session" !in data) recentInputs.put(r.pendingInput);
+            // Held until its message shows whether a timer or background
+            // result generated it (`auto_initiated`); a peer's is never kept.
+            flushTyped();
+            if ("from_session" !in data) typedCandidate = some(r.pendingInput);
             r.hasPending = true;
             r.pending = PendingInput(pendingId, r.pendingInput,
                 lineNo < skipBefore ? skimmedLen : r.conversation.length);
             break;
         case "message":
+            {
+                // The first message after an input is its user message: an
+                // automatic one is not something the user typed. A local
+                // steer (typed during a running turn) is.
+                auto role = "role" in data;
+                immutable isUser = role !is null && role.type == JSONType.string && role.str == "user";
+                bool flag(string k) { auto v = k in data; return v !is null && v.type == JSONType.true_; }
+                if (isUser && !typedCandidate.isNone)
+                {
+                    if (!flag("auto_initiated")) flushTyped();
+                    typedCandidate = none;
+                }
+                else if (isUser && flag("steered") && "from_session" !in data)
+                {
+                    auto c = "content" in data;
+                    if (c !is null && c.type == JSONType.string) { flushTyped(); recentInputs.put(c.str); }
+                }
+            }
             if (lineNo < skipBefore)
             {
                 auto o = messageFromRecord(data);
@@ -2112,6 +2140,7 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
     });
     // Apply the deltas after the latest full snapshot, if any remain.
     if (planDeltas.length > planFrom) r.plan = planAt(planFrom);
+    flushTyped();
     r.recentInputs = recentInputs.lines;
     return r;
 }
@@ -4167,6 +4196,21 @@ unittest // a resumed session's typed prompts come back for Up/Down recall; peer
     log.input("in-2", "from a peer", "sess-other");
     log.turnEnd("in-2", "", "end_turn");
     log.input("in-3", "now add a test");
+    auto um = Message.user("now add a test");
+    log.append(um);
+    auto steer = Message.user("also the docs"); // typed while the turn ran
+    steer.steered = true;
+    log.append(steer);
+    auto peerSteer = Message.user("peer steer");
+    peerSteer.steered = true;
+    peerSteer.fromSession = "sess-other";
+    log.append(peerSteer);
+    log.turnEnd("in-3", "", "end_turn");
+    log.input("in-4", "timer fired"); // a timer's turn: not typed
+    auto am = Message.auto_("timer fired");
+    log.append(am);
+    log.turnEnd("in-4", "", "end_turn");
+    log.input("in-5", "last one");
     log.close();
-    assert(restore(log.path).recentInputs == ["fix the race", "now add a test"]);
+    assert(restore(log.path).recentInputs == ["fix the race", "now add a test", "also the docs", "last one"]);
 }
