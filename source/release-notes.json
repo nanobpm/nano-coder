@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.26.0", "date": "2026-11-24", "items": [
+      {"type":"feat","scope":"settings","title":"configure sub-agents and inter-session messages in /settings","pr":328}
+    ]},
     {"version": "1.25.4", "date": "2026-11-24", "items": [
       {"type":"perf","scope":"session","title":"stream .jsonl.gz compression and archive reopen","pr":331}
     ]},
@@ -439,9 +442,6 @@
     ]},
     {"version": "0.39.0", "date": "2026-10-07", "items": [
       {"type":"feat","scope":"commands","title":"never send /… input to the model","pr":75}
-    ]},
-    {"version": "0.38.0", "date": "2026-10-06", "items": [
-      {"type":"feat","scope":"instructions","title":"read Claude instruction files; prompt memory saving","pr":99}
     ]}
   ]
 }
