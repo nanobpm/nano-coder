@@ -117,36 +117,81 @@ package uint zlibWindow(size_t remaining) pure nothrow @nogc @safe
 ubyte[] gzipLog(const(char)[] text) { return gzipLog(text.representation); }
 
 /// ditto, for raw bytes (a log read from disk, compressed unvalidated).
-ubyte[] gzipLog(const(ubyte)[] text) @trusted
+ubyte[] gzipLog(const(ubyte)[] text)
+{
+    import std.array : appender;
+    auto o = appender!(ubyte[]);
+    o.reserve(text.length / 4 + 256);
+    bool given;
+    gzipChunks(() { if (given) return (const(ubyte)[]).init; given = true; return text; },
+        (const(ubyte)[] c) { o ~= c; });
+    return o.data;
+}
+
+/// Compress the file at `src` into the new file `dst` (created exclusively
+/// with `mode`), 64 KiB at a time (issue #313: tidy-up compresses a huge log
+/// without holding it, a doubling buffer and a copy at once). Returns the
+/// compressed size.
+private ulong gzipFile(string src, string dst, uint mode)
+{
+    import std.stdio : File;
+    import nano.safeio : writeFd, closeFd;
+    auto f = File(src, "rb");
+    scope (exit) f.close();
+    auto fd = createPrivateFd(dst, mode);
+    scope (exit) closeFd(fd);
+    auto buf = new ubyte[](64 * 1024);
+    ulong written;
+    gzipChunks(() => f.rawRead(buf), (const(ubyte)[] c) {
+        writeAllFd(fd, c, dst);
+        written += c.length;
+    });
+    return written;
+}
+
+/// Deflate (gzip wrapper) every chunk `next` returns until it returns an
+/// empty one, handing each compressed chunk to `put` (valid only during the
+/// call). Input and output stay bounded to one chunk and a 64 KiB window.
+private void gzipChunks(scope const(ubyte)[] delegate() @safe next,
+    scope void delegate(const(ubyte)[]) @safe put) @trusted
 {
     import etc.c.zlib : z_stream, deflateInit2, deflate, deflateEnd, Z_FINISH, Z_NO_FLUSH, Z_STREAM_END, Z_BUF_ERROR;
     z_stream zs;
     if (deflateInit2(&zs, 6, 8 /* Z_DEFLATED */, 15 + 16 /* gzip wrapper */, 8, 0) != 0)
         throw new Exception("deflate init failed");
     scope (exit) deflateEnd(&zs);
-    auto out_ = new ubyte[](text.length / 4 + 256);
-    // Chunked like gunzipLog: a >4 GiB log must compress whole, never as
-    // its wrapped-length prefix (tidy-up deletes the original afterwards).
-    size_t fed, used;
+    auto out_ = new ubyte[](64 * 1024);
+    const(ubyte)[] chunk = next();
+    size_t fed;
+    bool last = chunk.length == 0;
     for (;;)
     {
-        if (zs.avail_in == 0 && fed < text.length)
+        // zlib counts in 32-bit uints: feed in windows of at most uint.max,
+        // so a >4 GiB chunk compresses whole, never its wrapped prefix.
+        if (zs.avail_in == 0 && !last)
         {
-            immutable n = zlibWindow(text.length - fed);
-            zs.next_in = text.ptr + fed;
-            zs.avail_in = n;
-            fed += n;
+            if (fed == chunk.length)
+            {
+                chunk = next();
+                fed = 0;
+                last = chunk.length == 0;
+            }
+            if (!last)
+            {
+                immutable n = zlibWindow(chunk.length - fed);
+                zs.next_in = chunk.ptr + fed;
+                zs.avail_in = n;
+                fed += n;
+            }
         }
-        if (used == out_.length) out_.length = out_.length * 2;
-        immutable window = zlibWindow(out_.length - used);
-        zs.next_out = out_.ptr + used;
-        zs.avail_out = window;
-        auto rc = deflate(&zs, fed < text.length ? Z_NO_FLUSH : Z_FINISH);
-        used += window - zs.avail_out;
+        zs.next_out = out_.ptr;
+        zs.avail_out = zlibWindow(out_.length);
+        auto rc = deflate(&zs, last ? Z_FINISH : Z_NO_FLUSH);
+        // No pointer into the caller's chunk outlives this iteration's use.
+        if (immutable got = out_.length - zs.avail_out) put(out_[0 .. got]);
         if (rc == Z_STREAM_END) break;
         if (rc != 0 && rc != Z_BUF_ERROR) throw new Exception("deflate failed compressing a session log");
     }
-    return out_[0 .. used].dup;
 }
 
 /// Feed every committed (newline-terminated) line of the log at `path` to
@@ -668,7 +713,7 @@ class SessionLog
             }
             auto tmp = format("%s.tmp-%s", plain, thisProcessID);
             scope (failure) if (tmp.exists) remove(tmp);
-            writePrivate(tmp, logText(path).representation, modeOf(path));
+            gunzipFile(path, tmp, modeOf(path)); // streamed: never the whole log in RAM (#313)
             publishOver(tmp, plain); // fsync the copy, link, sync the entry, unlink
             remove(path);
             archive.close();
@@ -2602,17 +2647,56 @@ private uint modeOf(string path)
 /// (never wider than owner-only, whatever the umask), failing if it exists.
 private void writePrivate(string path, const(ubyte)[] data, uint mode)
 {
+    import nano.safeio : closeFd;
+    auto fd = createPrivateFd(path, mode);
+    scope (exit) closeFd(fd);
+    writeAllFd(fd, data, path);
+}
+
+/// A new file at `path` created exclusively, write-only, owner-only `mode`;
+/// the caller closes the descriptor.
+private int createPrivateFd(string path, uint mode)
+{
     import core.sys.posix.fcntl : O_WRONLY, O_CREAT, O_EXCL;
-    import nano.safeio : openPath, fchmodFd, writeFd, closeFd;
+    import nano.safeio : openPath, fchmodFd, closeFd;
     auto fd = openPath(path, O_WRONLY | O_CREAT | O_EXCL, mode & octal!600);
     if (fd < 0) throw new Exception("cannot create " ~ path);
-    scope (exit) closeFd(fd);
+    scope (failure) closeFd(fd);
     fchmodFd(fd, mode & octal!600);
+    return fd;
+}
+
+/// Write all of `data` to `fd` (named `path` in errors).
+private void writeAllFd(int fd, const(ubyte)[] data, string path)
+{
+    import nano.safeio : writeFd;
     while (data.length)
     {
         auto n = writeFd(fd, data);
         if (n <= 0) throw new Exception("cannot write " ~ path);
         data = data[n .. $];
+    }
+}
+
+/// Inflate the compressed log at `src` into the new file `dst` (created
+/// exclusively with `mode`) through `GunzipStream`, 64 KiB at a time (issue
+/// #313: reopening an archive never holds the whole log in RAM).
+private void gunzipFile(string src, string dst, uint mode)
+{
+    import std.stdio : File;
+    import nano.safeio : closeFd;
+    auto f = File(src, "rb");
+    scope (exit) f.close();
+    auto gz = GunzipStream(src);
+    scope (exit) gz.close();
+    auto fd = createPrivateFd(dst, mode);
+    scope (exit) closeFd(fd);
+    auto buf = new ubyte[](64 * 1024);
+    for (;;)
+    {
+        auto got = gz.read(f, buf);
+        if (!got.length) break;
+        writeAllFd(fd, got, dst);
     }
 }
 
@@ -2745,12 +2829,15 @@ private void tidyDir(string dir, SysTime now, long compressAfterDays, long reten
                 import std.file : setTimes;
                 auto gz = e.name ~ ".gz";
                 auto before = getSize(e.name);
-                auto packed = gzipLog(readBytes(e.name));
-                // Gzip can grow a short log: keep the original then.
-                if (packed.length >= before) continue;
                 auto tmp = format("%s.tmp-%s", gz, thisProcessID);
                 scope (failure) if (tmp.exists) remove(tmp);
-                writePrivate(tmp, packed, modeOf(e.name));
+                // Streamed (issue #313): the log is never held whole.
+                // Gzip can grow a short log: keep the original then.
+                if (gzipFile(e.name, tmp, modeOf(e.name)) >= before)
+                {
+                    remove(tmp);
+                    continue;
+                }
                 // Keep the last activity time: retention and the picker
                 // measure age from it, not from compression.
                 auto mtime = timeLastModified(e.name);
@@ -4373,4 +4460,45 @@ unittest // compacted_log_recall_matches_full_decode: the skim keeps steers, dro
     auto skimmed = restoreLog(path, true), fullR = restoreLog(path, false);
     assert(fullR.recentInputs == ["typed \"one\"", "a steer \u00e9", "go \U0001F680"]);
     assert(skimmed.recentInputs == fullR.recentInputs);
+}
+
+// Issue #313: compressing a log in tidy-up, reopening an archive and
+// streaming its lines keep GC allocation bounded, not proportional to the
+// log's uncompressed size.
+unittest
+{
+    import core.memory : GC;
+    import std.array : appender;
+    import std.conv : to;
+    import std.file : tempDir, remove, exists, getSize;
+    import nano.clock : monoNow;
+    auto base = buildPath(tempDir, "nano-gz-bound-" ~ to!string(monoNow.ticks));
+    auto plain = base ~ ".jsonl", gz = base ~ ".jsonl.gz", back = base ~ ".back";
+    scope (exit) foreach (p; [plain, gz, back]) if (p.exists) remove(p);
+    {
+        auto o = appender!string;
+        foreach (i; 0 .. 120_000)
+            o ~= `{"type":"text","data":{"text":"line ` ~ to!string(i) ~ ` of a long session log"}}` ~ "\n";
+        std.file.write(plain, o.data);
+    }
+    immutable size = getSize(plain);
+    assert(size > 6 << 20, "the log is large enough to show a leak");
+    enum bound = 2 << 20;
+    GC.collect();
+    auto before = GC.stats.allocatedInCurrentThread;
+    gzipFile(plain, gz, octal!600);
+    immutable zipped = GC.stats.allocatedInCurrentThread - before;
+    assert(zipped < bound, "gzipFile allocated " ~ to!string(zipped));
+    before = GC.stats.allocatedInCurrentThread;
+    gunzipFile(gz, back, octal!600);
+    immutable unzipped = GC.stats.allocatedInCurrentThread - before;
+    assert(unzipped < bound, "gunzipFile allocated " ~ to!string(unzipped));
+    assert(getSize(back) == size, "the round trip keeps every byte");
+    before = GC.stats.allocatedInCurrentThread;
+    ulong lines;
+    eachLogLineUntil(gz, (const(char)[] l, ulong n) { lines = n; return true; });
+    immutable streamed = GC.stats.allocatedInCurrentThread - before;
+    assert(lines == 120_000);
+    assert(streamed < bound, "eachLogLineUntil allocated " ~ to!string(streamed));
+    assert(gzipLog(readBytes(back)) .length > 0 && logText(gz).length == size, "gzipLog still compresses whole text");
 }
