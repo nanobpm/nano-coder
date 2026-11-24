@@ -130,10 +130,10 @@ struct Rule
 }
 
 /// The Landlock rules for `roots` (writable) and `reads` (readable), given
-/// the handled `fs` rights; files get only file rights. Pure so the rule set
-/// is unit-tested without a Landlock kernel.
+/// the handled `fs` rights; files get only file rights. The directory test is
+/// injected so the rule set is unit-tested without a Landlock kernel.
 Rule[] ruleSet(ulong fs, const string[] roots, bool confineReads, const string[] reads,
-    scope bool delegate(string) @safe isDirectory) pure
+    scope bool delegate(string) @safe isDirectory)
 {
     // Device-node creation is handled but granted nowhere, so mknod fails
     // closed everywhere (a node in the workspace could reach a raw device).

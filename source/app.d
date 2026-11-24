@@ -3369,6 +3369,13 @@ int runMain(string[] args)
     }
     immutable sandboxSummary = format("%s (%s)", sandboxMode.mode.modeName, sandboxMode.source.sourceName);
     if (o.acp) stdErr.writeln("nano-coder: sandbox ", sandboxSummary);
+    // The selected config (any of --config, NANO_CODER_CONFIG, XDG_CONFIG_HOME)
+    // and the saved Copilot token hold credentials wherever they live, so
+    // commands and file tools may not read them (#333).
+    {
+        import std.path : absolutePath;
+        cfg.sandbox.denyRead ~= [absolutePath(cfgPath), absolutePath(imported!"nano.copilot".credentialsPath())];
+    }
     if (headless && cfg.sandbox.active)
         if (auto why = applyFailure(cfg.sandbox, getcwd()))
             die(format("the %s sandbox (%s) can't be applied: %s. To run unsandboxed, opt out explicitly with "

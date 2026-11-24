@@ -503,7 +503,8 @@ struct SandboxConfig
             if (auto e = check(network)) throw new Exception(e);
             auto plan = readPlan(cwd);
             auto reads = plan.confine == ReadConfine.off ? null
-                : landlockReadRoots(plan, (string d) => listDir(d), (string d) => isDir(d), writableRoots(cwd));
+                : landlockReadRoots(plan, (string d) => listDir(d), (string d) => isDir(d), writableRoots(cwd),
+                    (string d) => canonicalize(d));
             return argv(network, writableRoots(cwd), plan.confine != ReadConfine.off, reads, shell, script);
         }
         else
@@ -521,16 +522,16 @@ struct SandboxConfig
         auto p = "(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*" ~ allowed ~ ")\n";
         if (!network)
             p ~= "(deny network-outbound (remote ip))\n(allow network-outbound (remote ip \"localhost:*\"))\n";
-        return p ~ seatbeltReadRules(plan, homeDir());
+        return p ~ seatbeltReadRules(plan);
     }
 }
 
 /// The Seatbelt rules confining reads to `plan` (appended after the write
-/// rules; later rules win). `workspace` mode denies reads under `$HOME`,
-/// `/Users` and `/Volumes`, re-allows the readable roots there (and metadata
+/// rules; later rules win). `workspace` mode denies every read, re-allows
+/// `/` itself and the readable roots (and metadata
 /// of their ancestors, for `getcwd`/`realpath`); every mode then denies the
 /// secret paths. `subpath` covers a path itself, so files work too.
-string seatbeltReadRules(const ReadPlan plan, string home) pure
+string seatbeltReadRules(const ReadPlan plan) pure
 {
     import std.array : appender;
     auto o = appender!string;
@@ -539,12 +540,10 @@ string seatbeltReadRules(const ReadPlan plan, string home) pure
         case ReadConfine.off: return null;
         case ReadConfine.secrets: break;
         case ReadConfine.workspace:
-            string[] hidden = ["/Users", "/Volumes"];
-            if (home.length && home != "/" && !hidden.any!(h => within(home, h))) hidden ~= home;
-            o ~= "(deny file-read*";
-            foreach (h; hidden) o ~= " (subpath " ~ quote(h) ~ ")";
-            o ~= ")
-";
+            // Deny every read, then re-allow the planned roots: the profile
+            // starts from (allow default), so a narrower deny would leave other
+            // roots (e.g. a mount at /mnt) readable outside the allow-list.
+            o ~= "(deny file-read* (subpath \"/\"))\n(allow file-read* (literal \"/\"))\n";
             string[] ancestors;
             foreach (r; plan.readable)
                 for (auto a = parentOf(r); a !is null && a != "/"; a = parentOf(a))
@@ -583,11 +582,16 @@ string seatbeltReadRules(const ReadPlan plan, string home) pure
 /// writable `roots` (which get no read rights of their own, so a write root
 /// containing a denied path, e.g. cwd = $HOME, is split the same way).
 string[] landlockReadRoots(const ReadPlan plan, scope string[] delegate(string) @safe list,
-    scope bool delegate(string) @safe isDirectory, const string[] roots = null)
+    scope bool delegate(string) @safe isDirectory, const string[] roots = null,
+    scope string delegate(string) @safe resolve = null)
 {
     string[] result;
     void grant(string root, size_t depth)
     {
+        // The helper opens each rule's path following symlinks, so judge (and
+        // grant) the resolved target: `alias -> private` must not grant `private`.
+        if (resolve !is null)
+            if (auto real_ = resolve(root)) root = real_;
         if (plan.denied.any!(d => within(root, d))) return;
         if (!plan.denied.any!(d => within(d, root) && d != root))
         {
@@ -1064,24 +1068,23 @@ unittest
 unittest
 {
     ReadPlan secrets = { confine: ReadConfine.secrets, denied: ["/h/.ssh", "/h/.netrc"] };
-    assert(seatbeltReadRules(secrets, "/h") == "(deny file-read* (subpath \"/h/.ssh\") (subpath \"/h/.netrc\"))\n");
-    assert(seatbeltReadRules(ReadPlan.init, "/h") is null);
+    assert(seatbeltReadRules(secrets) == "(deny file-read* (subpath \"/h/.ssh\") (subpath \"/h/.netrc\"))\n");
+    assert(seatbeltReadRules(ReadPlan.init) is null);
     ReadPlan ws = { confine: ReadConfine.workspace, denied: ["/Users/u/.ssh"], readable: ["/usr", "/Users/u/src/p"] };
-    auto r = seatbeltReadRules(ws, "/Users/u");
-    assert(r == "(deny file-read* (subpath \"/Users\") (subpath \"/Volumes\"))\n"
+    auto r = seatbeltReadRules(ws);
+    // Every read is denied, not only under /Users: a mount elsewhere (/mnt)
+    // stays unreadable unless planned. The secret denial comes last so it wins.
+    assert(r == "(deny file-read* (subpath \"/\"))\n(allow file-read* (literal \"/\"))\n"
         ~ "(allow file-read-metadata (literal \"/Users/u/src\") (literal \"/Users/u\") (literal \"/Users\"))\n"
         ~ "(allow file-read* (subpath \"/usr\") (subpath \"/Users/u/src/p\"))\n"
         ~ "(deny file-read* (subpath \"/Users/u/.ssh\"))\n", r);
-    // A home outside /Users is hidden too; the secret denial comes last so it wins.
-    auto linux = seatbeltReadRules(ws, "/home/u");
-    assert(linux.canFind(`(subpath "/home/u")`) && linux.endsWith("(deny file-read* (subpath \"/Users/u/.ssh\"))\n"));
     // The full profile appends the read rules after the write rules.
     SandboxConfig c = { mode: SandboxMode.workspace };
     auto p = c.profile(["/w"], secrets);
     assert(p.canFind("(allow file-write* (literal \"/w\"))\n(deny file-read*"), p);
     // Paths are quoted.
     ReadPlan q = { confine: ReadConfine.secrets, denied: [`/h/a "b"`] };
-    assert(seatbeltReadRules(q, "/h").canFind(`(subpath "/h/a \"b\"")`));
+    assert(seatbeltReadRules(q).canFind(`(subpath "/h/a \"b\"")`));
 }
 
 // issue #333: Landlock read roots leave denied paths (and their ancestors) out
@@ -1114,6 +1117,21 @@ unittest
         foreach (d; w2.denied) assert(!within(d, r) && !within(r, d), r ~ " exposes " ~ d);
     ReadPlan s2 = { confine: ReadConfine.secrets, denied: ["/home/u/.ssh"] };
     foreach (r; landlockReadRoots(s2, &list, &dir, ["/home/u"])) assert(!within("/home/u/.ssh", r), r);
+    // A symlink to a denied path (or to a directory holding one) is judged by
+    // its target: `alias -> .ssh` is not granted, `cfg -> .config` is split.
+    string res(string p)
+    {
+        if (p == "/home/u/src/alias") return "/home/u/.ssh";
+        if (p == "/home/u/src/cfg") return "/home/u/.config";
+        return p;
+    }
+    tree["/home/u/src"] = ["alias", "cfg", "main.d"];
+    ReadPlan w3 = { confine: ReadConfine.workspace, denied: ["/home/u/.ssh", "/home/u/.config/gh"],
+        readable: ["/home/u/src/alias", "/home/u/src/cfg", "/home/u/src/main.d"] };
+    auto sr = landlockReadRoots(w3, &list, &dir, null, &res);
+    assert(sr == ["/home/u/.config/git", "/home/u/src/main.d"], sr.join(" "));
+    ReadPlan s3 = { confine: ReadConfine.secrets, denied: ["/home/u/.ssh"] };
+    foreach (r; landlockReadRoots(s3, &list, &dir, null, &res)) assert(!within(r, "/home/u/.ssh"), r);
 }
 
 // issue #333: sandboxed commands can't read denied paths; normal work still runs

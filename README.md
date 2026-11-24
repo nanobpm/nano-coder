@@ -428,7 +428,9 @@ model where it may write and what it may not read.
   `~/.docker/config.json`, `~/.kube`, `~/.password-store`, `~/.pypirc`, cargo credentials,
   keyrings and `~/Library/Keychains`, browser profiles and cookies, shell/REPL history,
   nano-coder's own config directory (`~/.config/nano-coder`: API keys and
-  `api_key_command`), and `/etc/shadow`-style system files — plus every `deny_read` path.
+  `api_key_command`) and the config file actually in use (also when `--config`,
+  `NANO_CODER_CONFIG` or `XDG_CONFIG_HOME` picks another), the saved GitHub Copilot token,
+  and `/etc/shadow`-style system files — plus every `deny_read` path.
 - `workspace`: only the workspace (and its git dirs), system and toolchain directories
   (`/usr`, `/etc`, `/opt`, `~/.cargo`, `~/.rustup`, mise/nvm/volta/dub installs,
   `~/.gitconfig`, ...), package caches, temp dirs, `writable` and `readable` paths; the
@@ -438,7 +440,9 @@ model where it may write and what it may not read.
 `cat ~/.ssh/id_ed25519` or `ls ~/.config/gh` then fail with a permission error, and the
 file tools refuse those paths with "outside what the … sandbox may read" (`grep`/`glob`
 walks skip them). Builds, `git` (including worktrees) and `gh` with `GH_TOKEN` in the
-environment keep working. On macOS the Seatbelt profile denies the paths. Landlock on
+environment keep working. On macOS the Seatbelt profile denies the paths (in `workspace`
+mode it denies every read and re-allows only the planned roots). A symlink is judged by
+its target, so a link to a denied path is denied too. Landlock on
 Linux can only allow, so `deny_read` is implemented by leaving the denied paths out of
 the read rules: the readable set is split around them, which also means a directory that
 *contains* a denied path (e.g. `$HOME` itself) can't be listed, though its other entries
