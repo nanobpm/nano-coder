@@ -2696,7 +2696,12 @@ class Agent
             const swStart = monoNow;
             // Count retried stream attempts too, on success and on failure
             // (issue #340), as the leaf summary request does.
-            auto r = chatCounted(req, (bool, string) {}, ev);
+            LLMResponse r;
+            // An aborted attempt counts its reported usage, or one uncounted
+            // request, before the fallback, as the leaf summary's does.
+            try r = chatCounted(req, (bool, string) {}, ev);
+            catch (Cancelled e) { countAborted(e.usage, ev); throw e; }
+            catch (StreamInterrupted e) { countAborted(e.usage, ev); throw e; }
             ms = since(swStart).total!"msecs";
             countRetried(r.retried, ev);
             recordUsage(r.usage);

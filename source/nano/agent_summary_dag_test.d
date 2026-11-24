@@ -361,3 +361,57 @@ unittest
         assert(agent.uncountedRequests == 3 * condensations, agent.uncountedRequests.to!string);
     }
 }
+
+// An aborted condensation attempt (a cancel exception or a dropped stream)
+// counts its reported usage, or one uncounted request when it reported none,
+// on top of its retried attempts (issue #340).
+unittest
+{
+    import nano.control : Cancelled;
+    import nano.http : StreamInterrupted;
+    foreach (kind; 0 .. 4)
+    {
+        immutable withUsage = kind >= 2;
+        LLMResponse[] replies;
+        foreach (i; 0 .. 8)
+        {
+            replies ~= LLMResponse("answer " ~ i.to!string);
+            replies ~= LLMResponse("SUMMARY " ~ i.to!string ~ ": work done in this span with many words");
+            replies ~= LLMResponse("CONDENSED " ~ i.to!string);
+        }
+        size_t condensations;
+        auto mock = new class MockClient
+        {
+            this() { super(replies); }
+            override LLMResponse chat(const ref ChatRequest req, StreamSink sink)
+            {
+                auto r = super.chat(req, sink);
+                if (req.messages[0].content != dag.condenseSystemPrompt) return r;
+                ++condensations;
+                immutable u = withUsage ? TokenUsage(7, 0) : TokenUsage(0, 0);
+                if (kind % 2 == 0)
+                {
+                    auto e = new Cancelled;
+                    e.usage = u;
+                    e.retried = RetrySpend(TokenUsage(0, 0), 2);
+                    throw e;
+                }
+                auto e = new StreamInterrupted("condense: stream dropped");
+                e.usage = u;
+                e.retried = RetrySpend(TokenUsage(0, 0), 2);
+                throw e;
+            }
+        };
+        auto agent = logged("condense-aborted-" ~ kind.to!string, mock);
+        agent.summaryDagBudgetBytes = 100;
+        foreach (i; 0 .. 5)
+        {
+            agent.run("step " ~ i.to!string, new NullEvents);
+            assert(compactAs(agent, ctx.CompactionMode.smart));
+        }
+        assert(condensations >= 1, "a condensation call was made");
+        immutable perCall = withUsage ? 2 : 3;
+        assert(agent.uncountedRequests == perCall * condensations, agent.uncountedRequests.to!string);
+        if (withUsage) assert(agent.sessionInputTokens >= 7 * condensations, agent.sessionInputTokens.to!string);
+    }
+}
