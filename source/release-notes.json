@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.31.2", "date": "2026-11-24", "items": [
+      {"type":"fix","scope":"plan","title":"stop restating a finished plan; bound plan notes and pending timers","pr":353}
+    ]},
     {"version": "1.31.1", "date": "2026-11-24", "items": [
       {"type":"fix","scope":"ui","title":"don't print the plan after the replay on resume and relaunch","pr":356}
     ]},
@@ -439,9 +442,6 @@
     ]},
     {"version": "0.47.1", "date": "2026-10-21", "items": [
       {"type":"fix","scope":"permissions","title":"allow provably read-only shell loop bodies","pr":125}
-    ]},
-    {"version": "0.47.0", "date": "2026-10-20", "items": [
-      {"type":"feat","scope":"tools","title":"add structured read-only grep and glob tools, retire echo","pr":124}
     ]}
   ]
 }
