@@ -1228,11 +1228,17 @@ logs, so when several nano-coder sessions run on one machine context moves betwe
 without copy-paste. A third tool joins the history tools, and `history_search`/`history_read`
 take an optional `session` argument:
 
-- `sessions_list(filter?)` - this machine's sessions, newest first: id, title or first
-  request, working directory, last activity, and `[live]` when a process currently has the
-  session open (probed with the session log's own lock). `filter` keeps sessions whose id,
-  title or directory contains it (case-insensitive), and the listing is capped in bytes like
-  any tool output.
+- `sessions_list(filter?, live?, messages?, limit?)` - this machine's sessions, live ones
+  first, then newest first: id, title or first request, working directory, last activity,
+  and `[live pid N]` when a process currently has the session open (probed with the session
+  log's own lock; the pid, and `[now in DIR]` when that process has since changed
+  directory, come from `/proc` on Linux). `filter` keeps sessions whose id, title or
+  directory contains it (case-insensitive); `live: true` keeps open sessions and
+  `messages: true` those `session_send` can reach. `limit` (default 50, max 500) caps the
+  lines and the result says how many more matched. Titles are capped at 120 bytes, and a
+  worker (ACP job) session whose first input is a job payload is titled
+  `jobType · pik processInstanceKey`, e.g. `senior:pr-review · pik 289676`. The listing is
+  also capped in bytes like any tool output.
 - `session` - a handle, an id, a unique id prefix, or a title from `sessions_list` (see
   [Session handles](#session-handles) for the order). An ambiguous match
   is an error listing the candidates; without the argument the tools read the current

@@ -79,11 +79,12 @@ ToolDefinition[] definitions(bool crossSession = true) pure
 ToolDefinition sessionsDefinition() pure
 {
     return ToolDefinition(sessionsTool,
-        "List this machine's nano-coder sessions, newest first: id, title or first request, working directory, "
-        ~ "last activity, and whether a process currently has the session open ([live]). Pass an id, a unique id "
+        "List this machine's nano-coder sessions, live ones first, then newest first: id, short title, working directory, "
+        ~ "last activity, whether a process currently has the session open ([live pid N], with its current directory "
+        ~ "when it moved) and whether session_send can reach it ([messages]). At most `limit` (default 50) are shown. Pass an id, a unique id "
         ~ "prefix or a title as the `session` argument of history_search/history_read to read that session's "
         ~ "history. Reading a session from another working directory may be blocked by the permission policy.",
-        parseJSON(`{"type":"object","properties":{"filter":{"type":"string","description":"Only sessions whose id, handle, title or working directory contains this (case-insensitive)"}}}`));
+        parseJSON(`{"type":"object","properties":{"filter":{"type":"string","description":"Only sessions whose id, handle, title or working directory contains this (case-insensitive)"},"live":{"type":"boolean","description":"Only sessions a process currently has open"},"messages":{"type":"boolean","description":"Only sessions session_send can reach"},"limit":{"type":"integer","description":"Maximum sessions listed (default 50, max 500); the result says how many more matched"}}}`));
 }
 
 struct Entry
