@@ -136,11 +136,7 @@ bool[] statementRows(const string[] lines) pure
         res[i] = true;
         auto l = lines[i];
         if (lineKey(l) is null) { i++; continue; }
-        auto t = l.stripLeft;
-        size_t col = l.length - t.length;
-        if (t[0] == '"' || t[0] == '\'')
-            col += 1 + t[1 .. $].indexOf(t[0]) + 1;
-        col += l[col .. $].indexOf('=') + 1;
+        size_t col = afterEq(l);
         while (col < l.length && (l[col] == ' ' || l[col] == '\t')) col++;
         if (col >= l.length) { i++; continue; }
         size_t endRow;
@@ -150,24 +146,61 @@ bool[] statementRows(const string[] lines) pure
     return res;
 }
 
+/// The column of the `=` ending a `key = value` line's key, or -1 when the
+/// line isn't one. Walks the dotted key segment by segment, so quoted segments
+/// (`"a".b`, `a."x=y"`) neither hide the line nor fake its `=`.
+private ptrdiff_t keyEq(string line, out string first, out bool dotted) pure
+{
+    size_t i;
+    static size_t ws(string l, size_t i) { while (i < l.length && (l[i] == ' ' || l[i] == '\t')) i++; return i; }
+    i = ws(line, 0);
+    if (i >= line.length || line[i] == '#' || line[i] == '[') return -1;
+    for (size_t seg = 0;; seg++)
+    {
+        string k;
+        if (line[i] == '"' || line[i] == '\'')
+        {
+            auto q = line[i];
+            auto j = i + 1;
+            for (; j < line.length && line[j] != q; j++) if (q == '"' && line[j] == '\\') j++;
+            if (j >= line.length) return -1;
+            k = line[i + 1 .. j];
+            i = j + 1;
+        }
+        else
+        {
+            auto j = i;
+            while (j < line.length && line[j] != ' ' && line[j] != '\t' && line[j] != '=' && line[j] != '.') j++;
+            if (j == i) return -1;
+            k = line[i .. j];
+            i = j;
+        }
+        if (seg == 0) first = k;
+        i = ws(line, i);
+        if (i >= line.length) return -1;
+        if (line[i] == '=') { dotted = seg > 0; return i; }
+        if (line[i] != '.') return -1;
+        i = ws(line, i + 1);
+        if (i >= line.length) return -1;
+    }
+}
+
 /// The key a `key = value` line sets (unquoted), or null.
+/// A dotted key reads as "\0" ~ its first segment.
 private string lineKey(string line) pure
 {
-    auto t = line.stripLeft;
-    if (!t.length || t[0] == '#' || t[0] == '[') return null;
-    if (t[0] == '"' || t[0] == '\'')
-    {
-        auto q = t[0];
-        auto end = t[1 .. $].indexOf(q);
-        if (end < 0) return null;
-        auto rest = t[end + 2 .. $].stripLeft;
-        return rest.startsWith("=") ? t[1 .. end + 1] : null;
-    }
-    auto eq = t.indexOf('=');
-    if (eq <= 0) return null;
-    auto k = t[0 .. eq].strip;
-    // A dotted key reads as "\0" ~ its first segment.
-    return k.indexOf('.') >= 0 ? "\0" ~ k[0 .. k.indexOf('.')].strip : k;
+    string first;
+    bool dotted;
+    if (keyEq(line, first, dotted) < 0) return null;
+    return dotted ? "\0" ~ first : first;
+}
+
+/// The column just past a key line's `=` (0 when the line isn't one).
+private size_t afterEq(string line) pure
+{
+    string f;
+    bool d;
+    return keyEq(line, f, d) + 1;
 }
 
 /// Where a value starting at `v` ends (exclusive), counting multi-line
@@ -275,7 +308,7 @@ Result!(string, string) tomlSet(string doc, const string[] path, string key, str
                 if (k is null) continue;
                 auto h = tableAt(lines, stmt, i);
                 if (!(h.length < path.length && equal(h, path[0 .. h.length]) && k == path[h.length])) continue;
-                auto col = l.indexOf('=') + 1;
+                auto col = afterEq(l);
                 while (col < l.length && l[col] == ' ') col++;
                 if (col >= l.length || l[col] != '{') continue;
                 bool found;
@@ -312,8 +345,7 @@ Result!(string, string) tomlSet(string doc, const string[] path, string key, str
         if (k == "\0" ~ key)
             return R.err(format("%s is written as a dotted key; edit it by hand", key));
         if (k != key) continue;
-        auto eq = lines[i].indexOf('=');
-        auto col = eq + 1;
+        auto col = afterEq(lines[i]);
         while (col < lines[i].length && lines[i][col] == ' ') col++;
         size_t endRow;
         auto stop = valueEnd(lines, i, col, endRow);
@@ -332,7 +364,7 @@ Result!(string, string) tomlSet(string doc, const string[] path, string key, str
     // Insert after the table's last key line (before trailing blanks/comments).
     size_t at = start;
     foreach (i; toSize(start) .. end)
-        if (stmt[i] && lineKey(lines[i]) !is null) { size_t er; valueEnd(lines, i, lines[i].indexOf('=') + 1, er); at = er + 1; }
+        if (stmt[i] && lineKey(lines[i]) !is null) { size_t er; valueEnd(lines, i, afterEq(lines[i]), er); at = er + 1; }
     auto res = lines[0 .. at] ~ [tomlKey(key) ~ " = " ~ value] ~ lines[at .. $];
     return R.ok(res.join("\n") ~ "\n");
 }
@@ -458,6 +490,18 @@ unittest
     assert(tomlSet("a.b = 1\n", ["c"], "k", "1").unwrap("editable") == "a.b = 1\n\n[c]\nk = 1\n");
     assert(tomlSet("[providers]\nx = { kind = \"openai\" }\n", ["providers", "x"], "kind", `"a"`).isErr);
     assert(tomlSet("[providers]\n", ["providers", "x"], "kind", `"a"`).unwrap("editable") == "[providers]\n\n[providers.x]\nkind = \"a\"\n");
+}
+
+// A multi-line value under a quoted dotted key is one statement: its
+// header-looking lines are text, and `=` inside a quoted segment isn't the key's.
+unittest
+{
+    assert(statementRows([`"x".y = '''`, "[providers.p]", "'''", "z = 1"]) == [true, false, false, true]);
+    assert(statementRows([`a."k=v" = """`, "[t]", `"""`]) == [true, false, false]);
+    assert(lineKey(`"a b".c = 1`) == "\0a b" && lineKey(`"q" = 1`) == "q" && lineKey(`a."x=y" = 1`) == "\0a");
+    assert(lineKey(`"open = 1`) is null && lineKey("a. = 1") is null);
+    auto doc = "\"x\".y = '''\n[providers.p]\n'''\nmodel = \"a\"\n";
+    assert(tomlSet(doc, [], "model", `"b"`).unwrap("valid") == "\"x\".y = '''\n[providers.p]\n'''\nmodel = \"b\"\n");
 }
 
 // A root-key removal leaves a key-looking line inside a multi-line string alone.
