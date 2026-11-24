@@ -1079,6 +1079,8 @@ final class AcpServer : AgentEvents
     private void startPeerListener()
     {
         stopPeerListener();
+        // Follow a log recovery to its new id (issue #338), as the CLI does.
+        agent.log.ifSome((SessionLog l) { l.onIdChangeListener = &peerIdChanged; });
         if (!agent.messagesOn || host.sessionDir is null || agent.log.isNone) return;
         auto dir = peers.peersDir();
         string dirFailed;
@@ -1105,6 +1107,15 @@ final class AcpServer : AgentEvents
         }
         auto halt = Shared!bool.make(false);
         peerPump = [PeerPump(halt, spawnDaemon(&pumpPeers, peerRouter, peerQueue, router, halt))];
+    }
+
+    /// A recovery moved the log to `newId` (issue #338): move the socket
+    /// with it, keeping the router and pump. Throws the reason on failure
+    /// (the log reports what its hook throws).
+    private void peerIdChanged(string oldId, string newId)
+    {
+        if (auto failed = peers.moveListener(peerListener, peers.peersDir(), newId, peerRouter.requests))
+            throw new Exception("messages: " ~ failed);
     }
 
     private void stopPeerListener()
