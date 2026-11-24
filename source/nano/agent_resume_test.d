@@ -496,7 +496,7 @@ unittest
     assert(agent.compact(report));
     auto summary = agent.messages[1].content;
     assert(summary.canFind("SUMMARY: looked for the bug") && summary.canFind("Goal: Fix the bug"), summary);
-    assert(summary.canFind("- it is in parser.rs:40") && summary.canFind("Next: 2. Fix it"), summary);
+    assert(!summary.canFind("- it is in parser.rs:40") && summary.canFind("(1 note)") && summary.canFind("Next: 2. Fix it"), summary);
 
     auto resumed = new Agent(new MockClient([]), echoTools, Policy.init, "sys");
     resumed.control.mode = AgentMode.plan;
@@ -529,6 +529,31 @@ unittest
     auto resumed = new Agent(new MockClient([]), echoTools, Policy.init, "sys");
     resumed.loadRestored(r, some(new SessionLog(log.path)));
     assert(resumed.plan == agent.plan, "the delta chain rebuilds the plan");
+}
+
+// plan_add on a finished plan starts a new one (issue #346): the old plan is
+// archived in the log and a resume restores the new plan, not a mix.
+unittest
+{
+    import std.algorithm : canFind, count;
+    auto dir = freshDir("plan-restart");
+    auto mock = new MockClient([
+        LLMResponse("", "", [ToolCall.fromRaw("p1", "plan_add", `{"goal":"Old","items":["One","Two"]}`)]),
+        LLMResponse("", "", [ToolCall.fromRaw("p2", "plan_update", `{"updates":[{"id":1,"status":"done"},{"id":2,"status":"done"}]}`)]),
+        LLMResponse("", "", [ToolCall.fromRaw("p3", "plan_add", `{"goal":"New","items":["Three"]}`)]),
+        LLMResponse("done")]);
+    auto agent = new Agent(mock, echoTools, Policy.init, "sys");
+    auto log = new SessionLog(dir, "mock/m", "/w");
+    log.append(agent.messages[0]);
+    agent.log = some(log);
+    agent.run("go", new NullEvents);
+    assert(agent.plan.goal == "New" && agent.plan.items.length == 1 && agent.plan.items[0].id == 1);
+    auto text = readText(log.path);
+    assert(text.count(`{"type":"plan_archive"`) == 1 && text.canFind(`"Old"`), text);
+    auto r = restore(log.path);
+    auto resumed = new Agent(new MockClient([]), echoTools, Policy.init, "sys");
+    resumed.loadRestored(r, some(new SessionLog(log.path)));
+    assert(resumed.plan == agent.plan);
 }
 
 // A restart or a load drops the session's thinking override and its totals.

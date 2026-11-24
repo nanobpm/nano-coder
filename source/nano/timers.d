@@ -27,6 +27,9 @@ enum long minDelaySecs = 60;
 /// Longest delay: a session-scoped reminder, not a scheduler.
 enum long maxDelaySecs = 24 * 3600;
 enum maxNoteChars = 1_000;
+/// Most fired-not-done timers kept: beyond it the oldest is auto-closed
+/// (issue #346), so a session that never calls `timer_done` stays bounded.
+enum maxPending = 10;
 
 immutable string[] toolNames = ["timer_set", "timer_list", "timer_cancel", "timer_done"];
 /// Steps between reminders about a fired timer the agent hasn't marked done.
@@ -72,11 +75,24 @@ struct Timers
     /// Remove and return the timers due at `now`.
     Timer[] takeDue(long now) pure
     {
+        Timer[] closed;
+        return takeDue(now, closed);
+    }
+
+    /// As `takeDue`; `closed` gets the oldest pending timers auto-closed to
+    /// keep at most `maxPending` waiting for `timer_done`.
+    Timer[] takeDue(long now, out Timer[] closed) pure
+    {
         size_t n;
         while (n < items.length && items[n].dueAt <= now) n++;
         auto due = items[0 .. n].dup;
         items = items[n .. $].dup;
         pending ~= due;
+        if (pending.length > maxPending)
+        {
+            closed = pending[0 .. pending.length - maxPending].dup;
+            pending = pending[pending.length - maxPending .. $].dup;
+        }
         return due;
     }
 
@@ -478,4 +494,17 @@ unittest
     assert(!shown.canFind("[2J") && !shown.canFind("]0;title"), shown);
     auto raw = t.list(now + 600);
     assert(raw.canFind("evil\x1b[2J") && raw.canFind("done?\x1b]0;title\x07"), "the model's listing keeps the note");
+}
+
+unittest // fired-not-done timers are capped; the oldest are auto-closed
+{
+    Timers t;
+    foreach (i; 0 .. maxPending + 3) t.items ~= Timer(i + 1, 0, 100 + i, "n");
+    t.lastId = maxPending + 3;
+    Timer[] closed;
+    auto due = t.takeDue(1000, closed);
+    assert(due.length == maxPending + 3);
+    assert(t.pending.length == maxPending);
+    assert(closed.map!(x => x.id).array == [1u, 2, 3]);
+    assert(t.pending[0].id == 4);
 }
