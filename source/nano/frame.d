@@ -2973,9 +2973,9 @@ unittest
 
     // 2. Render-cache + FrameRenderer steady-state allocation stays lean.
     Transcript t;
-    t.byteCap = 2 << 20; // 2 MiB transcript cap
+    t.byteCap = 512 << 10; // 512 KiB transcript cap (small enough for the module's 1 s test budget)
     string row = "x".replicate(70) ~ "\n";
-    foreach (_; 0 .. 40_000) t.feed(row.representation); // ~2.8 MiB fed -> capped at <= 2 MiB
+    foreach (_; 0 .. 10_000) t.feed(row.representation); // ~710 KiB fed -> capped at <= 512 KiB
     assert(t.bytesHeld() <= t.byteCap);
 
     auto beforeRender = GC.stats.allocatedInCurrentThread;
@@ -2986,8 +2986,8 @@ unittest
     foreach (i; 0 .. t.lines.length)
         assert(t.cache[i].length == 1 && t.cache[i][0] is t.lines[i]);
     // `t.render(80)` only allocates slice headers (cache + out_), not copies of
-    // the ~2 MiB of line text: verify per-thread allocation stays under 2 MiB.
-    assert(renderAlloc < 2 * 1024 * 1024, format("expected < 2 MiB for render, got %s bytes", renderAlloc));
+    // the ~512 KiB of line text: verify per-thread allocation stays under that.
+    assert(renderAlloc < t.byteCap, format("expected < %s bytes for render, got %s bytes", t.byteCap, renderAlloc));
 
     auto r = new FrameRenderer((string s) {});
     // Render with a 30-row editor (exceeding height=24 so part of it scrolls off),
@@ -3004,7 +3004,7 @@ unittest
     auto beforeRepeat = GC.stats.allocatedInCurrentThread;
     foreach (_; 0 .. 3) r.render(rendered ~ ["e0"], 80, 24, rendered.length);
     auto repeatAlloc = GC.stats.allocatedInCurrentThread - beforeRepeat;
-    assert(repeatAlloc < 3 * 2 * 1024 * 1024, format("repeat renders allocated %s bytes", repeatAlloc));
+    assert(repeatAlloc < 3 * t.byteCap, format("repeat renders allocated %s bytes", repeatAlloc));
     // Differential shrink copies only slice headers, never the text.
-    assert(shrinkAlloc < 2 * 1024 * 1024, format("expected < 2 MiB for shrink, got %s bytes", shrinkAlloc));
+    assert(shrinkAlloc < t.byteCap, format("expected < %s bytes for shrink, got %s bytes", t.byteCap, shrinkAlloc));
 }
