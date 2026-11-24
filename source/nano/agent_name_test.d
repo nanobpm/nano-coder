@@ -13,7 +13,7 @@ import std.path : buildPath;
 import nano.agent;
 import nano.handle : handlePath, sessionLine, resumeArg;
 import nano.llm;
-import nano.option : some;
+import nano.option : ifSome, some;
 import nano.peers;
 import nano.permissions : Policy;
 import nano.providers.mock : MockClient;

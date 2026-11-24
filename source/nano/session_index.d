@@ -563,7 +563,8 @@ bool[string] titledIds(string dir)
 /// Sessions the index lacks, or whose log changed since it was indexed, are
 /// summarized from their logs, and the index is updated. A missing directory
 /// is no sessions; other filesystem errors propagate. `strictIndex` also
-/// fails on an unreadable or corrupt index (see `load`). `skip` hides a log
+/// fails on an unreadable or corrupt index (see `load`) or an index it could
+/// not update (a stale index may lack a newer handle). `skip` hides a log
 /// from the listing entirely (issue #271: a session the permission policy
 /// denies is neither summarized nor reported from cached metadata, so its
 /// title or first request can't leak); a skipped log's cached record is
@@ -679,7 +680,13 @@ Summary[] list(string dir, bool strictIndex = false, scope bool delegate(string 
         }
         else append(dir, updates);
     }
-    catch (Exception) {} // only a cache
+    catch (Exception e)
+    {
+        // Strict callers (retention) must not trust an index this pass
+        // could not refresh: a stale one may miss a newer handle.
+        if (strictIndex) throw e;
+        // otherwise only a cache
+    }
     auto out_ = current.byValue.filter!(s => s.prompts > 0).array;
     out_.sort!((a, b) => a.lastUsed > b.lastUsed);
     return out_;
