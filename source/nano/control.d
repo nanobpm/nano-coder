@@ -206,6 +206,10 @@ struct Steer
     bool fromPeer;
     /// The sending peer's full session id (empty unless `fromPeer`).
     string sender;
+    /// The peer message's hop and thread (issue #350; 0/null unless `fromPeer`).
+    uint hop;
+    /// ditto
+    string thread;
 
     this(string text, JSONValue tag = JSONValue.init)
     {
@@ -293,12 +297,15 @@ final class TurnControl
 
     /// Queue a steer carrying a `/queue` id, so it can be edited or
     /// withdrawn until the agent reads it.
-    void steerWithId(string text, size_t id, bool fromPeer = false, string sender = null) shared
+    void steerWithId(string text, size_t id, bool fromPeer = false, string sender = null,
+        uint hop = 0, string thread = null) shared
     {
         auto m = Steer(text);
         m.id = id;
         m.fromPeer = fromPeer;
         m.sender = sender;
+        m.hop = hop;
+        m.thread = thread;
         steer(m);
     }
 
@@ -320,7 +327,7 @@ final class TurnControl
     size_t pendingSteerBytes() shared
     {
         size_t n;
-        foreach (m; state.get.steers) n += m.text.length + m.sender.length;
+        foreach (m; state.get.steers) n += m.text.length + m.sender.length + m.thread.length;
         return n;
     }
 
