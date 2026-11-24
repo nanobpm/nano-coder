@@ -1292,7 +1292,8 @@ import nano.ui : Verbosity, parseVerbosity, verbosityListing, providersListing;
 string runMemoryMigrate(MemoryStore store, LLMClient client, nano.memmigrate.Ui ui, bool dryRun, out bool ok,
     void delegate(scope void delegate() @safe) @safe aroundAsk = null)
 {
-    import nano.http : addUsage, hasUsage;
+    import nano.http : addUsage, hasUsage, StreamInterrupted;
+    import nano.control : Cancelled;
     nano.memmigrate.Options mo;
     mo.dryRun = dryRun;
     // Every model call's usage, retried attempts and failures included
@@ -1303,6 +1304,9 @@ string runMemoryMigrate(MemoryStore store, LLMClient client, nano.memmigrate.Ui 
         spent.usage = addUsage(spent.usage, s.usage);
         spent.uncounted += s.uncounted;
     }
+    // A dropped or cancelled call's final attempt: its usage, or the
+    // uncounted-request marker when none arrived.
+    void countFinal(RetrySpend retried, TokenUsage last) { count(finalAttemptSpend(retried, last)); }
     string ask(string system, string user)
     {
         ChatRequest req;
@@ -1313,6 +1317,8 @@ string runMemoryMigrate(MemoryStore store, LLMClient client, nano.memmigrate.Ui 
         {
             LLMResponse r;
             try r = client.chat(req, (bool, string) {});
+            catch (StreamInterrupted e) { countFinal(e.retried, e.usage); throw e; }
+            catch (Cancelled e) { countFinal(e.retried, e.usage); throw e; }
             catch (SpendingException e) { count(e.retried); throw e; }
             count(r.retried);
             if (hasUsage(r.usage)) count(RetrySpend(r.usage, 0));
@@ -1331,6 +1337,26 @@ string runMemoryMigrate(MemoryStore store, LLMClient client, nano.memmigrate.Ui 
     }
     catch (Exception e) report = "memory migrate failed (applied batches are kept; run it again to resume): " ~ e.msg;
     return report ~ "\n" ~ migrateUsageLine(spent);
+}
+
+/// What a dropped or cancelled call cost: its retried attempts plus the
+/// final attempt's usage, or one uncounted request when it reported none
+/// (issue #371).
+RetrySpend finalAttemptSpend(RetrySpend retried, TokenUsage last) pure
+{
+    import nano.http : addUsage, hasUsage;
+    if (hasUsage(last)) retried.usage = addUsage(retried.usage, last);
+    else retried.uncounted++;
+    return retried;
+}
+
+unittest
+{
+    TokenUsage last;
+    last.inputTokens = 5;
+    auto r = RetrySpend(last, 1);
+    assert(finalAttemptSpend(r, last) == RetrySpend(imported!"nano.http".addUsage(last, last), 1));
+    assert(finalAttemptSpend(r, TokenUsage.init).uncounted == 2);
 }
 
 /// The model usage line `memory migrate` ends its report with (issue #371).
@@ -5180,6 +5206,13 @@ int runMain(string[] args)
                 peerRouter.routePending(queue);
                 return peerRouter.hasWaiting;
             }
+            // A title finished while idle: show its spending now (issue #371).
+            // Never ends the read.
+            bool titleSpendNow() @safe
+            {
+                if (agent.collectTitleSpend()) refreshStatus();
+                return false;
+            }
             // Esc Esc at the idle prompt stops background sub-agents.
             bool stopBackground;
             ed.onIdleEscEsc = () @safe { if (agent.subagentsActive) stopBackground = true; };
@@ -5188,6 +5221,7 @@ int runMain(string[] args)
                 || timerNow()
                 || subNow()
                 || peerNow()
+                || titleSpendNow()
                 || idleNow()
                 || (updateHints && updateHints.tryTake(updateHint))
                 || (releaseNotice && releaseNotice.tryTake(fetchedNotice));

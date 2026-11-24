@@ -899,16 +899,20 @@ class Agent
 
     /// Count what finished title requests cost into the session totals
     /// (issue #371). Called before a turn, when titles settle and when the
-    /// status line is built.
-    void collectTitleSpend()
+    /// status line is built, and polled at the idle prompt. Returns whether
+    /// any arrived, so an idle caller knows to redraw the totals.
+    bool collectTitleSpend()
     {
-        if (!titleSpend) return;
+        if (!titleSpend) return false;
         RetrySpend s;
+        bool any;
         while (titleSpend.tryTake(s))
         {
+            any = true;
             if (hasUsage(s.usage)) recordUsage(s.usage);
             uncountedRequests += s.uncounted;
         }
+        return any;
     }
 
     /// Title requests in flight (tests join them).
@@ -2775,6 +2779,9 @@ class Agent
         aicReports = 0;
         uncountedRequests = 0;
         compactions = 0;
+        // Title threads still running hold the old channel, so a late title
+        // from the previous session is not charged to this one (issue #371).
+        titleSpend = Chan!RetrySpend.init;
     }
 
     private string cancelled(AgentEvents ev)
@@ -6523,6 +6530,40 @@ unittest
             assert(agent.sessionInputTokens == before + 140 && agent.uncountedRequests == uncountedBefore + 1,
                 "the title request and its retried attempt count");
         }
+        rmdirRecurse(dir);
+    }
+}
+
+// A title that finishes after the session resets (restart, resume) is not
+// charged to the new session, and idle polling reports when spending arrived
+// (issue #371).
+unittest
+{
+    import std.file : tempDir, exists, rmdirRecurse;
+    import std.path : buildPath;
+    import core.time : msecs;
+    import nano.session : SessionLog;
+    import nano.providers.mock : MockClient;
+    auto dir = buildPath(tempDir, "nano-d-agent-title-reset");
+    if (dir.exists) rmdirRecurse(dir);
+    foreach (reset; [false, true])
+    {
+        auto agent = new Agent(new MockClient([LLMResponse("a")]), new ToolRegistry, Policy.init, null);
+        agent.log = some(new SessionLog(dir, "mock/m", "/w"));
+        agent.sessionTitles = true;
+        agent.titleClient = (string spec) {
+            auto r = LLMResponse("Deploy test fix");
+            r.usage.inputTokens = 100;
+            return cast(LLMClient) new MockClient([r]);
+        };
+        agent.run("Fix the flaky deploy test in CI", new NullEvents);
+        foreach (t; agent.titleThreads)
+            while (t.running) sleepFor(5.msecs);
+        if (reset) agent.resetSessionCounters();
+        immutable before = agent.sessionInputTokens;
+        assert(agent.collectTitleSpend() == !reset);
+        assert(agent.sessionInputTokens == before + (reset ? 0 : 100));
+        assert(!agent.collectTitleSpend(), "nothing more arrived");
         rmdirRecurse(dir);
     }
 }
