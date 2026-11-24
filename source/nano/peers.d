@@ -349,6 +349,10 @@ struct ReplyCell
     bool expired;
 }
 
+/// The peers-dir file whose flock serializes every listener's owner claim
+/// (issue #370); one fixed name, so the directory never grows per session.
+enum claimLockName = ".claim.lock";
+
 /// A listening session's end of the registry: the socket file it owns.
 /// `close` stops the listener and removes the socket (idempotent). A struct
 /// (one impl per listener), so no new reference type.
@@ -390,10 +394,23 @@ struct PeerListener
         // with nobody accepting: close them first so the bind below can
         // replace the socket (issue #349).
         closeOrphanedPeerFds(dir);
+        // Serialize owner inspection, claim and bind across processes
+        // (issue #370): without it, a second listener could see a claim in
+        // progress (an empty pid file) as stale, replace it, and both would
+        // proceed. Released when this function returns. One lock file for
+        // the whole directory, not one per id, so sessions leave no file
+        // behind (removing a flock file races a waiter holding its inode).
+        // Fail closed: an unheld lock would bring the race back.
+        import nano.safeio : lockExclusive;
+        immutable lockPath = imported!"std.path".buildPath(dir, claimLockName);
+        auto claimLock = lockExclusive(lockPath);
+        if (!claimLock.held)
+            throw new ListenError(format("cannot lock %s to claim %s", lockPath, path));
         Socket socket;
         try socket = unixSocket();
         catch (SocketException e)
             throw new ListenError(format("cannot create a socket for %s: %s", path, e.msg));
+        bool claimed; // this call created the pid file, so its failure removes it
         try
         {
             // A stale socket from a dead session is replaced; a live one
@@ -409,21 +426,45 @@ struct PeerListener
                 }
                 remove(path);
             }
+            // Record the owner BEFORE bind (issue #370): between bind and
+            // listen the socket refuses connections, and a peer probing then
+            // must see a live owner, not a missing or stale pid file, or it
+            // deletes our fresh socket. Claimed exclusively, so of two
+            // listeners racing for one id only the first records itself and
+            // the loser never deletes the winner's pid file.
+            if (!path.exists)
+            {
+                int other;
+                // A record already naming this process belongs to another
+                // listener here (a repeated `listen`): not ours to remove.
+                int self;
+                immutable already = ownerOf(dir, id, self) == Owner.self;
+                string error;
+                if (!claimOwner(dir, id, other, error))
+                {
+                    socket.close();
+                    throw new ListenError(error.length
+                        ? format("cannot listen on %s: %s", path, error)
+                        : format("cannot listen on %s: process %s still owns it", path, other));
+                }
+                claimed = !already;
+            }
             socket.bind(new UnixAddress(path));
             socket.listen(listenBacklog);
         }
         catch (SocketException e)
         {
             socket.close();
+            if (claimed) removeOwner(dir, id);
             throw new ListenError(format("cannot listen on %s: %s", path, e.msg));
         }
         catch (FileException e)
         {
             // An unremovable stale socket path: report it like a bind failure.
             socket.close();
+            if (claimed) removeOwner(dir, id);
             throw new ListenError(format("cannot replace stale socket %s: %s", path, e.msg));
         }
-        writeOwner(dir, id);
         registerOwnListener(path);
         auto impl = new Impl;
         impl.path = path;
@@ -860,6 +901,57 @@ private void writeOwner(string dir, string id)
     catch (FileException) {} // best effort: senders fall back to the probe
 }
 
+/// Create `<dir>/<id>.pid` naming this process, exclusively. An existing
+/// file naming a dead process (or nobody) is replaced; one naming this
+/// process is kept. Returns false when the claim fails: `other` is set when
+/// another live process owns it (two listeners racing for one id must not
+/// both write it, issue #370), else `error` says why the record could not be
+/// written. Fails closed on I/O errors: without a readable owner record a
+/// sender probing before `listen` would delete the fresh socket. A partly
+/// written file is removed.
+private bool claimOwner(string dir, string id, out int other, out string error)
+{
+    import std.stdio : File;
+    import std.exception : ErrnoException;
+    import std.process : thisProcessID;
+    import nano.safeio : processStartTime;
+    immutable pid = thisProcessID;
+    immutable path = pidPath(dir, id);
+    foreach (attempt; 0 .. 2)
+    {
+        bool created;
+        try
+        {
+            auto f = File(path, "wx");
+            created = true;
+            f.writef("%s %s\n", pid, processStartTime(pid));
+            f.close();
+            return true;
+        }
+        catch (ErrnoException e)
+        {
+            import core.stdc.errno : EEXIST;
+            if (created || e.errno != EEXIST)
+            {
+                if (created) removeIfThere(path);
+                error = format("cannot write %s: %s", path, e.msg);
+                return false;
+            }
+        }
+        final switch (ownerOf(dir, id, other))
+        {
+            case Owner.self: return true;
+            case Owner.alive: return false;
+            case Owner.gone:
+            case Owner.unknown:
+                removeIfThere(path);
+                break;
+        }
+    }
+    error = format("cannot claim %s: replaced concurrently", path);
+    return false;
+}
+
 /// Remove `<dir>/<id>.pid` if it names this process (a successor may own
 /// it now).
 private void removeOwner(string dir, string id)
@@ -1028,7 +1120,10 @@ Status send(string dir, string to, PeerMessage pm, out string note)
                 removeIfThere(pidPath(dir, to));
                 break;
             case Owner.unknown:
-                break; // an older listener without a pid file: refused means stale
+                // No pid file: an older build that never writes one. Current
+                // listeners write it before bind (issue #370), so a refused
+                // socket without one is not a listener mid-startup: stale.
+                break;
         }
         // Stale: nobody is accepting. Remove it so the next listing is clean.
         removeIfThere(path);
@@ -2071,6 +2166,61 @@ unittest
     if (processStartTime(ppid) != 0) assert(ownerOf(dir, "sess-reused", pid) == Owner.gone);
 }
 
+@("issue #370: a refusing socket whose pid file names a live process is kept")
+unittest
+{
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir, exists, write;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    import std.socket : Socket, UnixAddress, AddressFamily, SocketType;
+    import nano.safeio : processStartTime;
+    auto dir = buildPath(tempDir, format("np370%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto path = socketPath(dir, "sess-mid");
+    // A listener caught between bind and listen: the socket exists and
+    // refuses, and its pid file (written before bind) names a live process.
+    auto s = new Socket(AddressFamily.UNIX, SocketType.STREAM);
+    scope (exit) s.close();
+    s.bind(new UnixAddress(path));
+    write(pidPath(dir, "sess-mid"), format("%s %s\n", thisProcessID, processStartTime(thisProcessID)));
+    string note;
+    assert(send(dir, "sess-mid", PeerMessage("sess-sender", null, "hi", "m", false), note) == Status.refused, note);
+    assert(path.exists && pidPath(dir, "sess-mid").exists, "the fresh socket must not be deleted");
+}
+
+@("issue #370: listen records the owner and a racing listener keeps it")
+unittest
+{
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir, exists, write;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    auto dir = buildPath(tempDir, format("np370b%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    int pid;
+    string error;
+    // A fresh claim names this process.
+    assert(claimOwner(dir, "sess-a", pid, error));
+    assert(ownerOf(dir, "sess-a", pid) == Owner.self && pid == thisProcessID);
+    // A stale (garbage) pid file is replaced.
+    write(pidPath(dir, "sess-b"), "garbage");
+    assert(claimOwner(dir, "sess-b", pid, error));
+    assert(ownerOf(dir, "sess-b", pid) == Owner.self);
+    // A live other owner (pid 1, start time unknown) is not overwritten,
+    // and the loser's cleanup leaves the winner's file alone.
+    write(pidPath(dir, "sess-c"), "1 0\n");
+    assert(!claimOwner(dir, "sess-c", pid, error) && pid == 1 && !error.length);
+    removeOwner(dir, "sess-c");
+    assert(pidPath(dir, "sess-c").exists && ownerOf(dir, "sess-c", pid) == Owner.alive);
+    // An I/O error (here: a missing directory) fails the claim, closed,
+    // instead of letting listen bind without an owner record.
+    assert(!claimOwner(buildPath(dir, "missing"), "sess-d", pid, error));
+    assert(error.length && pid == 0);
+}
+
 @("issue #349: listen closes this process's orphaned listener and rebinds")
 unittest
 {
@@ -2262,4 +2412,64 @@ unittest
     assert(live(path), "cleanup keeps a permission-denied socket");
     assert(!connectable(path), "discovery rejects a permission-denied socket");
     assert(!accepting(dir, "sess-denied"));
+}
+
+@("issue #370: a repeated listen for a live id keeps the owner's pid file")
+unittest
+{
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir, exists;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    import nano.control : TurnControl;
+    import core.atomic : atomicLoad;
+    auto dir = buildPath(tempDir, format("np370c%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto router = PeerRouter.make(atomicLoad(new shared TurnControl));
+    router.confirm(false);
+    auto first = PeerListener.listen(dir, "sess-dup", router.requests);
+    scope (exit) first.close();
+    bool threw;
+    try PeerListener.listen(dir, "sess-dup", router.requests).close();
+    catch (ListenError) threw = true;
+    assert(threw, "the second bind must fail");
+    int pid;
+    assert(ownerOf(dir, "sess-dup", pid) == Owner.self && pid == thisProcessID,
+        "the failed listen must not remove the first listener's pid file");
+}
+
+@("issue #370: listen/close leaves no per-id lock file, only the shared claim lock")
+unittest
+{
+    import std.file : exists, dirEntries, SpanMode, mkdirRecurse, rmdirRecurse, tempDir;
+    import std.path : buildPath, baseName;
+    import std.process : thisProcessID;
+    import std.conv : to;
+    auto dir = buildPath(tempDir, "nano-peers-lock-" ~ thisProcessID.to!string);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    foreach (i; 0 .. 3)
+    {
+        auto l = PeerListener.listen(dir, "s" ~ i.to!string, Chan!PeerRequest.make);
+        l.close();
+    }
+    string[] left;
+    foreach (e; dirEntries(dir, SpanMode.shallow)) left ~= e.name.baseName;
+    assert(left == [claimLockName], left.to!string);
+}
+
+@("issue #370: listen fails closed when the claim lock can't be taken")
+unittest
+{
+    import std.exception : assertThrown;
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    import std.conv : to;
+    auto dir = buildPath(tempDir, "nano-peers-nolock-" ~ thisProcessID.to!string);
+    // A directory where the lock file should be: open(2) fails.
+    mkdirRecurse(buildPath(dir, claimLockName));
+    scope (exit) rmdirRecurse(dir);
+    assertThrown!ListenError(PeerListener.listen(dir, "x", Chan!PeerRequest.make));
 }

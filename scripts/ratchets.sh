@@ -44,7 +44,7 @@ files=$(find source -name '*.d' | sort)
 classnull=$(awk -v n="$nfiles" -f "$S/class-null.awk" $files $files $files) || { echo "ratchets.sh: class-null.awk failed" >&2; exit 2; }
 out class-null-budget max "$(printf '%s' "$classnull" | grep -c .)" 'null checks on class references outside *_test.d (use nano.option.Option!T)'
 out nullable-budget max "$(nontest | xargs grep -hE 'Nullable!' | grep -vE '^[[:space:]]*//' | grep -oE 'Nullable!' | num)" '`Nullable!` uses outside *_test.d (use nano.option.Option!T)'
-out class-budget max "$(nontest | xargs grep -hE '^[[:space:]]*((final|abstract|private|public)[[:space:]]+)*class[[:space:]]+[A-Z]' | grep -vE 'class[[:space:]]+[A-Za-z0-9_]*(Error|Exception)\b|:[[:space:]]*Exception' | num)" 'class declarations (exceptions aside) outside *_test.d'
+out class-budget max "$(nontest | xargs grep -hE '^[[:space:]]*((final|abstract|private|public)[[:space:]]+)*class[[:space:]]+[A-Z]' | grep -vE 'class[[:space:]]+[A-Za-z0-9_]*(Error|Exception)\b|:[[:space:]]*([A-Za-z0-9_!".]*\.)?[A-Za-z0-9_]*Exception\b' | num)" 'class declarations (exceptions aside) outside *_test.d'
 out nullable-mark-budget max "$(nontest | xargs grep -hE '^[[:space:]]*@nullable\(' | num)" '`@nullable` marks outside *_test.d'
 casts=$(find source -name '*.d' ! -name '*_test.d' ! -name safeio.d | sort | xargs awk -f "$S/cast.awk") || { echo "ratchets.sh: cast.awk failed" >&2; exit 2; }
 out cast-budget max "$(printf '%s' "$casts" | grep -c .)" '`cast(`s outside unittests, *_test.d and safeio.d'

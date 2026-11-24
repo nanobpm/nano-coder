@@ -1,5 +1,12 @@
 {
   "releases": [
+    {"version": "1.33.6", "date": "2026-11-24", "items": [
+      {"type":"fix","scope":"session","title":"log finished sub-agents' usage in the parent session log","pr":376}
+    ]},
+    {"version": "1.33.5", "date": "2026-11-24", "items": [
+      {"type":"fix","scope":"status","title":"count running sub-agents' tokens and AIC in the status line","pr":344},
+      {"type":"fix","scope":"messages","title":"write the owner pid file before bind","pr":373}
+    ]},
     {"version": "1.33.4", "date": "2026-11-24", "items": [
       {"type":"fix","scope":"session","title":"keep a restored context-window override across /model switch","pr":364}
     ]},
@@ -436,12 +443,6 @@
     ]},
     {"version": "0.52.0", "date": "2026-10-26", "items": [
       {"type":"feat","scope":"timers","title":"session-scoped timers the agent sets to come back later","pr":151}
-    ]},
-    {"version": "0.51.1", "date": "2026-10-23", "items": [
-      {"type":"fix","scope":"commands","title":"release stats lock before printing slash command output","pr":143}
-    ]},
-    {"version": "0.51.0", "date": "2026-10-23", "items": [
-      {"type":"feat","scope":"herdr","title":"report state, resume command and release to Herdr","pr":142}
     ]}
   ]
 }

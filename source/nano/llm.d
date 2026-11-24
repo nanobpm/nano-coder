@@ -272,6 +272,26 @@ void readCopilotAic(const JSONValue parent, ref TokenUsage usage) pure @safe
     assert(zero.hasAic && zero.aic == 0);
 }
 
+/// What stream attempts dropped and retried before any visible output cost:
+/// the usage they reported, and how many reported none. Kept apart from the
+/// successful attempt's usage, which alone sizes the context (issue #340).
+struct RetrySpend
+{
+    /// The summed usage the retried attempts reported.
+    TokenUsage usage;
+    /// Retried attempts that reported no usage (counted as uncounted requests).
+    size_t uncounted;
+}
+
+/// A failed model request that still carries what its retried stream
+/// attempts cost (issue #340), so every failure path can count it.
+class SpendingException : Exception
+{
+    /// Spending of stream attempts dropped and retried before the failure.
+    RetrySpend retried;
+    this(string msg) pure nothrow @safe { super(msg); }
+}
+
 struct LLMResponse
 {
     string content;
@@ -283,6 +303,9 @@ struct LLMResponse
     /// `thinking`/`redacted_thinking` blocks, OpenAI `reasoning_content`,
     /// Responses `reasoning` items).
     JSONValue[] thinkingBlocks;
+    /// Spending of attempts retried before this reply; added to the session
+    /// totals only, never to the context-size calibration.
+    RetrySpend retried;
 }
 
 struct ToolDefinition

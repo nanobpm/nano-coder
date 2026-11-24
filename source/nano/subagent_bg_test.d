@@ -121,13 +121,22 @@ final class OpensGate : MockClient
     }
 }
 
+/// `r` with `input` tokens and `aic` credits of usage.
+LLMResponse costing(LLMResponse r, long input, double aic)
+{
+    r.usage.inputTokens = input;
+    r.usage.hasAic = true;
+    r.usage.aic = aic;
+    return r;
+}
+
 final class Scripts : SubClientFactory
 {
     LLMClient make(string spec) const
     {
         switch (spec)
         {
-            case "mock/search": return new MockClient([grep("parse"), report("parser at src/p.d:12")]);
+            case "mock/search": return new MockClient([costing(grep("parse"), 100, 0.25), costing(report("parser at src/p.d:12"), 200, 0.5)]);
             case "mock/gated": return new Gated;
             case "mock/loop": return new Looping;
             case "mock/hang": return new Hanging;
@@ -241,6 +250,10 @@ unittest
     f.awaitDone();
     assert(f.agent.run("next", new NullEvents) == "got it");
     assert(f.deliveries("parser at src/p.d:12") == 1);
+    // A background child's usage counts once: per request while it runs,
+    // and its final result adds nothing more (issue #340).
+    import std.math : isClose;
+    assert(f.agent.sessionInputTokens == 300 && f.agent.hasSessionAic && isClose(f.agent.sessionAic, 0.75));
     auto seen = f.parent.seen[2];
     assert(seen.canFind!(m => m.content.canFind("parser at src/p.d:12")), "the model saw the result");
     assert(f.agent.run("again", new NullEvents) == "still nothing new");
