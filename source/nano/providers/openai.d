@@ -514,6 +514,15 @@ class CopilotClient : OpenAIClient
                 again.retried = addSpend(e.retried, again.retried);
                 throw again;
             }
+            catch (Exception other)
+            {
+                // A non-spending failure (e.g. a malformed token exchange)
+                // must not lose the first route's retried spending.
+                if (e.retried == RetrySpend.init) throw other;
+                auto wrapped = new RequestException(other.msg, other);
+                wrapped.retried = e.retried;
+                throw wrapped;
+            }
         }
     }
 
