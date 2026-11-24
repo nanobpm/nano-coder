@@ -198,6 +198,30 @@ private ptrdiff_t keyEq(string line, out string first, out bool dotted) pure
     }
 }
 
+/// The first (decoded) segment of the key a `key = value` line sets, or
+/// null when the line isn't one; lets callers find dotted keys like
+/// `a.b = 1` that belong to table `a`.
+string lineFirstKey(string line) pure
+{
+    string first;
+    bool dotted;
+    return keyEq(line, first, dotted) < 0 ? null : first;
+}
+
+/// The last row of the statement starting at key line `row`, following a
+/// multi-line string or array value onto later rows.
+size_t statementEnd(const string[] lines, size_t row) pure
+{
+    auto l = lines[row];
+    if (lineKey(l) is null) return row;
+    size_t col = afterEq(l);
+    while (col < l.length && (l[col] == ' ' || l[col] == '\t')) col++;
+    if (col >= l.length) return row;
+    size_t endRow;
+    valueEnd(lines, row, col, endRow);
+    return endRow < row ? row : endRow;
+}
+
 /// The key a `key = value` line sets (unquoted), or null.
 /// A dotted key reads as "\0" ~ its first segment.
 private string lineKey(string line) pure

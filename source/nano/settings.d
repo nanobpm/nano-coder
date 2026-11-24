@@ -13,7 +13,7 @@ import nano.qwen : QwenEndpoint;
 import std.string : strip;
 import nano.thinking : Thinking;
 import nano.toml_edit;
-import nano.result : toOption, unwrap;
+import nano.result : Result, orThrow, toOption, unwrap, unwrapErr;
 
 /// What a visit changed (each saved as its own key).
 struct Changes
@@ -357,27 +357,47 @@ string applyChanges(string doc, const ref Config c, const ref Changes ch, const 
 }
 
 /// `doc` with every `[[subagent_models]]` table replaced by `models`,
-/// appended at the end. Other keys, tables and comments stay; comment and
-/// blank lines just before the table that follows a removed one belong to
-/// that table and are kept.
+/// appended at the end. Child tables (`[subagent_models.x]`,
+/// `[[subagent_models.y]]`) and root keys defining `subagent_models` go
+/// too, so the result never defines it twice. Other keys, tables and
+/// comments stay; comment and blank lines just before the table that
+/// follows a removed one belong to that table and are kept.
 string replaceSubagentModels(string doc, const imported!"nano.config".SubagentModel[] models) pure
 {
     import std.algorithm : startsWith;
     import std.array : join;
     import std.string : splitLines, stripLeft, strip;
-    import nano.toml_edit : arrayHeaderPath, statementRows;
+    import nano.toml_edit : arrayHeaderPath, headerPath, lineFirstKey, statementEnd, statementRows;
     auto lines = doc.splitLines;
     // Only statement rows can be headers: a `[x]` line inside a multi-line
     // string or array is part of a value.
     auto stmt = statementRows(lines);
-    bool isOurs(size_t i) { return stmt[i] && arrayHeaderPath(lines[i]) == ["subagent_models"]; }
     bool isHeader(size_t i) { return stmt[i] && lines[i].stripLeft.startsWith("["); }
+    bool isOurs(size_t i)
+    {
+        if (!isHeader(i)) return false;
+        auto p = arrayHeaderPath(lines[i]);
+        if (p is null) p = headerPath(lines[i]);
+        return p.length && p[0] == "subagent_models";
+    }
     string[] kept;
+    bool atRoot = true;
     for (size_t i = 0; i < lines.length;)
     {
-        if (!isOurs(i)) { kept ~= lines[i++]; continue; }
+        if (atRoot && stmt[i] && !isHeader(i) && lineFirstKey(lines[i]) == "subagent_models")
+        {
+            i = statementEnd(lines, i) + 1;
+            continue;
+        }
+        if (!isOurs(i))
+        {
+            if (isHeader(i)) atRoot = false;
+            kept ~= lines[i++];
+            continue;
+        }
+        atRoot = false;
         auto end = i + 1;
-        while (end < lines.length && !isHeader(end)) end++;
+        while (end < lines.length && (!isHeader(end) || isOurs(end))) end++;
         auto keepFrom = end;
         if (end < lines.length)
             while (keepFrom > i + 1 && stmt[keepFrom - 1]
@@ -398,6 +418,17 @@ string replaceSubagentModels(string doc, const imported!"nano.config".SubagentMo
     return kept.length ? kept.join("\n") ~ "\n" : "";
 }
 
+/// Ok when `doc` parses as TOML, so `save` never
+/// writes a config the next start can't read; the error says why.
+Result!(bool, string) checkLoadable(string doc) pure
+{
+    import nano.toml : parseToml;
+    alias R = Result!(bool, string);
+    auto parsed = parseToml(doc);
+    if (parsed.isErr) return R.err("the edited config would not parse; not saved: " ~ parsed.unwrapErr("checked isErr"));
+    return R.ok(true);
+}
+
 /// Writes the changes into `path` atomically (0600 when a key is stored).
 void save(const ref Config c, const ref Changes ch, const ProviderConfig[string] user, string path)
 {
@@ -406,6 +437,7 @@ void save(const ref Config c, const ref Changes ch, const ProviderConfig[string]
     import std.conv : octal;
     auto doc = path.exists ? readText(path) : "";
     doc = applyChanges(doc, c, ch, user);
+    checkLoadable(doc).orThrow!(e => new Exception(e));
     bool secret;
     foreach (ref p; user) if (p.apiKey.length) secret = true;
     // The file may already hold inline keys of providers this save leaves
@@ -664,4 +696,58 @@ unittest
     assert(text.canFind("\"\"\"\nsubagent_models = [{ model = \"x\" }]\n\"\"\""), text);
     assert(!text.canFind("\"old\""), text);
     assert(text.count("[[subagent_models]]") == 1, text);
+}
+
+unittest
+{
+    // Child tables of [[subagent_models]] and root dotted keys are removed
+    // with it, so the rewrite never defines `subagent_models` twice.
+    import std.algorithm : canFind;
+    import nano.config : SubagentModel, parseSubagentModels;
+    import nano.toml : parseToml;
+    enum withLimits = "# top\nmodel = \"m\"\n\n[[subagent_models]]\nmodel = \"a/x\"\n[subagent_models.limits]\nn = 1\n\n"
+        ~ "# the providers\n[providers.p]\nkind = \"mock\"\n";
+    enum withExtra = "model = \"m\"\n[[subagent_models]]\nmodel = \"a/x\"\n[[subagent_models.extra]]\nk = 1\n"
+        ~ "[[subagent_models]]\nmodel = \"b/y\"\n[other]\nz = 2\n";
+    enum dotted = "subagent_models.x = \"\"\"\n[fake]\n\"\"\"\nmodel = \"m\"\n[other]\nz = 2\n";
+    foreach (doc; [withLimits, withExtra, dotted])
+    {
+        foreach (models; [[SubagentModel("c/z", "big", 0, 7, 0)], cast(SubagentModel[]) null])
+        {
+            auto out_ = replaceSubagentModels(doc, models);
+            assert(checkLoadable(out_).isOk, out_);
+            auto parsed = parseToml(out_).unwrap("checked");
+            assert(!out_.canFind("a/x") && !out_.canFind("limits") && !out_.canFind("extra")
+                && !out_.canFind("[fake]"), out_);
+            assert(out_.canFind("model = \"m\""), out_);
+            if (doc != dotted) assert(out_.canFind("[providers.p]") || out_.canFind("[other]\nz = 2"), out_);
+            if (doc == withLimits) assert(out_.canFind("# top") && out_.canFind("# the providers\n[providers.p]"), out_);
+            string[] w;
+            auto v = "subagent_models" in parsed;
+            if (models.length)
+            {
+                auto got = parseSubagentModels(*v, w);
+                assert(got.length == 1 && got[0].model == "c/z" && !w.length, out_);
+            }
+            else assert(v is null, out_);
+        }
+    }
+}
+
+unittest
+{
+    // save refuses to write a document that would not load.
+    import std.file : tempDir, remove, exists, write, readText;
+    import std.path : buildPath;
+    assert(checkLoadable("a = \n").isErr);
+    auto path = buildPath(tempDir, "nano-settings-unloadable-test.toml");
+    scope (exit) if (path.exists) remove(path);
+    enum bad = "model = \"m\"\n[x]\nk = 1\n[x]\nk = 2\n";
+    write(path, bad);
+    Config c;
+    Changes ch;
+    ch.subagents = true;
+    import std.exception : assertThrown;
+    assertThrown(save(c, ch, null, path));
+    assert(readText(path) == bad && !exists(path ~ ".tmp"));
 }
