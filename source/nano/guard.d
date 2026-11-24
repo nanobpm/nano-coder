@@ -435,8 +435,26 @@ struct Guard
     bool inGitDir(string p) pure
     {
         auto parts = components(p);
-        if (!samePath(cwd, "/") && startsWithPath(p, cwd)) parts = parts[components(cwd).length .. $];
+        if (!samePath(cwd, "/") && startsWithPath(p, cwd) && !cwdIsGitMetadata())
+            parts = parts[components(cwd).length .. $];
         return parts.canFind(".git");
+    }
+
+    /// Whether the working directory is itself git metadata: a `.git`
+    /// directory, or one of git's own subdirectories (objects, refs, ...)
+    /// below it. Such a cwd gets no exemption from the `.git` guard; only a
+    /// scratch directory under `.git` (like a worker's `.git/tmp`) does.
+    bool cwdIsGitMetadata() pure
+    {
+        static immutable metadata = ["objects", "refs", "hooks", "info", "logs", "worktrees",
+            "modules", "lfs", "rr-cache", "branches", "refs.d", "reftable"];
+        auto parts = components(cwd);
+        foreach_reverse (i, part; parts)
+        {
+            if (part != ".git") continue;
+            return i + 1 == parts.length || metadata.canFind(parts[i + 1]);
+        }
+        return false;
     }
 
     /// Like `danger`, but only catastrophic roots outside the workspace.
@@ -663,4 +681,13 @@ unittest
     assert(g.catastrophicRoot("/w/.git/tmp/ws/.git/refs") == "a git repository's .git directory");
     assert(g.catastrophicRoot("/w/.git/objects") == "a git repository's .git directory");
     assert(g.catastrophicRoot("/w/.git/tmp/ws/build") is null);
+    // A cwd that is git metadata itself gets no exemption.
+    g.cwd = "/repo/.git";
+    assert(g.danger("/repo/.git/objects", true) == "a git repository's .git directory");
+    assert(g.catastrophicRoot("/repo/.git/objects") == "a git repository's .git directory");
+    g.cwd = "/repo/.git/refs";
+    assert(g.danger("/repo/.git/refs/heads", true) == "a git repository's .git directory");
+    assert(g.catastrophicRoot("/repo/.git/refs/heads") == "a git repository's .git directory");
+    g.cwd = "/repo/.git/objects/ab";
+    assert(g.catastrophicRoot("/repo/.git/objects/ab/cd") == "a git repository's .git directory");
 }
