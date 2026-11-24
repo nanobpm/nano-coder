@@ -801,12 +801,15 @@ unittest // startup claims the pane for its pid; a child inheriting that environ
 
 unittest // a nested start() leaves reporting inactive and the environment untouched
 {
-    if (atomicLoad(gStarted)) return; // another test already started reporting
+    // Reset the latch first so the test always exercises start(), then restore it.
+    immutable startedBefore = atomicLoad(gStarted);
+    atomicStore(gStarted, false);
+    scope (exit) atomicStore(gStarted, startedBefore);
     string[string] env = ["HERDR_ENV": "1", "HERDR_BIN_PATH": "/bin/herdr", "HERDR_PANE_ID": "p1", ownerVar: "1"];
     import std.process : environment;
     immutable ownerBefore = environment.get(ownerVar, null);
     start((string k) => env.get(k, null));
-    scope (exit) atomicStore(gStarted, false); // undo the process-wide start latch for other tests
+    assert(atomicLoad(gStarted)); // start() ran its body rather than returning early
     assert(!active);
     assert(environment.get(ownerVar, null) == ownerBefore); // a nested start claims nothing
 }
