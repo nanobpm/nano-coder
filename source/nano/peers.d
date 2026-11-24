@@ -2111,6 +2111,43 @@ unittest
     assert(!isOwnListenerPath(socketPath(dir, "sess-own")), "close unregisters the path");
 }
 
+@("issue #349: the orphan sweep spares a registered listener's disconnected accepted fd")
+unittest
+{
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir, exists;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    import std.socket : UnixAddress;
+    import nano.safeio : unixSocketPathOf, hasCloexec, isListeningSocket;
+    auto dir = buildPath(tempDir, format("np349g%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto path = socketPath(dir, "sess-gone");
+    auto l = unixSocket();
+    scope (exit) l.close();
+    l.bind(new UnixAddress(path));
+    l.listen(4);
+    auto c = unixSocket();
+    c.connect(new UnixAddress(path));
+    auto conn = l.accept(); // not close-on-exec yet, like serve() before setCloexec
+    scope (exit) conn.close();
+    c.close(); // the client hangs up: on macOS the fd now reads as a listener
+    immutable fd = cast(int) conn.handle;
+    assert(!hasCloexec(fd) && unixSocketPathOf(fd) == path);
+    registerOwnListener(path);
+    assert(closeOrphanedPeerFds(dir) == 0, "a registered listener's connection is not an orphan");
+    assert(unixSocketPathOf(fd) == path && !hasCloexec(fd), "the accepted fd stays open");
+    unregisterOwnListener(path);
+    // Red without the guard: where the hung-up fd reads as listening, an
+    // unregistered path lets the sweep take it.
+    if (isListeningSocket(fd))
+    {
+        assert(closeOrphanedPeerFds(dir) == 1, "unguarded, the sweep closes it");
+        conn = unixSocket(); // fd is closed; don't close its number again
+    }
+}
+
 @("issue #349: a liveness probe of a full backlog never blocks")
 unittest
 {
