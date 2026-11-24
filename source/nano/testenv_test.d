@@ -288,19 +288,76 @@ void watchdog(imported!"nano.safeio".Shared!(immutable(Running)[]) running)
 {
     import core.time : msecs;
     import nano.clock : sleepFor;
-    import nano.safeio : exitProcess, stdErr;
     while (true)
     {
         sleepFor(250.msecs);
-        foreach (r; overdue(running.get(), monoNow))
-        {
-            stdErr.writefln("%s: unit tests still running after %s ms, over the %s ms hard limit: "
-                ~ "the module hangs; failing the run", r.name, since(r.start).total!"msecs", r.hardLimitMs);
-            stdErr.writefln("1 module FAILED unittests: %s (hung past %s ms)", r.name, r.hardLimitMs);
-            stdErr.flush();
-            exitProcess(1);
-        }
+        watchdogTick(running, monoNow, (Running r) => failHung(r));
     }
+}
+
+/// One watchdog check at `now`: calls `hung` with the first overdue running
+/// module and returns true, else returns false. Split out so tests can drive
+/// it against a really blocked module without ending the process.
+bool watchdogTick(imported!"nano.safeio".Shared!(immutable(Running)[]) running,
+    imported!"core.time".MonoTime now, scope void delegate(Running) @safe hung)
+{
+    foreach (r; overdue(running.get(), now))
+    {
+        hung(r);
+        return true;
+    }
+    return false;
+}
+
+/// Reports `r` as hung and exits the process failing.
+private void failHung(Running r)
+{
+    import nano.safeio : exitProcess, stdErr;
+    stdErr.writefln("%s: unit tests still running after %s ms, over the %s ms hard limit: "
+        ~ "the module hangs; failing the run", r.name, since(r.start).total!"msecs", r.hardLimitMs);
+    stdErr.writefln("1 module FAILED unittests: %s (hung past %s ms)", r.name, r.hardLimitMs);
+    stdErr.flush();
+    exitProcess(1);
+}
+
+private shared bool blockedRelease;
+
+/// A module body that blocks until `blockedRelease` is set.
+private void blockedModule()
+{
+    import core.atomic : atomicLoad;
+    import core.time : msecs;
+    import nano.clock : sleepFor;
+    while (!atomicLoad(blockedRelease)) sleepFor(1.msecs);
+}
+
+unittest
+{
+    // A worker really blocked in a module is registered, seen as hung by
+    // the watchdog with its name, and removed once it completes (#358).
+    import core.atomic : atomicStore;
+    import core.time : seconds, msecs;
+    import nano.clock : sleepFor;
+    import nano.safeio : Chan, Shared, spawn;
+    atomicStore(blockedRelease, false);
+    immutable all = [immutable TestEntry("nano.blocked", &blockedModule)];
+    auto queue = Chan!size_t.make;
+    auto results = Chan!ModuleRun.make;
+    auto running = Shared!(immutable(Running)[]).make;
+    queue.put(0);
+    queue.close();
+    immutable limits = [immutable HardLimit("", 5)];
+    auto worker = spawn(&runQueue, all, queue, results, running, limits);
+    while (running.get().length == 0) sleepFor(1.msecs);
+    string hungName;
+    assert(watchdogTick(running, monoNow + 1.seconds, (Running r) { hungName = r.name; }));
+    assert(hungName == "nano.blocked");
+    atomicStore(blockedRelease, true);
+    worker.join();
+    assert(running.get().length == 0);
+    assert(!watchdogTick(running, monoNow + 1.seconds, (Running r) { assert(false, r.name); }));
+    ModuleRun m;
+    assert(results.tryTake(m) && m.passed && m.name == "nano.blocked");
 }
 
 /// Default per-module unit-test time limit (scripts/slow-tests lists more).
