@@ -454,13 +454,45 @@ string postStream(S)(ref S st, string url, string[string] headers, JSONValue bod
     };
     auto initial = local;
     string whole;
+    // Usage reported by attempts dropped and retried before visible output
+    // (e.g. Anthropic's message_start input tokens) is still billed.
+    imported!"nano.llm".TokenUsage retried;
+    void restart()
+    {
+        static if (__traits(hasMember, S, "r")) retried = addUsage(retried, local.r.usage);
+        local = initial;
+    }
     // An aborted stream keeps the usage it already reported (issue #340).
     try whole = postProvider(url, headers, body_, what, c, (string data) { local.event(data); }, () => shown,
-        () { local = initial; });
-    catch (StreamInterrupted dropped) { static if (__traits(hasMember, S, "r")) dropped.usage = local.r.usage; throw dropped; }
-    catch (imported!"nano.control".Cancelled stopped) { static if (__traits(hasMember, S, "r")) stopped.usage = local.r.usage; throw stopped; }
+        &restart);
+    catch (StreamInterrupted dropped) { static if (__traits(hasMember, S, "r")) dropped.usage = addUsage(retried, local.r.usage); throw dropped; }
+    catch (imported!"nano.control".Cancelled stopped) { static if (__traits(hasMember, S, "r")) stopped.usage = addUsage(retried, local.r.usage); throw stopped; }
+    static if (__traits(hasMember, S, "r")) local.r.usage = addUsage(retried, local.r.usage);
     st = local;
     return whole;
+}
+
+/// The sum of two requests' usage: a retried attempt's tokens and credits
+/// are added to the attempt that replaced it.
+imported!"nano.llm".TokenUsage addUsage(imported!"nano.llm".TokenUsage a, imported!"nano.llm".TokenUsage b) pure nothrow @nogc @safe
+{
+    a.inputTokens += b.inputTokens;
+    a.outputTokens += b.outputTokens;
+    a.cachedInputTokens += b.cachedInputTokens;
+    a.aic += b.aic;
+    a.hasAic = a.hasAic || b.hasAic;
+    return a;
+}
+
+unittest
+{
+    import nano.llm : TokenUsage;
+    TokenUsage dropped = { inputTokens: 100 };
+    TokenUsage done = { inputTokens: 100, outputTokens: 7, cachedInputTokens: 3, hasAic: true, aic: 0.5 };
+    auto sum = addUsage(dropped, done);
+    assert(sum.inputTokens == 200 && sum.outputTokens == 7 && sum.cachedInputTokens == 3);
+    assert(sum.hasAic && sum.aic == 0.5);
+    assert(addUsage(TokenUsage.init, TokenUsage.init) == TokenUsage.init);
 }
 
 /// The `data: [DONE]` end-of-stream marker (not a JSON event).
