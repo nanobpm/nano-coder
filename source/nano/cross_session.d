@@ -148,6 +148,14 @@ SessionInfo[] listSessions(ref Policy policy, string dir, string cwd, string fil
     import nano.peers : peersDir;
     SessionInfo[] out_;
     auto handles = runningHandles(peersDir(), dir);
+    // /proc/locks is read and indexed once per discovery, not per live session.
+    bool locksRead;
+    int[string] locks;
+    void probe(ref SessionInfo i)
+    {
+        if (!locksRead) { locks = readLockIndex(); locksRead = true; }
+        probeProcess(i, locks);
+    }
     bool matches(const ref SessionInfo i, string f)
     {
         return i.id.toLower.canFind(f) || i.title.toLower.canFind(f)
@@ -171,7 +179,7 @@ SessionInfo[] listSessions(ref Policy policy, string dir, string cwd, string fil
             // The registry is current for a running session (the index
             // catches up after its next turn).
             i.name = handles.get(i.id, null);
-            probeProcess(i);
+            probe(i);
         }
         if (!i.cwd.length) i.cwd = logHeaderCwd(s.path);
         if (filter.length && !matches(i, filter.toLower)) continue;
@@ -183,7 +191,7 @@ SessionInfo[] listSessions(ref Policy policy, string dir, string cwd, string fil
     foreach (i; listeningWithoutPrompts(dir, out_, &deniedPath))
     {
         i.name = handles.get(i.id, null);
-        probeProcess(i);
+        probe(i);
         if (filter.length && !matches(i, filter.toLower)) continue;
         out_ ~= i;
     }
@@ -334,29 +342,47 @@ unittest
     assert(shortTitle("a".replicate(maxTitleBytes)) == "a".replicate(maxTitleBytes));
 }
 
-/// Fill a live session's `pid` and `processCwd` from `/proc/locks` (the
-/// process holding the log's flock) and `/proc/<pid>/cwd`. Best effort:
-/// leaves them unset where `/proc` is absent (macOS) or unreadable.
-private void probeProcess(ref SessionInfo i) @safe
+/// `/proc/locks` indexed by `lockIndex`; empty where `/proc` is absent
+/// (macOS), unreadable or malformed, so pids stay unknown (best effort).
+private int[string] readLockIndex() @safe
 {
-    import std.file : DirEntry, readText, readLink, FileException;
+    import std.file : readText, FileException;
     import std.conv : ConvException;
+    try return lockIndex(readText("/proc/locks"));
+    catch (FileException) {} // no /proc: leave pids unknown
+    catch (ConvException) {} // malformed /proc/locks line: leave pids unknown
+    return null;
+}
+
+/// Fill a live session's `pid` and `processCwd` from the `/proc/locks`
+/// index (the process holding the log's flock) and `/proc/<pid>/cwd`. Best
+/// effort: leaves them unset where `/proc` is absent or unreadable.
+private void probeProcess(ref SessionInfo i, const int[string] locks) @safe
+{
+    import std.file : DirEntry, readLink, FileException;
     try
     {
         auto st = DirEntry(i.path).statBuf;
-        i.pid = lockHolder(readText("/proc/locks"), st.st_dev, st.st_ino);
+        i.pid = locks.get(lockKey(st.st_dev, st.st_ino), 0);
         if (i.pid > 0) i.processCwd = readLink(format("/proc/%s/cwd", i.pid));
     }
-    catch (FileException) {} // no /proc, or the process just exited: leave unknown
-    catch (ConvException) {} // malformed /proc/locks line: leave unknown
+    catch (FileException) {} // the log or process just went away: leave unknown
 }
 
-/// The pid holding a FLOCK on the file `dev`:`ino` per `/proc/locks` text, or 0.
-int lockHolder(string locks, ulong dev, ulong ino) pure @safe
+/// The `lockIndex` key for the file `dev`:`ino`.
+private string lockKey(ulong dev, ulong ino) pure @safe
 {
-    import std.string : lineSplitter, split;
     immutable major = ((dev >> 8) & 0xfff) | ((dev >> 32) & ~0xfffUL);
     immutable minor = (dev & 0xff) | ((dev >> 12) & ~0xffUL);
+    return format("%x:%x:%s", major, minor, ino);
+}
+
+/// FLOCK holders in `/proc/locks` text, keyed by `lockKey`, so one read
+/// serves every live session's lookup.
+int[string] lockIndex(string locks) pure @safe
+{
+    import std.string : lineSplitter, split;
+    int[string] out_;
     foreach (line; locks.lineSplitter)
     {
         auto f = line.split;
@@ -364,10 +390,16 @@ int lockHolder(string locks, ulong dev, ulong ino) pure @safe
         if (f.length < 6 || f[1] != "FLOCK") continue;
         auto parts = f[5].split(":");
         if (parts.length != 3) continue;
-        if (parts[0].to!ulong(16) == major && parts[1].to!ulong(16) == minor && parts[2].to!ulong == ino)
-            return f[4].to!int;
+        auto key = format("%x:%x:%s", parts[0].to!ulong(16), parts[1].to!ulong(16), parts[2].to!ulong);
+        if (key !in out_) out_[key] = f[4].to!int;
     }
-    return 0;
+    return out_;
+}
+
+/// The pid holding a FLOCK on the file `dev`:`ino` per `/proc/locks` text, or 0.
+int lockHolder(string locks, ulong dev, ulong ino) pure @safe
+{
+    return lockIndex(locks).get(lockKey(dev, ino), 0);
 }
 
 unittest
@@ -426,12 +458,41 @@ string listResult(ref Policy policy, string dir, string cwd, JSONValue args) @sa
             ? format("No %ssessions match %s.", what, JSONValue(filter).jsonText)
             : what.length ? format("No %ssessions.", what) : "No saved sessions.";
     }
+    return truncateOutputBytes(limitedLines(sessions, limit), defaultMaxOutput, "sessions-list");
+}
+
+/// The first `limit` (clamped to 1..`maxListLimit`) of `sessions` as lines,
+/// plus a note saying how many more matched.
+string limitedLines(SessionInfo[] sessions, long limit) @safe
+{
+    if (limit < 1) limit = 1;
+    if (limit > maxListLimit) limit = maxListLimit;
     auto shown = sessions.length > limit ? sessions[0 .. limit.to!size_t] : sessions;
     auto text = shown.map!lineOf.array.join("\n");
     if (sessions.length > shown.length)
         text ~= format("\n(%s more not shown; raise limit or narrow with filter/live/messages)",
             sessions.length - shown.length);
-    return truncateOutputBytes(text, defaultMaxOutput, "sessions-list");
+    return text;
+}
+
+unittest
+{
+    import std.algorithm : count;
+    SessionInfo[] many;
+    foreach (n; 0 .. 600)
+    {
+        SessionInfo i;
+        i.id = format("s%s", n);
+        many ~= i;
+    }
+    size_t rows(string t) { return t.count('\n') + 1 - (t.canFind("more not shown") ? 1 : 0); }
+    auto def = limitedLines(many, defaultListLimit);
+    assert(rows(def) == defaultListLimit && def.canFind("(550 more not shown"));
+    assert(rows(limitedLines(many, 3)) == 3 && limitedLines(many, 3).canFind("(597 more not shown"));
+    assert(rows(limitedLines(many, 0)) == 1 && limitedLines(many, -5).canFind("(599 more not shown"));
+    assert(rows(limitedLines(many, 10_000)) == maxListLimit && limitedLines(many, 10_000).canFind("(100 more"));
+    auto few = limitedLines(many[0 .. 2], defaultListLimit);
+    assert(rows(few) == 2 && !few.canFind("more not shown"));
 }
 
 /// `sessions` filtered by `live`/`messages` and ordered live first, then by
