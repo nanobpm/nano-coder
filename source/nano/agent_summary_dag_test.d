@@ -219,3 +219,53 @@ unittest
     assert(hist.read(path, parseJSON(`{"node":"S1"}`)).canFind("LEAF1"), "the archived node is intact");
     assert(hist.read(path, parseJSON(`{"node":"S2"}`)).canFind("fresh-marker"));
 }
+
+// Switching sessions on the same Agent (`loadRestored` → `replaceLog`): the
+// ID high-water mark seeded from session A must not carry over to session B,
+// whose archived nodes reach higher, or B's IDs would be reissued.
+unittest
+{
+    auto mockB = new MockClient([LLMResponse("b1"), LLMResponse("B-LEAF1"), LLMResponse("b2"), LLMResponse("B-LEAF2"),
+        LLMResponse("b3"), LLMResponse("B-FLAT")]);
+    auto b = logged("switch-b", mockB);
+    b.run("one", new NullEvents);
+    assert(compactAs(b, ctx.CompactionMode.smart));
+    b.run("two", new NullEvents);
+    assert(compactAs(b, ctx.CompactionMode.smart));
+    b.compactionSummaryDag = false;
+    b.run("three", new NullEvents);
+    assert(compactAs(b, ctx.CompactionMode.smart));
+
+    auto mockA = new MockClient([LLMResponse("a1"), LLMResponse("A-LEAF1"), LLMResponse("a2"),
+        LLMResponse("switched-marker")]);
+    auto a = logged("switch-a", mockA);
+    a.run("first", new NullEvents);
+    assert(compactAs(a, ctx.CompactionMode.smart));
+    // Adopt session B on the same Agent.
+    auto bPath = b.log.unwrap("logged").path;
+    a.messages = b.messages.dup;
+    a.replaceLog(some(new SessionLog(bPath)));
+    a.run("second", new NullEvents);
+    assert(compactAs(a, ctx.CompactionMode.smart));
+    auto live = dag.parse(a.messages[1].content);
+    assert(live.length == 1 && live[0].id == 3, "B's archived S1/S2 are not reissued");
+    assert(hist.read(bPath, parseJSON(`{"node":"S2"}`)).canFind("B-LEAF2"));
+    assert(hist.read(bPath, parseJSON(`{"node":"S3"}`)).canFind("switched-marker"));
+}
+
+// Expanding a leaf over a long range stops collecting digests at the output
+// limit instead of building the whole listing first.
+unittest
+{
+    LLMResponse[] replies;
+    foreach (i; 0 .. 40) replies ~= LLMResponse("reply-" ~ i.to!string);
+    replies ~= LLMResponse("BIGLEAF");
+    auto agent = logged("expand-bounded", new MockClient(replies));
+    foreach (i; 0 .. 40) agent.run("question number " ~ i.to!string, new NullEvents);
+    assert(compactAs(agent, ctx.CompactionMode.smart));
+    auto path = agent.log.unwrap("logged").path;
+    auto full = hist.read(path, parseJSON(`{"node":"S1","max_output_length":100000}`));
+    assert(full.canFind("question number 39") && !full.canFind("more log lines"), full);
+    auto small = hist.read(path, parseJSON(`{"node":"S1","max_output_length":300}`));
+    assert(!small.canFind("question number 39"), small);
+}

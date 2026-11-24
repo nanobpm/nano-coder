@@ -4266,6 +4266,16 @@ class Agent
     {
         auto old = log;
         log = newLog;
+        // The node-ID high-water mark belongs to the log it was seeded
+        // from: a different session must be scanned afresh, or its archived
+        // IDs could be reissued (issue #274).
+        bool sameLog;
+        old.ifSome((SessionLog o) { newLog.ifSome((SessionLog n) { sameLog = n is o; }); });
+        if (!sameLog)
+        {
+            summaryNodeSeeded = false;
+            summaryNodeHigh = 0;
+        }
         old.ifSome((SessionLog o) {
             bool same;
             newLog.ifSome((SessionLog n) { same = n is o; });

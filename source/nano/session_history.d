@@ -505,7 +505,7 @@ private SummaryNode findNode(string path, uint id, out ulong line)
 
 /// `history_read` of a node: its prose, then its children's (a condensed
 /// node) or a one-line digest of each original message it covers (level 0).
-private string expandNode(string path, uint id)
+private string expandNode(string path, uint id, size_t limit = size_t.max)
 {
     import nano.session : foreachLogLineSkippingTorn;
     ulong recordLine;
@@ -523,16 +523,26 @@ private string expandNode(string path, uint id)
     }
     if (!node.first) return text ~ "\n(the node's message range is unknown)";
     text ~= format("\nOriginal messages #%s-#%s (history_read an ID for the whole message):\n", node.first, node.last);
-    ulong n;
+    // Bound working memory by the caller's output limit: a leaf inherited
+    // from a flat summary can cover the whole session, so stop collecting
+    // digests once the listing is past the limit and just count the rest.
+    import std.array : appender;
+    auto out_ = appender!string;
+    out_ ~= text;
+    ulong n, omitted;
     foreachLogLineSkippingTorn(path, (const(char)[] logLine) {
         ++n;
         if (n < node.first || n > node.last || !logLine.length) return;
+        if (out_.data.length >= limit) { ++omitted; return; }
         Message m;
         if (!messageLine(logLine, m) || m.role == Role.system) return;
         auto body_ = searchable(m);
-        text ~= label(n, m) ~ ": " ~ snippet(body_, 0, 0) ~ "\n";
+        out_ ~= label(n, m) ~ ": " ~ snippet(body_, 0, 0) ~ "\n";
     }, (head) => headMayBeMessage(head));
-    return text;
+    if (omitted)
+        out_ ~= format("... %s more log lines in the range not listed (over max_output_length); "
+            ~ "history_search or history_read an ID to reach them\n", omitted);
+    return out_.data;
 }
 
 /// `history_read`: one message in full, bounded (the whole is spilled to a file).
@@ -552,11 +562,11 @@ string read(string path, JSONValue args)
     // A summary node (`S7`, issue #274) expands to the next level down.
     if (auto v = args.type == JSONType.object ? "node" in args.objectNoRef : null)
         if (v.type != JSONType.null_)
-            return truncateOutput(expandNode(path, nodeArg(*v)), limit, "history-node");
+            return truncateOutput(expandNode(path, nodeArg(*v), limit), limit, "history-node");
     // A node name passed as the id is expanded too.
     if (auto v = args.type == JSONType.object ? "id" in args.objectNoRef : null)
         if (v.type == JSONType.string && parseNodeName(v.str).isSome)
-            return truncateOutput(expandNode(path, nodeArg(*v)), limit, "history-node");
+            return truncateOutput(expandNode(path, nodeArg(*v), limit), limit, "history-node");
     auto id = idArg(args, "id", true);
     // Stream the log (issue #271): only the target message is retained, so
     // reading one message from a huge session stays bounded.

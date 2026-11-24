@@ -226,9 +226,10 @@ CondenseGroup condenseGroup(const SummaryNode[] nodes, size_t budgetBytes) nothr
             i = j;
         }
     }
-    // No two peers are adjacent: merge the oldest nodes, as before.
-    auto k = old.length;
-    return CondenseGroup(0, k < condenseFanIn ? k : condenseFanIn);
+    // No two peers are adjacent: defer. Merging unequal levels here would
+    // fold the oldest span again and again into a linear-depth chain; the
+    // next leaf makes a peer run, so the overshoot lasts one compaction.
+    return CondenseGroup.init;
 }
 
 /// A condensed node over `children` with `text` (the caller writes it, by
@@ -408,9 +409,10 @@ unittest
 unittest // condensation merges peers, so the tree stays balanced (issue #274)
 {
     SummaryNode n(uint id, uint level) { return SummaryNode(id, level, 0, 0, null, "xxxxxxxxxxxxxxxxxxxx"); }
-    // The newest leaf is excluded, so no two peers are adjacent: fall back
-    // to merging the oldest.
-    assert(condenseGroup([n(7, 1), n(8, 0), n(9, 0)], 10) == CondenseGroup(0, 2));
+    // The newest leaf is excluded, so no two peers are adjacent: defer
+    // rather than fold unequal levels into a chain.
+    assert(condenseGroup([n(7, 1), n(8, 0), n(9, 0)], 10).count == 0);
+    assert(condenseGroup([n(6, 2), n(7, 1), n(8, 0), n(9, 0)], 10).count == 0);
     // Leaves after a condensed node are merged among themselves.
     assert(condenseGroup([n(7, 1), n(8, 0), n(9, 0), n(10, 0)], 10) == CondenseGroup(1, 2));
     // Two level-1 nodes and no leaf run: the level-1 peers merge.
@@ -419,4 +421,25 @@ unittest // condensation merges peers, so the tree stays balanced (issue #274)
     SummaryNode[] many = [n(1, 2)];
     foreach (uint i; 2 .. 12) many ~= n(i, 0);
     assert(condenseGroup(many, 10) == CondenseGroup(1, condenseFanIn));
+}
+
+unittest // repeated compaction keeps the depth logarithmic (issue #274)
+{
+    // 2,400-byte leaves, 900-byte condensations, a 4,000-byte budget: the
+    // shape that used to grow a chain one level per compaction.
+    SummaryNode[] ns;
+    uint next = 1, maxLevel;
+    foreach (round; 0 .. 200)
+    {
+        ns ~= SummaryNode(next++, 0, 0, 0, null, replicate("x", 2_400));
+        for (;;)
+        {
+            auto g = condenseGroup(ns, 4_000);
+            if (!g.count) break;
+            auto c = condensed(ns[g.start .. g.start + g.count], next++, replicate("y", 900));
+            ns = ns[0 .. g.start] ~ c ~ ns[g.start + g.count .. $];
+        }
+        foreach (ref n; ns) if (n.level > maxLevel) maxLevel = n.level;
+    }
+    assert(maxLevel <= 8, "depth grows with the log of the leaf count");
 }
