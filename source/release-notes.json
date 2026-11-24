@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.29.0", "date": "2026-11-24", "items": [
+      {"type":"feat","scope":"acp","title":"report AI Credits in PromptResponse usage","pr":345}
+    ]},
     {"version": "1.28.1", "date": "2026-11-24", "items": [
       {"type":"perf","scope":"build","title":"pass -lowmem to LDC to cut build peak memory","pr":343}
     ]},
@@ -439,9 +442,6 @@
     ]},
     {"version": "0.44.0", "date": "2026-10-12", "items": [
       {"type":"feat","scope":"ui","title":"show whose turn it is on the prompt line (spinner / ready hint)","pr":110}
-    ]},
-    {"version": "0.43.0", "date": "2026-10-11", "items": [
-      {"type":"feat","scope":"commands","title":"apply /model <spec> typed mid-turn at the next model call","pr":107}
     ]}
   ]
 }
