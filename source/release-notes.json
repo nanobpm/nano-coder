@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.33.0", "date": "2026-11-24", "items": [
+      {"type":"feat","scope":"compaction","title":"hierarchical summary DAG expandable via history_read","pr":366}
+    ]},
     {"version": "1.32.0", "date": "2026-11-24", "items": [
       {"type":"feat","scope":"messages","title":"replace the peer-turn send block with a hop limit when confirmation is off","pr":359}
     ]},
@@ -439,9 +442,6 @@
     ]},
     {"version": "0.48.0", "date": "2026-10-22", "items": [
       {"type":"feat","scope":"ui","title":"render markdown tables in the terminal","pr":130}
-    ]},
-    {"version": "0.47.2", "date": "2026-10-21", "items": [
-      {"type":"fix","scope":"npm","title":"replace postinstall swap with lazy self-replacement in launcher","pr":128}
     ]}
   ]
 }
