@@ -882,6 +882,24 @@ class SessionLog
 
     /// Where the warning about a replaced log goes (tests capture it).
     void delegate(string) warn;
+    /// Called after a recovery moved this session to a new id (oldId, newId),
+    /// so the owner can move state keyed on the id (the handle claim). Runs
+    /// on the append path: whatever it throws is swallowed.
+    void delegate(string oldId, string newId) onIdChange;
+
+    /// Show `msg` to the user: through `warn` when set, else on stderr.
+    void report(string msg)
+    {
+        if (warn) warn(msg);
+        else
+        {
+            import nano.safeio : stdErr;
+            import std.exception : collectException;
+            // Best-effort diagnostic: a closed or unwritable stderr must not
+            // abort the caller's pending write after a successful recovery.
+            if (collectException(stdErr.writeln("\n", msg)) !is null) {}
+        }
+    }
 
     /// The path no longer names the file this writer holds open (something
     /// moved, deleted or rewrote the live log). Appending on would write into
@@ -1033,14 +1051,12 @@ class SessionLog
             buildPath(path.dirName, id ~ ".attachments"));
         auto msg = "WARNING: session log " ~ old ~ " no longer names the file this session was writing: "
             ~ how ~ ". Nothing was lost.";
-        if (warn) warn(msg);
-        else
+        report(msg);
+        if (id != oldId && onIdChange)
         {
-            import nano.safeio : stdErr;
             import std.exception : collectException;
-            // Best-effort diagnostic: a closed or unwritable stderr must not
-            // abort the caller's pending write after a successful recovery.
-            if (collectException(stdErr.writeln("\n", msg)) !is null) {}
+            // The recovery already succeeded: a failing hook must not fail the write.
+            if (auto e = collectException(onIdChange(oldId, id))) report("WARNING: " ~ e.msg);
         }
     }
 

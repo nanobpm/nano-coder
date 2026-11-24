@@ -2804,7 +2804,32 @@ class Agent
         }
         if (name.length && changed) releaseName();
         name = handle;
+        log.ifSome((SessionLog l) { l.onIdChange = &moveNameClaim; });
         return null;
+    }
+
+    /// The log moved to a recovery id: move the handle's claim with it, or
+    /// the old (now unlocked) id reads as stopped and another session could
+    /// take the handle. Never throws: it runs on the log's append path.
+    private void moveNameClaim(string oldId, string newId) nothrow
+    {
+        import nano.handle : claim, release;
+        if (!name.length) return;
+        string refused;
+        try
+        {
+            log.ifSome((SessionLog l) { refused = claim(peers.peersDir(), sessionDirOf(l), name, newId); });
+            release(peers.peersDir(), name, oldId);
+        }
+        catch (Exception e) refused = e.msg;
+        if (refused is null) return;
+        immutable lost = name;
+        name = null;
+        try log.ifSome((SessionLog l) {
+            l.report("WARNING: this session lost its handle " ~ lost ~ " when its log moved to " ~ newId
+                ~ ": " ~ refused ~ " (set it again with /name)");
+        });
+        catch (Exception) {} // best-effort diagnostic: the handle is already dropped
     }
 
     /// Drop this session's registry claim on its handle (it keeps the name

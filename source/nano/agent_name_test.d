@@ -297,3 +297,34 @@ unittest
     assert(cross.resolve("sess-target", infos).id == "sess-target");
     closeLog(other);
 }
+
+// A recovery that moves the log to `<id>.recovered-N` moves the handle's
+// claim with it: the handle still resolves to the running session and no
+// other session can take it.
+unittest
+{
+    import std.file : write;
+    import nano.handle : runningHolder;
+    import nano.llm : Message;
+    auto d = Dirs.make("nd-name-recovered");
+    scope (exit) d.cleanup();
+    auto a = d.agent("s-a");
+    assert(a.setName("perf") is null);
+    string warned;
+    a.log.ifSome((SessionLog l) {
+        l.warn = (string m) { warned ~= m; };
+        // A different (non-prefix) file at the path forces a recovery log.
+        import std.file : remove;
+        remove(l.path);
+        write(l.path, "{\"type\":\"session\",\"data\":{\"id\":\"other\"}}\n");
+        auto m = Message.user("after");
+        l.append(m);
+        assert(l.id == "s-a.recovered-1", l.id);
+    });
+    assert(a.name == "perf");
+    assert(runningHolder(d.peers, d.sessions, "perf") == "s-a.recovered-1");
+    auto b = d.agent("s-b");
+    assert(b.setName("perf") !is null, "the recovered session still holds the handle");
+    closeLog(a);
+    closeLog(b);
+}
