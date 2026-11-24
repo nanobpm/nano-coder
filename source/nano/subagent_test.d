@@ -725,3 +725,46 @@ unittest
     assert(f.agent.sessionInputTokens == 34, "both failures' retried usage is counted once");
     assert(f.agent.uncountedRequests >= 3, "their usage-free retried attempts are counted");
 }
+
+/// The parent log's `subagent_usage` records (issue #341).
+JSONValue[] subagentUsageRecords(string path)
+{
+    import std.string : lineSplitter;
+    JSONValue[] rs;
+    foreach (line; readText(path).lineSplitter)
+    {
+        if (!line.canFind(`"subagent_usage"`)) continue;
+        auto j = parseJSON(line);
+        if (j["type"].str == "subagent_usage") rs ~= j["data"];
+    }
+    return rs;
+}
+
+// A finished sub-agent's whole usage goes to the parent log once, with its
+// id, log path and model (issue #341).
+unittest
+{
+    auto f = new Fixture([LLMResponse("", "", [ToolCall.fromRaw("c1", "agent", agentCall("parser", "mock/search"))]),
+        LLMResponse("done")]);
+    f.persist();
+    scope (exit) if (f.dir.exists) rmdirRecurse(f.dir);
+    assert(f.agent.run("go", new NullEvents) == "done");
+    auto rs = subagentUsageRecords(f.agent.log.unwrap("persisted").path);
+    assert(rs.length == 1, rs.length.stringof);
+    assert(rs[0]["model"].str == "mock/search");
+    assert(rs[0]["id"].str.length && rs[0]["log"].str.length && rs[0]["log"].str.exists, rs[0].toString);
+    assert(rs[0]["input_tokens"].integer == 300 && rs[0]["output_tokens"].integer == 30, rs[0].toString);
+}
+
+// A sub-agent cancelled mid-run still gets exactly one record.
+unittest
+{
+    auto f = new Fixture([LLMResponse("", "", [ToolCall.fromRaw("c", "agent", agentCall("x", "mock/cancel"))]),
+        LLMResponse("never")]);
+    f.persist();
+    scope (exit) if (f.dir.exists) rmdirRecurse(f.dir);
+    assert(f.agent.run("go", new NullEvents) == cancelledResponse);
+    f.agent.control.startTurn();
+    auto rs = subagentUsageRecords(f.agent.log.unwrap("persisted").path);
+    assert(rs.length == 1 && rs[0]["model"].str == "mock/cancel" && rs[0]["id"].str.length, rs.length.stringof);
+}
