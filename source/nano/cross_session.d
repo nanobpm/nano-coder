@@ -85,7 +85,8 @@ private bool acceptsMessages(string id) @safe
     import std.socket : Socket, UnixAddress, AddressFamily, SocketType, SocketException, SocketOSException;
     auto path = socketPath(peersDir(), id);
     if (!path.exists) return false;
-    auto s = new Socket(AddressFamily.UNIX, SocketType.STREAM);
+    import nano.peers : unixSocket;
+    auto s = unixSocket();
     scope (exit) s.close();
     // Non-blocking: a listener whose backlog is full (busy routing) must not
     // stall discovery; a would-block connect means a live listener.
