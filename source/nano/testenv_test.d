@@ -313,17 +313,20 @@ enum watchdogPollMs = 1000;
 /// `NANO_TEST_STUCK=1` adds a module that never returns, to see it work.
 private void startWatchdog(double scale)
 {
+    import std.path : absolutePath;
     import nano.safeio : spawnDaemon;
-    spawnDaemon(&watchdog, scale);
+    // Resolve on the runner thread, before any test can chdir, so the
+    // watchdog never reads a relative path against a moved cwd.
+    spawnDaemon(&watchdog, scale, absolutePath("scripts/slow-tests"));
 }
 
-private void watchdog(double scale)
+private void watchdog(double scale, string slowTests)
 {
     import core.time : msecs;
     import nano.clock : sleepFor;
     import nano.safeio : exitProcess, stdErr;
     long[string] limits;
-    foreach (name, rest; listedModules("scripts/slow-tests"))
+    foreach (name, rest; listedModules(slowTests))
     {
         import std.array : split;
         import std.conv : to;
