@@ -19,6 +19,16 @@ import nano.tools : ToolRegistry;
 
 private:
 
+/// A session log that skips the per-turn fsync: these tests write thousands
+/// of turns, and on a loaded disk the syncs alone outlast the module's time
+/// limit (issue #374). Durability is not what they check.
+SessionLog quickLog(string dir)
+{
+    auto l = new SessionLog(dir, "mock/m", "/w");
+    l.syncTurns = false;
+    return l;
+}
+
 Agent agentFor(LLMClient c)
 {
     return new Agent(c, new ToolRegistry, Policy.init, "system");
@@ -37,7 +47,7 @@ unittest
     auto big = (string c) => c.replicate(cap / 2 + 1);
     auto agent = agentFor(new MockClient([LLMResponse(big("a")), LLMResponse(big("b")), LLMResponse(big("c"))]));
     agent.completedCap = cap;
-    agent.log = some(new SessionLog(dir, "mock/m", "/w"));
+    agent.log = some(quickLog(dir));
     foreach (id; ["in-a", "in-b", "in-c"]) agent.run("go " ~ id, new NullEvents, true, id);
     assert(agent.completedBytes <= cap && agent.completedInputs.length == 1, agent.completedBytes.to!string);
     assert("in-c" in agent.completedInputs && agent.completedEvicted.mayContain("in-a")
@@ -60,7 +70,9 @@ unittest
     auto r = restore(path);
     auto resumed = agentFor(new MockClient([]));
     resumed.completedCap = cap;
-    resumed.loadRestored(r, some(new SessionLog(path)));
+    auto reopened = new SessionLog(path);
+    reopened.syncTurns = false;
+    resumed.loadRestored(r, some(reopened));
     assert(resumed.completedBytes <= cap && resumed.completedInputs.length < 30);
     assert("bulk-999" in resumed.completedInputs && "bulk-0" !in resumed.completedInputs);
     assert(resumed.run("q", new NullEvents, true, "bulk-0") == "r".replicate(200) ~ "0");
@@ -91,7 +103,7 @@ unittest
     foreach (i; 0 .. 200) script ~= LLMResponse("");
     auto agent = agentFor(new MockClient(script));
     agent.completedCap = 2_048;
-    agent.log = some(new SessionLog(dir, "mock/m", "/w"));
+    agent.log = some(quickLog(dir));
     foreach (i; 0 .. 200) agent.run("go", new NullEvents, true, "id-" ~ i.to!string);
     assert(agent.completedBytes <= 2_048 && agent.completedInputs.length < 50);
 
@@ -144,7 +156,7 @@ unittest
         scope (exit) if (dir.exists) rmdirRecurse(dir);
         auto agent = agentFor(new MockClient([LLMResponse("a".replicate(3_000)), LLMResponse("b".replicate(3_000))]));
         agent.completedCap = 4_096;
-        auto l = new SessionLog(dir, "mock/m", "/w");
+        auto l = quickLog(dir);
         l.warn = (string) {};
         agent.log = some(l);
         agent.run("go", new NullEvents, true, "in-a");

@@ -26,7 +26,7 @@ shared static this()
 /// directory of this process's own: tests name their scratch directories by
 /// purpose (`nano-d-mem-index`), so two test runs at once (two worktrees, or
 /// ci.sh while a pre-push hook runs) would otherwise delete and overwrite
-/// each other's files (issue #253).
+/// each other's files (issue #253). It also becomes a git ceiling directory.
 private void privateTempDir()
 {
     import std.file : mkdirRecurse;
@@ -36,6 +36,12 @@ private void privateTempDir()
     const ownTemp = buildPath(base, ownTempName);
     mkdirRecurse(ownTemp);
     environment["TMPDIR"] = ownTemp;
+    // Repository discovery (ours and git's) must not climb out of the temp
+    // directory: on a host whose TMPDIR sits inside a git checkout (a Nano
+    // Workforce worker's is under its workspace's `.git`), a test's "outside
+    // any repository" directory would otherwise find that checkout (#374).
+    const ceilings = environment.get("GIT_CEILING_DIRECTORIES", "");
+    environment["GIT_CEILING_DIRECTORIES"] = ceilings.length ? ownTemp ~ ":" ~ ceilings : ownTemp;
 }
 
 /// The name of this process's temp directory.
@@ -83,6 +89,28 @@ struct TestEntry
     void function() run;
 }
 
+/// `all` limited to the comma-separated module names in `only` (all of them
+/// when `only` is empty). `NANO_TEST_ONLY` sets it: scripts/ci.sh reruns the
+/// modules that read the host's home and repositories in a worker-like
+/// environment (issue #374).
+immutable(TestEntry)[] onlyModules(immutable(TestEntry)[] all, string only) pure
+{
+    import std.algorithm : canFind, filter, map, splitter;
+    import std.array : array;
+    import std.string : strip;
+    if (!only.strip.length) return all;
+    auto names = only.splitter(',').map!(n => n.strip).array;
+    return all.filter!(t => names.canFind(t.name)).array;
+}
+
+unittest
+{
+    static void f() {}
+    immutable all = [immutable TestEntry("a.b", &f), immutable TestEntry("c", &f)];
+    assert(onlyModules(all, "").length == 2);
+    assert(onlyModules(all, " c , x").length == 1 && onlyModules(all, "c")[0].name == "c");
+}
+
 /// The last dotted component: `core.exception.AssertError` -> `AssertError`.
 private string findLastDot(string s) pure nothrow @nogc
 {
@@ -104,6 +132,7 @@ UnitTestResult runModuleTests() @trusted
     immutable(TestEntry)[] all;
     foreach (m; ModuleInfo)
         if (m !is null && m.unitTest !is null) all ~= immutable TestEntry(m.name, cast(void function() @safe) m.unitTest);
+    all = onlyModules(all, environment.get("NANO_TEST_ONLY", ""));
     const jobs = environment.get("NANO_TEST_JOBS", "1").to!size_t;
     const serial = listedModules("scripts/serial-tests");
     // The host's load before the tests start (see loadFactor).

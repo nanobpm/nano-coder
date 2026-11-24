@@ -492,8 +492,7 @@ unittest
     write(buildPath(root, "b/sub/z.txt"), "one\nhit two\n");
     write(buildPath(root, "a/y.txt"), "hit\n");
     symlink(root, buildPath(root, "a/loop"));
-    import std.array : replace;
-    string rel(string s) { import std.string : stripRight; return s.replace(root ~ "/", "").stripRight; }
+    string rel(string s) { return stripRoot(s, root); }
     JSONValue j(string extra) { return parseJSON(`{"pattern":"hit","path":` ~ JSONValue(root).toString ~ extra ~ `}`); }
     // Content mode: path:line:text, sorted; nested .gitignore with negation.
     assert(rel(grep(j(``))) == "a/y.txt:1:hit\nb/keep.tmp:1:hit\nb/sub/z.txt:2:hit two", rel(grep(j(``))));
@@ -544,11 +543,22 @@ version (unittest)
 
     private string files(string pattern, string path, DenyScan scan = null)
     {
-        import std.array : replace;
-        import std.string : stripRight;
         auto out_ = grep(parseJSON(`{"pattern":` ~ JSONValue(pattern).toString ~ `,"path":` ~ JSONValue(path).toString
             ~ `,"output_mode":"files"}`), scan);
-        return out_.replace(path ~ "/", "").stripRight;
+        return stripRoot(out_, path);
+    }
+
+    /// Tool output with `root/` removed from its paths. Paths under the
+    /// working directory are shown relative to it, and the temp directory can
+    /// be under it (a worker's is in its workspace, issue #374).
+    private string stripRoot(string out_, string root)
+    {
+        import std.array : replace;
+        import std.file : getcwd;
+        import std.string : stripRight;
+        const cwd = getcwd() ~ "/";
+        const prefix = root.startsWith(cwd) ? root[cwd.length .. $] : root;
+        return out_.replace(prefix ~ "/", "").stripRight;
     }
 }
 
@@ -655,12 +665,10 @@ version (unittest)
 {
     private string run(string tool, string json, string root)
     {
-        import std.array : replace;
-        import std.string : stripRight;
         auto args = parseJSON(json);
         args["path"] = args.type == JSONType.object && "path" in args ? buildPath(root, args["path"].str) : root;
         auto out_ = tool == "glob" ? glob(args) : grep(args);
-        return out_.replace(root ~ "/", "").stripRight;
+        return stripRoot(out_, root);
     }
 }
 

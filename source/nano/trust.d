@@ -143,7 +143,15 @@ bool decideRoot(string root, const string[] skillDirs, bool aiLock, Options opts
 private bool withinBoundary(string path, string boundary)
 {
     auto real_ = canonical(path);
-    return real_ !is null && underPath(real_, boundary) && !real_.pathSplitter.canFind(".git") && isFileAt(real_);
+    return real_ !is null && underPath(real_, boundary) && !gitBelow(real_, boundary) && isFileAt(real_);
+}
+
+/// Whether `path` (under `root`) passes through a `.git` below `root`. Only
+/// the part below counts: the root itself may sit under some other
+/// repository's `.git` (a worker's temp directory does, issue #374).
+private bool gitBelow(string path, string root) pure
+{
+    return path[root.length .. $].pathSplitter.canFind(".git");
 }
 
 private bool underPath(string path, string root) pure
@@ -160,12 +168,12 @@ bool dirHasSkill(string repoRoot, string dir)
 {
     auto repo = canonical(repoRoot);
     auto boundary = canonical(dir);
-    if (repo is null || boundary is null || !underPath(boundary, repo)) return false;
+    if (repo is null || boundary is null || !underPath(boundary, repo) || gitBelow(boundary, repo)) return false;
     size_t[string] visited;
     bool scan(string d, size_t depth)
     {
         auto real_ = canonical(d);
-        if (real_ is null || !underPath(real_, boundary) || real_.pathSplitter.canFind(".git")) return false;
+        if (real_ is null || !underPath(real_, boundary) || gitBelow(real_, boundary)) return false;
         if (auto seen = real_ in visited)
             if (*seen <= depth) return false;
         visited[real_] = depth;
@@ -612,4 +620,12 @@ unittest
     environment["NANO_CODER_TRUST_FILE"] = "hunter2";
     scope (exit) { if (old is null) environment.remove("NANO_CODER_TRUST_FILE"); else environment["NANO_CODER_TRUST_FILE"] = old; }
     assert(trustFile() == "hunter2");
+}
+
+// issue #374: only a `.git` below the root counts; the root itself may sit
+// under another repository's `.git`.
+unittest
+{
+    assert(!gitBelow("/w/.git/tmp/repo/a/SKILL.md", "/w/.git/tmp/repo"));
+    assert(gitBelow("/w/.git/tmp/repo/.git/x/SKILL.md", "/w/.git/tmp/repo"));
 }

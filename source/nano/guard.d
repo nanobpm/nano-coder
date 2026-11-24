@@ -424,14 +424,42 @@ struct Guard
         if (!inWorkspace && componentCount(p) <= 2) return "a top-level system directory";
         if (!inWorkspace && systemDirs.any!(d => startsWithPath(p, d))) return "a system directory";
         if (!inWorkspace && varRoots.canFind(p)) return "a system directory";
-        if (components(p).canFind(".git")) return "a git repository's .git directory";
+        if (inGitDir(p)) return "a git repository's .git directory";
         return null;
+    }
+
+    /// Whether `p` passes through a `.git` directory. Inside the workspace only
+    /// the part below the working directory counts: a workspace that itself
+    /// sits under some `.git` (a worker's temp directory does, issue #374)
+    /// still guards its own repositories' `.git`, but is not wholly off limits.
+    bool inGitDir(string p) pure
+    {
+        auto parts = components(p);
+        if (!samePath(cwd, "/") && startsWithPath(p, cwd) && !cwdIsGitMetadata())
+            parts = parts[components(cwd).length .. $];
+        return parts.canFind(".git");
+    }
+
+    /// Whether the working directory is itself git metadata: a `.git`
+    /// directory, or anything below it other than a scratch directory
+    /// (`.git/tmp`, `.git/nano-tmp`: worker workspaces and test temp dirs). The check is an allowlist so any
+    /// unknown git state dir (rebase-merge, sequencer, ...) stays guarded.
+    bool cwdIsGitMetadata() pure
+    {
+        static immutable scratchDirs = ["tmp", "nano-tmp"];
+        auto parts = components(cwd);
+        foreach_reverse (i, part; parts)
+        {
+            if (part != ".git") continue;
+            return i + 1 == parts.length || !scratchDirs.canFind(parts[i + 1]);
+        }
+        return false;
     }
 
     /// Like `danger`, but only catastrophic roots outside the workspace.
     string catastrophicRoot(string p) pure
     {
-        if (components(p).canFind(".git")) return "a git repository's .git directory";
+        if (inGitDir(p)) return "a git repository's .git directory";
         if (!samePath(cwd, "/") && startsWithPath(p, cwd)) return null;
         if (samePath(p, "/")) return "the filesystem root";
         if (home !is null)
@@ -638,4 +666,34 @@ private string envGet(string name)
 {
     import std.process : environment;
     return environment.get(name);
+}
+
+// issue #374: a workspace that sits under some `.git` (a worker's temp
+// directory does) is not wholly off limits, but `.git` below it still is,
+// and any `.git` outside it too.
+unittest
+{
+    Guard g;
+    g.cwd = "/w/.git/tmp/ws";
+    assert(g.danger("/w/.git/tmp/ws/build", true) is null);
+    assert(g.danger("/w/.git/tmp/ws/repo/.git", true) == "a git repository's .git directory");
+    assert(g.catastrophicRoot("/w/.git/tmp/ws/.git/refs") == "a git repository's .git directory");
+    assert(g.catastrophicRoot("/w/.git/objects") == "a git repository's .git directory");
+    assert(g.catastrophicRoot("/w/.git/tmp/ws/build") is null);
+    // A cwd that is git metadata itself gets no exemption.
+    g.cwd = "/repo/.git";
+    assert(g.danger("/repo/.git/objects", true) == "a git repository's .git directory");
+    assert(g.catastrophicRoot("/repo/.git/objects") == "a git repository's .git directory");
+    g.cwd = "/repo/.git/refs";
+    assert(g.danger("/repo/.git/refs/heads", true) == "a git repository's .git directory");
+    assert(g.catastrophicRoot("/repo/.git/refs/heads") == "a git repository's .git directory");
+    foreach (dir; ["rebase-merge", "rebase-apply", "sequencer", "svn", "subtree-cache"])
+    {
+        g.cwd = "/repo/.git/" ~ dir;
+        assert(g.catastrophicRoot("/repo/.git/" ~ dir ~ "/x") == "a git repository's .git directory");
+    }
+    g.cwd = "/w/.git/nano-tmp/ws";
+    assert(g.catastrophicRoot("/w/.git/nano-tmp/ws/build") is null);
+    g.cwd = "/repo/.git/objects/ab";
+    assert(g.catastrophicRoot("/repo/.git/objects/ab/cd") == "a git repository's .git directory");
 }
