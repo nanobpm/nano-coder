@@ -508,7 +508,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
 - `/providers` - List providers, endpoints and whether their API key is available
 - `/session` - Show the session ID, its handle (if any) and log path
 - `/name [HANDLE|--clear]` - Show, set or clear this session's handle: a stable name other sessions use to reach it (see [Session handles](#session-handles))
-- `/trajectory` - Show this session's trajectory turn by turn: user input, thinking, answers, tool calls and results, tokens and timings. Each message row is labelled with its `#N` session-log ID, the same ID `history_read` and smart-compaction summaries use (compaction and crash-recovered input rows have no `#N`, as they aren't cited that way). It opens in your pager (`$PAGER`, default `less`), even when it would fit on the screen, so you dismiss it with `q` and it doesn't stay in the transcript or your scrollback — but only at an idle prompt on a terminal: invoked mid-turn (while a turn runs) or with piped output it prints inline instead. `/trajectory --json` or `/trajectory --markdown` prints an export instead; `nano-coder --trajectory SESSION_ID [--json|--markdown]` does the same for any saved session
+- `/trajectory` - Show this session's trajectory turn by turn: user input, thinking, answers, tool calls and results, sub-agent usage, tokens and timings, and the session's total usage. Each message row is labelled with its `#N` session-log ID, the same ID `history_read` and smart-compaction summaries use (compaction and crash-recovered input rows have no `#N`, as they aren't cited that way). It opens in your pager (`$PAGER`, default `less`), even when it would fit on the screen, so you dismiss it with `q` and it doesn't stay in the transcript or your scrollback — but only at an idle prompt on a terminal: invoked mid-turn (while a turn runs) or with piped output it prints inline instead. `/trajectory --json` or `/trajectory --markdown` prints an export instead; `nano-coder --trajectory SESSION_ID [--json|--markdown]` does the same for any saved session
 - `/resume [SESSION|last]` - Switch to a saved session without restarting: the same picker as `--resume` (leaving out the session in use), or the session with that handle, ID, unique ID prefix or title, or `last` (the most recent other session in this directory). Run it at the prompt, not during a turn
 - `/restart` - Start a fresh session (clean context) without exiting
 - `/exit` - Exit the agent (prints the session's `--resume` command first, when session persistence is enabled)
@@ -574,7 +574,12 @@ so an `agent` call after it starts only once the change is made. A sub-agent has
 through this session's permission policy and hooks (a denied call is an error for the sub-agent, it
 never prompts), Esc/Ctrl-C stops it, and its usage counts toward the session's. Its log is written
 next to the session's (`<session>/sub-<call id>.jsonl`), referenced from the `agent` result, and
-expanded by `--trajectory`.
+expanded by `--trajectory`. When a sub-agent ends (done, cancelled or stopped), the parent session
+log gets one `subagent_usage` record (`version` 1: `id`, child `log` path, `model`, `input_tokens`,
+`output_tokens`, and `aic` when reported), so anything reading the parent log sees sub-agent spend.
+`/trajectory` shows it as a `SUB-AGENT sub-N (model)` row and ends with a `Total:` line that counts
+it once beside the main agent's usage (`--json` adds a `totals` object when there were sub-agents);
+older logs without the record still load.
 
 To give the agent a curated, cost-controlled choice of sub-agent models, list them:
 

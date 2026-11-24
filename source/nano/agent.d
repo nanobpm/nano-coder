@@ -3724,6 +3724,11 @@ class Agent
                 recordUsage(subSlots[i].fold.advance(subSlots[i].result.usage, subSlots[i].result.aicReports,
                     subSlots[i].result.uncountedRequests, lost));
                 uncountedRequests += lost;
+                // The parent log gets the sub-agent's whole usage once
+                // (issue #341), whatever ended it.
+                foreach (l; log)
+                    l.subagentUsage(subSlots[i].id, subSlots[i].logPath, subSlots[i].spec.model,
+                        subSlots[i].result.usage);
                 // Start the replacements first, so the one report shows
                 // them running (a child sends no progress during its first
                 // model request).

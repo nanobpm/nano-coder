@@ -1300,6 +1300,15 @@ class SessionLog
         write_(record("subagent", JSONValue(["id": id, "event": event, "text": text, "recorded_at": nowStamp()])));
     }
 
+    /// A finished sub-agent's usage (issue #341): written once when it ends
+    /// (done, cancelled or stopped), so readers of this log (`/trajectory`,
+    /// external tools) count sub-agent spend without opening the child log.
+    /// Record `subagent_usage`, `version` 1; a resume ignores it.
+    void subagentUsage(string id, string childLog, string model, imported!"nano.llm".TokenUsage u)
+    {
+        write_(record("subagent_usage", subagentUsageData(id, childLog, model, u, nowStamp())));
+    }
+
     /// A session setting the agent changed (`session_settings`, issue #293).
     /// Audit only: a resumed session starts from the config again.
     void setting(string key, string old, string next, string reason)
@@ -2715,7 +2724,7 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
                 if (v.type == JSONType.true_ || v.type == JSONType.false_)
                     r.settings.messagesConfirm = v.type == JSONType.true_ ? 1 : 0;
             break;
-        default: // hooks, setting: audit only
+        default: // hooks, setting, subagent_usage: audit only
             break;
         }
         index++;
@@ -5131,4 +5140,53 @@ unittest
     b.maxFileBytes = 1;
     auto bs = streamLogLinesWith(p, (line) => true, b);
     assert(bs.truncated && bs.fileBytes == 64 * 1024);
+}
+
+/// The `subagent_usage` record's data (issue #341). `aic` only when the
+/// provider reported credits.
+JSONValue subagentUsageData(string id, string childLog, string model, imported!"nano.llm".TokenUsage u,
+    string recordedAt) pure
+{
+    JSONValue d = ["version": JSONValue(1), "id": JSONValue(id), "log": JSONValue(childLog),
+        "model": JSONValue(model), "input_tokens": JSONValue(u.inputTokens),
+        "output_tokens": JSONValue(u.outputTokens), "recorded_at": JSONValue(recordedAt)];
+    if (u.hasAic) d["aic"] = u.aic;
+    return d;
+}
+
+// Issue #341: a finished sub-agent's usage round-trips through the log, and
+// a resume still loads (the record is audit only).
+unittest
+{
+    import nano.llm : TokenUsage;
+    import nano.trajectory : load, Kind;
+    auto dir = buildPath(tempDir, "nano-coder-session-subusage");
+    if (dir.exists) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/a", "/x");
+    auto sys = Message.system("sys");
+    log.append(sys);
+    TokenUsage u;
+    u.inputTokens = 120;
+    u.outputTokens = 30;
+    u.hasAic = true;
+    u.aic = 0.5;
+    log.subagentUsage("sub-1", "/logs/child.jsonl", "mock/b", u);
+    log.subagentUsage("sub-2", "", "mock/c", TokenUsage(7, 3));
+    auto r = restore(log.path);
+    assert(r.model == "mock/a" && r.conversation.length == 1);
+    auto t = load(log.path);
+    auto tot = t.totals;
+    assert(tot.subagentCount == 2);
+    assert(tot.subagents.inputTokens == 127 && tot.subagents.outputTokens == 33);
+    assert(tot.subagents.hasAic && tot.subagents.aic == 0.5);
+    size_t rows;
+    foreach (ref turn; t.turns)
+        foreach (ref row; turn.rows)
+            if (row.kind == Kind.subagent)
+            {
+                rows++;
+                if (row.name == "sub-1")
+                    assert(row.compactModel == "mock/b" && row.text == "log: /logs/child.jsonl" && row.aic == "0.5");
+            }
+    assert(rows == 2);
 }
