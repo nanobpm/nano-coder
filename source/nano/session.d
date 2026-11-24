@@ -283,12 +283,14 @@ StreamStats streamLogLinesWith(string path, scope bool delegate(const(char)[] li
     if (isCompressedLog(path))
     {
         auto gz = GunzipStream(path);
+        gz.limit = o.maxFileBytes;
         scope (exit) gz.close();
         for (;;)
         {
             if (!budgetLeft()) break;
             auto got = gz.read(f, buf);
             st.fileBytes = gz.consumed;
+            if (gz.limitHit) st.truncated = true;
             if (!got.length) break;
             st.textBytes += got.length;
             if (!feedChunk(carry, skipping, st.oversized, got, sink, o.keep, o.oversized, o.maxLine)) break;
@@ -400,6 +402,11 @@ private struct GunzipStream
     private bool ended;
     /// Compressed bytes read from the file so far.
     ulong consumed;
+    /// Cap on compressed bytes read (0: none), checked before every
+    /// underlying read so one `read` call cannot overrun it.
+    ulong limit;
+    /// Set when `read` stopped because `limit` was reached, not at EOF.
+    bool limitHit;
 
     /// A reader over the log at `path`.
     this(string path) { this.path = path; }
@@ -416,9 +423,14 @@ private struct GunzipStream
         {
             if (zs.availIn == 0)
             {
-                auto got = f.rawRead(inBuf);
+                if (limit && consumed >= limit)
+                {
+                    limitHit = true;
+                    return null;
+                }
+                auto got = f.rawRead(inBuf[0 .. limit ? min(inBuf.length, limit - consumed) : $]);
                 consumed += got.length;
-                if (!got.length) throw new Exception("gunzip " ~ path ~ ": truncated stream");
+                if (!got.length) throw new FileException(path, "gunzip: truncated stream");
                 zs.feed(got);
             }
             auto rc = zs.inflateInto(buf);
@@ -429,11 +441,11 @@ private struct GunzipStream
                 return used ? buf[0 .. used] : null;
             }
             if (rc == InflateStream.Rc.error)
-                throw new Exception("gunzip " ~ path ~ ": " ~ zs.errorMessage);
+                throw new FileException(path, "gunzip: " ~ zs.errorMessage);
             if (used) return buf[0 .. used];
             // Z_BUF_ERROR with no output means zlib can make no progress: with
             // input still buffered that is a stuck stream, not a read more.
-            if (zs.availIn) throw new Exception("gunzip " ~ path ~ ": corrupt stream (no progress)");
+            if (zs.availIn) throw new FileException(path, "gunzip: corrupt stream (no progress)");
             // else zlib wants more input; loop to read it.
         }
     }
@@ -622,6 +634,34 @@ unittest // a corrupt or truncated gzip log is a FileException, not a bare Excep
     immutable ubyte[] truncated = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
     assertThrown!FileException(gunzipLog(corrupt, "x.jsonl.gz"));
     assertThrown!FileException(gunzipLog(truncated, "x.jsonl.gz"));
+}
+
+unittest // the streaming reader also fails with FileException and honours its byte limit
+{
+    import std.exception : assertThrown;
+    import std.file : FileException, write, remove;
+    import std.stdio : File;
+    auto p = buildPath(tempDir, "nano-coder-gzstream-test.jsonl.gz");
+    scope (exit) if (p.exists) remove(p);
+    immutable ubyte[] corrupt = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3, 0xff, 0xff, 0xff, 0xff];
+    immutable ubyte[] truncated = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
+    auto buf = new ubyte[](4096);
+    foreach (bytes; [corrupt, truncated])
+    {
+        write(p, bytes);
+        auto f = File(p, "rb");
+        auto gz = GunzipStream(p);
+        scope (exit) { gz.close(); f.close(); }
+        assertThrown!FileException(gz.read(f, buf));
+    }
+    // A limit below the header stops before any output, without reading past it.
+    write(p, gzipLog("hello\n"));
+    auto f = File(p, "rb");
+    auto gz = GunzipStream(p);
+    scope (exit) { gz.close(); f.close(); }
+    gz.limit = 4;
+    assert(gz.read(f, buf) is null);
+    assert(gz.limitHit && gz.consumed == 4);
 }
 
 unittest
