@@ -195,21 +195,25 @@ unittest
     long now = 1_000_000 * minute;
     foreach (i; 0 .. 10)
     {
-        assert(Agent.rateRefusal(sent, "b", now, 10) is null);
-        sent["b"] ~= now;
+        assert(Agent.rateRefusal(sent, "a", "b", now, 10) is null);
+        sent[Agent.sendKey("a", "b")] ~= now;
         now += minute;
     }
-    auto why = Agent.rateRefusal(sent, "b", now, 10);
+    auto why = Agent.rateRefusal(sent, "a", "b", now, 10);
     assert(why.canFind("rate limit reached") && why.canFind("10 messages"), why);
+    // The message names only the target: no sender id, no NUL from the key.
+    assert(why.canFind("session b ") && !why.canFind("\x00") && !why.canFind("a\x00"), why);
+    // Another sender to the same target has its own cap.
+    assert(Agent.rateRefusal(sent, "x", "b", now, 10) is null);
     // Another target is capped separately; 0 means no cap.
-    assert(Agent.rateRefusal(sent, "c", now, 10) is null);
-    assert(Agent.rateRefusal(sent, "b", now, 0) is null);
+    assert(Agent.rateRefusal(sent, "a", "c", now, 10) is null);
+    assert(Agent.rateRefusal(sent, "a", "b", now, 0) is null);
     // An hour after the first send, its slot frees.
     now = 1_000_000 * minute + 60 * minute;
-    assert(Agent.rateRefusal(sent, "b", now, 10) is null);
-    assert(sent["b"].length == 9);
+    assert(Agent.rateRefusal(sent, "a", "b", now, 10) is null);
+    assert(sent[Agent.sendKey("a", "b")].length == 9);
     // Stale targets are pruned: the map stays bounded.
-    assert(Agent.rateRefusal(sent, "z", now + 120 * minute, 10) is null);
+    assert(Agent.rateRefusal(sent, "a", "z", now + 120 * minute, 10) is null);
     assert(sent.length == 0);
     // Hops: user turns send hop 1; a peer turn one more than its input
     // (an older sender's message without a hop counts as hop 1).

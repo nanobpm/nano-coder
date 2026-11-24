@@ -2752,7 +2752,7 @@ class Agent
         if (auto denied = policy.checkIn(peers.sendTool, args, cwd))
             throw new hist.HistoryError(denied);
         auto now = stdTimeNow;
-        if (auto why = rateRefusal(recentSends, ownLog.id ~ "\x00" ~ target.id, now, maxSendsPerHour))
+        if (auto why = rateRefusal(recentSends, ownLog.id, target.id, now, maxSendsPerHour))
             throw new hist.HistoryError(why);
         peers.PeerMessage pm;
         pm.senderId = ownLog.id;
@@ -2768,7 +2768,7 @@ class Agent
         string note;
         auto status = peers.send(peers.peersDir(), target.id, pm, note);
         if (status != peers.Status.notRunning && status != peers.Status.refused)
-            recentSends[ownLog.id ~ "\x00" ~ target.id] ~= now; // keyed per sender/target pair
+            recentSends[sendKey(ownLog.id, target.id)] ~= now; // keyed per sender/target pair
         return format("%s: %s", statusText(status), note.length ? note : defaultNote(status, target));
     }
 
@@ -2794,15 +2794,16 @@ class Agent
     /// Why one more send to `target` at `now` (stdTime) breaks the per-pair
     /// cap of `perHour` sends an hour (0: no cap), or null. Prunes the
     /// target's entries older than an hour, so the map stays bounded.
-    static string rateRefusal(ref long[][string] sent, string target, long now, uint perHour) pure
+    static string rateRefusal(ref long[][string] sent, string sender, string target, long now, uint perHour) pure
     {
+        const key = sendKey(sender, target);
         enum long hourTicks = 3600L * 10_000_000L;
-        if (auto times = target in sent)
+        if (auto times = key in sent)
         {
             import std.algorithm : filter;
             import std.array : array;
             *times = (*times).filter!(t => t + hourTicks > now).array;
-            if (!times.length) sent.remove(target);
+            if (!times.length) sent.remove(key);
         }
         // Drop other targets' stale entries too: a long session talks to many.
         string[] stale;
@@ -2810,10 +2811,16 @@ class Agent
             if (!v.length || v[$ - 1] + hourTicks <= now) stale ~= k;
         foreach (k; stale) sent.remove(k);
         if (!perHour) return null;
-        auto times = target in sent;
+        auto times = key in sent;
         if (times is null || times.length < perHour) return null;
         return format("rate limit reached: %s messages to session %s in the last hour "
             ~ "(session_messages_max_per_hour); stop, or ask your user", times.length, target);
+    }
+
+    /// The `recentSends` key of a sender/target pair; never shown to the model.
+    static string sendKey(string sender, string target) pure nothrow
+    {
+        return sender ~ "\x00" ~ target;
     }
 
     private static string statusText(peers.Status s) pure
