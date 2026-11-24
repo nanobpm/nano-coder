@@ -623,16 +623,20 @@ string[] landlockReadRoots(const ReadPlan plan, scope string[] delegate(string) 
         // The helper opens each rule's path following symlinks, so judge (and
         // grant) the resolved target: `alias -> private` must not grant `private`.
         if (resolve !is null)
-            if (auto real_ = resolve(root))
-            {
-                // A symlink found while splitting (`/work/escape -> ~/other`)
-                // was never approved: in workspace mode its target must lie in
-                // an approved root. Approved roots (depth 0) keep their targets.
-                if (depth > 0 && real_ != root && plan.confine == ReadConfine.workspace
-                    && !plan.readable.any!(r => within(real_, r)) && !roots.any!(r => within(real_, r)))
-                    return;
-                root = real_;
-            }
+        {
+            auto real_ = resolve(root);
+            // An unresolvable root (a dangling link `stale -> missing`, a
+            // loop) can't be opened by the helper: granting it would fail
+            // every sandboxed command, so it gets no rule (it holds nothing).
+            if (real_ is null) return;
+            // A symlink found while splitting (`/work/escape -> ~/other`)
+            // was never approved: in workspace mode its target must lie in
+            // an approved root. Approved roots (depth 0) keep their targets.
+            if (depth > 0 && real_ != root && plan.confine == ReadConfine.workspace
+                && !plan.readable.any!(r => within(real_, r)) && !roots.any!(r => within(real_, r)))
+                return;
+            root = real_;
+        }
         if (plan.denied.any!(d => within(root, d))) return;
         if (!plan.denied.any!(d => within(d, root) && d != root))
         {
@@ -1260,6 +1264,13 @@ unittest
     ReadPlan s4 = { confine: ReadConfine.secrets, denied: ["/work/private"] };
     tree["/"] = ["work"];
     assert(landlockReadRoots(s4, &list, &dir, null, &res2).canFind("/home/u/other"));
+    // A dangling link found while splitting (`resolve` fails) gets no rule,
+    // in both modes, so it can't make the helper reject the whole rule set.
+    string resDangling(string p) => p == "/work/stale" ? null : p;
+    tree["/work"] = ["stale", "lib", "private"];
+    foreach (m; [w4, s4])
+        assert(!landlockReadRoots(m, &list, &dir, null, &resDangling).canFind("/work/stale"));
+    assert(landlockReadRoots(w4, &list, &dir, null, &resDangling).canFind("/work/lib"));
     // Cyclic links (`a -> .`, `b -> .`) split each directory once, not 2^64 times.
     size_t listed;
     string[] countList(string d) { ++listed; return list(d); }
