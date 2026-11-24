@@ -302,21 +302,7 @@ struct SandboxConfig
         if (mode == SandboxMode.workspace)
         {
             if (cwd != "/") add(cwd);
-            auto dirs = gitDirs(cwd);
-            bool worktreeOfCwd;
-            foreach (d; dirs)
-                if (auto r = canonicalize(d))
-                    worktreeOfCwd = worktreeOfCwd || worktreeBackpointerWithin(r, cwdReal);
-            foreach (d; dirs)
-            {
-                // A poisoned `.git` file can point at an unrelated repository:
-                // grant only git dirs inside the workspace, whose repo contains
-                // it, or that git ties back to this worktree.
-                auto r = canonicalize(d);
-                if (r is null) continue;
-                auto parent = parentOf(r);
-                if (within(r, cwdReal) || (parent !is null && within(cwdReal, parent)) || worktreeOfCwd) add(d);
-            }
+            foreach (d; trustedGitDirs(cwd)) add(d);
             if (toolCaches && home.length)
             {
                 auto homeReal = canonicalize(home);
@@ -388,6 +374,29 @@ struct SandboxConfig
         return false;
     }
 
+    /// The repository's git dirs that may be granted for `cwd`, canonical.
+    /// A poisoned `.git` file can point at an unrelated repository: only git
+    /// dirs inside the workspace, whose repo contains it, or that git ties
+    /// back to this worktree qualify. Used for both write and read grants.
+    static string[] trustedGitDirs(string cwd)
+    {
+        auto cwdReal = canonicalize(cwd);
+        if (cwdReal is null) cwdReal = cwd;
+        string[] real_;
+        foreach (d; gitDirs(cwd))
+            if (auto r = canonicalize(d)) real_ ~= r;
+        bool worktreeOfCwd;
+        foreach (r; real_) worktreeOfCwd = worktreeOfCwd || worktreeBackpointerWithin(r, cwdReal);
+        string[] result;
+        foreach (r; real_)
+        {
+            auto parent = parentOf(r);
+            if (within(r, cwdReal) || (parent !is null && within(cwdReal, parent)) || worktreeOfCwd)
+                if (!result.canFind(r)) result ~= r;
+        }
+        return result;
+    }
+
     /// Whether reads are confined at all.
     bool confinesReads() const pure nothrow { return active && readConfine != ReadConfine.off; }
 
@@ -422,7 +431,7 @@ struct SandboxConfig
                 foreach (d; toolCacheDirs) addTo(p.readable, joinPath(home, d));
             }
             if (cwd != "/") addTo(p.readable, cwd);
-            foreach (d; gitDirs(cwd)) addTo(p.readable, d);
+            foreach (d; trustedGitDirs(cwd)) addTo(p.readable, d);
             foreach (r; writableRoots(cwd)) addTo(p.readable, r);
             foreach (x; readable) addTo(p.readable, expand(x));
         }
@@ -591,7 +600,16 @@ string[] landlockReadRoots(const ReadPlan plan, scope string[] delegate(string) 
         // The helper opens each rule's path following symlinks, so judge (and
         // grant) the resolved target: `alias -> private` must not grant `private`.
         if (resolve !is null)
-            if (auto real_ = resolve(root)) root = real_;
+            if (auto real_ = resolve(root))
+            {
+                // A symlink found while splitting (`/work/escape -> ~/other`)
+                // was never approved: in workspace mode its target must lie in
+                // an approved root. Approved roots (depth 0) keep their targets.
+                if (depth > 0 && real_ != root && plan.confine == ReadConfine.workspace
+                    && !plan.readable.any!(r => within(real_, r)) && !roots.any!(r => within(real_, r)))
+                    return;
+                root = real_;
+            }
         if (plan.denied.any!(d => within(root, d))) return;
         if (!plan.denied.any!(d => within(d, root) && d != root))
         {
@@ -954,6 +972,12 @@ unittest // a poisoned .git pointer to an external repo isn't granted
     write(ws ~ "/.git", "gitdir: " ~ fake ~ "\n");
     SandboxConfig c = { mode: SandboxMode.workspace, toolCaches: false };
     foreach (r; c.writableRoots(ws)) assert(!within(r, canonicalize(fake)), r);
+    // Nor made readable in workspace read mode, in either sandbox mode (#333).
+    foreach (m; [SandboxMode.workspace, SandboxMode.readOnly])
+    {
+        SandboxConfig rc = { mode: m, toolCaches: false, readConfine: ReadConfine.workspace };
+        foreach (r; rc.readPlan(ws).readable) assert(!within(r, canonicalize(fake)), r);
+    }
 }
 
 // rust: sandbox.rs::linked_worktree_git_dirs_are_granted
@@ -1132,6 +1156,22 @@ unittest
     assert(sr == ["/home/u/.config/git", "/home/u/src/main.d"], sr.join(" "));
     ReadPlan s3 = { confine: ReadConfine.secrets, denied: ["/home/u/.ssh"] };
     foreach (r; landlockReadRoots(s3, &list, &dir, null, &res)) assert(!within(r, "/home/u/.ssh"), r);
+    // A symlink discovered while splitting can't reach an unapproved root;
+    // one inside an approved root (or a split of `secrets` mode) still works.
+    string res2(string p)
+    {
+        if (p == "/work/escape") return "/home/u/other";
+        if (p == "/work/inside") return "/work/lib";
+        if (p == "/approved") return "/home/u/other2";
+        return p;
+    }
+    tree["/work"] = ["escape", "inside", "lib", "private"];
+    ReadPlan w4 = { confine: ReadConfine.workspace, denied: ["/work/private"], readable: ["/work", "/approved"] };
+    auto er = landlockReadRoots(w4, &list, &dir, null, &res2);
+    assert(er == ["/work/lib", "/home/u/other2"], er.join(" "));
+    ReadPlan s4 = { confine: ReadConfine.secrets, denied: ["/work/private"] };
+    tree["/"] = ["work"];
+    assert(landlockReadRoots(s4, &list, &dir, null, &res2).canFind("/home/u/other"));
 }
 
 // issue #333: sandboxed commands can't read denied paths; normal work still runs

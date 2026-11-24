@@ -402,6 +402,9 @@ struct Policy
     {
         foreach (ref r; deny)
             if (r.subject == Subject.path && r.appliesTo("read_file")) scan.rules ~= r;
+        // The sandbox's denied paths for *this* cwd (#333): generated per
+        // search, so a cwd change (ACP) can't leave them aimed at the old one.
+        foreach (src; sandbox.readDenyRules(cwd)) scan.rules ~= parseRule(src);
         if (!scan.rules.length) return false;
         scan.cwdNormalized = scan.rootNormalized = normalize(cwd);
         scan.cwdResolved = scan.rootResolved = resolveSymlinks(cwd);
@@ -409,12 +412,14 @@ struct Policy
     }
 
     /// The sources of the rules `readDenyScan` uses, so another thread can
-    /// rebuild the scan with `parseRule` (a `Policy` isn't sendable).
-    immutable(string)[] readDenySources() const
+    /// rebuild the scan with `parseRule` (a `Policy` isn't sendable),
+    /// including the sandbox's denied paths for `cwd`.
+    immutable(string)[] readDenySources(string cwd) const
     {
         immutable(string)[] r;
         foreach (ref r_; deny)
             if (r_.subject == Subject.path && r_.appliesTo("read_file")) r ~= r_.source;
+        foreach (src; sandbox.readDenyRules(cwd)) r ~= src;
         return r;
     }
 

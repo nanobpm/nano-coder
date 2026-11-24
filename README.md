@@ -446,7 +446,11 @@ its target, so a link to a denied path is denied too. Landlock on
 Linux can only allow, so `deny_read` is implemented by leaving the denied paths out of
 the read rules: the readable set is split around them, which also means a directory that
 *contains* a denied path (e.g. `$HOME` itself) can't be listed, though its other entries
-can be read. Only tool-spawned commands, project hooks and file tools are confined; the
+can be read. Because the split is fixed when the command starts, a file or directory a
+command *creates* directly in such a directory is writable but not readable until the
+next command; keep `deny_read` paths out of the workspace root (or put build output in a
+subdirectory) if a build needs to read back what it wrote there. A symlink found while
+splitting is followed only when its target lies in an approved read root. Only tool-spawned commands, project hooks and file tools are confined; the
 nano-coder process itself still reads its config and API keys.
 
 **Default mode.** The mode comes from, in order: `--sandbox`, `NANO_CODER_SANDBOX`, the

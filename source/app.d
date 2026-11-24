@@ -3382,9 +3382,8 @@ int runMain(string[] args)
                 ~ "--sandbox off, NANO_CODER_SANDBOX=off or [sandbox] mode = \"off\" in the config",
                 sandboxMode.mode.modeName, sandboxMode.source.sourceName, why));
     policy.sandbox = cfg.sandbox;
-    // Search walks hide what the sandbox won't let commands read (#333).
-    foreach (r; cfg.sandbox.readDenyRules(getcwd()))
-        policy.deny ~= imported!"nano.permissions".parseRule(r);
+    // Search walks hide what the sandbox won't let commands read (#333):
+    // Policy.readDenyScan/readDenySources add its rules for the current cwd.
 
     auto tools = new ToolRegistry;
     auto readState = new ReadState;
@@ -3406,8 +3405,9 @@ int runMain(string[] args)
         return (string path) @safe => forRoot.denied(path);
     }, () @safe {
         // The same rules as text, for a search on a worker thread (#222).
-        auto sources = built.match!(a => a.policy.readDenySources, () => policy.readDenySources);
-        return sources.length ? getcwd() ~ sources : null;
+        auto cwd = getcwd();
+        auto sources = built.match!(a => a.policy.readDenySources(cwd), () => policy.readDenySources(cwd));
+        return sources.length ? cwd ~ sources : null;
     });
 
     // Repository trust gates the repo's own skills, skill lock and hooks.
