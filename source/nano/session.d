@@ -4501,4 +4501,8 @@ unittest
     assert(lines == 120_000);
     assert(streamed < bound, "eachLogLineUntil allocated " ~ to!string(streamed));
     assert(gzipLog(readBytes(back)) .length > 0 && logText(gz).length == size, "gzipLog still compresses whole text");
+    // Byte-for-byte: same-length corruption, reordering or duplication of
+    // chunks must fail, since tidy-up deletes the original after compressing.
+    assert(std.file.read(back) == std.file.read(plain), "the round trip preserves the log exactly");
+    assert(logText(gz) == std.file.readText(plain), "the archive decompresses to the original");
 }
