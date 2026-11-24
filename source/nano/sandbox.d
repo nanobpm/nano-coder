@@ -407,21 +407,22 @@ struct SandboxConfig
         if (!confinesReads) return p;
         p.confine = readConfine;
         auto home = homeDir();
-        void addTo(ref string[] list, string path)
+        // `/` is never a readable grant, but it is a valid denial.
+        void addTo(ref string[] list, string path, bool keepRoot = false)
         {
             auto n = normalize(path);
-            if (n.length && n != "/" && !list.canFind(n)) list ~= n;
+            if (n.length && (keepRoot || n != "/") && !list.canFind(n)) list ~= n;
             auto r = canonicalize(path);
-            if (r !is null && r != "/" && !list.canFind(r)) list ~= r;
+            if (r !is null && (keepRoot || r != "/") && !list.canFind(r)) list ~= r;
         }
         string expand(string x)
         {
             if (x.startsWith("~/") && home.length) return joinPath(home, x[2 .. $]);
             return joinPath(cwd, x);
         }
-        if (home.length) foreach (d; defaultDenyRead) addTo(p.denied, joinPath(home, d));
-        foreach (d; systemDenyRead) addTo(p.denied, d);
-        foreach (d; denyRead) addTo(p.denied, expand(d));
+        if (home.length) foreach (d; defaultDenyRead) addTo(p.denied, joinPath(home, d), true);
+        foreach (d; systemDenyRead) addTo(p.denied, d, true);
+        foreach (d; denyRead) addTo(p.denied, expand(d), true);
         if (readConfine == ReadConfine.workspace)
         {
             foreach (d; systemReadDirs) addTo(p.readable, d);
@@ -461,7 +462,7 @@ struct SandboxConfig
         {
             if (p is null) continue;
             foreach (d; plan.denied)
-                if (within(p, d))
+                if (withinDenied(p, d))
                     return format("%s is outside what the %s sandbox may read: credentials and secrets (%s) are "
                         ~ "never readable", path, mode.modeName, d);
             if (plan.confine == ReadConfine.workspace && !plan.readable.any!(r => within(p, r)))
@@ -595,6 +596,7 @@ string[] landlockReadRoots(const ReadPlan plan, scope string[] delegate(string) 
     scope string delegate(string) @safe resolve = null)
 {
     string[] result;
+    bool[string] expanded; // directories already split: symlink cycles stop here
     void grant(string root, size_t depth)
     {
         // The helper opens each rule's path following symlinks, so judge (and
@@ -617,7 +619,8 @@ string[] landlockReadRoots(const ReadPlan plan, scope string[] delegate(string) 
             return;
         }
         // A denied path lies strictly below: grant the children instead.
-        if (depth > 64 || !isDirectory(root)) return;
+        if (depth > 64 || root in expanded || !isDirectory(root)) return;
+        expanded[root] = true;
         foreach (child; list(root)) grant(joinPath(root, child), depth + 1);
     }
     final switch (plan.confine)
@@ -667,6 +670,25 @@ bool within(string path, string root) pure nothrow
 {
     if (root == "/") return path.startsWith("/");
     return path == root || (path.startsWith(root) && path.length > root.length && path[root.length] == '/');
+}
+
+/// `within` for denials: on macOS the default filesystem is case-insensitive,
+/// so `~/.SSH` names `~/.ssh`; compare case-insensitively there (fails closed).
+bool withinDenied(string path, string root) pure
+{
+    version (OSX)
+    {
+        import std.uni : toLower;
+        return within(path.toLower, root.toLower);
+    }
+    else return within(path, root);
+}
+
+unittest // denial matching on macOS ignores case (issue #333 review)
+{
+    version (OSX) assert(withinDenied("/Users/a/.SSH/id", "/Users/a/.ssh"));
+    else assert(!withinDenied("/home/a/.SSH/id", "/home/a/.ssh"));
+    assert(withinDenied("/etc/x", "/"));
 }
 
 string parentOf(string p) pure nothrow
@@ -1109,6 +1131,9 @@ unittest
     // Paths are quoted.
     ReadPlan q = { confine: ReadConfine.secrets, denied: [`/h/a "b"`] };
     assert(seatbeltReadRules(q).canFind(`(subpath "/h/a \"b\"")`));
+    // A root denial is emitted, not dropped.
+    ReadPlan rootDeny = { confine: ReadConfine.secrets, denied: ["/"] };
+    assert(seatbeltReadRules(rootDeny).canFind(`(deny file-read* (subpath "/"))`));
 }
 
 // issue #333: Landlock read roots leave denied paths (and their ancestors) out
@@ -1172,6 +1197,18 @@ unittest
     ReadPlan s4 = { confine: ReadConfine.secrets, denied: ["/work/private"] };
     tree["/"] = ["work"];
     assert(landlockReadRoots(s4, &list, &dir, null, &res2).canFind("/home/u/other"));
+    // Cyclic links (`a -> .`, `b -> .`) split each directory once, not 2^64 times.
+    size_t listed;
+    string[] countList(string d) { ++listed; return list(d); }
+    string res3(string p) { return p == "/cyc/a" || p == "/cyc/b" ? "/cyc" : p; }
+    tree["/cyc"] = ["a", "b", "private", "ok"];
+    ReadPlan w5 = { confine: ReadConfine.workspace, denied: ["/cyc/private"], readable: ["/cyc"] };
+    assert(landlockReadRoots(w5, &countList, &dir, null, &res3) == ["/cyc/ok"]);
+    import std.conv : to;
+    assert(listed == 1, listed.to!string);
+    // Denying `/` grants nothing.
+    ReadPlan s5 = { confine: ReadConfine.secrets, denied: ["/"] };
+    assert(landlockReadRoots(s5, &list, &dir).length == 0);
 }
 
 // issue #333: sandboxed commands can't read denied paths; normal work still runs

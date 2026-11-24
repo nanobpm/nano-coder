@@ -125,8 +125,15 @@ string homeDir()
     return h.length ? h : null;
 }
 
+/// `path` with a leading `~` or `~user` expanded, exactly as the file tools
+/// (`std.path.expandTilde`) expand it, so policy checks see the same path.
 string expandTilde(string path)
 {
+    if (path.startsWith("~") && path != "~" && !path.startsWith("~/"))
+    {
+        static import std.path;
+        return std.path.expandTilde(path);
+    }
     auto home = homeDir();
     if (home is null) return path;
     if (path == "~") return home;
@@ -136,6 +143,13 @@ string expandTilde(string path)
 
 /// Resolve through symlinks by canonicalizing the deepest existing ancestor
 /// and re-appending the not-yet-existing tail.
+unittest // a named-user tilde expands like the file tools (issue #333 review)
+{
+    static import std.path;
+    assert(expandTilde("~root/x") == std.path.expandTilde("~root/x"));
+    assert(expandTilde("~nosuchuser_zz/x") == "~nosuchuser_zz/x");
+}
+
 string resolveSymlinks(string path)
 {
     string existing = path;
