@@ -3550,7 +3550,7 @@ class Agent
                 // A running child's usage counts as it is spent (issue
                 // #340): fold in what this snapshot adds to the last one.
                 size_t lost;
-                recordUsage(subSlots[i].fold.advance(m.spent, m.uncounted, lost));
+                recordUsage(subSlots[i].fold.advance(m.spent, m.aicReports, m.uncounted, lost));
                 uncountedRequests += lost;
                 reportSubagents();
                 break;
@@ -3564,7 +3564,8 @@ class Agent
                 // Usage rolls up into this session's totals (status line, /cost).
                 // Only what the progress snapshots didn't already add.
                 size_t lost;
-                recordUsage(subSlots[i].fold.advance(subSlots[i].result.usage, subSlots[i].result.uncountedRequests, lost));
+                recordUsage(subSlots[i].fold.advance(subSlots[i].result.usage, subSlots[i].result.aicReports,
+                    subSlots[i].result.uncountedRequests, lost));
                 uncountedRequests += lost;
                 // Start the replacements first, so the one report shows
                 // them running (a child sends no progress during its first

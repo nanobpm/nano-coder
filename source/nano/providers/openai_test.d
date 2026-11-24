@@ -451,3 +451,21 @@ unittest
     // The first attempt reported usage; the second none; the final its own.
     assert(dropped.retried.uncounted == 1 && t.requests + 1 == seen.length, "every attempt is one request");
 }
+
+// A retry whose next attempt fails in the parser (malformed JSON) still
+// carries the dropped attempt's spending (issue #340).
+unittest
+{
+    import std.math : isClose;
+    import nano.llm : SpendingException;
+    auto srv = serve([immutable Reply(200, cutHeaders, sse([spentEvent]) ~ `data: {"choices":[{"delta":{"content":"pa`),
+        immutable Reply(200, streamHeaders, "data: {not json\n\n")]);
+    auto req = hello();
+    SpendingException failed;
+    try against(srv.url).chat(req, (bool t, string x) {});
+    catch (SpendingException e) failed = e;
+    srv.finish();
+    assert(failed !is null, "the parser error carries the retried spending");
+    assert(failed.retried.usage.inputTokens == 10 && isClose(failed.retried.usage.aic, 0.25));
+    assert(failed.next !is null, "the original error stays chained");
+}

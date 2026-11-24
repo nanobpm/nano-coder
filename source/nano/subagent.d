@@ -240,18 +240,21 @@ struct SubMsg
     TokenUsage spent;
     /// `progress`: the child's model requests interrupted without usage.
     size_t uncounted;
+    /// `progress`: how many AI Credit reports the child has received so far,
+    /// so an unchanged snapshot is not mistaken for a new report.
+    ulong aicReports;
 }
 
 /// What `now` adds to a running sub-agent's usage the parent already counted
 /// (`seen`): the parent folds each progress snapshot in as this delta, and the
-/// final usage too, so every token and credit is counted exactly once.
+/// final usage too, so every token and credit is counted exactly once. The
+/// delta never carries `hasAic`: `UsageFold` sets it from the report count.
 TokenUsage usageDelta(TokenUsage seen, TokenUsage now) pure nothrow @nogc
 {
     import nano.arith : saturatingSub;
     TokenUsage d;
     d.inputTokens = saturatingSub(now.inputTokens, seen.inputTokens);
     d.outputTokens = saturatingSub(now.outputTokens, seen.outputTokens);
-    d.hasAic = now.hasAic;
     import std.algorithm.comparison : max;
     d.aic = max(0.0, now.aic - seen.aic);
     return d;
@@ -265,13 +268,21 @@ struct UsageFold
 {
     TokenUsage counted;
     size_t uncounted;
+    /// AI Credit reports already folded in.
+    ulong aicReports;
 
-    /// Advance to the cumulative `now`; returns what to add to the totals
-    /// (and, in `newUncounted`, the newly interrupted requests).
-    TokenUsage advance(TokenUsage now, size_t uncountedNow, out size_t newUncounted) pure nothrow @nogc
+    /// Advance to the cumulative `now`, which carries `reportsNow` AI Credit
+    /// reports; returns what to add to the totals (and, in `newUncounted`,
+    /// the newly interrupted requests). The delta has `hasAic` only when a
+    /// new credit report arrived, so a replayed or tool-only snapshot never
+    /// looks like a provider reporting zero credits.
+    TokenUsage advance(TokenUsage now, ulong reportsNow, size_t uncountedNow, out size_t newUncounted)
+        pure nothrow @nogc
     {
         import nano.arith : saturatingSub;
         auto d = usageDelta(counted, now);
+        d.hasAic = reportsNow > aicReports;
+        if (reportsNow > aicReports) aicReports = reportsNow;
         if (now.inputTokens > counted.inputTokens) counted.inputTokens = now.inputTokens;
         if (now.outputTokens > counted.outputTokens) counted.outputTokens = now.outputTokens;
         if (now.aic > counted.aic) counted.aic = now.aic;
@@ -296,14 +307,14 @@ unittest
     p1.inputTokens = 200; p1.outputTokens = 20; p1.hasAic = true; p1.aic = 0.02;
     p2 = p1; p2.inputTokens = 500; p2.outputTokens = 50; p2.aic = 0.05;
     fin = p2; fin.inputTokens = 700; fin.aic = 0.07;
-    add(parent, f.advance(p1, 0, nu));
+    add(parent, f.advance(p1, 1, 0, nu));
     assert(parent.inputTokens == 1200 && parent.outputTokens == 20 && isClose(parent.aic, 0.12));
-    add(parent, f.advance(p2, 0, nu));
+    add(parent, f.advance(p2, 2, 0, nu));
     assert(parent.inputTokens == 1500 && parent.outputTokens == 50 && isClose(parent.aic, 0.15));
-    add(parent, f.advance(fin, 1, nu));
+    add(parent, f.advance(fin, 3, 1, nu));
     lost += nu;
     assert(parent.inputTokens == 1700 && isClose(parent.aic, 0.17) && lost == 1);
-    add(parent, f.advance(fin, 1, nu));
+    add(parent, f.advance(fin, 3, 1, nu));
     lost += nu;
     assert(parent.inputTokens == 1700 && isClose(parent.aic, 0.17) && lost == 1, "done counts exactly once");
 }
@@ -314,8 +325,24 @@ unittest
     a.inputTokens = 100; a.outputTokens = 10; a.hasAic = true; a.aic = 0.5;
     b = a; b.inputTokens = 250; b.aic = 0.75;
     auto d = usageDelta(a, b);
-    assert(d.inputTokens == 150 && d.outputTokens == 0 && d.hasAic && d.aic == 0.25);
+    assert(d.inputTokens == 150 && d.outputTokens == 0 && !d.hasAic && d.aic == 0.25);
     assert(usageDelta(b, a).inputTokens == 0 && usageDelta(b, a).aic == 0);
+}
+
+unittest
+{
+    // A cumulative snapshot with hasAic set but no new credit report (a
+    // replay, or a tool-only progress update) must not count as a report.
+    TokenUsage now;
+    now.inputTokens = 100; now.hasAic = true; now.aic = 0.5;
+    UsageFold f;
+    size_t nu;
+    assert(f.advance(now, 1, 0, nu).hasAic);
+    assert(!f.advance(now, 1, 0, nu).hasAic, "unchanged snapshot");
+    now.inputTokens = 200;
+    assert(!f.advance(now, 1, 0, nu).hasAic, "tokens without a new credit report");
+    auto z = f.advance(now, 2, 0, nu);
+    assert(z.hasAic && z.aic == 0, "a genuine zero-credit report stays distinguishable");
 }
 
 /// The parent's answer to a forwarded tool call.
@@ -377,6 +404,8 @@ struct SubResult
     /// Model requests interrupted before the provider reported their usage:
     /// not counted (never estimated), but reported.
     size_t uncountedRequests;
+    /// AI Credit reports the child received (see `UsageFold`).
+    ulong aicReports;
     size_t turns, toolCalls;
     long durationMs;
     /// The child's session log (null when the parent has none).
@@ -531,7 +560,7 @@ private final class ChildEvents : imported!"nano.agent".AgentEvents
         m.turns = generations;
         m.tokens = tokens;
         m.spent = spent;
-        foreach (a; agent) m.uncounted = a.uncountedRequests;
+        foreach (a; agent) { m.uncounted = a.uncountedRequests; m.aicReports = a.aicReports; }
         up.put(m);
     }
 
@@ -943,6 +972,7 @@ SubResult runChild(immutable SubSpec spec, immutable(SubClientFactory) factory, 
         res.hasAic = agent.hasSessionAic;
         res.aic = agent.sessionAic;
         res.uncountedRequests = agent.uncountedRequests;
+        res.aicReports = agent.aicReports;
         if (st.limitHit !is null && !res.truncated)
         {
             res.truncated = true;
@@ -967,6 +997,7 @@ SubResult runChild(immutable SubSpec spec, immutable(SubClientFactory) factory, 
             res.hasAic = a.hasSessionAic;
             res.aic = a.sessionAic;
             res.uncountedRequests = a.uncountedRequests;
+            res.aicReports = a.aicReports;
         }
     }
     return res;

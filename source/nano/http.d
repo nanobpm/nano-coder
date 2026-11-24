@@ -32,6 +32,8 @@ class StreamInterrupted : imported!"nano.llm".SpendingException
 class RequestException : imported!"nano.llm".SpendingException
 {
     this(string msg) pure nothrow @safe { super(msg); }
+    /// `cause`'s message, chained to it, so its spending can be attached.
+    this(string msg, Throwable cause) pure nothrow @safe { super(msg); next = cause; }
 }
 
 class ApiError : imported!"nano.llm".SpendingException
@@ -503,6 +505,16 @@ string postStream(S)(ref S st, out imported!"nano.llm".RetrySpend spent, string 
     {
         failed.retried = ledger.retried;
         throw failed;
+    }
+    catch (Exception other)
+    {
+        // Any other failure (a provider error event, malformed JSON from the
+        // parser) after a retried drop would lose the dropped attempts'
+        // spending: wrap it so it carries them. Without retries it passes as is.
+        if (ledger.retried == imported!"nano.llm".RetrySpend.init) throw other;
+        auto wrapped = new RequestException(other.msg, other);
+        wrapped.retried = ledger.retried;
+        throw wrapped;
     }
     spent = ledger.retried;
     st = local;
