@@ -54,7 +54,7 @@ import std.typecons : Nullable;
 import std.algorithm : min, max, clamp;
 import nano.plan : Plan, isPlanTool, planDefinitions = definitions;
 import settings = nano.session_settings;
-import nano.timers : Timers, TimerError, isTimerTool, timerDefinitions = definitions, firedMessage, firedNotice, pendingNudge, pendingNudgeEvery;
+import nano.timers : Timers, TimerError, isTimerTool, timerDefinitions = definitions, firedMessage, firedNotice, pendingNudge, pendingNudgeEvery, Timer, maxPending;
 import nano.permissions;
 import nano.session;
 import nano.control;
@@ -4629,7 +4629,8 @@ class Agent
     {
         auto t = timerNow();
         auto before = Timers(timers.items.dup, timers.pending.dup, timers.lastId);
-        auto due = timers.takeDue(t);
+        Timer[] closed;
+        auto due = timers.takeDue(t, closed);
         if (!due.length) return null;
         {
             // Unrecorded, they stay due and fire on the next try.
@@ -4638,7 +4639,18 @@ class Agent
         }
         stepsSinceTimerNote = 0; // a fresh firing restarts the nudge interval
         notice = firedNotice(due);
-        return firedMessage(due, t);
+        import std.algorithm : map;
+        auto msg = firedMessage(due, t);
+        if (closed.length)
+        {
+            // Both the display and the model need it: earlier reminders still
+            // name the closed ids, and the model would keep chasing them.
+            auto why = format("\n(auto-closed fired timer%s %s: at most %s wait for timer_done)",
+                closed.length == 1 ? "" : "s", closed.map!(x => x.id.to!string).join(", "), maxPending);
+            notice ~= why;
+            msg ~= why;
+        }
+        return msg;
     }
 
     /// Mid-turn: due timers join the conversation before the next model call,
@@ -4682,7 +4694,7 @@ class Agent
             // As for timers: a change that cannot be recorded is rolled back
             // (the rollback itself lives in `planChanged`, which disarms it
             // once the change is persisted).
-            planChanged(before);
+            planChanged(before, o.restarted);
         }
         return o.text;
     }
@@ -4694,7 +4706,7 @@ class Agent
     private enum size_t planSnapshotEvery = 20;
     private size_t planDeltasSinceSnapshot;
 
-    private void planChanged(Plan before)
+    private void planChanged(Plan before, bool restarted = false)
     {
         import std.algorithm : canFind;
         // Only persistence may roll the plan back: once the change is
@@ -4703,7 +4715,11 @@ class Agent
         bool persisted;
         scope (failure) if (!persisted) plan = before;
         log.ifSome((SessionLog l) {
-            if (++planDeltasSinceSnapshot >= planSnapshotEvery || (before.items.length == 0 && plan.items.length > 1))
+            // Keep the finished plan findable by the history tools; a failed
+            // write rolls the restart back with the rest.
+            if (restarted) l.planArchive(before.toJSON);
+            if (++planDeltasSinceSnapshot >= planSnapshotEvery || restarted
+                || (before.items.length == 0 && plan.items.length > 1))
             {
                 l.plan(plan.toJSON);
                 planDeltasSinceSnapshot = 0;

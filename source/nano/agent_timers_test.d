@@ -126,3 +126,27 @@ unittest
     assert(threw && agent.timers.items.length == 1 && !agent.timers.pending.length, "still due");
     assert(agent.takeFiredTimers(notice).length && agent.timers.pending.length == 1);
 }
+
+// The auto-closure note reaches the model, not only the display.
+unittest
+{
+    import nano.providers.mock : MockClient;
+    import nano.timers : maxPending;
+    import std.algorithm : canFind;
+    import std.conv : to;
+    long clock = 1_000_000;
+    auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "sys");
+    agent.now = () => clock;
+    string notice;
+    foreach (i; 0 .. maxPending)
+    {
+        agent.timers.apply("timer_set", parseJSON(`{"after": "1m", "note": "n` ~ i.to!string ~ `"}`), clock);
+        clock += 120;
+        assert(agent.takeFiredTimers(notice).length);
+    }
+    agent.timers.apply("timer_set", parseJSON(`{"after": "1m", "note": "last"}`), clock);
+    clock += 120;
+    auto msg = agent.takeFiredTimers(notice);
+    assert(notice.canFind("auto-closed"), notice);
+    assert(msg.canFind("auto-closed"), msg);
+}

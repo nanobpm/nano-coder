@@ -1527,6 +1527,7 @@ version (OSX) unittest
     import nano.paths : canonicalize;
     import std.file : mkdirRecurse, rmdirRecurse, exists, getcwd;
     import std.process : thisProcessID;
+    if (imported!"nano.sandbox".skipUnderTempRoot("claude_hooks sandbox test")) return;
     auto base = getcwd ~ format("/.dub/hook-sbx-%s", thisProcessID);
     auto ws = base ~ "/ws", outside = base ~ "/out";
     mkdirRecurse(ws);

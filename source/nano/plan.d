@@ -28,6 +28,10 @@ enum maxGoalChars = 2_000;
 enum uint maxId = 1_000_000;
 /// Budget for the plan restated after compaction.
 enum contextChars = 8_000;
+/// Most bytes of notes kept per item; older notes are dropped beyond it.
+enum maxNotesBytes = 4_096;
+/// Stands for the notes dropped to keep an item under `maxNotesBytes`.
+enum droppedNotesMarker = "(older notes dropped)";
 
 immutable string[] toolNames = ["plan_add", "plan_update", "plan_show"];
 
@@ -150,6 +154,9 @@ struct Outcome
 {
     string text;
     bool changed;
+    /// `plan_add` found the plan finished and started a new one: the
+    /// caller archives the old plan and records the new one as a snapshot.
+    bool restarted;
 }
 
 struct Plan
@@ -178,6 +185,9 @@ struct Plan
     }
 
     bool empty() pure const { return !goal.length && !items.length; }
+
+    /// Every item is done or dropped (and there is at least one).
+    bool finished() pure const { return items.length && !items.any!(i => !i.status.closed); }
 
     /// (done, total), not counting dropped items.
     size_t[2] progress() pure const
@@ -234,7 +244,9 @@ struct Plan
     private PlanResult!Outcome add(JSONValue args) pure
     {
         alias R = PlanResult!Outcome;
-        auto plan = dup();
+        // A finished plan is history: new work starts a fresh plan (issue #346).
+        bool restart = finished;
+        auto plan = restart ? Plan.init : dup();
         string[] summary;
         if (auto g = field(args, "goal"))
             if (g.type == JSONType.string && g.str.strip.length)
@@ -253,6 +265,8 @@ struct Plan
         }
         if (!list.length && !summary.length)
             return R.err("plan_add needs `items` (a list of step titles or {title, after} objects) or a `goal`");
+        // Only real work restarts a finished plan; the notice is not work.
+        if (restart) summary = format!"started a new plan (the previous one, %s items, is finished)"(items.length) ~ summary;
         uint firstId = (plan.items.length ? plan.items.map!(i => i.id).maxElement : 0) + 1;
         if (list.length > maxItems || plan.items.length + list.length > maxItems)
             return R.err(format!"a plan holds at most %s items; drop or merge some first"(maxItems));
@@ -289,7 +303,9 @@ struct Plan
         if (added.length == 1) summary ~= format!"added item %s"(added[0]);
         else if (added.length > 1) summary ~= format!"added items %s-%s"(added[0], added[$ - 1]);
         this = plan;
-        return R.ok(outcome(summary.join(", ")));
+        auto o = outcome(summary.join(", "));
+        o.restarted = restart;
+        return R.ok(o);
     }
 
     private PlanResult!Outcome update(JSONValue args) pure
@@ -335,7 +351,7 @@ struct Plan
             if (auto n = field(up, "note"))
                 if (n.type == JSONType.string && n.str.strip.length)
                 {
-                    it.notes ~= clip(n.str.strip, maxNoteChars);
+                    it.notes = capNotes(it.notes ~ clip(n.str.strip, maxNoteChars));
                     did ~= "noted";
                 }
             if (!did.length) return R.err(format!"item %s: give a `status`, `note` or `title` to change"(id));
@@ -352,10 +368,11 @@ struct Plan
 
     /// The plan as a checklist. `notes` includes each item's notes; output
     /// over `budget` characters drops the notes of finished items, then all notes.
-    string render(bool notes, size_t budget) pure const
+    string render(bool notes, size_t budget, bool closedNotes = true) pure const
     {
         if (empty) return "The plan is empty.";
-        bool[2][] modes = notes ? [[true, true], [true, false], [false, false]] : [[false, false]];
+        bool[2][] modes = !notes ? [[false, false]]
+            : closedNotes ? [[true, true], [true, false], [false, false]] : [[true, false], [false, false]];
         string text;
         foreach (m; modes)
         {
@@ -396,16 +413,26 @@ struct Plan
     /// The plan restated for the model after its context was compacted.
     string contextNote() pure const
     {
+        if (finished) return finishedNote;
         return "[Your plan, kept by the harness. Earlier conversation may be summarized, but the plan and its notes are "
-            ~ "complete. Continue from it and keep it current with plan_update.]\n" ~ render(true, contextChars);
+            ~ "complete. Continue from it and keep it current with plan_update.]\n" ~ render(true, contextChars, false);
     }
 
     /// The plan handed to a new session that continues an earlier run.
     string carriedOverNote() pure const
     {
+        if (finished) return finishedNote;
         return "[A plan carried over from an earlier, interrupted run of this task, kept by the harness. Work already "
             ~ "marked done may be committed or pushed: check the current state before redoing it. Continue from the "
-            ~ "plan and keep it current with plan_update.]\n" ~ render(true, contextChars);
+            ~ "plan and keep it current with plan_update.]\n" ~ render(true, contextChars, false);
+    }
+
+    /// One line standing for a finished plan: restating it would only
+    /// re-inject stale work into the context.
+    private string finishedNote() pure const
+    {
+        auto g = goal.length ? " '" ~ clip(goal.replace("\n", " "), 200) ~ "'" : "";
+        return format!"[Previous plan%s completed (%s items); details in the session log.]"(g, items.length);
     }
 
     /// ACP `plan` entries (dropped items omitted).
@@ -468,8 +495,10 @@ struct Plan
                         foreach (x; n.arrayNoRef)
                         {
                             if (x.type != JSONType.string) return R.err(shape);
-                            p.notes ~= x.str;
+                            p.notes ~= x.str == droppedNotesMarker ? x.str : clip(x.str, maxNoteChars);
                         }
+                // Logs written before the cap (or edited by hand) obey it too.
+                p.notes = capNotes(p.notes);
                 if (auto a = field(it, "after"))
                 {
                     auto ids = idsOf(*a);
@@ -577,6 +606,19 @@ private PlanResult!(uint[]) idsOf(const JSONValue v) pure
         out_ ~= id;
     }
     return R.ok(out_);
+}
+
+/// `notes` with the oldest dropped so they total at most `maxNotesBytes`
+/// (the newest is always kept), led by `droppedNotesMarker` when any were.
+private string[] capNotes(string[] notes) pure
+{
+    import std.algorithm : sum;
+    if (notes.map!(n => n.length).sum <= maxNotesBytes) return notes;
+    auto rest = notes.length && notes[0] == droppedNotesMarker ? notes[1 .. $] : notes;
+    // The newest note always stays (each is at most `maxNoteChars` chars).
+    size_t keep = rest.length - 1, total = droppedNotesMarker.length + rest[$ - 1].length;
+    while (keep > 0 && total + rest[keep - 1].length <= maxNotesBytes) total += rest[--keep].length;
+    return [droppedNotesMarker] ~ rest[keep .. $];
 }
 
 private string clip(string text, size_t max) pure
@@ -776,4 +818,62 @@ unittest
     plan.items ~= PlanItem(1, "\x1b[2Jwipe\x1b[H", Status.pending);
     auto r = checklist(plan, 80, true);
     assert(!r.canFind("\x1b[2J") && !r.canFind("\x1b[H") && r.canFind("wipe"), r);
+}
+
+unittest // issue #346: a finished plan is one line; plan_add starts afresh
+{
+    Plan plan;
+    plan.apply("plan_add", parseJSON(`{"goal": "Old", "items": ["a", "b"]}`)).unwrap("valid");
+    plan.apply("plan_update", parseJSON(`{"updates": [{"id": 1, "status": "done", "note": "n"}, {"id": 2, "status": "dropped"}]}`)).unwrap("valid");
+    assert(plan.finished);
+    assert(plan.contextNote == "[Previous plan 'Old' completed (2 items); details in the session log.]", plan.contextNote);
+    assert(plan.carriedOverNote == plan.contextNote);
+    auto o = plan.apply("plan_add", parseJSON(`{"goal": "New", "items": ["c"]}`)).unwrap("valid");
+    assert(o.restarted && o.changed, o.text);
+    assert(plan.goal == "New" && plan.items.length == 1 && plan.items[0].id == 1, plan.render(true, size_t.max));
+    assert(!plan.finished && plan.contextNote.canFind("Continue from it"));
+    auto again = plan.apply("plan_add", parseJSON(`{"items": ["d"]}`)).unwrap("valid");
+    assert(!again.restarted && plan.items.length == 2);
+}
+
+unittest // issue #346: closed items' notes are hidden in contextNote, kept in plan_show
+{
+    Plan plan;
+    plan.apply("plan_add", parseJSON(`{"items": ["a", "b"]}`)).unwrap("valid");
+    plan.apply("plan_update", parseJSON(`{"updates": [{"id": 1, "status": "done", "note": "old finding"}, {"id": 2, "note": "live finding"}]}`)).unwrap("valid");
+    auto c = plan.contextNote;
+    assert(!c.canFind("old finding") && c.canFind("(1 note)") && c.canFind("- live finding"), c);
+    assert(plan.apply("plan_show", parseJSON(`{}`)).unwrap("valid").text.canFind("old finding"));
+}
+
+unittest // issue #346: per-item notes are capped in bytes, newest kept
+{
+    import std.algorithm : sum;
+    import std.array : replicate;
+    Plan plan;
+    plan.apply("plan_add", parseJSON(`{"items": ["a"]}`)).unwrap("valid");
+    foreach (i; 0 .. 20)
+        plan.apply("plan_update", JSONValue(["id": JSONValue(1), "note": JSONValue(format!"%02d"(i) ~ "x".replicate(900))])).unwrap("valid");
+    auto notes = plan.items[0].notes;
+    assert(notes.map!(n => n.length).sum <= maxNotesBytes, notes.length.to!string);
+    assert(notes[0] == droppedNotesMarker);
+    assert(notes[$ - 1].startsWith("19") && notes.length > 2);
+}
+
+unittest // finished_plan_ignores_an_empty_add_and_caps_loaded_notes
+{
+    auto p = Plan.fromJSON(parseJSON(`{"items":[{"id":1,"title":"a","status":"done"}]}`)).unwrap("valid");
+    assert(p.apply("plan_add", parseJSON(`{}`)).isErr);
+    assert(p.apply("plan_add", parseJSON(`{"items":[]}`)).isErr);
+    assert(p.items.length == 1, "an empty call keeps the finished plan");
+    import std.array : replicate;
+    import std.algorithm : sum;
+    JSONValue[] notes;
+    foreach (i; 0 .. 20) notes ~= JSONValue("n".replicate(900));
+    notes ~= JSONValue("x".replicate(100_000));
+    auto j = parseJSON(`{"items":[{"id":1,"title":"a","status":"pending"}]}`);
+    j["items"][0]["notes"] = JSONValue(notes);
+    auto q = Plan.fromJSON(j).unwrap("valid");
+    assert(q.items[0].notes.map!(n => n.length).sum <= maxNotesBytes);
+    assert(q.items[0].notes[0] == droppedNotesMarker);
 }

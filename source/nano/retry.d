@@ -74,6 +74,14 @@ bool retryable(const ErrorInfo e, const(ushort)[] statuses) pure nothrow
     return true;
 }
 
+/// The offline wait in unit tests: a mock server that has stopped listening
+/// refuses every retry, so an unbounded wait would hang `dub test` (#358).
+enum testOfflineBudget = 10.seconds;
+
+/// `RetryPolicy.offlineBudget`'s default: unbounded in use, bounded in tests.
+version (unittest) enum defaultOfflineBudget = testOfflineBudget;
+else enum defaultOfflineBudget = Duration.max;
+
 struct RetryPolicy
 {
     long maxRetries = 5;
@@ -82,8 +90,10 @@ struct RetryPolicy
     /// How long to keep waiting for the network while requests can't connect
     /// (DNS, refused, reset, timeout). These failures don't use up `maxRetries`:
     /// a laptop that goes offline mid-turn carries on once it reconnects.
-    /// Unbounded by default; Ctrl-C cancels the wait.
-    Duration offlineBudget = Duration.max;
+    /// Unbounded by default; Ctrl-C cancels the wait. Unit tests get
+    /// `testOfflineBudget` instead, so a test whose mock server has stopped
+    /// answering fails instead of waiting forever (issue #358).
+    Duration offlineBudget = defaultOfflineBudget;
 
     /// Exponential backoff for a zero-based attempt.
     Duration backoff(long attempt) pure const
@@ -217,4 +227,11 @@ unittest
     assert(retryDelay(p, 0, null, null, now, 1) == 800.msecs);
     auto over = ErrorInfo(529);
     assert(retryDelay(p, 0, &over, null, now, 0) == 10.seconds);
+}
+
+// A test's offline wait is bounded, so a refused mock server can't hang the run (#358).
+unittest
+{
+    RetryPolicy p;
+    assert(p.offlineBudget == testOfflineBudget && p.offlineBudget != Duration.max);
 }

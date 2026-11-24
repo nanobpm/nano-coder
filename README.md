@@ -344,6 +344,9 @@ phases). Disable them with `--no-hooks`, or granularly via the
   `read_file` (or written by these tools) in this process, and to be unchanged on disk since.
   Otherwise they ask the model to read it again, so an edit can't land on stale text.
 - `plan_add`, `plan_update`, `plan_show` - The agent's task plan (see [Task Plans](#task-plans)).
+- `timer_set`, `timer_list`, `timer_cancel`, `timer_done` - Timers the agent sets to come back
+  to something later in the session. A fired timer is restated until `timer_done`; at most 10
+  wait at once, and older ones are auto-closed (with a notice) beyond that.
 - `session_settings` - The agent reads or adjusts its own session's settings (see
   [Agent-adjusted compaction](#agent-adjusted-compaction)).
 - `report_outcome` - Report the task `completed`, `blocked` or `needs_input`, with a `summary`; ends
@@ -663,7 +666,10 @@ host doesn't fail a correct change: before failing a module, the runner times a 
 machine, at most 3x. `NANO_TEST_TIMES=N dub test` lists the
 N slowest modules. `NANO_TEST_JOBS=N` runs modules in parallel (`scripts/ci.sh` uses 4); modules
 that change process-wide state (the cancel flag, environment variables) are listed in
-`scripts/serial-tests` and run alone first.
+`scripts/serial-tests` and run alone first. A module still running at twice its most-scaled limit
+(at least 10 s) is treated as hung: the runner names it and exits failing instead of waiting
+forever. In tests, HTTP retries wait out an unreachable server for at most 10 s (in use the wait is
+unbounded until Ctrl-C).
 
 Functions are `pure` wherever they can be: the result depends only on the arguments, with no
 clock, environment, files or global state. Modules that start with `pure:` (parsing, markdown,
@@ -1455,9 +1461,16 @@ conversation be summarized without losing track.
 Each change returns a compact checklist ending with what is in progress or ready next. A bad
 call (unknown id, bad status) changes nothing.
 
+A finished plan (every item done or dropped) is history: `plan_add` then starts a new plan
+(ids from 1, new goal) and the finished one is kept in the session log as a `plan_archive`
+record. Each item keeps at most 4 KB of notes; older ones are replaced by
+"(older notes dropped)".
+
 The harness keeps the plan in front of the model:
-- **Compaction.** The summary message is followed by the full plan with notes (up to 8,000
-  characters; notes on finished items go first when it's too long).
+- **Compaction.** The summary message is followed by the plan with the notes of open items (up
+  to 8,000 characters); finished items show only a note count (`plan_show` has every note). A
+  finished plan is reduced to one line ("Previous plan '…' completed (N items)"), also when
+  carried over to a new session.
 - **Resume.** Every change is written to the session log, and `--resume` / `session/load`
   restore the latest plan.
 - **Another worker.** ACP `session/new` can be seeded with `_meta.plan` (see ACP above). The

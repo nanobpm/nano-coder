@@ -1106,6 +1106,15 @@ class SessionLog
         write_(record("plan", d));
     }
 
+    /// A finished plan replaced by a new one (issue #346): an audit record
+    /// so the history tools can still find it; resume ignores it.
+    void planArchive(JSONValue plan)
+    {
+        JSONValue d = ["recorded_at": nowStamp()];
+        d["plan"] = plan;
+        write_(record("plan_archive", d));
+    }
+
     /// A plan change as a delta against the plan the log so far restores to
     /// (issue #205: a full snapshot per `plan_update` rewrites every note on
     /// every change). `goal` when it changed, `upserts` the added/updated
