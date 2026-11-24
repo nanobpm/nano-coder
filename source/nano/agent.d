@@ -538,6 +538,17 @@ class Agent
         configuredWindow = w.tokens;
         if (w.source.length) configuredWindowSource = w.source;
     }
+
+    /// Apply a configured window restored from a session record (issue
+    /// #297). Clearing a positive window re-probes the endpoint: the probe
+    /// made under the old window skipped window detection, so without it the
+    /// session would fall back to a model-name estimate.
+    void restoreConfiguredWindow(ConfiguredWindow w)
+    {
+        const cleared = configuredWindow > 0 && w.tokens == 0;
+        setConfiguredWindow(w);
+        if (cleared) refreshCapabilities();
+    }
     /// Learned from a context-overflow error (0: none).
     size_t learnedWindow;
     /// Compactions this session.
@@ -1114,9 +1125,13 @@ class Agent
         }
         if (auto level = control.takeThinkingRequest())
         {
-            import nano.thinking : sessionSetting;
+            import nano.thinking : sessionSetting, sessionSettingValue;
             // Checked when it was typed, so this can't fail.
             sessionThinking = sessionSetting(level).unwrap("validated when typed");
+            // A resume restores the session's thinking level (#297).
+            SessionSettings ss;
+            ss.thinking = sessionSettingValue(sessionThinking);
+            logSettings(ss);
         }
         return true;
     }
@@ -1127,7 +1142,14 @@ class Agent
     {
         // `/subagents on|off` typed mid-turn: every request, retries
         // included, follows it; sub-agents already running finish.
-        if (auto sub = control.takeSubagentsRequest()) subagentsOn = sub == 1;
+        if (auto sub = control.takeSubagentsRequest())
+        {
+            subagentsOn = sub == 1;
+            // A resume restores the session's sub-agents switch (#297).
+            SessionSettings ss;
+            ss.subagents = subagentsOn ? 1 : 0;
+            logSettings(ss);
+        }
         ChatRequest req;
         req.messages = messages;
         req.tools = offeredTools();
@@ -1997,6 +2019,20 @@ class Agent
 
     /// The temperature the current model is sent, and why.
     temp.Resolved temperatureNow() { return temperatureFor(thinking().anthropicThinkingOn); }
+
+    /// The warnings a resumed session's restored settings bring (issue
+    /// #297), as `/model` (`model`: the model was switched) and `/thinking`
+    /// (`thinkingLevel`: a level was restored) would show them, so a restored
+    /// value the model does not support is not applied silently.
+    string[] restoreWarnings(bool model, bool thinkingLevel)
+    {
+        string[] w;
+        if (model)
+            if (auto t = temperatureNow.warning) w ~= t;
+        if (model || thinkingLevel)
+            if (auto t = thinking().warning) w ~= t;
+        return w;
+    }
 
     /// Whether (and how) the current model can view images.
     Nullable!Vision vision()
@@ -3809,6 +3845,11 @@ class Agent
         // before the conversation and log are replaced, for every loader
         // (`/resume`, ACP `session/load`).
         leaveSessionSubagents();
+        // Setting requests queued for the session being left (model, thinking,
+        // sub-agents) must not apply to the loaded one on its next turn.
+        control.takeModelRequest();
+        control.takeThinkingRequest();
+        control.takeSubagentsRequest();
         // Repairs are logged first: a failed write leaves the live session as
         // it was — and closes the incoming log, which the agent never
         // adopted, so its descriptor and lock do not leak into `openHere`.
@@ -3955,6 +3996,11 @@ class Agent
     {
         // Sub-agents belong to the session being left (issue #266).
         leaveSessionSubagents();
+        // Setting requests queued for the session being left must not apply
+        // to the new one on its first turn (issue #297).
+        control.takeModelRequest();
+        control.takeThinkingRequest();
+        control.takeSubagentsRequest();
         import nano.mode : AgentMode;
         // An empty system prompt (e.g. an ACP host without one) sends no
         // system message at all: some providers reject an empty one.
@@ -4175,18 +4221,33 @@ class Agent
     /// A direct switch (at the prompt or from settings): it supersedes a
     /// `/model` still queued from the last turn, even when `build` fails, and
     /// a failed build changes nothing else.
-    void setModel(string spec, LLMClient delegate(string spec, out ConfiguredWindow window) @safe build)
+    void setModel(string spec, LLMClient delegate(string spec, out ConfiguredWindow window) @safe build,
+        bool logChange = true)
     {
         control.takeModelRequest();
         ConfiguredWindow window;
         auto c = build(spec, window);
-        useClient(c, window);
+        useClient(c, window, logChange);
     }
 
     /// Switch to a built client; history carries over, what was learned about
     /// the old model doesn't.
-    void useClient(LLMClient c, ConfiguredWindow window)
+    void useClient(LLMClient c, ConfiguredWindow window, bool logChange = true)
     {
+        if (logChange)
+        {
+            // A resume restores the session's last model (issue #297).
+            // Switching models resets the live context window to the new
+            // provider's configuration; record that concrete window (0: none),
+            // so a resume restores what is live now, not whatever the config
+            // resolves to later. Logged before the switch: a failed write
+            // leaves the old client in place.
+            SessionSettings s;
+            s.model = c.providerName ~ "/" ~ c.modelName;
+            import std.conv : to;
+            s.contextWindow = window.tokens.to!long;
+            logSettings(s);
+        }
         client = c;
         setConfiguredWindow(window);
         learnedWindow = 0;
@@ -4194,6 +4255,13 @@ class Agent
         // A mid-turn switch never waits on the endpoint.
         if (midTurnSwitch) startBackgroundProbe();
         else refreshCapabilities();
+    }
+
+    /// Record a runtime settings change in the session log (issue #297): a
+    /// resumed session restores the latest record of each field.
+    void logSettings(const SessionSettings s)
+    {
+        log.ifSome((SessionLog l) { l.settings(s); });
     }
 
     /// Set while a queued `/model` applies (`useClient` then probes in the background).
@@ -4254,6 +4322,12 @@ class Agent
                 compactionMode = r.mode;
                 settingChangedAt[r.key] = turnSerial;
                 announceSetting(r.key, old, next, r.reason);
+                {
+                    // A resume restores the session's compaction mode (#297).
+                    SessionSettings s;
+                    s.compactionMode = next;
+                    logSettings(s);
+                }
                 return format("%s: %s → %s for this session (the user's config is unchanged)", r.key, old, next);
             case settings.Action.compactNow:
                 agentCompact = true;
@@ -5839,4 +5913,37 @@ unittest // a move's destination hook input comes from the patch's own sequentia
         ~ "*** Move File: nano-test-none/e.txt -> nano-test-none/f.txt\n*** End Patch\n"]);
     edits = Agent.patchEdits(deleted);
     assert("content" !in edits[$ - 1].args.objectNoRef);
+}
+
+// issue #297: setting requests queued for the session being left (model,
+// thinking, sub-agents) are dropped when another session is loaded, so they
+// cannot overwrite the restored settings on its next turn.
+unittest
+{
+    import nano.session : Restored;
+    import nano.providers.mock;
+    auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "sys");
+    agent.control.requestModel("mock/old");
+    agent.control.requestThinking("high");
+    agent.control.requestSubagents(false);
+    Restored r;
+    agent.loadRestored(r, Option!SessionLog.init);
+    assert(agent.control.takeModelRequest() is null);
+    assert(agent.control.takeThinkingRequest() is null);
+    assert(agent.control.takeSubagentsRequest() == 0);
+}
+
+// issue #297: `restart` (`/restart`, ACP `session/new`) also drops queued
+// setting requests from the session being left.
+unittest
+{
+    import nano.providers.mock;
+    auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "sys");
+    agent.control.requestModel("mock/old");
+    agent.control.requestThinking("high");
+    agent.control.requestSubagents(false);
+    agent.restart("sys", Option!SessionLog.init);
+    assert(agent.control.takeModelRequest() is null);
+    assert(agent.control.takeThinkingRequest() is null);
+    assert(agent.control.takeSubagentsRequest() == 0);
 }

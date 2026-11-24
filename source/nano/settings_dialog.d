@@ -59,6 +59,13 @@ struct SettingsHost
     string delegate(string provider) @safe refreshClient;
     /// Where `/providers` key status reads stored logins (tests).
     string dataDir;
+    /// Records a runtime settings change in the session log (issue #297): a
+    /// resumed session restores it. Null in tests.
+    void delegate(const imported!"nano.session".SessionSettings s) @safe logSettings;
+    /// Called after the dialog saved the config, so the caller can take the
+    /// saved values as its new defaults (issue #297); `saved` is what the
+    /// save wrote. Null in tests.
+    void delegate(const ref Changes saved) @safe onSaved;
     /// Runs `/subagents <arg>` (`on`/`off`) and returns its reply, so the
     /// dialog switches the `agent` tool the same way the command does.
     string delegate(string arg) @safe subagentsCommand;
@@ -268,8 +275,10 @@ private void saveAndReport(SettingsUi ui, ref SettingsHost h, ref Changes change
     try
     {
         save(*h.cfg, changes, user, h.configPath);
+        const saved = changes;
         changes = Changes.init;
         notices = clearSaveFailures(notices);
+        if (h.onSaved !is null) h.onSaved(saved);
         ui.say(format("Saved to %s", h.configPath));
     }
     catch (Exception e) notices ~= format("Could not save settings: %s", e.msg);
@@ -318,6 +327,17 @@ private bool editContext(SettingsUi ui, ref SettingsHost h)
     a.setConfiguredWindow(window > 0 ? ConfiguredWindow(toSize(window), "context_window in config")
         : pc !is null && pc.contextWindow > 0 ? ConfiguredWindow(toSize(pc.contextWindow), "provider context_window")
         : ConfiguredWindow.init);
+    if (h.logSettings !is null)
+    {
+        // A resume restores the session's context settings (issue #297),
+        // even when this change is also saved to the config.
+        imported!"nano.session".SessionSettings s;
+        s.autoCompact = auto_ ? 1 : 0;
+        s.autoCompactThreshold = threshold;
+        s.compactionMode = cfg.compactionMode;
+        s.contextWindow = window;
+        h.logSettings(s);
+    }
     return true;
 }
 

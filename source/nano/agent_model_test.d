@@ -653,3 +653,20 @@ unittest
     assert(agent.settleProbes(5.seconds), "the cancelled probe is joined");
     assert(p.probes.get == 1, "no probe for the switched-to client");
 }
+
+// Restoring a session's `context_window = 0` over a positive window (issue
+// #297) re-probes the endpoint's window, which the earlier probe skipped.
+unittest
+{
+    auto p = Probes.make(true);
+    auto agent = agentFor(p.client("probed", null, 7_777));
+    agent.setConfiguredWindow(ConfiguredWindow(50_000, "context_window in config"));
+    agent.refreshCapabilities();
+    assert(p.windowProbes.get == 0, "a configured window skips window detection");
+    agent.restoreConfiguredWindow(ConfiguredWindow.init);
+    assert(p.windowProbes.get == 1, "clearing it detects the endpoint's window");
+    string source;
+    assert(agent.contextWindow(source) == 7_777 && source == "reported by the endpoint (probed)", source);
+    agent.restoreConfiguredWindow(ConfiguredWindow.init);
+    assert(p.windowProbes.get == 1, "an already-clear window does not re-probe");
+}

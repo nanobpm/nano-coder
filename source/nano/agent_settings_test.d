@@ -111,3 +111,125 @@ unittest
     agent.settingsTools = false;
     assert(!agent.offeredTools.any!(d => d.name == "session_settings"));
 }
+
+// issue #297: a `session_settings` compaction-mode change also writes a
+// `settings` record, so a resume restores it.
+unittest
+{
+    auto mock = new MockClient([call("s", `{"action":"set","key":"compaction_mode","value":"extract"}`), LLMResponse("ok")]);
+    auto agent = logged("settings-record", mock);
+    agent.run("go", new NullEvents);
+    assert(records(agent).any!(r => r["type"].str == "settings" && r["data"]["compaction_mode"].str == "extract"));
+}
+
+// issue #297: a model switch writes a `settings` record with the new
+// provider/model, so a resume restores it; restoring with `logChange = false`
+// does not append a duplicate record.
+unittest
+{
+    import nano.session : SessionSettings, restore;
+    auto agent = logged("model-record", new MockClient([]));
+    SessionSettings prior;
+    prior.contextWindow = 50_000;
+    agent.logSettings(prior);
+    auto other = new MockClient([]);
+    agent.useClient(other, ConfiguredWindow.init);
+    assert(records(agent).any!(r => r["type"].str == "settings"
+        && "model" in r["data"] && r["data"]["model"].str == "mock/mock"
+        && "context_window" in r["data"] && r["data"]["context_window"].integer == 0));
+    auto before = records(agent).length;
+    agent.useClient(new MockClient([]), ConfiguredWindow.init, false);
+    assert(records(agent).length == before, "restore switch does not write a duplicate settings record");
+    // Restoring the log sees the cleared override (`contextWindow == 0`), not the prior 50_000.
+    auto path = agent.log.unwrap("logged").path;
+    auto r = restore(path);
+    assert(r.settings.model == "mock/mock");
+    assert(r.settings.contextWindow == 0);
+}
+
+// issue #297: a model switch records the concrete window it made live, so a
+// resume restores that window rather than re-resolving the config.
+unittest
+{
+    import nano.session : restore;
+    auto agent = logged("model-window", new MockClient([]));
+    agent.useClient(new MockClient([]), ConfiguredWindow(32_000, "provider context_window"));
+    assert(restore(agent.log.unwrap("logged").path).settings.contextWindow == 32_000);
+}
+
+// issue #297: a model switch whose settings write fails changes nothing: the
+// old client and window stay live.
+unittest
+{
+    auto agent = logged("model-write-fails", new MockClient([]));
+    auto old = agent.client;
+    agent.setConfiguredWindow(ConfiguredWindow(40_000, "context_window in config"));
+    agent.log.unwrap("logged").failNextWrite = true;
+    import std.exception : assertThrown;
+    assertThrown(agent.useClient(new MockClient([]), ConfiguredWindow(32_000, "provider context_window")));
+    assert(agent.client is old);
+    assert(agent.configuredWindow == 40_000);
+}
+
+// issue #297: `/subagents off` mid-turn writes a `settings` record, so a
+// resume restores the switch.
+unittest
+{
+    auto mock = new MockClient([LLMResponse("ok")]);
+    auto agent = logged("subagents-record", mock);
+    agent.control.requestSubagents(false);
+    agent.run("go", new NullEvents);
+    assert(!agent.subagentsOn);
+    assert(records(agent).any!(r => r["type"].str == "settings" && "subagents" in r["data"]
+        && r["data"]["subagents"].boolean == false));
+}
+
+// issue #297: mid-turn `/thinking` writes a `settings` record distinguishing
+// `"default"` from `"reset"`, and both round-trip via `sessionSetting`.
+unittest
+{
+    import std.conv : to;
+    import nano.result : unwrap;
+    import nano.thinking : Thinking, sessionSetting, sessionSettingValue;
+    auto mock = new MockClient([LLMResponse("ok"), LLMResponse("ok"), LLMResponse("ok")]);
+    auto agent = logged("thinking-record", mock);
+    agent.control.requestThinking("high");
+    agent.run("go1", new NullEvents);
+    assert(!agent.sessionThinking.isNull && agent.sessionThinking.get == Thinking.of("high"));
+    agent.control.requestThinking("default");
+    agent.run("go2", new NullEvents);
+    assert(!agent.sessionThinking.isNull && agent.sessionThinking.get == Thinking.init);
+    agent.control.requestThinking("reset");
+    agent.run("go3", new NullEvents);
+    assert(agent.sessionThinking.isNull);
+    string[] loggedThinking;
+    foreach (r; records(agent))
+        if (r["type"].str == "settings" && "thinking" in r["data"])
+            loggedThinking ~= r["data"]["thinking"].str;
+    assert(loggedThinking == ["high", "default", "reset"], loggedThinking.to!string);
+    // Round-trip check via sessionSetting + sessionSettingValue.
+    foreach (v; ["high", "off", "default", "reset"])
+    {
+        auto parsed = sessionSetting(v);
+        assert(!parsed.isErr);
+        assert(sessionSettingValue(parsed.unwrap("isOk")) == v);
+    }
+    assert(sessionSetting("default").unwrap("ok").isNull == false);
+    assert(sessionSetting("reset").unwrap("ok").isNull == true);
+    assert(sessionSetting("bad level!").isErr);
+}
+
+// A restored model or thinking level the model does not support brings the
+// warning `/model` or `/thinking` would show, not a silent change (issue #297).
+unittest
+{
+    import nano.thinking : Thinking;
+    auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "sys");
+    assert(agent.restoreWarnings(false, false).length == 0);
+    agent.sessionThinking = Thinking.of("xhigh");
+    auto w = agent.thinking().warning;
+    assert(w.length, "the mock model has no xhigh level");
+    assert(agent.restoreWarnings(false, true) == [w]);
+    assert(agent.restoreWarnings(true, false).canFind(w));
+    assert(agent.restoreWarnings(false, false).length == 0, "nothing restored, nothing to warn about");
+}

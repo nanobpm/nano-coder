@@ -213,10 +213,30 @@ struct Host
     JSONValue delegate() sessionMeta;
     /// Configured and preset provider names, for `/providers`.
     string[] delegate() providerNames;
+    /// The system prompt for `cwd` rendered for plan or normal mode, so a
+    /// loaded session's restored mode gets matching guidance (null: keep the
+    /// prompt `systemPrompt` rendered).
+    string delegate(string cwd, bool plan) modeSystemPrompt;
+    /// The mode `systemPrompt` renders for (the startup `--plan`).
+    bool plan;
+    /// Whether a saved `provider/model` names a provider still configured
+    /// (null: assume it does).
+    bool delegate(string spec) savedModelKnown;
+    /// The canonical `provider/model` form of a verbatim model spec (a bare
+    /// model or alias in a session header). Null: the spec as given.
+    string delegate(string spec) canonicalModel;
+    /// The configured context window for a model spec's provider (null: the
+    /// startup window).
+    ConfiguredWindow delegate(string spec) windowFor;
+    /// The provider's own context window for a model spec, ignoring the
+    /// top-level one: what a session's `context_window = 0` ("from
+    /// provider/model") restores. Null: the startup window.
+    ConfiguredWindow delegate(string spec) providerWindowFor;
     /// The configured `model` and `system_prompt`, for `/settings`.
     string configModel, configSystemPrompt;
     /// Write `subagents = on` to the user config (`/subagents on|off --save`);
-    /// returns where it saved or why it could not. Null: --save is refused.
+    /// returns where it saved or why it could not (starting "could not").
+    /// Null: --save is refused.
     string delegate(bool on) saveSubagents;
     /// "Updated X → Y" and what changed (#282), sent once as an info notice
     /// after the first session/new or session/load; null for none.
@@ -419,6 +439,14 @@ final class AcpServer : AgentEvents
     private string sessionId_;
     private size_t messageSeq;
     private bool releaseNoticeSent;
+    // Defaults captured at server construction so `session/load` resets
+    // runtime settings left by an earlier session before applying the loaded
+    // session's `settings` records.
+    private bool defaultSubagentsOn;
+    private imported!"nano.context".CompactionMode defaultCompactionMode;
+    private bool defaultAutoCompact;
+    private double defaultAutoCompactThreshold;
+    private ConfiguredWindow defaultConfiguredWindow;
     /// Inter-session messages (issue #272): the router draining the
     /// listener, and the listener itself (zero or one).
     private peers.PeerRouter peerRouter;
@@ -430,6 +458,11 @@ final class AcpServer : AgentEvents
         this.agent = agent;
         // The ACP orchestrator runs its own verification (Rust #158).
         agent.verifyBeforeComplete = false;
+        defaultSubagentsOn = agent.subagentsOn;
+        defaultCompactionMode = agent.compactionMode;
+        defaultAutoCompact = agent.autoCompact;
+        defaultAutoCompactThreshold = agent.autoCompactThreshold;
+        defaultConfiguredWindow = ConfiguredWindow(agent.configuredWindow, agent.configuredWindowSource);
         this.host = host;
         outLock = new Mutex;
         router = AcpRouter.make(agent.control.nonNull);
@@ -807,9 +840,19 @@ final class AcpServer : AgentEvents
         }
         if (text.startsWith("/model ") && host.makeClient !is null)
         {
-            try agent.client = host.makeClient(text[7 .. $].strip);
+            auto spec = text[7 .. $].strip;
+            LLMClient c;
+            ConfiguredWindow w;
+            try
+            {
+                c = host.makeClient(spec);
+                w = host.windowFor !is null ? host.windowFor(spec) : defaultConfiguredWindow;
+            }
             catch (Exception e) return rpcError(id, -32602, e.msg);
-            agent.refreshCapabilities();
+            // Through `useClient` so the previous client's configured window,
+            // learned window and max output are reset, the new model probed,
+            // and the `settings` record logged for resume (#297).
+            agent.useClient(c, w, true);
             auto temp = agent.temperatureNow;
             auto th = agent.thinking();
             JSONValue body_ = ["stopReason": "end_turn", "provider": agent.client.providerName,
@@ -837,8 +880,23 @@ final class AcpServer : AgentEvents
                 if (!agent.subagentsEnabled) return rpcError(id, -32602, "sub-agents are not available in this session");
                 if (t.save && host.saveSubagents is null) return rpcError(id, -32602, "/subagents: --save is not available");
                 agent.control.takeSubagentsRequest(); // a direct switch supersedes a queued one
+                auto was = agent.subagentsOn;
                 agent.subagentsOn = t.on;
-                if (t.save) body_["saved"] = host.saveSubagents(t.on);
+                if (was != t.on)
+                {
+                    // A resume restores the session's sub-agents switch (#297).
+                    SessionSettings ss;
+                    ss.subagents = t.on ? 1 : 0;
+                    agent.logSettings(ss);
+                }
+                if (t.save)
+                {
+                    auto saved = host.saveSubagents(t.on);
+                    body_["saved"] = saved;
+                    // A saved switch is the new default `session/new` resets
+                    // to, as a fresh process would read it; a failed save is not.
+                    if (!saved.startsWith("could not")) defaultSubagentsOn = t.on;
+                }
             }
             auto model = agent.subagentModel.length ? agent.subagentModel
                 : agent.client.providerName ~ "/" ~ agent.client.modelName;
@@ -854,9 +912,16 @@ final class AcpServer : AgentEvents
             auto arg = text["/thinking".length .. $].strip;
             if (arg.length)
             {
+                import nano.thinking : sessionSettingValue;
                 auto setting = sessionSetting(arg);
                 if (setting.isErr) return rpcError(id, -32602, setting.unwrapErr("isErr"));
                 agent.sessionThinking = resultUnwrap(setting, "isOk");
+                {
+                    // A resume restores the session's thinking level (#297).
+                    SessionSettings ss;
+                    ss.thinking = sessionSettingValue(agent.sessionThinking);
+                    agent.logSettings(ss);
+                }
             }
             auto th = agent.thinking();
             JSONValue body_ = ["stopReason": "end_turn"];
@@ -971,6 +1036,19 @@ final class AcpServer : AgentEvents
             agent.restart(sys, Option!SessionLog.init);
             sessionId = format("session-%x", stdTimeNow);
         }
+        // A new session starts from the startup defaults, not the settings a
+        // `session/load` restored (issue #297): its log has no record of
+        // them, so a later load would not reproduce them.
+        resetToStartupDefaults(true);
+        // Record a startup `--plan` in the new log, as CLI startup does, so a
+        // flag-free process loading it keeps plan mode's restrictions.
+        if (host.plan)
+        {
+            SessionSettings s;
+            import nano.mode : AgentMode, mname = name;
+            s.mode = mname(AgentMode.plan);
+            agent.log.ifSome((SessionLog l) { l.settings(s); });
+        }
         if (host.loadHooks !is null) agent.useHooks(host.loadHooks(cwd), false);
         startPeerListener();
     }
@@ -999,6 +1077,15 @@ final class AcpServer : AgentEvents
         scope (failure) if (!agent.ownsLog(log)) agent.messages = prior;
         agent.messages = sys.length ? [Message.system(sys)] : null;
         agent.loadRestored(restored, some(log)); // ACP has no channel for the dropped-state notes
+        applyRestoredSettings(restored.settings, restored.model);
+        // `sys` was rendered for the startup mode; re-render it for the
+        // restored one so plan guidance matches plan-mode tool limits.
+        agent.promptPlan = host.plan;
+        if (host.modeSystemPrompt !is null)
+        {
+            auto dir = getcwd();
+            agent.syncModePrompt((bool plan) => host.modeSystemPrompt(dir, plan));
+        }
         sessionId = log.id;
         startPeerListener();
         if (host.loadHooks !is null) agent.useHooks(host.loadHooks(getcwd()), true);
@@ -1009,6 +1096,130 @@ final class AcpServer : AgentEvents
         restored = Restored.init;
         prior = null;
         releaseHeap();
+    }
+
+    /// Reset the runtime settings a session can change (issue #297) to the
+    /// server's startup defaults: sub-agents, compaction mode, auto-compaction,
+    /// its threshold, the mode and the configured window. With
+    /// `activeWindow`, the window is the active provider's (the model may
+    /// have been switched), else the startup one.
+    private void resetToStartupDefaults(bool activeWindow)
+    {
+        import nano.mode : AgentMode;
+        agent.subagentsOn = defaultSubagentsOn;
+        agent.compactionMode = defaultCompactionMode;
+        agent.autoCompact = defaultAutoCompact;
+        agent.autoCompactThreshold = defaultAutoCompactThreshold;
+        agent.control.mode = host.plan ? AgentMode.plan : AgentMode.normal;
+        agent.setConfiguredWindow(defaultConfiguredWindow);
+        if (activeWindow && host.windowFor !is null)
+        {
+            // A provider since removed from config keeps the default.
+            import std.exception : collectException;
+            ConfiguredWindow w;
+            if (collectException(w = host.windowFor(agent.client.providerName ~ "/" ~ agent.client.modelName)) is null)
+                agent.setConfiguredWindow(w);
+        }
+    }
+
+    /// Apply the runtime settings a loaded session logged (issue #297): model,
+    /// mode, thinking, sub-agents and context settings. A model that is no
+    /// longer available keeps the current client rather than failing the load.
+    private void applyRestoredSettings(const SessionSettings st, string headerModel)
+    {
+        import nano.context : parseCompactionMode;
+        import nano.mode : parseMode;
+        import nano.arith : toSize;
+        import std.math : isNaN;
+
+        // Reset settings an earlier session on this server may have changed so
+        // they do not leak into a loaded session with no record for them.
+        resetToStartupDefaults(false);
+
+        auto wanted = st.model.length ? st.model : headerModel;
+        auto current = agent.client.providerName ~ "/" ~ agent.client.modelName;
+        // Only a canonical settings record is checked: a header spec is verbatim
+        // and may be a bare model containing `/`.
+        if (st.model.length && wanted != host.configModel && host.savedModelKnown !is null && !host.savedModelKnown(wanted))
+        {
+            stdErr.writeln("nano-coder: ACP session/load: the provider of ", wanted,
+                " is not configured; using ", host.configModel);
+            wanted = host.configModel;
+        }
+        bool tryModel(string spec)
+        {
+            import std.exception : collectException;
+            auto e = collectException(() {
+                auto c = host.makeClient(spec);
+                // Through `useClient` so the previous client's learned
+                // window and max output are reset and the new model probed.
+                agent.useClient(c, host.windowFor !is null ? host.windowFor(spec) : defaultConfiguredWindow, false);
+            }());
+            if (e !is null)
+                stdErr.writeln("nano-coder: ACP session/load: could not restore model ", spec, ": ", e.msg);
+            return e is null;
+        }
+        bool switched;
+        if (wanted.length && host.makeClient !is null && wanted != current)
+        {
+            // A failed restore falls back to the config model, not whatever
+            // an earlier session on this server switched to.
+            switched = tryModel(wanted);
+            if (!switched && wanted != host.configModel && host.configModel.length
+                && host.configModel != current)
+                switched = tryModel(host.configModel);
+        }
+        if (!switched && host.windowFor !is null && current.length)
+        {
+            // No rebuild: the reset above installed the startup provider's
+            // window; resolve the active provider's own. A provider since
+            // removed from config keeps the default rather than failing the load.
+            import std.exception : collectException;
+            ConfiguredWindow w;
+            if (collectException(w = host.windowFor(current)) is null)
+                agent.setConfiguredWindow(w);
+        }
+        if (st.mode.length)
+        {
+            import nano.result : match;
+            parseMode(st.mode).match!((m) { agent.control.mode = m; }, (string) {});
+        }
+        if (st.thinking.length)
+        {
+            auto setting = sessionSetting(st.thinking);
+            if (!setting.isErr) agent.sessionThinking = resultUnwrap(setting, "isOk");
+            else stdErr.writeln("nano-coder: ACP session/load: the saved thinking level is invalid: ",
+                setting.unwrapErr("isErr"));
+        }
+        // ACP has no notice channel: the warnings `/model` and `/thinking`
+        // show for the restored values go to stderr, as the fallbacks do.
+        foreach (w; agent.restoreWarnings(switched, st.thinking.length > 0))
+            stdErr.writeln("nano-coder: ACP session/load: warning: ", w);
+        if (st.subagents >= 0) agent.subagentsOn = st.subagents != 0;
+        if (st.compactionMode.length)
+            parseCompactionMode(st.compactionMode).match!((m) { agent.compactionMode = m; }, () {});
+        if (st.autoCompact >= 0) agent.autoCompact = st.autoCompact != 0;
+        if (!st.autoCompactThreshold.isNaN) agent.autoCompactThreshold = st.autoCompactThreshold;
+        // A window recorded with a model (a switch records the window it made
+        // live) belongs to that model: it does not apply to a fallback.
+        // One recorded without a model belongs to the header's model.
+        const windowOwner = st.model.length ? st.model : headerModel;
+        const liveModel = agent.client.providerName ~ "/" ~ agent.client.modelName;
+        const windowApplies = !windowOwner.length || windowOwner == liveModel
+            || (host.canonicalModel !is null && host.canonicalModel(windowOwner) == liveModel);
+        if (!windowApplies) {}
+        else if (st.contextWindow > 0)
+            agent.setConfiguredWindow(ConfiguredWindow(toSize(st.contextWindow), "the session's settings"));
+        else if (st.contextWindow == 0)
+        {
+            // 0 is "from provider/model": the provider's own window. A
+            // provider since removed from config keeps the current one.
+            import std.exception : collectException;
+            ConfiguredWindow w;
+            auto spec = agent.client.providerName ~ "/" ~ agent.client.modelName;
+            if (host.providerWindowFor is null) agent.restoreConfiguredWindow(defaultConfiguredWindow);
+            else if (collectException(w = host.providerWindowFor(spec)) is null) agent.restoreConfiguredWindow(w);
+        }
     }
 
     /// Replay the conversation as session/update notifications.
@@ -1441,4 +1652,310 @@ unittest
     assert(!byId[3]["result"]["tools"].arrayNoRef.canFind!(t => t.str == "agent"));
     assert(byId[4]["error"]["message"].str.canFind("--save"), "no host save: refused");
     assert(byId[5]["result"]["subagents"].boolean && agent.offeredTools.canFind!(t => t.name == "agent"));
+}
+
+// issue #297: `/subagents off --save` makes off the default `session/new`
+// resets to (as a fresh process would read it); a failed save does not.
+unittest
+{
+    import nano.providers.mock;
+    import nano.tools;
+    import nano.permissions : Policy;
+    import nano.subagent : SubClientFactory;
+    static final class NoClients : SubClientFactory
+    {
+        LLMClient make(string spec) const { assert(0, "no sub-agent runs here"); }
+    }
+    foreach (fail; [false, true])
+    {
+        auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, null);
+        agent.subagentClients = new immutable NoClients;
+        assert(agent.subagentsOn);
+        auto host = Host((string cwd) => "sys", null, null, "test");
+        host.saveSubagents = (bool on) => fail ? "could not save: disk full" : "saved to /cfg";
+        auto srv = new AcpServer(agent, host, (string l) {});
+        srv.receive(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}`);
+        srv.receive(`{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"prompt":[{"type":"text","text":"/subagents off --save"}]}}`);
+        srv.receive(`{"jsonrpc":"2.0","id":3,"method":"session/new","params":{}}`);
+        srv.close();
+        assert(srv.run());
+        assert(agent.subagentsOn == fail);
+    }
+}
+
+// issue #297: ACP `/model`, `/subagents` and `/thinking` log `settings`
+// records, and `session/load` restores them (without failing when a model is
+// unavailable).
+unittest
+{
+    import std.file : exists, rmdirRecurse, tempDir;
+    import std.path : buildPath;
+    import nano.providers.mock;
+    import nano.tools;
+    import nano.permissions : Policy;
+    import nano.subagent : SubClientFactory;
+    import nano.thinking : Thinking;
+    static final class NoClients : SubClientFactory
+    {
+        LLMClient make(string spec) const { assert(0, "no sub-agent runs here"); }
+    }
+    static final class NamedMock : MockClient
+    {
+        string prov, mod;
+        this(string p, string m) pure { super([]); prov = p; mod = m; }
+        override string providerName() const pure { return prov; }
+        override string modelName() const pure { return mod; }
+    }
+    auto dir = buildPath(tempDir, "nano-acp-settings-restore");
+    if (exists(dir)) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+
+    auto agent1 = new Agent(new MockClient([]), new ToolRegistry, Policy.init, null);
+    agent1.subagentClients = new immutable NoClients;
+    agent1.setConfiguredWindow(ConfiguredWindow(7_777, "startup provider"));
+    agent1.learnedWindow = 4_000;
+    agent1.learnedMaxOutput = 512;
+    string[] lines1;
+    Host host1;
+    host1.systemPrompt = (string cwd) => "sys";
+    host1.makeClient = (string spec) => new NamedMock("alt", spec);
+    host1.windowFor = (string spec) => ConfiguredWindow(5_555, "switched provider");
+    host1.sessionDir = dir;
+    host1.version_ = "test";
+    auto srv1 = new AcpServer(agent1, host1, (string l) { lines1 ~= l; });
+    srv1.receive(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}`);
+    srv1.receive(`{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"prompt":[{"type":"text","text":"/model other"}]}}`);
+    srv1.receive(`{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"prompt":[{"type":"text","text":"/subagents off"}]}}`);
+    srv1.receive(`{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"prompt":[{"type":"text","text":"/thinking high"}]}}`);
+    srv1.close();
+    assert(srv1.run());
+    assert(agent1.configuredWindow == 5_555);
+    assert(agent1.learnedWindow == 0 && agent1.learnedMaxOutput == 0);
+    auto sid = parseJSON(lines1[0])["result"]["sessionId"].str;
+    agent1.replaceLog(Option!SessionLog.init);
+
+    auto agent2 = new Agent(new MockClient([]), new ToolRegistry, Policy.init, null);
+    agent2.subagentClients = new immutable NoClients;
+    string[] lines2;
+    Host host2;
+    host2.systemPrompt = (string cwd) => "sys";
+    host2.makeClient = (string spec) {
+        assert(spec == "alt/other", spec);
+        return new NamedMock("alt", "other");
+    };
+    host2.sessionDir = dir;
+    host2.version_ = "test";
+    auto srv2 = new AcpServer(agent2, host2, (string l) { lines2 ~= l; });
+    srv2.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ sid ~ `"}}`);
+    srv2.close();
+    assert(srv2.run());
+    assert(agent2.client.providerName == "alt" && agent2.client.modelName == "other");
+    assert(!agent2.subagentsOn);
+    assert(!agent2.sessionThinking.isNull && agent2.sessionThinking.get == Thinking.of("high"));
+    agent2.replaceLog(Option!SessionLog.init);
+
+    // session/load then session/new: the new session starts from the startup
+    // defaults, not the loaded session's settings, so it behaves live as it
+    // does when reloaded (issue #297).
+    auto agentN = new Agent(new MockClient([]), new ToolRegistry, Policy.init, null);
+    agentN.subagentClients = new immutable NoClients;
+    agentN.setConfiguredWindow(ConfiguredWindow(8_888, "startup provider"));
+    const startSub = agentN.subagentsOn, startMode = agentN.compactionMode, startAuto = agentN.autoCompact;
+    Host hostN = host2;
+    hostN.makeClient = (string spec) => new NamedMock("alt", "other");
+    hostN.windowFor = (string spec) => ConfiguredWindow(6_666, "switched provider");
+    string[] linesN;
+    auto srvN = new AcpServer(agentN, hostN, (string l) { linesN ~= l; });
+    srvN.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ sid ~ `"}}`);
+    srvN.receive(`{"jsonrpc":"2.0","id":3,"method":"session/new","params":{}}`);
+    srvN.close();
+    assert(srvN.run());
+    assert(agentN.subagentsOn == startSub && startSub, linesN.format!"%s");
+    assert(agentN.compactionMode == startMode && agentN.autoCompact == startAuto);
+    assert(agentN.sessionThinking.isNull);
+    assert(agentN.configuredWindow == 6_666, "the active provider's window, not the loaded one's");
+    auto newSid = parseJSON(linesN[$ - 1])["result"]["sessionId"].str;
+    assert(newSid != sid);
+    agentN.replaceLog(Option!SessionLog.init);
+    // Reloading the new session reproduces what it had live.
+    auto agentR = new Agent(new MockClient([]), new ToolRegistry, Policy.init, null);
+    agentR.subagentClients = new immutable NoClients;
+    auto srvR = new AcpServer(agentR, hostN, (string l) {});
+    srvR.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ newSid ~ `"}}`);
+    srvR.close();
+    assert(srvR.run());
+    assert(agentR.subagentsOn == agentN.subagentsOn && agentR.compactionMode == agentN.compactionMode);
+    assert(agentR.sessionThinking.isNull);
+    agentR.replaceLog(Option!SessionLog.init);
+
+    // An unavailable model during session/load falls back to the current client.
+    auto agent3 = new Agent(new MockClient([]), new ToolRegistry, Policy.init, null);
+    string[] lines3;
+    Host host3;
+    host3.systemPrompt = (string cwd) => "sys";
+    host3.makeClient = (string spec) { throw new Exception("gone: " ~ spec); };
+    host3.sessionDir = dir;
+    host3.version_ = "test";
+    auto srv3 = new AcpServer(agent3, host3, (string l) { lines3 ~= l; });
+    srv3.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ sid ~ `"}}`);
+    srv3.close();
+    assert(srv3.run());
+    assert(agent3.client.providerName == "mock" && agent3.client.modelName == "mock");
+    assert(!agent3.subagentsOn);
+    assert(!agent3.sessionThinking.isNull && agent3.sessionThinking.get == Thinking.of("high"));
+    agent3.replaceLog(Option!SessionLog.init);
+
+    // A failed restore falls back to the config model, not the client an
+    // earlier session switched to; a removed provider is not reparsed; the
+    // restored window comes from the target provider, and the system prompt
+    // follows the restored mode.
+    auto agent4 = new Agent(new NamedMock("prev", "stale"), new ToolRegistry, Policy.init, null);
+    string[] lines4, built4;
+    Host host4;
+    host4.systemPrompt = (string cwd) => "sys-normal";
+    host4.modeSystemPrompt = (string cwd, bool plan) => plan ? "sys-plan" : "sys-normal";
+    host4.configModel = "cfg/default";
+    host4.savedModelKnown = (string spec) => !spec.startsWith("alt/");
+    host4.windowFor = (string spec) => ConfiguredWindow(1234, "test window");
+    host4.makeClient = (string spec) {
+        built4 ~= spec;
+        return new NamedMock("cfg", "default");
+    };
+    host4.sessionDir = dir;
+    host4.version_ = "test";
+    auto srv4 = new AcpServer(agent4, host4, (string l) { lines4 ~= l; });
+    srv4.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ sid ~ `"}}`);
+    srv4.close();
+    assert(srv4.run());
+    assert(built4 == ["cfg/default"], built4[0]);
+    assert(agent4.client.providerName == "cfg" && agent4.client.modelName == "default");
+    assert(agent4.configuredWindow == 1234);
+    assert(agent4.messages[0].content == "sys-normal");
+    agent4.replaceLog(Option!SessionLog.init);
+
+    // No rebuild (the fallback is already the active model): the window is
+    // still resolved for the active provider, not left at the startup one.
+    auto agent5 = new Agent(new NamedMock("cfg", "default"), new ToolRegistry, Policy.init, null);
+    agent5.setConfiguredWindow(ConfiguredWindow(99, "startup provider"));
+    built4 = null;
+    auto srv5 = new AcpServer(agent5, host4, (string l) {});
+    srv5.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ sid ~ `"}}`);
+    srv5.close();
+    assert(srv5.run());
+    assert(built4.length == 0, built4[0]);
+    assert(agent5.configuredWindow == 1234);
+    agent5.replaceLog(Option!SessionLog.init);
+
+    // A failed switch with the config model already active still resolves
+    // the active provider's window; a windowFor that throws keeps the load.
+    Host host6 = host4;
+    host6.savedModelKnown = (string spec) => true;
+    host6.makeClient = (string spec) { throw new Exception("no such model"); return new NamedMock("x", "y"); };
+    auto agent6 = new Agent(new NamedMock("cfg", "default"), new ToolRegistry, Policy.init, null);
+    agent6.setConfiguredWindow(ConfiguredWindow(99, "startup provider"));
+    auto srv6 = new AcpServer(agent6, host6, (string l) {});
+    srv6.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ sid ~ `"}}`);
+    srv6.close();
+    assert(srv6.run());
+    assert(agent6.configuredWindow == 1234);
+    agent6.replaceLog(Option!SessionLog.init);
+
+    host6.windowFor = (string spec) { throw new Exception("provider removed"); return ConfiguredWindow.init; };
+    auto agent7 = new Agent(new NamedMock("cfg", "default"), new ToolRegistry, Policy.init, null);
+    auto srv7 = new AcpServer(agent7, host6, (string l) {});
+    srv7.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ sid ~ `"}}`);
+    srv7.close();
+    assert(srv7.run());
+    assert(agent7.messages.length > 0);
+    agent7.replaceLog(Option!SessionLog.init);
+
+    // A record of `context_window = 0` ("from provider/model": a switch with
+    // no configured window) restores the provider's own window, not the
+    // top-level one `windowFor` would resolve.
+    Host host8 = host1;
+    host8.windowFor = (string spec) => ConfiguredWindow.init;
+    auto agent8 = new Agent(new MockClient([]), new ToolRegistry, Policy.init, null);
+    string[] lines8;
+    auto srv8 = new AcpServer(agent8, host8, (string l) { lines8 ~= l; });
+    srv8.receive(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}`);
+    srv8.receive(`{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"prompt":[{"type":"text","text":"/model other"}]}}`);
+    srv8.close();
+    assert(srv8.run());
+    auto sid8 = parseJSON(lines8[0])["result"]["sessionId"].str;
+    agent8.replaceLog(Option!SessionLog.init);
+    Host host9 = host8;
+    host9.makeClient = (string spec) => new NamedMock("alt", "other");
+    host9.windowFor = (string spec) => ConfiguredWindow(64_000, "context_window in config");
+    host9.providerWindowFor = (string spec) => ConfiguredWindow(3_333, "provider context_window");
+    auto agent9 = new Agent(new MockClient([]), new ToolRegistry, Policy.init, null);
+    auto srv9 = new AcpServer(agent9, host9, (string l) {});
+    srv9.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ sid8 ~ `"}}`);
+    srv9.close();
+    assert(srv9.run());
+    assert(agent9.configuredWindow == 3_333);
+    agent9.replaceLog(Option!SessionLog.init);
+
+    // A window recorded without a model (a `/settings` edit) belongs to the
+    // header's model: a load that falls back to another model drops it.
+    {
+        auto la = new SessionLog(dir, "hdr/one", "/");
+        SessionSettings ws;
+        ws.contextWindow = 4_242;
+        la.settings(ws);
+        auto sidA = la.id;
+        la.close();
+        Host hostW = host3; // makeClient throws: stays on mock/mock
+        hostW.windowFor = (string spec) => ConfiguredWindow(777, "fallback provider");
+        auto agentW = new Agent(new MockClient([]), new ToolRegistry, Policy.init, null);
+        auto srvW = new AcpServer(agentW, hostW, (string l) {});
+        srvW.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ sidA ~ `"}}`);
+        srvW.close();
+        assert(srvW.run());
+        assert(agentW.configuredWindow != 4_242, "model hdr/one's window applied to mock/mock");
+        agentW.replaceLog(Option!SessionLog.init);
+    }
+
+    // A header naming the live model by a bare name or alias still owns the
+    // window: it is compared canonically, as the REPL does.
+    {
+        auto lb = new SessionLog(dir, "one", "/");
+        SessionSettings ws;
+        ws.contextWindow = 4_343;
+        lb.settings(ws);
+        auto sidB = lb.id;
+        lb.close();
+        Host hostB = host3;
+        hostB.makeClient = (string spec) => new NamedMock("hdr", "one");
+        hostB.canonicalModel = (string spec) => spec == "one" ? "hdr/one" : spec;
+        auto agentB = new Agent(new NamedMock("hdr", "one"), new ToolRegistry, Policy.init, null);
+        auto srvB = new AcpServer(agentB, hostB, (string l) {});
+        srvB.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ sidB ~ `"}}`);
+        srvB.close();
+        assert(srvB.run());
+        assert(agentB.configuredWindow == 4_343, "a bare header model lost its window");
+        agentB.replaceLog(Option!SessionLog.init);
+    }
+
+    // A `session/new` under startup `--plan` records plan mode, so a
+    // flag-free server loading it restores plan mode.
+    {
+        import nano.mode : AgentMode;
+        Host hostP = host2;
+        hostP.plan = true;
+        auto agentP = new Agent(new MockClient([]), new ToolRegistry, Policy.init, null);
+        string[] linesP;
+        auto srvP = new AcpServer(agentP, hostP, (string l) { linesP ~= l; });
+        srvP.receive(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}`);
+        srvP.close();
+        assert(srvP.run());
+        auto sidP = parseJSON(linesP[0])["result"]["sessionId"].str;
+        agentP.replaceLog(Option!SessionLog.init);
+        auto agentL = new Agent(new MockClient([]), new ToolRegistry, Policy.init, null);
+        auto srvL = new AcpServer(agentL, host3, (string l) {});
+        srvL.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ sidP ~ `"}}`);
+        srvL.close();
+        assert(srvL.run());
+        assert(agentL.control.mode == AgentMode.plan);
+        agentL.replaceLog(Option!SessionLog.init);
+    }
 }

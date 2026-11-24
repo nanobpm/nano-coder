@@ -25,6 +25,7 @@ import core.time : dur;
 import std.process : environment, thisProcessID;
 import std.algorithm : sort, filter, map, min;
 import std.array : array;
+import std.math : isNaN;
 import nano.llm;
 import nano.option : Option, some, none, ifSome, match;
 import nano.plan : Plan;
@@ -386,6 +387,64 @@ string logHeaderCwd(string path)
         });
     catch (Exception) {} // an unreadable or corrupt header is no cwd, as documented
     return cwd;
+}
+
+/// The model a saved session will resume with: the latest `settings` record's
+/// `model` field, else the header's `model`, or null if unreadable (issue #297).
+/// Used at `--resume` startup to select the saved model before constructing the
+/// startup client, so a disabled or failing default provider does not block
+/// resuming a session whose own provider is usable. `fromHeader` is true when
+/// the model came from the header, which stores the spec verbatim (it may be a
+/// bare model containing `/`), not from a canonical `settings` record.
+string logSavedModel(string path, out bool fromHeader)
+{
+    string model;
+    try
+        streamLogLines(path, (line) {
+            // Fast path: skip lines that cannot be the header or a settings record.
+            if (!line.canFind(`"type":"session"`) && !line.canFind(`"type": "session"`)
+                && !line.canFind(`"type":"settings"`) && !line.canFind(`"type": "settings"`))
+                return;
+            JSONValue obj;
+            try obj = parseJSON(line);
+            catch (Exception) return; // a corrupt line does not block startup peeking
+            if (obj.type != JSONType.object) return;
+            auto t = "type" in obj, d = "data" in obj;
+            if (t is null || t.type != JSONType.string || d is null || d.type != JSONType.object) return;
+            if (t.str != "session" && t.str != "settings") return;
+            if (auto m = "model" in *d)
+                if (m.type == JSONType.string && m.str.length) { model = m.str; fromHeader = t.str == "session"; }
+        });
+    catch (Exception) {} // an unreadable or corrupt log falls back to config model
+    return model;
+}
+
+unittest // logSavedModel: header model, overridden by settings.model, corrupt lines ignored
+{
+    auto dir = buildPath(tempDir, "nano-coder-saved-model-test");
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) if (dir.exists) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "openai/gpt-4o", "/tmp");
+    auto p = log.path;
+    log.close();
+    bool hdr;
+    assert(logSavedModel(p, hdr) == "openai/gpt-4o" && hdr);
+
+    auto log2 = new SessionLog(p);
+    SessionSettings s1;
+    s1.verbosity = "verbose";
+    log2.settings(s1);
+    SessionSettings s2;
+    s2.model = "anthropic/claude-sonnet";
+    log2.settings(s2);
+    log2.close();
+    assert(logSavedModel(p, hdr) == "anthropic/claude-sonnet" && !hdr);
+
+    // Corrupt line and non-string model field are ignored.
+    std.file.append(p, "{not json\n");
+    std.file.append(p, `{"type":"settings","data":{"model":123}}` ~ "\n");
+    assert(logSavedModel(p, hdr) == "anthropic/claude-sonnet" && !hdr);
+    assert(logSavedModel(buildPath(dir, "missing.jsonl"), hdr) is null);
 }
 
 /// The session log directory: `NANO_CODER_SESSIONS`, else the configured
@@ -1052,6 +1111,26 @@ class SessionLog
             "recorded_at": nowStamp()])));
     }
 
+    /// A runtime setting changed (`/model`, `/mode`, `/verbosity`, `/thinking`,
+    /// `/subagents`, the context settings; issue #297): only the fields `s`
+    /// names are recorded, and on restore the latest record of each field
+    /// wins, so a resumed session carries on with the settings it stopped
+    /// with.
+    void settings(const SessionSettings s)
+    {
+        JSONValue d = ["recorded_at": nowStamp()];
+        if (s.model.length) d["model"] = s.model;
+        if (s.mode.length) d["mode"] = s.mode;
+        if (s.verbosity.length) d["verbosity"] = s.verbosity;
+        if (s.thinking.length) d["thinking"] = s.thinking;
+        if (s.subagents >= 0) d["subagents"] = s.subagents != 0;
+        if (s.compactionMode.length) d["compaction_mode"] = s.compactionMode;
+        if (s.autoCompact >= 0) d["auto_compact"] = s.autoCompact != 0;
+        if (!s.autoCompactThreshold.isNaN) d["auto_compact_threshold"] = s.autoCompactThreshold;
+        if (s.contextWindow >= 0) d["context_window"] = s.contextWindow;
+        write_(record("settings", d));
+    }
+
     /// The timers after a change; the latest record wins.
     void timers(JSONValue timers)
     {
@@ -1344,10 +1423,51 @@ struct PendingInput
     size_t recallNotes;
 }
 
+/// The session's runtime settings as a `settings` record logs them (issue
+/// #297): every field is absent-by-default, so a record changes only what it
+/// names and the latest record of each field wins on restore. The header's
+/// `model` is the starting value; a record's `model` supersedes it.
+struct SessionSettings
+{
+    /// `provider/model` (empty: unchanged).
+    string model;
+    /// `/mode` name: normal, plan or auto (empty: unchanged).
+    string mode;
+    /// `/verbosity` name (empty: unchanged).
+    string verbosity;
+    /// `/thinking`: "reset" (clear override), "default", "off" or a level name (empty: unchanged).
+    string thinking;
+    /// `/subagents`: 1 on, 0 off, -1 unchanged.
+    int subagents = -1;
+    /// Compaction mode name: standard, smart or extract (empty: unchanged).
+    string compactionMode;
+    /// Auto-compaction: 1 on, 0 off, -1 unchanged.
+    int autoCompact = -1;
+    /// The auto-compaction threshold (NaN: unchanged).
+    double autoCompactThreshold = double.nan;
+    /// The context-window override in tokens; 0 clears it (-1: unchanged).
+    long contextWindow = -1;
+
+    /// Field-wise: the NaN "unchanged" threshold equals itself, which a
+    /// struct's default bitwise equality rejects.
+    bool opEquals(const ref SessionSettings o) const pure nothrow @nogc
+    {
+        import std.math : isNaN;
+        return model == o.model && mode == o.mode && verbosity == o.verbosity && thinking == o.thinking
+            && subagents == o.subagents && compactionMode == o.compactionMode && autoCompact == o.autoCompact
+            && (autoCompactThreshold == o.autoCompactThreshold
+                || (autoCompactThreshold.isNaN && o.autoCompactThreshold.isNaN))
+            && contextWindow == o.contextWindow;
+    }
+}
+
 /// What a session log restores to.
 struct Restored
 {
     string id, cwd, model, createdAt;
+    /// The runtime settings the log's `settings` records restore (issue #297);
+    /// `settings.model`, when set, supersedes `model`.
+    SessionSettings settings;
     Message[] conversation;
     /// The newest prompts typed in this session, oldest first (bounded by the
     /// editor history's caps), for Up/Down recall after a resume. Prompts
@@ -2295,7 +2415,42 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
         case "recall":
             r.recall = data["recall"];
             break;
-        default: // hooks: audit only
+        case "settings":
+            // The latest record of each field wins (issue #297); a field a
+            // record omits keeps its earlier value. Hand-edited or corrupt
+            // fields with the wrong JSON type or out-of-range values are
+            // ignored instead of failing the resume.
+            if (auto v = "model" in data)
+                if (v.type == JSONType.string) r.settings.model = v.str;
+            if (auto v = "mode" in data)
+                if (v.type == JSONType.string) r.settings.mode = v.str;
+            if (auto v = "verbosity" in data)
+                if (v.type == JSONType.string) r.settings.verbosity = v.str;
+            if (auto v = "thinking" in data)
+                if (v.type == JSONType.string) r.settings.thinking = v.str;
+            if (auto v = "subagents" in data)
+                if (v.type == JSONType.true_ || v.type == JSONType.false_)
+                    r.settings.subagents = v.type == JSONType.true_ ? 1 : 0;
+            if (auto v = "compaction_mode" in data)
+                if (v.type == JSONType.string) r.settings.compactionMode = v.str;
+            if (auto v = "auto_compact" in data)
+                if (v.type == JSONType.true_ || v.type == JSONType.false_)
+                    r.settings.autoCompact = v.type == JSONType.true_ ? 1 : 0;
+            if (auto v = "auto_compact_threshold" in data)
+            {
+                double t = double.nan;
+                ulong n;
+                if (v.type == JSONType.float_) t = v.floating;
+                else if (jsonUnsigned(*v, n)) t = n;
+                if (t > 0.0 && t <= 1.0) r.settings.autoCompactThreshold = t;
+            }
+            if (auto v = "context_window" in data)
+            {
+                ulong n;
+                if (jsonUnsigned(*v, n) && n <= long.max) r.settings.contextWindow = n.to!long;
+            }
+            break;
+        default: // hooks, setting: audit only
             break;
         }
         index++;
@@ -2942,6 +3097,119 @@ unittest
     // A header from another format version is refused.
     std.file.write(buildPath(dir, "v9.jsonl"), `{"type":"session","data":{"version":9,"id":"v9","created_at":"x"}}` ~ "\n");
     assertThrown(restore(buildPath(dir, "v9.jsonl")));
+}
+
+// issue #297: settings records round-trip; the latest record of each field
+// wins, a record changes only what it names, and a log without any keeps the
+// defaults (the header's model is the starting value).
+unittest
+{
+    auto dir = buildPath(tempDir, "nano-coder-session-settings");
+    if (dir.exists) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/a", "/x");
+    auto sys = Message.system("sys");
+    log.append(sys);
+    // Old log, no settings records: every field is "unchanged".
+    auto r0 = restore(log.path);
+    auto noSettings = SessionSettings.init;
+    assert(r0.model == "mock/a" && r0.settings == noSettings);
+    SessionSettings s1;
+    s1.model = "mock/b";
+    s1.mode = "plan";
+    s1.verbosity = "verbose";
+    s1.thinking = "high";
+    s1.subagents = 0;
+    s1.compactionMode = "smart";
+    s1.autoCompact = 1;
+    s1.autoCompactThreshold = 0.7;
+    s1.contextWindow = 50_000;
+    log.settings(s1);
+    SessionSettings s2;
+    s2.model = "mock/c";
+    s2.subagents = 1;
+    log.settings(s2);
+    auto r = restore(log.path);
+    assert(r.model == "mock/a", "the header keeps the creation-time model");
+    assert(r.settings.model == "mock/c", "the latest record wins");
+    assert(r.settings.mode == "plan" && r.settings.verbosity == "verbose" && r.settings.thinking == "high");
+    assert(r.settings.subagents == 1 && r.settings.compactionMode == "smart");
+    assert(r.settings.autoCompact == 1);
+    // JSON text round-trips a double only approximately.
+    assert(imported!"std.math".isClose(r.settings.autoCompactThreshold, 0.7));
+    assert(r.settings.contextWindow == 50_000);
+    // A record names only what changed: the earlier record's fields survive.
+    auto lines = readText(log.path).lineSplitter.array;
+    auto rec = parseJSON(lines[$ - 1]);
+    assert(rec["type"].str == "settings" && rec["data"]["model"].str == "mock/c");
+    assert("mode" !in rec["data"] && rec["data"]["subagents"].boolean == true);
+    assert("recorded_at" in rec["data"]);
+    // A resumed log keeps accepting appends after the records.
+    auto again = new SessionLog(log.path);
+    auto more = Message.user("more");
+    again.append(more);
+    assert(restore(log.path).settings.model == "mock/c");
+}
+
+// issue #297: a settings record with a cleared context window (0) restores
+// as 0, distinct from "never recorded" (-1).
+unittest
+{
+    auto dir = buildPath(tempDir, "nano-coder-session-settings-clear");
+    if (dir.exists) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/a", "/x");
+    auto sys = Message.system("sys");
+    log.append(sys);
+    SessionSettings s;
+    s.contextWindow = 0;
+    log.settings(s);
+    auto r = restore(log.path);
+    assert(r.settings.contextWindow == 0);
+}
+
+// issue #297: corrupt or hand-edited `settings` records with wrong JSON types
+// or out-of-range numeric values are ignored per-field instead of failing the
+// resume; uinteger context_window values still decode via jsonUnsigned.
+unittest
+{
+    auto dir = buildPath(tempDir, "nano-coder-session-settings-corrupt");
+    if (dir.exists) rmdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto log = new SessionLog(dir, "mock/a", "/x");
+    auto sys = Message.system("sys");
+    log.append(sys);
+    SessionSettings good;
+    good.model = "mock/good";
+    good.mode = "plan";
+    good.verbosity = "verbose";
+    good.thinking = "high";
+    good.subagents = 1;
+    good.compactionMode = "smart";
+    good.autoCompact = 1;
+    good.autoCompactThreshold = 0.75;
+    good.contextWindow = 64_000;
+    log.settings(good);
+    log.close();
+    // Append a malformed settings record with wrong types and out-of-range numbers.
+    std.file.append(log.path, `{"type":"settings","data":{"model":123,"mode":true,"verbosity":[],`
+        ~ `"thinking":{},"subagents":"yes","compaction_mode":42,"auto_compact":"no",`
+        ~ `"auto_compact_threshold":"bad","context_window":"nope"}}` ~ "\n");
+    std.file.append(log.path, `{"type":"settings","data":{"auto_compact_threshold":-0.5,"context_window":-10}}` ~ "\n");
+    std.file.append(log.path, `{"type":"settings","data":{"auto_compact_threshold":1.5}}` ~ "\n");
+    auto r = restore(log.path);
+    assert(r.settings.model == "mock/good");
+    assert(r.settings.mode == "plan");
+    assert(r.settings.verbosity == "verbose");
+    assert(r.settings.thinking == "high");
+    assert(r.settings.subagents == 1);
+    assert(r.settings.compactionMode == "smart");
+    assert(r.settings.autoCompact == 1);
+    assert(imported!"std.math".isClose(r.settings.autoCompactThreshold, 0.75));
+    assert(r.settings.contextWindow == 64_000);
+    // A valid integer threshold (1) and large positive context_window still apply.
+    std.file.append(log.path, `{"type":"settings","data":{"auto_compact_threshold":1,"context_window":200000}}` ~ "\n");
+    auto r2 = restore(log.path);
+    assert(r2.settings.autoCompactThreshold == 1.0);
+    assert(r2.settings.contextWindow == 200_000);
 }
 
 // rust: session_index.rs::set_title_does_not_replace_an_existing_title

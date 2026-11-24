@@ -915,6 +915,13 @@ private string subagentsToggle(Agent agent, ref Config cfg, imported!"nano.subag
     agent.control.takeSubagentsRequest(); // a direct switch supersedes a queued one
     auto was = agent.subagentsOn;
     agent.subagentsOn = t.on;
+    if (was != t.on)
+    {
+        // A resume restores the session's sub-agents switch (#297).
+        SessionSettings s;
+        s.subagents = t.on ? 1 : 0;
+        agent.log.ifSome((SessionLog l) { l.settings(s); });
+    }
     auto msg = format("Sub-agents %s for this session", t.on ? "on" : "off");
     if (was != t.on) msg ~= " (the tool list changed, so the provider's prompt cache is rebuilt once)";
     if (t.save) msg ~= "; " ~ saveSubagentsSetting(cfg, t.on);
@@ -1315,6 +1322,340 @@ unittest
     auto names = reg.definitions.map!(d => d.name).array;
     assert(names.canFind("grep") && names.canFind("glob") && names.canFind("bash") && names.canFind("edit_file"));
     assert(!names.canFind("echo"), "no vestigial echo tool");
+}
+
+/// Whether a saved `provider/model` spec names a provider still in the
+/// config (issue #297): a resume falls back to the config model otherwise.
+/// A spec with no `/` has no provider prefix to check.
+bool savedProviderKnown(string spec, const ProviderConfig[string] providers) pure
+{
+    auto slash = spec.indexOf('/');
+    return slash < 0 || (spec[0 .. slash] in providers) !is null;
+}
+
+unittest
+{
+    ProviderConfig[string] ps;
+    ps["openai"] = ProviderConfig.init;
+    assert(savedProviderKnown("openai/gpt-4o", ps));
+    assert(!savedProviderKnown("removed/model", ps));
+    assert(savedProviderKnown("bare", ps));
+}
+
+/// The config defaults of the runtime settings a session can override
+/// (issue #297), as saved in the config file. Snapshotted at startup and
+/// refreshed only when the config is saved: the `/settings` dialog edits the
+/// live `Config` before (or without) saving, so comparing against or
+/// resetting to that `Config` would treat an unsaved edit as the default.
+struct RuntimeDefaults
+{
+    Verbosity verbosity; /// `verbosity`
+    bool subagents; /// `subagents`
+    string compactionMode; /// `compaction_mode`
+    bool autoCompact; /// `auto_compact`
+    double autoCompactThreshold; /// `auto_compact_threshold`
+    long contextWindow; /// top-level `context_window` (0: none)
+
+    /// The defaults `c` holds.
+    static RuntimeDefaults of(const ref Config c) pure nothrow @nogc
+    {
+        return RuntimeDefaults(c.verbosity, c.subagents, c.compactionMode, c.autoCompact,
+            c.autoCompactThreshold, c.contextWindow);
+    }
+
+    /// These defaults with only the fields a save wrote (`ch`) taken from
+    /// `c`: unsaved edits left in `c` by an earlier visit stay out, so a
+    /// resume or `/restart` still treats them as session-only overrides.
+    RuntimeDefaults refreshed(const ref Config c, const ref imported!"nano.settings".Changes ch) const pure nothrow @nogc
+    {
+        RuntimeDefaults r = this;
+        if (ch.verbosity) r.verbosity = c.verbosity;
+        if (ch.subagents) r.subagents = c.subagents;
+        if (ch.compaction)
+        {
+            r.compactionMode = c.compactionMode;
+            r.autoCompact = c.autoCompact;
+            r.autoCompactThreshold = c.autoCompactThreshold;
+            r.contextWindow = c.contextWindow;
+        }
+        return r;
+    }
+
+    /// The configured window under these defaults for a provider whose own
+    /// `context_window` is `providerWindow` (0: none), as `windowFor`
+    /// resolves it.
+    ConfiguredWindow window(long providerWindow) const pure
+    {
+        if (contextWindow > 0) return ConfiguredWindow(toSize(contextWindow), "context_window in config");
+        if (providerWindow > 0) return ConfiguredWindow(toSize(providerWindow), "provider context_window");
+        return ConfiguredWindow.init;
+    }
+}
+
+unittest // RuntimeDefaults.refreshed: only fields the save wrote become defaults
+{
+    import nano.settings : Changes;
+    Config cfg;
+    cfg.verbosity = Verbosity.normal;
+    cfg.contextWindow = 100_000;
+    cfg.compactionMode = "smart";
+    auto d = RuntimeDefaults.of(cfg);
+    // An unsaved Context edit, then a verbosity-only save.
+    cfg.contextWindow = 0;
+    cfg.compactionMode = "extract";
+    cfg.verbosity = Verbosity.verbose;
+    Changes ch;
+    ch.verbosity = true;
+    auto r = d.refreshed(cfg, ch);
+    assert(r.verbosity == Verbosity.verbose);
+    assert(r.contextWindow == 100_000 && r.compactionMode == "smart", "unsaved Context edits stay out");
+    ch.compaction = true;
+    r = d.refreshed(cfg, ch);
+    assert(r.contextWindow == 0 && r.compactionMode == "extract");
+}
+
+unittest // retainedRestartSettings: a cleared window over a saved one is recorded whatever its source label
+{
+    import nano.context : CompactionMode;
+    Config cfg;
+    cfg.contextWindow = 100_000;
+    auto d = RuntimeDefaults.of(cfg);
+    bool hasAny;
+    auto s = retainedRestartSettings(d, d.verbosity, d.subagents, CompactionMode.smart, d.autoCompact,
+        d.autoCompactThreshold, 0, "context_window in config", hasAny);
+    assert(hasAny && s.contextWindow == 0);
+}
+
+/// The configured window a session record of `context_window = 0` restores
+/// (issue #297): "from provider/model", as `/settings` offers it, so the
+/// provider's own `context_window` (`providerWindow`, 0: none) and never the
+/// top-level one.
+ConfiguredWindow providerWindow(long providerWindow) pure
+{
+    return providerWindow > 0 ? ConfiguredWindow(toSize(providerWindow), "provider context_window")
+        : ConfiguredWindow.init;
+}
+
+unittest // context_window 0 restores the provider's window, ignoring the top-level one
+{
+    assert(providerWindow(32_000).tokens == 32_000);
+    assert(providerWindow(0).tokens == 0);
+}
+
+/// Reset the runtime settings an in-process `/resume` must not carry from
+/// the session being left (issue #297) to the saved config defaults `d`:
+/// sub-agents, compaction mode, auto-compaction, its threshold and the mode;
+/// the configured window too when `window` (`providerWindow`: the active
+/// provider's own `context_window`). Verbosity is the caller's (it lives in
+/// the UI).
+void resetRuntimeSettings(Agent agent, const ref RuntimeDefaults d, long providerWindow, bool window)
+{
+    import nano.context : parseCompactionMode;
+    agent.subagentsOn = d.subagents;
+    parseCompactionMode(d.compactionMode).match!((m) { agent.compactionMode = m; }, () {});
+    agent.autoCompact = d.autoCompact;
+    agent.autoCompactThreshold = d.autoCompactThreshold;
+    agent.control.mode = AgentMode.normal;
+    if (window) agent.setConfiguredWindow(d.window(providerWindow));
+}
+
+unittest // an unsaved `/settings` edit of cfg does not leak into a `/resume` (issue #297)
+{
+    import nano.context : CompactionMode;
+    import nano.permissions : Policy;
+    import nano.providers.mock : MockClient;
+    import nano.tools : ToolRegistry;
+    Config cfg;
+    cfg.compactionMode = "smart";
+    cfg.autoCompact = true;
+    cfg.autoCompactThreshold = 0.8;
+    cfg.subagents = true;
+    const defaults = RuntimeDefaults.of(cfg);
+    // The dialog's unsaved Context edit, as `editContext` applies it.
+    cfg.compactionMode = "extract";
+    cfg.autoCompact = false;
+    cfg.autoCompactThreshold = 0.5;
+    cfg.contextWindow = 64_000;
+    auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "sys");
+    agent.compactionMode = CompactionMode.extract;
+    agent.autoCompact = false;
+    agent.autoCompactThreshold = 0.5;
+    agent.subagentsOn = false;
+    agent.setConfiguredWindow(ConfiguredWindow(64_000, "context_window in config"));
+    resetRuntimeSettings(agent, defaults, 32_000, true);
+    assert(agent.compactionMode == CompactionMode.smart);
+    assert(agent.autoCompact && agent.autoCompactThreshold == 0.8 && agent.subagentsOn);
+    assert(agent.configuredWindow == 32_000 && agent.configuredWindowSource == "provider context_window");
+    resetRuntimeSettings(agent, defaults, 0, true);
+    assert(agent.configuredWindow == 0);
+}
+
+/// The runtime settings `/restart` carries over into the new session's log
+/// (issue #297): the new session keeps the live verbosity, sub-agents switch
+/// and context settings, so seeding any value that differs from the saved
+/// config defaults `d` ensures a later flag-free resume restores them instead
+/// of reverting to config defaults. Returns `hasAny` = true when at least one
+/// field is set.
+SessionSettings retainedRestartSettings(const ref RuntimeDefaults d, Verbosity liveVerbosity,
+    bool liveSubagents, imported!"nano.context".CompactionMode liveCompactionMode, bool liveAutoCompact,
+    double liveAutoCompactThreshold, size_t liveConfiguredWindow, string liveConfiguredWindowSource,
+    out bool hasAny) pure
+{
+    import nano.context : modeName;
+    import nano.ui : vname = name;
+    SessionSettings s;
+    if (liveVerbosity != d.verbosity) { s.verbosity = vname(liveVerbosity); hasAny = true; }
+    if (liveSubagents != d.subagents) { s.subagents = liveSubagents ? 1 : 0; hasAny = true; }
+    if (modeName(liveCompactionMode) != d.compactionMode) { s.compactionMode = modeName(liveCompactionMode); hasAny = true; }
+    if (liveAutoCompact != d.autoCompact) { s.autoCompact = liveAutoCompact ? 1 : 0; hasAny = true; }
+    if (liveAutoCompactThreshold != d.autoCompactThreshold) { s.autoCompactThreshold = liveAutoCompactThreshold; hasAny = true; }
+    if (liveConfiguredWindow > 0 && liveConfiguredWindowSource == "the session's settings")
+    {
+        import std.conv : to;
+        s.contextWindow = liveConfiguredWindow.to!long;
+        hasAny = true;
+    }
+    else if (liveConfiguredWindow > 0 && liveConfiguredWindowSource == "context_window in config"
+        && liveConfiguredWindow != (d.contextWindow > 0 ? toSize(d.contextWindow) : 0))
+    {
+        import std.conv : to;
+        s.contextWindow = liveConfiguredWindow.to!long;
+        hasAny = true;
+    }
+    else if (d.contextWindow > 0 && (liveConfiguredWindow == 0
+        || (liveConfiguredWindowSource != "context_window in config"
+            && liveConfiguredWindowSource != "the session's settings")))
+    {
+        // `/settings` set 0 ("from provider/model") over a saved top-level
+        // window: record 0 so a resume uses the provider's window too.
+        s.contextWindow = 0;
+        hasAny = true;
+    }
+    return s;
+}
+
+/// Whether a restored `context_window` record applies to the live model
+/// (issue #297): it belongs to `owner` (the record's model, else the header's,
+/// `canonOwner` its canonical form), so a fallback or `-m` override to
+/// another model must not take it. No owner (an old log) applies.
+bool recordedWindowApplies(string owner, string canonOwner, string live) pure nothrow @nogc
+{
+    return !owner.length || owner == live || canonOwner == live;
+}
+
+unittest // a window recorded by a `/settings` edit belongs to the header model, not a `-m` override
+{
+    assert(recordedWindowApplies("a/one", "a/one", "a/one"));
+    assert(!recordedWindowApplies("a/one", "a/one", "b/two"), "model A's window applied to B");
+    assert(recordedWindowApplies("one", "a/one", "a/one"), "a bare header alias matches canonically");
+    assert(recordedWindowApplies(null, null, "b/two"), "an old log with no model keeps the window");
+}
+
+unittest // retainedRestartSettings: records only live settings that diverge from config
+{
+    import nano.context : CompactionMode;
+    Config cfg;
+    cfg.verbosity = Verbosity.normal;
+    cfg.subagents = true;
+    cfg.compactionMode = "smart";
+    cfg.autoCompact = true;
+    cfg.autoCompactThreshold = 0.8;
+    auto d = RuntimeDefaults.of(cfg);
+    bool hasAny;
+    const SessionSettings empty;
+    auto same = retainedRestartSettings(d, Verbosity.normal, true, CompactionMode.smart, true, 0.8, 0, "", hasAny);
+    assert(!hasAny && same == empty);
+
+    auto changed = retainedRestartSettings(d, Verbosity.verbose, false, CompactionMode.extract, false, 0.65,
+        50_000, "the session's settings", hasAny);
+    assert(hasAny);
+    assert(changed.verbosity == "verbose");
+    assert(changed.subagents == 0);
+    assert(changed.compactionMode == "extract");
+    assert(changed.autoCompact == 0);
+    assert(changed.autoCompactThreshold == 0.65);
+    assert(changed.contextWindow == 50_000);
+
+    // A `/settings` context_window edit (labelled "context_window in config") is also seeded.
+    auto dlgWin = retainedRestartSettings(d, Verbosity.normal, true, CompactionMode.smart, true, 0.8,
+        64_000, "context_window in config", hasAny);
+    assert(hasAny && dlgWin.contextWindow == 64_000);
+
+    // A saved config context_window that matches is not redundantly recorded.
+    cfg.contextWindow = 64_000;
+    d = RuntimeDefaults.of(cfg);
+    auto sameWin = retainedRestartSettings(d, Verbosity.normal, true, CompactionMode.smart, true, 0.8,
+        64_000, "context_window in config", hasAny);
+    assert(!hasAny && sameWin.contextWindow == -1);
+
+    // A provider window live over a saved top-level one (`/settings` set 0)
+    // is recorded as 0, "from provider/model".
+    auto provWin = retainedRestartSettings(d, Verbosity.normal, true, CompactionMode.smart, true, 0.8,
+        128_000, "provider context_window", hasAny);
+    assert(hasAny && provWin.contextWindow == 0);
+
+    // Without a top-level window, the provider's is the default: not recorded.
+    cfg.contextWindow = 0;
+    d = RuntimeDefaults.of(cfg);
+    auto provOnly = retainedRestartSettings(d, Verbosity.normal, true, CompactionMode.smart, true, 0.8,
+        128_000, "provider context_window", hasAny);
+    assert(!hasAny && provOnly.contextWindow == -1);
+}
+
+unittest // an unsaved `/settings` Context edit survives `/restart` (issue #297)
+{
+    import nano.context : CompactionMode;
+    Config cfg;
+    cfg.compactionMode = "smart";
+    cfg.autoCompact = true;
+    cfg.autoCompactThreshold = 0.8;
+    const d = RuntimeDefaults.of(cfg);
+    // `editContext` writes the edit into cfg (and the agent) without saving.
+    cfg.compactionMode = "extract";
+    cfg.autoCompact = false;
+    cfg.autoCompactThreshold = 0.5;
+    cfg.contextWindow = 64_000;
+    bool hasAny;
+    auto s = retainedRestartSettings(d, cfg.verbosity, cfg.subagents, CompactionMode.extract, false, 0.5,
+        64_000, "context_window in config", hasAny);
+    assert(hasAny);
+    assert(s.compactionMode == "extract" && s.autoCompact == 0 && s.autoCompactThreshold == 0.5);
+    assert(s.contextWindow == 64_000);
+}
+
+/// Pick the initial startup model candidate for `--resume` (issue #297):
+/// explicit `-m` wins, else a saved model whose provider is configured, else
+/// `cfg.model`. Sets `note` when a saved model's provider was removed from
+/// config. A header spec (`fromHeader`) is stored verbatim and may be a bare
+/// model containing `/` (e.g. `meta-llama/Llama-3`), so it is kept as is.
+string startupResumeModel(string explicitModel, string savedModel, bool fromHeader, const ref Config cfg,
+    out string note) pure
+{
+    if (explicitModel.length) return explicitModel;
+    if (!savedModel.length || savedModel == cfg.model) return cfg.model;
+    if (!fromHeader && !savedProviderKnown(savedModel, cfg.providers))
+    {
+        note = format("the session's model %s is not available (provider %s is not configured); using %s from the config",
+            savedModel, savedModel[0 .. savedModel.indexOf('/')], cfg.model);
+        return cfg.model;
+    }
+    return savedModel;
+}
+
+unittest // startupResumeModel: explicit flag > configured saved model > config fallback
+{
+    import std.algorithm.searching : canFind;
+    Config cfg;
+    cfg.model = "disabled-a/model-a";
+    cfg.providers["b"] = ProviderConfig.init;
+    string note;
+    assert(startupResumeModel("b/explicit", "b/saved", false, cfg, note) == "b/explicit" && !note.length);
+    assert(startupResumeModel(null, "b/saved", false, cfg, note) == "b/saved" && !note.length);
+    assert(startupResumeModel(null, "gone/saved", false, cfg, note) == "disabled-a/model-a" && note.canFind("gone/saved"));
+    // A legacy header spec with a slash is a bare model, not a removed provider.
+    note = null;
+    assert(startupResumeModel(null, "meta-llama/Llama-3", true, cfg, note) == "meta-llama/Llama-3" && !note.length);
+    assert(startupResumeModel(null, null, false, cfg, note) == "disabled-a/model-a" && !note.length);
 }
 
 void setVerbosity(Verbosity v)
@@ -2853,6 +3194,39 @@ int appMain(string[] args)
     return rc;
 }
 
+/// Forget a `--resume`d session's model that startup already found
+/// unavailable (and fell back from), so it is not retried; the window
+/// recorded with it is dropped too, since it belongs to that model and must
+/// not be applied to the fallback (the config/learned window applies).
+void dropFallenBackModel(ref SessionSettings st, ref string headerModel, string startupSavedModel) pure nothrow
+{
+    auto saved = st.model.length ? st.model : headerModel;
+    if (saved != startupSavedModel) return;
+    st.model = null;
+    headerModel = null;
+    st.contextWindow = -1;
+}
+
+unittest
+{
+    // Startup fell back from an unavailable model: its recorded window is
+    // not applied to the fallback.
+    SessionSettings st;
+    st.model = "gone/big";
+    st.contextWindow = 1_000_000;
+    string header = "gone/big";
+    dropFallenBackModel(st, header, "gone/big");
+    assert(!st.model.length && !header.length && st.contextWindow == -1);
+
+    // A different saved model is left alone, window included.
+    SessionSettings other;
+    other.model = "ok/m";
+    other.contextWindow = 5000;
+    string h2;
+    dropFallenBackModel(other, h2, "gone/big");
+    assert(other.model == "ok/m" && other.contextWindow == 5000);
+}
+
 int runMain(string[] args)
 {
     Options o;
@@ -2924,7 +3298,24 @@ int runMain(string[] args)
         catch (Exception e) die(e.msg);
     }
 
-    auto spec = o.model.length ? o.model : cfg.model;
+    // On `--resume` without `-m`, peek the saved session's model before
+    // building the startup client (issue #297): a disabled or failing default
+    // provider must not block resuming a session whose own provider is usable.
+    auto cwd = getcwd();
+    string resumePath;
+    string startupSavedModel;
+    string startupModelFallbackNote;
+    bool startupSavedFromHeader;
+    if (o.hasResume && !o.acp)
+    {
+        try resumePath = findSession(sessionDir, o.resume, cwd);
+        catch (Exception e) die(e.msg);
+        if (!o.model.length)
+            startupSavedModel = logSavedModel(resumePath, startupSavedFromHeader);
+    }
+    auto spec = o.hasResume && !o.acp
+        ? startupResumeModel(o.model, startupSavedModel, startupSavedFromHeader, cfg, startupModelFallbackNote)
+        : (o.model.length ? o.model : cfg.model);
     ConfiguredWindow configuredWindow;
     LLMClient client = () {
         try
@@ -2933,7 +3324,25 @@ int runMain(string[] args)
             configuredWindow = windowFor(cfg, rp.config);
             return makeClient(rp);
         }
-        catch (Exception e) die(e.msg);
+        catch (Exception e)
+        {
+            // If the saved session's model failed at startup, fall back to the
+            // config default rather than failing the resume.
+            if (o.hasResume && !o.acp && !o.model.length && spec != cfg.model && cfg.model.length)
+            {
+                startupModelFallbackNote = format("the session's model %s is not available (%s); using %s",
+                    spec, e.msg, cfg.model);
+                spec = cfg.model;
+                try
+                {
+                    auto rp = resolve(cfg, spec);
+                    configuredWindow = windowFor(cfg, rp.config);
+                    return makeClient(rp);
+                }
+                catch (Exception e2) die(e2.msg);
+            }
+            die(e.msg);
+        }
     }();
 
     Policy policy;
@@ -2985,7 +3394,6 @@ int runMain(string[] args)
         return sources.length ? getcwd() ~ sources : null;
     });
 
-    auto cwd = getcwd();
     // Repository trust gates the repo's own skills, skill lock and hooks.
     bool trusted(string dir)
     {
@@ -3207,6 +3615,9 @@ int runMain(string[] args)
     agent.refreshCapabilities();
     // A configured temperature or thinking level that is adjusted or ignored.
     if (!o.acp && !o.prompt.length) foreach (w; settingWarnings(agent)) stdErr.writeln("Warning: ", w);
+    // The saved config's runtime defaults (issue #297): `/settings` edits
+    // `cfg` before saving, so resets and `/restart` compare against this.
+    auto runtimeDefaults = RuntimeDefaults.of(cfg);
 
     if (o.acp)
     {
@@ -3230,11 +3641,19 @@ int runMain(string[] args)
         host.beforePrompt = () {
             auto change = refreshSkills();
             if (!change.length) return null;
-            agent.installSystem(systemFor(skillsDir, plan), indexShown);
+            // The live mode, not the startup `--plan`: a loaded session may
+            // have restored another one.
+            agent.installSystem(systemFor(skillsDir, agent.control.mode == AgentMode.plan), indexShown);
             // Published to the ACP client as a `_nano/notice`, not the model.
             return "skills: " ~ change;
         };
         host.makeClient = (string s) => makeClient(resolve(cfg, s));
+        host.plan = plan;
+        host.modeSystemPrompt = (string dir, bool p) => systemFor(dir, p);
+        host.savedModelKnown = (string s) => savedProviderKnown(s, cfg.providers);
+        host.canonicalModel = (string s) { static import nano.recents; return nano.recents.canonical(s, cfg.providers, cfg.defaultProvider); };
+        host.windowFor = (string s) => windowFor(cfg, resolve(cfg, s).config);
+        host.providerWindowFor = (string s) => providerWindow(resolve(cfg, s).config.contextWindow);
         host.sessionDir = o.noSession ? null : sessionDir;
         host.version_ = versionString;
         {
@@ -3278,6 +3697,19 @@ int runMain(string[] args)
         }
         return 0;
     }
+
+
+
+    /// The settings of the session `loadSession` just loaded, waiting for the
+    /// resume path to apply them once `switchModel` and `syncMode` exist (D
+    /// orders declarations in a function body).
+    struct PendingSettings
+    {
+        SessionSettings st;
+        string headerModel;
+        bool set;
+    }
+    PendingSettings pendingSettings;
 
     // The resumed session's prompts (bounded), until the editor is seeded
     // with them: Up/Down recalls what was typed before the resume.
@@ -3330,6 +3762,15 @@ int runMain(string[] args)
                 notes ~= "nano-coder: ignoring " ~ note;
         }
         updateStatus((ref Stats s) { s.historySearches = s.historyReads = 0; });
+        // The restored runtime settings apply after `loadRestored` (which
+        // resets the mode and thinking) and after the log is adopted (so a
+        // model switch logs itself). `restored` is released below, so the
+        // applier keeps just the settings and the header model; the resume
+        // paths run it once `switchModel` and `syncMode` are declared (D
+        // orders declarations in a function body).
+        auto st = restored.settings;
+        auto headerModel = restored.model;
+        pendingSettings = PendingSettings(st, headerModel, true);
         if (!agent.timers.empty)
             notes ~= format("%s timer%s still set (/timers lists them)", agent.timers.items.length,
                 agent.timers.items.length == 1 ? "" : "s");
@@ -3348,9 +3789,12 @@ int runMain(string[] args)
         return notes;
     }
 
+
+
     try
     {
-        if (o.hasResume) foreach (n; loadSession(findSession(sessionDir, o.resume, cwd))) stdErr.writeln(n);
+        if (o.hasResume)
+            foreach (n; loadSession(resumePath.length ? resumePath : findSession(sessionDir, o.resume, cwd))) stdErr.writeln(n);
         else if (!o.noSession)
         {
             auto log = new SessionLog(sessionDir, spec, cwd);
@@ -3475,10 +3919,19 @@ int runMain(string[] args)
         return modelSuggestions(cfg, currentSpec(), recent);
     };
 
+    /// Record a runtime settings change in the session log (issue #297): a
+    /// resumed session restores the latest record of each field.
+    void logSessionSettings(const SessionSettings s)
+    {
+        agent.log.ifSome((SessionLog l) { l.settings(s); });
+    }
+
     /// Switch the model (history carries over); the "Model set to" text.
     /// `queued`: a `/model` from mid-turn, already taken off the queue; a
-    /// direct switch also drops one still queued.
-    string switchModel(string spec, bool queued = false)
+    /// direct switch also drops one still queued. `record`: false when
+    /// restoring a resumed session's own model (avoids appending a duplicate
+    /// `settings` record or rewriting recents).
+    string switchModel(string spec, bool queued = false, bool record = true)
     {
         auto previous = currentSpec();
         LLMClient build(string s, out ConfiguredWindow w)
@@ -3493,15 +3946,18 @@ int runMain(string[] args)
         {
             ConfiguredWindow w;
             auto c = build(spec, w);
-            agent.useClient(c, w);
+            agent.useClient(c, w, record);
         }
-        else agent.setModel(spec, &build);
+        else agent.setModel(spec, &build, record);
         client = agent.client;
-        synchronized
+        if (record)
         {
-            recents.record(previous);
-            recents.record(nano.recents.canonical(spec, cfg.providers, cfg.defaultProvider));
-            nano.recents.save(recentsPath, recents);
+            synchronized
+            {
+                recents.record(previous);
+                recents.record(nano.recents.canonical(spec, cfg.providers, cfg.defaultProvider));
+                nano.recents.save(recentsPath, recents);
+            }
         }
         auto text = format("Model set to %s (provider %s)", client.modelName, client.providerName);
         foreach (w; settingWarnings(agent)) text ~= "\nWarning: " ~ w;
@@ -3532,12 +3988,253 @@ int runMain(string[] args)
         view.set("log", agent.log.match!(l => l.path, () => string.init));
         refreshStatus();
     }
-    console.afterStep = &refreshView;
 
-    // The system prompt's plan section follows the mode; Shift-Tab mid-turn
-    // only switches the live mode, so the prompt catches up at the next turn.
+    // The system prompt's plan section follows the mode; Shift-Tab and
+    // mid-turn `/mode` or `/verbosity` change live state on the key-reader
+    // thread, so `syncMode` / `syncRuntimeSettings` catch the prompt and log up
+    // on the agent thread.
     agent.promptPlan = o.plan;
-    void syncMode() { agent.syncModePrompt((bool plan) => systemFor(cwd, plan)); }
+    AgentMode lastLoggedMode = agent.control.mode;
+    Verbosity lastLoggedVerbosity = verbosity;
+    void logModeIfChanged()
+    {
+        auto m = agent.control.mode;
+        if (m == lastLoggedMode) return;
+        SessionSettings s;
+        s.mode = m.name;
+        logSessionSettings(s);
+        // Only after the write: a failed one is retried on the next sync.
+        lastLoggedMode = m;
+    }
+    void logVerbosityIfChanged()
+    {
+        auto v = verbosity;
+        if (v == lastLoggedVerbosity) return;
+        SessionSettings s;
+        s.verbosity = nano.ui.name(v);
+        logSessionSettings(s);
+        // Only after the write: a failed one is retried on the next sync.
+        lastLoggedVerbosity = v;
+    }
+    void syncMode()
+    {
+        agent.syncModePrompt((bool plan) => systemFor(cwd, plan));
+        logModeIfChanged();
+    }
+    void syncRuntimeSettings()
+    {
+        syncMode();
+        logVerbosityIfChanged();
+    }
+    // Log mid-turn `/mode` and `/verbosity` changes after every model call
+    // and tool too, so a turn cut short by a crash still resumes with them.
+    // The end-of-turn sync above stays for changes after the last step.
+    console.afterStep = ()
+    {
+        refreshView();
+        logModeIfChanged();
+        logVerbosityIfChanged();
+    };
+
+
+
+    /// Apply the runtime settings a resumed session logged (issue #297), so
+    /// it carries on with the model, mode, verbosity, thinking level,
+    /// sub-agents switch and context settings it stopped with. Precedence:
+    /// on startup `--resume` (`explicitFlags = true`), explicit `-m`/`--model`,
+    /// `--verbosity` and `--plan` flags win, then the session's last recorded
+    /// value, then the config default. On an in-session `/resume`
+    /// (`explicitFlags = false`), startup CLI flags do not override the
+    /// target session and settings the previous session modified are reset to
+    /// config defaults before applying `st`. The header's model is the starting
+    /// value for a log with no settings records. A provider or model that is
+    /// gone falls back to the config default with a notice; the resume never
+    /// fails.
+    void applyRestoredSettings(const SessionSettings st, string headerModel, bool explicitFlags, ref string[] notes)
+    {
+        import nano.context : parseCompactionMode;
+        import nano.thinking : sessionSetting;
+        import std.math : isNaN;
+
+        if (!explicitFlags)
+        {
+            // Switching sessions in-process (`/resume`): reset settings the
+            // session being left may have changed so they do not leak into a
+            // target session with no `settings` record for them.
+            setVerbosity(runtimeDefaults.verbosity);
+            resetRuntimeSettings(agent, runtimeDefaults, 0, false);
+        }
+
+        // The model: explicit flag > session's last record > session header >
+        // config default. Canonicalize before comparing so a short alias that
+        // resolves to the already-active client does not rebuild it.
+        auto wanted = explicitFlags && o.model.length ? o.model
+            : st.model.length ? st.model
+            : headerModel.length ? headerModel
+            : cfg.model;
+        auto current = client.providerName ~ "/" ~ client.modelName;
+        bool fromFlag = explicitFlags && o.model.length;
+        bool switchedModel;
+        // A settings record's spec is always canonical `provider/model`; a
+        // provider since removed must fall back, not be reparsed as a bare
+        // model on the default provider. A header spec is stored verbatim
+        // and may be a bare model containing `/`, so it is not checked.
+        if (wanted.length && !fromFlag && st.model.length && wanted == st.model && wanted != cfg.model && !savedProviderKnown(wanted, cfg.providers))
+        {
+            notes ~= format("the session's model %s is not available (provider %s is not configured); using %s from the config",
+                wanted, wanted[0 .. wanted.indexOf('/')], cfg.model);
+            wanted = cfg.model;
+        }
+        auto canonWanted = wanted.length ? nano.recents.canonical(wanted, cfg.providers, cfg.defaultProvider) : null;
+        if (wanted.length && canonWanted != current && wanted != current)
+        {
+            try
+            {
+                switchModel(wanted, false, false);
+                switchedModel = true;
+            }
+            catch (Exception e)
+            {
+                // `switchModel` builds the new client before swapping, so a
+                // failure leaves the current client running. On an in-process
+                // `/resume` that client is the previous session's model, so
+                // fall back to the config default rather than keep it.
+                auto fallback = current;
+                if (wanted != cfg.model && cfg.model.length
+                    && nano.recents.canonical(cfg.model, cfg.providers, cfg.defaultProvider) != current)
+                {
+                    try
+                    {
+                        switchModel(cfg.model, false, false);
+                        switchedModel = true;
+                        fallback = cfg.model;
+                    }
+                    catch (Exception e2)
+                        notes ~= format("the config model %s is not available either (%s)", cfg.model, e2.msg);
+                }
+                else if (wanted != cfg.model) fallback = cfg.model;
+                notes ~= format("the session's model %s is not available (%s); using %s",
+                    wanted, e.msg, fallback);
+            }
+        }
+        if (!explicitFlags)
+        {
+            // Reset any context-window override left by the previous session
+            // (a switched model's client was built with the live `cfg`, which
+            // may hold an unsaved `/settings` edit). Always reset: a recorded
+            // window applies below only when its model is the live one, so a
+            // fallback must not keep the previous session's override.
+            agent.setConfiguredWindow(runtimeDefaults.window(cfg.providers.get(client.providerName, ProviderConfig.init).contextWindow));
+        }
+        if (explicitFlags && o.plan)
+        {
+            agent.control.mode = AgentMode.plan;
+            agent.syncModePrompt((bool plan) => systemFor(cwd, plan));
+            updateStatus((ref Stats s) { s.mode = AgentMode.plan; });
+        }
+        else if (st.mode.length)
+            parseMode(st.mode).match!((m) {
+                agent.control.mode = m;
+                agent.syncModePrompt((bool plan) => systemFor(cwd, plan));
+                updateStatus((ref Stats s) { s.mode = m; });
+            }, (e) { notes ~= "the saved mode: " ~ e; });
+        else
+        {
+            agent.syncModePrompt((bool plan) => systemFor(cwd, plan));
+            updateStatus((ref Stats s) { s.mode = agent.control.mode; });
+        }
+        if (st.verbosity.length && !(explicitFlags && o.verbosity.length))
+        {
+            import nano.ui : allVerbosities, vname = name;
+            import std.algorithm.searching : find;
+            auto found = allVerbosities.find!(v => vname(v) == st.verbosity);
+            if (found.length) setVerbosity(found[0]);
+            else notes ~= "the saved verbosity is unknown: " ~ st.verbosity;
+        }
+        if (st.thinking.length)
+        {
+            auto setting = sessionSetting(st.thinking);
+            if (setting.isErr) notes ~= "the saved thinking level is invalid: " ~ setting.unwrapErr("isErr");
+            else agent.sessionThinking = setting.unwrap("isOk");
+        }
+        if (st.subagents >= 0) agent.subagentsOn = st.subagents != 0;
+        if (st.compactionMode.length)
+            parseCompactionMode(st.compactionMode).match!((m) { agent.compactionMode = m; },
+                () { notes ~= `the saved compaction mode "` ~ st.compactionMode ~ `" is unknown; using the config's`; });
+        if (st.autoCompact >= 0) agent.autoCompact = st.autoCompact != 0;
+        if (!st.autoCompactThreshold.isNaN) agent.autoCompactThreshold = st.autoCompactThreshold;
+        // A window recorded with a model (a switch records the window it made
+        // live) belongs to that model: it does not apply to a fallback or a
+        // `-m` override.
+        // A window recorded without a model belongs to the header's model
+        // (a `/settings` edit with no `/model` switch), so `--resume -m B`
+        // must not apply model A's window to B.
+        const windowOwner = st.model.length ? st.model : headerModel;
+        if (st.contextWindow >= 0 && recordedWindowApplies(windowOwner,
+            windowOwner.length ? nano.recents.canonical(windowOwner, cfg.providers, cfg.defaultProvider) : null,
+            agent.client.providerName ~ "/" ~ agent.client.modelName))
+        {
+            if (st.contextWindow > 0)
+                agent.setConfiguredWindow(ConfiguredWindow(toSize(st.contextWindow), "the session's settings"));
+            else
+            {
+                // 0 is "from provider/model" (as `/settings` offers it): the
+                // provider's own window, not the top-level `context_window`.
+                agent.restoreConfiguredWindow(providerWindow(cfg.providers.get(client.providerName, ProviderConfig.init).contextWindow));
+            }
+        }
+        // The warnings `/model` and `/thinking` show for the restored values.
+        foreach (w; agent.restoreWarnings(switchedModel, st.thinking.length > 0)) notes ~= "warning: " ~ w;
+        lastLoggedMode = agent.control.mode;
+        lastLoggedVerbosity = verbosity;
+    }
+
+    /// Apply the settings of the session just loaded, if any; the notes.
+    string[] applyPendingSettings(bool explicitFlags)
+    {
+        string[] notes;
+        if (pendingSettings.set)
+        {
+            applyRestoredSettings(pendingSettings.st, pendingSettings.headerModel, explicitFlags, notes);
+            pendingSettings = PendingSettings.init;
+        }
+        return notes;
+    }
+
+    // A `--resume`d session's runtime settings (issue #297) apply once the log
+    // is adopted and `switchModel`/`syncMode` exist (declaration order).
+    if (o.hasResume)
+    {
+        if (startupModelFallbackNote.length) stdErr.writeln("nano-coder: " ~ startupModelFallbackNote);
+        // If startup already fell back from `startupSavedModel` to `cfg.model`
+        // and emitted the notice, skip re-trying the same failed saved model.
+        if (startupModelFallbackNote.length && pendingSettings.set)
+        {
+            dropFallenBackModel(pendingSettings.st, pendingSettings.headerModel, startupSavedModel);
+        }
+        foreach (n; applyPendingSettings(true)) stdErr.writeln("nano-coder: " ~ n);
+    }
+
+    // Explicit startup flags are recorded so a later flag-free resume keeps
+    // them (issue #297): a fresh session's header holds only the model, and a
+    // resumed one's last record would otherwise win over `-m`.
+    {
+        SessionSettings explicitSettings;
+        if (o.hasResume && o.model.length)
+        {
+            // Record the override's live window too (0: none), as `useClient`
+            // does for a switch, so a later flag-free resume doesn't pair the
+            // previous model's window with this model.
+            import std.conv : to;
+            explicitSettings.model = currentSpec();
+            explicitSettings.contextWindow = agent.configuredWindow.to!long;
+        }
+        if (o.plan) explicitSettings.mode = agent.control.mode.name;
+        if (o.verbosity.length) explicitSettings.verbosity = nano.ui.name(verbosity);
+        if (explicitSettings.model.length || explicitSettings.mode.length || explicitSettings.verbosity.length)
+            logSessionSettings(explicitSettings);
+    }
+
 
     // Re-read the instruction files (AGENTS.md, CLAUDE.md, rules, your own
     // files) so edits apply without a restart. A change to what they put in
@@ -3589,6 +4286,12 @@ int runMain(string[] args)
             try { switchModel(spec); return ""; }
             catch (Exception e) return e.msg;
         };
+        onVerbosity = (Verbosity v) {
+            setVerbosity(v);
+            logVerbosityIfChanged();
+        };
+        h.logSettings = (const SessionSettings s) { logSessionSettings(s); };
+        h.onSaved = (const ref imported!"nano.settings".Changes saved) { runtimeDefaults = runtimeDefaults.refreshed(cfg, saved); };
         // The same paths as `/subagents on|off` and `/messages ...`, so the
         // dialog never duplicates their state changes.
         h.subagentsCommand = (string arg) {
@@ -3600,7 +4303,6 @@ int runMain(string[] args)
             &startPeerListener, &stopPeerListener);
         h.messagesOn = () => agent.messagesOn && peerListener.length != 0;
         h.messagesConfirm = () => peerRouter.confirm;
-        onVerbosity = (Verbosity v) { setVerbosity(v); };
         return h;
     }
 
@@ -3729,6 +4431,7 @@ int runMain(string[] args)
         updateStatus((ref Stats s) { s.activity = Activity.thinking; s.tokensPerSec = 0; });
         scope (exit)
         {
+            syncRuntimeSettings();
             refreshStatus();
             updateStatus((ref Stats s) { s.activity = Activity.idle; s.tokensPerSec = 0; });
         }
@@ -4101,7 +4804,7 @@ int runMain(string[] args)
                 || (releaseNotice && releaseNotice.tryTake(fetchedNotice));
             auto r = ed.readLine(.stamp(false) ~ "› ", console.stamp() ~ glyphMark ~ " ", false, lapse);
             ed.restyle = null;
-            syncMode(); // Shift-Tab at the prompt switched the mode
+            syncRuntimeSettings(); // Shift-Tab at the prompt switched the mode
             ed.onIdleEscEsc = null;
             // Show a hint or notice the lapse already took before anything else:
             // the timer and idle branches below would otherwise drop it, and the
@@ -4243,6 +4946,18 @@ int runMain(string[] args)
                         () => systemFor(cwd, false));
                     catch (Exception e) { writeln(console.red("error: " ~ e.msg)); continue; }
                     auto log = agent.log;
+                    {
+                        // Seed the new log with live settings that `/restart`
+                        // retains (verbosity, sub-agents, context settings) so
+                        // a later flag-free resume restores them (issue #297).
+                        bool hasRetained;
+                        auto retained = retainedRestartSettings(runtimeDefaults, verbosity, agent.subagentsOn,
+                            agent.compactionMode, agent.autoCompact, agent.autoCompactThreshold,
+                            agent.configuredWindow, agent.configuredWindowSource, hasRetained);
+                        if (hasRetained) logSessionSettings(retained);
+                    }
+                    lastLoggedMode = agent.control.mode;
+                    lastLoggedVerbosity = verbosity;
                     updateStatus((ref Stats s) { s.historySearches = s.historyReads = 0; });
                     agent.useHooks(loadHooks(cwd), false);
                     rebindPeerListener();
@@ -4260,7 +4975,7 @@ int runMain(string[] args)
                     // At the idle prompt the queue is empty (queued messages
                     // run before it shows) and the draft was this command, so
                     // there is nothing to confirm discarding.
-                    import nano.update : launchExe, relaunchArgv;
+                    import nano.update : launchExe, relaunchArgv, withCurrentSettings;
                     import nano.safeio : execProgram;
                     auto id = agent.log.match!(l => l.id, () => string.init);
                     if (!id.length)
@@ -4278,7 +4993,9 @@ int runMain(string[] args)
                     stdOut.flush();
                     leaveKeyMode();
                     nano.herdr.release();
-                    auto err = execProgram(exe, [exe] ~ relaunchArgv(args[1 .. $], id));
+                    auto err = execProgram(exe, [exe] ~ relaunchArgv(withCurrentSettings(args[1 .. $],
+                        agent.client.providerName ~ "/" ~ agent.client.modelName, nano.ui.name(verbosity()),
+                        agent.control.mode == AgentMode.plan), id));
                     nano.herdr.reacquire();
                     enterKeyMode(0);
                     if (gFrame) gFrame.resume();
@@ -4296,6 +5013,7 @@ int runMain(string[] args)
                         {
                             auto v = parseVerbosity(arg);
                             setVerbosity(v);
+                            logVerbosityIfChanged();
                             writefln("Verbosity set to %s (%s); /settings saves it", nano.ui.name(v), nano.ui.describe(v));
                         }
                         catch (Exception e) writeln(e.msg);
@@ -4320,12 +5038,18 @@ int runMain(string[] args)
                     continue;
                 }
                 case "/thinking":
-                    import nano.thinking : statusText, sessionSetting;
+                    import nano.thinking : statusText, sessionSetting, sessionSettingValue;
                     if (arg.length)
                     {
                         auto setting = sessionSetting(arg);
                         if (setting.isErr) { writeln(setting.unwrapErr("isErr")); continue; }
                         agent.sessionThinking = setting.unwrap("isOk");
+                        {
+                            // A resume restores the session's thinking level (#297).
+                            SessionSettings s;
+                            s.thinking = sessionSettingValue(agent.sessionThinking);
+                            logSessionSettings(s);
+                        }
                         auto r = agent.thinking();
                         writeln("Thinking set to ", r.describe);
                         if (r.warning.length) writeln("Warning: ", r.warning);
@@ -4367,6 +5091,8 @@ int runMain(string[] args)
                 {
                     string showLog;
                     auto said = subagentsCommand(agent, cfg, arg, showLog);
+                    // `--save` wrote the switch to the config: it is the new default.
+                    if (imported!"std.algorithm.searching".canFind(said, "; saved to ")) runtimeDefaults.subagents = cfg.subagents;
                     if (showLog.length) showSubagentLog(arg.strip["show".length .. $].strip, showLog, console);
                     else writeln(escapeMarks(sanitizeBlock(said)));
                     continue;
@@ -4434,6 +5160,7 @@ int runMain(string[] args)
                     agent.stopSubagents(); // they belong to the session being left
                     try loadNotes = loadSession(path);
                     catch (Exception e) { writeln(e.msg); continue; }
+                    foreach (n; applyPendingSettings(false)) loadNotes ~= "nano-coder: " ~ n;
                     seedInputHistory(editor);
                     rebindPeerListener();
                     if (gFrame) { gFrame.clear(); replayTranscript(agent, console); releaseHeap(); }
