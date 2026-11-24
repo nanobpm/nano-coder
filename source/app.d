@@ -3137,7 +3137,9 @@ void replayTranscript(Agent agent, Console console)
         }
     }
     flushPending();
-    if (!agent.plan.empty && !console.quiet) writeln(escapeMarks(sanitizeBlock(planText(agent, console.renderMarkdown))));
+    // No plan dump here: the replay shows what the user saw before the
+    // relaunch or resume (the plan_* calls are already in it); /plan shows
+    // the whole plan on demand.
     // toolStart/toolEnd drive the live status; the replay leaves it idle
     // (and this one redraw covers every batched change).
     gStatusBatched = wasBatched;
@@ -3279,7 +3281,7 @@ unittest
     assert(unwrapReminder("<system-reminder>\n\n</system-reminder>") == "");
 }
 
-/// The plan for `/plan` and replay; `symbols` (a rendering terminal) shows
+/// The plan for `/plan`; `symbols` (a rendering terminal) shows
 /// item marks as ☐/◐/☑/⊘/☒ like rendered markdown task lists.
 string planText(Agent agent, bool symbols = false) pure
 {
