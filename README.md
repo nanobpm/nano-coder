@@ -666,7 +666,10 @@ host doesn't fail a correct change: before failing a module, the runner times a 
 machine, at most 3x. `NANO_TEST_TIMES=N dub test` lists the
 N slowest modules. `NANO_TEST_JOBS=N` runs modules in parallel (`scripts/ci.sh` uses 4); modules
 that change process-wide state (the cancel flag, environment variables) are listed in
-`scripts/serial-tests` and run alone first.
+`scripts/serial-tests` and run alone first. A watchdog ends a hung run: once a module has run 10x
+its limit (times `NANO_TEST_BUDGET_SCALE`), the runner prints that module and every module still
+running, and exits 1. `NANO_TEST_STUCK=1` adds a module that never returns, to check it (`ci.sh`
+does).
 
 Functions are `pure` wherever they can be: the result depends only on the arguments, with no
 clock, environment, files or global state. Modules that start with `pure:` (parsing, markdown,

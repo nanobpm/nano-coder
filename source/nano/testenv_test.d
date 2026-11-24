@@ -108,6 +108,9 @@ UnitTestResult runModuleTests() @trusted
     const serial = listedModules("scripts/serial-tests");
     // The host's load before the tests start (see loadFactor).
     const startLoad = calibrate();
+    const scaleText = environment.get("NANO_TEST_BUDGET_SCALE");
+    const scale = scaleText.length ? scaleText.to!double : 1.0;
+    startWatchdog(scale);
     auto results = Chan!ModuleRun.make;
     auto queue = Chan!size_t.make;
     if (jobs > 1)
@@ -132,8 +135,7 @@ UnitTestResult runModuleTests() @trusted
     ModuleRun[] runs;
     ModuleRun r;
     while (results.take(r)) runs ~= r;
-    const scaleText = environment.get("NANO_TEST_BUDGET_SCALE");
-    checkBudgets(runs, scaleText.length ? scaleText.to!double : 1.0, true, startLoad);
+    checkBudgets(runs, scale, true, startLoad);
     auto top = environment.get("NANO_TEST_TIMES");
     if (top.length)
     {
@@ -191,6 +193,8 @@ void runQueue(immutable(TestEntry)[] all, imported!"nano.safeio".Chan!size_t que
         if (trace) stdErr.writefln("test start %s", all[i].name);
         scope (exit) if (trace) stdErr.writefln("test end %s", all[i].name);
         const start = monoNow;
+        markRunning(all[i].name, start);
+        scope (exit) markDone(all[i].name);
         bool ok = true;
         string reason;
         try all[i].run();
@@ -203,6 +207,146 @@ void runQueue(immutable(TestEntry)[] all, imported!"nano.safeio".Chan!size_t que
         }
         results.put(ModuleRun(all[i].name, since(start).total!"msecs", ok, reason));
     }
+}
+
+/// A module whose tests are running now, and since when.
+struct Running
+{
+    string name;
+    MonoTime start;
+}
+
+import core.time : Duration, MonoTime;
+
+/// The modules running now, for the watchdog (the runner only learns a
+/// module's time when it finishes, so a hung one would never be named).
+private shared Locked!(immutable(Running)[]) gRunning;
+
+import nano.safeio : Locked;
+
+shared static this() { gRunning = new shared Locked!(immutable(Running)[]); }
+
+private void markRunning(string name, MonoTime start)
+{
+    gRunning.update((ref immutable(Running)[] r) { r ~= immutable Running(name, start); });
+}
+
+private void markDone(string name)
+{
+    import std.algorithm : countUntil, remove;
+    gRunning.update((ref immutable(Running)[] r) {
+        const i = r.countUntil!(x => x.name == name);
+        if (i >= 0) r = r[0 .. i] ~ r[i + 1 .. $];
+    });
+}
+
+/// How many times its time limit a module may run before the watchdog calls
+/// it hung and ends the run.
+enum hangFactor = 10;
+
+/// The running modules past `hangFactor` times their limit (`limits`, else
+/// `defaultBudgetMs`, times `scale`) at `now`, each as
+/// `name (running N ms, hang bound M ms)`; empty when none is.
+string[] stuckModules(const Running[] running, MonoTime now, const long[string] limits, double scale) pure
+{
+    import std.format : format;
+    string[] r;
+    foreach (x; running)
+    {
+        const bound = cast(long)(limits.get(x.name, defaultBudgetMs) * scale * hangFactor);
+        const ran = (now - x.start).total!"msecs";
+        if (ran > bound) r ~= format("%s (running %s ms, hang bound %s ms)", x.name, ran, bound);
+    }
+    return r;
+}
+
+/// One watchdog check: the stuck modules among those running now, and a
+/// report naming them and every module still running (empty when none is
+/// stuck).
+string watchdogCheck(const Running[] running, MonoTime now, const long[string] limits, double scale)
+{
+    import std.array : join;
+    import std.format : format;
+    const stuck = stuckModules(running, now, limits, scale);
+    if (!stuck.length) return null;
+    string[] all;
+    foreach (x; running) all ~= format("%s (%s ms)", x.name, (now - x.start).total!"msecs");
+    return format("unit-test watchdog: %s hung: %s; still running: %s. A test waits forever "
+        ~ "(deadlock, or a real process/socket with no timeout): find the wait in that module.",
+        stuck.length == 1 ? "a module" : "modules", stuck.join(", "), all.join(", "));
+}
+
+unittest // a stuck module is named once past its hang bound, on fake time
+{
+    import core.time : msecs;
+    import std.datetime.systime : SysTime;
+    import nano.clock : FakeClock;
+    auto clock = FakeClock.install(SysTime(0));
+    const long[string] limits = ["nano.slow": 3000];
+    const running = [Running("nano.stuck", monoNow), Running("nano.slow", monoNow)];
+    clock.advance((defaultBudgetMs * 2 * hangFactor).msecs);
+    assert(watchdogCheck(running, monoNow, limits, 2.0) is null);
+    clock.advance(1.msecs);
+    const report = watchdogCheck(running, monoNow, limits, 2.0);
+    assert(report == "unit-test watchdog: a module hung: nano.stuck (running 20001 ms, hang bound 20000 ms); "
+        ~ "still running: nano.stuck (20001 ms), nano.slow (20001 ms). A test waits forever "
+        ~ "(deadlock, or a real process/socket with no timeout): find the wait in that module.", report);
+    assert(stuckModules(running, monoNow + (3000 * 2 * hangFactor).msecs, limits, 2.0).length == 2);
+}
+
+unittest // the registry the watchdog reads tracks what runs
+{
+    import std.algorithm : canFind;
+    markRunning("nano.registry-probe", monoNow);
+    assert(gRunning.get.canFind!(x => x.name == "nano.registry-probe"));
+    markDone("nano.registry-probe");
+    assert(!gRunning.get.canFind!(x => x.name == "nano.registry-probe"));
+}
+
+/// How often the watchdog looks at the running modules.
+enum watchdogPollMs = 1000;
+
+/// Start the watchdog thread: once a running module passes its hang bound
+/// (`stuckModules`) it prints which, and every module still running, and
+/// ends the process with status 1, so a hung test is a named, fast failure
+/// instead of a CI job that sits silent for hours (issue #357).
+/// `NANO_TEST_STUCK=1` adds a module that never returns, to see it work.
+private void startWatchdog(double scale)
+{
+    import nano.safeio : spawnDaemon;
+    spawnDaemon(&watchdog, scale);
+}
+
+private void watchdog(double scale)
+{
+    import core.time : msecs;
+    import nano.clock : sleepFor;
+    import nano.safeio : exitProcess, stdErr;
+    long[string] limits;
+    foreach (name, rest; listedModules("scripts/slow-tests"))
+    {
+        import std.array : split;
+        import std.conv : to;
+        limits[name] = rest.split[0].to!long;
+    }
+    while (true)
+    {
+        sleepFor(watchdogPollMs.msecs);
+        const report = watchdogCheck(gRunning.get, monoNow, limits, scale);
+        if (report is null) continue;
+        stdErr.writeln(report);
+        stdErr.flush();
+        exitProcess(1);
+    }
+}
+
+unittest // the test-only switch: a module that hangs, for the watchdog to catch
+{
+    import std.process : environment;
+    if (environment.get("NANO_TEST_STUCK") != "1") return;
+    import core.time : hours;
+    import nano.clock : sleepFor;
+    while (true) sleepFor(1.hours);
 }
 
 /// Default per-module unit-test time limit (scripts/slow-tests lists more).
