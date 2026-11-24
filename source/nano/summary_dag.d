@@ -26,6 +26,7 @@ import std.conv : to, ConvException;
 import std.format : format;
 import std.json : JSONType, JSONValue;
 import std.string : indexOf, lineSplitter, strip;
+import nano.arith : saturatingSub;
 import nano.option : Option, some, unwrap;
 
 /// How many of the oldest nodes one condensation merges (pi-lcm uses 6).
@@ -72,12 +73,322 @@ string header(const ref SummaryNode n)
     return h ~ "]]";
 }
 
-/// The node list as summary text: each header followed by its prose.
-string render(const SummaryNode[] nodes)
+/// The node list as summary text: each header followed by its prose,
+/// at most `maxBytes` long (issue #369), so the size bound of the in-context
+/// summary is enforced rather than emergent from the condensation budget.
+/// Over the cap, every node keeps its header (the agent cites and expands
+/// nodes by it) and its prose is cut to an equal share; if even the headers
+/// do not fit, the newest whole lines that do are kept.
+string render(const SummaryNode[] nodes, size_t maxBytes = size_t.max)
 {
+    string[] heads, bodies;
+    // Count exactly the bytes emitted: "\n\n" between parts, "\n" between
+    // a header and a nonempty body.
+    size_t total = nodes.length ? 2 * (nodes.length - 1) : 0, headBytes = total;
+    foreach (ref n; nodes)
+    {
+        heads ~= header(n);
+        bodies ~= escapeText(n.text.strip);
+        headBytes += heads[$ - 1].length + 1;
+        total += heads[$ - 1].length + (bodies[$ - 1].length ? 1 + bodies[$ - 1].length : 0);
+    }
+    if (total > maxBytes && nodes.length)
+    {
+        immutable share = saturatingSub(maxBytes, headBytes) / nodes.length;
+        foreach (ref b; bodies) b = cutText(b, share);
+    }
     string[] parts;
-    foreach (ref n; nodes) parts ~= header(n) ~ "\n" ~ escapeText(n.text.strip);
-    return parts.join("\n\n");
+    foreach (i, h; heads) parts ~= bodies[i].length ? h ~ "\n" ~ bodies[i] : h;
+    auto text = parts.join("\n\n");
+    if (text.length <= maxBytes) return text;
+    // Headers alone overflow (adversarial child lists): keep the newest
+    // whole lines that fit, so no header is cut in half.
+    auto cut = text.length - maxBytes;
+    while (cut < text.length && text[cut - 1] != '\n') ++cut;
+    while (cut < text.length && text[cut] == '\n') ++cut;
+    return text[cut .. $];
+}
+
+/// `s` cut to at most `n` bytes on a UTF-8 boundary, marked with `…` when cut.
+private string cutText(string s, size_t n)
+{
+    enum mark = " …";
+    if (s.length <= n) return s;
+    if (n <= mark.length) return null;
+    auto end = n - mark.length;
+    while (end > 0 && (s[end] & 0xC0) == 0x80) --end;
+    return s[0 .. end] ~ mark;
+}
+
+/// The raw JSON text of a `replace` record's `summary_nodes` array, or
+/// null (issue #369). Scanning the line and parsing only that value avoids
+/// decoding the record's whole message list just to read its nodes. Only
+/// the direct `data.summary_nodes` field of a record whose `type` is
+/// `replace` counts: the same key nested deeper (a tool call's arguments,
+/// a message string) is not a node list.
+const(char)[] summaryNodesJson(const(char)[] line)
+{
+    size_t depth, i;
+    char[] closers; // the closer each open container expects, innermost last
+    const(char)[] key1, type, found; // key1: the top-level key being read
+    bool okData; // the depth-2 container is the value of top-level "data"
+    while (i < line.length)
+    {
+        immutable c = line[i];
+        if (c == '"')
+        {
+            immutable s = i + 1;
+            for (++i; i < line.length && line[i] != '"'; ++i)
+                if (line[i] == '\\') ++i;
+            if (i >= line.length) return null;
+            const(char)[] str = line[s .. i];
+            ++i;
+            auto j = i;
+            while (j < line.length && isJsonSpace(line[j])) ++j;
+            if (j < line.length && line[j] == ':')
+            {
+                // A key: note its value where it matters.
+                ++j;
+                while (j < line.length && isJsonSpace(line[j])) ++j;
+                if (depth <= 2)
+                {
+                    auto k = unescapeJsonKey(str);
+                    if (k.isNone) return null;
+                    str = k.unwrap("checked isNone");
+                }
+                if (depth == 1)
+                {
+                    key1 = str;
+                    if (str == "type" && j < line.length && line[j] == '"')
+                    {
+                        auto e = j + 1;
+                        for (; e < line.length && line[e] != '"'; ++e)
+                            if (line[e] == '\\') ++e;
+                        if (e >= line.length) return null;
+                        type = line[j + 1 .. e];
+                        auto t = unescapeJsonKey(type);
+                        if (t.isNone) return null;
+                        type = t.unwrap("checked isNone");
+                    }
+                }
+                else if (depth == 2 && okData && str == "summary_nodes" && found is null
+                    && j < line.length && line[j] == '[')
+                {
+                    auto end = closing(line, j);
+                    if (end == 0) return null;
+                    found = line[j .. end + 1];
+                }
+                i = j;
+            }
+            continue;
+        }
+        if (c == '{' || c == '[')
+        {
+            ++depth;
+            closers ~= c == '{' ? '}' : ']';
+            if (depth == 2) okData = c == '{' && key1 == "data";
+        }
+        else if (c == '}' || c == ']')
+        {
+            // A mismatched closer makes the record invalid JSON.
+            if (depth == 0 || closers[$ - 1] != c) return null;
+            --depth;
+            closers = closers[0 .. $ - 1];
+        }
+        ++i;
+    }
+    // A torn record (unclosed containers) supplies nothing, and nor does a
+    // balanced but malformed one (bad values, separators, trailing input).
+    return depth == 0 && type == "replace" && found !is null && isValidJson(line) ? found : null;
+}
+
+/// Whether `s` is exactly one well-formed JSON value (RFC 8259), surrounding
+/// whitespace allowed. Validates without materialising anything, so a large
+/// record's messages cost one linear pass and no allocation.
+bool isValidJson(const(char)[] s) pure nothrow @nogc
+{
+    size_t i;
+    void ws() { while (i < s.length && isJsonSpace(s[i])) ++i; }
+    bool lit(string w)
+    {
+        if (s.length - i < w.length || s[i .. i + w.length] != w) return false;
+        i += w.length;
+        return true;
+    }
+    bool str()
+    {
+        if (i >= s.length || s[i] != '"') return false;
+        for (++i; i < s.length; ++i)
+        {
+            immutable c = s[i];
+            if (c == '"') { ++i; return true; }
+            if (c < 0x20) return false;
+            if (c != '\\') continue;
+            if (++i >= s.length) return false;
+            switch (s[i])
+            {
+                case '"': case '\\': case '/': case 'b': case 'f': case 'n': case 'r': case 't': break;
+                case 'u':
+                    if (s.length - i < 5) return false;
+                    foreach (h; s[i + 1 .. i + 5])
+                        if (!((h >= '0' && h <= '9') || ((h | 0x20) >= 'a' && (h | 0x20) <= 'f')))
+                            return false;
+                    i += 4;
+                    break;
+                default: return false;
+            }
+        }
+        return false;
+    }
+    bool digits()
+    {
+        immutable st = i;
+        while (i < s.length && s[i] >= '0' && s[i] <= '9') ++i;
+        return i > st;
+    }
+    bool num()
+    {
+        if (i < s.length && s[i] == '-') ++i;
+        if (i < s.length && s[i] == '0') ++i;
+        else if (!digits()) return false;
+        if (i < s.length && s[i] == '.') { ++i; if (!digits()) return false; }
+        if (i < s.length && (s[i] == 'e' || s[i] == 'E'))
+        {
+            ++i;
+            if (i < s.length && (s[i] == '+' || s[i] == '-')) ++i;
+            if (!digits()) return false;
+        }
+        return true;
+    }
+    // Iterative, so deep nesting cannot exhaust the stack: each open
+    // container's kind is one bit (1 = object), capped at `maxDepth`.
+    enum maxDepth = 4096;
+    ulong[maxDepth / 64] isObj;
+    size_t depth;
+    bool inObj() { return (isObj[(depth - 1) / 64] >> ((depth - 1) % 64)) & 1; }
+    ws();
+    for (;;)
+    {
+        // Expect a value.
+        if (i >= s.length) return false;
+        immutable c = s[i];
+        bool opened;
+        if (c == '{' || c == '[')
+        {
+            if (depth == maxDepth) return false;
+            immutable bit = 1UL << (depth % 64);
+            if (c == '{') isObj[depth / 64] |= bit; else isObj[depth / 64] &= ~bit;
+            ++depth; ++i; ws();
+            if (i < s.length && s[i] == (c == '{' ? '}' : ']')) { --depth; ++i; }
+            else opened = true;
+        }
+        else if (c == '"') { if (!str()) return false; }
+        else if (c == 't') { if (!lit("true")) return false; }
+        else if (c == 'f') { if (!lit("false")) return false; }
+        else if (c == 'n') { if (!lit("null")) return false; }
+        else if (!num()) return false;
+        if (opened && inObj())
+        {
+            // First member of a new object: key then colon.
+            if (!str()) return false;
+            ws();
+            if (i >= s.length || s[i] != ':') return false;
+            ++i; ws();
+            continue;
+        }
+        if (opened) continue; // first element of a new array
+        // After a value: close containers or move to the next member.
+        for (;;)
+        {
+            ws();
+            if (depth == 0) return i == s.length;
+            if (i >= s.length) return false;
+            immutable obj = inObj();
+            if (s[i] == (obj ? '}' : ']')) { --depth; ++i; continue; }
+            if (s[i] != ',') return false;
+            ++i; ws();
+            if (obj)
+            {
+                if (!str()) return false;
+                ws();
+                if (i >= s.length || s[i] != ':') return false;
+                ++i; ws();
+            }
+            break;
+        }
+    }
+}
+
+/// Whether `c` is JSON insignificant whitespace (RFC 8259: space, tab, LF, CR).
+private bool isJsonSpace(char c) pure nothrow @nogc
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+/// The raw JSON key text `key` with its escapes decoded (a fresh copy only
+/// when it has any), or none for a malformed escape. Shared by session.d's
+/// record skimmer and `summaryNodesJson` so both read keys as a decoder would.
+Option!(const(char)[]) unescapeJsonKey(const(char)[] key)
+{
+    import std.ascii : isHexDigit;
+    import std.utf : encode;
+    size_t i;
+    while (i < key.length && key[i] != '\\') ++i;
+    if (i == key.length) return some(key);
+    char[] o = key[0 .. i].dup;
+    for (; i < key.length; ++i)
+    {
+        if (key[i] != '\\') { o ~= key[i]; continue; }
+        if (++i >= key.length) return Option!(const(char)[]).init;
+        switch (key[i])
+        {
+            case '"': case '\\': case '/': o ~= key[i]; break;
+            case 'b': o ~= '\b'; break;
+            case 'f': o ~= '\f'; break;
+            case 'n': o ~= '\n'; break;
+            case 'r': o ~= '\r'; break;
+            case 't': o ~= '\t'; break;
+            case 'u':
+                if (i + 4 >= key.length) return Option!(const(char)[]).init;
+                dchar c = 0;
+                foreach (h; key[i + 1 .. i + 5])
+                {
+                    if (!h.isHexDigit) return Option!(const(char)[]).init;
+                    c = c * 16 + (h <= '9' ? h - '0' : (h | 0x20) - 'a' + 10);
+                }
+                i += 4;
+                // Surrogates never spell a key we compare against: keep them
+                // distinct but harmless.
+                if (c >= 0xD800 && c <= 0xDFFF) c = 0xFFFD;
+                char[4] buf;
+                o ~= buf[0 .. encode(buf, c)];
+                break;
+            default: return Option!(const(char)[]).init;
+        }
+    }
+    const(char)[] r = o;
+    return some(r);
+}
+
+/// The index of the bracket closing the array or object at `line[start]`,
+/// or 0 if the line ends first.
+private size_t closing(const(char)[] line, size_t start)
+{
+    size_t depth;
+    bool inStr;
+    for (auto i = start; i < line.length; ++i)
+    {
+        immutable c = line[i];
+        if (inStr)
+        {
+            if (c == '\\') ++i;
+            else if (c == '"') inStr = false;
+        }
+        else if (c == '"') inStr = true;
+        else if (c == '[' || c == '{') ++depth;
+        else if ((c == ']' || c == '}') && --depth == 0) return i;
+    }
+    return 0;
 }
 
 /// `text` with every line that `parse` would read as structure (a node
@@ -97,6 +408,12 @@ string escapeText(string text)
 /// flat one, or one written before layering) yields no nodes.
 SummaryNode[] parse(string summary)
 {
+    // Only a summary carrying the expand note is layered (issue #369): a
+    // flat summary whose prose has a `[[node ` line must stay prose.
+    bool layered;
+    foreach (line; summary.lineSplitter)
+        if (line.startsWith(expandNote[0 .. 30])) { layered = true; break; }
+    if (!layered) return null;
     SummaryNode[] nodes;
     string[] body_;
     void flush()
@@ -338,15 +655,104 @@ unittest // render and parse round-trip, ignoring prose outside nodes
     auto a = SummaryNode(1, 0, 2, 40, null, "fixed the auth bug (#12)\nsecond line");
     auto b = SummaryNode(3, 1, 41, 400, [2, 4], "condensed");
     auto text = "[prefix]\n" ~ render([a, b]);
-    auto got = parse(text);
+    auto got = parse(text ~ "\n\n" ~ expandNote);
     assert(got.length == 2);
     assert(got[0] == a);
     assert(got[1] == b);
     assert(header(b) == "[[node S3 level=1 range=#41-#400 children=S2,S4]]");
     assert(parse("a flat summary\n[[node nonsense]]").length == 0);
+    assert(parse(text ~ "\n\n" ~ expandNote) == got);
     auto tail = parse(render([a]) ~ "\n\n" ~ expandNote ~ "\n\n[pinned requests]\nfoo");
     assert(tail.length == 1 && tail[0] == a, "the notes after the nodes are not node prose");
-    assert(parse("[[node S2 level=x]]").length == 0);
+    assert(parse("[[node S2 level=x]]\n" ~ expandNote).length == 0);
+}
+
+unittest // a legacy flat summary with a header-like line stays prose (issue #369)
+{
+    auto flat = "Earlier we fixed auth.\n[[node S1 level=0]]\nmore prose";
+    assert(parse(flat).length == 0);
+    assert(parse(" " ~ expandNote ~ "\n" ~ flat).length == 0, "an escaped note is prose");
+}
+
+unittest // render enforces a hard byte cap, even on adversarial nodes (issue #369)
+{
+    SummaryNode[] ns;
+    foreach (uint i; 1 .. 6) ns ~= SummaryNode(i, 0, i, i, null, "é".replicate(10_000));
+    ns ~= SummaryNode(9, 0, 1, 2, null, "tiny");
+    auto r = render(ns, 2_000);
+    assert(r.length <= 2_000);
+    import std.utf : validate;
+    validate(r);
+    auto back = parse(r ~ "\n" ~ expandNote);
+    assert(back.length == ns.length, "every header survives the cap");
+    assert(back[$ - 1].text == "tiny" || back[$ - 1].text.length <= 2_000);
+    uint[] many;
+    foreach (uint c; 0 .. 5_000) many ~= c;
+    auto huge = [SummaryNode(1, 1, 1, 2, many, "x"), SummaryNode(2, 0, 3, 4, null, "y")];
+    auto h = render(huge, 500);
+    assert(h.length <= 500);
+    assert(h.startsWith(nodeOpen ~ "S2"), "the newest whole lines are kept");
+    assert(render(ns[$ - 1 .. $], 1) == "");
+    assert(render(ns) == render(ns, size_t.max));
+    // The exact rendered size fits without truncation (no phantom separators).
+    auto two = [SummaryNode(1, 0, 0, 0, null, "x".replicate(1000)), SummaryNode(2, 0, 0, 0, null, "tiny")];
+    auto full = render(two);
+    assert(render(two, full.length) == full);
+    assert(render(two, full.length - 1) != full);
+}
+
+unittest // summary_nodes extraction (issue #369)
+{
+    assert(summaryNodesJson(`{"type":"replace","data":{"summary_nodes":[{"id":1,"text":"a]}\"["}]}}`)
+        == `[{"id":1,"text":"a]}\"["}]`);
+    assert(summaryNodesJson(`{"type":"replace","m":"say \"summary_nodes\": [1]","data":{"summary_nodes" : [2]}}`)
+        == `[2]`);
+    assert(summaryNodesJson(`{"type":"replace","data":{"summary_nodes":[1,`) is null);
+    // The key nested deeper than data.summary_nodes is tool data, not nodes:
+    // alone it yields nothing, and it never hides the real array.
+    enum call = `{"tool_calls":[{"arguments":{"summary_nodes":[9]}}]}`;
+    assert(summaryNodesJson(`{"type":"replace","data":{"messages":[` ~ call ~ `]}}`) is null);
+    assert(summaryNodesJson(`{"type":"replace","data":{"messages":[` ~ call ~ `],"summary_nodes":[3]}}`) == `[3]`);
+    assert(summaryNodesJson(`{"type":"message","data":{"role":"assistant","args":{"summary_nodes":[9]}}}`) is null);
+    // Only a replace record holds nodes, wherever its type key sits.
+    assert(summaryNodesJson(`{"type":"message","data":{"summary_nodes":[9]}}`) is null);
+    // Escaped keys and type values decode as the JSON decoder would.
+    assert(summaryNodesJson(`{"type":"repla\u0063e","data":{"summary_nodes":[4]}}`) == `[4]`);
+    assert(summaryNodesJson(`{"\u0074ype":"replace","data":{"summary_nodes":[5]}}`) == `[5]`);
+    assert(summaryNodesJson(`{"type":"replace","d\u0061ta":{"summary_n\u006fdes":[6]}}`) == `[6]`);
+    assert(summaryNodesJson(`{"type":"repl\uZZZZ","data":{"summary_nodes":[7]}}`) is null);
+    // Unclosed enclosing containers: torn, not a node source.
+    assert(summaryNodesJson(`{"type":"replace","data":{"summary_nodes":[{"id":99}],"messages":[`) is null);
+    assert(summaryNodesJson(`{"type":"replace","data":{"summary_nodes":[1]}`) is null);
+    assert(summaryNodesJson(`{"data":{"summary_nodes":[4]},"type":"replace"}`) == `[4]`);
+    assert(summaryNodesJson(`{"summary_nodes":[5],"type":"replace"}`) is null);
+    assert(summaryNodesJson(`{"x":1}`) is null);
+    // Mismatched closers are invalid JSON, at every level.
+    assert(summaryNodesJson(`{"type":"replace","data":{"summary_nodes":[{"id":99}]}]`) is null);
+    assert(summaryNodesJson(`{"type":"replace","data":{"summary_nodes":[{"id":99}]]}`) is null);
+    assert(summaryNodesJson(`{"type":"replace","data":{"summary_nodes":[{"id":99]}}}`) is null);
+    // Any JSON whitespace (CR, LF too) may surround a key's colon.
+    assert(summaryNodesJson("{\"type\"\r:\"replace\",\"data\":{\"summary_nodes\":[{\"id\":7}]}}") == `[{"id":7}]`);
+    assert(summaryNodesJson("{\"type\":\n\"replace\",\"data\"\r\n:\t{\"summary_nodes\"\n:\r[7]}}") == `[7]`);
+    // Balanced but malformed records supply nothing.
+    assert(summaryNodesJson(`{"type":"replace","data":{"summary_nodes":[{"id":99}],"messages":BROKEN}}`) is null);
+    assert(summaryNodesJson(`{"type":"replace","data":{"summary_nodes":[{"id":99}] "messages":[]}}`) is null);
+    assert(summaryNodesJson(`{"type":"replace","data":{"summary_nodes":[{"id":99}]}} trailing`) is null);
+    assert(summaryNodesJson(`{"type":"replace","data":{"summary_nodes":[{"id":99},]}}`) is null);
+    assert(summaryNodesJson(`{"type":"replace","data":{"summary_nodes":[{"id":99}],"m":"a` ~ "\x01" ~ `"}}`) is null);
+    assert(summaryNodesJson(`{"type":"replace","data":{"summary_nodes":[{"id":-1.5e+3}],"m":[true,false,null,{}]}}  `)
+        == `[{"id":-1.5e+3}]`);
+}
+
+unittest // isValidJson
+{
+    foreach (ok; [`0`, `"a\u00e9"`, `[]`, `{}`, ` [1, {"a": [null]}] `, `{"a":{"b":[]},"c":-0.1E2}`])
+        assert(isValidJson(ok), ok);
+    foreach (bad; [``, `[`, `[1,]`, `{"a"}`, `{"a":1,}`, `01`, `1.`, `tru`, `"\x"`, `[1 2]`, `{1:2}`, `[]]`, `{} {}`])
+        assert(!isValidJson(bad), bad);
+    char[] deep;
+    foreach (_; 0 .. 5000) deep ~= '[';
+    assert(!isValidJson(deep));
 }
 
 unittest // node names
@@ -403,7 +809,7 @@ unittest
     assert(got[0].id == 1 && got[1].id == 2 && got[1].text == "second");
     assert(got[0].text.indexOf("end") >= 0);
     // Re-rendering is stable.
-    assert(render(got) == render(parse(render(got))));
+    assert(render(got) == render(parse(render(got) ~ "\n" ~ expandNote)));
 }
 
 unittest // condensation merges peers, so the tree stays balanced (issue #274)

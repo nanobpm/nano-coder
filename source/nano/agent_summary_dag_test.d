@@ -95,7 +95,7 @@ unittest
     for (;;)
     {
         auto got = hist.read(path, parseJSON(`{"node":"` ~ dag.nodeName(leaf) ~ `"}`));
-        auto ns = dag.parse(got);
+        auto ns = dag.parse(got ~ "\n" ~ dag.expandNote);
         if (ns[0].level == 0)
         {
             assert(got.canFind("Original messages"), got);
