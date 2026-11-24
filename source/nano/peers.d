@@ -263,6 +263,40 @@ class ListenError : Exception
     this(string msg) pure @safe { super(msg); }
 }
 
+/// How the listener reacts to a failed `accept`.
+enum AcceptFailure
+{
+    transient, /// the pending peer's own failure (a probe that left): retry at once
+    resource,  /// out of fds/memory: retry after a back-off so the loop can't spin
+    fatal,     /// the listening socket itself is gone: stop serving
+}
+
+/// Classify an `accept` errno. A peer that connected and left at once (a
+/// liveness probe) fails with ECONNABORTED, or EINVAL on macOS; anything not
+/// known to be per-connection backs off rather than busy-looping.
+AcceptFailure classifyAcceptError(int err) pure nothrow @nogc
+{
+    import core.stdc.errno : EBADF, ENOTSOCK, ECONNABORTED, EINVAL, EINTR,
+        EAGAIN, EWOULDBLOCK, EPROTO;
+    if (err == EBADF || err == ENOTSOCK) return AcceptFailure.fatal;
+    if (err == ECONNABORTED || err == EINVAL || err == EINTR || err == EAGAIN
+        || err == EWOULDBLOCK || err == EPROTO)
+        return AcceptFailure.transient;
+    return AcceptFailure.resource;
+}
+
+unittest // accept errors: probes retry, resource exhaustion backs off, a dead socket stops
+{
+    import core.stdc.errno : EBADF, ENOTSOCK, ECONNABORTED, EINVAL, EMFILE,
+        ENFILE, ENOBUFS, ENOMEM;
+    assert(classifyAcceptError(ECONNABORTED) == AcceptFailure.transient);
+    assert(classifyAcceptError(EINVAL) == AcceptFailure.transient);
+    foreach (e; [EMFILE, ENFILE, ENOBUFS, ENOMEM])
+        assert(classifyAcceptError(e) == AcceptFailure.resource);
+    assert(classifyAcceptError(EBADF) == AcceptFailure.fatal);
+    assert(classifyAcceptError(ENOTSOCK) == AcceptFailure.fatal);
+}
+
 /// One accepted connection's parsed message, handed from the listener
 /// thread to the UI thread (which routes it and fills `reply`).
 struct PeerRequest
@@ -405,13 +439,19 @@ struct PeerListener
             try conn = listener.accept();
             catch (SocketException)
             {
-                import core.stdc.errno : EBADF, ENOTSOCK;
-                // `close` sets `stop` before shutting the socket down. Any
-                // other failure is the one pending connection's: a peer that
-                // connected and left at once (a liveness probe) fails accept
-                // with ECONNABORTED, or EINVAL on macOS. Serving goes on.
-                if (stop.get || errno == EBADF || errno == ENOTSOCK) return;
-                continue;
+                // `close` sets `stop` before shutting the socket down.
+                if (stop.get) return;
+                final switch (classifyAcceptError(errno))
+                {
+                case AcceptFailure.transient: continue;
+                case AcceptFailure.fatal: return;
+                case AcceptFailure.resource:
+                    // EMFILE/ENOBUFS/...: the connection stays queued, so
+                    // select fires again at once. Back off instead of spinning.
+                    import nano.clock : sleepFor;
+                    sleepFor(100.msecs);
+                    continue;
+                }
             }
             scope (exit) conn.close();
             import nano.safeio : setCloexec;
