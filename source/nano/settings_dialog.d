@@ -756,7 +756,9 @@ private void editMessages(SettingsUi ui, ref SettingsHost h, ref Changes changes
             bool want = confirm(ui, "Ask before accepting an incoming message?", conf);
             if (want == conf) continue;
             if (h.messagesCommand !is null) ui.say(h.messagesCommand(want ? "confirm on" : "confirm off"));
-            cfg.sessionMessagesConfirm = stateOf(h.messagesConfirm, want);
+            auto now = stateOf(h.messagesConfirm, want);
+            if (now != want) continue; // could not switch: nothing to save
+            cfg.sessionMessagesConfirm = now;
             changes.sessionMessagesConfirm = true;
         }
     }

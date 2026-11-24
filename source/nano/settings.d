@@ -611,3 +611,38 @@ unittest
     save(c, ch, null, path);
     version (Posix) assert((getAttributes(path) & octal!7777) == octal!600);
 }
+
+unittest
+{
+    // [[subagent_models]] rewrite: spaced headers, a following table keeps its
+    // comment, an empty list removes every table, and the result parses back.
+    import std.algorithm : canFind;
+    import nano.config : SubagentModel;
+    import nano.toml : parseToml;
+    enum doc = "model = \"m\"\n\n[[subagent_models]]\nmodel = \"a/x\"\n\n[[ subagent_models ]]\nmodel = \"b/y\"\n\n"
+        ~ "# the providers\n[providers.p]\nkind = \"mock\"\n";
+    auto out1 = replaceSubagentModels(doc, [SubagentModel("c/z", "big", 0, 7, 0)]);
+    assert(!out1.canFind("a/x") && !out1.canFind("b/y"), out1);
+    assert(out1.canFind("# the providers\n[providers.p]") && out1.canFind("model = \"m\""), out1);
+    assert(out1.canFind("[[subagent_models]]\nmodel = \"c/z\"\nuse = \"big\"\nmax_turns = 7\n"), out1);
+    auto parsed = parseToml(out1).unwrap("valid TOML");
+    string[] w;
+    auto ms = imported!"nano.config".parseSubagentModels(parsed["subagent_models"], w);
+    assert(ms == [SubagentModel("c/z", "big", 0, 7, 0)] && !w.length);
+    auto out2 = replaceSubagentModels(doc, null);
+    assert(!out2.canFind("subagent_models") && out2.canFind("# the providers"), out2);
+}
+
+unittest
+{
+    // applyChanges: a cleared subagent_model is removed; limits are written.
+    import std.algorithm : canFind;
+    Config c;
+    c.subagentMaxConcurrency = 2;
+    Changes ch;
+    ch.subagentModel = ch.subagentLimits = true;
+    auto out_ = applyChanges("subagent_model = \"a/x\"\n", c, ch, null);
+    assert(!out_.canFind("subagent_model =") && out_.canFind("subagent_max_concurrency = 2"), out_);
+    c.subagentModel = "b/y";
+    assert(applyChanges("", c, ch, null).canFind(`subagent_model = "b/y"`));
+}
