@@ -432,6 +432,9 @@ class Agent
     /// IDs stay above it, so a flat compaction that resets the node list
     /// never reuses an ID an archived node's children still refer to.
     private uint summaryNodeHigh;
+    /// Whether `summaryNodeHigh` has been seeded from the session log, so a
+    /// resumed session keeps issuing IDs above the ones it archived.
+    private bool summaryNodeSeeded;
     /// The node-prose budget of a layered summary in bytes; 0 derives it
     /// from the window (tests set it to force a condensation).
     size_t summaryDagBudgetBytes;
@@ -2352,6 +2355,14 @@ class Agent
         dag.SummaryNode[] newNodes;
         if (layered)
         {
+            if (!summaryNodeSeeded)
+            {
+                log.ifSome((SessionLog l) {
+                    immutable logged = hist.maxNodeId(l.path);
+                    if (logged > summaryNodeHigh) summaryNodeHigh = logged;
+                });
+                summaryNodeSeeded = true;
+            }
             uint freshId()
             {
                 auto id = dag.nextId(nodes);

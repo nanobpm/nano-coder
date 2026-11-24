@@ -470,6 +470,30 @@ private SummaryNode[uint] findNodes(string path, const uint[] ids, ulong upTo, o
     return found;
 }
 
+/// The largest summary-node ID any `replace` record in the log at `path`
+/// holds, 0 if none (issue #274). A resumed agent seeds its ID high-water
+/// mark from it, so a layered compaction after a flat reset never reissues
+/// an archived node's ID.
+uint maxNodeId(string path)
+{
+    import nano.session : foreachLogLineSkippingTorn;
+    uint high;
+    foreachLogLineSkippingTorn(path, (const(char)[] line) {
+        if (line.indexOf(`"summary_nodes"`) < 0) return;
+        JSONValue rec;
+        try rec = parseJSON(line);
+        catch (JSONException) return; // a torn or foreign line holds no node
+        auto d = "data" in rec.objectNoRef;
+        if (d is null || d.type != JSONType.object) return;
+        auto ns = "summary_nodes" in d.objectNoRef;
+        if (ns is null || ns.type != JSONType.array) return;
+        foreach (j; ns.arrayNoRef)
+            foreach (n; fromJson(j))
+                if (n.id > high) high = n.id;
+    });
+    return high;
+}
+
 private SummaryNode findNode(string path, uint id, out ulong line)
 {
     ulong[uint] at;

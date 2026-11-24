@@ -193,3 +193,29 @@ unittest
     assert(got.canFind("fresh-marker") && !got.canFind("LEAF1"), got);
     assert(hist.read(path, parseJSON(`{"node":"S1"}`)).canFind("LEAF1"), "the archived node is intact");
 }
+
+// Resume between a flat reset and the next layered compaction: the new
+// agent seeds its ID high-water mark from the log, so S1 is not reissued.
+unittest
+{
+    auto mock = new MockClient([LLMResponse("a1"), LLMResponse("LEAF1"), LLMResponse("a2"), LLMResponse("FLAT2"),
+        LLMResponse("a3"), LLMResponse("fresh-marker")]);
+    auto agent = logged("resume-high", mock);
+    agent.run("first", new NullEvents);
+    assert(compactAs(agent, ctx.CompactionMode.smart));
+    agent.compactionSummaryDag = false;
+    agent.run("second", new NullEvents);
+    assert(compactAs(agent, ctx.CompactionMode.smart));
+    // "Resume": a fresh agent over the same log and messages.
+    auto resumed = new Agent(mock, new ToolRegistry, Policy.init, "sys");
+    resumed.messages = agent.messages.dup;
+    resumed.log = agent.log;
+    resumed.compactionSummaryDag = true;
+    resumed.run("third", new NullEvents);
+    assert(compactAs(resumed, ctx.CompactionMode.smart));
+    auto live = dag.parse(resumed.messages[1].content);
+    assert(live.length == 1 && live[0].id == 2, "a new ID after resume");
+    auto path = resumed.log.unwrap("logged").path;
+    assert(hist.read(path, parseJSON(`{"node":"S1"}`)).canFind("LEAF1"), "the archived node is intact");
+    assert(hist.read(path, parseJSON(`{"node":"S2"}`)).canFind("fresh-marker"));
+}
