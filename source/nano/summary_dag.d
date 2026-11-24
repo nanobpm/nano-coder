@@ -138,7 +138,7 @@ const(char)[] summaryNodesJson(const(char)[] line)
             for (++i; i < line.length && line[i] != '"'; ++i)
                 if (line[i] == '\\') ++i;
             if (i >= line.length) return null;
-            auto str = line[s .. i];
+            const(char)[] str = line[s .. i];
             ++i;
             auto j = i;
             while (j < line.length && (line[j] == ' ' || line[j] == '\t')) ++j;
@@ -147,14 +147,25 @@ const(char)[] summaryNodesJson(const(char)[] line)
                 // A key: note its value where it matters.
                 ++j;
                 while (j < line.length && (line[j] == ' ' || line[j] == '\t')) ++j;
+                if (depth <= 2)
+                {
+                    auto k = unescapeJsonKey(str);
+                    if (k.isNone) return null;
+                    str = k.unwrap("checked isNone");
+                }
                 if (depth == 1)
                 {
                     key1 = str;
                     if (str == "type" && j < line.length && line[j] == '"')
                     {
                         auto e = j + 1;
-                        while (e < line.length && line[e] != '"' && line[e] != '\\') ++e;
+                        for (; e < line.length && line[e] != '"'; ++e)
+                            if (line[e] == '\\') ++e;
+                        if (e >= line.length) return null;
                         type = line[j + 1 .. e];
+                        auto t = unescapeJsonKey(type);
+                        if (t.isNone) return null;
+                        type = t.unwrap("checked isNone");
                     }
                 }
                 else if (depth == 2 && okData && str == "summary_nodes" && found is null
@@ -180,7 +191,53 @@ const(char)[] summaryNodesJson(const(char)[] line)
         }
         ++i;
     }
-    return type == "replace" ? found : null;
+    // A torn record (unclosed containers) supplies nothing.
+    return depth == 0 && type == "replace" ? found : null;
+}
+
+/// The raw JSON key text `key` with its escapes decoded (a fresh copy only
+/// when it has any), or none for a malformed escape. Shared by session.d's
+/// record skimmer and `summaryNodesJson` so both read keys as a decoder would.
+Option!(const(char)[]) unescapeJsonKey(const(char)[] key)
+{
+    import std.ascii : isHexDigit;
+    import std.utf : encode;
+    size_t i;
+    while (i < key.length && key[i] != '\\') ++i;
+    if (i == key.length) return some(key);
+    char[] o = key[0 .. i].dup;
+    for (; i < key.length; ++i)
+    {
+        if (key[i] != '\\') { o ~= key[i]; continue; }
+        if (++i >= key.length) return Option!(const(char)[]).init;
+        switch (key[i])
+        {
+            case '"': case '\\': case '/': o ~= key[i]; break;
+            case 'b': o ~= '\b'; break;
+            case 'f': o ~= '\f'; break;
+            case 'n': o ~= '\n'; break;
+            case 'r': o ~= '\r'; break;
+            case 't': o ~= '\t'; break;
+            case 'u':
+                if (i + 4 >= key.length) return Option!(const(char)[]).init;
+                dchar c = 0;
+                foreach (h; key[i + 1 .. i + 5])
+                {
+                    if (!h.isHexDigit) return Option!(const(char)[]).init;
+                    c = c * 16 + (h <= '9' ? h - '0' : (h | 0x20) - 'a' + 10);
+                }
+                i += 4;
+                // Surrogates never spell a key we compare against: keep them
+                // distinct but harmless.
+                if (c >= 0xD800 && c <= 0xDFFF) c = 0xFFFD;
+                char[4] buf;
+                o ~= buf[0 .. encode(buf, c)];
+                break;
+            default: return Option!(const(char)[]).init;
+        }
+    }
+    const(char)[] r = o;
+    return some(r);
 }
 
 /// The index of the bracket closing the array or object at `line[start]`,
@@ -524,6 +581,14 @@ unittest // summary_nodes extraction (issue #369)
     assert(summaryNodesJson(`{"type":"message","data":{"role":"assistant","args":{"summary_nodes":[9]}}}`) is null);
     // Only a replace record holds nodes, wherever its type key sits.
     assert(summaryNodesJson(`{"type":"message","data":{"summary_nodes":[9]}}`) is null);
+    // Escaped keys and type values decode as the JSON decoder would.
+    assert(summaryNodesJson(`{"type":"repla\u0063e","data":{"summary_nodes":[4]}}`) == `[4]`);
+    assert(summaryNodesJson(`{"\u0074ype":"replace","data":{"summary_nodes":[5]}}`) == `[5]`);
+    assert(summaryNodesJson(`{"type":"replace","d\u0061ta":{"summary_n\u006fdes":[6]}}`) == `[6]`);
+    assert(summaryNodesJson(`{"type":"repl\uZZZZ","data":{"summary_nodes":[7]}}`) is null);
+    // Unclosed enclosing containers: torn, not a node source.
+    assert(summaryNodesJson(`{"type":"replace","data":{"summary_nodes":[{"id":99}],"messages":[`) is null);
+    assert(summaryNodesJson(`{"type":"replace","data":{"summary_nodes":[1]}`) is null);
     assert(summaryNodesJson(`{"data":{"summary_nodes":[4]},"type":"replace"}`) == `[4]`);
     assert(summaryNodesJson(`{"summary_nodes":[5],"type":"replace"}`) is null);
     assert(summaryNodesJson(`{"x":1}`) is null);

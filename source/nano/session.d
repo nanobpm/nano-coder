@@ -5,7 +5,8 @@ module nano.session;
 @safe:
 
 import std.conv : to;
-import nano.summary_dag : SummaryNode;
+import nano.summary_dag : SummaryNode, unescapeJsonKey;
+import nano.option : unwrap;
 
 import nano.safeio : jsonText, jsonPretty;
 import nano.clock : wallNow;
@@ -1783,50 +1784,6 @@ private size_t skipJSONValue(const(char)[] s, size_t i) pure nothrow @nogc
     return i;
 }
 
-/// Decode the JSON escapes in the raw key text `key` in place of the slice
-/// (a fresh copy only when it has any); false for a malformed escape.
-private bool unescapeKey(ref const(char)[] key) pure @safe
-{
-    import std.ascii : isHexDigit;
-    import std.utf : encode;
-    size_t i;
-    while (i < key.length && key[i] != '\\') ++i;
-    if (i == key.length) return true;
-    char[] o = key[0 .. i].dup;
-    for (; i < key.length; ++i)
-    {
-        if (key[i] != '\\') { o ~= key[i]; continue; }
-        if (++i >= key.length) return false;
-        switch (key[i])
-        {
-            case '"': case '\\': case '/': o ~= key[i]; break;
-            case 'b': o ~= '\b'; break;
-            case 'f': o ~= '\f'; break;
-            case 'n': o ~= '\n'; break;
-            case 'r': o ~= '\r'; break;
-            case 't': o ~= '\t'; break;
-            case 'u':
-                if (i + 4 >= key.length) return false;
-                dchar c = 0;
-                foreach (h; key[i + 1 .. i + 5])
-                {
-                    if (!h.isHexDigit) return false;
-                    c = c * 16 + (h <= '9' ? h - '0' : (h | 0x20) - 'a' + 10);
-                }
-                i += 4;
-                // Surrogates never spell a key we compare against: keep them
-                // distinct but harmless.
-                if (c >= 0xD800 && c <= 0xDFFF) c = 0xFFFD;
-                char[4] buf;
-                o ~= buf[0 .. encode(buf, c)];
-                break;
-            default: return false;
-        }
-    }
-    key = o;
-    return true;
-}
-
 /// Call `dg` with each top-level key (JSON escapes decoded) and the raw text of its
 /// value in the JSON object `obj`, without parsing the values (issue #244: a
 /// superseded compaction snapshot is skimmed, not decoded). Stops when `dg`
@@ -1854,7 +1811,9 @@ private bool skimObjectAt(const(char)[] obj, scope bool delegate(const(char)[] k
         const(char)[] key = obj[i + 1 .. ke - 1];
         // An escaped key (`"folded\u005fbase"`) must compare by its decoded
         // value, or a delta could be misread as a full snapshot.
-        if (!unescapeKey(key)) return false;
+        auto dk = unescapeJsonKey(key);
+        if (dk.isNone) return false;
+        key = dk.unwrap("checked isNone");
         i = ke;
         ws();
         if (i >= obj.length || obj[i] != ':') return false;
@@ -1899,8 +1858,8 @@ private const(char)[] skimString(const(char)[] obj, string key)
     if (raw.length < 2 || raw[0] != '"' || raw[$ - 1] != '"') return null;
     const(char)[] type = raw[1 .. $ - 1];
     // A malformed escape fails closed: the record is not skimmed by type.
-    if (!unescapeKey(type)) return null;
-    return type;
+    auto t = unescapeJsonKey(type);
+    return t.isNone ? null : t.unwrap("checked isNone");
 }
 
 unittest // escaped_type_decodes_before_comparison
