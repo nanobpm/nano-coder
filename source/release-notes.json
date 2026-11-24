@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.25.4", "date": "2026-11-24", "items": [
+      {"type":"perf","scope":"session","title":"stream .jsonl.gz compression and archive reopen","pr":331}
+    ]},
     {"version": "1.25.3", "date": "2026-11-24", "items": [
       {"type":"fix","scope":"messages","title":"make peer sockets close-on-exec so /relaunch can listen again","pr":330},
       {"type":"fix","scope":"frame","title":"reserve the render cache so the first render allocates a fixed amount","pr":329}
@@ -439,9 +442,6 @@
     ]},
     {"version": "0.38.0", "date": "2026-10-06", "items": [
       {"type":"feat","scope":"instructions","title":"read Claude instruction files; prompt memory saving","pr":99}
-    ]},
-    {"version": "0.37.1", "date": "2026-10-06", "items": [
-      {"type":"fix","scope":"thinking","title":"apply /thinking typed mid-turn from the agent's next step (#78)","pr":101}
     ]}
   ]
 }
