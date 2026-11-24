@@ -603,7 +603,8 @@ class Agent
             else if (completedEvicted.mayContain(givenId))
             {
                 Option!CompletedTurn found;
-                log.ifSome((SessionLog l) { found = findCompletedTurn(l.path, givenId); });
+                // Recover a removed or replaced log first: the lookup reads by path.
+                log.ifSome((SessionLog l) { l.revalidate(); found = findCompletedTurn(l.path, givenId); });
                 foreach (t; found)
                 {
                     stdErr.writefln("[agent] input %s already processed; returning recorded response",

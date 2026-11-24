@@ -765,6 +765,14 @@ class SessionLog
         ++lines;
     }
 
+    /// Recover now if the path no longer names the held file, so a reader
+    /// of `path` (the idempotency read-back, issue #312) sees this session's
+    /// records rather than a missing or foreign file.
+    void revalidate()
+    {
+        if (f.isOpen && !sameFile(f, path)) recoverReplaced();
+    }
+
     /// Where the warning about a replaced log goes (tests capture it).
     void delegate(string) warn;
 
@@ -1627,7 +1635,12 @@ Option!CompletedTurn findCompletedTurn(string path, string inputId)
     eachLogLine(path, (const(char)[] line, ulong) {
         // Decoded comparison: any spacing or escaping `restore` accepts.
         if (skimType(line) != "turn_end") return;
-        if (skimString(skimField(line, "data"), "input_id") != inputId) return;
+        // The skim decodes each lone surrogate escape to U+FFFD, so a
+        // surrogate-pair id only prefilters here; parseJSON decides.
+        auto sid = skimString(skimField(line, "data"), "input_id");
+        if (sid is null) return;
+        import std.algorithm.searching : canFind;
+        if (sid != inputId && !sid.canFind("\uFFFD")) return;
         auto rec = parseJSON(line);
         auto data = "data" in rec;
         if (data is null || data.type != JSONType.object) return;

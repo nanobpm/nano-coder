@@ -118,3 +118,41 @@ unittest
     assert(t.response == "r2" && t.stopReason == "max_tokens");
     assert(findCompletedTurn(p, "zz").isNone);
 }
+
+// issue #312: a surrogate-pair id written escaped is found by its decoded form.
+unittest
+{
+    import std.file : write, remove;
+    import nano.session : findCompletedTurn;
+    auto p = buildPath(tempDir, "nano-find-completed-surrogate.jsonl");
+    scope (exit) if (p.exists) remove(p);
+    write(p, `{"type":"turn_end","data":{"input_id":"id-\ud83d\ude00","response":"r1"}}` ~ "\n");
+    assert(findCompletedTurn(p, "id-\U0001F600").unwrap("surrogate pair").response == "r1");
+    assert(findCompletedTurn(p, "id-\uFFFD\uFFFD").isNone);
+}
+
+// issue #312: an evicted id redelivered after the live log was removed or
+// replaced is still found (the log is recovered before the lookup).
+unittest
+{
+    import std.array : replicate;
+    import std.file : remove, rename, write;
+    foreach (replace; [false, true])
+    {
+        auto dir = buildPath(tempDir, "nano-d-loop-completed-gone-" ~ replace.to!string);
+        if (dir.exists) rmdirRecurse(dir);
+        scope (exit) if (dir.exists) rmdirRecurse(dir);
+        auto agent = agentFor(new MockClient([LLMResponse("a".replicate(3_000)), LLMResponse("b".replicate(3_000))]));
+        agent.completedCap = 4_096;
+        auto l = new SessionLog(dir, "mock/m", "/w");
+        l.warn = (string) {};
+        agent.log = some(l);
+        agent.run("go", new NullEvents, true, "in-a");
+        agent.run("go", new NullEvents, true, "in-b");
+        assert("in-a" !in agent.completedInputs);
+        auto path = l.path;
+        if (replace) { rename(path, path ~ ".old"); write(path, "{}\n"); }
+        else remove(path);
+        assert(agent.run("go", new NullEvents, true, "in-a") == "a".replicate(3_000));
+    }
+}
