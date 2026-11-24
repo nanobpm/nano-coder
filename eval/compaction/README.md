@@ -111,6 +111,7 @@ detail):
 | `rejected-approach` | an approach the user ruled out, and why (PR number, deadlock) |
 | `recent-control` | a detail in the last message, which compaction keeps. Both modes should pass; if not, the question or grading is off |
 | `pinned-request` | a flag, a pass count and a label stated once in the first message, compacted **twice** (issue #66) |
+| `deep-history` | the function and port of a startup failure in the first span, compacted **22 times** (issue #274) |
 
 Unique values are derived from the seed, so the answer can't be known
 without the history. More filler makes the summary lossier: the default of
@@ -142,6 +143,21 @@ eval/compaction/run.py --models … --modes standard,smart,standard-nopin,smart-
 
 Each `-nopin` cell is reported separately, so `standard` vs `standard-nopin`
 is the with/without-pin A/B for standard compaction (and likewise for smart).
+
+### Flat vs layered summaries (issue #274)
+
+Append `-layered` to a mode (it combines with `-nopin`) to run it with
+`compaction_summary_dag = true`: each compaction adds a summary node and old
+nodes are condensed instead of re-summarised. The `deep-history` case asks,
+after 22 compactions, for a detail from the first span; compare the flat and
+layered cells:
+
+```sh
+eval/compaction/run.py --models … --synthetic deep-history --modes smart,smart-layered,extract,extract-layered
+```
+
+`--self-test` runs `smart-layered` too. Its summaries grow by one node per
+compaction until they are condensed, which the summary-ratchet check allows.
 
 Real sessions: list the turns of a log, pick a fork point right after a
 detail was established plus some later work, and write a case file:

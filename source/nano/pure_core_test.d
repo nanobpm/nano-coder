@@ -16,6 +16,7 @@ static import nano.context;
 static import nano.emoji;
 static import nano.emoji_table;
 static import nano.extract;
+static import nano.summary_dag;
 static import nano.goal;
 static import nano.session_settings;
 static import nano.history;
@@ -43,6 +44,7 @@ alias pureCore = AliasSeq!(
     nano.emoji,
     nano.emoji_table,
     nano.extract,
+    nano.summary_dag,
     nano.goal,
     nano.session_settings,
     nano.history,

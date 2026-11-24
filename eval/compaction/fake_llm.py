@@ -15,7 +15,8 @@ LOSSY_SUMMARY = "The user and the agent worked on the lease crate and then did s
 
 # Question keyword -> pattern the oracle searches for.
 SEARCHES = [("method", "no method named"), ("branch", "branch"), ("command", "--features"), ("mutex", "mutex"),
-            ("ticket", "ticket"), ("flag", "--strict-lease")]
+            ("ticket", "ticket"), ("flag", "--strict-lease"),
+            ("port", "could not bind")]
 
 # Marker a prompt can carry to get a fixed, content-free reply: the eval's
 # between-compactions follow-up uses it so the intermediate assistant message
@@ -39,6 +40,9 @@ def reply(body):
     messages = body.get("messages", [])
     tools = {t["function"]["name"] for t in body.get("tools", [])}
     system = messages[0].get("content", "") if messages else ""
+    if "condense several consecutive summaries" in system:
+        # A layered summary's condensation (issue #274): as lossy as a summary.
+        return {"content": LOSSY_SUMMARY}
     if "compacting an AI agent's conversation" in system:
         transcript = "\n".join(str(m.get("content") or "") for m in messages[1:])
         if FAIL_SUMMARY_MARKER in transcript:

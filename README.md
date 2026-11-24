@@ -758,6 +758,7 @@ subagent_max_tokens = 1000000
 auto_compact = true                     # summarize automatically when the context fills up
 auto_compact_threshold = 0.8            # fraction of the context window
 compaction_mode = "smart"               # smart | standard | extract (see Smart compaction)
+compaction_summary_dag = false          # layered, expandable summaries (see Smart compaction)
 # context_window = 128000               # override the window (providers can set it too)
 verbosity = "normal"                    # quiet | normal | verbose | debug (or --verbosity)
 timestamps = true                       # prefix CLI messages with the local time (HH:MM:SS)
@@ -1201,7 +1202,8 @@ session log, and falls back to a standard summary when `persist_sessions` is off
     three snippets (and a `[K matches]` count when more matched). Earlier history lookups
     are not searched.
   - `history_read(id, max_output_length?, session?)` - one message in full, bounded like other tool
-    output (the whole is spilled to a file when it is longer).
+    output (the whole is spilled to a file when it is longer). With `node` instead of `id` it expands
+    a layered summary node (see below).
   Before a smart compaction the tools are not offered, so they cost nothing.
 
 **Extract mode** (`compaction_mode = "extract"`, or `/compact --extract`) is smart
@@ -1212,6 +1214,19 @@ each with its `(#N)`, plus the pinned requests and the plan as usual. It says wh
 things are rather than what they mean, so the agent leans on the history tools. An
 earlier extract summary is merged rather than nested, so each section stays capped. See
 [#273](https://github.com/nanobpm/nano-coder/issues/273) for its measurement against smart.
+
+**Layered summaries** (`compaction_summary_dag = true`, issue
+[#274](https://github.com/nanobpm/nano-coder/issues/274)) stop smart and extract compaction from
+re-summarising the previous summary. Each compaction summarises only the new span into a
+*node*, shown under a header such as `[[node S7 level=1 range=#2-#300 children=S1,S2]]`, and
+carries the older nodes forward verbatim. When the nodes' text outgrows about a tenth of the
+context window, the oldest six are condensed into one node a level up: one extra model call
+(none in extract mode, which condenses in code), at most once per compaction. So the summary
+grows only logarithmically with session length, and early detail stays one lookup away:
+`history_read(node="S7")` expands a node to the nodes it condensed, or a level-0 node to a
+one-line digest of each original message it covers; `history_search(…, node="S7")` searches
+only that node's range. Each compaction's `replace` record lists the nodes it created under
+`summary_nodes`; older records are read as before.
 
 #### Agent-adjusted compaction
 

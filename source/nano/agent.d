@@ -33,6 +33,7 @@ import nano.goal : Outcome, OutcomeStatus, verifyReminder, outcomeToolName = too
 import nano.reminders : Reminders, wrap;
 import mem = nano.memory;
 import ctx = nano.context;
+import dag = nano.summary_dag;
 import hist = nano.session_history;
 import cross = nano.cross_session;
 import peers = nano.peers;
@@ -424,6 +425,19 @@ class Agent
     /// Pin the user's requests verbatim after each compaction summary
     /// (`compaction_pin_requests`, issue #66).
     bool compactionPinRequests = true;
+    /// Layer smart/extract summaries into a summary DAG instead of
+    /// re-summarising the previous summary (`compaction_summary_dag`, issue #274).
+    bool compactionSummaryDag;
+    /// The largest summary-node ID this agent has issued (issue #274): new
+    /// IDs stay above it, so a flat compaction that resets the node list
+    /// never reuses an ID an archived node's children still refer to.
+    private uint summaryNodeHigh;
+    /// Whether `summaryNodeHigh` has been seeded from the session log, so a
+    /// resumed session keeps issuing IDs above the ones it archived.
+    private bool summaryNodeSeeded;
+    /// The node-prose budget of a layered summary in bytes; 0 derives it
+    /// from the window (tests set it to force a condensation).
+    size_t summaryDagBudgetBytes;
     /// The accepted input whose turn has not ended (redelivering its id resumes it).
     bool hasPending;
     PendingInput pending;
@@ -2231,13 +2245,41 @@ class Agent
         auto summarized = messages[bodyStart .. split].dup;
         if (!summarized.length) return false;
         auto tokensBefore = estimateContextTokens();
+        // Layered (issue #274): the previous summary's nodes are carried
+        // forward verbatim and only the new span is summarized.
+        immutable layered = smart && compactionSummaryDag;
+        dag.SummaryNode[] nodes;
+        Message[] source = summarized;
+        bool inheritsFlat;
+        if (layered)
+        {
+            source = null;
+            foreach (ref x; summarized)
+            {
+                // A flat summary (from before layering, or a standard
+                // compaction in between) has no nodes: summarize it with
+                // the new span rather than drop its content.
+                auto parsed = ctx.isSummaryMessage(x) ? dag.parse(x.content) : null;
+                if (parsed.length) nodes ~= parsed;
+                else
+                {
+                    source ~= x;
+                    if (ctx.isSummaryMessage(x)) inheritsFlat = true;
+                }
+            }
+        }
+        string leafText;
         ulong first, last;
-        foreach (ref x; summarized)
+        foreach (ref x; source)
             if (x.logLine)
             {
                 if (!first || x.logLine < first) first = x.logLine;
                 if (x.logLine > last) last = x.logLine;
             }
+        // A folded flat summary covers everything before it, from the
+        // session's start: the new leaf's range must too, or expanding and
+        // searching it would miss the history its prose describes.
+        if (inheritsFlat && last) first = 1;
 
         long budget;
         // The output cap an output-cap rejection taught us (0: none yet).
@@ -2255,7 +2297,8 @@ class Agent
             // Built in code: no model call, so no usage, retry or fallback.
             import nano.extract : extractSummary;
             const swStart = monoNow;
-            summary = ctx.smartSummaryPrefix ~ "\n" ~ extractSummary(summarized) ~ "\n\n" ~ ctx.smartSummaryNote(first, last);
+            leafText = extractSummary(source);
+            summary = ctx.smartSummaryPrefix ~ "\n" ~ leafText ~ "\n\n" ~ ctx.smartSummaryNote(first, last);
             summaryMs = since(swStart).total!"msecs";
         }
         else for (;;)
@@ -2275,13 +2318,13 @@ class Agent
             if (learnedCap && learnedCap < budget) budget = learnedCap;
             auto inputWindow = saturatingSub(window, budget);
             auto chars = checkedMul(max(saturatingSub(inputWindow, 2_000), 2_000), 3);
-            auto request = "Conversation to summarize:\n\n" ~ ctx.renderTranscript(summarized, chars, smart);
+            auto request = "Conversation to summarize:\n\n" ~ ctx.renderTranscript(source, chars, smart);
             if (focus.strip.length) request ~= "\n\nWhen summarizing, focus on: " ~ focus.strip;
             ChatRequest req;
             auto system = ctx.summarySystemPrompt ~ (smart ? ctx.smartSummaryInstructions : "");
             // A repeated compaction folds the previous summary back in: warn
             // that it is lossy (issue #66).
-            if (summarized.canFind!((ref m) => ctx.isSummaryMessage(m)))
+            if (source.canFind!((ref m) => ctx.isSummaryMessage(m)))
                 system ~= compactionPinRequests ? ctx.earlierSummaryLossyInstructions : ctx.earlierSummaryLossyNoPinInstructions;
             req.messages = [Message.system(system), Message.user(request)];
             req.maxTokens = budget;
@@ -2304,6 +2347,7 @@ class Agent
                 if (body_.length)
                 {
                     if (truncated) body_ ~= ctx.summaryTruncatedNote;
+                    leafText = body_;
                     summary = smart ? ctx.smartSummaryPrefix ~ "\n" ~ body_ ~ "\n\n" ~ ctx.smartSummaryNote(first, last)
                         : ctx.summaryPrefix ~ "\n" ~ body_;
                 }
@@ -2349,6 +2393,58 @@ class Agent
             auto note = format("[%s earlier messages were removed to fit the context window; no summary is available]",
                 summarized.length);
             summary = smart && first ? ctx.smartSummaryPrefix ~ "\n" ~ note ~ "\n\n" ~ ctx.smartSummaryNote(first, last) : note;
+            leafText = note;
+        }
+        dag.SummaryNode[] newNodes;
+        if (layered)
+        {
+            if (!summaryNodeSeeded)
+            {
+                log.ifSome((SessionLog l) {
+                    // A deleted or replaced log path must be recovered first, or the
+                    // scan throws or reads a foreign file's node IDs.
+                    l.revalidate();
+                    immutable logged = hist.maxNodeId(l.path);
+                    if (logged > summaryNodeHigh) summaryNodeHigh = logged;
+                });
+                summaryNodeSeeded = true;
+            }
+            uint freshId()
+            {
+                auto id = dag.nextId(nodes);
+                if (id <= summaryNodeHigh) id = summaryNodeHigh + 1;
+                return id;
+            }
+            auto leaf = dag.SummaryNode(freshId(), 0, first, last, null, leafText);
+            nodes ~= leaf;
+            newNodes ~= leaf;
+            immutable dagBudget = summaryDagBudgetBytes ? summaryDagBudgetBytes : condenseBudgetBytes(window);
+            auto g = dag.condenseGroup(nodes, dagBudget);
+            if (g.count)
+            {
+                auto children = nodes[g.start .. g.start + g.count];
+                string text;
+                if (m == ctx.CompactionMode.extract) text = dag.deterministicText(children, dagBudget / 4);
+                else
+                {
+                    long ms;
+                    text = condenseByModel(children, dagBudget / 4, ev, summaryUsage, ms);
+                    // A cancel during condensation stops before anything is committed.
+                    if (control.isCancelled) return false;
+                    if (ms >= 0) summaryMs = (summaryMs < 0 ? 0 : summaryMs) + ms;
+                }
+                auto c = dag.condensed(children, freshId(), text);
+                nodes = nodes[0 .. g.start] ~ c ~ nodes[g.start + g.count .. $];
+                newNodes ~= c;
+            }
+            ulong lo = nodes[0].first, hi;
+            foreach (ref x; nodes)
+            {
+                if (x.first && (!lo || x.first < lo)) lo = x.first;
+                if (x.last > hi) hi = x.last;
+            }
+            summary = ctx.smartSummaryPrefix ~ "\n" ~ dag.render(nodes) ~ "\n\n" ~ dag.expandNote ~ "\n\n"
+                ~ ctx.smartSummaryNote(lo, hi);
         }
         if (planTools && !plan.empty) summary ~= "\n\n" ~ plan.contextNote();
         // Pin the user's own words, rebuilt from the originals every time.
@@ -2479,11 +2575,13 @@ class Agent
             import std.conv : to;
             l.replace(messages, first, last, ctx.modeName(m), client.providerName ~ "/" ~ client.modelName, pinnedNew,
                 hasPending ? &pending : null, folded, extendsStash ? some(stashBase) : Option!size_t.init, replayRestated,
-                pinnedBase, trigger.to!string);
+                pinnedBase, trigger.to!string, newNodes);
         });
         // The replace record is durable: the live state now matches the log,
         // so nothing past this point may roll it back.
         persisted = true;
+        foreach (ref nn; newNodes)
+            if (nn.id > summaryNodeHigh) summaryNodeHigh = nn.id;
         pinStashRestate = false;
         // Bound the stash once the log holds it in full (issue #312).
         trimPins(window);
@@ -2505,6 +2603,57 @@ class Agent
         historyAvailable = historyHintPending = ctx.citesHistory(m);
         if (onCompacted !is null) onCompacted(report);
         return true;
+    }
+
+    /// The byte budget of a layered summary's node prose (issue #274): about
+    /// a tenth of the window in tokens, at ~3 bytes per token.
+    private static size_t condenseBudgetBytes(size_t window) pure nothrow @nogc
+    {
+        auto b = window / 10 * 3;
+        return b < 4_000 ? 4_000 : b;
+    }
+
+    /// The one condensation call of a layered compaction (issue #274): the
+    /// model merges `children` into one summary. Any failure falls back to
+    /// the deterministic condensation, so a compaction never fails here (a
+    /// cancel returns at once; the caller checks it before committing). The
+    /// call's usage is added to `usage` and its duration set in `ms`, so the
+    /// persisted summary accounts for both requests.
+    private string condenseByModel(const dag.SummaryNode[] children, size_t maxBytes, Option!AgentEvents ev,
+        ref TokenUsage usage, out long ms)
+    {
+        ms = -1;
+        // A `/model` queued during the leaf summary applies first, as before
+        // every model call; a cancel pending now makes no call.
+        applyModelRequest();
+        if (control.isCancelled) return "";
+        ChatRequest req;
+        req.messages = [Message.system(dag.condenseSystemPrompt), Message.user(dag.condenseRequest(children))];
+        long cap = toLong(maxBytes / 3 < 256 ? 256 : maxBytes / 3);
+        immutable limit = effectiveMaxTokens();
+        if (limit > 0 && limit < cap) cap = limit;
+        req.maxTokens = cap;
+        req.temperature = temperatureFor(thinking().alwaysAnthropicThinking).effective;
+        import std.exception : collectException;
+        string t;
+        auto err = collectException(() {
+            foreach (e; ev) e.summaryStart();
+            const swStart = monoNow;
+            auto r = client.chat(req, (bool, string) {});
+            ms = since(swStart).total!"msecs";
+            recordUsage(r.usage);
+            usage.inputTokens += r.usage.inputTokens;
+            usage.outputTokens += r.usage.outputTokens;
+            usage.cachedInputTokens += r.usage.cachedInputTokens;
+            if (r.usage.hasAic) { usage.hasAic = true; usage.aic += r.usage.aic; }
+            foreach (e; ev) e.usage(r.usage);
+            // A truncated condensation would silently replace several summaries
+            // with an incomplete prefix: fall back to the deterministic text.
+            t = r.stopReason == "length" || r.stopReason == "max_tokens" ? "" : r.content.strip;
+        }());
+        if (control.isCancelled) return "";
+        if (err !is null) stdErr.writefln("[agent] condensing summaries failed (%s); condensing in code", err.msg);
+        return t.length ? t : dag.deterministicText(children, maxBytes);
     }
 
     private void recordUsage(TokenUsage u) pure
@@ -4224,6 +4373,16 @@ class Agent
     {
         auto old = log;
         log = newLog;
+        // The node-ID high-water mark belongs to the log it was seeded
+        // from: a different session must be scanned afresh, or its archived
+        // IDs could be reissued (issue #274).
+        bool sameLog;
+        old.ifSome((SessionLog o) { newLog.ifSome((SessionLog n) { sameLog = n is o; }); });
+        if (!sameLog)
+        {
+            summaryNodeSeeded = false;
+            summaryNodeHigh = 0;
+        }
         old.ifSome((SessionLog o) {
             bool same;
             newLog.ifSome((SessionLog n) { same = n is o; });

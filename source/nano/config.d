@@ -466,6 +466,8 @@ struct Config
     string compactionMode = "smart";
     /// Pin the user's requests verbatim after each compaction summary.
     bool compactionPinRequests = true;
+    /// Layer smart/extract summaries into an expandable summary DAG (issue #274).
+    bool compactionSummaryDag;
     /// Compact at the idle prompt, once quiet for the hold (Rust #186).
     bool idleCompact = true;
     /// Persist conversations as JSONL session logs (false: like --no-session).
@@ -581,6 +583,7 @@ struct Config
             c.autoCompactThreshold = v.type == JSONType.integer ? v.integer : v.floating;
         if (auto v = "compaction_mode" in doc) c.compactionMode = v.str;
         if (auto v = "compaction_pin_requests" in doc) c.compactionPinRequests = v.boolean;
+        if (auto v = "compaction_summary_dag" in doc) c.compactionSummaryDag = v.boolean;
         if (auto v = "idle_compact" in doc) c.idleCompact = v.boolean;
         if (auto v = "persist_sessions" in doc) c.persistSessions = v.boolean;
         if (auto v = "cross_session_history" in doc) c.crossSessionHistory = v.boolean;
