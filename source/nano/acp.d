@@ -723,7 +723,7 @@ final class AcpServer : AgentEvents
                 peers.settle(inbound, true);
                 subCalls = null;
                 terminalCalls = null;
-                runTurn(JSONValue.init, inbound.labelled, null, true, inbound.pm.senderId);
+                runTurn(JSONValue.init, inbound.labelled, null, true, inbound.pm.senderId, inbound.pm.hop, inbound.pm.thread);
                 subCalls = null;
                 terminalCalls = null;
                 continue;
@@ -1433,7 +1433,7 @@ final class AcpServer : AgentEvents
 
     /// Run one prompt turn; the reader thread routes cancels and steers meanwhile.
     private void runTurn(JSONValue id, string text, string givenId = null, bool fromPeer = false,
-        string peerSender = null)
+        string peerSender = null, uint peerHop = 1, string peerThread = null)
     {
         router.startTurn();
         peerRouter.midTurn(true);
@@ -1441,7 +1441,7 @@ final class AcpServer : AgentEvents
         immutable ulong[2] tokensBefore = [agent.sessionInputTokens, agent.sessionOutputTokens];
         immutable aicBefore = AicTotal(agent.aicReports, agent.sessionAic);
         string response;
-        try response = agent.run(text, this, false, givenId, fromPeer, peerSender);
+        try response = agent.run(text, this, false, givenId, fromPeer, peerSender, peerHop, peerThread);
         catch (Exception e)
         {
             response = "Error: " ~ e.msg;
@@ -1475,8 +1475,9 @@ final class AcpServer : AgentEvents
             auto leftover = agent.control.takePending;
             // A peer's late steer runs later as a peer prompt (loop guard
             // kept), even on cancel: its sender was told it was queued.
-            leftover = requeuePeerSteers(leftover, (string text, string sender) {
-                if (peerRouter.requeueLate(text, sender)) return;
+            leftover = requeuePeerSteers(leftover, (Steer s) {
+                string text = s.text;
+                if (peerRouter.requeueLate(text, s.sender, s.hop, s.thread)) return;
                 stdErr.writeln(format("peer message from %s dropped: inbox full",
                     peers.PeerRouter.senderFromLabel(text)));
             });
@@ -1495,11 +1496,11 @@ final class AcpServer : AgentEvents
 /// Hand every peer steer in `leftover` to `requeue` (its sender was told it
 /// was queued, so it runs later even when the turn was cancelled) and
 /// return the rest, which the caller answers or requeues as prompts.
-Steer[] requeuePeerSteers(Steer[] leftover, scope void delegate(string text, string sender) @safe requeue)
+Steer[] requeuePeerSteers(Steer[] leftover, scope void delegate(Steer s) @safe requeue)
 {
     Steer[] rest;
     foreach (s; leftover)
-        if (s.fromPeer) requeue(s.text, s.sender);
+        if (s.fromPeer) requeue(s);
         else rest ~= s;
     return rest;
 }
@@ -1511,7 +1512,7 @@ unittest
     peer.sender = "abcd1234-full";
     auto plain = Steer("user steer");
     string[] got;
-    auto rest = requeuePeerSteers([plain, peer], (string t, string s) { got ~= s ~ "|" ~ t; });
+    auto rest = requeuePeerSteers([plain, peer], (Steer s) { got ~= s.sender ~ "|" ~ s.text; });
     assert(got == ["abcd1234-full|[from session abcd1234] hi"], got[0]);
     assert(rest.length == 1 && rest[0].text == "user steer" && !rest[0].fromPeer);
 }

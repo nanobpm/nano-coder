@@ -100,7 +100,7 @@ UnitTestResult runModuleTests() @trusted
     import std.algorithm : sort;
     import std.conv : to;
     import std.process : environment;
-    import nano.safeio : Chan, spawn, stdErr;
+    import nano.safeio : Chan, Shared, spawn, spawnDaemon, stdErr;
     immutable(TestEntry)[] all;
     foreach (m; ModuleInfo)
         if (m !is null && m.unitTest !is null) all ~= immutable TestEntry(m.name, cast(void function() @safe) m.unitTest);
@@ -108,27 +108,29 @@ UnitTestResult runModuleTests() @trusted
     const serial = listedModules("scripts/serial-tests");
     // The host's load before the tests start (see loadFactor).
     const startLoad = calibrate();
-    const scaleText = environment.get("NANO_TEST_BUDGET_SCALE");
-    const scale = scaleText.length ? scaleText.to!double : 1.0;
-    startWatchdog(scale);
     auto results = Chan!ModuleRun.make;
     auto queue = Chan!size_t.make;
+    const scaleText = environment.get("NANO_TEST_BUDGET_SCALE");
+    const scale = scaleText.length ? scaleText.to!double : 1.0;
+    auto running = Shared!(immutable(Running)[]).make;
+    auto limits = hardLimits(scale);
+    spawnDaemon(&watchdog, running);
     if (jobs > 1)
     {
         // Modules that change process-wide state go first, alone.
         foreach (i, e; all) if (e.name in serial) queue.put(i);
         queue.close();
-        runQueue(all, queue, results);
+        runQueue(all, queue, results, running, limits);
         queue = Chan!size_t.make;
         foreach (i, e; all) if (e.name !in serial) queue.put(i);
     }
     else foreach (i; 0 .. all.length) queue.put(i);
     queue.close();
-    if (jobs <= 1) runQueue(all, queue, results);
+    if (jobs <= 1) runQueue(all, queue, results, running, limits);
     else
     {
-        typeof(spawn(&runQueue, all, queue, results))[] workers;
-        foreach (_; 0 .. jobs) workers ~= spawn(&runQueue, all, queue, results);
+        typeof(spawn(&runQueue, all, queue, results, running, limits))[] workers;
+        foreach (_; 0 .. jobs) workers ~= spawn(&runQueue, all, queue, results, running, limits);
         foreach (ref w; workers) w.join();
     }
     results.close();
@@ -182,7 +184,8 @@ unittest
 // above) and catches Throwable: a failed assert is an Error, and a runner must
 // report it and go on, as druntime's does.
 void runQueue(immutable(TestEntry)[] all, imported!"nano.safeio".Chan!size_t queue,
-    imported!"nano.safeio".Chan!ModuleRun results) @trusted
+    imported!"nano.safeio".Chan!ModuleRun results, imported!"nano.safeio".Shared!(immutable(Running)[]) running,
+    immutable(HardLimit)[] limits) @trusted
 {
     import std.process : environment;
     import nano.safeio : stdErr;
@@ -193,8 +196,14 @@ void runQueue(immutable(TestEntry)[] all, imported!"nano.safeio".Chan!size_t que
         if (trace) stdErr.writefln("test start %s", all[i].name);
         scope (exit) if (trace) stdErr.writefln("test end %s", all[i].name);
         const start = monoNow;
-        markRunning(all[i].name, start);
-        scope (exit) markDone(all[i].name);
+        immutable entry = immutable Running(all[i].name, hardLimitOf(limits, all[i].name), start);
+        running.update((ref immutable(Running)[] r) { r ~= entry; });
+        scope (exit) running.update((ref immutable(Running)[] r) {
+            import std.algorithm : remove;
+            import std.array : array;
+            import std.algorithm : filter;
+            r = r.filter!(x => x != entry).array;
+        });
         bool ok = true;
         string reason;
         try all[i].run();
@@ -209,138 +218,146 @@ void runQueue(immutable(TestEntry)[] all, imported!"nano.safeio".Chan!size_t que
     }
 }
 
-/// A module whose tests are running now, and since when.
+/// A module whose tests are running: its hard limit and when it started.
 struct Running
 {
     string name;
-    MonoTime start;
+    long hardLimitMs;
+    imported!"core.time".MonoTime start;
 }
 
-import core.time : Duration, MonoTime;
+/// The least hard limit: below it the watchdog never ends the run.
+enum minHardLimitMs = 10_000;
 
-/// The modules running now, for the watchdog (the runner only learns a
-/// module's time when it finishes, so a hung one would never be named).
-private shared Locked!(immutable(Running)[]) gRunning;
-
-import nano.safeio : Locked;
-
-shared static this() { gRunning = new shared Locked!(immutable(Running)[]); }
-
-private void markRunning(string name, MonoTime start)
+/// Each module's hard limit, in msecs: twice its budget at the most load
+/// `checkBudgets` allows, so a module the watchdog stops would have failed
+/// its budget anyway. The `""` key holds the default.
+immutable(HardLimit)[] hardLimits(double scale)
 {
-    gRunning.update((ref immutable(Running)[] r) { r ~= immutable Running(name, start); });
+    import std.array : split;
+    import std.conv : to;
+    HardLimit[] r;
+    long hard(long budget) { const h = cast(long)(budget * scale * maxLoadFactor * 2); return h > minHardLimitMs ? h : minHardLimitMs; }
+    foreach (name, rest; listedModules("scripts/slow-tests")) r ~= HardLimit(name, hard(rest.split[0].to!long));
+    r ~= HardLimit("", hard(defaultBudgetMs));
+    return r.idup;
 }
 
-private void markDone(string name)
-{
-    import std.algorithm : countUntil, remove;
-    gRunning.update((ref immutable(Running)[] r) {
-        const i = r.countUntil!(x => x.name == name);
-        if (i >= 0) r = r[0 .. i] ~ r[i + 1 .. $];
-    });
-}
+/// A module's hard limit (`""`: the default).
+struct HardLimit { string name; long ms; }
 
-/// How many times its time limit a module may run before the watchdog calls
-/// it hung and ends the run.
-enum hangFactor = 10;
-
-/// The running modules past `hangFactor` times their limit (`limits`, else
-/// `defaultBudgetMs`, times `scale`) at `now`, each as
-/// `name (running N ms, hang bound M ms)`; empty when none is.
-string[] stuckModules(const Running[] running, MonoTime now, const long[string] limits, double scale) pure
+/// `module`'s hard limit in `limits`, else the default entry's.
+long hardLimitOf(const HardLimit[] limits, string module_) pure
 {
-    import std.format : format;
-    string[] r;
-    foreach (x; running)
+    long fallback = minHardLimitMs;
+    foreach (l; limits)
     {
-        const bound = cast(long)(limits.get(x.name, defaultBudgetMs) * scale * hangFactor);
-        const ran = (now - x.start).total!"msecs";
-        if (ran > bound) r ~= format("%s (running %s ms, hang bound %s ms)", x.name, ran, bound);
+        if (l.name == module_) return l.ms;
+        if (l.name == "") fallback = l.ms;
     }
-    return r;
+    return fallback;
 }
 
-/// One watchdog check: the stuck modules among those running now, and a
-/// report naming them and every module still running (empty when none is
-/// stuck).
-string watchdogCheck(const Running[] running, MonoTime now, const long[string] limits, double scale)
+/// The first running module past its hard limit at `now`, if any.
+imported!"nano.option".Option!Running overdue(const Running[] running, imported!"core.time".MonoTime now)
 {
-    import std.array : join;
-    import std.format : format;
-    const stuck = stuckModules(running, now, limits, scale);
-    if (!stuck.length) return null;
-    string[] all;
-    foreach (x; running) all ~= format("%s (%s ms)", x.name, (now - x.start).total!"msecs");
-    return format("unit-test watchdog: %s hung: %s; still running: %s. A test waits forever "
-        ~ "(deadlock, or a real process/socket with no timeout): find the wait in that module.",
-        stuck.length == 1 ? "a module" : "modules", stuck.join(", "), all.join(", "));
+    import nano.option : some, Option;
+    foreach (r; running)
+        if ((now - r.start).total!"msecs" > r.hardLimitMs) return some(Running(r.name, r.hardLimitMs, r.start));
+    return Option!Running.init;
 }
 
-unittest // a stuck module is named once past its hang bound, on fake time
+unittest
 {
-    import core.time : msecs;
-    import std.datetime.systime : SysTime;
-    import nano.clock : FakeClock;
-    auto clock = FakeClock.install(SysTime(0));
-    const long[string] limits = ["nano.slow": 3000];
-    const running = [Running("nano.stuck", monoNow), Running("nano.slow", monoNow)];
-    clock.advance((defaultBudgetMs * 2 * hangFactor).msecs);
-    assert(watchdogCheck(running, monoNow, limits, 2.0) is null);
-    clock.advance(1.msecs);
-    const report = watchdogCheck(running, monoNow, limits, 2.0);
-    assert(report == "unit-test watchdog: a module hung: nano.stuck (running 20001 ms, hang bound 20000 ms); "
-        ~ "still running: nano.stuck (20001 ms), nano.slow (20001 ms). A test waits forever "
-        ~ "(deadlock, or a real process/socket with no timeout): find the wait in that module.", report);
-    assert(stuckModules(running, monoNow + (3000 * 2 * hangFactor).msecs, limits, 2.0).length == 2);
+    import core.time : MonoTime, msecs;
+    auto t0 = monoNow;
+    auto rs = [Running("a", 100, t0), Running("b", 50, t0 + 10.msecs)];
+    assert(overdue(rs, t0 + 60.msecs).isNone);
+    import nano.option : unwrap;
+    assert(overdue(rs, t0 + 61.msecs).unwrap("b is overdue").name == "b");
+    assert(overdue(rs, t0 + 101.msecs).unwrap("a is overdue").name == "a");
+    assert(hardLimitOf(hardLimits(1.0), "nano.nonesuch") >= minHardLimitMs);
+    assert(hardLimitOf([HardLimit("x", 20_000), HardLimit("", 12_000)], "x") == 20_000);
+    assert(hardLimitOf([HardLimit("x", 20_000), HardLimit("", 12_000)], "y") == 12_000);
 }
 
-unittest // the registry the watchdog reads tracks what runs
-{
-    import std.algorithm : canFind;
-    markRunning("nano.registry-probe", monoNow);
-    assert(gRunning.get.canFind!(x => x.name == "nano.registry-probe"));
-    markDone("nano.registry-probe");
-    assert(!gRunning.get.canFind!(x => x.name == "nano.registry-probe"));
-}
-
-/// How often the watchdog looks at the running modules.
-enum watchdogPollMs = 1000;
-
-/// Start the watchdog thread: once a running module passes its hang bound
-/// (`stuckModules`) it prints which, and every module still running, and
-/// ends the process with status 1, so a hung test is a named, fast failure
-/// instead of a CI job that sits silent for hours (issue #357).
-/// `NANO_TEST_STUCK=1` adds a module that never returns, to see it work.
-private void startWatchdog(double scale)
-{
-    import std.path : absolutePath;
-    import nano.safeio : spawnDaemon;
-    // Resolve on the runner thread, before any test can chdir, so the
-    // watchdog never reads a relative path against a moved cwd.
-    spawnDaemon(&watchdog, scale, absolutePath("scripts/slow-tests"));
-}
-
-private void watchdog(double scale, string slowTests)
+/// Ends the run when a module's tests outlive their hard limit: a test that
+/// hangs (a refused retry loop, a lost wakeup) can't be joined, so the run
+/// names the module and exits failing instead of never finishing (#358).
+void watchdog(imported!"nano.safeio".Shared!(immutable(Running)[]) running)
 {
     import core.time : msecs;
     import nano.clock : sleepFor;
-    import nano.safeio : exitProcess, stdErr;
-    long[string] limits;
-    foreach (name, rest; listedModules(slowTests))
-    {
-        import std.array : split;
-        import std.conv : to;
-        limits[name] = rest.split[0].to!long;
-    }
     while (true)
     {
-        sleepFor(watchdogPollMs.msecs);
-        const report = watchdogCheck(gRunning.get, monoNow, limits, scale);
-        if (report is null) continue;
-        stdErr.writeln(report);
-        stdErr.flush();
-        exitProcess(1);
+        sleepFor(250.msecs);
+        watchdogTick(running, monoNow, (Running r) => failHung(r));
     }
+}
+
+/// One watchdog check at `now`: calls `hung` with the first overdue running
+/// module and returns true, else returns false. Split out so tests can drive
+/// it against a really blocked module without ending the process.
+bool watchdogTick(imported!"nano.safeio".Shared!(immutable(Running)[]) running,
+    imported!"core.time".MonoTime now, scope void delegate(Running) @safe hung)
+{
+    foreach (r; overdue(running.get(), now))
+    {
+        hung(r);
+        return true;
+    }
+    return false;
+}
+
+/// Reports `r` as hung and exits the process failing.
+private void failHung(Running r)
+{
+    import nano.safeio : exitProcess, stdErr;
+    stdErr.writefln("%s: unit tests still running after %s ms, over the %s ms hard limit: "
+        ~ "the module hangs; failing the run", r.name, since(r.start).total!"msecs", r.hardLimitMs);
+    stdErr.writefln("1 module FAILED unittests: %s (hung past %s ms)", r.name, r.hardLimitMs);
+    stdErr.flush();
+    exitProcess(1);
+}
+
+private shared bool blockedRelease;
+
+/// A module body that blocks until `blockedRelease` is set.
+private void blockedModule()
+{
+    import core.atomic : atomicLoad;
+    import core.time : msecs;
+    import nano.clock : sleepFor;
+    while (!atomicLoad(blockedRelease)) sleepFor(1.msecs);
+}
+
+unittest
+{
+    // A worker really blocked in a module is registered, seen as hung by
+    // the watchdog with its name, and removed once it completes (#358).
+    import core.atomic : atomicStore;
+    import core.time : seconds, msecs;
+    import nano.clock : sleepFor;
+    import nano.safeio : Chan, Shared, spawn;
+    atomicStore(blockedRelease, false);
+    immutable all = [immutable TestEntry("nano.blocked", &blockedModule)];
+    auto queue = Chan!size_t.make;
+    auto results = Chan!ModuleRun.make;
+    auto running = Shared!(immutable(Running)[]).make;
+    queue.put(0);
+    queue.close();
+    immutable limits = [immutable HardLimit("", 5)];
+    auto worker = spawn(&runQueue, all, queue, results, running, limits);
+    while (running.get().length == 0) sleepFor(1.msecs);
+    string hungName;
+    assert(watchdogTick(running, monoNow + 1.seconds, (Running r) { hungName = r.name; }));
+    assert(hungName == "nano.blocked");
+    atomicStore(blockedRelease, true);
+    worker.join();
+    assert(running.get().length == 0);
+    assert(!watchdogTick(running, monoNow + 1.seconds, (Running r) { assert(false, r.name); }));
+    ModuleRun m;
+    assert(results.tryTake(m) && m.passed && m.name == "nano.blocked");
 }
 
 unittest // the test-only switch: a module that hangs, for the watchdog to catch

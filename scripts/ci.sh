@@ -72,7 +72,7 @@ unit() {
         NANO_TEST_BUDGET_SCALE=${NANO_TEST_BUDGET_SCALE:-${CI:+3}} dub test -q
     step "test watchdog names a hung module"
     # NANO_TEST_STUCK=1 adds a module that never returns; the watchdog must
-    # name it and fail the run within its hang bound (seconds, not hours).
+    # name it and fail the run within its hard limit (seconds, not hours).
     # perl's alarm survives exec: a parent-side deadline (SIGALRM kills the
     # runner) so a broken watchdog fails this check instead of hanging CI.
     status=0
@@ -84,7 +84,7 @@ unit() {
     if [ "$status" -eq 142 ]; then
         echo "the watchdog did not end the run within 300s:"; printf '%s\n' "$out" | tail -20; exit 1
     fi
-    printf '%s\n' "$out" | grep -q "unit-test watchdog: a module hung: nano.testenv_test" \
+    printf '%s\n' "$out" | grep -q "1 module FAILED unittests: nano.testenv_test (hung past" \
         || { echo "the watchdog did not name the stuck module:"; printf '%s\n' "$out" | tail -20; exit 1; }
 }
 

@@ -484,6 +484,12 @@ struct Config
     /// queued (`session_messages_confirm`, default true); off, it is queued
     /// (or starts a turn) at once.
     bool sessionMessagesConfirm = true;
+    /// The most hops a message thread between sessions may take
+    /// (`session_messages_max_hops`, default 4; issue #350).
+    uint sessionMessagesMaxHops = 4;
+    /// The most messages one session may send another per hour
+    /// (`session_messages_max_per_hour`, default 10, 0: no cap; issue #350).
+    uint sessionMessagesMaxPerHour = 10;
     /// Inter-session messages for `--acp` sessions (`acp_session_messages`,
     /// default false; issue #347). ACP ignores `session_messages`: a worker
     /// runs unattended, so it joins the registry only when opted in here or
@@ -581,6 +587,12 @@ struct Config
         if (auto v = "session_messages" in doc) c.sessionMessages = v.boolean;
         if (auto v = "acp_session_messages" in doc) c.acpSessionMessages = v.boolean;
         if (auto v = "session_messages_confirm" in doc) c.sessionMessagesConfirm = v.boolean;
+        import std.algorithm : clamp;
+        import std.conv : to;
+        if (auto v = "session_messages_max_hops" in doc)
+            c.sessionMessagesMaxHops = clamp(v.integer, 1, 1000).to!uint;
+        if (auto v = "session_messages_max_per_hour" in doc)
+            c.sessionMessagesMaxPerHour = clamp(v.integer, 0, 100_000).to!uint;
         if (auto v = "session_dir" in doc) c.sessionDir = v.str;
         if (auto v = "session_compress_after_days" in doc) c.sessionCompressAfterDays = v.integer;
         if (auto v = "session_retention_days" in doc) c.sessionRetentionDays = v.integer;
