@@ -323,7 +323,8 @@ string applyChanges(string doc, const ref Config c, const ref Changes ch, const 
     }
     if (ch.subagentModels)
     {
-        doc = tomlSet(doc, [], "subagent_models", null);
+        // replaceSubagentModels drops root keys itself; a tomlSet first
+        // would choke on a dotted root definition before it ran.
         doc = replaceSubagentModels(doc, c.subagentModels);
     }
     if (ch.sessionMessages) doc = tomlSet(doc, [], "session_messages", c.sessionMessages ? "true" : "false");
@@ -732,6 +733,21 @@ unittest
             else assert(v is null, out_);
         }
     }
+}
+
+unittest
+{
+    // applyChanges (not just the helper) rewrites a root dotted definition.
+    import nano.config : SubagentModel;
+    Config c;
+    c.subagentModels = [SubagentModel("c/z", "", 0, 0, 0)];
+    Changes ch;
+    ch.subagentModels = true;
+    ProviderConfig[string] user;
+    auto out_ = applyChanges("subagent_models.x = 1\nmodel = \"m\"\n", c, ch, user);
+    assert(checkLoadable(out_).isOk, out_);
+    import std.algorithm : canFind;
+    assert(!out_.canFind("subagent_models.x") && out_.canFind("c/z"), out_);
 }
 
 unittest
