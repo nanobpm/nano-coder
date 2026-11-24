@@ -100,7 +100,7 @@ UnitTestResult runModuleTests() @trusted
     import std.algorithm : sort;
     import std.conv : to;
     import std.process : environment;
-    import nano.safeio : Chan, spawn, stdErr;
+    import nano.safeio : Chan, Shared, spawn, spawnDaemon, stdErr;
     immutable(TestEntry)[] all;
     foreach (m; ModuleInfo)
         if (m !is null && m.unitTest !is null) all ~= immutable TestEntry(m.name, cast(void function() @safe) m.unitTest);
@@ -110,30 +110,34 @@ UnitTestResult runModuleTests() @trusted
     const startLoad = calibrate();
     auto results = Chan!ModuleRun.make;
     auto queue = Chan!size_t.make;
+    const scaleText = environment.get("NANO_TEST_BUDGET_SCALE");
+    const scale = scaleText.length ? scaleText.to!double : 1.0;
+    auto running = Shared!(immutable(Running)[]).make;
+    auto limits = hardLimits(scale);
+    spawnDaemon(&watchdog, running);
     if (jobs > 1)
     {
         // Modules that change process-wide state go first, alone.
         foreach (i, e; all) if (e.name in serial) queue.put(i);
         queue.close();
-        runQueue(all, queue, results);
+        runQueue(all, queue, results, running, limits);
         queue = Chan!size_t.make;
         foreach (i, e; all) if (e.name !in serial) queue.put(i);
     }
     else foreach (i; 0 .. all.length) queue.put(i);
     queue.close();
-    if (jobs <= 1) runQueue(all, queue, results);
+    if (jobs <= 1) runQueue(all, queue, results, running, limits);
     else
     {
-        typeof(spawn(&runQueue, all, queue, results))[] workers;
-        foreach (_; 0 .. jobs) workers ~= spawn(&runQueue, all, queue, results);
+        typeof(spawn(&runQueue, all, queue, results, running, limits))[] workers;
+        foreach (_; 0 .. jobs) workers ~= spawn(&runQueue, all, queue, results, running, limits);
         foreach (ref w; workers) w.join();
     }
     results.close();
     ModuleRun[] runs;
     ModuleRun r;
     while (results.take(r)) runs ~= r;
-    const scaleText = environment.get("NANO_TEST_BUDGET_SCALE");
-    checkBudgets(runs, scaleText.length ? scaleText.to!double : 1.0, true, startLoad);
+    checkBudgets(runs, scale, true, startLoad);
     auto top = environment.get("NANO_TEST_TIMES");
     if (top.length)
     {
@@ -180,7 +184,8 @@ unittest
 // above) and catches Throwable: a failed assert is an Error, and a runner must
 // report it and go on, as druntime's does.
 void runQueue(immutable(TestEntry)[] all, imported!"nano.safeio".Chan!size_t queue,
-    imported!"nano.safeio".Chan!ModuleRun results) @trusted
+    imported!"nano.safeio".Chan!ModuleRun results, imported!"nano.safeio".Shared!(immutable(Running)[]) running,
+    immutable(HardLimit)[] limits) @trusted
 {
     import std.process : environment;
     import nano.safeio : stdErr;
@@ -191,6 +196,14 @@ void runQueue(immutable(TestEntry)[] all, imported!"nano.safeio".Chan!size_t que
         if (trace) stdErr.writefln("test start %s", all[i].name);
         scope (exit) if (trace) stdErr.writefln("test end %s", all[i].name);
         const start = monoNow;
+        immutable entry = immutable Running(all[i].name, hardLimitOf(limits, all[i].name), start);
+        running.update((ref immutable(Running)[] r) { r ~= entry; });
+        scope (exit) running.update((ref immutable(Running)[] r) {
+            import std.algorithm : remove;
+            import std.array : array;
+            import std.algorithm : filter;
+            r = r.filter!(x => x != entry).array;
+        });
         bool ok = true;
         string reason;
         try all[i].run();
@@ -202,6 +215,91 @@ void runQueue(immutable(TestEntry)[] all, imported!"nano.safeio".Chan!size_t que
             reason = format("%s at %s(%s)", typeid(t).name.findLastDot, t.file, t.line);
         }
         results.put(ModuleRun(all[i].name, since(start).total!"msecs", ok, reason));
+    }
+}
+
+/// A module whose tests are running: its hard limit and when it started.
+struct Running
+{
+    string name;
+    long hardLimitMs;
+    imported!"core.time".MonoTime start;
+}
+
+/// The least hard limit: below it the watchdog never ends the run.
+enum minHardLimitMs = 10_000;
+
+/// Each module's hard limit, in msecs: twice its budget at the most load
+/// `checkBudgets` allows, so a module the watchdog stops would have failed
+/// its budget anyway. The `""` key holds the default.
+immutable(HardLimit)[] hardLimits(double scale)
+{
+    import std.array : split;
+    import std.conv : to;
+    HardLimit[] r;
+    long hard(long budget) { const h = cast(long)(budget * scale * maxLoadFactor * 2); return h > minHardLimitMs ? h : minHardLimitMs; }
+    foreach (name, rest; listedModules("scripts/slow-tests")) r ~= HardLimit(name, hard(rest.split[0].to!long));
+    r ~= HardLimit("", hard(defaultBudgetMs));
+    return r.idup;
+}
+
+/// A module's hard limit (`""`: the default).
+struct HardLimit { string name; long ms; }
+
+/// `module`'s hard limit in `limits`, else the default entry's.
+long hardLimitOf(const HardLimit[] limits, string module_) pure
+{
+    long fallback = minHardLimitMs;
+    foreach (l; limits)
+    {
+        if (l.name == module_) return l.ms;
+        if (l.name == "") fallback = l.ms;
+    }
+    return fallback;
+}
+
+/// The first running module past its hard limit at `now`, if any.
+imported!"nano.option".Option!Running overdue(const Running[] running, imported!"core.time".MonoTime now)
+{
+    import nano.option : some, Option;
+    foreach (r; running)
+        if ((now - r.start).total!"msecs" > r.hardLimitMs) return some(Running(r.name, r.hardLimitMs, r.start));
+    return Option!Running.init;
+}
+
+unittest
+{
+    import core.time : MonoTime, msecs;
+    auto t0 = monoNow;
+    auto rs = [Running("a", 100, t0), Running("b", 50, t0 + 10.msecs)];
+    assert(overdue(rs, t0 + 60.msecs).isNone);
+    import nano.option : unwrap;
+    assert(overdue(rs, t0 + 61.msecs).unwrap("b is overdue").name == "b");
+    assert(overdue(rs, t0 + 101.msecs).unwrap("a is overdue").name == "a");
+    assert(hardLimitOf(hardLimits(1.0), "nano.nonesuch") >= minHardLimitMs);
+    assert(hardLimitOf([HardLimit("x", 20_000), HardLimit("", 12_000)], "x") == 20_000);
+    assert(hardLimitOf([HardLimit("x", 20_000), HardLimit("", 12_000)], "y") == 12_000);
+}
+
+/// Ends the run when a module's tests outlive their hard limit: a test that
+/// hangs (a refused retry loop, a lost wakeup) can't be joined, so the run
+/// names the module and exits failing instead of never finishing (#358).
+void watchdog(imported!"nano.safeio".Shared!(immutable(Running)[]) running)
+{
+    import core.time : msecs;
+    import nano.clock : sleepFor;
+    import nano.safeio : exitProcess, stdErr;
+    while (true)
+    {
+        sleepFor(250.msecs);
+        foreach (r; overdue(running.get(), monoNow))
+        {
+            stdErr.writefln("%s: unit tests still running after %s ms, over the %s ms hard limit: "
+                ~ "the module hangs; failing the run", r.name, since(r.start).total!"msecs", r.hardLimitMs);
+            stdErr.writefln("1 module FAILED unittests: %s (hung past %s ms)", r.name, r.hardLimitMs);
+            stdErr.flush();
+            exitProcess(1);
+        }
     }
 }
 
