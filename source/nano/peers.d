@@ -1154,6 +1154,26 @@ unittest // restoredMessages: the record wins; unrecorded settings reset only on
     assert(restoredMessages(-1, -1, true, true, false) == MessagesTarget(1, 0));
 }
 
+/// Move an open listener to `newId` after the session log moved to a
+/// recovery id (issue #338), so peers reach the session under its current
+/// id: listen under the new id first, then close the old listener (which
+/// removes its socket). Does nothing when no listener is open. Never throws
+/// (it runs on the log's append path): returns why the new socket couldn't
+/// be bound, keeping the old listener; null on success.
+string moveListener(ref PeerListener[] listener, string dir, string newId, Chan!PeerRequest requests) nothrow
+{
+    if (!listener.length) return null;
+    import std.exception : collectException;
+    PeerListener[] next;
+    if (auto e = collectException(next = [PeerListener.listen(dir, newId, requests)]))
+        return "messages still go to the old id: " ~ e.msg;
+    // A failed close leaves only a stale socket: the new listener is what counts.
+    foreach (ref l; listener)
+        if (collectException(l.close())) {}
+    listener = next;
+    return null;
+}
+
 /// Bring the live messaging state to `t` after a resume (issue #336), once
 /// the session's log and id are set so `start` binds the resumed session's
 /// socket. `listening`: a listener is open; `messagesOn`: the agent's switch,
@@ -1652,4 +1672,53 @@ unittest // listen: an unremovable stale path is a ListenError, not a FileExcept
     mkdirRecurse(buildPath(dir, "blocked.sock", "child"));
     scope (exit) if (dir.exists) rmdirRecurse(dir);
     assertThrown!ListenError(PeerListener.listen(dir, "blocked", Chan!PeerRequest.make));
+}
+
+// issue #338: a log recovered to `<id>.recovered-1` moves the listener with
+// it: a send to the new id is delivered and the old socket path is gone.
+unittest
+{
+    import std.file : exists, tempDir, mkdirRecurse, rmdirRecurse, remove, write;
+    import std.path : buildPath;
+    import nano.control : TurnControl;
+    import nano.session : SessionLog;
+    import nano.llm : Message;
+    import core.atomic : atomicLoad;
+    auto root = buildPath(tempDir, "nd-rec");
+    if (root.exists) rmdirRecurse(root);
+    scope (exit) rmdirRecurse(root);
+    mkdirRecurse(root);
+    auto control = new shared TurnControl;
+    auto router = PeerRouter.make(atomicLoad(control));
+    router.confirm(false);
+    auto log = new SessionLog(buildPath(root, "sessions"), "mock/m", root, "r");
+    scope (exit) log.close();
+    log.warn = (string m) {};
+    PeerListener[] listener = [PeerListener.listen(root, "r", router.requests)];
+    scope (exit) foreach (ref l; listener) l.close();
+    string failed = "unset";
+    log.onIdChangeListener = (string oldId, string newId) {
+        failed = moveListener(listener, root, newId, router.requests);
+    };
+    auto sys = Message.system("sys");
+    log.append(sys);
+    // A different (non-prefix) file at the path forces a recovery log.
+    remove(log.path);
+    write(log.path, "{\"type\":\"session\",\"data\":{\"id\":\"other\"}}\n");
+    auto m = Message.user("after");
+    log.append(m);
+    assert(log.id == "r.recovered-1", log.id);
+    assert(failed is null, failed);
+    assert(!socketPath(root, "r").exists, "the old socket is gone");
+    auto pump = TestPump.start(router);
+    string note;
+    auto status = send(root, "r.recovered-1", PeerMessage("sess-sender", null, "hi", "m-1", false), note);
+    pump.stop();
+    assert(status == Status.delivered, note);
+    Inbound inbound;
+    assert(router.takeWaiting(inbound) && inbound.pm.text == "hi");
+    settle(inbound, true);
+    // No listener open: nothing to move.
+    PeerListener[] none;
+    assert(moveListener(none, root, "x", router.requests) is null && none.length == 0);
 }

@@ -886,6 +886,10 @@ class SessionLog
     /// so the owner can move state keyed on the id (the handle claim). Runs
     /// on the append path: whatever it throws is swallowed.
     void delegate(string oldId, string newId) onIdChange;
+    /// Like `onIdChange`, for the peer listener (issue #338): it moves the
+    /// session's socket to the new id. A separate slot so the handle claim
+    /// and the listener don't overwrite each other's hook.
+    void delegate(string oldId, string newId) onIdChangeListener;
 
     /// Show `msg` to the user: through `warn` when set, else on stderr.
     void report(string msg)
@@ -1057,6 +1061,12 @@ class SessionLog
             import std.exception : collectException;
             // The recovery already succeeded: a failing hook must not fail the write.
             if (auto e = collectException(onIdChange(oldId, id))) report("WARNING: " ~ e.msg);
+        }
+        if (id != oldId && onIdChangeListener)
+        {
+            import std.exception : collectException;
+            // As above: the recovery succeeded whatever the hook does.
+            if (auto e = collectException(onIdChangeListener(oldId, id))) report("WARNING: " ~ e.msg);
         }
     }
 

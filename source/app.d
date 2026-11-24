@@ -4060,6 +4060,20 @@ int runMain(string[] args)
         }
         catch (ListenError e) return e.msg;
     }
+    // A recovery moved the log to a new id (issue #338): move the socket
+    // with it. Deliveries to the old id are still this session's, so the
+    // router keeps them. A failure is reported by the log (it runs on the
+    // append path, which swallows what the hook throws).
+    void peerIdChanged(string oldId, string newId)
+    {
+        import nano.peers : moveListener, peersDir;
+        if (auto failed = moveListener(peerListener, peersDir(), newId, peerRouter.requests))
+            throw new Exception("messages: " ~ failed);
+    }
+    void watchLogId()
+    {
+        agent.log.ifSome((SessionLog l) { l.onIdChangeListener = &peerIdChanged; });
+    }
     // After a session switch (/restart, /resume): drop what was addressed
     // to the old session and listen under the new id. Routing only runs on
     // this thread, so nothing old was routed between the switch and here.
@@ -4067,6 +4081,7 @@ int runMain(string[] args)
     {
         // Old-session deliveries go even when messages are off already.
         peerRouter.discardAll();
+        watchLogId();
         if (!peerListener.length) return;
         stopPeerListener();
         if (auto failed = startPeerListener())
@@ -4078,6 +4093,7 @@ int runMain(string[] args)
     peerRouter = PeerRouter.make(agent.control.nonNull);
     peerRouter.confirm(cfg.sessionMessagesConfirm);
     agent.messagesWanted = cfg.sessionMessages;
+    watchLogId();
     if (cfg.sessionMessages)
         if (auto failed = startPeerListener())
             stdErr.writeln(console.red("[messages: " ~ failed ~ "]"));
