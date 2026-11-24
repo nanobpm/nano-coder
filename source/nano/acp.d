@@ -222,6 +222,9 @@ struct Host
     /// Whether a saved `provider/model` names a provider still configured
     /// (null: assume it does).
     bool delegate(string spec) savedModelKnown;
+    /// The canonical `provider/model` form of a verbatim model spec (a bare
+    /// model or alias in a session header). Null: the spec as given.
+    string delegate(string spec) canonicalModel;
     /// The configured context window for a model spec's provider (null: the
     /// startup window).
     ConfiguredWindow delegate(string spec) windowFor;
@@ -1201,8 +1204,9 @@ final class AcpServer : AgentEvents
         // live) belongs to that model: it does not apply to a fallback.
         // One recorded without a model belongs to the header's model.
         const windowOwner = st.model.length ? st.model : headerModel;
-        const windowApplies = !windowOwner.length
-            || agent.client.providerName ~ "/" ~ agent.client.modelName == windowOwner;
+        const liveModel = agent.client.providerName ~ "/" ~ agent.client.modelName;
+        const windowApplies = !windowOwner.length || windowOwner == liveModel
+            || (host.canonicalModel !is null && host.canonicalModel(windowOwner) == liveModel);
         if (!windowApplies) {}
         else if (st.contextWindow > 0)
             agent.setConfiguredWindow(ConfiguredWindow(toSize(st.contextWindow), "the session's settings"));
@@ -1909,6 +1913,27 @@ unittest
         assert(srvW.run());
         assert(agentW.configuredWindow != 4_242, "model hdr/one's window applied to mock/mock");
         agentW.replaceLog(Option!SessionLog.init);
+    }
+
+    // A header naming the live model by a bare name or alias still owns the
+    // window: it is compared canonically, as the REPL does.
+    {
+        auto lb = new SessionLog(dir, "one", "/");
+        SessionSettings ws;
+        ws.contextWindow = 4_343;
+        lb.settings(ws);
+        auto sidB = lb.id;
+        lb.close();
+        Host hostB = host3;
+        hostB.makeClient = (string spec) => new NamedMock("hdr", "one");
+        hostB.canonicalModel = (string spec) => spec == "one" ? "hdr/one" : spec;
+        auto agentB = new Agent(new NamedMock("hdr", "one"), new ToolRegistry, Policy.init, null);
+        auto srvB = new AcpServer(agentB, hostB, (string l) {});
+        srvB.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ sidB ~ `"}}`);
+        srvB.close();
+        assert(srvB.run());
+        assert(agentB.configuredWindow == 4_343, "a bare header model lost its window");
+        agentB.replaceLog(Option!SessionLog.init);
     }
 
     // A `session/new` under startup `--plan` records plan mode, so a

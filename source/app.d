@@ -3651,6 +3651,7 @@ int runMain(string[] args)
         host.plan = plan;
         host.modeSystemPrompt = (string dir, bool p) => systemFor(dir, p);
         host.savedModelKnown = (string s) => savedProviderKnown(s, cfg.providers);
+        host.canonicalModel = (string s) { static import nano.recents; return nano.recents.canonical(s, cfg.providers, cfg.defaultProvider); };
         host.windowFor = (string s) => windowFor(cfg, resolve(cfg, s).config);
         host.providerWindowFor = (string s) => providerWindow(resolve(cfg, s).config.contextWindow);
         host.sessionDir = o.noSession ? null : sessionDir;
