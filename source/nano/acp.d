@@ -1175,7 +1175,7 @@ final class AcpServer : AgentEvents
         if (st.thinking.length)
         {
             auto setting = sessionSetting(st.thinking);
-            if (!setting.isErr) agent.sessionThinking = setting.unwrap("isOk");
+            if (!setting.isErr) agent.sessionThinking = resultUnwrap(setting, "isOk");
             else stdErr.writeln("nano-coder: ACP session/load: the saved thinking level is invalid: ",
                 setting.unwrapErr("isErr"));
         }
