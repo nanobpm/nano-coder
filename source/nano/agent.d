@@ -4646,6 +4646,7 @@ class Agent
             s.model = c.providerName ~ "/" ~ c.modelName;
             import std.conv : to;
             s.contextWindow = window.tokens.to!long;
+            s.contextWindowFromProvider = window.source == "provider context_window";
             logSettings(s);
         }
         client = c;

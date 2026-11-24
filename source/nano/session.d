@@ -1325,6 +1325,7 @@ class SessionLog
         if (s.autoCompact >= 0) d["auto_compact"] = s.autoCompact != 0;
         if (!s.autoCompactThreshold.isNaN) d["auto_compact_threshold"] = s.autoCompactThreshold;
         if (s.contextWindow >= 0) d["context_window"] = s.contextWindow;
+        if (s.contextWindow > 0) d["context_window_source"] = s.contextWindowFromProvider ? "provider" : "user";
         if (s.messages >= 0) d["session_messages"] = s.messages != 0;
         if (s.messagesConfirm >= 0) d["session_messages_confirm"] = s.messagesConfirm != 0;
         write_(record("settings", d));
@@ -1665,6 +1666,10 @@ struct SessionSettings
     double autoCompactThreshold = double.nan;
     /// The context-window override in tokens; 0 clears it (-1: unchanged).
     long contextWindow = -1;
+    /// `contextWindow` is a snapshot of the provider's own `context_window`
+    /// (a model switch records it), not an explicit override: a resume must
+    /// not carry it to another provider (issue #315).
+    bool contextWindowFromProvider;
     /// Inter-session messages (`/messages on|off`, issue #336): 1 on, 0 off, -1 unchanged.
     int messages = -1;
     /// `/messages confirm on|off` (issue #336): 1 on, 0 off, -1 unchanged.
@@ -1679,7 +1684,8 @@ struct SessionSettings
             && subagents == o.subagents && compactionMode == o.compactionMode && autoCompact == o.autoCompact
             && (autoCompactThreshold == o.autoCompactThreshold
                 || (autoCompactThreshold.isNaN && o.autoCompactThreshold.isNaN))
-            && contextWindow == o.contextWindow && messages == o.messages
+            && contextWindow == o.contextWindow && contextWindowFromProvider == o.contextWindowFromProvider
+            && messages == o.messages
             && messagesConfirm == o.messagesConfirm;
     }
 }
@@ -2683,7 +2689,24 @@ private Restored restoreLog(string path, bool skipSuperseded, bool slimStash = t
             if (auto v = "context_window" in data)
             {
                 ulong n;
-                if (jsonUnsigned(*v, n) && n <= long.max) r.settings.contextWindow = n.to!long;
+                if (jsonUnsigned(*v, n) && n <= long.max)
+                {
+                    r.settings.contextWindow = n.to!long;
+                    // The source travels with its window (issue #315). A
+                    // marked record says which it is; an unknown mark is a
+                    // provider snapshot. A legacy unmarked record is a
+                    // model-switch snapshot when it also carries a `model`
+                    // and a /settings Context edit (an override) when not.
+                    // Accepted trade-off: a legacy /settings-only override
+                    // followed by a model switch reads back as that switch's
+                    // provider snapshot, so the override is dropped on resume
+                    // (the safe direction: never pin a stale window).
+                    auto src = "context_window_source" in data;
+                    if (src !is null && src.type == JSONType.string)
+                        r.settings.contextWindowFromProvider = src.str != "user";
+                    else
+                        r.settings.contextWindowFromProvider = ("model" in data) !is null;
+                }
             }
             if (auto v = "session_messages" in data)
                 if (v.type == JSONType.true_ || v.type == JSONType.false_)
@@ -3378,6 +3401,30 @@ unittest
     auto more = Message.user("more");
     again.append(more);
     assert(restore(log.path).settings.model == "mock/c");
+    assert(!restore(log.path).settings.contextWindowFromProvider, "written without the provider mark: a user override");
+    assert(imported!"std.algorithm".canFind(readText(log.path), `"context_window_source":"user"`));
+    // A provider snapshot keeps its source; a later override drops it.
+    SessionSettings snap;
+    snap.contextWindow = 128_000;
+    snap.contextWindowFromProvider = true;
+    again.settings(snap);
+    assert(restore(log.path).settings.contextWindowFromProvider);
+    SessionSettings explicitSame;
+    explicitSame.contextWindow = 128_000;
+    again.settings(explicitSame);
+    assert(!restore(log.path).settings.contextWindowFromProvider);
+    import std.file : append;
+    // A legacy unmarked model-switch snapshot is provider-derived.
+    append(log.path, `{"type":"settings","data":{"model":"p/m","context_window":90000}}` ~ "\n");
+    assert(restore(log.path).settings.contextWindow == 90_000);
+    assert(restore(log.path).settings.contextWindowFromProvider, "unmarked legacy snapshot promoted to an override");
+    // A legacy unmarked /settings Context edit (no model) is an override.
+    append(log.path, `{"type":"settings","data":{"context_window":50000,"auto_compact":true}}` ~ "\n");
+    assert(restore(log.path).settings.contextWindow == 50_000);
+    assert(!restore(log.path).settings.contextWindowFromProvider, "legacy explicit edit demoted to a snapshot");
+    // An unknown mark fails toward provider.
+    append(log.path, `{"type":"settings","data":{"context_window":60000,"context_window_source":"x"}}` ~ "\n");
+    assert(restore(log.path).settings.contextWindowFromProvider);
 }
 
 // issue #336: the messaging switch and its confirm setting round-trip; the
