@@ -200,12 +200,23 @@ here=$(measure . "the working tree") || exit 1
 # The commit messages of pull request $1, separated by blank lines:
 # NANO_RATCHET_PR_MESSAGES_DIR/<n> when set (tests), else the GitHub API when
 # GITHUB_REPOSITORY is set (CI, with GH_TOKEN); nothing otherwise.
-pr_messages() {
+# The Ratchet-Override values of PR $1's commits, but only when PR $1 is
+# merged and its merge commit is $2: a `(#N)` subject alone proves nothing.
+# Each message is parsed on its own with Git's trailer parser, so example
+# text in a body is ignored and keys match case-insensitively, as in git log.
+pr_overrides() {
     if [ -n "${NANO_RATCHET_PR_MESSAGES_DIR:-}" ]; then
-        cat "$NANO_RATCHET_PR_MESSAGES_DIR/$1" 2>/dev/null
+        d=$NANO_RATCHET_PR_MESSAGES_DIR/$1
+        [ "$(cat "$d/merge_commit_sha" 2>/dev/null)" = "$2" ] || return 0
+        for f in "$d"/msg*; do
+            [ -f "$f" ] && git interpret-trailers --parse < "$f"
+        done
     elif [ -n "${GITHUB_REPOSITORY:-}" ] && command -v gh >/dev/null 2>&1; then
-        gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$1/commits" --jq '.[].commit.message + "\n"' 2>/dev/null
-    fi
+        m=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$1" --jq 'select(.merged) | .merge_commit_sha' 2>/dev/null)
+        [ -n "$m" ] && [ "$m" = "$2" ] || return 0
+        gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$1/commits" --jq '.[].commit.message | @base64' 2>/dev/null |
+            while read -r b; do printf '%s' "$b" | base64 -d | git interpret-trailers --parse; done
+    fi | awk '{ i = index($0, ":"); if (i > 1 && tolower(substr($0, 1, i - 1)) == "ratchet-override") { v = substr($0, i + 1); sub(/^[ \t]+/, "", v); print v } }'
 }
 base_ref=${NANO_RATCHET_BASE:-origin/main}
 base=""
@@ -253,9 +264,9 @@ else
     # A squash merge keeps only the PR title `… (#N)` and the sign-offs, so the
     # trailers of the PR's commits are lost on main. For each commit whose
     # subject ends in `(#N)`, read the trailers of PR N's commits too.
-    pr_overrides=$(git log --format=%s "$base..HEAD" 2>/dev/null |
-        sed -n 's/.*(#\([0-9][0-9]*\))[[:space:]]*$/\1/p' | sort -u | while read -r pr; do
-            pr_messages "$pr" | sed -n 's/^Ratchet-Override:[[:space:]]*//p'
+    pr_overrides=$(git log --format='%H %s' "$base..HEAD" 2>/dev/null |
+        sed -n 's/^\([0-9a-f]*\) .*(#\([0-9][0-9]*\))[[:space:]]*$/\2 \1/p' | while read -r pr sha; do
+            pr_overrides "$pr" "$sha"
         done)
     overrides=$(printf '%s\n%s\n' "$overrides" "$pr_overrides" | grep .)
     short=$(git rev-parse --short "$base")

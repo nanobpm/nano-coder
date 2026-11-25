@@ -4,7 +4,8 @@
 #   - a change that adds a `@trusted` site fails;
 #   - one that removes a site passes without touching scripts/;
 #   - one that adds a site with a `Ratchet-Override` trailer passes and prints it;
-#   - a squash commit `… (#N)` finds the trailer in PR N's commits;
+#   - a squash commit `… (#N)` that is PR N's merge commit finds the
+#     trailers of PR N's commits;
 #   - a committed scripts/*-budget or *-floor file fails;
 #   - two branches that both improve one ratchet merge without conflict.
 set -eu
@@ -56,14 +57,23 @@ if check && grep -q 'Ratchet-Override: the fixture needs it' out; then ok "a Rat
 git checkout -q -b squash base
 add_trusted
 git commit -q -m 'add a @trusted site (#7)' -m 'Signed-off-by: test <test@example.com>'
-mkdir -p "$tmp/prs"
-printf 'add a @trusted site\n\nRatchet-Override: trusted-budget the PR needs it\n\n' > "$tmp/prs/7"
-printf 'unrelated\n\nRatchet-Override: trusted-budget wrong PR\n' > "$tmp/prs/8"
-if NANO_RATCHET_PR_MESSAGES_DIR="$tmp/prs" check && grep -q 'Ratchet-Override: the PR needs it' out; then ok "a squash merge finds the override in its PR's commits"; else no "a squash merge finds the override in its PR's commits"; fi
+sha=$(git rev-parse HEAD)
+mkdir -p "$tmp/prs/7" "$tmp/prs/8" "$tmp/prs/10"
+printf 'add a @trusted site\n\nratchet-override: trusted-budget the PR needs it\n' > "$tmp/prs/7/msg1"
+printf '%s\n' "$sha" > "$tmp/prs/7/merge_commit_sha"
+printf 'unrelated\n\nRatchet-Override: trusted-budget wrong PR\n' > "$tmp/prs/8/msg1"
+printf '%s\n' "$sha" > "$tmp/prs/8/merge_commit_sha"
+printf 'docs\n\nUse a footer such as\nRatchet-Override: trusted-budget body text\nin the body.\n\nSigned-off-by: test <test@example.com>\n' > "$tmp/prs/10/msg1"
+if NANO_RATCHET_PR_MESSAGES_DIR="$tmp/prs" check && grep -q 'Ratchet-Override: the PR needs it' out; then ok "a squash merge finds the override (any key case) in its PR's commits"; else no "a squash merge finds the override (any key case) in its PR's commits"; fi
+printf '0000000000000000000000000000000000000000\n' > "$tmp/prs/7/merge_commit_sha"
+if NANO_RATCHET_PR_MESSAGES_DIR="$tmp/prs" check; then no "a PR whose merge commit is another commit gives no override"; else ok "a PR whose merge commit is another commit gives no override"; fi
 git commit -q --amend -m 'add a @trusted site (#8x)'
 if NANO_RATCHET_PR_MESSAGES_DIR="$tmp/prs" check; then no "a squash without a PR override still fails"; else ok "a squash without a PR override still fails"; fi
 git commit -q --amend -m 'add a @trusted site (#9)'
 if NANO_RATCHET_PR_MESSAGES_DIR="$tmp/prs" check; then no "an unknown PR gives no override"; else ok "an unknown PR gives no override"; fi
+git commit -q --amend -m 'add a @trusted site (#10)'
+git rev-parse HEAD > "$tmp/prs/10/merge_commit_sha"
+if NANO_RATCHET_PR_MESSAGES_DIR="$tmp/prs" check; then no "an override in body text, not a trailer, is ignored"; else ok "an override in body text, not a trailer, is ignored"; fi
 
 # Remove one @trusted outside safeio.d: drop the attribute from its line.
 remove_trusted() {
