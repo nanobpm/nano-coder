@@ -643,7 +643,8 @@ unittest // fetching from a local server: conversion, paging, and a redirect to 
     string[] dns(string h) { return ["93.184.216.34"]; }
     auto srv = serve([
         Reply(200, "Content-Type: text/html; charset=utf-8\r\n", "<h1>Hi</h1><script>x</script><p>Body text</p>"),
-        Reply(302, "Location: /next\r\n", ""),
+        // Relative: the test server only answers under its own path prefix.
+        Reply(302, "Location: next\r\n", ""),
         Reply(200, "Content-Type: text/plain\r\n", "0123456789"),
         Reply(302, "Location: http://localhost:1/\r\n", ""),
         Reply(200, "Content-Type: application/pdf\r\n", "%PDF"),
