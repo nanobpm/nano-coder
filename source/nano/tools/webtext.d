@@ -600,7 +600,7 @@ Result!(Url, string) parseUrl(string text)
     if (!tail.length) tail = "/";
     else if (tail[0] == '?') tail = "/" ~ tail;
     foreach (c; tail) if (c < ' ' || c == ' ' || c == 0x7f) return R.err("URL contains spaces or control characters");
-    u.path = tail;
+    u.path = removeDotSegments(tail);
     return R.ok(u);
 }
 
@@ -615,15 +615,16 @@ Result!(Url, string) resolveLocation(Url base, string location)
     if (l.startsWith("#") || !l.length) return parseUrl(base.toString);
     auto dir = pathOnly(base.path);
     auto slash = dir.lastIndexOfChar('/');
-    return parseUrl(base.origin ~ removeDotSegments(dir[0 .. slash + 1] ~ l));
+    return parseUrl(base.origin ~ dir[0 .. slash + 1] ~ l); // parseUrl drops the fragment, then dot segments
 }
 
-/// RFC 3986 5.2.4 dot-segment removal on a path (any `?query` kept as is):
-/// `/a/b/../c` is `/a/c`, `/a/..` is `/`.
+/// RFC 3986 5.2.4 dot-segment removal on a path (any `?query` or `#fragment`
+/// kept as is): `/a/b/../c` is `/a/c`, `/a/..` is `/`.
 string removeDotSegments(string pathAndQuery) pure nothrow
 {
     import std.array : join, split;
-    auto q = pathAndQuery.indexOf('?');
+    ptrdiff_t q = -1;
+    foreach (k, c; pathAndQuery) if (c == '?' || c == '#') { q = k; break; }
     auto path = q < 0 ? pathAndQuery : pathAndQuery[0 .. q];
     auto query = q < 0 ? "" : pathAndQuery[q .. $];
     auto parts = path.split("/");
@@ -654,6 +655,14 @@ unittest
     auto first = resolveLocation(base, "..").orThrow!(e => new Exception(e));
     assert(first.path == "/");
     assert(resolveLocation(first, "next").orThrow!(e => new Exception(e)).toString == "https://h/next");
+    assert(removeDotSegments("/a/x#/../../y") == "/a/x#/../../y");
+    auto abc = parseUrl("https://h/a/b/c").orThrow!(e => new Exception(e));
+    string res(string l) { return resolveLocation(abc, l).orThrow!(e => new Exception(e)).toString; }
+    assert(res("/a/../b") == "https://h/b");
+    assert(res("//h/a/./../b") == "https://h/b");
+    assert(res("https://h/x/../y?q=../z") == "https://h/y?q=../z");
+    assert(res("x#/../../y") == "https://h/a/b/x");
+    assert(parseUrl("https://h/a/../b").orThrow!(e => new Exception(e)).path == "/b");
 }
 
 /// Whether `ref_` starts with a URI scheme (`ALPHA *(ALPHA / DIGIT / "+" / "-" / ".") ":"`),
