@@ -1138,19 +1138,19 @@ unittest
     if (which("brew") is null) return; // runInstaller needs brew on PATH
     string[] ran;
     auto rec = (string p, string[] a, const string[string] e) @safe { ran ~= p; return p == "git" ? 1 : 0; };
-    auto out_ = runInstaller(Channel.brew, "/x", "0.1.0", rec, (string e) @safe => "0.2.0", () @safe => "/tap");
+    auto out_ = runInstaller(Channel.brew, "/x", "0.1.0", rec, (string e) @safe => "0.2.0", () @safe => "/tap", (string d) @safe => true);
     assert(ran == ["git"], "a failed tap refresh stops before brew upgrade");
     assert(out_[0].canFind("git -C /tap pull") && out_[0].canFind("unchanged"), out_[0]);
     ran = null;
     auto failing = (string p, string[] a, const string[string] e) @safe { ran ~= p; return 1; };
-    out_ = runInstaller(Channel.brew, "/x", "0.1.0", failing, (string e) @safe => "0.2.0", () @safe => "/tap");
+    out_ = runInstaller(Channel.brew, "/x", "0.1.0", failing, (string e) @safe => "0.2.0", () @safe => "/tap", (string d) @safe => true);
     assert(ran == ["git"], "brew never runs when the tap refresh failed");
     assert(out_[0].canFind("git -C /tap pull") && out_[0].canFind("unchanged"), out_[0]);
     assert(!out_[0].canFind("full error: brew"), "the retry hint names the failed refresh, not brew upgrade");
     ran = null;
     auto noGit = (string p, string[] a, const string[string] e) @safe {
         ran ~= p; if (p == "git") throw new Exception("git: not found"); return 0; };
-    out_ = runInstaller(Channel.brew, "/x", "0.1.0", noGit, (string e) @safe => "0.2.0", () @safe => "/tap");
+    out_ = runInstaller(Channel.brew, "/x", "0.1.0", noGit, (string e) @safe => "0.2.0", () @safe => "/tap", (string d) @safe => true);
     assert(ran == ["git"], "git missing from PATH stops before brew upgrade too");
     assert(out_[0].canFind("Could not run `env -u ") && out_[0].canFind(" git -C /tap pull") && out_[0].canFind("git: not found")
         && out_[0].canFind("unchanged") && !out_[0].canFind("status -1"), out_[0]);
@@ -1162,7 +1162,7 @@ unittest
         if (p == "brew") foreach (k; ["HOMEBREW_NO_AUTO_UPDATE", "HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK",
                 "HOMEBREW_NO_INSTALL_CLEANUP", "HOMEBREW_NO_ENV_HINTS"]) if (auto v = k in e) brewEnv[k] = *v;
         return 0; };
-    out_ = runInstaller(Channel.brew, "/x", "0.1.0", okRun, (string e) @safe => "0.2.0", () @safe => "/tap");
+    out_ = runInstaller(Channel.brew, "/x", "0.1.0", okRun, (string e) @safe => "0.2.0", () @safe => "/tap", (string d) @safe => true);
     assert(ran == ["git", "brew"], "a successful tap refresh is followed by brew upgrade");
     assert(out_[0].canFind("Updated to 0.2.0"), out_[0]);
     foreach (k; ["HOMEBREW_NO_AUTO_UPDATE", "HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK",
@@ -1171,7 +1171,7 @@ unittest
     // No tap checkout (tapRepo null): plain `brew upgrade` is the only step.
     ran = null;
     auto plainRun = (string p, string[] a, const string[string] e) @safe { ran ~= p; return 0; };
-    out_ = runInstaller(Channel.brew, "/x", "0.1.0", plainRun, (string e) @safe => "0.2.0", () @safe => cast(string) null);
+    out_ = runInstaller(Channel.brew, "/x", "0.1.0", plainRun, (string e) @safe => "0.2.0", () @safe => cast(string) null, (string d) @safe => true);
     assert(ran == ["brew"], "no tap checkout: plain brew upgrade");
     assert(out_[0].canFind("Updated to 0.2.0"), out_[0]);
     // A throwing tap lookup is reported as the lookup, not the unattempted upgrade.
