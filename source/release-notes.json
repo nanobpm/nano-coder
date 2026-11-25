@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.35.1", "date": "2026-11-25", "items": [
+      {"type":"fix","scope":"frame","title":"coalesce editor draws so key repeat doesn't queue up","pr":383}
+    ]},
     {"version": "1.35.0", "date": "2026-11-25", "items": [
       {"type":"feat","scope":"terminal","title":"report session state with the Program Status Protocol (OSC 7501)","pr":382}
     ]},
@@ -441,9 +444,6 @@
     ]},
     {"version": "0.55.0", "date": "2026-10-28", "items": [
       {"type":"feat","scope":"","title":"add /version command","pr":153}
-    ]},
-    {"version": "0.54.0", "date": "2026-10-27", "items": [
-      {"type":"feat","scope":"","title":"wait for network reconnection instead of failing the turn (Closes #148)","pr":149}
     ]}
   ]
 }
