@@ -5,7 +5,7 @@
 #
 #   scripts/ci.sh [all|lint|test|quick]   (default: all)
 #
-#   lint   check-safe, parity manifest, ratchet tests, dscanner                    (CI job `lint`)
+#   lint   platform matrix, check-safe, parity manifest, ratchet tests, dscanner                    (CI job `lint`)
 #   test   unit tests, release build and smoke checks  (CI jobs `test (<os>)`)
 #   quick  check-safe, both builds typechecked, unit tests (pre-push)
 #   all    lint + test
@@ -31,6 +31,8 @@ typecheck() {
 }
 
 lint() {
+    step "platforms: PR CI tests every Release platform"
+    ./scripts/check-platforms.sh
     step "check-safe"
     # In CI the ratchets must be compared against the merge base (the
     # workflow fetches full history so origin/main is there); outside CI the

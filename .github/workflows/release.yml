@@ -100,6 +100,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # PR CI (ci.yml) must test every os here; scripts/check-platforms.sh
+        # enforces it.
         include:
           - { os: macos-15, target: aarch64-apple-darwin, npm: darwin-arm64 }
           - { os: macos-15-intel, target: x86_64-apple-darwin, npm: darwin-x64 }
