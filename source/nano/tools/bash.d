@@ -103,6 +103,135 @@ private struct RunStatus
     bool cancelled;
 }
 
+/// Whether a spawn error means our executable was replaced (an upgrade): the
+/// only failure that is permanent for this session.
+bool isUpgradeFailure(string msg) pure nothrow
+{
+    import std.algorithm : canFind;
+    return msg.canFind(" (deleted)");
+}
+
+/// The Linux sandbox helper's path (mirrors `nano.landlock.helperExe`, which
+/// only exists on Linux).
+private enum helperExe = "/proc/self/exe";
+
+/// Whether a spawn error is a failed launch of the Linux sandbox helper
+/// (`/proc/self/exe`): every sandboxed command would fail the same way, so it
+/// is permanent for this session. A bad working directory is not: it depends
+/// on the call, so it stays recoverable.
+bool isHelperFailure(string msg) pure nothrow
+{
+    import std.algorithm : canFind;
+    import std.uni : toLower;
+    import std.exception : assumeWontThrow;
+    auto lower = assumeWontThrow(msg.toLower);
+    // Call-specific failures (bad cwd, oversized argv/env) are recoverable:
+    // a different call can still start the helper.
+    if (lower.canFind("working directory") || lower.canFind("argument list too long")) return false;
+    return msg.canFind(helperExe);
+}
+
+/// The message for a command that could not be started: an executable whose
+/// path ends in " (deleted)" was replaced under this session (an upgrade), so
+/// say to restart instead of surfacing the raw exec error.
+string spawnFailure(string msg) pure
+{
+    if (isHelperFailure(msg) && !isUpgradeFailure(msg))
+        return "the bash tool's sandbox helper (" ~ helperExe ~ ") could not start; "
+            ~ "restart nano-coder (" ~ msg ~ ")";
+    if (isUpgradeFailure(msg))
+        return "nano-coder was upgraded under this session, so the bash tool can't start its helper; "
+            ~ "restart nano-coder (" ~ msg ~ ")";
+    return "could not start the command: " ~ msg;
+}
+
+unittest
+{
+    import std.algorithm : canFind, startsWith;
+    assert(spawnFailure("Failed to execute '/usr/bin/nano-coder (deleted)'").startsWith("nano-coder was upgraded"));
+    assert(spawnFailure("Failed to execute 'bash'").startsWith("could not start the command"));
+    assert(spawnFailure("Failed to execute '/proc/self/exe' (Permission denied)").canFind("sandbox helper"));
+    assert(isHelperFailure("Failed to execute '/proc/self/exe' (Permission denied)"));
+    assert(!isHelperFailure("Failed to set working directory '/nope' for '/proc/self/exe'"));
+    assert(!isHelperFailure("Failed to execute 'bash'"));
+    assert(!isHelperFailure("Failed to execute '/proc/self/exe' (Argument list too long)"));
+}
+
+/// The failure result a headless run records when its shell is gone: the
+/// agent can't write AGENT_RESULT_FILE itself without one, so its work would
+/// otherwise be reported as nothing at all.
+string fatalResultJson(string msg)
+{
+    import std.json : JSONValue;
+    return JSONValue(["status": "blocked", "summary": "bash tool unavailable: " ~ msg]).toString;
+}
+
+/// Write `fatalResultJson` to `$AGENT_RESULT_FILE` when it is set and the
+/// agent hasn't written a result yet (never overwrite a real one).
+void recordFatalResult(string msg)
+{
+    import std.stdio : File;
+    auto path = environment.get("AGENT_RESULT_FILE");
+    if (!path.length) return;
+    import std.exception : collectException;
+    // "wx" opens with O_CREAT | O_EXCL: creation fails if a result already
+    // exists, so a result written concurrently is never overwritten. Best
+    // effort: the ToolError still reports the failure if this can't write
+    // (including the exists case, which is the intended skip).
+    collectException({ auto f = File(path, "wx"); f.write(fatalResultJson(msg)); }());
+}
+
+/// The ToolError message for a failed spawn. Only the permanent upgrade case
+/// records a fatal result; an ordinary failure (bad cwd, missing bash) is
+/// recoverable, so AGENT_RESULT_FILE is left for the agent.
+string handleSpawnFailure(string raw)
+{
+    auto msg = spawnFailure(raw);
+    if (isUpgradeFailure(raw) || isHelperFailure(raw)) recordFatalResult(msg);
+    return msg;
+}
+
+unittest
+{
+    import std.file : exists, remove, tempDir;
+    import std.path : buildPath;
+    import std.conv : to;
+    import std.process : thisProcessID;
+    auto path = buildPath(tempDir, "nano-spawnfail-" ~ thisProcessID.to!string ~ ".json");
+    auto old = environment.get("AGENT_RESULT_FILE");
+    environment["AGENT_RESULT_FILE"] = path;
+    scope (exit)
+    {
+        if (old is null) environment.remove("AGENT_RESULT_FILE");
+        else environment["AGENT_RESULT_FILE"] = old;
+        if (path.exists) remove(path);
+    }
+    handleSpawnFailure("Failed to execute 'bash'");
+    assert(!path.exists);
+    handleSpawnFailure("Failed to set working directory '/nope' for '/proc/self/exe'");
+    assert(!path.exists);
+    handleSpawnFailure("Failed to execute '/usr/bin/nano-coder (deleted)'");
+    assert(path.exists);
+    remove(path);
+    handleSpawnFailure("Failed to execute '/proc/self/exe' (Argument list too long)");
+    assert(!path.exists);
+    handleSpawnFailure("Failed to execute '/proc/self/exe' (Permission denied)");
+    assert(path.exists);
+    // An existing (real) result is never overwritten.
+    import std.file : readText, fwrite = write;
+    fwrite(path, "real");
+    handleSpawnFailure("Failed to execute '/proc/self/exe' (Permission denied)");
+    assert(readText(path) == "real");
+}
+
+unittest
+{
+    import std.json : parseJSON;
+    auto j = parseJSON(fatalResultJson("restart nano-coder"));
+    assert(j["status"].str == "blocked");
+    assert(j["summary"].str == "bash tool unavailable: restart nano-coder");
+}
+
 private RunStatus runToFiles(string command, Duration timeout, string outPath, string errPath,
     string cwd = null, const SandboxConfig sandbox = SandboxConfig.init)
 {
@@ -117,7 +246,12 @@ private RunStatus runToFiles(string command, Duration timeout, string outPath, s
         try argv = sandbox.command("bash", command, cwd.length ? cwd : getcwd());
         catch (Exception e) throw new ToolError(e.msg);
     }
-    auto pid = spawnProcess(argv, inF, outF, errF, null, cfg, cwd);
+    Pid pid;
+    try pid = spawnProcess(argv, inF, outF, errF, null, cfg, cwd);
+    catch (ProcessException e)
+    {
+        throw new ToolError(handleSpawnFailure(e.msg));
+    }
     outF.close();
     errF.close();
     RunStatus r;

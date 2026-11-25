@@ -43,18 +43,36 @@ struct TestServer
 }
 
 /// Serve `replies` in order, one per connection, on 127.0.0.1.
+///
+/// The URL carries a path prefix unique to this server. Tests run on threads
+/// of one process, and a client of another test (a retry or an outage probe
+/// aimed at a port that has since closed) can connect to this server once
+/// the OS hands it the same port. Such a connection gets a 404 and does not
+/// use up a reply, so the test's own client still gets every reply
+/// (issue #388: a stray connection took the second reply and the retry
+/// found the server gone).
 TestServer serve(immutable(Reply)[] replies)
 {
+    import std.format : format;
+    import core.atomic : atomicOp;
+    static shared ulong servers;
+    immutable prefix = format("/srv%s-%s", processNonce, atomicOp!"+="(servers, 1));
     auto port = Chan!ushort.make;
     auto stop = Chan!bool.make;
-    auto h = spawn(&run, replies, port, stop);
+    auto h = spawn(&run, replies, prefix, port, stop);
     ushort p;
     port.take(p);
-    import std.format : format;
-    return TestServer(format("http://127.0.0.1:%s", p), h, stop);
+    return TestServer(format("http://127.0.0.1:%s%s", p, prefix), h, stop);
 }
 
-private immutable(Captured)[] run(immutable(Reply)[] replies, Chan!ushort port, Chan!bool stop)
+/// Differs between test processes, so a prefix can't match another run's.
+private ulong processNonce() nothrow
+{
+    import std.process : thisProcessID;
+    return thisProcessID;
+}
+
+private immutable(Captured)[] run(immutable(Reply)[] replies, string prefix, Chan!ushort port, Chan!bool stop)
 {
     import core.time : seconds;
     import std.algorithm : canFind;
@@ -69,18 +87,18 @@ private immutable(Captured)[] run(immutable(Reply)[] replies, Chan!ushort port, 
     listener.listen(8);
     port.put((cast(InternetAddress) listener.localAddress).port);
     immutable(Captured)[] seen;
-    for (size_t i = 0; i < replies.length;)
+    for (size_t next = 0; next < replies.length;)
     {
+        auto r = replies[next];
         if (!awaitClient(listener, stop)) break;
-        auto r = replies[i];
-        // On macOS accept fails (ECONNABORTED) for a client that reset
-        // before it was accepted, e.g. a timed-out connect on a loaded
-        // runner; that client consumes no reply, so wait for the next.
-        Socket conn;
-        try
-            conn = listener.accept();
-        catch (SocketAcceptException)
-            continue;
+        // Not `listener.accept()`: on macOS a client that already left makes
+        // it leave a GC finalizer that later closes a reused fd number
+        // (nano.safeio.acceptFd, issue #388).
+        import nano.safeio : acceptFd;
+        int acceptErr;
+        immutable fd = acceptFd(listener.handle, acceptErr);
+        if (fd == socket_t.init) continue;
+        auto conn = new Socket(fd, AddressFamily.INET);
         scope (exit) conn.close();
         char[] buf;
         char[4096] chunk;
@@ -100,15 +118,22 @@ private immutable(Captured)[] run(immutable(Reply)[] replies, Chan!ushort port, 
             }
             if (head >= 0 && buf.length >= head + 4 + want) break;
         }
-        // A client that hung up before sending a whole request (e.g. a
-        // connect that timed out under load) doesn't consume a reply: wait
-        // for the next one instead of shutting the server down.
-        if (head < 0) continue;
-        i++;
+        if (head < 0) continue; // no request on it: not our client
         auto headText = buf[0 .. head].idup;
         auto first = headText[0 .. headText.indexOf("\r\n") < 0 ? $ : headText.indexOf("\r\n")];
         auto sp1 = first.indexOf(' '), sp2 = first.indexOf(' ', sp1 + 1);
-        seen ~= Captured(first[0 .. sp1], first[sp1 + 1 .. sp2], headText, buf[head + 4 .. $].idup);
+        if (sp1 < 0 || sp2 < 0) continue;
+        auto path = first[sp1 + 1 .. sp2];
+        // Delimited match: server `/srv<pid>-1` must not take `/srv<pid>-10/...`.
+        immutable ours = path.startsWith(prefix)
+            && (path.length == prefix.length || path[prefix.length] == '/' || path[prefix.length] == '?');
+        if (!ours)
+        {
+            conn.send("HTTP/1.1 404 Status\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            continue;
+        }
+        next++;
+        seen ~= Captured(first[0 .. sp1], path[prefix.length .. $], headText, buf[head + 4 .. $].idup);
         if (r.dripMs > 0)
         {
             import core.thread : Thread;
@@ -166,4 +191,31 @@ unittest
     assert(perform(req, got) == 200);
     auto seen = srv.finish();
     assert(got == "hello" && seen.length == 1 && seen[0].method == "POST" && seen[0].path == "/p" && seen[0].body_ == "body");
+}
+
+// A connection from another test's client (stray: no request, or a path
+// without this server's prefix) doesn't use up a reply (issue #388).
+unittest
+{
+    import std.socket : TcpSocket, InternetAddress;
+    import std.string : indexOf, lastIndexOf;
+    import std.conv : to;
+    import nano.http : perform, Request;
+    auto srv = serve([immutable Reply(200, "", "mine")]);
+    immutable hostPort = srv.url["http://".length .. $];
+    immutable slash = hostPort.indexOf('/');
+    immutable port = hostPort[hostPort.lastIndexOf(':', slash) + 1 .. slash].to!ushort;
+    auto silent = new TcpSocket(new InternetAddress("127.0.0.1", port));
+    silent.close();
+    Request other;
+    other.url = "http://127.0.0.1:" ~ port.to!string ~ "/elsewhere";
+    string got;
+    assert(perform(other, got) == 404);
+    other.url = srv.url ~ "0/p"; // a sibling server's longer prefix
+    assert(perform(other, got) == 404);
+    Request req;
+    req.url = srv.url ~ "/p";
+    assert(perform(req, got) == 200 && got == "mine");
+    auto seen = srv.finish();
+    assert(seen.length == 1 && seen[0].path == "/p");
 }
