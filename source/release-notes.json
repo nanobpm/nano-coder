@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.35.2", "date": "2026-11-25", "items": [
+      {"type":"fix","scope":"sandbox","title":"keep the bash tool working after nano-coder is upgraded under a session","pr":391}
+    ]},
     {"version": "1.35.1", "date": "2026-11-25", "items": [
       {"type":"fix","scope":"frame","title":"coalesce editor draws so key repeat doesn't queue up","pr":383}
     ]},
@@ -441,9 +444,6 @@
     ]},
     {"version": "0.55.1", "date": "2026-10-29", "items": [
       {"type":"fix","scope":"search","title":"bound walker and ignore-loading resource use","pr":160}
-    ]},
-    {"version": "0.55.0", "date": "2026-10-28", "items": [
-      {"type":"feat","scope":"","title":"add /version command","pr":153}
     ]}
   ]
 }

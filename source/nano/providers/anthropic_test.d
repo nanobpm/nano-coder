@@ -8,9 +8,19 @@ import std.json;
 import nano.config : ResolvedProvider;
 import nano.llm;
 import nano.providers.anthropic;
+import nano.clock : FakeClock;
 import nano.thinking : Request, anthropicDefaultMaxTokens;
 
 private:
+
+/// Fake time for one test: retry backoffs and offline waits advance it
+/// instead of sleeping, so a loaded host can't outlast the test server's
+/// 10 s accept window.
+FakeClock fakeTime()
+{
+    import std.datetime.systime : SysTime;
+    return FakeClock.install(SysTime(0));
+}
 
 JSONValue body_(const ref ChatRequest req)
 {
@@ -174,6 +184,7 @@ unittest
     import std.algorithm : canFind;
     import std.string : toLower;
     import nano.testserver;
+    auto clock = fakeTime();
     auto srv = serve([
         immutable Reply(529, "retry-after: 0.01\r\n", `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`),
         immutable Reply(200, "", `{"content":[{"type":"text","text":"Let me check."},`
@@ -196,6 +207,7 @@ unittest
 unittest
 {
     import nano.testserver;
+    auto clock = fakeTime();
     enum start = `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`;
     auto truncated = sse([start, `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}`])
         ~ "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"wor";
@@ -218,6 +230,7 @@ unittest
 unittest
 {
     import nano.testserver;
+    auto clock = fakeTime();
     auto srv = serve([immutable Reply(200, "content-type: text/event-stream\r\n", sse([
         `{"type":"message_start","message":{"usage":{"input_tokens":20,"output_tokens":1}}}`,
         `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`,
