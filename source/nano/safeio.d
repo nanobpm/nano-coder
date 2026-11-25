@@ -149,6 +149,16 @@ int openPath(string path, int flags, uint mode = 0) @trusted nothrow
     return open(path.toStringz, flags, cast(mode_t) mode);
 }
 
+/// `access(path, W_OK)` (issue #384): whether the real user may write
+/// `path`, so `/update` can refuse an install prefix it can't write before
+/// running the installer.
+bool accessWritable(string path) @trusted nothrow
+{
+    import core.sys.posix.unistd : access, W_OK;
+    import std.string : toStringz;
+    return access(path.toStringz, W_OK) == 0;
+}
+
 /// `chmod(2)`; returns 0 or -1.
 int chmodPath(string path, uint mode) @trusted nothrow
 {
