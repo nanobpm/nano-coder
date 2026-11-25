@@ -380,10 +380,15 @@ the [permission rules and sandbox](#permissions-and-sandbox) instead.
 - `web_fetch(url, max_bytes?, offset?)` - GET an http/https page and return it as readable
   text (HTML is converted: scripts, styles, nav and footers dropped; headings, links as
   `[text](url)`, lists, code and tables kept). Returns at most `max_bytes` (default
-  `max_result_bytes`) from `offset`, plus the total length so the model can page on. Only
-  text, JSON and XML types are fetched; at most 5 redirects are followed.
+  `max_result_bytes`) from `offset`, plus the total length so the model can page on; the cap
+  covers the whole result, metadata included. Only text, JSON and XML types are fetched; at
+  most 5 redirects are followed. A redirect is approved again unless the first approval
+  covered its host (a Yes answer, `--web` or `--yolo`): a `--allow` rule covers only the
+  URLs it matches. Without an approval prompt (e.g. `TERM=dumb`) fetches follow the headless
+  default: allowed with `--web`, otherwise refused.
 
-Results are wrapped in `<untrusted source="web" url="…">…</untrusted>`; the model is told
+Results are wrapped in `<untrusted source="web" url="…">…</untrusted>` (a redirect target is
+shown only inside the block); the model is told
 instructions inside are data, not commands.
 
 ```toml

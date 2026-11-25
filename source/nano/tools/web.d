@@ -161,8 +161,16 @@ string resolveBraveKey(const WebConfig c)
 
 /// Asks whether a fetch may go ahead, given the call's arguments with
 /// `url` set to the (hop's) target, so argument-scoped allow rules still
-/// see the other fields; false when declined.
-alias Approve = bool delegate(JSONValue args) @safe;
+/// see the other fields.
+alias Approve = Approval delegate(JSONValue args) @safe;
+
+/// How far an `Approve` answer reaches.
+enum Approval
+{
+    no, /// declined
+    url, /// this URL only (an argument-scoped allow rule): every other hop is checked again
+    host, /// the whole host, for this fetch (the user said yes, or the default allows)
+}
 /// The permission policy's deny rules for one fetch's arguments (as for
 /// `Approve`): the reason they are refused, or null.
 alias PolicyCheck = string delegate(JSONValue args) @safe;
@@ -274,8 +282,11 @@ string hostRefusal(const WebConfig c, const Url u, scope Resolver resolve, out s
             return format("%s resolves to %s, %s; set [web] allow_private = true or list it in allowed_hosts",
                 u.host, a, why);
     immutable port = u.port ? u.port : u.scheme == "https" ? 443 : 80;
-    foreach (a; addrs)
-        pinned ~= format("%s:%s:%s", u.host, port, a.indexOf(':') >= 0 ? "[" ~ a ~ "]" : a);
+    // One entry with every address: curl keeps only the last entry for a
+    // host and port, which would drop the other address family.
+    string[] bracketed;
+    foreach (a; addrs) bracketed ~= a.indexOf(':') >= 0 ? "[" ~ a ~ "]" : a;
+    pinned ~= format("%s:%s:%-(%s,%)", u.host, port, bracketed);
     return null;
 }
 
@@ -302,10 +313,17 @@ Fetched fetchUrl(const WebConfig c, string url, scope Resolver resolve, scope Ho
     foreach (n; 0 .. maxRedirects + 1)
     {
         auto shown = u.toString;
+        // After a redirect the target (and any message naming it) is server
+        // text, so it reaches the model only inside an untrusted block.
+        ToolError fail(string detail)
+        {
+            return n == 0 ? new ToolError("web_fetch: " ~ detail)
+                : new ToolError(format("web_fetch: a redirect from %s failed:\n%s", url, wrapUntrusted(url, detail)));
+        }
         string[] pinned;
-        if (auto why = hostRefusal(c, u, resolve, pinned)) throw new ToolError(format("web_fetch refused %s: %s", shown, why));
+        if (auto why = hostRefusal(c, u, resolve, pinned)) throw fail(format("refused %s: %s", shown, why));
         if (hop !is null)
-            if (auto why = hop(shown)) throw new ToolError(format("web_fetch refused %s: %s", shown, why));
+            if (auto why = hop(shown)) throw fail(format("refused %s: %s", shown, why));
         Request req;
         req.method = "GET";
         req.url = shown;
@@ -325,15 +343,15 @@ Fetched fetchUrl(const WebConfig c, string url, scope Resolver resolve, scope Ho
         int status;
         try status = perform(req, body_, meta);
         catch (CurlException e)
-            throw new ToolError(format("web_fetch: %s failed: %s", shown, imported!"nano.http".curlReason(e.msg)));
+            throw fail(format("%s failed: %s", shown, imported!"nano.http".curlReason(e.msg)));
         if (status >= 300 && status < 400 && meta.location.length)
         {
             if (n == maxRedirects) throw new ToolError(format("web_fetch: more than %s redirects from %s", maxRedirects, url));
-            u = resolveLocation(u, meta.location).orThrow!(e => new ToolError(format("web_fetch: redirect from %s: %s", shown, e)));
+            u = resolveLocation(u, meta.location).orThrow!(e => fail(format("redirect from %s: %s", shown, e)));
             continue;
         }
         if (status < 200 || status >= 300)
-            throw new ToolError(format("web_fetch: %s returned HTTP %s", shown, status));
+            throw fail(format("%s returned HTTP %s", shown, status));
         return Fetched(shown, meta.contentType, body_, meta.truncated);
     }
     assert(0, "the loop returns or throws on its last pass");
@@ -357,17 +375,28 @@ string fetchResult(const WebConfig c, Fetched f, string requested, long offset, 
     case ContentKind.text: break;
     }
     if (offset < 0) throw new ToolError("web_fetch: offset must not be negative");
-    auto cap = maxBytes <= 0 ? c.maxResultBytes : maxBytes > c.maxResultBytes ? c.maxResultBytes : maxBytes;
-    auto page = pageOf(f.body_, offset, cap).orThrow!(e => new ToolError("web_fetch: " ~ e));
-    auto head = format("URL: %s\n", f.url);
-    if (f.url != requested) head ~= format("Redirected from: %s\n", requested);
-    // The bare, validated media type: the header's free text never leaves <untrusted>.
-    immutable mt = mediaType(f.contentType);
-    head ~= format("Content-Type: %s\n", mt.length ? mt : "unknown");
-    head ~= format("Bytes %s-%s of %s%s%s\n", page.offset, page.end, page.total,
-        page.end < page.total ? format(" (more: call again with offset %s)", page.end) : "",
-        f.truncated ? format("; the download stopped at max_download_bytes (%s)", c.maxDownloadBytes) : "");
-    return head ~ wrapUntrusted(f.url, page.text);
+    immutable cap = maxBytes <= 0 ? c.maxResultBytes : maxBytes > c.maxResultBytes ? c.maxResultBytes : maxBytes;
+    // The cap is on the whole result: shrink the page until the metadata,
+    // the wrapper and its escaping fit (each pass drops at least the excess).
+    size_t textCap = cap;
+    for (;;)
+    {
+        auto page = pageOf(f.body_, offset, textCap).orThrow!(e => new ToolError("web_fetch: " ~ e));
+        auto head = format("URL: %s\n", requested);
+        // The bare, validated media type: the header's free text never leaves <untrusted>.
+        immutable mt = mediaType(f.contentType);
+        head ~= format("Content-Type: %s\n", mt.length ? mt : "unknown");
+        head ~= format("Bytes %s-%s of %s%s%s\n", page.offset, page.end, page.total,
+            page.end < page.total ? format(" (more: call again with offset %s)", page.end) : "",
+            f.truncated ? format("; the download stopped at max_download_bytes (%s)", c.maxDownloadBytes) : "");
+        // A redirect target is server text: it stays inside the block.
+        auto inner = f.url != requested ? format("Redirected to: %s\n", f.url) ~ page.text : page.text;
+        auto result = head ~ wrapUntrusted(requested, inner);
+        // pageOf returns at least 4 bytes, so a page always advances.
+        if (result.length <= cap || textCap <= 4) return result;
+        immutable excess = result.length - cap;
+        textCap = excess >= textCap - 4 ? 4 : textCap - excess;
+    }
 }
 
 /// Run one search. Throws ToolError for a failure the model should read.
@@ -437,12 +466,14 @@ ToolDefinition fetchDefinition(const WebConfig c)
             "required":["url"]}`));
 }
 
-/// The per-hop check for one fetch: the policy's `hop` check, then, for a
-/// hop to a host not yet approved (a redirect elsewhere), `approve` again,
-/// so approving one URL never covers content from another host.
-HopCheck redirectGate(string approvedHost, JSONValue callArgs, Approve approve, PolicyCheck hop)
+/// The per-hop check for one fetch: the policy's `hop` check, then `approve`
+/// again for any hop not already covered. A host-wide approval (`first` is
+/// `Approval.host`) covers later hops on that host; an approval that only
+/// covered one URL (an allow rule) never covers a redirect elsewhere, even
+/// on the same host.
+HopCheck redirectGate(string approvedHost, Approval first, JSONValue callArgs, Approve approve, PolicyCheck hop)
 {
-    string[] approved = [hostKey(approvedHost)];
+    string[] approved = first == Approval.host ? [hostKey(approvedHost)] : null;
     return (string next) @safe {
         import std.algorithm : canFind;
         if (hop !is null)
@@ -451,9 +482,12 @@ HopCheck redirectGate(string approvedHost, JSONValue callArgs, Approve approve, 
         auto h = parsed.isOk ? hostKey(parsed.orThrow!(e => new ToolError(e)).host) : "";
         if (!h.length) return "the redirect target is not a valid URL";
         if (approved.canFind(h)) return null;
-        if (!approve(withUrl(callArgs, next))) return "a redirect to " ~ h ~ " (a host other than the approved one) was not approved";
-        approved ~= h;
-        return null;
+        final switch (approve(withUrl(callArgs, next)))
+        {
+        case Approval.no: return "a redirect to " ~ next ~ " (not covered by the approval of the first URL) was not approved";
+        case Approval.url: return null;
+        case Approval.host: approved ~= h; return null;
+        }
     };
 }
 
@@ -489,9 +523,10 @@ void register(ToolRegistry tools, WebConfig c, WebOffer offer, Approve approve, 
             auto url = requireString(a, "url", "web_fetch").strip;
             auto u = parseUrl(url).orThrow!(e => new ToolError("web_fetch: " ~ e));
             auto shown = u.toString;
-            if (!approve(withUrl(a, shown))) throw new ToolError(format("web_fetch of %s was not approved. In a headless or ACP run, "
+            immutable first = approve(withUrl(a, shown));
+            if (first == Approval.no) throw new ToolError(format("web_fetch of %s was not approved. In a headless or ACP run, "
                 ~ "pass --web or --allow 'WebFetch(domain:%s)'; interactively, answer Yes", shown, u.host));
-            auto f = fetchUrl(c, shown, resolve, redirectGate(u.host, a, approve, hop));
+            auto f = fetchUrl(c, shown, resolve, redirectGate(u.host, first, a, approve, hop));
             return fetchResult(c, f, shown, optInt(a, "offset", 0), optInt(a, "max_bytes", 0));
         });
 }
@@ -499,18 +534,30 @@ void register(ToolRegistry tools, WebConfig c, WebOffer offer, Approve approve, 
 unittest // a redirect to another host needs its own approval
 {
     string[] asked;
-    bool yes;
-    auto gate = redirectGate("docs.example.com", JSONValue(["offset": 7]),
-        (JSONValue a) { asked ~= a["url"].str; assert(a["offset"].integer == 7); return yes; }, null);
+    auto answer = Approval.no;
+    auto gate = redirectGate("docs.example.com", Approval.host, JSONValue(["offset": 7]),
+        (JSONValue a) { asked ~= a["url"].str; assert(a["offset"].integer == 7); return answer; }, null);
     assert(gate("https://docs.example.com/a") is null && !asked.length); // the approved host
     assert(gate("https://DOCS.example.com./b") is null && !asked.length);
     assert(gate("https://other.net/x") !is null && asked == ["https://other.net/x"]); // declined
-    yes = true;
+    answer = Approval.host;
     assert(gate("https://other.net/x") is null);
-    yes = false;
+    answer = Approval.no;
     assert(gate("https://other.net/y") is null); // approved once, for this fetch
-    auto denyAll = redirectGate("a.com", JSONValue.init, (JSONValue a) => true, (JSONValue a) => "denied");
+    auto denyAll = redirectGate("a.com", Approval.host, JSONValue.init, (JSONValue a) => Approval.host, (JSONValue a) => "denied");
     assert(denyAll("https://a.com/") == "denied"); // the policy check still comes first
+}
+
+unittest // an approval scoped to one URL (an allow rule) is checked again for every hop, same host or not
+{
+    string[] asked;
+    auto gate = redirectGate("a.com", Approval.url, JSONValue.init, (JSONValue a) {
+        asked ~= a["url"].str;
+        return a["url"].str == "https://a.com/ok" ? Approval.url : Approval.no;
+    }, null);
+    assert(gate("https://a.com/other") !is null && asked == ["https://a.com/other"]); // same host, not covered
+    assert(gate("https://a.com/ok") is null);
+    assert(gate("https://a.com/ok") is null && asked.length == 3); // never cached
 }
 
 unittest // the checked addresses are pinned, so a rebinding second lookup can't bypass the check
@@ -520,7 +567,7 @@ unittest // the checked addresses are pinned, so a rebinding second lookup can't
     string[] dns(string h) { lookups++; return lookups == 1 ? ["93.184.216.34", "2606:2800::1"] : ["127.0.0.1"]; }
     string[] pinned;
     assert(hostRefusal(c, parseUrl("https://rebind.example/").orThrow!(e => new ToolError(e)), &dns, pinned) is null);
-    assert(pinned == ["rebind.example:443:93.184.216.34", "rebind.example:443:[2606:2800::1]"]);
+    assert(pinned == ["rebind.example:443:93.184.216.34,[2606:2800::1]"], pinned[0]); // one entry: curl keeps the last per host:port
     assert(lookups == 1); // curl is given these, never a second answer
     assert(hostRefusal(c, parseUrl("http://1.2.3.4:8080/").orThrow!(e => new ToolError(e)), &dns, pinned) is null && !pinned.length);
 }
@@ -606,16 +653,41 @@ unittest // fetching from a local server: conversion, paging, and a redirect to 
     f = fetchUrl(c, srv.url ~ "/r", &dns);
     assert(f.url == srv.url ~ "/next");
     text = fetchResult(c, f, srv.url ~ "/r", 2, 4);
-    assert(text.canFind("Redirected from: " ~ srv.url ~ "/r") && text.canFind("Bytes 2-6 of 10 (more: call again with offset 6)")
+    assert(text.canFind("URL: " ~ srv.url ~ "/r\n") && text.canFind("Bytes 2-6 of 10 (more: call again with offset 6)")
         && text.canFind("\n2345\n"), text);
+    // The redirect target is server text: only inside the untrusted block.
+    auto open = text.indexOf("<untrusted");
+    assert(open > 0 && text.indexOf("Redirected to: " ~ srv.url ~ "/next") > open, text);
     // A redirect to a host outside allowed_hosts (here loopback) is refused at that hop.
     import std.exception : collectExceptionMsg;
     auto msg = collectExceptionMsg!ToolError(fetchUrl(c, srv.url ~ "/evil", &dns));
     assert(msg.canFind("refused http://localhost:1/"), msg);
+    assert(msg.indexOf("<untrusted") >= 0 && msg.indexOf("<untrusted") < msg.indexOf("localhost:1"), msg);
     // Unsupported types are an error with the type and size.
     f = fetchUrl(c, srv.url ~ "/doc.pdf", &dns);
     msg = collectExceptionMsg!ToolError(fetchResult(c, f, srv.url, 0, 0));
     assert(msg.canFind("application/pdf") && msg.canFind("4 bytes"), msg);
+}
+
+unittest // max_result_bytes caps the whole result: metadata, wrapper and escaping included
+{
+    import std.array : replicate;
+    WebConfig c;
+    c.maxResultBytes = 600;
+    auto body_ = "</untrusted>".replicate(200); // each copy grows when defused
+    auto f = Fetched("https://example.com/final", "text/plain", body_, false);
+    auto text = fetchResult(c, f, "https://example.com/start", 0, 0);
+    assert(text.length <= 600, text);
+    import std.algorithm : canFind;
+    import std.regex : matchFirst;
+    auto m = text.matchFirst(`offset (\d+)\)`);
+    assert(!m.empty, text);
+    // The next offset follows the bytes actually shown, and the page still ends the block.
+    import std.conv : to;
+    immutable next = m[1].to!size_t;
+    assert(next > 0 && next < 600 && text.endsWith("</untrusted>"), text);
+    auto more = fetchResult(c, f, "https://example.com/start", next, 0);
+    assert(more.canFind(format("Bytes %s-", next)) && more.length <= 600, more);
 }
 
 unittest // the download cap, and a refused first hop never connects

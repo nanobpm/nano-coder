@@ -565,7 +565,7 @@ Result!(Url, string) parseUrl(string text)
 Result!(Url, string) resolveLocation(Url base, string location)
 {
     auto l = location.strip;
-    if (l.indexOf("://") > 0 && l.indexOf("://") < l.indexOf('/') + 1) return parseUrl(l);
+    if (hasScheme(l)) return parseUrl(l);
     if (l.startsWith("//")) return parseUrl(base.scheme ~ ":" ~ l);
     if (l.startsWith("/")) return parseUrl(base.origin ~ l);
     if (l.startsWith("?")) return parseUrl(base.origin ~ pathOnly(base.path) ~ l);
@@ -573,6 +573,20 @@ Result!(Url, string) resolveLocation(Url base, string location)
     auto dir = pathOnly(base.path);
     auto slash = dir.lastIndexOfChar('/');
     return parseUrl(base.origin ~ dir[0 .. slash + 1] ~ l);
+}
+
+/// Whether `ref_` starts with a URI scheme (`ALPHA *(ALPHA / DIGIT / "+" / "-" / ".") ":"`),
+/// so `login?next=https://x/` stays a relative reference.
+private bool hasScheme(string ref_) pure nothrow @nogc
+{
+    import std.ascii : isAlpha, isAlphaNum;
+    if (!ref_.length || !isAlpha(ref_[0])) return false;
+    foreach (c; ref_[1 .. $])
+    {
+        if (c == ':') return true;
+        if (!isAlphaNum(c) && c != '+' && c != '-' && c != '.') return false;
+    }
+    return false;
 }
 
 private string pathOnly(string p) nothrow
@@ -1120,6 +1134,11 @@ unittest // URL parsing
     assert(resolveLocation(base, "q").match!(v => v.toString, e => e) == "https://a.com/x/q");
     assert(resolveLocation(base, "//b.com/r").match!(v => v.toString, e => e) == "https://b.com/r");
     assert(resolveLocation(base, "http://127.0.0.1/").match!(v => v.host, e => e) == "127.0.0.1");
+    // A scheme counts only at the start: an absolute URL in the query stays relative.
+    assert(resolveLocation(base, "login?next=https://b.com/").match!(v => v.toString, e => e) == "https://a.com/x/login?next=https://b.com/");
+    assert(resolveLocation(base, "a/b?u=http://c/").match!(v => v.toString, e => e) == "https://a.com/x/a/b?u=http://c/");
+    assert(resolveLocation(base, "HTTP://c.com/").match!(v => v.host, e => e) == "c.com");
+    assert(resolveLocation(base, "javascript:alert(1)").isErr);
 }
 
 unittest // host classification: IPv4 in every form

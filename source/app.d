@@ -3839,7 +3839,7 @@ int runMain(string[] args)
     // (interactive) or refused; the policy's deny rules apply to every
     // redirect hop as well as to the call.
     {
-        import nano.tools.web : webOffer, fetchDefault, FetchDefault, registerWeb = register;
+        import nano.tools.web : webOffer, fetchDefault, FetchDefault, Approval, registerWeb = register;
         auto offer = webOffer(cfg.web, o.web, o.acp);
         immutable interactiveRun = !o.acp && !o.prompt.length && isTerminal(0) && isTerminal(1);
         immutable fetchMode = fetchDefault(o.yolo, o.web, interactiveRun);
@@ -3847,13 +3847,22 @@ int runMain(string[] args)
         // an argument-scoped rule sees every field.
         registerWeb(tools, cfg.web, offer, (JSONValue args) @safe {
             immutable url = args["url"].str;
+            // An allow rule covers this URL only; every redirect is checked again.
             if (built.match!(a => a.policy.allows("web_fetch", args), () => policy.allows("web_fetch", args)))
-                return true;
+                return Approval.url;
+            // Without an approval UI (no frame editor: TERM=dumb, plain
+            // input, ...) asking would always refuse; fall back to the
+            // headless default, so --web still allows.
+            immutable headlessMode = fetchDefault(o.yolo, o.web, false);
+            Approval fallback() { return headlessMode == FetchDefault.allow ? Approval.host : Approval.no; }
             final switch (fetchMode)
             {
-            case FetchDefault.allow: return true;
-            case FetchDefault.deny: return false;
-            case FetchDefault.ask: return built.match!(a => a.confirm(format("Fetch %s ?", url), "web_fetch"), () => false);
+            case FetchDefault.allow: return Approval.host;
+            case FetchDefault.deny: return Approval.no;
+            case FetchDefault.ask:
+                return built.match!(a => a.questions && a.questions.interactive
+                    ? (a.confirm(format("Fetch %s ?", url), "web_fetch") ? Approval.host : Approval.no)
+                    : fallback(), () => fallback());
             }
         }, (JSONValue args) @safe {
             return built.match!(a => a.policy.checkIn("web_fetch", args, getcwd()),
