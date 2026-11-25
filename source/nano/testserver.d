@@ -124,7 +124,10 @@ private immutable(Captured)[] run(immutable(Reply)[] replies, string prefix, Cha
         auto sp1 = first.indexOf(' '), sp2 = first.indexOf(' ', sp1 + 1);
         if (sp1 < 0 || sp2 < 0) continue;
         auto path = first[sp1 + 1 .. sp2];
-        if (!path.startsWith(prefix))
+        // Delimited match: server `/srv<pid>-1` must not take `/srv<pid>-10/...`.
+        immutable ours = path.startsWith(prefix)
+            && (path.length == prefix.length || path[prefix.length] == '/' || path[prefix.length] == '?');
+        if (!ours)
         {
             conn.send("HTTP/1.1 404 Status\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             continue;
@@ -207,6 +210,8 @@ unittest
     Request other;
     other.url = "http://127.0.0.1:" ~ port.to!string ~ "/elsewhere";
     string got;
+    assert(perform(other, got) == 404);
+    other.url = srv.url ~ "0/p"; // a sibling server's longer prefix
     assert(perform(other, got) == 404);
     Request req;
     req.url = srv.url ~ "/p";
