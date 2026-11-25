@@ -930,7 +930,9 @@ unittest
     import std.range : repeat;
     import std.array : array;
     import nano.testserver : serve, Reply;
-    immutable loop = Reply(301, "Location: /\r\n", "");
+    // A relative target keeps the server's per-test path prefix, so the loop
+    // really reaches curl's redirect limit instead of a prefix-miss 404.
+    immutable loop = Reply(301, "Location: x\r\n", "");
     auto srv = serve(loop.repeat(60).array.idup);
     RetryPolicy p;
     p.maxRetries = 0;
@@ -940,6 +942,8 @@ unittest
     auto msg = collectExceptionMsg(postJson(srv.url ~ "/x", null, JSONValue(1), "probe", p, [], 5));
     assert(monoNow - start < 3.seconds, "a redirect loop was waited out as an outage: " ~ msg);
     assert(msg.length && !msg.canFind("network unavailable"), msg);
+    import std.string : toLower;
+    assert(msg.toLower.canFind("redirect"), "not a redirect failure: " ~ msg);
     srv.finish();
 }
 
