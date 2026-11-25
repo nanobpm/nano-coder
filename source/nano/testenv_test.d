@@ -128,7 +128,7 @@ UnitTestResult runModuleTests() @trusted
     import std.algorithm : sort;
     import std.conv : to;
     import std.process : environment;
-    import nano.safeio : Chan, Shared, spawn, spawnDaemon, stdErr;
+    import nano.safeio : Chan, Shared, spawn, stdErr;
     immutable(TestEntry)[] all;
     foreach (m; ModuleInfo)
         if (m !is null && m.unitTest !is null) all ~= immutable TestEntry(m.name, cast(void function() @safe) m.unitTest);
@@ -143,7 +143,15 @@ UnitTestResult runModuleTests() @trusted
     const scale = scaleText.length ? scaleText.to!double : 1.0;
     auto running = Shared!(immutable(Running)[]).make;
     auto limits = hardLimits(scale);
-    spawnDaemon(&watchdog, running);
+    // Joined before returning: a watchdog still running when druntime tears
+    // the GC down at exit reads freed memory and crashes the run (issue #388).
+    auto stopWatchdog = Shared!bool.make(false);
+    auto watchdogThread = spawn(&watchdog, running, stopWatchdog);
+    scope (exit)
+    {
+        stopWatchdog.update((ref bool b) { b = true; });
+        watchdogThread.join();
+    }
     if (jobs > 1)
     {
         // Modules that change process-wide state go first, alone.
@@ -313,11 +321,11 @@ unittest
 /// Ends the run when a module's tests outlive their hard limit: a test that
 /// hangs (a refused retry loop, a lost wakeup) can't be joined, so the run
 /// names the module and exits failing instead of never finishing (#358).
-void watchdog(imported!"nano.safeio".Shared!(immutable(Running)[]) running)
+void watchdog(imported!"nano.safeio".Shared!(immutable(Running)[]) running, imported!"nano.safeio".Shared!bool stop)
 {
     import core.time : msecs;
     import nano.clock : sleepFor;
-    while (true)
+    while (!stop.get)
     {
         sleepFor(250.msecs);
         watchdogTick(running, monoNow, (Running r) => failHung(r));
