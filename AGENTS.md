@@ -30,6 +30,11 @@ enforced by `scripts/check-safe.sh`; the reasons are in REVIEW.md.
   `catch (Exception)`, classes, nullable references and more; the `*-floor`
   files set minimums for `pure`. If you remove an escape, lower the budget in
   the same PR. Raising one needs a stated reason in the PR description.
+  Ratchets are measured against the merge base; a worse count fails unless
+  a commit carries a `Ratchet-Override: <name> <reason>` trailer. A squash
+  merge drops that trailer, so on main `scripts/check-safe.sh` also reads
+  the trailers of the commits of the merged PR named by the squash subject (only when that PR's merge commit is the commit being checked)
+  (`… (#N)`), through the GitHub API.
 - Compiler flags include `-preview=dip1000 -preview=nosharedaccess`: scope and
   shared errors are real bugs, not noise.
 

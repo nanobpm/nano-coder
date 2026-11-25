@@ -7,11 +7,15 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 # Ratchet base for check-safe: on a push to main, HEAD and origin/main are the
 # pushed commit, so compare against the commit before the push instead.
 env:
   NANO_RATCHET_BASE: ${{ github.event_name == 'push' && github.event.before || 'origin/main' }}
+  # check-safe reads the Ratchet-Override trailers of a squash-merged PR's
+  # commits through the GitHub API (the squash message drops them).
+  GH_TOKEN: ${{ github.token }}
 
 jobs:
   # The job names `test (<os>)` are required checks in the main branch ruleset.
