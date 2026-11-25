@@ -69,9 +69,10 @@ private immutable(Captured)[] run(immutable(Reply)[] replies, Chan!ushort port, 
     listener.listen(8);
     port.put((cast(InternetAddress) listener.localAddress).port);
     immutable(Captured)[] seen;
-    foreach (ref r; replies)
+    for (size_t i = 0; i < replies.length;)
     {
         if (!awaitClient(listener, stop)) break;
+        auto r = replies[i];
         auto conn = listener.accept();
         scope (exit) conn.close();
         char[] buf;
@@ -92,7 +93,11 @@ private immutable(Captured)[] run(immutable(Reply)[] replies, Chan!ushort port, 
             }
             if (head >= 0 && buf.length >= head + 4 + want) break;
         }
-        if (head < 0) break;
+        // A client that hung up before sending a whole request (e.g. a
+        // connect that timed out under load) doesn't consume a reply: wait
+        // for the next one instead of shutting the server down.
+        if (head < 0) continue;
+        i++;
         auto headText = buf[0 .. head].idup;
         auto first = headText[0 .. headText.indexOf("\r\n") < 0 ? $ : headText.indexOf("\r\n")];
         auto sp1 = first.indexOf(' '), sp2 = first.indexOf(' ', sp1 + 1);
