@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.35.3", "date": "2026-11-25", "items": [
+      {"type":"fix","scope":"update","title":"update the running binary's install prefix and explain an unwritable one","pr":385}
+    ]},
     {"version": "1.35.2", "date": "2026-11-25", "items": [
       {"type":"fix","scope":"sandbox","title":"keep the bash tool working after nano-coder is upgraded under a session","pr":391}
     ]},
@@ -441,9 +444,6 @@
     ]},
     {"version": "0.55.2", "date": "2026-10-29", "items": [
       {"type":"fix","scope":"reminders","title":"harden loop-detector shell/writer heuristics","pr":159}
-    ]},
-    {"version": "0.55.1", "date": "2026-10-29", "items": [
-      {"type":"fix","scope":"search","title":"bound walker and ignore-loading resource use","pr":160}
     ]}
   ]
 }
