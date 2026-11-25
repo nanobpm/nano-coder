@@ -932,14 +932,18 @@ unittest
     assert(took >= 80.msecs && took < 600.msecs, "the backoff is clamped to the budget");
 }
 
-private void holdStalledListener(ushort port, imported!"nano.safeio".Chan!bool done)
+private void holdStalledListener(imported!"nano.safeio".Chan!ushort portOut, imported!"nano.safeio".Chan!bool done)
 {
-    import std.socket : TcpSocket, InternetAddress, SocketOptionLevel, SocketOption;
-    sleepFor(30.msecs);
+    import std.socket : TcpSocket, InternetAddress;
+    // The port stays bound from the start: bound but not listening refuses
+    // connections (the outage), and it is never released for a concurrent
+    // test's server to take, which would then get this test's requests.
     auto l = new TcpSocket;
     scope (exit) l.close();
-    l.setOption(SocketOptionLevel.SOCKET, SocketOption.REUSEADDR, true);
-    l.bind(new InternetAddress("127.0.0.1", port));
+    l.bind(new InternetAddress("127.0.0.1", InternetAddress.PORT_ANY));
+    import std.conv : to;
+    portOut.put(l.localAddress.toPortString.to!ushort);
+    sleepFor(30.msecs);
     l.listen(4); // never accepted: connections complete and then hear nothing
     bool v;
     done.take(v); // until the test is finished with it
@@ -950,18 +954,13 @@ unittest
 {
     import core.time : MonoTime;
     import std.algorithm : canFind;
-    import std.socket : TcpSocket, InternetAddress;
     import nano.safeio : spawn;
-    ushort port;
-    {
-        auto probe = new TcpSocket;
-        probe.bind(new InternetAddress("127.0.0.1", InternetAddress.PORT_ANY));
-        port = (cast(InternetAddress) probe.localAddress).port;
-        probe.close(); // the first attempt is refused: the outage starts
-    }
     import nano.safeio : Chan;
     auto done = Chan!bool.make;
-    auto h = spawn(&holdStalledListener, port, done);
+    auto portIn = Chan!ushort.make;
+    auto h = spawn(&holdStalledListener, portIn, done);
+    ushort port;
+    portIn.take(port); // the first attempt is refused: the outage starts
     RetryPolicy p;
     p.maxRetries = 0;
     p.initialBackoff = 20.msecs;
