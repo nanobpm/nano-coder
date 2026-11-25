@@ -159,15 +159,6 @@ unittest
     assert(r.toolCalls[0].arguments == parseJSON(`{}`));
 }
 
-/// Fake time for one test: retry backoffs and offline waits advance it
-/// instead of sleeping (issues #379, #388).
-imported!"nano.clock".FakeClock fakeTime()
-{
-    import std.datetime.systime : SysTime;
-    import nano.clock : FakeClock;
-    return FakeClock.install(SysTime(0));
-}
-
 AnthropicClient against(string url, bool stream)
 {
     ResolvedProvider p;
