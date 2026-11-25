@@ -202,84 +202,11 @@ private void frameThread(Isolated!FrameState state, Chan!Request requests)
             ubyte[64] buf;
             while (readFd_(f.wakeFd, buf[]) > 0) {}
         }
-        Request r;
-        while (requests.tryTake(r))
+        if (serveRequests(f, requests))
         {
-            bool closed = r.match!(
-                (Draw d) { f.editorRows = d.rows; f.render(); return false; },
-                (Commit c) {
-                    f.drain();
-                    f.editorRows = null;
-                    import std.array : replace;
-                    // A committed prompt keeps the ready glyph, not a spinner frame.
-                    auto line = c.line.replace(glyphMark, promptGlyph(false, 0));
-                    f.transcript.feed((line ~ "\n").representation);
-                    f.render();
-                    c.done.put(true);
-                    return false;
-                },
-                (Redraw _) { f.render(); return false; },
-                (Status st) { if (!f.paused) writeFd(f.tty, st.bytes); return false; },
-                (Hold h) {
-                    f.drain();
-                    f.held = h.on;
-                    if (!h.on) f.render();
-                    h.done.put(true);
-                    return false;
-                },
-                (Toggle _) {
-                    f.drain();
-                    if (f.transcript.toggle()) f.render();
-                    return false;
-                },
-                (Verbose v) {
-                    f.drain();
-                    if (f.transcript.setVerbose(v.on)) f.render();
-                    return false;
-                },
-                (Clear c) {
-                    f.drain();
-                    f.transcript.clear();
-                    f.renderer.invalidate();
-                    f.render();
-                    c.done.put(true);
-                    return false;
-                },
-                (Suspend c) { f.drain(); f.paused = true; c.done.put(true); return false; },
-                (Resume c) {
-                    f.paused = false;
-                    f.renderer.invalidate();
-                    f.render();
-                    c.done.put(true);
-                    return false;
-                },
-                (Busy b) {
-                    f.busy = b.on;
-                    if (b.on) f.clock = WorkClock.started(FrameState.nowMs());
-                    f.render();
-                    return false;
-                },
-                (WorkPause p) {
-                    if (p.paused) f.clock.pause(FrameState.nowMs());
-                    else f.clock.resume(FrameState.nowMs());
-                    return false;
-                },
-                (Close c) {
-                    f.drain();
-                    f.render();
-                    f.paused = true;
-                    auto lines = f.transcript.lines.idup;
-                    if (f.transcript.cur.length) lines ~= f.transcript.cur.idup;
-                    c.lines.put(lines);
-                    return true;
-                },
-            );
-            if (closed)
-            {
-                closeFd(f.readFd);
-                closeFd(f.wakeFd);
-                return;
-            }
+            closeFd(f.readFd);
+            closeFd(f.wakeFd);
+            return;
         }
         if (pipeOpen && ps[1].revents)
         {
@@ -288,6 +215,93 @@ private void frameThread(Isolated!FrameState state, Chan!Request requests)
         }
         f.tick();
     }
+}
+
+/// Serves every request waiting in `requests`; true once `Close` arrived.
+/// Editor draws, redraws and busy changes only mark the frame dirty, and
+/// the batch renders once at the end: key auto-repeat sends a draw per
+/// key, faster than a long transcript renders, and rendering each one
+/// queued them up, so the cursor kept moving after the key was released.
+/// Requests that need their render before replying (commit, hold, clear,
+/// resume, close) still render in place, which also clears `dirty`.
+private bool serveRequests(FrameState f, Chan!Request requests)
+{
+    Request r;
+    while (requests.tryTake(r))
+    {
+        bool closed = r.match!(
+            (Draw d) { f.editorRows = d.rows; f.dirty = true; return false; },
+            (Commit c) {
+                f.drain();
+                f.editorRows = null;
+                import std.array : replace;
+                // A committed prompt keeps the ready glyph, not a spinner frame.
+                auto line = c.line.replace(glyphMark, promptGlyph(false, 0));
+                f.transcript.feed((line ~ "\n").representation);
+                f.render();
+                c.done.put(true);
+                return false;
+            },
+            (Redraw _) { f.dirty = true; return false; },
+            (Status st) { if (!f.paused) writeFd(f.tty, st.bytes); return false; },
+            (Hold h) {
+                f.drain();
+                f.held = h.on;
+                if (!h.on) f.render();
+                h.done.put(true);
+                return false;
+            },
+            (Toggle _) {
+                f.drain();
+                if (f.transcript.toggle()) f.render();
+                return false;
+            },
+            (Verbose v) {
+                f.drain();
+                if (f.transcript.setVerbose(v.on)) f.render();
+                return false;
+            },
+            (Clear c) {
+                f.drain();
+                f.transcript.clear();
+                f.renderer.invalidate();
+                f.render();
+                c.done.put(true);
+                return false;
+            },
+            (Suspend c) { f.drain(); f.paused = true; c.done.put(true); return false; },
+            (Resume c) {
+                f.paused = false;
+                f.renderer.invalidate();
+                f.render();
+                c.done.put(true);
+                return false;
+            },
+            (Busy b) {
+                f.busy = b.on;
+                if (b.on) f.clock = WorkClock.started(FrameState.nowMs());
+                f.dirty = true;
+                return false;
+            },
+            (WorkPause p) {
+                if (p.paused) f.clock.pause(FrameState.nowMs());
+                else f.clock.resume(FrameState.nowMs());
+                return false;
+            },
+            (Close c) {
+                f.drain();
+                f.render();
+                f.paused = true;
+                auto lines = f.transcript.lines.idup;
+                if (f.transcript.cur.length) lines ~= f.transcript.cur.idup;
+                c.lines.put(lines);
+                return true;
+            },
+        );
+        if (closed) return true;
+    }
+    if (f.dirty) f.render();
+    return false;
 }
 
 /// The frame's state, owned by the frame thread.
@@ -309,10 +323,14 @@ private final class FrameState
     bool busy;
     WorkClock clock;
     long lastRenderMs;
+    /// A render is due at the end of the current request batch
+    /// (`serveRequests`).
+    bool dirty;
 
     void render()
     {
         if (paused || held) return;
+        dirty = false;
         auto w = terminalWidth(tty), h = terminalHeight(tty);
         lastW = w;
         lastH = h;
@@ -377,4 +395,26 @@ unittest
     f.held = false;
     f.render();
     assert(outs.length == 1, "the release renders once");
+}
+
+unittest
+{
+    // Key auto-repeat: a burst of editor draws queued while the frame thread
+    // was busy renders once, with the newest rows, not once per key.
+    string[] outs;
+    auto f = new FrameState(new FrameRenderer((string s) { outs ~= s; }));
+    auto requests = Chan!Request.make;
+    foreach (i; 0 .. 100)
+    {
+        import std.conv : to;
+        requests.put(Request(Draw(["> " ~ i.to!string])));
+    }
+    assert(!serveRequests(f, requests));
+    assert(outs.length == 1, "a burst of draws renders once");
+    assert(f.editorRows == ["> 99"], "the newest draw wins");
+    assert(!f.dirty);
+
+    // Nothing waiting: nothing rendered.
+    assert(!serveRequests(f, requests));
+    assert(outs.length == 1);
 }
