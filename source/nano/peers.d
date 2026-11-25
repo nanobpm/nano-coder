@@ -566,8 +566,15 @@ struct PeerListener
             // its line must not pin the sole listener (or `close`'s join).
             import std.socket : SocketOptionLevel, SocketOption;
             import core.time : seconds;
-            conn.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, 5.seconds);
-            conn.setOption(SocketOptionLevel.SOCKET, SocketOption.SNDTIMEO, 5.seconds);
+            // On macOS setsockopt fails (EINVAL) on a connection whose peer
+            // already left (a liveness probe): drop that connection rather
+            // than let the exception end the serve loop for good.
+            try
+            {
+                conn.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, 5.seconds);
+                conn.setOption(SocketOptionLevel.SOCKET, SocketOption.SNDTIMEO, 5.seconds);
+            }
+            catch (SocketException) continue;
             handle(conn, requests, stop);
         }
     }
