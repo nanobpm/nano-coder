@@ -65,7 +65,7 @@ enum string versionString = "nano-coder " ~ packageVersion;
 enum string usage = `Usage: nano-coder [--model provider/model] [--config PATH] [-p PROMPT]
                     [--resume [SESSION|last]] [--name HANDLE] [--plan] [--sandbox off|workspace|read-only]
                     [--allow RULE]... [--deny RULE]...
-                    [--no-session] [--no-hooks] [--yolo] [--wait-timers] [--verbosity quiet|normal|verbose|debug] [--acp [--session-messages]]
+                    [--no-session] [--no-hooks] [--yolo] [--web|--no-web] [--wait-timers] [--verbosity quiet|normal|verbose|debug] [--acp [--session-messages]]
        nano-coder --list-sessions [--all] [--json]
        nano-coder --trajectory SESSION_ID [--json|--markdown]
        nano-coder --list-models PROVIDER[/model]
@@ -79,6 +79,8 @@ running each as it fires); with no -p, prompts are read from stdin (a REPL on a 
 --acp serves the Agent Client Protocol (JSON-RPC 2.0, one message per line) on stdin/stdOut.
 --session-messages lets an --acp session send and receive inter-session messages (ACP ignores
 session_messages; acp_session_messages = true in the config does the same).
+--web offers web_search/web_fetch in an --acp session (off there by default) and approves web_fetch
+in headless runs; --no-web never offers them. Configure them under [web] in the config.
 REPL commands: /help lists them (/model, /mode, /verbosity, /providers, /restart, /resume, ...)
 Ctrl-C cancels a running turn; a line typed during a turn steers it.
 A repository's own skills and .claude/settings*.json hooks load only once you trust it: an
@@ -97,6 +99,8 @@ struct Options
     bool waitTimers, yolo, markdown, plan, noSession, noHooks, verbose, hasResume, acp, listSessions, all, json;
     /// `--session-messages`: an `--acp` session takes inter-session messages (issue #347).
     bool sessionMessages;
+    /// `--web` / `--no-web`: whether the web tools are offered (issue #386).
+    imported!"nano.tools.web".WebFlag web;
     /// `--memory-migrate` and its `--dry-run`.
     bool memoryMigrate, dryRun;
     string[] allow, deny;
@@ -146,6 +150,14 @@ Options parseArgs(string[] args)
             }
             case "--acp": o.acp = true; break;
             case "--session-messages": o.sessionMessages = true; break;
+            case "--web", "--no-web":
+            {
+                import nano.tools.web : WebFlag;
+                auto want = flag == "--web" ? WebFlag.on : WebFlag.off;
+                if (o.web != WebFlag.unset && o.web != want) fail("--web and --no-web are mutually exclusive");
+                o.web = want;
+                break;
+            }
             case "--list-sessions": o.listSessions = true; break;
             case "--all": o.all = true; break;
             case "--json": o.json = true; break;
@@ -211,6 +223,13 @@ unittest
     assert(ok("--acp", "--resume", "sess-1"));
     assert(ok("--acp", "--session-messages") && !ok("--session-messages"));
     assert(parseArgs(["nano-coder", "--acp", "--session-messages"]).sessionMessages);
+    {
+        import nano.tools.web : WebFlag;
+        assert(parseArgs(["nano-coder", "--acp", "--web"]).web == WebFlag.on);
+        assert(parseArgs(["nano-coder", "--no-web"]).web == WebFlag.off);
+        assert(parseArgs(["nano-coder"]).web == WebFlag.unset);
+        assert(!ok("--web", "--no-web"));
+    }
     assert(parseArgs(["nano-coder", "--resume", "sess-1"]).resume == "sess-1");
     assert(ok("--memory-migrate") && ok("--memory-migrate", "--dry-run") && !ok("--dry-run"));
     assert(!ok("--memory-migrate", "-p", "hi") && !ok("--memory-migrate", "--acp"));
@@ -3814,6 +3833,42 @@ int runMain(string[] args)
         auto sources = built.match!(a => a.policy.readDenySources, () => policy.readDenySources);
         return sources.length ? getcwd() ~ sources : null;
     });
+    // The web tools (issue #386): offered per `[web]`, `--web`/`--no-web`
+    // and the mode (off in ACP unless `--web`). A fetch no allow rule covers
+    // is allowed (--yolo, or --web when headless), asked about
+    // (interactive) or refused; the policy's deny rules apply to every
+    // redirect hop as well as to the call.
+    {
+        import nano.tools.web : webOffer, fetchDefault, FetchDefault, Approval, registerWeb = register;
+        auto offer = webOffer(cfg.web, o.web, o.acp);
+        immutable interactiveRun = !o.acp && !o.prompt.length && isTerminal(0) && isTerminal(1);
+        immutable fetchMode = fetchDefault(o.yolo, o.web, interactiveRun);
+        // Both checks get the call's own arguments (url set to the hop), so
+        // an argument-scoped rule sees every field.
+        registerWeb(tools, cfg.web, offer, (JSONValue args) @safe {
+            immutable url = args["url"].str;
+            // An allow rule covers this URL only; every redirect is checked again.
+            if (built.match!(a => a.policy.allows("web_fetch", args), () => policy.allows("web_fetch", args)))
+                return Approval.url;
+            // Without an approval UI (no frame editor: TERM=dumb, plain
+            // input, ...) asking would always refuse; fall back to the
+            // headless default, so --web still allows.
+            immutable headlessMode = fetchDefault(o.yolo, o.web, false);
+            Approval fallback() { return headlessMode == FetchDefault.allow ? Approval.host : Approval.no; }
+            final switch (fetchMode)
+            {
+            case FetchDefault.allow: return Approval.host;
+            case FetchDefault.deny: return Approval.no;
+            case FetchDefault.ask:
+                return built.match!(a => a.questions && a.questions.interactive
+                    ? (a.confirm(format("Fetch %s ?", url), "web_fetch") ? Approval.host : Approval.no)
+                    : fallback(), () => fallback());
+            }
+        }, (JSONValue args) @safe {
+            return built.match!(a => a.policy.checkIn("web_fetch", args, getcwd()),
+                () => policy.checkIn("web_fetch", args, getcwd()));
+        });
+    }
 
     // Repository trust gates the repo's own skills, skill lock and hooks.
     bool trusted(string dir)

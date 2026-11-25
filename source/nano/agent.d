@@ -1609,11 +1609,19 @@ class Agent
         {
             {
                 import nano.tools : truncateOutput;
-                // bash, read_file and history_read bound their own output.
+                // bash, read_file, history_read and the web tools bound their
+                // own output (a generic cut would break web_fetch paging and
+                // the <untrusted> blocks).
                 if (call.name != "bash" && call.name != "read_file" && call.name != hist.readTool
-                    && call.name != "load_skill")
+                    && call.name != "load_skill" && call.name != "web_fetch" && call.name != "web_search")
                     result = truncateOutput(result, toolOutputLimit,
                         format("tool-%s-%s", safeName(call.id), safeName(call.name)));
+                // A failed web call has no paging, and a cut could split an
+                // <untrusted> block: an oversized error becomes a short one.
+                else if (isError && (call.name == "web_fetch" || call.name == "web_search")
+                    && result.length > toolOutputLimit)
+                    result = format("%s failed; its error message (%s bytes) was too long to show.",
+                        call.name, result.length);
             }
             // A successful edit marks the tree unchecked; a bash call
             // that started (even one exiting non-zero) is the check.
@@ -3288,9 +3296,16 @@ class Agent
     /// they decline or no one can answer (headless fails closed, issue #271).
     private bool confirmedCrossRead(const ref cross.SessionInfo target)
     {
+        return confirm(cross.confirmQuestion(target), null);
+    }
+
+    /// Ask the user a Yes/No approval question; false when they decline or
+    /// no one can answer (headless fails closed). web_fetch asks with it.
+    bool confirm(string question, string header)
+    {
         import nano.question : Question, QuestionOption, Answered;
         if (!questions || !questions.interactive) return false;
-        auto q = Question(cross.confirmQuestion(target), null,
+        auto q = Question(question, header,
             [QuestionOption("No"), QuestionOption("Yes")]);
         q.custom = false;
         q.approval = true;

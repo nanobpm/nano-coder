@@ -444,6 +444,7 @@ void save(const ref Config c, const ref Changes ch, const ProviderConfig[string]
     // The file may already hold inline keys of providers this save leaves
     // alone; keep it private so a rewrite never widens their permissions.
     foreach (ref p; c.providers) if (p.apiKey.length) secret = true;
+    if (c.web.apiKey.length) secret = true; // an inline [web] api_key (Brave)
     if (path.dirName.length) mkdirRecurse(path.dirName);
     auto tmp = path ~ ".tmp";
     write(tmp, doc);

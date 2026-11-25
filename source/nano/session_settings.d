@@ -31,7 +31,7 @@ immutable string[] writableKeys = ["compaction_mode"];
 /// let a prompt injection loosen the user's safety settings or spend money.
 immutable string[] protectedKeys = ["permissions", "permission_mode", "mode", "allow", "deny", "ask", "sandbox",
     "yolo", "hooks", "providers", "provider", "api_key", "api_key_command", "base_url", "model", "thinking",
-    "max_tokens", "persist_sessions", "cross_session_history"];
+    "max_tokens", "persist_sessions", "cross_session_history", "web"];
 
 /// Turns after an agent change before the same setting may change again.
 enum settingCooldownTurns = 3;

@@ -52,6 +52,9 @@ enum Subject
     path,
     /// Any other tool name: matched against its JSON arguments.
     arguments,
+    /// `WebFetch(domain:example.com)`: matched against the URL's host
+    /// (`*.example.com` for its subdomains).
+    domain,
 }
 
 struct Rule
@@ -61,12 +64,19 @@ struct Rule
     Subject subject;
     /// null: every call to the tool.
     string patternSource;
+    /// The host pattern of a `domain` rule.
+    string domain;
     Regex!char pattern;
 
     bool appliesTo(string tool) pure const { return tools.canFind(tool); }
 
     bool matches(string text) const
     {
+        if (subject == Subject.domain)
+        {
+            import nano.tools.webtext : hostMatches;
+            return hostMatches(domain, text);
+        }
         if (patternSource is null) return true;
         // A `const` Regex can't be matched with, and copying one out of
         // `const` needs a cast; reuse a per-thread compiled copy instead.
@@ -106,9 +116,18 @@ Rule parseRule(string src)
     case "grep": r.tools = ["grep"]; r.subject = Subject.arguments; break;
     case "glob": r.tools = ["glob"]; r.subject = Subject.arguments; break;
     case "edit", "write", "edit_file", "write_file": r.tools = ["write_file", "edit_file"]; r.subject = Subject.path; break;
+    case "webfetch", "web_fetch": r.tools = ["web_fetch"]; r.subject = Subject.arguments; break;
+    case "websearch", "web_search": r.tools = ["web_search"]; r.subject = Subject.arguments; break;
     default: r.tools = [name]; r.subject = Subject.arguments;
     }
     auto p = pattern.strip;
+    if (r.tools == ["web_fetch"] && p.startsWith("domain:"))
+    {
+        r.subject = Subject.domain;
+        r.domain = p["domain:".length .. $].strip;
+        if (!r.domain.length) throw new RuleError(format("permission rule %s has an empty domain", quoted(source)));
+        return r;
+    }
     if (hasPattern && p.length && p != "*" && p != "**")
     {
         r.patternSource = r.subject == Subject.path ? pathGlob(p) : commandGlob(p);
@@ -210,7 +229,19 @@ bool ruleMatches(string ruleSrc, string tool, JSONValue args)
         return pathRuleMatches(rule, normalize(joined), cwd) || pathRuleMatches(rule, resolveSymlinks(joined), cwd);
     case Subject.arguments:
         return rule.matches(args.jsonText);
+    case Subject.domain:
+        return rule.matches(urlHost(args));
     }
+}
+
+/// The host of a web_fetch call's `url`, or null when it has none.
+private string urlHost(JSONValue args)
+{
+    import nano.tools.webtext : parseUrl;
+    import nano.result : match;
+    auto url = stringArg(args, "url");
+    if (url is null) return null;
+    return parseUrl(url).match!(u => u.host, e => string.init);
 }
 
 /// The parse error of a malformed rule, or null.
@@ -366,6 +397,15 @@ struct Policy
                             return r.replace("denies edit_file on", "denies apply_patch on");
                 }
                 return null;
+            case "web_fetch":
+                // Domain rules judge the URL's host; any other rule its arguments.
+                auto host = urlHost(args);
+                auto text = args.jsonText;
+                foreach (rule; deny)
+                    if (rule.appliesTo(tool) && (rule.subject == Subject.domain ? host !is null && rule.matches(host)
+                            : rule.matches(text)))
+                        return format("rule `%s` denies %s of %s", rule.source, tool, stringArg(args, "url"));
+                return null;
             case "grep", "glob":
                 auto root = stringArg(args, "path");
                 if (root is null) root = ".";
@@ -385,6 +425,20 @@ struct Policy
             }
         }
         catch (Blocked b) return b.msg;
+    }
+
+    /// Whether an allow rule approves this call outright (`web_fetch`,
+    /// `WebFetch(domain:...)`), so it needn't ask. Deny rules are checked
+    /// separately (`decide`) and win.
+    bool allows(string tool, JSONValue args)
+    {
+        auto host = urlHost(args);
+        auto text = args.jsonText;
+        foreach (rule; allow)
+            if (rule.appliesTo(tool) && (rule.subject == Subject.domain ? host !is null && rule.matches(host)
+                    : rule.matches(text)))
+                return true;
+        return false;
     }
 
     /// Whether a `Read(...)` deny rule covers `path` or any ancestor of it.
@@ -561,6 +615,30 @@ unittest
     assert(p.check("apply_patch", pt("*** Move File: /x/.env -> /x/b\n")) !is null);
     assert(p.check("apply_patch", pt("*** Add File: /x/.env\n+a\n")) is null);
     assert(p.check("apply_patch", pt("*** Delete File: /x/ok\n")) is null);
+}
+
+unittest // web rules: WebFetch(domain:...) by host, web_search and web_fetch by name
+{
+    Policy p;
+    JSONValue url(string u) { return JSONValue(["url": u]); }
+    p.deny = [parseRule("WebFetch(domain:*.evil.com)"), parseRule("WebFetch(domain:bad.org)")];
+    assert(p.check("web_fetch", url("https://x.evil.com/a")) !is null);
+    assert(p.check("web_fetch", url("https://bad.org/")) !is null);
+    assert(p.check("web_fetch", url("https://bad.org./")) !is null); // a trailing dot is the same host
+    assert(p.check("web_fetch", url("https://x.evil.com./a")) !is null);
+    assert(p.check("web_fetch", url("https://evil.com/")) is null); // the subdomain pattern only
+    assert(p.check("web_fetch", url("https://good.org/?q=bad.org")) is null); // the host, not the query
+    p.allow = [parseRule("WebFetch(domain:docs.example.com)")];
+    assert(p.allows("web_fetch", url("https://docs.example.com/x")));
+    assert(!p.allows("web_fetch", url("https://example.com/x")));
+    p.allow = [parseRule("web_fetch")];
+    assert(p.allows("web_fetch", url("https://anything.net/")));
+    assert(!p.allows("web_search", JSONValue(["query": "x"])));
+    p.deny ~= parseRule("WebSearch");
+    assert(p.check("web_search", JSONValue(["query": "x"])) !is null);
+    assert(validateRule("WebFetch(domain:)") !is null);
+    assert(ruleMatches("WebFetch(domain:*.github.com)", "web_fetch", url("https://api.github.com/")));
+    assert(!ruleMatches("WebFetch(domain:*.github.com)", "web_fetch", url("https://github.com.evil/")));
 }
 
 /// Read-deny rules prepared for judging many walked paths (`Policy.readDenyScan`).
