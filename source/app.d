@@ -240,6 +240,17 @@ int runLogin(string provider, string cfgPath)
         import nano.safeio : onSignal;
         onSignal(SIGINT, &onLoginInterrupt);
     }
+    // The same flag cancels in-flight HTTP requests and retry waits, which
+    // poll `cancelRequested`.
+    {
+        import nano.control : pushCancelScope, popCancelScope;
+        pushCancelScope(&gLoginInterrupted);
+    }
+    scope (exit)
+    {
+        import nano.control : popCancelScope;
+        popCancelScope();
+    }
     void delegate(long) @safe sleep = toDelegate((long n) {
         foreach (_; 0 .. n * 10)
         {
@@ -5271,10 +5282,8 @@ int runMain(string[] args)
                     s.activity = subagents ? "background sub-agents" : null;
                     s.name = name;
                 });
-                bool typed;
+                // Every real key acknowledges: the emitter drops unchanged reports.
                 ed.onKey = () @safe {
-                    if (typed) return;
-                    typed = true;
                     nano.progstatus.update((ref ProgSession s) { s.turnEnded = false; s.turnError = null; s.answer = null; });
                 };
             }
