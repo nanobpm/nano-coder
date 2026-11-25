@@ -137,6 +137,16 @@ void clobberStack() nothrow
 /// `replayed` is the content bytes the replay produced.
 size_t retainedByResume(string path, out size_t stash, out size_t replayed)
 {
+    size_t text_;
+    return retainedByResume(path, stash, replayed, text_);
+}
+
+/// As above; `stashText` is the reply and tool-output text (content,
+/// reasoning and thinking blocks) the resumed agent's replay stash still
+/// holds: an exact count, the same on every platform, where the GC figure
+/// also has allocator overhead that differs by platform (issue #388).
+size_t retainedByResume(string path, out size_t stash, out size_t replayed, out size_t stashText)
+{
     auto agent = new Agent(new MockClient([]), new ToolRegistry, Policy.init, "sys");
     immutable before = usedAfterCollect();
     {
@@ -148,6 +158,11 @@ size_t retainedByResume(string path, out size_t stash, out size_t replayed)
     clobberStack();
     immutable after = usedAfterCollect();
     stash = agent.replayStash.length;
+    foreach (ref m; agent.replayStash)
+    {
+        stashText += m.content.length + m.thinking.length;
+        foreach (ref b; m.thinkingBlocks) stashText += b.toString.length;
+    }
     agent.log.ifSome((SessionLog l) { l.close(); });
     return saturatingSub(after, before);
 }
@@ -179,15 +194,17 @@ unittest
     auto dir = buildPath(tempDir, "nano-d-resume-memory-replies-" ~ newSessionId);
     mkdirRecurse(dir);
     scope (exit) rmdirRecurse(dir);
-    size_t smallStash, largeStash, smallReplayed, largeReplayed;
-    immutable small = retainedByResume(writeLog(dir, "small", 300_000, true), smallStash, smallReplayed);
-    immutable large = retainedByResume(writeLog(dir, "large", 1_200_000, true), largeStash, largeReplayed);
+    size_t smallStash, largeStash, smallReplayed, largeReplayed, smallText, largeText;
+    retainedByResume(writeLog(dir, "small", 300_000, true), smallStash, smallReplayed, smallText);
+    retainedByResume(writeLog(dir, "large", 1_200_000, true), largeStash, largeReplayed, largeText);
     assert(largeStash > 3 * smallStash, "the large log folds more turns");
     assert(largeReplayed > 300_000, text("replay rehydrated only ", largeReplayed, " B"));
-    // Each folded turn's reply holds ~20 KB of answer and reasoning, ~2 KB
-    // per stash entry, ~3.9 KB kept per entry when replies were not slimmed:
-    // what stays is the entries' metadata only (~0.6 KB on Linux, less on
-    // macOS; #233 would turn that into line references too).
-    assert(large < largeStash * 1000, text("resume keeps ", large, " B for ", largeStash,
-        " stashed entries of a 1.2 MB log"));
+    // Each folded turn's reply holds ~20 KB of answer and reasoning: a stash
+    // that kept them would hold about what the replay rehydrated. Counted
+    // exactly from the stash, not from GC.stats: the heap figure also holds
+    // allocator overhead and conservatively scanned garbage that differ by
+    // platform and load (0.05 MB on macOS, 0.4 MB on linux-arm64 Release,
+    // issue #388), so a bound on it can't separate the two.
+    assert(smallText * 100 < smallReplayed && largeText * 100 < largeReplayed, text("the stash keeps ",
+        smallText, " B of reply text of a 0.3 MB log and ", largeText, " B of a 1.2 MB log"));
 }
