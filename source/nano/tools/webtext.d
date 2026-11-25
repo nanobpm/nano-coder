@@ -115,6 +115,20 @@ private string asciiLower(string s) nothrow
 
 /// Writes readable text: collapses whitespace outside `pre`, and keeps track
 /// of line starts so blocks get their blank lines.
+/// Marks a `<pre>` fence line for tidy; never left in page text.
+private enum char preOpen = '\x01', preClose = '\x02';
+
+/// `s` without the fence sentinels, so page text can't fake a fence.
+private string dropSentinels(string s) pure nothrow
+{
+    bool has;
+    foreach (char c; s) if (c == preOpen || c == preClose) { has = true; break; }
+    if (!has) return s;
+    auto o = appender!string;
+    foreach (char c; s) if (c != preOpen && c != preClose) o.put(c);
+    return o.data;
+}
+
 private struct TextWriter
 {
     Appender!(char[]) out_;
@@ -139,6 +153,7 @@ private struct TextWriter
     /// Markup the converter adds (`- `, `[`, `](url)`).
     void raw(string s) pure nothrow
     {
+        s = dropSentinels(s);
         if (!s.length) return;
         flushBreaks();
         if (pendingSpace) { out_.put(' '); pendingSpace = false; }
@@ -149,6 +164,7 @@ private struct TextWriter
     /// Document text: whitespace collapsed unless `verbatim`.
     void text(string s, bool verbatim) pure nothrow
     {
+        s = dropSentinels(s);
         if (verbatim) { if (s.length) { flushBreaks(); out_.put(s); atStart = false; } return; }
         foreach (char c; s)
         {
@@ -259,11 +275,12 @@ string htmlToText(string html, string baseUrl = null, size_t maxBytes = size_t.m
                     // The fence closes on its own line without adding a blank one.
                     w.pendingBreaks = 0;
                     auto d = w.out_.data;
-                    w.raw(d.length && d[$ - 1] == '\n' ? "```" : "\n```");
+                    w.flushBreaks();
+                    w.out_.put(d.length && d[$ - 1] == '\n' ? "```" ~ preClose : "\n```" ~ preClose);
                     w.block(2);
                 }
             }
-            else { w.block(2); if (!preDepth) w.raw("```\n"); preDepth++; }
+            else { w.block(2); if (!preDepth) { w.flushBreaks(); w.out_.put(preOpen ~ "```\n"); w.atStart = false; } preDepth++; }
             break;
         case "code", "kbd", "samp", "tt":
             if (!preDepth) w.raw("`");
@@ -349,8 +366,9 @@ private size_t skipElement(string html, size_t i, string name)
 }
 
 /// Trailing spaces off each line, at most one blank line in a row, no
-/// leading or trailing blank lines. Lines inside a ``` fence (a `<pre>`
-/// block) are kept byte for byte.
+/// leading or trailing blank lines. Lines inside a `<pre>` fence (marked
+/// by the preOpen/preClose sentinels, which page text can't contain) are
+/// kept byte for byte.
 private string tidy(const(char)[] s)
 {
     auto o = appender!(char[]);
@@ -363,9 +381,10 @@ private string tidy(const(char)[] s)
         auto nl = s[i .. $].indexOf('\n');
         auto end = nl < 0 ? s.length : i + nl;
         auto line = s[i .. end];
-        if (fence || line == "```")
+        if (fence || line == preOpen ~ "```")
         {
-            if (line == "```") fence = !fence;
+            if (line == preOpen ~ "```") { fence = true; line = line[1 .. $]; }
+            else if (line == "```" ~ preClose) { fence = false; line = line[0 .. $ - 1]; }
             if (any) o.put(blank ? "\n\n" : "\n");
             o.put(line);
             any = true;
@@ -1285,4 +1304,15 @@ unittest // whitespace inside <pre> survives the final cleanup
     import std.algorithm : canFind;
     auto t = htmlToText("<p>a</p><pre>x  \n\n\n\ty \n</pre><p>b</p>");
     assert(t.canFind("```\nx  \n\n\n\ty \n```\n\nb"), t);
+}
+
+unittest // a literal ``` line in the page doesn't flip the <pre> fence tracking
+{
+    import std.algorithm : canFind;
+    auto t = htmlToText("<p>```</p><p>a  </p><pre>```\ncode  \n```</pre><p>b</p><pre>k  \n\n\n\nk</pre>");
+    assert(t.canFind("```\n```\ncode  \n```\n```"), t);
+    assert(t.canFind("```\nk  \n\n\n\nk\n```"), t);
+    assert(!t.canFind('\x01') && !t.canFind('\x02'), t);
+    auto u = htmlToText("<p>\x01```</p><p>x  </p><p>```\x02</p>");
+    assert(!u.canFind('\x01') && !u.canFind("x  "), u);
 }
