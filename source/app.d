@@ -3843,8 +3843,10 @@ int runMain(string[] args)
         auto offer = webOffer(cfg.web, o.web, o.acp);
         immutable interactiveRun = !o.acp && !o.prompt.length && isTerminal(0) && isTerminal(1);
         immutable fetchMode = fetchDefault(o.yolo, o.web, interactiveRun);
-        registerWeb(tools, cfg.web, offer, (string url) @safe {
-            auto args = JSONValue(["url": url]);
+        // Both checks get the call's own arguments (url set to the hop), so
+        // an argument-scoped rule sees every field.
+        registerWeb(tools, cfg.web, offer, (JSONValue args) @safe {
+            immutable url = args["url"].str;
             if (built.match!(a => a.policy.allows("web_fetch", args), () => policy.allows("web_fetch", args)))
                 return true;
             final switch (fetchMode)
@@ -3853,8 +3855,7 @@ int runMain(string[] args)
             case FetchDefault.deny: return false;
             case FetchDefault.ask: return built.match!(a => a.confirm(format("Fetch %s ?", url), "web_fetch"), () => false);
             }
-        }, (string url) @safe {
-            auto args = JSONValue(["url": url]);
+        }, (JSONValue args) @safe {
             return built.match!(a => a.policy.checkIn("web_fetch", args, getcwd()),
                 () => policy.checkIn("web_fetch", args, getcwd()));
         });

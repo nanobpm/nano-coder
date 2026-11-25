@@ -1609,9 +1609,11 @@ class Agent
         {
             {
                 import nano.tools : truncateOutput;
-                // bash, read_file and history_read bound their own output.
+                // bash, read_file, history_read and the web tools bound their
+                // own output (a generic cut would break web_fetch paging and
+                // the <untrusted> blocks).
                 if (call.name != "bash" && call.name != "read_file" && call.name != hist.readTool
-                    && call.name != "load_skill")
+                    && call.name != "load_skill" && call.name != "web_fetch" && call.name != "web_search")
                     result = truncateOutput(result, toolOutputLimit,
                         format("tool-%s-%s", safeName(call.id), safeName(call.name)));
             }
