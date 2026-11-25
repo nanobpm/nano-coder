@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.36.0", "date": "2026-11-25", "items": [
+      {"type":"feat","scope":"tools","title":"web_search (Brave, SearXNG) and web_fetch, off in ACP unless --web","pr":387}
+    ]},
     {"version": "1.35.3", "date": "2026-11-25", "items": [
       {"type":"fix","scope":"update","title":"update the running binary's install prefix and explain an unwritable one","pr":385}
     ]},
@@ -441,9 +444,6 @@
     {"version": "0.56.0", "date": "2026-10-29", "items": [
       {"type":"feat","scope":"frame","title":"expand/collapse the latest tool call/result or thinking block with Ctrl-O","pr":156},
       {"type":"feat","scope":"agent","title":"verify evidence before accepting report_outcome(completed)","pr":158}
-    ]},
-    {"version": "0.55.2", "date": "2026-10-29", "items": [
-      {"type":"fix","scope":"reminders","title":"harden loop-detector shell/writer heuristics","pr":159}
     ]}
   ]
 }
