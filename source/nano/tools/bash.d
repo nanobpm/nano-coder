@@ -103,13 +103,20 @@ private struct RunStatus
     bool cancelled;
 }
 
+/// Whether a spawn error means our executable was replaced (an upgrade): the
+/// only failure that is permanent for this session.
+bool isUpgradeFailure(string msg) pure nothrow
+{
+    import std.algorithm : canFind;
+    return msg.canFind(" (deleted)");
+}
+
 /// The message for a command that could not be started: an executable whose
 /// path ends in " (deleted)" was replaced under this session (an upgrade), so
 /// say to restart instead of surfacing the raw exec error.
 string spawnFailure(string msg) pure
 {
-    import std.algorithm : canFind;
-    if (msg.canFind(" (deleted)"))
+    if (isUpgradeFailure(msg))
         return "nano-coder was upgraded under this session, so the bash tool can't start its helper; "
             ~ "restart nano-coder (" ~ msg ~ ")";
     return "could not start the command: " ~ msg;
@@ -143,6 +150,37 @@ void recordFatalResult(string msg)
     collectException(write(path, fatalResultJson(msg)));
 }
 
+/// The ToolError message for a failed spawn. Only the permanent upgrade case
+/// records a fatal result; an ordinary failure (bad cwd, missing bash) is
+/// recoverable, so AGENT_RESULT_FILE is left for the agent.
+string handleSpawnFailure(string raw)
+{
+    auto msg = spawnFailure(raw);
+    if (isUpgradeFailure(raw)) recordFatalResult(msg);
+    return msg;
+}
+
+unittest
+{
+    import std.file : exists, remove, tempDir;
+    import std.path : buildPath;
+    import std.conv : to;
+    import std.process : thisProcessID;
+    auto path = buildPath(tempDir, "nano-spawnfail-" ~ thisProcessID.to!string ~ ".json");
+    auto old = environment.get("AGENT_RESULT_FILE");
+    environment["AGENT_RESULT_FILE"] = path;
+    scope (exit)
+    {
+        if (old is null) environment.remove("AGENT_RESULT_FILE");
+        else environment["AGENT_RESULT_FILE"] = old;
+        if (path.exists) remove(path);
+    }
+    handleSpawnFailure("Failed to execute 'bash'");
+    assert(!path.exists);
+    handleSpawnFailure("Failed to execute '/usr/bin/nano-coder (deleted)'");
+    assert(path.exists);
+}
+
 unittest
 {
     import std.json : parseJSON;
@@ -169,9 +207,7 @@ private RunStatus runToFiles(string command, Duration timeout, string outPath, s
     try pid = spawnProcess(argv, inF, outF, errF, null, cfg, cwd);
     catch (ProcessException e)
     {
-        auto msg = spawnFailure(e.msg);
-        recordFatalResult(msg);
-        throw new ToolError(msg);
+        throw new ToolError(handleSpawnFailure(e.msg));
     }
     outF.close();
     errF.close();
