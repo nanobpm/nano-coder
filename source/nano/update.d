@@ -1175,7 +1175,9 @@ unittest
     write(buildPath(pkg, "nano-coder"), "");
     mkdirRecurse(buildPath(dir, "bin"));
     symlink(buildPath(pkg, "nano-coder"), buildPath(dir, "bin", "nano-coder"));
-    assert(prefixFor(Channel.npm, buildPath(dir, "bin", "nano-coder")) == buildPath(dir, "real prefix"));
+    import nano.paths : resolveSymlinks;
+    auto got = prefixFor(Channel.npm, buildPath(dir, "bin", "nano-coder"));
+    assert(got == resolveSymlinks(buildPath(dir, "real prefix")), got);
     assert(prefixFor(Channel.npm, "") is null);
 }
 
@@ -1205,8 +1207,10 @@ unittest
     import std.file : mkdirRecurse, write, rmdirRecurse;
     import std.path : buildPath;
     if (which("npm") is null) return; // runInstaller needs npm on PATH
-    auto dir = fakeRegistryDir("prefixw");
-    scope (exit) rmdirRecurse(dir);
+    import nano.paths : resolveSymlinks;
+    auto raw = fakeRegistryDir("prefixw");
+    scope (exit) rmdirRecurse(raw);
+    auto dir = resolveSymlinks(raw);
     auto bin = buildPath(dir, "lib", "node_modules", "@nanobpm", "nano-coder", "bin");
     mkdirRecurse(bin);
     auto exe = buildPath(bin, "nano-coder");

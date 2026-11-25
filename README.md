@@ -710,6 +710,23 @@ session logs through `step` and checks that each turn asks for what the log show
 with the recorded answer. Point `NANO_REPLAY_DIR` at a sessions directory to replay all of its
 turns.
 
+## Updating
+
+`/update` updates the installation the running binary came from. For npm it reads the install
+prefix from the executable's path (`<prefix>/lib/node_modules/@nanobpm/…`, following the global
+`bin/nano-coder` link) and runs `npm install -g --prefix <prefix> @nanobpm/nano-coder@latest`, so
+a copy installed with `--prefix ~/.local`, under nvm or volta, is updated in place even when
+`npm config get prefix` points elsewhere. For Homebrew it reads the prefix from the keg
+(`<prefix>/Cellar/nano-coder/…`) and runs that prefix's own `<prefix>/bin/brew` (the `brew` on
+PATH only when the prefix has none). A release tarball or a local build is never changed.
+
+Before running anything, `/update` checks that the current user can write the install location
+(npm: `<prefix>/lib/node_modules` and `<prefix>/bin`; Homebrew: `<prefix>/Cellar` and the tap
+checkout). If it can't, for example a root-owned `/usr/lib/node_modules`, it runs nothing and
+prints the folder and the exact command to run by hand (`sudo npm install -g --prefix /usr
+@nanobpm/nano-coder@latest`, or for Homebrew the command to run as the user that owns the
+installation). The running session is unchanged.
+
 ## What Changed After an Update
 
 After an update (`/update` and `/relaunch`, `brew upgrade` or an npm update), the next
