@@ -257,21 +257,19 @@ int runLogin(string provider, string cfgPath)
                 import nano.copilot : copilotLogin = login;
                 reportBlocked(ProgKind.auth, "Sign in to GitHub Copilot");
                 auto saved = copilotLogin(note, sleep);
-                nano.progstatus.update((ref ProgSession s) {
-                    s = ProgSession.init;
-                    s.turnEnded = true;
-                    s.answer = "Signed in to GitHub Copilot";
-                });
+                // The process ends here: remove the record rather than leave a
+                // stale `done` behind for a process that no longer exists.
+                nano.progstatus.clear();
                 writeln("Saved GitHub Copilot credentials to ", saved);
                 return 0;
             default:
+                nano.progstatus.clear();
                 die(format("unknown provider %(%s%) for --login; supported: github-copilot (other providers use API keys)", [provider]));
         }
     }
     catch (Exception e)
     {
-        auto why = e.msg;
-        nano.progstatus.update((ref ProgSession s) { s = ProgSession.init; s.turnEnded = true; s.turnError = why; });
+        nano.progstatus.clear(); // die() exits: leave no stale record behind
         die(e.msg);
     }
     assert(0);

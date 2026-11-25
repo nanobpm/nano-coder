@@ -27,3 +27,4 @@ nano.agent_cross_session_test the process working directory (the permission chec
 nano.agent_peers_test environment variables (NANO_CODER_PEERS)
 nano.agent_name_test environment variables (NANO_CODER_PEERS); flock probes
 nano.handle flock probes: another module's fork briefly shares the log's locked description until exec
+nano.progstatus the process-wide reporter (clear() test)

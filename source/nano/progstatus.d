@@ -408,6 +408,24 @@ void clear()
     if (bytes.length) atomicLoad(gSink)(bytes);
 }
 
+// What the test sink received (only touched by the unittest below).
+private string gTestSent;
+
+unittest // clear() removes the record and stops reporting (--login, quit)
+{
+    import std.algorithm : canFind;
+    start(Route.direct, (string b) @safe { gTestSent ~= b; });
+    scope (exit) atomicStore(gReporter, null);
+    update((ref Session s) { s.blocked = true; s.blockedOn = Kind.auth; s.question = "Sign in"; });
+    assert(gTestSent.canFind("state=blocked"));
+    gTestSent = null;
+    clear();
+    assert(gTestSent.canFind("state=clear"));
+    gTestSent = null;
+    update((ref Session s) { s.turnEnded = true; });
+    assert(gTestSent is null, "nothing is sent after clear()");
+}
+
 /// The value in `tmux show -v` output: its last non-blank line, trimmed.
 string lastValue(string output) pure
 {
