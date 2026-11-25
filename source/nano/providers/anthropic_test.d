@@ -8,9 +8,19 @@ import std.json;
 import nano.config : ResolvedProvider;
 import nano.llm;
 import nano.providers.anthropic;
+import nano.clock : FakeClock;
 import nano.thinking : Request, anthropicDefaultMaxTokens;
 
 private:
+
+/// Fake time for one test: retry backoffs and offline waits advance it
+/// instead of sleeping, so a loaded host can't outlast the test server's
+/// 10 s accept window.
+FakeClock fakeTime()
+{
+    import std.datetime.systime : SysTime;
+    return FakeClock.install(SysTime(0));
+}
 
 JSONValue body_(const ref ChatRequest req)
 {
