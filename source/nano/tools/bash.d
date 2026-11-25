@@ -103,6 +103,54 @@ private struct RunStatus
     bool cancelled;
 }
 
+/// The message for a command that could not be started: an executable whose
+/// path ends in " (deleted)" was replaced under this session (an upgrade), so
+/// say to restart instead of surfacing the raw exec error.
+string spawnFailure(string msg) pure
+{
+    import std.algorithm : canFind;
+    if (msg.canFind(" (deleted)"))
+        return "nano-coder was upgraded under this session, so the bash tool can't start its helper; "
+            ~ "restart nano-coder (" ~ msg ~ ")";
+    return "could not start the command: " ~ msg;
+}
+
+unittest
+{
+    import std.algorithm : canFind, startsWith;
+    assert(spawnFailure("Failed to execute '/usr/bin/nano-coder (deleted)'").startsWith("nano-coder was upgraded"));
+    assert(spawnFailure("Failed to execute 'bash'").startsWith("could not start the command"));
+}
+
+/// The failure result a headless run records when its shell is gone: the
+/// agent can't write AGENT_RESULT_FILE itself without one, so its work would
+/// otherwise be reported as nothing at all.
+string fatalResultJson(string msg)
+{
+    import std.json : JSONValue;
+    return JSONValue(["status": "blocked", "summary": "bash tool unavailable: " ~ msg]).toString;
+}
+
+/// Write `fatalResultJson` to `$AGENT_RESULT_FILE` when it is set and the
+/// agent hasn't written a result yet (never overwrite a real one).
+void recordFatalResult(string msg)
+{
+    import std.file : exists, write;
+    auto path = environment.get("AGENT_RESULT_FILE");
+    if (!path.length || path.exists) return;
+    import std.exception : collectException;
+    // Best effort: the ToolError still reports the failure if this can't write.
+    collectException(write(path, fatalResultJson(msg)));
+}
+
+unittest
+{
+    import std.json : parseJSON;
+    auto j = parseJSON(fatalResultJson("restart nano-coder"));
+    assert(j["status"].str == "blocked");
+    assert(j["summary"].str == "bash tool unavailable: restart nano-coder");
+}
+
 private RunStatus runToFiles(string command, Duration timeout, string outPath, string errPath,
     string cwd = null, const SandboxConfig sandbox = SandboxConfig.init)
 {
@@ -117,7 +165,14 @@ private RunStatus runToFiles(string command, Duration timeout, string outPath, s
         try argv = sandbox.command("bash", command, cwd.length ? cwd : getcwd());
         catch (Exception e) throw new ToolError(e.msg);
     }
-    auto pid = spawnProcess(argv, inF, outF, errF, null, cfg, cwd);
+    Pid pid;
+    try pid = spawnProcess(argv, inF, outF, errF, null, cfg, cwd);
+    catch (ProcessException e)
+    {
+        auto msg = spawnFailure(e.msg);
+        recordFatalResult(msg);
+        throw new ToolError(msg);
+    }
     outF.close();
     errF.close();
     RunStatus r;

@@ -102,12 +102,18 @@ string check(bool network)
     return rights(network, v, fs, net);
 }
 
+/// The executable that re-runs this binary as the sandbox helper. The
+/// `/proc/self/exe` magic link, not its resolved path: an upgrade that
+/// replaces the installed file leaves the resolved path ending in
+/// " (deleted)", but exec through the link still reaches the running image,
+/// so the bash tool keeps working under a long-lived session (issue 390).
+enum helperExe = "/proc/self/exe";
+
 /// The argv that runs `shell -c script` confined to `roots`.
 string[] argv(bool network, const string[] roots, string shell, string script)
 {
-    import std.file : thisExePath;
     import std.conv : to;
-    return [thisExePath, execFlag, network ? "1" : "0", roots.length.to!string] ~ roots.dup ~ [shell, "-c", script];
+    return [helperExe, execFlag, network ? "1" : "0", roots.length.to!string] ~ roots.dup ~ [shell, "-c", script];
 }
 
 /// Restrict this process to `roots` (call it single-threaded, before exec).
@@ -182,4 +188,29 @@ shared static this() @trusted
         stderr.flush();
         exit(rc);
     }
+}
+
+unittest
+{
+    // The helper runs through the magic link, never a resolved path that an
+    // upgrade can turn into "… (deleted)".
+    assert(argv(false, ["/w"], "bash", "true")[0] == "/proc/self/exe");
+}
+
+// An executable deleted while running can still exec itself through
+// /proc/self/exe (the property the helper relies on after an upgrade).
+unittest
+{
+    import std.file : copy, remove, setAttributes, tempDir, mkdirRecurse, rmdirRecurse;
+    import std.path : buildPath;
+    import std.process : execute, thisProcessID;
+    import std.conv : octal, to;
+    auto dir = buildPath(tempDir, "nano-landlock-" ~ thisProcessID.to!string);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto sh = buildPath(dir, "sh");
+    copy("/bin/sh", sh);
+    setAttributes(sh, octal!755);
+    auto r = execute([sh, "-c", "rm \"$0\"; exec /proc/self/exe -c 'echo ok'", sh]);
+    assert(r.status == 0 && r.output == "ok\n", r.output);
 }
