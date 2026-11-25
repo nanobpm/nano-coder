@@ -73,7 +73,14 @@ private immutable(Captured)[] run(immutable(Reply)[] replies, Chan!ushort port, 
     {
         if (!awaitClient(listener, stop)) break;
         auto r = replies[i];
-        auto conn = listener.accept();
+        // On macOS accept fails (ECONNABORTED) for a client that reset
+        // before it was accepted, e.g. a timed-out connect on a loaded
+        // runner; that client consumes no reply, so wait for the next.
+        Socket conn;
+        try
+            conn = listener.accept();
+        catch (SocketAcceptException)
+            continue;
         scope (exit) conn.close();
         char[] buf;
         char[4096] chunk;
