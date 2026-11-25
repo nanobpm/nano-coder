@@ -197,6 +197,16 @@ measure() {
     printf '%s\n' "$m"
 }
 here=$(measure . "the working tree") || exit 1
+# The commit messages of pull request $1, separated by blank lines:
+# NANO_RATCHET_PR_MESSAGES_DIR/<n> when set (tests), else the GitHub API when
+# GITHUB_REPOSITORY is set (CI, with GH_TOKEN); nothing otherwise.
+pr_messages() {
+    if [ -n "${NANO_RATCHET_PR_MESSAGES_DIR:-}" ]; then
+        cat "$NANO_RATCHET_PR_MESSAGES_DIR/$1" 2>/dev/null
+    elif [ -n "${GITHUB_REPOSITORY:-}" ] && command -v gh >/dev/null 2>&1; then
+        gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$1/commits" --jq '.[].commit.message + "\n"' 2>/dev/null
+    fi
+}
 base_ref=${NANO_RATCHET_BASE:-origin/main}
 base=""
 if git rev-parse --git-dir >/dev/null 2>&1; then
@@ -240,6 +250,14 @@ else
             printf '%s\n' "$then_" > "$part" && mv -f "$part" "$cache/$key"
     fi
     overrides=$(git log --format='%(trailers:key=Ratchet-Override,valueonly)' "$base..HEAD" 2>/dev/null | grep .)
+    # A squash merge keeps only the PR title `… (#N)` and the sign-offs, so the
+    # trailers of the PR's commits are lost on main. For each commit whose
+    # subject ends in `(#N)`, read the trailers of PR N's commits too.
+    pr_overrides=$(git log --format=%s "$base..HEAD" 2>/dev/null |
+        sed -n 's/.*(#\([0-9][0-9]*\))[[:space:]]*$/\1/p' | sort -u | while read -r pr; do
+            pr_messages "$pr" | sed -n 's/^Ratchet-Override:[[:space:]]*//p'
+        done)
+    overrides=$(printf '%s\n%s\n' "$overrides" "$pr_overrides" | grep .)
     short=$(git rev-parse --short "$base")
     bad=$(printf '%s\n' "$here" | while read -r name dir now what; do
         was=$(printf '%s\n' "$then_" | awk -v n="$name" '$1 == n { print $3 }')

@@ -4,6 +4,7 @@
 #   - a change that adds a `@trusted` site fails;
 #   - one that removes a site passes without touching scripts/;
 #   - one that adds a site with a `Ratchet-Override` trailer passes and prints it;
+#   - a squash commit `… (#N)` finds the trailer in PR N's commits;
 #   - a committed scripts/*-budget or *-floor file fails;
 #   - two branches that both improve one ratchet merge without conflict.
 set -eu
@@ -49,6 +50,20 @@ if check; then no "adding a @trusted site fails"; elif grep -q "Error: trusted-b
 
 git commit -q --allow-empty -m 'justify it' -m 'Ratchet-Override: trusted-budget the fixture needs it'
 if check && grep -q 'Ratchet-Override: the fixture needs it' out; then ok "a Ratchet-Override trailer allows it and is printed"; else no "a Ratchet-Override trailer allows it and is printed"; fi
+
+# A squash merge drops the PR's trailers: the override is found in the
+# commits of the PR named by the squash subject `(#N)`.
+git checkout -q -b squash base
+add_trusted
+git commit -q -m 'add a @trusted site (#7)' -m 'Signed-off-by: test <test@example.com>'
+mkdir -p "$tmp/prs"
+printf 'add a @trusted site\n\nRatchet-Override: trusted-budget the PR needs it\n\n' > "$tmp/prs/7"
+printf 'unrelated\n\nRatchet-Override: trusted-budget wrong PR\n' > "$tmp/prs/8"
+if NANO_RATCHET_PR_MESSAGES_DIR="$tmp/prs" check && grep -q 'Ratchet-Override: the PR needs it' out; then ok "a squash merge finds the override in its PR's commits"; else no "a squash merge finds the override in its PR's commits"; fi
+git commit -q --amend -m 'add a @trusted site (#8x)'
+if NANO_RATCHET_PR_MESSAGES_DIR="$tmp/prs" check; then no "a squash without a PR override still fails"; else ok "a squash without a PR override still fails"; fi
+git commit -q --amend -m 'add a @trusted site (#9)'
+if NANO_RATCHET_PR_MESSAGES_DIR="$tmp/prs" check; then no "an unknown PR gives no override"; else ok "an unknown PR gives no override"; fi
 
 # Remove one @trusted outside safeio.d: drop the attribute from its line.
 remove_trusted() {
