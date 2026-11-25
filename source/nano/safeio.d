@@ -200,6 +200,45 @@ socket_t dupSocket(socket_t fd) nothrow @nogc
     return n < 0 ? socket_t.init : cast(socket_t) n;
 }
 
+/// Accept one connection on the listening socket `listener`: the new fd,
+/// close-on-exec and (on macOS) SO_NOSIGPIPE, or `socket_t.init` with the
+/// accept errno in `err`. Wrap it with `new Socket(fd, family)`.
+///
+/// Not `std.socket.Socket.accept`: on macOS it stores the fd in a new
+/// `Socket` and then sets SO_NOSIGPIPE, which fails (EINVAL) for a peer that
+/// already left; it closes the fd and throws, but the abandoned `Socket`
+/// still holds the number, and its GC finalizer closes that number again
+/// later, closing whatever socket or file of another thread reused it
+/// (issue #388).
+socket_t acceptFd(socket_t listener, out int err) @trusted nothrow @nogc
+{
+    import core.sys.posix.sys.socket : accept, setsockopt, SOL_SOCKET;
+    import core.sys.posix.unistd : close;
+    import core.stdc.errno : errno;
+    // accept(2) with null address arguments writes no memory; setsockopt
+    // reads exactly `one`, whose size it is given; close(2) closes only the
+    // fd this call just received and nothing else holds.
+    auto fd = accept(listener, null, null);
+    if (fd < 0)
+    {
+        err = errno;
+        return socket_t.init;
+    }
+    version (OSX)
+    {
+        enum soNoSigpipe = 0x1022;
+        int one = 1;
+        if (setsockopt(fd, SOL_SOCKET, soNoSigpipe, &one, one.sizeof) != 0)
+        {
+            err = errno;
+            close(fd);
+            return socket_t.init;
+        }
+    }
+    setCloexec(fd);
+    return cast(socket_t) fd;
+}
+
 /// Whether `fd` is a listening socket (SO_ACCEPTCONN). The orphan sweep
 /// closes only listeners: accepted connections report the listener's path
 /// from getsockname and may briefly lack close-on-exec.

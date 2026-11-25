@@ -91,7 +91,14 @@ private immutable(Captured)[] run(immutable(Reply)[] replies, string prefix, Cha
     {
         auto r = replies[next];
         if (!awaitClient(listener, stop)) break;
-        auto conn = listener.accept();
+        // Not `listener.accept()`: on macOS a client that already left makes
+        // it leave a GC finalizer that later closes a reused fd number
+        // (nano.safeio.acceptFd, issue #388).
+        import nano.safeio : acceptFd;
+        int acceptErr;
+        immutable fd = acceptFd(listener.handle, acceptErr);
+        if (fd == socket_t.init) continue;
+        auto conn = new Socket(fd, AddressFamily.INET);
         scope (exit) conn.close();
         char[] buf;
         char[4096] chunk;
