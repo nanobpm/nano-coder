@@ -234,13 +234,22 @@ string[] writeTargets(Channel c, string prefix, string tapRepo, bool npmLib = tr
     }
 }
 
-/// Whether the current user may write `dir`; a missing directory counts as
-/// writable (the installer creates it, or fails with its own message).
+/// Whether the current user may write `dir`. A missing directory is judged
+/// by its nearest existing ancestor, since the installer must create it there
+/// (an unwritable prefix with no `bin` yet still fails the update).
 bool dirWritable(string dir)
 {
     import std.file : exists;
+    import std.path : dirName;
     import nano.safeio : accessWritable;
-    return !dir.exists || accessWritable(dir);
+    for (auto d = dir; d.length; )
+    {
+        if (d.exists) return accessWritable(d);
+        auto up = d.dirName;
+        if (up == d) break;
+        d = up;
+    }
+    return false;
 }
 
 /// The tap that serves `brewFormula`.
@@ -1291,7 +1300,17 @@ unittest
         (string d) @safe => true, npmFound);
     assert(ran == [["npm", "install", "-g", npmPackage ~ "@latest"]], "no --prefix into a project");
     // The real probe: a temp dir is writable.
-    assert(dirWritable(dir) && dirWritable(buildPath(dir, "missing")));
+    assert(dirWritable(dir) && dirWritable(buildPath(dir, "missing", "deeper")));
+    // A missing dir under an unwritable parent is not creatable.
+    import std.file : setAttributes;
+    import std.conv : octal;
+    import nano.safeio : accessWritable;
+    auto ro = buildPath(dir, "ro");
+    mkdirRecurse(ro);
+    setAttributes(ro, octal!555);
+    scope (exit) setAttributes(ro, octal!755);
+    if (!accessWritable(ro)) // root bypasses mode bits
+        assert(!dirWritable(buildPath(ro, "bin")) && !dirWritable(buildPath(ro, "a", "b")));
 }
 
 // brew: an unwritable Cellar names the command for the prefix's owner.
