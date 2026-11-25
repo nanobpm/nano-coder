@@ -39,6 +39,8 @@ import nano.plan : Plan, checklist;
 import nano.queue : MessageQueue, QueuedMessage, QueueUsage, queueParse = parse, queueApply = apply;
 import nano.mode : AgentMode, allModes, parseMode, planPromptNote, name, describe, nextMode = next;
 static import nano.herdr;
+static import nano.progstatus;
+import nano.progstatus : ProgSession = Session, ProgKind = Kind;
 import nano.frame : glyphMark, foldMark, refoldMark, expandedBody, expandedResult, dropSoftWraps, escapeMarks, rawModelText;
 import core.time : MonoTime, seconds;
 import std.sumtype : match;
@@ -224,26 +226,78 @@ unittest
 }
 
 /// `--login PROVIDER`: interactive device-flow sign-in.
-int runLogin(string provider)
+int runLogin(string provider, string cfgPath)
 {
     import core.thread : Thread;
-    import core.time : seconds;
+    import core.time : seconds, msecs;
     import std.functional : toDelegate;
     void delegate(string) @safe note = toDelegate((string s) { stdErr.writeln(s); });
-    void delegate(long) @safe sleep = toDelegate((long n) { sleepFor(n.seconds); });
+    // Ctrl-C during the login wait is turned into an exception (via a flag
+    // the signal handler sets) so the catch below clears the status record;
+    // the handler itself does no locking or I/O.
+    {
+        import core.sys.posix.signal : SIGINT;
+        import nano.safeio : onSignal;
+        onSignal(SIGINT, &onLoginInterrupt);
+    }
+    // The same flag cancels in-flight HTTP requests and retry waits, which
+    // poll `cancelRequested`.
+    {
+        import nano.control : pushCancelScope, popCancelScope;
+        pushCancelScope(&gLoginInterrupted);
+    }
+    scope (exit)
+    {
+        import nano.control : popCancelScope;
+        popCancelScope();
+    }
+    void delegate(long) @safe sleep = toDelegate((long n) {
+        foreach (_; 0 .. n * 10)
+        {
+            if (atomicLoad(gLoginInterrupted)) throw new Exception("login cancelled");
+            sleepFor(100.msecs);
+        }
+        if (atomicLoad(gLoginInterrupted)) throw new Exception("login cancelled");
+    });
+    // No frame renderer here: a terminal status report (blocked on a login,
+    // then done or error) goes straight to stdout when it is a terminal.
     try
     {
+        if (isTerminal(1))
+        {
+            import nano.result : orElse;
+            // Only `[terminal] program_status` is read: a config that is
+            // otherwise broken doesn't stop a login.
+            bool enabled = true;
+            auto doc = cfgPath.exists ? parseToml(readText(cfgPath)).orElse(JSONValue(string[string].init))
+                : JSONValue(string[string].init);
+            if (doc.type == JSONType.object)
+                if (auto t = "terminal" in doc)
+                    if (t.type == JSONType.object)
+                        if (auto v = "program_status" in *t) enabled = v.type != JSONType.false_;
+            startProgramStatus(enabled, (string b) { stdOut.flush(); writeFd(1, b); });
+        }
         switch (provider)
         {
             case "github-copilot":
                 import nano.copilot : copilotLogin = login;
-                writeln("Saved GitHub Copilot credentials to ", copilotLogin(note, sleep));
+                reportBlocked(ProgKind.auth, "Sign in to GitHub Copilot");
+                auto saved = copilotLogin(note, sleep);
+                // The process ends here: remove the record rather than leave a
+                // stale `done` behind for a process that no longer exists.
+                nano.progstatus.clear();
+                writeln("Saved GitHub Copilot credentials to ", saved);
                 return 0;
             default:
+                nano.progstatus.clear();
                 die(format("unknown provider %(%s%) for --login; supported: github-copilot (other providers use API keys)", [provider]));
         }
     }
-    catch (Exception e) die(e.msg);
+    catch (Exception e)
+    {
+        nano.progstatus.clear(); // die() exits: leave no stale record behind
+        die(e.msg);
+    }
     assert(0);
 }
 
@@ -300,6 +354,29 @@ noreturn die(string msg)
     exitProcess(2);
 }
 
+/// Start the terminal status reports (OSC 7501) through `sink` when
+/// `enabled` (`[terminal] program_status`); inside tmux only if its
+/// passthrough is on, wrapped for it.
+void startProgramStatus(bool enabled, nano.progstatus.Sink sink)
+{
+    import std.process : environment;
+    bool inTmux = environment.get("TMUX", "").length > 0;
+    nano.progstatus.start(nano.progstatus.routeFor(enabled, inTmux,
+        enabled && inTmux ? nano.progstatus.tmuxPassthrough() : null), sink);
+}
+
+/// Report that the session waits on the user (`kind`, the question shown).
+void reportBlocked(ProgKind kind, string question)
+{
+    nano.progstatus.update((ref ProgSession s) { s.blocked = true; s.blockedOn = kind; s.question = question; });
+}
+
+/// The user answered: back to the state before `reportBlocked`.
+void reportUnblocked()
+{
+    nano.progstatus.update((ref ProgSession s) { s.blocked = false; s.blockedOn = ProgKind.none; s.question = null; });
+}
+
 bool isTerminal(int fd)
 {
     import core.sys.posix.unistd : isatty;
@@ -316,6 +393,14 @@ bool isTerminal(int fd)
 shared(TurnControl) gControl() nothrow @nogc { return atomicLoad(gControl_); }
 void gControl(shared TurnControl c) nothrow @nogc { atomicStore(gControl_, c); }
 shared bool gTurnRunning;
+
+/// Set by `onLoginInterrupt` when Ctrl-C arrives during `--login`.
+shared bool gLoginInterrupted;
+
+extern (C) void onLoginInterrupt(int) nothrow @nogc @system
+{
+    atomicStore(gLoginInterrupted, true);
+}
 
 /// Route SIGINT to `onInterrupt`.
 void installSigint()
@@ -726,6 +811,8 @@ private void readTurnKeys(LineEditor editor, ConsoleLink console, shared(bool)* 
                 {
                     console.endLine();
                     nano.herdr.report(nano.herdr.State.blocked, qs.length ? terminalSafe(qs[0].question) : null);
+                    reportBlocked(qs.length && qs[0].approval ? ProgKind.permission : ProgKind.question,
+                        qs.length ? qs[0].question : null);
                     // The user's time at the picker isn't working time.
                     auto paused = PickerPause((bool p) @safe { if (gFrame) gFrame.pauseWork(p); });
                     bool delegate() @safe away = null;
@@ -742,6 +829,7 @@ private void readTurnKeys(LineEditor editor, ConsoleLink console, shared(bool)* 
                         console.note("[auto: no answer — making the best decision]");
                     questions.resolve(answer);
                     nano.herdr.report(nano.herdr.State.working);
+                    reportUnblocked();
                     break;
                 }
                 return;
@@ -1267,6 +1355,8 @@ Answer askQuestions(LineEditor editor, const Question[] qs, bool delegate() @saf
         }
         import nano.question : questionPrompt;
         string[] body_;
+        // Report the question being asked now, not the batch's first.
+        reportBlocked(q.approval ? ProgKind.permission : ProgKind.question, q.question);
         auto prompt = questionPrompt(q.question, terminalWidth(), body_);
         auto at = editor.select(prompt, labels, 0, away, body_);
         if (at == -2) return Answer(Away());
@@ -3557,7 +3647,7 @@ int runMain(string[] args)
     auto cfgPath = o.configPath.length ? o.configPath : Config.defaultPath;
     Config cfg;
     JSONValue rawConfig = JSONValue(string[string].init);
-    if (o.login.length) return runLogin(o.login);
+    if (o.login.length) return runLogin(o.login, cfgPath);
     try
     {
         cfg = Config.load(cfgPath);
@@ -4829,6 +4919,13 @@ int runMain(string[] args)
         peerRouter.midTurn(true);
         scope (exit) peerRouter.midTurn(false);
         nano.herdr.report(nano.herdr.State.working);
+        nano.progstatus.update((ref ProgSession s) {
+            s.turnRunning = true;
+            s.activity = "thinking";
+            s.turnEnded = false;
+            s.turnError = null;
+            s.answer = null;
+        });
         nano.herdr.showTimer(!agent.timers.empty);
         // Follow timers set or cancelled during the turn too, not only the
         // state sampled here and at the idle prompt.
@@ -4845,6 +4942,20 @@ int runMain(string[] args)
             refreshStatus();
             updateStatus((ref Stats s) { s.activity = Activity.idle; s.tokensPerSec = 0; });
         }
+        string turnError, turnAnswer;
+        // Background sub-agents still running keep the session `working`, so
+        // no transient `done` reaches the terminal (a completion notice).
+        scope (exit)
+        {
+            bool background = agent.subagentsActive;
+            nano.progstatus.update((ref ProgSession s) {
+            s.turnRunning = background;
+            s.activity = background ? "background sub-agents" : null;
+            s.turnEnded = true;
+            s.turnError = turnError;
+            s.answer = turnAnswer;
+            });
+        }
         return driven(() @safe {
             bool ok = true;
             console.finalAnswer = null;
@@ -4856,12 +4967,18 @@ int runMain(string[] args)
                 console.endLine();
                 stdErr.writeln(console.red("error: " ~ e.msg));
                 ok = false;
+                // The terminal status report says why (capped: the message
+                // is kept until the user types).
+                turnError = nano.progstatus.clean(e.msg, nano.progstatus.maxMsgBytes);
             }
             console.endLine();
             // Quiet shows only the final answer; a turn that got louder after
             // answer deltas were dropped reprints the whole answer (ui.rs).
             auto reprint = turnReprint(console.quiet, console.answerMayBeTruncated, console.finalAnswer, response,
                 agent.lastStop == StopReason.maxTurnRequests);
+            // Only the first line is reported, so only it is kept.
+            turnAnswer = nano.progstatus.clean(nano.progstatus.firstLine(response.length ? response : console.finalAnswer),
+                nano.progstatus.maxMsgBytes);
             if (reprint.length)
             {
                 writeln(console.display(reprint));
@@ -4962,6 +5079,7 @@ int runMain(string[] args)
             leaveKeyMode();
             die("could not start the terminal renderer");
         }
+        startProgramStatus(cfg.programStatus, (string b) { if (auto f = gFrame) f.report(b); });
         editor = some(makeEditor(console.link, agent.control.nonNull));
         seedInputHistory(editor);
         questions.interactive = true;
@@ -4974,6 +5092,8 @@ int runMain(string[] args)
     }
     scope (exit) leaveKeyMode();
     scope (exit) if (gFrame) { gFrame.uninstall(); gFrame = FrameUi.init; }
+    // Before the frame goes: the report is written through it.
+    scope (exit) nano.progstatus.clear();
     if (interactive && editor.isNone)
     {
         import core.thread : Thread;
@@ -5088,6 +5208,8 @@ int runMain(string[] args)
                 // prompt, so `questions.ask` would block forever. No editor
                 // (plain input) means no way to ask: decline.
                 accepted = false;
+                reportBlocked(ProgKind.question, confirmQuestion(inbound));
+                scope (exit) reportUnblocked();
                 foreach (ed; editor)
                 {
                     // Keep routing while the picker waits, so later senders hear
@@ -5150,6 +5272,21 @@ int runMain(string[] args)
             nano.herdr.showName(agent.name);
             nano.herdr.showModel(agent.client.modelName);
             nano.herdr.showTimer(!agent.timers.empty);
+            // The terminal's status: `done`/`error` after a turn until a key
+            // is typed, then `idle` (working while sub-agents run).
+            {
+                bool subagents = agent.subagentsActive;
+                string name = agent.name;
+                nano.progstatus.update((ref ProgSession s) {
+                    s.turnRunning = subagents;
+                    s.activity = subagents ? "background sub-agents" : null;
+                    s.name = name;
+                });
+                // Every real key acknowledges: the emitter drops unchanged reports.
+                ed.onKey = () @safe {
+                    nano.progstatus.update((ref ProgSession s) { s.turnEnded = false; s.turnError = null; s.answer = null; });
+                };
+            }
             // The prompt's stamp is redrawn with the submission time (Rust's restamp).
             ed.restyle = () => console.stamp() ~ console.bold("› ");
             // While the Ctrl-C exit hint is armed, end the read when the window
@@ -5404,6 +5541,7 @@ int runMain(string[] args)
                     // A new session has no handle (issue #300): drop it from the prompt.
                     agent.installSystem(systemFor(cwd, agent.promptPlan), indexShown);
                     nano.herdr.showName(null);
+                    nano.progstatus.update((ref ProgSession s) { s = ProgSession.init; });
                     if (gFrame) gFrame.clear();
                     refreshStatus();
                     log.match!(l => writefln("Session: %s (resume with nano-coder --resume %s)", l.id, l.id),
@@ -5442,6 +5580,7 @@ int runMain(string[] args)
                         agent.control.mode == AgentMode.plan), id));
                     enterKeyMode(0);
                     if (gFrame) gFrame.resume();
+                    nano.progstatus.resend();
                     writefln("Relaunch failed: could not exec %s: %s", exe, err);
                     continue;
                 }
@@ -5636,6 +5775,11 @@ int runMain(string[] args)
                     foreach (n; loadNotes) stdErr.writeln(n);
                     stdErr.flush();
                     nano.herdr.showName(agent.name);
+                    {
+                        string name = agent.name;
+                        nano.progstatus.update((ref ProgSession s) { s = ProgSession.init; s.name = name; });
+                        nano.progstatus.resend();
+                    }
                     refreshStatus();
                     writefln("Resumed session %s%s (resume later with nano-coder --resume=%s)", id,
                         agent.name.length ? " · " ~ agent.name : "", nano.handle.resumeArg(sessionDir, id, agent.name));

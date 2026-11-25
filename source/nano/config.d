@@ -455,6 +455,9 @@ struct Config
     bool checkUpdates = true;
     /// After an update, show what changed since the version that ran last (#282).
     bool showReleaseNotes = true;
+    /// `[terminal] program_status`: report the session's state to the
+    /// terminal with OSC 7501 (`nano.progstatus`).
+    bool programStatus = true;
     /// Instruction files (AGENTS.md and friends, the user's own, rules).
     bool projectInstructions = true;
     string[] projectInstructionFiles = ["AGENTS.md", "CLAUDE.md", ".claude/CLAUDE.md", ".github/copilot-instructions.md"];
@@ -614,6 +617,8 @@ struct Config
         if (auto v = "memory_dir" in doc) c.memoryDir = expandTilde(v.str);
         if (auto v = "memory_expiry_days" in doc) c.memoryExpiryDays = v.integer;
         if (auto v = "memory_recall" in doc) { parseRecallMode(v.str); c.memoryRecall = v.str.strip; }
+        if (auto t = "terminal" in doc)
+            if (auto v = "program_status" in *t) c.programStatus = v.boolean;
         if (auto v = "skills" in doc) c.skills = SkillsConfig.fromToml(*v);
         if (auto ps = "providers" in doc)
             foreach (name, table; ps.objectNoRef)
@@ -1116,6 +1121,17 @@ unittest
 }
 
 // rust: config.rs::a_retired_legacy_renderer_setting_still_loads_with_a_notice
+unittest // `[terminal] program_status`: on by default, `false` turns it off
+{
+    import std.file : write, tempDir, remove;
+    auto path = buildPath(tempDir, "nano-coder-progstatus-test.toml");
+    scope (exit) remove(path);
+    write(path, "model = \"work/x\"\n");
+    assert(Config.load(path).programStatus);
+    write(path, "model = \"work/x\"\n[terminal]\nprogram_status = false\n");
+    assert(!Config.load(path).programStatus);
+}
+
 unittest // a retired `renderer = "legacy"` still loads, with a notice
 {
     import std.algorithm : canFind;

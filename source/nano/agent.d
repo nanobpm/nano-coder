@@ -3293,6 +3293,7 @@ class Agent
         auto q = Question(cross.confirmQuestion(target), null,
             [QuestionOption("No"), QuestionOption("Yes")]);
         q.custom = false;
+        q.approval = true;
         auto a = questions.ask([q]);
         return a.match!(
             (Answered got) => got.answers.length && got.answers[0] == "Yes",
@@ -4714,6 +4715,7 @@ class Agent
         auto q = Question("Reached the turn cap without a final answer. Keep going?", null,
             [QuestionOption("No"), QuestionOption("Yes")]);
         q.custom = false;
+        q.approval = true;
         auto a = questions.ask([q]);
         return a.match!(
             (Answered got) => got.answers.length && got.answers[0] == "Yes",

@@ -682,6 +682,9 @@ final class LineEditor
     /// Esc Esc at the idle prompt (after clearing the input): the app
     /// stops background sub-agents with it (issue #266). Null: clear only.
     void delegate() @safe onIdleEscEsc;
+    /// Every key read (the app turns a `done` status report into `idle`
+    /// once the user types). Null: nothing.
+    void delegate() @safe onKey;
     /// On submit, the styled prompt to redraw the line with (Rust's
     /// `restamp_prompt`: the timestamp becomes the submission time). It must
     /// keep the prompt's visible width.
@@ -789,6 +792,9 @@ final class LineEditor
             }
             // Every key is activity for the idle-compaction quiet check.
             state.keySeen(monoNow);
+            // Only typing acknowledges a finished turn: focus/mouse reports
+            // (K.ignored) and a closed input are not the user at the keys.
+            if (onKey !is null && key.kind != K.ignored && key.kind != K.closed) onKey();
             notice = null;
             final switch (key.kind)
             {
@@ -917,6 +923,8 @@ final class LineEditor
                 frameDraw(null);
                 return -2;
             }
+            // Picker input acknowledges a finished turn just as typing does.
+            if (onKey !is null && key.kind != K.none && key.kind != K.ignored && key.kind != K.closed) onKey();
             final switch (key.kind)
             {
                 case K.up: at = at ? at - 1 : labels.length - 1; break;
