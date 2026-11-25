@@ -43,3 +43,17 @@ jobs:
               echo "::endgroup::"
             done
           done
+      - name: 50 runs of the three modules together (NANO_TEST_JOBS=4)
+        run: |
+          m=nano.providers.anthropic_test,nano.peers,nano.session_resume_memory_test
+          for i in $(seq 1 50); do
+            echo "::group::together run $i"
+            if [ "$RUNNER_OS" = Linux ]; then
+              NANO_TEST_ONLY=$m NANO_TEST_JOBS=4 NANO_TEST_BUDGET_SCALE=1 gdb -q -batch -return-child-result -ex "handle all nostop noprint pass" -ex "handle SIGSEGV SIGBUS SIGABRT stop print" -ex run -ex "thread apply all bt" ./nano-coder-test-application > out.txt 2>&1 || true
+            else
+              NANO_TEST_ONLY=$m NANO_TEST_JOBS=4 NANO_TEST_BUDGET_SCALE=1 lldb --batch -o run -k "thread backtrace all" -k "quit 1" ./nano-coder-test-application > out.txt 2>&1 || true
+            fi
+            if ! grep -qE "modules? passed unittests" out.txt || grep -qE "stop reason|SIGSEGV|FAILED" out.txt; then cat out.txt; echo "together run $i failed"; exit 1; fi
+            grep -E "passed unittests" out.txt
+            echo "::endgroup::"
+          done
