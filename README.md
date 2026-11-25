@@ -787,6 +787,9 @@ memory = "on"                           # on | read_only | off — cross-session
 memory_expiry_days = 90                 # expire memories unused this long (0 = never)
 memory_recall = "entity"                # entity | anchor — how tool calls recall memories (see Memory)
 
+[terminal]
+program_status = true                   # report the session's state to the terminal (OSC 7501, see Terminal Status)
+
 [skills]                                # see Skills
 enabled = true
 dirs = [".agents/skills", ".github/skills", ".claude/skills"]   # relative to the git root
@@ -1772,6 +1775,32 @@ Record times and each message's `timestamp` are RFC 3339 with the local UTC offs
   `session_retention_days` (default 0 = keep forever) deletes logs untouched that long,
   except named sessions (a title or a handle). The tidy-up runs at most once a day and never touches a log a
   running session holds open.
+
+## Terminal Status
+
+The interactive CLI tells the terminal what the session is doing with the
+[Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status)
+(OSC 7501), so a terminal that supports it (e.g. Rex) can show it in tabs, session
+pickers or notifications; other terminals ignore it. Every report says `app=nano-coder`
+and carries the session's [handle](#session-handles) as its title when one is set:
+
+- `working` while a turn runs (also while background sub-agents run at the prompt);
+- `blocked` while it waits on you: `kind=question` for a question or a peer-message
+  confirmation, `kind=permission` for an approval (going past the turn cap, reading
+  another workspace's session), `kind=auth` during `--login`, with the question as the
+  message;
+- `done` after a turn, with the answer's first line, until you type; then `idle`;
+- `error` when a turn failed, with the reason;
+- the record is cleared when you quit.
+
+A report is sent only when it changes, and again after `/resume` or a failed
+`/relaunch`. Reports go through the terminal renderer, so they never split other
+output, and only when stdout is a terminal: headless runs (`-p`, `--acp`, piped
+output) and a nano-coder started from the bash tool send nothing. Inside tmux they
+are wrapped for tmux's passthrough when `allow-passthrough` is `on` or `all`
+(`set -g allow-passthrough on`), and skipped otherwise. Inside Herdr they are sent
+as well as the Herdr reports below. Turn them off with `program_status = false`
+under `[terminal]`.
 
 ## Herdr
 

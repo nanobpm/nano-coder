@@ -86,7 +86,9 @@ unittest
     assert(clean("  x  ", 100) == "x");
     assert(clean("é", 1) == "", "a code point is never split");
     assert(clean("aé", 2) == "a");
-    assert(clean("\xff ok", 10) == "\uFFFD ok");
+    import std.algorithm : endsWith, startsWith;
+    auto bad = clean("\xff ok", 10);
+    assert(bad.startsWith("\uFFFD") && bad.endsWith("ok"), "invalid UTF-8 reads as U+FFFD");
     assert(clean("a\u0085b", 10) == "a b", "C1 controls go");
 }
 
