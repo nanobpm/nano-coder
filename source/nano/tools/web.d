@@ -16,7 +16,7 @@ import std.json;
 import std.format : format;
 import std.string : strip, startsWith, endsWith, indexOf, stripRight;
 import std.sumtype : SumType, match;
-import core.time : Duration, seconds;
+import core.time : Duration, msecs, seconds;
 import nano.llm : ToolDefinition;
 import nano.tools : ToolError, ToolRegistry, requireString, optInt;
 import nano.tools.webtext;
@@ -152,8 +152,9 @@ string resolveBraveKey(const WebConfig c)
         if (auto k = environment.get(c.apiKeyEnv, null)) if (k.strip.length) return k.strip;
     if (c.apiKeyCommand.length)
     {
-        import nano.keycmd : runKeyCommand;
-        return runKeyCommand("web", c.apiKeyCommand);
+        import nano.keycmd : keyCommandDrainGrace, keyCommandTimeout, runKeyCommand;
+        // Without stderr: this error reaches the conversation, and stderr may hold secrets.
+        return runKeyCommand("web", c.apiKeyCommand, keyCommandTimeout, keyCommandDrainGrace, false);
     }
     throw new ToolError("web_search: no Brave API key; set [web] api_key_command or api_key_env");
 }
@@ -166,15 +167,37 @@ alias HopCheck = string delegate(string url) @safe;
 /// Resolves a host name to its addresses as text (a test fakes DNS).
 alias Resolver = string[] delegate(string host) @safe;
 
-/// The addresses `host` resolves to, as text.
-string[] systemResolve(string host)
+/// The addresses `host` resolves to, as text; a lookup still running after
+/// `timeout` is abandoned (its daemon thread ends when the resolver does).
+string[] systemResolve(string host, Duration timeout)
+{
+    import nano.clock : monoNow, since, sleepFor;
+    import nano.safeio : Chan, spawnDaemon;
+    auto ch = Chan!(immutable(string)[]).make;
+    spawnDaemon(&lookup, host, ch);
+    immutable start = monoNow;
+    immutable(string)[] got;
+    while (!ch.tryTake(got))
+    {
+        if (imported!"nano.control".cancelRequested())
+            throw new ToolError(format("web_fetch: resolving %s was cancelled", host));
+        if (since(start) >= timeout)
+            throw new ToolError(format("web_fetch: resolving %s took longer than %s", host, timeout));
+        sleepFor(5.msecs);
+    }
+    if (got.length && got[0] is null) throw new ToolError(format("web_fetch: can't resolve %s: %s", host, got[1]));
+    return got.dup;
+}
+
+/// The resolver thread: the addresses, or `[null, why]` on failure.
+private void lookup(string host, imported!"nano.safeio".Chan!(immutable(string)[]) ch)
 {
     import std.socket : getAddress, SocketException;
-    string[] out_;
+    immutable(string)[] out_;
     try
         foreach (a; getAddress(host)) out_ ~= a.toAddrString;
-    catch (SocketException e) throw new ToolError(format("web_fetch: can't resolve %s: %s", host, e.msg));
-    return out_;
+    catch (SocketException e) out_ = [null, e.msg];
+    ch.put(out_);
 }
 
 /// Why web_fetch may not reach `u` (null when it may): denied and allowed
@@ -252,6 +275,7 @@ Fetched fetchUrl(const WebConfig c, string url, scope Resolver resolve, scope Ho
         req.noRedirects = true;
         req.httpOnly = true;
         req.pinned = pinned;
+        req.noProxy = pinned.length > 0; // a proxy would resolve the host again
         string body_;
         ResponseMeta meta;
         int status;
@@ -271,6 +295,13 @@ Fetched fetchUrl(const WebConfig c, string url, scope Resolver resolve, scope Ho
     assert(0, "the loop returns or throws on its last pass");
 }
 
+/// The most converted page text web_fetch keeps: room for markup expansion
+/// over the download cap, but bounded.
+size_t htmlTextCap(const WebConfig c) pure nothrow
+{
+    return c.maxDownloadBytes * 2 + 4096;
+}
+
 /// The web_fetch result text: where it came from, which bytes of how many,
 /// and the page wrapped as untrusted.
 string fetchResult(const WebConfig c, Fetched f, string requested, long offset, long maxBytes)
@@ -278,7 +309,7 @@ string fetchResult(const WebConfig c, Fetched f, string requested, long offset, 
     auto kind = contentKind(f.contentType, f.body_.length).orThrow!(e => new ToolError(e));
     final switch (kind)
     {
-    case ContentKind.html: f.body_ = htmlToText(f.body_, f.url); break;
+    case ContentKind.html: f.body_ = htmlToText(f.body_, f.url, htmlTextCap(c)); break;
     case ContentKind.text: break;
     }
     if (offset < 0) throw new ToolError("web_fetch: offset must not be negative");
@@ -309,6 +340,8 @@ string search(Backend b, const WebConfig c, string query, long count)
     req.totalTimeout = c.timeoutSecs.seconds;
     req.maxBytes = c.maxDownloadBytes;
     req.httpOnly = true;
+    // A redirect would carry the Brave key to wherever it points.
+    req.noRedirects = true;
     req.headers = ["Accept": "application/json"];
     immutable name = b.match!((Brave _) => "Brave Search", (SearXng _) => "SearXNG");
     b.match!(
@@ -393,7 +426,7 @@ private string hostKey(string host) pure
 void register(ToolRegistry tools, WebConfig c, WebOffer offer, Approve approve, HopCheck hop = null,
     Resolver resolve = null)
 {
-    if (resolve is null) resolve = (string h) => systemResolve(h);
+    if (resolve is null) resolve = (string h) => systemResolve(h, c.timeoutSecs.seconds);
     if (offer.search)
     {
         string key; // resolved once, on the first search, and kept out of every message
@@ -560,6 +593,22 @@ unittest // the download cap, and a refused first hop never connects
     assert(collectExceptionMsg!ToolError(fetchUrl(strict, "http://u:p@example.com/", &dns)).canFind("credentials"));
 }
 
+unittest // a failing key helper's stderr never reaches the tool error
+{
+    import std.algorithm : canFind;
+    import std.exception : collectExceptionMsg;
+    WebConfig c;
+    c.apiKeyCommand = "echo LEAKED-SECRET >&2; exit 3";
+    auto msg = collectExceptionMsg(resolveBraveKey(c));
+    assert(msg.canFind("exit 3") && !msg.canFind("LEAKED"), msg);
+}
+
+unittest // resolution runs under a deadline and reports the addresses
+{
+    import std.algorithm : canFind;
+    assert(systemResolve("localhost", 5.seconds).length > 0);
+}
+
 unittest // search against recorded Brave and SearXNG responses; errors are tool errors without the key
 {
     import nano.testserver : serve, Reply;
@@ -575,18 +624,21 @@ unittest // search against recorded Brave and SearXNG responses; errors are tool
         Reply(200, "Content-Type: application/json\r\n", "not json"),
         Reply(200, "Content-Type: application/json\r\n", `{"results":[{"title":"S","url":"https://s/","content":"snip"}]}`),
         Reply(403, "", "Forbidden"),
+        Reply(302, "Location: http://elsewhere.invalid/steal\r\n", ""),
     ]);
     auto brave = Backend(Brave(() => "SECRET-KEY", srv.url ~ "/res/v1/web/search"));
     auto out_ = search(brave, c, "d lang", 3);
-    assert(out_.canFind("1. D\n   https://dlang.org/") && out_.canFind("The D language"), out_);
+    assert(out_.canFind("title: D\nurl: https://dlang.org/") && out_.canFind("The D language"), out_);
     foreach (want; ["API key", "rate limit", "isn't JSON"])
     {
         auto msg = collectExceptionMsg!ToolError(search(brave, c, "q", 3));
         assert(msg.canFind(want) && !msg.canFind("SECRET"), msg);
     }
     auto searx = Backend(SearXng(srv.url));
-    assert(search(searx, c, "q", 3).canFind("1. S\n   https://s/"));
+    assert(search(searx, c, "q", 3).canFind("title: S\nurl: https://s/"));
     assert(collectExceptionMsg!ToolError(search(searx, c, "q", 3)).canFind("settings.yml"));
+    // A redirect is not followed, so the key never goes to another host.
+    assert(collectExceptionMsg!ToolError(search(brave, c, "q", 3)).canFind("302"));
     auto seen = srv.finish();
     assert(seen[0].path == "/res/v1/web/search?q=d%20lang&count=3", seen[0].path);
     assert(seen[0].headers.canFind("X-Subscription-Token: SECRET-KEY"));

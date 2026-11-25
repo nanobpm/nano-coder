@@ -25,8 +25,10 @@ enum keyCommandDrainGrace = 500.msecs;
 extern (C) private int setsid() nothrow @nogc;
 
 /// The trimmed key `command` prints; throws with an actionable message.
+/// `withStderr: false` leaves the command's stderr out of a failure message,
+/// for a caller whose errors reach the conversation (stderr may hold secrets).
 string runKeyCommand(string provider, string command, Duration timeout = keyCommandTimeout,
-    Duration drainGrace = keyCommandDrainGrace)
+    Duration drainGrace = keyCommandDrainGrace, bool withStderr = true)
 {
     import core.sys.posix.poll : pollfd, POLLIN;
     import core.sys.posix.signal : SIGKILL;
@@ -109,7 +111,7 @@ string runKeyCommand(string provider, string command, Duration timeout = keyComm
     killPid(group, SIGKILL); // stdout is closed: nothing left in the group can add to the key
     if (status != 0)
     {
-        auto err = stderrText();
+        auto err = withStderr ? stderrText() : "";
         throw new Exception(format("%s failed (exit %s)%s", what, status, err.length ? ": " ~ err : ""));
     }
     auto key = lossyUtf8(captured).strip;

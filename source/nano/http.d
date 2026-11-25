@@ -76,6 +76,9 @@ struct Request
     /// `host:port:address` entries libcurl uses instead of its own lookup
     /// (CURLOPT_RESOLVE), so web_fetch connects to the addresses it checked.
     string[] pinned;
+    /// Connect directly, ignoring any proxy from the environment: a proxy
+    /// resolves the host itself and would bypass `pinned`.
+    bool noProxy;
 }
 
 /// Perform `req`; each received chunk goes to `onChunk` (when set) as it
@@ -181,6 +184,7 @@ int perform(const ref Request req, out string body_, out ResponseMeta meta,
         import etc.c.curl : CurlOption;
         if (req.totalTimeout > Duration.zero) http.handle.set(CurlOption.timeout_ms, req.totalTimeout.total!"msecs");
         if (req.noRedirects) http.handle.set(CurlOption.followlocation, 0L);
+        if (req.noProxy) http.handle.set(CurlOption.noproxy, "*");
         enum long httpAndHttps = 1 | 2; // CURLPROTO_HTTP | CURLPROTO_HTTPS
         if (req.httpOnly)
         {
