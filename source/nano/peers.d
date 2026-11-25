@@ -539,13 +539,17 @@ struct PeerListener
                 return; // closed by `close`
             }
             if (n <= 0) continue; // timeout: poll again (close wakes select)
-            Socket conn;
-            try conn = listener.accept();
-            catch (SocketException)
+            // Not `listener.accept()`: on macOS it leaves a GC finalizer that
+            // closes a reused fd number (nano.safeio.acceptFd, issue #388).
+            import nano.safeio : acceptFd;
+            import std.socket : socket_t;
+            int acceptErr;
+            immutable fd = acceptFd(listener.handle, acceptErr);
+            if (fd == socket_t.init)
             {
                 // `close` sets `stop` before shutting the socket down.
                 if (stop.get) return;
-                final switch (classifyAcceptError(errno))
+                final switch (classifyAcceptError(acceptErr))
                 {
                 case AcceptFailure.transient: continue;
                 case AcceptFailure.fatal: return;
@@ -557,17 +561,20 @@ struct PeerListener
                     continue;
                 }
             }
+            auto conn = new Socket(fd, AddressFamily.UNIX);
             scope (exit) conn.close();
-            import nano.safeio : setCloexec;
-            setCloexec(conn.handle);
             // Same uid only: anything else is dropped unanswered.
             if (socketPeerUid(conn.handle) != long(getuid())) continue;
             // Bound framing I/O: a client that connects and never finishes
             // its line must not pin the sole listener (or `close`'s join).
             import std.socket : SocketOptionLevel, SocketOption;
             import core.time : seconds;
-            conn.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, 5.seconds);
-            conn.setOption(SocketOptionLevel.SOCKET, SocketOption.SNDTIMEO, 5.seconds);
+            try
+            {
+                conn.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, 5.seconds);
+                conn.setOption(SocketOptionLevel.SOCKET, SocketOption.SNDTIMEO, 5.seconds);
+            }
+            catch (SocketException) continue; // the peer already left (EINVAL on macOS)
             handle(conn, requests, stop);
         }
     }
@@ -2472,4 +2479,45 @@ unittest
     mkdirRecurse(buildPath(dir, claimLockName));
     scope (exit) rmdirRecurse(dir);
     assertThrown!ListenError(PeerListener.listen(dir, "x", Chan!PeerRequest.make));
+}
+
+// issue #388: accepting a connection whose peer already left must not leave
+// a `Socket` behind whose GC finalizer closes the fd number again: on macOS
+// std.socket's `accept` did, and the finalizer later closed a sender's
+// socket mid-exchange ("the receiver closed without answering").
+unittest
+{
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir, exists;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    import std.socket : UnixAddress, socket_t;
+    import core.memory : GC;
+    import nano.safeio : acceptFd, closeFd, hasCloexec;
+    auto dir = buildPath(tempDir, format("np388%s", thisProcessID));
+    if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto path = socketPath(dir, "sess-gone");
+    auto l = unixSocket();
+    scope (exit) l.close();
+    l.bind(new UnixAddress(path));
+    l.listen(4);
+    foreach (_; 0 .. 3)
+    {
+        auto c = unixSocket();
+        c.connect(new UnixAddress(path));
+        c.close(); // gone before the accept
+        int err;
+        immutable fd = acceptFd(l.handle, err);
+        if (fd != socket_t.init)
+        {
+            assert(hasCloexec(cast(int) fd), "accepted close-on-exec");
+            closeFd(cast(int) fd);
+        }
+    }
+    // A fresh socket reuses the freed numbers; a stale finalizer would close it.
+    auto s = unixSocket();
+    scope (exit) s.close();
+    GC.collect();
+    assert(hasCloexec(cast(int) s.handle), "a collection closed a live socket's fd");
 }
