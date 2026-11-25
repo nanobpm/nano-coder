@@ -392,8 +392,12 @@ string fetchResult(const WebConfig c, Fetched f, string requested, long offset, 
         // A redirect target is server text: it stays inside the block.
         auto inner = f.url != requested ? format("Redirected to: %s\n", f.url) ~ page.text : page.text;
         auto result = head ~ wrapUntrusted(requested, inner);
-        // pageOf returns at least 4 bytes, so a page always advances.
-        if (result.length <= cap || textCap <= 4) return result;
+        if (result.length <= cap) return result;
+        // pageOf returns at least 4 bytes, so a page always advances: if even
+        // that doesn't fit, the budget can't hold the metadata. Refuse rather
+        // than return more than the cap (the message is short and fixed).
+        if (textCap <= 4)
+            throw new ToolError(format("web_fetch: max_bytes %s is too small for the result metadata; use a larger max_bytes", cap));
         immutable excess = result.length - cap;
         textCap = excess >= textCap - 4 ? 4 : textCap - excess;
     }
@@ -652,14 +656,17 @@ unittest // fetching from a local server: conversion, paging, and a redirect to 
     // Followed redirect, then a page of 4 bytes from offset 2.
     f = fetchUrl(c, srv.url ~ "/r", &dns);
     assert(f.url == srv.url ~ "/next");
-    text = fetchResult(c, f, srv.url ~ "/r", 2, 4);
-    assert(text.canFind("URL: " ~ srv.url ~ "/r\n") && text.canFind("Bytes 2-6 of 10 (more: call again with offset 6)")
-        && text.canFind("\n2345\n"), text);
+    import std.exception : collectExceptionMsg;
+    text = fetchResult(c, f, srv.url ~ "/r", 2, 0);
+    assert(text.canFind("URL: " ~ srv.url ~ "/r\n") && text.canFind("Bytes 2-10 of 10")
+        && text.canFind("\n23456789\n"), text);
+    // A budget too small for the metadata is refused, never exceeded.
+    auto small = collectExceptionMsg!ToolError(fetchResult(c, f, srv.url ~ "/r", 2, 4));
+    assert(small.canFind("too small"), small);
     // The redirect target is server text: only inside the untrusted block.
     auto open = text.indexOf("<untrusted");
     assert(open > 0 && text.indexOf("Redirected to: " ~ srv.url ~ "/next") > open, text);
     // A redirect to a host outside allowed_hosts (here loopback) is refused at that hop.
-    import std.exception : collectExceptionMsg;
     auto msg = collectExceptionMsg!ToolError(fetchUrl(c, srv.url ~ "/evil", &dns));
     assert(msg.canFind("refused http://localhost:1/"), msg);
     assert(msg.indexOf("<untrusted") >= 0 && msg.indexOf("<untrusted") < msg.indexOf("localhost:1"), msg);
@@ -688,6 +695,12 @@ unittest // max_result_bytes caps the whole result: metadata, wrapper and escapi
     assert(next > 0 && next < 600 && text.endsWith("</untrusted>"), text);
     auto more = fetchResult(c, f, "https://example.com/start", next, 0);
     assert(more.canFind(format("Bytes %s-", next)) && more.length <= 600, more);
+    // Tiny budgets and long URLs: refused, never over the cap.
+    import std.exception : collectExceptionMsg;
+    foreach (mb; [1L, 4, 50])
+        assert(collectExceptionMsg!ToolError(fetchResult(c, f, "https://example.com/start", 0, mb)).canFind("too small"));
+    auto longUrl = "https://example.com/" ~ "a".replicate(700);
+    assert(collectExceptionMsg!ToolError(fetchResult(c, f, longUrl, 0, 0)).canFind("too small"));
 }
 
 unittest // the download cap, and a refused first hop never connects

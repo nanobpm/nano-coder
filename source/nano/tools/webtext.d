@@ -252,9 +252,18 @@ string htmlToText(string html, string baseUrl = null, size_t maxBytes = size_t.m
             w.raw("  ".replicate(depth) ~ marker);
             break;
         case "pre":
-            w.block(2);
-            if (t.closing) { if (preDepth) { preDepth--; if (!preDepth) { w.raw("\n```"); w.block(2); } } }
-            else { if (!preDepth) w.raw("```\n"); preDepth++; }
+            if (t.closing)
+            {
+                if (preDepth && !--preDepth)
+                {
+                    // The fence closes on its own line without adding a blank one.
+                    w.pendingBreaks = 0;
+                    auto d = w.out_.data;
+                    w.raw(d.length && d[$ - 1] == '\n' ? "```" : "\n```");
+                    w.block(2);
+                }
+            }
+            else { w.block(2); if (!preDepth) w.raw("```\n"); preDepth++; }
             break;
         case "code", "kbd", "samp", "tt":
             if (!preDepth) w.raw("`");
@@ -340,19 +349,31 @@ private size_t skipElement(string html, size_t i, string name)
 }
 
 /// Trailing spaces off each line, at most one blank line in a row, no
-/// leading or trailing blank lines.
+/// leading or trailing blank lines. Lines inside a ``` fence (a `<pre>`
+/// block) are kept byte for byte.
 private string tidy(const(char)[] s)
 {
     auto o = appender!(char[]);
     o.reserve(s.length);
     size_t blank = 0;
-    bool any;
+    bool any, fence;
     size_t i;
     while (i <= s.length)
     {
         auto nl = s[i .. $].indexOf('\n');
         auto end = nl < 0 ? s.length : i + nl;
         auto line = s[i .. end];
+        if (fence || line == "```")
+        {
+            if (line == "```") fence = !fence;
+            if (any) o.put(blank ? "\n\n" : "\n");
+            o.put(line);
+            any = true;
+            blank = 0;
+            if (nl < 0) break;
+            i = end + 1;
+            continue;
+        }
         size_t e = line.length;
         while (e > 0 && (line[e - 1] == ' ' || line[e - 1] == '\t')) e--;
         line = line[0 .. e];
@@ -1085,7 +1106,7 @@ unittest // lists, nested and numbered
 unittest // pre and code
 {
     auto t = htmlToText("<p>Use <code>x()</code>:</p><pre><code>if (a)\n    b();\n</code></pre><p>done</p>");
-    assert(t == "Use `x()`:\n\n```\nif (a)\n    b();\n\n```\n\ndone", t);
+    assert(t == "Use `x()`:\n\n```\nif (a)\n    b();\n```\n\ndone", t);
 }
 
 unittest // tables
@@ -1257,4 +1278,11 @@ unittest // a comparison in a script doesn't swallow its end tag or the page aft
         ~ "<style>a<b{}</STYLE ><p>after style</p><script>s</scripty>still script</script><p>end</p>");
     assert(t.indexOf("after script") >= 0 && t.indexOf("after style") >= 0 && t.indexOf("end") >= 0, t);
     assert(t.indexOf("f()") < 0 && t.indexOf("still script") < 0, t);
+}
+
+unittest // whitespace inside <pre> survives the final cleanup
+{
+    import std.algorithm : canFind;
+    auto t = htmlToText("<p>a</p><pre>x  \n\n\n\ty \n</pre><p>b</p>");
+    assert(t.canFind("```\nx  \n\n\n\ty \n```\n\nb"), t);
 }
