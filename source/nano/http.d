@@ -63,6 +63,16 @@ struct Request
     Duration connectTimeout = 30.seconds;
     /// Abort the transfer (an exception) once the body would exceed this many bytes; 0: no limit.
     size_t maxBytes;
+    /// With `maxBytes`: keep the first `maxBytes` bytes and end the transfer
+    /// there (`ResponseMeta.truncated`) instead of failing.
+    bool truncateAtMax;
+    /// Return a redirect as it is (its target in `ResponseMeta.location`)
+    /// instead of following it, so the caller can check each hop (web_fetch).
+    bool noRedirects;
+    /// Only http and https, never another scheme libcurl knows.
+    bool httpOnly;
+    /// A cap on the whole transfer; zero: none (only the idle timeout).
+    Duration totalTimeout;
 }
 
 /// Perform `req`; each received chunk goes to `onChunk` (when set) as it
@@ -71,6 +81,10 @@ struct Request
 struct ResponseMeta
 {
     string contentType, retryAfter;
+    /// The `Location` header (a redirect's target, unresolved).
+    string location;
+    /// The body was cut at `Request.maxBytes` (`Request.truncateAtMax`).
+    bool truncated;
 }
 
 /// libcurl's low-speed limit, used as an idle timeout: the transfer fails once
@@ -160,6 +174,17 @@ int perform(const ref Request req, out string body_, out ResponseMeta meta,
     http.connectTimeout = req.connectTimeout;
     foreach (o; timeoutOptions(req.idleTimeout))
         http.handle.set(o.option, o.value);
+    {
+        import etc.c.curl : CurlOption;
+        if (req.totalTimeout > Duration.zero) http.handle.set(CurlOption.timeout_ms, req.totalTimeout.total!"msecs");
+        if (req.noRedirects) http.handle.set(CurlOption.followlocation, 0L);
+        enum long httpAndHttps = 1 | 2; // CURLPROTO_HTTP | CURLPROTO_HTTPS
+        if (req.httpOnly)
+        {
+            http.handle.set(CurlOption.protocols, httpAndHttps);
+            http.handle.set(CurlOption.redir_protocols, httpAndHttps);
+        }
+    }
     if (req.method != "GET")
     {
         const(void)[] payload = req.body_;
@@ -182,6 +207,7 @@ int perform(const ref Request req, out string body_, out ResponseMeta meta,
         auto k = key.idup.toLower;
         if (k == "content-type") meta.contentType = value.idup;
         else if (k == "retry-after") meta.retryAfter = value.idup;
+        else if (k == "location") meta.location = value.idup;
     };
     http.onReceive = (ubyte[] data) {
         // A streamed 2xx SSE reply is consumed chunk-by-chunk by `onChunk`;
@@ -191,13 +217,24 @@ int perform(const ref Request req, out string body_, out ResponseMeta meta,
             && meta.contentType.indexOf("event-stream") >= 0;
         // The cap bounds the transfer, not just what is retained: returning
         // less than offered makes libcurl abort before more is buffered or streamed.
-        if (req.maxBytes && received + data.length > req.maxBytes) return 0;
+        if (req.maxBytes && received + data.length > req.maxBytes)
+        {
+            if (!req.truncateAtMax) return 0;
+            buf ~= data[0 .. req.maxBytes - received];
+            received = req.maxBytes;
+            meta.truncated = true;
+            return 0;
+        }
         received += data.length;
         if (!streamOnly) buf ~= data;
         if (onChunk !is null) onChunk(asChars(data)); // unchecked: a chunk may end inside a character
         return data.length;
     };
-    http.perform();
+    try http.perform();
+    catch (CurlException e)
+    {
+        if (!meta.truncated) throw e;
+    }
     body_ = buf.length ? lossyText(buf) : null;
     return http.statusLine.code;
 }

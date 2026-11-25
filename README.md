@@ -116,6 +116,10 @@ Inter-session messages are off in ACP mode whatever `session_messages` says; pas
 `--session-messages` (or set `acp_session_messages = true`) to make the session reachable
 (see [Inter-session messages](#inter-session-messages)).
 
+The web tools (`web_search`, `web_fetch`) are likewise off in ACP mode; pass `--web` to
+offer them (and to approve `web_fetch` calls no rule covers). `--no-web` turns them off in
+any mode. See [Web tools](#web-tools).
+
 **Protocol methods supported:**
 - `initialize` → returns protocol version and capabilities (`loadSession` when persistence is on)
 - `session/new` → starts a fresh conversation (and session log), returns sessionId.
@@ -367,6 +371,46 @@ and its path in the marker. `read_file` pages instead.
 Relative paths resolve against the working directory (ACP `session/new` `cwd`). Writes are
 atomic (temp file + rename). There is no permission prompt; every call is checked against
 the [permission rules and sandbox](#permissions-and-sandbox) instead.
+
+### Web tools
+
+- `web_search(query, count?)` - Search the web through Brave Search or a SearXNG instance
+  (`[web] search`). Returns up to `count` results (default 5, max 20) with title, URL and
+  snippet. Only offered when a backend is configured.
+- `web_fetch(url, max_bytes?, offset?)` - GET an http/https page and return it as readable
+  text (HTML is converted: scripts, styles, nav and footers dropped; headings, links as
+  `[text](url)`, lists, code and tables kept). Returns at most `max_bytes` (default
+  `max_result_bytes`) from `offset`, plus the total length so the model can page on. Only
+  text, JSON and XML types are fetched; at most 5 redirects are followed.
+
+Results are wrapped in `<untrusted source="web" url="…">…</untrusted>`; the model is told
+instructions inside are data, not commands.
+
+```toml
+[web]
+search = "brave"                 # "brave" | "searxng" | unset (no web_search tool)
+api_key_command = "cat ~/.config/nano-coder/keys/brave"   # brave; or api_key_env
+searxng_url = "http://merlin.local:8888"                   # searxng (JSON format enabled)
+fetch = true                     # offer web_fetch
+allowed_hosts = []               # empty = any public host
+denied_hosts = []
+allow_private = false            # LAN / loopback / link-local / CGNAT / metadata addresses
+max_result_bytes = 32768
+max_download_bytes = 5242880
+timeout_secs = 20
+```
+
+The tools run in the harness, not in the sandboxed shell, so `[sandbox]` does not apply to
+them; their network rules are enforced by the tools themselves. Every hop (including each
+redirect) is checked: URLs with userinfo are refused, and hosts resolving to private,
+loopback, link-local, CGNAT (100.64/10), ULA or cloud-metadata addresses are refused unless
+`allow_private = true` or the host is in `allowed_hosts`. The Brave key never appears in logs
+or errors.
+
+Permissions: `web_search` is allowed by default. `web_fetch` asks in an interactive session,
+and in headless/ACP runs is allowed only with `--web` (or `--yolo`, or an allow rule).
+Rules can scope it by host: `WebFetch(domain:example.com)`, `WebFetch(domain:*.github.com)`.
+The full URL is shown in the prompt and transcript.
 
 ## Permissions and Sandbox
 

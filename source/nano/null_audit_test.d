@@ -98,6 +98,8 @@ static import nano.tools.bash;
 static import nano.tools.files;
 static import nano.tools;
 static import nano.tools.search;
+static import nano.tools.web;
+static import nano.tools.webtext;
 static import nano.trajectory;
 static import nano.trust;
 static import nano.turn_commands;
@@ -197,6 +199,8 @@ private alias modules = imported!"std.meta".AliasSeq!(
     nano.tools.files,
     nano.tools,
     nano.tools.search,
+    nano.tools.web,
+    nano.tools.webtext,
     nano.trajectory,
     nano.trust,
     nano.turn_commands,

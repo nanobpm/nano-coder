@@ -78,6 +78,8 @@ immutable string[] planAllowedTools = [
     // Session settings change the harness, not the workspace.
     "session_settings",
     "load_skill",
+    // Reading the web changes nothing locally (issue #386).
+    "web_search", "web_fetch",
     "report_outcome", "question", "history_search", "history_read", "sessions_list", "memory_search",
     // Read-only sub-agents: their own calls are checked against plan mode.
     "agent", "agent_status", "agent_read", "agent_cancel", "agent_wait",

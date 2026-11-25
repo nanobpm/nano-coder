@@ -35,6 +35,7 @@ static import nano.temperature;
 static import nano.thinking;
 static import nano.toml;
 static import nano.toml_edit;
+static import nano.tools.webtext;
 static import nano.turn;
 static import nano.vision;
 
@@ -64,6 +65,7 @@ alias pureCore = AliasSeq!(
     nano.toml,
     nano.turn,
     nano.toml_edit,
+    nano.tools.webtext,
     nano.vision,
 );
 

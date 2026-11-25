@@ -3288,9 +3288,16 @@ class Agent
     /// they decline or no one can answer (headless fails closed, issue #271).
     private bool confirmedCrossRead(const ref cross.SessionInfo target)
     {
+        return confirm(cross.confirmQuestion(target), null);
+    }
+
+    /// Ask the user a Yes/No approval question; false when they decline or
+    /// no one can answer (headless fails closed). web_fetch asks with it.
+    bool confirm(string question, string header)
+    {
         import nano.question : Question, QuestionOption, Answered;
         if (!questions || !questions.interactive) return false;
-        auto q = Question(cross.confirmQuestion(target), null,
+        auto q = Question(question, header,
             [QuestionOption("No"), QuestionOption("Yes")]);
         q.custom = false;
         q.approval = true;

@@ -519,6 +519,8 @@ struct Config
     JSONValue hooks;
     /// `[sandbox]`: OS sandbox for shell commands and project hooks.
     SandboxConfig sandbox;
+    /// `[web]`: the web_search backend and web_fetch's limits (issue #386).
+    imported!"nano.tools.web".WebConfig web;
     string memoryDir;
     long memoryExpiryDays = defaultExpiryDays;
     string path;
@@ -613,6 +615,7 @@ struct Config
             try c.sandbox = SandboxConfig.fromJSON(*v);
             catch (Exception e) throw new Exception("[sandbox]: " ~ e.msg);
         }
+        if (auto v = "web" in doc) c.web = imported!"nano.tools.web".WebConfig.fromJSON(*v);
         if (auto v = "memory" in doc) c.memory = parseMemoryMode(v.str);
         if (auto v = "memory_dir" in doc) c.memoryDir = expandTilde(v.str);
         if (auto v = "memory_expiry_days" in doc) c.memoryExpiryDays = v.integer;
