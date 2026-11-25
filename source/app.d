@@ -229,10 +229,25 @@ unittest
 int runLogin(string provider, string cfgPath)
 {
     import core.thread : Thread;
-    import core.time : seconds;
+    import core.time : seconds, msecs;
     import std.functional : toDelegate;
     void delegate(string) @safe note = toDelegate((string s) { stdErr.writeln(s); });
-    void delegate(long) @safe sleep = toDelegate((long n) { sleepFor(n.seconds); });
+    // Ctrl-C during the login wait is turned into an exception (via a flag
+    // the signal handler sets) so the catch below clears the status record;
+    // the handler itself does no locking or I/O.
+    {
+        import core.sys.posix.signal : SIGINT;
+        import nano.safeio : onSignal;
+        onSignal(SIGINT, &onLoginInterrupt);
+    }
+    void delegate(long) @safe sleep = toDelegate((long n) {
+        foreach (_; 0 .. n * 10)
+        {
+            if (atomicLoad(gLoginInterrupted)) throw new Exception("login cancelled");
+            sleepFor(100.msecs);
+        }
+        if (atomicLoad(gLoginInterrupted)) throw new Exception("login cancelled");
+    });
     // No frame renderer here: a terminal status report (blocked on a login,
     // then done or error) goes straight to stdout when it is a terminal.
     try
@@ -367,6 +382,14 @@ bool isTerminal(int fd)
 shared(TurnControl) gControl() nothrow @nogc { return atomicLoad(gControl_); }
 void gControl(shared TurnControl c) nothrow @nogc { atomicStore(gControl_, c); }
 shared bool gTurnRunning;
+
+/// Set by `onLoginInterrupt` when Ctrl-C arrives during `--login`.
+shared bool gLoginInterrupted;
+
+extern (C) void onLoginInterrupt(int) nothrow @nogc @system
+{
+    atomicStore(gLoginInterrupted, true);
+}
 
 /// Route SIGINT to `onInterrupt`.
 void installSigint()

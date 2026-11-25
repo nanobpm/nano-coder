@@ -923,6 +923,8 @@ final class LineEditor
                 frameDraw(null);
                 return -2;
             }
+            // Picker input acknowledges a finished turn just as typing does.
+            if (onKey !is null && key.kind != K.none && key.kind != K.ignored && key.kind != K.closed) onKey();
             final switch (key.kind)
             {
                 case K.up: at = at ? at - 1 : labels.length - 1; break;
