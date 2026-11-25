@@ -118,26 +118,101 @@ string launchExe()
     return opt.length && opt.exists ? opt : exe;
 }
 
-/// The installer program `/update` runs (null for other).
-string installer(Channel c) pure
+/// The install prefix an executable path lies under (issue #384), so
+/// `/update` replaces the copy that is running rather than whatever npm's or
+/// brew's current prefix holds: `<prefix>/lib/node_modules/@nanobpm/…` (or
+/// the Windows-style `<prefix>/node_modules/@nanobpm/…`) for npm,
+/// `<prefix>/Cellar/nano-coder/…` or `<prefix>/opt/nano-coder/…` for brew.
+/// Null when the path has no such layout.
+string installPrefix(Channel c, string path) pure
+{
+    import std.algorithm : splitter;
+    import std.array : array, join;
+    auto parts = path.splitter('/').array;
+    static ptrdiff_t find(string[] parts, string a, string b) pure
+    {
+        foreach (i; 0 .. parts.length < 2 ? 0 : parts.length - 1)
+            if (parts[i] == a && parts[i + 1] == b) return i;
+        return -1;
+    }
+    ptrdiff_t end = -1;
+    final switch (c)
+    {
+        case Channel.npm:
+            auto i = find(parts, "node_modules", "@nanobpm");
+            if (i < 0) return null;
+            end = i > 0 && parts[i - 1] == "lib" ? i - 1 : i;
+            break;
+        case Channel.brew:
+            end = find(parts, "Cellar", "nano-coder");
+            if (end < 0) end = find(parts, "opt", "nano-coder");
+            break;
+        case Channel.other: return null;
+    }
+    if (end < 0) return null;
+    auto prefix = parts[0 .. end].join("/");
+    if (!prefix.length && end > 0) return "/";
+    return prefix.length ? prefix : null;
+}
+
+/// The install prefix of the running executable: that of the file `exe`
+/// links to (a global `bin/nano-coder` launcher or a brew `opt` link), else
+/// that of `exe` itself; null when neither has one.
+string prefixFor(Channel c, string exe)
+{
+    import nano.paths : resolveSymlinks;
+    if (!exe.length) return null;
+    auto p = installPrefix(c, resolveSymlinks(exe));
+    return p.length ? p : installPrefix(c, exe);
+}
+
+/// The installer program `/update` runs (null for other). `brew` is the
+/// Homebrew to run: the prefix's own `bin/brew` when it has one.
+string installer(Channel c, string brew = "brew") pure
 {
     final switch (c)
     {
         case Channel.npm: return "npm";
-        case Channel.brew: return "brew";
+        case Channel.brew: return brew;
         case Channel.other: return null;
     }
 }
 
-/// The installer's arguments that install the latest release.
-string[] installArgs(Channel c) pure
+/// The installer's arguments that install the latest release, into `prefix`
+/// for npm when it is known.
+string[] installArgs(Channel c, string prefix = null) pure
 {
     final switch (c)
     {
-        case Channel.npm: return ["install", "-g", npmPackage ~ "@latest"];
+        case Channel.npm:
+            return prefix.length ? ["install", "-g", "--prefix", prefix, npmPackage ~ "@latest"]
+                : ["install", "-g", npmPackage ~ "@latest"];
         case Channel.brew: return ["upgrade", brewFormula];
         case Channel.other: return null;
     }
+}
+
+/// The directories an update writes to, which must be writable: npm's
+/// package tree and launcher dir, brew's Cellar and the tap checkout.
+string[] writeTargets(Channel c, string prefix, string tapRepo) pure
+{
+    import std.path : buildPath;
+    if (!prefix.length) return null;
+    final switch (c)
+    {
+        case Channel.npm: return [buildPath(prefix, "lib", "node_modules"), buildPath(prefix, "bin")];
+        case Channel.brew: return [buildPath(prefix, "Cellar")] ~ (tapRepo.length ? [tapRepo] : null);
+        case Channel.other: return null;
+    }
+}
+
+/// Whether the current user may write `dir`; a missing directory counts as
+/// writable (the installer creates it, or fails with its own message).
+bool dirWritable(string dir)
+{
+    import std.file : exists;
+    import nano.safeio : accessWritable;
+    return !dir.exists || accessWritable(dir);
 }
 
 /// The tap that serves `brewFormula`.
@@ -190,30 +265,54 @@ shared static this()
 /// `brew upgrade` (brew refreshes every tap itself). A failed refresh stops
 /// before the upgrade: running plain `brew upgrade` there would re-enable the
 /// all-tap auto-update and dependents check, and could mask the failure.
-InstallStep[] installSteps(Channel c, string tapRepo)
+/// `prefix` is the running binary's install prefix (null: npm's current
+/// one) and `brew` the Homebrew program owning it.
+InstallStep[] installSteps(Channel c, string tapRepo, string prefix = null, string brew = "brew")
 {
     if (c == Channel.other) return null;
     if (c == Channel.brew && tapRepo.length)
         return [InstallStep("git", ["-C", tapRepo, "pull", "--ff-only", "--quiet"], cleanGitEnv()),
-            InstallStep(installer(c), installArgs(c), quietBrewEnv.dup)];
-    return [InstallStep(installer(c), installArgs(c))];
+            InstallStep(installer(c, brew), installArgs(c, prefix), quietBrewEnv.dup)];
+    return [InstallStep(installer(c, brew), installArgs(c, prefix))];
 }
 
 /// The local checkout of `brewTap` (`brew --repository`), or null when it is
 /// missing or not a git checkout. Throws when brew cannot be run.
-string brewTapRepo()
+string brewTapRepo(string brew = "brew")
 {
     import std.process : execute;
     import std.file : exists;
     import std.path : buildPath;
-    auto r = execute(["brew", "--repository", brewTap]);
+    auto r = execute([brew, "--repository", brewTap]);
     if (r.status != 0) return null;
     auto dir = r.output.strip;
     return dir.length && exists(buildPath(dir, ".git")) ? dir : null;
 }
 
 /// The update command for a channel ("" for other).
-string installCommand(Channel c) pure { return c == Channel.other ? "" : installer(c) ~ " " ~ installArgs(c).joinWords; }
+string installCommand(Channel c, string prefix = null, string brew = "brew") pure
+{
+    return c == Channel.other ? "" : shellWord(installer(c, brew)) ~ " " ~ installArgs(c, prefix).joinWords;
+}
+
+/// The Homebrew that owns `prefix`: its `bin/brew` when that exists
+/// (`hasOwnBrew`), else the first `brew` on PATH.
+string brewProgram(string prefix, bool hasOwnBrew) pure
+{
+    import std.path : buildPath;
+    return prefix.length && hasOwnBrew ? buildPath(prefix, "bin", "brew") : "brew";
+}
+
+/// The message for an install location the user can't write: which folder,
+/// and the exact command to run by hand (with sudo for npm; as the owner for brew).
+string unwritableMessage(Channel c, string dir, string user, string command) pure
+{
+    auto who = user.length ? format("the current user (%s)", user) : "the current user";
+    auto how = c == Channel.npm ? "sudo " ~ command : command;
+    auto as = c == Channel.npm ? "" : " as the user that owns the Homebrew installation";
+    return format("`%s` is not writable by %s, so /update cannot install the new version there. "
+        ~ "Run it by hand%s: %s — the running session is unchanged.", dir, who, as, how);
+}
 
 /// Where the channel's latest version is read (null for other).
 string latestUrl(Channel c) pure
@@ -530,17 +629,28 @@ Chan!string startChecker(Channel channel, string running)
 /// `/update`'s outcome: lines to print.
 string[] runInstaller(Channel channel, string exe, string running,
     int delegate(string program, string[] args, const string[string] env) @safe runner,
-    string delegate(string exe) @safe versionOf = null, string delegate() @safe tapRepoOf = null)
+    string delegate(string exe) @safe versionOf = null, string delegate() @safe tapRepoOf = null,
+    bool delegate(string dir) @safe writable = null)
 {
     if (channel == Channel.other)
         return [format("This nano-coder was not installed with npm or Homebrew (install channel: other), so it cannot update itself. "
             ~ "Download the latest release from %s — a locally built binary is never overwritten.", releasesUrl)];
-    auto program = installer(channel);
-    if (which(program) is null)
+    import std.file : exists;
+    import std.path : buildPath;
+    auto prefix = prefixFor(channel, exe);
+    auto brew = channel == Channel.brew ? brewProgram(prefix, prefix.length && buildPath(prefix, "bin", "brew").exists) : "brew";
+    auto program = installer(channel, brew);
+    auto command = installCommand(channel, prefix, brew);
+    if (!(program.startsWith("/") ? program.exists : which(program) !is null))
         return [format("`%s` is not on PATH, so nano-coder cannot run the update itself. Install it manually with: %s",
-            program, installCommand(channel))];
+            program, command)];
+    bool canWrite(string dir) { return writable is null ? dirWritable(dir) : writable(dir); }
+    // Checked before anything runs, so a root-owned prefix gets the command
+    // to run with sudo instead of an opaque EACCES from the installer.
+    foreach (dir; writeTargets(channel, prefix, null))
+        if (!canWrite(dir)) return [unwritableMessage(channel, dir, currentUser(), command)];
     string tapRepo;
-    string shown = installCommand(channel);
+    string shown = command;
     InstallStep[] steps;
     int status;
     // One catch for every process this runs: brew --repository, git, the installer.
@@ -550,10 +660,13 @@ string[] runInstaller(Channel channel, string exe, string running,
         {
             // Name the lookup itself if it throws; the loop below then
             // replaces `shown` with each step it actually runs.
-            shown = "brew --repository " ~ brewTap;
-            tapRepo = tapRepoOf is null ? brewTapRepo() : tapRepoOf();
+            shown = shellWord(brew) ~ " --repository " ~ brewTap;
+            tapRepo = tapRepoOf is null ? brewTapRepo(brew) : tapRepoOf();
+            if (tapRepo.length && !canWrite(tapRepo))
+                return [unwritableMessage(channel, tapRepo, currentUser(),
+                    stepCommand(installSteps(channel, tapRepo, prefix, brew)[0]) ~ " && " ~ command)];
         }
-        steps = installSteps(channel, tapRepo);
+        steps = installSteps(channel, tapRepo, prefix, brew);
         foreach (i, step; steps)
         {
             shown = stepCommand(step);
@@ -579,6 +692,14 @@ string[] runInstaller(Channel channel, string exe, string running,
         return [format("Updated to %s — /relaunch to restart into it; your session will resume.", v)];
     return [format("The installer succeeded but `nano-coder --version` still reports %s (this process is %s). "
         ~ "The new version takes effect on the next start.", v, running)];
+}
+
+/// The current user's login name, or null.
+string currentUser()
+{
+    import std.process : environment;
+    auto u = environment.get("USER", "");
+    return u.length ? u : environment.get("LOGNAME", "");
 }
 
 /// Runs the installer attached to the terminal; its exit status.
@@ -1021,4 +1142,94 @@ unittest
         ~ "      url \"https://github.com/nanobpm/nano-coder/releases/download/v0.68.1/nano-coder-0.68.1-aarch64-apple-darwin.tar.gz\"\n";
     assert(formulaVersion(formula) == "0.68.1");
     assert(formulaVersion("class NanoCoder < Formula\nend\n") is null);
+}
+
+// Issue #384: the install prefix comes from the running binary's path.
+unittest
+{
+    assert(installPrefix(Channel.npm, "/usr/lib/node_modules/@nanobpm/nano-coder/bin/nano-coder") == "/usr");
+    assert(installPrefix(Channel.npm, "/home/u/.local/lib/node_modules/@nanobpm/nano-coder-linux-x64/bin/nano-coder")
+        == "/home/u/.local");
+    assert(installPrefix(Channel.npm, "/home/u/.nvm/versions/node/v20.1.0/lib/node_modules/@nanobpm/nano-coder/bin/nano-coder")
+        == "/home/u/.nvm/versions/node/v20.1.0");
+    assert(installPrefix(Channel.npm, "C:/npm/node_modules/@nanobpm/nano-coder/bin/nano-coder") == "C:/npm");
+    assert(installPrefix(Channel.brew, "/opt/homebrew/Cellar/nano-coder/0.67.0/bin/nano-coder") == "/opt/homebrew");
+    assert(installPrefix(Channel.brew, "/home/linuxbrew/.linuxbrew/Cellar/nano-coder/0.67.0/bin/nano-coder")
+        == "/home/linuxbrew/.linuxbrew");
+    assert(installPrefix(Channel.brew, "/usr/local/opt/nano-coder/bin/nano-coder") == "/usr/local");
+    assert(installPrefix(Channel.npm, "/opt/nano/nano-coder") is null);
+    assert(installPrefix(Channel.brew, "/opt/nano/nano-coder") is null);
+    assert(installPrefix(Channel.other, "/usr/lib/node_modules/@nanobpm/nano-coder/bin/nano-coder") is null);
+    assert(installPrefix(Channel.npm, "/lib/node_modules/@nanobpm/nano-coder/bin/nano-coder") == "/");
+}
+
+// A symlinked launcher derives the prefix of its target.
+unittest
+{
+    import std.file : mkdirRecurse, write, symlink, rmdirRecurse;
+    import std.path : buildPath;
+    auto dir = fakeRegistryDir("prefixlink");
+    scope (exit) rmdirRecurse(dir);
+    auto pkg = buildPath(dir, "real prefix", "lib", "node_modules", "@nanobpm", "nano-coder", "bin");
+    mkdirRecurse(pkg);
+    write(buildPath(pkg, "nano-coder"), "");
+    mkdirRecurse(buildPath(dir, "bin"));
+    symlink(buildPath(pkg, "nano-coder"), buildPath(dir, "bin", "nano-coder"));
+    assert(prefixFor(Channel.npm, buildPath(dir, "bin", "nano-coder")) == buildPath(dir, "real prefix"));
+    assert(prefixFor(Channel.npm, "") is null);
+}
+
+// npm and brew steps target the prefix; spaced paths round-trip.
+unittest
+{
+    auto npm = installSteps(Channel.npm, null, "/home/u/my prefix");
+    assert(npm.length == 1 && npm[0].args == ["install", "-g", "--prefix", "/home/u/my prefix", npmPackage ~ "@latest"]);
+    assert(stepCommand(npm[0]) == "npm install -g --prefix '/home/u/my prefix' @nanobpm/nano-coder@latest");
+    assert(installCommand(Channel.npm, "/home/u/my prefix") == stepCommand(npm[0]));
+    assert(brewProgram("/opt/home brew", true) == "/opt/home brew/bin/brew");
+    assert(brewProgram("/opt/homebrew", false) == "brew" && brewProgram(null, true) == "brew");
+    auto brew = installSteps(Channel.brew, "/tap", "/opt/home brew", "/opt/home brew/bin/brew");
+    assert(brew[1].program == "/opt/home brew/bin/brew" && brew[1].args == ["upgrade", brewFormula]);
+    assert(installCommand(Channel.brew, "/opt/home brew", "/opt/home brew/bin/brew")
+        == "'/opt/home brew/bin/brew' upgrade " ~ brewFormula);
+    assert(writeTargets(Channel.npm, "/usr", null) == ["/usr/lib/node_modules", "/usr/bin"]);
+    assert(writeTargets(Channel.brew, "/opt/homebrew", "/tap") == ["/opt/homebrew/Cellar", "/tap"]);
+    assert(writeTargets(Channel.npm, null, null) is null);
+}
+
+// An unwritable prefix runs nothing and names the command to run by hand;
+// a writable one runs the prefixed installer.
+unittest
+{
+    import std.algorithm : canFind;
+    import std.file : mkdirRecurse, write, rmdirRecurse;
+    import std.path : buildPath;
+    if (which("npm") is null) return; // runInstaller needs npm on PATH
+    auto dir = fakeRegistryDir("prefixw");
+    scope (exit) rmdirRecurse(dir);
+    auto bin = buildPath(dir, "lib", "node_modules", "@nanobpm", "nano-coder", "bin");
+    mkdirRecurse(bin);
+    auto exe = buildPath(bin, "nano-coder");
+    write(exe, "");
+    string[][] ran;
+    auto rec = (string p, string[] a, const string[string] e) @safe { ran ~= [p] ~ a; return 0; };
+    auto lines = runInstaller(Channel.npm, exe, "0.1.0", rec, (string e) @safe => "0.2.0", null,
+        (string d) @safe => false);
+    assert(ran is null, "nothing runs on an unwritable prefix");
+    assert(lines[0].canFind("sudo npm install -g --prefix " ~ dir ~ " @nanobpm/nano-coder@latest"), lines[0]);
+    assert(lines[0].canFind(buildPath(dir, "lib", "node_modules")) && lines[0].canFind("not writable")
+        && lines[0].canFind("unchanged"), lines[0]);
+    lines = runInstaller(Channel.npm, exe, "0.1.0", rec, (string e) @safe => "0.2.0", null, (string d) @safe => true);
+    assert(ran == [["npm", "install", "-g", "--prefix", dir, npmPackage ~ "@latest"]], "the prefix is targeted");
+    assert(lines[0].canFind("Updated to 0.2.0"), lines[0]);
+    // The real probe: a temp dir is writable.
+    assert(dirWritable(dir) && dirWritable(buildPath(dir, "missing")));
+}
+
+// brew: an unwritable Cellar names the command for the prefix's owner.
+unittest
+{
+    import std.algorithm : canFind;
+    auto m = unwritableMessage(Channel.brew, "/opt/homebrew/Cellar", "u", "brew upgrade " ~ brewFormula);
+    assert(m.canFind("as the user that owns") && !m.canFind("sudo") && m.canFind("(u)") && m.canFind("unchanged"), m);
 }
