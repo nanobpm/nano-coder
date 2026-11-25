@@ -48,6 +48,9 @@ struct Question
     string header; /// very short label
     immutable(QuestionOption)[] options;
     bool custom = true; /// allow a typed answer
+    /// Asks for approval to do something (not for information): the
+    /// terminal status report says `kind=permission` (`nano.progstatus`).
+    bool approval;
 }
 
 /// How a question resolves.

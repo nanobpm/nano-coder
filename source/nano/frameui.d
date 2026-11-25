@@ -34,7 +34,8 @@ private struct WorkPause { bool paused; }
 private struct Toggle {}
 private struct Verbose { bool on; }
 private struct Hold { bool on; Chan!bool done; }
-private alias Request = SumType!(Draw, Commit, Redraw, Clear, Suspend, Resume, Close, Busy, WorkPause, Toggle, Verbose, Hold);
+private struct Status { string bytes; }
+private alias Request = SumType!(Draw, Commit, Redraw, Clear, Suspend, Resume, Close, Busy, WorkPause, Toggle, Verbose, Hold, Status);
 
 /// The frame renderer, as seen from other threads: a sendable handle to the
 /// thread that owns the transcript and the renderer (an actor). Copies
@@ -172,6 +173,11 @@ struct FrameUi
         sendWait((Chan!bool d) => Request(Hold(on, d)));
     }
 
+    /// Writes a terminal status report (`nano.progstatus`, OSC 7501) to the
+    /// terminal between two renders, so it never lands inside another
+    /// escape sequence. Dropped while a child (a pager) owns the terminal.
+    void report(string bytes) { send(Request(Status(bytes))); }
+
     /// Empties the transcript (`/restart`).
     void clear()
     {
@@ -213,6 +219,7 @@ private void frameThread(Isolated!FrameState state, Chan!Request requests)
                     return false;
                 },
                 (Redraw _) { f.render(); return false; },
+                (Status st) { if (!f.paused) writeFd(f.tty, st.bytes); return false; },
                 (Hold h) {
                     f.drain();
                     f.held = h.on;
