@@ -52,6 +52,8 @@ private size_t parseTag(string html, size_t i, out Tag t)
     size_t j = i + 1;
     if (j < html.length && html[j] == '/') { t.closing = true; j++; }
     auto nameStart = j;
+    // A tag name starts with a letter: `x<3` is text.
+    if (j >= html.length || !isAlpha(html[j])) return i;
     while (j < html.length && (isAlphaNum(html[j]) || html[j] == '-' || html[j] == ':')) j++;
     if (j == nameStart) return i;
     t.name = asciiLower(html[nameStart .. j]);
@@ -292,6 +294,9 @@ string htmlToText(string html, string baseUrl = null, size_t maxBytes = size_t.m
                 {
                     auto href = linkStack[$ - 1];
                     linkStack = linkStack[0 .. $ - 1];
+                    // Resolved only now: the stack keeps the short raw hrefs.
+                    if (href.length && base.isOk)
+                        href = resolveLocation(baseFrom(base), href).match!(u => u.toString, e => href);
                     if (href.length) w.raw("](" ~ href ~ ")");
                 }
             }
@@ -299,8 +304,6 @@ string htmlToText(string html, string baseUrl = null, size_t maxBytes = size_t.m
             {
                 auto href = t.href.strip;
                 if (href.startsWith("#") || asciiLower(href).startsWith("javascript:")) href = null;
-                if (href.length && base.isOk)
-                    href = resolveLocation(baseFrom(base), href).match!(u => u.toString, e => href);
                 linkStack ~= href;
                 if (href.length) w.raw("[");
             }
@@ -612,7 +615,45 @@ Result!(Url, string) resolveLocation(Url base, string location)
     if (l.startsWith("#") || !l.length) return parseUrl(base.toString);
     auto dir = pathOnly(base.path);
     auto slash = dir.lastIndexOfChar('/');
-    return parseUrl(base.origin ~ dir[0 .. slash + 1] ~ l);
+    return parseUrl(base.origin ~ removeDotSegments(dir[0 .. slash + 1] ~ l));
+}
+
+/// RFC 3986 5.2.4 dot-segment removal on a path (any `?query` kept as is):
+/// `/a/b/../c` is `/a/c`, `/a/..` is `/`.
+string removeDotSegments(string pathAndQuery) pure nothrow
+{
+    import std.array : join, split;
+    auto q = pathAndQuery.indexOf('?');
+    auto path = q < 0 ? pathAndQuery : pathAndQuery[0 .. q];
+    auto query = q < 0 ? "" : pathAndQuery[q .. $];
+    auto parts = path.split("/");
+    string[] outp;
+    bool trailing;
+    foreach (k, seg; parts)
+    {
+        trailing = false;
+        if (k == 0) continue; // before the leading slash
+        if (seg == ".") trailing = true;
+        else if (seg == "..") { if (outp.length) outp = outp[0 .. $ - 1]; trailing = true; }
+        else outp ~= seg;
+    }
+    auto r = "/" ~ outp.join("/");
+    if (trailing && !r.endsWith("/")) r ~= "/";
+    return r ~ query;
+}
+
+unittest
+{
+    import nano.result : orThrow;
+    assert(removeDotSegments("/a/b/../c") == "/a/c");
+    assert(removeDotSegments("/a/..") == "/");
+    assert(removeDotSegments("/a/./b/") == "/a/b/");
+    assert(removeDotSegments("/../../x?y=../z") == "/x?y=../z");
+    assert(removeDotSegments("/a/b/..") == "/a/");
+    auto base = parseUrl("https://h/a/b").orThrow!(e => new Exception(e));
+    auto first = resolveLocation(base, "..").orThrow!(e => new Exception(e));
+    assert(first.path == "/");
+    assert(resolveLocation(first, "next").orThrow!(e => new Exception(e)).toString == "https://h/next");
 }
 
 /// Whether `ref_` starts with a URI scheme (`ALPHA *(ALPHA / DIGIT / "+" / "-" / ".") ":"`),
@@ -1141,6 +1182,7 @@ unittest // malformed HTML never throws and keeps the text
     assert(htmlToText("<div attr='>' x=\"y\">q</div>") == "q");
     assert(htmlToText("<script>never closed") == "");
     assert(htmlToText("<!-- c --><!DOCTYPE html>x<![CDATA[y]]>") == "xy");
+    assert(htmlToText("Return 1 if x<3 and y>4.") == "Return 1 if x<3 and y>4.");
     assert(decodeEntities("&bogus; &#xZZ; & &#0;") == "&bogus; &#xZZ; & \uFFFD");
 }
 

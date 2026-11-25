@@ -1616,6 +1616,12 @@ class Agent
                     && call.name != "load_skill" && call.name != "web_fetch" && call.name != "web_search")
                     result = truncateOutput(result, toolOutputLimit,
                         format("tool-%s-%s", safeName(call.id), safeName(call.name)));
+                // A failed web call has no paging, and a cut could split an
+                // <untrusted> block: an oversized error becomes a short one.
+                else if (isError && (call.name == "web_fetch" || call.name == "web_search")
+                    && result.length > toolOutputLimit)
+                    result = format("%s failed; its error message (%s bytes) was too long to show.",
+                        call.name, result.length);
             }
             // A successful edit marks the tree unchecked; a bash call
             // that started (even one exiting non-zero) is the check.

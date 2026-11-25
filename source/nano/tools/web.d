@@ -314,14 +314,21 @@ Fetched fetchUrl(const WebConfig c, string url, scope Resolver resolve, scope Ho
     {
         auto shown = u.toString;
         // After a redirect the target (and any message naming it) is server
-        // text, so it reaches the model only inside an untrusted block.
-        ToolError fail(string detail)
+        // text, so it reaches the model only inside an untrusted block; so
+        // does a `Location` diagnostic on any hop (`server`). Every part is
+        // clipped, so a long server-supplied URL can't outgrow the result cap.
+        ToolError fail(string detail, bool server = false)
         {
-            return n == 0 ? new ToolError("web_fetch: " ~ detail)
-                : new ToolError(format("web_fetch: a redirect from %s failed:\n%s", url, wrapUntrusted(url, detail)));
+            auto from = clipError(url);
+            return n == 0 && !server ? new ToolError("web_fetch: " ~ clipError(detail))
+                : new ToolError(format("web_fetch: a redirect from %s failed:\n%s", from, wrapUntrusted(from, clipError(detail))));
         }
         string[] pinned;
-        if (auto why = hostRefusal(c, u, resolve, pinned)) throw fail(format("refused %s: %s", shown, why));
+        string refusal;
+        // The resolver's errors name the (possibly redirected) host.
+        try refusal = hostRefusal(c, u, resolve, pinned);
+        catch (ToolError e) throw fail(e.msg);
+        if (refusal.length) throw fail(format("refused %s: %s", shown, refusal));
         if (hop !is null)
             if (auto why = hop(shown)) throw fail(format("refused %s: %s", shown, why));
         Request req;
@@ -347,7 +354,7 @@ Fetched fetchUrl(const WebConfig c, string url, scope Resolver resolve, scope Ho
         if (status >= 300 && status < 400 && meta.location.length)
         {
             if (n == maxRedirects) throw new ToolError(format("web_fetch: more than %s redirects from %s", maxRedirects, url));
-            u = resolveLocation(u, meta.location).orThrow!(e => fail(format("redirect from %s: %s", shown, e)));
+            u = resolveLocation(u, meta.location).orThrow!(e => fail(format("redirect from %s: %s", shown, e), true));
             continue;
         }
         if (status < 200 || status >= 300)
@@ -355,6 +362,31 @@ Fetched fetchUrl(const WebConfig c, string url, scope Resolver resolve, scope Ho
         return Fetched(shown, meta.contentType, body_, meta.truncated);
     }
     assert(0, "the loop returns or throws on its last pass");
+}
+
+/// The most bytes of one diagnostic part (a URL, a reason) a web_fetch error
+/// carries: errors bypass the generic output cap.
+enum maxErrorPart = 1024;
+
+/// `s` cut to `maxErrorPart` bytes on a UTF-8 boundary, noting the cut.
+string clipError(string s) pure nothrow
+{
+    if (s.length <= maxErrorPart) return s;
+    size_t k = maxErrorPart;
+    while (k > 0 && (s[k] & 0xC0) == 0x80) k--;
+    import std.conv : to;
+    return s[0 .. k] ~ "… (" ~ (s.length - k).to!string ~ " bytes cut)";
+}
+
+unittest
+{
+    assert(clipError("abc") == "abc");
+    import std.array : replicate;
+    auto long_ = "é".replicate(maxErrorPart);
+    auto c = clipError(long_);
+    assert(c.length < maxErrorPart + 40);
+    import std.utf : validate;
+    validate(c);
 }
 
 /// The most converted page text web_fetch keeps: room for markup expansion
