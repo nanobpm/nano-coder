@@ -25,11 +25,21 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq libcurl4-openssl-dev zlib1g-dev
       - name: build the test runner
         run: NANO_TEST_ONLY=nano.testenv_test dub test -q
-      - name: 50 runs of the three modules (each within its 1 s budget)
+      - name: debugger
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y -qq gdb
+      - name: 50 runs of each module (each within its 1 s budget)
         run: |
-          for i in $(seq 1 50); do
-            echo "::group::run $i"
-            NANO_TEST_ONLY=nano.providers.anthropic_test,nano.peers,nano.session_resume_memory_test \
-              NANO_TEST_JOBS=4 NANO_TEST_BUDGET_SCALE=1 ./nano-coder-test-application || { echo "run $i failed"; exit 1; }
-            echo "::endgroup::"
+          for m in nano.providers.anthropic_test nano.peers nano.session_resume_memory_test; do
+            for i in $(seq 1 50); do
+              echo "::group::$m run $i"
+              if [ "$RUNNER_OS" = Linux ]; then
+                NANO_TEST_ONLY=$m NANO_TEST_BUDGET_SCALE=1 gdb -q -batch -return-child-result -ex "handle SIGUSR1 SIGUSR2 SIGPIPE nostop noprint pass" -ex run -ex "thread apply all bt" ./nano-coder-test-application > out.txt 2>&1 || true
+              else
+                NANO_TEST_ONLY=$m NANO_TEST_BUDGET_SCALE=1 lldb --batch -o run -k "thread backtrace all" -k "quit 1" ./nano-coder-test-application > out.txt 2>&1 || true
+              fi
+              if ! grep -q "modules\? passed unittests" out.txt || grep -qE "stop reason|SIGSEGV|FAILED" out.txt; then cat out.txt; echo "$m run $i failed"; exit 1; fi
+              grep -E "passed unittests" out.txt
+              echo "::endgroup::"
+            done
           done
