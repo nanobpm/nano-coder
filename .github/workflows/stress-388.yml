@@ -38,7 +38,7 @@ jobs:
               else
                 NANO_TEST_ONLY=$m NANO_TEST_BUDGET_SCALE=1 lldb --batch -o run -k "thread backtrace all" -k "quit 1" ./nano-coder-test-application > out.txt 2>&1 || true
               fi
-              if ! grep -q "modules\? passed unittests" out.txt || grep -qE "stop reason|SIGSEGV|FAILED" out.txt; then cat out.txt; echo "$m run $i failed"; exit 1; fi
+              if ! grep -qE "modules? passed unittests" out.txt || grep -qE "stop reason|SIGSEGV|FAILED" out.txt; then cat out.txt; echo "$m run $i failed"; exit 1; fi
               grep -E "passed unittests" out.txt
               echo "::endgroup::"
             done
