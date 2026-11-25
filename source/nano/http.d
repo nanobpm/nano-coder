@@ -935,16 +935,18 @@ unittest
 private void holdStalledListener(imported!"nano.safeio".Chan!ushort portOut, imported!"nano.safeio".Chan!bool done)
 {
     import std.socket : TcpSocket, InternetAddress;
-    // The port stays bound from the start: bound but not listening refuses
-    // connections (the outage), and it is never released for a concurrent
-    // test's server to take, which would then get this test's requests.
+    // Listening from the start, so the port is never free for a concurrent
+    // test's server to take. The first connection is accepted and dropped at
+    // once (an empty reply: the outage starts); the rest are never accepted, so
+    // they connect and then hear nothing. No timing: a bound socket that isn't
+    // listening is refused on Linux but silently dropped on macOS.
     auto l = new TcpSocket;
     scope (exit) l.close();
     l.bind(new InternetAddress("127.0.0.1", InternetAddress.PORT_ANY));
+    l.listen(4);
     import std.conv : to;
     portOut.put(l.localAddress.toPortString.to!ushort);
-    sleepFor(30.msecs);
-    l.listen(4); // never accepted: connections complete and then hear nothing
+    l.accept().close();
     bool v;
     done.take(v); // until the test is finished with it
 }
@@ -960,7 +962,7 @@ unittest
     auto portIn = Chan!ushort.make;
     auto h = spawn(&holdStalledListener, portIn, done);
     ushort port;
-    portIn.take(port); // the first attempt is refused: the outage starts
+    portIn.take(port); // the first attempt is dropped: the outage starts
     RetryPolicy p;
     p.maxRetries = 0;
     p.initialBackoff = 20.msecs;
