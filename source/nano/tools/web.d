@@ -14,7 +14,7 @@ module nano.tools.web;
 
 import std.json;
 import std.format : format;
-import std.string : strip, startsWith, indexOf, stripRight;
+import std.string : strip, startsWith, endsWith, indexOf, stripRight;
 import std.sumtype : SumType, match;
 import core.time : Duration, seconds;
 import nano.llm : ToolDefinition;
@@ -182,6 +182,17 @@ string[] systemResolve(string host)
 /// host resolves to.
 string hostRefusal(const WebConfig c, const Url u, scope Resolver resolve)
 {
+    string[] unused;
+    return hostRefusal(c, u, resolve, unused);
+}
+
+/// As above; `pinned` gets the checked addresses as libcurl `--resolve`
+/// entries (`host:port:address`), so the connection goes to exactly the
+/// addresses that passed and a second, rebinding DNS answer can't redirect
+/// it to a private one. Empty when nothing was resolved (an IP literal, a
+/// listed host or allow_private).
+string hostRefusal(const WebConfig c, const Url u, scope Resolver resolve, out string[] pinned)
+{
     if (anyHostMatches(c.deniedHosts, u.host)) return format("%s is in [web] denied_hosts", u.host);
     immutable listed = anyHostMatches(c.allowedHosts, u.host);
     if (c.allowedHosts.length && !listed) return format("%s is not in [web] allowed_hosts", u.host);
@@ -195,6 +206,9 @@ string hostRefusal(const WebConfig c, const Url u, scope Resolver resolve)
         if (auto why = privateHostName(a))
             return format("%s resolves to %s, %s; set [web] allow_private = true or list it in allowed_hosts",
                 u.host, a, why);
+    immutable port = u.port ? u.port : u.scheme == "https" ? 443 : 80;
+    foreach (a; addrs)
+        pinned ~= format("%s:%s:%s", u.host, port, a.indexOf(':') >= 0 ? "[" ~ a ~ "]" : a);
     return null;
 }
 
@@ -221,7 +235,8 @@ Fetched fetchUrl(const WebConfig c, string url, scope Resolver resolve, scope Ho
     foreach (n; 0 .. maxRedirects + 1)
     {
         auto shown = u.toString;
-        if (auto why = hostRefusal(c, u, resolve)) throw new ToolError(format("web_fetch refused %s: %s", shown, why));
+        string[] pinned;
+        if (auto why = hostRefusal(c, u, resolve, pinned)) throw new ToolError(format("web_fetch refused %s: %s", shown, why));
         if (hop !is null)
             if (auto why = hop(shown)) throw new ToolError(format("web_fetch refused %s: %s", shown, why));
         Request req;
@@ -236,6 +251,7 @@ Fetched fetchUrl(const WebConfig c, string url, scope Resolver resolve, scope Ho
         req.truncateAtMax = true;
         req.noRedirects = true;
         req.httpOnly = true;
+        req.pinned = pinned;
         string body_;
         ResponseMeta meta;
         int status;
@@ -342,6 +358,35 @@ ToolDefinition fetchDefinition(const WebConfig c)
             "required":["url"]}`));
 }
 
+/// The per-hop check for one fetch: the policy's `hop` check, then, for a
+/// hop to a host not yet approved (a redirect elsewhere), `approve` again,
+/// so approving one URL never covers content from another host.
+HopCheck redirectGate(string approvedHost, Approve approve, HopCheck hop)
+{
+    string[] approved = [hostKey(approvedHost)];
+    return (string next) @safe {
+        import std.algorithm : canFind;
+        if (hop !is null)
+            if (auto why = hop(next)) return why;
+        auto parsed = parseUrl(next);
+        auto h = parsed.isOk ? hostKey(parsed.orThrow!(e => new ToolError(e)).host) : "";
+        if (!h.length) return "the redirect target is not a valid URL";
+        if (approved.canFind(h)) return null;
+        if (!approve(next)) return "a redirect to " ~ h ~ " (a host other than the approved one) was not approved";
+        approved ~= h;
+        return null;
+    };
+}
+
+/// A host as compared for approval: lowercase, without trailing dots.
+private string hostKey(string host) pure
+{
+    import std.uni : toLower;
+    auto h = host.toLower;
+    while (h.endsWith(".")) h = h[0 .. $ - 1];
+    return h;
+}
+
 /// Register the tools `offer` names. `approve` decides a fetch no allow
 /// rule covers (it may ask the user); `hop` applies the permission policy
 /// to every redirect target.
@@ -367,9 +412,37 @@ void register(ToolRegistry tools, WebConfig c, WebOffer offer, Approve approve, 
             auto shown = u.toString;
             if (!approve(shown)) throw new ToolError(format("web_fetch of %s was not approved. In a headless or ACP run, "
                 ~ "pass --web or --allow 'WebFetch(domain:%s)'; interactively, answer Yes", shown, u.host));
-            auto f = fetchUrl(c, shown, resolve, hop);
+            auto f = fetchUrl(c, shown, resolve, redirectGate(u.host, approve, hop));
             return fetchResult(c, f, shown, optInt(a, "offset", 0), optInt(a, "max_bytes", 0));
         });
+}
+
+unittest // a redirect to another host needs its own approval
+{
+    string[] asked;
+    bool yes;
+    auto gate = redirectGate("docs.example.com", (string u) { asked ~= u; return yes; }, null);
+    assert(gate("https://docs.example.com/a") is null && !asked.length); // the approved host
+    assert(gate("https://DOCS.example.com./b") is null && !asked.length);
+    assert(gate("https://other.net/x") !is null && asked == ["https://other.net/x"]); // declined
+    yes = true;
+    assert(gate("https://other.net/x") is null);
+    yes = false;
+    assert(gate("https://other.net/y") is null); // approved once, for this fetch
+    auto denyAll = redirectGate("a.com", (string u) => true, (string u) => "denied");
+    assert(denyAll("https://a.com/") == "denied"); // the policy check still comes first
+}
+
+unittest // the checked addresses are pinned, so a rebinding second lookup can't bypass the check
+{
+    WebConfig c;
+    int lookups;
+    string[] dns(string h) { lookups++; return lookups == 1 ? ["93.184.216.34", "2606:2800::1"] : ["127.0.0.1"]; }
+    string[] pinned;
+    assert(hostRefusal(c, parseUrl("https://rebind.example/").orThrow!(e => new ToolError(e)), &dns, pinned) is null);
+    assert(pinned == ["rebind.example:443:93.184.216.34", "rebind.example:443:[2606:2800::1]"]);
+    assert(lookups == 1); // curl is given these, never a second answer
+    assert(hostRefusal(c, parseUrl("http://1.2.3.4:8080/").orThrow!(e => new ToolError(e)), &dns, pinned) is null && !pinned.length);
 }
 
 unittest // tool offering per mode and flag

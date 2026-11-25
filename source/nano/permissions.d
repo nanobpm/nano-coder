@@ -624,6 +624,8 @@ unittest // web rules: WebFetch(domain:...) by host, web_search and web_fetch by
     p.deny = [parseRule("WebFetch(domain:*.evil.com)"), parseRule("WebFetch(domain:bad.org)")];
     assert(p.check("web_fetch", url("https://x.evil.com/a")) !is null);
     assert(p.check("web_fetch", url("https://bad.org/")) !is null);
+    assert(p.check("web_fetch", url("https://bad.org./")) !is null); // a trailing dot is the same host
+    assert(p.check("web_fetch", url("https://x.evil.com./a")) !is null);
     assert(p.check("web_fetch", url("https://evil.com/")) is null); // the subdomain pattern only
     assert(p.check("web_fetch", url("https://good.org/?q=bad.org")) is null); // the host, not the query
     p.allow = [parseRule("WebFetch(domain:docs.example.com)")];

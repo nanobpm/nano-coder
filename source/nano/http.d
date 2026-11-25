@@ -73,6 +73,9 @@ struct Request
     bool httpOnly;
     /// A cap on the whole transfer; zero: none (only the idle timeout).
     Duration totalTimeout;
+    /// `host:port:address` entries libcurl uses instead of its own lookup
+    /// (CURLOPT_RESOLVE), so web_fetch connects to the addresses it checked.
+    string[] pinned;
 }
 
 /// Perform `req`; each received chunk goes to `onChunk` (when set) as it
@@ -184,6 +187,17 @@ int perform(const ref Request req, out string body_, out ResponseMeta meta,
             http.handle.set(CurlOption.protocols, httpAndHttps);
             http.handle.set(CurlOption.redir_protocols, httpAndHttps);
         }
+    }
+    import etc.c.curl : curl_slist, curl_slist_append, curl_slist_free_all, CurlOption;
+    import std.string : toStringz;
+    curl_slist* pins;
+    // The list is freed after the transfer; libcurl copies nothing out of it later.
+    scope (exit) if (pins !is null) curl_slist_free_all(pins);
+    foreach (p; req.pinned) pins = curl_slist_append(pins, p.toStringz);
+    if (req.pinned.length)
+    {
+        if (pins is null) throw new imported!"std.net.curl".CurlException("can't pin the checked addresses");
+        http.handle.set(CurlOption.resolve, pins);
     }
     if (req.method != "GET")
     {

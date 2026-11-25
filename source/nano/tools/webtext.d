@@ -757,6 +757,7 @@ private immutable string[] metadataNames = ["metadata.google.internal", "metadat
 string privateHostName(string host) nothrow
 {
     auto h = asciiLower(host);
+    while (h.endsWith(".")) h = h[0 .. $ - 1]; // `localhost.` is `localhost`
     foreach (m; metadataNames) if (h == m) return "a cloud metadata host";
     if (h == "localhost" || h.endsWith(".localhost")) return "a loopback address";
     string why;
@@ -777,8 +778,10 @@ bool isIpLiteral(string host) nothrow
 bool hostMatches(string pattern, string host) nothrow
 {
     auto p = asciiLower(pattern.strip);
-    auto h = asciiLower(host);
+    auto h = asciiLower(host.strip);
+    // A trailing dot names the same host (`bad.org.` is `bad.org`).
     while (p.endsWith(".")) p = p[0 .. $ - 1];
+    while (h.endsWith(".")) h = h[0 .. $ - 1];
     if (p == "*") return true;
     if (p.startsWith("*.")) return h.length > p.length - 1 && h.endsWith(p[1 .. $]);
     return p == h;
@@ -1092,6 +1095,8 @@ unittest // host patterns
 {
     assert(hostMatches("example.com", "EXAMPLE.com") && !hostMatches("example.com", "a.example.com"));
     assert(hostMatches("*.github.com", "api.github.com") && !hostMatches("*.github.com", "github.com"));
+    assert(hostMatches("bad.org", "bad.org.") && hostMatches("bad.org", "BAD.org..")); // trailing dots
+    assert(hostMatches("*.evil.com", "x.evil.com.") && !hostMatches("*.evil.com", "evil.com."));
     assert(!hostMatches("*.github.com", "evilgithub.com") && hostMatches("*", "x"));
     assert(anyHostMatches(["a.com", "*.b.com"], "x.b.com") && !anyHostMatches([], "a.com"));
 }

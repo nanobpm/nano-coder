@@ -404,7 +404,10 @@ The tools run in the harness, not in the sandboxed shell, so `[sandbox]` does no
 them; their network rules are enforced by the tools themselves. Every hop (including each
 redirect) is checked: URLs with userinfo are refused, and hosts resolving to private,
 loopback, link-local, CGNAT (100.64/10), ULA or cloud-metadata addresses are refused unless
-`allow_private = true` or the host is in `allowed_hosts`. The Brave key never appears in logs
+`allow_private = true` or the host is in `allowed_hosts`. The connection goes to the very
+addresses that were checked (a second DNS answer can't rebind it), a trailing dot
+(`bad.org.`) matches the same host rules, and a redirect to a host other than the approved
+one needs approval of its own (an allow rule, `--web`, or a Yes). The Brave key never appears in logs
 or errors.
 
 Permissions: `web_search` is allowed by default. `web_fetch` asks in an interactive session,
