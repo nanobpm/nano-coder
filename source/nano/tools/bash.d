@@ -124,7 +124,10 @@ bool isHelperFailure(string msg) pure nothrow
     import std.algorithm : canFind;
     import std.uni : toLower;
     import std.exception : assumeWontThrow;
-    if (assumeWontThrow(msg.toLower).canFind("working directory")) return false;
+    auto lower = assumeWontThrow(msg.toLower);
+    // Call-specific failures (bad cwd, oversized argv/env) are recoverable:
+    // a different call can still start the helper.
+    if (lower.canFind("working directory") || lower.canFind("argument list too long")) return false;
     return msg.canFind(helperExe);
 }
 
@@ -151,6 +154,7 @@ unittest
     assert(isHelperFailure("Failed to execute '/proc/self/exe' (Permission denied)"));
     assert(!isHelperFailure("Failed to set working directory '/nope' for '/proc/self/exe'"));
     assert(!isHelperFailure("Failed to execute 'bash'"));
+    assert(!isHelperFailure("Failed to execute '/proc/self/exe' (Argument list too long)"));
 }
 
 /// The failure result a headless run records when its shell is gone: the
@@ -166,12 +170,15 @@ string fatalResultJson(string msg)
 /// agent hasn't written a result yet (never overwrite a real one).
 void recordFatalResult(string msg)
 {
-    import std.file : exists, write;
+    import std.stdio : File;
     auto path = environment.get("AGENT_RESULT_FILE");
-    if (!path.length || path.exists) return;
+    if (!path.length) return;
     import std.exception : collectException;
-    // Best effort: the ToolError still reports the failure if this can't write.
-    collectException(write(path, fatalResultJson(msg)));
+    // "wx" opens with O_CREAT | O_EXCL: creation fails if a result already
+    // exists, so a result written concurrently is never overwritten. Best
+    // effort: the ToolError still reports the failure if this can't write
+    // (including the exists case, which is the intended skip).
+    collectException({ auto f = File(path, "wx"); f.write(fatalResultJson(msg)); }());
 }
 
 /// The ToolError message for a failed spawn. Only the permanent upgrade case
@@ -206,8 +213,15 @@ unittest
     handleSpawnFailure("Failed to execute '/usr/bin/nano-coder (deleted)'");
     assert(path.exists);
     remove(path);
+    handleSpawnFailure("Failed to execute '/proc/self/exe' (Argument list too long)");
+    assert(!path.exists);
     handleSpawnFailure("Failed to execute '/proc/self/exe' (Permission denied)");
     assert(path.exists);
+    // An existing (real) result is never overwritten.
+    import std.file : readText, fwrite = write;
+    fwrite(path, "real");
+    handleSpawnFailure("Failed to execute '/proc/self/exe' (Permission denied)");
+    assert(readText(path) == "real");
 }
 
 unittest
