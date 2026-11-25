@@ -1,0 +1,35 @@
+# TEMPORARY (issue #388): runs the three fixed modules 50 times on the
+# platforms where they failed. Removed before merge.
+name: stress-388
+on:
+  push:
+    branches: [feat/issue-388]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  stress:
+    name: stress (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel, ubuntu-22.04-arm]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dlang-community/setup-dlang@v2
+        with:
+          compiler: ldc-1.43.0
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libcurl4-openssl-dev zlib1g-dev
+      - name: build the test runner
+        run: NANO_TEST_ONLY=nano.testenv_test dub test -q
+      - name: 50 runs of the three modules (each within its 1 s budget)
+        run: |
+          for i in $(seq 1 50); do
+            echo "::group::run $i"
+            NANO_TEST_ONLY=nano.providers.anthropic_test,nano.peers,nano.session_resume_memory_test \
+              NANO_TEST_JOBS=4 NANO_TEST_BUDGET_SCALE=1 ./nano-coder-test-application || { echo "run $i failed"; exit 1; }
+            echo "::endgroup::"
+          done
