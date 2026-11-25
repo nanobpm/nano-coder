@@ -197,13 +197,13 @@ measure() {
     printf '%s\n' "$m"
 }
 here=$(measure . "the working tree") || exit 1
-# The commit messages of pull request $1, separated by blank lines:
-# NANO_RATCHET_PR_MESSAGES_DIR/<n> when set (tests), else the GitHub API when
-# GITHUB_REPOSITORY is set (CI, with GH_TOKEN); nothing otherwise.
 # The Ratchet-Override values of PR $1's commits, but only when PR $1 is
 # merged and its merge commit is $2: a `(#N)` subject alone proves nothing.
 # Each message is parsed on its own with Git's trailer parser, so example
 # text in a body is ignored and keys match case-insensitively, as in git log.
+# Source: the fixture directory NANO_RATCHET_PR_MESSAGES_DIR/<n> (files msg*
+# plus merge_commit_sha) when set (tests), else the GitHub API when
+# GITHUB_REPOSITORY is set (CI, with GH_TOKEN); nothing otherwise.
 pr_overrides() {
     if [ -n "${NANO_RATCHET_PR_MESSAGES_DIR:-}" ]; then
         d=$NANO_RATCHET_PR_MESSAGES_DIR/$1
