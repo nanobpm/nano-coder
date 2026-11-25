@@ -183,7 +183,11 @@ int perform(const ref Request req, out string body_, out ResponseMeta meta,
     {
         import etc.c.curl : CurlOption;
         if (req.totalTimeout > Duration.zero) http.handle.set(CurlOption.timeout_ms, req.totalTimeout.total!"msecs");
-        if (req.noRedirects) http.handle.set(CurlOption.followlocation, 0L);
+        if (req.noRedirects)
+        {
+            http.handle.set(CurlOption.followlocation, 0L);
+            http.handle.set(CurlOption.maxredirs, 0L); // backstop: never follow even if followlocation flips
+        }
         if (req.noProxy) http.handle.set(CurlOption.noproxy, "*");
         enum long httpAndHttps = 1 | 2; // CURLPROTO_HTTP | CURLPROTO_HTTPS
         if (req.httpOnly)

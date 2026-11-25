@@ -581,6 +581,11 @@ Result!(Url, string) parseUrl(string text)
     }
     while (u.host.endsWith(".")) u.host = u.host[0 .. $ - 1];
     if (!u.host.length) return R.err("URL has no host");
+    // A non-ASCII (IDN) host is refused: an IDN-capable libcurl would turn it
+    // into punycode, so the checked-and-pinned name would not be the one
+    // curl looks up, and curl would resolve it again (DNS rebinding).
+    foreach (char c; u.host)
+        if (c >= 0x80) return R.err("non-ASCII (internationalized) host names are refused; use the xn-- (punycode) form");
     foreach (c; u.host)
         if (c <= ' ' || c == '/' || c == '\\' || (c == '%' && u.host.indexOf(':') < 0))
             return R.err("malformed host in URL");
@@ -851,6 +856,8 @@ string privateV4(uint a) nothrow @nogc
     if (inNet(0xC0A80000, 16)) return "a private address";
     if (inNet(0x64400000, 10)) return "a CGNAT/Tailscale address";
     if (inNet(0xC0000000, 24)) return "an IETF protocol address";
+    if (inNet(0xC0000200, 24) || inNet(0xC6336400, 24) || inNet(0xCB007100, 24)) return "a documentation address";
+    if (inNet(0xC0586300, 24)) return "a 6to4 relay anycast address";
     if (inNet(0xC6120000, 15)) return "a benchmarking address";
     if (inNet(0xE0000000, 4)) return "a multicast address";
     if (inNet(0xF0000000, 4)) return "a reserved address";
@@ -869,6 +876,11 @@ string privateV6(ubyte[16] b) nothrow @nogc
     if (zero(0, 12)) return privateV4(v4(12));
     if (b[0] == 0x00 && b[1] == 0x64 && b[2] == 0xff && b[3] == 0x9b && zero(4, 12)) return privateV4(v4(12));
     if (b[0] == 0x20 && b[1] == 0x02) return privateV4(v4(2));
+    // Teredo (2001::/32): the client IPv4 is the last 32 bits, inverted.
+    if (b[0] == 0x20 && b[1] == 0x01 && b[2] == 0 && b[3] == 0)
+        return privateV4(~v4(12));
+    if (b[0] == 0x20 && b[1] == 0x01 && b[2] == 0x0d && b[3] == 0xb8) return "a documentation address";
+    if (b[0] == 0x01 && zero(1, 8)) return "a discard-only address";
     if (b[0] == 0xfe && (b[1] & 0xc0) == 0x80) return "a link-local address";
     if (b[0] == 0xfe && (b[1] & 0xc0) == 0xc0) return "a site-local address";
     if ((b[0] & 0xfe) == 0xfc) return "a unique local (ULA) address";
@@ -1219,6 +1231,9 @@ unittest // URL parsing
     assert(parseUrl("http://example.com@evil.com/").isErr);
     assert(parseUrl("file:///etc/passwd").isErr);
     assert(parseUrl("ftp://x/").isErr && parseUrl("example.com").isErr && parseUrl("http:///x").isErr);
+    // IDN hosts are refused (an IDN libcurl would re-resolve the punycode name past the pin)
+    assert(parseUrl("http://bücher.example/").match!(v => "", e => e).indexOf("non-ASCII") >= 0);
+    assert(parseUrl("http://xn--bcher-kva.example/").match!(v => v.host, e => "") == "xn--bcher-kva.example");
     assert(parseUrl("http://x:99999/").isErr && parseUrl("http://x/a b").isErr);
     auto base = parseUrl("https://a.com/x/y?z").match!(v => v, e => Url.init);
     assert(resolveLocation(base, "/p").match!(v => v.toString, e => e) == "https://a.com/p");
@@ -1243,7 +1258,7 @@ unittest // host classification: IPv4 in every form
     assert(parseIPv4("example.com").isNone && parseIPv4("1.2.3.4.5").isNone && parseIPv4("256.1.1.1").isNone);
     assert(parseIPv4("08.1.1.1").isNone && parseIPv4("1.2.3.").isNone);
     foreach (h; ["127.0.0.1", "2130706433", "0x7f.1", "0177.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1",
-            "169.254.169.254", "169.254.1.1", "100.64.0.1", "100.127.255.255", "0.0.0.0", "224.0.0.1",
+            "169.254.169.254", "169.254.1.1", "100.64.0.1", "192.0.2.1", "198.51.100.7", "203.0.113.255", "192.88.99.1", "100.127.255.255", "0.0.0.0", "224.0.0.1",
             "metadata.google.internal", "METADATA.google.internal.", "localhost", "a.localhost"])
         assert(privateHostName(h.endsWith(".") ? h[0 .. $ - 1] : h).length, h);
     foreach (h; ["8.8.8.8", "100.128.0.1", "172.32.0.1", "example.com", "1.1.1.1"])
@@ -1257,7 +1272,11 @@ unittest // host classification: IPv6
     foreach (h; ["::1", "::", "fe80::1", "fc00::1", "fd12:3456::1", "ff02::1", "::ffff:127.0.0.1",
             "::ffff:7f00:1", "64:ff9b::a9fe:a9fe", "2002:0a00:0001::1", "fe80::1%en0", "::127.0.0.1"])
         assert(privateHostName(h).length, h);
-    foreach (h; ["2606:4700::1111", "2001:4860:4860::8888", "::ffff:8.8.8.8"])
+    // documentation, discard-only, 6to4 relay; Teredo judged by its (inverted) embedded IPv4
+    foreach (h; ["2001:db8::1", "100::1", "::ffff:192.0.2.1", "::ffff:198.51.100.1", "::ffff:203.0.113.9",
+            "::ffff:192.88.99.1", "2001:0:4136:e378:8000:63bf:80ff:fffe", "2001:0:4136:e378:8000:63bf:5601:56fe"])
+        assert(privateHostName(h).length, h);
+    foreach (h; ["2606:4700::1111", "2001:4860:4860::8888", "::ffff:8.8.8.8", "2001:0:4136:e378:8000:63bf:f7f7:f7f7"])
         assert(!privateHostName(h).length, h);
     assert(parseIPv6("1::2::3").isNone && parseIPv6("12345::").isNone && parseIPv6(":1::").isNone);
     assert(parseIPv6("1:2:3:4:5:6:7:8").isSome && parseIPv6("1:2:3:4:5:6:7").isNone);

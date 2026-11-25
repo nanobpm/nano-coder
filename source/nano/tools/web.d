@@ -605,6 +605,11 @@ unittest // the checked addresses are pinned, so a rebinding second lookup can't
     assert(hostRefusal(c, parseUrl("https://rebind.example/").orThrow!(e => new ToolError(e)), &dns, pinned) is null);
     assert(pinned == ["rebind.example:443:93.184.216.34,[2606:2800::1]"], pinned[0]); // one entry: curl keeps the last per host:port
     assert(lookups == 1); // curl is given these, never a second answer
+    // the pin key is exactly the host in the URL curl receives
+    auto pu = parseUrl("https://Rebind.Example./x").orThrow!(e => new ToolError(e));
+    string[] pub(string h) { return ["93.184.216.34"]; }
+    assert(hostRefusal(c, pu, &pub, pinned) is null);
+    assert(pu.toString.startsWith("https://" ~ pinned[0][0 .. pinned[0].indexOf(':')] ~ "/"), pu.toString);
     assert(hostRefusal(c, parseUrl("http://1.2.3.4:8080/").orThrow!(e => new ToolError(e)), &dns, pinned) is null && !pinned.length);
 }
 
