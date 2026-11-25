@@ -215,7 +215,7 @@ string[] installArgs(Channel c, string prefix = null) pure
 }
 
 /// The directories an update writes to, which must be writable: npm's
-/// package tree and launcher dir, brew's Cellar and the tap checkout.
+/// package tree, its `@nanobpm` scope dir and launcher dir, brew's Cellar and the tap checkout.
 /// `npmLib` is false for the Windows-style layout, where packages sit in
 /// `<prefix>/node_modules` and launchers in `<prefix>` itself.
 string[] writeTargets(Channel c, string prefix, string tapRepo, bool npmLib = true) pure
@@ -224,8 +224,11 @@ string[] writeTargets(Channel c, string prefix, string tapRepo, bool npmLib = tr
     if (!prefix.length) return null;
     final switch (c)
     {
-        case Channel.npm: return npmLib ? [buildPath(prefix, "lib", "node_modules"), buildPath(prefix, "bin")]
-            : [buildPath(prefix, "node_modules"), prefix];
+        case Channel.npm:
+            // The scope dir too: a past `sudo npm install` can leave it
+            // root-owned under a user-writable node_modules.
+            auto mods = npmLib ? buildPath(prefix, "lib", "node_modules") : buildPath(prefix, "node_modules");
+            return [mods, buildPath(mods, "@nanobpm"), npmLib ? buildPath(prefix, "bin") : prefix];
         case Channel.brew: return [buildPath(prefix, "Cellar")] ~ (tapRepo.length ? [tapRepo] : null);
         case Channel.other: return null;
     }
@@ -1234,10 +1237,10 @@ unittest
     assert(brew[1].program == "/opt/home brew/bin/brew" && brew[1].args == ["upgrade", brewFormula]);
     assert(installCommand(Channel.brew, "/opt/home brew", "/opt/home brew/bin/brew")
         == "'/opt/home brew/bin/brew' upgrade " ~ brewFormula);
-    assert(writeTargets(Channel.npm, "/usr", null) == ["/usr/lib/node_modules", "/usr/bin"]);
+    assert(writeTargets(Channel.npm, "/usr", null) == ["/usr/lib/node_modules", "/usr/lib/node_modules/@nanobpm", "/usr/bin"]);
     assert(writeTargets(Channel.brew, "/opt/homebrew", "/tap") == ["/opt/homebrew/Cellar", "/tap"]);
     assert(writeTargets(Channel.npm, null, null) is null);
-    assert(writeTargets(Channel.npm, "C:/npm", null, false) == ["C:/npm/node_modules", "C:/npm"]);
+    assert(writeTargets(Channel.npm, "C:/npm", null, false) == ["C:/npm/node_modules", "C:/npm/node_modules/@nanobpm", "C:/npm"]);
     assert(npmFlatLayout("C:/npm", "C:/npm/node_modules/@nanobpm/nano-coder/bin/nano-coder"));
     assert(!npmFlatLayout("/usr", "/usr/lib/node_modules/@nanobpm/nano-coder/bin/nano-coder"));
     assert(npmFlatLayout("/", "/node_modules/@nanobpm/nano-coder/bin/nano-coder") && !npmFlatLayout(null, "x"));
@@ -1271,6 +1274,12 @@ unittest
         npmFound);
     assert(ran == [["npm", "install", "-g", "--prefix", dir, npmPackage ~ "@latest"]], "the prefix is targeted");
     assert(lines[0].canFind("Updated to 0.2.0"), lines[0]);
+    // Mixed ownership: node_modules and bin writable, the scope dir not.
+    auto scopeDir = buildPath(dir, "lib", "node_modules", "@nanobpm");
+    ran = null;
+    lines = runInstaller(Channel.npm, exe, "0.1.0", rec, (string e) @safe => "0.2.0", null,
+        (string d) @safe => d != scopeDir, npmFound);
+    assert(ran is null && lines[0].canFind(scopeDir) && lines[0].canFind("not writable"), lines[0]);
     // A POSIX flat node_modules is a project-local / npx install: no prefix
     // is forced, so npm's own global prefix is updated instead.
     auto flat = buildPath(dir, "flat");
