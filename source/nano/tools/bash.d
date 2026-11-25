@@ -111,11 +111,31 @@ bool isUpgradeFailure(string msg) pure nothrow
     return msg.canFind(" (deleted)");
 }
 
+/// The Linux sandbox helper's path (mirrors `nano.landlock.helperExe`, which
+/// only exists on Linux).
+private enum helperExe = "/proc/self/exe";
+
+/// Whether a spawn error is a failed launch of the Linux sandbox helper
+/// (`/proc/self/exe`): every sandboxed command would fail the same way, so it
+/// is permanent for this session. A bad working directory is not: it depends
+/// on the call, so it stays recoverable.
+bool isHelperFailure(string msg) pure nothrow
+{
+    import std.algorithm : canFind;
+    import std.uni : toLower;
+    import std.exception : assumeWontThrow;
+    if (assumeWontThrow(msg.toLower).canFind("working directory")) return false;
+    return msg.canFind(helperExe);
+}
+
 /// The message for a command that could not be started: an executable whose
 /// path ends in " (deleted)" was replaced under this session (an upgrade), so
 /// say to restart instead of surfacing the raw exec error.
 string spawnFailure(string msg) pure
 {
+    if (isHelperFailure(msg) && !isUpgradeFailure(msg))
+        return "the bash tool's sandbox helper (" ~ helperExe ~ ") could not start; "
+            ~ "restart nano-coder (" ~ msg ~ ")";
     if (isUpgradeFailure(msg))
         return "nano-coder was upgraded under this session, so the bash tool can't start its helper; "
             ~ "restart nano-coder (" ~ msg ~ ")";
@@ -127,6 +147,10 @@ unittest
     import std.algorithm : canFind, startsWith;
     assert(spawnFailure("Failed to execute '/usr/bin/nano-coder (deleted)'").startsWith("nano-coder was upgraded"));
     assert(spawnFailure("Failed to execute 'bash'").startsWith("could not start the command"));
+    assert(spawnFailure("Failed to execute '/proc/self/exe' (Permission denied)").canFind("sandbox helper"));
+    assert(isHelperFailure("Failed to execute '/proc/self/exe' (Permission denied)"));
+    assert(!isHelperFailure("Failed to set working directory '/nope' for '/proc/self/exe'"));
+    assert(!isHelperFailure("Failed to execute 'bash'"));
 }
 
 /// The failure result a headless run records when its shell is gone: the
@@ -156,7 +180,7 @@ void recordFatalResult(string msg)
 string handleSpawnFailure(string raw)
 {
     auto msg = spawnFailure(raw);
-    if (isUpgradeFailure(raw)) recordFatalResult(msg);
+    if (isUpgradeFailure(raw) || isHelperFailure(raw)) recordFatalResult(msg);
     return msg;
 }
 
@@ -177,7 +201,12 @@ unittest
     }
     handleSpawnFailure("Failed to execute 'bash'");
     assert(!path.exists);
+    handleSpawnFailure("Failed to set working directory '/nope' for '/proc/self/exe'");
+    assert(!path.exists);
     handleSpawnFailure("Failed to execute '/usr/bin/nano-coder (deleted)'");
+    assert(path.exists);
+    remove(path);
+    handleSpawnFailure("Failed to execute '/proc/self/exe' (Permission denied)");
     assert(path.exists);
 }
 
