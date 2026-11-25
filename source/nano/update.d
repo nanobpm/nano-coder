@@ -155,6 +155,16 @@ string installPrefix(Channel c, string path) pure
     return prefix.length ? prefix : null;
 }
 
+/// Whether `path` is in the Windows-style npm layout under `prefix`
+/// (`<prefix>/node_modules/@nanobpm/…`, no `lib`).
+bool npmFlatLayout(string prefix, string path) pure
+{
+    import std.algorithm : startsWith;
+    if (!prefix.length) return false;
+    auto base = prefix == "/" ? "/" : prefix ~ "/";
+    return path.startsWith(base ~ "node_modules/@nanobpm/");
+}
+
 /// The install prefix of the running executable: that of the file `exe`
 /// links to (a global `bin/nano-coder` launcher or a brew `opt` link), else
 /// that of `exe` itself; null when neither has one.
@@ -194,13 +204,16 @@ string[] installArgs(Channel c, string prefix = null) pure
 
 /// The directories an update writes to, which must be writable: npm's
 /// package tree and launcher dir, brew's Cellar and the tap checkout.
-string[] writeTargets(Channel c, string prefix, string tapRepo) pure
+/// `npmLib` is false for the Windows-style layout, where packages sit in
+/// `<prefix>/node_modules` and launchers in `<prefix>` itself.
+string[] writeTargets(Channel c, string prefix, string tapRepo, bool npmLib = true) pure
 {
     import std.path : buildPath;
     if (!prefix.length) return null;
     final switch (c)
     {
-        case Channel.npm: return [buildPath(prefix, "lib", "node_modules"), buildPath(prefix, "bin")];
+        case Channel.npm: return npmLib ? [buildPath(prefix, "lib", "node_modules"), buildPath(prefix, "bin")]
+            : [buildPath(prefix, "node_modules"), prefix];
         case Channel.brew: return [buildPath(prefix, "Cellar")] ~ (tapRepo.length ? [tapRepo] : null);
         case Channel.other: return null;
     }
@@ -630,7 +643,7 @@ Chan!string startChecker(Channel channel, string running)
 string[] runInstaller(Channel channel, string exe, string running,
     int delegate(string program, string[] args, const string[string] env) @safe runner,
     string delegate(string exe) @safe versionOf = null, string delegate() @safe tapRepoOf = null,
-    bool delegate(string dir) @safe writable = null)
+    bool delegate(string dir) @safe writable = null, bool delegate(string program) @safe onPath = null)
 {
     if (channel == Channel.other)
         return [format("This nano-coder was not installed with npm or Homebrew (install channel: other), so it cannot update itself. "
@@ -641,13 +654,17 @@ string[] runInstaller(Channel channel, string exe, string running,
     auto brew = channel == Channel.brew ? brewProgram(prefix, prefix.length && buildPath(prefix, "bin", "brew").exists) : "brew";
     auto program = installer(channel, brew);
     auto command = installCommand(channel, prefix, brew);
-    if (!(program.startsWith("/") ? program.exists : which(program) !is null))
+    bool found(string p) { return onPath is null ? which(p) !is null : onPath(p); }
+    if (!(program.startsWith("/") ? program.exists : found(program)))
         return [format("`%s` is not on PATH, so nano-coder cannot run the update itself. Install it manually with: %s",
             program, command)];
     bool canWrite(string dir) { return writable is null ? dirWritable(dir) : writable(dir); }
     // Checked before anything runs, so a root-owned prefix gets the command
     // to run with sudo instead of an opaque EACCES from the installer.
-    foreach (dir; writeTargets(channel, prefix, null))
+    import nano.paths : resolveSymlinks;
+    immutable npmLib = channel != Channel.npm
+        || !(npmFlatLayout(prefix, resolveSymlinks(exe)) || npmFlatLayout(prefix, exe));
+    foreach (dir; writeTargets(channel, prefix, null, npmLib))
         if (!canWrite(dir)) return [unwritableMessage(channel, dir, currentUser(), command)];
     string tapRepo;
     string shown = command;
@@ -1197,6 +1214,10 @@ unittest
     assert(writeTargets(Channel.npm, "/usr", null) == ["/usr/lib/node_modules", "/usr/bin"]);
     assert(writeTargets(Channel.brew, "/opt/homebrew", "/tap") == ["/opt/homebrew/Cellar", "/tap"]);
     assert(writeTargets(Channel.npm, null, null) is null);
+    assert(writeTargets(Channel.npm, "C:/npm", null, false) == ["C:/npm/node_modules", "C:/npm"]);
+    assert(npmFlatLayout("C:/npm", "C:/npm/node_modules/@nanobpm/nano-coder/bin/nano-coder"));
+    assert(!npmFlatLayout("/usr", "/usr/lib/node_modules/@nanobpm/nano-coder/bin/nano-coder"));
+    assert(npmFlatLayout("/", "/node_modules/@nanobpm/nano-coder/bin/nano-coder") && !npmFlatLayout(null, "x"));
 }
 
 // An unwritable prefix runs nothing and names the command to run by hand;
@@ -1206,7 +1227,6 @@ unittest
     import std.algorithm : canFind;
     import std.file : mkdirRecurse, write, rmdirRecurse;
     import std.path : buildPath;
-    if (which("npm") is null) return; // runInstaller needs npm on PATH
     import nano.paths : resolveSymlinks;
     auto raw = fakeRegistryDir("prefixw");
     scope (exit) rmdirRecurse(raw);
@@ -1217,15 +1237,27 @@ unittest
     write(exe, "");
     string[][] ran;
     auto rec = (string p, string[] a, const string[string] e) @safe { ran ~= [p] ~ a; return 0; };
+    bool delegate(string) @safe npmFound = (string p) @safe => p == "npm"; // fake PATH lookup: runs without npm installed
     auto lines = runInstaller(Channel.npm, exe, "0.1.0", rec, (string e) @safe => "0.2.0", null,
-        (string d) @safe => false);
+        (string d) @safe => false, npmFound);
     assert(ran is null, "nothing runs on an unwritable prefix");
-    assert(lines[0].canFind("sudo npm install -g --prefix " ~ dir ~ " @nanobpm/nano-coder@latest"), lines[0]);
+    assert(lines[0].canFind("sudo " ~ installCommand(Channel.npm, dir)), lines[0]);
     assert(lines[0].canFind(buildPath(dir, "lib", "node_modules")) && lines[0].canFind("not writable")
         && lines[0].canFind("unchanged"), lines[0]);
-    lines = runInstaller(Channel.npm, exe, "0.1.0", rec, (string e) @safe => "0.2.0", null, (string d) @safe => true);
+    lines = runInstaller(Channel.npm, exe, "0.1.0", rec, (string e) @safe => "0.2.0", null, (string d) @safe => true,
+        npmFound);
     assert(ran == [["npm", "install", "-g", "--prefix", dir, npmPackage ~ "@latest"]], "the prefix is targeted");
     assert(lines[0].canFind("Updated to 0.2.0"), lines[0]);
+    // Windows-style layout: the checked dirs are <prefix>/node_modules and <prefix>.
+    auto flat = buildPath(dir, "flat");
+    auto fbin = buildPath(flat, "node_modules", "@nanobpm", "nano-coder", "bin");
+    mkdirRecurse(fbin);
+    write(buildPath(fbin, "nano-coder"), "");
+    string[] checked;
+    runInstaller(Channel.npm, buildPath(fbin, "nano-coder"), "0.1.0", rec, (string e) @safe => "0.2.0", null,
+        (string d) @safe { checked ~= d; return false; }, npmFound);
+    import std.array : join;
+    assert(checked == [buildPath(flat, "node_modules")], checked.join(","));
     // The real probe: a temp dir is writable.
     assert(dirWritable(dir) && dirWritable(buildPath(dir, "missing")));
 }
