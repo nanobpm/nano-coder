@@ -792,7 +792,9 @@ final class LineEditor
             }
             // Every key is activity for the idle-compaction quiet check.
             state.keySeen(monoNow);
-            if (onKey !is null) onKey();
+            // Only typing acknowledges a finished turn: focus/mouse reports
+            // (K.ignored) and a closed input are not the user at the keys.
+            if (onKey !is null && key.kind != K.ignored && key.kind != K.closed) onKey();
             notice = null;
             final switch (key.kind)
             {

@@ -1321,6 +1321,8 @@ Answer askQuestions(LineEditor editor, const Question[] qs, bool delegate() @saf
         }
         import nano.question : questionPrompt;
         string[] body_;
+        // Report the question being asked now, not the batch's first.
+        reportBlocked(q.approval ? ProgKind.permission : ProgKind.question, q.question);
         auto prompt = questionPrompt(q.question, terminalWidth(), body_);
         auto at = editor.select(prompt, labels, 0, away, body_);
         if (at == -2) return Answer(Away());
@@ -4907,13 +4909,19 @@ int runMain(string[] args)
             updateStatus((ref Stats s) { s.activity = Activity.idle; s.tokensPerSec = 0; });
         }
         string turnError, turnAnswer;
-        scope (exit) nano.progstatus.update((ref ProgSession s) {
-            s.turnRunning = false;
-            s.activity = null;
+        // Background sub-agents still running keep the session `working`, so
+        // no transient `done` reaches the terminal (a completion notice).
+        scope (exit)
+        {
+            bool background = agent.subagentsActive;
+            nano.progstatus.update((ref ProgSession s) {
+            s.turnRunning = background;
+            s.activity = background ? "background sub-agents" : null;
             s.turnEnded = true;
             s.turnError = turnError;
             s.answer = turnAnswer;
-        });
+            });
+        }
         return driven(() @safe {
             bool ok = true;
             console.finalAnswer = null;
