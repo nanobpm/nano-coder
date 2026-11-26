@@ -105,6 +105,86 @@ unittest
     assert(stripDeletedSuffix("/home/u/.cargo/bin/nano-coder") == "/home/u/.cargo/bin/nano-coder");
 }
 
+/// `path` with npm's staging folders mapped back to the live ones (issue
+/// #399). npm replaces a package by renaming it to `.<name>-<8 base64url>` in
+/// the same scope and then deleting it; /proc/self/exe follows the rename.
+/// Only components directly under `node_modules/@nanobpm/` are rewritten.
+string unstageNpmPath(string path) pure
+{
+    import std.algorithm : splitter, all;
+    import std.array : array, join;
+    import std.ascii : isAlphaNum;
+    enum suffixLen = 8;
+    auto parts = path.splitter('/').array;
+    bool changed;
+    foreach (i; 2 .. parts.length)
+    {
+        if (parts[i - 2] != "node_modules" || parts[i - 1] != "@nanobpm") continue;
+        auto c = parts[i];
+        if (c.length < 1 + 1 + 1 + suffixLen || c[0] != '.') continue;
+        auto dash = c.length - suffixLen - 1;
+        if (c[dash] != '-' || !c[dash + 1 .. $].all!(ch => isAlphaNum(ch) || ch == '-' || ch == '_')) continue;
+        parts[i] = c[1 .. dash];
+        changed = true;
+    }
+    return changed ? parts.join("/") : path;
+}
+
+unittest
+{
+    enum live = "/usr/lib/node_modules/@nanobpm/nano-coder/node_modules/@nanobpm/nano-coder-linux-x64/bin/nano-coder";
+    assert(unstageNpmPath("/usr/lib/node_modules/@nanobpm/.nano-coder-ajgp2ZfA/node_modules/@nanobpm/nano-coder-linux-x64/bin/nano-coder") == live);
+    assert(unstageNpmPath("/usr/lib/node_modules/@nanobpm/nano-coder/node_modules/@nanobpm/.nano-coder-linux-x64-Ab3dE6gH/bin/nano-coder") == live);
+    assert(unstageNpmPath("/usr/lib/node_modules/@nanobpm/.nano-coder-a_Gp2-fA/node_modules/@nanobpm/nano-coder-linux-x64/bin/nano-coder") == live);
+    assert(unstageNpmPath("/usr/lib/node_modules/@nanobpm/nano-coder/node_modules/@nanobpm/.nano-coder-linux-x64--b_3dE6g/bin/nano-coder") == live);
+    assert(unstageNpmPath(stripDeletedSuffix(
+        "/usr/lib/node_modules/@nanobpm/.nano-coder-ajgp2ZfA/node_modules/@nanobpm/nano-coder-linux-x64/bin/nano-coder (deleted)")) == live);
+    // Unchanged paths.
+    foreach (p; [live,
+            "/home/u/.local/lib/node_modules/@nanobpm/nano-coder/node_modules/@nanobpm/nano-coder-linux-x64/bin/nano-coder",
+            "/opt/homebrew/Cellar/nano-coder/1.2.3/bin/nano-coder",
+            "/home/linuxbrew/.linuxbrew/opt/nano-coder/bin/nano-coder",
+            "/home/u/src/nano-coder/nano-coder",
+            "/home/u/.nano-coder-notes/x",
+            "/home/u/.nano-coder-abcdefgh/x",
+            "/x/node_modules/@other/.nano-coder-ajgp2ZfA/bin/nano-coder",
+            "/x/node_modules/@nanobpm/.nano-coder-short/bin/nano-coder",
+            "/x/node_modules/@nanobpm/.nano-coder-ab.dE6gH/bin/nano-coder"])
+        assert(unstageNpmPath(p) == p, p);
+}
+
+/// The path to relaunch for executable `exe` (already without " (deleted)"):
+/// npm's staging folder mapped back to the live one when only that exists,
+/// and the rewritten path when neither does, so the error names where the
+/// binary should be. `exists` is injected so tests need no real install.
+string resolveLaunchExe(string exe, scope bool delegate(string) @safe exists)
+{
+    auto live = unstageNpmPath(exe);
+    if (live != exe && !exists(exe)) exe = live;
+    // Linux names the versioned keg; after `brew upgrade` only `opt` is valid.
+    auto opt = brewOptExe(exe);
+    return opt.length && exists(opt) ? opt : exe;
+}
+
+unittest
+{
+    import std.file : mkdirRecurse, rmdirRecurse, write, exists, tempDir;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    import std.conv : to;
+    auto root = buildPath(tempDir, "nano-unstage-" ~ thisProcessID.to!string);
+    scope (exit) if (root.exists) rmdirRecurse(root);
+    auto liveDir = buildPath(root, "lib/node_modules/@nanobpm/nano-coder/bin");
+    mkdirRecurse(liveDir);
+    write(buildPath(liveDir, "nano-coder"), "");
+    auto staged = buildPath(root, "lib/node_modules/@nanobpm/.nano-coder-ajgp2ZfA/bin/nano-coder");
+    bool ex(string p) @safe { return p.exists; }
+    assert(resolveLaunchExe(staged, &ex) == buildPath(liveDir, "nano-coder"));
+    // Neither exists: the rewritten path, so the error names the live one.
+    rmdirRecurse(root);
+    assert(resolveLaunchExe(staged, &ex) == buildPath(liveDir, "nano-coder"));
+}
+
 /// This process's executable.
 string launchExe()
 {
@@ -113,9 +193,7 @@ string launchExe()
     string exe;
     try exe = stripDeletedSuffix(thisExePath());
     catch (Exception) return null; // no executable path: updates can't relaunch, the caller says so
-    // Linux names the versioned keg; after `brew upgrade` only `opt` is valid.
-    auto opt = brewOptExe(exe);
-    return opt.length && opt.exists ? opt : exe;
+    return resolveLaunchExe(exe, (string p) => p.exists);
 }
 
 /// The install prefix an executable path lies under (issue #384), so
