@@ -203,7 +203,7 @@ The default model is `gpt-4o-mini` on the `mock` provider, so the harness still 
 | `providers.<name>.list_models` | string | `"endpoint"` | endpoint \| configured: where the model picker's list comes from |
 | `providers.<name>.disabled` | boolean | `false` | Hide the provider and refuse its models |
 | `providers.<name>.hidden` | boolean | `false` | Hide the provider from listings |
-| `providers.<name>.timeout_secs` | integer | `600` | Idle timeout: most silence between streamed bytes |
+| `providers.<name>.timeout_secs` | integer |  | Idle timeout: most silence between streamed bytes (unset: 120) |
 | `providers.<name>.max_retries` | integer | `5` | Retries of a failed request |
 | `providers.<name>.retry_initial_backoff_ms` | integer |  | First retry delay |
 | `providers.<name>.retry_max_backoff_ms` | integer |  | Longest retry delay |

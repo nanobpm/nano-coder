@@ -315,6 +315,12 @@ Available in plan mode: yes (read-only).
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `questions` | array of object | yes |  |
+| `questions[].custom` | boolean | no | Allow a custom typed answer (default true) |
+| `questions[].header` | string | no | Very short label (max 30 chars) |
+| `questions[].options` | array of object | no |  |
+| `questions[].options[].description` | string | no |  |
+| `questions[].options[].label` | string | yes |  |
+| `questions[].question` | string | yes | The complete question to ask |
 
 ### memory_search
 

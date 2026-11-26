@@ -19,7 +19,7 @@ nano-coder keeps its files.
 |---|---|
 | Config | `~/.config/nano-coder/config.toml` (or `--config PATH`), see [Configuration](configuration.md) |
 | Session logs | `<data dir>/nano-coder/sessions/<id>.jsonl` (or `session_dir`), see [Sessions](sessions.md#sessions) |
-| Session index (picker cache) | `.index.jsonl` in the session directory; safe to delete, it is rebuilt |
+| Session index (picker cache) | `.index.jsonl` in the session directory; rebuilt if deleted, but session titles live only there, so back it up first (deleting it loses them) |
 | Memories | `<data dir>/nano-coder/memory` (or `memory_dir`), see [Memory](memory.md) |
 | GitHub Copilot credentials | `<data dir>/nano-coder/github-copilot.json` |
 | Last version run | `<data dir>/nano-coder/last_version` |

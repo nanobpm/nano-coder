@@ -35,6 +35,29 @@ def commands(ref):
     return rows
 
 
+def param_rows(props, required, prefix):
+    """Rows for every parameter, recursing into nested objects and arrays of
+    objects (`questions[].options[].label`) so the reference shows the full
+    schema a call must follow."""
+    rows = []
+    for name, p in props.items():
+        kind = p.get("type", "")
+        if isinstance(kind, list):
+            kind = " or ".join(kind)
+        if "enum" in p:
+            kind += ": " + ", ".join(code(e) for e in p["enum"])
+        items = p.get("items") if isinstance(p.get("items"), dict) else {}
+        if kind.startswith("array") and items.get("type"):
+            kind = f"array of {items['type']}"
+        rows.append("| {} | {} | {} | {} |".format(code(prefix + name), cell(kind), "yes" if name in required else "no",
+                                                   cell(p.get("description", ""))))
+        if items.get("properties"):
+            rows += param_rows(items["properties"], set(items.get("required") or []), f"{prefix}{name}[].")
+        if p.get("properties"):
+            rows += param_rows(p["properties"], set(p.get("required") or []), f"{prefix}{name}.")
+    return rows
+
+
 def tools(ref):
     out = ["| Tool | Plan mode | Summary |", "|---|---|---|"]
     for t in ref["tools"]:
@@ -51,16 +74,7 @@ def tools(ref):
             out.append("No parameters.")
             continue
         out += ["| Parameter | Type | Required | Description |", "|---|---|---|---|"]
-        for name, p in props.items():
-            kind = p.get("type", "")
-            if isinstance(kind, list):
-                kind = " or ".join(kind)
-            if "enum" in p:
-                kind += ": " + ", ".join(code(e) for e in p["enum"])
-            if kind.startswith("array") and isinstance(p.get("items"), dict) and p["items"].get("type"):
-                kind = f"array of {p['items']['type']}"
-            out.append("| {} | {} | {} | {} |".format(code(name), cell(kind), "yes" if name in required else "no",
-                                                      cell(p.get("description", ""))))
+        out += param_rows(props, required, "")
     return out
 
 

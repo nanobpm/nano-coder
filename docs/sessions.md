@@ -89,7 +89,7 @@ just "hi"), nano-coder asks the model for a title of at most six words in the ba
 (counted in the status line's token and AI Credit totals once it finishes),
 tried at most once per session per run (so a failed or deleted title is retried after a restart,
 not on the next turn). The picker then shows `title · last prompt`. Titles live only in the index,
-so older nano-coders can still read the logs. Deleting `index.jsonl` loses them; a new run then
+so older nano-coders can still read the logs. Deleting `.index.jsonl` loses them; a new run then
 asks again on the session's next turn.
 
 ## Updating

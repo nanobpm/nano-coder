@@ -134,7 +134,7 @@ immutable ConfigKey[] configKeys = [
     ConfigKey("providers.<name>.list_models", "string", `"endpoint"`, "endpoint | configured: where the model picker's list comes from"),
     ConfigKey("providers.<name>.disabled", "boolean", "false", "Hide the provider and refuse its models"),
     ConfigKey("providers.<name>.hidden", "boolean", "false", "Hide the provider from listings"),
-    ConfigKey("providers.<name>.timeout_secs", "integer", "600", "Idle timeout: most silence between streamed bytes"),
+    ConfigKey("providers.<name>.timeout_secs", "integer", "", "Idle timeout: most silence between streamed bytes (unset: 120)"),
     ConfigKey("providers.<name>.max_retries", "integer", "5", "Retries of a failed request"),
     ConfigKey("providers.<name>.retry_initial_backoff_ms", "integer", "", "First retry delay"),
     ConfigKey("providers.<name>.retry_max_backoff_ms", "integer", "", "Longest retry delay"),
@@ -196,4 +196,82 @@ unittest
     foreach (k; quotedBefore(web[from .. to], `":`)) webKeys ~= k;
     assert(webKeys.length >= 12);
     check("web.", webKeys);
+}
+
+/// `fieldName` in snake_case, the config file's spelling of a `Config` field.
+private string snakeCase(string fieldName) pure
+{
+    import std.ascii : isUpper, toLower;
+    string s;
+    foreach (c; fieldName)
+        if (c.isUpper) s ~= "_" ~ [c.toLower];
+        else s ~= c;
+    return s;
+}
+
+/// `v` written as TOML, as `ConfigKey.default_` spells it; null for a type the
+/// reference does not render.
+private string tomlOf(T)(const T v)
+{
+    import std.conv : to;
+    import std.format : format;
+    static if (is(T == bool) || is(T == long) || is(T == int))
+        return v.to!string;
+    else static if (is(T == double))
+        return format("%g", v);
+    else static if (is(T == string))
+        return v.length ? format(`"%s"`, v) : "";
+    else static if (is(T == string[]))
+    {
+        string s = "[";
+        foreach (i, e; v) s ~= (i ? ", " : "") ~ format(`"%s"`, e);
+        return s ~ "]";
+    }
+    else
+        return null;
+}
+
+/// The TOML type name of `T`, as `ConfigKey.type` spells it; null otherwise.
+private string tomlType(T)()
+{
+    static if (is(T == bool)) return "boolean";
+    else static if (is(T == long) || is(T == int)) return "integer";
+    else static if (is(T == double)) return "float";
+    else static if (is(T == string)) return "string";
+    else static if (is(T == string[])) return "array";
+    else return null;
+}
+
+// The table's types and defaults match the parsers' structs: changing a
+// default or a field's type in `Config` (or `ProviderConfig`) without the
+// reference fails here, so the generated docs cannot go stale silently.
+unittest
+{
+    import nano.config : Config, ProviderConfig;
+    void checkStruct(S)(string prefix)
+    {
+        S init_ = S.init;
+        static foreach (i, field; S.tupleof)
+        {{
+            enum name = __traits(identifier, field);
+            alias F = typeof(field);
+            static if (tomlType!F !is null)
+            {
+                immutable path = prefix ~ snakeCase(name);
+                foreach (k; configKeys)
+                    if (k.path == path)
+                    {
+                        assert(k.type == tomlType!F,
+                            "config key " ~ path ~ ": type " ~ k.type ~ " in nano.config_keys, " ~ tomlType!F ~ " in the parser");
+                        auto actual = tomlOf!F(init_.tupleof[i]);
+                        // An empty reference default means unset: the field must be too (zero, or the -1 "unset" sentinel).
+                        assert(k.default_ == actual || (k.default_.length == 0 && (actual == tomlOf!F(F.init) || actual == "-1")),
+                            "config key " ~ path ~ ": default " ~ k.default_ ~ " in nano.config_keys, " ~ actual
+                            ~ " in the parser; fix the table, then run scripts/gen-reference.sh");
+                    }
+            }
+        }}
+    }
+    checkStruct!Config("");
+    checkStruct!ProviderConfig("providers.<name>.");
 }
