@@ -109,12 +109,12 @@ The default model is `gpt-4o-mini` on the `mock` provider, so the harness still 
 | `bash_heartbeat_secs` | integer | `0` | Interval of the supervisor-visible "still running" note of a long bash call (0: the built-in interval; or NANO_CODER_BASH_HEARTBEAT_SECS) |
 | `plan_tools` | boolean | `true` | Offer the plan_* tools (see Task Plans) |
 | `outcome_tool` | boolean | `true` | Offer report_outcome (see Outcomes) |
-| `reminders` | boolean | `true` | Append <system-reminder> notes to tool results |
+| `reminders` | boolean | `true` | Append &lt;system-reminder&gt; notes to tool results |
 | `verify_before_complete` | boolean | `true` | Remind the agent to verify edits before it finishes |
 | `check_updates` | boolean | `true` | Check for a newer release at startup |
 | `show_release_notes` | boolean | `true` | After an update, show what changed |
 | `persist_sessions` | boolean | `true` | Write a session log |
-| `session_dir` | string |  | Where session logs go (default: <platform data dir>/nano-coder/sessions) |
+| `session_dir` | string |  | Where session logs go (default: &lt;platform data dir&gt;/nano-coder/sessions) |
 | `session_compress_after_days` | integer | `14` | Gzip logs idle this long at startup (0 = never) |
 | `session_retention_days` | integer | `0` | Delete logs untouched this long (0 = keep; named sessions are kept) |
 | `session_titles` | boolean | `false` | Ask the model for a few-word title per session (`--resume` picker) |
@@ -153,7 +153,7 @@ The default model is `gpt-4o-mini` on the `mock` provider, so the harness still 
 | `claude_user_hooks` | boolean | `true` | Load hooks from ~/.claude/settings.json |
 | `hooks` | table |  | Hooks in Claude Code's format, as in .claude/settings.json |
 | `memory` | string | `"on"` | on \| read_only \| off: cross-session memory |
-| `memory_dir` | string |  | Where memories are kept (default: <platform data dir>/nano-coder/memory) |
+| `memory_dir` | string |  | Where memories are kept (default: &lt;platform data dir&gt;/nano-coder/memory) |
 | `memory_expiry_days` | integer | `90` | Expire memories unused this long (0 = never) |
 | `memory_recall` | string | `"entity"` | entity \| anchor: how tool calls recall memories |
 | `terminal.program_status` | boolean | `true` | Report the session's state to the terminal (OSC 7501) |
@@ -199,7 +199,7 @@ The default model is `gpt-4o-mini` on the `mock` provider, so the harness still 
 | `providers.<name>.thinking` | string |  | Thinking level for this provider's models |
 | `providers.<name>.vision` | boolean |  | Whether this provider's models accept images |
 | `providers.<name>.thinking_levels` | array |  | The thinking levels its models support |
-| `providers.<name>.models` | table |  | Per-model settings (see providers.<name>.models.<model>.*), or a list of model names |
+| `providers.<name>.models` | table |  | Per-model settings (see providers.&lt;name&gt;.models.&lt;model&gt;.*), or a list of model names |
 | `providers.<name>.list_models` | string | `"endpoint"` | endpoint \| configured: where the model picker's list comes from |
 | `providers.<name>.disabled` | boolean | `false` | Hide the provider and refuse its models |
 | `providers.<name>.hidden` | boolean | `false` | Hide the provider from listings |

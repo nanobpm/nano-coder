@@ -49,9 +49,30 @@ def links(path):
                 yield no, m.group(1)
 
 
+BARE_TAG = re.compile(r"</?[A-Za-z][\w.-]*>")
+
+
+def bare_tags(path):
+    """Lines with a bare <word> outside code spans and fences: Markdown renderers
+    treat it as an unknown HTML tag and drop it, so the reader loses the text."""
+    fenced = False
+    with open(path, encoding="utf-8") as fh:
+        for no, line in enumerate(fh, 1):
+            if FENCE.match(line.lstrip()):
+                fenced = not fenced
+                continue
+            if fenced:
+                continue
+            for m in BARE_TAG.finditer(re.sub(r"`[^`]*`", "", line)):
+                yield no, m.group(0)
+
+
 def main():
     pages = ["README.md"] + sorted(glob.glob("docs/*.md"))
     bad = []
+    for page in pages[1:]:
+        for no, tag in bare_tags(page):
+            bad.append(f"{page}:{no}: bare {tag} outside a code span is dropped by HTML renderers; escape it or use backticks")
     for page in pages:
         if page.startswith("docs/"):
             with open(page, encoding="utf-8") as fh:
@@ -71,7 +92,7 @@ def main():
     for b in bad:
         print(b)
     if bad:
-        print(f"{len(bad)} broken docs link(s)")
+        print(f"{len(bad)} docs problem(s)")
         sys.exit(1)
 
 
