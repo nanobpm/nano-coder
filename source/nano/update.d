@@ -106,7 +106,7 @@ unittest
 }
 
 /// `path` with npm's staging folders mapped back to the live ones (issue
-/// #399). npm replaces a package by renaming it to `.<name>-<8 alnum>` in
+/// #399). npm replaces a package by renaming it to `.<name>-<8 base64url>` in
 /// the same scope and then deleting it; /proc/self/exe follows the rename.
 /// Only components directly under `node_modules/@nanobpm/` are rewritten.
 string unstageNpmPath(string path) pure
@@ -123,7 +123,7 @@ string unstageNpmPath(string path) pure
         auto c = parts[i];
         if (c.length < 1 + 1 + 1 + suffixLen || c[0] != '.') continue;
         auto dash = c.length - suffixLen - 1;
-        if (c[dash] != '-' || !c[dash + 1 .. $].all!isAlphaNum) continue;
+        if (c[dash] != '-' || !c[dash + 1 .. $].all!(ch => isAlphaNum(ch) || ch == '-' || ch == '_')) continue;
         parts[i] = c[1 .. dash];
         changed = true;
     }
@@ -135,6 +135,8 @@ unittest
     enum live = "/usr/lib/node_modules/@nanobpm/nano-coder/node_modules/@nanobpm/nano-coder-linux-x64/bin/nano-coder";
     assert(unstageNpmPath("/usr/lib/node_modules/@nanobpm/.nano-coder-ajgp2ZfA/node_modules/@nanobpm/nano-coder-linux-x64/bin/nano-coder") == live);
     assert(unstageNpmPath("/usr/lib/node_modules/@nanobpm/nano-coder/node_modules/@nanobpm/.nano-coder-linux-x64-Ab3dE6gH/bin/nano-coder") == live);
+    assert(unstageNpmPath("/usr/lib/node_modules/@nanobpm/.nano-coder-a_Gp2-fA/node_modules/@nanobpm/nano-coder-linux-x64/bin/nano-coder") == live);
+    assert(unstageNpmPath("/usr/lib/node_modules/@nanobpm/nano-coder/node_modules/@nanobpm/.nano-coder-linux-x64--b_3dE6g/bin/nano-coder") == live);
     assert(unstageNpmPath(stripDeletedSuffix(
         "/usr/lib/node_modules/@nanobpm/.nano-coder-ajgp2ZfA/node_modules/@nanobpm/nano-coder-linux-x64/bin/nano-coder (deleted)")) == live);
     // Unchanged paths.
@@ -146,7 +148,8 @@ unittest
             "/home/u/.nano-coder-notes/x",
             "/home/u/.nano-coder-abcdefgh/x",
             "/x/node_modules/@other/.nano-coder-ajgp2ZfA/bin/nano-coder",
-            "/x/node_modules/@nanobpm/.nano-coder-short/bin/nano-coder"])
+            "/x/node_modules/@nanobpm/.nano-coder-short/bin/nano-coder",
+            "/x/node_modules/@nanobpm/.nano-coder-ab.dE6gH/bin/nano-coder"])
         assert(unstageNpmPath(p) == p, p);
 }
 
