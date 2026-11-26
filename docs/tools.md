@@ -397,7 +397,10 @@ Available in plan mode: yes (read-only).
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `goal` | string | no | The overall objective, in one or two sentences |
-| `items` | array | no | Steps in order: title strings, or {title, after, note} objects |
+| `items` | array of string or object | no | Steps in order: title strings, or {title, after, note} objects |
+| `items[].after` | array of integer | no | Ids of items that must be done first |
+| `items[].note` | string | no |  |
+| `items[].title` | string | yes |  |
 
 ### plan_update
 

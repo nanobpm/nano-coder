@@ -41,21 +41,39 @@ def param_rows(props, required, prefix):
     schema a call must follow."""
     rows = []
     for name, p in props.items():
-        kind = p.get("type", "")
+        alts = [a for a in (p.get("anyOf") or p.get("oneOf") or []) if isinstance(a, dict)]
+        kind = p.get("type", "") or " or ".join(alt_kind(a) for a in alts)
         if isinstance(kind, list):
             kind = " or ".join(kind)
         if "enum" in p:
             kind += ": " + ", ".join(code(e) for e in p["enum"])
         items = p.get("items") if isinstance(p.get("items"), dict) else {}
-        if kind.startswith("array") and items.get("type"):
-            kind = f"array of {items['type']}"
+        if kind.startswith("array") and (items.get("type") or items.get("anyOf") or items.get("oneOf")):
+            kind = f"array of {alt_kind(items)}"
         rows.append("| {} | {} | {} | {} |".format(code(prefix + name), cell(kind), "yes" if name in required else "no",
                                                    cell(p.get("description", ""))))
+        for alt in alts:
+            if alt.get("properties"):
+                rows += param_rows(alt["properties"], set(alt.get("required") or []), f"{prefix}{name}.")
+        for alt in [a for a in (items.get("anyOf") or items.get("oneOf") or []) if isinstance(a, dict)]:
+            if alt.get("properties"):
+                rows += param_rows(alt["properties"], set(alt.get("required") or []), f"{prefix}{name}[].")
         if items.get("properties"):
             rows += param_rows(items["properties"], set(items.get("required") or []), f"{prefix}{name}[].")
         if p.get("properties"):
             rows += param_rows(p["properties"], set(p.get("required") or []), f"{prefix}{name}.")
     return rows
+
+
+def alt_kind(schema):
+    """Type name of a schema, joining `anyOf`/`oneOf` alternatives (`string or object`)."""
+    kind = schema.get("type", "")
+    if isinstance(kind, list):
+        return " or ".join(kind)
+    if kind:
+        return kind
+    alts = schema.get("anyOf") or schema.get("oneOf") or []
+    return " or ".join(alt_kind(a) for a in alts if isinstance(a, dict))
 
 
 def tools(ref):
