@@ -100,7 +100,10 @@ bounded.
   listed in `scripts/serial-tests`.
 - Public symbols have `///` doc comments that say what and why.
 - User-visible behaviour (commands, keys, config, output) is documented in
-  README.md in the same PR.
+  `docs/` in the same PR (the website publishes it at each release); run
+  `scripts/gen-reference.sh` after changing flags, commands, tools or config
+  keys. README.md keeps only the intro, install, quick start and contributor
+  sections.
 - Benchmark changes on hot paths (rendering, the agent loop, session I/O) and
   report the numbers.
 - Don't add dependencies without a reason in the PR.

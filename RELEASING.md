@@ -105,6 +105,14 @@ installed on `homebrew-tap` too. Users install with `brew install nanobpm/tap/na
 the tap by hand (e.g. after a failed job), run the script locally against the release's
 `SHA256SUMS` and push the result to the tap's `main`.
 
+## Website
+
+The `website` job sends a `repository_dispatch` (type `nano-coder-released`, payload
+`{version}`) to [nanobpm/nano-bpm](https://github.com/nanobpm/nano-bpm), which rebuilds
+https://nanobpm.io/nano-coder/docs/ from `docs/` at the new tag. It uses the release app's token,
+so the app must be installed on `nano-bpm`; without it the job logs that it skipped, and the site
+picks the release up on its daily rebuild.
+
 ## Registry auth
 
 npm uses trusted publishing (GitHub OIDC); there are no registry tokens. The publishers are

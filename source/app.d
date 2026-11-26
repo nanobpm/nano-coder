@@ -91,6 +91,86 @@ takes a handle, an id, a unique id prefix or a title.
 --memory-migrate tags, merges and supersedes the saved memories with the model's help, asking
 before each change (as /memory migrate does); --dry-run writes the proposals to a file instead.`;
 
+/// One command-line flag: the table `parseArgs` resolves every argument
+/// through (an argument not in it is rejected) and `--dump-reference` prints
+/// for the generated docs/cli.md (issue #397).
+struct Flag
+{
+    /// The canonical long name, e.g. `--model`.
+    string name;
+    /// Other spellings, e.g. `-m`.
+    string[] aliases;
+    /// The value it takes, e.g. `PROVIDER/MODEL` (empty: a switch).
+    string arg;
+    /// One line for the reference.
+    string description;
+    /// Left out of the reference (internal flags).
+    bool hidden;
+}
+
+/// Every flag `nano-coder` accepts.
+immutable Flag[] flags = [
+    Flag("--model", ["-m"], "PROVIDER/MODEL", "Model to use, e.g. `openai/gpt-4o` (default: the config's `model`)"),
+    Flag("--config", [], "PATH", "Read this config file instead of `~/.config/nano-coder/config.toml`"),
+    Flag("--prompt", ["-p"], "PROMPT", "Run one prompt and exit"),
+    Flag("--resume", [], "[SESSION|last]", "Resume a saved session: a handle, an id, a unique id prefix or a title (no value: pick one)"),
+    Flag("--name", [], "HANDLE", "Name the session with a handle other sessions reach it by (as `/name` does)"),
+    Flag("--plan", [], "", "Start in plan mode (read-only tools)"),
+    Flag("--sandbox", [], "off|workspace|read-only", "Sandbox mode for bash (overrides `[sandbox] mode`)"),
+    Flag("--allow", [], "RULE", "Add a permission allow rule (repeatable)"),
+    Flag("--deny", [], "RULE", "Add a permission deny rule (repeatable)"),
+    Flag("--no-session", [], "", "Don't write a session log"),
+    Flag("--no-hooks", [], "", "Don't run user hooks"),
+    Flag("--yolo", [], "", "Trust the repository without asking (as `--acp` does)"),
+    Flag("--web", [], "", "Offer web_search/web_fetch in an `--acp` session and approve web_fetch in headless runs"),
+    Flag("--no-web", [], "", "Never offer the web tools"),
+    Flag("--wait-timers", [], "", "With `-p`: wait for the timers the agent set, running each as it fires"),
+    Flag("--verbosity", [], "quiet|normal|verbose|debug", "Output detail"),
+    Flag("--verbose", ["-v"], "", "Same as `--verbosity verbose`"),
+    Flag("--acp", [], "", "Serve the Agent Client Protocol (JSON-RPC 2.0, one message per line) on stdin/stdout"),
+    Flag("--session-messages", [], "", "Let an `--acp` session send and receive inter-session messages"),
+    Flag("--list-sessions", [], "", "List saved sessions for this directory"),
+    Flag("--all", [], "", "With `--list-sessions`: list the sessions of every directory"),
+    Flag("--json", [], "", "With `--list-sessions` or `--trajectory`: print JSON"),
+    Flag("--markdown", [], "", "With `--trajectory`: print Markdown"),
+    Flag("--trajectory", [], "SESSION_ID", "Print a session's turn-by-turn trajectory"),
+    Flag("--list-models", [], "PROVIDER[/model]", "List a provider's models"),
+    Flag("--memory-migrate", [], "", "Tag, merge and supersede saved memories with the model's help, asking before each change"),
+    Flag("--dry-run", [], "", "With `--memory-migrate`: write the proposals to a file instead"),
+    Flag("--login", [], "github-copilot", "Log in to GitHub Copilot (device flow)"),
+    Flag("--version", ["-V"], "", "Print the version and exit"),
+    Flag("--help", ["-h"], "", "Print the usage and exit"),
+    Flag("--dump-reference", [], "", "Print the flag, command, tool and config-key reference as JSON", true),
+];
+
+/// The table entry `arg` names (by name or alias), if any.
+Option!Flag findFlag(string arg) pure
+{
+    import std.algorithm : canFind;
+    foreach (f; flags)
+        if (f.name == arg || f.aliases.canFind(arg)) return some(Flag(f.name, f.aliases.dup, f.arg, f.description, f.hidden));
+    return Option!Flag.init;
+}
+
+unittest
+{
+    import std.algorithm : any, canFind;
+    assert(findFlag("-m").unwrap("an alias").name == "--model");
+    assert(findFlag("--bogus").isNone);
+    // Every flag reaches a case of parseArgs (none hits its assert).
+    foreach (f; flags)
+        if (f.name != "--version" && f.name != "--help")
+        {
+            try parseArgs(["nano-coder", f.name] ~ (f.arg.length ? ["x"] : null));
+            catch (UsageError e) {} // only that it parsed matters, not the combination
+        }
+    // Every flag the reference lists is in the usage text.
+    foreach (f; flags)
+        if (!f.hidden)
+            assert(usage.canFind(f.name) || f.aliases.any!(a => usage.canFind(a ~ " ")) || f.name == "--verbose"
+                || f.name == "--help", f.name);
+}
+
 struct Options
 {
     string model, configPath, prompt, resume, listModels, sandbox, login, trajectory, verbosity;
@@ -101,6 +181,8 @@ struct Options
     bool sessionMessages;
     /// `--web` / `--no-web`: whether the web tools are offered (issue #386).
     imported!"nano.tools.web".WebFlag web;
+    /// `--dump-reference`: print the reference JSON and exit (issue #397).
+    bool dumpReference;
     /// `--memory-migrate` and its `--dry-run`.
     bool memoryMigrate, dryRun;
     string[] allow, deny;
@@ -128,11 +210,14 @@ Options parseArgs(string[] args)
             if (i + 1 >= args.length) fail(flag ~ " needs a value");
             return args[++i];
         }
-        switch (flag)
+        auto known = findFlag(flag);
+        if (known.isNone) fail("unknown argument " ~ a ~ "\n\n" ~ usage);
+        immutable name = known.unwrap("checked above").name;
+        switch (name)
         {
-            case "--model", "-m": o.model = value(); break;
+            case "--model": o.model = value(); break;
             case "--config": o.configPath = value(); break;
-            case "-p", "--prompt": o.prompt = value(); break;
+            case "--prompt": o.prompt = value(); break;
             case "--list-models": o.listModels = value(); break;
             case "--login": o.login = value(); break;
             case "--allow": o.allow ~= value(); break;
@@ -153,7 +238,7 @@ Options parseArgs(string[] args)
             case "--web", "--no-web":
             {
                 import nano.tools.web : WebFlag;
-                auto want = flag == "--web" ? WebFlag.on : WebFlag.off;
+                auto want = name == "--web" ? WebFlag.on : WebFlag.off;
                 if (o.web != WebFlag.unset && o.web != want) fail("--web and --no-web are mutually exclusive");
                 o.web = want;
                 break;
@@ -167,7 +252,7 @@ Options parseArgs(string[] args)
             case "--wait-timers": o.waitTimers = true; break;
             case "--no-hooks": o.noHooks = true; break;
             case "--yolo": o.yolo = true; break;
-            case "--verbose", "-v": o.verbosity = "verbose"; break;
+            case "--verbose": o.verbosity = "verbose"; break;
             case "--verbosity": o.verbosity = value(); break;
             case "--resume":
                 o.hasResume = true;
@@ -175,9 +260,10 @@ Options parseArgs(string[] args)
                 else if (i + 1 < args.length && !args[i + 1].startsWith("-")) o.resume = args[++i];
                 else o.resume = "";
                 break;
-            case "--version", "-V": writeln(versionString); exitProcess(0);
-            case "--help", "-h": writeln(usage); exitProcess(0);
-            default: fail("unknown argument " ~ a ~ "\n\n" ~ usage);
+            case "--version": writeln(versionString); exitProcess(0);
+            case "--help": writeln(usage); exitProcess(0);
+            case "--dump-reference": o.dumpReference = true; break;
+            default: assert(0, "a flag in the table with no case: " ~ name);
         }
     }
     if (o.json && o.markdown) fail("--json and --markdown are mutually exclusive");
@@ -3658,11 +3744,62 @@ unittest
     assert(other.model == "ok/m" && other.contextWindow == 5000);
 }
 
+/// The reference `--dump-reference` prints (issue #397): the CLI flags,
+/// slash commands, built-in tools and config keys, each from the table the
+/// code itself uses, for scripts/gen-reference.sh to render into docs/.
+JSONValue referenceJson()
+{
+    import nano.commands : commands;
+    import nano.config_keys : configKeys;
+    import nano.mode : planAllows;
+    import nano.tools.web : searchDefinition, fetchDefinition, WebConfig;
+    import nano.memory : memoryDefinitions = definitions;
+    JSONValue[] flagList, commandList, toolList, keyList;
+    foreach (f; flags)
+        if (!f.hidden)
+            flagList ~= JSONValue(["name": JSONValue(f.name), "aliases": JSONValue(f.aliases.dup),
+                "argument": JSONValue(f.arg), "description": JSONValue(f.description)]);
+    foreach (c; commands)
+        commandList ~= JSONValue(["name": c.name, "arguments": c.args, "description": c.description]);
+    // Every tool any session can offer: the registry's built-ins plus the
+    // optional ones (web, skills, question, memory) and the agent's own.
+    auto reg = new ToolRegistry;
+    Config cfg;
+    registerBuiltinTools(reg, cfg, new ReadState, (string root) @safe => Denied.init);
+    auto defs = reg.definitions ~ [searchDefinition(), fetchDefinition(WebConfig.init), skillsDefinition(),
+        questionDefinition()] ~ memoryDefinitions(true)
+        ~ Agent.agentToolDefinitions(true, true, true, true, true, true, true, true, true);
+    foreach (d; defs)
+        toolList ~= JSONValue(["name": JSONValue(d.name), "description": JSONValue(d.description),
+            "parameters": d.parameters, "readOnly": JSONValue(planAllows(d.name))]);
+    foreach (k; configKeys)
+        keyList ~= JSONValue(["path": k.path, "type": k.type, "default": k.default_, "description": k.description]);
+    return JSONValue(["version": JSONValue(packageVersion), "flags": JSONValue(flagList),
+        "commands": JSONValue(commandList), "tools": JSONValue(toolList), "configKeys": JSONValue(keyList)]);
+}
+
+unittest
+{
+    import std.algorithm : canFind, map;
+    import std.array : array;
+    auto r = referenceJson();
+    auto tools = r["tools"].arrayNoRef.map!(t => t["name"].str).array;
+    foreach (t; ["bash", "read_file", "grep", "web_fetch", "question", "plan_add", "report_outcome", "agent", "memory_search"])
+        assert(tools.canFind(t), t);
+    assert(!r["flags"].arrayNoRef.map!(f => f["name"].str).canFind("--dump-reference"));
+    assert(r["commands"].arrayNoRef.length > 20 && r["configKeys"].arrayNoRef.length > 50);
+}
+
 int runMain(string[] args)
 {
     Options o;
     try o = parseArgs(args);
     catch (UsageError e) die(e.msg);
+    if (o.dumpReference)
+    {
+        writeln(referenceJson().toPrettyString(JSONOptions.doNotEscapeSlashes));
+        return 0;
+    }
     auto cfgPath = o.configPath.length ? o.configPath : Config.defaultPath;
     Config cfg;
     JSONValue rawConfig = JSONValue(string[string].init);
