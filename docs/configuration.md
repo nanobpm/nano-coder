@@ -166,7 +166,7 @@ The default model is `gpt-4o-mini` on the `mock` provider, so the harness still 
 | `permissions.builtin_rules` | boolean | `true` | Block destructive commands unless allowed |
 | `permissions.allow` | array | `[]` | Allow rules, e.g. `["Bash(sqlite3 test.db *)"]` |
 | `permissions.deny` | array | `[]` | Deny rules, e.g. `["Bash(git push:*)", "Edit(**/.env)"]` |
-| `permissions.protected_branches` | array | `["main", "master", "trunk", "develop"]` | Branches git commits and pushes to need approval on |
+| `permissions.protected_branches` | array | `["main", "master", "trunk", "develop"]` | Branches the git guard blocks force-pushes to and remote deletion of (ordinary commits and pushes are allowed) |
 | `sandbox.mode` | string |  | off \| workspace \| read-only (or `--sandbox`); unset: workspace headless, off interactive |
 | `sandbox.writable` | array | `[]` | Extra writable paths |
 | `sandbox.network` | boolean | `true` | false blocks outbound connections |
@@ -208,7 +208,7 @@ The default model is `gpt-4o-mini` on the `mock` provider, so the harness still 
 | `providers.<name>.retry_initial_backoff_ms` | integer |  | First retry delay |
 | `providers.<name>.retry_max_backoff_ms` | integer |  | Longest retry delay |
 | `providers.<name>.retryable_statuses` | array |  | HTTP statuses that are retried |
-| `providers.<name>.replay_reasoning` | boolean | `false` | Send each assistant message's reasoning_content back |
+| `providers.<name>.replay_reasoning` | boolean |  | Send each assistant message's reasoning_content back (default: on for Copilot reasoning models and the kimi preset, off otherwise) |
 | `providers.<name>.models.<model>.temperature` | float |  | Temperature for this model |
 | `providers.<name>.models.<model>.thinking` | string |  | Thinking level for this model |
 | `providers.<name>.models.<model>.vision` | boolean |  | Whether this model accepts images |
