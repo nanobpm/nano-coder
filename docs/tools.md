@@ -178,6 +178,8 @@ The full URL is shown in the prompt and transcript.
 ### apply_patch
 
 Apply a patch that changes one or more files at once, atomically: every hunk must apply or nothing is written. Use it for multi-location or multi-file changes (and to add, delete or move files); use edit_file for a single surgical edit. Format (no line numbers; hunks are anchored by content):
+
+```text
 *** Begin Patch
 *** Update File: src/a.d
 @@ void run(
@@ -188,8 +190,10 @@ Apply a patch that changes one or more files at once, atomically: every hunk mus
 *** Add File: src/b.d
 +every line of the new file, prefixed with +
 *** Delete File: old.sh
-*** Move File: from.d -&gt; to.d
+*** Move File: from.d -> to.d
 *** End Patch
+```
+
 An `@@` line names a nearby line (e.g. a signature) to narrow the search; `@@` alone is allowed. Each hunk needs a few unchanged context lines and must match exactly one place (trailing whitespace, then indentation, are relaxed if needed); hunks apply in order, each to the file as the earlier ones left it. A move may be followed by hunks. Returns the applied unified diff; dry_run returns it without writing.
 
 Available in plan mode: no.

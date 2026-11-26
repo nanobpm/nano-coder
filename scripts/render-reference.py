@@ -31,6 +31,26 @@ def prose(text):
     return "\n".join(out)
 
 
+def fence_literals(text):
+    """Wrap literal grammar blocks in tool descriptions (the lines from
+    `*** Begin ...` to `*** End ...`, e.g. apply_patch's format) in a ```text
+    fence, so Markdown does not turn `***`/`-`/`+` lines into rules and lists
+    and `->` stays literal (prose() does not escape inside fences)."""
+    out, inside = [], False
+    for line in text.split("\n"):
+        if not inside and re.match(r"^\*\*\* Begin\b", line):
+            out += ["", "```text", line]
+            inside = True
+        elif inside and re.match(r"^\*\*\* End\b", line):
+            out += [line, "```", ""]
+            inside = False
+        else:
+            out.append(line)
+    if inside:
+        out.append("```")
+    return "\n".join(out)
+
+
 def cell(text):
     """One Markdown table cell: no newlines, pipes escaped, HTML escaped outside code spans."""
     return escape_inline(" ".join(str(text).split())).replace("|", "\\|")
@@ -103,7 +123,7 @@ def tools(ref):
         first = re.split(r"(?<=\.)\s", first, maxsplit=1)[0]
         out.append("| [{0}](#{0}) | {1} | {2} |".format(t["name"], "yes" if t["readOnly"] else "no", cell(first)))
     for t in ref["tools"]:
-        out += ["", f"### {t['name']}", "", prose(t["description"].strip()), "",
+        out += ["", f"### {t['name']}", "", prose(fence_literals(t["description"].strip())), "",
                 "Available in plan mode: " + ("yes (read-only)." if t["readOnly"] else "no."), ""]
         params = t.get("parameters") or {}
         props = params.get("properties") or {}

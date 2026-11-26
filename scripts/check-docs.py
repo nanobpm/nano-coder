@@ -67,12 +67,30 @@ def bare_tags(path):
                 yield no, m.group(0)
 
 
+def apply_patch_fence(path="docs/tools.md"):
+    """The apply_patch grammar must render as a copyable ```text fence holding a
+    literal `->` (not prose, where Markdown mangles `***`/`-`/`+` lines)."""
+    with open(path, encoding="utf-8") as fh:
+        m = re.search(r"### apply_patch\n(.*?)(?=\n### |\Z)", fh.read(), re.S)
+    if not m:
+        return "no ### apply_patch section"
+    f = re.search(r"```text\n(\*\*\* Begin Patch\n.*?\*\*\* End Patch)\n```", m.group(1), re.S)
+    if not f:
+        return "apply_patch grammar is not in a ```text fence"
+    if "->" not in f.group(1) or "&gt;" in f.group(1):
+        return "apply_patch fence lacks a literal ->"
+    return None
+
+
 def main():
     pages = ["README.md"] + sorted(glob.glob("docs/*.md"))
     bad = []
     for page in pages[1:]:
         for no, tag in bare_tags(page):
             bad.append(f"{page}:{no}: bare {tag} outside a code span is dropped by HTML renderers; escape it or use backticks")
+    err = apply_patch_fence()
+    if err:
+        bad.append(f"docs/tools.md: {err}")
     for page in pages:
         if page.startswith("docs/"):
             with open(page, encoding="utf-8") as fh:
