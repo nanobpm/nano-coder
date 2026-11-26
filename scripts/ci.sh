@@ -5,8 +5,8 @@
 #
 #   scripts/ci.sh [all|lint|test|quick]   (default: all)
 #
-#   lint   platform matrix, check-safe, parity manifest, ratchet tests, dscanner                    (CI job `lint`)
-#   test   unit tests, release build and smoke checks  (CI jobs `test (<os>)`)
+#   lint   platform matrix, check-safe, parity manifest, docs links, ratchet tests, dscanner                   (CI job `lint`)
+#   test   unit tests, release build, docs reference drift and smoke checks (CI jobs `test (<os>)`)
 #   quick  check-safe, both builds typechecked, unit tests (pre-push)
 #   all    lint + test
 set -eu
@@ -59,6 +59,8 @@ lint() {
     else
         echo "skipped: the current version's tag is missing (git fetch --tags)"
     fi
+    step "docs links"
+    python3 scripts/check-docs.py
     step "ratchet tests"
     ./scripts/test-ratchets.sh
     step "dscanner"
@@ -135,6 +137,17 @@ test_() {
     step "release build"
     dub build -q -b release
     ./nano-coder --version
+    step "docs reference drift"
+    # docs/{cli,commands,tools,configuration}.md hold blocks generated from
+    # `nano-coder --dump-reference` (issue #397): a flag, command, tool or
+    # config key added without regenerating them fails here.
+    ./scripts/gen-reference.sh ./nano-coder
+    if ! git diff --exit-code --stat -- docs/; then
+        git diff -- docs/ | head -60
+        echo "docs/ is out of date with the code: a flag, slash command, tool or config key changed."
+        echo "Run scripts/gen-reference.sh (after dub build -b release) and commit docs/."
+        exit 1
+    fi
     step "compaction eval self-test (fake model)"
     out=$(mktemp -d)
     python3 eval/compaction/run.py --self-test --seeds 1 --filler-turns 4 --modes standard,smart,extract --bin ./nano-coder --out "$out"

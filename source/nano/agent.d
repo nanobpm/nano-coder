@@ -4694,16 +4694,28 @@ class Agent
     /// The tools offered to the model: plan mode keeps only the read-only ones.
     ToolDefinition[] offeredTools() pure
     {
-        auto all = tools.definitions ~ (planTools ? planDefinitions() : null)
-            ~ (outcomeTool ? [outcomeDefinition()] : null) ~ (historyEnabled ? hist.definitions(crossSessionHistory) : null)
-            ~ (sessionsOffered ? [hist.sessionsDefinition()] : null)
-            ~ (messagesOn && log.isSome ? [peers.sendDefinition()] : null)
-            ~ (timerTools ? timerDefinitions() : null) ~ (settingsTools ? [settings.definition()] : null)
-            ~ (subagentsOffered ? [subDefinition(subagentCandidates)] ~ subControlDefinitions() : null);
+        auto all = tools.definitions ~ agentToolDefinitions(planTools, outcomeTool, historyEnabled,
+            crossSessionHistory, sessionsOffered, messagesOn && log.isSome, timerTools, settingsTools,
+            subagentsOffered, subagentCandidates);
         if (control.mode != AgentMode.plan) return all;
         ToolDefinition[] kept;
         foreach (t; all) if (planAllows(t.name)) kept ~= t;
         return kept;
+    }
+
+    /// The tools the agent itself adds to its registry's, each kind only when
+    /// its flag is set. One list for `offeredTools` and for the reference
+    /// `nano-coder --dump-reference` prints with every flag on (issue #397).
+    static ToolDefinition[] agentToolDefinitions(bool plan, bool outcome, bool history, bool crossSession,
+        bool sessions, bool send, bool timers, bool settingsTool, bool subagents,
+        const(SubCandidate)[] candidates = null) pure
+    {
+        return (plan ? planDefinitions() : null)
+            ~ (outcome ? [outcomeDefinition()] : null) ~ (history ? hist.definitions(crossSession) : null)
+            ~ (sessions ? [hist.sessionsDefinition()] : null)
+            ~ (send ? [peers.sendDefinition()] : null)
+            ~ (timers ? timerDefinitions() : null) ~ (settingsTool ? [settings.definition()] : null)
+            ~ (subagents ? [subDefinition(candidates)] ~ subControlDefinitions() : null);
     }
 
     /// The `/tools` listing: the tools offered right now (plan mode hides

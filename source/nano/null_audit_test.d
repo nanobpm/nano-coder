@@ -20,6 +20,7 @@ static import nano.claude_hooks;
 static import nano.cmdexpand;
 static import nano.commands;
 static import nano.config;
+static import nano.config_keys;
 static import nano.context;
 static import nano.control;
 static import nano.copilot;
@@ -121,6 +122,7 @@ private alias modules = imported!"std.meta".AliasSeq!(
     nano.cmdexpand,
     nano.commands,
     nano.config,
+    nano.config_keys,
     nano.context,
     nano.control,
     nano.copilot,

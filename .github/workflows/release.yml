@@ -204,6 +204,37 @@ jobs:
           git commit -qam "nano-coder $VERSION"
           git push
 
+  # Tell the website (nanobpm/nano-bpm) a release is out, so it rebuilds the
+  # docs from docs/ at the new tag (issue #397). Needs the release app installed
+  # on nano-bpm; without it the step is skipped with a log line (the site also
+  # rebuilds daily).
+  website:
+    needs: [release, github-release]
+    if: needs.release.outputs.released == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Release app token for nano-bpm
+        id: app
+        continue-on-error: true
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          repositories: nano-bpm
+          permission-contents: write
+      - name: Send nano-coder-released to nanobpm/nano-bpm
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "skipped: the release app is not installed on nanobpm/nano-bpm; the site picks up v$VERSION on its daily rebuild"
+            exit 0
+          fi
+          gh api repos/nanobpm/nano-bpm/dispatches -f event_type=nano-coder-released -F "client_payload[version]=$VERSION"
+
   npm:
     needs: [release, build]
     runs-on: ubuntu-24.04
