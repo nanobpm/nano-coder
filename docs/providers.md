@@ -159,8 +159,9 @@ Endpoints that report levels:
   `enable_thinking` switch (Qwen 3 and the like) gets `off` and `on`, and any named level
   turns thinking on; a template that takes `reasoning_effort` (gpt-oss) gets `low`, `medium`
   and `high`.
-- **Splash:** `/v1/models` gives a thinking model (`reasoning.thinks`) its
-  `reasoning.efforts`, plus `off`, sent as `reasoning_effort`.
+- **Splash:** `/v1/models` gives a model that reports `reasoning.thinks` (true, or false
+  when its default effort is `none`) its `reasoning.efforts`, plus `off`, sent as
+  `reasoning_effort`.
 
 Ollama, llama.cpp and Splash are recognized however the provider is named, the same way as for the
 context window, but only servers that are probed are asked: a loopback `base_url`, or a provider

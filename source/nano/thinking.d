@@ -280,14 +280,17 @@ struct Reported
         return Nullable!Reported(Reported(levels, adaptive, Format.effort));
     }
 
-    /// Splash `/v1/models` entry: `reasoning.efforts` when `reasoning.thinks`,
+    /// Splash `/v1/models` entry: `reasoning.efforts` when `reasoning.thinks` is a boolean,
     /// plus `off` (Splash takes `reasoning_effort: "none"`); empty when absent.
     private static string[] reasoningLevels(const JSONValue entry) pure
     {
         auto r = objGet(entry, "reasoning");
         if (r is null) return null;
         auto thinks = objGet(*r, "thinks");
-        if (thinks is null || thinks.type != JSONType.true_) return null;
+        // `thinks` is false under `--default-reasoning-effort none`, yet the
+        // advertised efforts stay valid; only absent/non-boolean metadata is rejected.
+        if (thinks is null || (thinks.type != JSONType.true_ && thinks.type != JSONType.false_))
+            return null;
         auto efforts = objGet(*r, "efforts");
         if (efforts is null || efforts.type != JSONType.array) return null;
         auto levels = effortList(*efforts);
@@ -1164,7 +1167,9 @@ unittest
     auto r = Reported.fromModelEntry(e);
     assert(!r.isNull && r.get.levels == ["off", "low", "medium", "xhigh"] && r.get.format == Format.effort);
     assert(Reported.fromModelEntry(parseJSON(`{"id":"m"}`)).isNull);
-    assert(Reported.fromModelEntry(parseJSON(`{"id":"m","reasoning":{"thinks":false,"efforts":["low"]}}`)).isNull);
+    assert(Reported.fromModelEntry(parseJSON(`{"id":"m","reasoning":{"thinks":false,"efforts":["low"]}}`)).get.levels == ["off", "low"]);
+    assert(Reported.fromModelEntry(parseJSON(`{"id":"m","reasoning":{"thinks":null,"efforts":["low"]}}`)).isNull);
+    assert(Reported.fromModelEntry(parseJSON(`{"id":"m","reasoning":{"efforts":["low"]}}`)).isNull);
     assert(Reported.fromModelEntry(parseJSON(`{"id":"m","reasoning":{"thinks":true}}`)).isNull);
 
     // A configured thinking_levels overrides the reported ones.
