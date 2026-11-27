@@ -570,3 +570,12 @@ unittest
     srv.finish();
     assertRetriedKept(failed, 10, 0.25);
 }
+
+// A provider named `splash` is probed even off loopback (a LAN or tailnet
+// host), so its `reasoning.efforts` are read; another name there is not.
+unittest
+{
+    assert(probesServer("splash", "http://100.64.1.2:8000/v1"));
+    assert(!probesServer("together", "http://100.64.1.2:8000/v1"));
+    assert(probesServer("together", "http://127.0.0.1:8000/v1"));
+}

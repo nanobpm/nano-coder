@@ -259,27 +259,57 @@ struct Reported
     bool adaptive;
     Format format;
 
-    /// Copilot-style `/models` entry: `capabilities.supports.reasoning_effort`.
+    /// A `/models` entry: Copilot-style `capabilities.supports.reasoning_effort`,
+    /// else Splash-style `reasoning: {thinks, efforts}` (which also accepts `off`).
     static Nullable!Reported fromModelEntry(const JSONValue entry) pure
     {
         Nullable!Reported none;
         auto caps = objGet(entry, "capabilities");
         auto supports = caps is null ? null : objGet(*caps, "supports");
-        if (supports is null) return none;
-        auto effort = objGet(*supports, "reasoning_effort");
-        if (effort is null || effort.type != JSONType.array) return none;
+        auto effort = supports is null ? null : objGet(*supports, "reasoning_effort");
+        if (effort is null || effort.type != JSONType.array)
+        {
+            auto splash = reasoningLevels(entry);
+            if (!splash.length) return none;
+            return typeof(none)(Reported(splash, false, Format.effort));
+        }
+        auto levels = effortList(*effort);
+        if (!levels.length) return none;
+        auto ad = objGet(*supports, "adaptive_thinking");
+        bool adaptive = ad !is null && ad.type == JSONType.true_;
+        return Nullable!Reported(Reported(levels, adaptive, Format.effort));
+    }
+
+    /// Splash `/v1/models` entry: `reasoning.efforts` when `reasoning.thinks` is a boolean,
+    /// plus `off` (Splash takes `reasoning_effort: "none"`); empty when absent.
+    private static string[] reasoningLevels(const JSONValue entry) pure
+    {
+        auto r = objGet(entry, "reasoning");
+        if (r is null) return null;
+        auto thinks = objGet(*r, "thinks");
+        // `thinks` is false under `--default-reasoning-effort none`, yet the
+        // advertised efforts stay valid; only absent/non-boolean metadata is rejected.
+        if (thinks is null || (thinks.type != JSONType.true_ && thinks.type != JSONType.false_))
+            return null;
+        auto efforts = objGet(*r, "efforts");
+        if (efforts is null || efforts.type != JSONType.array) return null;
+        auto levels = effortList(*efforts);
+        if (levels.length && !levels.canFind("off")) levels = "off" ~ levels;
+        return levels;
+    }
+
+    /// The string levels in `arr`, lower-cased, with `none` read as `off`.
+    private static string[] effortList(const JSONValue arr) pure
+    {
         string[] levels;
-        foreach (l; effort.arrayNoRef)
+        foreach (l; arr.arrayNoRef)
         {
             if (l.type != JSONType.string) continue;
             auto s = l.str.strip.toLower;
             if (s == "none") s = "off";
             if (s.length) levels ~= s;
         }
-        if (!levels.length) return none;
-        auto ad = objGet(*supports, "adaptive_thinking");
-        bool adaptive = ad !is null && ad.type == JSONType.true_;
-        return Nullable!Reported(Reported(levels, adaptive, Format.effort));
+        return levels;
     }
 
     /// Ollama `/api/show`: the `thinking` capability takes `reasoning_effort`.
@@ -1127,4 +1157,26 @@ unittest
     assert(!r.extraBodyThinkingOn.isNull && !r.extraBodyThinkingOn.get && !r.anthropicThinkingOn);
     r = rd(A, prov(`extra_body = { output_config = { format = "json" }, thinking = true }`), "claude-sonnet-4-6");
     assert(r.extraBodyThinkingOn.get && r.anthropicThinkingOn, "a thinking control past a non-thinking output_config");
+}
+
+// Splash `/v1/models`: `reasoning.efforts` when `reasoning.thinks`, plus off.
+unittest
+{
+    auto e = parseJSON(`{"id":"mlx-community/Qwen3.8-27B-4bit","context_length":262144,
+        "reasoning":{"thinks":true,"efforts":["low","medium","xhigh"],"default":"xhigh"}}`);
+    auto r = Reported.fromModelEntry(e);
+    assert(!r.isNull && r.get.levels == ["off", "low", "medium", "xhigh"] && r.get.format == Format.effort);
+    assert(Reported.fromModelEntry(parseJSON(`{"id":"m"}`)).isNull);
+    assert(Reported.fromModelEntry(parseJSON(`{"id":"m","reasoning":{"thinks":false,"efforts":["low"]}}`)).get.levels == ["off", "low"]);
+    assert(Reported.fromModelEntry(parseJSON(`{"id":"m","reasoning":{"thinks":null,"efforts":["low"]}}`)).isNull);
+    assert(Reported.fromModelEntry(parseJSON(`{"id":"m","reasoning":{"efforts":["low"]}}`)).isNull);
+    assert(Reported.fromModelEntry(parseJSON(`{"id":"m","reasoning":{"thinks":true}}`)).isNull);
+
+    // A configured thinking_levels overrides the reported ones.
+    auto p = prov(`thinking_levels = ["off", "low"]`);
+    auto rep = r.get;
+    auto res = rs(Thinking.init, ProviderKind.openai, p, "mlx-community/Qwen3.8-27B-4bit", &rep);
+    assert(res.levels == ["off", "low"]);
+    res = rs(Thinking.init, ProviderKind.openai, prov(``), "mlx-community/Qwen3.8-27B-4bit", &rep);
+    assert(res.levels == ["off", "low", "medium", "xhigh"]);
 }
