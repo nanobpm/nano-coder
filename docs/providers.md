@@ -163,7 +163,9 @@ Endpoints that report levels:
   `reasoning.efforts`, plus `off`, sent as `reasoning_effort`.
 
 Ollama, llama.cpp and Splash are recognized however the provider is named, the same way as for the
-context window. For other models, list the levels yourself:
+context window, but only servers that are probed are asked: a loopback `base_url`, or a provider
+named `ollama`, `llamacpp`, `lmstudio` or `splash`. A Splash server on another host (a LAN or
+tailnet address) is read when its provider is named `splash`. For other models, list the levels yourself:
 
 ```toml
 [providers.together.models."deepseek-r1"]

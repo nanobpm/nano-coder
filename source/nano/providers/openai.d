@@ -244,14 +244,8 @@ class OpenAIClient : LLMClient, CapabilityProbe, KindedClient
     }
 
     /// Whether probing is worth a startup round trip: Copilot, or a local
-    /// server (Ollama, llama.cpp, LM Studio, or any loopback endpoint).
-    protected bool shouldProbe() pure
-    {
-        import nano.vision : baseUrlHost;
-        auto host = baseUrlHost(p.config.baseUrl);
-        return p.name == "ollama" || p.name == "llamacpp" || p.name == "lmstudio"
-            || host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]";
-    }
+    /// server (Ollama, llama.cpp, LM Studio, Splash, or any loopback endpoint).
+    protected bool shouldProbe() pure { return probesServer(p.name, p.config.baseUrl); }
 
     /// Copilot reads its window from `capabilities.limits` instead.
     protected bool copilotLimits() pure { return false; }
@@ -790,4 +784,15 @@ unittest
     c = Capabilities.init;
     ollamaWindow(JSONValue.init, parseJSON(`{"parameters":"temperature 0.6\nnum_ctx                        16384"}`), "qwen3:8b", c);
     assert(c.window == 16384 && c.windowSource == "Ollama num_ctx");
+}
+
+/// Whether a provider named `name` at `baseUrl` is a known local or
+/// self-hosted server worth probing: Ollama, llama.cpp, LM Studio and
+/// Splash by name (wherever they run), anything else only on loopback.
+bool probesServer(string name, string baseUrl) pure
+{
+    import nano.vision : baseUrlHost;
+    auto host = baseUrlHost(baseUrl);
+    return name == "ollama" || name == "llamacpp" || name == "lmstudio" || name == "splash"
+        || host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]";
 }
