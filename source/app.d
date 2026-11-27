@@ -59,7 +59,7 @@ import nano.peers : PeerListener, PeerRouter, Inbound, ListenError, settle, conf
 import nano.instructions : ProjectInstructions, InstructionOptions = Options, expandHome;
 import core.atomic : atomicLoad, atomicStore, cas;
 
-enum string packageVersion = "1.36.1";
+enum string packageVersion = "1.37.0";
 enum string versionString = "nano-coder " ~ packageVersion;
 
 enum string usage = `Usage: nano-coder [--model provider/model] [--config PATH] [-p PROMPT]
