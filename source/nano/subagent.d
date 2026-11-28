@@ -859,8 +859,6 @@ private imported!"nano.tools".ToolHandler forwarder(ChildEvents st, string name)
     return (JSONValue a) => st.forward(name, a);
 }
 
-/// The sub-agent's thread: run `spec.task` to a report. Never throws; the
-/// last thing it does is send `done`.
 /// Give a child `agent` its configured limits from `b`.
 void applyBudget(imported!"nano.agent".Agent agent, const ChildBudget b)
 {
@@ -869,6 +867,8 @@ void applyBudget(imported!"nano.agent".Agent agent, const ChildBudget b)
     agent.setConfiguredWindow(ConfiguredWindow(b.window, b.windowSource));
 }
 
+/// The sub-agent's thread: run `spec.task` to a report. Never throws; the
+/// last thing it does is send `done`.
 SubResult runChild(immutable SubSpec spec, immutable(SubClientFactory) factory, Chan!SubMsg up,
     Chan!ToolReply down, SubAbort abort)
 {
