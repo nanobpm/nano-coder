@@ -28,7 +28,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
   compaction (see [Smart compaction](context-compaction.md#smart-compaction)). Optional text tells the
   summary what to focus on. Esc Esc or Ctrl-C cancels
 - `/verbosity [quiet|normal|verbose|debug]` - Show or set how much is printed (see below)
-- `/context` - Show context usage, window, session token totals, AI Credits (GitHub Copilot), auto-compaction state and the loaded instruction files
+- `/context` - Show context usage, window, the effective `max_tokens` and its source, session token totals, AI Credits (GitHub Copilot), auto-compaction state and the loaded instruction files
 - `/settings` - Interactive settings menu:
   - **Model**: starts with the last four models you used, then pick a provider and a
     model from its live model list (or type an ID)

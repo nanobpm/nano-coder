@@ -413,3 +413,57 @@ unittest
     assert(ev.names[0] == "text-delta:partial reply " && ev.names[1] == "restart", imported!"std.conv".to!string(ev.names));
     assert(ev.names[$ - 1] == "message:the full answer|");
 }
+
+// Per-model and per-provider `max_tokens` (issue #403): the request carries
+// the resolved value, the thinking budget is clamped below it, and a model
+// switch re-resolves it.
+unittest
+{
+    import nano.thinking : cappedBudget;
+    auto pc = new ProviderConfig;
+    pc.hasKind = true;
+    pc.kind = ProviderKind.anthropic;
+    pc.merge(parseJSON(`{"max_tokens": 8000, "models": {"claude-sonnet-4-5": {"max_tokens": 20000}}}`));
+    auto first = new Claude("claude-sonnet-4-5", [LLMResponse("one")]);
+    auto agent = new Agent(first, new ToolRegistry, Policy.init, "system");
+    agent.providerLookup = (string name) => cast(const(ProviderConfig)*) pc;
+    agent.configuredWindow = 1_000_000;
+    agent.maxTokens = 4000; // top level: the lowest precedence
+    agent.sessionThinking = session("high");
+    assert(agent.configuredMaxTokens.value == 20_000);
+    assert(agent.run("go", new NullEvents) == "one");
+    assert(first.sent[0].maxTokens == 20_000);
+    assert(cappedBudget(first.sent[0].thinking.budget, first.sent[0].maxTokens) == 16_384, "the full budget fits");
+    assert(agent.thinking().warning is null || !agent.thinking().warning.canFind("caps"), agent.thinking().warning);
+
+    // Another model on the provider: the provider's value, and the budget
+    // clamp uses it.
+    auto second = new Claude("claude-sonnet-4-0", [LLMResponse("two")]);
+    agent.useClient(second, ConfiguredWindow(1_000_000, "test"));
+    assert(agent.run("go", new NullEvents) == "two");
+    assert(second.sent[0].maxTokens == 8000);
+    // The wire clamp (`anthropicFields`) caps the budget below the sent value.
+    assert(cappedBudget(second.sent[0].thinking.budget, second.sent[0].maxTokens) == 7999);
+    assert(agent.thinking().warning.canFind("max_tokens 8000"), agent.thinking().warning);
+}
+
+// The resolved value goes out under a custom `max_tokens_param`.
+unittest
+{
+    import nano.config : Config, resolve, resolveMaxTokens;
+    import nano.providers.openai : OpenAIClient;
+    Config c;
+    c.maxTokens = 1000;
+    ProviderConfig p;
+    p.merge(parseJSON(`{"kind": "openai", "base_url": "http://localhost:1/v1", "max_tokens_param": "max_completion_tokens",
+        "max_tokens": 2000, "models": {"q": {"max_tokens": 49152, "context_window": 131072}}}`));
+    c.providers["splash"] = p;
+    auto rp = resolve(c, "splash/q");
+    assert(rp.config.contextWindow == 131_072);
+    ChatRequest req;
+    req.messages = [Message.user("hi")];
+    req.maxTokens = resolveMaxTokens(c.maxTokens, c.providers["splash"], "q").value;
+    auto b = new OpenAIClient(rp).requestBody(req, false);
+    assert(b["max_completion_tokens"].integer == 49_152 && "max_tokens" !in b);
+    assert(resolve(c, "splash/other").config.contextWindow == 0);
+}

@@ -227,6 +227,27 @@ placeholder. Images are stored once per session under `<session>.attachments/` (
 content hash), so session logs stay small and `--resume` still works; a missing file on
 resume is sent as a text placeholder.
 
+### Output and context limits per provider and model
+
+`max_tokens` (most tokens per reply) and `context_window` can be set per provider and per
+model, so a local thinking model gets a large budget without changing a hosted one:
+
+```toml
+[providers.splash]
+max_tokens = 32768
+thinking = "medium"
+[providers.splash.models."mlx-community/Qwen3.8-27B-4bit"]
+max_tokens = 49152
+context_window = 131072
+```
+
+`max_tokens` resolves like `thinking`: the model's value, then the provider's, then the
+top-level `max_tokens`, else the model's own limit. It is re-resolved on every request, so a
+`/model` switch picks up the new model's value, and `/context` shows the value and where it
+came from. It goes out under `max_tokens_param` when that is set, and an Anthropic thinking
+budget is clamped below it. A model's `context_window` overrides the provider's; the
+top-level `context_window` (which `/settings` edits for the session) still wins over both.
+
 Other per-provider fields: `replay_reasoning`, `max_tokens_param` (`max_tokens`, or `max_completion_tokens`
 which is the `openai` default), `retry_initial_backoff_ms`, `retry_max_backoff_ms` and
 `retryable_statuses`.

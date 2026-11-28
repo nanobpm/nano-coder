@@ -43,6 +43,10 @@ struct ModelSettings
     /// Endpoint for this model, overriding the provider's `base_url` (null:
     /// unset), e.g. an OpenRouter workspace serving each model on one region.
     string baseUrl;
+    /// Most tokens per reply for this model (0: unset), over the provider's.
+    long maxTokens;
+    /// Context window of this model (0: unset), over the provider's.
+    long contextWindow;
 
     static ModelSettings fromJSON(JSONValue o) pure
     {
@@ -60,6 +64,8 @@ struct ModelSettings
         if (auto v = "thinking_levels" in o) thinkingLevels = strings(*v), hasThinkingLevels = true;
         if (auto v = "name" in o) name = v.str;
         if (auto v = "base_url" in o) baseUrl = v.str;
+        if (auto v = "max_tokens" in o) maxTokens = v.integer;
+        if (auto v = "context_window" in o) contextWindow = v.integer;
     }
 }
 
@@ -110,6 +116,8 @@ struct ProviderConfig
     string[] dropParams;
     string maxTokensParam;
     long contextWindow;
+    /// `max_tokens` for this provider's models (0: unset).
+    long maxTokens;
     bool stream = true;
     TemperatureSetting temperature;
     Nullable!Thinking thinking;
@@ -194,6 +202,7 @@ struct ProviderConfig
         if (auto v = "drop_params" in o) { dropParams = null; foreach (p; v.arrayNoRef) dropParams ~= p.str; }
         if (auto v = "max_tokens_param" in o) maxTokensParam = v.str;
         if (auto v = "context_window" in o) contextWindow = v.integer;
+        if (auto v = "max_tokens" in o) maxTokens = v.integer;
         if (auto v = "stream" in o) stream = v.boolean;
         if (auto v = "temperature" in o) temperature = numberOrDefault(*v);
         if (auto v = "thinking" in o) thinking = Thinking.parse(v.str).orThrow!(e => new Exception(e));
@@ -224,6 +233,15 @@ struct ProviderConfig
             foreach (st; v.arrayNoRef) retryableStatuses ~= st.integer.to!ushort;
         }
         if (auto v = "replay_reasoning" in o) replayReasoning = v.boolean;
+    }
+
+    /// The context window configured for `model`: the model's own
+    /// `context_window`, else the provider's (0: none).
+    long windowFor(string model) pure const nothrow
+    {
+        if (auto m = model in models)
+            if (m.contextWindow > 0) return m.contextWindow;
+        return contextWindow;
     }
 
     /// The configured models as (id, display name), sorted by id, when
@@ -305,6 +323,44 @@ string[] enabledProviderNames(const ProviderConfig[string] providers) pure
 }
 
 /// Whether a provider appears in listings and pickers.
+/// The `max_tokens` a request to `model` on provider `p` is configured
+/// with, and where it came from. Precedence (as `thinking`): the model's,
+/// the provider's, the top-level `global`, else 0 (the provider default).
+struct MaxTokensSetting
+{
+    long value; /// 0: unset
+    MaxTokensSource source; /// which key set it
+}
+
+/// Which key a `MaxTokensSetting` came from.
+enum MaxTokensSource { unset, model, provider, config }
+
+/// ditto
+MaxTokensSetting resolveMaxTokens(long global, const ref ProviderConfig p, string model) pure nothrow
+{
+    if (auto m = model in p.models)
+        if (m.maxTokens > 0) return MaxTokensSetting(m.maxTokens, MaxTokensSource.model);
+    if (p.maxTokens > 0) return MaxTokensSetting(p.maxTokens, MaxTokensSource.provider);
+    if (global > 0) return MaxTokensSetting(global, MaxTokensSource.config);
+    return MaxTokensSetting(0, MaxTokensSource.unset);
+}
+
+unittest // max_tokens and context_window: model > provider > top level > default
+{
+    ProviderConfig p;
+    assert(resolveMaxTokens(0, p, "m") == MaxTokensSetting(0, MaxTokensSource.unset));
+    assert(resolveMaxTokens(100, p, "m") == MaxTokensSetting(100, MaxTokensSource.config));
+    p.merge(parseJSON(`{"max_tokens": 200, "context_window": 1000,
+        "models": {"m": {"max_tokens": 300, "context_window": 2000}, "n": {"thinking": "low"}}}`));
+    assert(resolveMaxTokens(100, p, "o") == MaxTokensSetting(200, MaxTokensSource.provider));
+    assert(resolveMaxTokens(100, p, "n") == MaxTokensSetting(200, MaxTokensSource.provider));
+    assert(resolveMaxTokens(100, p, "m") == MaxTokensSetting(300, MaxTokensSource.model));
+    assert(p.windowFor("m") == 2000 && p.windowFor("n") == 1000 && p.windowFor("o") == 1000);
+    // A later layer keeps the model's settings it doesn't name.
+    p.merge(parseJSON(`{"models": {"m": {"thinking": "high"}}}`));
+    assert(resolveMaxTokens(0, p, "m").value == 300 && p.windowFor("m") == 2000);
+}
+
 bool isVisible(const ref ProviderConfig p) pure nothrow { return !p.disabled && !p.hidden; }
 
 /// Whether a model spec (`provider/model`, or a bare model on the default
@@ -911,6 +967,8 @@ ResolvedProvider resolve(const ref Config c, string spec)
     // A model's own `base_url` wins (regional OpenRouter hosts, #169).
     if (auto ms = r.model in pc.models)
         if (ms.baseUrl !is null) r.config.baseUrl = ms.baseUrl;
+    // A model's own `context_window` wins over the provider's.
+    r.config.contextWindow = pc.windowFor(r.model);
     if (!r.config.hasKind) r.config.kind = ProviderKind.openai;
     auto why = endpointProblem(name, *pc, r.model);
     if (why.length) throw new Exception(why);
