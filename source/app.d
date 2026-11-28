@@ -1054,6 +1054,43 @@ final class ConfigClients : imported!"nano.subagent".SubClientFactory
     private Config cfg;
     this(immutable Config cfg) immutable { this.cfg = cfg; }
     LLMClient make(string spec) const { return makeClient(resolve(cfg, spec)); }
+    imported!"nano.subagent".ChildBudget budget(string spec) const
+    {
+        return childBudget(cfg, spec);
+    }
+}
+
+/// A sub-agent's limits on model `spec` from `cfg`: `max_tokens` from the
+/// model, provider, else top level; the window as `windowFor` resolves it
+/// (the top-level override, else the model's, else the provider's).
+imported!"nano.subagent".ChildBudget childBudget(const ref Config cfg, string spec)
+{
+    import nano.config : resolveMaxTokens;
+    auto r = resolve(cfg, spec);
+    auto w = windowFor(cfg, r.config);
+    return typeof(return)(resolveMaxTokens(cfg.maxTokens, r.config, r.model).value, w.tokens, w.source);
+}
+
+unittest
+{
+    import nano.config : ProviderConfig, ModelSettings;
+    Config c;
+    ProviderConfig p;
+    p.baseUrl = "http://localhost:1";
+    p.maxTokens = 200;
+    p.contextWindow = 1000;
+    ModelSettings m;
+    m.maxTokens = 300;
+    m.contextWindow = 2000;
+    p.models["big"] = m;
+    c.providers["x"] = p;
+    c.maxTokens = 100;
+    auto b = childBudget(c, "x/big");
+    assert(b.maxTokens == 300 && b.window == 2000, "the child gets the model's limits");
+    b = childBudget(c, "x/small");
+    assert(b.maxTokens == 200 && b.window == 1000, "else the provider's");
+    c.contextWindow = 5000;
+    assert(childBudget(c, "x/big").window == 5000, "the top-level override wins");
 }
 
 /// Give `agent` sub-agents from `cfg`: clients from a frozen copy (so

@@ -41,6 +41,21 @@ interface SubClientFactory
 {
     /// A new client for `spec` (`provider/model`).
     LLMClient make(string spec) const;
+    /// The configured output and context limits for `spec`, resolved as
+    /// the parent resolves its own (model, then provider, then global), so
+    /// a child honours a model's `max_tokens` and `context_window`.
+    ChildBudget budget(string spec) const;
+}
+
+/// A sub-agent's configured limits; 0 in a field: unset (fallbacks apply).
+struct ChildBudget
+{
+    /// Resolved `max_tokens`.
+    long maxTokens;
+    /// Resolved context window in tokens.
+    size_t window;
+    /// Which key set `window`, for diagnostics.
+    string windowSource;
 }
 
 /// Per sub-agent caps. Hitting one ends the sub-agent with its partial
@@ -846,6 +861,14 @@ private imported!"nano.tools".ToolHandler forwarder(ChildEvents st, string name)
 
 /// The sub-agent's thread: run `spec.task` to a report. Never throws; the
 /// last thing it does is send `done`.
+/// Give a child `agent` its configured limits from `b`.
+void applyBudget(imported!"nano.agent".Agent agent, const ChildBudget b)
+{
+    import nano.agent : ConfiguredWindow;
+    agent.maxTokens = b.maxTokens;
+    agent.setConfiguredWindow(ConfiguredWindow(b.window, b.windowSource));
+}
+
 SubResult runChild(immutable SubSpec spec, immutable(SubClientFactory) factory, Chan!SubMsg up,
     Chan!ToolReply down, SubAbort abort)
 {
@@ -891,6 +914,7 @@ SubResult runChild(immutable SubSpec spec, immutable(SubClientFactory) factory, 
         // one only refuses what no policy allows.
         auto agent = new Agent(client, tools, Policy.init, spec.system);
         st.agent = some(agent);
+        applyBudget(agent, factory.budget(spec.model));
         agent.planTools = false;
         agent.timerTools = false;
         agent.settingsTools = false;

@@ -1824,9 +1824,10 @@ unittest
     import nano.providers.mock;
     import nano.tools;
     import nano.permissions : Policy;
-    import nano.subagent : SubClientFactory;
+    import nano.subagent : ChildBudget, SubClientFactory;
     static final class NoClients : SubClientFactory
     {
+        ChildBudget budget(string spec) const { return ChildBudget.init; }
         LLMClient make(string spec) const { assert(0, "no sub-agent runs here"); }
     }
     auto agent = new Agent(new MockClient([LLMResponse("ok")]), new ToolRegistry, Policy.init, null);
@@ -1859,9 +1860,10 @@ unittest
     import nano.providers.mock;
     import nano.tools;
     import nano.permissions : Policy;
-    import nano.subagent : SubClientFactory;
+    import nano.subagent : ChildBudget, SubClientFactory;
     static final class NoClients : SubClientFactory
     {
+        ChildBudget budget(string spec) const { return ChildBudget.init; }
         LLMClient make(string spec) const { assert(0, "no sub-agent runs here"); }
     }
     foreach (fail; [false, true])
@@ -1891,10 +1893,11 @@ unittest
     import nano.providers.mock;
     import nano.tools;
     import nano.permissions : Policy;
-    import nano.subagent : SubClientFactory;
+    import nano.subagent : ChildBudget, SubClientFactory;
     import nano.thinking : Thinking;
     static final class NoClients : SubClientFactory
     {
+        ChildBudget budget(string spec) const { return ChildBudget.init; }
         LLMClient make(string spec) const { assert(0, "no sub-agent runs here"); }
     }
     static final class NamedMock : MockClient

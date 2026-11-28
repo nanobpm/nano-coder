@@ -22,7 +22,7 @@ import nano.option : Option, some, unwrap;
 import nano.permissions : Policy;
 import nano.providers.mock : MockClient;
 import nano.session : SessionLog;
-import nano.subagent : SubClientFactory;
+import nano.subagent : ChildBudget, SubClientFactory;
 import nano.tools : ToolRegistry;
 
 private:
@@ -132,6 +132,7 @@ LLMResponse costing(LLMResponse r, long input, double aic)
 
 final class Scripts : SubClientFactory
 {
+    ChildBudget budget(string spec) const { return ChildBudget.init; }
     LLMClient make(string spec) const
     {
         switch (spec)
