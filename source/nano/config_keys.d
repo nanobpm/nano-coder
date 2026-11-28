@@ -108,6 +108,7 @@ immutable ConfigKey[] configKeys = [
     ConfigKey("web.api_key_command", "string", "", "Command printing the Brave API key"),
     ConfigKey("web.searxng_url", "string", "", "Base URL of a SearXNG instance"),
     ConfigKey("web.fetch", "boolean", "true", "Offer web_fetch"),
+    ConfigKey("web.fetch_permission", "string", "allow", "allow | ask | deny: what a web_fetch no permission rule covers does (ask refuses when nobody can answer, unless --yolo or --web)"),
     ConfigKey("web.allowed_hosts", "array", "[]", "Hosts web_fetch may reach (empty: any public host); `*.example.com` matches subdomains"),
     ConfigKey("web.denied_hosts", "array", "[]", "Hosts web_fetch never reaches"),
     ConfigKey("web.allow_private", "boolean", "false", "Let web_fetch reach private and local addresses"),

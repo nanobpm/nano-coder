@@ -79,8 +79,9 @@ running each as it fires); with no -p, prompts are read from stdin (a REPL on a 
 --acp serves the Agent Client Protocol (JSON-RPC 2.0, one message per line) on stdin/stdOut.
 --session-messages lets an --acp session send and receive inter-session messages (ACP ignores
 session_messages; acp_session_messages = true in the config does the same).
---web offers web_search/web_fetch in an --acp session (off there by default) and approves web_fetch
-in headless runs; --no-web never offers them. Configure them under [web] in the config.
+--web offers web_search/web_fetch in an --acp session (off there by default) and, with
+[web] fetch_permission = "ask", approves web_fetch in headless runs; --no-web never offers them.
+web_fetch is allowed by default; configure it under [web] in the config.
 REPL commands: /help lists them (/model, /mode, /verbosity, /providers, /restart, /resume, ...)
 Ctrl-C cancels a running turn; a line typed during a turn steers it.
 A repository's own skills and .claude/settings*.json hooks load only once you trust it: an
@@ -122,7 +123,7 @@ immutable Flag[] flags = [
     Flag("--no-session", [], "", "Don't write a session log"),
     Flag("--no-hooks", [], "", "Don't run user hooks"),
     Flag("--yolo", [], "", "Trust the repository without asking (as `--acp` does)"),
-    Flag("--web", [], "", "Offer web_search/web_fetch in an `--acp` session and approve web_fetch in headless runs"),
+    Flag("--web", [], "", "Offer web_search/web_fetch in an `--acp` session and, under `[web] fetch_permission = ask`, approve web_fetch in headless runs"),
     Flag("--no-web", [], "", "Never offer the web tools"),
     Flag("--wait-timers", [], "", "With `-p`: wait for the timers the agent set, running each as it fires"),
     Flag("--verbosity", [], "quiet|normal|verbose|debug", "Output detail"),
@@ -3972,14 +3973,13 @@ int runMain(string[] args)
     });
     // The web tools (issue #386): offered per `[web]`, `--web`/`--no-web`
     // and the mode (off in ACP unless `--web`). A fetch no allow rule covers
-    // is allowed (--yolo, or --web when headless), asked about
-    // (interactive) or refused; the policy's deny rules apply to every
+    // follows `[web] fetch_permission` (allow by default; ask or deny on
+    // request, see fetchDefault); the policy's deny rules apply to every
     // redirect hop as well as to the call.
     {
         import nano.tools.web : webOffer, fetchDefault, FetchDefault, Approval, registerWeb = register;
         auto offer = webOffer(cfg.web, o.web, o.acp);
         immutable interactiveRun = !o.acp && !o.prompt.length && isTerminal(0) && isTerminal(1);
-        immutable fetchMode = fetchDefault(o.yolo, o.web, interactiveRun);
         // Both checks get the call's own arguments (url set to the hop), so
         // an argument-scoped rule sees every field.
         registerWeb(tools, cfg.web, offer, (JSONValue args) @safe {
@@ -3990,9 +3990,11 @@ int runMain(string[] args)
             // Without an approval UI (no frame editor: TERM=dumb, plain
             // input, ...) asking would always refuse; fall back to the
             // headless default, so --web still allows.
-            immutable headlessMode = fetchDefault(o.yolo, o.web, false);
+            // Read per call: the settings dialog can change it mid-session.
+            immutable configured = cfg.web.fetchPermission;
+            immutable headlessMode = fetchDefault(configured, o.yolo, o.web, false);
             Approval fallback() { return headlessMode == FetchDefault.allow ? Approval.host : Approval.no; }
-            final switch (fetchMode)
+            final switch (fetchDefault(configured, o.yolo, o.web, interactiveRun))
             {
             case FetchDefault.allow: return Approval.host;
             case FetchDefault.deny: return Approval.no;

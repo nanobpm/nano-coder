@@ -27,7 +27,7 @@ Inter-session messages are off in ACP mode whatever `session_messages` says; pas
 (see [Inter-session messages](messaging.md#inter-session-messages)).
 
 The web tools (`web_search`, `web_fetch`) are likewise off in ACP mode; pass `--web` to
-offer them (and to approve `web_fetch` calls no rule covers). `--no-web` turns them off in
+offer them (and, with `[web] fetch_permission = "ask"`, to approve `web_fetch` calls no rule covers). `--no-web` turns them off in
 any mode. See [Web tools](tools.md#web-tools).
 
 **Protocol methods supported:**

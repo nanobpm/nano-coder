@@ -32,7 +32,7 @@ The most used flags: `--login github-copilot`, `--list-models PROVIDER`, `--traj
 | `--no-session` |  |  | Don't write a session log |
 | `--no-hooks` |  |  | Don't run user hooks |
 | `--yolo` |  |  | Trust the repository without asking (as `--acp` does) |
-| `--web` |  |  | Offer web_search/web_fetch in an `--acp` session and approve web_fetch in headless runs |
+| `--web` |  |  | Offer web_search/web_fetch in an `--acp` session and, under `[web] fetch_permission = ask`, approve web_fetch in headless runs |
 | `--no-web` |  |  | Never offer the web tools |
 | `--wait-timers` |  |  | With `-p`: wait for the timers the agent set, running each as it fires |
 | `--verbosity` |  | `quiet\|normal\|verbose\|debug` | Output detail |

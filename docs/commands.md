@@ -45,6 +45,8 @@ argument: a type-ahead list narrows as you type and Tab completes it.
     one, each with its "use for" text and optional timeout, turns and tokens (0 = default)
   - **Session messages**: on/off (as `/messages on|off`) and confirm incoming on/off
     (as `/messages confirm on|off`)
+  - **Web fetch**: allow, ask or deny for a `web_fetch` no permission rule covers
+    (`[web] fetch_permission`; applies at once). See [Web tools](tools.md#web-tools)
   - **Save to config file**: writes only the keys you changed into the config file
     (`--config` or `~/.config/nano-coder/config.toml`), keeping comments and
     other settings. Leaving with unsaved changes asks whether to save
