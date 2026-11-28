@@ -775,7 +775,7 @@ unittest
     assert(rs.length == 1 && rs[0]["model"].str == "mock/cancel" && rs[0]["id"].str.length, rs.length.stringof);
 }
 
-private shared long childMaxTokensSent;
+shared long childMaxTokensSent;
 
 // A child's requests carry the `max_tokens` its factory resolves for its
 // model (model > provider > global), not the fallback budget (PR #404).

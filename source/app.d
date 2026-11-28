@@ -1065,10 +1065,18 @@ final class ConfigClients : imported!"nano.subagent".SubClientFactory
 /// (the top-level override, else the model's, else the provider's).
 imported!"nano.subagent".ChildBudget childBudget(const ref Config cfg, string spec)
 {
-    import nano.config : resolveMaxTokens;
-    auto r = resolve(cfg, spec);
-    auto w = windowFor(cfg, r.config);
-    return typeof(return)(resolveMaxTokens(cfg.maxTokens, r.config, r.model).value, w.tokens, w.source);
+    import nano.config : resolveMaxTokens, parseModelSpec;
+    // Read the provider table only: `resolve` would run `api_key_command`
+    // again after `make` already did, and fail the launch if it fails.
+    string name, model;
+    parseModelSpec(spec, cfg.providers, cfg.defaultProvider, name, model);
+    auto pc = name in cfg.providers;
+    if (pc is null) return typeof(return).init;
+    if (!model.length) model = pc.defaultModel;
+    ProviderConfig p = imported!"nano.safeio".deepCopy(*pc);
+    p.contextWindow = pc.windowFor(model);
+    auto w = windowFor(cfg, p);
+    return typeof(return)(resolveMaxTokens(cfg.maxTokens, *pc, model).value, w.tokens, w.source);
 }
 
 unittest
@@ -1091,6 +1099,8 @@ unittest
     assert(b.maxTokens == 200 && b.window == 1000, "else the provider's");
     c.contextWindow = 5000;
     assert(childBudget(c, "x/big").window == 5000, "the top-level override wins");
+    c.providers["x"].apiKeyCommand = "exit 1";
+    assert(childBudget(c, "x/big").maxTokens == 300, "no credential helper runs");
 }
 
 /// Give `agent` sub-agents from `cfg`: clients from a frozen copy (so
@@ -4857,6 +4867,8 @@ int runMain(string[] args)
             // The live config too: a later `/model` builds its window from
             // it, so the previous session's override must not come back.
             cfg.contextWindow = resumedContextWindow(cfg.contextWindow, runtimeDefaults.contextWindow, true, false, -1);
+            // Children's budgets come from a frozen config: re-freeze it.
+            configureSubagents(agent, cfg, false);
         }
         if (explicitFlags && o.plan)
         {
@@ -4911,6 +4923,7 @@ int runMain(string[] args)
             // window from `cfg`; issue #315). 0 clears the top-level window.
             cfg.contextWindow = resumedContextWindow(cfg.contextWindow, runtimeDefaults.contextWindow, false, true, st.contextWindow,
                 st.contextWindowFromProvider);
+            configureSubagents(agent, cfg, false); // children's budgets follow the restored window
             {
                 const w = resumedLiveWindow(st.contextWindow, st.contextWindowFromProvider,
                     cfg.providers.get(client.providerName, ProviderConfig.init).windowFor(client.modelName));
@@ -6123,6 +6136,9 @@ int runMain(string[] args)
                         auto h = settingsHost();
                         foreach (n; runSettings(new EditorUi(editor.unwrap("checked above")), h)) writeln(n);
                     }
+                    // `max_tokens`/`context_window` edits (saved or not) reach
+                    // children only through a re-frozen config.
+                    configureSubagents(agent, cfg, false);
                     refreshStatus();
                     continue;
                 case "/model":
