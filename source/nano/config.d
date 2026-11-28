@@ -322,7 +322,6 @@ string[] enabledProviderNames(const ProviderConfig[string] providers) pure
     return o;
 }
 
-/// Whether a provider appears in listings and pickers.
 /// The `max_tokens` a request to `model` on provider `p` is configured
 /// with, and where it came from. Precedence (as `thinking`): the model's,
 /// the provider's, the top-level `global`, else 0 (the provider default).
@@ -361,6 +360,7 @@ unittest // max_tokens and context_window: model > provider > top level > defaul
     assert(resolveMaxTokens(0, p, "m").value == 300 && p.windowFor("m") == 2000);
 }
 
+/// Whether a provider appears in listings and pickers.
 bool isVisible(const ref ProviderConfig p) pure nothrow { return !p.disabled && !p.hidden; }
 
 /// Whether a model spec (`provider/model`, or a bare model on the default
