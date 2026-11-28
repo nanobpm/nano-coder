@@ -302,6 +302,10 @@ struct Host
     /// `fromProvider`: the provider's own), so the host's config, and the
     /// sub-agent budgets frozen from it, follow the live window. Null: none.
     void delegate(long recorded, bool fromProvider) sessionWindowRestored;
+    /// Told a session reset (new or load), before the next window is
+    /// resolved, so the host drops a previous session's window override and
+    /// re-freezes sub-agent budgets from its startup config. Null: none.
+    void delegate() sessionWindowReset;
     /// The configured `model` and `system_prompt`, for `/settings`.
     string configModel, configSystemPrompt;
     /// The effective sandbox mode and its source, for `/settings` (#118).
@@ -1300,6 +1304,7 @@ final class AcpServer : AgentEvents
         agent.autoCompact = defaultAutoCompact;
         agent.autoCompactThreshold = defaultAutoCompactThreshold;
         agent.control.mode = host.plan ? AgentMode.plan : AgentMode.normal;
+        if (host.sessionWindowReset !is null) host.sessionWindowReset();
         agent.setConfiguredWindow(defaultConfiguredWindow);
         if (activeWindow && host.windowFor !is null)
         {
@@ -2161,7 +2166,9 @@ unittest
         hostP.providerWindowFor = (string spec) => ConfiguredWindow(32_000, "provider context_window");
         long told = -1;
         bool toldFromProvider;
-        hostP.sessionWindowRestored = (long r, bool fp) { told = r; toldFromProvider = fp; };
+        string[] order;
+        hostP.sessionWindowReset = () { order ~= "reset"; };
+        hostP.sessionWindowRestored = (long r, bool fp) { told = r; toldFromProvider = fp; order ~= "restored"; };
         auto agentP = new Agent(new NamedMock("hdr", "one"), new ToolRegistry, Policy.init, null);
         auto srvP = new AcpServer(agentP, hostP, (string l) {});
         srvP.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ sidP ~ `"}}`);
@@ -2174,6 +2181,7 @@ unittest
             assert(agentP.configuredWindow == 128_000 && agentP.configuredWindowSource == "the session's settings",
                 "a user-marked window restores as an override");
         assert(told == 128_000 && toldFromProvider == fromProvider, "the host (and sub-agent budgets) hear the restored window");
+        assert(order == ["reset", "restored"], "the host drops a previous session's window before the load restores one");
         agentP.replaceLog(Option!SessionLog.init);
     }
 
