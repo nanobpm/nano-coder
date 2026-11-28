@@ -1786,11 +1786,24 @@ class Agent
     /// `effectiveMaxTokens` for a configured `max_tokens` (0: unset).
     private long effectiveMaxTokensFor(long configured) pure const
     {
-        long base = configured > 0 ? configured
+        const base = baseMaxTokensFor(configured);
+        return learnedMaxOutput > 0 && learnedMaxOutput < base ? learnedMaxOutput : base;
+    }
+
+    /// A cap learned from a provider error is what lowers `effectiveMaxTokens`
+    /// now (shown as the reason in `/settings`).
+    bool learnedCapBinding()
+    {
+        return learnedMaxOutput > 0 && learnedMaxOutput < baseMaxTokensFor(configuredMaxTokens().value);
+    }
+
+    /// `effectiveMaxTokensFor` before the learned cap.
+    private long baseMaxTokensFor(long configured) pure const
+    {
+        return configured > 0 ? configured
             : capabilities.maxOutput ? clampToLong(capabilities.maxOutput)
             : ctx.outputLimitForModel(client.modelName) ? clampToLong(ctx.outputLimitForModel(client.modelName))
             : ctx.defaultMaxOutputTokens;
-        return learnedMaxOutput > 0 && learnedMaxOutput < base ? learnedMaxOutput : base;
     }
 
     /// The endpoint's prompt-only cap is in force (Copilot `max_prompt_tokens`).
