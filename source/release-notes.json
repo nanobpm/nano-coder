@@ -1,5 +1,8 @@
 {
   "releases": [
+    {"version": "1.38.0", "date": "2026-11-28", "items": [
+      {"type":"feat","scope":"web","title":"allow web_fetch by default; [web] fetch_permission = allow|ask|deny","pr":405}
+    ]},
     {"version": "1.37.0", "date": "2026-11-27", "items": [
       {"type":"feat","scope":"thinking","title":"read thinking levels from /v1/models reasoning.efforts (Splash)","pr":402}
     ]},
@@ -440,9 +443,6 @@
     ]},
     {"version": "0.58.1", "date": "2026-11-03", "items": [
       {"type":"fix","scope":"trajectory","title":"open /trajectory in the pager even when it fits on screen","pr":162}
-    ]},
-    {"version": "0.58.0", "date": "2026-10-29", "items": [
-      {"type":"feat","scope":"context","title":"pin error lines when clipping long tool results for compaction","pr":161}
     ]}
   ]
 }
