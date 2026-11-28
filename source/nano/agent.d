@@ -1767,18 +1767,43 @@ class Agent
 
     size_t estimateContextTokens() { bool _; return estimateContextTokens(_); }
 
-    private size_t outputBase() pure const { return toSize(effectiveMaxTokens()); }
+    private size_t outputBase() { return toSize(effectiveMaxTokens()); }
+
+    /// The configured `max_tokens` for the live model and where it came
+    /// from: the model's, the provider's, else the top-level `maxTokens`
+    /// (re-resolved on every call, so a `/model` switch picks it up).
+    imported!"nano.config".MaxTokensSetting configuredMaxTokens()
+    {
+        return imported!"nano.config".resolveMaxTokens(maxTokens, *providerEntry, client.modelName);
+    }
 
     /// The output budget before the context-window clamp: `max_tokens` when
-    /// configured, else the model's published cap, a known cap for the model
-    /// name, or the large default; never above a cap learned from an error.
-    long effectiveMaxTokens() pure const
+    /// configured (`configuredMaxTokens`), else the model's published cap, a
+    /// known cap for the model name, or the large default; never above a cap
+    /// learned from an error.
+    long effectiveMaxTokens() { return effectiveMaxTokensFor(configuredMaxTokens().value); }
+
+    /// `effectiveMaxTokens` for a configured `max_tokens` (0: unset).
+    private long effectiveMaxTokensFor(long configured) pure const
     {
-        long base = maxTokens > 0 ? maxTokens
+        const base = baseMaxTokensFor(configured);
+        return learnedMaxOutput > 0 && learnedMaxOutput < base ? learnedMaxOutput : base;
+    }
+
+    /// A cap learned from a provider error is what lowers `effectiveMaxTokens`
+    /// now (shown as the reason in `/settings`).
+    bool learnedCapBinding()
+    {
+        return learnedMaxOutput > 0 && learnedMaxOutput < baseMaxTokensFor(configuredMaxTokens().value);
+    }
+
+    /// `effectiveMaxTokensFor` before the learned cap.
+    private long baseMaxTokensFor(long configured) pure const
+    {
+        return configured > 0 ? configured
             : capabilities.maxOutput ? clampToLong(capabilities.maxOutput)
             : ctx.outputLimitForModel(client.modelName) ? clampToLong(ctx.outputLimitForModel(client.modelName))
             : ctx.defaultMaxOutputTokens;
-        return learnedMaxOutput > 0 && learnedMaxOutput < base ? learnedMaxOutput : base;
     }
 
     /// The endpoint's prompt-only cap is in force (Copilot `max_prompt_tokens`).
@@ -1837,7 +1862,7 @@ class Agent
         idleCached = false;
     }
 
-    private bool idleCompactDueAt(size_t tokens) pure
+    private bool idleCompactDueAt(size_t tokens)
     {
         if (!idleCompact || !overThresholdAt(tokens)) return false;
         auto window = contextWindow();
@@ -1873,7 +1898,10 @@ class Agent
     }
 
     /// `overThreshold` for an already-estimated context size.
-    bool overThresholdAt(size_t tokens) pure
+    bool overThresholdAt(size_t tokens) { return overThresholdWith(tokens, outputBase); }
+
+    /// `overThresholdAt` with the output budget `outputBase` already resolved.
+    private bool overThresholdWith(size_t tokens, size_t outputBase) pure
     {
         if (!autoCompact) return false;
         auto threshold = effectiveAutoCompactThreshold;

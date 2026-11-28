@@ -1054,6 +1054,53 @@ final class ConfigClients : imported!"nano.subagent".SubClientFactory
     private Config cfg;
     this(immutable Config cfg) immutable { this.cfg = cfg; }
     LLMClient make(string spec) const { return makeClient(resolve(cfg, spec)); }
+    imported!"nano.subagent".ChildBudget budget(string spec) const
+    {
+        return childBudget(cfg, spec);
+    }
+}
+
+/// A sub-agent's limits on model `spec` from `cfg`: `max_tokens` from the
+/// model, provider, else top level; the window as `windowFor` resolves it
+/// (the top-level override, else the model's, else the provider's).
+imported!"nano.subagent".ChildBudget childBudget(const ref Config cfg, string spec)
+{
+    import nano.config : resolveMaxTokens, parseModelSpec;
+    // Read the provider table only: `resolve` would run `api_key_command`
+    // again after `make` already did, and fail the launch if it fails.
+    string name, model;
+    parseModelSpec(spec, cfg.providers, cfg.defaultProvider, name, model);
+    auto pc = name in cfg.providers;
+    if (pc is null) return typeof(return).init;
+    if (!model.length) model = pc.defaultModel;
+    ProviderConfig p = imported!"nano.safeio".deepCopy(*pc);
+    p.contextWindow = pc.windowFor(model);
+    auto w = windowFor(cfg, p);
+    return typeof(return)(resolveMaxTokens(cfg.maxTokens, *pc, model).value, w.tokens, w.source);
+}
+
+unittest
+{
+    import nano.config : ProviderConfig, ModelSettings;
+    Config c;
+    ProviderConfig p;
+    p.baseUrl = "http://localhost:1";
+    p.maxTokens = 200;
+    p.contextWindow = 1000;
+    ModelSettings m;
+    m.maxTokens = 300;
+    m.contextWindow = 2000;
+    p.models["big"] = m;
+    c.providers["x"] = p;
+    c.maxTokens = 100;
+    auto b = childBudget(c, "x/big");
+    assert(b.maxTokens == 300 && b.window == 2000, "the child gets the model's limits");
+    b = childBudget(c, "x/small");
+    assert(b.maxTokens == 200 && b.window == 1000, "else the provider's");
+    c.contextWindow = 5000;
+    assert(childBudget(c, "x/big").window == 5000, "the top-level override wins");
+    c.providers["x"].apiKeyCommand = "exit 1";
+    assert(childBudget(c, "x/big").maxTokens == 300, "no credential helper runs");
 }
 
 /// Give `agent` sub-agents from `cfg`: clients from a frozen copy (so
@@ -3640,6 +3687,28 @@ string modeListing(AgentMode current) pure
     return (out_ ~ "(Shift+Tab cycles; /mode NAME sets it directly)").join("\n");
 }
 
+/// The `/context` line for `max_tokens`: the value a reply may use and
+/// where it came from (the model's, the provider's or the top-level key,
+/// else the model's own limit).
+string maxTokensReport(imported!"nano.config".MaxTokensSetting configured, long effective) pure
+{
+    import nano.config : MaxTokensSource;
+    final switch (configured.source)
+    {
+        case MaxTokensSource.model: return format("%s (model max_tokens)", effective);
+        case MaxTokensSource.provider: return format("%s (provider max_tokens)", effective);
+        case MaxTokensSource.config: return format("%s (max_tokens in config)", effective);
+        case MaxTokensSource.unset: return format("%s (unset: the model's limit)", effective);
+    }
+}
+
+unittest
+{
+    import nano.config : MaxTokensSetting, MaxTokensSource;
+    assert(maxTokensReport(MaxTokensSetting(49_152, MaxTokensSource.model), 49_152) == "49152 (model max_tokens)");
+    assert(maxTokensReport(MaxTokensSetting(0, MaxTokensSource.unset), 32_000) == "32000 (unset: the model's limit)");
+}
+
 string contextReport(Agent agent)
 {
     import nano.context : formatTokens, modeName;
@@ -3656,6 +3725,7 @@ string contextReport(Agent agent)
     out_ ~= format("Messages:     %s", agent.messages.length);
     out_ ~= "Temperature:  " ~ agent.temperatureNow.describe;
     out_ ~= "Thinking:     " ~ agent.thinking().describe;
+    out_ ~= "Max tokens:   " ~ maxTokensReport(agent.configuredMaxTokens(), agent.effectiveMaxTokens);
     auto vision = agent.vision;
     out_ ~= "Vision:       " ~ (vision.isNull ? "no" : format("yes (up to %s image(s), %s bytes each)", vision.get.maxImages, vision.get.maxImageBytes));
     auto loaded = agent.instructions.match!(pi => pi.loadedPaths, () => string[].init);
@@ -4271,6 +4341,20 @@ int runMain(string[] args)
         host.canonicalModel = (string s) { static import nano.recents; return nano.recents.canonical(s, cfg.providers, cfg.defaultProvider); };
         host.windowFor = (string s) => windowFor(cfg, resolve(cfg, s).config);
         host.providerWindowFor = (string s) => providerWindow(resolve(cfg, s).config.contextWindow);
+        const startupContextWindow = cfg.contextWindow;
+        host.sessionWindowReset = () {
+            // A previous session's restored override must not leak into the
+            // next session's window or its children's budgets.
+            cfg.contextWindow = startupContextWindow;
+            configureSubagents(agent, cfg, false);
+        };
+        host.sessionWindowRestored = (long recorded, bool fromProvider) {
+            // As interactive resume: held in the live config, and children's
+            // budgets re-frozen from it, so a cleared override (0) does not
+            // leave children on the old top-level window.
+            cfg.contextWindow = resumedContextWindow(cfg.contextWindow, cfg.contextWindow, false, true, recorded, fromProvider);
+            configureSubagents(agent, cfg, false);
+        };
         host.sessionDir = o.noSession ? null : sessionDir;
         host.version_ = versionString;
         {
@@ -4793,10 +4877,12 @@ int runMain(string[] args)
             // fallback must not keep the previous session's override.
             // Restore, not set: clearing a carried-over positive window must
             // re-probe the endpoint, whose window detection it suppressed.
-            agent.restoreConfiguredWindow(runtimeDefaults.window(cfg.providers.get(client.providerName, ProviderConfig.init).contextWindow));
+            agent.restoreConfiguredWindow(runtimeDefaults.window(cfg.providers.get(client.providerName, ProviderConfig.init).windowFor(client.modelName)));
             // The live config too: a later `/model` builds its window from
             // it, so the previous session's override must not come back.
             cfg.contextWindow = resumedContextWindow(cfg.contextWindow, runtimeDefaults.contextWindow, true, false, -1);
+            // Children's budgets come from a frozen config: re-freeze it.
+            configureSubagents(agent, cfg, false);
         }
         if (explicitFlags && o.plan)
         {
@@ -4851,9 +4937,10 @@ int runMain(string[] args)
             // window from `cfg`; issue #315). 0 clears the top-level window.
             cfg.contextWindow = resumedContextWindow(cfg.contextWindow, runtimeDefaults.contextWindow, false, true, st.contextWindow,
                 st.contextWindowFromProvider);
+            configureSubagents(agent, cfg, false); // children's budgets follow the restored window
             {
                 const w = resumedLiveWindow(st.contextWindow, st.contextWindowFromProvider,
-                    cfg.providers.get(client.providerName, ProviderConfig.init).contextWindow);
+                    cfg.providers.get(client.providerName, ProviderConfig.init).windowFor(client.modelName));
                 if (w.source == "the session's settings") agent.setConfiguredWindow(w);
                 else agent.restoreConfiguredWindow(w);
             }
@@ -6063,6 +6150,9 @@ int runMain(string[] args)
                         auto h = settingsHost();
                         foreach (n; runSettings(new EditorUi(editor.unwrap("checked above")), h)) writeln(n);
                     }
+                    // `max_tokens`/`context_window` edits (saved or not) reach
+                    // children only through a re-frozen config.
+                    configureSubagents(agent, cfg, false);
                     refreshStatus();
                     continue;
                 case "/model":

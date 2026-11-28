@@ -8,7 +8,7 @@ module nano.settings;
 import std.format : format;
 import std.math : isNaN;
 import std.typecons : Nullable, Tuple, tuple;
-import nano.config : Config, ProviderConfig, ProviderKind, ModelSettings, enabledProviderNames, isVisible, parseModelSpec;
+import nano.config : Config, MaxTokensSetting, ProviderConfig, ProviderKind, ModelSettings, enabledProviderNames, isVisible, parseModelSpec;
 import nano.qwen : QwenEndpoint;
 import std.string : strip;
 import nano.thinking : Thinking;
@@ -41,10 +41,25 @@ string turnCapLabel(long maxIterations) pure
     return maxIterations <= 0 ? "unbounded" : format("%s LLM calls per input (normal mode asks before stopping)", maxIterations);
 }
 
-/// `0` is "unset": shown as what it resolves to.
-string maxTokensLabel(long configured, string effective) pure
+/// The `/settings` "Max tokens" row: the global `max_tokens` (`0`: "auto")
+/// and, when requests use a different value, that value and the real reason:
+/// a model or provider `max_tokens` (`setting`), or a cap learned from a
+/// provider error (`learnedCap`: that cap is binding). The dialog thus never
+/// reports a limit requests don't use, nor blames the wrong key for it.
+string maxTokensLabel(long global, MaxTokensSetting setting, long effective, bool learnedCap) pure
 {
-    return configured > 0 ? format("%s", configured) : format("auto (%s)", effective);
+    import nano.config : MaxTokensSource;
+    const head = global > 0 ? format("%s", global) : "auto";
+    if (learnedCap) return format("%s (capped at %s after a provider error)", head, effective);
+    string from;
+    final switch (setting.source)
+    {
+        case MaxTokensSource.model: from = "the model max_tokens"; break;
+        case MaxTokensSource.provider: from = "the provider max_tokens"; break;
+        case MaxTokensSource.config, MaxTokensSource.unset: break;
+    }
+    if (from.length && effective != global) return format("%s (in use: %s, from %s)", head, effective, from);
+    return global > 0 ? head : format("auto (%s)", effective);
 }
 
 enum size_t recentModelsShown = 4;
@@ -468,7 +483,25 @@ void save(const ref Config c, const ref Changes ch, const ProviderConfig[string]
 unittest
 {
     import std.algorithm : canFind;
-    assert(turnCapLabel(0) == "unbounded" && maxTokensLabel(0, "model default") == "auto (model default)");
+    import nano.config : MaxTokensSource;
+    alias S = MaxTokensSetting;
+    assert(turnCapLabel(0) == "unbounded" && maxTokensLabel(0, S(), 32_000, false) == "auto (32000)");
+    // config: the global value is in use
+    assert(maxTokensLabel(4000, S(4000, MaxTokensSource.config), 4000, false) == "4000");
+    // model / provider overrides name their key
+    assert(maxTokensLabel(4000, S(20_000, MaxTokensSource.model), 20_000, false)
+        == "4000 (in use: 20000, from the model max_tokens)");
+    assert(maxTokensLabel(4000, S(8000, MaxTokensSource.provider), 8000, false)
+        == "4000 (in use: 8000, from the provider max_tokens)");
+    assert(maxTokensLabel(0, S(8000, MaxTokensSource.provider), 8000, false)
+        == "auto (in use: 8000, from the provider max_tokens)");
+    // learned cap only, with a global value: not blamed on a model/provider key
+    assert(maxTokensLabel(4000, S(4000, MaxTokensSource.config), 2000, true)
+        == "4000 (capped at 2000 after a provider error)");
+    // learned cap below a model override
+    assert(maxTokensLabel(4000, S(20_000, MaxTokensSource.model), 3000, true)
+        == "4000 (capped at 3000 after a provider error)");
+    assert(maxTokensLabel(0, S(), 2000, true) == "auto (capped at 2000 after a provider error)");
     ProviderConfig a, b;
     ProviderConfig[string] all = ["a": a, "b": b];
     assert(recentModels(["a/x", "gone/y", "b/z", "a/1", "a/2", "a/3"], all) == ["a/x", "b/z", "a/1", "a/2"]);

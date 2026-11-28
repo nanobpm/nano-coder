@@ -21,7 +21,7 @@ import nano.option : some, unwrap;
 import nano.permissions : Policy, parseRule;
 import nano.providers.mock : MockClient;
 import nano.session : SessionLog;
-import nano.subagent : SubClientFactory, SubLimits;
+import nano.subagent : ChildBudget, SubClientFactory, SubLimits;
 import nano.tools : ToolRegistry;
 
 private:
@@ -79,6 +79,7 @@ LLMResponse report(string summary)
 /// The children's models, by the `model` an `agent` call asks for.
 final class Scripts : SubClientFactory
 {
+    ChildBudget budget(string spec) const { return ChildBudget.init; }
     LLMClient make(string spec) const
     {
         switch (spec)
@@ -328,6 +329,7 @@ unittest
         LLMResponse("done")]);
     final class ReadScript : SubClientFactory
     {
+        ChildBudget budget(string spec) const { return ChildBudget.init; }
         LLMClient make(string spec) const
         {
             return new MockClient([LLMResponse("", "", [ToolCall.fromRaw("r", "read_file",
@@ -358,6 +360,7 @@ unittest
 {
     final class BigTokens : SubClientFactory
     {
+        ChildBudget budget(string spec) const { return ChildBudget.init; }
         LLMClient make(string spec) const
         {
             return new MockClient([used(report("done but over budget"), 500, 50)]);
@@ -400,6 +403,7 @@ string childReadReport(string target, Policy policy)
     {
         string t;
         this(string t) immutable { this.t = t; }
+        ChildBudget budget(string spec) const { return ChildBudget.init; }
         LLMClient make(string spec) const { return new ReadEcho(t); }
         void configure(Agent a, string spec) const {}
     }
@@ -468,6 +472,7 @@ unittest
         {
             this.ok = ok; this.secret = secret; this.missing = missing;
         }
+        ChildBudget budget(string spec) const { return ChildBudget.init; }
         LLMClient make(string spec) const
         {
             return new MockClient([LLMResponse("", "", [
@@ -503,6 +508,7 @@ unittest
     scope (exit) if (dir.exists) rmdirRecurse(dir);
     final class Immediate : SubClientFactory
     {
+        ChildBudget budget(string spec) const { return ChildBudget.init; }
         LLMClient make(string spec) const { return new MockClient([report("first child")]); }
     }
     import nano.session : gzipLog;
@@ -767,4 +773,33 @@ unittest
     f.agent.control.startTurn();
     auto rs = subagentUsageRecords(f.agent.log.unwrap("persisted").path);
     assert(rs.length == 1 && rs[0]["model"].str == "mock/cancel" && rs[0]["id"].str.length, rs.length.stringof);
+}
+
+shared long childMaxTokensSent;
+
+// A child's requests carry the `max_tokens` its factory resolves for its
+// model (model > provider > global), not the fallback budget (PR #404).
+unittest
+{
+    final class BudgetClient : MockClient
+    {
+        this() { super([report("ok")]); }
+        override LLMResponse chat(const ref ChatRequest req, StreamSink sink)
+        {
+            atomicStore(childMaxTokensSent, req.maxTokens);
+            return super.chat(req, sink);
+        }
+    }
+    final class Budgeted : SubClientFactory
+    {
+        ChildBudget budget(string spec) const { return ChildBudget(1234, 200_000, "model context_window"); }
+        LLMClient make(string spec) const { return new BudgetClient; }
+    }
+    atomicStore(childMaxTokensSent, 0L);
+    auto parent = new MockClient([LLMResponse("", "", [ToolCall.fromRaw("c", "agent",
+        `{"task":"one","model":"mock/b"}`)]), LLMResponse("done")]);
+    auto agent = new Agent(parent, new ToolRegistry, Policy.init, "sys");
+    agent.subagentClients = new immutable Budgeted;
+    agent.run("go", new NullEvents);
+    assert(atomicLoad(childMaxTokensSent) == 1234);
 }

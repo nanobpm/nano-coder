@@ -125,6 +125,7 @@ immutable ConfigKey[] configKeys = [
     ConfigKey("providers.<name>.drop_params", "array", "", "Request parameters to leave out, e.g. `[\"temperature\"]`"),
     ConfigKey("providers.<name>.max_tokens_param", "string", "", "Name of the max-tokens parameter, e.g. `max_completion_tokens`"),
     ConfigKey("providers.<name>.context_window", "integer", "", "Context window of this provider's models"),
+    ConfigKey("providers.<name>.max_tokens", "integer", "", "Most tokens per reply for this provider's models, over the top-level `max_tokens`"),
     ConfigKey("providers.<name>.stream", "boolean", "true", "Stream replies"),
     ConfigKey("providers.<name>.temperature", "float", "", "Temperature for this provider's models"),
     ConfigKey("providers.<name>.thinking", "string", "", "Thinking level for this provider's models"),
@@ -145,6 +146,8 @@ immutable ConfigKey[] configKeys = [
     ConfigKey("providers.<name>.models.<model>.vision", "boolean", "", "Whether this model accepts images"),
     ConfigKey("providers.<name>.models.<model>.thinking_levels", "array", "", "The thinking levels this model supports"),
     ConfigKey("providers.<name>.models.<model>.name", "string", "", "Display name in the model picker"),
+    ConfigKey("providers.<name>.models.<model>.max_tokens", "integer", "", "Most tokens per reply for this model, over the provider's"),
+    ConfigKey("providers.<name>.models.<model>.context_window", "integer", "", "Context window of this model, overriding the provider's"),
     ConfigKey("providers.<name>.models.<model>.base_url", "string", "", "Endpoint for this model, overriding the provider's"),
 ];
 

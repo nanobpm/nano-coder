@@ -170,7 +170,7 @@ string[] runSettings(SettingsUi ui, ref SettingsHost h)
             "Add or edit a provider",
             format("Temperature      %s", a.temperatureNow.describe),
             format("Thinking         %s", a.thinking.describe),
-            format("Max tokens       %s", maxTokensLabel(cfg.maxTokens, format("%s", a.effectiveMaxTokens))),
+            format("Max tokens       %s", maxTokensLabel(cfg.maxTokens, a.configuredMaxTokens, a.effectiveMaxTokens, a.learnedCapBinding)),
             format("Turn cap         %s", turnCapLabel(cfg.maxIterations)),
             "System prompt",
             format("Context          %s window, auto-compact %s, %s compaction", formatTokens(a.contextWindow),
@@ -327,9 +327,7 @@ private bool editContext(SettingsUi ui, ref SettingsHost h)
     a.compactionMode = m == 2 ? CompactionMode.extract : m == 1 ? CompactionMode.smart : CompactionMode.standard;
     cfg.contextWindow = window;
     auto pc = a.client.providerName in cfg.providers;
-    a.setConfiguredWindow(window > 0 ? ConfiguredWindow(toSize(window), "context_window in config")
-        : pc !is null && pc.contextWindow > 0 ? ConfiguredWindow(toSize(pc.contextWindow), "provider context_window")
-        : ConfiguredWindow.init);
+    a.setConfiguredWindow(dialogWindow(window, pc is null ? 0 : pc.windowFor(a.client.modelName)));
     if (h.logSettings !is null)
     {
         // A resume restores the session's context settings (issue #297),
@@ -800,4 +798,26 @@ private void editMessages(SettingsUi ui, ref SettingsHost h, ref Changes changes
             changes.sessionMessagesConfirm = true;
         }
     }
+}
+
+/// The configured window the Context dialog applies: the typed `window`,
+/// else the provider/model's own `context_window` (`modelWindow`, already
+/// resolved per model by `ProviderConfig.windowFor`; 0: none).
+ConfiguredWindow dialogWindow(long window, long modelWindow) pure
+{
+    return window > 0 ? ConfiguredWindow(toSize(window), "context_window in config")
+        : modelWindow > 0 ? ConfiguredWindow(toSize(modelWindow), "provider/model context_window")
+        : ConfiguredWindow.init;
+}
+
+unittest // a per-model context_window survives setting the dialog's window to 0
+{
+    import nano.config : ProviderConfig;
+    import std.json : parseJSON;
+    ProviderConfig p;
+    p.merge(parseJSON(`{"context_window": 1000, "models": {"m": {"context_window": 2000}}}`));
+    assert(dialogWindow(0, p.windowFor("m")).tokens == 2000);
+    assert(dialogWindow(0, p.windowFor("other")).tokens == 1000);
+    assert(dialogWindow(500, p.windowFor("m")).tokens == 500);
+    assert(dialogWindow(0, 0) == ConfiguredWindow.init);
 }
