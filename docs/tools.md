@@ -109,6 +109,7 @@ search = "brave"                 # "brave" | "searxng" | unset (no web_search to
 api_key_command = "cat ~/.config/nano-coder/keys/brave"   # brave; or api_key_env
 searxng_url = "http://merlin.local:8888"                   # searxng (JSON format enabled)
 fetch = true                     # offer web_fetch
+fetch_permission = "allow"       # "allow" | "ask" | "deny" (see Permissions below)
 allowed_hosts = []               # empty = any public host
 denied_hosts = []
 allow_private = false            # LAN / loopback / link-local / CGNAT / metadata addresses
@@ -125,13 +126,24 @@ loopback, link-local, CGNAT (100.64/10), ULA, documentation, Teredo-embedded pri
 addresses that were checked (a second DNS answer can't rebind it), a trailing dot
 (`bad.org.`) matches the same host rules, non-ASCII (IDN) host names are refused (write the
 `xn--` punycode form instead, so the checked name is the one connected to), and a redirect to a host other than the approved
-one needs approval of its own (an allow rule, `--web`, or a Yes). The Brave key never appears in logs
+one needs approval of its own when `fetch_permission = "ask"` (an allow rule, `--web`, or a Yes). The Brave key never appears in logs
 or errors.
 
-Permissions: `web_search` is allowed by default. `web_fetch` asks in an interactive session,
-and in headless/ACP runs is allowed only with `--web` (or `--yolo`, or an allow rule).
-Rules can scope it by host: `WebFetch(domain:example.com)`, `WebFetch(domain:*.github.com)`.
-The full URL is shown in the prompt and transcript.
+Permissions: `web_search` and `web_fetch` are allowed by default, so an agent never stops
+at a prompt to read a page. `[web] fetch_permission` changes what a `web_fetch` no
+permission rule covers does (also in `/settings` → Web fetch, which applies at once):
+
+| `fetch_permission` | Interactive | Headless / ACP |
+|---|---|---|
+| `"allow"` (default) | fetch | fetch |
+| `"ask"` | ask per host (`--yolo`: fetch) | refuse, unless `--web` or `--yolo` |
+| `"deny"` | refuse | refuse |
+
+Permission rules still apply on top: a deny rule refuses a fetch whatever the setting, and an
+allow rule approves one even under `"ask"` or `"deny"`. Rules can scope it by host:
+`WebFetch(domain:example.com)`, `WebFetch(domain:*.github.com)`. The host rules above
+(`allowed_hosts`, `denied_hosts`, private addresses) always apply. The full URL is shown in
+the prompt and transcript.
 
 ## Tool reference
 

@@ -177,6 +177,7 @@ The default model is `gpt-4o-mini` on the `mock` provider, so the harness still 
 | `web.api_key_command` | string |  | Command printing the Brave API key |
 | `web.searxng_url` | string |  | Base URL of a SearXNG instance |
 | `web.fetch` | boolean | `true` | Offer web_fetch |
+| `web.fetch_permission` | string | `allow` | allow \| ask \| deny: what a web_fetch no permission rule covers does (ask refuses when nobody can answer, unless --yolo or --web) |
 | `web.allowed_hosts` | array | `[]` | Hosts web_fetch may reach (empty: any public host); `*.example.com` matches subdomains |
 | `web.denied_hosts` | array | `[]` | Hosts web_fetch never reaches |
 | `web.allow_private` | boolean | `false` | Let web_fetch reach private and local addresses |

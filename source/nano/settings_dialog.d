@@ -179,11 +179,12 @@ string[] runSettings(SettingsUi ui, ref SettingsHost h)
             format("Sub-agents       %s", subagentsSummary(a.subagentsOn, cfg.subagentModel, cfg.subagentModels.length)),
             format("Session messages %s", messagesSummary(stateOf(h.messagesOn, cfg.sessionMessages),
                 stateOf(h.messagesConfirm, cfg.sessionMessagesConfirm))),
+            format("Web fetch        %s", fetchPermissionLabel(cfg.web.fetchPermission)),
             format("Save to config file%s", changes.any ? " (unsaved changes)" : ""),
             "Done",
         ];
         auto sel = ui.select("Select setting", items, 0);
-        if (sel < 0 || sel == 12)
+        if (sel < 0 || sel == 13)
         {
             if (changes.any && confirm(ui, format("Save changes to %s?", h.configPath), true))
                 saveAndReport(ui, h, changes, notices);
@@ -238,7 +239,8 @@ string[] runSettings(SettingsUi ui, ref SettingsHost h)
                 break;
             case 9: editSubagents(ui, h, changes); break;
             case 10: editMessages(ui, h, changes); break;
-            case 11: saveAndReport(ui, h, changes, notices); break;
+            case 11: if (editWebFetch(ui, cfg)) changes.webFetchPermission = true; break;
+            case 12: saveAndReport(ui, h, changes, notices); break;
             default: break;
         }
     }
@@ -800,4 +802,36 @@ private void editMessages(SettingsUi ui, ref SettingsHost h, ref Changes changes
             changes.sessionMessagesConfirm = true;
         }
     }
+}
+
+/// How a `[web] fetch_permission` value reads in the dialog.
+private string fetchPermissionLabel(imported!"nano.tools.web".FetchDefault p) pure nothrow
+{
+    import nano.tools.web : FetchDefault;
+    final switch (p)
+    {
+        case FetchDefault.allow: return "allow (fetch without asking)";
+        case FetchDefault.ask: return "ask (confirm each host; refused when nobody can answer)";
+        case FetchDefault.deny: return "deny (only permission allow rules fetch)";
+    }
+}
+
+/// Picks `[web] fetch_permission`; it applies at once (the fetch approval
+/// reads it per call). True when it changed.
+private bool editWebFetch(SettingsUi ui, Config* cfg)
+{
+    import nano.tools.web : FetchDefault;
+    import std.traits : EnumMembers;
+    static immutable all = [EnumMembers!FetchDefault];
+    string[] labels;
+    size_t cur;
+    foreach (i, p; all)
+    {
+        labels ~= fetchPermissionLabel(p);
+        if (p == cfg.web.fetchPermission) cur = i;
+    }
+    auto i = ui.select("Web fetch: what a fetch no permission rule covers does", labels, cur);
+    if (i < 0 || all[i] == cfg.web.fetchPermission) return false;
+    cfg.web.fetchPermission = all[i];
+    return true;
 }

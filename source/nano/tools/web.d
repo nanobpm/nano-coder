@@ -52,6 +52,10 @@ struct WebConfig
     string searxngUrl;
     /// Offer `web_fetch` (default true).
     bool fetch = true;
+    /// What a web_fetch call no permission rule covers does: allow
+    /// (default), ask or deny (`fetch_permission`). Asking needs someone
+    /// to answer: see `fetchDefault`.
+    FetchDefault fetchPermission = FetchDefault.allow;
     /// Hosts web_fetch may reach (empty: any public host); `*.example.com`
     /// matches subdomains. A listed host may also be private.
     string[] allowedHosts;
@@ -90,6 +94,10 @@ struct WebConfig
             case "api_key": c.apiKey = v.str; break;
             case "searxng_url": c.searxngUrl = v.str.strip.stripRight("/"); break;
             case "fetch": c.fetch = v.boolean; break;
+            case "fetch_permission":
+                c.fetchPermission = parseFetchPermission(v.str)
+                    .orThrow!(e => new Exception(e));
+                break;
             case "allowed_hosts": c.allowedHosts = strs(v); break;
             case "denied_hosts": c.deniedHosts = strs(v); break;
             case "allow_private": c.allowPrivate = v.boolean; break;
@@ -121,16 +129,38 @@ WebOffer webOffer(const WebConfig c, WebFlag flag, bool acp) pure nothrow
     return WebOffer(c.search.length > 0, c.fetch);
 }
 
-/// What happens to a web_fetch call no allow rule covers.
+/// What happens to a web_fetch call no permission rule covers.
 enum FetchDefault { allow, ask, deny }
 
-/// `--yolo` allows; a headless or ACP run allows only with `--web` (else
-/// denies: nobody can answer); an interactive run asks.
-FetchDefault fetchDefault(bool yolo, WebFlag flag, bool interactive) pure nothrow
+/// The `fetch_permission` value `s` names ("allow", "ask" or "deny").
+nano.result.Result!(FetchDefault, string) parseFetchPermission(string s) pure nothrow
 {
-    if (yolo) return FetchDefault.allow;
-    if (!interactive) return flag == WebFlag.on ? FetchDefault.allow : FetchDefault.deny;
-    return FetchDefault.ask;
+    alias R = typeof(return);
+    switch (s.strip)
+    {
+        case "allow": return R.ok(FetchDefault.allow);
+        case "ask": return R.ok(FetchDefault.ask);
+        case "deny": return R.ok(FetchDefault.deny);
+        default: return R.err(`[web] fetch_permission must be "allow", "ask" or "deny", not "` ~ s ~ `"`);
+    }
+}
+
+/// What a fetch no permission rule covers does, given the configured
+/// `fetch_permission`. `allow` (the default) and `deny` hold everywhere.
+/// `ask` asks in an interactive run; with nobody to answer (headless,
+/// ACP) it allows only with `--web`, else denies. `--yolo` turns `ask`
+/// into `allow` but leaves an explicit `deny`.
+FetchDefault fetchDefault(FetchDefault configured, bool yolo, WebFlag flag, bool interactive) pure nothrow
+{
+    final switch (configured)
+    {
+        case FetchDefault.allow: return FetchDefault.allow;
+        case FetchDefault.deny: return FetchDefault.deny;
+        case FetchDefault.ask:
+            if (yolo) return FetchDefault.allow;
+            if (!interactive) return flag == WebFlag.on ? FetchDefault.allow : FetchDefault.deny;
+            return FetchDefault.ask;
+    }
 }
 
 /// The backend `c` configures, if any, as `dg`'s argument (a SumType with a
@@ -629,10 +659,29 @@ unittest // tool offering per mode and flag
 
 unittest // fetch approval defaults
 {
-    assert(fetchDefault(true, WebFlag.unset, false) == FetchDefault.allow); // --yolo
-    assert(fetchDefault(false, WebFlag.unset, true) == FetchDefault.ask); // interactive
-    assert(fetchDefault(false, WebFlag.unset, false) == FetchDefault.deny); // headless
-    assert(fetchDefault(false, WebFlag.on, false) == FetchDefault.allow); // headless with --web
+    alias A = FetchDefault;
+    // allow (the default): everywhere, without a prompt.
+    assert(fetchDefault(A.allow, false, WebFlag.unset, true) == A.allow); // interactive
+    assert(fetchDefault(A.allow, false, WebFlag.unset, false) == A.allow); // headless
+    // ask: asks when someone can answer.
+    assert(fetchDefault(A.ask, true, WebFlag.unset, false) == A.allow); // --yolo
+    assert(fetchDefault(A.ask, false, WebFlag.unset, true) == A.ask); // interactive
+    assert(fetchDefault(A.ask, false, WebFlag.unset, false) == A.deny); // headless
+    assert(fetchDefault(A.ask, false, WebFlag.on, false) == A.allow); // headless with --web
+    // deny: even --yolo and --web keep it.
+    assert(fetchDefault(A.deny, true, WebFlag.on, true) == A.deny);
+    assert(fetchDefault(A.deny, false, WebFlag.unset, false) == A.deny);
+    assert(WebConfig.init.fetchPermission == A.allow);
+}
+
+unittest // fetch_permission parses the three values and rejects others
+{
+    import nano.result : unwrap;
+    assert(parseFetchPermission("allow").unwrap("valid") == FetchDefault.allow);
+    assert(parseFetchPermission(" ask ").unwrap("valid") == FetchDefault.ask);
+    assert(parseFetchPermission("deny").unwrap("valid") == FetchDefault.deny);
+    assert(parseFetchPermission("prompt").isErr);
+    assert(WebConfig.fromJSON(parseJSON(`{"fetch_permission":"deny"}`)).fetchPermission == FetchDefault.deny);
 }
 
 unittest // config

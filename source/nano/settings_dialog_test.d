@@ -100,8 +100,8 @@ unittest
     auto f = new Fixture;
     auto h = host(f, path);
     f.agent.subagentsOn = false;
-    // main: Sub-agents(9) → Enabled(0) → Yes(0) → Back(7) → Save(11) → Done(12)
-    runSettings(new ScriptedUi(["9", "0", "0", "7", "11", "12"]), h);
+    // main: Sub-agents(9) → Enabled(0) → Yes(0) → Back(7) → Save(12) → Done(13)
+    runSettings(new ScriptedUi(["9", "0", "0", "7", "12", "13"]), h);
     assert(f.subCalls == ["on"] && f.agent.subagentsOn && f.cfg.subagents);
     assert(readText(path).canFind("subagents = true"), readText(path));
 
@@ -110,7 +110,7 @@ unittest
     auto h2 = host(g, buildPath(dir, "other.toml"));
     h2.subagentsCommand = (string arg) { g.subCalls ~= arg; return "not available"; };
     g.agent.subagentsOn = false;
-    runSettings(new ScriptedUi(["9", "0", "0", "7", "12"]), h2);
+    runSettings(new ScriptedUi(["9", "0", "0", "7", "13"]), h2);
     assert(g.subCalls == ["on"] && g.cfg.subagents && !exists(buildPath(dir, "other.toml")));
     rmdirRecurse(dir);
 }
@@ -122,7 +122,7 @@ unittest
     auto path = buildPath(dir, "config.toml");
     auto f = new Fixture;
     auto h = host(f, path);
-    auto ui = new ScriptedUi(["9", "2", "0", "x", "3", "7", "11", "12"]);
+    auto ui = new ScriptedUi(["9", "2", "0", "x", "3", "7", "12", "13"]);
     runSettings(ui, h);
     assert(ui.said.canFind("enter a whole number of at least 1"), ui.said.to!string);
     assert(f.cfg.subagentMaxConcurrency == 3 && f.reconfigured == 1);
@@ -144,7 +144,7 @@ unittest
     auto h = host(f, path);
     // Sub-agents → Candidates(6) → a/x(0) → Edit(0) → Keep(0) → use, 5, 0, 0
     // → b/y(1) → Remove(1) → Back(1) → Back(7) → Save → Done
-    runSettings(new ScriptedUi(["9", "6", "0", "0", "0", "quick", "5", "0", "0", "1", "1", "2", "7", "11", "12"]), h);
+    runSettings(new ScriptedUi(["9", "6", "0", "0", "0", "quick", "5", "0", "0", "1", "1", "2", "7", "12", "13"]), h);
     assert(f.reconfigured == 1 && f.cfg.subagentModels == [SubagentModel("a/x", "quick", 5, 0, 0)]);
     auto c = Config.load(path);
     assert(c.subagentModels == [SubagentModel("a/x", "quick", 5, 0, 0)], readText(path));
@@ -159,7 +159,7 @@ unittest
     auto dir = scratch("candidate-esc");
     auto h = host(f, buildPath(dir, "config.toml"));
     // Sub-agents → Candidates(6) → a/x(0) → Edit(0) → Esc → Back(2) → Back(7) → Done
-    runSettings(new ScriptedUi(["9", "6", "0", "0", "esc", "2", "7", "12"]), h);
+    runSettings(new ScriptedUi(["9", "6", "0", "0", "esc", "2", "7", "13"]), h);
     assert(f.cfg.subagentModels == [SubagentModel("a/x", "old", 0, 0, 0)] && f.reconfigured == 0);
     rmdirRecurse(dir);
 }
@@ -172,7 +172,7 @@ unittest
     auto f = new Fixture;
     auto h = host(f, path);
     // Messages(10) → Enabled(0) → Yes → Confirm(1) → No(1) → Back(2) → Save → Done
-    runSettings(new ScriptedUi(["10", "0", "0", "1", "1", "2", "11", "12"]), h);
+    runSettings(new ScriptedUi(["10", "0", "0", "1", "1", "2", "12", "13"]), h);
     assert(f.msgCalls == ["on", "confirm off"] && f.cfg.sessionMessages && !f.cfg.sessionMessagesConfirm);
     auto t = readText(path);
     assert(t.canFind("session_messages = true") && t.canFind("session_messages_confirm = false"), t);
@@ -180,7 +180,7 @@ unittest
     auto g = new Fixture;
     auto h2 = host(g, buildPath(dir, "other.toml"));
     h2.messagesCommand = (string arg) { g.msgCalls ~= arg; return "refused"; };
-    runSettings(new ScriptedUi(["10", "0", "0", "1", "1", "2", "12"]), h2);
+    runSettings(new ScriptedUi(["10", "0", "0", "1", "1", "2", "13"]), h2);
     assert(g.msgCalls == ["on", "confirm off"] && !exists(buildPath(dir, "other.toml")));
     rmdirRecurse(dir);
 }
@@ -193,7 +193,7 @@ unittest
     f.agent.subagentsOn = true;
     f.msgOn = true;
     // Sub-agents → Enabled → Esc → Back; Messages → Enabled → Esc → Confirm → Esc → Back; Done
-    runSettings(new ScriptedUi(["9", "0", "esc", "7", "10", "0", "esc", "1", "esc", "2", "12"]), h);
+    runSettings(new ScriptedUi(["9", "0", "esc", "7", "10", "0", "esc", "1", "esc", "2", "13"]), h);
     assert(f.subCalls.length == 0 && f.msgCalls.length == 0, f.msgCalls.to!string);
     assert(f.agent.subagentsOn && f.msgOn && f.msgConfirm);
 }
@@ -226,7 +226,26 @@ unittest
     auto h = host(f, buildPath(dir, "config.toml"));
     f.msgOn = false;
     // Messages(10) → Enabled(0) → No(1) → Back(2) → Save → Done
-    runSettings(new ScriptedUi(["10", "0", "1", "2", "11", "12"]), h);
+    runSettings(new ScriptedUi(["10", "0", "1", "2", "12", "13"]), h);
     assert(f.msgCalls == ["off"], f.msgCalls.to!string);
+    rmdirRecurse(dir);
+}
+
+unittest
+{
+    // Web fetch(11): picking ask applies at once and saves under [web].
+    import nano.tools.web : FetchDefault;
+    auto dir = scratch("webfetch");
+    auto path = buildPath(dir, "config.toml");
+    auto f = new Fixture;
+    auto h = host(f, path);
+    assert(f.cfg.web.fetchPermission == FetchDefault.allow);
+    // Web fetch(11) → ask(1) → Save(12) → Done(13)
+    runSettings(new ScriptedUi(["11", "1", "12", "13"]), h);
+    assert(f.cfg.web.fetchPermission == FetchDefault.ask);
+    assert(Config.load(path).web.fetchPermission == FetchDefault.ask, readText(path));
+    // Esc at the chooser changes nothing.
+    runSettings(new ScriptedUi(["11", "esc", "13"]), h);
+    assert(f.cfg.web.fetchPermission == FetchDefault.ask);
     rmdirRecurse(dir);
 }

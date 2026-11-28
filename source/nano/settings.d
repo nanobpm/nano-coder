@@ -19,7 +19,7 @@ import nano.result : Result, orThrow, toOption, unwrap, unwrapErr;
 struct Changes
 {
     bool model, temperature, thinking, maxTokens, maxIterations, systemPrompt, compaction, verbosity, subagents,
-        sessionMessages, sessionMessagesConfirm, subagentModel, subagentLimits, subagentModels;
+        sessionMessages, sessionMessagesConfirm, subagentModel, subagentLimits, subagentModels, webFetchPermission;
     bool[string] providerTemperatures, providerThinking, providers;
     /// "provider\0model" pairs.
     bool[string] modelTemperatures, modelThinking;
@@ -28,7 +28,7 @@ struct Changes
     {
         return model || temperature || thinking || maxTokens || maxIterations || systemPrompt || compaction
             || verbosity || subagents || sessionMessages || sessionMessagesConfirm
-            || subagentModel || subagentLimits || subagentModels
+            || subagentModel || subagentLimits || subagentModels || webFetchPermission
             || providerTemperatures.length || providerThinking.length || providers.length
             || modelTemperatures.length || modelThinking.length;
     }
@@ -330,6 +330,12 @@ string applyChanges(string doc, const ref Config c, const ref Changes ch, const 
     if (ch.sessionMessages) doc = tomlSet(doc, [], "session_messages", c.sessionMessages ? "true" : "false");
     if (ch.sessionMessagesConfirm)
         doc = tomlSet(doc, [], "session_messages_confirm", c.sessionMessagesConfirm ? "true" : "false");
+    if (ch.webFetchPermission)
+    {
+        import std.conv : to;
+        // The enum's member names are the config values.
+        doc = tomlSet(doc, ["web"], "fetch_permission", tomlString(c.web.fetchPermission.to!string));
+    }
     // The retired `renderer` key (Rust #133) is dropped on any save.
     doc = tomlSet(doc, [], "renderer", null);
     if (ch.compaction)
