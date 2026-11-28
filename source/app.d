@@ -4341,6 +4341,13 @@ int runMain(string[] args)
         host.canonicalModel = (string s) { static import nano.recents; return nano.recents.canonical(s, cfg.providers, cfg.defaultProvider); };
         host.windowFor = (string s) => windowFor(cfg, resolve(cfg, s).config);
         host.providerWindowFor = (string s) => providerWindow(resolve(cfg, s).config.contextWindow);
+        host.sessionWindowRestored = (long recorded, bool fromProvider) {
+            // As interactive resume: held in the live config, and children's
+            // budgets re-frozen from it, so a cleared override (0) does not
+            // leave children on the old top-level window.
+            cfg.contextWindow = resumedContextWindow(cfg.contextWindow, cfg.contextWindow, false, true, recorded, fromProvider);
+            configureSubagents(agent, cfg, false);
+        };
         host.sessionDir = o.noSession ? null : sessionDir;
         host.version_ = versionString;
         {

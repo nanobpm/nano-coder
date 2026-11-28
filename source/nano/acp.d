@@ -298,6 +298,10 @@ struct Host
     /// top-level one: what a session's `context_window = 0` ("from
     /// provider/model") restores. Null: the startup window.
     ConfiguredWindow delegate(string spec) providerWindowFor;
+    /// Told the window a loaded session restores (`recorded` >= 0; 0 or
+    /// `fromProvider`: the provider's own), so the host's config, and the
+    /// sub-agent budgets frozen from it, follow the live window. Null: none.
+    void delegate(long recorded, bool fromProvider) sessionWindowRestored;
     /// The configured `model` and `system_prompt`, for `/settings`.
     string configModel, configSystemPrompt;
     /// The effective sandbox mode and its source, for `/settings` (#118).
@@ -1398,6 +1402,8 @@ final class AcpServer : AgentEvents
         const liveModel = agent.client.providerName ~ "/" ~ agent.client.modelName;
         const windowApplies = !windowOwner.length || windowOwner == liveModel
             || (host.canonicalModel !is null && host.canonicalModel(windowOwner) == liveModel);
+        if (windowApplies && st.contextWindow >= 0 && host.sessionWindowRestored !is null)
+            host.sessionWindowRestored(st.contextWindow, st.contextWindowFromProvider);
         if (!windowApplies) {}
         else if (st.contextWindow > 0 && !st.contextWindowFromProvider)
             // Only a user override (marked, or a legacy record without a
@@ -2153,6 +2159,9 @@ unittest
         Host hostP = host3;
         hostP.makeClient = (string spec) => new NamedMock("hdr", "one");
         hostP.providerWindowFor = (string spec) => ConfiguredWindow(32_000, "provider context_window");
+        long told = -1;
+        bool toldFromProvider;
+        hostP.sessionWindowRestored = (long r, bool fp) { told = r; toldFromProvider = fp; };
         auto agentP = new Agent(new NamedMock("hdr", "one"), new ToolRegistry, Policy.init, null);
         auto srvP = new AcpServer(agentP, hostP, (string l) {});
         srvP.receive(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"` ~ sidP ~ `"}}`);
@@ -2164,6 +2173,7 @@ unittest
         else
             assert(agentP.configuredWindow == 128_000 && agentP.configuredWindowSource == "the session's settings",
                 "a user-marked window restores as an override");
+        assert(told == 128_000 && toldFromProvider == fromProvider, "the host (and sub-agent budgets) hear the restored window");
         agentP.replaceLog(Option!SessionLog.init);
     }
 

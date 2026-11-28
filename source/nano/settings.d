@@ -41,10 +41,14 @@ string turnCapLabel(long maxIterations) pure
     return maxIterations <= 0 ? "unbounded" : format("%s LLM calls per input (normal mode asks before stopping)", maxIterations);
 }
 
-/// `0` is "unset": shown as what it resolves to.
+/// `0` is "unset": shown as what it resolves to. A set global value that a
+/// model or provider `max_tokens` overrides shows both, so the dialog never
+/// reports a limit requests don't use.
 string maxTokensLabel(long configured, string effective) pure
 {
-    return configured > 0 ? format("%s", configured) : format("auto (%s)", effective);
+    if (configured <= 0) return format("auto (%s)", effective);
+    const g = format("%s", configured);
+    return g == effective ? g : format("%s (in use: %s, from the model/provider max_tokens)", g, effective);
 }
 
 enum size_t recentModelsShown = 4;
@@ -469,6 +473,8 @@ unittest
 {
     import std.algorithm : canFind;
     assert(turnCapLabel(0) == "unbounded" && maxTokensLabel(0, "model default") == "auto (model default)");
+    assert(maxTokensLabel(4000, "4000") == "4000");
+    assert(maxTokensLabel(4000, "20000") == "4000 (in use: 20000, from the model/provider max_tokens)");
     ProviderConfig a, b;
     ProviderConfig[string] all = ["a": a, "b": b];
     assert(recentModels(["a/x", "gone/y", "b/z", "a/1", "a/2", "a/3"], all) == ["a/x", "b/z", "a/1", "a/2"]);
